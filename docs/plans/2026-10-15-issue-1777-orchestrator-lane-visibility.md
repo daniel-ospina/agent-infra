@@ -357,7 +357,7 @@ weight is zero).
 ## 6. Acceptance criteria
 
 1. `python3.12 tools/fleet/liveness.test.py` green (31 tests) and `--mutations` all RED-as-required.
-2. `python3.12 tools/fleet/claim_lanes.test.py` green (25 tests) and `--mutations` all caught (30).
+2. `python3.12 tools/fleet/claim_lanes.test.py` green (26 tests) and `--mutations` all caught (30).
 3. `python3.12 tools/fleet/lane_liveness.test.py` green with the DISCLOSURE leg and its red control.
 4. **Headline invariant:** T28 proves every claim-shaped verdict is `unknown`, named, `holder_pid is
    None`, and `escalatable(...) is False`; T29/T30 prove the existing ordering and existing verdicts are

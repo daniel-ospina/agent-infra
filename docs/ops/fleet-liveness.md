@@ -506,16 +506,21 @@ A reader must not trust two contracts for one rule. Concretely:
 creating it is one atomic push, so two boxes racing the same PR head cannot both win, and the
 record survives the process that made it.
 
-**⛔ The namespace carries TWO key shapes, and only one is HEAD-scoped.** `claim_issue_key` mints
-`refs/claims/issue-<N>` into the *same* namespace for issue dispatch (`claim_issue_preflight` /
-`claim_acquire_issue`). An issue key names an **issue**, not a head, so the reader classifies every
-ref's shape explicitly (`parse_key` → `head` | `issue` | `foreign`): an `issue-<N>` row is still
-reported (presence is presence) but it is **never** matched by `--sha`, never returned for `--pr`,
-and never disclosed as a PR's sibling — and the read's `detail` names the exclusion. Without that
-split `<pr>-<sha12>` parsing reads `issue-1850` as `pr="issue", sha12="1850"`, so a short
-`--sha 1850` (or `18`) prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the
-queried head" — for a head nobody holds. A key of neither shape is `foreign`, declared rather than
-guessed into an invented `pr`/`sha12` pair.
+**⛔ The namespace carries THREE key shapes, and only one is HEAD-scoped.** Besides the HEAD key,
+`claims.sh` mints `refs/claims/issue-<N>` (`claim_issue_key`, for issue dispatch via
+`claim_issue_preflight` / `claim_acquire_issue`) and `refs/claims/pr-<N>` (`claim_pr_key`, the
+**landing** key, #1952, minted by `claim_pr_ref`) into the *same* namespace. Neither names a head,
+so the reader classifies every ref's shape explicitly (`parse_key` → `head` | `issue` | `foreign`):
+an `issue-<N>` or `pr-<N>` row is still reported (presence is presence) but it is **never** matched
+by `--sha`, never returned for `--pr`, and never disclosed as a PR's sibling — and the read's
+`detail` names the excluded keys. Both are bucketed `foreign`, so a live LANDING claim reads
+`no-claim-visible` for the head it is landing: fail-closed (exit 3), and the `detail` names the
+excluded key, but a consumer reading only `--json`'s `verdict.reason` sees the abstention and not
+the caveat — which is why the shape is enumerated here. Without the matched split, `<pr>-<sha12>`
+parsing reads `issue-1850` as `pr="issue", sha12="1850"`, so a short `--sha 1850` (or `18`)
+prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the queried head" — for a head
+nobody holds. A key of no known shape is `foreign`, declared rather than guessed into an invented
+`pr`/`sha12` pair.
 
 **⛔ `ref-claim` is not "claim".** The fleet carries a second, unrelated sense: the
 **comment-claim** — a GitHub issue comment a lane takes ownership with, read by the product
@@ -637,7 +642,7 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 31 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (37)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
-python3 tools/fleet/claim_lanes.test.py            # 25 reader tests
+python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin

@@ -1052,7 +1052,7 @@ def l24_origin_without_repo_is_usage():
 # ══════════════════════════════════════════════════════════════════════════
 @test("L25 `issue-<N>` keys share the namespace and never answer for a head (#1784)")
 def l25_issue_keys_are_not_head_scoped():
-    """The namespace carries TWO key shapes; only `<pr>-<sha12>` is HEAD-scoped.
+    """The namespace carries THREE key shapes; only `<pr>-<sha12>` is HEAD-scoped.
 
     `claims.sh` mints `claim_key`'s `<pr>-<sha12>` AND `claim_issue_key`'s
     `issue-<N>` into ONE namespace (claims.sh:189, :219). Splitting every ref on the

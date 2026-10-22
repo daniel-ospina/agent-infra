@@ -471,11 +471,12 @@ class Claim:
     key: str = ""            # "<pr>-<sha12>" — the content address (HEAD-scoped)
     pr: str = ""
     sha12: str = ""
-    # ⛔ TWO KEY SHAPES SHARE ``refs/claims/`` (see ``claim_lanes.parse_key``): the
-    # HEAD key ``<pr>-<sha12>`` (``claim_key``) and the ISSUE key ``issue-<N>``
-    # (``claim_issue_key``). ``kind`` is ``head`` | ``issue`` | ``foreign``; ONLY a
-    # ``head`` key is HEAD-scoped, so only it may answer a ``--sha`` query. Without
-    # this field ``issue-1850`` parses as ``pr="issue", sha12="1850"`` and a short
+    # ⛔ THREE KEY SHAPES SHARE ``refs/claims/`` (see ``claim_lanes.parse_key``): the
+    # HEAD key ``<pr>-<sha12>`` (``claim_key``), the ISSUE key ``issue-<N>``
+    # (``claim_issue_key``) and the LANDING key ``pr-<N>`` (``claim_pr_key``, #1952).
+    # ``kind`` is ``head`` | ``issue`` | ``foreign``; ONLY a ``head`` key is
+    # HEAD-scoped, so only it may answer a ``--sha`` query. Without this field
+    # ``issue-1850`` parses as ``pr="issue", sha12="1850"`` and a short
     # ``--sha 1850`` reads a held head nobody holds.
     kind: str = "head"
     issue: str = ""         # the issue number, for ``kind == "issue"``

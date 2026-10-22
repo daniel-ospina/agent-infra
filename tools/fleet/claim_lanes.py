@@ -60,13 +60,18 @@ expired** — ``claims.sh``'s ``claim_acquire`` and ``claim_prune`` and
 tighter reading here would be the very two-readers-disagree defect those sites
 document.
 
-**The namespace carries TWO key shapes**, and they are matched explicitly
-(``parse_key``): the HEAD key ``<pr>-<sha12>`` (``claims.sh``'s ``claim_key``) and
-the ISSUE key ``issue-<N>`` (its ``claim_issue_key``), both under ``CLAIM_NS``. An
-issue key is not HEAD-scoped, so it is reported (presence) but never matched by
-``--sha``, never returned for ``--pr``, and never disclosed as a PR's sibling; the
-exclusion is named in the read's detail. Any other shape is ``foreign`` rather
-than an invented ``pr``/``sha12`` pair.
+**The namespace carries THREE key shapes** (`claims.sh` mints all three into
+``CLAIM_NS``), and they are matched explicitly (``parse_key``): the HEAD key
+``<pr>-<sha12>`` (``claim_key``), the ISSUE key ``issue-<N>``
+(``claim_issue_key``), and the LANDING key ``pr-<N>`` (``claim_pr_key``, #1952,
+minted by ``claim_pr_ref`` for "this PR is being landed"). Only the HEAD key is
+HEAD-scoped: an issue key and a landing key are reported (presence is presence)
+but never matched by ``--sha``, never returned for ``--pr``, and never disclosed
+as a PR's sibling — and the read's ``detail`` names the exclusion. Both are
+bucketed ``foreign`` by ``kind``, so a live LANDING claim reads
+``no-claim-visible`` for its head: fail-closed, but the reason names the excluded
+key rather than the shape, which is why the shape is enumerated here. Any other
+shape is ``foreign`` rather than an invented ``pr``/``sha12`` pair.
 
 FAIL-CLOSED, STRUCTURALLY
 -------------------------
@@ -162,9 +167,10 @@ ADVISORY = (
 READER_LIMITS = (
     "HEAD-scoped key: `refs/claims/<pr>-<sha12>` is keyed on the head sha, and a "
     "ref is DELETED on release and PRUNED on expiry — an absent key is not a free PR",
-    "two key shapes share this namespace: `claims.sh` also mints `refs/claims/issue-<N>` "
-    "(claim_issue_key). Those are ISSUE claims, not HEAD claims: they are reported "
-    "(presence) but never matched by --sha and never disclosed as a PR's siblings",
+    "three key shapes share this namespace: `claims.sh` also mints `refs/claims/issue-<N>` "
+    "(claim_issue_key) and `refs/claims/pr-<N>` (claim_pr_key, the landing key). Those are "
+    "ISSUE/LANDING claims, not HEAD claims: they are reported (presence) but bucketed "
+    "`foreign`, so they never match --sha and are never disclosed as a PR's siblings",
     "remote-only: only claims pushed to the target remote are visible; a lane that "
     "has not yet claimed, or whose claim was deleted, is invisible",
     "local harness state NOT read: `~/orchestrator/state/*` and the tmux `lane-*` / "
