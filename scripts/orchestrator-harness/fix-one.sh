@@ -117,7 +117,7 @@ if [ -f "$SELF/ci-queue.sh" ]; then
       fi
       exit 0
     fi
-    echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} — pushing is worth it" >> "$L.log"
+    echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s — pushing is worth it" >> "$L.log"
   fi
 fi
 CROSS_OWN=""; CROSS_RC=0

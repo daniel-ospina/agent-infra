@@ -105,6 +105,12 @@ if [ -f "$CIQ_MOD" ]; then
   else
     echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed); the CI-queue gate is INERT for this batch" >&2
   fi
+else
+  # ⛔ AN ABSENT MODULE IS ANNOUNCED TOO (#2333 cycle 3, P2). This is the stale-`$O` shape that
+  # `install.sh` and `check-single-source.sh` now detect — and a silent skip here means the batch
+  # stampedes exactly as before while every OTHER surface (the controller, `fix-one.sh`) says
+  # UNMEASURED out loud. Silence in one of three callers is how a gate rots into a decoration.
+  echo "dispatch-merge: WARNING — no ci-queue.sh at $CIQ_MOD; the CI-queue gate is UNMEASURED for this batch (the batch proceeds, and the controller's own arm already decided this cycle)" >&2
 fi
 
 for N in "$@"; do

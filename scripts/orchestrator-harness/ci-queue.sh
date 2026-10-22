@@ -376,7 +376,13 @@ ciq_cli() {
       printf 'derivation: ceiling = ceil(runners * horizon / job_p90) = ceil(%s * %s / %s) = %s\n' \
         "${CIQ_RUNNERS:-?}" "$(ciq_horizon_min)" "$(ciq_job_p90_min)" "${CIQ_CEILING:-?}"
       if [ "$verb" = defer ] && [ "$rc" != 1 ]; then
-        ciq_defer_note "CI-spending work (manual check)"
+        # ⛔ IN-SHELL, NOT A SECOND READ (#2333 cycle 3, P2). `ciq_defer_note` re-reads, so on a queue
+        # that moved between line 371's read and this one the second verdict could be `ok` — and then
+        # NOTHING was printed while the command still exited 0/2: a deferral with no line, the one
+        # failure the wiring's `ciq_defer_note_here` was introduced to eliminate. It also printed the
+        # `record:`/`derivation:` block from one read beside a line derived from another.
+        v="$(ciq_eval)"; drc=$?
+        ciq_defer_line "CI-spending work (manual check)" "$v" "$drc"
       fi
       return "$rc" ;;
     ceiling)

@@ -3198,10 +3198,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
+            # ⛔ THE QUEUE GATE APPLIES TO THIS ARM TOO (#2333 cycle 3, P2). This spawn is a PUSHER as
+            # well — `fix-one.sh`'s product is a new head — so it obeys the same rule the other two
+            # fixer arms do: on a deep or unreadable queue the push would void this PR's head-bound
+            # review record and queue behind a backlog it cannot outlast. (The README and the suite
+            # both said "both fixer spawn arms"; there are three, and the suite pinned the gap.)
+            # The eligibility predicate is hoisted so the DEFER arm below can share it verbatim rather
+            # than duplicating the guard, and so a non-eligible PR can never be reported as deferred.
+            _fix_eligible=0
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && can_spawn \
                && [ "$(wt_count fix-)" -lt "$MF" ]; then
+              _fix_eligible=1
+            fi
+            if [ "$_fix_eligible" = "1" ] && ciq_push_ok; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
@@ -3217,6 +3228,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
+            elif [ "$_fix_eligible" = "1" ]; then
+              ciq_defer_note_here "review-gate fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
@@ -3317,21 +3331,19 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # enqueues work on the same runners the gate is holding work OUT of — the one surface in
           # this sweep that ADDS queue while the gate says "do not". Reviewing, re-recording and
           # merging an existing head spends no new CI, which is why those arms stay ungated; a rerun
-          # does, so on a deep or unknown queue it is WITHHELD and the PR keeps its single
-          # disposition row (a second `act` row would make the cycle's act count exceed the number of
-          # units actually spawned).
-          if ! ciq_push_ok; then
+          # does, so on a deep or unknown queue it is WITHHELD.
+          # ⛔ AND THE GATE SITS INSIDE THE `RID` GUARD (#2333 cycle 3, P2). Tested BEFORE it, an
+          # unreadable `gh pr checks` (RID empty → no rerun was ever possible) still produced a
+          # "rerun withheld" line AND a ledger row — a deferral credited for an act that could not
+          # have happened. And it only ever RECORDS the withholding when this PR has no row yet: an
+          # existing `act` is a stronger fact, and an existing `wait` may be a stronger reason
+          # (`parked: … needs a human`).
+          if [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ] && ! ciq_push_ok; then
             ciq_defer_note_here "CI rerun for #$PR (run ${RID:-?} would enqueue another run behind the backlog)" >> "$LOG"
-            # ⛔ IT MUST NOT OVERWRITE AN `act` ROW (#2333 review cycle 2, P1). `dispreplace` DELETES
-            # the PR's row and writes one, and this block runs AFTER the arm chain — so on a deep
-            # queue it would replace an `act` the review-gate arm had just written (reviewing spends
-            # no new CI, so that arm is deliberately ungated). The cycle then reports `acts=0` while a
-            # worker WAS spawned: "NO UNIT SPAWNED" written over a spawn, which is the exact
-            # false-negative this sidecar exists to prevent. `pr-dispatch.test.sh` T3 measured it.
-            if awk -F'\t' -v p="$PR" '$1==p && $4=="act"{f=1} END{exit f?0:1}' "$PRDISP" 2>/dev/null; then
-              echo "#$PR CI rerun WITHHELD by the ci-queue gate — an act row already stands for this PR this cycle, so it is left alone and the withholding is recorded here" >> "$LOG"
-            else
+            if ! awk -F'\t' -v p="$PR" '$1==p{f=1} END{exit f?0:1}' "$PRDISP" 2>/dev/null; then
               dispreplace "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — rerun withheld; a rerun adds a run to the queue the gate is holding work out of"
+            else
+              echo "#$PR CI rerun WITHHELD by the ci-queue gate — this PR already has a disposition row this cycle, so it is left standing rather than overwritten" >> "$LOG"
             fi
           elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
             if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then

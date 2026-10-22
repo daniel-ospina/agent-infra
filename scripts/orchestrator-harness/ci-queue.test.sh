@@ -269,11 +269,15 @@ ck "(e2) orch-loop.sh reads the queue ONCE per cycle, IN THIS SHELL (not a subsh
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")"
-ck "(e4) BOTH push arms defer (the CONFLICTED and CI-red fixer spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e4) BOTH fixer push arms defer (the CONFLICTED and CI-red spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e4b) AND SO DOES THE THIRD PUSHER — the review-gate fixer arm (its product is a new head too)" \
+   "$( grep -q '_fix_eligible" = "1" ] && ciq_push_ok' "$LOOP"; echo $? )"
+ck "(e4c) …and its defer arm cannot fire for a PR that was simply not eligible (the guard is shared, not duplicated)" \
+   "$( grep -q 'elif \[ "\$_fix_eligible" = "1" \]; then' "$LOOP"; echo $? )"
 n="$(grep -c 'ciq_defer_note_here "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "CI-red fixer' "$LOOP")"
 ck "(e5) each push arm emits the deferral line" "$( { [ "$n" -eq 1 ] && [ "$m" -eq 1 ]; } ; echo $? )"
 n="$(grep -c 'ci-queue(\${CIQ_VER:-unmeasured})' "$LOOP")"
-ck "(e6) every CI-SPENDING arm (both fixer spawns + the rerun) writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet (n=$n)" "$( [ "$n" -eq 3 ]; echo $? )"
+ck "(e6) every CI-SPENDING arm (both fixer spawns + the review-gate fixer + the rerun) writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet (n=$n)" "$( [ "$n" -eq 4 ]; echo $? )"
 ck "(e6b) no push arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
    "$( grep -q 'CIQ_VER:-deep' "$LOOP"; [ $? -ne 0 ]; echo $? )"
 grep -q 'ci-queue.sh' "$FIX" && grep -q 'ciq_ci_allowed "\$OR"' "$FIX"
@@ -291,7 +295,7 @@ ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner rulin
 # future edit reverting one of them.
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
 ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
-   "$( { [ "$n" -eq 3 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
+   "$( { [ "$n" -eq 4 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
 
 printf '\n── (f) A READING THAT DOES NOT FIT IS NOT A READING (an errored [ ] is FALSE) ──\n'
 # ⛔ `[ … -gt … ]` ERRORS above intmax, an errored test is FALSE, and a FALSE test here lands on the

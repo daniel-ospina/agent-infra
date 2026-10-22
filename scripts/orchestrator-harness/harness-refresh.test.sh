@@ -741,23 +741,40 @@ printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/sleep";  chmod +x "$D/bin/sleep"
 printf '#!/bin/bash\necho load\n'    > "$D/bin/uptime"; chmod +x "$D/bin/uptime"
 for f in lane.sh merge-one.sh chain-merge.sh claims.sh; do : > "$D/O/$f"; done
-SPAWN="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="behind:111111111111" \
+# ⛔ THE CI-QUEUE READING THIS RIG MUST SUPPLY (#2296, cycle-3 P1). `dispatch-merge.sh` now reads the
+# CI queue before it dispatches a batch, and an UNREADABLE queue DEFERS (fail-closed — an unreadable
+# queue is not an empty one). This rig has no `gh`, so without a reading every line the three
+# assertions below assert would be deferred away and they would fail for a reason they do not test
+# (measured: 191 passed, 3 failed, all three of them this). The reading is SUPPLIED through the
+# module's documented `CIQ_GH` seam with a SHALLOW queue — the production precondition under which a
+# batch may run — rather than switching the gate off: a gate an env var can open is not a gate.
+cat > "$D/bin/gh-queue" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 1}' ;;
+  *status=in_progress*) echo '{"total_count": 0}' ;;
+  *actions/runners*)    echo '{"total_count": 3, "runners": [{"status": "online", "busy": false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$D/bin/gh-queue"
+SPAWN="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="behind:111111111111" \
         bash "$DM" "$D/repo" owner/repo 7 2>&1 | grep 'lane-7')"
 case "$SPAWN" in *"[harness=behind:111111111111]"*) ok "the lane-7 spawn line names the behind checkout" ;;
                   *) bad "the lane spawn line does not disclose it: '$SPAWN'" ;; esac
 # An ABSENT token must not read as "current": the default is the honest unknown.
-SPAWN2="$(PATH="$D/bin:$PATH" O="$D/O" bash "$DM" "$D/repo" owner/repo 8 2>&1 | grep 'lane-8')"
+SPAWN2="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" bash "$DM" "$D/repo" owner/repo 8 2>&1 | grep 'lane-8')"
 case "$SPAWN2" in *"[harness=unknown]"*) ok "an unsupplied token reads as unknown, never as current" ;;
                    *) bad "an absent token printed '$(printf '%s' "$SPAWN2" | tr -d '\n')'" ;; esac
 # ⛔ AND AN EMPTY TOKEN IS A REAL ANSWER (the box is current), NOT AN ABSENT ONE. `${TOKEN:-unknown}`
 # collapses the two, so every HEALTHY box stamped `[harness=unknown]` — the marker a reader needs in
 # order to spot a stale box would then be present always, and therefore read never.
-ALL9="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+ALL9="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
 case "$ALL9" in *harness=*) bad "an EMPTY (current) token still stamped a spawn line: '$(printf '%s' "$ALL9" | grep -o '\[harness=[^]]*\]' | head -1)'" ;;
                   *) ok "…and an EMPTY (current) token leaves BOTH spawn lines clean (lane- and chain-) — only UNSET is unknown" ;; esac
 # The chain- line is a SECOND spawn path, and it used to stamp unconditionally: `[harness=]` on every
 # current box, which is exactly the always-present marker this design refuses.
-ALL7="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+ALL7="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
 case "$ALL7" in *"chain-9"*"[harness=behind:111111111111]"*) ok "the CHAIN spawn line names the behind checkout too" ;;
                *) bad "the chain spawn line does not disclose it: $(printf '%s' "$ALL7" | tr '\n' ' ' | cut -c1-200)" ;; esac
 

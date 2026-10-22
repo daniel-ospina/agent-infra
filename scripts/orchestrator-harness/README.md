@@ -2744,7 +2744,9 @@ question — may this box send more CI-spending work yet. The ceiling is **deriv
 `ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
 owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
 nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
-(one read per cycle, in-shell, before dispatch — and both fixer spawn arms), `fix-one.sh` (the lane
+(one read per cycle, in-shell, before dispatch — and THREE fixer spawn arms: the CONFLICTED one, the
+CI-red one, and the review-gate one, whose product is also a new head — plus the CI RERUN, which is
+the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
 whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes).
 
 Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
