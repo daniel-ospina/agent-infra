@@ -29,8 +29,9 @@
 #   F. wiring pins: lane.sh reaps in its EXIT trap, fix-one.sh reaps AFTER the merge chain, the cell
 #      supervisor no longer blind-`rm`s a `.venv` and delegates to the reaper instead, setup.sh farms
 #      the reaper so a cell can find it.
-#   G. the `uv` download cache is never referenced — a venv hardlinks into it, and deleting it is the
-#      measured regression (#1932) that turned "6.1 GB freed" into duplicated venvs.
+#   G. the `uv` download cache is never referenced — deleting it re-spends the space whether or not
+#      this box shares blocks with it, and that is the measured regression (#1932) that turned
+#      "6.1 GB freed" into duplicated venvs.
 #
 # Hermetic apart from §E, which is REAL by design and uses only fixtures under $T (plus a private
 # `tmux -L` server killed by the EXIT trap). Each section gets its OWN throwaway repo, so a fixture
@@ -219,7 +220,7 @@ assert_contains "$out" "reaped=1" "the footer counts one reaped env"
 absent "$W_DEAD/.venv" "the dead lane's .venv is gone"
 exists "$W_DEAD/f.txt" "the worktree's TRACKED content is untouched (only .venv was removed)"
 assert_contains "$out" "reclaimed_du=" "byte accounting is reported"
-assert_contains "$out" "du over-counts hardlinked uv-cache blocks" "the du figure is labelled an over-count"
+assert_contains "$out" "over-counts only where that sharing exists" "the du figure is labelled a PER-MACHINE over-count, not a universal hardlink claim"
 
 echo " A2 a LIVE lane (its tmux pane is inside the worktree) is KEPT"
 out="$(run_shimmed FAKE_TMUX_TABLE="$T/tmux-live.tsv" --worktree "$W_LIVE" --apply)"
