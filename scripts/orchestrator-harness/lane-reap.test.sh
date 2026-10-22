@@ -565,6 +565,17 @@ for spelling in 'pipe' '->0x0'; do
   eq "$rc" "3" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: the pass ABSTAINS (exit 3), never a clean 0"
 done
 
+# ⛔ THE CENSUS MUST ABSTAIN TOO (#2163 review r6, P1). The rc-2/rc-4 split left `cmd_count` with no
+# arm for an unusable identity: the tree fell through to `attributed` with an EMPTY path, the lane-log
+# filter dropped it, and the census printed `lanes=0/0` exit 0 over a RESIDENT lane — the same
+# under-count ⇒ false MAX_LANES ⇒ dispatch-more fail-open this issue closes, on the only platform
+# where `fleet` ancestry exists. Measured before the fix: `lanes=0/0 zombie=0`, rc 0.
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
+       LSOF_PIPE_PI="pipe" LSOF_PIPE_STDIN="pipe" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_count "$T/t-alien3")"; rc=$?
+has "$out" "lanes=?/?" "CENSUS-UNIDENTIFIABLE: an unusable identity abstains the census, never a confident 0/0"
+eq "$rc" "3" "CENSUS-UNIDENTIFIABLE: …with exit 3"
+
 # ── EVIDENCE-MIXED: a readable box must not be reported as a BLIND one ─────────────────────────
 # ⛔ MEASURED (#2163 review r5, P3). The generic-spelling abstention reused the READ-FAILURE refusal
 # and counter, so on a box with ONE healthy live lane and ONE generic-spelling tee tree the reaper
