@@ -95,31 +95,50 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
 # 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
 # old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI and still leaves the rest of the lane's own budget (`LANE_TIMEOUT`, 3300s) for the
-# MERGE chain, which is where the remaining time must go. A re-run is still permitted and still
-# cheap (one PR read) — the bound is a runaway guard, never a reason to call a head green.
+# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
+# supervision bound below is derived from what is left AFTER it AND after the lane's implementation
+# time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
+# PR read) — the bound is a runaway guard, never a reason to call a head green.
 WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # per-round check wait
+POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
 # ⛔ --watch IS BOUNDED TOO. A pid probe cannot distinguish "the chain is still working" from "the pid
 # was reused", so an unbounded --watch loop would be a lane that never ends — the same defect the
-# round cap removes, one layer down. 20 chunks x LANE_MERGE_POLL (120s) ≈ 40 minutes of supervision,
-# after which the lane hands off instead of waiting forever.
-# ⛔ 20 CHUNKS WAS TOO SMALL TO SUPERVISE ONE CYCLE — it bounded supervision at 40 min while the cycle
-# this loop exists to wait for is CI (up to ~24 min under 22 landers) + merge-one.sh's REVIEW_TIMEOUT
-# (1800s) + the rail's own retries ≈ 55-60 min. So the HEALTHY-but-slow PR — precisely the one closest
-# to merging — would exhaust supervision and be reported as BLOCKED_ATTEMPTS with "budget spent": the
-# instrument failing the case it was written for.
-# ⛔ BUT IT MUST FIT INSIDE THE LANE'S OWN WALL CLOCK (reviewer finding, P2, verified). 35 x 120s =
-# 4200s EXCEEDS lane.sh's LANE_TIMEOUT (3300s): the bound is then unreachable by the lane that owns
-# it — the process is killed first — and is only ever spent by a LATER lane that inherited the counter,
-# which then hands off with "budget spent" for a budget it never had.
-# ⛔ AND THE INVARIANT IS NOT `MAX_WATCH x POLL < LANE_TIMEOUT` — it is
-# `WAIT_S + MAX_WATCH x POLL <= LANE_TIMEOUT` (reviewer finding, P2, verified). The check wait above
-# spends WAIT_S (1500s) of the SAME 3300s wall clock, so 25 chunks left only ~15 reachable and the rest
-# was still inherited from a later lane — the symptom narrowed, not closed. 1500 + 15 x 120 = 3300: the
-# supervision budget is exactly what remains after the wait. A cycle that needs longer is not a lane
-# failure: it hands off as WAITING_* (exit 11) and the next invocation resumes the SAME counter.
-MAX_WATCH="${LANE_MERGE_MAX_WATCH:-15}"; is_limit "$MAX_WATCH" || MAX_WATCH=15
-POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
+# round cap removes, one layer down.
+# ⛔ AND THE BOUND MUST BE SIZED TO WHAT THE LANE CAN ACTUALLY SPEND, WHICH IS NOT THE WHOLE WALL CLOCK
+# (reviewer finding, P1, verified). The previous sizing satisfied `WAIT_S + MAX_WATCH x POLL <=
+# LANE_TIMEOUT` by making the two sides EQUAL: 1500 + 15 x 120 = 3300 = lane.sh's LANE_TIMEOUT. That sum
+# is spent from the SAME wall clock that pays for the lane's implementation, its commits, its pushes and
+# opening the PR — for which it left exactly ZERO. So with any real implementation time the lane was
+# killed at 3300s still inside its merge phase: neither bound was ever REACHED by the lane that owns
+# them, no verdict was written, no hand-off comment was posted, and the only signal left was lane.sh's
+# "NO merge-phase verdict" line. The BLOCKED_ATTEMPTS / "supervision budget spent" path was unreachable
+# in production — an instrument that only fires for a lane that could not exist.
+# So the invariant has THREE terms, and the lane's own implementation time is one of them:
+#     WAIT_S + MAX_WATCH x POLL + IMPL_RESERVE_S <= LANE_TIMEOUT
+# IMPL_RESERVE_S is the floor a lane needs for implement → commit → push → open PR before its merge
+# phase can start; the merge phase must never be sized out of it. MAX_WATCH is DERIVED from what that
+# leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
+# eat the implementation time again. Shipped defaults:
+#     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
+# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
+# reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
+# WAITING_* (exit 11) and the next invocation resumes the SAME counter.
+IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
+LANE_WALL_S="${LANE_TIMEOUT:-3300}";              is_limit "$LANE_WALL_S" || LANE_WALL_S=3300
+# The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
+# that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
+# yielding a bound.
+_fit_poll="$POLL_S"; [ "$_fit_poll" -ge 1 ] || _fit_poll=120
+MAX_WATCH_FIT=$(( (LANE_WALL_S - WAIT_S - IMPL_RESERVE_S) / _fit_poll ))
+[ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
+MAX_WATCH="$MAX_WATCH_FIT"
+if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
+  # An explicit override is an operator's escape hatch and is HONOURED rather than silently rewritten —
+  # but it is never silent about breaking the invariant above, because the next reader would take the
+  # bound at face value.
+  MAX_WATCH="$LANE_MERGE_MAX_WATCH"
+  [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
+fi
 INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 [ "$INTERVAL" -ge 5 ] || INTERVAL=20
 
@@ -598,6 +617,30 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
 }
 
 # ── FIX / BLOCK emitters (they own the round counter and the handoff comment) ────────────────────
+# ── the hand-off's "how to merge this" instruction ────────────────────────────────────────────────
+# ⛔ THE PRINTED REMEDY MUST NAME THE SAME CHECKOUT `launch_chain` WOULD ACCEPT (landing-review F1, P1,
+# verified). It used `${REPO_PATH:-$(pwd)}` — the LANE'S OWN checkout — which is precisely the tree
+# `resolve_trusted_checkout` refuses (see its header). `merge-one.sh` resolves the merge authority as
+# `$REPO/scripts/admin-merge.sh`, and that rail resolves its own graders (`ci_exemption.py`,
+# `ci-failure-set.sh`) from its own directory, so a PR that edits either was merged THROUGH THE LANE'S
+# EDITED COPY by whoever followed the printed instruction: the exact bypass the launch path hardened
+# the code against, reintroduced as documentation. So the instruction is derived from the SAME resolver
+# as the launch, and when the resolver refuses the hand-off REFUSES TOO — an instruction must never
+# point at a tree the guard refuses.
+chain_cmd() { # chain_cmd <trusted-checkout> <branch> <lead-in> <suffix>
+  printf 'Next: %s`bash "%s/merge-one.sh" "%s" "%s" %s "%s"`%s\n' \
+    "$3" "$O" "$1" "$OR" "$PR" "$2" "$4"
+}
+merge_authority_unresolved_note() { # no trusted checkout could be resolved — refuse, do not point
+  printf 'Next: NO merge command is printed here — no trusted (main) checkout could be resolved from\n'
+  printf 'this lane'"'"'s checkout, and `merge-one.sh` reads the merge authority (`scripts/admin-merge.sh`)\n'
+  printf 'and that rail'"'"'s own graders FROM THE TREE IT IS RUN IN. Aiming it at a lane worktree is the\n'
+  printf 'bypass this script refuses to LAUNCH through, so it is not offered as a remedy either. Run the\n'
+  printf 'chain from the repo'"'"'s MAIN worktree instead:\n'
+  printf '  git worktree list --porcelain    # the FIRST "worktree " line names the main checkout\n'
+  printf '  bash "%s/merge-one.sh" "<that path>" "%s" %s "%s"\n' "$O" "$OR" "$PR" "${_br:-<branch>}"
+}
+
 post_handoff() { # post_handoff <verdict-token> <reason>
   local tok="$1" reason="$2" marker body
   marker="<!-- lane-merge-handoff: ${HEAD:-unknown} -->"
@@ -640,9 +683,11 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     # ⛔ A DETACHED HEAD IS NOT A BRANCH (reviewer finding, P2, R12, measured): `git rev-parse
     # --abbrev-ref HEAD` answers "HEAD" outside a branch, and `origin/HEAD` resolves to main — so the
     # printed command would hand the reviewer MAIN's content under the PR's name, and a `CLEAN` verdict
-    # from it would be recorded with no error at all. Resolve against the SAME tree the command names
-    # (REPO_PATH), and accept only something that is a branch: never empty, never HEAD, never spaced.
-    _rp="${REPO_PATH:-$(pwd)}"
+    # from it would be recorded with no error at all. Accept only something that is a branch: never
+    # empty, never HEAD, never spaced.
+    # ⛔ AND THE CHECKOUT IS RESOLVED, NEVER INHERITED (landing-review F1, P1): `_rp` is the tree the
+    # chain would actually run from, or empty when the resolver refuses (see chain_cmd above).
+    _rp="$(resolve_trusted_checkout "${REPO_PATH:-$(pwd)}" 2>/dev/null)" || _rp=""
     _br="$RESOLVED_BR"
     [ -n "$_br" ] || _br="<branch>"
     # ⛔ THE NEXT STEP MUST BE TRUE FOR THIS TOKEN *AND* EXECUTABLE AS WRITTEN (reviewer finding, R10):
@@ -655,8 +700,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
       BLOCKED_ATTESTATION)
         printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
         printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself.\n'
-        printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br"
+        if [ -n "$_rp" ]; then chain_cmd "$_rp" "$_br" "" "."
+        else merge_authority_unresolved_note; fi
         [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
       BLOCKED_CLOSED)
         printf 'This PR is CLOSED and was not merged. A chain cannot fix that, so do NOT launch one\n'
@@ -667,8 +712,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
                    printf 'budget — re-running the chunk reaches the same cap on its first fix.\n' ;;
           running) printf 'Next: the chain was STILL RUNNING — wait for the pid above, or once it exits\n'
                    printf 'run `%s/lane-merge.sh %s --repo %s` (no --watch: the budget is spent).\n' "$O" "$PR" "$OR" ;;
-          absent)  printf 'Next: launch the chain — `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br"
+          absent)  if [ -n "$_rp" ]; then chain_cmd "$_rp" "$_br" "launch the chain — " "."
+                   else merge_authority_unresolved_note; fi
                    [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
           # ⛔ NOT `--watch` (reviewer finding, P1, R11, measured: RC=13, same token, 0.455s, zero
           # supervision — the budget is what refused it, so chunk N+1 is charged before any work and
@@ -677,8 +722,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
                    printf 'refused you, so another watch chunk is charged before it does any work.\n' ;;
         esac ;;
       *)
-        printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"` (reviews, records, merges).\n' \
-          "$O" "$_rp" "$OR" "$PR" "$_br"
+        if [ -n "$_rp" ]; then chain_cmd "$_rp" "$_br" "" " (reviews, records, merges)."
+        else merge_authority_unresolved_note; fi
         [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
     esac
     case "$tok" in
@@ -908,6 +953,26 @@ if [ "$WATCH" -eq 1 ]; then
       exit 11
     fi
     if ! chain_alive; then
+      # ⛔ AN UNREADABLE PR STATE IS A WAIT, NOT A JUDGEMENT (reviewer finding, P2, verified). When a
+      # chunk's `pr_read` fails (rate limit / DNS / auth), `read_up` is empty and ST/MT/HD keep their
+      # previous (or no) value — the guard at the top of the tick correctly refuses to BLANK the head,
+      # but nothing stopped the JUDGEMENT below. With a dead chain and an inconclusive merge log,
+      # `chain_verdict_from_log` returns UNKNOWN and the `*)` arm ATTESTS: "green and mergeable, but no
+      # signed review record exists for head ${HEAD:-?} …" — two facts asserted about a PR nothing was
+      # read for, posted as a public PR comment, with exit 12 ("stop fixing and hand off") on a PR that
+      # may be perfectly mergeable. The file already has the correct re-runnable disposition for exactly
+      # this: WAITING_API (exit 11). So it is taken here, BEFORE any classification, and nothing is
+      # posted. The chunk is CHARGED (not refunded) on purpose, so a permanently unreadable API
+      # converges on the budget hand-off that already says the truth — "the last chunk could not read
+      # the merge confirmation, so this verdict says nothing about the PR: it may well be merged"
+      # instead of manufacturing a review verdict.
+      if [ -z "${read_up:-}" ]; then
+        say "… the PR could not be READ this chunk (rate limit / auth / DNS) — nothing about it is decided:"
+        say "   no attestation, no hand-off comment, no fix round. Re-run when gh answers."
+        disposition WAITING_API
+        verdict WAITING_API "the PR read failed this chunk; no judgement about the PR was made"
+        exit 11
+      fi
       cv="$(chain_verdict_from_log "$(chain_log)" "${HD:-}")"
       case "$cv" in
         MERGED)

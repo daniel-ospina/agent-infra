@@ -808,6 +808,38 @@ ck "…the chain is handed the MAIN worktree, not the lane's own checkout (got: 
 ck "…so the rail the chain will exec is the TRUSTED copy, not the lane's tampered one" \
    $(grep -q "the TRUSTED rail" "$LM_GOT/scripts/admin-merge.sh" 2>/dev/null && echo 0 || echo 1)
 
+# ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
+# ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —
+# merge-one.sh resolves the merge authority as `$REPO/scripts/admin-merge.sh` and that rail resolves its
+# own graders from its own directory — but the hand-off body told the next holder to run
+# `merge-one.sh "${REPO_PATH:-$(pwd)}"`, i.e. THE LANE'S OWN CHECKOUT. A PR that edits the rail or
+# `ci_exemption.py` was then merged THROUGH THE LANE'S EDITED COPY by whoever followed the instruction.
+# The fixture is the same real worktree pair as above, and the assertion reads what the next holder
+# would actually copy: the POSTED COMMENT BODY.
+new_o "$T/junk-q46.tsv"
+printf 'open||fh46|clean\n' > "$T/pr-open46.tsv"
+printf '%s deadbeef %s\n' 999978 "$OT/logs/lane-merge-46.log" > "$OT/state/lanemerge-46.chain"
+printf 'nothing useful here\n' > "$OT/logs/lane-merge-46.log"
+TRUST_BODY="$T/gh-trust46.log"; : > "$TRUST_BODY"
+OUT="$(cd "$LMWT" && REPO_PATH="$LMWT" PATH="$BIN:$PATH" GH_LOG="$TRUST_BODY" O="$OT" HOME="$T/home" \
+      LANE_MERGE_POLL=0 bash "$SCRIPT" 46 --watch --repo o/r --pr-tsv "$T/pr-open46.tsv" 2>&1)"; RC=$?
+LMFR_R="$(cd "$LMFR" && pwd -P)"; LMWT_R="$(cd "$LMWT" && pwd -P)"
+ck "the hand-off's remedy names the MAIN worktree the guard accepts, never the lane's own checkout (got rc=$RC)" \
+   $([ "$RC" = 12 ] && grep -qF "merge-one.sh\" \"$LMFR_R\"" "$TRUST_BODY" && ! grep -qF "$LMWT_R" "$TRUST_BODY" && echo 0 || echo 1)
+# ⛔ AND WHEN THE RESOLVER REFUSES, THE HAND-OFF REFUSES TOO — it does not fall back to a tree the guard
+# would reject. An instruction must never point at what the launch path refuses.
+new_o "$T/junk-q47.tsv"
+printf 'open||fh47|clean\n' > "$T/pr-open47.tsv"
+printf '%s deadbeef %s\n' 999977 "$OT/logs/lane-merge-47.log" > "$OT/state/lanemerge-47.chain"
+printf 'nothing useful here\n' > "$OT/logs/lane-merge-47.log"
+REF_BODY="$T/gh-refuse47.log"; : > "$REF_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$REF_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      REPO_PATH="$T/no-such-checkout" bash "$SCRIPT" 47 --watch --repo o/r --pr-tsv "$T/pr-open47.tsv" 2>&1)"; RC=$?
+ck "an UNRESOLVABLE checkout prints a REFUSAL (with the discovery command), not a command aimed at a tree the guard would reject" \
+   $([ "$RC" = 12 ] && grep -q 'NO merge command is printed here' "$REF_BODY" \
+      && grep -q 'git worktree list --porcelain' "$REF_BODY" \
+      && grep -qF 'merge-one.sh" "<that path>"' "$REF_BODY" && echo 0 || echo 1)
+
 # ── 11c-decies. the classifier's vocabulary is the WRITER's (landing-review: two dead patterns) ──
 # gate mode's success line and the verdict-less line are the shipped `merge-one.sh` echoes; the suite
 # previously wrote only the rail line and `NOT CLEAN or reviewer failed` (a string merge-one never
@@ -961,24 +993,50 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
        LANE_MERGE_WAIT=0 LANE_MERGE_INTERVAL=0 bash "$SCRIPT" 31 --repo o/r --pr-tsv "$T/pr31.tsv" >/dev/null 2>&1; RC2=$?; \
      [ "$RC2" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
 
-# ── 18. the SUPERVISION BUDGET is sized to one documented cycle AND re-armed (E1) ───────────────
-ck "the watch budget (15 x 120s) plus the check wait (WAIT_S) fits INSIDE lane.sh's 3300s wall clock" \
-   $(grep -q 'LANE_MERGE_MAX_WATCH:-15}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-35}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-25}' "$SCRIPT" && echo 0 || echo 1)
-# ⛔ THE ARITHMETIC, not the literal: the shipped default x the shipped chunk length must be strictly
-# less than LANE_TIMEOUT in lane.sh, or the bound is unreachable by the lane that owns it and is only
-# ever spent by a LATER lane (the "budget spent" handoff for a budget it never had).
-_mw="$(sed -n 's/.*LANE_MERGE_MAX_WATCH:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
-_ps="$(sed -n 's/.*LANE_MERGE_POLL:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+# ── 18. the SUPERVISION BUDGET is sized to what the LANE can actually SPEND, and re-armed (E1) ────
+# ⛔ THE OLD INVARIANT WAS SATISFIED BY MAKING THE TWO SIDES EQUAL (landing review, P1, verified):
+# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = lane.sh's LANE_TIMEOUT, so the merge phase
+# consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
+# pushes and opening the PR. With any real implementation time the lane was killed at 3300s still
+# inside its merge phase — neither bound was ever reached by the lane that OWNS them, no verdict was
+# written, no hand-off comment was posted, and the only signal was lane.sh's "NO merge-phase verdict"
+# line. The BLOCKED_ATTEMPTS / "supervision budget spent" path was unreachable in production.
+# The invariant now has THREE terms, and the implementation reserve is one of them:
+#     WAIT_S + MAX_WATCH x POLL + IMPL_RESERVE <= LANE_TIMEOUT
+ck "the supervision budget is DERIVED from the lane's wall clock and RESERVES implementation time (no literal default that can eat the whole clock)" \
+   $(grep -q 'LANE_MERGE_IMPL_RESERVE:-900}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-[0-9]' "$SCRIPT" \
+     && grep -q 'MAX_WATCH_FIT=' "$SCRIPT" && echo 0 || echo 1)
+# ⛔ THE ARITHMETIC, not the literal: the derived default x the shipped chunk length PLUS the check
+# wait PLUS the implementation reserve must fit inside LANE_TIMEOUT in lane.sh, or a bound is unreachable
+# by the lane that owns it — and it must leave a NON-ZERO reserve, or the merge phase is again paid for
+# out of the lane's implementation time.
+_ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-3300}" …`, so read the default out of THAT call.
 _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
-# ⛔ THE INVARIANT IS `WAIT_S + MAX_WATCH x POLL <= LANE_TIMEOUT`, not `MAX_WATCH x POLL <
-# LANE_TIMEOUT`: the check wait spends WAIT_S of the SAME wall clock, so a budget that ignores it leaves
-# most of the chunks unreachable and the rest is inherited by a LATER lane — the "budget spent for a
-# budget it never had" symptom, narrowed rather than closed (reviewer finding, verified).
-_ws="$(sed -n 's/.*LANE_MERGE_WAIT:-"\([0-9]*\)".*/\1/p' "$SCRIPT" | head -1)"
+_ws="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
-ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} )) ≤ lane.sh LANE_TIMEOUT ($_lt) — by ARITHMETIC across the two files" \
-   $([ -n "$_mw" ] && [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ $((_ws + _mw * _ps)) -le "$_lt" ] && echo 0 || echo 1)
+_ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+[ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ -n "$_ir" ] && _mw=$(( (_lt - _ws - _ir) / _ps )) || _mw=0
+ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane.sh LANE_TIMEOUT ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
+   $([ -n "$_mw" ] && [ "${_ir:-0}" -gt 0 ] && [ "${_mw:-0}" -ge 1 ] && [ $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) -le "$_lt" ] && echo 0 || echo 1)
+# ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
+# script whose runtime lost the property). Drive the DERIVED cap through --watch with a SHRUNK
+# LANE_TIMEOUT: 1500 - 0 (check wait) - 900 (reserve) = 600s / 120s = 5 chunks, so chunk 6 is refused
+# and chunk 5 is not. Under the old literal default (15) BOTH were admitted — the bound never fired.
+new_o "$T/pr-fit.tsv"
+printf 'open||fithead|clean\n' > "$T/pr-fit.tsv"
+printf '5\n' > "$OT/state/lanemerge-39.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=1500 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 39 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "the DERIVED cap is what refuses the crossing chunk (LANE_TIMEOUT=1500 ⇒ 5 chunks after a 900s implementation reserve), not a literal" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+printf '4\n' > "$OT/state/lanemerge-40.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=1500 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…and one chunk EARLIER the derived cap does NOT refuse it (the bound is REACHABLE by the lane that owns it, not always-already-spent)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
 printf '15\n' > "$OT/state/lanemerge-32.apiretry"
@@ -1008,6 +1066,28 @@ ck "an UNREADABLE PR is not 'closed and merged' (unreadable ≠ MERGED; it stays
 # than to fix a present double-read — asserted structurally, and labelled as such.
 ck "the read is applied only on a NON-EMPTY read (so a failed read cannot blank the head)" \
    $(grep -q 'if \[ -n "${read_up:-}" \]; then' "$SCRIPT" && echo 0 || echo 1)
+
+# ── 19b. a DEAD chain + an UNREADABLE PR is a WAIT, not an attestation (landing-review P2) ────────
+# ⛔ THE GUARD AT THE TOP OF THE TICK STOPS THE BLANKING OF HEAD, NOT THE JUDGEMENT. With a failed
+# `pr_read` (rate limit / DNS) ST/MT/HD are empty, the chain is dead and the merge log is inconclusive,
+# so `chain_verdict_from_log` returned UNKNOWN and the `*)` arm ATTESTED: "green and mergeable, but no
+# signed review record exists for head ${HEAD:-?} …" — two facts asserted about a PR nothing had been
+# read for, posted as a public PR comment, with exit 12 ("stop fixing and hand off") on a PR that may
+# well be mergeable. The file already has the correct re-runnable disposition for exactly this —
+# WAITING_API, exit 11 — and it is now taken BEFORE any classification, with nothing posted.
+new_o "$T/junk-q19b.tsv"
+printf '%s deadbeef %s\n' 999980 "$OT/logs/lane-merge-38.log" > "$OT/state/lanemerge-38.chain"
+printf 'nothing useful here\n' > "$OT/logs/lane-merge-38.log"
+: > "$T/gh-19b.log"
+# NO such fixture: `pr_read` returns nothing = the rate-limited / failed read.
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh-19b.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_POLL=0 bash "$SCRIPT" 38 --watch --repo o/r --pr-tsv "$T/no-such-pr-fixture.tsv" 2>&1)"; RC=$?
+ck "a DEAD chain + an UNREADABLE PR → exit 11 WAITING_API (no verdict about a state nobody read)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 38 | cut -d' ' -f1)" = WAITING_API ] \
+      && [ "$(cat "$OT/state/lanemerge-38.lastdisp" 2>/dev/null)" = WAITING_API ] && echo 0 || echo 1)
+ck "…and NO attestation is recorded and NO hand-off comment is posted (a public 'green and mergeable … head ?' about an unread PR is a false claim)" \
+   $([ "$(verdict_of 38 | cut -d' ' -f1)" != BLOCKED_ATTESTATION ] && ! grep -q 'green and mergeable' <<<"$OUT" \
+      && ! grep -q 'issues/38/comments' "$T/gh-19b.log" && echo 0 || echo 1)
 
 # ── 20. the DETACHED wrapper records MERGED from the chaid's own marker — and ONLY on confirmation ──
 # F5: without this the wrapper's MERGED branch is dead code as far as the suite is concerned, and the

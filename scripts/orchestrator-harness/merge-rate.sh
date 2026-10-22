@@ -22,10 +22,12 @@
 #   * the LAST status line per lane wins, because a lane log is APPENDED to across re-dispatches of
 #     the same issue and an early "PR_OPENED" followed by "MERGED" is one merged lane, not both;
 #   * "MERGED" is claimed from a MERGED token **or** from `state/merged-<PR>.done`, and the second is
-#     counted in the numerator only for a lane whose own last word was PR_OPENED/UNKNOWN, named as
-#     `merged_from_marker` so the inference is visible — a lane that opened a PR the controller merged
-#     is NOT credited twice, and a lane whose own deliverable says BLOCKED/ALREADY_FIXED/OUT-OF-REPO is
-#     never upgraded (its own conclusion is the authority about itself);
+#     counted in the numerator only for a lane whose own last word was PR_OPENED/UNKNOWN **and that named
+#     its own PR on its deliverable**, named as `merged_from_marker` so the inference is visible — a lane
+#     that opened a PR the controller merged is NOT credited twice, and a lane whose own deliverable says
+#     BLOCKED/ALREADY_FIXED/OUT-OF-REPO is NEVER upgraded (its own conclusion is the authority about
+#     itself). See the two ⛔ blocks at the attribution site for what that costs and why the direction is
+#     never the flattering one;
 #   * a lane that opened a PR and then handed off (`BLOCKED_*`) is a DEFINITE non-merge and sits in the
 #     denominator as `handed_off` — excluding it would let the post-change population read 100% by
 #     construction, which is the flattering direction this file exists to refuse;
@@ -90,6 +92,24 @@ classify_status() {
   esac
 }
 
+# deliverable_block <log> — the lane's OWN final deliverable, never its transcript.
+# ⛔ SCOPE, NOT SHAPE (landing review F2, P2, verified): the attribution below must read the block the
+# brief requires the lane to END on — the LAST line carrying a `status:` field, through EOF — because
+# the alternative (the whole log) let a lane be credited with a merge it never made. A lane that ended
+# `status: PR_OPENED` and somewhere in its transcript wrote "blocked on PR: …/pull/45" was credited with
+# PR 45's merge: numerator up, `handed_off` and the denominator unchanged, so two lanes that merged
+# nothing could report a high rate. A lane with NO `status:` line has no deliverable block and is
+# therefore never attributed — it stays UNKNOWN, which is printed and in neither side of the rate. That
+# is the un-flattering direction on purpose (a killed lane may then be under-counted); the file's
+# contract is that the rate can never be too HIGH.
+deliverable_block() { # deliverable_block <log>
+  local ln
+  ln="$(grep -ain 'status:' "$1" 2>/dev/null | tail -n 1 | cut -d: -f1)"
+  case "${ln:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$ln" -ge 1 ] || return 0
+  tail -n +"$ln" "$1" 2>/dev/null
+}
+
 n=0; merged=0; opened=0; handed=0; other=0; unknown=0; merged_marker=0; details=""
 for f in "$LOGS"/lane-*.log; do
   [ -f "$f" ] || continue
@@ -107,18 +127,29 @@ for f in "$LOGS"/lane-*.log; do
   # therefore UNDER-COUNTS exactly the case the change exists to produce, and the headline rate FALLS
   # the better it works. Attribute the durable artifact to the lane that named the PR — printed as its
   # own column so the inference is visible, never silently folded into the agents' own reports.
-  # Only a lane whose own last word was PR_OPENED (or that said nothing) can be upgraded: an
-  # ALREADY_FIXED/BLOCKED lane that merely MENTIONED another lane's PR URL must not be credited with
-  # that merge, and the marker is not evidence about a lane that concluded something else.
+  # Only a lane whose own last word was PR_OPENED (or that said nothing) can be upgraded, and the PR it
+  # is credited with must be one its OWN DELIVERABLE named — never a transcript mention.
+  # ⛔ AND A BLOCKED LANE IS NOT UPGRADED (landing review P2, verified): this arm read
+  # `PR_OPENED|UNKNOWN|'OTHER BLOCKED'*`, so EVERY BLOCKED/BLOCKED_ATTESTATION/BLOCKED_ATTEMPTS lane
+  # whose log merely named a PR number WITH a `state/merged-<PR>.done` present was counted
+  # MERGED_VIA_MARKER — numerator up, `handed_off` down (the denominator's non-merge side), so the
+  # headline rate ROSE when the change failed. The header and this comment both promised the opposite;
+  # the arm now matches the contract.
   case "$c" in
-    PR_OPENED|UNKNOWN|'OTHER BLOCKED'*)
-      # ⛔ ONLY THE LANE'S OWN DELIVERABLE LINE (F2). Scanning the whole log let a lane be credited
-      # with a merge because its prose mentioned ANOTHER lane's PR URL (or another REPO's, since the
-      # marker carries no repo component) — measured: two lanes that merged nothing reported 100%.
-      for prn in $(grep -aE '(^|[^A-Z_])(PR:|PR_OPENED)' "$f" 2>/dev/null \
-                     | grep -aoE '/pull/[0-9]+' | grep -oE '[0-9]+' | sort -u); do
-        if [ -f "$STATE/merged-$prn.done" ]; then c="MERGED_VIA_MARKER"; break; fi
-      done ;;
+    PR_OPENED|UNKNOWN)
+      # ⛔ ONLY THE LANE'S OWN DELIVERABLE BLOCK (F2, P2, verified). Scanning the whole log let a lane be
+      # credited with a merge because its prose mentioned ANOTHER lane's PR URL (or another REPO's, since
+      # the marker carries no repo component) — measured: two lanes that merged nothing reported 100%.
+      # The PR number is taken from the block `deliverable_block` returns, so a mid-log mention of a
+      # foreign PR is not evidence about this lane. `- PR:`/`PR_OPENED` narrows it further to lines that
+      # are naming a PR rather than prose that happens to contain a `/pull/` path.
+      _block="$(deliverable_block "$f")"
+      if [ -n "$_block" ]; then
+        for prn in $(printf '%s\n' "$_block" | grep -aE '(^|[^A-Z_])(PR:|PR_OPENED)' \
+                       | grep -aoE '/pull/[0-9]+' | grep -oE '[0-9]+' | sort -u); do
+          if [ -f "$STATE/merged-$prn.done" ]; then c="MERGED_VIA_MARKER"; break; fi
+        done
+      fi ;;
   esac
   case "$c" in
     MERGED_VIA_MARKER) merged_marker=$((merged_marker + 1)); merged=$((merged + 1)) ;;
