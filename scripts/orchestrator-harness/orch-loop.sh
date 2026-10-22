@@ -1482,7 +1482,11 @@ sess() { wt_alive "${1:-}"; }
 # Spawning an agent during a load spike makes the spike worse. A Mac reboot lands in an indexing
 # storm (Spotlight, PerfPowerServices, duetexpertd) that the LANE dispatch gate already respects
 # while the merge sweep did not — so a fresh boot got six reviewers piled onto it. The cheap actions
-# (gh pr merge / ready / run rerun) stay ungated, so merges keep flowing while the spike passes.
+# (gh pr merge / ready) stay ungated, so merges keep flowing while the spike passes. ⛔ `run rerun` is
+# NOT among them any more: it is the one verb here that ADDS to the CI queue the back-pressure gate is
+# holding work out of, so it is gated by `ciq_push_ok` (#2296). The merge rail's own second-sample
+# re-run is a deliberate exclusion, disclosed in `ci-queue.sh`'s header — it runs inside a merge
+# decision that REMOVES queue.
 # Nothing is starved: a held-back spawn retries next cycle, because the marker that authorises it
 # (needsfix-<PR>-<head>, fixcount-<PR>) is only written on a SUCCESSFUL spawn.
 can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }

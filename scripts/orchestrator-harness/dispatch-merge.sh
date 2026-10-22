@@ -82,8 +82,12 @@ git fetch origin main --quiet 2>/dev/null
 # queued=92/in_progress=6 on 5 runners (tortoise) and queued=97/in_progress=7 (agent-infra) — a batch
 # dispatched into that finishes nothing and makes the backlog worse. The read is the SAME module the
 # controller and fix-one.sh read (`ci-queue.sh`), so the three surfaces cannot disagree about the
-# queue. Deferring here claims nothing and starts nothing: the issues stay in the pool, and the very
-# next invocation re-reads the queue and proceeds once it has drained (no record of "we deferred").
+# queue. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes
+# `refs/claims/issue-<N>` (orch-loop.sh:3860) and appends N to `.batch` AND `dispatched.txt` BEFORE it
+# hands the batch to this script, so "deferring claims nothing" was FALSE. Without the release below,
+# every issue in a deferred batch would sit on a 3 h cross-box lease held by a box that started no
+# work — refused by every peer — and be skipped by this box until the row was reaped. The release and
+# the row drop are what make "the issues stay in the pool, re-decided on the next invocation" true.
 CIQ_MOD="$O/ci-queue.sh"
 [ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then
@@ -99,6 +103,29 @@ if [ -f "$CIQ_MOD" ]; then
     if ! ciq_ci_allowed "$OR"; then
       echo "dispatch-merge: nothing dispatched this run"
       ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
+      # ⛔ UNDO WHAT THE CONTROLLER ALREADY DID (#2296 cycle 4, P1). Each issue here is CLAIMED
+      # (`refs/claims/issue-<N>`, 3 h lease) and recorded in `dispatched.txt` before this script was
+      # called. No lane and no chain will start, so nothing would ever reach the release in
+      # `chain-merge.sh`'s EXIT trap — the same failure `release_issue_claim_unspawned` exists for on
+      # the `cd` failure above. Release the claims AND drop the rows: a row with no dispatch makes
+      # this box skip a FREE issue until the reaper prunes it, which is a turn consumed for work that
+      # never started.
+      _deferred_ids=""
+      for N in "$@"; do
+        case "${N:-}" in ''|*[!0-9]*) continue ;; esac
+        release_issue_claim_unspawned "$N"
+        _deferred_ids="$_deferred_ids $N"
+      done
+      if [ -n "$_deferred_ids" ] && [ -f "$O/dispatched.txt" ]; then
+        _dtmp="$(mktemp "${TMPDIR:-/tmp}/dispatchmerge.XXXXXX" 2>/dev/null)" || _dtmp=""
+        if [ -n "$_dtmp" ] && awk -v ids="$_deferred_ids" \
+             'BEGIN{n=split(ids,a," "); for(i=1;i<=n;i++) if(a[i]!="") drop[a[i]]=1} !($0 in drop)' \
+             "$O/dispatched.txt" > "$_dtmp" 2>/dev/null; then
+          mv -f "$_dtmp" "$O/dispatched.txt" 2>/dev/null || rm -f "$_dtmp"
+        else
+          [ -n "$_dtmp" ] && rm -f "$_dtmp"
+        fi
+      fi
       echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
       exit 0
     fi

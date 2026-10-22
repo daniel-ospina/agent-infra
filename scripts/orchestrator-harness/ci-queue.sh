@@ -6,6 +6,15 @@
 # answer the question on whichever surface asks it. It never calls `set` — a sourced library must
 # not mutate its caller's shell options.
 #
+# ── COVERAGE, AND THE ONE DELIBERATE EXCLUSION (#2296 review cycle 4) ───────────────────────────
+# Gated: ONE read per controller cycle before dispatch, every fixer spawn arm (the CONFLICTED, the
+# CI-red and the review-gate ones — each product is a new head), every pre-push check in `fix-one.sh`,
+# the batch dispatcher, and the CI RERUN.
+# ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
+# It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
+# refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
+# merge decision. Stated here because a coverage claim a reader cannot check is a claim that rots.
+#
 # ── WHY THIS EXISTS (measured 2026-10-22 13:40 UTC, both repos) ─────────────────────────────────
 #   tortoise      queued=92  in_progress=6  runners online=5 (busy=5)   ← queue 18x the runner count
 #   agent-infra   queued=97  in_progress=7  (runner endpoint unreadable) ← 97 runs, 7 executing

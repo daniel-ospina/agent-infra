@@ -772,6 +772,51 @@ case "$SPAWN2" in *"[harness=unknown]"*) ok "an unsupplied token reads as unknow
 ALL9="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
 case "$ALL9" in *harness=*) bad "an EMPTY (current) token still stamped a spawn line: '$(printf '%s' "$ALL9" | grep -o '\[harness=[^]]*\]' | head -1)'" ;;
                   *) ok "…and an EMPTY (current) token leaves BOTH spawn lines clean (lane- and chain-) — only UNSET is unknown" ;; esac
+
+# ⛔ A DEFERRED BATCH MUST UNDO WHAT THE CONTROLLER DID (#2296 cycle 4, P1). The controller CLAIMS
+# `refs/claims/issue-<N>` and appends the id to `dispatched.txt` BEFORE it calls this script, so an
+# early `exit 0` that only printed a line left every issue in the batch on a 3 h cross-box lease held
+# by a box that started nothing — and skipped by this box until the row was reaped. Measured here:
+# the claims are released and the rows are dropped, so the batch really is back in the pool.
+_CASE=$((_CASE+1)); echo "=== C2b: a CI-CONGESTED batch releases the claims and rows it never used ==="
+DQ="$T/c2b"; mkdir -p "$DQ/bin" "$DQ/O/state" "$DQ/repo"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/git";   chmod +x "$DQ/bin/git"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/tmux";  chmod +x "$DQ/bin/tmux"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/uptime"; chmod +x "$DQ/bin/uptime"
+# ⛔ NO EMPTY worker-terminal.sh IN THIS RIG (#2296 cycle 4 verification): an EMPTY module is worse
+# than none — `dispatch-merge.sh` prefers `$O/worker-terminal.sh` when it exists, finds no `wt_spawn`,
+# and exits 78 before any of the congestion logic below runs. Left absent, it falls through to the
+# sibling shipped module (which is what the neighbouring C2 case relies on too).
+# A claims module that records what it was asked to release — the assertion is on the CALL, because a
+# release that is attempted and fails is a different (loud) outcome the helper already reports.
+cat > "$DQ/O/claims.sh" <<'CLS'
+claim_issue_release_record() { echo "RELEASED $3" >> "$CLAIM_LOG"; return 0; }
+CLS
+printf '7\n9\n' > "$DQ/O/dispatched.txt"
+# DEEP: 999 queued against 2 runners => ceiling 4 => every batch defers.
+cat > "$DQ/bin/gh-queue" <<'GHQD'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 999}' ;;
+  *status=in_progress*) echo '{"total_count": 1}' ;;
+  *actions/runners*)    echo '{"total_count": 2, "runners": [{"status": "online", "busy": true}, {"status": "online", "busy": true}]}' ;;
+  *) exit 1 ;;
+esac
+GHQD
+chmod +x "$DQ/bin/gh-queue"
+: > "$T/c2b-claims.log"
+DOUT="$(PATH="$DQ/bin:$PATH" O="$DQ/O" CIQ_GH="$DQ/bin/gh-queue" CLAIM_LOG="$T/c2b-claims.log" \
+        bash "$DM" "$DQ/repo" owner/repo 7 9 2>&1)"
+case "$DOUT" in *"nothing dispatched this run"*) ok "a congested queue defers the whole batch, and says so" ;;
+                 *) bad "the congested batch did not defer: $(printf '%s' "$DOUT" | tr '\n' ' ' | cut -c1-160)" ;; esac
+CLAIMS="$(cat "$T/c2b-claims.log" 2>/dev/null | tr '\n' ' ')"
+case "$CLAIMS" in *"RELEASED 7"*"RELEASED 9"*) ok "…and BOTH issue claims it never used are released (no 3 h stranded lease)" ;;
+                  *) bad "a deferred batch stranded its claims: released=[$CLAIMS] — every peer refuses those issues until the lease expires" ;; esac
+if [ -f "$DQ/O/dispatched.txt" ] && [ ! -s "$DQ/O/dispatched.txt" ]; then
+  ok "…and the dispatched.txt rows are dropped, so this box re-reads them next cycle (no turn consumed)"
+else
+  bad "a deferred batch left dispatched.txt rows: [$(tr '\n' ' ' < "$DQ/O/dispatched.txt" 2>/dev/null)] — this box skips free issues until the reaper prunes them"
+fi
 # The chain- line is a SECOND spawn path, and it used to stamp unconditionally: `[harness=]` on every
 # current box, which is exactly the always-present marker this design refuses.
 ALL7="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
