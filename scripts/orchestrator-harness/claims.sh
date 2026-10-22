@@ -1059,6 +1059,15 @@ claim_pr_preflight() {
   _claim_preflight_at "$(claim_pr_ref "$2")" "PR #$2"
 }
 
+# claim_head_preflight <repo> <pr> <sha> — the PER-HEAD question, and the one a FIXER/reviewer asks.
+# ⛔ THE COARSE `pr-<N>` KEY ANSWERS A DIFFERENT QUESTION: claims.sh documents it as taken ONLY by the
+# landing path (merge-one.sh). A peer fixing head H holds `refs/claims/<PR>-<sha12>` (claim_acquire),
+# which claim_pr_preflight never looks at — so a two-box fleet read CLEAN for a head another box was
+# already fixing, and only fix-one.sh's own CAS stopped the duplicate AFTER the attempt was booked.
+claim_head_preflight() {
+  _claim_preflight_at "$(claim_ref "$2" "$3")" "PR #$2 at $(printf '%s' "${3:-}" | cut -c1-12)"
+}
+
 claim_issue_preflight() {
   _claim_preflight_at "$(claim_issue_ref "$1")" "#$1"
 }

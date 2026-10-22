@@ -3267,6 +3267,14 @@ while true; do
           # marker for THIS head is the one whose refund applies.
           RF_HAD_GATE=0
           [ -f "$O/state/fixgate-$PR-$HEAD_N" ] && RF_HAD_GATE=1
+          # ⛔ THE MARKER REFUNDS EVERY ROLE THAT BOOKED AGAINST IT, not just this one (2026-10-22).
+          # `fixgate-<PR>-<HEAD>` says "a load/disk gate refused the agent at this head" — a fact about
+          # the HEAD, not about this role. This block glob-deletes it for its own counter, and the PR
+          # sickness queue books the same kind of head-keyed attempt; deleting the marker here made
+          # that role's refund INERT for exactly the PRs both roles target (a rail-refused red tree),
+          # so two load refusals still parked the PR "needs a human" with no agent ever run. The
+          # refund is one call, and the module owns it (absent module = nothing to refund).
+          declare -f psick_refund_head >/dev/null 2>&1 && psick_refund_head "$O/state" "$PR" "$HEAD_N" >>"$LOG" 2>&1
           rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
           if [ "$RF_HAD_GATE" = "1" ]; then
             if [ "$RF_N" -gt 0 ]; then
@@ -3940,6 +3948,16 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     PS_MAXSPAWN=$(( $(fix_slots "${UPN:-0}") - $(wt_count fix-) ))
     is_num "${PS_MAXSPAWN:-}" || PS_MAXSPAWN=0
     [ "$PS_MAXSPAWN" -lt 0 ] && PS_MAXSPAWN=0
+    # ⛔ AND THE LOAD GATE, because every other spawn site in this file ANDs it in
+    # (`[ … -lt "$MF" ] && can_spawn`). Without it a box over MAX_LOAD spawns fixers the controller
+    # just refused, and `fix-one.sh` materialises the worktree BEFORE its own gate refuses the agent —
+    # so the worktree is paid for either way. The pass still RECONCILES and REPORTS (that is how the
+    # deferral survives), it just spawns nothing, and says why.
+    _ps_L="$(load1)"
+    if ! { is_num "${_ps_L:-}" && [ "${_ps_L:-0}" -lt "${MAX_LOAD:-40}" ]; }; then
+      PS_MAXSPAWN=0
+      echo "[prsick] load gate closed (L=${_ps_L:-?} >= MAX_LOAD=${MAX_LOAD:-?}) — the pass reconciles and reports, spawning nothing; deferred items keep their place" >>"$LOG"
+    fi
     PS_STATE_DIR="$O/state" PS_OR="$OR" PS_REPO_PATH="$REPO" PS_SPAWN_CWD="$SPAWN_CWD" \
       ps_select --repo "$OR" --max-spawn "$PS_MAXSPAWN" --verbose >> "$LOG" 2>&1
     _ps_rc=$?

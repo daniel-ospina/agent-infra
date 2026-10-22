@@ -121,7 +121,7 @@ ps_open_prs() {
       "$repo" "$rc" "${#out}"
     return 2
   fi
-  printf '%s' "$out" | REPO="$repo" python3 -c '
+  _rows_out="$(printf '%s' "$out" | REPO="$repo" python3 -c '
 import sys, json, os
 REPO = os.environ.get("REPO") or ""
 # one object per page: concatenate the streams first, then walk each array
@@ -135,22 +135,49 @@ while i < len(s):
     elif isinstance(obj, dict):
         if isinstance(obj.get("items"), list): rows.extend(obj["items"])
         else: rows.append(obj)
+ok = 0
 for p in rows:
-    if not isinstance(p, dict): continue
+    # ⛔ A MALFORMED ROW IS NOT SKIPPED SILENTLY (review P2). One bad object used to kill the whole
+    # parse while the function still returned 0, so the pass read "no open PRs" and the RECONCILER
+    # then treated every open PR as merged/closed — dropping the deferral ledger and DELETING each
+    # per-head attempt cap, the guard against an auto-repair loop. A row this parser cannot vouch for
+    # is a parse failure, not an empty repo.
+    if not isinstance(p, dict) or not isinstance(p.get("head"), dict):
+        print("__PARSE_ERR__", "a pull request object is not the documented shape"); raise SystemExit
     try: n = int(p.get("number") or 0)
-    except Exception: continue
+    except Exception:
+        print("__PARSE_ERR__", "a pull request number is not an integer"); raise SystemExit
+    if n <= 0:
+        print("__PARSE_ERR__", "a pull request number is not positive"); raise SystemExit
     head = p.get("head") or {}
     sha = str(head.get("sha") or "")
     br = str(head.get("ref") or "")
+    if not sha or not br:
+        print("__PARSE_ERR__", "a pull request carries no head sha/ref"); raise SystemExit
     # ⛔ A FORK HEAD REF DOES NOT EXIST IN THIS REPO, so a fixer can never materialise a worktree
     # for it — fix-one.sh aborts at materialisation AFTER the attempt was booked, which reads as
     # "still red after N fixes — needs a human" for a PR this queue could never fix. Flagged here so
     # the selector skips it WITH A REASON instead of paying for the discovery.
+    # AN ABSENT repo KEY IS NOT EVIDENCE OF A FORK; a PRESENT but null one is a DELETED fork, whose
+    # head ref is gone from this repo too, so both differ from a head that lives in this repo.
     hr = head.get("repo")
-    # AN ABSENT repo KEY IS NOT EVIDENCE OF A FORK: only a NAMED repo that differs is one.
-    fork = 1 if isinstance(hr, dict) and str(hr.get("full_name") or "") not in ("", REPO) else 0
+    if "repo" in head and hr is None: fork = 1
+    elif isinstance(hr, dict) and str(hr.get("full_name") or "") not in ("", REPO): fork = 1
+    else: fork = 0
     print("%d\t%s\t%s\t%d\t%d" % (n, sha, br.replace("\t","").replace("\n",""), 1 if p.get("draft") else 0, fork))
-' 2>/dev/null
+    ok += 1
+print("__END__", ok)
+' 2>/dev/null)"
+  # the sentinel decides the RETURN CODE, not just a printed line — an empty answer and a failed
+  # parse are both FAILED CALLS, never "this repo has no open PRs"
+  _end="$(printf '%s\n' "$_rows_out" | grep -c '^__END__' 2>/dev/null)"
+  _err="$(printf '%s\n' "$_rows_out" | sed -n 's/^__PARSE_ERR__[[:space:]]*//p' | head -1)"
+  if [ -n "${_err:-}" ] || [ "${_end:-0}" != "1" ]; then
+    printf 'the open-PR listing could NOT be parsed (%s) — a parse failure is a FAILED CALL, not "this repo has no open PRs"' \
+      "${_err:-no completion sentinel; the parser died}"
+    return 2
+  fi
+  printf '%s\n' "$_rows_out" | grep -v '^__END__'
   return 0
 }
 
@@ -315,7 +342,8 @@ ps_brief() {
   mkdir -p "$(ps_state_dir)" 2>/dev/null || true
   log="$(ps_job_log "$repo" "$rid" "$jid" 2>/dev/null)"
   {
-    printf '# CI failure brief — PR #%s at %s\n\n' "$pr" "${sha:0:12}"
+    printf '# CI failure brief — PR #%s at %s\n\n' "$pr" "$sha"
+    printf 'head12: %s\n' "${sha:0:12}"
     printf 'Generated from the FAILURE (not from a template): %s\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'repo: %s\n' "$repo"
     printf 'failing group: %s\n' "$group"
@@ -353,6 +381,20 @@ ps_held() {
   fi
   if ps_alive "fix-$pr"; then printf 'live session fix-%s' "$pr"; return 0; fi
   if ps_alive "merge-$pr"; then printf 'live session merge-%s' "$pr"; return 0; fi
+  # ⛔ TWO KEYS, TWO QUESTIONS, AND BOTH ARE ASKED. A fixer/reviewer holds the PER-HEAD key
+  # (`<PR>-<sha12>`); only the landing path holds the coarse `pr-<N>` key. Reading the coarse one
+  # alone made this guard inert for exactly the peer we must not duplicate (measured: two boxes each
+  # spawn `fix-<PR>` for one head, and only fix-one.sh's CAS stops the second AFTER the budget was
+  # booked). Any non-CLEAN answer from either key holds; INCOMPLETE (rc 2) is not free.
+  local hrc
+  if [ -n "${sha:-}" ] && declare -f claim_head_preflight >/dev/null 2>&1; then
+    why="$(claim_head_preflight "$repo" "$pr" "$sha" 2>/dev/null)"; hrc=$?
+    case "$hrc" in
+      0) : ;;
+      1) printf '%s' "${why:-a live per-head claim}"; return 0 ;;
+      *) printf '%s' "${why:-the per-head claim registry could not be read}"; return 2 ;;
+    esac
+  fi
   why="$(ps_claim_preflight "$repo" "$pr" 2>/dev/null)"; rc=$?
   case "$rc" in
     0) return 1 ;;                                  # CLEAN: nobody holds it
@@ -377,7 +419,17 @@ ps_queue_verdict() {
     tok="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp" 2>/dev/null
     q="${CIQ_QUEUED:-?}"; r="${CIQ_RUNNERS:-?}"; src=ci-queue.sh
     case "$rc" in
-      1) printf 'ok\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 0 ;;
+      1)
+        if [ "${q:-x}" = "0" ]; then
+          local q2
+          q2="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+          if ! ps_is_num "${q2:-}" || [ "${q2:-0}" -ne 0 ]; then
+            printf 'unknown\tq=0 r=%s ceiling=%s source=%s (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' \
+              "$r" "${CIQ_CEILING:-?}" "$src" "${q2:-unreadable}"
+            return 2
+          fi
+        fi
+        printf 'ok\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 0 ;;
       0) printf 'deep\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 1 ;;
       *) printf 'unknown\tq=%s r=%s ceiling=%s source=%s (%s)' "$q" "$r" "${CIQ_CEILING:-?}" "$src" "${tok:-no reason recorded}"; return 2 ;;
     esac
@@ -396,6 +448,23 @@ ps_queue_verdict() {
   local c=$(( (r * PS_HORIZON_MIN + PS_JOB_P90_MIN - 1) / PS_JOB_P90_MIN ))
   if [ "$q" -gt "$c" ]; then
     printf 'deep\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 1
+  fi
+  # ⛔ A CLAIM OF "EMPTY" IS THE ONE READING THAT OPENS THIS GATE, so it is the one reading that has to
+  # be corroborated. MEASURED 2026-10-22 against the real endpoint, six samples: 70, 70, 0, 70, 70, 70 —
+  # the 0 was a complete, valid 36-byte body (`{"total_count":0,"workflow_runs":[]}`) with ~70 runs
+  # actually queued. Parsing it as a measurement is a FAIL-OPEN on the exact gate whose comment says an
+  # unreadable count is UNKNOWN and defers; a spurious zero parses fine, so no rule caught it. One
+  # re-read costs a request and turns a coin-flip into UNKNOWN, which defers — the cheap direction.
+  if [ "${q:-0}" -eq 0 ]; then
+    local q2
+    q2="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    if ! ps_is_num "${q2:-}"; then
+      printf 'unknown\tq=0 r=%s ceiling=%s source=measured-fallback (a zero queue could not be corroborated: the re-read failed)' "$r" "$c"; return 2
+    fi
+    if [ "${q2:-0}" -ne 0 ]; then
+      printf 'unknown\tq=%s r=%s ceiling=%s source=measured-fallback (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' "${q2}" "$r" "$c" "${q2}"
+      return 2
+    fi
   fi
   printf 'ok\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 0
 }
@@ -417,7 +486,16 @@ ps_load_ci_queue() {
 # back-pressure comes back on the next pass even if the PR has left the enumerated window.
 ps_defer_file() { printf '%s/prsick-deferred.tsv' "$(ps_state_dir)"; }
 ps_defer_append() { # <repo> <pr> <sha> <check> [branch]
-  local f; f="$(ps_defer_file)"; mkdir -p "$(ps_state_dir)" 2>/dev/null || true
+  local f tmp; f="$(ps_defer_file)"; mkdir -p "$(ps_state_dir)" 2>/dev/null || true
+  # ⛔ ONE ROW PER (repo, pr, head). A deep queue re-defers the same PR every pass; appending
+  # unconditionally grew the ledger by one row per pass per PR, and the drain then decided the same
+  # PR several times in ONE pass (a second spawn, and a head parked "needs a human" after a single
+  # pass). Re-appending REPLACES the row.
+  if [ -f "$f" ] && grep -qF "$(printf '%s\t%s\t%s' "${1:-}" "${2:-}" "${3:-}")" "$f" 2>/dev/null; then
+    tmp="$f.new"
+    awk -F'\t' -v r="${1:-}" -v p="${2:-}" -v s="${3:-}" '!($1==r && $2==p && $3==s)' "$f" > "$tmp" 2>/dev/null \
+      && mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" >> "$f" 2>/dev/null || true
 }
 ps_defer_list() { cat "$(ps_defer_file)" 2>/dev/null; }
@@ -430,6 +508,32 @@ ps_defer_drop() { # <repo> <pr> <sha>
 }
 
 # ── 7. ONE PR'S DECISION, AND THE DISPATCH ────────────────────────────────────────────────────
+# psick_refund_head <state-dir> <pr> <head> -> refund the head-keyed attempt when a marker says NO
+# AGENT RAN. Prints one line per refund. Exposed (not inlined) for THREE callers: ps_decide below, the
+# red-fixer role in orch-loop.sh — which consumes `fixgate-<PR>-*` for its OWN counter and deleted the
+# marker before this role could see it (so the refund was inert for exactly the PRs both roles target)
+# — and a future role that books a head-keyed attempt. ONE marker must refund EVERY role that booked.
+psick_refund_head() {
+  local dir="${1:-}" pr="${2:-}" head="${3:-}" bcnt budget f any=0
+  [ -n "$dir" ] && [ -n "$pr" ] && [ -n "$head" ] || return 0
+  budget="$dir/psick-$pr-$(printf '%s' "$head" | cut -c1-12)"
+  for f in "$dir/fixgate-$pr-$head" "$dir/fixbail-$pr-$head"; do
+    [ -f "$f" ] || continue
+    any=1
+    if [ -f "$budget" ]; then
+      bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+      if [ "$bcnt" -gt 0 ]; then
+        printf '%s\n' "$((bcnt - 1))" > "$budget" 2>/dev/null || true
+        printf '[prsick] #%s %s at head=%s was not an attempt — budget refunded %s -> %s\n' \
+          "$pr" "$(basename "$f")" "$(printf '%s' "$head" | cut -c1-12)" "$bcnt" "$((bcnt - 1))"
+      fi
+    fi
+    rm -f "$f" 2>/dev/null || true
+  done
+  [ "$any" = "1" ] && return 0
+  return 1
+}
+
 # ps_decide <or> <pr> <sha> <branch> [fork] -> prints ONE decision line; rc 0 = dispatched.
 # The four shapes (the operator's grep):
 #   RED #<pr> <check> -> dispatch <tag>
@@ -452,6 +556,13 @@ ps_decide() {
   case "${br:-}" in
     ''|[-.]*|*..*|*[!A-Za-z0-9._/-]*) printf 'skip #%s: unsafe or empty branch name (%s) — not acted on\n' "$pr" "${br:-<empty>}"; return 1 ;;
   esac
+  # …and git's own grammar when a checkout is reachable, because the pattern above is only a filter.
+  if [ -n "${PS_REPO_PATH:-}" ] && [ -d "${PS_REPO_PATH:-}/.git" ] \
+     && command -v git >/dev/null 2>&1 \
+     && ! git -C "$PS_REPO_PATH" check-ref-format --branch "$br" >/dev/null 2>&1; then
+    printf 'skip #%s: branch name %s is not a valid ref in this repo — not acted on\n' "$pr" "$br"
+    return 1
+  fi
   tok="$(ps_verdict "$repo" "$sha")"; rc=$?
   case "$tok" in
     NOREAD*)
@@ -484,21 +595,11 @@ ps_decide() {
     return 1
   fi
   budget="$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)"
-  # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT. `fix-one.sh` books the marker `fixgate-<PR>-<HEAD>` when a
-  # load/disk gate refused the agent (it is the only party that knows nothing ran) and the controller
-  # is supposed to consume it. The red-fixer role consumes it; THIS role booked the same kind of
-  # head-keyed attempt, so it must refund it too — otherwise two load refusals (the normal state on a
-  # busy box) exhaust the budget and print "needs a human" about a PR where no agent ever started.
-  gatef="$(ps_state_dir)/fixgate-$pr-$sha"
-  if [ -f "$gatef" ]; then
-    bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
-    if [ "$bcnt" -gt 0 ]; then
-      printf '%s\n' "$((bcnt - 1))" > "$budget" 2>/dev/null || true
-      printf '[prsick] #%s a gate refusal at head=%s was not an attempt — budget refunded %s -> %s\n' \
-        "$pr" "${sha:0:12}" "$bcnt" "$((bcnt - 1))"
-    fi
-    rm -f "$gatef" 2>/dev/null || true
-  fi
+  # ⛔ NO AGENT RAN IS NOT AN ATTEMPT, and there are TWO markers that mean it:
+  #   fixgate-<PR>-<HEAD>  a load/disk gate refused the agent (fix-one.sh)
+  #   fixbail-<PR>-<HEAD>  the cross-box CAS refused (another box owned the head; fix-one.sh exits 0)
+  # This role booked a head-keyed attempt for both, so it refunds both. See psick_refund_head.
+  psick_refund_head "$(ps_state_dir)" "$pr" "$sha"
   bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
   if [ "$bcnt" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; then
     printf 'skip #%s: budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
@@ -507,7 +608,11 @@ ps_decide() {
   fi
   # ── BACK-PRESSURE: the one gate that is about the OTHER side's capacity ────────────────────
   local qv qrc qfields qn rn
-  qv="$(ps_queue_verdict "$repo")"; qrc=$?
+  if [ -n "${PS_QV:-}" ]; then
+    qv="$PS_QV"; qrc="${PS_QRC:-2}"; qfields="${PS_QFIELDS:-}"
+  else
+    qv="$(ps_queue_verdict "$repo")"; qrc=$?
+  fi
   # ⛔ ONE ASSIGNMENT, TWO CONSUMERS OF DIFFERENT FIELDS. The token is `ok|deep|unknown<TAB>q=<n> r=<n> …`
   # and the `q=`/`r=` numbers live in field 2 — reading a field that was never assigned is exactly how
   # this line printed `backpressure(q=?,r=?)` on a deep queue (found by VGATE; the pass-level gate in
@@ -551,11 +656,8 @@ ps_decide() {
   if declare -f dispreplace >/dev/null 2>&1; then
     dispreplace "$pr" "$sha" "SICK:$group" act "sickness fixer spawned from the failure itself ($group)"
   fi
-  # Prune this PR's superseded per-head budget files with the head we KNOW (never a glob): a new head
-  # is new work, and the old tree's counter can never be reached again.
-  if [ -n "${PS_PREV_HEAD:-}" ] && [ "${PS_PREV_HEAD:-}" != "$sha" ]; then
-    rm -f "$(ps_state_dir)/psick-$pr-$(printf '%s' "$PS_PREV_HEAD" | cut -c1-12)" 2>/dev/null || true
-  fi
+  # (The superseded per-head budget is pruned by the LEDGER RECONCILER: a row whose head moved drops
+  # the old counter. A prune driven by a variable nothing assigned was dead code.)
   printf 'RED #%s %s -> dispatch %s\n' "$pr" "$group" "$tag"
   return 0
 }
@@ -592,14 +694,24 @@ ps_select() {
   repo="$(ps_repo "$repo")"
   limit="$(ps_limit "${limit:-$PS_MAX_PRS}")"
   PS_DRY_RUN="$dry"
+  mkdir -p "$(ps_state_dir)" 2>/dev/null || true
   # `` (absent) = no caller-imposed allowance: dispatch as the gates decide. `` is NOT 0 — a 0 here
   # would silently disable the whole queue on a caller that forgot the flag.
   if [ -n "$maxspawn" ] && ! ps_is_num "$maxspawn"; then maxspawn=""; fi
 
   # ── the queue gate is read ONCE per pass, before anything is emitted ────────────────────────
+  # ⛔ CLEARED FIRST. The verdict is handed to `ps_decide` through these globals, and the controller
+  # runs the pass in ITS OWN shell every cycle — a value left over from cycle N would be a stale
+  # queue depth used to decide cycle N+1.
+  PS_QV=""; PS_QRC=""; PS_QFIELDS=""
   local qv qrc qfields qsrc
   qv="$(ps_queue_verdict "$repo")"; qrc=$?
   qfields="$(printf '%s' "$qv" | cut -f2)"; qsrc="${qfields##*source=}"
+  # ⛔ ONE READ PER PASS, REUSED BY EVERY PR. `ps_decide` used to re-read the queue for each PR (two
+  # `gh api` calls apiece on the fallback path); the numbers cannot change mid-pass in a way that
+  # matters, and a stale-by-seconds reading is still a MEASURED one. A direct call (no pass) still
+  # reads for itself, which is what the suite's (h)/(i) probes exercise.
+  PS_QV="$qv"; PS_QRC="$qrc"; PS_QFIELDS="$qfields"
   if [ "$verb" = "1" ] || [ "$qrc" -ne 0 ]; then
     # ⛔ A DEFERRAL IS NEVER SILENT, and it names which rule produced it. `source=measured-fallback`
     # means the parallel lane's `ci-queue.sh` was not installed on this box yet.
@@ -625,6 +737,7 @@ ps_select() {
   local drepo dpr dsha dchk dbr live keptf
   keptf="$(ps_state_dir)/prsick-kept.$$"
   : > "$keptf" 2>/dev/null || keptf=/dev/null
+  [ -f "$(ps_defer_file)" ] || : > "$(ps_defer_file)" 2>/dev/null || true
   while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
     [ -n "${dpr:-}" ] || continue
     [ "$drepo" = "$repo" ] || continue
@@ -650,6 +763,12 @@ ps_select() {
   if [ "$qrc" -eq 0 ]; then
     while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
       [ -n "${dpr:-}" ] || continue
+      # ⛔ THE SAME ONE-DECISION-PER-PR INVARIANT THE ENUMERATION HAS. The drain had no guard, so a
+      # ledger holding two rows for one PR (before dedupe, or a re-appended row) decided it twice in
+      # ONE pass: two `fix-<PR>` spawns for one head, and the attempt budget consumed twice. The
+      # liveness read is NOT a substitute — wt_alive answers "not alive" for a worker that already
+      # exited (a cross-box bail or a gate refusal), so the second row would spawn.
+      case " ${SEEN_PRS:-} ${DISPATCHED_PRS:-} " in *" $dpr "*) continue ;; esac
       if [ "$seen" -ge "$limit" ]; then break; fi
       # REMOVE FIRST, then decide: `ps_decide` re-appends the row when its own gate defers, so the
       # ledger survives exactly as long as the DEFERRAL does. Draining the row instead let green /
@@ -720,6 +839,7 @@ EOF
 ps_cli() {
   local verb="${1:-report}"; shift 2>/dev/null || true
   PS_STATE_DIR="${PS_STATE_DIR:-${TMPDIR:-/tmp}/ps-cli-$$}"
+  ps_load_ci_queue >/dev/null 2>&1 || true
   case "$verb" in
     report) PS_DRY_RUN=1 ps_select --verbose "$@" ;;
     *) printf 'usage: pr-sickness.sh report|pass [--repo owner/name] [--limit N] [--dry-run]\n' >&2; return 64 ;;

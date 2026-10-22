@@ -58,6 +58,12 @@ case "${1:-}" in
         [ -f "$FIX/joblog-$jid.txt" ] && { cat "$FIX/joblog-$jid.txt"; exit 0; }
         exit 1 ;;
       *"/actions/runs?status=queued"*)
+        if [ -f "$F/queued-seq" ]; then
+          n="$(head -1 "$F/queued-seq" 2>/dev/null)"
+          tail -n +2 "$F/queued-seq" > "$F/queued-seq.next" 2>/dev/null && mv "$F/queued-seq.next" "$F/queued-seq" 2>/dev/null
+          printf '{"total_count": %s, "workflow_runs": []}\n' "${n:-0}"
+          exit 0
+        fi
         printf '{"total_count": %s, "workflow_runs": []}\n' "$(cat "$F/queued" 2>/dev/null || echo 0)"
         exit 0 ;;
       *"/actions/runners")
@@ -133,8 +139,10 @@ pulls_one() { printf '[{"number":%s,"head":{"sha":"%s","ref":"fix/sick-%s","repo
 reset_all() { rm -rf "$STATE" "$FIX" "$FLAGS" "$TMP/spawns.log" 2>/dev/null; mkdir -p "$STATE" "$FIX" "$FLAGS"; }
 
 # one pass, in a subshell so module globals never leak between cases
-run_pass() { # [<module>] [extra args…]
-  local mod="${1:-$MOD}"; shift 2>/dev/null || true
+run_pass() { # [<module>] [extra args…]  — a first arg that is a FILE is the module, anything else is a flag
+  local mod="$MOD"
+  if [ -f "${1:-}" ] && [ "${1#-}" = "${1:-}" ]; then mod="$1"; shift; fi
+  shift 2>/dev/null || true
   ( . "$mod"; . "$TMP/stubs.sh"
     PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" PS_OR="$OR" PS_REPO_PATH="$TMP/repo" \
       ps_select --repo "$OR" --limit 8 "$@" ) 2>&1
@@ -313,7 +321,7 @@ sha12="$(printf '%s' "$sha_red" | cut -c1-12)"
 printf '2\n' > "$STATE/psick-77-$sha12"          # budget already exhausted by two prior attempts
 : > "$STATE/fixgate-77-$sha_red"                  # …both of which were GATE refusals: no agent ran
 out="$(run_pass)"
-has "$out" "a gate refusal at head=$sha12 was not an attempt" "the refusal is REFUNDED and named"
+has "$out" "fixgate-77-$sha_red at head=$sha12 was not an attempt" "the refusal is REFUNDED and named (by the marker that proves it)"
 has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "so the exhausted budget does not become a false 'needs a human'"
 # non-vacuity: without the marker the SAME state is exhausted and nothing is dispatched
 reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
@@ -351,6 +359,94 @@ printf '[{"number":91,"head":{"sha":"%s","ref":"evil;rm -rf /","repo":{"full_nam
 out="$(run_pass)"
 has "$out" "skip #91: unsafe or empty branch name" "an unsafe ref is refused with the reason"
 eq "$(spawns)" "0" "and no shell ever sees it"
+
+reset_all
+
+
+echo "══ (k) two ledger rows for one PR never spawn twice in one pass"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+ROW="$(printf '%s\t%s\t%s\t%s\t%s' "$OR" 77 "$sha_red" docs-lint fix/sick-77)"
+printf '%s\n%s\n' "$ROW" "$ROW" >> "$STATE/prsick-deferred.tsv"
+out="$(run_pass --max-spawn 5)"
+eq "$(printf '%s\n' "$out" | grep -c 'RED #77 github-actions/docs-lint -> dispatch fix-77')" "1" \
+  "exactly ONE dispatch for the duplicated PR (the drain has the same one-decision-per-PR guard)"
+eq "$(spawns)" "1" "and exactly one spawn — not one per ledger row"
+# and a re-deferral REPLACES the row instead of appending a second one
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
+run_pass >/dev/null; run_pass >/dev/null
+eq "$(cat "$STATE/prsick-deferred.tsv" | grep -c .)" "1" "a re-deferred PR keeps ONE row across passes (no unbounded growth)"
+
+echo "══ (l) a malformed listing is a FAILED CALL — it must not wipe the ledger or the attempt caps"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+sha12b="$(printf '%s' "$sha_red" | cut -c1-12)"
+printf '%s\t%s\t%s\t%s\t%s\n' "$OR" 77 "$sha_red" docs-lint fix/sick-77 >> "$STATE/prsick-deferred.tsv"
+printf '1\n' > "$STATE/psick-77-$sha12b"
+printf '[{"number":5,"head":["oops"]}]\n' > "$FIX/pulls.json"     # head is a LIST, not an object
+out="$(run_pass)"; rc=$?
+eq "$rc" "2" "the pass reports rc=2 (a parse failure is not an empty repo)"
+has "$out" "could NOT be parsed" "and names the parse failure"
+no "$out" "left the open set" "no PR is declared merged/closed from a parse failure"
+eq "$(cat "$STATE/prsick-deferred.tsv" | grep -c .)" "1" "the deferral ledger SURVIVES"
+[ -f "$STATE/psick-77-$sha12b" ] && ok "the per-head attempt cap SURVIVES (an auto-repair loop guard)" \
+  || bad "the attempt cap was deleted by a parse failure"
+# a non-list page (the runs shape) must not become a row for PR 0
+printf '{"total_count":0,"workflow_runs":[]}\n' > "$FIX/pulls.json"
+out="$(run_pass)"; rc=$?
+eq "$rc" "2" "a non-list payload is a parse failure too"
+no "$out" "dispatch fix-0" "and PR 0 is never decided"
+
+echo "══ (m) the other 'no agent ran' marker — fixbail (a cross-box CAS refusal) — is refunded too"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '2\n' > "$STATE/psick-77-$sha12b"
+: > "$STATE/fixbail-77-$sha_red"
+out="$(run_pass)"
+has "$out" "fixbail-77-$sha_red at head=$sha12b was not an attempt" "a bail is not an attempt"
+has "$out" "dispatch fix-77" "so the budget does not become a false 'needs a human'"
+
+echo "══ (n) the holder read asks the PER-HEAD claim (a peer fixing this head), not only the landing key"
+cat > "$TMP/headclaim.sh" <<'HC'
+claim_head_preflight() { printf 'a claim on PR #%s at %s is held by boxB (held-by-live)' "$2" "${3:0:12}"; return 1; }
+HC
+hc="$( . "$MOD"; . "$TMP/stubs.sh"; . "$TMP/headclaim.sh"; ps_held "$OR" 77 "$sha_red" )"; hcrc=$?
+eq "$hcrc" "0" "a live PER-HEAD claim reads as HELD"
+has "$hc" "held by boxB" "and the holder is named"
+# …while the same PR with no per-head claim is free (the stub registry says CLEAN)
+fc="$( . "$MOD"; . "$TMP/stubs.sh"; ps_held "$OR" 77 "$sha_red" )"; fcrc=$?
+eq "$fcrc" "1" "(control) with no per-head claim the PR reads as FREE"
+
+echo "══ (o) the brief carries the head it was made at, so a later fixer can tell it is stale"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+run_pass >/dev/null
+has "$(cat "$STATE/sickbrief-77.md")" "head12: $sha12b" "the brief records the 12-char head the fixer compares"
+
+reset_all
+
+
+echo "══ (p) a SPURIOUS EMPTY queue is corroborated — a zero is the one reading that opens the gate"
+# measured 2026-10-22: the queued endpoint answered a valid 36-byte {"total_count":0} while ~70 runs
+# were queued (six samples: 70,70,0,70,70,70). Parsing that as a measurement dispatches INTO a deep
+# queue and destroys the head-bound attestation — a fail-open on the gate itself.
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '0\n70\n' > "$FIX/queued-seq"                        # first read lies, the re-read tells the truth
+out="$(run_pass)"
+has "$out" "a ZERO was re-read as 70" "the spurious zero is NAMED, not measured"
+has "$out" "DEFERRED (queue UNKNOWN" "and UNKNOWN defers"
+no "$out" " -> dispatch" "nothing is dispatched into a queue that is actually 70 deep"
+eq "$(spawns)" "0" "no spawn"
+# control: a queue that really is empty (both reads agree) still opens the gate
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '0\n0\n' > "$FIX/queued-seq"
+out="$(run_pass)"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "(control) a corroborated empty queue still dispatches"
+eq "$(spawns)" "1" "(control) exactly one spawn"
+
+echo "══ (q) a FIRST pass on a fresh state dir keeps its deferral (the writes need the directory)"
+reset_all; rm -rf "$STATE"; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
+out="$(run_pass)"
+no "$out" "No such file or directory" "the pass does not write into a directory it never created"
+eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "1" "and the deferred item is actually recorded on the FIRST pass"
 
 reset_all
 
