@@ -196,7 +196,7 @@ read_meta() {
   # SUCCESSFUL read made the url/head read fail with exit 3 — the exact defect #2284 exists
   # to fix in this repo's fetch path (`a warning on a successful fetch must not become a
   # parse error`), reproduced here in the seam that reviews those PRs.
-  errf="$(mktemp "${TMPDIR:-/tmp}/review-pr-meta.XXXXXX" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/review-pr-meta-$$.err")"
+  errf="$(mktemp "${TMPDIR:-/tmp}/review-pr-meta.XXXXXX" 2>/dev/null)" || { META_ERR="mktemp failed — cannot capture gh's stderr safely"; return 1; }
   if [ -n "$REPO_IN" ]; then
     out="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO_IN" \
              --json url,headRefOid,title,state,baseRefName \
@@ -310,7 +310,9 @@ BODY_META_RC=$?
 # bytes fed a partial diff to the reviewer — and a clean record was minted over a diff nobody
 # fully saw. Same class as the body/issue reads; same refusal.
 DIFF="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)"
-DIFF_RC=$?
+DIFF_RC=$?          # ⛔ IMMEDIATELY: any assignment in between resets `$?` (it did — the rc
+                    # check was dead and §Z caught it, after the reviewer had already run)
+DIFF_FULL="$DIFF"
 [ "$DIFF_RC" -eq 0 ] \
   || die "$E_EVIDENCE" "could not READ the diff of $REPO#$PR at ${HEAD:0:12}… (gh rc=$DIFF_RC) — refusing to review a partial diff: a failed read is not 'nothing to review'"
 [ -n "${DIFF//[[:space:]]/}" ] \
@@ -328,6 +330,9 @@ if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
   DIFF="${DIFF:0:$DIFF_CAP}"
 fi
+# The identity of what the reviewer is about to read (the same bytes we inline; the full read
+# for the truncate case is compared by the re-read below using the same truncation).
+
 ISSUE_TEXT=""
 ISSUE_URLS="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences --jq '.closingIssuesReferences[]?.url' 2>/dev/null)"
 ISSUE_URLS_RC=$?
@@ -363,8 +368,11 @@ COMMENT_FILE="$RUN_DIR/comment.md"
 # ⛔ THE TEMPLATE MUST END IN THE X's (P3, eleventh fresh review): macOS/BSD `mktemp`
 # rejects `…XXXXXX.log`, so the fallback (a PREDICTABLE path) was always taken on the very
 # platform this is farmed to. A temp DIR with a fixed filename works everywhere.
-TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX" 2>/dev/null || true)"
-TRANSCRIPT="${TRANSCRIPT_DIR:-${TMPDIR:-/tmp}}/reviewer.log"
+# A mktemp FAILURE IS FATAL (P3, thirteenth fresh review): the `|| fallback` re-introduced the
+# predictable shared-$TMPDIR path this comment says `mktemp` removed.
+TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX" 2>/dev/null)" \
+  || die "$E_RECORD" "mktemp failed for the transcript directory — refusing to write an audit trail to a predictable path in a shared $TMPDIR"
+TRANSCRIPT="$TRANSCRIPT_DIR/reviewer.log"
 cleanup() {
   # ⛔ ONLY THE MAIN SHELL CLEANS UP (real defect, found by looping a scenario: the
   # WATCHDOG subshell inherits the EXIT trap, so `kill "$w"` after a fast review fired
@@ -489,16 +497,30 @@ KIND=reviewer; TAG="$PR"; export KIND TAG
 # pin is pr-doctor.py's rule: resolve by evidence, then PIN, so every child agrees.
 GH_REPO="$REPO"; export GH_REPO
 run_reviewer() { # <secs> <log> <prompt-file>
-  local t="$1" log="$2" pf="$3" pid w start elapsed
+  # ⛔ A FOREGROUND POLL, NOT A WATCHDOG SUBSHELL (P3, thirteenth fresh review; and the race that
+  # made this suite flaky: the watchdog's `sleep` was orphaned on `kill`, and its inherited EXIT
+  # trap could run the cleanup from inside the subshell). Polling costs one `kill -0` every 5 s and
+  # has neither failure mode.
+  local t="$1" log="$2" pf="$3" pid start elapsed alive_after_cap=0
   start="$(date +%s)"
   "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" >> "$log" 2>&1 &
   pid=$!
-  ( trap - EXIT; sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge "$t" ]; then
+      alive_after_cap=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$alive_after_cap" = 1 ]; then
+    kill -TERM "$pid" 2>/dev/null
+    sleep 15
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  fi
   wait "$pid" 2>/dev/null; local rc=$?
-  kill "$w" 2>/dev/null
   elapsed=$(( $(date +%s) - start ))
-  printf '%s\n' "[review-pr] reviewer pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  printf '%s\n' "[review-pr] reviewer pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc capped=${alive_after_cap}" >> "$log"
   return "$rc"
 }
 say "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
@@ -552,10 +574,22 @@ fi
 # findings`), but not by a bare word: `Clean separation of concerns …` is prose about the
 # code and must never become a verdict (P2, ninth fresh review: a decorated `CLEAN — …`
 # line was rejected as NO VERDICT).
-VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*clean[[:space:]]*[])]?[[:space:]]*([-–—:.!*,;_]|[[:space:]]*$)'
-VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*issues[[:space:]]*[([ ]?[[:space:]]*[0-9]+'
-VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*verdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(clean|issues)([^[:alnum:]]|$)'
-LAST="$(grep -aiE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+# ⛔ THE VERDICT TOKEN IS UPPERCASE, AND IT IS THE *FIRST* CANDIDATE IN THE TAIL (P1, thirteenth
+# fresh review). Two defects made this a fail-OPEN:
+#   * taking the LAST matching line let a trailing prose line ("Clean-up: remove the dead
+#     helper") override an `ISSUES 2` verdict and record a signed, head-bound `clean`;
+#   * a case-insensitive `clean` with a separator let that same prose line be a verdict at all.
+# So: the token must be UPPERCASE (that is the contract the prompt states, and it is what
+# distinguishes the verdict from prose), and among the last 5 non-empty lines the FIRST verdict
+# candidate wins — a verdict followed by closing prose still parses, while prose after a verdict
+# can no longer replace it. Our own appended `[review-pr] reviewer pid=…` line is not a verdict
+# and is simply not a candidate.
+VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\)|\])?[[:space:]]*([-–—:.!*,;_]|[[:space:]]*$)'
+VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:space:]]*[0-9]+'
+VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)([^[:alnum:]]|$)'
+LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' | tail -5 \
+             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | head -1 | tr -d '\r')"
+LAST="$LAST_LINE"
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
 # A finding line LEADS with its severity; mid-line mentions are prose, not findings. See the
@@ -639,6 +673,16 @@ fi
 if [ "$KIND" = clean ]; then
   HEAD_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
   [ -n "$HEAD_AFTER" ] || die "$E_EVIDENCE" "could not re-read the head of $REPO#$PR before posting/recording — refusing to certify a head I cannot verify"
+  # ⛔ THE REVIEWED *DIFF* IS RE-VERIFIED, NOT JUST THE HEAD (P2, thirteenth fresh review). An
+  # unchanged head does not prove an unchanged diff: a BASE retarget (`gh pr edit --base`) or a
+  # rewrite of the base branch moves the three-dot merge base, and `record-review.sh` hashes and
+  # signs the LIVE diff at record time — so the record would attest a diff the reviewer never saw,
+  # and check (c) would still be green because it binds the head sha. One extra read closes it.
+  DIFF_AFTER="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \
+    || die "$E_EVIDENCE" "could not re-read the diff of $REPO#$PR before posting/recording — refusing to certify a diff I cannot verify"
+  if [ "$DIFF_AFTER" != "${DIFF_FULL:-$DIFF_REVIEWED}" ]; then
+    die "$E_MOVED" "the DIFF CHANGED during the review (the head sha is unchanged, so this is a BASE retarget or a rewritten base — the three-dot merge base moved) — NOTHING was posted and NO record was written: the reviewer read a different diff than the one the recorder would sign. Re-run at the new base."
+  fi
   if [ "$HEAD_AFTER" != "$HEAD" ]; then
     die "$E_MOVED" "the head MOVED during the review (reviewed ${HEAD:0:12}…, now ${HEAD_AFTER:0:12}…) — NOTHING was posted and NO record was written: the review attests the revision it read, and a clean artifact created now would be accepted by the recorder against the NEW head, certifying code nobody reviewed. Re-run at the new head."
   fi

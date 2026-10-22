@@ -41,6 +41,8 @@
 #   §Y a failed claim/issue read refuses (a failed read is not an empty value)
 #   §Z a failed DIFF read that emitted partial bytes refuses
 #   §AA an EMPTY --repo value is a usage error, never a silent fallback
+#   §AB a prose line after a verdict cannot replace it; 'ISSUES: 2' parses
+#   §AC the reviewed DIFF is re-verified (a base retarget with an unchanged head refuses)
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -77,7 +79,7 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -149,7 +151,9 @@ case "$cmd" in
           printf '\n'
         else
           printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}"
-        fi ;;
+        fi
+        [ -f "$TMP/diff-body" ] && cat "$TMP/diff-body"
+        exit 0 ;;
       comment)
         # Each posted comment is kept UNDER ITS OWN NAME (the seam posts a notes comment
         # before the verdict comment), and the last one is also $TMP/comment.md.
@@ -174,6 +178,8 @@ for a in "$@"; do prompt="$a"; done
 printf '%s' "$prompt" > "$TMP/pi-prompt.txt"
 printf 'ran\n' >> "$TMP/pi-runs.txt"
 printf 'GHREPO=%s\n' "${GH_REPO:-<unset>}" >> "$TMP/pi-env.txt"
+# A BASE retarget during the review: the head sha is untouched, the three-dot diff is not.
+[ "${FIXTURE_FLIP_DIFF:-0}" = "1" ] && printf 'diff --git a/x b/x\n+BASE RETARGETED\n' > "$TMP/diff-body"
 # A head move DURING the review (the caller must refuse to record it).
 [ -n "${FIXTURE_MOVE_HEAD_TO:-}" ] && printf '%s\n' "$FIXTURE_MOVE_HEAD_TO" > "$TMP/head"
 cat "$TMP/reviewer-out" 2>/dev/null
@@ -212,13 +218,13 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
-  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0
+  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
@@ -634,6 +640,28 @@ run "$SRC" 2284 --repo=
 [ "$(rc_of)" = "2" ]; ck $? "exit 2 for '--repo=' (rc=$(rc_of))"
 no_reviewer; ck $? "  no reviewer dispatched on either"
 
+# ── §AB a prose line after an ISSUES verdict cannot override it ─────────────
+echo; echo "§AB trailing prose cannot replace a verdict (the first candidate in the tail wins)"
+reset; printf '[P3] scripts/x.sh:1 — nit\nISSUES 2\nClean-up: remove the dead helper in a follow-up.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a trailing 'Clean-up: …' line does not turn ISSUES 2 into clean (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'All good.\n**CLEAN — no blocking findings.**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "an uppercase decorated CLEAN still parses (rc=$(rc_of))"
+reset; printf 'Two bugs.\nISSUES: 2\n[P1] a.sh:1 — x\n[P2] b.sh:2 — y\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "'ISSUES: 2' (colon) parses and blocks (rc=$(rc_of))"
+
+# ── §AC a BASE retarget with an unchanged head is refused ────────────────────
+echo; echo "§AC the reviewed DIFF is re-verified, not just the head"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_FLIP_DIFF=1
+run "$SRC" 2284
+[ "$(rc_of)" = "8" ]; ck $? "exit 8 when the DIFF changed while the head did not (a base retarget) (rc=$(rc_of))"
+err_has "DIFF CHANGED"; ck $? "…naming the diff, not the head"
+no_record; ck $? "…nothing recorded"
+no_comment; ck $? "…and nothing posted"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -656,10 +684,10 @@ echo
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
 # the very smallest deletion fires. It is still not a coverage claim, and a section smaller
-# than (total - 158) is not caught by it.
+# than (total - 166) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 158 ]; ck $? "assertion-count pin: >= 158 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 166 ]; ck $? "assertion-count pin: >= 166 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
