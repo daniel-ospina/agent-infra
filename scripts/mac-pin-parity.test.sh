@@ -98,9 +98,23 @@ RUN() { # <extra-env…> -- <install.sh args…>
 # The same parser `install.sh` uses to read the program back out of its own render. Duplicated on
 # purpose: a suite that re-implemented the check with a DIFFERENT parse would pass while the shipped
 # assertion was broken, and the shipped one is the thing that must fire.
+# ⛔ THE SUITE'S COPY OF THE SHIPPED RULE, AND IT MUST BE THE SAME RULE (review finding): `install.sh`
+# flattens the file, matches each `<string>` ELEMENT, and takes the FIRST token that is not a flag and not
+# an interpreter. A copy that took the LAST `<string>` would keep passing while the shipped parser
+# regressed — the witness would vouch for a rule the installer no longer implements.
 plist_program() { # <plist>
-  awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
-    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1
+  local flat args
+  [ -f "$1" ] || return 0
+  flat="$(tr '\n' ' ' < "$1" 2>/dev/null || true)"
+  args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
+  printf '%s' "$args" | awk '
+    { s = $0
+      while (match(s, /<string>[^<]*<\/string>/)) {
+        v = substr(s, RSTART + 8, RLENGTH - 17)
+        print v
+        s = substr(s, RSTART + RLENGTH)
+      } }' \
+    | awk '!(/^-/) && !/(^|\/)(ba|z|k)?sh$/ && !/\/env$/ { print; exit }'
 }
 
 # A1 — the FIRST pin, materialised by the cells' own materialiser.
