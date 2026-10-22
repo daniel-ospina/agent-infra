@@ -5,7 +5,7 @@
 <dict>
     <!-- pr-doctor (#2303): drive every open PR toward `merged`, automatically.
          The doctor itself is agent-infra/scripts/pr-doctor.py, farmed to
-         {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts farm.
+         $HOME/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts farm.
 
          ⛔ WHY THIS TEMPLATE EXISTS AT ALL. The code had been shipped and farmed
          for days while NO job definition existed for it: on 2026-10-21
@@ -18,18 +18,17 @@
          REPLACES that hand-made agent with the tracked one — same label, same
          script, now reproducible from source. That replacement is the point.
 
-         THE TARGET IS THE CHECKOUT'S SCRIPT, NOT THE FARMED COPY, and that is
-         deliberate: a `<string>` here must resolve on a FRESH box, and the only
-         target that always does is one inside a checkout the installer itself just
-         resolved ({{AGENT_INFRA_PATH}} is this repo's MAIN checkout — worktree-safe,
-         so it survives teardown of any feature worktree). install-launchd.sh
-         hard-fails a job whose target does not resolve; pointing at a farmed path
-         would make the first install on a new box fail until a separate bootstrap
-         step had run, and a dead job must never be installed. The interpreter is
-         `/usr/bin/env python3` — the shape the LIVE job was armed with — because it
-         is the only one that resolves on BOTH a swarm box and a bare one:
-         {{PYTHON_BIN}} is $SWARM_ROOT/.venv/bin/python when a swarm root exists and
-         is deliberately pointed at a nonexistent path on a non-swarm machine, which
+         THE TARGET IS THE FARMED COPY, like every other always-installable job in
+         this directory (pi-reap-orphans, pi-cache-reap, lane-liveness): setup.sh's
+         fleet-scripts farm copies pr-doctor.py to that path BEFORE the launchd
+         convergence step, which is what makes the `<string>` resolve on a fresh box.
+         install-launchd.sh hard-fails a job whose target does not resolve, and that
+         check is deliberately NOT defeated here: a bare `install-launchd.sh` on a box
+         that never ran the farm FAILs this job instead of installing a dead one, which
+         is the correct verdict and the same one every farmed job gets.
+         The interpreter is `/usr/bin/env python3` — the shape the LIVE job was armed
+         with — and not the installer's PYTHON_BIN placeholder: on a non-swarm box that
+         placeholder is deliberately pointed at a venv that does not exist, so using it
          would hard-fail this install for a reason that has nothing to do with the
          doctor.
 
@@ -44,7 +43,7 @@
          operator wants a pass now.
 
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
-         {{HOME}}/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
+         $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
          .../pr-doctor.status.json; the launchd capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
@@ -74,9 +73,12 @@
     </dict>
     <key>StartInterval</key>
     <integer>1800</integer>
+    <!-- ⛔ /tmp, like every other template in this directory: launchd opens these files BEFORE exec,
+         and nothing in install-launchd.sh creates $HOME/.pi/agent/state. A capture path whose parent
+         may not exist fails at bootstrap, and the job that loses its only crash surface is this one. -->
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.pi/agent/state/pr-doctor.launchd.log</string>
+    <string>/tmp/pr-doctor.launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.pi/agent/state/pr-doctor.launchd.err</string>
+    <string>/tmp/pr-doctor.launchd.err</string>
 </dict>
 </plist>

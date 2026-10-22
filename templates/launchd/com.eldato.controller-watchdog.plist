@@ -26,8 +26,10 @@
 
          ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
          FRESH box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
-         must not be defeated). {{AGENT_INFRA_PATH}} is this repo's MAIN checkout — worktree-safe, so
-         a passing worktree's teardown cannot leave this job pointing at nothing.
+         must not be defeated). The installer renders it from resolve_infra_main() — this repo's MAIN
+         checkout, worktree-safe — so a passing worktree's teardown cannot leave this job pointing at
+         nothing. (That canary script is farmed to $HOME/.pi/agent/scripts for the CELL, which has no
+         launchd; this Mac job runs the checkout's copy so it moves with the merge, not with a sync.)
 
          ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's
          shell env nor its rc files, so an unset variable silently keeps the script's default — and
@@ -45,9 +47,9 @@
 
          ⛔ EXIT 0 ALWAYS. launchd's last-exit-status is read by nobody, so a non-zero exit from a
          watchdog is invisible exactly when it matters. The decision is the OUTPUT: one line per pass
-         in {{HOME}}/.pi/agent/state/controller-watchdog.log (bounded, rotated with a line saying
-         so), plus the crash record at .../controller-watchdog.crash. the script's own `status` verb
-         reprints both, which is the surface a human and `status` read.
+         in $HOME/.pi/agent/state/controller-watchdog.log (bounded, rotated with a line saying so),
+         plus the crash record at $HOME/.pi/agent/state/controller-watchdog.crash. The script's own
+         `status` verb reprints both, which is the surface a human and `status` read.
          The launchd capture below is only for a death BEFORE the script can log anything (a bash
          syntax error in the script itself, a missing interpreter) — the same class that wedged the
          controller, so the watchdog must not reproduce it silently.
@@ -70,6 +72,13 @@
         <string>{{HOME}}</string>
         <key>O</key>
         <string>{{HOME}}/orchestrator</string>
+        <!-- ⛔ THE RESTART TARGET IS CONFIGURABLE, because the fleet ships TWO controller labels:
+             install.sh's launchd job is com.eldato.orchestrator-loop (orch-loop.sh directly) while
+             this box's stack is com.eldato.orchestrator-stack (supervisor.sh). Hardcoding the wrong
+             one makes every pass exit `RESTART-FAILED` while the wedge persists. This box's label is
+             the default and is written out so an operator can see and change it here. -->
+        <key>LABEL</key>
+        <string>com.eldato.orchestrator-stack</string>
         <key>HB_STALE</key>
         <string>780</string>
         <key>SETTLE</key>
@@ -83,9 +92,13 @@
          once per controller cycle (240s), so a tighter timer would read the same instant again.
          This is the cadence the live box was hand-armed at. -->
     <integer>300</integer>
+    <!-- ⛔ /tmp, like every other template here: launchd opens both files BEFORE exec, and nothing in
+         install-launchd.sh creates $HOME/.pi/agent/state. This capture is only for a death BEFORE the
+         script can log (a syntax error in the watchdog itself) — the durable decision record is the
+         script's own bounded log. -->
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.pi/agent/state/controller-watchdog.launchd.log</string>
+    <string>/tmp/controller-watchdog.launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.pi/agent/state/controller-watchdog.launchd.err</string>
+    <string>/tmp/controller-watchdog.launchd.err</string>
 </dict>
 </plist>

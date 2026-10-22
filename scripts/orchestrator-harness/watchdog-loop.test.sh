@@ -16,7 +16,16 @@ WD="$SELF_DIR/watchdog-loop.sh"
 [ -f "$WD" ] || { echo "FATAL: $WD not found" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-loop-test.XXXXXX")"
-trap 'kill $(cat "$WORK"/*.ctrlpid 2>/dev/null) 2>/dev/null; rm -rf "$WORK"' EXIT
+# ⛔ The fake controllers are recorded in their case's .orch.lock (that is the file the watchdog reads),
+# never in a *.ctrlpid this trap invented: the earlier trap killed nothing and every run leaked its
+# fixture processes — `sleep 300`s whose argv ends in `orch-loop.sh`, i.e. exactly the noise the
+# fleet's own process-table scanners have to tell apart from a real controller.
+# ⛔ A SEPARATE PID LEDGER, not the lock: several cases deliberately overwrite `$O/.orch.lock` with a
+# DEAD pid (that is the DOWN fixture), which loses the live controller's pid — and a trap that reads the
+# lock therefore leaks every one of them. Measured: 11 strays per run before this line existed, each an
+# `orch-loop.sh`-looking process the fleet's own process-table readers must then tell from a real one.
+trap 'while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$WORK/pids" 2>/dev/null; rm -rf "$WORK"' EXIT
+: > "$WORK/pids"
 ok()  { printf 'ok   %s\n' "$*"; }
 bad() { printf 'BAD  %s\n' "$*"; FAIL=$((FAIL+1)); }
 FAIL=0
@@ -36,6 +45,7 @@ start_ctrl() {
   printf 'sleep 300\n' > "$C/o/fake-orch-loop.sh"
   bash "$C/o/fake-orch-loop.sh" >/dev/null 2>&1 &
   CPID=$!
+  printf '%s\n' "$CPID" >> "$WORK/pids"
   printf '%s' "$CPID" > "$C/o/.orch.lock"
 }
 stop_ctrl() { [ -n "${CPID:-}" ] && kill "$CPID" 2>/dev/null; CPID=""; : > "$C/o/.orch.lock"; }
@@ -47,7 +57,7 @@ run() {
       WATCHDOG_LOG="$C/state/controller-watchdog.log" \
       WATCHDOG_RESTART_CMD="$STUB" SETTLE=0 HB_STALE=780 MAX_CONSEC="${MAXC:-3}" \
       WATCHDOG_NO_RESTART=1 ${@:+"/usr/bin/env" "$@"} bash "$WD" 2>&1 \
-    | grep -m1 'verdict=' || true
+    | grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|RESTART-FAILED|RESTART-SUPPRESSED)' || true
 }
 # runall — every line the pass emitted (the post-restart re-check is a SECOND line, and a case about
 # recovery must read it; `run` returns the DECISION line, so a STILL_WEDGED follow-up cannot mask it).
@@ -68,7 +78,15 @@ assert_contains "$out" "verdict=HEALTHY" "a fresh heartbeat + live pid is HEALTH
 assert_contains "$out" "pid=$CPID" "…and the line names the controller pid"
 assert_eq "$(restarts)" "0" "…and the restart command was NOT called (proven, not assumed)"
 assert_eq "$(crashes)" "0" "…and no crash record was written"
-assert_eq "$(run --status | wc -l | tr -d ' ')" "$(run --status >/dev/null; run --status | wc -l | tr -d ' ')" "--status renders the state (a reader other than launchd can see it)"
+# ⛔ THE EARLIER VERSION OF THIS LINE COMPARED X TO X and could never fail; it also routed `--status`
+# through `/usr/bin/env`, so the flag never reached the script (`env: illegal option -- s`) and both
+# sides were empty. `--status` is the human surface the contract names, so it is driven DIRECTLY here.
+stout="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
+         WATCHDOG_LOG="$C/state/controller-watchdog.log" \
+         WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 bash "$WD" --status 2>&1)"
+assert_contains "$stout" "controller-watchdog:" "--status renders the state (a reader other than launchd can see it)"
+assert_contains "$stout" "HEALTHY" "--status reprints the last decision"
+assert_eq "$(restarts)" "0" "--status dispatches nothing"
 
 # ═══ 2. THE MEASURED CASE: live pid + stale heartbeat → exactly ONE restart, WEDGED ══════════════
 echo "── 2. WEDGED: pid alive, heartbeat stale (the measured hour)"
@@ -91,6 +109,18 @@ chmod +x "$STUB"
 assert_contains "$(runall)" "verdict=RECOVERED" "a restart that restores cycling is reported RECOVERED"
 assert_eq "$(restarts)" "1" "…with exactly one restart"
 
+# ═══ 2c. THE P0 FROM REVIEW: a CYCLING controller whose pid cannot be found must not be killed ═════
+echo "── 2c. a fresh heartbeat with no discoverable pid is UNCERTAIN, never a restart"
+newcase; start_ctrl; hb_now
+: > "$C/o/.orch.lock"        # the lock was removed/stale (the #1715 class)
+# …and the scan cannot match this case's argv, so NO pid is discoverable while the loop IS cycling
+mv "$C/o/fake-orch-loop.sh" "$C/o/detached-loop.sh" 2>/dev/null || true
+out="$(run)"
+assert_contains "$out" "verdict=UNCERTAIN" "fresh heartbeat + no pid is UNCERTAIN (a 0s-old heartbeat proves it IS cycling)"
+assert_absent  "$out" "restart=1" "…and nothing in the line asks for a restart"
+assert_eq "$(restarts)" "0" "…and the restart command was NOT called — killing a cycling controller on a bookkeeping miss is the P0"
+assert_absent  "$out" "verdict=DOWN" "…and it is not DOWN either"
+
 # ═══ 3. dead pid + stale heartbeat → DOWN → restart ═════════════════════════════════════════════
 echo "── 3. DOWN: no pid, heartbeat stale"
 newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale
@@ -108,10 +138,12 @@ assert_contains "$out" "no readable heartbeat" "…and it names the missing datu
 assert_eq "$(restarts)" "1" "…and it restarts"
 # 4b. an empty / garbage heartbeat file is the same class — present but not a usable instant
 newcase; start_ctrl; printf 'not-a-time' > "$C/o/heartbeat"; touch -t 202001010000 "$C/o/heartbeat"
-# ⛔ present-but-unusable is NOT the same class as ABSENT: the value cannot be read, but the file's own
-# mtime still dates the last write — and that age is 6 years, i.e. ALIVE BUT STALE, which is WEDGED.
-# Reporting DOWN here would send an operator looking for a dead process that is running.
-assert_contains "$(run)" "verdict=WEDGED" "a heartbeat present but unusable (mtime 2020) is WEDGED, never healthy"
+# ⛔ A file whose content carries no instant is UNKNOWN, and UNKNOWN maps to DOWN — it must NOT be
+# dated from its mtime: any `touch`/copy/restore would then renew "health" for HB_STALE seconds on a
+# wedged box (the fail-open direction review found untested). DOWN sends the operator to a restart,
+# which is the safe arm here; the alternative sends them to a green tick.
+assert_contains "$(run)" "verdict=DOWN" "a heartbeat whose content is not an instant is DOWN (no mtime fallback), never healthy"
+assert_absent "$(run)" "verdict=HEALTHY" "…and never HEALTHY"
 
 # ═══ 5. N consecutive wedges → restarting STOPS, ONE crash line, and it SURVIVES a restart ═══════
 echo "── 5. a crash loop stops being restarted, and the crash is recorded ONCE"
@@ -127,6 +159,7 @@ assert_contains "$o3" "restart=0" "…and says so in the same line"
 assert_eq "$(restarts)" "2" "…and the restart count stopped at the limit (2), not 3"
 assert_eq "$(crashes)" "1" "…and ONE crash record exists"
 assert_contains "$(cat "$C/state/controller-watchdog.crash")" "syntax error" "…and it NAMES the crash from the controller's own stdout"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "verdict=WEDGED_STOPPED" "…using the SAME verdict token as the decision log (not WEDGED-STOPPED)"
 assert_contains "$(cat "$C/state/controller-watchdog.crash")" "last 25 lines" "…and carries the tail of that log"
 sig1="$(cksum < "$C/state/controller-watchdog.crash")"
 # a SIMULATED restart: the stub runs, the controller is replaced, the wedge continues
@@ -135,6 +168,27 @@ o4="$(run)"
 assert_contains "$o4" "verdict=WEDGED_STOPPED" "after a restart the loop is STILL stopped"
 assert_eq "$(restarts)" "2" "…and it did not restart again"
 assert_eq "$(cksum < "$C/state/controller-watchdog.crash")" "$sig1" "…and the crash record SURVIVED the restart byte for byte (written once)"
+
+# ═══ 5b. DOWN is CAPPED too: a controller that crashes on start is not restarted forever ═════════
+echo "── 5b. a repeating DOWN stops being restarted, and each crash EPISODE is recorded"
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=2
+printf 'bash: line 412: syntax error near unexpected token `(`\n' > "$C/o/logs/controller-stdout.log"
+d1="$(run)"; d2="$(run)"; d3="$(run)"
+assert_contains "$d1" "verdict=DOWN" "DOWN 1 restarts"
+assert_contains "$d2" "verdict=DOWN" "DOWN 2 restarts"
+assert_contains "$d3" "verdict=DOWN_STOPPED" "DOWN 3 (> 2) STOPS restarting (crash-on-start cannot loop forever)"
+assert_eq "$(restarts)" "2" "…and the DOWN restart count stopped at the limit"
+assert_eq "$(crashes)" "1" "…and the crash WAS recorded (previously only the WEDGED arm recorded anything)"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "syntax error" "…naming the crash"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "episode=1" "…and its episode"
+
+# a SECOND, DIFFERENT crash loop must be recorded too — the record is once PER EPISODE, not once ever
+start_ctrl; hb_now; run >/dev/null                  # one healthy pass ends episode 1
+stop_ctrl; printf '999999' > "$C/o/.orch.lock"; hb_stale
+printf 'Traceback (most recent call last):\nKeyError: worker-missing\n' > "$C/o/logs/controller-stdout.log"
+run >/dev/null; run >/dev/null; run >/dev/null
+assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "2" "a SECOND crash episode is appended, not swallowed by the first"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "KeyError: worker-missing" "…and it names the SECOND crash (the earlier record named only the first)"
 
 # ═══ 6. the decision log is bounded and rotated with a line saying so ═══════════════════════════
 echo "── 6. the decision log cannot grow without bound"
@@ -150,14 +204,24 @@ assert_contains "$(cat "$C/state/controller-watchdog.log")" "LOG-ROTATED" "an ov
 echo "── 7. a non-numeric HB_STALE must not turn a healthy controller into a wedged one"
 newcase; start_ctrl; hb_now
 out="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=abc bash "$WD" 2>&1 | grep -m1 verdict=)"
+        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=abc bash "$WD" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
 assert_contains "$out" "verdict=HEALTHY" "HB_STALE=abc falls back to 780 and the controller stays healthy"
 assert_eq "$(restarts)" "0" "…and nothing was restarted"
 # a zero HB_STALE is a legitimate (strict) setting: every non-zero age is stale
 newcase; start_ctrl; echo $(( $(date +%s) - 5 )) > "$C/o/heartbeat"
 out="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=0 bash "$WD" 2>&1 | grep -m1 verdict=)"
+        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=0 bash "$WD" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
 assert_contains "$out" "verdict=WEDGED" "HB_STALE=0 is honoured (a 5s-old heartbeat is stale), not silently defaulted"
+
+# 7b. an unvalidated LOG_MAX_BYTES used to truncate the decision log on EVERY pass
+echo "── 7b. a non-numeric log bound falls back instead of erasing the verdict"
+newcase; start_ctrl; hb_now
+printf 'prior decision line\n' > "$C/state/controller-watchdog.log"
+env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/controller-watchdog.log" \
+    WATCHDOG_LOG_MAX_BYTES=abc WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$WD" >/dev/null 2>&1
+assert_contains "$(cat "$C/state/controller-watchdog.log")" "prior decision line" "a typo'd LOG_MAX_BYTES does NOT truncate the log"
+assert_contains "$(cat "$C/state/controller-watchdog.log")" "BOUND-FALLBACK" "…and the ignored bound is said out loud"
+assert_eq "$(env O="$C/o" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" bash "$WD" --bogus >/dev/null 2>&1; echo $?)" "0" "even a mistyped verb exits 0 (the trap covers the parse)"
 
 # ═══ 8. exit 0 always ══════════════════════════════════════════════════════════════════════════
 echo "── 8. the watchdog always exits 0"
@@ -168,11 +232,18 @@ assert_eq "$?" "0" "a FAILED restart verb still exits 0 (the verdict is the outp
 env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
     WATCHDOG_RESTART_CMD="/bin/false" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$WD" >/dev/null 2>&1
 assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l")" "RESTART-FAILED" "…and it says the restart failed"
-# ⛔ THE STUB AND THE SUPPRESSION ARE NOT OPTIONAL, even here: the FIRST version of this case ran the
-# real platform verb and issued `launchctl kickstart -k gui/501/com.eldato.orchestrator-stack` against
-# the LIVE stack (measured — the job's pid changed). A unit test must never be able to do that, which
-# is why `WATCHDOG_NO_RESTART` exists in the product, not only in this file.
-assert_eq "$(env O=/nonexistent/xyz WATCHDOG_STATE_DIR="$C/state2" WATCHDOG_NO_RESTART=1 WATCHDOG_LOG="$C/state2/l" SETTLE=0 bash "$WD" >/dev/null 2>&1; echo $?)" "0" "an unusable O still exits 0"
+# ⛔ THE STUB IS NOT OPTIONAL, even here: the FIRST version of this case ran the real platform verb and
+# issued `launchctl kickstart -k gui/501/com.eldato.orchestrator-stack` against the LIVE stack
+# (measured — the job's pid changed). A unit test must never be able to do that.
+assert_eq "$(env O=/nonexistent/xyz WATCHDOG_STATE_DIR="$C/state2" WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 WATCHDOG_LOG="$C/state2/l" SETTLE=0 bash "$WD" >/dev/null 2>&1; echo $?)" "0" "an unusable O still exits 0"
+# ⛔ AND THE SUPPRESSION ITSELF IS ASSERTED, not assumed: the earlier version relied on the flag without
+# ever checking it was taken, so a renamed/moved guard would be both invisible here and live-firing on
+# the operator's box.
+newcase; start_ctrl; hb_stale
+env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+    WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$WD" >/dev/null 2>&1
+assert_contains "$(grep -m1 RESTART-SUPPRESSED "$C/state/l")" "RESTART-SUPPRESSED" "WATCHDOG_NO_RESTART reaches the platform verb and is taken"
+assert_eq "$(restarts)" "0" "…and the stub proves no restart was issued"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
@@ -183,7 +254,7 @@ if cmp -s "$WD" "$MUT"; then
 else
   newcase; start_ctrl; hb_stale
   mout="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-           WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$MUT" 2>&1 | grep -m1 verdict=)"
+           WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$MUT" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
   assert_contains "$mout" "verdict=HEALTHY" "MUTANT: with the heartbeat check gone, the wedged controller reads HEALTHY"
   assert_eq "$(restarts)" "0" "MUTANT: …and is never restarted — so case 2 is not passing by accident"
   # the shipped script, same fixture, must disagree
