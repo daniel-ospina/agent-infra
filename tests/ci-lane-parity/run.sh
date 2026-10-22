@@ -65,9 +65,13 @@ trap 'rm -rf "$TMP"' EXIT
 
 # A FAST copy of the runner (long shards dropped) for the runtime-mutation pins: they must
 # exercise the runner's own self-checks, not spend ten minutes running the real suites.
+# `scripts/heartbeat-loop.test.sh` is on the list because this script RUNS the fast copy four times
+# (below) and that shard is ~29 real one-pass loop launches (~10 s measured): it would otherwise
+# cost ~40 s of pure duplication per lane, and a sabotage pin learns nothing from it (review
+# advisory, #1954).
 grep -v -e 'pi-reap-idle' -e 'pi-task-session-prune' -e 'pi-reap-worktrees' -e 'install-launchd' \
   -e 'test-setup-no-nesting' -e 'scratch-worktree' -e 'tests/admin-merge' -e 'tests/atomic-land' \
-  -e 'tests/gh-shim' -e 'tests/search-cost' "$RUNNER" >"$TMP/runner-fast.sh"
+  -e 'tests/gh-shim' -e 'tests/search-cost' -e 'heartbeat-loop' "$RUNNER" >"$TMP/runner-fast.sh"
 
 OUT=""
 RC=0

@@ -140,8 +140,10 @@ const NOT_A_REPO_RE = /not a git repository/i;
 /**
  * Does `cwd` or ANY ancestor carry a `.git` entry (dir, file, OR symlink)? git
  * reports a corrupt/incomplete repository boundary with the SAME `fatal: not a
- * git repository` (exit 128) it uses for a plain directory, so the message alone
- * cannot tell them apart. If a boundary exists but git rejected it, the repo
+ * git repository` (exit 128) it uses for a plain directory — and, from git 2.55,
+ * sometimes as `fatal: error reading '<path>'` — so the message alone cannot tell
+ * them apart (and it is not read here at all). If a boundary exists but git
+ * rejected it, the repo
  * scope is UNRESOLVABLE (fail closed); only a walk that finds no `.git` entry
  * anywhere is the definitive "not a repository" answer.
  *
@@ -205,20 +207,22 @@ interface MainRootResolution {
    * legitimate launch cwd). An opt-out at any other ancestor is still honoured:
    * the caller walks ancestors with {@link ancestorDenyExists} before trusting
    * this answer. `resolved:false` is reserved for a genuine failure — git absent,
-   * a timeout, a corrupt `.git` (git reports it with the same message), or a
+   * a timeout, a corrupt `.git` (git reports that with the same message up to 2.51
+   * and `fatal: error reading '<path>'` from 2.55 — see `boundaryRejected`), or a
    * layout whose main root cannot be named (see {@link resolveMainRepoRoot}).
    */
   notARepo: boolean;
   /**
-   * True when git answered DEFINITIVELY `fatal: not a git repository` (exit 128)
-   * but a `.git` boundary DOES exist above — a corrupt/incomplete repository, or
-   * a boundary git rejects (a broken/looping symlink left by an unmounted volume,
+   * True when git DIED with its own diagnostic exit code 128 for `cwd` and a
+   * `.git` boundary DOES exist above — a corrupt/incomplete repository, or a
+   * boundary git rejects (a broken/looping symlink left by an unmounted volume,
    * a deleted central gitdir, a `cp -r` that excluded the target, a ZIP export).
-   * This is NOT a genuine git failure, so an ancestor opt-out — a purely
-   * filesystem read that does not depend on git — is still trustworthy and must
-   * be honoured before failing closed (review cycle 3 P0). It is tracked
-   * separately from `notARepo` precisely because a genuine failure (git absent,
-   * a timeout) must NOT be treated as a definitive answer.
+   * The boundary is MEASURED with `lstat` on exit 128, not inferred from git's
+   * diagnostic text: git reworded the unreadable-boundary case (`fatal: error
+   * reading '<path>'`, measured on 2.55.0) and keying this flag on the prose
+   * silently disabled it. An ancestor opt-out — a purely filesystem read that does
+   * not depend on git — is still trustworthy and must be honoured before failing
+   * closed (review cycle 3 P0). Deny-only, so it can only ever NARROW egress.
    */
   boundaryRejected: boolean;
 }
@@ -292,7 +296,21 @@ function resolveMainRootUncached(cwd: string): MainRootResolution {
     const e = err as { status?: number; stderr?: unknown } | undefined;
     const stderr = typeof e?.stderr === "string" ? e.stderr : "";
     const answered = e?.status === 128 && NOT_A_REPO_RE.test(stderr);
-    const boundary = answered && hasGitBoundary(cwd);
+    // ⛔ THE BOUNDARY IS MEASURED ON EXIT 128, NEVER INFERRED FROM GIT'S WORDING.
+    // This used to be `answered && hasGitBoundary(cwd)`, i.e. a rejection was only
+    // recognised when git said the words `not a git repository` — so a diagnostic
+    // REWORDING alone flipped a REJECTED boundary to "unresolvable", skipped the
+    // ancestor deny walk, and stopped honouring the opt-out the cwd sits under.
+    // Measured 2026-10-20 on the Actions runner (git 2.55.0): a self-referential
+    // `.git` symlink now exits 128 with `fatal: error reading '<path>'` (gits up to
+    // 2.51 said `fatal: not a git repository (or any of the parent directories):
+    // .git`) — same exit code, new prose — which is how main went red while this
+    // suite stayed green on an older git. 128 is git's own `die()` code, so it
+    // still separates a DIAGNOSTIC answer from an ordinary command failure (the
+    // git-failure pin below uses exit 1 and must stay "unresolvable"); the `.git`
+    // entry is the fact, and git's prose is not. Deny-only either way, so a
+    // boundary found here can only NARROW egress.
+    const boundary = e?.status === 128 && hasGitBoundary(cwd);
     return { root: null, notARepo: answered && !boundary, boundaryRejected: boundary };
   }
 }

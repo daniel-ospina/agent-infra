@@ -40,6 +40,10 @@ are actually invoked by a LaunchAgent: `pi-cache-reap.sh` → `com.eldato.pi-cac
 `pi-reap-idle.sh` → `com.eldato.pi-session-reaper`, `pi-task-session-prune.sh` →
 `com.eldato.pi-task-session-prune`, and `pi-reap-worktrees` via the sibling wrapper
 `pi-reap-worktrees-launchd.py` → `com.tortoise.worktree-reaper` / `com.tortoise.branch-reaper`.
+(The consolidated disk reaper, #2048, is scheduled the same way on Darwin:
+`com.eldato.disk-reaper` runs `disk-reaper.sh` through that same wrapper, because a launchd-spawned
+`bash` cannot read a repo under `~/Documents`. It is installed by `install-disk-reaper-timer.sh`, not
+by `install-launchd.sh` — see `docs/ops/disk-reaper.md`.)
 **`orphan-reap.py` and `lane-watchdog.py` are referenced by no LaunchAgent on this box** — they are
 armed elsewhere or not at all; do not infer that they run from their presence.
 

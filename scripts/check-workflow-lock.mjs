@@ -68,6 +68,12 @@ export const UNLOCKED_WORKFLOWS = Object.freeze([
   ".github/workflows/pipeline-compliance.yml",
   ".github/workflows/python-ci.yml",
   ".github/workflows/workflow-lock.yml",
+  // agent-infra#2160 — the harness single-source gate. Its own workflow on purpose: it would
+  // otherwise live in the BYTE-LOCKED ci.yml, forcing every branch that touches the harness to also
+  // re-cut `scripts/workflow-lock.json`, which is a last-writer-wins recording of ci.yml's hash — so
+  // two concurrent PRs conflict on it every time one of them re-locks. Unlocked and classified, per
+  // this file's own rule that a workflow must be in one list or the other.
+  ".github/workflows/harness-single-source.yml",
 ]);
 export const UPDATE_COMMAND = "node scripts/check-workflow-lock.mjs --update-lock";
 

@@ -1,0 +1,1139 @@
+#!/usr/bin/env bash
+# pi-reap-orphans.test.sh — self-check for scripts/pi-reap-orphans.sh (#1142).
+#
+# Run: bash scripts/pi-reap-orphans.test.sh [--repro]
+# Exits 0 when ALL assertions pass, 1 on any failure.
+#
+# Hermetic by default: `ps` / `lsof` / `kill` are shimmed through the script's
+# env seams, so NO real process is enumerated, NO real process is signalled, and
+# no real ~/.pi state is touched. The ps shim walks a SEQUENCE of fixture tables
+# (one per call), which is what makes the two-snapshot cpu-time delta — and the
+# post-signal re-probe — deterministic instead of racy.
+#
+# `--repro` additionally runs the REAL reproduction from the issue on the real
+# host: spawn a child, delete its cwd, let it reparent to launchd, and prove the
+# detector identifies it while leaving a live-cwd process alone. It is opt-in
+# (not part of the hermetic suite) because it needs a real ppid=1 reparent, and
+# it always trap-kills what it spawned.
+#
+# Coverage — each gate driven to its fail path:
+#   reapable                 O1   (ppid=1 + deleted cwd + cpu advancing)
+#   dry-run is default       O2   (no flag => kill shim NEVER invoked)
+#   apply / SIGTERM          O3   (TERM sent, REAPED, exit 0)
+#   ignores SIGTERM          O4   (TERM then KILL, REAPED=2nd signal)
+#   survives KILL            O5   (KILL-FAILED + FAILED=1 + exit 4)
+#   cwd-live                 O6   (a live cwd is left ALONE)
+#   cpu-idle                 O7
+#   centisecond resolution   O8   (0.20s -> 0.40s over the window is a REAP;
+#                                  integer-second truncation read it as 0 -> 0
+#                                  and hid a sustained 10%-of-a-core leak)
+#   cpu goes backwards       O8b  (cpu-unmeasurable)
+#   cpu unmeasurable         O8c  (absent from snapshot A)
+#   too-young                O9
+#   wrong-uid                O10
+#   not-orphan               O11  (ppid != 1 => never even classified)
+#   cwd-unknown              O12  (lsof has no entry => PRESERVE, not a reap)
+#   cwd-unreadable           O13  (an ancestor that is not a directory)
+#   cwd-out-of-scope         O14  (deleted cwd outside the roots; --any-cwd)
+#   ps failed/empty          O15  (exit 3, NOTHING signalled)
+#   ps non-empty/unparseable O15c (same failure class — a shape check, not `-s`)
+#   post-signal probe        O18d (unparseable => STILL ALIVE, no "REAPED")
+#   stale lock / live owner  O18b/O18c (broken when stale; HELD while the owner
+#                                  is alive, whatever the dir age; stat flavour
+#                                  detected so Linux breaks a stale lock)
+#   lsof failed/empty        O16  (exit 3, NOTHING signalled — the fail-closed
+#                                  probe the #1095 review found twice)
+#   lsof missing             O16b
+#   --list                   O17  (read-only: no lock, no log, no signal)
+#   lock held                O18  (exit 3)
+#   log unwritable (armed)   O19  (exit 3)
+#   log gate vs identity abort O19c (the log gate runs BEFORE the identity pass's
+#                                  fail-closed paths, so an identity abort on a
+#                                  fresh state dir is LOGGED, not a bare shell
+#                                  redirection error on stderr)
+#   flags / env validation   O20  (--help, unknown arg, bad numbers)
+#   verbose vs summary       O21  (non-verbose still reports exact counts)
+#   identity binding (F11/F12) O27 (identity table captured right after snapshot B,
+#                                  BEFORE lsof — the binding spans identity-pass ->
+#                                  signal; a changed/absent identity => PRESERVE, no
+#                                  signal; a stable identity still reaps; F13
+#                                  histogram and counters agree on the downgraded path)
+#   gate 4 launchd-registered O28 (a MANAGED job is preserved; an unreadable or
+#                                  non-launchctl-shaped registration table aborts
+#                                  exit 3; a host with no launchctl logs INERT)
+#   gate 5 designed-daemon   O29  (daemon-ish argv, and a state-dir pidfile naming
+#                                  the pid; a plain candidate in the same fixture
+#                                  still reaps, so the gate does not disable the tool)
+#   budget DEFERRED          O30  (a budget-truncated pass reports deferred=N, a
+#                                  per-reason row, INCOMPLETE PASS, and keeps the
+#                                  histogram reconciling with reapable+preserved)
+#   TERM-FAILED              O31  (an undelivered SIGTERM => exit 4, no SIGKILL)
+#   watchdog list pruned     O32  (the EXIT trap signals no pid this pass already
+#                                  collected, + a mutation restoring the old shape
+#                                  to prove that assertion is live)
+#   ancestry BOUNDARY        O33  (a candidate whose parent is a human anchor is
+#                                  never classified — the disclosed residual, pinned)
+#   multiplexer spellings     O34  (a GNU screen server `SCREEN` and a tmux server
+#                                  title `tmux: server` are human anchors; the
+#                                  exact lowercase arm missed both spellings)
+#   real reproduction        R1   (--repro only)
+
+set -uo pipefail
+
+bash -n "$0" || { echo "FATAL: the suite itself does not parse (see above)" >&2; exit 2; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAPER="$SCRIPT_DIR/pi-reap-orphans.sh"
+# Invoke the reaper through a function so no `bash <path>` appears INSIDE a
+# `$( )` span: the main-worktree-guard script-content walker (#1484) cannot
+# verify that form and fails closed, which would make this suite unrunnable
+# from any session rooted in the shared main checkout (cf. #1095's note).
+reap_invoke() { bash "$REAPER" "$@"; }
+PASS=0
+FAIL=0
+ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
+bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
+assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+assert_absent()   { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi; }
+assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
+assert_nofile()   { if [ -e "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; fi; }
+assert_rc()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (rc=$1, want $2)"; fi; }
+
+T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-orphans-test.XXXXXX")"
+T="$(cd "$T" && pwd -P)"
+SPAWNED=""
+cleanup() {
+    for p in $SPAWNED; do kill -9 "$p" 2>/dev/null; done
+    rm -rf "$T"
+}
+trap cleanup EXIT
+
+REAPER_UNDER_TEST="$REAPER"
+# The real reproduction spawns real processes; keep their pids for the trap.
+add_spawned() { SPAWNED="$SPAWNED $1"; }
+
+# ── shims ──────────────────────────────────────────────────────────────
+mkdir -p "$T/bin"
+cat >"$T/bin/ps" <<'SHIM'
+#!/usr/bin/env bash
+# IDENTITY probe: `ps -o lstart= -p PID`. Answered from FAKE_IDENT_SEQ (a
+# `|`-separated walk — lstart contains COLONS in its time field, so `:` cannot be
+# the delimiter; past the end the LAST value repeats) so a fixture can make a
+# pid's start identity CHANGE between snapshot B and the signal — the #1863 F11
+# regression. The literal token __EMPTY__ models an unevaluable read.
+# The IDENTITY TABLE (`ps -axo pid=,lstart=`, #1863 F12) is a distinct
+# call shape answered from FAKE_IDENT_TABLE (a fixture file of `pid lstart` rows)
+# or, when unset, synthesized from every pid in the fixture sequence with a STABLE
+# identity — which is what the pre-existing apply fixtures rely on. Both branches
+# run BEFORE the snapshot walk, so identity probes never consume a fixture table.
+for a in "$@"; do
+    case "$a" in
+        'pid=,lstart=')
+            if [ -n "${FAKE_IDENT_TABLE:-}" ]; then cat "$FAKE_IDENT_TABLE"; exit 0; fi
+            IFS=':' read -r -a ifiles <<<"${FAKE_PS_SEQ:-}"
+            for f in "${ifiles[@]}"; do
+                [ -f "$f" ] && awk '$1 ~ /^[0-9]+$/ { print $1, "Wed Oct 15 10:04:03 2025" }' "$f"
+            done | sort -u
+            exit 0 ;;
+        'lstart=')
+            idx=0
+            if [ -n "${FAKE_IDENT_COUNTER:-}" ]; then
+                idx="$(cat "$FAKE_IDENT_COUNTER" 2>/dev/null || printf 0)"
+                printf '%s' "$((idx + 1))" >"$FAKE_IDENT_COUNTER"
+            fi
+            idx="${idx:-0}"
+            seq="${FAKE_IDENT_SEQ:-}"
+            if [ -z "$seq" ]; then
+                printf 'Wed Oct 15 10:04:03 2025\n'
+                exit 0
+            fi
+            IFS='|' read -r -a vals <<<"$seq"
+            if [ "${#vals[@]}" -eq 0 ]; then exit 0; fi
+            last=$((${#vals[@]} - 1))
+            [ "$idx" -gt "$last" ] && idx="$last"
+            v="${vals[$idx]}"
+            [ "$v" = "__EMPTY__" ] && exit 0
+            printf '%s\n' "$v"
+            exit 0
+            ;;
+    esac
+done
+# Emits the Nth fixture table from FAKE_PS_SEQ (colon-separated paths); past the
+# end the LAST table repeats. A counter file makes the walk deterministic across
+# the reaper's A / B / post-signal probes.
+idx=0
+if [ -n "${FAKE_PS_COUNTER:-}" ]; then
+    idx="$(cat "$FAKE_PS_COUNTER" 2>/dev/null || printf 0)"
+    printf '%s' "$((idx + 1))" >"$FAKE_PS_COUNTER"
+fi
+IFS=':' read -r -a files <<<"${FAKE_PS_SEQ:-}"
+if [ "${#files[@]}" -eq 0 ]; then exit 0; fi
+last=$((${#files[@]} - 1))
+[ "$idx" -gt "$last" ] && idx="$last"
+cat "${files[$idx]}" 2>/dev/null
+exit 0
+SHIM
+cat >"$T/bin/ps-fail" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+cat >"$T/bin/ps-garbage" <<'SHIM'
+#!/usr/bin/env bash
+# A NON-EMPTY, non-ps table. The emptiness check cannot see this: every row is
+# dropped by the `$2 == 1` filter, the loop body never runs, and the pass would
+# report a clean exit 0 — the false PASS the shape check closes (#1161 review).
+printf 'bash: ps: command not found\n'
+printf 'usage: ps [-a] [-x]\n'
+exit 0
+SHIM
+cat >"$T/bin/lsof" <<'SHIM'
+#!/usr/bin/env bash
+[ -n "${FAKE_LSOF_ARGS_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_LSOF_ARGS_LOG"
+cat "${FAKE_LSOF_TABLE:-/dev/null}" 2>/dev/null
+exit 0
+SHIM
+cat >"$T/bin/lsof-fail" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+cat >"$T/bin/kill" <<'SHIM'
+#!/usr/bin/env bash
+# Records the signal instead of delivering it. NEVER kills a real process.
+[ -n "${FAKE_KILL_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_KILL_LOG"
+exit 0
+SHIM
+cat >"$T/bin/kill-fail" <<'SHIM'
+#!/usr/bin/env bash
+[ -n "${FAKE_KILL_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_KILL_LOG"
+exit 1
+SHIM
+# GATE 4 seam. `launchctl list` always prints a PID/Status/Label header; the rows
+# are the pids this (fake) host has registered. FAKE_LAUNCHD_PIDS is
+# space-separated, so a fixture can register exactly one pid.
+cat >"$T/bin/launchctl" <<'SHIM'
+#!/usr/bin/env bash
+printf 'PID\tStatus\tLabel\n'
+for p in ${FAKE_LAUNCHD_PIDS:-}; do
+    printf '%s\t0\tcom.example.job-%s\n' "$p" "$p"
+done
+exit 0
+SHIM
+cat >"$T/bin/launchctl-fail" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+cat >"$T/bin/launchctl-garbage" <<'SHIM'
+#!/usr/bin/env bash
+# A NON-EMPTY, non-launchctl table: reading it as "nothing is registered" would
+# be a fail-open gate, so the shape check must reject it.
+printf 'launchctl: command not found\n'
+printf 'usage: launchctl list\n'
+exit 0
+SHIM
+# ⛔ THERE IS DELIBERATELY NO `uname` SHIM HERE. There used to be one, and it was DEAD: `$T/bin` is
+# not on PATH (the other shims work only because they are handed to the reaper as absolute paths via
+# PS_BIN/LSOF_BIN/KILL_BIN), so the reaper's `case "$(uname -s)"` always saw the HOST's kernel. Pinning
+# it to Darwin from here would be worse than useless on Linux: the reaper would then call BSD
+# `stat -f %m`, the host's GNU `stat` would fail, `stat_mtime` would yield nothing and the stale-lock
+# legs would red on a host that behaves correctly. So this suite exercises the HOST's stat flavour,
+# and that is what it claims (#1863 review P2).
+chmod +x "$T"/bin/*
+# GATE 4: every invocation below (including the direct `reap_invoke` legs that do
+# not go through run_reaper) inherits the SHIM, never the host's real `launchctl`
+# — otherwise this suite would be host-dependent, and on macOS a fixture pid could
+# collide with a real registered job. A leg that needs another outcome overrides
+# it (RUN_LAUNCHCTL_BIN for run_reaper, or an inline assignment).
+export LAUNCHCTL_BIN="$T/bin/launchctl"
+
+MY_UID="$(id -u)"
+
+# ── fixtures ───────────────────────────────────────────────────────────
+# A root in which the orphan's cwd can be created and then deleted, so the
+# `deleted` cwd state is REAL (not a shimmed notion).
+CWD_ROOT="$T/scratch"
+mkdir -p "$CWD_ROOT"
+
+# fake_ps <name> <rows...>  — write a ps-shaped fixture table.
+fake_ps() {
+    local name="$1"; shift
+    printf '%s\n' "$@" >"$T/$name.ps"
+    printf '%s' "$T/$name.ps"
+}
+# ps_row_line <pid> <ppid> <uid> <cpu> <elapsed> <cmd>
+ps_row_line() { printf '%s %s %s %s %s %s' "$1" "$2" "$3" "$4" "$5" "$6"; }
+
+# lsof_fixture <name> <pid:path>...
+lsof_fixture() {
+    local name="$1"; shift
+    : >"$T/$name.lsof"
+    local spec pid path
+    for spec in "$@"; do
+        pid="${spec%%:*}"; path="${spec#*:}"
+        printf 'p%s\nfcwd\nn%s\n' "$pid" "$path" >>"$T/$name.lsof"
+    done
+    printf '%s' "$T/$name.lsof"
+}
+
+# run_reaper <label> <ps-seq> <lsof-table> [extra args...]
+# Prints "RC=<n>" then the reaper's output. Reads $RUN_ARGS for flags.
+RUN_LOG=""
+RUN_KILL=""
+# Identity walk for the F11 fixtures; empty => the shim's STABLE default.
+RUN_IDENT_SEQ=""
+# Identity-pass TABLE override (#1863 F12); empty => the shim synthesizes a
+# STABLE identity for every pid in the fixture sequence.
+RUN_IDENT_TABLE=""
+# GATE 4 / signal seams. RUN_KILL_BIN lets a leg drive the TERM-FAILED path;
+# RUN_LAUNCHCTL_BIN lets a leg drive gate 4 (registered / unreadable / unshaped /
+# absent). The suite NEVER runs the host's real `launchctl`: the default shim
+# prints a header with no rows (a valid, empty launchd table), which keeps this
+# suite hermetic and host-independent.
+RUN_KILL_BIN=""
+RUN_LAUNCHCTL_BIN=""
+RUN_LAUNCHD_PIDS=""
+run_reaper() {
+    local label="$1" ps_seq="$2" lsof_table="$3"; shift 3
+    # These MUST be set OUTSIDE the command substitution below: assignments made
+    # inside `out="$( ... )"` happen in the subshell and are invisible to the
+    # caller, so the kill-log assertions silently read a stale file.
+    RUN_LOG="$T/$label.state/log"
+    RUN_KILL="$T/$label.kills"
+    rm -f "$RUN_KILL"
+    : >"$T/$label.counter"
+    : >"$T/$label.identcounter"
+    local rc=0
+    out="$(
+        FAKE_PS_SEQ="$ps_seq" FAKE_PS_COUNTER="$T/$label.counter" \
+        FAKE_IDENT_SEQ="${RUN_IDENT_SEQ:-}" FAKE_IDENT_COUNTER="$T/$label.identcounter" \
+        FAKE_IDENT_TABLE="${RUN_IDENT_TABLE:-}" \
+        FAKE_LSOF_TABLE="$lsof_table" FAKE_KILL_LOG="$RUN_KILL" \
+        FAKE_LAUNCHD_PIDS="${RUN_LAUNCHD_PIDS:-}" \
+        PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" \
+        KILL_BIN="${RUN_KILL_BIN:-$T/bin/kill}" \
+        LAUNCHCTL_BIN="${RUN_LAUNCHCTL_BIN:-$T/bin/launchctl}" \
+        REAP_ORPHAN_STATE_DIR="$T/$label.state" REAP_ORPHAN_LOG="$RUN_LOG" \
+        reap_invoke "$@" 2>&1
+    )" || rc=$?
+    printf 'RC=%s\n%s\n' "$rc" "$out"
+}
+kills() { [ -f "$T/$1.kills" ] && cat "$T/$1.kills" || printf ''; }
+
+echo "=== pi-reap-orphans.test.sh (#1142) ==="
+
+# ── O1: the reapable case, dry-run default ─────────────────────────────
+echo "— O1/O2: reapable + dry-run is the default —"
+DEADCWD1="$CWD_ROOT/gone1"; mkdir -p "$DEADCWD1"
+ORPH=4001
+A="$(fake_ps psA "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.50' '00:05:00' /bin/sh-spin)" \
+                     "$(ps_row_line 9999 1 "$MY_UID" '0:03.00' '02:00:00' /usr/bin/idle-daemon)")"
+B="$(fake_ps psB "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.90' '00:05:20' /bin/sh-spin)" \
+                     "$(ps_row_line 9999 1 "$MY_UID" '0:03.00' '02:00:20' /usr/bin/idle-daemon)")"
+L="$(lsof_fixture ls1 "$ORPH:$DEADCWD1" "9999:/usr/bin")"
+rmdir "$DEADCWD1"
+OUT="$(run_reaper o1 "$A:$B" "$L" --min-elapsed-seconds 1 --sample-seconds 0 --verbose)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O1 dry-run exits 0"
+assert_contains "$OUT" "reason=reapable" "O1 the deleted-cwd orphan is classified reapable"
+assert_contains "$OUT" "pid=$ORPH" "O1 ... naming the orphan pid"
+assert_contains "$OUT" "reason=cpu-idle" "O1 the idle but otherwise-eligible pid is preserved"
+assert_contains "$OUT" "reapable=1" "O1 exactly one reapable"
+assert_nofile "$T/o1.kills" "O2 dry-run is the DEFAULT: the kill shim was NEVER invoked"
+assert_contains "$OUT" "dry-run: NOTHING was signalled" "O2 the dry-run line says so in words"
+
+# ── O3: apply sends SIGTERM; the process honours it ────────────────────
+echo "— O3: --apply SIGTERMs, and a process that exits on TERM is not KILLed —"
+DEADCWD3="$CWD_ROOT/gone3"; mkdir -p "$DEADCWD3"
+GONE="$(fake_ps psGone "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)")"
+L3="$(lsof_fixture ls3 "$ORPH:$DEADCWD3")"
+rmdir "$DEADCWD3"
+OUT="$(run_reaper o3 "$A:$B:$GONE" "$L3" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O3 apply exits 0"
+assert_contains "$(kills o3)" "-TERM $ORPH" "O3 SIGTERM was delivered to the orphan"
+assert_absent "$(kills o3)" "-KILL" "O3 a process that exited on TERM is NEVER KILLed"
+assert_contains "$OUT" "REAPED — exited on SIGTERM" "O3 the reap is reported"
+assert_contains "$(cat "$T/o3.state/log")" "REAPED=1" "O3 the log records REAPED=1"
+assert_contains "$OUT" "reaped=1" "O3 the summary reports reaped=1"
+
+# ── O4/O5: ignores TERM -> KILL; survives KILL -> exit 4 ───────────────
+echo "— O4/O5: TERM ignored escalates to KILL; surviving KILL is a FAILURE —"
+DEADCWD4="$CWD_ROOT/gone4"; mkdir -p "$DEADCWD4"
+STILL="$(fake_ps psStill "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                           "$(ps_row_line $ORPH 1 "$MY_UID" '0:01.00' '00:05:00' /bin/sh-spin)")"
+L4="$(lsof_fixture ls4 "$ORPH:$DEADCWD4")"
+rmdir "$DEADCWD4"
+OUT="$(run_reaper o4 "$A:$B:$STILL:$GONE" "$L4" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$(kills o4)" "-TERM $ORPH" "O4 TERM is tried first"
+assert_contains "$(kills o4)" "-KILL $ORPH" "O4 a process still present after the grace is KILLed"
+assert_contains "$OUT" "REAPED — required SIGKILL" "O4 the SIGKILL reap is reported"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O4 escalating to KILL is still a clean pass"
+
+DEADCWD5="$CWD_ROOT/gone5"; mkdir -p "$DEADCWD5"
+L5="$(lsof_fixture ls5 "$ORPH:$DEADCWD5")"
+rmdir "$DEADCWD5"
+OUT="$(run_reaper o5 "$A:$B:$STILL:$STILL:$STILL:$STILL" "$L5" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 4 "O5 a process that survives KILL exits 4"
+assert_contains "$OUT" "KILL-FAILED" "O5 an unproven death is reported as KILL-FAILED, never as a reap"
+assert_contains "$OUT" "failed=1" "O5 the summary counts the failure"
+
+# ── O6: live cwd is left ALONE (the acceptance's "legitimate process") ──
+echo "— O6: a legitimate ppid=1 process with a LIVE cwd is left alone —"
+LIVE6="$CWD_ROOT/live6"; mkdir -p "$LIVE6"
+L6="$(lsof_fixture ls6 "$ORPH:$LIVE6")"
+OUT="$(run_reaper o6 "$A:$B" "$L6" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cwd-live" "O6 a live cwd is preserved"
+assert_contains "$OUT" "reapable=0" "O6 nothing is reapable"
+assert_nofile "$T/o6.kills" "O6 no signal was sent"
+
+# ── O7: cpu-idle ───────────────────────────────────────────────────────
+echo "— O7/O8: cpu gates — idle, centisecond advance, backwards, unmeasurable —"
+DEADCWD7="$CWD_ROOT/gone7"; mkdir -p "$DEADCWD7"
+IDLE_A="$(fake_ps psIa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:00' /bin/sh-spin)")"
+IDLE_B="$(fake_ps psIb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:20' /bin/sh-spin)")"
+L7="$(lsof_fixture ls7 "$ORPH:$DEADCWD7")"
+rmdir "$DEADCWD7"
+OUT="$(run_reaper o7 "$IDLE_A:$IDLE_B" "$L7" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cpu-idle" "O7 a zero CPU delta is preserved"
+assert_nofile "$T/o7.kills" "O7 no signal was sent"
+
+# O8: 0.20s -> 0.40s over the window = a 20cs advance. Integer-second truncation
+# read BOTH as 0 and classified a sustained 10%-of-a-core leak as cpu-idle.
+CS_A="$(fake_ps psCa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                   "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.20' '00:05:00' /bin/sh-spin)")"
+CS_B="$(fake_ps psCb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                   "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.40' '00:05:20' /bin/sh-spin)")"
+OUT="$(run_reaper o8 "$CS_A:$CS_B" "$L7" --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=reapable cpu +20cs" "O8 a 20-centisecond advance is a REAP (regression: seconds-truncation hid it)"
+assert_contains "$OUT" "reapable=1" "O8 ... and it is the only reclaimable row"
+
+BACK_A="$(fake_ps psBa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:09.00' '00:05:00' /bin/sh-spin)")"
+BACK_B="$(fake_ps psBb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
+OUT="$(run_reaper o8b "$BACK_A:$BACK_B" "$L7" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cpu-unmeasurable" "O8b a cpu-time that goes BACKWARDS is unevaluable, not a reap"
+assert_nofile "$T/o8b.kills" "O8b ... and nothing is signalled"
+
+ABSENT_B="$(fake_ps psAb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
+OUT="$(run_reaper o8c "$GONE:$ABSENT_B" "$L7" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cpu-unmeasurable" "O8c a pid absent from snapshot A is unevaluable, not a reap"
+assert_nofile "$T/o8c.kills" "O8c ... and nothing is signalled"
+
+# O8d — an UNPARSEABLE etime (#1863 F1). `ps_normalize` leaves `elapsed` EMPTY,
+# and because TAB is IFS *whitespace* the old candidate loop collapsed the empty
+# field and slid the command into `elapsed`; the age floor then compared a string
+# ("integer expression expected"), evaluated FALSE, and SKIPPED the floor — a
+# fresh reparented child could be signalled. The empty position must be preserved
+# and an unevaluable age PRESERVED (fail-closed), never silently skipped.
+BADETIME_A="$(fake_ps psBadEtA "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.10' '1:2:3:4' /bin/sh-spin)")"
+BADETIME_B="$(fake_ps psBadEtB "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:09.00' '1:2:3:4' /bin/sh-spin)")"
+OUT="$(run_reaper o8d "$BADETIME_A:$BADETIME_B" "$L7" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=elapsed-unmeasurable" "O8d an unparseable etime is unevaluable and PRESERVED (the age floor is never skipped)"
+assert_absent "$OUT" "reason=reapable" "O8d ... never reapable"
+assert_absent "$OUT" "integer expression expected" "O8d ... and the shifted-field compare error is gone"
+assert_nofile "$T/o8d.kills" "O8d ... and nothing is signalled"
+
+# ── O9: too-young ──────────────────────────────────────────────────────
+echo "— O9/O10/O11: age floor, uid, and the orphan requirement itself —"
+DEADCWD9="$CWD_ROOT/gone9"; mkdir -p "$DEADCWD9"
+L9="$(lsof_fixture ls9 "$ORPH:$DEADCWD9")"
+rmdir "$DEADCWD9"
+OUT="$(run_reaper o9 "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 99999 --sample-seconds 0)"
+assert_contains "$OUT" "reason=too-young" "O9 a process younger than the floor is preserved"
+assert_nofile "$T/o9.kills" "O9 ... and nothing is signalled"
+
+# O9b/O9c — the UNIT contract (#1161 review). `ps_normalize` used to convert
+# `etime` with `csecs()` and `classify_one` compared it against a SECONDS floor,
+# so a 320 s process read as 32000 and 32000 < 600 was false: the "never signal a
+# process younger than 60 s" gate was really 0.6 s. Both polarities are pinned so
+# neither can pass vacuously: 320 s MUST be too-young under a 600 s floor, and
+# MUST be reapable under a 60 s floor.
+OUT="$(run_reaper o9b "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 600 --sample-seconds 0)"
+assert_contains "$OUT" "reason=too-young" "O9b 320s vs a 600s floor is too-young (the floor is SECONDS)"
+assert_contains "$OUT" "elapsed=320s < 600s" "O9b ... and the detail prints SECONDS, not centiseconds"
+assert_nofile "$T/o9b.kills" "O9b ... and nothing is signalled"
+
+OUT="$(run_reaper o9c "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 60 --sample-seconds 0)"
+assert_contains "$OUT" "reason=reapable" "O9c 320s vs a 60s floor is old enough to reap"
+assert_file "$T/o9c.kills" "O9c ... and the signal is recorded (the floor is not always too-young)"
+
+OTHER_UID=4002
+OA="$(fake_ps psOa "$(ps_row_line $OTHER_UID 1 4242 '0:00.10' '01:00:00' /usr/bin/other)")"
+OB="$(fake_ps psOb "$(ps_row_line $OTHER_UID 1 4242 '0:09.00' '01:00:20' /usr/bin/other)")"
+OL="$(lsof_fixture lsOther "$OTHER_UID:$DEADCWD9")"
+if [ "$MY_UID" = "4242" ]; then
+    ok "O10 skipped (uid 4242 is ours; cannot build a wrong-uid fixture)"
+else
+    OUT="$(run_reaper o10 "$OA:$OB" "$OL" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+    assert_contains "$OUT" "reason=wrong-uid" "O10 another user's process is never signalled"
+    assert_nofile "$T/o10.kills" "O10 ... and nothing is signalled"
+fi
+
+DEADCWD11="$CWD_ROOT/gone11"; mkdir -p "$DEADCWD11"
+NA="$(fake_ps psNa "$(ps_row_line $ORPH 7777 "$MY_UID" '0:00.10' '01:00:00' /bin/sh-spin)")"
+NB="$(fake_ps psNb "$(ps_row_line $ORPH 7777 "$MY_UID" '0:09.00' '01:00:20' /bin/sh-spin)")"
+NL="$(lsof_fixture lsNo "$ORPH:$DEADCWD11")"
+rmdir "$DEADCWD11"
+OUT="$(run_reaper o11 "$NA:$NB" "$NL" --apply --min-elapsed-seconds 1 --sample-seconds 0 --verbose)"
+assert_absent "$OUT" "pid=$ORPH" "O11 a process with a live parent (ppid != 1) is never even classified"
+assert_contains "$OUT" "reapable=0" "O11 ... and nothing is reapable"
+
+# ── O12/O13/O14: the cwd gates ─────────────────────────────────────────
+echo "— O12/O13/O14: cwd-unknown, cwd-unreadable, cwd-out-of-scope —"
+OUT="$(run_reaper o12 "$A:$B" "$(lsof_fixture lsUnknown 1:/sbin/launchd)" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cwd-unknown" "O12 a pid with NO lsof entry is preserved (absence is not evidence)"
+assert_nofile "$T/o12.kills" "O12 ... and nothing is signalled"
+
+# unreadable: an ANCESTOR that exists but is not a directory. `[ -e ]` is true
+# and `[ -d ]` false, so absence cannot be proven -> preserve.
+NOTADIR="$T/notadir"; : >"$NOTADIR"
+L13="$(lsof_fixture lsUnreadable "$ORPH:$NOTADIR/child")"
+OUT="$(run_reaper o13 "$A:$B" "$L13" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cwd-unreadable" "O13 an unprovable absence is preserved, never reaped"
+assert_nofile "$T/o13.kills" "O13 ... and nothing is signalled"
+
+# O13b: lsof writes its READLINK FAILURE INSIDE the `n` field. Measured on the fleet:
+#   lsof -a -d cwd -Fpn -p 1   ->   n/proc/1/cwd (readlink: Permission denied)
+# Verbatim that string is not a path, so `[ -d ]` is false, the nearest existing ancestor is `/`, and
+# the row was classified `deleted` — a FALSE FACT about a cwd nobody read, and under --any-cwd a
+# licence to signal it. An annotation is an UNREADABLE verdict: preserve, and never claim `deleted`.
+ANNOTATED="/proc/4242/cwd (readlink: Permission denied)"
+L13B="$(lsof_fixture lsAnnotated "$ORPH:$ANNOTATED")"
+OUT="$(run_reaper o13b "$A:$B" "$L13B" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cwd-unreadable" "O13b an lsof readlink-failure annotation is unreadable, not deleted"
+assert_absent "$OUT" "deleted" "O13b ... and it is NEVER reported as a deleted cwd"
+assert_nofile "$T/o13b.kills" "O13b ... and nothing is signalled"
+# The false fact reached --list too (a human reads it before arming): no `deleted` there either.
+OUT="$(run_reaper o13c "$A:$B" "$L13B" --list --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "cwd=unreadable" "O13c --list reports cwd=unreadable for an annotated entry"
+assert_absent "$OUT" "cwd=deleted" "O13c ... and never a cwd=deleted it did not establish"
+# --any-cwd must NOT convert an unproven cwd into a licence to signal.
+OUT="$(REAP_ORPHAN_CWD_ROOTS="$CWD_ROOT" run_reaper o13d "$A:$B" "$L13B" \
+        --apply --min-elapsed-seconds 1 --sample-seconds 0 --any-cwd)"
+assert_contains "$OUT" "reason=cwd-unreadable" "O13d --any-cwd does not widen an unreadable cwd"
+assert_nofile "$T/o13d.kills" "O13d ... and nothing is signalled even with --any-cwd wide open"
+
+OUTER="$T/outside"; mkdir -p "$OUTER"; rmdir "$OUTER"
+OUT="$(REAP_ORPHAN_CWD_ROOTS="$CWD_ROOT" run_reaper o14 "$A:$B" "$(lsof_fixture lsScope "$ORPH:$OUTER")" \
+        --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=cwd-out-of-scope" "O14 a deleted cwd outside the scratch roots is not reaped"
+assert_contains "$OUT" "use --any-cwd to widen" "O14 ... and the output names the flag that widens it"
+assert_nofile "$T/o14.kills" "O14 ... and nothing is signalled"
+OUT="$(REAP_ORPHAN_CWD_ROOTS="$CWD_ROOT" run_reaper o14b "$A:$B" "$(lsof_fixture lsScope2 "$ORPH:$OUTER")" \
+        --min-elapsed-seconds 1 --sample-seconds 0 --any-cwd)"
+assert_contains "$OUT" "reason=reapable" "O14 --any-cwd widens the scope deliberately"
+
+# ── O15/O16: FAIL-CLOSED on unevaluable probes ─────────────────────────
+echo "— O15/O16: an unevaluable probe must NOT reclaim —"
+# ps failed: point PS_BIN at the failing shim.
+RUN_LOG="$T/o15.state/log"; RUN_KILL="$T/o15.kills"; rm -f "$RUN_KILL"
+rc=0
+out="$(FAKE_LSOF_TABLE="$L" FAKE_KILL_LOG="$RUN_KILL" PS_BIN="$T/bin/ps-fail" LSOF_BIN="$T/bin/lsof" \
+       KILL_BIN="$T/bin/kill" REAP_ORPHAN_STATE_DIR="$T/o15.state" REAP_ORPHAN_LOG="$RUN_LOG" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O15 ps failure aborts with exit 3"
+assert_contains "$out" "FAIL-CLOSED abort: ps enumeration failed" "O15 ... naming the failing probe"
+assert_nofile "$T/o15.kills" "O15 ... and NOTHING is signalled (fail-closed, not fail-open)"
+
+# ps empty (a FAILED probe, not "no orphaned processes").
+EMPTY_PS="$T/empty.ps"; : >"$EMPTY_PS"
+RUN_KILL="$T/o15b.kills"; rm -f "$RUN_KILL"
+rc=0
+out="$(FAKE_PS_SEQ="$EMPTY_PS" FAKE_PS_COUNTER="$T/o15b.counter" FAKE_LSOF_TABLE="$L" FAKE_KILL_LOG="$RUN_KILL" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o15b.state" REAP_ORPHAN_LOG="$T/o15b.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O15b an EMPTY ps table aborts with exit 3 (not 'no orphans')"
+assert_nofile "$T/o15b.kills" "O15b ... and NOTHING is signalled"
+
+# ps NON-EMPTY but unparseable: same failure class, and the one the `-s` check
+# alone misses. Pre-fix this exited 0 with reapable=0 (a false clean pass).
+RUN_KILL="$T/o15c.kills"; rm -f "$RUN_KILL"
+rc=0
+out="$(FAKE_LSOF_TABLE="$L" FAKE_KILL_LOG="$RUN_KILL" PS_BIN="$T/bin/ps-garbage" LSOF_BIN="$T/bin/lsof" \
+       KILL_BIN="$T/bin/kill" REAP_ORPHAN_STATE_DIR="$T/o15c.state" REAP_ORPHAN_LOG="$T/o15c.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O15c a NON-EMPTY but unparseable ps table aborts with exit 3"
+assert_contains "$out" "FAIL-CLOSED abort: ps enumeration failed" "O15c ... naming the ps probe"
+assert_nofile "$T/o15c.kills" "O15c ... and NOTHING is signalled"
+
+for kind in fail empty missing; do
+    RUN_KILL="$T/o16$kind.kills"; rm -f "$RUN_KILL"
+    lsof_bin="$T/bin/lsof"; [ "$kind" = fail ] && lsof_bin="$T/bin/lsof-fail"
+    [ "$kind" = missing ] && lsof_bin="$T/bin/lsof-does-not-exist"
+    tbl="$L"; [ "$kind" = empty ] && tbl="$T/empty.lsof"
+    [ -f "$tbl" ] || : >"$tbl"
+    rc=0
+    out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o16$kind.counter" FAKE_LSOF_TABLE="$tbl" \
+           FAKE_KILL_LOG="$RUN_KILL" PS_BIN="$T/bin/ps" LSOF_BIN="$lsof_bin" KILL_BIN="$T/bin/kill" \
+           REAP_ORPHAN_STATE_DIR="$T/o16$kind.state" REAP_ORPHAN_LOG="$T/o16$kind.state/log" \
+           reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+    assert_rc "$rc" 3 "O16 lsof $kind aborts with exit 3"
+    assert_contains "$out" "FAIL-CLOSED abort: lsof cwd enumeration" "O16 ... naming the cwd probe"
+    assert_nofile "$T/o16$kind.kills" "O16 lsof $kind: NOTHING is signalled"
+done
+
+# ── O17: --list is read-only ───────────────────────────────────────────
+echo "— O17/O18/O19: --list, lock, and log guards —"
+OUT="$(run_reaper o17 "$A:$B" "$L" --list)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "--list exits 0"
+assert_contains "$OUT" "ppid=1" "--list prints the orphan population"
+assert_nofile "$T/o17.kills" "--list signals nothing"
+assert_nofile "$T/o17.state/log" "--list does NOT write the log"
+assert_nofile "$T/o17.state/pi-reap-orphans.lock" "--list does NOT take the lock"
+# F3 (#1863): `ps_normalize` stores cpu in CENTISECONDS (`csecs`), so the label
+# must be `cs` — printing `s` reported 1.23s as `cpu=123s` (100x wrong). From
+# snapshot B the ORPH row is `0:00.90` = 90cs.
+assert_contains "$OUT" "cpu=90cs" "--list prints cpu in CENTISECONDS (cs), never mislabelled seconds"
+
+# O17b — `--list` is documented READ-ONLY ("no lock, no log, no signal"), but
+# `ps_load`/`lsof_cwd_load` logged their failure paths before the list branch, so
+# a failed `--list` CREATED the log. The contract must hold on the failure path
+# too. The state dir is created first so a real log() call WOULD create the file
+# (otherwise the assertion is vacuous).
+mkdir -p "$T/o17b.state"
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o17b.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof-does-not-exist" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o17b.state" REAP_ORPHAN_LOG="$T/o17b.state/log" \
+       reap_invoke --list --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O17b --list with a missing lsof still fails closed (exit 3)"
+assert_nofile "$T/o17b.state/log" "O17b ... and --list writes NO log line (read-only holds on the failure path)"
+
+mkdir -p "$T/o18.state/pi-reap-orphans.lock"
+printf '%s\n' "$$" >"$T/o18.state/pi-reap-orphans.lock/pid"
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o18.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o18.state" REAP_ORPHAN_LOG="$T/o18.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O18 a held lock aborts with exit 3"
+assert_contains "$out" "lock held" "O18 ... naming the lock"
+rm -rf "$T/o18.state/pi-reap-orphans.lock"
+
+# O18b/O18c — lock recovery (#1161 review). `stat -f %m` is BSD-only; on Linux
+# (the CI runner) it errored, so the age stayed 0 and a STALE lock was NEVER
+# broken (every later pass exited 3 forever). A dead owner + an old lock dir must
+# be broken and the pass must proceed; a LIVE owner must still hold the lock even
+# when the directory is older than the stale bound (the old code overwrote the
+# liveness result with the age and broke a held lock on macOS).
+echo "— O18b/O18c: stale-lock recovery vs a live owner —"
+mkdir -p "$T/o18b.state/pi-reap-orphans.lock"
+printf '%s\n' 999999 >"$T/o18b.state/pi-reap-orphans.lock/pid"   # a pid that is not running
+touch -t "202001010000" "$T/o18b.state/pi-reap-orphans.lock"
+OUT="$(run_reaper o18b "$A:$B" "$L" --apply --min-elapsed-seconds 99999 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O18b a stale lock (dead owner, old dir) is broken and the pass proceeds"
+assert_absent "$OUT" "lock held" "O18b ... and is not reported as held"
+
+mkdir -p "$T/o18c.state/pi-reap-orphans.lock"
+printf '%s\n' "$$" >"$T/o18c.state/pi-reap-orphans.lock/pid"       # THIS shell: alive
+touch -t "202001010000" "$T/o18c.state/pi-reap-orphans.lock"
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o18c.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o18c.state" REAP_ORPHAN_LOG="$T/o18c.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O18c an OLD lock with a LIVE owner is NOT broken (exit 3)"
+assert_contains "$out" "lock held" "O18c ... and says the lock is held"
+rm -rf "$T/o18c.state/pi-reap-orphans.lock"
+
+# O18d — the POST-SIGNAL probe (#1161 review). A sequence shim that answers the
+# two snapshots legitimately and then garbage must not read as "the process
+# died": the old pid_alive returned 1 ("proven absent") for a table it could not
+# parse, so the pass printed REAPED, skipped the SIGKILL and exited 0 without ever
+# proving death. An unevaluable probe is STILL ALIVE.
+echo "— O18d: an unparseable post-signal probe is STILL ALIVE, never a proven reap —"
+GARBAGE_PS="$T/garbage.ps"
+printf 'bash: ps: command not found\n' >"$GARBAGE_PS"
+OUT="$(run_reaper o18d "$A:$B:$GARBAGE_PS" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_absent "$OUT" "REAPED" "O18d an unparseable post-signal probe is NOT reported as REAPED"
+assert_contains "$OUT" "KILL-FAILED" "O18d ... and the death is reported as unproven"
+assert_contains "$(kills o18d)" "-KILL" "O18d ... so the SIGKILL escalation still runs"
+
+REAP_ORPHAN_STATE_DIR="$T/o19.state" REAP_ORPHAN_LOG="$T/o19-blocked/log" \
+  bash -c 'mkdir -p "$(dirname "$REAP_ORPHAN_LOG")" 2>/dev/null; :' 2>/dev/null
+mkdir -p "$T/o19.state"; mkdir -p "$T/o19-blocked/log"   # a DIRECTORY at the log path
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o19.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o19.state" REAP_ORPHAN_LOG="$T/o19-blocked/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O19 an unwritable log on an ARMED pass aborts with exit 3"
+assert_contains "$out" "REAP_ORPHAN_LOG unwritable" "O19 ... naming the log"
+
+# O19b — the SAME gate must apply to the DEPLOYED mode. The plist ships
+# REAP_ORPHAN_DRY_RUN=1 and promises the report lands in the log; an ungated
+# dry-run exited 0 with NO report when the log path was unwritable — exactly the
+# "installed-but-inert" state #1862 exists to eliminate.
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o19b.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o19.state" REAP_ORPHAN_LOG="$T/o19-blocked/log" \
+       reap_invoke --dry-run --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O19b an unwritable log on a DRY-RUN pass also aborts with exit 3 (not a silent inert pass)"
+assert_contains "$out" "REAP_ORPHAN_LOG unwritable" "O19b ... naming the log"
+
+# O19c — the log gate must run BEFORE the identity pass's fail-closed paths
+# (#1863 cycle-5 A5-1). The identity pass logs its abort; if it ran before the
+# state dir existed, the append would fail AND bash would print a raw
+# redirection error to stderr, so a launchd run (no StandardErrorPath) would
+# abort with NO record — the installed-but-inert shape the gate exists to
+# prevent. On a fresh state dir the abort must (a) exit 3, (b) land in the log,
+# and (c) emit NO shell redirection error.
+cat >"$T/bin/ps-identfail" <<'SHIM'
+#!/usr/bin/env bash
+# Fails ONLY the identity-table call shape; snapshot enumeration succeeds.
+for a in "$@"; do
+    case "$a" in
+        'pid=,lstart=') exit 1 ;;
+    esac
+done
+cat "${FAKE_PS_TABLE:-/dev/null}" 2>/dev/null
+exit 0
+SHIM
+chmod +x "$T/bin/ps-identfail"
+printf '%s\n' "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+              "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.50' '00:05:00' /bin/sh-spin)" >"$T/o19c.ps"
+: >"$T/o19c.lsof"
+assert_nofile "$T/o19c.state" "O19c precondition: the state dir does NOT exist before the pass"
+rc=0
+out="$(FAKE_PS_TABLE="$T/o19c.ps" FAKE_LSOF_TABLE="$T/o19c.lsof" \
+       PS_BIN="$T/bin/ps-identfail" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o19c.state" REAP_ORPHAN_LOG="$T/o19c.state/log" \
+       reap_invoke --dry-run --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O19c an identity-pass failure on a fresh state dir exits 3"
+assert_contains "$out" "FAIL-CLOSED abort" "O19c ... reporting the abort"
+assert_absent "$out" "No such file or directory" "O19c ... with NO raw shell redirection error on stderr"
+assert_file "$T/o19c.state/log" "O19c the abort is recorded: the log exists"
+assert_contains "$(cat "$T/o19c.state/log")" "FAIL-CLOSED abort" "O19c ... and carries the abort line"
+
+# ── O20: flags and env validation ──────────────────────────────────────
+echo "— O20/O21: flags, env validation, and honest reporting —"
+reap_invoke --help >/dev/null 2>&1; assert_rc "$?" 0 "--help exits 0"
+reap_invoke --nope >/dev/null 2>&1; assert_rc "$?" 2 "an unknown flag exits 2"
+reap_invoke --min-cpu-centiseconds 3 --help >/dev/null 2>&1; assert_rc "$?" 0 "--min-cpu-centiseconds is accepted"
+reap_invoke --min-cpu-centiseconds >/dev/null 2>&1; assert_rc "$?" 2 "a missing flag value exits 2"
+REAP_ORPHAN_PS_TIMEOUT=abc reap_invoke --dry-run >/dev/null 2>&1
+assert_rc "$?" 2 "a non-numeric timeout is refused BEFORE it can disable a watchdog"
+REAP_ORPHAN_LSOF_TIMEOUT=abc reap_invoke --dry-run >/dev/null 2>&1
+assert_rc "$?" 2 "a non-numeric lsof timeout is refused"
+
+# A non-verbose pass must still report EXACT counts for the rows it does not
+# print (a skipped pass must not look like a successful one).
+BIG_A="$(fake_ps psBig "$(ps_row_line 1 0 0 '0:01.00' '01:00:00' /sbin/launchd)" \
+                        "$(ps_row_line 5001 1 "$MY_UID" '0:00.00' '01:00:00' /usr/bin/quiet1)" \
+                        "$(ps_row_line 5002 1 "$MY_UID" '0:00.00' '01:00:00' /usr/bin/quiet2)")"
+BIG_B="$(fake_ps psBigB "$(ps_row_line 1 0 0 '0:01.00' '01:00:20' /sbin/launchd)" \
+                        "$(ps_row_line 5001 1 "$MY_UID" '0:00.00' '01:00:20' /usr/bin/quiet1)" \
+                        "$(ps_row_line 5002 1 "$MY_UID" '0:00.00' '01:00:20' /usr/bin/quiet2)")"
+OUT="$(run_reaper o21 "$BIG_A:$BIG_B" "$(lsof_fixture lsNope 1:/)" --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_absent "$OUT" "pid=5001" "O21 non-verbose does not print every preserved row"
+assert_contains "$OUT" "cpu-idle" "O21 ... but the reason histogram still reports the exact count"
+assert_contains "$OUT" "     2  cpu-idle" "O21 ... with the exact number"
+
+# ── O22–O26: the ancestry gate — PARKED IS NOT ORPHANED ────────
+# `ppid==1` says "the parent is gone". It does NOT say "nobody needs it": a
+# process whose parent was a login shell reparents to 1 exactly like a leaked
+# test child, and on the CPU layer the two are indistinguishable. Every fixture
+# below PASSES every other gate (ppid=1, deleted cwd under a scratch root,
+# advancing cpu), so ancestry is the ONLY thing that can preserve it. If these
+# pass while O1/O8 still reap, the gate discriminates rather than disables.
+echo "— O22–O26: ancestry — parked is not orphaned —"
+
+HUPID=4101
+DEADCWDHU="$CWD_ROOT/goneHu"; mkdir -p "$DEADCWDHU"
+HU_A="$(fake_ps psHua "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                      "$(ps_row_line $HUPID 1 "$MY_UID" '0:00.10' '09:00:00' 'login -pf someone')")"
+HU_B="$(fake_ps psHub "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                      "$(ps_row_line $HUPID 1 "$MY_UID" '0:09.00' '09:00:20' 'login -pf someone')")"
+LHU="$(lsof_fixture lsHu "$HUPID:$DEADCWDHU")"
+rmdir "$DEADCWDHU"
+OUT="$(run_reaper o22 "$HU_A:$HU_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O22 a parked login(1) is a PERSON'S process, not a leak"
+assert_contains "$OUT" "reapable=0" "O22 ... nothing is reapable"
+assert_nofile "$T/o22.kills" "O22 ... and NO signal was sent (the kill shim was never invoked)"
+
+# O23 pins the login-shell spelling. `ps` prints argv[0] WITH its leading '-';
+# matched naively against zsh|bash|sh|..., ``-zsh'' matches NOTHING and the gate
+# is silently dead for the exact spelling a real interactive session uses.
+LSH_A="$(fake_ps psLsha "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4102 1 "$MY_UID" '0:00.10' '09:00:00' -zsh)")"
+LSH_B="$(fake_ps psLshb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4102 1 "$MY_UID" '0:09.00' '09:00:20' -zsh)")"
+OUT="$(run_reaper o23 "$LSH_A:$LSH_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O23 a login shell (``-zsh'') is caught DESPITE the leading dash"
+assert_nofile "$T/o23.kills" "O23 ... and NO signal was sent"
+
+TERM_A="$(fake_ps psTerma "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                        "$(ps_row_line 4103 1 "$MY_UID" '0:00.10' '09:00:00' /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal)")"
+TERM_B="$(fake_ps psTermb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                        "$(ps_row_line 4103 1 "$MY_UID" '0:09.00' '09:00:20' /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal)")"
+OUT="$(run_reaper o24 "$TERM_A:$TERM_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O24 a terminal emulator is never reapable"
+assert_nofile "$T/o24.kills" "O24 ... and NO signal was sent"
+
+# O25: an UNREADABLE chain is not proof of independence. The fixture omits the
+# pid-1 row on purpose, so the walk cannot reach the top => REPORT, never reap.
+UN_A="$(fake_ps psUna "$(ps_row_line 4104 1 "$MY_UID" '0:00.10' '09:00:00' /bin/sh-spin)")"
+UN_B="$(fake_ps psUnb "$(ps_row_line 4104 1 "$MY_UID" '0:09.00' '09:00:20' /bin/sh-spin)")"
+OUT="$(run_reaper o25 "$UN_A:$UN_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-ancestry-unknown" "O25 an unreadable chain is REPORTED, not reaped"
+assert_nofile "$T/o25.kills" "O25 ... and NO signal was sent"
+
+# O26: THE MUTATION PROOF. A guard with no failing-mutation proof is not a
+# guard. Neuter human_anchor and the O22 candidate must flip to reapable; if it
+# does not, O22 was passing for some other reason and proves nothing.
+MUT="$T/mutant-no-anchor.sh"
+awk '
+  /^human_anchor\(\) \{/ { skip=1; print "human_anchor() { return 1; }"; next }
+  skip && /^\}/ { skip=0; next }
+  !skip { print }
+' "$REAPER" >"$MUT"
+# Invoke through a FUNCTION, exactly like reap_invoke above: a literal
+# `bash <path>` inside a `$( )` span is the form the #1484 script-content walker
+# cannot verify and fails closed on. The function form is the sanctioned shape.
+mutant_invoke() { bash "$MUT" "$@"; }
+if ! diff -q "$REAPER" "$MUT" >/dev/null 2>&1; then
+    ok "O26 the mutation applied (human_anchor rewritten)"
+    mutant_invoke --help >/dev/null 2>&1; assert_rc "$?" 0 "O26 the mutant parses"
+    : >"$T/o26.counter"; rm -f "$T/o26.kills"
+    MOUT="$(FAKE_PS_SEQ="$HU_A:$HU_B" FAKE_PS_COUNTER="$T/o26.counter" \
+            FAKE_LSOF_TABLE="$LHU" FAKE_KILL_LOG="$T/o26.kills" \
+            PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+            REAP_ORPHAN_STATE_DIR="$T/o26.state" REAP_ORPHAN_LOG="$T/o26.state/log" \
+            mutant_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)"
+    assert_absent "$MOUT" "reason=human-owned" "O26 MUTATION: human_anchor neutered => the gate is GONE (no human-owned)"
+    assert_contains "$MOUT" "reason=reapable" "O26 MUTATION: ... and the very same candidate becomes REAPABLE"
+else
+    bad "O26 the mutation did not apply (human_anchor not rewritten) — the proof is void"
+fi
+
+# ── O34: the multiplexer SPELLINGS `ps` actually prints ────────────────
+# O22–O24 pin login(1), a login shell and a terminal emulator. The multiplexer
+# arm had NO leg at all, and an exact, case-sensitive `tmux|screen` match does
+# not fire for either spelling a real host produces: a GNU screen server's
+# argv[0] is `SCREEN`, and a tmux server appears as the TITLE `tmux: server`
+# (so the first token, which is what `human_anchor` matches, is `tmux:`).
+# A missed spelling is not a near-miss: the candidate walks to pid 1 and — the
+# cwd/CPU gates being satisfied, as they are in these fixtures — is classified
+# reapable, i.e. a human's multiplexer is SIGKILLed. Both fixtures PASS every
+# other gate on purpose, so ancestry is the only thing that can preserve them.
+# (agent-infra#1863 review, P2: "the ancestry gate's multiplexer arms are
+# pinned by no leg and cannot match the SCREEN/tmux: title spellings".)
+echo "— O34: multiplexer spellings — SCREEN and the tmux title form 'tmux: server' are human anchors —"
+DEADCWD34="$CWD_ROOT/gone34"; mkdir -p "$DEADCWD34"
+L34="$(lsof_fixture ls34 "4107:$DEADCWD34" "4108:$DEADCWD34")"
+rmdir "$DEADCWD34"
+# 4107: a GNU screen server, presented as `SCREEN`.
+SCR_A="$(fake_ps psScra "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4107 1 "$MY_UID" '0:00.10' '09:00:00' 'SCREEN -S work')")"
+SCR_B="$(fake_ps psScrb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4107 1 "$MY_UID" '0:09.00' '09:00:20' 'SCREEN -S work')")"
+OUT="$(run_reaper o34a "$SCR_A:$SCR_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O34 a GNU screen server ('SCREEN') is a human anchor, not a leak"
+assert_contains "$OUT" "reapable=0" "O34 ... nothing is reapable in that fixture"
+assert_nofile "$T/o34a.kills" "O34 ... and NO signal was sent"
+# 4108: a tmux server, presented as the title `tmux: server`.
+TMX_A="$(fake_ps psTmxa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4108 1 "$MY_UID" '0:00.10' '09:00:00' 'tmux: server')")"
+TMX_B="$(fake_ps psTmxb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4108 1 "$MY_UID" '0:09.00' '09:00:20' 'tmux: server')")"
+OUT="$(run_reaper o34b "$TMX_A:$TMX_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O34 a tmux server ('tmux: server' title form) is a human anchor"
+assert_nofile "$T/o34b.kills" "O34 ... and NO signal was sent"
+
+# ── O27: the signal is bound to process identity (#1863 F11/F12) ───────
+# The binding window spans the identity pass -> signal, including the whole lsof
+# pass, so a pid REUSED after the identity pass must never be signalled. The
+# expected identity is the one recorded by the identity pass run immediately
+# after snapshot B (BEFORE lsof); a fresh read immediately before each signal
+# must still match it. A pid whose identity changed, or for which no identity was
+# recorded, is PRESERVEd; a stable identity must still reap, so the binding
+# cannot disable the tool.
+echo "— O27: identity binding — a reused/changed pid is PRESERVED, never signalled —"
+DEADCWD27="$CWD_ROOT/gone27"; mkdir -p "$DEADCWD27"
+L27="$(lsof_fixture ls27 "$ORPH:$DEADCWD27")"
+rmdir "$DEADCWD27"
+IDENT_S="Wed Oct 15 10:04:03 2025"
+IDENT_C="Wed Oct 15 11:22:44 2025"
+# Identity-pass table fixture (#1863 F12): one `pid identity` line.
+ident_table() { # <name> <pid> <identity>
+    printf '%s %s\n' "$2" "$3" >"$T/$1.ident"
+    printf '%s' "$T/$1.ident"
+}
+
+# O27a: STABLE identity still reaps (the binding must not disable the tool).
+RUN_IDENT_TABLE="$(ident_table o27a "$ORPH" "$IDENT_S")"
+OUT="$(run_reaper o27a "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_TABLE=""
+assert_contains "$(kills o27a)" "-TERM $ORPH" "O27a a STABLE identity is still signalled (the binding does not disable the reap)"
+assert_contains "$OUT" "REAPED" "O27a ... and the reap completes"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O27a ... exit 0"
+
+# O27b: identity changes before SIGTERM -> PRESERVE, NO signal at all, and
+# exactly ONE final reason — the histogram must NOT also carry `reapable` (F13).
+RUN_IDENT_TABLE="$(ident_table o27b "$ORPH" "$IDENT_S")"
+RUN_IDENT_SEQ="$IDENT_C"
+OUT="$(run_reaper o27b "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_TABLE=""; RUN_IDENT_SEQ=""
+assert_contains "$OUT" "identity-changed" "O27b a pid whose identity changed before SIGTERM is PRESERVED (reason named)"
+assert_nofile "$T/o27b.kills" "O27b ... and NO signal is delivered"
+assert_contains "$OUT" "reaped=0" "O27b ... nothing is reported reaped"
+assert_contains "$OUT" "reapable=0" "O27b ... and the summary counts ZERO reapable"
+# F13: the histogram and the counters must AGREE. `preserved` counts every
+# preserved row (the idle-daemon fixture is `cpu-idle` too), so compare the
+# histogram total to it rather than pinning a single row.
+PRESERVED_SUM="$(sed -n 's/.*preserved=\([0-9]*\).*/\1/p' <<<"$OUT")"
+# The heading is deliberately `per-reason counts`, not `preserve reasons`: the
+# histogram counts EVERY row (a `reapable` row is included, and so is a `deferred`
+# one), so a heading that promised "preserve reasons" could not be reconciled with
+# `preserved=N` — see O29, which pins the reconciliation on a DEFERRED pass.
+HIST_SUM="$(awk '/^per-reason counts/{f=1;next} f && /^ +[0-9]+ +/{s+=$1} END{print s+0}' <<<"$OUT")"
+assert_eq "$HIST_SUM" "$PRESERVED_SUM" "O27b ... with the histogram total equal to preserved=N (counters agree)"
+assert_eq "$(grep -cE '^ +1 +identity-changed$' <<<"$OUT")" "1" "O27b the histogram records identity-changed EXACTLY once (F13)"
+assert_eq "$(grep -cE '^ +[0-9]+ +reapable$' <<<"$OUT")" "0" "O27b ... and carries NO stale reapable row (F13)"
+
+# O27c: identity changes before the SIGKILL escalation -> no SIGKILL, one reason.
+STILL27="$(fake_ps psStill27 "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:01.00' '00:05:00' /bin/sh-spin)")"
+RUN_IDENT_TABLE="$(ident_table o27c "$ORPH" "$IDENT_S")"
+RUN_IDENT_SEQ="$IDENT_S|$IDENT_C"
+OUT="$(run_reaper o27c "$A:$B:$STILL27" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_TABLE=""; RUN_IDENT_SEQ=""
+assert_contains "$(kills o27c)" "-TERM $ORPH" "O27c SIGTERM was delivered to the VERIFIED process"
+assert_absent "$(kills o27c)" "-KILL" "O27c ... but a pid that changed before escalation is NEVER KILLed"
+assert_contains "$OUT" "identity-changed" "O27c ... and the escalation preserve is reported"
+assert_eq "$(grep -cE '^ +[0-9]+ +reapable$' <<<"$OUT")" "0" "O27c the histogram carries no reapable row for the downgraded candidate (F13)"
+
+# O27d: a pid with NO recorded identity-pass entry is not a licence to signal.
+# The table is NON-EMPTY (pid 1 only) so a global probe remains valid while the
+# orphan is genuinely absent from it.
+RUN_IDENT_TABLE="$(ident_table o27d 1 "$IDENT_S")"
+OUT="$(run_reaper o27d "$A:$B:$GONE" "$L27" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_TABLE=""
+assert_contains "$OUT" "reason=identity-unknown" "O27d an unrecorded start identity is PRESERVED (fail-closed)"
+assert_nofile "$T/o27d.kills" "O27d ... and NO signal is delivered"
+
+# ── O28: GATE 4 — a launchd-REGISTERED job is never a leak ─────────────
+# The sanctioned owner of this invariant (scripts/orphan-reap.py, gate 4) grew
+# this gate because a MANAGED job has an owner. It is the population this tool's
+# own header warns about (user agents are ppid=1 by construction), so a carrier
+# without it is a weaker fourth owner (#1863 review P1). The candidate below
+# passes EVERY other gate, so gate 4 is the only thing that can preserve it.
+echo "— O28: gate 4 — launchd registration —"
+RUN_LAUNCHD_PIDS="$ORPH"
+OUT="$(run_reaper o28 "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=launchd-registered" "O28 a launchd-registered pid is PRESERVED (a managed job has an owner)"
+assert_contains "$OUT" "reapable=0" "O28 ... nothing is reapable"
+assert_nofile "$T/o28.kills" "O28 ... and NO signal was sent to a managed job"
+# The gate must not DISABLE the tool: the same fixture with an empty launchd table
+# still reaps, so O28 above is not passing because everything is preserved.
+RUN_LAUNCHD_PIDS=""
+OUT="$(run_reaper o28b "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$(kills o28b)" "-TERM $ORPH" "O28b control: with nothing registered the orphan IS still reaped (the gate does not disable the tool)"
+assert_contains "$(cat "$T/o28b.state/log")" "launchd_gate=on" "O28b ... and the pass header records the launchd gate as ON"
+# FAIL-CLOSED: an unreadable registration table must ABORT, never read as
+# "nothing is registered" — that would be a fail-open gate.
+RUN_LAUNCHCTL_BIN="$T/bin/launchctl-fail"
+OUT="$(run_reaper o28c "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 3 "O28c an unreadable launchd registration probe aborts (exit 3)"
+assert_nofile "$T/o28c.kills" "O28c ... and signals NOTHING"
+assert_contains "$OUT" "launchctl registration probe" "O28c ... naming the probe that failed closed"
+# ... and neither may a NON-LAUNCHCTL-SHAPED table be read as an empty one.
+RUN_LAUNCHCTL_BIN="$T/bin/launchctl-garbage"
+OUT="$(run_reaper o28d "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 3 "O28d a non-launchctl-shaped table aborts (exit 3) instead of reading as 'nothing registered'"
+assert_nofile "$T/o28d.kills" "O28d ... and signals NOTHING"
+# A host with NO launchctl (a Linux cell) is not an unreadable probe: launchd does
+# not exist there. The gate is INERT, and the pass says so rather than going silent.
+RUN_LAUNCHCTL_BIN="$T/bin/no-such-launchctl"
+OUT="$(run_reaper o28e "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O28e with no launchctl on the host the gate is INERT and the pass completes"
+assert_contains "$(cat "$T/o28e.state/log")" "gate INERT" "O28e ... and the log RECORDS the inert gate (never silent)"
+assert_contains "$(kills o28e)" "-TERM $ORPH" "O28e ... while the orphan is still reaped"
+RUN_LAUNCHCTL_BIN=""
+
+# ── O29: GATE 5 — a DESIGNED daemon is never a leak ────────────────────
+# "Intent leaves traces; an orphan does not" (orphan-reap.py gate 5). Both arms
+# below are driven separately, and a plain candidate in the same fixture still
+# reaps, so neither arm can be passing by preserving everything.
+echo "— O29: gate 5 — designed daemon (daemon-ish argv / pidfile) —"
+DESIGNED_CWD="$CWD_ROOT/goneDesigned"; mkdir -p "$DESIGNED_CWD"
+DA="$(fake_ps psDa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                 "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.50' '00:05:00' '/opt/x/testserver --port 9000')")"
+DB="$(fake_ps psDb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                 "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.90' '00:05:20' '/opt/x/testserver --port 9000')")"
+LD="$(lsof_fixture lsD "$ORPH:$DESIGNED_CWD")"
+rmdir "$DESIGNED_CWD"
+OUT="$(run_reaper o29a "$DA:$DB:$GONE" "$LD" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=designed-daemon" "O29a a daemon-ish argv ('--port') is PRESERVED as DESIGNED"
+assert_contains "$OUT" "daemon-ish argv" "O29a ... naming the evidence, not just the verdict"
+assert_nofile "$T/o29a.kills" "O29a ... and NO signal was sent"
+# pidfile arm: a state-dir pidfile naming the candidate is the second trace.
+mkdir -p "$T/o29b.state"; printf '%s\n' "$ORPH" >"$T/o29b.state/testserver.pid"
+OUT="$(run_reaper o29b "$A:$B:$GONE" "$LD" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=designed-daemon" "O29b a pidfile naming the candidate PRESERVEs it as DESIGNED"
+assert_contains "$OUT" "pidfile testserver.pid" "O29b ... naming the pidfile"
+assert_nofile "$T/o29b.kills" "O29b ... and NO signal was sent"
+# control: SAME fixture, no pidfile, plain command => the orphan IS reaped.
+OUT="$(run_reaper o29c "$A:$B:$GONE" "$LD" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$(kills o29c)" "-TERM $ORPH" "O29c control: with no daemon trace the same candidate IS reaped (the gate does not disable the tool)"
+
+# ── O30: the classification BUDGET defers candidates, and the pass SAYS SO ──
+# The shipped budget is 300 s over a population of hundreds, i.e. reachable in
+# exactly the incident shape this tool exists for. A deferred row used to bypass
+# report_row, so `preserved=N` counted rows the per-reason histogram did not — the
+# invariant O27b pins — and the pass exited 0 looking clean (#1863 review P2).
+echo "— O30: budget DEFERRED — the histogram reconciles and the pass declares itself incomplete —"
+ORPH2=4002
+DCWD30="$CWD_ROOT/gone30a"; DCWD30B="$CWD_ROOT/gone30b"
+mkdir -p "$DCWD30" "$DCWD30B"
+D30A="$(fake_ps ps30a "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                  "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.50' '00:05:00' /bin/sh-spin-one)" \
+                  "$(ps_row_line $ORPH2 1 "$MY_UID" '0:00.50' '00:05:00' /bin/sh-spin-two)")"
+D30B="$(fake_ps ps30b "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                  "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.90' '00:05:20' /bin/sh-spin-one)" \
+                  "$(ps_row_line $ORPH2 1 "$MY_UID" '0:00.90' '00:05:20' /bin/sh-spin-two)")"
+L30="$(lsof_fixture ls30 "$ORPH:$DCWD30" "$ORPH2:$DCWD30B")"
+rmdir "$DCWD30" "$DCWD30B"
+OUT="$(REAP_ORPHAN_TERM_GRACE_SECONDS=1 REAP_ORPHAN_BUDGET_SECONDS=1 \
+       run_reaper o30 "$D30A:$D30B:$GONE" "$L30" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O30 a deferred pass exits 0 (nothing FAILED) — it does not pretend to be complete"
+assert_contains "$OUT" "deferred=1" "O30 ... and reports deferred=1"
+assert_contains "$OUT" "reason=deferred" "O30 ... a deferred candidate is REPORTED with its reason"
+assert_contains "$OUT" "INCOMPLETE PASS" "O30 ... in words, so exit 0 is not read as 'nothing left to do'"
+assert_contains "$(cat "$T/o30.state/log")" "DEFERRED pid=$ORPH2" "O30 ... and the log carries a DEFERRED line for the unclassified pid"
+assert_absent "$(kills o30)" "-TERM $ORPH2" "O30 a deferred candidate is NEVER signalled"
+# The histogram counts EVERY row report_row saw — reapable rows included (the
+# heading says so) — so on a pass with a reap the invariant is
+# histogram == reapable + preserved. The DEFERRED row must be IN it, which is the
+# defect this leg exists for: a deferred row used to be counted into preserved and
+# left out of the histogram.
+RPIECE="$(sed -n 's/.*reapable=\([0-9]*\).*/\1/p' <<<"$OUT")"
+PRESERVED_SUM="$(sed -n 's/.*preserved=\([0-9]*\).*/\1/p' <<<"$OUT")"
+HIST_SUM="$(awk '/^per-reason counts/{f=1;next} f && /^ +[0-9]+ +/{s+=$1} END{print s+0}' <<<"$OUT")"
+assert_eq "$HIST_SUM" "$((RPIECE + PRESERVED_SUM))" "O30 the per-reason histogram total equals reapable+preserved on a DEFERRED pass (counters reconcile)"
+assert_eq "$(grep -cE '^ +1 +deferred$' <<<"$OUT")" "1" "O30 ... and deferred appears in the histogram exactly once"
+
+# ── O31: TERM-FAILED — a signal that could not be delivered is a FAILURE ────
+# The fail path existed with a purpose-built seam that NO arm ever wired: every
+# run passed KILL_BIN=kill (exit 0), so `TERM-FAILED` and its exit 4 were never
+# executed (#1863 review P2). A signal the process never received must not read
+# as a reap, and must not escalate to SIGKILL.
+echo "— O31: TERM-FAILED — an undelivered SIGTERM is a FAILED pass, never a reap —"
+RUN_KILL_BIN="$T/bin/kill-fail"
+OUT="$(run_reaper o31 "$A:$B:$GONE" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_KILL_BIN=""
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 4 "O31 an undelivered SIGTERM exits 4 (a FAILED pass)"
+assert_contains "$OUT" "TERM-FAILED" "O31 ... and is reported as TERM-FAILED"
+assert_contains "$OUT" "failed=1" "O31 ... counted in the summary"
+assert_contains "$(kills o31)" "-TERM $ORPH" "O31 the TERM was attempted"
+assert_absent "$(kills o31)" "-KILL" "O31 ... and a failed TERM is NEVER escalated to SIGKILL"
+assert_absent "$OUT" "REAPED" "O31 ... with nothing reported reap"
+
+# ── O32: the watchdog list must not outlive its watchdogs ──────────────
+# $WATCHDOGS was appended once per bounded probe and never pruned, while each
+# watchdog is waited for at the end of the SAME run_bounded call — so the EXIT
+# trap aimed SIGTERMs at pids this process had already collected, i.e. bare pids
+# with no identity binding, whose numbers the kernel may have reused (#1863
+# review P2). A pass makes ~6-10 bounded calls, so the list was non-empty on
+# EVERY run. The old reap logged; the fix logs nothing because it signals nothing.
+echo "— O32: watchdog list is pruned — the EXIT trap cannot signal a reaped pid —"
+OUT="$(run_reaper o32 "$A:$B" "$L" --dry-run --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_absent "$(cat "$T/o32.state/log")" "WATCHDOG-REAP" "O32 a completed pass signals NO watchdog from its EXIT trap (the list was pruned)"
+# Non-vacuity: the pre-fix shape, restored in a mutant, DOES log a watchdog signal
+# for the same pass — so O32 is a live assertion, not a comment.
+WDMUT="$T/mutant-stale-watchdogs.sh"
+grep -v '^ *watchdogs_prune "\$wd"$' "$REAPER" | awk '
+  /^watchdogs_reap\(\) \{$/ {
+      print "watchdogs_reap() {"
+      print "    local w"
+      print "    for w in $WATCHDOGS; do log \"WATCHDOG-REAP pid=$w\"; kill -TERM \"$w\" 2>/dev/null; done"
+      print "    WATCHDOGS=\"\""
+      body = 1; next
+  }
+  body && /^\}$/ { body = 0; print; next }
+  body { next }
+  { print }
+' >"$WDMUT"
+wdmutant_invoke() { bash "$WDMUT" "$@"; }
+if ! diff -q "$REAPER" "$WDMUT" >/dev/null 2>&1; then
+    : >"$T/o32m.counter"; : >"$T/o32m.identcounter"; rm -f "$T/o32m.kills"; mkdir -p "$T/o32m.state"
+    FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o32m.counter" FAKE_IDENT_COUNTER="$T/o32m.identcounter" \
+    FAKE_LSOF_TABLE="$L" FAKE_KILL_LOG="$T/o32m.kills" \
+    PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+    REAP_ORPHAN_STATE_DIR="$T/o32m.state" REAP_ORPHAN_LOG="$T/o32m.state/log" \
+    wdmutant_invoke --dry-run --min-elapsed-seconds 1 --sample-seconds 0 >/dev/null 2>&1
+    assert_contains "$(cat "$T/o32m.state/log" 2>/dev/null)" "WATCHDOG-REAP" "O32 MUTATION: with the prune removed the trap DOES signal a reaped pid (so O32 is live)"
+else
+    bad "O32 the mutation did not apply — the proof is void"
+fi
+
+# ── O33: the ancestry BOUNDARY is pinned, not just described ───────────
+# Every review of this tool asked the same question: the header says "walk the
+# chain to the TOP", but a ppid=1 candidate HAS no chain above launchd. The
+# honest contract is now in the header. This leg pins the boundary as a tested
+# fact: a candidate whose PARENT is a human anchor (`-zsh`) is never classified at
+# all, because the ppid=1 filter does not select it — so the residual (a
+# reparented DESCENDANT of a human session is undetectable here) is demonstrated
+# rather than asserted in prose.
+echo "— O33: ancestry boundary — a non-ppid=1 candidate is never classified (the disclosed residual) —"
+BD_A="$(fake_ps psBda "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line 9998 1 "$MY_UID" '0:00.10' '09:00:00' /usr/bin/bash)" \
+                     "$(ps_row_line 4106 9998 "$MY_UID" '0:00.10' '09:00:00' -zsh)" \
+                     "$(ps_row_line 4105 4106 "$MY_UID" '0:00.10' '09:00:00' /bin/sh-spin)")"
+BD_B="$(fake_ps psBdb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line 9998 1 "$MY_UID" '0:00.10' '09:00:20' /usr/bin/bash)" \
+                     "$(ps_row_line 4106 9998 "$MY_UID" '0:00.10' '09:00:20' -zsh)" \
+                     "$(ps_row_line 4105 4106 "$MY_UID" '0:09.00' '09:00:20' /bin/sh-spin)")"
+BD_CWD="$CWD_ROOT/goneBd"; mkdir -p "$BD_CWD"
+BD_L="$(lsof_fixture lsBd "4105:$BD_CWD")"
+rmdir "$BD_CWD"
+OUT="$(run_reaper o33 "$BD_A:$BD_B" "$BD_L" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_absent "$OUT" "pid=4105" "O33 a candidate whose PARENT is a human anchor is never even classified (the ppid=1 filter is the boundary)"
+assert_absent "$OUT" "pid=4106" "O33 ... nor is its -zsh parent (ppid=1 only)"
+assert_contains "$OUT" "reapable=0" "O33 ... nothing is reapable in that fixture"
+assert_nofile "$T/o33.kills" "O33 ... and NO signal is sent"
+
+echo ""
+echo "── hermetic suite: $PASS passed, $FAIL failed ──"
+
+# ── R1: the real reproduction (opt-in) ─────────────────────────────────
+if [ "${1:-}" = "--repro" ]; then
+    echo ""
+    echo "=== R1: REAL reproduction — spawn, delete cwd, reparent to launchd ==="
+    RSA="$T/repro"; mkdir -p "$RSA/deadcwd" "$RSA/livecwd"
+    # Double-fork: the inner subshell's parent (the outer subshell) exits
+    # immediately, so the grandchild is reparented to pid 1.
+    ( ( cd "$RSA/deadcwd" && exec /bin/sh -c 'SUITE_ORPHAN_QQA=1; while :; do :; done' ) >/dev/null 2>&1 & )
+    ( ( cd "$RSA/livecwd" && exec /bin/sh -c 'SUITE_LEGIT_QQB=1; while :; do :; done' ) >/dev/null 2>&1 & )
+    sleep 2
+    P_ORPH="$(ps -axo pid=,command= | awk '/SUITE_ORPHAN_QQA/ && !/awk|grep/ {print $1; exit}')"
+    P_LEGIT="$(ps -axo pid=,command= | awk '/SUITE_LEGIT_QQB/ && !/awk|grep/ {print $1; exit}')"
+    add_spawned "$P_ORPH"; add_spawned "$P_LEGIT"
+    CANON="$(cd "$RSA" && pwd -P)"
+    rmdir "$RSA/deadcwd"
+    echo "  orphan pid=$P_ORPH (ppid=$(ps -p "$P_ORPH" -o ppid= 2>/dev/null | tr -d ' '))  legit pid=$P_LEGIT"
+    # Scope the cwd roots to THIS reproduction's scratch dir: nothing else on
+    # the host can match, so the demo cannot signal an unrelated process.
+    ROUT="$(REAP_ORPHAN_CWD_ROOTS="$CANON" REAP_ORPHAN_STATE_DIR="$T/repro.state" \
+            REAP_ORPHAN_LOG="$T/repro.state/log" \
+            reap_invoke --min-elapsed-seconds 1 --sample-seconds 2 --verbose 2>&1)"
+    echo "$ROUT" | grep -E "^reap|reapable=|cwd-live" | sed 's/^/  /'
+    assert_contains "$ROUT" "pid=$P_ORPH" "R1 the deleted-cwd orphan IS identified"
+    assert_contains "$ROUT" "reason=reapable" "R1 ... as reapable"
+    assert_contains "$ROUT" "reason=cwd-live" "R1 the live-cwd process is preserved"
+    if kill -0 "$P_LEGIT" 2>/dev/null; then ok "R1 the legitimate process is STILL ALIVE after the dry-run"; else bad "R1 the legitimate process died"; fi
+    if kill -0 "$P_ORPH" 2>/dev/null; then ok "R1 the orphan is still alive (dry-run signalled nothing)"; else bad "R1 the orphan died in a dry-run"; fi
+    echo ""
+    echo "── with --repro: $PASS passed, $FAIL failed ──"
+fi
+
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

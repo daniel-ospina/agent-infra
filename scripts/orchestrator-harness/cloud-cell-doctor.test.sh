@@ -310,7 +310,10 @@ printf '4646\n' > "$T/tmux/panes/lane-46"
 printf '4646 1 00:00:10\n' > "$T/ps/table"
 doc reap
 killed lane-46 && bad "reap: killed a session with no progress signal" || ok "reap: skipped the log-less session"
-result_has "no readable log" && ok "reap: names the reason (no log)" || bad "reap: log reason not recorded — $OUT"
+# ⛔ "no log" and "a log whose mtime cannot be READ" are different facts and now have different
+# branches: the first is the documented exclusion (a lane that tees nothing cannot be judged), the
+# second is cannot-verify. The reason string therefore names the log itself, not "readable".
+result_has "no log (no progress signal)" && ok "reap: names the reason (no log)" || bad "reap: log reason not recorded — $OUT"
 
 # ── 8) MERGE: the rail is called only with a clean attestation at THIS head ─────────────────────
 say_case "merge: the rail is gated on a clean attestation at the current head"

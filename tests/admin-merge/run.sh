@@ -214,6 +214,13 @@ DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
 checks=0
 failures=0
+# The two new windows default to "one observation, no waiting" for the WHOLE
+# suite, including the ~61 direct `bash "$ADM"` invocations that do not go
+# through run_admin. Without this, a scenario that reaches the wait with the
+# production default would silently run ~3,900 fake-gh polls (~30s) on a window
+# nobody chose. A test that wants the wait sets SUITE_* on run_admin.
+export ADMIN_MERGE_FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-0}"
+export ADMIN_MERGE_MERGE_REF_WAIT="${ADMIN_MERGE_MERGE_REF_WAIT:-0}"
 
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -372,6 +379,11 @@ case "$key" in
     # opt-out, not a `gh run list` flag. The fake used to ignore unknown flags,
     # which hid admin-merge forwarding it and silently killing the
     # WAIT-vs-STALLED diagnostic behind `2>/dev/null || true`.
+    # A listing-read failure SCOPED to the FIRST-CHECKS wait: its `--json` list is
+    # the only one asking for `createdAt`, so the parser and the #1417 settle probe
+    # in the same rail run stay readable (a fixture for the wait's OWN unreadable
+    # branch, not for a whole-repo outage).
+    case "$*" in *createdAt*) [ -f "$SCEN/unreadable-first-checks-list" ] && exit 1 ;; esac
     for x in "$@"; do
       case "$x" in --any-workflow)
         echo "gh: unknown flag: --any-workflow" >&2; exit 1 ;;
@@ -417,6 +429,24 @@ case "$key" in
       *workflowDatabaseId*) want_raw=1 ;;
       *event*)
         case "$fields" in *status*|*conclusion*) ;; *) want_map=1 ;; esac ;;
+    esac
+    # THE FIRST-CHECKS WAIT'S OWN LISTING (`createdAt` is the ONLY field that
+    # caller asks for). A per-call sequence models a head that becomes terminal
+    # between polls — the clear path, which a static fixture cannot express.
+    case "$fields" in *createdAt*)
+      if [ -f "$SCEN/first-checks-gen-1" ]; then
+        fn=$(( $(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$fn" > "$SCEN/first-checks-list-count"
+        while [ "$fn" -gt 1 ] && [ ! -f "$SCEN/first-checks-gen-$fn" ]; do fn=$((fn - 1)); done
+        cat "$SCEN/first-checks-gen-$fn"
+        # PUBLISH the generation the wait just observed as the shared run
+        # surface, so the rail's own RE-READ after a clearing wait sees it. The
+        # parser cuts the first three fields, so the 4-field line is a valid
+        # surface fixture.
+        [ "$mode" = "commit" ] && cp "$SCEN/first-checks-gen-$fn" "$SCEN/runs-$val"
+        exit 0
+      fi
+      ;;
     esac
     if [ "$want_map" = 1 ]; then
       # The map is keyed the same way the rail keyed the listing: `--commit` for a
@@ -533,33 +563,67 @@ case "$key" in
     # Deliberately distinct from a run that is merely not progressing: the rail
     # must never call an unreadable run STALLED — "no progress" is a claim about
     # a field we read, and an outage is the absence of that reading.
-    want_upd=0; uprev=""
+    want_upd=0; want_att=0; want_status=0; uprev=""
     for x in "$@"; do
-      if [ "$uprev" = "--json" ]; then case "$x" in *updatedAt*) want_upd=1 ;; esac; fi
+      if [ "$uprev" = "--json" ]; then
+        case "$x" in *updatedAt*) want_upd=1 ;; esac
+        case "$x" in *attempt*) want_att=1 ;; esac
+        case "$x" in *status*) want_status=1 ;; esac
+      fi
       uprev="$x"
     done
     [ -f "$SCEN/unreadable-$id" ] && exit 1
-    if [ -f "$SCEN/status-$id" ]; then
+    # THE RE-RUN'S OBSERVABLE IDENTITY. `attempt-<id>` is a sequence consumed one
+    # line per read (its last line repeats), so a test can model GitHub not yet
+    # having registered the re-run (attempt stays at the pre-request value) and
+    # then registering it (attempt advances). NO fixture models the real default:
+    # attempt 1 before `run rerun`, 2 after it — so every pre-existing scenario
+    # that only reads status keeps its exact meaning.
+    # The status sequence is consumed ONLY when status was actually asked for: an
+    # attempt-only read (the pre-rerun baseline) must not advance the status clock,
+    # or it would eat the `in_progress` line the wait is meant to observe.
+    if [ "$want_status" = 1 ] && [ -f "$SCEN/status-$id" ]; then
       n=$(( $(cat "$SCEN/status-count-$id" 2>/dev/null || echo 0) + 1 ))
       printf '%s' "$n" > "$SCEN/status-count-$id"
       s="$(sed -n "${n}p" "$SCEN/status-$id")"
       [ -n "$s" ] || s="$(tail -n1 "$SCEN/status-$id")"
-      if [ "$want_upd" = 1 ]; then
-        u="$(sed -n "${n}p" "$SCEN/updated-$id" 2>/dev/null)"
-        [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
-        [ -n "$u" ] || u="2026-01-01T00:00:00Z"
-        printf '%s %s\n' "$s" "$u"
-      else
-        printf '%s\n' "$s"
-      fi
-      exit 0
+    else
+      s="completed"
     fi
-    printf 'completed\n'
+    if [ -f "$SCEN/attempt-$id" ]; then
+      an=$(( $(cat "$SCEN/attempt-count-$id" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$an" > "$SCEN/attempt-count-$id"
+      a="$(sed -n "${an}p" "$SCEN/attempt-$id")"
+      [ -n "$a" ] || a="$(tail -n1 "$SCEN/attempt-$id")"
+    else
+      # `attempt-current-<id>` is incremented ONLY by the `run rerun` handler, so
+      # a scenario that pre-creates `rerun-<id>` to model post-rerun LOGS does not
+      # accidentally claim a re-run was observed, and a scenario that runs the
+      # rail TWICE still gets the real baseline on the second run (a run attempt
+      # is per-run state, not per-scenario state).
+      a="$(cat "$SCEN/attempt-current-$id" 2>/dev/null || echo 1)"
+    fi
+    if [ "$want_upd" = 1 ]; then
+      u="$(sed -n "${n:-1}p" "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="2026-01-01T00:00:00Z"
+      printf '%s %s\n' "$s" "$u"
+    elif [ "$want_att" = 1 ] && [ "$want_status" = 1 ]; then
+      printf '%s\t%s\n' "$s" "$a"
+    elif [ "$want_att" = 1 ]; then
+      printf '%s\n' "$a"
+    else
+      printf '%s\n' "$s"
+    fi
     exit 0 ;;
   "run rerun")
     id="${3:-}"
     [ -f "$SCEN/fail-rerun-$id" ] && exit 1
     : > "$SCEN/rerun-$id"
+    # GitHub increments `run_attempt` on every re-run; model it so `wait_for_run`
+    # can prove the re-run STARTED instead of accepting the old `completed`.
+    cur="$(cat "$SCEN/attempt-current-$id" 2>/dev/null || echo 1)"
+    printf '%s' "$((cur + 1))" > "$SCEN/attempt-current-$id"
     exit 0 ;;
   "pr comment")
     pr="${3:-}"
@@ -876,8 +940,16 @@ case "$key" in
         *'.jobs[]'*) cat "$SCEN/jobs-failed-$id"; exit 0 ;;
       esac
     fi
-    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then cat "$SCEN/jobs-count-$id"; exit 0; fi
-    if [ -f "$SCEN/jobs-count" ]; then cat "$SCEN/jobs-count"; exit 0; fi
+    # The COUNT seam answers the `.total_count` PROJECTION only; a raw jobs read
+    # (fetch_run_jobs, no --jq) must get the JSON document. Serving the number to
+    # both made the raw reader parse "0" and fail closed, so a zero-job run was
+    # excluded by one reader and counted by the other.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then
+      case "$(flag_val --jq "$@")" in *total_count*) cat "$SCEN/jobs-count-$id"; exit 0 ;; esac
+    fi
+    if [ -f "$SCEN/jobs-count" ]; then
+      case "$(flag_val --jq "$@")" in *total_count*) cat "$SCEN/jobs-count"; exit 0 ;; esac
+    fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
     exit 1 ;;
   *)
@@ -910,8 +982,14 @@ new_scen() {
 }
 
 run_admin() {
+  # THE TWO NEW WINDOWS DEFAULT TO "one observation, no waiting" HERE, exactly as
+  # the pre-fix rail behaved: every pre-existing scenario that expected an instant
+  # refusal keeps it, and a test that wants the WAIT sets SUITE_FIRST_CHECKS_WAIT /
+  # SUITE_MERGE_REF_WAIT (seconds) on the function call.
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
     ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
+    ADMIN_MERGE_FIRST_CHECKS_WAIT="${SUITE_FIRST_CHECKS_WAIT:-0}" \
+    ADMIN_MERGE_MERGE_REF_WAIT="${SUITE_MERGE_REF_WAIT:-0}" \
     ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
@@ -926,6 +1004,8 @@ run_admin() {
 run_admin_here() {
   local -a env_args=(
     "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
   # REPRO_CMD="" means "OMIT the seam": the PRODUCTION path runs (a real base
@@ -1018,6 +1098,10 @@ repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
 lane_line() { printf '%s\t%s\t%s:%s\n' "$1" "$2" "$3" "$4"; }
+# The FIRST-CHECKS wait's own projection carries `createdAt` as a fourth field
+# (the wait reports the age of what it last observed). It is a SEPARATE fixture
+# family because it is the only caller asking for that field.
+first_checks_line() { printf '%s\t%s\t%s:%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}"; }
 lane_fail() { lane_line completed failure "$1" "$2"; }
 # A passing lane run also carries a JOB LIST: the #1319 lane-coverage gate reads
 # one Jobs listing per completed run, so a run-list fixture without a matching
@@ -4968,9 +5052,9 @@ case "$stall_line" in
 esac
 grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge on a stall" || pass "(b) no merge attempted"
 
-# (c) THE TWO WAITS READ DIFFERENTLY. The lane-terminal precondition fires
-# first; raising --rerun-timeout must NOT change that exit (B7's instant exit)
-# and the output must name WHICH wait it was and state the other never started.
+# (c) THE THREE WAITS READ DIFFERENTLY. The FIRST-CHECKS wait fires first;
+# raising --rerun-timeout must NOT change that exit (B7's instant exit) and the
+# output must name WHICH wait it was — never borrow the re-run wait's wording.
 new_scen twowaits
 HEAD_W3="d3d3000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_W3" > "$SCEN/head"
@@ -4983,15 +5067,15 @@ run_admin 42 --main-runs 1 --rerun-timeout 900 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 900" \
   || fail "(c) a pending lane certified with a raised re-run bound"
-grep -q "precondition unmet: run still in_progress — no classification attempted" "$TMP/err" \
-  && pass "(c) the refusal NAMES the precondition and that no classification was attempted" \
-  || fail "(c) the precondition refusal is not named"
-grep -q "LANE-TERMINAL PRECONDITION" "$TMP/err" \
-  && pass "(c) …and names it as the lane-terminal precondition" \
-  || fail "(c) …but does not say which wait it is"
-grep -q -- "--rerun-timeout never started" "$TMP/err" \
-  && pass "(c) …and states the re-run wait never started" \
-  || fail "(c) …and leaves the two waits confusable"
+grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
+  && pass "(c) the refusal NAMES the FIRST-CHECKS wait and that no classification was attempted" \
+  || fail "(c) the FIRST-CHECKS refusal is not named"
+grep -q 'ADMIN_MERGE_FIRST_CHECKS_WAIT' "$TMP/err" \
+  && pass "(c) …and names its own window knob" \
+  || fail "(c) …but does not say which window closed"
+grep -qE 'LANE-TERMINAL|--rerun-timeout never started' "$TMP/err" \
+  && fail "(c) the FIRST-CHECKS refusal still borrows the re-run wait's wording" \
+  || pass "(c) …and never claims to be the re-run wait"
 grep -q "still RUNNING at the" "$TMP/err" && fail "(c) the two waits read alike" \
   || pass "(c) the re-run wait's message is absent (they are distinguishable)"
 grep -q "run rerun" "$SCEN/calls" && fail "(c) no re-run may start from a precondition block" \
@@ -5337,16 +5421,19 @@ printf 'in_progress\n' > "$SCEN/status-9801"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(i) a pending lane blocks (exit $rc)" || fail "(i) the precondition did not block"
-grep -q 'still running. A running job is not a failure, and this is NOT a stall claim' "$TMP/err" \
+grep -q 'A running job is not a failure, and this is NOT a stall claim' "$TMP/err" \
   && pass "(i) a pending lane reads as still-running, NOT a stall" \
   || { fail "(i) the still-running reading is missing"; sed 's/^/      /' "$TMP/err"; }
 grep -q 'STALLED' "$TMP/err" && fail "(i) a pending lane was called STALLED" || pass "(i) …and NOT as STALLED"
-grep -q -- '--rerun-timeout never started' "$TMP/err" \
-  && pass "(i) …and the re-run wait is still stated as never started" \
-  || fail "(i) the never-started statement disappeared"
-[ "$(grep -c '^run view 9801' "$SCEN/calls" || true)" -eq 1 ] \
-  && pass "(i) exactly ONE gh run view call for the diagnostic" \
-  || fail "(i) expected one run view call, got $(grep -c '^run view 9801' "$SCEN/calls" || true)"
+grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
+  && pass "(i) …and the FIRST-CHECKS wait reports its OWN expiry" \
+  || fail "(i) the FIRST-CHECKS expiry is missing"
+grep -q 'RE-RUN wait' "$TMP/err" \
+  && fail "(i) the FIRST-CHECKS refusal borrowed the RE-RUN wait's wording" \
+  || pass "(i) …and does not speak for the re-run wait"
+[ "$(grep -c '^run view 9801' "$SCEN/calls" || true)" -eq 0 ] \
+  && pass "(i) the FIRST-CHECKS wait reports from the run list (no extra per-run read)" \
+  || fail "(i) unexpected run view call(s): $(grep -c '^run view 9801' "$SCEN/calls" || true)"
 
 # (ii) THE FALSE STALL, pinned out. The run is in_progress and its `updatedAt` is
 # FROZEN at 2020 — exactly the field evidence that produced the false STALLED
@@ -5366,7 +5453,7 @@ rc=$?
 grep -q 'STALLED' "$TMP/err" \
   && fail "(ii) a FROZEN updatedAt was called STALLED — the false block this fix removes" \
   || pass "(ii) a frozen updatedAt is NOT a stall (no progress claim is made)"
-grep -q 'still running. A running job is not a failure' "$TMP/err" \
+grep -q 'A running job is not a failure' "$TMP/err" \
   && pass "(ii) …it reads as still-running, like any pending lane" \
   || { fail "(ii) the still-running reading is missing"; sed 's/^/      /' "$TMP/err"; }
 grep -q 'updatedAt' "$TMP/err" \
@@ -5473,7 +5560,7 @@ run_admin 42 --main-runs 1 --any-workflow >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(P2-4) a pending lane blocks under --any-workflow (exit $rc)" \
   || fail "(P2-4) a pending lane certified under --any-workflow"
-grep -q 'still running. A running job is not a failure' "$TMP/err" \
+grep -q 'A running job is not a failure' "$TMP/err" \
   && pass "(P2-4) the precondition diagnostic survives --any-workflow" \
   || { fail "(P2-4) the diagnostic is silently dead under --any-workflow"; sed 's/^/      /' "$TMP/err"; }
 grep -q -- '--any-workflow' "$SCEN/calls" \
@@ -5489,8 +5576,10 @@ printf '%s\n' "$HEAD_PW" > "$SCEN/head"
 lane_queued "$HEAD_PW" 9921 > "$SCEN/runs-$HEAD_PW"
 lane_fail mainfix2 9922 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9922"
-# The lane run's STATE cannot be read at all (gh failure/auth/network).
-: > "$SCEN/unreadable-9921"
+# The WINDOW'S OWN listing cannot be read (gh failure/auth/network). The seam is
+# keyed on the `createdAt` projection ONLY the FIRST-CHECKS wait asks for, so the
+# parser/settle reads in the same run are unaffected.
+: > "$SCEN/unreadable-first-checks-list"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(P2-5) an unreadable run still blocks (exit $rc)" \
@@ -12475,6 +12564,227 @@ for ov_bad in 08 0 abc 1000000000; do
     && pass "override: '$ov_bad' is REFUSED BY NAME (rc=$OV_RC, 0 reads, count reported as 0)" \
     || fail "override: '$ov_bad' was NOT refused (rc=$OV_RC calls=$OV_CALLS attempts=$OV_ATTEMPTS err=$(head -1 "$TMP/ov-err-bad-$ov_bad"))"
 done
+
+# ── 76. THE THREE WAITS EACH NAME THEMSELVES (#2090) ───────────────────────
+# Measured 2026-10-21 on #2233/#2234: the rail refused a queued lane INSTANTLY,
+# then explained itself with a line about --rerun-timeout — a wait that had
+# never started and could not have changed the exit. The waits are distinct
+# states with distinct bounds, and each must report its OWN, or an operator
+# cannot tell "CI has not started" from "my re-run is wedged" from "GitHub has
+# not computed the merge ref".
+echo "== 76. FIRST-CHECKS / RE-RUN / MERGE-REF each name their own wait =="
+
+# (a) CHECKS NEVER START — the fresh-PR race. NO run fixture exists for the head,
+# so the run list is EMPTY (a readable empty, not an error). The FIRST-CHECKS wait
+# must expire NAMING THAT, and must not borrow either other wait's wording.
+new_scen waits-first-never
+HEAD_WF="e1e1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WF" > "$SCEN/head"
+SUITE_FIRST_CHECKS_WAIT=2 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) checks that never start BLOCK (exit $rc)" \
+  || fail "(a) a head with no checks at all CERTIFIED the merge"
+grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
+  && pass "(a) …and the FIRST-CHECKS wait names its own expiry" \
+  || { fail "(a) the FIRST-CHECKS expiry is not named"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'NO run of the lane ever attached to this head' "$TMP/err" \
+  && pass "(a) …naming checks-never-started (not 'still running', not a CI verdict)" \
+  || fail "(a) the never-started state is not distinguished"
+grep -q 'ADMIN_MERGE_FIRST_CHECKS_WAIT' "$TMP/err" \
+  && pass "(a) …and names the window it owns" \
+  || fail "(a) the FIRST-CHECKS window knob is missing"
+grep -q 'RE-RUN wait' "$TMP/err" && fail "(a) the FIRST-CHECKS refusal spoke as the RE-RUN wait" \
+  || pass "(a) it never speaks as the RE-RUN wait"
+grep -q 'MERGE-REF wait' "$TMP/err" && fail "(a) the FIRST-CHECKS refusal spoke as the MERGE-REF wait" \
+  || pass "(a) it never speaks as the MERGE-REF wait"
+grep -q 'pr merge' "$SCEN/calls" && fail "(a) a merge was attempted with no checks" \
+  || pass "(a) no merge attempted"
+[ -f "$SCEN/comment" ] && fail "(a) evidence was posted with no checks" \
+  || pass "(a) no evidence posted"
+
+# (a2) CHECKS STARTED BUT ARE STILL RUNNING — the #2233/#2234 shape, exactly:
+# one queued/in-progress lane run. The wait must report the RUN it observed (id +
+# status), then block; it must not claim a stall (no per-shard bound exists yet).
+new_scen waits-first-running
+HEAD_WQ="e2e2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WQ" > "$SCEN/head"
+lane_queued "$HEAD_WQ" 9711 > "$SCEN/runs-$HEAD_WQ"
+printf 'in_progress\n' > "$SCEN/status-9711"
+SUITE_FIRST_CHECKS_WAIT=1 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a2) a still-running lane BLOCKS (exit $rc)" \
+  || fail "(a2) a still-running lane certified the merge"
+grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
+  && pass "(a2) …naming the FIRST-CHECKS wait" \
+  || fail "(a2) the FIRST-CHECKS expiry is not named"
+grep -q 'run 9711 status=in_progress' "$TMP/err" \
+  && pass "(a2) …and reports the run + status it last observed" \
+  || { fail "(a2) the last observation is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'STALLED' "$TMP/err" && fail "(a2) a still-running lane was called STALLED" \
+  || pass "(a2) …and does NOT claim a stall"
+grep -q 'pr merge' "$SCEN/calls" && fail "(a2) a merge was attempted" || pass "(a2) no merge attempted"
+
+# (a3) THE WAIT CLEARS — the path the fix exists for. The first poll sees the
+# run queued; the second sees it completed. The rail must PROCEED and merge, not
+# refuse. This is the assertion that fails if `return 0` is removed from
+# wait_for_first_checks (without it the #2090 fix is unverified).
+new_scen waits-first-clears
+HEAD_WCL="e2e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WCL" > "$SCEN/head"
+# The parser's surface starts pending. The wait's own sequence is pending ->
+# completed, and the fake PUBLISHES each observed generation back onto the run
+# surface, so the rail's re-read after a clearing wait is terminal (exactly what
+# happens live when the same listing changes between polls).
+lane_queued "$HEAD_WCL" 9751 > "$SCEN/runs-$HEAD_WCL"
+first_checks_line in_progress "" "$HEAD_WCL" 9751 2026-10-21T00:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_line completed success "$HEAD_WCL" 9751 2026-10-21T00:05:00Z > "$SCEN/first-checks-gen-2"
+# The wait probes the pending run's job list (#1623); this run HAS jobs.
+lane_jobset 9751 success 'test (a)' 'test (b)'
+lane_pass maincl 9752 > "$SCEN/runs-main"
+pr_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+SUITE_FIRST_CHECKS_WAIT=5 run_admin 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a3) the FIRST-CHECKS wait CLEARS when the run finishes — the rail proceeds (exit 0)" \
+  || { fail "(a3) the wait did not clear a terminal lane (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'FIRST-CHECKS wait: 1 run(s) still queued/in progress' "$TMP/out" \
+  && pass "(a3) …it observed the run queued on the first poll" \
+  || fail "(a3) the first poll's observation is missing"
+grep -q 'FIRST-CHECKS wait expired' "$TMP/out" "$TMP/err" \
+  && fail "(a3) an expired wait was reported even though the lane finished" \
+  || pass "(a3) …and no expiry was reported"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" \
+  && pass "(a3) …and the PR merged on the now-terminal lane" \
+  || fail "(a3) the PR did not merge after the wait cleared"
+
+# (a4) A RUN GITHUB NEVER EXPANDED IS NOT IN FLIGHT (#1623). The parser already
+# excludes a zero-job queued run from `pending`; the wait must not re-introduce
+# the 65-minute hold the parser removed. With no other run, the head is refused
+# as UNTESTED (the safe over-block), not held as "still queued".
+new_scen waits-first-zerojob
+HEAD_WZ="e2e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WZ" > "$SCEN/head"
+lane_queued "$HEAD_WZ" 9741 > "$SCEN/runs-$HEAD_WZ"
+# BOTH surfaces the two readers use: the parser reads `.total_count` (the
+# `jobs-count-<id>` seam), the wait reads the jobs document (#1623 in both).
+printf '0\n' > "$SCEN/jobs-count-9741"
+printf '{"total_count":0,"jobs":[]}\n' > "$SCEN/jobs-9741.json"
+SUITE_FIRST_CHECKS_WAIT=5 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a4) a zero-job queued run BLOCKS (exit $rc)" \
+  || fail "(a4) a zero-job queued run certified the merge"
+grep -q 'actually TESTED' "$TMP/err" \
+  && pass "(a4) …as UNTESTED (the same rule the parser applies), not as still-running" \
+  || { fail "(a4) a zero-job run was misreported"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'FIRST-CHECKS wait expired' "$TMP/err" \
+  && fail "(a4) the wait held the full window on a run GitHub never expanded" \
+  || pass "(a4) …and the wait did not hold the window for it"
+
+# (b) A RE-RUN IS REQUESTED AND COMPLETES — the wait must OBSERVE it (attempt
+# advances) and proceed. The attempt sequence models GitHub not having registered
+# the re-run on the first poll (attempt 1, status in_progress) and then having
+# registered it (attempt 2, completed).
+new_scen waits-rerun-complete
+HEAD_WRC="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WRC" > "$SCEN/head"
+FL_RC='tests/test_flaky.py::test_sometimes'
+lane_fail "$HEAD_WRC" 301 > "$SCEN/runs-$HEAD_WRC"
+log_failed "$FL_RC" > "$SCEN/log-301"
+lane_fail mainrc 401 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-401"
+log_passed "$FL_RC" > "$SCEN/log-after-301"
+printf 'in_progress\ncompleted\n' > "$SCEN/status-301"
+printf '1\n1\n2\n' > "$SCEN/attempt-301"
+SUITE_FIRST_CHECKS_WAIT=5 SUITE_MERGE_REF_WAIT=0 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(b) a re-run that completes lets the rail proceed (exit 0)" \
+  || { fail "(b) the re-run wait blocked a completed re-run (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'RE-RUN wait: re-running failed jobs of run 301' "$TMP/out" \
+  && pass "(b) …the RE-RUN wait names the run it requested" \
+  || fail "(b) the re-run request is not named"
+grep -q 'RE-RUN wait: run 301 STILL RUNNING' "$TMP/out" \
+  && pass "(b) …observes the run START and reports its progress" \
+  || fail "(b) the wait never observed the re-run starting"
+grep -q 'FIRST-CHECKS' "$TMP/err" && fail "(b) the re-run path spoke as the FIRST-CHECKS wait" \
+  || pass "(b) it never speaks as the FIRST-CHECKS wait"
+[ "$(grep -c '^run rerun 301' "$SCEN/calls" || true)" -eq 1 ] \
+  && pass "(b) the rail requested the re-run exactly once" \
+  || fail "(b) expected one 'gh run rerun 301', got $(grep -c '^run rerun 301' "$SCEN/calls" || true)"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" && pass "(b) …and the PR merged on the re-run's green" \
+  || fail "(b) the PR did not merge after the re-run completed"
+
+# (b2) THE RE-RUN IS REQUESTED BUT NEVER OBSERVED — `gh run rerun` is accepted,
+# yet the run keeps reporting the PRE-rerun attempt as completed. Accepting that
+# first poll would "pass" while tracking nothing; the wait must block instead.
+new_scen waits-rerun-unobserved
+HEAD_WRU="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WRU" > "$SCEN/head"
+NEW_RU='tests/test_new.py::test_brand_new'
+lane_fail "$HEAD_WRU" 302 > "$SCEN/runs-$HEAD_WRU"
+log_failed "$NEW_RU" > "$SCEN/log-302"
+cp "$SCEN/log-302" "$SCEN/log-after-302"
+lane_fail mainru 402 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-402"
+printf '1\n1\n1\n' > "$SCEN/attempt-302"
+run_admin 42 --main-runs 1 --rerun-timeout 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b2) an UNOBSERVED re-run BLOCKS (exit $rc)" \
+  || fail "(b2) the old result certified the merge as if it were the re-run"
+grep -q 'RE-RUN wait could not OBSERVE the re-run of run 302' "$TMP/err" \
+  && pass "(b2) …naming the RE-RUN wait and the missing observation" \
+  || { fail "(b2) the unobserved re-run is not named"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'attempt never advanced' "$TMP/err" \
+  && pass "(b2) …and states what was missing (the attempt never advanced)" \
+  || fail "(b2) the missing observation is not stated"
+grep -q 'pr merge' "$SCEN/calls" && fail "(b2) a merge was attempted" || pass "(b2) no merge attempted"
+
+# (c) THE MERGE REF NEVER APPEARS — GitHub's mergeability background job never
+# answers. The MERGE-REF wait must expire NAMING THAT, not the fresh-PR race and
+# not a CI verdict.
+new_scen waits-mergeref
+HEAD_WMR="e5e5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WMR" > "$SCEN/head"
+lane_pass "$HEAD_WMR" 9721 > "$SCEN/runs-$HEAD_WMR"
+lane_pass mainmr 9722 > "$SCEN/runs-main"
+pr_merge_ref null ""
+SUITE_MERGE_REF_WAIT=2 run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) an absent merge ref BLOCKS (exit $rc)" \
+  || fail "(c) an absent merge ref certified the merge"
+grep -q 'the MERGE-REF wait closed after' "$TMP/err" \
+  && pass "(c) …the MERGE-REF wait names its own expiry and window" \
+  || { fail "(c) the MERGE-REF expiry is not named"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'has not computed mergeability' "$TMP/err" \
+  && pass "(c) …and states what was missing (mergeability never computed)" \
+  || fail "(c) the missing merge ref is not stated"
+grep -q 'FIRST-CHECKS' "$TMP/err" && fail "(c) the MERGE-REF refusal spoke as the FIRST-CHECKS wait" \
+  || pass "(c) it never speaks as the FIRST-CHECKS wait"
+grep -q 'RE-RUN wait' "$TMP/err" && fail "(c) the MERGE-REF refusal spoke as the RE-RUN wait" \
+  || pass "(c) it never speaks as the RE-RUN wait"
+grep -q 'pr merge' "$SCEN/calls" && fail "(c) a merge was attempted with no merge ref" \
+  || pass "(c) no merge attempted"
+
+# (d) THE GATE IS NOT WEAKENED. A genuine red that survives the re-run still
+# blocks with every wait configured — the waits only hold the rail until there is
+# something to measure; they never turn a measured red into a certificate.
+new_scen waits-red-still-blocks
+HEAD_WRB="e6e6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WRB" > "$SCEN/head"
+NEW_RB='tests/test_new.py::test_brand_new_failure'
+lane_fail "$HEAD_WRB" 303 > "$SCEN/runs-$HEAD_WRB"
+log_failed "$NEW_RB" > "$SCEN/log-303"
+cp "$SCEN/log-303" "$SCEN/log-after-303"
+lane_fail mainrb 403 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-403"
+SUITE_FIRST_CHECKS_WAIT=5 SUITE_MERGE_REF_WAIT=5 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) a red that survives the re-run still BLOCKS (exit $rc)" \
+  || fail "(d) the waits weakened the merge gate"
+grep -q "$NEW_RB" "$TMP/err" && pass "(d) …and the residual failure is printed" \
+  || fail "(d) the residual failure was not printed"
+grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" \
+  || pass "(d) no merge attempted on a red"
+[ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

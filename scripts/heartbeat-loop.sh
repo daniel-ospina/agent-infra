@@ -48,7 +48,10 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # LIFECYCLE
 #   start:  bash ~/.pi/agent/scripts/heartbeat-loop.sh        (idempotent)
 #   stop:   touch ~/.pi/agent/state/HEARTBEAT-OFF             (loop exits)
-#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF, then start again to resume
+#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF            (exits at the top of the next pass)
+#   resume: rm -f ~/.pi/agent/state/HEARTBEAT-OFF && bash ~/.pi/agent/scripts/heartbeat-loop.sh
+#           (a start WITHOUT the rm prints "heartbeat loop started" and then exits on its own
+#            kill file in that same pass — the resume is the rm AND the start)
 #   status: cat ~/.pi/agent/state/heartbeat-loop.pid && kill -0 $(cat ...)
 #
 # ⛔ REBOOT: the loop does not survive one, and it CANNOT be restarted by launchd
@@ -57,8 +60,15 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # — that is an owner decision (it relaxes the socket from "only processes started
 # inside cmux" to "any process by this user"), filed as an issue, not taken here.
 
-STATE="$HOME/.pi/agent/state"
-SCRIPTS="$HOME/.pi/agent/scripts"
+# The deployed layout, and the ONE override both roots share. Production launches set nothing
+# and get `$HOME/.pi/agent` exactly as before. The override exists because #1933 requires the
+# failure branch to be PROVEN REACHABLE by running a real pass, and a test that had to write
+# into the live state directory (or that could only run on a box where it is safe to) would
+# either corrupt the fleet's state or test nothing. It is a root, not a switch: every path
+# below still derives from it, so a scratch instance is a layout, not a parallel mechanism.
+PI_AGENT_DIR="${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}"
+STATE="$PI_AGENT_DIR/state"
+SCRIPTS="$PI_AGENT_DIR/scripts"
 LOG="$STATE/orchestrator-heartbeat.log"
 # The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
 # ONCE rather than once per reader. This script is a READER of the sidecar (it logs the act clause),
@@ -74,7 +84,9 @@ INTERVAL=120          # fallback sleep ONLY -- the real cadence is TARGET-driven
 # total = sleep + however long the steps happen to take, so the observed cadence was 8/10/16/11/28
 # minutes against a 2-minute sleep.
 # The fix is a TOTAL-PASS BUDGET, not a per-step one: every pass starts a clock, each remaining
-# step is skipped once the budget is spent, and the sleep is target-minus-elapsed, floored.
+# step is bounded by what is LEFT of it, and the sleep is target-minus-elapsed, floored. (There
+# is no longer a step that gets SKIPPED when a slice is spent: that slice was the retired
+# dispatcher's, and it left the pass — see `DISPATCH_BUDGET` below and the note at step 4.)
 # Worst case is now TARGET, whatever any child does -- a hung step costs the pass its own work,
 # never the cadence. Set inside the 5-9 min band the owner named.
 TARGET=540            # 9 min total pass -> the TOP of the 5-9 min cadence band the owner set
@@ -84,15 +96,24 @@ TARGET=540            # 9 min total pass -> the TOP of the 5-9 min cadence band 
                       # killed mid-work every pass, so the fleet's own state report was TRUNCATED
                       # while the pass still reported success. Step 1 needs ~300s (it runs the JEV
                       # triage across 29 lanes plus objective.py, which makes many gh calls).
-                      # TARGET=540 keeps step 1 at TARGET-DISPATCH_BUDGET = 300s AND still leaves the
-                      # dispatcher its full 240s reserve, which is the point of the reserve.
+                      # TARGET=540 keeps step 1 at `TARGET - IN_PASS_RESERVE` = 390s AND still leaves
+                      # the IN-PASS steps their 150s reserve, which is the point of that reserve.
+                      # ⚠️ The 240s DISPATCH reserve that once also lived here belonged to the
+                      # lane-table dispatcher, RETIRED in #1874 (see the note at step 4 below). Step 1
+                      # (~300s) PLUS that 240s reserve was EXACTLY TARGET=540 -- no slack at all -- and
+                      # the dispatcher actually needed ~280-390s, overrunning that reserve by
+                      # ~40-150s (and the pass total by the same). That is why
+                      # the step left the pass rather than being re-budgeted. A future cadence change
+                      # re-derives TARGET from step 1 PLUS `IN_PASS_RESERVE` -- that is the ONE live
+                      # reservation.
 # ⛔ 150 WAS NOT ENOUGH AND THE DISPATCHER KEPT BEING KILLED. It is gh-latency-bound (29 lanes,
 # several API calls each), so its runtime varies pass to pass: it completed at 00:08:45
 # (PASS done in 278s, no stall) and was KILLED at 00:50:04 (QUEUE-DISPATCH FAILED rc=143,
 # PASS done in 391s). A reserve sized to the FAST pass is not a reserve -- it is a coin flip,
 # and the losing side silently feeds no lane while the heartbeat itself still reports healthy.
 # Sized to the SLOW observed pass instead, and TARGET raised to match so the reserve is real
-# rather than nominal (step 1 now gets TARGET-DISPATCH_BUDGET = 240s).
+# rather than nominal (it then bound step 1 at `TARGET - 240` = 300s, which is the bound that was
+# killing step 1 -- see the correct derivation above; `DISPATCH_BUDGET` is gone now).
 # ⛔ DISPATCH_BUDGET IS RETIRED (2026-10-05). It reserved a slice of the pass for the dispatcher --
 # but the dispatcher was moved OUT of the pass and launched DETACHED ("DISPATCH-STEP launched
 # detached (not bounded by the pass)"), so nothing inside the pass is competing for that 240s any
@@ -102,9 +123,14 @@ TARGET=540            # 9 min total pass -> the TOP of the 5-9 min cadence band 
 # turn-classify.py ... killed (rc=143)` lines, i.e. the auto-nudge machinery was routinely killed
 # before it could send. A reserve for a step that no longer lives here is not a safety margin; it
 # is a kill timer for whatever runs next.
-DISPATCH_BUDGET=0
-# The slice steps 2-4 (the nudger) actually need. This is the ONE reservation now, and it is for a
-# step that really does run inside the pass.
+# ⛔ THE CONSTANT ITSELF IS NOW GONE (agent-infra#1874): the step it reserved for — the lane-table
+# dispatcher — is retired, and no line read `$DISPATCH_BUDGET` any more (it was `=0` and referenced
+# only from prose). The ONE live reservation is `IN_PASS_RESERVE` below: it is reserved FOR the
+# in-pass steps by capping step 1 at `TARGET - 150`, so at least 150s survives for them. What
+# BOUNDS them is `slack()`/`remaining()`, unchanged. This paragraph stays as the record of why a
+# per-step reserve is dangerous — it is not an instruction to re-add one.
+# The slice the IN-PASS steps actually need. This is the ONE reservation now, and it is for
+# steps that really do run inside the pass.
 IN_PASS_RESERVE=150
                       # Was 300, which measured 7-8 min between ticks because the
                       # run itself costs 2-3 min — the interval is the SLEEP, not the
@@ -148,6 +174,121 @@ run_bounded() {
   return "$rc"
 }
 
+# mtime_of <file> -- POSIX-portable mtime in epoch seconds, 0 when the file is absent. GNU FIRST,
+# and that order is the whole point: on Linux `stat -f %m FILE` is FILESYSTEM information, so it
+# FAILS (rc 1) while still writing its report to STDOUT -- which the `||` chain then captures along
+# with the GNU answer, poisoning the arithmetic. MEASURED on the Linux runner: every pass DIED at
+# the objective-freshness line with `syntax error in expression (error token is ": \"/tmp/…")`,
+# -- the arithmetic error is fatal to a non-interactive bash (exit 1; the next line never ran), so
+# the loop could not run off this laptop at all -- and said nothing about it. BSD `stat` rejects
+# `-c` outright, so trying GNU first costs the mac nothing.
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
+# ── #1933: A DETACHED CHILD'S EXIT STATUS, DRAINED ON THE PASS AFTER IT ────────────────
+# ⛔ THE LAUNCHES BELOW ARE NON-BLOCKING ON PURPOSE (a pass must not wait on a full dispatch
+# cycle), so a child's rc is NOT available to the pass that launches it. It used to be
+# INVENTED instead: a literal `rc=0` sat immediately above the only branch that reported a
+# dispatch failure, so that branch was unreachable BY CONSTRUCTION and every pass logged a
+# healthy launch whatever the child did -- an enforcer whose condition can never fire, the
+# same class this file already documents twice above (#1933). It matters concretely for
+# `pr-doctor`: #1872 gives it a REFUSAL path (exit 2 on an unreadable queue) -- a refusal the
+# launcher cannot see is, operationally, still a silent zero. The rc is the FACT and the word is
+# only a label, so the label is chosen BY THE RC (review P1, #1954): `REFUSED` is #1872's exit-2
+# vocabulary and is printed for EXACTLY 2; every other non-zero rc is `PR-DOCTOR RED rc=N`, the
+# same word the status-record reader further down uses for the same pass. A previous version of
+# this comment claimed `pr-doctor.py` had no non-zero return at all, and labelled every rc
+# `REFUSED` on that basis -- FALSE against the tree it ships in: `record_exit(2, ...)` for an
+# unreadable queue, `SystemExit(4)` from the crash handler, 1 for a module-level/precondition
+# failure (the seam check), and argparse's own 2 for a usage error, 137/143 for a kill. It sent
+# the reader to the queue read when the child had been KILLED. A crash is not a refusal; a refusal
+# the operator chases in the wrong file is the same defect as no report at all, one coat further
+# on. (rc=2 is "refusal" by #1872's convention, and a usage error inheriting that word is the
+# residue of it: it is still an exit the launcher must not call healthy.)
+#
+# So the child writes its OWN rc to a sidecar FROM INSIDE the subshell -- the only place where
+# `$?` is still the child's status -- and this helper drains it on the NEXT pass. That is a
+# reporting delay of one tick, which is the price of not blocking; it is not silence.
+#   * a clean run (0) leaves NOTHING behind: the sidecar is REMOVED once read, so a failure
+#     seen once cannot be re-reported on every pass thereafter;
+#   * a sidecar that holds something that is not a number is NAMED as unreadable rather than
+#     read as a success (`[ "$rc" -ne 0 ]` on garbage would error, and an error read as
+#     "not a failure" is the same defect in a different coat).
+#   * no sidecar at all = nothing to report (first pass after deployment, or the loop was
+#     restarted): absence is not a pass, it is an absence, and it writes no line.
+# ⛔ THE TAIL MUST COME FROM THE CHILD'S OWN STDERR FILE, NOT FROM $STERR. `$STERR` is the SHARED
+# sink (`>>`) for every step of every pass, and the drain runs a whole pass later -- so `tail -1
+# "$STERR"` is "whoever wrote last", which is routinely a LATER step, not this failure's cause.
+# A diagnosis line that names the wrong component is worse than a bare rc: it sends the reader to
+# the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
+# report_detached_rc <log-prefix> <rc-sidecar> <child-stderr> [<label-at-rc-2>]
+#   <log-prefix> is the word for any non-zero rc; <label-at-rc-2>, when given, replaces it for
+#   rc=2 ONLY (see the header: `REFUSED` is exit-2 vocabulary, so it must not decorate a crash).
+report_detached_rc() {
+  # ⛔ `_src` IS ASSIGNED ON ITS OWN LINE, NOT IN THE `local` LIST. `local a="$1" b="$a"` does NOT
+  # see the local `a`: the shell expands every word BEFORE it runs the `local` builtin, so `b` gets
+  # the GLOBAL (here: empty) value and the drain returns early on `[ -f "" ]` — measured: the whole
+  # suite went to 14 failures because `_src` was empty and NOTHING was ever reported.
+  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc="" _reported=0 _src="" _tail="" _word=""
+  _src="$rcfile"
+  # ⛔ A PENDING CARRIER OUTRANKS THIS RUN'S SIDECAR (review P3-2, MEASURED). Gating the unlink is
+  # not enough on its own: the next LAUNCH writes the same path, so a value retained through a log
+  # outage was overwritten by the next child's `write-then-rename` and lost anyway — reproduced with
+  # a seeded rc=2, `$LOG` unwritable, and the child NOT disarmed: the sidecar read `2` right after
+  # the pass and `0` once the new child exited. An unreported value is therefore MOVED to
+  # `<child>.rc.pending` — a path NO CHILD writes; its only writers are this retention branch and
+  # the launch guard below — and a pending carrier is drained first.
+  [ -f "$rcfile.pending" ] && _src="$rcfile.pending"
+  [ -f "$_src" ] || return 0
+  # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
+  # `|| rc=""` form discarded the very value it had just read (measured: `143` with no newline ->
+  # rc=[] -> "UNREADABLE", and the failure is gone). `|| true` keeps it.
+  read -r rc < "$_src" 2>/dev/null || true
+  # ⛔ `2>/dev/null` COMES BEFORE `>> "$LOG"`, not after (review P3-5, MEASURED): a redirection
+  # error is raised by the SHELL while applying `>>`, so redirecting the command's stderr after it
+  # cannot suppress it — `bash: …: Is a directory` still reached the pass's stderr.
+  # ⛔ THE TAIL MUST TRAVEL WITH THE VALUE IT BELONGS TO (review P2, #1954; MEASURED). A value
+  # retained through a log outage is moved to `<child>.rc.pending`, but every LAUNCH truncates
+  # `<child>.stderr`, so `tail -1 "$errfile"` one pass later is the NEXT run's last line: seeded
+  # `rc=2` + a later run's stderr reported `PR-DOCTOR REFUSED rc=2 :: LATER-RUN-MARKER`. So the
+  # tail is SNAPSHOT into `<child>.rc.tail` at the moment the value is retained, and a report
+  # drained from the pending carrier prints the snapshot -- never the live file, and never a tail
+  # at all when no snapshot was taken (a bare rc is honest about what is missing; the wrong
+  # component's line is not).
+  case "$rc" in
+    ''|*[!0-9]*)
+      printf '%s %s UNREADABLE (sidecar %s held "%s") -- no failure is claimed, none is denied\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$label" "$_src" "$rc" 2>/dev/null >> "$LOG" && _reported=1 ;;
+    0) _reported=1 ;;
+    *)
+      if [ "$_src" = "$rcfile" ]; then
+        _tail="$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)"
+      else
+        _tail="$(cat "$rcfile.tail" 2>/dev/null | cut -c1-200)"
+      fi
+      # ⛔ THE WORD IS CHOSEN BY THE RC (review P1, #1954). `REFUSED` for rc=2 only; anything else
+      # is RED, matching the record reader's vocabulary for the same pass.
+      if [ "$rc" = 2 ] && [ -n "$rc2_label" ]; then _word="$rc2_label"; else _word="$label"; fi
+      printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_word" "$rc" "$_tail" \
+        2>/dev/null >> "$LOG" && _reported=1 ;;
+  esac
+  # ⛔ UNLINK ONLY A REPORT THAT ACTUALLY LANDED (review P3, MEASURED). "Unlink last" is not enough:
+  # a failed `printf … >> "$LOG"` does not abort the function, so `rm -f` still ran and DELETED the
+  # only copy of the rc -- an unwritable log (disk full in the wake of the child) then cost the
+  # failure permanently, after the log recovered. With the write gated, the value is retained: it
+  # is moved aside on the first failed attempt, so neither this unlink nor the next launch can
+  # destroy it, and the next pass retries. `rc=0` is consumed unconditionally: there is nothing to
+  # say. The pending carrier outranking `$rcfile` means each pass reports at most ONE value per
+  # child, so the one-shot guarantee is unchanged.
+  if [ "$_reported" -eq 1 ]; then
+    rm -f "$_src"
+    [ "$_src" = "$rcfile.pending" ] && rm -f "$rcfile.tail"
+  elif [ "$_src" = "$rcfile" ]; then
+    # Snapshot BEFORE the value leaves the sidecar: this pass's launch truncates `<child>.stderr`.
+    tail -1 "$errfile" 2>/dev/null | cut -c1-200 > "$rcfile.tail" 2>/dev/null
+    mv -f "$rcfile" "$rcfile.pending" 2>/dev/null
+  fi
+}
+
 if [ -z "${LOOP_DETACHED:-}" ]; then
   if [ -f "$PIDFILE" ]; then
     old=$(cat "$PIDFILE" 2>/dev/null)
@@ -164,7 +305,16 @@ fi
 # launchd is not involved, but a detached process still inherits the environment it
 # was started with, which may be a cmux pane's interactive shell. Pin the two
 # variables everything downstream actually needs rather than trusting that.
-export HOME="/Users/danielospina"
+# ⛔ A PIN IS A REPAIR, NOT AN OVERRIDE (#1933). It is applied only when the directory it names
+# EXISTS. Unconditionally, it also silently turned the whole loop into a no-op on any box that is
+# not this laptop: `cd "$HOME" || exit 0` below went to a path that does not exist and exited 0
+# having written NOTHING to the log -- the exact silent-green shape this file documents twice
+# above. MEASURED (`HOME=$tmp LOOP_DETACHED=1 bash scripts/heartbeat-loop.sh` on a box without
+# /Users/danielospina): rc=0, heartbeat log absent. And `STATE`/`SCRIPTS` are derived from the
+# CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
+# one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
+# that does not gets its own HOME -- consistent with the state and scripts paths.
+if [ -d /Users/danielospina ]; then export HOME="/Users/danielospina"; fi
 # ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
 # default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
 # session) exports a path that does not exist on this box, and every tool silently falls back to its
@@ -193,17 +343,19 @@ while :; do
   # makes the cadence a property of the loop instead of a hope about its children. A step that
   # overruns now costs the pass its own remaining work, not the next pass its start time.
   remaining() { local r=$(( TARGET - $(elapsed) )); [ "$r" -lt 20 ] && r=20; echo "$r"; }
-  # ⛔ STEPS 2-4 MUST NOT EAT THE DISPATCHER'S RESERVED SLICE.
+  # ⛔ STEPS 2-4 MUST NOT EAT THE RESERVE. THAT WAS TRUE WHILE A DISPATCHER RAN INSIDE THE PASS.
   # They were each bounded by the full `remaining()`, so with a slow step 1 they consumed the
-  # reserve down to the 20s floor and the dispatcher was killed almost immediately -- on EVERY
-  # tick, while the pass still reported a healthy `PASS done in 489s`. The reserve existed and
-  # was honoured at step 1 only; nothing stopped steps 2-4 from spending it.
+  # reserve down to the 20s floor -- and the dispatcher that reserve existed for was killed almost
+  # immediately, on EVERY tick, while the pass still reported a healthy `PASS done in 489s`.
   # MEASURED 2026-10-04: `07:04:44 STALL orchestrator-heartbeat.sh exceeded 240s and was killed`
   # then `07:08:53 STALL queue-dispatch.py exceeded 20s and was killed (rc=143)`. Result: three
   # newly-freed landing rows (#7050, #6273, #4687) sat FREE and unclaimed and the fleet was fed
   # NOTHING, while the loop appeared to be working. An automatic dispatcher that dies quietly
   # reports a green -- the same failure shape as the heartbeat bug this file already documents.
-  # So: the auxiliary steps may use only what is left AFTER the dispatcher's slice.
+  # ⚠️ THE DISPATCHER LEFT THE PASS (retired in #1874), SO THERE IS NO SLICE TO PROTECT ANY MORE:
+  # `slack()` is now byte-equivalent to `remaining()` (same body, same 20s floor). Nothing should
+  # be re-added here to "reserve" a slice for a step that is not in this pass; folding the two
+  # helpers into one is a mechanical cleanup, not a behaviour change.
   slack() {
     local r=$(remaining); [ "$r" -lt 20 ] && r=20; echo "$r"
   }
@@ -222,16 +374,20 @@ while :; do
   # log showed zero errors, because the only copy of the error went to /dev/null.
   # A watchdog that can fail silently is worse than none: it reports a green.
   STERR="$STATE/heartbeat-stderr.log"
-  # ⛔ STEP 1 MUST NOT BE ALLOWED TO EAT THE DISPATCHER'S SLICE. It was bounded by the WHOLE
-  # $TARGET, so a slow tick (steps 2-4 are also $(remaining)) left queue-dispatch whatever
-  # survived -- and it was then KILLED by its own bound. MEASURED 2026-10-03 23:53:50:
+  # ⛔ STEP 1 MUST NOT BE ALLOWED TO EAT THE WHOLE PASS -- AND THE "RESERVE" THAT ONCE SAID SO IS
+  # GONE. The history, kept because it is why the bound is `TARGET - IN_PASS_RESERVE` and not
+  # `$TARGET`: step 1 WAS bounded by the whole $TARGET, so a slow tick (steps 2-4 are also
+  # $(remaining)) left the then-live dispatcher whatever survived -- and it was KILLED by its own
+  # bound. MEASURED 2026-10-03 23:53:50:
   #   STALL queue-dispatch.py exceeded 100s and was killed (rc=143) -- heartbeat continues
   #   QUEUE-DISPATCH FAILED rc=143
   # That pass fed NO lane, while the heartbeat itself looked perfectly healthy -- the exact
-  # silent-starvation shape this loop exists to prevent, and it is invisible unless you read
-  # the dispatcher's log. DISPATCH_BUDGET existed for this purpose and was never referenced.
-  # Reserving it here is what makes the constant real: the fleet gets fed or the reason is
-  # stated (the BUDGET-spent branch below), never silently dropped.
+  # silent-starvation shape this loop exists to prevent. `DISPATCH_BUDGET` was introduced to give
+  # the dispatcher its slice, was never referenced, and is now DELETED with the step it reserved
+  # for (agent-infra#1874). What remains is the one live reservation, `IN_PASS_RESERVE`: it is
+  # reserved FOR the in-pass steps by capping step 1 at `TARGET - 150`. What BOUNDS those steps is
+  # `slack()`. There is no "BUDGET-spent" branch below any more, because there is no dispatcher
+  # inside this pass to skip.
   # ⛔ THE NUDGE MOVED OUT OF THE PASS ENTIRELY -- cadence-timer.sh owns it now.
   # It lived here for a while, and the reason to remove it is MEASURED: TWO drivers (this pass, every
   # ~9 min, plus the timer, every 5) interleaved into gaps of **4m** -- BELOW the owner's 5-minute floor.
@@ -240,7 +396,10 @@ while :; do
   # All the reasoning about WHY the message must not compete with the pass for time still holds -- it is
   # preserved in cadence-timer.sh, which is the single driver, and in cadence-nudge.sh, which is the
   # single implementation. One driver, one cadence.
-  # ⛔ THE TICK NOW GETS THE FULL TARGET (2026-10-05) -- IT WAS BEING KILLED AT 300s EVERY PASS.
+  # ⛔ THE TICK GOT THE FULL TARGET (2026-10-05) -- IT HAD BEEN KILLED AT 300s EVERY PASS.
+  # ⚠️ SUPERSEDED, KEPT AS THE RECORD: the live bound TODAY is `TARGET - IN_PASS_RESERVE` = 390s
+  # (see the derivation at the top of this file), because the in-pass steps needed a reserve the
+  # tick must not eat. What follows is why the tick stopped being capped at 300s at all.
   # Measured: `07:27:33 STALL orchestrator-heartbeat.sh exceeded 300s and was killed (rc=143)`,
   # then `TICK FAILED rc=143`. The bound was `TARGET - DISPATCH_BUDGET` = 540-240 = 300s, and the
   # reservation existed to protect the dispatcher's slice -- but the dispatcher was moved OUT of the
@@ -275,7 +434,7 @@ while :; do
   # ⛔ Do NOT make this live-per-read and do NOT delete the TTL gate. The `blind=` guard in objective.py
   # (which refuses to cache a FAILED read) is CORRECT and must stay.
   _obj_file="$STATE/objective.last"
-  _obj_age=$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || stat -c %Y "$_obj_file" 2>/dev/null || echo 0) ))
+  _obj_age=$(( $(date +%s) - $(mtime_of "$_obj_file") ))
   if [ ! -f "$_obj_file" ] || [ "$_obj_age" -gt 900 ]; then
     # SYNCHRONOUS + BOUNDED (2026-10-10, #7871). A DETACHED refresh only bounds the NEXT read --
     # this pass's readers would still see the stale value, which is exactly the "not bounding it"
@@ -288,7 +447,7 @@ while :; do
     run_bounded 90 "objective-refresh" "$LOG" /usr/bin/python3 "$SCRIPTS/objective.py"
     printf '%s OBJECTIVE refresh DONE (cache_age now %ss)\n' \
       "$(date '+%m-%d %H:%M:%S')" \
-      "$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || echo 0) ))" >> "$LOG"
+      "$(( $(date +%s) - $(mtime_of "$_obj_file") ))" >> "$LOG"
   fi
 
   run_bounded "$(( TARGET - IN_PASS_RESERVE ))" "orchestrator-heartbeat.sh" /dev/null \
@@ -305,8 +464,10 @@ while :; do
   # in the loop gives it the pass budget instead: it runs whether the tick completed or was killed,
   # and its INPUT is the snapshot the tick already paid for. The tick pipes its lane-status read
   # through `tee` into state/lane-status.last.json, which is also the ONLY full-fleet copy that
-  # survives: the lane-status cache is ONE file keyed by --only, so a later subset read (the
-  # dispatcher's two-read guard) overwrites it with a handful of lanes.
+  # survives: the lane-status cache is ONE file keyed by --only, so a later subset read would
+  # overwrite it with a handful of lanes. No live caller uses `--only` today (the retired
+  # dispatcher's two-read guard WAS that caller, retired in #1874 — `lane-status.py` records the
+  # same fact); it is a foot-gun for a future subset read, not a current one.
   #
   # state/LANE-STATE-DECISION-TREE.md is the spec; scripts/lane-actions.py implements it IN ITS
   # ORDER -- Steps 0-4 deterministic code, Step 5 ONE batched Jev call. It writes
@@ -392,81 +553,118 @@ while :; do
   # 3. the turn-end fallback: only reaches a lane turn-classify did not claim
   run_bounded "$(slack)" "turn-end.py" "$STATE/turn-end.log" \
     /usr/bin/python3 "$SCRIPTS/turn-end.py"
-  # 4. THE QUEUE DISPATCHER -- this is what makes the loop survive the orchestrator.
-  #    Steps 2-3 can only say "carry on" to a lane that stopped mid-work; neither can
-  #    choose its NEXT item, because turn-end.py says so in its own docstring: "choosing
-  #    the next issue needs the lane->label->rank judgement the orchestrator holds". That
-  #    put the next-work decision in an agent's CONTEXT, against AGENTS.md's rule that
-  #    operational state must not live only there. Measured the day this was added: 10
-  #    lanes sat DONE-IDLE with 46 work orders queued, and NOTHING was feeding them.
-  #    The dispatcher reads lane->class from LANE-ASSIGNMENTS.tsv and the work itself from
-  #    LANDABLE.tsv / REMEDY.tsv -- both durable files -- so any successor session, or this
-  #    timer with no session at all, keeps the fleet fed.
-  #    DONE-IDLE only, never a protected lane, one item per lane per 15-min cooldown, and
-  #    the claim is taken before the send and RELEASED if the send does not land.
-  #    Fail loud: an automatic dispatcher that dies quietly reports a green, exactly like
-  #    the heartbeat bug above.
-  # RE-ARMED 2026-10-01 13:xx, with the guard it was missing:
-  #   * TWO independent verdict reads, seconds apart; BOTH must say idle
-  #   * positive no-WIP evidence required -- no spinner, no child, no session growth
-  #   * disagreement REFUSES (conservative)
-  #   * a lane quiet <120s is WITHHELD as "too recently active to call idle"
-  #   * claim taken BEFORE the send, RELEASED if the send does not land
-  # Measured before arming: 9 refusals / 4 sends across several runs, every working lane
-  # correctly refused rather than double-sent. Without the guard it sidetracked a live lane.
-  # ── REFRESH THE QUEUES FROM LIVE STATE FIRST (2026-10-01) ──────────────────────
-  # A queue is a CACHE of a fact that changes, and these files were hand-built once and
-  # never re-read. MEASURED: 16 of 86 queue rows named an ALREADY-MERGED PR — the dispatcher
-  # handed real lanes #6389 and #5136 after they had landed, costing a cycle each and
-  # leaving claims on nothing. The owner's ruling on base-staleness (#6792) names the lever:
-  # the REFRESH RATE. So the queue is refreshed at the top of every dispatch cycle, which
-  # makes it demand-driven instead of hand-maintained. refresh-queues.py drops a row ONLY
-  # on an explicit non-OPEN read (never on a failed or truncated one) and never touches
-  # CLAIMS.tsv, so a bad afternoon cannot empty the backlog. Non-fatal: if the refresh
-  # cannot run, the dispatcher still runs against the last known-good queue.
-  run_bounded "$(slack)" "refresh-queues.py" "$STATE/queue-refresh.log" \
-    /usr/bin/python3 "$STATE/queues/refresh-queues.py" --apply || \
-    echo "$(date '+%H:%M:%S') queue refresh failed (non-fatal; dispatcher uses the last known-good queue)" >> "$STATE/queue-refresh.log"
-  # ── THE DISPATCHER NOW RUNS DETACHED FROM THE PASS (2026-10-05) ────────────────────
-  # MEASURED DEFECT: `QUEUE-DISPATCH FAILED rc=143` appeared **130 times**, on essentially EVERY
-  # pass (04:19:32, 04:28:37, 04:37:12, 05:22:43, 05:48:12 ...). rc=143 is run_bounded's OWN
-  # SIGTERM, not a failure in the work, so the step burned 240s of every 540s pass and fed NO lane.
+  # 4. THE QUEUE DISPATCHER — RETIRED 2026-10-17 (agent-infra#1874, the retirement half of #1890).
+  #    WHAT IT WAS: the step that made the loop survive the orchestrator. Steps 2-3 can only say
+  #    "carry on" to a lane that stopped mid-work; neither can choose its NEXT item, so that
+  #    judgement lived in the durable queue (LANE-ASSIGNMENTS.tsv + LANDABLE/REMEDY.tsv) and this
+  #    step handed a row to a lane that ALREADY EXISTED and read DONE-IDLE.
+  #    WHY IT IS GONE: a lane-table dispatcher cannot start work that has no lane. Measured on the
+  #    box (#1874): 8 conflicted PRs sat undrained while `lane-actions` read `idle=2` — and one of
+  #    those two was a false idle (#1867, stale session binding). It was also independently broken
+  #    (~48% of passes aborted, #1876: stderr glued into the roster JSON). A cap on lanes is a cap
+  #    on the fleet's PARALLELISM, which is the drain ceiling #1874 measured.
   #
-  # ⛔ NO CONSTANT CAN FIX THIS, WHICH IS WHY THE EARLIER RESERVE SIZING DID NOT TAKE.
-  # Step 1 (orchestrator-heartbeat.sh) needs ~300s -- this file already raised TARGET 480 -> 540
-  # FOR THAT REASON, and a lower reserve re-kills the fleet's own state report. The dispatcher
-  # needs ~280-390s because it is gh-latency-bound (29 lanes x several API calls each), and it
-  # tracks box load, which sits at I/O-wait saturation. 300 + 280 = 580 > TARGET 540. THE PASS IS
-  # OVERSUBSCRIBED BY ~40-100s, so every choice of DISPATCH_BUDGET either starves step 1 or kills
-  # the dispatcher -- and killing it is the worse of the two, because the dispatcher is the step
-  # that FEEDS THE FLEET. A watchdog that kills its own feeder reports `PASS` while feeding nobody,
-  # which is the silent-green failure this file already documents twice above.
+  #    ⛔ DO NOT RE-ADD IT. The replacement is the PR-DOCTOR step below (`pr-doctor`), which
+  #    sources its work from GitHub's branch-protection reality instead of a queue row. Its SPAWN
+  #    half — one load-gated background worker per item through `nonblocking-dispatch.sh` — LANDED
+  #    in #1894 (agent-infra#1890): `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper and
+  #    starts a fresh worker in the PR's OWN worktree, and `idle_lanes()` is no longer a function in
+  #    the file at all. Read the code, not this note, for which half is live — but read it as: the
+  #    lane table could not start work that had no lane, the surviving path does not need one.
+  #    (This paragraph said the spawn half was "NOT WIRED YET" from the day this step was retired
+  #    until #1894 merged. That was true then and is FALSE now; it is corrected here because a
+  #    retirement note that understates the replacement invites exactly the re-add it forbids.)
+  #    TWO live dispatch paths is the divergence #1890 exists to remove, and "a replacement that is
+  #    added but not switched on is indistinguishable from no replacement" is the inversion this
+  #    retirement finishes undoing. `scripts/test_dispatch_wiring.py` asserts this step stays gone,
+  #    that `pr-doctor.py` is the beat's only dispatch entry point AND that it is launched without
+  #    a no-op flag, that its guard is not inverted and it is not wrapped in an uncalled function,
+  #    and that nothing live re-arms the retired name or re-reads its queue files.
   #
-  # So the dispatcher leaves the pass. That is SAFE here, from its own design: it takes its claim
-  # BEFORE the send and RELEASES it if the send does not land, so concurrent or out-of-band runs
-  # cannot double-feed a lane. It is bounded by its OWN lock (stale after 20 min) rather than by
-  # the pass, and TARGET -- the owner's 5-9 min cadence -- is left exactly as it was.
-  if [ -d "$STATE/queue-dispatch.lock" ] && \
-     [ -z "$(find "$STATE/queue-dispatch.lock" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then
-    printf '%s DISPATCH-STEP skipped: a detached dispatcher is still running (lock held)\n' \
-      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-  else
-    rmdir "$STATE/queue-dispatch.lock" 2>/dev/null
-    if mkdir "$STATE/queue-dispatch.lock" 2>/dev/null; then
-      ( nohup /usr/bin/python3 "$SCRIPTS/queue-dispatch.py" --apply \
-          >>"$STATE/queue-dispatch.log" 2>>"$STERR"
-        rmdir "$STATE/queue-dispatch.lock" 2>/dev/null ) &
-      printf '%s DISPATCH-STEP launched detached (not bounded by the pass; ~280-390s)\n' \
-        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-    elif [ "$(elapsed)" -lt "$TARGET" ]; then
-      # The lock could not be taken but is not stale -- treat as in flight, never as a failure.
-      printf '%s DISPATCH-STEP skipped: lock held by a concurrent run\n' \
-        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-    else
-      printf '%s PASS BUDGET spent (%ss of %ss) -- queue-dispatch SKIPPED this pass, cadence kept\n' \
-        "$(date '+%m-%d %H:%M:%S')" "$(elapsed)" "$TARGET" >> "$LOG"
-    fi
-  fi
+  #    ORPHANED BY IT, named rather than left to be discovered: `scripts/safe-send.sh` (the guarded
+  #    send primitive, `lane-guard.py` inside it) had this step as its ONLY live invoker — it is
+  #    manual-only now. `lane-status.py`'s "the guard is still performed at the moment of sending"
+  #    was true in this path only while this file ran; it is corrected there. Re-wiring a guarded
+  #    send is a real change, not a cleanup. (`scripts/lane-wip.py` is NOT in this list: it was
+  #    manual-only by design from its first commit — "run this BEFORE sending anything" — and this
+  #    step never invoked it.)
+  #
+  #    ⛔ ONE THING THIS RETIREMENT ORPHANS WITHOUT A CONSUMER, recorded here rather than left to be
+  #    discovered: `pr-doctor.py` still PUBLISHES `issue_work` in its status sidecar — the "owned
+  #    PRs first, then new issue work" rule, measured from live ownership — and the retired
+  #    dispatcher was its only reader (`scripts/test_queue_dispatch.py`, deleted with the dispatcher
+  #    because it tested that reader). The RULE is a product decision and stays; its enforcement
+  #    moves to agent-infra#2129 (the PR-first selection), which is where it is proved now.
+  #
+  #    RETIRED WITH IT: the `refresh-queues.py` step (the queue existed to feed this step; it is
+  #    gh-latency-bound and was a per-pass cost against #1910's secondary rate limit) and the dead
+  #    queue-count reads in cadence-nudge.sh. The queue FILES stay on disk for the record; nothing
+  #    consumes them. The retired source is kept at
+  #    `scripts/orchestrator-harness/retired/queue-dispatch.py` (record only, wired to nothing, no
+  #    longer farmed by pi-bootstrap/setup.sh). Coverage this dispatcher had that `pr-doctor` does
+  #    not — draft-promote / close / ask-owner rows — is filed as agent-infra#1912, not dropped
+  #    silently.
+  #
+  #    ⚠️ DEPLOY IS A SEPARATE STEP, AND UNTIL IT RUNS THE BOX IS UNCHANGED. This file is NOT in any
+  #    farm array (`pi-bootstrap/setup.sh:387` — `lane_root_srcs` is #1553's, not landed) and the
+  #    farm never DELETES a file it stopped delivering (`setup.sh:264`, "extras kept"), so this
+  #    repo-side edit reaches no box by itself. ⛔ A PLAIN `cp` OVER THE LIVE FILE IS NOT THE STEP:
+  #    the beat is a detached `while :; do ... done` that has already PARSED this file, and `cp`
+  #    truncates the destination inode in place — the running loop either keeps executing the old
+  #    bytes (retirement not applied) or dies mid-read with its stderr in the void
+  #    (`pi-bootstrap/tests/test-setup-no-nesting.sh:203-207` records the same parse-once mechanism,
+  #    #1738). So: stop the loop, replace atomically, then start it — AS ONE CHAIN, because every
+  #    step after the replace is destructive and must not run if the replace did not:
+  #        touch ~/.pi/agent/state/HEARTBEAT-OFF        # the loop exits at the top of its next pass
+  #        # wait for "LOOP exiting: kill file present" in $STATE/orchestrator-heartbeat.log
+  #        #   (that is `LOG` at the top of this file; there is no `heartbeat-loop.log`), then:
+  #        cp scripts/heartbeat-loop.sh ~/.pi/agent/scripts/heartbeat-loop.sh.new \
+  #          && mv ~/.pi/agent/scripts/heartbeat-loop.sh.new ~/.pi/agent/scripts/heartbeat-loop.sh \
+  #          && bash pi-bootstrap/setup.sh \
+  #          && rm -f ~/.pi/agent/state/HEARTBEAT-OFF \
+  #          && bash ~/.pi/agent/scripts/heartbeat-loop.sh
+  #        # ⛔ WITHOUT THE `rm` OF THE KILL FILE THE RESTART IS A NO-OP: the loop re-reads it at the
+  #        #   top of the pass and exits immediately after printing "heartbeat loop started" — a
+  #        #   dead fleet reported as deployed. And without the `&&` a failed `cp`/`mv` still unfarms
+  #        #   the dispatcher and deletes the kill file, then restarts the OLD beat — which still
+  #        #   launches the retired dispatcher, so every pass silently runs a dead step.
+  #        # CONFIRM IT TOOK: `tail -5 ~/.pi/agent/state/orchestrator-heartbeat.log` must show a
+  #        #   fresh `LOOP started`, and a later `PASS done` must NOT be followed by a
+  #        #   QUEUE-DISPATCH line (the step is gone). Start it from a cmux pane (socket attribution).
+  #    ⛔ THE DISPATCHER'S REMOVAL IS NOT IN THE RECIPE, DELIBERATELY. It is DECLARED in
+  #    `pi-bootstrap/farm-retired.txt` (`scripts/queue-dispatch.py`), so the farm's UNFARM leg
+  #    (agent-infra#1924) removes the deployed copy during the `pi-bootstrap/setup.sh` step above — declared, never
+  #    inferred from absence, and it cannot be forgotten from a hand-written chain. Two further
+  #    reasons it is not spelled here: a command in this note is an INSTRUCTION an operator runs, and
+  #    the producer-closure guard (`pi-bootstrap/tests/test-setup-no-nesting.sh`, #1899) derives the
+  #    farm's population from exactly that shape — naming the retired path as a `$SCRIPTS/…` or
+  #    `agent/scripts/…` exec form re-enters it as an undelivered producer and reds the guard.
+  #
+  #    ⚠️ CADENCE: `TARGET=540` was raised 480 -> 540 to fit step 1 (~300s) PLUS this step's ~240s
+  #    reserve — exactly TARGET, no slack, which is why the step was later detached and then
+  #    retired. A reserve for a step that cannot run protects nothing — but do NOT re-derive TARGET
+  #    from step 1 alone: `IN_PASS_RESERVE` is LIVE and bounds the in-pass steps, so the
+  #    re-derivation is step 1 PLUS `IN_PASS_RESERVE`. `DISPATCH_BUDGET` NO LONGER EXISTS — it was
+  #    deleted with this step (its last value was `0`; see the ⛔ block above), so no executable
+  #    line in this file reads it any more — it survives in prose only. `slack()` is NOT dead: it
+  #    bounds the three steps that run after it (`lane-actions.py`, `turn-classify.py`,
+  #    `turn-end.py`). It is behaviourally identical to `remaining()` — it calls it and re-applies
+  #    the same 20s floor, and that body is UNCHANGED by this retirement — so folding the two into
+  #    one is a mechanical cleanup, not a behaviour change.
+  #
+  # ── #1933: DRAIN THE LAST DETACHED RUN'S EXIT STATUS ─────────────────────────────────
+  # Placed HERE, ahead of the surviving launch and OUTSIDE its disarm check, for two reasons: a
+  # pending failure must be reported even on a pass where the child is disarmed or skipped by a
+  # held lock (otherwise the only pass that reports it is one that also runs it), and the line
+  # must precede this pass's launch line, so the log reads "last run failed, this run launched"
+  # rather than the reverse.
+  # ⛔ THE `QUEUE-DISPATCH FAILED` DRAIN THAT STOOD BESIDE THIS ONE LEFT WITH ITS CHILD (#1874):
+  # a report line outlives its step only as a claim that the step can still fail, and this step
+  # cannot be launched any more. The surviving line is still pinned by `scripts/heartbeat-loop.test.sh`.
+  # rc=2 -> `PR-DOCTOR REFUSED` (#1933's vocabulary); any other non-zero rc -> `PR-DOCTOR RED rc=N`,
+  # never a refusal claim.
+  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED"
+
 
   # ---------------------------------------------------------------------------------------
   # PR-DOCTOR -- the DRAIN. Added 2026-10-10 (owner: "having to fix things is a natural part
@@ -475,13 +673,14 @@ while :; do
   # WHY IT LIVES HERE: this pass already reads every open PR (step 1) and already owns the
   # dispatch machinery -- pr-doctor is the ACTION half of a measurement this loop was already
   # making. It drives every open PR toward `merged`: fix a failing check -> re-review -> record
-  # -> call the rail, dispatching each PR to an idle lane. Before it existed, `waiting` went
+  # -> call the rail, spawning a background worker in the PR's own git worktree via
+  # `nonblocking-dispatch.sh` (load/disk-gated in `spawn-gate.sh`). Before it existed, `waiting` went
   # 10 -> 25 in one day while the fleet worked hard, because a failing requirable check was
   # REPORTED as a blocker instead of being repaired.
   #
-  # Its own lock, separate from queue-dispatch's, so a slow drain can never starve the queue
-  # dispatcher (and vice versa). Detached for the same reason queue-dispatch is: it is
-  # gh-latency-bound and must not eat step 1's reserved slice.
+  # Its own lock, and detached because it is gh-latency-bound: it must not eat step 1's
+  # reserved slice. It is the beat's ONLY dispatch entry point now that the lane-table
+  # dispatcher is retired (step 4 above).
   #
   # DISARM: touch $STATE/PR-DOCTOR-OFF  (the loop's HEARTBEAT-OFF still stops everything).
   if [ ! -f "$STATE/PR-DOCTOR-OFF" ]; then
@@ -492,8 +691,24 @@ while :; do
     else
       rmdir "$STATE/pr-doctor.lock" 2>/dev/null
       if mkdir "$STATE/pr-doctor.lock" 2>/dev/null; then
-        ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
-            >>"$STATE/pr-doctor.log" 2>>"$STERR"
+        ( # ⛔ See the dispatcher's twin above — INCLUDING the "only when no carrier is waiting"
+          # test: an rc already on disk here (a child that finished after this pass's drain, or a
+          # sibling started by the stale-lock takeover) is moved to `.pending` -- with its tail,
+          # snapshotted BEFORE the truncation below -- instead of being overwritten by the write
+          # further down, but never over a value the drain has yet to report.
+          if [ ! -f "$STATE/pr-doctor.rc.pending" ] && [ -f "$STATE/pr-doctor.rc" ]; then
+            tail -1 "$STATE/pr-doctor.stderr" 2>/dev/null | cut -c1-200 > "$STATE/pr-doctor.rc.tail" 2>/dev/null
+            mv -f "$STATE/pr-doctor.rc" "$STATE/pr-doctor.rc.pending" 2>/dev/null
+          fi
+          # Own stderr file -- see the dispatcher's twin above for why the shared $STERR cannot
+          # be the tail of a report drained a pass later.
+          : > "$STATE/pr-doctor.stderr"
+          nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
+            >>"$STATE/pr-doctor.log" 2>>"$STATE/pr-doctor.stderr"
+          # #1933 -- see the dispatcher's twin above: the rc is captured here or nowhere.
+          _rc=$?
+          printf '%s\n' "$_rc" > "$STATE/pr-doctor.rc.tmp" &&
+            mv -f "$STATE/pr-doctor.rc.tmp" "$STATE/pr-doctor.rc"
           rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &
         printf '%s PR-DOCTOR launched detached (drives open PRs toward merged)\n' \
           "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
@@ -503,6 +718,21 @@ while :; do
       fi
     fi
   fi
+  # ⛔ WHAT WAS HERE, ATTRIBUTED CORRECTLY (review P2 + re-review P2, #1954). The shape that made
+  # the report unreachable was the `rc=0` / `if [ "$rc" -ne 0 ]` pair. On `origin/main` (`7a051b7b`,
+  # line 581) that pair was ALREADY gone: #2056 (`838228de`) had deleted it, left a bare literal
+  # `rc=0` with no reader at all, and `QUEUE-DISPATCH FAILED` survived there only in comments. On
+  # THIS branch's first fix commit (`f639d384`) the pair was then deleted for real, because a
+  # branch cut before `838228de` still carried it. Either way the REPORT had to be ADDED, not
+  # repaired: both detached children now write their own rc to a sidecar and are reported by
+  # `report_detached_rc` above. (The test header names `origin/main` for the base measurement and
+  # says the same thing; an earlier version of this comment said the deletion predated this branch
+  # AND that nothing was deleted here — the first half false for `f639d384`, the second false for
+  # the merge base. Name the ref, or the two records disagree about the same code.) The
+  # record readers below are the OTHER half of the same repair (#1933/#1988): the child's own
+  # status.json carries a verdict and an AGE, so a stale record is named RED rather than read as
+  # ok -- and the sidecar drain above still reports the rc this pass could not observe. Both are
+  # kept: neither one can see what the other sees.
   # ⛔ THE EXIT STATUS IS READ FROM A RECORD, NOT FROM A VARIABLE THAT CANNOT HOLD IT (#1933).
   # The launch is DETACHED, so nothing in this shell can observe `$?` -- and the old code set
   # `rc=0` and then tested it, a branch that could never fire. MEASURED 2026-10-18 over
@@ -577,9 +807,23 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
     printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
       "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
   fi
-  rc=0
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \
     "$(date '+%m-%d %H:%M:%S')" "$EL" "$TARGET" "$SLP" >> "$LOG"
+  # #1933 -- ONE-PASS MODE, for the suite that has to PROVE the failure branch is reachable
+  # (a branch that is merely present is the defect). It runs one real pass and exits; it changes
+  # nothing about a normal run, and it cannot skip a step: the seam is after the pass, not in it.
+  # ⛔ ONLY `1` IS ONE-PASS, AND THE PASS SAYS SO (review P2, #1954). `[ -n "${HEARTBEAT_PASS_ONCE:-}" ]`
+  # honoured ANY non-empty value, so an ambient `HEARTBEAT_PASS_ONCE=0` -- an operator "disabling"
+  # the seam, or an env leak into the pane the loop was started from -- stopped the heartbeat after
+  # ONE pass, having just logged `PASS done in …s … sleeping 5s`: a dead beat whose last line
+  # promises a sleep that never happens, with nothing naming the mode. The seam now requires the
+  # affirmative value and logs that it took it, so a stuck value is visible instead of inferred
+  # from a log that simply stops.
+  if [ "${HEARTBEAT_PASS_ONCE:-}" = 1 ]; then
+    printf '%s ONE-PASS MODE (HEARTBEAT_PASS_ONCE=1) -- exiting after this pass\n' \
+      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+    exit 0
+  fi
   sleep "$SLP"
 done
