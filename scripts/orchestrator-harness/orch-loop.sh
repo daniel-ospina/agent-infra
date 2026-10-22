@@ -2992,6 +2992,51 @@ while true; do
   }
   # [prdisp:end]
 
+  # ── SPAWN REFUSALS: A PER-CYCLE MEASUREMENT, NOT A LOG LINE (measured 2026-10-22) ───────────
+  # The controller can only advance the fleet through the launcher. When the launcher refuses, every
+  # spawn site below records a per-PR `wait` — and the cycle's own `[pr]`/`[dispatch]` line reads
+  # `N acted, M named wait(s)`, which is indistinguishable from a healthy busy cycle. MEASURED: 1,562
+  # refusals in one log (`cmux layout apply failed: … database or disk is full` — the registry volume
+  # at 100%) while `lanes=0 workers=5` printed every cycle for six hours and not one PR landed. The
+  # refusal record is written by the launcher (`wt_refusal_record`, worker-terminal.sh) and TRUNCATED
+  # here, before the sweep, so cycle N can never read cycle N-1's refusals as its own.
+  # ⛔ ONE RESOLVER, NOT TWO. The path comes from the launcher's OWN `wt_refused_file` when the module
+  # provides it (a stale `worker-terminal.sh` must not stop the controller — the guard above does not
+  # require this function, and a mixed deploy would otherwise refuse to run): with two independent
+  # spellings, a `WT_DIR` test seam made the writer record one file while this reader watched another,
+  # and the measurement would read 0 forever (the single-source class).
+  # [spawnref:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  SPAWNREF=""; SPAWNREF_OK=1; SPAWNREF_WHY_BAD=""
+  if command -v wt_refused_file >/dev/null 2>&1; then
+    SPAWNREF="$(wt_refused_file)" 2>/dev/null
+  else
+    # ⛔ A STALE LAUNCHER MODULE IS NOT A MEASUREMENT OF ZERO. The guard at the top of this file does
+    # not require `wt_refused_file` (a mixed deploy must not stop the controller), so this state is
+    # reachable — and with no writer, "0 refusals" would be a claim about a record nothing fills.
+    SPAWNREF="$O/state/spawn-refused.tsv"
+    SPAWNREF_OK=0
+    SPAWNREF_WHY_BAD="the launcher module predates wt_refused_file, so nothing records refusals"
+  fi
+  if [ "${SPAWNREF_OK:-1}" = "1" ]; then
+    # ⛔ A TRUNCATE IS NOT A WRITE PROBE (review, cycle 2). `: > file` is allocation-free and SUCCEEDS
+    # on a full filesystem — the exact condition that causes refusals. So the probe is a SENTINEL ROW
+    # that must actually be written; its absence is what turns "0 refusals" into "UNMEASURED".
+    # ⛔ THE PROBE MUST BE THE SIZE OF A REAL ROW (review, cycle 3). A 13-byte probe passes on a volume
+    # with 13–250 bytes free and then every refusal row (up to ~250 B) is dropped: OK=1, N=0, no suffix
+    # — a MEASURED zero, which is the false PASS the probe exists to prevent. Pad it to the row bound.
+    _pr_probe="$(printf '%*s' 260 '' | tr ' ' x)"
+    if : > "$SPAWNREF" 2>/dev/null && printf '#\t%s\n' "$_pr_probe" >> "$SPAWNREF" 2>/dev/null; then :; else
+      SPAWNREF=/dev/null; SPAWNREF_OK=0
+      SPAWNREF_WHY_BAD="state/ is not writable (the probe row could not be written)"
+    fi
+  fi
+  SPAWNREF_BASE=0
+  if [ -s "${SPAWNREF:-/nonexistent}" ]; then
+    SPAWNREF_BASE="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"
+  fi
+  is_num "${SPAWNREF_BASE:-}" || SPAWNREF_BASE=0
+  # [spawnref:end]
+
   printf '%s\n' "$SEL_ROWS" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT OWN; do
     [ -z "${PR:-}" ] && continue
@@ -3905,6 +3950,33 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   done
   # [prdisp-apply:end]
   # [prsum:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  # ── THE ACTUATOR'S OWN ANSWER, BESIDE THE TALLY ─────────────────────────────────────────────
+  # ⛔ `N acted` MUST NEVER HIDE A REFUSED SPAWN. An "act" can be a draft-ready or an auto-arm that
+  # starts no worker; the refusal record is the only measurement of "did a lane actually start".
+  # Print the count and the launcher's OWN reason (never a guess) on every state of the line below,
+  # so `lanes=0` and "the loop is doing nothing" cannot again be printed without the cause beside it.
+  SPAWNREF_N=0; SPAWNREF_WHY=""
+  if [ "${SPAWNREF_OK:-1}" = "1" ] && [ -s "${SPAWNREF:-/nonexistent}" ]; then
+    _srn="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"
+    is_num "${_srn:-}" || _srn=0
+    SPAWNREF_N=$(( _srn - ${SPAWNREF_BASE:-0} )); [ "$SPAWNREF_N" -lt 0 ] && SPAWNREF_N=0
+    # The probe row is `#`, never a worker name; skipping it keeps the reason the launcher's own.
+    SPAWNREF_WHY="$(awk -F"$(printf '\t')" 'NF>=2 && $1 != "#"{print $2; exit}' "$SPAWNREF" 2>/dev/null | cut -c1-200)"
+  fi
+  _refsuf=""
+  # ⛔ TWO HONESTY RULES ON THIS SUFFIX (review, cycle 1):
+  #  • NO ABSOLUTE CLAIM. "NO LANE COULD START" was printed beside "N worker(s) in flight" on any
+  #    PARTIAL refusal — a false statement on the operator's decision line. The count and the
+  #    launcher's words are the measurement; the conclusion is the reader's.
+  #  • `≥` AT THE CAP. The record is bounded at 200 rows per cycle, so a storm is 200 rows and an
+  #    exact count would understate it while reading as exact.
+  if [ "${SPAWNREF_OK:-1}" != "1" ]; then
+    _refsuf=" ⛔ refusal measurement UNAVAILABLE (${SPAWNREF_WHY_BAD:-state/ is not writable}) — any refused spawn this cycle is UNMEASURED"
+  elif [ "${SPAWNREF_N:-0}" -ge 200 ]; then
+    _refsuf=" ⛔ ≥200 spawn(s) REFUSED by the launcher (${SPAWNREF_WHY:-reason not recorded}) — the record is capped at 200 rows this cycle"
+  elif [ "${SPAWNREF_N:-0}" -gt 0 ]; then
+    _refsuf=" ⛔ ${SPAWNREF_N} spawn(s) REFUSED by the launcher (${SPAWNREF_WHY:-reason not recorded})"
+  fi
   # TALLY. `act` = an action this cycle ACTUALLY took (a worker spawned, a merge issued, an auto-arm,
   # a draft readied, a rerun); `wait` = a row with a printed reason. Both are counts of LEDGER ROWS,
   # not of un-owned PRs: the swept set also carries owned PRs (the sweep never filters the OWN column),
@@ -3929,7 +4001,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   # that does not close this block exists to end. And if `state/` is unwritable the ledger is empty by
   # CONSTRUCTION: the outcome is then UNKNOWN, never "nothing happened".
   if [ "${PRDISP_OK:-1}" != "1" ]; then
-    echo "[pr] PR path: record UNWRITABLE (state/ is not writable) — this cycle's PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned PR(s) are counted" >>"$LOG"
+    echo "[pr] PR path: record UNWRITABLE (state/ is not writable) — this cycle's PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned PR(s) are counted${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="unknown (the PR record is unwritable — see the [pr] line)"
   elif [ "$PRDISP_ROWS" -eq 0 ]; then
     # ⛔ A ZERO ROW COUNT HAS TWO CAUSES AND THE COUNT CANNOT TELL THEM APART (review cycle 2, P2): no
@@ -3937,10 +4009,10 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # so a full `state/` passes the `PRDISP_OK` probe at the top and then every `disp` fails). Naming
     # only the first would send an operator to repair the GraphQL listing when the state filesystem is
     # the broken thing. Both are stated; neither is asserted.
-    echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)" >>"$LOG"
+    echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -3948,7 +4020,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # one: no unit ran, and the dominant reason is named rather than inferred. It does NOT claim what
     # the issue path will do — the gate is decided further down, and a forward claim here would be the
     # same defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
-    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}" >>"$LOG"
+    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none acted — see the [pr] line"
   fi
   # ⛔ THE FUNNEL TAKES THE SAME THREE FACTS, INCLUDING WHETHER THEY WERE MEASURED AT ALL: 0 acts with a
@@ -4216,12 +4288,12 @@ PY
       if [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
       elif [ "$_lage" -ge "$_stallmin" ]; then
-        echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
+        echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
+      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
     fi
     # [drain-health:end]
   fi
@@ -4580,6 +4652,30 @@ PY
       # `held:` clause and the reason survived only in the cycle record and a separate log line — the
       # sibling no-batch branch below passes it, so the two halves of one outcome printed differently.
       dispatch_funnel "$K" "$(queue_state_token)" "$GATE_WHY" "" "${Y:-0}" >> "$LOG"
+      # ⛔ THE ISSUE PATH SPAWNS AFTER THE `[dispatch]` LINE IS ALREADY PRINTED (review, cycle 1). The
+      # refusal count above is read at the end of the PR phase, so without this second read a refused
+      # issue-path spawn would be truncated by the NEXT cycle and never appear on any line — the same
+      # blindness this change removes, relocated to the path that is open when the PR queue is empty.
+      # [issueref:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+      if [ "${SPAWNREF_OK:-1}" = "1" ] && [ -n "${SPAWNREF:-}" ] && [ -s "${SPAWNREF:-/nonexistent}" ]; then
+        _irn="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"; is_num "${_irn:-}" || _irn=0
+        # ⛔ THE DELTA, NOT THE TOTAL (review, cycle 2): the `[pr]` line already reported the PR
+        # phase's refusals, so printing the cumulative count here over-reports this path by exactly
+        # that number and hands it the PR phase's reason. Rows before `base + N` belong to that line.
+        _iid=$(( _irn - ${SPAWNREF_BASE:-0} - ${SPAWNREF_N:-0} ))
+        if [ "$_iid" -le 0 ] && [ "$_irn" -ge 201 ]; then
+          # ⛔ THE CAP IS NOT SILENCE (review, cycle 3): the writer stops at 200 refusal rows, so a
+          # storm that the PR phase already saturated leaves this path with nothing to add — and a
+          # refused issue path would be invisible. Say the measurement stopped instead.
+          echo "[dispatch] ⛔ the refusal record is at its 200-row cap, so any ISSUE-path refusal this cycle is UNMEASURED (the [pr] line reports ≥200)" >> "$LOG"
+        elif [ "$_iid" -gt 0 ]; then
+          _irw="$(awk -F"$(printf '\t')" -v b="$(( ${SPAWNREF_BASE:-0} + ${SPAWNREF_N:-0} ))" \
+                   'NR>b && NF>=2 && $1 != "#"{print $2; exit}' "$SPAWNREF" 2>/dev/null | cut -c1-200)"
+          [ "$_iid" -ge 200 ] && _iid="≥200"
+          echo "[dispatch] ⛔ ${_iid} spawn(s) REFUSED by the launcher (${_irw:-reason not recorded}) on the ISSUE path too — the launcher did not start them; see the [worker-terminal] REFUSED lines" >> "$LOG"
+        fi
+      fi
+      # [issueref:end]
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
     # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
     # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch
@@ -4599,6 +4695,13 @@ PY
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
     elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
     else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
+    # ⛔ THE ACTUATOR'S ANSWER RIDES THE GATE LINE (measured 2026-10-22). `lanes=0` with no reason is
+    # the line that let a 100%-full launcher volume freeze the fleet for six hours: this tail is the
+    # ONE place the operator (and the beat) reads, so the refusal count and the launcher's own words
+    # go here, not only into per-PR rows and a log nobody parses.
+    # [prtail:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+    _prtail="${_prtail}${_refsuf:-}"
+    # [prtail:end]
     dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
