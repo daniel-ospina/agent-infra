@@ -39,10 +39,14 @@
 #     falls back to per-path and reports what it had to skip;
 #   - commits already on the branch but NOT pushed are out of scope — this tool archives uncommitted
 #     work. The clean exit says so rather than implying the lane is safe.
+#   - ONE credential retry is attempted, and only for a github.com WORKFLOW-SCOPE refusal of a snapshot
+#     that touches `.github/workflows/` (the configured token often lacks `Workflows: write` while the
+#     keychain credential has it, #2292). Every other refusal is reported as-is — see section 6.
 #
 # Exit: 0 = nothing at risk, or rescued and pushed (prints the ref + sha)
 #       1 = the path is not the root of a git worktree
-#       2 = there was work that could NOT be archived or pushed — printed loudly, it is still at risk
+#       2 = there was work that could NOT be archived or pushed — printed loudly, it is still at risk,
+#           and the printed cause says WHY (workflow scope / auth / network / rejected / unclassified)
 set -uo pipefail
 
 WT="${1:?usage: bg-rescue-wip.sh <worktree> [note]}"
@@ -276,9 +280,84 @@ if [ -n "$REMOTE_TIP" ] && ! git -C "$WT" merge-base --is-ancestor "$REMOTE_TIP"
   echo "bg-rescue-wip: archived $BR at $C ($N_PATHS changed/untracked path(s))" >&2
 fi
 
-if bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
-     push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"; then
-  echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
+# ⛔ THE CREDENTIAL THAT CAN PUSH, AND THE PREDICATE THAT TELLS ONE REFUSAL FROM ANOTHER (agent-infra#2292).
+# A fine-grained PAT without `Workflows: write` is refused by github.com for ANY snapshot that touches
+# `.github/workflows/` — and the rescue then reported "push failed" and exited 2, i.e. the tool that
+# exists to survive a killed lane degraded to local-only for exactly the lanes whose work touches CI.
+# The osxkeychain credential carries `workflow` in its scopes, so ONE retry with that helper selected
+# publishes the same ref. Three properties this must keep:
+#   - the retry is gated on the REFUSAL, not on "the push failed": a network outage, an auth failure, a
+#     non-fast-forward or a hook rejection is NOT retried, because a blanket retry can turn a
+#     diagnosable failure into a green run and hide the cause;
+#   - it is never a force and never a config write: `-c credential.helper=` clears the configured
+#     helpers for THIS invocation only, so the repo's credential config is untouched;
+#   - it cannot block the kill: GIT_TERMINAL_PROMPT=0 means a keychain entry that is missing FAILS
+#     instead of prompting on a terminal nobody is watching.
+# ⛔ THE MATCHER IS DELIBERATELY NARROW. `grep workflow` would match this script's own refspec echoed
+# back in a rejection (`! [remote rejected] … refs/wip/fix-workflow-scope`), so a branch merely NAMED
+# "workflow" would take the retry path on an ordinary rejection. Only GitHub's scope refusal matches.
+WORKFLOW_SCOPE_RE='refusing to allow .*(create|update) workflow|without .?workflow.? scope'
+is_workflow_scope() { grep -qiE "$WORKFLOW_SCOPE_RE" "$1" 2>/dev/null; }
+
+# push_plain / push_keychain — the SAME refspec, the same bounds, the same no-force. The only difference
+# is which credential is consulted, so a retry can never publish something the first push would not.
+push_plain() {
+  bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
+    push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"
+}
+push_keychain() {
+  bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
+    -c credential.helper= -c credential.helper=osxkeychain \
+    push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"
+}
+
+# classify_push_failure <stderr-file> — ONE line naming WHY, because "the push failed" sent a diagnosis
+# cycle after the wrong cause (#2292): the workflow refusal and an expired credential print nothing alike
+# but both read as "push failed". Order matters — a scope refusal ALSO says "[remote rejected]".
+classify_push_failure() {
+  local f="$1"
+  if is_workflow_scope "$f"; then
+    echo "cause: WORKFLOW SCOPE — this credential may not create or update a .github/workflows file."
+  elif grep -qiE 'is not a git command|helper .*(not found|does not exist)' "$f" 2>/dev/null; then
+    echo "cause: NO USABLE CREDENTIAL HELPER — the helper named for the retry is not installed on this host."
+  elif grep -qiE 'authentication failed|could not read (username|password)|terminal prompts disabled|invalid username or password|\b40[13]\b|permission denied' "$f" 2>/dev/null; then
+    echo "cause: AUTHENTICATION — the credential was rejected or absent (the remote was reachable)."
+  elif grep -qiE 'could not resolve host|connection (refused|timed out)|unable to access|network is unreachable|operation timed out|failed to connect|low-speed' "$f" 2>/dev/null; then
+    echo "cause: NETWORK — the remote could not be reached; no credential was consulted."
+  elif grep -qiE 'non-fast-forward|fetch first|\[rejected\]|pre-receive hook declined|protected branch' "$f" 2>/dev/null; then
+    echo "cause: REMOTE REJECTED THE UPDATE — the ref did not fast-forward or a server policy refused it."
+  else
+    echo "cause: UNCLASSIFIED — the push output below is the only evidence."
+  fi
+}
+
+RETRIED=0; PUSHED=0; FIRST_CAUSE=""; PUSH_TIMEOUTS=""
+if push_plain; then
+  PUSHED=1
+else
+  [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the first push HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
+  FIRST_CAUSE="$(classify_push_failure "$ERRF")"
+  if is_workflow_scope "$ERRF"; then
+    RETRIED=1
+    # ⛔ NO PROMPT: this runs in the second before a kill, so an absent keychain entry must FAIL rather
+    # than wait on a terminal nobody is watching. Exported once here — every later git call in this
+    # script is non-interactive too, so there is nothing to restore.
+    GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
+    echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the osxkeychain credential (no force, no config written)" >&2
+    if push_keychain; then
+      PUSHED=1
+    else
+      [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the keychain retry HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
+    fi
+  fi
+fi
+
+if [ "$PUSHED" -eq 1 ]; then
+  if [ "$RETRIED" -eq 1 ]; then
+    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with the OSXKEYCHAIN credential (the configured credential lacks workflow scope)"
+  else
+    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
+  fi
   # A partial archive is a rescue, not a clean one: the skipped paths are still only on this disk.
   if [ "${#SKIPPED[@]}" -gt 0 ]; then
     loud "the rescue above is PARTIAL — these paths are STILL ONLY ON THIS DISK:" ${SKIPPED[@]+"${SKIPPED[@]}"} \
@@ -288,18 +367,27 @@ if bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
   exit 0
 fi
 PUSH_ERR="$(cat "$ERRF" 2>/dev/null)"
-if [ "$BOUNDED_TIMEOUT" -eq 1 ]; then
-  loud "the push HIT ITS TIME BOUND and was cut off (not rejected) — the remote is stalled, not refusing." \
-       "The work is still only on this disk."
+[ -n "$PUSH_TIMEOUTS" ] && loud "$PUSH_TIMEOUTS." "The work is still only on this disk."
+
+# ⛔ THE CAUSE IS PART OF THE MESSAGE (#2292, item 2). "the push failed" is the string that sent a
+# diagnosis cycle after the wrong cause; the operator needs to know whether to fix a credential, a
+# network path, or a ref. The FIRST attempt's cause is the primary one — a retry that fails for a
+# DIFFERENT reason (a missing keychain entry after a scope refusal) is reported separately, never
+# allowed to overwrite why the work could not leave in the first place.
+WHY=("$FIRST_CAUSE")
+if [ "$RETRIED" -eq 1 ]; then
+  WHY+=("retried ONCE with the osxkeychain credential — it ALSO failed: $(classify_push_failure "$ERRF")")
 fi
 
 if [ "$LOCAL_OK" -eq 1 ]; then
   loud "RESCUED LOCALLY BUT THE PUSH FAILED — this work is STILL ONLY ON THIS DISK." \
        "$BR → refs/wip-local/$SLUG ($C)" \
+       ${WHY[@]+"${WHY[@]}"} \
        "retry: bash '$HERE_R/$(basename "$0")' '$WT' 'rescue retry'  (re-fetches and chains)"
 else
   loud "THE PUSH FAILED AND THE LOCAL REF COULD NOT BE WRITTEN — this work is STILL ONLY ON THIS DISK." \
        "$BR → commit $C (unreferenced: run 'git -C $WT update-ref refs/wip-local/$SLUG $C' NOW)" \
+       ${WHY[@]+"${WHY[@]}"} \
        "retry: bash '$HERE_R/$(basename "$0")' '$WT' 'rescue retry'  (re-fetches and chains)"
 fi
 [ -n "$PUSH_ERR" ] && head -5 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
