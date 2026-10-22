@@ -131,7 +131,8 @@ written).
 | #959 (button overwrites `reviewer`) | OPEN | a button approval cannot satisfy the human gate |
 | #188 / #386 / #172 | CLOSED | fixed by adding lease machinery, not by removing the socket |
 
-**So: months, 7,260 lines, 20 commits, four open defects, zero delivered questions.** The lesson is
+**So: months, 7,260 lines, 20 commits, three open defects (plus #40's still-live disabled-by-default
+state), zero delivered questions.** The lesson is
 not "Slack is bad". It is that **every hop we hand-roll acquires a second contract**, and a second
 contract is where the message dies.
 
@@ -140,14 +141,19 @@ contract is where the message dies.
 - **R1 — one writer per record.** The question, the verdict and the answer live on the GitHub issue.
   The chat surface carries *copies* for attention; it never owns state. (Kills #956 and #959.)
 - **R2 — no inbound socket.** Outbound HTTPS only: POST to send, long-poll to receive. No listener,
-  no public URL, no WebSocket, no single-owner lease. (Kills #188/#386/#172.)
+  no public URL, no WebSocket, no single-owner lease. (The *poller* does need one explicitly
+  designated box — §5.2 — but that is a config assignment, not an inbound lease.) (Kills
+  #188/#386/#172.)
 - **R3 — no duplicated derivation of any path or slug.** One definition, in agent-infra, exercised
   by a test that crosses the boundary. (Kills #956.)
 - **R4 — every hop can report its own delivery, and one instrument must be able to see a lost
   answer.** Reuse `undelivered-answers.py`; a "✓ relayed" confirmation in the thread is part of the
   feature, not a nicety. (Kills the #1667 silent-receipt failure.)
 - **R5 — the transport must not depend on a laptop daemon.** The sender/poller runs in the heartbeat
-  tick (which is already single per machine+repo, agent-infra#1761), not in a per-session process.
+  tick, not in a per-session process. It must NOT assume the heartbeat is already single per
+  machine+repo: agent-infra#1761 is **OPEN** and measures the opposite ("one box runs `SCOPE=broad`"
+  is the target; "each cell runs exactly one controller copy (today: two)"), so a poller needs an
+  explicitly designated box (§5.2).
 
 ---
 
@@ -190,7 +196,7 @@ limited to what the vendor documents (not measured from this harness).
 | **Notion comments** | Native apps | `POST /v1/comments` on a page, block, **or existing discussion thread** (https://developers.notion.com/reference/create-a-comment) | Comment objects retrievable | Notion app notifications; **no way to aim a push at a person from the API** — the notification is page/subscription-shaped | **No date retrieved** (`developers.notion.com/changelog.md` → 404) | Free plan / paid per seat | None | Fails requirement 4 in practice: a question cannot be *pushed to* the owner; it waits on a page he must be watching |
 | **Linear comments** | Native apps, good push | GraphQL `commentCreate` + webhooks (https://linear.app/docs/api-and-webhooks) | GraphQL | App push, reliable | **No date retrieved** (changelog pages returned JS shells / 404) | Free tier; paid per seat | None | Duplicates the GitHub queue we already have — a question *is* already an issue. No gain, one more tracker |
 | **GitHub Discussions + GitHub Mobile** | GitHub Mobile — but its documented scope is "read, review, and collaborate on issues and pull requests" and push *"when someone mentions your username"* (https://docs.github.com/en/get-started/using-github/github-mobile) | GraphQL `addDiscussionComment` — confirmed present by schema introspection 2026-10-21 | GraphQL discussion comments (full read) | **Not a documented push target for discussion replies** | Continuous product (GitHub); the *client* signal is the weak part | $0 on public repos; our repos are private, so the plan tier must be checked before relying on Discussions at all | None | **Fails requirement 4** — this is the status quo's hole, re-implemented in a different tab |
-| **Slack** (baseline) | Native apps, excellent push | Web API (`chat.postMessage`), excellent; events need Socket Mode/HTTP endpoint | `conversations.replies`, excellent | Excellent | Mature vendor; **our** integration is the broken part (§1) | Free tier workable at this volume | None | **Not the platform's fault — ours**: 7,260 lines, 4 open defects, 0 delivered questions (§1). Adopting it again means hand-rolling the same bridge |
+| **Slack** (baseline) | Native apps, excellent push | Web API (`chat.postMessage`), excellent; events need Socket Mode/HTTP endpoint | `conversations.replies`, excellent | Excellent | Mature vendor; **our** integration is the broken part (§1) | Free tier workable at this volume | None | **Not the platform's fault — ours**: 7,260 lines, 3 open defects (+#40's live disabled-by-default state), 0 delivered questions (§1). Adopting it again means hand-rolling the same bridge |
 | **Agent-native chat UI** (e.g. Open WebUI, self-hosted) | Web UI wrapping the agent API; **no native Android client with real push** (PWA push) | Full control — it *is* the agent API | Full control | Weak: Android PWA push, not an app-store app | **Open WebUI v0.12.3, 2026-10-16** — https://github.com/open-webui/open-webui/releases/tag/v0.12.3 | $0 licence + a VPS | **High** — this is the "chat UI we build/maintain" the issue excludes | Fails the non-goals ("not a chat UI we build") and R5 (a server for us to run) |
 
 **Two rows deserve a note.** *Discord* and *Slack* are the technically strongest chat APIs in the
@@ -279,8 +285,10 @@ The gate's existing handshake is unchanged; the new sender is bolted on **downst
 
 1. A lane posts its question as one comment beginning with the declaration line
    (`RESEARCH: skill=… sources=… refs=…`) and runs `python3 scripts/ask-owner.py <repo> <n>`.
-2. The gate makes **one Jev call** (`JEV_MODEL = jev-1.13.0`), scoring five structural marks at 0.80
-   and two mechanical language marks at 0.55; on a pass it adds the `owner-decision` label and
+2. The gate makes **one Jev call** (`JEV_MODEL = jev-1.13.0`), scoring four structural marks
+   (`has_options`, `has_analysis`, `has_recommendation`, `contradiction_test`) at 0.80, `has_context`
+   at `THRESHOLD_LANGUAGE = 0.70`, and the two mechanical language marks (`jargon_free`,
+   `understandable`) at `THRESHOLD_JARGON = 0.55`; on a pass it adds the `owner-decision` label and
    prints the per-mark scores to stdout; on a bounce it posts the template **plus the exact counted
    occurrences**, adds `question-bounced` and **removes** `owner-decision`.
    Therefore: **the `owner-decision` label already *is* the JEV filter's verdict.** Raw (unfiltered)
@@ -319,8 +327,15 @@ The poller runs in the same heartbeat tick (`scripts/owner-notify.py poll`), one
 only:
 
 1. `getUpdates?offset=<stored>&timeout=0`. The offset is one integer in
-   `~/.pi/agent/telegram-offset`; the heartbeat is already single per machine+repo (agent-infra#1761),
-   so there is no second consumer to split updates with — and **no lease to fight over** (R2).
+   `~/.pi/agent/telegram-offset`, and it is **one destructive stream per bot token** (server-side,
+   shared by every box holding the token): two pollers do not duplicate updates, one of them absorbs
+   and silently drops them. So the poller **must not be left to "whoever's heartbeat runs"** —
+   agent-infra#1761 is OPEN ("each cell runs exactly one controller copy (today: two)", plus two
+   `SCOPE=broad` controllers on agent-infra), so exactly **one box is designated the poller**, set
+   explicitly in that box's heartbeat config and visible in a log line. That is a *local* single-
+   consumer assignment, not an inbound lease/election: no socket, no leader, no fence (#188/#386/#172
+   stay dead), and R2's "no lease" is about the transport — the one place a second consumer exists is
+   named here rather than assumed away.
 2. For each inbound item, resolve the issue:
    - `callback_query` → `data = ans:<repo>:<n>:<choice>` (we wrote that string);
    - `message` with `reply_to_message` → parse `<repo>#<n>` out of the quoted card text;
@@ -367,8 +382,9 @@ only:
 - **Do not touch `ask-owner.py`.** It is the calibrated gate; the surface is downstream of it.
 - **Do not port the Slack bridge, and do not write a state file the two sides share.** Rules R1/R3.
 - **Retire `extensions/slack-bridge/`** once the Telegram path has delivered its first ten answers
-  (follow-up issue, not this PR — this PR is docs-only). Its four open defects (#956/#958/#959, and
-  the disabled-by-default state in #40) stop being work the moment the path is not used.
+  (follow-up issue, not this PR — this PR is docs-only). Its three open defects (#956/#958/#959,
+  plus the still-live disabled-by-default state recorded on closed #40) stop being work the moment
+  the path is not used.
 
 ---
 
