@@ -2029,6 +2029,19 @@ STUB_DIFF_FAIL=1 run_check_carry 424911 "$CC_REPO"
 assert_eq "$CC_RC" "5" "11.13f2 a digest-less record answers nodigest even when the diff cannot be read"
 assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13f2 …not 'unreadable' (a RETRY loop that cannot converge)"
 
+# (f3) THE `nodigest` REMEDY MUST BE RUNNABLE IN THE STATE IT FIRES IN (review, #2353
+# round 4). It used to end `… $REPO`, which with REPO empty is an EMPTY SLOT: the advised
+# command is refused by the recorder's own carry arms (they must compute the diff, which
+# needs a repo), names "run the review" — the 20-40 minute path this mode exists to avoid
+# — and re-running --check-carry answers `nodigest` again. A remedy that cannot converge
+# is not a remedy; with no repo it must name what is missing instead.
+cc_rec 424917 "$CC_STALE" EMPTY
+run_check_carry 424917 ""
+assert_eq "$CC_RC" "5" "11.13f3 no repo + digest-less record → still 'nodigest' (exit 5), not a carry"
+assert_contains "$(cat "$T/cc-err")" "owner/repo" "11.13f3 …and the remedy NAMES the missing repo instead of printing an empty slot"
+assert_contains "$(cat "$T/cc-err")" "NO repo was resolved here" "11.13f3 …stating that the carry arms cannot verify identity without it"
+rm -f "$CC_FILE-424917.json"
+
 # (h) READ-ONLY means read-only: a record-minting flag is REFUSED, not ignored —
 #     otherwise a caller believes it recorded something it did not.
 CC_RC=0

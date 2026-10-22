@@ -1463,7 +1463,18 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # `carry`, so the swap weakens nothing.
   if ! cc_is_identity "$CC_DIFF"; then
     printf 'nodigest\t-\t%s\n' "${DIFF_HASH:--}"
-    echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity. Re-run the recorder at the current head and let its carry arms decide: record-review.sh $PR <current head> <same verdict> $REPO — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    # ⛔ THE REMEDY MUST BE RUNNABLE IN THE STATE THAT FIRES IT (review, #2353 round 4).
+    # Printing `… $REPO` with REPO empty promised a carry that CANNOT exist: the recorder's
+    # carry arms verify identity by computing the diff, which needs the repo, so the advised
+    # command refuses and names "→ Run the review" — the 20-40 minute path this mode exists
+    # to avoid — and re-running --check-carry answers `nodigest` again, so the advice cannot
+    # converge. With no repo the command is not merely incomplete, it is the wrong command,
+    # so say what is missing instead of printing an empty slot.
+    if [ -n "$REPO" ]; then
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity. Re-run the recorder at the current head and let its carry arms decide: record-review.sh $PR <current head> <same verdict> $REPO — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    else
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity — and NO repo was resolved here, so the recorder's carry arms cannot compute the identity that would let it. Pass it explicitly: record-review.sh $PR <current head> <same verdict> owner/repo — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    fi
     exit 5
   fi
   # ⛔ AN UNREADABLE DIFF IS NEVER A CARRY. Every non-ok status means the diff
