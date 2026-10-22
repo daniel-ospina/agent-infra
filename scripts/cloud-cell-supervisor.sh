@@ -1402,6 +1402,34 @@ cmd_check() {
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
+  # ── the RESOLVED LANE MODEL must exist on THIS box (agent-infra#2208) ───────────────────────
+  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` now default to
+  # `deepseek/deepseek-flash` (env-overridable), but a box's model list is its OWN:
+  # `pi-bootstrap/cell-install.sh` deliberately does not manage `models.json` ("the cell's
+  # identity"), so a drifted cell can still hand every lane an id its provider entry does not list.
+  # pi answers that with `Warning: Model "…" not found for provider … Using custom model id` — a
+  # lane that STARTS, spends tokens and degrades silently instead of refusing at dispatch. The
+  # failure is silent by construction, so a certification command is the only place that can name
+  # it; the id is named here, and an unreadable/absent entry is reported rather than guessed (the
+  # model list is the box's identity, and this script does not own it).
+  local lane_provider lane_model models_json lane_state
+  lane_provider="${PI_LANE_PROVIDER:-deepseek}"
+  lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  models_json="$CELL_HOME/.pi/agent/models.json"
+  if [ -f "$models_json" ] && command -v jq >/dev/null 2>&1; then
+    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
+        (.providers[$p].models) as $ms
+        | if $ms == null then "no-provider"
+          elif ($ms | type) == "array" then (if any($ms[]; .id == $m) then "ok" else "missing" end)
+          else (if ($ms | has($m)) then "ok" else "missing" end) end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
+    case "$lane_state" in
+      ok) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json)" ;;
+      missing) die "the lane model '$lane_provider/$lane_model' is NOT listed by providers.$lane_provider in $models_json — every lane this cell spawns would start on pi's 'Using custom model id' fallback and degrade silently (agent-infra#2208). Remedy: set PI_LANE_MODEL/PI_LANE_PROVIDER to an id that entry lists, or add '$lane_model' to that provider's models." ;;
+      *) say "      lane model: $lane_provider/$lane_model — NOT PROBED (no readable providers.$lane_provider entry in $models_json; the model list is the box's own)" ;;
+    esac
+  else
+    say "      lane model: $lane_provider/$lane_model — NOT PROBED (no readable $models_json on this box)"
+  fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test

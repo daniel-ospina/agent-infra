@@ -381,7 +381,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   fi
   AGENT_STARTED=1
   start="$(date +%s)"
-  pi -p --provider "${PI_LANE_PROVIDER:-deepseek}" --model "${PI_LANE_MODEL:-deepseek-flash}" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ THE RESOLVED MODEL IS NAMED IN THE LOG (agent-infra#2208, review). Before the override this was
+  # a literal — knowable from the tree — so a lane's log answered "which model ran?". An ambient
+  # `PI_LANE_MODEL`/`PI_LANE_PROVIDER` (shell, `keys.env` sourced with `set -a`, the tmux server) now
+  # changes it for every lane with no log line, no ledger field and no `walltime.tsv` column; the
+  # provider half also moves the cost tier (flash vs pro) and which credential the lane needs
+  # (#1852). Resolve ONCE into locals so the log and the argv cannot disagree.
+  local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
+  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
