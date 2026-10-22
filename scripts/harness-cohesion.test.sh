@@ -17,6 +17,14 @@
 #         dir the RUNNING controller executes that main does not carry, and — fail-closed — an
 #         unreadable one is BROKEN (exit 2), never OK. Plus: no candidate dir at all is exit 2.
 set -u
+# ⛔ HERMETIC INCLUDES THE SHELL THE SUITE RUNS IN. A cell's shell exports `REPO` (its TARGET checkout,
+# from keys.env) and `harness-refresh.sh:223` tells operators to "set HARNESS_REPO". `harness-up` reads
+# an ambient `REPO` as the TARGET and probes THAT repo's `refs/claims/*`, so an inherited value from a
+# shell whose target origin is unreadable (offline, unauthenticated) stops the walk before `loop` and
+# reddens this shard on a CORRECT tree — measured on this head: `REPO=<target with unreadable origin>`
+# → 2 failures (`:517`, `:586`), while the same shard on origin/main's launcher stayed green. Every arm
+# here passes `--repo` explicitly; the arms that need a TARGET name it on their own line.
+unset REPO HARNESS_REPO
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every
@@ -598,20 +606,25 @@ ck "nothing was started when the drift check could not verify" "$([ ! -s "$F6/fi
 # `--no-fetch` comparison cannot-verify rather than fresh.
 F9="$(mkfix f9)"; CELL9="$TMP/cell9"
 OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
-        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" REPO="$REPO_FIX" \
         bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
-case "$OUT" in
-  *"claims"*"OK ("*) ck "claims row: with NO record it PROBES and answers (not BROKEN)" 0 ;;
-  *) ck "claims row: with NO record it PROBES and answers (not BROKEN) [$(printf '%s' "$OUT" | grep -i '^claims' | tr '\n' ' ')]" 1 ;;
+# ⛔ THE ASSERTION IS ANCHORED TO THE CLAIMS ROW. `*"claims"*"OK ("*` matches anywhere in the output, so
+# the capacity row's `OK (lanes=…)` kept it green while the claims row itself read `UNKNOWN` — a masked
+# false green (measured in review). The row is extracted first and matched alone.
+claims_row9="$(printf '%s\n' "$OUT" | grep -E '^claims[[:space:]]' | head -1)"
+case "$claims_row9" in
+  *"OK ("*) ck "claims row: with NO record it PROBES and answers (not BROKEN)" 0 ;;
+  *) ck "claims row: with NO record it PROBES and answers (not BROKEN) [$claims_row9]" 1 ;;
 esac
 # an AGED record is LATE, not OK: a stale "reachable" speaks about a probe nobody repeated
 mkdir -p "$CELL9/orchestrator/state"; printf 'claims=reachable at=1\n' > "$CELL9/orchestrator/state/harness-claims"
 # the AGE is the file's mtime (that is what the row measures), so backdate it portably
 touch -t 202001010000 "$CELL9/orchestrator/state/harness-claims" 2>/dev/null
 OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
-        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HARNESS_UP_CLAIMS_STALE=1 \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HARNESS_UP_CLAIMS_STALE=1 REPO="$REPO_FIX" \
         bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
-case "$OUT" in *"claims"*"LATE"*) ck "claims row: an AGED record is LATE, never OK" 0 ;; *) ck "claims row: an AGED record is LATE, never OK [$(printf '%s' "$OUT" | grep -i '^claims' | tr '\n' ' ')]" 1 ;; esac
+claims_row9b="$(printf '%s\n' "$OUT" | grep -E '^claims[[:space:]]' | head -1)"
+case "$claims_row9b" in *LATE*) ck "claims row: an AGED record is LATE, never OK" 0 ;; *) ck "claims row: an AGED record is LATE, never OK [$claims_row9b]" 1 ;; esac
 # the refresh RECORD shape: canonical keys, and `fetch=` present (a `--no-fetch` run must not read fresh)
 rm -f "$CELL9/orchestrator/state/harness-refresh"
 OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
