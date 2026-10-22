@@ -309,10 +309,11 @@ done
 # ⛔ A PRESENT-BUT-STALE COPY IS THE SAME DEFECT AS AN ABSENT ONE: if the module does not define the
 # verbs this controller actually calls, a spawn silently becomes "no session", the census reports an
 # empty box and the loop prints a healthy idle controller. So the guard covers EVERY verb used below —
-# not just the three that look load-bearing (`wt_launcher` feeds the startup line and `wt_table` feeds
-# the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
-for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
+# not just the three that look load-bearing (`wt_startup_banner` feeds the startup line and
+# `wt_table` feeds the reap, and a module missing either would leave the controller logging
+# `launcher=` with no reason and 0 workers).
+for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_launcher_why wt_startup_banner wt_table; do
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_launcher_why/wt_startup_banner/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
 # ⛔ DEFINING THE VERBS IS NOT HAVING INITIALISED THE MODULE (#2248). The verbs above are FUNCTIONS;
 # the two embedded Python programs are VARIABLES assigned by a command substitution at source time,
@@ -329,9 +330,12 @@ done
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
 # workers cd to their own repo/worktree themselves, so this only has to be a sane, existing place.
 SPAWN_CWD="$(pwd)"
-# Say which launcher this surface got, ONCE, at startup. A cell that quietly landed on `none` would
-# otherwise look like a controller with nothing to do — the exact false green this change removes.
-echo "[startup] worker launcher=$(wt_launcher) (cmux=$(command -v cmux >/dev/null 2>&1 && echo yes || echo no), uname=$(uname -s 2>/dev/null))" >> "$LOG"
+# Say which launcher this surface got, ONCE, at startup — and WHY when it got none
+# (agent-infra#2366). The line is built by `wt_startup_banner` in worker-terminal.sh, beside the verb
+# whose verdict it reports, so the shipped text is the text a test drives; a cell that quietly landed
+# on `none` would otherwise look like a controller with nothing to do — the exact false green this
+# line exists to remove — and `launcher=none` alone names a verdict with no cause.
+wt_startup_banner >> "$LOG"
 touch "$O/dispatched.txt" "$O/candidates.txt" "$O/checked.txt"
 chmod +x "$O"/*.sh 2>/dev/null
 

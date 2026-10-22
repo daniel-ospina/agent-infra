@@ -524,6 +524,58 @@ wt_launcher_env() {
   return 0
 }
 
+# WHY the launcher is not `terminal` — the PROBE'S OWN ANSWER, for the startup line and the refusal.
+# ⛔ THE ANSWER USED TO BE THROWN AWAY, AND THAT IS THE DEFECT THIS FUNCTION REMOVES. `cmux tree
+# --json >/dev/null 2>&1` keeps the DECISION and discards the REASON, so a box reports
+# `launcher=none (cmux=yes, uname=Linux)` — true, actionable in no way, and indistinguishable from a
+# tty gate, a TERM/TERM_PROGRAM gate, a `cmux tree` whose output SHAPE drifted, or a daemon that is
+# simply not there. Measured 2026-10-22 on cell-1 (agent-infra#2366): the answer the probe already
+# held was `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the box had no
+# daemon at all — and the binary that message names is the guest CLI's own CLIENT, which
+# /usr/local/libexec/cmux-cloud-adapter:762-772 requires as `[ -x "$CMUX_TUI_BIN" ]` for every verb
+# but identity and help. One log line would have said so; `none` alone left it to be re-derived.
+# An instrument that holds the datum and does not read it is a category-A defect, so the reason now
+# travels with the verdict.
+# ONE probe, not two: the daemon's stderr is captured on the same call whose exit status decides
+# whether there is a reason to print, so a hung `cmux` costs one timeout and not two.
+wt_launcher_why() {
+  if ! command -v cmux >/dev/null 2>&1; then
+    printf 'cmux is not on PATH'
+    return 0
+  fi
+  # STDERR ONLY. `2>&1` duplicates fd2 onto the substitution's pipe BEFORE `>/dev/null` moves fd1, so
+  # the daemon's own complaint is kept and a multi-kilobyte workspace tree is not.
+  local err rc flat
+  err="$(cmux tree --json 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    # Reachable only when the LAUNCHER's own probe failed and this one did not — a probe flipped
+    # between two reads. Saying anything else here would name a mechanism the code does not have.
+    printf 'cmux tree --json answered on re-probe (it failed on the launcher read): a probe flip'
+    return 0
+  fi
+  # The sibling idiom for a captured message (see wt_spawn's own refusals): flatten, then bound.
+  flat="$(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
+  printf 'cmux tree --json failed (rc=%s): %s' "$rc" "${flat:-no stderr, exit status only}"
+}
+
+# THE controller's one startup line — which launcher this surface got, and WHY when it got none.
+# It lives here, beside the verb whose verdict it reports, so that a test can drive the REAL line
+# instead of a copy of it (the copy this fix first shipped was vacuous: it matched the reason on the
+# `REFUSED` line further down the same capture, so it passed with the startup half deleted).
+# The suffix is appended ONLY for `none` — the refused state. A healthy launchd Mac reports `tmux`,
+# which is DELIBERATE and not a degrade (see the table above), and stamping `failed:` on a designed
+# state is how `failed` stops meaning anything.
+wt_startup_banner() {
+  local la
+  la="$(wt_launcher)"
+  printf '[startup] worker launcher=%s (cmux=%s, uname=%s)' "$la" \
+    "$(command -v cmux >/dev/null 2>&1 && echo yes || echo no)" "$(uname -s 2>/dev/null)"
+  case "$la" in none) printf ' — %s' "$(wt_launcher_why)" ;; esac
+  printf '\n'
+  return 0
+}
+
 # `surface` (the named primitive) vs `layout` (the guest CLI's equivalent). Probed ONCE, because a
 # CLI that answers `surface ls` is a different build, not a transient state.
 wt_grammar() {
@@ -969,7 +1021,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # command substitution, so it cannot hand a variable back).
       _cmrc=127
       if command -v cmux >/dev/null 2>&1; then _cmrc=0; cmux tree --json >/dev/null 2>&1 || _cmrc=$?; fi
-      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
+      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent)) — why: $(wt_launcher_why)"
       return 1 ;;
     tmux)
       # The launchd Mac surface and the Linux cell (see wt_launcher) — WITH the environment contract.
