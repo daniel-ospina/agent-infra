@@ -6790,6 +6790,52 @@ test("#1382-c10 (3) the naming exemption must not over-refuse: `ls *.md` after w
   }
 });
 
+test("#1382-c11 (1) P0: the naming exemption is not a proof when the NAME is shadowed or wraps a substitution", () => {
+  // Cycle 11, measured ALLOWED before the fix. HEREDOC_FILE_NAMING_ONLY claims a PROGRAM cannot run a
+  // file it names; a function/alias/assignment of that name replaces the program, and a command
+  // substitution makes the ARGUMENT something else's output. Both then run the body while it is
+  // masked. The naming test now runs the SAME `heredocReaderIsShadowed` the opener's reader gets, and
+  // any `$(`, backtick or process substitution in the segment is not naming.
+  const M = "gh pr merge 999 --admin";
+  const body = `\n${M}\nEOF\n`;
+  const w = (t: string) => `cat > ${t} <<'EOF'${body}`;
+  for (const [label, cmd] of [
+    ["shadowed ls", `ls() { bash "$@"; }\n${w("x.sh")}ls x.sh`],
+    ["shadowed echo", `echo() { bash "$@"; }\n${w("x.sh")}echo x.sh`],
+    ["shadowed stat", `stat() { bash "$@"; }\n${w("x.sh")}stat x.sh`],
+    ["shadowed du", `du() { bash "$@"; }\n${w("x.sh")}du x.sh`],
+    ["alias shadowed", `alias ls=bash\n${w("x.sh")}ls x.sh`],
+    ["substitution argument", `${w("x.sh")}ls "$(bash x.sh)"`],
+    ["backtick argument", `${w("x.sh")}echo "\`bash x.sh\`"`],
+  ] as Array<[string, string]>) {
+    ok(countMergeVerbs(maskHeredocData(cmd)) > 0, `a shadowed/wrapped naming word must not unmask the body: ${label}`);
+  }
+});
+
+test("#1382-c11 (2) P1: an invalid glob class must not throw out of the gate", () => {
+  // Measured: a run spelling `f.sh[z-a]` after writing `f.sh` threw "Range out of order in character
+  // class" from `maskHeredocData` inside the `tool_call` handler. It fails CLOSED today (pi blocks a
+  // tool call whose handler throws), but an unhandled exception on ordinary input is one try/catch
+  // away from a fail-open — so an uncompilable glob is treated as MATCHING and the body stays readable.
+  const M = "gh pr merge 999 --admin";
+  // ⛔ THE GLOB MUST NOT BE LITERALLY IN THE TARGET (#1382 VGATE, self-inflicted): the first version
+  // wrote `bash f.sh[z-a]` for a target of `f.sh`, and `heredocNamesTarget`'s raw-substring arm matches
+  // `f.sh` inside it, so the `&&` short-circuits and `globToRegExp` is NEVER CALLED — the test passed
+  // against the pre-fix code and pinned nothing. The word must be one the substring arm cannot see.
+  const cmd = `cat > f.sh <<'EOF'\n${M}\nEOF\nbash f[z-a]`;
+  ok(countMergeVerbs(maskHeredocData(cmd)) > 0, "an uncompilable glob keeps the body readable, and does not throw");
+});
+
+test("#1382-c11 (3) the write-then-CLEAN-UP sequence must stay masked (the glob arm's other side)", () => {
+  // The basename match made `rm *.md` after `cat >> notes.md` a "written then executed" refusal — the
+  // reported prose false positive returning from the over-block side. rm/mv/cp/find can only NAME a file.
+  const M = "gh pr merge 999 --admin";
+  for (const after of [`rm *.md`, `mv *.md /tmp/`, `find . -name '*.md'`, `cp notes.md /tmp/`, `chmod 600 notes.md`, `touch notes.md`]) {
+    equal(countMergeVerbs(maskHeredocData(`cat >> notes.md <<'EOF'\n${M}\nEOF\n${after}`)), 0,
+      `a filesystem mover must not unmask the body: ${after}`);
+  }
+});
+
 test("#1382-c9 (2) P0: every SPELLING of the written path a runner can reach keeps the body readable", () => {
   // MEASURED FAIL-OPEN #2, same review. The execution test compared the redirect target to the
   // later word as a RAW SUBSTRING, so every spelling that reaches the same file was missed: a `./`

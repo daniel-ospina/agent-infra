@@ -667,6 +667,12 @@ const HEREDOC_STDIN_DATA_CONSUMERS = new Set([
 const HEREDOC_FILE_NAMING_ONLY = new Set([
   ...HEREDOC_STDIN_DATA_CONSUMERS,
   "ls", "stat", "du", "readlink", "realpath", "dirname", "basename", "echo", "printf", "test", "[",
+  // Filesystem MOVERS: they name a file, they never run its contents. Without these, the glob arm's
+  // basename match made the ordinary write-then-clean-up sequence (`cat >> notes.md <<'EOF'` …
+  // `rm *.md`) a "written then executed" refusal — the reported prose false positive returning from
+  // the other side (#1382 cycle 11 review, P2). `chmod` is here too: it cannot run a file, and the
+  // `chmod +x f; ./f` shape is caught by the SECOND segment's command word.
+  "rm", "mv", "cp", "find", "touch", "mkdir", "chmod", "ln",
 ]);
 
 /**
@@ -751,7 +757,7 @@ const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
  * `grep X`), which is rare; the ordinary `cat >> CHANGELOG.md` … `git add CHANGELOG.md` sequence
  * stays masked, which is the case that would otherwise bring the reported false positive back.
  */
-function heredocLineExecutes(line: string, target: string): boolean {
+function heredocLineExecutes(line: string, target: string, scope = line): boolean {
   // ⛔ A PROCESS SUBSTITUTION RUNS A PROGRAM WITH THE TARGET AS ITS STDIN (#1382 cycle 10 review, P0 —
   // measured: `cat /tmp/x.sh > >(bash)` executes the file and contains NO `|` at all, so the pipe arm
   // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
@@ -775,7 +781,7 @@ function heredocLineExecutes(line: string, target: string): boolean {
   for (const segment of line.split(/[;|&]+/)) {
     if (!heredocNamesTarget(segment, target) && !heredocGlobMentions(segment, target)) continue;
     if (pipedIntoProgram) return true;
-    if (!heredocSegmentIsNaming(segment)) return true;
+    if (!heredocSegmentIsNaming(segment, scope)) return true;
   }
   return false;
 }
@@ -929,13 +935,28 @@ function heredocGlobMentions(line: string, target: string): boolean {
     const w = canon(rawWord);
     if (!w || !/[?*[]/.test(w)) continue;
     const re = globToRegExp(w);
-    if (re.test(norm) || (base && re.test(base))) return true;
+    // ⛔ A GLOB THAT IS NOT A VALID REGEX MUST NOT THROW OUT OF THE GATE (#1382 cycle 11 review, P1 —
+    // measured: `bash f[z-a]` after writing `f.sh` threw `Range out of order in character class`
+    // from `maskHeredocData` inside the `tool_call` handler). It fails CLOSED today because pi blocks
+    // a tool call whose handler throws — but an unhandled exception on ordinary input is one
+    // `try/catch` away from being a fail-open, so an uncompilable glob is treated as MATCHING (the
+    // body stays readable) instead.
+    // `null` means the glob could not be compiled — treat it as MATCHING (the body stays readable).
+    let matched = re === null;
+    if (re !== null) {
+      try {
+        matched = re.test(norm) || (base ? re.test(base) : false);
+      } catch {
+        matched = true;
+      }
+    }
+    if (matched) return true;
   }
   return false;
 }
 
 /** `*`/`?`/`[...]` as a shell glob, anchored. Everything else is literal. */
-function globToRegExp(glob: string): RegExp {
+function globToRegExp(glob: string): RegExp | null {
   let re = "^";
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
@@ -950,7 +971,13 @@ function globToRegExp(glob: string): RegExp {
       }
     } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
-  return new RegExp(re + "$");
+  // An invalid character class (`[z-a]`) is a shell glob bash LEAVES LITERAL but a regex compiler
+  // REJECTS. Returning null (rather than throwing) keeps the gate's decision in the gate.
+  try {
+    return new RegExp(re + "$");
+  } catch {
+    return null;
+  }
 }
 
 /** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
@@ -976,9 +1003,21 @@ function globToRegExp(glob: string): RegExp {
  * (See the declared residual in the #1382 issue comment; the argv layer (#984) is the layer that
  * sees the real invocation.)
  */
-function heredocSegmentIsNaming(segment: string): boolean {
+function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
+  // ⛔ A NAMING WORD THAT WRAPS A COMMAND SUBSTITUTION PROVES NOTHING (#1382 cycle 11 review, P0 —
+  // measured ALLOWED: `ls "$(bash x.sh)"` and `echo "$(bash x.sh)"` masked a body they then ran).
+  // The substitution's OUTPUT is the argument, so the reader is not reading the file — something else
+  // is running it. Any `$(`, backtick or process substitution in the segment returns "not naming".
+  if (/\$\(|`|[<>]\(/.test(segment)) return false;
   const words = segment.trim().split(/\s+/);
   const commandWord = (words[0] ?? "").replace(/["'\\]/g, "");
+  // ⛔ SHADOWED IS NOT NAMING (#1382 cycle 11 review, P0 — measured ALLOWED: `ls() { bash "$@"; }`
+  // then `ls x.sh` masked a body the function then RAN, and the same for `echo()`/`stat()`/`du()`).
+  // The naming set is a claim about a PROGRAM; a function, alias or assignment of that name in the
+  // command replaces the program. `heredocReaderIsShadowed` is the same test the OPENER's reader gets
+  // — applying it here is what makes the two halves of the proof agree. The scope is the whole
+  // command (over-conservative on ordering), which keeps a body readable, the allowed direction.
+  if (heredocReaderIsShadowed(scope, commandWord)) return false;
   if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
   if (commandWord !== "git") return false;
   // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
@@ -1282,7 +1321,10 @@ export function maskHeredocData(command: string): string {
       // while bash ran it (#1382 cycle 10 review, P0 — measured ALLOWED).
       .replace(/\|[ \t]*\r?\n/g, "| ")
       .split("\n");
-    if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t)))) continue;
+    // The scope passed to the naming test is the WHOLE command (a function/alias/assignment may be
+    // defined on any line), so a shadowed reader keeps the body readable from any direction.
+    const scope = lines.join("\n");
+    if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t, scope)))) continue;
     // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or
     // hold the written path in a variable.
     if (heredocPrefixIsUnprovable(lines.slice(0, i).join("\n"), targets)) continue;
