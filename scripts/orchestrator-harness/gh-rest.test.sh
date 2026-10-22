@@ -76,8 +76,20 @@ STUB
 chmod +x "$TMP/stub-gh"
 # GH_LIMIT_DIR keeps the LIMIT LAYER (#1988) hermetic too: without it the adapter's helper would
 # write its lock, ETag cache and limit record into the operator's real ~/.cache/gh-limit.
-run() { STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" GH_LIMIT_DIR="$TMP/limit" \
-        GH_LIMIT_CONDITIONAL=0 bash "$SHIM" "$@"; }
+# ⛔ AND EACH CASE STARTS WITH A CLEAN BUDGET. This suite shares ONE state dir across ~50 cases and
+# every case sets its own stub behaviour, so a budget/health/limit record left by an earlier case is
+# state about a DIFFERENT box — and the failover now ACTS on that state (it distrusts the core pool and
+# diverts or refuses reads), which made the adapter's “a refused read keeps the layer's words” cases
+# fail on a message from the wrong case. Clearing the three pressure files per case is this suite's own
+# hermeticity rule, not a disabled feature: a real box has ONE consistent budget, and the fabricated
+# refusals this suite feeds the adapter are not observations about it.
+# ⛔ AND GH_LIMIT_READ_CACHE=0 IS PART OF THAT HERMETICISM. The stub answers from ENV (STUB_SHA_FAIL),
+# so two cases issue BYTE-IDENTICAL argv and expect DIFFERENT answers — the cache (correctly) keys on
+# the request, so it replayed an earlier case's SUCCESS where this suite asserts a REFUSAL (measured by
+# review round 2: red 7 of 10 runs). A real `gh` never varies a response by our env.
+run() { rm -f "$TMP/limit/budget.json" "$TMP/limit/health" "$TMP/limit/last-limit"
+        STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" GH_LIMIT_DIR="$TMP/limit" \
+        GH_LIMIT_CONDITIONAL=0 GH_LIMIT_READ_CACHE=0 bash "$SHIM" "$@"; }
 stublog() { cat "$TMP/log" 2>/dev/null; }
 json_eq() { python3 -c "import json,sys; d=json.load(sys.stdin); print(0 if $1 else 1)" 2>/dev/null || echo 1; }
 # ⛔ No `producer | grep -q`: a quiet grep writes nothing into the pipe, so the PIPE (not the content)

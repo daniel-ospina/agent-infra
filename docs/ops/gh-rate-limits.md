@@ -362,26 +362,45 @@ the layer refuses to intercept can never be failed over either.
 
 | REST read (core) | Served from GraphQL | Notes |
 |---|---|---|
-| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, **body**, head.sha, head.ref, base.sha, base.ref, changed_files, additions, deletions, comments (count), merge_commit_sha, created_at/updated_at/closed_at/merged_at, user, html_url |
+| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, **body**, head.sha, head.ref, base.sha, base.ref, changed_files, additions, deletions, comments (count), created_at/updated_at/closed_at/merged_at, user, html_url |
 | `repos/{o}/{r}/pulls/{n}/reviews` | ✅ | id, state, body, submitted_at, commit_id, user |
 | `repos/{o}/{r}/issues/{n}/comments` | ✅ | id, body, created_at, html_url, user |
+| `repos/{o}/{r}/branches/{b}/protection[/…]` | ❌ **no equivalent** | GraphQL has no branch-protection query. Refused with the named state. |
+| `repos/{o}/{r}/commits/{sha}/check-runs`, `/status` | ❌ **deliberately absent** | `statusCheckRollup` mixes `CheckRun` and `StatusContext` nodes; a StatusContext has no `check_run` representation, so a synthesized list would silently drop legacy statuses — a red surface that reads green. Fail closed. |
+| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. (`gh api` mutations are refused by name when `core` is empty; `gh pr merge` is GraphQL-bucketed by `bucket_for`, so it is not gated by the core rule at all — a pre-existing heuristic, stated here rather than implied.) |
+
+⛔ **`merge_commit_sha` IS THE FIELD THAT MUST NOT BE REPRODUCED.** For an **unmerged** PR, REST
+`merge_commit_sha` is the *tentative* test-merge commit and GraphQL's `mergeCommit` is **null** — the
+merge rail's own header says so, and that is precisely why `admin-merge.sh` reads the REST object
+instead of `gh pr view --json mergeCommit`. Serving that name from the GraphQL field made the merge ref
+read `absent` for every open PR, and the rail then BLOCKS with *"no CI run has evaluated the merge of
+this PR into its base"* — a fabricated CI diagnosis, for the whole empty-core window, on the very
+merges the failover exists to keep alive. There is no faithful source, so the projection is refused
+(tests `(g2)`), and the rail's read fails closed on the NAMED state instead of blaming CI.
 
 ⛔ **A `--jq` THAT NAMES A FIELD THE ENCODER DOES NOT PRODUCE IS NOT FAILED OVER.** `jq` prints `null`
 for an absent field **and exits 0**, so a partly-reproduced body is not a near miss — it is an empty
 answer with a success status. Measured in review of this change: `--jq .body` returned `null`/rc 0, and
 `record-review.sh` reads `.body` precisely to tell "the GET failed" from "the body is empty" before it
 PATCHes a PR description. `_projection_ok()` therefore admits a projection only when every name it
-references is reproducible; otherwise the read is **not** failed over, and with the pool empty it is
-refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
+references is reproducible — **dotted, bracketed (`.["body"]`), and with no recursive descent (`..`) or
+shape operator (`keys`, `to_entries`, `getpath`, `paths`, `map_values`, `tojson`)** whose output cannot
+be shown to stay inside the body. Otherwise the read is **not** failed over, and with the pool empty it
+is refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
 confident wrong answer.
-| `repos/{o}/{r}/branches/{b}/protection[/…]` | ❌ **no equivalent** | GraphQL has no branch-protection query. Refused with the named state. |
-| `repos/{o}/{r}/commits/{sha}/check-runs`, `/status` | ❌ **deliberately absent** | `statusCheckRollup` mixes `CheckRun` and `StatusContext` nodes; a StatusContext has no `check_run` representation, so a synthesized list would silently drop legacy statuses — a red surface that reads green. Fail closed. |
-| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. (`gh api` mutations are refused by name when `core` is empty; `gh pr merge` is GraphQL-bucketed by `bucket_for`, so it is not gated by the core rule at all — a pre-existing heuristic, stated here rather than implied.) |
 
 **The low-water band is not exhaustion.** `CORE_LOW_WATER` (default 100) moves *reads* to GraphQL so
 the tail of the pool is preserved for **writes** — writes are refused ONLY at `remaining == 0`, and no
-`gh-core-exhausted` record is written while the pool still has headroom. A band that refused writes
-would preserve a reserve no caller could spend, and would assert "EMPTY" about a pool that is not.
+`gh-core-exhausted` record is written while the pool still has headroom (including on the
+failover-FAILURE path, where the honest name is `gh-graphql-unavailable`, not an empty core pool). A
+band that refused writes would preserve a reserve no caller could spend, and would assert "EMPTY"
+about a pool that is not.
+
+**A refusal we could not DATE is still evidence, for a bounded window.** A core call refused without a
+reset (no `--include` framing, and every `GH_LIMIT_NO_WAIT` caller skips the probe) is recorded as
+`gh-core-exhausted resets_in=?`, and it is honoured for `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s) from
+its own `at=`. Deriving "healthy" from `reset == 0` made `--health` say `gh-ok` while the pool was
+spent and nothing failed over (test `(h2)`).
 
 ⛔ **A GAIN, NOT A LAUNDER.** Servings are recorded in `events.log` as
 `failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving \`gh api …\` from the GraphQL pool`.
@@ -452,8 +471,16 @@ recovery for `graphql`, and only a real `core` success clears `gh-core-exhausted
   request, not the refusal. Pacing (`gh-shim`, the box lock) is the answer to that one.
 - **Reads are conserved, not free.** A failover read still spends GraphQL quota; if BOTH pools are
   empty the named state is all that is left, and it fails closed (test `(b)`).
-- **`check-runs` and branch protection still cannot be read from an empty core.** They fail closed with
-  the name; they do not degrade.
+- **`check-runs`, branch protection and `merge_commit_sha` still cannot be read from an empty core.**
+  They fail closed with the name; they do not degrade.
+- **A FRESH meter outranks a durable record.** If `/rate_limit` reports headroom while calls are being
+  refused — the measured "lying meter" of #1988 (`4999/5000` beside every GraphQL call refused) — then
+  `core_pressure()` trusts the fresh snapshot and does NOT fail over for up to `GH_LIMIT_BUDGET_TTL`.
+  The record is deliberately subordinate to a newer measurement; the cost of being wrong is a window of
+  refused reads, not a wrong answer.
+- **A degraded state dir splits the two readers.** `repo-authority.sh` reads only the primary state
+  dir, while `gh-limit.py` falls back to `$TMPDIR/gh-limit-<uid>`; in that state both say nothing rather
+  than disagree, and the `--health` verb is the one that still answers.
 
 ### Where the budget actually goes (measured, not estimated)
 
