@@ -82,6 +82,10 @@
 # never reached and the controller dispatched MORE onto the box. A tree whose descriptors cannot be
 # read MAY be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors WERE read and
 # hold no fleet log is simply not a lane (`0/0` is then a real answer).
+# ⛔ A THIRD CASE ABSTAINS TOO (#2163 review r7, P3): the reads SUCCEEDED but the platform prints no
+# per-pipe name (`pipe`, `->0x0`), so a `tee` beside the tree cannot be shown to be its own writer.
+# The tree is counted in `unidentifiable=` and the census abstains — the cause is named in
+# $LANE_REAP_LOG, never as a failed read.
 #
 # WHAT THIS DOES NOT COVER (stated, not silently trusted):
 #   * the owner's own interactive `pi` INSIDE cmux with stdout redirected to a lane-shaped log —
@@ -1242,7 +1246,8 @@ usage() {
   cat <<'EOF'
 lane-reap.sh — count fleet lanes by evidence, and reap the ones that provably finished (#2163).
 
-  lane-reap.sh count                 print `lanes=<live>/<total> zombie=<n>` (exit 3 = unreadable)
+  lane-reap.sh count                 print `lanes=<live>/<total> zombie=<n>` (exit 3 = cannot-verify: unreadable, ambiguous, or an
+                                              unidentifiable pipe identity — see the header)
   lane-reap.sh reap [--dry-run]      report what WOULD be reaped (the default)
   lane-reap.sh reap --apply          signal the lanes that pass all three gates
   lane-reap.sh reap --json           one machine-readable summary line
