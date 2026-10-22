@@ -271,8 +271,54 @@ ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an EXPLICIT HARNESS installs (rc=$r
 ck "$([ "$(head -1 "$SHOME3Q/.harness-path" 2>/dev/null)" = "$FX3H" ] && echo 0 || echo 1)" \
    "…and records exactly the tree the operator named"
 ck "$(has "$out" "MAIN WORKTREE" && echo 0 || echo 1)" "…and DISCLOSES that the pin names a mutable main worktree"
-ck "$(has "$out" "Re-run this installer with no explicit HARNESS" && echo 0 || echo 1)" \
-   "…with a remedy that actually materialises the per-commit tree"
+ck "$(has "$out" "rm -f" && has "$out" ".harness-path" && echo 0 || echo 1)" \
+   "…with the STEP that clears it (remove the dir record), not a re-run that re-reads it"
+# ⛔ AND THE REMEDY MUST WORK (review M2): run 1 recorded the checkout, so a bare re-run re-reads that
+# record; the printed step is what reaches the materialise path. Verified by EXECUTING it.
+out2="$(env HOME="$SHOME3Q" O="$T/o-a3b" REPO="$FX3" OR="acme/widget" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc2=$?
+ck "$([ "$rc2" -eq 0 ] && [ "$(head -1 "$SHOME3Q/.harness-path" 2>/dev/null)" = "$FX3H" ] && echo 0 || echo 1)" \
+   "…and a BARE re-run records the same checkout (which is why the step is named, not just 're-run')"
+# (The printed step's EFFECT — a bare re-run after the record is removed reaching the materialise path —
+# is what arm A3 already asserts end to end on a clean HOME; re-driving it here as well would only re-test
+# A3 through a box whose records A3b has already touched.)
+
+# A4 — K4's mend: a sha record with NO dir record that the materialiser SUPERSEDES must be MENDED, not
+# refused DISAGREE (the false block this change removes). Deleting only the dir record is the ordinary
+# state install.sh itself describes (harness-refresh writes sha then dir; an interrupted first install).
+SHOME4P="$T/home-a4"; mkdir -p "$SHOME4P/Library/LaunchAgents" "$SHOME4P/.pi/agent/state"
+_prog4() { env HOME="$SHOME4P" O="$T/o-a4" REPO="$FX3" OR="acme/widget" HARNESS_REPO="$FX3" \
+             ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+             PATH="$SHOME4P/.local/share/pi-node/current/bin:$BIN:$PATH" bash "$STAGE/install.sh" 2>&1; }
+out="$(_prog4)"; rc=$?
+S4_OLD="$(head -1 "$SHOME4P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)"
+ck "$([ "$rc" -eq 0 ] && [ -n "$S4_OLD" ] && echo 0 || echo 1)" "A4 setup: the first pin records a sha ($S4_OLD)"
+# Advance the ref by one commit, then drop ONLY the dir record.
+( cd "$FX3" || exit 1
+  printf 'advance\n' >> scripts/orchestrator-harness/claims.sh
+  git -c user.email=t@t -c user.name=t commit -qam advance >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main HEAD ) >/dev/null 2>&1
+S4_NEW="$(git -C "$FX3" rev-parse HEAD 2>/dev/null)"
+rm -f "$SHOME4P/.harness-path"
+out="$(_prog4)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "A4: a superseded sha + no dir record INSTALLS (rc=$rc, was a post-materialise DISAGREE; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+ck "$([ "$(head -1 "$SHOME4P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$S4_NEW" ] && echo 0 || echo 1)" \
+   "…and the sha record was MENDED to the commit the materialiser pinned"
+ck "$(has "$out" "MENDED after the materialise" && echo 0 || echo 1)" "…and the mend is SAID, not silent"
+
+# A4b — the P3 relaxation at the LAUNCHER (review M4): a dir record that names a worktree at the pinned
+# commit OUTSIDE the pin root is OK; the same tree with a sha record naming another commit is MISMATCH.
+SHOME4Q="$T/home-a4b"; mkdir -p "$SHOME4Q/Library/LaunchAgents" "$SHOME4Q/.pi/agent/state"
+printf '%s\n' "$S4_NEW" > "$SHOME4Q/.pi/agent/state/HARNESS-PIN"
+_hs4() { CELL_HOME="$SHOME4Q" HOME="$SHOME4Q" O="$T/o-a4b" REPO="$FX3" HARNESS_PIN_DIR="$SHOME4Q/harness" \
+           HARNESS_PIN_FILE="$T/a4-path" HARNESS="$1" bash "$REPO_ROOT/scripts/harness-up" status 2>&1; }
+printf '%s\n' "$FX3H" > "$T/a4-path"
+ck "$(has "$(_hs4 "$FX3H")" "pin: OK" && echo 0 || echo 1)" "a worktree at the pinned commit OUTSIDE the pin root reads pin: OK"
+printf '%s\n' "$S4_OLD" > "$SHOME4Q/.pi/agent/state/HARNESS-PIN"
+mkdir -p "$SHOME4Q/harness"
+ck "$(has "$(_hs4 "$FX3H")" "NOT MATERIALISED" && echo 0 || echo 1)" "…and the same tree with a sha record naming another commit is NOT MATERIALISED (a refusal, not OK)"
+printf '%s\n' "$S4_NEW" > "$SHOME4Q/.pi/agent/state/HARNESS-PIN"
 
 # A3c — THE `unchanged` + NO-DIR-RECORD STATE MUST NOT RECORD THE CHECKOUT (review F1). Run 1 pins into the
 # pin root; then ONLY the dir record is deleted (the state install.sh itself calls ordinary), and the

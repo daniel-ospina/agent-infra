@@ -886,13 +886,14 @@ if [ "$PIN_DIR_RECORDED" != "$HARNESS" ]; then
   pin_say "pin dir record $HARNESS_PIN_FILE now names $HARNESS (was ${PIN_DIR_RECORDED:-none})"
 fi
 pin_say "pin: ${PIN_HEAD:0:12} at $HARNESS"
-# ⛔ A RECORDED CHECKOUT IS MUTABLE, AND NOTHING RE-CHECKS AT EXEC TIME (review finding, P3). The
-# `unchanged` first pin records the operator's working checkout (the materialiser leaves it where it is
-# on purpose), so a later `git pull` there makes launchd exec a commit the pin does not name, with no
-# refusal in between (`harness-up up` catches it at start; a KeepAlive restart does not). Say it, once,
-# where the operator can act on it.
+# ⛔ A RECORDED CHECKOUT IS MUTABLE, AND NOTHING RE-CHECKS AT EXEC TIME (review finding, P3). An EXPLICIT
+# `HARNESS` records the operator's working checkout (the materialise path never does — see the forced
+# per-commit tree above), so a later `git pull` there makes launchd exec a commit the pin does not name,
+# with no refusal in between (`harness-up up` catches it at start; a KeepAlive restart does not). The
+# remedy names the STEP that actually clears it: a re-run alone would re-read the dir record this run has
+# just written and record the same checkout again (measured).
 if [ "$(git -C "$HARNESS_REPO" rev-parse --show-toplevel 2>/dev/null)" = "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)" ]; then
-  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). Re-run this installer with no explicit HARNESS to materialise a per-commit tree under $HARNESS_PIN_DIR (it forces the worktree), which is what freezes the commit."
+  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). To freeze it, remove that record and re-run with no explicit HARNESS (rm -f \"$HARNESS_PIN_FILE\" && re-run this installer): the materialise path forces a per-commit worktree under $HARNESS_PIN_DIR."
 fi
 MAT_FOR_PLIST="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
 [ -f "$MAT_FOR_PLIST" ] || MAT_FOR_PLIST=""
