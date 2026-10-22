@@ -814,7 +814,12 @@ done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
+  # ⛔ NOT A BARE `cp '$HERE'/*.sh '$O'/` ANY MORE (review P2). That line is the depth-1, unverified copy
+  # #2041 measured as a false PASS — and it was the MOST operator-visible remedy in the harness, the one
+  # README §4.1 tells the operator to run right after a verified redeploy. The helper copies every
+  # shipped file (subdirectories and `gh-limit.py` included) and byte-verifies each one; it refuses
+  # rather than half-applies.
+  warn "  bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'   # every shipped file, byte-verified (#2041)";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
@@ -911,7 +916,8 @@ prov_dirty() {
 write_provenance() {
   local commit rel dirty_word payload tmp drc _depf _depb dep_why
   # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
-  # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
+  # `$O/*.sh` — this installer seeds only `$O/gh-rest/gh` and `$O/gh-limit.py` (the `*.sh` payload is
+  # the operator's copy, and the verified path for it is `deploy-harness.sh` — see the DRIFTED warning
   # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
   # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
   # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
@@ -994,7 +1000,7 @@ STAMPEOF
   fi
   if [ "$dep_match" = false ]; then
     warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
-    warn "  the record names $commit, but the box is not running those bytes — cp '$HERE'/*.sh '$O'/"
+    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"
   fi
   return 0
 }
