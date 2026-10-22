@@ -2014,6 +2014,36 @@ case "$OUTZ9" in *"could NOT produce an order"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] a floor that produced no order says so instead of 'no dispatchable candidate' (got '${OUTZ9:0:240}')" $Z9
 case "$OUTZ9" in *"no dispatchable product candidate"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not blame the queue for a floor that never ran" $Z10
+# ⛔ AND THE BACKLOG THE MEMBERSHIP LOOP *READS* NEEDS THE SAME GUARD (review cycle 58, P1). `done < "$O/candidates.txt"`
+# on an absent or mode-000 backlog runs ZERO iterations — indistinguishable from "every row is in the harness
+# queue" — so the variables, initialised to the PASSING value, published `product-floor N/A … NOT a finding about
+# product work` (and, in the OK arm, `unmet … the split RAN and found none`) over a backlog that was never read,
+# plus a raw `Permission denied` on stderr. Driven through BOTH arms, on both the absent and the unreadable state.
+for _bp in absent unreadable; do
+  for _arm in napr ok; do
+    _d="$T/o9ze-$_bp-$_arm"; mkdir -p "$_d/state"
+    printf '42\n43\n' > "$_d/candidates.txt"; printf '42\n43\n' > "$_d/candidates.harness.txt"
+    if [ "$_arm" = "napr" ]; then
+      : > "$_d/candidates.product.txt"
+      printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$_d/state/product-class"
+    else
+      : > "$_d/candidates.product.txt"; printf 'OK product=0 harness=2\n' > "$_d/state/product-class"
+    fi
+    if [ "$_bp" = "absent" ]; then rm -f "$_d/candidates.txt"; else chmod 000 "$_d/candidates.txt"; fi
+    if [ "$_bp" = "absent" ] || [ ! -r "$_d/candidates.txt" ]; then
+      _o="$(runblock "$_d" '42\n43\n' 1 2)"
+      case "$_o" in *"candidates.txt is ABSENT, not a regular file, or UNREADABLE"*) B1=0 ;; *) B1=1 ;; esac
+      ck "P9 [RED→GREEN] an unreadable/absent BACKLOG is named in the $_arm arm, not read as agreement (got '${_o:0:200}')" $B1
+      if [ "$_arm" = "napr" ]; then case "$_o" in *"product-floor N/A"*) B2=1 ;; *) B2=0 ;; esac
+      else case "$_o" in *"product-floor unmet"*) B2=1 ;; *) B2=0 ;; esac; fi
+      ck "P9 [RED→GREEN] ... and never the N/A or unmet verdict for a backlog it did not read" $B2
+    else
+      ck "P9 (skipped) cannot make candidates.txt unreadable on this box (running as root?)" 0
+      ck "P9 (skipped) ... and never the N/A or unmet verdict for a backlog it did not read" 0
+    fi
+    chmod 600 "$_d/candidates.txt" 2>/dev/null || :
+  done
+done
 # ⛔ AN UNREADABLE PRODUCT QUEUE IS NOT A MEASURED `product=0/N` (review cycle 57, P2). `-s` is TRUE for a
 # mode-000 regular file, so the met arm counted `PB` with `awk`, could not open the file, published `product=0`
 # as a measurement and leaked a raw `awk: can't open file` to stderr. Skipped under a root-like box.
@@ -2337,7 +2367,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=325
+MIN_CHECKS=333
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

@@ -3144,12 +3144,20 @@ PY
             # …candidates.harness.txt"). And the `else` half was UNPINNED: flipping it to `_napr_ok=1` left the
             # suite green while the masking verdict ("NOT a finding about product work") was published over a
             # record the cycle never checked.
-            _napr_ok=1; _napr_missing=0
+            _napr_ok=1; _napr_missing=0; _napr_bp=0
             # ⛔ THE FIFTH SITE OF THE SAME CLASS (review cycle 54, P2): this membership test kept a bare `-f` while its
             # siblings ask `-f && -r`, so a mode-000 harness queue passed the guard, `grep` could not open it, and
             # the failure was published as "a candidate … is NOT in candidates.harness.txt" — a membership result
             # the code never measured. The `_napr_missing` arm owns the unreadable state, with its own sentence.
-            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
+            # ⛔ AND THE FILE THIS LOOP *READS* NEEDS THE SAME GUARD (review cycle 58, P1). Both operands were
+            # guarded except the redirect source: `done < "$O/candidates.txt"` on an absent or mode-000 backlog
+            # runs ZERO iterations — which is indistinguishable from "every row is in the harness queue" — so the
+            # variables, initialised to the PASSING value, published `product-floor N/A … NOT a finding about
+            # product work` over a backlog that was never read (measured, absent and mode-000 alike), plus a raw
+            # `Permission denied` on stderr. `unmet`/`N/A` must be UNREACHABLE when the backlog was not read.
+            if [ ! -f "$O/candidates.txt" ] || [ ! -r "$O/candidates.txt" ]; then
+              _napr_ok=0; _napr_bp=1
+            elif [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               while IFS= read -r _nm; do
                 [ -n "$_nm" ] || continue
                 grep -qx -- "$_nm" "$O/candidates.harness.txt" 2>/dev/null || { _napr_ok=0; break; }
@@ -3184,6 +3192,8 @@ PY
             case "$PC_WHY" in *"do not read that as a class"*) _napr_stale=1 ;; esac
             if [ "$_napr_ok" = "1" ] && [ "$_napr_stale" = "0" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
+            elif [ "$_napr_bp" = "1" ]; then
+              echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.txt is ABSENT, not a regular file, or UNREADABLE, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_stale" = "1" ]; then
               echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY} — and that record's own text says the queues on disk may still hold a previous pass's split, so this cycle cannot claim the files AGREE; this is NOT the N/A verdict and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then
@@ -3245,8 +3255,10 @@ PY
             # ABSENT FROM a queue that exists — and the first version reported both with "a candidate … is NOT in
             # …harness.txt", a comparison it never made when there was no file to read. Each arm now says what it
             # read, and both are driven: a missing queue, and a queue whose rows do not contain the backlog.
-            _ok_sub=1; _ok_missing=0
-            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
+            _ok_sub=1; _ok_missing=0; _ok_bp=0
+            if [ ! -f "$O/candidates.txt" ] || [ ! -r "$O/candidates.txt" ]; then
+              _ok_sub=0; _ok_bp=1
+            elif [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               while IFS= read -r _om; do
                 [ -n "$_om" ] || continue
                 # ⛔ EXACT MEMBERSHIP, NOT A PREFIX (review cycle 43, P2). `grep -qx` is too narrow to trust
@@ -3265,6 +3277,8 @@ PY
             # queue falls through to the arm that prints `product=0` as a matched count (measured: o9q reddens).
             if [ -n "$_rec_p" ] && { [ -n "$_pq_note" ] || [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
               echo "[dispatch] product-floor unread (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}${_pq_note}${_hq_note}, but the record beside them says '${PC_WHY}' — its COUNTS cannot be matched to these files, so it does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measurement of product work — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            elif [ "$_ok_bp" = "1" ]; then
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.txt is ABSENT, not a regular file, or UNREADABLE, so the split's own backlog could not be read; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_missing" = "1" ]; then
               echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT, not a regular file, or UNREADABLE, so this cycle could not check whether the backlog was classified at all — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_sub" = "0" ]; then
