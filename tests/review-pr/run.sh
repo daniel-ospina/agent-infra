@@ -402,14 +402,22 @@ for form in '+ [P1] scripts/x.sh:1 — plus-marker form' '1. [P1] scripts/x.sh:1
   [ "$(rc_of)" = "7" ]; ck $? "  '${form%% *} …' => exit 7, no record (rc=$(rc_of))"
   no_record; ck $? "  …nothing recorded"
 done
-# ⛔ THE TRADE, PINNED: a prose MENTION of a severity also blocks a clean verdict. That is
-# deliberate (a false record costs the merge gate's integrity; a false refusal costs a
-# re-run), and the prompt tells a clean reviewer to state no severities. If this ever
-# becomes a nuisance, the fix is the PROMPT, not a narrower guard.
-reset; printf 'No [P1] findings; I looked at every changed file.\nCLEAN\n' > "$TMP/reviewer-out"
-run "$SRC" 2284
-[ "$(rc_of)" = "7" ]; ck $? "a prose MENTION of [P1] also refuses (fail-closed by design) (rc=$(rc_of))"
-no_record; ck $? "…and records nothing"
+# ⛔ AND A MID-LINE MENTION IS NOT A FINDING LINE (the other direction, and the one the
+# fourth fresh review measured: its own CLEAN was refused because the sentence said
+# "true of `[P1]` markup"). A guard that refuses every reviewer that explains itself is a
+# new wall; both directions are pinned here.
+for prose in 'No [P1] findings; I looked at every changed file.' 'true of `[P1]` markup, not of severity vocabulary' 'Priority 1 is handled by the adjacent guard'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a mid-line severity mention does NOT block: '${prose:0:34}…' (rc=$(rc_of))"
+done
+# …and the bare/bold/lowercase forms at the HEAD of a line DO (case-insensitivity too).
+for form in '**P1** scripts/x.sh:1 — bold' 'P1 — bare' '[p1] lowercase bracket' 'P2: colon'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a line-leading '${form:0:20}…' refuses (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
 
 # ── §R a signed marker wins over an earlier unsigned one at the same head ───
 echo; echo "§R an earlier UNSIGNED marker does not shadow the signed one"

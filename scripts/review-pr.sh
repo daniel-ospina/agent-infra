@@ -480,19 +480,18 @@ LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail
 # class missed `+`, ordered markers and table rows — measured by the third fresh
 # review, which turned `[P1]` into `+ [P1]` in §L and got exit 0 + a record: a
 # fail-OPEN in the one guard that must never fail open (P2, review of PR #2288).
-SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?\[P[0-3]\]'
-# ⛔ THE CONTRADICTION GUARD MUST NOT DEPEND ON THE REVIEWER'S FORMATTING (P2, fourth fresh
-# review). Everything above matches the CONTRACT form `[P1]`. The previous round already
-# lost `+ [P1]`/`1. [P1]`/table rows to this class; a reviewer writing `**P1**`, `P1 —` or
-# `Finding: [P1]` is one keystroke further from the contract and the same fail-open applies
-# — and a false `clean` record under a blocking finding is the ONE outcome this file says
-# must never happen. So the machine check is deliberately BROADER than the parser: ANY bare
-# `P0`/`P1`/`P2` token in the transcript blocks a `clean` verdict (fail-CLOSED, loud, and the
-# offending lines are printed). The prompt tells a clean reviewer to state no severities in
-# prose, so a false refusal is rare — and a false refusal costs a re-run, while a false
-# record costs the merge gate's integrity.
-BLOCK_RE='(^|[^[:alnum:]])P[012]([^[:alnum:]]|$)'
-FINDINGS="$(grep -aE "$SEV_RE" "$LOG" 2>/dev/null || true)"
+# ⛔ ONE RULE, AND IT IS THE LINE'S HEAD. A finding line LEADS with its severity under
+# any markup — `[P1] x`, `### **[P1]** x`, `- [P2] x`, `+ [P1] x`, `1. [P1] x`,
+# `| [P1] | x`, `**P1** x`, `P1 — x` — optionally case-insensitively, followed by a
+# non-alphanumeric (or line end). A severity MENTIONED mid-line is not a finding line:
+# the fourth fresh review's CLEAN was refused because its own prose said "true of
+# `[P1]` markup", and that false refusal is the failure mode of the previous, broader
+# pattern (a guard that refuses every reviewer that explains itself is a new wall).
+# Mid-line mentions are what the earlier rounds' fixes were about (list/table MARKUP at
+# the head of a finding), and both directions are fixtures below.
+SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
+BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
+FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # ⛔ THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES (found by the FIRST live run,
 # 2026-10-21 on #2284). The reviewer reported three P3 nits and printed `ISSUES 3`,
 # which by the skill's own definition (clean = zero P0/P1/P2) is a CLEAN verdict —
@@ -503,7 +502,7 @@ FINDINGS="$(grep -aE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # REFUSED rather than recorded, so no blocking finding can ride in under a clean
 # verdict whatever the reviewer's prose says. (A CLEAN with only P3 notes is the
 # skill's `follow_up` disposition: recorded, and the notes are posted in the comment.)
-BLOCKING_FINDINGS="$(grep -aE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
+BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
 case "$LAST" in
   CLEAN)      KIND=clean ;;
   "ISSUES "*) KIND=issues; ISSUE_N="$(printf '%s' "${LAST#ISSUES }" | tr -cd '0-9')" ;;
