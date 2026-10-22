@@ -516,6 +516,25 @@ no_record; ck $? "  …nothing recorded"
 reset; printf 'I read every hunk.\n**Verdict: ISSUES — 1 × P1, 2 × P3.** trailing prose\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…while a labelled verdict WITH trailing prose parses (rc=$(rc_of))"
+# ⛔ THE VERDICT WORD IS THE FIRST ONE (P1, ninth fresh review): `*clean*` anywhere made
+# `Verdict: ISSUES — … the code is not clean` record CLEAN.
+reset; printf '**Verdict: ISSUES — 1 × P1.** This is not clean.\n[P1] scripts/x.sh:1 — bug\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an ISSUES verdict whose prose says 'not clean' is NOT recorded clean (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# …and a decorated CLEAN with trailing prose still parses (it was rejected as NO VERDICT).
+reset; printf 'Nothing blocks.\n**CLEAN — no blocking findings.**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "'**CLEAN — no blocking findings.**' parses as clean (rc=$(rc_of))"
+# …while prose that merely STARTS with the word is not a verdict.
+reset; printf 'Clean separation of concerns throughout.\n**CLEAN**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a prose line starting 'Clean separation…' is not mistaken for a verdict (rc=$(rc_of))"
+# A severity SUMMARY table is counts, not findings.
+reset; printf '| severity | count |\n|---|---|\n| P0 | 0 |\n| P1 | 0 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a severity COUNT table (| P1 | 0 |) does not block a clean verdict (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
 reset; printf '[P3] scripts/x.sh:1 — nit\n[P2] scripts/x.sh:2 — blocking\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…but a P2 among them still refuses (rc=$(rc_of))"

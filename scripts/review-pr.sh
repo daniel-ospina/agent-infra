@@ -493,9 +493,13 @@ fi
 #      ("**Verdict: ISSUES — 1 × P1, 1 × P2**").
 # A heading (`## Issues`) belongs to neither shape, and a bare `ISSUES` with no count is not
 # shape (a) — ambiguous counts are the fail-OPEN direction.
-VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*clean[[:space:]]*[])]?[[:space:]]*[.:!*_]*[[:space:]]*$'
-VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*issues[[:space:]]*[([ ]?[[:space:]]*[0-9]+[[:space:]]*[])]?[[:space:]]*[.:!*_]*[[:space:]]*$'
-VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*verdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(clean|issues)'
+# `CLEAN` may be FOLLOWED by prose when a SEPARATOR introduces it (`CLEAN — no blocking
+# findings`), but not by a bare word: `Clean separation of concerns …` is prose about the
+# code and must never become a verdict (P2, ninth fresh review: a decorated `CLEAN — …`
+# line was rejected as NO VERDICT).
+VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*clean[[:space:]]*[])]?[[:space:]]*([-–—:.!*,;_]|[[:space:]]*$)'
+VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*issues[[:space:]]*[([ ]?[[:space:]]*[0-9]+'
+VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*verdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(clean|issues)([^[:alnum:]]|$)'
 LAST="$(grep -aiE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
@@ -504,12 +508,21 @@ LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # refused two genuinely clean reviews because their own prose quoted `[P1]`.
 SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
-FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null || true)"
-BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
+# ⛔ A SEVERITY SUMMARY ROW IS NOT A FINDING (P2, ninth fresh review). Reviewers close a
+# report with a table of counts (`| P0 | 0 |`, `| P1 | 0 |`); each row LEADS with a
+# severity token, so the positional rule read them as findings — a clean report refused
+# for reporting zeroes. A row whose only other content is a single number is a count.
+SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*P[0-3][[:space:]]*\|?[[:space:]]*[0-9]+[[:space:]]*\|?[[:space:]]*$'
+FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
+BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
 ISSUE_N="$(printf '%s' "$LAST_LC" | tr -cd '0-9')"
-case "$LAST_LC" in
-  *clean*)   KIND=clean ;;   # a CLEAN line carries no count
-  *issues*)  KIND=issues; ISSUE_N="${ISSUE_N:-1}" ;;   # no digits => treat as blocking, never as clean
+# ⛔ THE VERDICT WORD IS THE **FIRST** ONE ON THE LINE (P1, ninth fresh review). Matching
+# `*clean*` anywhere meant `**Verdict: ISSUES — … the code is not clean**` recorded CLEAN:
+# the worst possible reading of a line, from the widest possible pattern.
+VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
+case "$VWORD" in
+  clean)  KIND=clean ;;   # a CLEAN line carries no count
+  issues) KIND=issues; ISSUE_N="${ISSUE_N:-1}" ;;   # no digits => blocking, never clean
   *)
     err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line in its transcript (rc=$AGENT_RC)."
     err "  This is a reviewer failure (crash, wall-clock cap, provider refusal, or a final message that broke the format). Nothing was posted and NO record was written."
