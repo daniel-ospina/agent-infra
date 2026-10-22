@@ -705,6 +705,31 @@ jobs:
         # ci-main.yml is POST-MERGE only, and a fail-open regression in a guard
         # must not reach main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
+      - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
+        # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
+        # EQUALITY against the module's own checkout, which is only correct where
+        # the guard and the scripts live in ONE tree. On a copy-deployed box the
+        # module root is `~/.pi/agent` (partial `scripts/`, no `admin-merge.sh`
+        # at all, #2176) while the rail lives in `$AGENT_INFRA_PATH/scripts/` —
+        # so the mandated merge rail was REFUSED from every hub-rooted session
+        # and the only routes left were the hatch or a bare `gh pr merge` that
+        # skips every comparison the rail makes. This suite pins the two halves
+        # that make the widened exemption safe — sanctioned relpath INSIDE a
+        # framework checkout, sha256 equal to the pin, AND the audited DELEGATION
+        # CLOSURE (every `$SELF_DIR` helper the script executes) — and MUTATES the
+        # shipped source to prove each part is load-bearing (literal-path equality
+        # restored ⇒ the rail blocks again; leaf digest dropped ⇒ a renamed
+        # destructive script is allowed; root check dropped ⇒ a non-framework dir
+        # is exempted; closure dropped ⇒ the pinned rail runs an agent-chosen
+        # `ci_exemption.py`, its own grader). It is a PIN-FRESHNESS gate
+        # too: a PR that changes (or deletes) a listed script — or a helper one of
+        # them executes by its own location — without re-cutting
+        # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
+        # main and silently block the rail.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        # for the same reason as the suite above: the `extensions/*/test*.mjs`
+        # glob in ci-main.yml is POST-MERGE only.
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

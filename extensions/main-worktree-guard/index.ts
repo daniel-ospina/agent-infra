@@ -129,10 +129,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, dirname, join, relative } from "node:path";
+import { resolve, dirname, join, relative, sep } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
@@ -3631,7 +3632,7 @@ function _worktreeDiscardBlock(command: string): string | null {
     if (s.script === null) return true; // the command's own argv is never exempt
     let rel: string | null = null;
     // Fail closed on a probe failure: keep the set gated.
-    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
+    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script))?.rel ?? null; } catch { rel = null; }
     if (rel === null) return true;
     let real = resolve(execCwd, s.script);
     try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
@@ -3833,11 +3834,18 @@ function _worktreeDiscardBlock(command: string): string | null {
 // uncommitted work with the content walker switched off. Only scripts whose
 // git content is read-only or the documented recovery surface are listed.
 //
-// WHY THE GUARD'S OWN CHECKOUT: the realpath anchor is derived from this
-// module's location, so an agent-editable COPY of the framework (a linked
-// worktree, where the write gate is lifted) has a different realpath and is
-// NOT exempt. A repo-fingerprint anchor (isAgentInfraRepo) would have been
-// forgeable by exactly that route.
+// WHY THE GUARD'S OWN CHECKOUT — AND (since #2332) A FRAMEWORK CHECKOUT WITH THE
+// AUDITED BYTES: the realpath anchor is derived from this module's location, so
+// an agent-editable COPY of the framework (a linked worktree, where the write
+// gate is lifted) has a different realpath and is NOT exempt. A repo-fingerprint
+// anchor (isAgentInfraRepo) would have been forgeable by exactly that route, so
+// the root is never trusted ON ITS OWN: see `_sanctionedScriptExemption` — the
+// second arm requires the sanctioned relpath INSIDE a framework checkout AND a
+// sha256 match against `sanctioned-scripts.pin.json`. The pin is the half that
+// cannot be forged; the root check only confines the exemption to framework
+// trees. A copy of the audited bytes at an arbitrary path stays BLOCKED, and a
+// DIFFERENT script at a sanctioned relpath (renamed into a framework tree) is
+// BLOCKED too.
 const SANCTIONED_SCRIPT_RELPATHS = [
   // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
   "scripts/check-pipeline-compliance.sh",
@@ -3918,26 +3926,177 @@ const _frameworkRoot: string | null = (() => {
   }
 })();
 
-/** Sanctioned-framework-script exemption (#1129) — returns the matched
- *  relative path (for the audit row), or null. Realpath-keyed on BOTH sides:
- *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and a
- *  copy in another checkout does not. The listed relpath is realpath'd too, so
- *  a symlinked component inside the framework's own tree cannot silently
- *  disable the exemption. */
-function _sanctionedScriptExemption(resolvedScript: string): string | null {
-  if (!_frameworkRoot) return null;
+/** THE INVARIANT this function must keep (#2332) — it must be able to tell
+ *  "the sanctioned rail, run from a hub" from "an arbitrary script pretending
+ *  to be the rail":
+ *
+ *    exempt  IFF  (a) the file IS at a sanctioned relpath inside a FRAMEWORK
+ *                 CHECKOUT, and (b) its bytes ARE the audited bytes (the
+ *                 sha256 pinned in `sanctioned-scripts.pin.json`).
+ *
+ *  (a) alone is a FILENAME: any destructive script renamed `admin-merge.sh`
+ *  inside a directory carrying the framework's two fingerprint files would pass
+ *  — "a framework checkout" is purchasable (`git init` + `manifest.json` +
+ *  `pi-bootstrap/setup.sh` are all allowed operations).
+ *  (b) alone is a CONTENT RULE: the same bytes at ANY path would pass, which is
+ *  exactly the rule #1485 rejected at review (a committed script whose content
+ *  is destructive ran with the walk switched off).
+ *  TOGETHER they name ONE artifact — the framework's own rail, in a framework
+ *  tree, with the bytes the framework ships — and the half an agent cannot
+ *  reach is the BINDING, not the digest (digests are public: they hash shipped
+ *  files). Every individual ingredient is purchasable — a repo, its two
+ *  fingerprint files, the audited bytes (copy them) — so the soundness does NOT
+ *  rest on "this path is privileged". It rests on the closure below: the
+ *  exemption only ever admits an invocation whose EVERY executed file (leaf +
+ *  delegates) is the audited one, so the worst a forged tree can achieve is
+ *  running the REAL rail, which is the sanctioned behaviour by definition. Any
+ *  deviation — a different leaf, a different `ci_exemption.py`, a missing
+ *  delegate — declines the exemption and the content walk runs.
+ *
+ *  WHY TWO ARMS (and why this is not a widening of what the guard protects):
+ *  arm 1 is the pre-existing anchor, UNCHANGED — the module's own checkout.
+ *  It is the arm that makes the `~/.pi/agent` *copy* farm work, which is a
+ *  recorded deployment decision (#427, macOS TCC: "replacing farm symlink with
+ *  real copy"; the repo copy is CI-tested while production mints execute the
+ *  `~/.pi` copy) and the arm #1603/#1598 fixed the review RECORDER onto. Arm 2
+ *  exists because that farm ships only a PARTIAL scripts surface: `admin-merge.sh`
+ *  is not in it (#2176), so on a copy-deployed box the rail's only real home is
+ *  `$AGENT_INFRA_PATH/scripts/` — a DIFFERENT root from the module's — and arm 1
+ *  could never match it. Caught live 2026-10-22: the mandated rail was refused
+ *  from a hub-rooted session, i.e. the chokepoint that computes the failing set
+ *  before an `--admin` merge was unrunnable, and the only routes left were the
+ *  hatch or a bare `gh pr merge` that skips every comparison the rail makes
+ *  (#2332). Both arms fail CLOSED: no pin, no framework root, an unreadable
+ *  file, or a hash mismatch all return null → the content walk runs as before.
+ *  Realpath-keyed on both sides, so a symlinked spelling resolves to the same
+ *  file and a `scripts/<rel>` SYMLINK inside a framework tree still hashes the
+ *  file it points at (a mismatch unless that target IS the audited bytes).
+ *  ⚠️ SCOPE, stated exactly: arm 2 admits the audited leaf from ANY tree that
+ *  carries the framework fingerprint — including a linked worktree of this
+ *  framework at the pinned bytes — so the README must not claim otherwise. That
+ *  is intentional: once the closure is pinned, WHERE the audited program runs
+ *  from does not change what it does, and pretending the anchor is narrower than
+ *  it is would be the more dangerous error. */
+function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via: "module-root" | "identity" } | null {
   let real: string;
   try {
     real = realpathSync(resolvedScript);
   } catch {
     return null;
   }
-  for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
-    let sanctioned: string;
-    try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
-    if (real === sanctioned) return rel;
+  // ── arm 1: the guard's own checkout (pre-existing behaviour, unchanged) ──
+  if (_frameworkRoot) {
+    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
+      let sanctioned: string;
+      try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
+      if (real === sanctioned) return { rel, via: "module-root" };
+    }
+  }
+  // ── arm 2: identity — sanctioned relpath + framework root + audited bytes
+  //    AND the audited DELEGATION CLOSURE (see the comment above: a leaf whose
+  //    siblings the agent chose is not the sanctioned script, it is a launcher) ──
+  // Cheap pre-filter FIRST: for a command that executes some other script this
+  // returns before the pin is even read, which is the common case.
+  const candidates = SANCTIONED_SCRIPT_RELPATHS.filter((rel) => real.endsWith(sep + rel));
+  if (candidates.length === 0) return null;
+  const pin = _sanctionedScriptPin();
+  for (const rel of candidates) {
+    const want = pin.sha256[rel];
+    if (typeof want !== "string" || want.length !== 64) continue; // no pin → not exempt
+    const root = real.slice(0, real.length - rel.length - 1);
+    if (resolve(root, rel) !== real) continue;               // not literally <root>/<rel>
+    if (!_isFrameworkCheckout(root)) continue;
+    // The executed leaf is compared DIRECTLY, not via the pin's bookkeeping: a
+    // pin whose `delegates` omits the leaf (a hand re-cut, a partially-replaced
+    // deploy) must not admit arbitrary bytes at a sanctioned relpath (#2332
+    // review cycle 3). The closure then covers the REST of the program, so each
+    // half is independently load-bearing.
+    if (_sha256Of(real) !== want) continue;
+    if (!_delegationClosurePinned(root, pin.delegates, rel)) continue;
+    return { rel, via: "identity" };
   }
   return null;
+}
+
+/** The execution the exemption actually grants is leaf PLUS everything the leaf
+ *  executes. `admin-merge.sh` runs `$SELF_DIR/ci_exemption.py` (the exemption
+ *  GRADER) and `gh-shim/gh` runs `$SELF_DIR/../verify-admin-merge-evidence.sh`
+ *  (which says in its own words that it must not be redirectable), and the walk
+ *  is skipped for the whole invocation — so a pinned leaf beside an AGENT-CHOSEN
+ *  delegate is a launcher for arbitrary content (reproduced at review: the
+ *  audited rail at a forged root plus a one-line destructive
+ *  `ci_exemption.py` ran `reset --hard`). Pinning the leaf alone is therefore
+ *  not the identity; the closure is. Every pinned delegate must be PRESENT in
+ *  the same framework root and hash to its pin, or the whole exemption is
+ *  declined (fail-closed: absent, unreadable and mismatched are all `false`). */
+function _delegationClosurePinned(root: string, delegates: Record<string, string>, leaf: string): boolean {
+  const rels = Object.keys(delegates);
+  if (rels.length === 0) return false; // an empty closure is not a verified one
+  for (const rel of rels) {
+    if (rel === leaf) continue; // the leaf is compared directly by the caller
+    const want = delegates[rel];
+    if (typeof want !== "string" || want.length !== 64) return false;
+    const got = _sha256Of(resolve(root, rel));
+    if (got === null) return false; // absent is not "unverified", it DECLINES
+    if (got !== want) return false;
+  }
+  return true;
+}
+
+/** sha256 of a file, or null when it cannot be read (callers compare against a
+ *  digest, so null never equals one — the fail-closed direction). */
+function _sha256Of(path: string): string | null {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/** Is `root` a framework CHECKOUT (the `isAgentInfraRepo` fingerprint, read
+ *  from disk so this stays a pure path probe with no git invocation)? Arm 2
+ *  needs it so the exemption is confined to framework trees; the pin — not this
+ *  — is what makes forgery useless. Fail-closed on any probe error. */
+function _isFrameworkCheckout(root: string): boolean {
+  try {
+    return existsSync(join(root, "manifest.json")) && existsSync(join(root, "pi-bootstrap", "setup.sh"));
+  } catch {
+    return false;
+  }
+}
+
+/** The pinned digests, read ONCE from the guard's own directory and cached for
+ *  the life of the process. Cached deliberately (#2332 review P0): the module
+ *  tree is writable on a copy-deployed box, so a pin re-read per call would let
+ *  a session rewrite the pin and win the exemption IMMEDIATELY — while editing
+ *  the `index.ts` that enforces it needs a restart. Caching puts the pin's
+ *  integrity on the same footing as the code that reads it (where the guard is
+ *  loaded from is the trust anchor pi already chose), and keeps the "needs a
+ *  restart" boundary in one place instead of two. A re-cut is a deploy event,
+ *  so it lands with the session restart that the deployment already implies.
+ *  Any read/parse failure yields an EMPTY pin → arm 2 stays inert (fail-closed). */
+let _pinCache: { sha256: Record<string, string>; delegates: Record<string, string> } | null = null;
+function _sanctionedScriptPin(): { sha256: Record<string, string>; delegates: Record<string, string> } {
+  if (_pinCache) return _pinCache;
+  const empty = { sha256: {}, delegates: {} };
+  try {
+    const raw = readFileSync(fileURLToPath(new URL("./sanctioned-scripts.pin.json", import.meta.url)), "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    const norm = (v: unknown): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (!v || typeof v !== "object") return out;
+      for (const [k, d] of Object.entries(v as Record<string, unknown>)) {
+        if (typeof d === "string") out[k] = d.toLowerCase();
+      }
+      return out;
+    };
+    const sha256 = norm((parsed as { sha256?: unknown }).sha256);
+    const delegates = norm((parsed as { delegates?: unknown }).delegates);
+    _pinCache = { sha256, delegates };
+  } catch {
+    _pinCache = empty;
+  }
+  return _pinCache;
 }
 
 // Script-backdoor closure (Slice E): the documented escape
@@ -4014,8 +4173,8 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
     // audited (best-effort, never blocks) so the exemption is observable.
-    const sanctionedRel = _sanctionedScriptExemption(resolved);
-    if (sanctionedRel) {
+    const sanctionedMatch = _sanctionedScriptExemption(resolved);
+    if (sanctionedMatch) {
       try {
         // #1129 (code-review P2): record the REALPATH that matched, not just
         // the listed relpath — with only the relpath, an exemption taken
@@ -4026,7 +4185,14 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
         appendJsonl({
           event: "m4_script_exemption",
           extension: "main-worktree-guard",
-          script: sanctionedRel,
+          script: sanctionedMatch.rel,
+          // #2332 — WHICH arm granted it: `module-root` is the pre-existing
+          // anchor (the `~/.pi/agent` copy farm / the module's own checkout),
+          // `identity` is the root-agnostic arm (sanctioned relpath inside a
+          // framework checkout + the pinned audited bytes). Without this field
+          // an operator cannot tell a farm exemption from a checkout one — the
+          // distinction this issue is entirely about.
+          sanctioned_via: sanctionedMatch.via,
           script_realpath: realpathSync(resolved),
           framework_root: _frameworkRoot,
           session_cwd: resolve(process.cwd()),
