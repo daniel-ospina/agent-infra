@@ -515,8 +515,10 @@ ck "(d) …and the launch count is carried as EVIDENCE (7 launch(es)) [$(printf 
 # `LOOPING` would pass a check that only looked for the literal `PERSISTENT`. So: negate the whole
 # verdict vocabulary in use, AND positively require the CONDITIONAL sentence that makes the count
 # evidence rather than a diagnosis.
+# ⛔ THE `""` ARM IS THE POINT (review round 4): without it an EMPTY row makes every negative
+# assertion pass — the row could stop being emitted entirely and these would stay green.
 ck "(d) …but a cumulative count is NOT turned into any crash/persistence verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
-   "$(case "$launchd_row" in *CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
+   "$(case "$launchd_row" in ""|*CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and persistence is stated CONDITIONALLY, so the count is evidence not a verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *"if it STAYS here"*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh`'s lock path prints "already running"
@@ -531,7 +533,7 @@ launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) a CLEAN exit (0) is NAMED EXITED-CLEAN, not DIED [$launchd_row]" \
    "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
-   "$(case "$launchd_row" in *"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
+   "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
@@ -570,7 +572,7 @@ launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) an exit with NO launch count still prints the code [$launchd_row]" \
    "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and invents no count when launchd published none [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
-   "$(case "$launchd_row" in *"launch(es)"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
+   "$(case "$launchd_row" in ""|*"launch(es)"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
 # ⛔ AN ABSENT DATUM IS NEVER RENDERED AS A VALUE. With neither an exit code nor a run count the row
 # must fall back to LOADED-NO-PROCESS rather than claim "last exit 0" or "0 launches".
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
@@ -581,7 +583,7 @@ launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) with NO exit data the row falls back to LOADED-NO-PROCESS (it never invents a status) [$launchd_row]" \
    "$(case "$launchd_row" in *LOADED-NO-PROCESS*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and invents neither a code nor a count [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
-   "$(case "$launchd_row" in *"last exit 0"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
+   "$(case "$launchd_row" in ""|*"last exit 0"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
 # …and a DOMAIN-level rejection must not become a confident NOT LOADED + re-install remedy (review
 # round 4): rc is not the verdict, the text is — the rule launchd-cycle.sh `lc_probe` and
 # orchestrator-bringup.sh `launchd_job_state` both state.

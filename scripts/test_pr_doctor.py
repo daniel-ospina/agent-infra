@@ -68,10 +68,25 @@ def _pr(number: int, head: str = "a" * 40) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """A test must never inherit the developer's or the CI runner's capacity env."""
+def _clean_env(monkeypatch, tmp_path_factory):
+    """A test must never inherit the developer's or the CI runner's capacity env.
+
+    ⛔ AND IT MUST NEVER WRITE THE LIVE STATE DIR (2026-10-22, measured). This was opt-in: 11 tests
+    patched `STATE_DIR` and the rest wrote the operator's real `~/.pi/agent/state/` — measured as
+    exactly +3 fabricated lines per suite run (`12 PR(s) HELD …`, `REST-RECOVERED: ok`) in the audit
+    trail of a production job, indistinguishable from a live verdict, with nothing saying a test
+    wrote them. Two tests never redirected at all, so fixing `log()` to resolve `STATE_DIR` at call
+    time (which is also required) could not stop it: isolation has to be the DEFAULT.
+
+    All three paths are redirected here; a test that wants a specific location still patches over
+    this, and `monkeypatch` unwinds both.
+    """
     for k in ("MAX_FIX", "MAX_REVIEW"):
         monkeypatch.delenv(k, raising=False)
+    _iso = tmp_path_factory.mktemp("pr-doctor-state")
+    monkeypatch.setattr(pr, "STATE_DIR", str(_iso), raising=False)
+    monkeypatch.setattr(pr, "STATUS", str(_iso / "pr-doctor.status.json"), raising=False)
+    monkeypatch.setattr(pr, "LOG", str(_iso / "pr-doctor.log"), raising=False)
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
@@ -3309,22 +3324,43 @@ def test_the_token_is_resolved_once_per_pass_not_once_per_request(monkeypatch):
 
 # ── 6. the deploy seam: an OLD sibling `objective.py` must refuse, not run blind ─────────
 
-def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
-    """⛔ PINNED BECAUSE IT WAS NOT (#1872 review, reviewer E).
+def test_a_stale_sibling_objective_is_a_RECORDED_refusal(tmp_path):
+    """⛔ PINNED BECAUSE IT WAS NOT (#1872 review, reviewer E; reworked 2026-10-22 round 4).
 
     The two files are farmed SEPARATELY (`pi-bootstrap/setup.sh` `fleet_srcs`), so a partial farm
-    can leave this driver beside an older classifier. The driver asserts its seam at import;
-    without a test, an edit that dropped the assert would pass the whole suite while the fleet
-    silently dispatched from a classifier the beat never produced. Reproduction, not inspection.
+    can leave this driver beside an older classifier. Three properties, and the third is new:
+
+      1. a stale seam must NOT run (it would dispatch blind);
+      2. the refusal must NAME the missing symbol;
+      3. it must be RECORDED. It used to be a module-level `raise SystemExit(str)`, which exits 1
+         and writes nothing — launchd says 1 while the record still says the previous `ok`, the same
+         false PASS this PR removes, in the state the fleet most needs told. Only a test that reads
+         the record can see the difference (a bare `rc != 0` cannot).
+
+    ⛔ `HOME` IS OVERRIDDEN. Without it this fixture writes `~/.pi/agent/state/pr-doctor.log` in the
+    operator's real home (measured: 8 stale-seam lines after one suite run) and, on any argv that is
+    a real pass, would stamp the live `pr-doctor.status.json`.
     """
     import shutil
-    import subprocess
     shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
     (tmp_path / "objective.py").write_text("REQUIRED = ()\n")   # an old copy: no classify_one
-    r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py"), "--status"],
-                       capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
+    env = dict(os.environ, HOME=str(tmp_path))
+
+    # (a) a PASS is refused, and the refusal is RECORDED with its own code and reason.
+    r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py")],
+                       capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
     assert r.returncode != 0, "a stale sibling must NOT run: it would dispatch blind"
     assert "classify_one" in (r.stdout + r.stderr)
+    rec = json.loads((tmp_path / ".pi" / "agent" / "state" / "pr-doctor.status.json").read_text())
+    assert rec["rc"] == pr.EXIT_REFUSING == 2, rec
+    assert rec.get("read") == "seam", rec
+    assert "classify_one" in rec["reason"], rec
+
+    # (b) `--status` still ANSWERS: it prints local state and needs no classifier symbol, so the
+    # gate must not take away the one in-process listing on the box where the farm drifted.
+    r2 = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py"), "--status"],
+                        capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
+    assert r2.returncode == 0, (r2.returncode, r2.stdout, r2.stderr)
 
 
 
@@ -3861,6 +3897,9 @@ def test_a_blind_open_pr_read_still_exits_2(monkeypatch):
     (["--only=0"], ""),
     (["--status"], "--status is not a fleet reading"),
     (["--max", "3"], ""),
+    # Abbreviations are LEGAL, and the pre-parse must agree with main() about them.
+    (["--on", "5"], "--only 5 is not a fleet reading"),
+    (["--o", "5"], "--only 5 is not a fleet reading"),
 ])
 def test_the_prescan_agrees_with_the_parsed_flags(monkeypatch, argv, expected):
     """The prescan duplicates the MEANING of three flags, so it is pinned against the real assignment.
@@ -3937,9 +3976,18 @@ def test_the_stale_seam_is_a_RECORDED_refusal_not_a_bare_exit(monkeypatch):
 
 
 def test_the_valuefree_fallback_names_the_provable_flag():
-    """The scan that CANNOT parse still answers what it can: the value-free flags it did parse."""
-    assert pr._prescan_not_a_fleet_reading(["--dry-run", "--only", "abc"]) == "dry run"
-    assert pr._prescan_not_a_fleet_reading(["--only", "abc"]) == "--only is not a fleet reading"
+    """The scan that CANNOT parse still answers what it can — and resolves `--only` ITSELF.
+
+    ⛔ ARGPARSE RESOLVES THE OPTION, NOT A TOKEN MATCH (review round 4). `--only` abbreviates
+    legally (`--on`, `--o`), so a literal-spelling scan spared `--only abc` and recorded `--on abc`
+    — the same false RED, reached through a legal spelling.
+    """
+    for argv in (["--only", "abc"], ["--on", "abc"], ["--o", "abc"], ["--only=abc"]):
+        assert pr._prescan_not_a_fleet_reading(argv) == "--only is not a fleet reading", argv
+    # `--only` precedence matches the primary path, so a dry run with a bad --only still spares.
+    assert pr._prescan_not_a_fleet_reading(
+        ["--dry-run", "--only", "abc"]) == "--only is not a fleet reading"
+    assert pr._prescan_not_a_fleet_reading(["--dry-run", "--max", "abc"]) == "dry run"
     assert pr._prescan_not_a_fleet_reading(["--max", "abc"]) == ""
 
 
@@ -3966,3 +4014,24 @@ def test_a_closed_stdout_pipe_cannot_rewrite_the_verdict_as_a_crash(tmp_path):
     assert rec["rc"] == 64, rec
     assert "COMMAND LINE is unusable" in rec["reason"], rec
     assert rc not in (2, 4), (rc, "a closed pipe must not become a refusal or a crash verdict")
+
+
+def test_log_writes_under_the_CURRENT_STATE_DIR_not_the_import_time_path(monkeypatch, tmp_path):
+    """⛔ MEASURED LEAK (review round 4): the suite appended FABRICATED verdicts to the live log.
+
+    `LOG` was a module constant while `log()` called `os.makedirs(STATE_DIR)` — so a redirected
+    `STATE_DIR` created the new directory and then appended to the OPERATOR'S real
+    `~/.pi/agent/state/pr-doctor.log`. Measured: exactly +3 lines per suite run, reading like live
+    verdicts (`12 PR(s) HELD …`, `REST-RECOVERED: ok`) in the audit trail of a production job, with
+    nothing in the file saying a test wrote them.
+
+    This pins the invariant directly: the append must follow `STATE_DIR`, and must NOT touch the
+    frozen constant's path.
+    """
+    frozen = str(tmp_path / "MUST-NOT-BE-WRITTEN.log")
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "LOG", frozen, raising=False)
+    pr.log("a synthetic line")
+    written = (tmp_path / "state" / "pr-doctor.log").read_text()
+    assert written.strip().endswith("a synthetic line"), written
+    assert not os.path.exists(frozen), "log() appended to the import-time path, not STATE_DIR"

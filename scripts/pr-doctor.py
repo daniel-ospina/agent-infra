@@ -89,6 +89,8 @@ HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
 STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
+# ⛔ THE IMPORT-TIME SNAPSHOT ONLY -- DO NOT USE FOR I/O (see `_log_path()`): a writer that reads
+# this constant writes the REAL log no matter what `STATE_DIR` was redirected to.
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
 # ⛔ THE PASS VERDICT, WHERE A READER THAT IS NOT launchd CAN SEE IT (2026-10-18).
 # `com.tortoise.pr-doctor` exits non-zero on every refusal, and that code is recorded by launchd,
@@ -388,6 +390,20 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     return out
 
 
+def _log_path() -> str:
+    """The log file, resolved AT CALL TIME from `STATE_DIR`.
+
+    ⛔ A PATH FROZEN AT IMPORT IS A HALF-APPLIED REDIRECT (2026-10-22, measured). `LOG` was a module
+    constant while `log()` called `os.makedirs(STATE_DIR, ...)`: anything that redirected `STATE_DIR`
+    -- 11 tests do -- created the NEW directory and then appended to the OLD, REAL file. Measured on
+    the operator's box: exactly +3 fabricated lines per suite run, reading like live verdicts
+    (`12 PR(s) HELD for an unusable changed-file list`, `REST-RECOVERED: ok`). The audit trail of a
+    live job was being written by a test suite, and nothing in it said so. `STATUS` is NOT affected:
+    tests patch it directly, so `record_exit` keeps honouring that seam.
+    """
+    return os.path.join(STATE_DIR, "pr-doctor.log")
+
+
 def log(msg: str) -> None:
     line = "[%s] pr-doctor: %s" % (ts(), msg)
     try:
@@ -402,7 +418,7 @@ def log(msg: str) -> None:
         pass
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LOG, "a") as f:
+        with open(_log_path(), "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -2274,6 +2290,9 @@ def _valuefree_scanner():
     p = _QuietParser(add_help=False)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--status", action="store_true")
+    # `--only` carries the value that failed to parse. `nargs="?"` + `type=str` lets ARGPARSE
+    # resolve abbreviations (`--on`, `--o`) without ever validating that value.
+    p.add_argument("--only", nargs="?", const="", default=None, type=str)
     return p
 
 
@@ -2286,10 +2305,12 @@ def _prescan_not_a_fleet_reading(argv) -> str:
     record, trading a false PASS for a false RED. Both are wrong; the flags are what distinguish a
     lane's debugging invocation from the launchd tick.
 
-    ⛔ WHEN THE SCANNER ITSELF CANNOT PARSE (e.g. `--only abc`), IT RETURNS "" -- i.e. DO record.
-    That is deliberate and asymmetric: the pass genuinely did not run, and leaving the PREVIOUS
-    pass's `ok` in place is the false PASS this whole change removes. Silence is only granted when
-    the invocation is provably a debug one.
+    ⛔ ONLY A FULLY UNCLASSIFIABLE argv RECORDS (2026-10-22, rounds 3 and 4). The rule is NOT "an
+    unparseable value records": a VALUE-FREE flag that parsed (`--dry-run`, `--status`) and the
+    PRESENCE of `--only` -- in ANY legal spelling, abbreviations included -- still prove this is a
+    debug invocation, and those are SPARED. `--only abc` is exactly such a case: it is spared.
+    What records is an argv nothing identifies as a debug run, e.g. `--max abc` -- the pass did not
+    run, and leaving the PREVIOUS pass's `ok` in place is the false PASS this removes.
     """
     try:
         args, _ = _reading_scanner().parse_known_args(argv)
@@ -2303,12 +2324,13 @@ def _prescan_not_a_fleet_reading(argv) -> str:
         args, _ = _valuefree_scanner().parse_known_args(argv)
     except SystemExit:
         return ""
-    reason = _not_a_fleet_reason(args)
-    if reason:
-        return reason
-    for tok in argv:
-        if tok == "--only" or tok.startswith("--only="):
-            return "--only is not a fleet reading"
+    # Same precedence as `_not_a_fleet_reason()`: --only, then --dry-run, then --status.
+    if args.only is not None:
+        return "--only is not a fleet reading"
+    if args.dry_run:
+        return "dry run"
+    if args.status:
+        return "--status is not a fleet reading"
     # Nothing identifies this as a debug invocation: RECORD it. The pass did not run, and a stale
     # `ok` left in place is the false PASS this whole change removes.
     return ""
@@ -2357,6 +2379,26 @@ def main() -> int:
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
     NOT_A_FLEET_READING = _not_a_fleet_reason(args)
+
+    # ⛔ `--status` IS ANSWERED BEFORE THE SEAM GATE (2026-10-22, review round 4). It prints
+    # `load_state()` rows and reads no world, so it needs NO classifier symbol. Gating it behind
+    # SEAM_ERROR removed the only in-process state listing on exactly the box where the farm drifted
+    # -- i.e. where an operator needs it most. The gate below protects every path that READS.
+    st = load_state()
+    if args.status:
+        for k, v in sorted(st.items()):
+            if k.startswith("_"):
+                continue
+            # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
+            # it always did -- and a row that exists because the PR was REFUSED can no longer be
+            # read as "a worker was dispatched for this".
+            kind = v.get("kind") or "spawn"
+            print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
+                                                    (v.get("worker") or v.get("lane") or "?")[:12],
+                                                    v.get("at"),
+                                                    "" if kind == "spawn" else "  kind=" + kind))
+        return 0
+
     # ⛔ THE SEAM IS A RECORDED REFUSAL, NOT A BARE EXIT (2026-10-22, review round 3). See
     # SEAM_ERROR above: raising at import time exited 1 and left the previous pass's `ok` in place.
     # It is `EXIT_REFUSING` (2) because that is exactly the fact -- "I could not read the world, so
@@ -2372,21 +2414,6 @@ def main() -> int:
     # dispatch (that is the point of the flag); it may not speak for the fleet. The RULE lives in
     # `_not_a_fleet_reason()` -- one expression, also used by the pre-parse -- so this comment is
     # the rationale and not a second copy of it.
-
-    st = load_state()
-    if args.status:
-        for k, v in sorted(st.items()):
-            if k.startswith("_"):
-                continue
-            # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
-            # it always did -- and a row that exists because the PR was REFUSED can no longer be
-            # read as "a worker was dispatched for this".
-            kind = v.get("kind") or "spawn"
-            print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
-                                                    (v.get("worker") or v.get("lane") or "?")[:12],
-                                                    v.get("at"),
-                                                    "" if kind == "spawn" else "  kind=" + kind))
-        return 0
 
     # ⛔ A ROW LEFT BY A REFUSED SPAWN IS NOT A DISPATCH. dispatch() sees the refusal inside
     # CONFIRM_WINDOW_S (measured 32-36 ms), but a box slow enough to outrun that window leaves a

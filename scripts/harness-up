@@ -946,11 +946,21 @@ hu_row_exec() {
 # dropped rather than echoed.
 hp_launchd_dead_text() { # <label>
   local label="${1:-}" runs="${HP_LAUNCHD_RUNS:-}" lexit="${HP_LAUNCHD_LAST_EXIT:-}" seen=""
-  # Only a plain integer is quoted back: a garbled field is not evidence of anything. A SIGNED code
-  # is kept -- a signal death can be reported as a negative status, and dropping it would present a
-  # PRESENT datum as absent, the mirror of the rule this block states.
-  case "$lexit" in ''|-) lexit="" ;; -[0-9]*|[0-9]*) : ;; *) lexit="" ;; esac
-  case "$runs" in ''|*[!0-9]*) runs="" ;; esac
+  # ⛔ THE PATTERNS ARE EXACT, NOT LAX (2026-10-22, review round 4). `[0-9]*` accepts `128x` and
+  # `00`, and `-0` then reads as a crash and `00` defeats the `runs = 0` test below -- i.e. the
+  # stated invariants ("a garbled field is dropped", "runs = 0 wins") were asserted in prose and
+  # not enforced. A SIGNED code is kept (a signal death can be reported negative) but only its
+  # canonical form; anything else is treated as absent, which is the honest reading of a field
+  # launchd never emits.
+  case "$lexit" in
+    ''|-) lexit="" ;;
+    -*) case "${lexit#-}" in ''|*[!0-9]*) lexit="" ;; *) lexit=$(( -10#${lexit#-} )) ;; esac ;;
+    *) case "$lexit" in *[!0-9]*) lexit="" ;; *) lexit=$(( 10#$lexit )) ;; esac ;;
+  esac
+  case "$runs" in
+    ''|*[!0-9]*) runs="" ;;
+    *) runs=$(( 10#$runs )) ;;
+  esac
   [ -n "$runs" ] && seen="; launchd reports $runs launch(es) since it was loaded"
   # ⛔ `runs = 0` IS DECISIVE AND IS TESTED FIRST (2026-10-22, review round 3). launchd's
   # `last_exit_status` is CALLOC'd to 0 and is only overwritten when a run is REAPED, so a job that
