@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Twenty-five tests with thirty paired mutations: every mutation re-introduces
+Twenty-six tests with thirty paired mutations: every mutation re-introduces
 the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
 
-    python3.12 tools/fleet/claim_lanes.test.py              # the 25 tests, green
+    python3.12 tools/fleet/claim_lanes.test.py              # the 26 tests, green
     python3.12 tools/fleet/claim_lanes.test.py --mutations  # each mutation, RED
 
 `--mutations` writes BOTH modules — a mutated copy of one and a verbatim copy of

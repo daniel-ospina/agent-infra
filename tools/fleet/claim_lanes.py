@@ -242,9 +242,13 @@ def short_host(name: Optional[str] = None) -> str:
 
     ⚠️ Known residual: ``claims.sh`` also remembers FORMER host names
     (``$CLAIM_STATE_DIR/claim-hosts``) so a renamed box's own claims stay local;
-    this reader compares only the current name, so such a claim reads
-    ``holder-on-foreign-box``. Consequence is label-only — every claim verdict is
-    an abstention — and it is named here rather than fixed silently.
+    this reader compares only the current name, so that earlier-name claim is
+    scoped ``foreign``. The label that follows depends on the LEASE, because
+    scope is only one rung of the cascade (measured, not assumed): a **live** or
+    **unknown** lease still reads ``claim-held`` (the held rung fires first), and
+    only an **expired** one falls through to ``holder-on-foreign-box``.
+    Consequence is label-only — every claim verdict is an abstention — and it is
+    declared here rather than fixed silently.
     """
     env = os.environ.get("CLAIM_OWNER_HOST") or os.environ.get("CLAIM_HOST")
     if env:
