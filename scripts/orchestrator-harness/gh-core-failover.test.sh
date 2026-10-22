@@ -41,6 +41,9 @@ case "\$1 \$2" in
     # core: EMPTY (the incident). graphql: 4745 of 5000 (the headroom that existed and went unused).
     if [ "\${GH_TEST_SCENARIO:-}" = "coreok" ]; then
       printf '{"resources":{"core":{"limit":5000,"remaining":3000,"reset":$RESET,"used":2000},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
+    elif [ "\${GH_TEST_SCENARIO:-}" = "low" ]; then
+      # 50 left: inside the low-water band, NOT empty.
+      printf '{"resources":{"core":{"limit":5000,"remaining":50,"reset":$RESET,"used":4950},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
     else
       printf '{"resources":{"core":{"limit":5000,"remaining":0,"reset":$RESET,"used":5000},"graphql":{"limit":5000,"remaining":4745,"reset":$RESET,"used":255}}}\n'
     fi
@@ -50,7 +53,7 @@ case "\$1 \$2" in
       printf 'API rate limit exceeded for user ID 81560491.\n' >&2
       exit 1
     fi
-    printf '{"data":{"repository":{"pullRequest":{"number":7,"state":"OPEN","isDraft":false,"merged":false,"mergeable":"MERGEABLE","headRefOid":"abc123","baseRefName":"main","title":"t","url":"https://example/pull/7","updatedAt":"2026-10-22T00:00:00Z","author":{"login":"daniel-ospina"}}}}}\n'
+    printf '{"data":{"repository":{"pullRequest":{"number":7,"state":"OPEN","isDraft":false,"merged":false,"mergeable":"MERGEABLE","headRefOid":"abc123","headRefName":"feat","baseRefOid":"basesha","baseRefName":"main","title":"t","body":"prbody","url":"https://example/pull/7","updatedAt":"2026-10-22T00:00:00Z","createdAt":"2026-10-21T00:00:00Z","closedAt":null,"mergedAt":null,"changedFiles":3,"additions":10,"deletions":2,"comments":{"totalCount":4},"mergeCommit":null,"author":{"login":"daniel-ospina"}}}}}\n'
     ;;
   "api repos/o/r/pulls/7")
     # core is EMPTY in every scenario but `coreok`: a REST read is REFUSED, exactly like 14:03Z.
@@ -256,8 +259,86 @@ echo "── (f) the healthy path is unchanged and clears the named state ──
 reset_env f coreok
 run coreok api repos/o/r/pulls/7
 ck "(f) a normal core read still succeeds through the plain path" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+run coreok --health >/dev/null 2>&1 || true
 health coreok
 ck "(f) --health reports gh-ok and exits 0" $(printf '%s' "$OUT" | grep -q '^gh-ok$' && [ "$RC" -eq 0 ] && echo 0 || echo 1)
+
+echo "── (g) a PARTIAL equivalence must never answer with null+0 (review finding 1) ─────────────────"
+# `jq` prints null for a field that is absent and exits 0, so a partly-reproduced REST body is an
+# EMPTY ANSWER WITH A SUCCESS STATUS. A projection outside the encoder's field set must not be served.
+reset_env g core0
+budget core0
+: > "$STUB_LOG"
+run core0 api repos/o/r/pulls/7 --jq .requested_reviewers
+ck "(g) an unreproducible projection is REFUSED, not answered as null" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+ck "(g) … and NO failover request was spent on it" $([ "$(reqs 'api graphql')" -eq 0 ] && echo 0 || echo 1)
+ck "(g) … and it says why (the field is not reproducible)" \
+   $(grep -q 'encoder cannot' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '[.base.sha,.head.sha,.base.ref,.body]|@tsv'
+ck "(g) the DEEP fields in-tree callers read (.base.sha/.base.ref/.body) ARE reproduced" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'basesha' && printf '%s' "$OUT" | grep -q 'prbody' && echo 0 || echo 1)
+
+echo "── (h) BOTH pools empty keeps the NAMED state (review finding 2) ─────────────────────────────"
+reset_env h graphqldead
+budget graphqldead
+run graphqldead api repos/o/r/pulls/7
+ck "(h) the both-pools refusal still names the state" \
+   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=' && echo 0 || echo 1)
+health graphqldead
+ck "(h) --health does NOT report gh-ok while the core record is still live" \
+   $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=12m$' && [ "$RC" -eq 3 ] && echo 0 || echo 1)
+run graphqldead api repos/o/r/pulls/7 --jq .head.sha
+ck "(h) the SECOND core read still fails over rather than being sent to the empty pool" \
+   $([ "$(reqs 'api graphql')" -ge 1 ] && echo 0 || echo 1)
+
+echo "── (i) a GraphQL-served read must NOT mark the CORE bucket recovered (finding 3) ──────────────"
+reset_env i core0
+unset GH_LIMIT_NO_WAIT
+run core0 api repos/o/r/pulls/7          # lane A: refusal + the one exempt probe records core
+run core0 api repos/o/r/pulls/7 --jq .head.sha   # lane B: served from GraphQL
+ck "(i) lane B was served from GraphQL" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+ck "(i) the core record is NOT annotated recovered by it" \
+   $(grep -q 'bucket=core' "$GH_LIMIT_DIR/last-limit" && ! grep -q 'recovered=' "$GH_LIMIT_DIR/last-limit" && echo 0 || echo 1)
+export GH_LIMIT_NO_WAIT=1
+
+: > "$STUB_LOG"
+run core0 api repos/o/r/pulls/7 --jq .head.sha   # a LATER lane, budget snapshot expired by design
+ck "(i) a later lane still fails over (the evidence survived)" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "abc123" ] && [ "$(reqs 'pulls/7')" -eq 0 ] && echo 0 || echo 1)
+
+echo "── (j) the LOW-WATER band reserves the pool for WRITES and never claims exhaustion ─────────────"
+# core=50: reads move to GraphQL to keep the tail, writes SPEND it (that is what the reserve is for),
+# and nothing asserts “exhausted” while 50 requests of budget exist.
+reset_env j low
+budget low
+: > "$STUB_LOG"
+run low api repos/o/r/pulls/7 --jq .head.sha
+ck "(j) a read in the band moves to GraphQL (the tail is preserved)" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && echo 0 || echo 1)
+health low
+ck "(j) and it does NOT claim the pool is exhausted" \
+   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+run low api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
+ck "(j) a WRITE in the band is SENT (the reserve is spent by writes)" \
+   $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (g2) the projections REAL in-tree callers use are admitted (the gate is not an over-block) ──"
+# Pinned by READING the call sites, so a future tightening of PULL_NAMES cannot silently disable the
+# failover for the rail and the review recorder:
+#   record-review.sh:1117  [.base.sha,.head.sha,.base.ref]|@tsv
+#   record-review.sh:2143  [(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv
+#   admin-merge.sh:2085    "\(.mergeable)" + "\t" + (.merge_commit_sha // "")
+#   admin-merge.sh:7459    .merge_commit_sha // ""
+reset_env g2 core0
+budget core0
+run core0 api repos/o/r/pulls/7 --jq '[.base.sha,.head.sha,.base.ref]|@tsv'
+ck "(g2) record-review.sh:1117 projection is served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'basesha' && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv'
+ck "(g2) record-review.sh:2143 projection (with a jq FUNCTION) is served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q '3' && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'
+ck "(g2) admin-merge.sh:2085 projection is served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'true' && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
