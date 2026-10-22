@@ -351,6 +351,27 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: fleet-health REAPER-table suite (#1862, zero-dep)
+        # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
+        # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
+        # HARD-CODED label tuple: a job absent from it is never read at all, so the panel printed
+        # five rows and exited 0 over a reaper that could be NOT INSTALLED, loaded-and-inert, or
+        # exiting 3 (fail-closed — NOTHING SIGNALLED) on every hourly pass. That is a false PASS
+        # from the one instrument built for "a scheduled reaper that fails SILENTLY", so the panel
+        # is pinned here rather than left to a reader's memory: the label is in `REAPERS` and
+        # `REQUIRED_LABELS`, and whichever family it is filed under is the SCRIPT's own vocabulary
+        # (3 = fail-closed is an alarm; 4 = "a kill FAILED" is NOT worktree's "a removal FAILED").
+        # The table is also re-derived from `scripts/pi-reap-orphans.sh`'s own statement-position
+        # `exit N` set, so a new code in the script cannot silently land as UNRECOGNISED. Zero-dep:
+        # the module is loaded by path and `launchctl` is a fake — nothing reads the real launchd.
+        # Its own step, not a flag on the step above (one verdict cannot suppress the other).
+        run: python3.12 tools/fleet/fleet_health.test.py
+      - name: fleet-health REAPER-table mutation evidence (#1862, zero-dep)
+        # The suite above is only a pin if it can FAIL. Four mutations are written to TEMP copies of
+        # the module and re-imported: drop the orphan row (the pre-#1862 module), re-file `orphan` as
+        # `worktree`, drop the label from `REQUIRED_LABELS`, and flatten exit 4 to a benign ok — each
+        # must turn its paired leg RED. Its own step, same rule as every suite here.
+        run: python3.12 tools/fleet/fleet_health.test.py --red-control
       - name: Outcome-canary suite (fleet outcome assertions, zero-dep)
         # The fleet's failures are OUTCOMES that are absent while every component is up: a
         # controller running with a silent log, a queue the refresh could not read, 47 candidates

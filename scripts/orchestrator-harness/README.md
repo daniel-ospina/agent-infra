@@ -1358,13 +1358,23 @@ directions have already been measured: too little reaping (the ≈22 CPU-hours a
 runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reaper that skips this
 gate is a lane-killer, not a reaper.
 
-**Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
-mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
-two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
-designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
-socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
-were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own UI). It ships
-**dry-run** (`:195`) and nothing schedules it today (§6.5.1).
+**Status: IMPLEMENTED** — by FOUR carriers that do NOT carry the same gates, so say which one you
+mean. The table below is the per-carrier gate inventory this section asks for; a carrier that ships
+with a weaker set says so here rather than being discovered at arming time.
+
+| carrier | scheduled by | ancestry | gate 4 launchd-registered | gate 5 designed-daemon | gate order |
+|---|---|---|---|---|---|
+| `orphan-reap.py` (`:175`, rule at `:17-19`) | **nothing** (§6.5.1); ships dry-run (`:195`) | walk to the top | yes (`registered_launchd_pids`, `:109`) | yes — pidfile / daemon argv / recently-touched output / live holder of a socket it owns (`designed_daemon`, `:132`) | the sanctioned owner — the reference set |
+| `lane-watchdog.py` (`human_above()`, `:467`) | `heartbeat-loop.sh:365-368` (armed) | walk only | no | no | two-gate carrier; ARMED |
+| `pi-reap-idle.sh` (`:55`, `:381-429`) | hourly job, ships armed | additive third gate, can only REFUSE | no | no | REFUSE-only |
+| `pi-reap-orphans.sh` (this restore, #1862) | `com.eldato.pi-reap-orphans.plist`, hourly, ships **DISARMED** (`REAP_ORPHAN_DRY_RUN=1`) | candidate's OWN command must not be an anchor — a `ppid==1` candidate has no observable ancestor above launchd, so a reparented **descendant** of a human session is NOT detectable here | yes (`launchd_pids_load`; unreadable/unshaped probe aborts the pass, a host without `launchctl` logs the gate INERT) | argv + pidfile arms only — the socket-holder arm is deliberately NOT carried (it needs a second fleet-wide `lsof` pass on a host this tool exists to unload) | listed in the script header |
+
+`orphan-reap.py` walks to the top (`ancestry()`, `:175`) **and** adds the two gates `ppid 1` cannot
+express: launchd registration (gate 4 — a managed daemon has an owner) and designed-daemon (gate 5 —
+pidfile, daemon flag, recently-touched output, or any live holder of a socket it owns). Gate 5 was
+added AFTER a dry run passed gates 1-4 on three processes and all three were wrong to reap (gate 4
+came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (`:195`) and nothing
+schedules it today (§6.5.1).
 `lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
@@ -1373,6 +1383,13 @@ ships armed. ⛔ Note what is NOT that guard:
 (`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
 ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
 surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
+
+⛔ **The ancestry row is where arms get lost.** `ppid==1` is both this section's warning and
+`pi-reap-orphans.sh`'s candidate filter: once the kernel reparents a process, `ps` no longer holds
+the pre-reparent chain, so for that carrier an ancestor ABOVE launchd is not observable and its
+ancestry gate reduces to "the candidate must not BE a terminal / login shell / multiplexer". That is
+stated in the script header, in the plist's arming note, and pinned by a suite leg — do not read the
+narrower guarantee as the wider one when deciding whether to arm a job.
 
 ### 6.5.4 Reaping releases what the lane held
 
@@ -1405,10 +1422,21 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
-  `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
-  `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
-  decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.
+  `orphan-reap.py` (`:195`) — with nothing scheduling it. The process reaper restored by
+  #1862/#1863 (`pi-reap-orphans.sh`) is now SCHEDULED (hourly
+  `com.eldato.pi-reap-orphans.plist`) **and ships DISARMED**
+  (`REAP_ORPHAN_DRY_RUN=1`, pinned by `install-launchd.test.sh`), so the schedule and the arming
+  decision are deliberately separable — a template bump that armed it would red CI. **Arming it is
+  a REACHABLE, dated, reversible step** (#1863 review ISSUE 2): the template renders the placeholder
+  `{{REAP_ORPHAN_MODE}}`, and the installer writes the dated record that renders `0` —
+  `scripts/install-launchd.sh --arm-orphan-reaper --reason '<why, dated trigger>'` / reverse it with
+  `--disarm-orphan-reaper`; `--status` prints which state the box is in, and a half-written record
+  renders DISARMED (fail-closed). Hand-editing the installed plist is NOT the route — the next
+  render reverts it silently, leaving an installed-but-inert killer. The two that
+  actually run are ARMED: `heartbeat-loop.sh:365-368` passes `--apply` unless
+  `LANE_WATCHDOG_APPLY=0`, and `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0`
+  "by design". The rule that decides it is the same either way: a wrong reap destroys work, a wrong
+  non-reap only costs disk.
 - **`lane_liveness.py` never acts on `wedged`/`idle`** — it escalates `dead` only (`:68`). The one kill
   on a wedge signal is `lane-watchdog.py` (`os.kill`, `:623`), and it targets a frozen CHILD process,
   never the lane.
