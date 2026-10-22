@@ -138,6 +138,7 @@ run_shard scripts/cleanup-stale-branches.test.sh                          # #178
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/daily-backup.test.sh                                     # #907 the backup target is RESOLVED from the port it publishes and PROVEN to answer before any state exists; the LOAD_GATE_FORCE path runs; an incomplete backup dir is removed
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
+run_shard scripts/review-registry-sync.test.sh                            # the registry-union contract: byte-identical copy, idempotent pull, never-overwrite-newer, conflict/collision refuse rather than overwrite, key shapes never collapse, nothing deleted, lock → UNKNOWN
 run_shard scripts/ci_runner_gate.test.sh                                   # #1704 an unreadable queue count / a failed runner enumeration must not read as healthy; #1719 the launcher, the farm and the script must agree
 run_shard scripts/orchestrator-harness/cloud-cell-record-dep.test.sh       # #1717 cmd_check must refuse a cell without record-review.sh, and a record failure must PARK (not re-pay)
 run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate) (also a per-PR job in ci.yml)

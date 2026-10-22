@@ -1845,8 +1845,29 @@ check_orphan_reaper_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
-grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
-  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+# ⛔ DERIVED FROM `merge_gate_srcs`, NOT HARD-CODED — the SAME defect the lib assertion below
+# records (#1897), in the one place it was left behind. This pinned the literal string
+# `1 copied (record-review.sh, #562)`, so a legitimate SECOND merge-gate script
+# (`review-registry-sync.py`) turned a correct farm into a red run in both lanes. Read the count and
+# the names FROM the array, so the assertion fails for the reason it exists (a sibling that landed
+# undeclared, or a summary that lies about what was farmed) instead of on every addition.
+mg_decl="$(farm_array_entries merge_gate_srcs | tr '\n' ' ')"
+mg_n="$(printf '%s\n' "$mg_decl" | wc -w | tr -d ' ')"
+if [ -z "${mg_n:-}" ] || [ "$mg_n" -eq 0 ]; then
+  fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived"
+else
+  mg_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$mg_line" in
+    *"scripts merge-gate farm: $mg_n copied"*) ;;
+    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $mg_n copied, #562): ${mg_line:-<no merge-gate-farm line at all>}" ;;
+  esac
+  for mg_base in $mg_decl; do
+    case "$mg_line" in
+      *"$mg_base"*) ;;
+      *) fail "run 1: the merge-gate farm summary does not NAME the declared script '$mg_base' — a summary that omits what it farmed misreports the farm (#1897)" ;;
+    esac
+  done
+fi
 # ⛔ DERIVED FROM `lib_srcs`, NOT HARD-CODED (#1897). This used to pin the literal string `2 copied
 # (pid-identity.sh + diff-normalize.py)` — so adding a legitimate THIRD lib (beat-pair.sh, the
 # recap/beat rule both readers share) turned a correct farm into a CI red. Read the expected count and

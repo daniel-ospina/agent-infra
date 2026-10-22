@@ -695,7 +695,7 @@ fi
 # joined the #427/#373 farms and drifted: the repo copy is CI-tested while
 # production mints execute the ~/.pi copy. Same idempotent real-copy refresh
 # model as the farms above.
-merge_gate_srcs=(record-review.sh)
+merge_gate_srcs=(record-review.sh review-registry-sync.py)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
@@ -714,7 +714,7 @@ for base in "${merge_gate_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   merge_gate_copied=$((merge_gate_copied+1))
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, review-registry-sync.py, #562)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
