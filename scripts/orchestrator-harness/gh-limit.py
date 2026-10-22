@@ -462,6 +462,17 @@ MUTATING_PAIRS = {
     ("issue", "reopen"), ("run", "rerun"), ("run", "cancel"), ("release", "create"),
     ("release", "edit"), ("release", "delete"), ("label", "create"), ("label", "edit"),
     ("label", "delete"), ("repo", "edit"), ("workflow", "run"),
+    # ⛔ A WRITE THE TABLE DID NOT KNOW WAS A WRITE. These reached the READ branch, so the refusal told the
+    # operator “this READ has no exact GraphQL equivalent” about a mutation — the diagnostic falsehood this
+    # file exists to remove — and they were not PACED, because pacing keys on the same predicate. The
+    # safety outcome was right (refused, nothing spent); the one line a human reads was wrong (round 7).
+    ("secret", "set"), ("secret", "delete"), ("variable", "set"), ("variable", "delete"),
+    ("cache", "delete"), ("gist", "create"), ("gist", "delete"), ("gist", "edit"),
+    ("codespace", "create"), ("codespace", "delete"), ("codespace", "stop"),
+    ("ruleset", "create"), ("ruleset", "edit"), ("ruleset", "delete"),
+    ("ssh-key", "add"), ("ssh-key", "delete"), ("gpg-key", "add"), ("gpg-key", "delete"),
+    ("repo", "create"), ("repo", "delete"), ("repo", "fork"), ("repo", "rename"),
+    ("repo", "archive"), ("repo", "sync"), ("repo", "unarchive"),
 }
 METHOD_FLAGS = ("-X", "--method")
 DATA_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
@@ -2692,7 +2703,16 @@ def health_token():
     if snap is not None:
         core = snap.get("core") or {}
         rem, mreset = core.get("remaining"), core.get("reset")
-        if isinstance(rem, int) and isinstance(mreset, int) and mreset > clock():
+        if isinstance(rem, int) and isinstance(mreset, int):
+            # ⛔ A FRESH SNAPSHOT ALWAYS WINS — INCLUDING WHEN ITS WINDOW HAS ALREADY PASSED. The first
+            # version required `mreset > now`, so a fresh meter whose reset was in the past fell THROUGH
+            # to the durable record and reported an exhaustion the rail and the write guard both treat as
+            # closed (measured, round 7: `--health` said `resets_in=12m` rc 3 while `core_pressure()` said
+            # None and the rail printed nothing — the verb telling a lane to wait for a window nobody
+            # else believes in). Either the meter has headroom (gh-ok), or it is empty inside a live
+            # window (named), or its window is over (gh-ok, whatever the older record says).
+            if mreset <= clock():
+                return "gh-ok", 0
             if rem == 0:
                 return "gh-core-exhausted resets_in=%s" % resets_in(mreset), 3
             # ⛔ THE LOW-WATER BAND IS NOT EXHAUSTION — the same distinction `core_pressure` makes for
@@ -3131,10 +3151,12 @@ def _enc_issue_comments(doc):
     conn = issue.get("comments")
     if not isinstance(conn, dict):
         return None
-    if (conn.get("pageInfo") or {}).get("hasNextPage") is True:
-        # ⛔ A TRUNCATED LIST REPORTED AS COMPLETE IS A DIFFERENT ANSWER, NOT A SHORTER ONE. REST's own
-        # default page is 30 and a caller's `?per_page=`/`--paginate` shape is refused outright, so a
-        # 100-item window would answer a question nobody asked without saying so. Fail closed instead.
+    # ⛔ AN ABSENT `pageInfo` IS NOT “COMPLETE”. Testing only `hasNextPage is True` read a missing (or
+    # null) `pageInfo` as the end of the list and emitted a window truncated at `first:30` as the whole
+    # answer — the exact “a truncated list reported as complete is a different answer” this guard
+    # forbids, from the guard's own blind spot (measured, round 7). The connection must SAY it is
+    # complete: `hasNextPage` false.
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
         return None
     nodes = conn.get("nodes")
     if not isinstance(nodes, list):
@@ -3151,8 +3173,8 @@ def _enc_pr_reviews(doc):
     conn = pr.get("reviews")
     if not isinstance(conn, dict):
         return None                    # a missing connection is not an empty review list (see above)
-    if (conn.get("pageInfo") or {}).get("hasNextPage") is True:
-        return None                    # truncated: the REST read this replaces would not have been
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
+        return None                    # absent pageInfo = “I cannot prove this is the whole list”
     nodes = conn.get("nodes")
     if not isinstance(nodes, list):
         return None
