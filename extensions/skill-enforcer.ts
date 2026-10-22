@@ -874,9 +874,10 @@ export default function (pi: ExtensionAPI) {
       const file = skillDisplayPath(skillName);
       const reason = [
         `⛔ Skill gate — ${skillName}/SKILL.md not read this session.`,
-        // #1331: the gate message is the ONE gate-description site a blocked lane meets at
-        // the moment it matters, so it must not imply that only a read in THIS process
-        // counts — a read restored from a previous session (≤24 h of idleness) satisfies it.
+        // #1331: this message must not imply that only a read in THIS process counts — a
+        // read restored from a previous session (≤24 h of idleness) satisfies the gate. The
+        // same sentence is emitted by the nudge path's Level-3 hard block below, so the
+        // window line is carried there too; keep the two in step.
         `  (a read from a previous session counts: it is restored from ~/.pi/agent/skill-reads.json while ≤24 h idle)`,
         rule.message ? `  ${rule.message}` : "",
         `  Required: read ${file}`,
@@ -959,6 +960,8 @@ export default function (pi: ExtensionAPI) {
             // Level 3: hard block
             const reason = [
               `⛔ Skill gate — ${skillName}/SKILL.md not read this session.`,
+              // #1331: same sentence as the hard-rule block above — same window line.
+              `  (a read from a previous session counts: it is restored from ~/.pi/agent/skill-reads.json while ≤24 h idle)`,
               `  Required: read ${skillDisplayPath(skillName)}`,
               `  → Or SKILL_ENFORCER_DISABLED=1 to bypass.`,
             ].join("\n");
