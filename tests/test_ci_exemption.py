@@ -2596,3 +2596,125 @@ def test_runner_aggregate_reads_the_real_actions_capture_shape():
     assert ci_exemption.runner_aggregate_failures(
         "job\tstep\t2026-10-19T09:31:07Z ✅ **test-ok**: 5 passed, 0 failed, 0 skipped"
     ) == ([], {})
+
+
+# ── #9331 · a MEASURED value is not a different failure ───────────────────
+#
+# THE DEFECT (tortoise #9331). `normalize_signature` masks addresses, UUIDs, hex
+# run ids, `team_*` tenants and `host:port`, but NOT a measured DURATION. A test
+# whose assertion message interpolates its own measurement therefore has a
+# per-run signature, and `_signatures_overlap`'s SUBSET rule can never hold — an
+# id main measures red at 25% is BLOCKed forever as "a DIFFERENT failure":
+#
+#   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
+#           signature differs from main's (1/1 (100%) vs 1/4 (25%))
+#           — same id, a DIFFERENT failure is not exempt
+#
+# A duration is ENVIRONMENTAL substrate (the machine's load changed), not the
+# data the assertion is about — exactly the axis the mask list already excludes
+# ids by. The two directions are pinned below, because a mask is a fail-closed
+# input: over-masking makes two genuinely different failures compare EQUAL and
+# hands the exemption to a failure main never had.
+
+_EP_LATENCY_MSG_A = "local EP took 1.21s — interactive budget is ≤1s"
+_EP_LATENCY_MSG_B = "local EP took 1.47s — interactive budget is ≤1s"
+
+
+def test_9331_two_measured_durations_of_one_assertion_are_one_signature():
+    """RED before the fix: the two texts normalise to themselves and never match."""
+    a = ci_exemption.normalize_signature(_EP_LATENCY_MSG_A)
+    b = ci_exemption.normalize_signature(_EP_LATENCY_MSG_B)
+
+    assert a == b, (
+        "a measured duration must not be part of the signature — main's\n"
+        f"{_EP_LATENCY_MSG_A!r} and the PR's {_EP_LATENCY_MSG_B!r} are ONE failure"
+    )
+
+
+def test_9331_the_measured_duration_case_is_EXEMPT_end_to_end():
+    """The acceptance the issue asks for: the rail's own decision, not just the mask.
+
+    main measured this id red 1/4 with a signature carrying ITS run's elapsed
+    value; the PR's run carries a different elapsed value. Same id, same
+    assertion — the exemption must be available.
+    """
+    main_sig = ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_A}")
+    pr_sig = ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_B}")
+
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(1, 4)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+
+    assert not decision.any_blocked, (
+        "same id + same assertion + main's own measurement must EXEMPT; got "
+        f"{[b.reason for b in decision.blocked]}"
+    )
+    assert len(decision.exempt) == 1
+
+
+def test_9331_a_meaningful_number_stays_SIGNAL():
+    """The other direction: numbers that ARE the assertion must never be masked.
+
+    An HTTP 403 vs 404, a count budget, and a percentage are the DATA a failure
+    is about — collapsing them would mask a genuinely new failure (the fail-OPEN
+    direction the SUBSET rule exists to close).
+    """
+    pairs = [
+        ("AssertionError: expected status 403, got 404", "AssertionError: expected status 403, got 403"),
+        ("orphaned redislite servers after suite: 16 (threshold: 12)",
+         "orphaned redislite servers after suite: 12 (threshold: 12)"),
+        ("reach rate 91.2% is below the 95% floor", "reach rate 88.4% is below the 95% floor"),
+        ("coverage of the closure was 12/40 nodes", "coverage of the closure was 9/40 nodes"),
+    ]
+    for left, right in pairs:
+        assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
+            f"masking became a fail-OPEN: {left!r} and {right!r} collapsed"
+        )
+
+
+def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
+    """`ids` and `signatures` must sign the same id the same way (§4.6 coupling).
+
+    The prefixed capture shape is the one the rail actually reads, so the mask
+    has to survive `_strip_log_prefix` and the `E   ` line, not just the bare
+    string.
+    """
+    # The ORDER is the measured one (pytest 9.1): the MESSAGE line is the first
+    # `E` line, the `assert 1.21 < 1.2` expansion follows it.
+    log = "\n".join([
+        "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
+        "job\tstep\t2026-10-21T09:45:00.0Z ____ test_ac5_interactive_latency_zone ____",
+        f"job\tstep\t2026-10-21T09:45:00.0Z E       AssertionError: {_EP_LATENCY_MSG_A}",
+        "job\tstep\t2026-10-21T09:45:00.0Z E       assert 1.21 < 1.2",
+        "job\tstep\t2026-10-21T09:45:00.0Z FAILED tests/test_ep_local_395.py::test_ac5_interactive_latency_zone",
+    ])
+    parsed = ci_exemption.parse_pr_failure_text(log)
+    sigs = parsed.signatures["tests/test_ep_local_395.py::test_ac5_interactive_latency_zone"]
+
+    assert sigs == frozenset(
+        {ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_A}")}
+    ), f"the door did not apply the duration mask: {sigs}"
+    # …and the mask is actually APPLIED at the door, not merely absent from both
+    # sides of the comparison above (a tautology would pass on the unfixed tree).
+    (sig,) = sigs
+    assert "<MEAS>" in sig and "1.21s" not in sig, (
+        f"the door stored the raw measurement instead of masking it: {sig!r}"
+    )
+
+
+def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
+    """The DECLARED residual, pinned so it is a decision and not a surprise.
+
+    A message-less elapsed assertion renders as ``assert 1.47 < 1.2`` — a
+    unit-less number, indistinguishable from the data a failure is about
+    (``assert 403 == 404``). Masking it would be the fail-OPEN direction, so it
+    stays VOLATILE on purpose. This test is the tripwire: when evidence demands
+    the bare-comparison shape be masked too, this reds and the mask must be
+    widened deliberately, with its own two-direction tests.
+    """
+    assert ci_exemption.normalize_signature("assert 1.47 < 1.2") != (
+        ci_exemption.normalize_signature("assert 1.21 < 1.2")
+    ), "if this now matches, the mask was widened — re-derive the fail-OPEN guard"

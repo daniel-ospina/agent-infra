@@ -1033,11 +1033,46 @@ _TRAILER_RE = re.compile(
 # A section boundary that ends the current failure block.
 _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 
+# A MEASURED DURATION is substrate too — and it is the one substrate axis the
+# mask list was missing (tortoise #9331). An assertion message that interpolates
+# its own measurement (``elapsed < 1.2, f"local EP took {elapsed:.2f}s …"``) has
+# a DIFFERENT signature on every run, so `_signatures_overlap`'s SUBSET rule can
+# never hold for it: an id main measures red at 25% is BLOCKed forever as
+# "same id, a DIFFERENT failure" — and blocked randomly, depending on which run
+# sampled the timer. Measured on tortoise PR logs:
+#
+#   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
+#           signature differs from main's (1/1 (100%) vs 1/4 (25%))
+#
+# The mask is narrowed to numbers carrying a TIME UNIT, which is what makes it
+# safe in the other direction:
+#
+#   * a bare number stays SIGNAL — ``expected status 403, got 404``,
+#     ``orphaned servers: 16 (threshold: 12)``, ``91.2%`` and ``12/40`` are the
+#     DATA a failure is about, and collapsing them would hand the exemption to a
+#     failure main never had (the fail-OPEN direction the SUBSET rule closes);
+#   * SIZE units (``KiB``/``bytes``) are NOT masked, for the same reason — a
+#     written-byte count is data, not substrate, until evidence says otherwise;
+#   * DECLARED RESIDUAL: pytest also renders a message-less elapsed assertion as
+#     ``assert 1.47 < 1.2`` — a unit-less number, indistinguishable from data, so
+#     it stays volatile by design. It is pinned as a residual in
+#     ``tests/test_ci_exemption.py::test_9331_the_unitless_assert_expansion_is_a_declared_residual``.
+#     The measured case that filed #9331 carries a message, and pytest renders
+#     the MESSAGE line first (verified against pytest 9.1: the ``E`` line is
+#     ``AssertionError: local EP took 1.47s — …``), so the primary signature is
+#     the masked one.
+_MEASURED_DURATION_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s?"
+    r"(?:ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
+    r"(?!\w)"
+)
+
 # Volatile substrate IDENTIFIERS, each one named by measured evidence. The mask
 # list is deliberately CLOSED and documented: over-normalising is the fail-OPEN
 # direction (two different failures collapsing into one signature would make a
 # PR's signature set a subset of main's more easily), so nothing is masked that
-# the evidence does not demand. Ids/addresses/tenants only — never data values.
+# the evidence does not demand. Ids/addresses/tenants/measurements only — never
+# data values.
 _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<ADDR>"),
     (
@@ -1056,6 +1091,9 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
+    # Last, and unit-anchored: a duration is the machine's, not the assertion's
+    # (#9331). See `_MEASURED_DURATION_RE` for the fail-OPEN reasoning.
+    (_MEASURED_DURATION_RE, "<MEAS>"),
 )
 
 
