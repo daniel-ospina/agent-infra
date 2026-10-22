@@ -157,7 +157,9 @@ ok(
 //   (i) the head you pass is the RECORDED one — passing the live head is a FRESH mint, refused at
 //       record-review.sh:2008 (exit 3), which is the "command that cannot work" class this module
 //       exists to remove;
-//   (ii) the lane arm is a FORWARD MERGE; a rebase rewrites the head and never carries (:1377);
+//   (ii) the lane arm is a FORWARD MERGE: it requires the reviewed head to be an ANCESTOR of the
+//       target (:1377-1379), so a rebase rules out the LANE arm — the DIFF arm still carries when
+//       the recomputed three-dot digest is unchanged;
 //   (iii) a measurably RED target head vetoes the carry (#1575 clause E, :1951).
 ok(
   line.includes("the REVIEWED head, not the live one"),

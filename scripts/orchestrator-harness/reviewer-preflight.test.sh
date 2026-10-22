@@ -111,7 +111,8 @@ BIND_AT="${LINE%%"$REVIEWER_HEAD_BINDING"*}"
 [ "${#BIND_AT}" -lt "${#CARRY_AT}" ]; ck $? "…and AFTER the stale-head rule it is the exception to (no self-contradiction)"
 # The three facts the recorder enforces and a first draft got wrong (fresh review, P1/P2):
 # which head to pass (a live head is a FRESH mint, refused at record-review.sh:2008), that the lane
-# arm is a FORWARD MERGE (a rebase never carries, :1377), and the red-target veto (:1951).
+# arm is a FORWARD MERGE — an ANCESTRY check (:1377-1379), so a rebase rules out the LANE arm while
+# the DIFF arm still carries an unchanged recomputed digest — and the red-target veto (:1951).
 case "$LINE" in *"the REVIEWED head, not the live one"*) rc=0;; *) rc=1;; esac
 ck $rc "…naming WHICH head to pass (the recorded one) — the live head is a fresh mint, refused"
 # ⛔ THE VERDICT IS PART OF THE IDENTITY (cycle 2, P1): the DIFF arm pins `verdict=` in its marker

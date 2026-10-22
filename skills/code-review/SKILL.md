@@ -1672,7 +1672,9 @@ fi
 - If the PR head moves AFTER recording (fix commits, merge of main), the gate
   turns red again: re-review the new head and re-record — UNLESS a carry arm
   proves the reviewed artifact is unchanged (the same three-dot DIGEST, or a
-  base-only move of the lane's own commits), in which case nothing is owed: pass
+  base-only move — the base advanced, YOUR OWN commits did not), AND the target
+  head is not measurably red (#1575 clause E refuses the carry; re-run the
+  failing checks and re-record instead), in which case nothing is owed: pass
   the recorded head and the recorded verdict to `record-review.sh` and it
   re-binds (`mint:"carried"`, no `--evidence`). See
   `commit-workflow/workflow/04-merge-deploy.md` condition 6. NEVER re-record a
