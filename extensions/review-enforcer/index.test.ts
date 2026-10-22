@@ -586,6 +586,20 @@ test("the live-diff read bound outlasts the shared gh gate's queue", () => {
     equal(diffHashReadTimeoutMs(), 720_000, "a non-positive override is ignored, never a zero bound");
     process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "nope";
     equal(diffHashReadTimeoutMs(), 720_000, "an unparseable override is ignored too");
+    // ⛔ `parseInt` ACCEPTS A PREFIX, so `10m` used to yield TEN MILLISECONDS — the
+    // killed-while-queueing read this function exists to prevent, reintroduced by a
+    // config value with no warning (review, #2353 P2). A value below the floor is
+    // ignored outside test, and a non-integer spelling is not a number at all.
+    process.env.NODE_ENV = "production";
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "10m";
+    equal(diffHashReadTimeoutMs(), 720_000, "an SI-suffixed spelling is not silently read as 10ms");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "1000";
+    equal(diffHashReadTimeoutMs(), 720_000, "a sub-floor override is refused in production (not trusted)");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "90000";
+    equal(diffHashReadTimeoutMs(), 90_000, "…while a legitimate override above the floor is honoured");
+    process.env.NODE_ENV = "test";
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "500";
+    equal(diffHashReadTimeoutMs(), 500, "…and under test a short bound is honoured, so the knob stays testable");
   } finally {
     if (prevT === undefined) delete process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS;
     else process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = prevT;

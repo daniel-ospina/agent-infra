@@ -1958,10 +1958,24 @@ export function parseDiffHashHelperOutput(stdout: string): string | null {
  * ends in `null` — bounded, and now legible.
  */
 export function diffHashReadTimeoutMs(): number {
-  const explicit = parseInt(process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "", 10);
-  if (Number.isInteger(explicit) && explicit > 0) return explicit;
+  // ⛔ A FULL-INTEGER PARSE, AND A FLOOR ON THE OVERRIDE. `parseInt` accepts any
+  // leading-integer prefix, so a human spelling like `10m` yielded TEN MILLISECONDS —
+  // the same killed-while-queueing read this function exists to prevent, silently
+  // reintroduced fleet-wide by a config value (review, #2353 P2). An override is an
+  // operator's stated intent, so a legitimate short value is honoured under test, but
+  // outside test a bound below the floor is ignored rather than trusted.
+  const raw = (process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "").trim();
+  const FLOOR_MS = 60_000;
+  if (/^[0-9]+$/.test(raw)) {
+    const explicit = Number.parseInt(raw, 10);
+    if (explicit > 0 && (explicit >= FLOOR_MS || process.env.NODE_ENV === "test")) return explicit;
+  }
   const acquire = parseInt(process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT ?? "", 10);
   const acquireMs = (Number.isInteger(acquire) && acquire > 0 ? acquire : 300) * 1000;
+  // NOTE: the read itself retries (record-review.sh DIFF_FETCH_ATTEMPTS=3), so a path
+  // whose every attempt queues can still outlast any single bound. That residual is
+  // declared rather than papered over: the failure is now `diff_unreadable` (RETRY),
+  // which is cheap and re-decidable, instead of a false "the content changed".
   return Math.max(600_000, acquireMs + 120_000);
 }
 
@@ -2333,8 +2347,16 @@ export function evaluateMergeGate(
         `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
         `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
         "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
-        `     run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} ${pr} ${currentHead.slice(0, 12)}… clean`
-        + " [owner/repo] --evidence comment:<review-comment-id>",
+        // ⛔ THE SHA MUST BE A PLACEHOLDER, AND THE VERDICT MUST BE THE RECORD'S OWN.
+        // A truncated `${currentHead.slice(0,12)}…` LOOKS runnable — the two lines above
+        // are literal — and record-review.sh refuses anything short of 40 hex with exit 2,
+        // so the advice dead-ended exactly when a lane tried to land (review, #2353 P1).
+        // Hardcoding `clean` broke the rule this block's own sibling states at the
+        // head_advanced arm ("never a hardcoded `clean`"): a clean-micro PR was pushed to a
+        // full standard review and a clean-low one lost its re-derive-the-shape path.
+        // `<head_sha>` is the placeholder every neighbouring arm uses.
+        `     run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} ${pr} <head_sha>`
+        + ` ${record.verdict} [owner/repo] --evidence comment:<review-comment-id>`,
       ].join("\n"),
     };
   }

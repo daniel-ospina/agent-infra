@@ -1949,6 +1949,33 @@ run_check_carry 424907 "$CC_REPO"
 assert_eq "$CC_RC" "4" "11.13g another repo's legacy record is not read (exit 4)"
 rm -f "$CC_RDIR/424907.json"
 
+# (g2) THE GATE'S COLLISION RULE, APPLIED TO THE QUALIFIED FILE TOO (review, #2353 P1).
+# The merge gate treats a qualified record whose embedded `repo` names ANOTHER repo as
+# ABSENT (the identical-slug overwrite class). A surface that reported `carry … land it`
+# for it would be a second definition of "the record" — the exact divergence this mode
+# exists to prevent.
+printf '{"pr":424909,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424909.json"
+run_check_carry 424909 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g2 a qualified record naming ANOTHER repo is not read (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g2 …reports 'norecord', like the gate"
+rm -f "$CC_FILE-424909.json"
+
+# (g3) THE KEY IS CASE-EXACT. `repo` is compared as a string by the gate, and the record
+# path is derived from the spelling the writer was handed; folding case here would make
+# this mode accept a key the gate never looks up.
+printf '{"pr":424910,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"Daniel-Ospina/agent-infra"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424910.json"
+run_check_carry 424910 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g3 a differently-CASED repo is a different key (exit 4)"
+rm -f "$CC_FILE-424910.json"
+
+# (f2) `nodigest` NEEDS NO READ, so it must be decided BEFORE the diff read (review,
+# #2353 P2). With a digest-less record AND an unreadable diff, the answer is the one
+# that unsticks the lane (re-run the recorder's carry arms), not an endless RETRY.
+cc_rec 424911 "$CC_STALE" EMPTY
+STUB_DIFF_FAIL=1 run_check_carry 424911 "$CC_REPO"
+assert_eq "$CC_RC" "5" "11.13f2 a digest-less record answers nodigest even when the diff cannot be read"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13f2 …not 'unreadable' (a RETRY loop that cannot converge)"
+
 # (h) READ-ONLY means read-only: a record-minting flag is REFUSED, not ignored —
 #     otherwise a caller believes it recorded something it did not.
 CC_RC=0
