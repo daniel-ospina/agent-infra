@@ -830,6 +830,19 @@ grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
   || bad "orch-loop: the no-dispatch line does not carry the queue state"
 # Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
 # still appears in the comments that record WHY it was removed, and a comment is not a claim.
+# ── agent-infra#2019: the refresh gate must not be silenced by the queue it fills ──
+# MEASURED live 2026-10-21: candidates.txt pinned at 6 (the refresh's own LIMIT), so `BL -lt 6` was
+# permanently false and `state/refresh-funnel` was 29 HOURS old — the pool frozen, every issue
+# created in that window invisible. The anti-thrash intent is kept as an AGE floor.
+grep -q 'LATCH_MAX_AGE_MIN' "$LOOP" \
+  && ok "#2019: the refresh gate carries an age bound beside the length test" \
+  || bad "#2019: the refresh gate is length-only — a full queue silences the refresh forever"
+grep -q '_funnel_age_min' "$LOOP" \
+  && ok "#2019: the gate measures the AGE of the recorded pass, not only the queue length" \
+  || bad "#2019: the gate cannot see the age of the recorded pass"
+grep -q 'refreshing anyway (#2019)' "$LOOP" \
+  && ok "#2019: a full-but-stale queue is refreshed, and says why in the log" \
+  || bad "#2019: a full-but-stale queue is not refreshed (the latch)"
 grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
   && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
   || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
@@ -1573,7 +1586,21 @@ esac
 # The shipped refresh block is extracted VERBATIM (not re-implemented) and driven with stub scripts.
 # The pre-fix block discarded the exit status (`( … ) &`), so both cases below were indistinguishable
 # and the block re-spawned forever. `wait` is appended so the backgrounded subshell settles.
-awk '/---- 3\) background backlog refresh/{f=1} f{print} f&&/^  fi$/{exit}' "$LOOP" > "$T/refreshblock.sh"
+# ⛔ THE TERMINATOR IS THE NEXT SECTION, NOT THE FIRST `^  fi$` (agent-infra#2019). The block used
+# to contain no nested `if`, so "the first 2-space `fi`" and "the block's own `fi`" were the same
+# line. The age probe below adds a nested `if` at exactly 2-space indent, and the extractor then cut
+# the block off at ITS `fi` — before `refresh-candidates.sh` — so the whole of §7 fell through to
+# the `else` bad() and its 13 arms stopped running. Anchoring on the section that FOLLOWS the block
+# is invariant to how many `if`s the block grows; the `grep -q 'refresh-candidates.sh'` guard below
+# still fails loudly if the extraction truncates for any other reason.
+{
+  # The block now calls two helpers, so the shipped definitions are extracted too. Without them the
+  # age probe's `file_mtime_epoch` is a NOT FOUND, the `&&` short-circuits and the age is pinned at
+  # the "unknown" default — every arm below would pass on a block whose age test could be inverted.
+  grep -m1 '^is_num()' "$LOOP"
+  awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
+} > "$T/refreshblock.sh"
 printf '\nwait\n' >> "$T/refreshblock.sh"
 if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh"; then
   ok "orch-loop: the refresh block is extracted from the shipped loop"
@@ -1628,6 +1655,31 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   grep -q 'STALE PREVIOUS CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
     && bad "orch-loop: the marker quoted a PREVIOUS cycle's refusal as this run's reason" \
     || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
+  # (d)+(e) THE LATCH, DRIVEN (agent-infra#2019). The three `grep`s in §6b pin the TEXT of the fix;
+  # these two pin its BEHAVIOUR, because a grep passes on an age test that is inverted, mis-scaled,
+  # or never reached — which is precisely the defect class here (a gate that can never fire).
+  #   (d) queue FULL (6 = the refresh's own LIMIT) + a STALE recorded pass  -> refresh, and say why
+  #   (e) queue FULL + a FRESH recorded pass                                -> no rebuild (anti-thrash)
+  # The pass record's mtime is aged with `touch -t` (POSIX `[[CC]YY]MMDDhhmm`), portable to BSD and
+  # GNU alike; a FRESH one is simply written now, so neither arm depends on the host clock's era.
+  mk_latch_case() { # <dir> — a full queue and a recorded pass in $1/state
+    mkdir -p "$1/state"
+    printf 'a\nb\nc\nd\ne\nf\n' > "$1/candidates.txt"
+    printf 'listed=0 judged=0 queued=0 landed=0 limit=6 at=%s\n' "$(date +%s)" > "$1/state/refresh-funnel"
+    printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\n' "$1" > "$1/refresh-candidates.sh"
+    chmod +x "$1/refresh-candidates.sh"
+  }
+  BL4="$T/block4"; mk_latch_case "$BL4"; touch -t 200001010000 "$BL4/state/refresh-funnel"
+  O="$BL4" LOG="$BL4/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  [ -s "$BL4/invoked" ] && ok "#2019: a FULL queue whose recorded pass is STALE is refreshed" \
+                        || bad "#2019: a full-but-stale queue did NOT refresh — the latch is frozen again"
+  grep -q 'refreshing anyway (#2019)' "$BL4/log" 2>/dev/null \
+    && ok "#2019: the latch says WHY a full queue was refreshed anyway" \
+    || bad "#2019: the latch refreshed without naming its cause — $(cat "$BL4/log" 2>/dev/null)"
+  BL5="$T/block5"; mk_latch_case "$BL5"
+  O="$BL5" LOG="$BL5/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  [ ! -s "$BL5/invoked" ] && ok "#2019: a full queue with a FRESH pass is NOT rebuilt (anti-thrash kept)" \
+                          || bad "#2019: a fresh pass did not suppress the rebuild — the age floor is gone"
 else
   bad "orch-loop: could not extract the refresh block"
 fi
@@ -1876,6 +1928,23 @@ esac
 awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
+# ⛔ THE BLOCK'S OWN INPUTS MUST EXIST IN THE FIXTURE (agent-infra#2054). The batch body now asks the
+# PRODUCT FLOOR which file to read (`FLOOR_N="$(floor_norm …)"; ORDER_FILE="$(floor_choose_order …)"`),
+# and `done < "$ORDER_FILE"` is what the loop reads. Undefined here, those calls return 127, ORDER_FILE
+# comes out EMPTY, and the fixture reported "nothing was batched" — blaming the claim gate for a missing
+# stub (measured: 8 red in this suite when the floor landed). The daemon has these functions, so the
+# fixture takes them from the same shipped file rather than re-implementing them.
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  # agent-infra#2054: the emergency yield is asked from inside this block too, so it is extracted with the
+  # other three — otherwise its call returns 127 here, FLOOR_EMERGENCY comes out empty, and the fixture
+  # would silently grade a floor that never consulted an emergency.
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
+  cat "$T/dispatchblock.sh"
+} > "$T/dispatchblock.fns" && mv "$T/dispatchblock.fns" "$T/dispatchblock.sh"
+grep -q 'floor_choose_order()' "$T/dispatchblock.sh" && grep -q 'floor_emergency()' "$T/dispatchblock.sh" || { echo "  FAIL the dispatch fixture could not extract the product-floor functions from the shipped loop"; FAIL=$((FAIL+1)); }
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
   # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also

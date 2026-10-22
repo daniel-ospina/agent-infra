@@ -42,6 +42,17 @@ if [ -z "$PRUNE_OR" ]; then
     [ -n "$PRUNE_OR" ] && break
   done
 fi
+# ── THE PRODUCT WORK FLOOR'S INTAKE SIDE (agent-infra#2054) ──────────────────────────────────
+# `orch-loop.sh` fills up to PRODUCT_FLOOR of each batch from `candidates.product.txt` first. This
+# script is what decides WHICH candidates are product, and it decides by REPO plus LABEL — not by title
+# text, which is the mistake the 1,229-issue title-regex pass already paid for (232 unlabelled).
+#   product  =  the target repo is in PRODUCT_REPOS  AND  the issue does not carry the `harness` label
+#   harness  =  everything else, including every agent-infra issue
+# ⛔ AND THE TWO QUEUES ARE DERIVED FROM `candidates.txt`, NEVER ACCUMULATED INTO. The merged backlog is
+# the authority; a product queue that could drift (a queued-then-failed write, a dispatched issue, an
+# issue re-classified) would make the floor's share a claim about a past pass. Deriving the split at the
+# END of the pass makes it a function of the files as they are NOW.
+PRODUCT_REPOS="${PRODUCT_REPOS:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 
@@ -616,9 +627,10 @@ gh_env_verdict() {
 # ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
 # through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
 # seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` of README §4 — ⛔ NOT `install.sh`, which
-# only REPORTS the drift and prints that `cp` command; corrected 2026-10-16 after a review found the
-# old sentence sent the operator down a path that does not install it), so a deployed cell has it; a
+# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
+# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
+# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
+# remedy it prints is now this same helper), so a deployed cell has it; a
 # box without it cannot take the claim either, and refusing to queue on a missing FILE would make
 # every such box merge-only — a bigger, less reversible failure than the state being removed.
 # Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
@@ -813,7 +825,7 @@ cmd_check() {
     if ! ( CLAIM_REPO="$SC"; . "$O/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
       echo "[refresh] check: FAIL $O/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
       echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE, so a cell on this repo would MERGE ONLY"
-      echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run this check)"
+      echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
       return "$EXIT_NOT_PROVISIONABLE"
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
@@ -1129,6 +1141,12 @@ rm -f "$O/.write-probe"
 # every beat until the disk is fixed.
 # ⛔ `$$`-KEYED PROBE (review P2): a fixed `.write-probe` name means a leftover probe owned by another
 # user refuses a box whose record writes would actually succeed.
+# ⛔ `state/product-class` IS NOT INVALIDATED HERE (agent-infra#2054, review cycle 6, P1). That record
+# describes `candidates.product.txt` / `candidates.harness.txt`, so only the function that WRITES those
+# files may invalidate it, and it does: `write_product_queues` writes `PENDING` as its first action and
+# every arm below overwrites it. A pass that refuses HERE, at the environment check, at the budget or at
+# the pool read leaves the previous record standing — which is TRUE, because neither queue file changed
+# (measured: with an entry-time write, every such pass reported a blind intake on a healthy box).
 if ! ( mkdir -p "$O/state" && : > "$O/state/.write-probe.$$" ) 2>/dev/null; then
   rm -f "$O/state/.write-probe.$$" 2>/dev/null
   # ⛔ AND THE EXIT CODE MUST MATCH THE RETRYABILITY (review P2). A state dir that EXISTS but is not
@@ -1588,6 +1606,16 @@ rest_list() {
      'add // [] | (if $kind == "issues" then map(select(has("pull_request") | not)) else . end) | .[0:$limit] | '"$prog" \
      "$tmp"/p*.json
   n=$?
+  # ⛔ A WINDOW THAT ENDED ON ITS LAST PAGE WITH A NEXT PAGE STILL ADVERTISED IS SATURATED, NOT
+  # COMPLETE — and the distinction is LOAD-BEARING for any caller that reads ABSENCE from the answer as
+  # evidence. `.open_iss` can afford the loss (it only NARROWS, see the two paragraphs above); the
+  # product floor's harness-label listing CANNOT, because it classifies a candidate PRODUCT by its
+  # ABSENCE from this set — so a harness row pushed out of the window would be classified product and
+  # take the floor slot, which is the "never invent a class from a reading that did not answer" polarity
+  # inverted. The rc stays 0 (no existing caller's contract changes); the flag is set instead, and the
+  # floor's writer falls back to the conservative all-harness arm when it is set.
+  REST_WINDOW_FILLED=0
+  [ "${more:-0}" -ge 1 ] && REST_WINDOW_FILLED=1
   rm -rf "$tmp"
   return "$n"
 }
@@ -2423,7 +2451,7 @@ while read -r N; do
           # condition's status surviving into the else branch.
           issue_claim_verdict "$N"; ICR=$?
         else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)"
+          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
         fi
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
@@ -2496,7 +2524,7 @@ while read -r N; do
              # script has been fixed for twice), so take it to the provisioning channel: orch-loop.sh
              # records `.refresh-blocked`, stops retrying, and `status` names the reason.
              echo "[refresh] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question}"
-             echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run)"
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
@@ -2795,6 +2823,376 @@ mv "$O/.cand" "$O/candidates.txt" || {
   refresh_cmd "replace $O/candidates.txt (deduped backlog)"
   refresh_fail persist "$EXIT_TRANSIENT" "cannot replace $O/candidates.txt with the deduped backlog — the queue this pass built is not the one dispatch will read (agent-infra#1736)"
 }
+# ── THE TWO QUEUES (agent-infra#2054) ────────────────────────────────────────────────────────
+# ONE extra LISTING per pass reads the `harness`-labelled issues — up to `ceil(limit/100)` = 5 core
+# requests at `--limit 500`, budget-gated below (the bound is derived there, never glossed as "a call").
+# It is read AFTER the backlog is final, so the split costs nothing in ordering and cannot disturb it.
+# ⛔ A FAILED READ MUST NOT MANUFACTURE PRODUCT WORK, and it must not stop dispatch either. The polarity
+# is the same one the claim pre-flight uses in the opposite direction: without the label set, EVERY
+# candidate classifies as harness, so `candidates.product.txt` comes out EMPTY, the floor is unmet, and
+# orch-loop.sh says so WITH the queue-state token. That is a visible, conservative failure — never a
+# product candidate invented from a listing that did not answer.
+# ⛔ WRITTEN BY A FUNCTION, NOT INLINE (cycle-1 review, P1). Two defects came from the inline version:
+# (a) it called a helper that lives in orch-loop.sh — the refresh runs as a CHILD and never
+# sources it, so the operator's split line was `command not found` under `2>/dev/null` and printed
+# `[refresh] split: ` with NO COUNTS on every pass; (b) the failed-listing polarity had no assertion, so
+# a mutation making a failed read MANUFACTURE a full product queue stayed green. The function below is
+# the whole block, it inlines its own counting, and product-floor.test.sh drives BOTH arms against a
+# stubbed `rest_list`.
+# ⚠️ THE COST IS STATED, NOT GLOSSED: this is not "one REST call". `rest_list` pages, so a full window
+# costs ceil(limit/100) core requests, and it is spent AFTER the pass's budget discipline — so a pass
+# that just refused to spend its reserve on pre-flight would still pay for this. It is therefore GATED on
+# the same reserve: when the pass has nothing left, the listing is skipped, everything classifies as
+# harness, and the floor reports itself unmet (the conservative direction) with a named reason.
+# ⛔ EVERY "EVERY CANDIDATE IS HARNESS" ARM GOES THROUGH THIS ONE FUNCTION (review cycle 7, P1). Four of
+# them used to write the two queues with `|| :` and then print `[refresh] split: product 0 harness <n>` —
+# a count read from `candidates.txt` and a `0` TYPED as a literal — so a failed write both lied about the
+# counts and, worse, could LEAVE A STALE NON-EMPTY PRODUCT QUEUE while the record said the class was
+# absent: the loop then took the `[ -s candidates.product.txt ]` branch and satisfied the floor from a
+# file this pass had just declared it could not classify. The `-f`/numeric artefact gate that cycle 2/3
+# added existed only on the success path; here it covers every arm.
+# `wpq_degrade <o> <record line> <pass line>`: writes, verifies, records — and says so when the writes
+# did not land, rather than reporting a split it did not perform.
+# ⛔ "WHAT IS ON DISK" IS A MEASUREMENT, NOT AN ASSUMPTION (review cycle 14, P2). Every message about a
+# failed record write used to name a state it never read, and one of them cannot be true on the very failure
+# it exists for: `printf … > "$o/state/product-class"` TRUNCATES before the write fails, so on a FULL DISK the
+# file ends up EMPTY (0 bytes) — the loop then substitutes `PC_WHY=""` and prints `reason=UNRECORDED`, while
+# the message told the operator a previous record was standing there. A permission failure (chmod 400 file /
+# chmod 500 dir) fails WITHOUT truncating and does leave the old content. So read the file and say which.
+record_state_note() { # <o> -> a clause for the WARN sentences
+  local f="$1/state/product-class" first
+  if [ ! -e "$f" ]; then
+    printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
+  elif [ ! -s "$f" ]; then
+    printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report UNRECORDED rather than a class'
+  else
+    first="$(head -1 "$f" 2>/dev/null)"
+    printf 'carry the record already on disk ("%s"), which does not describe these queues' "$first"
+  fi
+}
+wpq_degrade() { # <o> <record> <message>; echoes the operator line
+  local o="$1" rec="$2" msg="$3" stale=""
+  { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
+  # The claim these arms make is about the FILES, so it is checked against the files: both must be
+  # regular, and the product queue must be EMPTY. A directory (or an unreadable file) on either path
+  # fails this, and a product queue that still holds rows is the dangerous case — it would satisfy the
+  # floor from a class this pass just declared unreadable.
+  # ⛔ BOTH FILES, AND THE HARNESS ONE BY CONTENT — BYTES, NOT A LINE COUNT (review cycle 12, P2). It was
+  # `-f` alone (cycle 8), then a line count, while the comment claimed content. A line count certifies a
+  # stale harness queue whenever its stale row count HAPPENS to match the backlog's — the common case right
+  # after one issue is dispatched and one queued — so the pass printed the split line and recorded a class
+  # over a file that still named the wrong issues (measured: backlog `12 34`, stale harness `12 99`, write
+  # refused → "every candidate is HARNESS", no warning, record written). The expected content is the backlog
+  # itself, so compare the bytes: `cmp` is the claim, and the file is read, not counted.
+  local hbytes=""
+  if [ -f "$o/candidates.harness.txt" ] && ! cmp -s "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
+    hbytes="1"
+  fi
+  if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] \
+     || [ -s "$o/candidates.product.txt" ] || [ -n "$hbytes" ]; then
+    stale=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch still filters through candidates.txt, but do not read that as a class)"
+  fi
+  # ⛔ THE RECORD WRITE IS CHECKED LIKE EVERY OTHER WRITE IN THIS FUNCTION (review cycle 8, P1). It was
+  # the ONE write here with a bare `|| :`, so an unwritable `state/` left the PREVIOUS pass's `OK
+  # product=0 harness=3` in place while the queues were rewritten — and the loop then reported "the split
+  # RAN and found none" for a pass whose listing never answered: the exact masking this record exists to
+  # remove, produced by the record itself failing silently.
+  if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/product-class" 2>/dev/null; then
+    # ⛔ SAY WHAT THE DISK HOLDS, NOT WHAT IT MIGHT (review cycle 10, P2). The PENDING write at the top of
+    # this function ran FIRST and normally succeeded, so the file holds THIS pass's `PENDING …` line — the
+    # "PREVIOUS pass's OK" this used to name was the one case that cannot happen on a full disk (the
+    # PENDING write fails first). The distinction matters because the loop maps a PENDING record to
+    # "the split has not recorded a class", and an operator reading "previous pass" looks for an OK line
+    # that is not there.
+    printf '%s%s\n AND state/product-class could NOT be written, so the floor'"'"'s reason= line will %s' "$msg" "$stale" "$(record_state_note "$o")"
+    return 0
+  fi
+  printf '%s%s\n' "$msg" "$stale"
+}
+write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; echoes one line
+  local o="$1" repo="$2" prepos="$3" isp=0
+  mkdir -p "$o/state" 2>/dev/null || :
+  # ⛔ THE RECORD DESCRIBES THESE TWO FILES, SO ONLY THE THING THAT WRITES THEM MAY INVALIDATE IT
+  # (review cycle 6, P1). This invalidation used to run at PASS ENTRY, ~1,400 lines before the first
+  # byte of either queue is written — so a pass that refused at the environment check, the budget or
+  # the pool read replaced a record that was still a byte-true description of the queues on disk with
+  # `PENDING`, and the loop then reported a BLIND INTAKE on a healthy box (measured: the pass exits at
+  # `gh_env_verdict || exit`, both queue files untouched, `state/product-class` = `PENDING`). That is
+  # the false positive the measured-empty arm exists to remove, one window over.
+  # Placed HERE, every arm below still overwrites it (so a pass that dies mid-split cannot leave the
+  # previous measurement standing — the cycle-3 defect), while a pass that never reaches this point
+  # leaves the previous record alone: it is still true, because neither queue file changed.
+  if ! printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$o/state/product-class" 2>/dev/null; then
+    # ⛔ AND THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It said the floor would "carry a
+    # PREVIOUS pass's record" whether or not a record exists at all — on a `state/` that cannot even be
+    # created (`chmod 500`, no `state/`) there is nothing to carry and the loop prints UNRECORDED, which is
+    # a different thing for an operator to chase. The two cases are distinguished by reading the path.
+    _had="$(record_state_note "$o")"
+    printf '[refresh] WARN: state/product-class is NOT writable — the product class cannot be recorded this pass, so the floor'"'"'s reason= line will %s. This is a state-dir failure, not a finding about product work.\n' "$_had"
+  fi
+  # ⛔ THE REASON IS A RECORD, NOT A SECOND INFERENCE (review cycle 2, P2). `orch-loop.sh` used to PRINT
+  # A QUESTION beside its unmet-floor line — "is this repo in PRODUCT_REPOS, and did the refresh pass
+  # list the harness label?" — for causes THIS function already knew and had just decided. On a repo
+  # that is simply not a product repo (agent-infra, the default `PRODUCT_REPOS` being tortoise) it asked
+  # it on EVERY pass, and a routine case printed in the same words as the real failure is how the real
+  # one stops being read (the #2042/#1931 masking shape, in the line that exists to expose it). So each
+  # arm records WHAT IT DECIDED in `state/product-class`, and the loop repeats that instead of guessing.
+  case " $(printf '%s' "$prepos" | tr ',' ' ') " in *" $repo "*) isp=1 ;; esac
+  if [ "$isp" != "1" ]; then
+    wpq_degrade "$o" \
+      "$(printf 'NOT-A-PRODUCT-REPO %s is not in PRODUCT_REPOS (%s), so every candidate is harness' "$repo" "${prepos:-<empty>}")" \
+      "$(printf '[refresh] split: every candidate is HARNESS — %s is not in PRODUCT_REPOS (%s)' "$repo" "${prepos:-<empty>}")"
+    return 0
+  fi
+  # The budget gate: `CORE_NOW`/`CORE_RESERVE` are the pass's own spend meters. An unreadable meter is
+  # NOT a refusal (the pre-flight takes the same view: it never starves on an unread metric).
+  local affordable=1 wpq_need=0 wpq_pages=0 wpq_prod="" wpq_harn="" wpq_ok=0 fell=""
+  # ⛔ THE WINDOW IS NAMED ONCE (review cycle 3, P2). The listing call and the budget bound that decides
+  # whether this pass can afford it used to spell `500` and `5` INDEPENDENTLY, so the two could drift and
+  # the bound would certify a read the call no longer costs. Both now read this constant, and the bound
+  # is computed from it (`ceil(WPQ_LISTING_LIMIT / 100)` requests, which is what `rest_list` pages at).
+  # LOCAL, not top-level: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it, so a
+  # top-level constant would be an unbound variable in the extracted copy (measured: 12 red).
+  local WPQ_LISTING_LIMIT=500
+  if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
+    case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
+      # ⛔ RESERVE THE LISTING'S OWN COST, COUNTED IN THE LISTING'S OWN UNIT (review cycle 3, P2).
+      # `rest_list` pages at 100 RAW rows per request, so a `--limit 500` read costs
+      # ceil(500/100) = 5 core REQUESTS. The previous form multiplied the PER-CANDIDATE estimate
+      # (`CORE_PER_CANDIDATE`, "one above the measured high water" *per candidate*) by the page count:
+      # `5 * 6 = 30` requests of headroom demanded for a 5-request read, while the reason printed beside
+      # it said "reserve %s + 5 paged requests" — a sum that could not add up, and a 6x over-block on a
+      # pass that could have afforded the read. Worse, it coupled this gate to a knob that means
+      # something else: `COLLISION_PREFLIGHT_CORE_PER_CANDIDATE=0` (a documented "disables pacing"
+      # setting) collapsed the bound to the bare reserve, so a pass sitting AT the reserve passed and
+      # spent it — the exact under-reserve this gate exists to prevent. The window is named ONCE, below,
+      # and the listing call uses the same constant, so the bound cannot drift from the read.
+      wpq_pages=$(( (WPQ_LISTING_LIMIT + 99) / 100 ))
+      wpq_need=$(( CORE_RESERVE + wpq_pages ))
+      [ "$CORE_NOW" -ge "$wpq_need" ] || affordable=0 ;;
+    esac
+  fi
+  if [ "$affordable" != "1" ]; then
+    wpq_degrade "$o" \
+      "$(printf 'BUDGET-SKIPPED the pass could not afford the harness-label listing (remaining=%s, needs=%s = reserve %s + %s paged request(s) at --limit %s), so it was not read' "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" "$wpq_pages" "$WPQ_LISTING_LIMIT")" \
+      "$(printf '[refresh] WARN: split SKIPPED — the pass cannot afford the harness-label listing (remaining=%s, needs %s = reserve %s + up to %s paged requests at --limit %s), so it was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.' "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" "$wpq_pages" "$WPQ_LISTING_LIMIT")"
+    return 0
+  fi
+  # ⛔ A SATURATED WINDOW IS NOT A COMPLETE ONE (review cycle 2, P2). `rest_list` sets
+  # `REST_WINDOW_FILLED=1` when it stopped because the window was full while the provider still
+  # advertised a next page — and this listing is read for ABSENCE, so a truncated one classifies the
+  # rows it never saw as PRODUCT. That is the one direction the polarity comment above forbids, so it
+  # takes the same conservative arm: everything harness, the floor reports itself unmet, and the reason
+  # says which it was.
+  local satur=0
+  if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+    [ "${REST_WINDOW_FILLED:-0}" = "1" ] && satur=1
+    if [ "$satur" = "1" ]; then
+      # ⛔ THE WINDOW IS NAMED FROM THE CONSTANT, NOT TYPED (review cycle 5, P2). Both operator-facing
+      # strings said `--limit 500` while the listing reads `"$WPQ_LISTING_LIMIT"`: raise the constant and
+      # the reason would keep telling the operator a window the call no longer used — the same
+      # "the reason prints a number that is not the one used" defect the budget message was fixed for.
+      wpq_degrade "$o" \
+        "$(printf 'LISTING-TRUNCATED the harness-label window (--limit %s) was filled with a next page still advertised, so a harness issue outside it would have been classified PRODUCT' "$WPQ_LISTING_LIMIT")" \
+        "$(printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet. A truncated exclusion set cannot be read as evidence of product work.' "$WPQ_LISTING_LIMIT")"
+      return 0
+    fi
+    # ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). Both queues
+    # were written with `awk … && mv` and the counts were then read back with `wc -l` and REPORTED AS
+    # MEASUREMENTS — so a full disk or a read-only state dir printed `OK product=0 harness=0` beside two
+    # files that did not exist, and a `0` here is the exact number the loop reports as "the split RAN
+    # and found no product work".
+    # ⛔ AND "BOTH WRITES LANDED" IS AN ARTEFACT CLAIM, NOT AN EXIT CODE (review cycle 3, P3). `mv f <dir>`
+    # exits 0 and moves the temp INSIDE a directory occupying the queue path, and `wc -l < <dir>` then
+    # prints `0` at rc 1 — so the exit-code gate certified a harness queue that was never written and
+    # printed the `0` it never measured. (The suite forced that path only on the PRODUCT side, so the
+    # harness side was the untested half.) Success is now gated on the ARTEFACT: both paths are regular
+    # files AND both counts are numeric. `-f` is what refuses a directory; the numeric check refuses an
+    # unreadable file whose `wc` failure would otherwise be read as a zero.
+    if awk -v hf="$o/.harness-issues" '
+      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
+      !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
+      && mv -f "$o/.product.tmp" "$o/candidates.product.txt" 2>/dev/null \
+      && awk -v pf="$o/candidates.product.txt" '
+      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+      !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null \
+      && mv -f "$o/.harness.tmp" "$o/candidates.harness.txt" 2>/dev/null \
+      && [ -f "$o/candidates.product.txt" ] && [ -f "$o/candidates.harness.txt" ]; then
+      wpq_prod="$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+      wpq_harn="$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+      case "${wpq_prod}${wpq_harn}" in ''|*[!0-9]*) wpq_ok=0 ;; *) wpq_ok=1 ;; esac
+    fi
+    if [ "$wpq_ok" = "1" ]; then
+      # ⛔ AND THE RECORD IS A WRITE LIKE ANY OTHER (review cycle 8, P1): `|| :` here would leave the
+      # previous pass's record describing queues this pass just rewrote — a measured-empty reported as
+      # the answer for a pass that never recorded one.
+      if ! printf 'OK product=%s harness=%s\n' "$wpq_prod" "$wpq_harn" > "$o/state/product-class" 2>/dev/null; then
+        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the floor'"'"'s reason= line will %s — not the OK above, so treat it as stale until a pass can write it.\n' \
+          "$wpq_prod" "$wpq_harn" "$(record_state_note "$o")"
+        return 0
+      fi
+      printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
+        "$wpq_prod" "$wpq_harn"
+      return 0
+    fi
+    # The degrade arm: today's order, all-harness, and a reason that claims NO count it did not measure.
+    # ⛔ AND THE FALLBACK IS VERIFIED TOO (same review finding): the arm's claim is that every candidate
+    # is NOW harness — a statement about the FILE, not about the intent. When the same unusable queue
+    # path defeats the fallback as well, the record says so instead of asserting a state the disk does
+    # not hold (the queue on disk would still be the previous pass's split).
+    rm -f "$o/.product.tmp" "$o/.harness.tmp" 2>/dev/null || :
+    # `;` not `&&`: an unusable PRODUCT path must not skip the HARNESS write, which is the one that
+    # carries the class (measured: with `&&`, a directory on the product path left BOTH queues unwritten
+    # and the arm still claimed every candidate was now harness).
+    { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
+    if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] || [ -s "$o/candidates.product.txt" ]; then
+      fell=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch order falls back to candidates.txt, but do not read that as a class)"
+    elif ! cmp -s "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
+      # ⛔ `-f` IS NOT "EVERY CANDIDATE IS HARNESS" (review cycle 20, P2) — the same reason `wpq_degrade`
+      # compares CONTENT. An ENOSPC/EDQUOT on the harness write, or a `cp` that failed after leaving the
+      # previous pass's file in place, keeps that stale split on disk while `-f` stays true, and this arm
+      # then published it as the class with no disclosure — a silently-wrong classification, in the one
+      # message whose whole job is to say nothing could be measured.
+      fell=" AND the all-harness fallback did NOT take: candidates.harness.txt still differs from candidates.txt ($(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :) lines on disk), i.e. a previous pass's split survives, so do not read every candidate as harness"
+    fi
+    # ⛔ THE LAST UNCHECKED RECORD WRITE (review cycle 9, P2). Its three siblings are checked; this one kept
+    # `|| :`, so a failure left the `PENDING` from the top of the function and the loop then reported
+    # `reason=PENDING` ("the pass aborted, or is still running") instead of `WRITE-FAILED` — a lost record,
+    # not a silent one, but the same shape. The operator line below carries the warning either way.
+    if ! printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null; then
+      printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the PASS LINE BELOW for what happened (that line is printed after this one).\n' "$(record_state_note "$o")"
+    fi
+    printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
+    return 0
+  fi
+  # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
+  # label set EVERY candidate classifies as harness, so the product queue is empty, the floor reports
+  # itself unmet, and nothing was invented from a listing that did not answer.
+  wpq_degrade "$o" \
+    'LISTING-FAILED the harness-label listing did not answer, so nothing is classified product' \
+    '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet (orch-loop.sh says so). Nothing is dispatched on a class this pass could not read.'
+  return 0
+}
+
+# ── THE EMERGENCY CLASS: what OUTRANKS the floor (agent-infra#2054) ─────────────────────────────────
+# ⛔ WHY THE FLOOR NEEDS THIS INPUT AT ALL. The floor reorders WITHIN one batch, which is harmless only
+# while nothing urgent is pending. `candidates.txt` is SEVERITY-ordered, so with `BATCH=2` and
+# `PRODUCT_FLOOR=1` the row the floor pushes out is the SECOND row of a severity-ordered window — and that
+# row is a P0 whenever the window holds two. A floor that can make a P0 wait is a worse defect than the
+# starvation it prevents, so the batch builder asks this class FIRST and stands the floor down when the
+# answer is "an emergency is pending".
+# ⛔ EVIDENCE, NOT A LIST OF ISSUE NUMBERS. The class is the item's OWN `P0-blocker` LABEL, read from the
+# same repo the pool is read from, and INTERSECTED WITH `candidates.txt`: a labelled issue that was never
+# queued (blocked, assigned, already dispatched) cannot preempt anything, because the backlog is still the
+# authority for what may be dispatched. Nothing here hardcodes an issue number, a title, or a repo other
+# than the one this pass is already pointed at.
+# ⛔ ONE PAGE, AND ITS TRUNCATION IS DETECTED. `--limit 100` is one core request (the pool reads this tier
+# at `--limit 300`), so a filled window is possible in principle — and a filled window is reported as
+# UNKNOWN rather than read as "no P0", because the rows it never showed are exactly the ones that would
+# have to be present to preempt.
+# ⛔ THE UNREADABLE DIRECTION IS THE OPPOSITE OF THE PRODUCT SPLIT'S, AND THAT ASYMMETRY IS THE DESIGN.
+# An unreadable PRODUCT class UNDER-claims: an unclassifiable item must not satisfy the floor, so
+# `write_product_queues` degrades to "everything is harness" and the floor reports itself unmet. An
+# unreadable EMERGENCY class must not do the same, because "no P0 could be read" is not "there is no P0"
+# — it would let the floor displace work it cannot see. So every unreadable arm records `UNKNOWN-…` and
+# the floor STANDS DOWN for that pass, naming the reason. A missed product slot costs one cycle and
+# re-asserts itself; a P0 delayed behind a share target does not.
+weq_degrade() { # <o> <record> <message>; echoes the operator line
+  local o="$1" rec="$2" msg="$3" stale=""
+  # ⛔ A DEGRADED PASS LEAVES **NO** EMERGENCY QUEUE — it REMOVES it (P2, fresh-context review). It used to
+  # truncate it to empty, which is byte-identical to a completed read that measured zero P0s, so a stale
+  # `OK p0=0` record surviving beside the emptied file was indistinguishable from a real "no P0" — the
+  # fail-open direction (the floor applies and can displace a P0). Absence cannot be confused that way:
+  # `floor_emergency` requires the file to EXIST under an `OK` record, because the writer CREATES it
+  # (possibly empty) on a completed read and removes it on every arm that could not classify.
+  rm -f "$o/candidates.emergency.txt" 2>/dev/null || :
+  [ -e "$o/candidates.emergency.txt" ] && stale=" AND the emergency queue could NOT be removed either, so the file on disk may still name a previous pass's P0s"
+  if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/emergency-class" 2>/dev/null; then
+    printf '%s%s AND state/emergency-class could NOT be written, so the floor reads whatever that file already holds — and since the emergency QUEUE is now ABSENT, an `OK` record there stands for nothing and the floor reads it as UNKNOWN rather than as a stale measurement\n' "$msg" "$stale"
+    return 0
+  fi
+  printf '%s%s\n' "$msg" "$stale"
+}
+write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emergency.txt, records state/emergency-class
+  local o="$1" repo="$2" prepos="$3" isp=0
+  mkdir -p "$o/state" 2>/dev/null || :
+  case " $(printf '%s' "$prepos" | tr ',' ' ') " in *" $repo "*) isp=1 ;; esac
+  if [ "$isp" != "1" ]; then
+    # No floor applies on a non-product repo, so there is nothing for an emergency to override and no read
+    # to spend. Recorded (not silent) so a reader can tell "N/A" from "not read".
+    weq_degrade "$o" \
+      "$(printf 'NOT-A-PRODUCT-REPO %s is not in PRODUCT_REPOS (%s) — no product floor applies here, so no emergency can override one' "$repo" "${prepos:-<empty>}")" \
+      "$(printf '[refresh] emergency class: N/A — %s is not in PRODUCT_REPOS (%s), so the product floor does not apply' "$repo" "${prepos:-<empty>}")"
+    return 0
+  fi
+  # LOCAL, not a top-level constant: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it.
+  local EQ_LIMIT=100 EQ_PAGES=1 eq_need=0 eq_ok=0 eq_n=""
+  if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
+    case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
+      eq_need=$(( CORE_RESERVE + EQ_PAGES ))
+      if [ "$CORE_NOW" -lt "$eq_need" ]; then
+        weq_degrade "$o" \
+          "$(printf 'UNKNOWN-BUDGET-SKIPPED the pass could not afford the P0-blocker listing (remaining=%s, needs=%s = reserve %s + %s request at --limit %s)' "${CORE_NOW:-?}" "$eq_need" "${CORE_RESERVE:-?}" "$EQ_PAGES" "$EQ_LIMIT")" \
+          "$(printf '[refresh] WARN: the P0-blocker listing was NOT read (remaining=%s, needs %s) — the emergency class is UNKNOWN, so the product floor STANDS DOWN this pass. An unread class must never be read as "no emergency": that is the direction in which a floor could displace a P0.' "${CORE_NOW:-?}" "$eq_need")"
+        return 0
+      fi ;;
+    esac
+  fi
+  # The same reachability filter the pool applies to this tier (unassigned, not an epic/lane/decision title):
+  # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
+  # does — so it must not stand the floor down either.
+  if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
+      --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|.number' \
+      > "$o/.emergency-issues" 2>/dev/null; then
+    if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
+      weq_degrade "$o" \
+        "$(printf 'UNKNOWN-LISTING-TRUNCATED the P0-blocker window (--limit %s) was filled with a next page still advertised, so a P0 outside it was not seen' "$EQ_LIMIT")" \
+        "$(printf '[refresh] WARN: the P0-blocker listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass, because the rows the window never showed are exactly the ones that would preempt it.' "$EQ_LIMIT")"
+      return 0
+    fi
+    # Derived as a subset of `candidates.txt` and left in the BACKLOG's own (severity) order, so the first
+    # emergency the dispatch side can see is the one that would have gone first anyway.
+    if awk -v ef="$o/.emergency-issues" '\
+        BEGIN { while ((getline l < ef) > 0) p0[l] = 1 }\
+        ($0 in p0) { print }' "$o/candidates.txt" > "$o/.emergency.tmp" 2>/dev/null \
+       && mv -f "$o/.emergency.tmp" "$o/candidates.emergency.txt" 2>/dev/null \
+       && [ -f "$o/candidates.emergency.txt" ]; then
+      eq_n="$(wc -l < "$o/candidates.emergency.txt" 2>/dev/null | tr -d ' ' || :)"
+      case "${eq_n:-}" in ''|*[!0-9]*) eq_n="" ;; *) eq_ok=1 ;; esac
+    fi
+    if [ "$eq_ok" = "1" ]; then
+      # ⛔ THE RECORD IS A WRITE LIKE ANY OTHER: `|| :` here would leave the PREVIOUS pass's class describing a
+      # queue this pass just rewrote, and the floor acts on the record — not on the file it cannot verify.
+      if ! printf 'OK p0=%s\n' "$eq_n" > "$o/state/emergency-class" 2>/dev/null; then
+        printf '[refresh] WARN: the emergency class was computed (p0=%s) but state/emergency-class could NOT be written — the floor will read the record already on disk (%s) instead of this measurement\n' \
+          "$eq_n" "$(head -1 "$o/state/emergency-class" 2>/dev/null || printf '<none>')"
+        return 0
+      fi
+      printf '[refresh] emergency class: p0=%s — %s P0-blocker candidate(s) are in the backlog\n' "$eq_n" "$eq_n"
+      return 0
+    fi
+    weq_degrade "$o" \
+      'UNKNOWN-WRITE-FAILED the P0 class was read but candidates.emergency.txt could not be written, so no emergency can be named' \
+      '[refresh] WARN: candidates.emergency.txt could NOT be written — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass. This is a write failure, not a finding about P0 work.'
+    return 0
+  fi
+  # A FAILED READ MUST NEVER BECOME "NO EMERGENCY" — see the polarity note above.
+  weq_degrade "$o" \
+    'UNKNOWN-LISTING-FAILED the P0-blocker listing did not answer, so this pass cannot say whether a P0 is pending' \
+    '[refresh] WARN: the P0-blocker listing FAILED — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass (an unreadable class must never be read as "no emergency")'
+  return 0
+}
+
+# ⛔ THE EMERGENCY READ RUNS FIRST, AND THAT ORDER IS THE BUDGET POLICY. Both writers gate on the SAME
+# pass-level snapshot (`CORE_NOW`, last set by the pool walk), so when the budget can afford only one of
+# the two reads, this order decides which one is bought — and the class that can stop a P0 being delayed
+# is the one to buy. ⛔ THE SNAPSHOT IS SHARED, NOT RE-READ: the split's gate therefore does not see the
+# one request this read just spent (nor the final candidate's pre-flight spend, a pre-existing staleness
+# in the same variable), so both writers can under-reserve by ~1 + CORE_PER_CANDIDATE requests. That is
+# bounded, it fails in the SAFE direction (both refuse when the snapshot says they cannot afford the
+# read), and it is filed as agent-infra#2270 rather than papered over here.
+write_emergency_queue "$O" "$OR" "${PRODUCT_REPOS:-}"
+write_product_queues "$O" "$OR" "${PRODUCT_REPOS:-}"
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
 # if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
 [ "$POOL_SWEPT" -eq 1 ] && pool_token_write 1
