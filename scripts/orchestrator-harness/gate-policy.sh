@@ -55,7 +55,13 @@ gate_policy_probe() {
   local base
   base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ -z "$repo" ]; then
-    repo="$(cd "$base/../.." 2>/dev/null && pwd)"
+    # ⛔ NOT `$base/../..`: on a FLAT DEPLOY (every `.sh` in one dir, which is the Mac's `$O` shape) that
+    # resolves to the deploy dir's GRANDPARENT — on this Mac, `/Users` — so the repo-side paths were
+    # permanently dead and the bypass could never flip (found by review). Ask git for the root, and if
+    # that fails leave the repo-side arms out and say so in the recorded reason rather than searching
+    # a path no satisfier will ever be installed at.
+    repo="$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)"
+    [ -n "$repo" ] || GP_NOTE="repo-root-unresolved"
   fi
   GP_REVIEW_OK=0; GP_VGATE_OK=0; GP_MISSING=""
 
@@ -69,9 +75,18 @@ gate_policy_probe() {
   for c in "$base/record-review.sh" "$repo/scripts/record-review.sh" "${HOME:-/nonexistent}/.pi/agent/scripts/record-review.sh"; do
     [ -f "$c" ] && { rec="$c"; break; }
   done
+  # ⛔ EXISTENCE IS NOT CAPABILITY (found by review). A zero-byte or non-executable `review-pr.sh` used
+  # to flip the probe to `enforced`, which UNSETS the skips — so every lane would be refused at its
+  # first push on every box, the exact fleet-stopping failure this sequencing exists to prevent. The
+  # seam must be an executable, non-empty, PARSEABLE script; a file that merely has the right name
+  # proves nothing about being callable.
   local seam=""
   for c in "$base/review-pr.sh" "${O:-/nonexistent}/review-pr.sh" "$repo/scripts/review-pr.sh" "${HOME:-/nonexistent}/orchestrator/review-pr.sh"; do
-    [ -f "$c" ] && { seam="$c"; break; }
+    [ -f "$c" ] || continue
+    [ -x "$c" ] || continue
+    [ -s "$c" ] || continue
+    bash -n "$c" 2>/dev/null || continue
+    seam="$c"; break
   done
   if [ -n "$rec" ] && [ -n "$seam" ]; then
     GP_REVIEW_OK=1
@@ -81,18 +96,22 @@ gate_policy_probe() {
   fi
 
   # ── VGATE: a NON-INTERACTIVE recorder is what a `pi -p` lane can drive. The gate's own bridge is
-  # `scripts/vgate.sh`, which today only INSPECTS and CLEARS (`status`/`clear`) — it has no `record`
-  # verb, so a lane cannot write verified state through the CLI. The gate's lane-satisfiable
-  # acceptance suite (#2313) is the machine-readable statement that a `pi -p` lane's own test run
-  # counts; when that lands, this probe reads it rather than re-deciding the question here.
+  # `vgate.sh`, which today only INSPECTS and CLEARS (`status`/`clear`) — it has no `record` verb, so a
+  # lane cannot write verified state through the CLI. ⛔ A TEST FILE'S EXISTENCE IS NOT A CAPABILITY
+  # (found by review): accepting `index.lane-satisfiable.test.ts` let an intent marker flip the probe,
+  # so the arm now requires a SHIPPED, executable, non-empty `vgate.sh` that actually carries a
+  # recorder verb. When the gate accepts a lane's own run (#2313) it must arrive with that verb, or the
+  # probe stays at the audited bypass and says so.
   local vrec=0
   for v in "$base/vgate.sh" "$repo/scripts/vgate.sh"; do
     [ -f "$v" ] || continue
+    [ -x "$v" ] || continue
+    [ -s "$v" ] || continue
     grep -qE '^\s*record\)|--record\b' "$v" 2>/dev/null && { vrec=1; break; }
   done
   local vacc=0
-  [ -f "$repo/extensions/verification-gate/index.lane-satisfiable.test.ts" ] && vacc=1
-  if [ "$vrec" -eq 1 ] || [ "$vacc" -eq 1 ]; then GP_VGATE_OK=1; else GP_MISSING="${GP_MISSING}vgate-record(#2313) "; fi
+  [ "$vacc" -eq 1 ] || true
+  if [ "$vrec" -eq 1 ]; then GP_VGATE_OK=1; else GP_MISSING="${GP_MISSING}vgate-record(#2313) "; fi
 
   GP_MISSING="${GP_MISSING% }"
   [ "$GP_REVIEW_OK" -eq 1 ] && [ "$GP_VGATE_OK" -eq 1 ]

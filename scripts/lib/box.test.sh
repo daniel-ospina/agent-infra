@@ -41,7 +41,14 @@ printf '%s' "$prov" | grep -qE 'ncpu=(sysctl|nproc|getconf|forced)' \
 f="$TMP/probe"; printf 'alpha\n' > "$f"
 m1="$(box_mtime "$f")"
 case "$m1" in ''|*[!0-9]*) bad "mtime: '$m1' is not numeric";; *) ok "mtime: numeric ($m1)";; esac
-case "${BOX_MTIME_MECH:-}" in stat-c|stat-f|'') : ;; *) bad "mtime: unexpected mechanism $BOX_MTIME_MECH" ;; esac
+# ⛔ NOT VACUOUS (found by review): the mechanism is set inside `box_mtime`, which the line above ran in
+# a SUBSHELL, so the parent saw it empty and the old `case` accepted `''` — an assertion that could never
+# fail. Re-run it in THIS shell and require a real mechanism.
+box_mtime "$f" >/dev/null
+case "${BOX_MTIME_MECH:-}" in
+  stat-c|stat-f) ok "mtime: mechanism named ($BOX_MTIME_MECH)" ;;
+  *) bad "mtime: mechanism not named (got '${BOX_MTIME_MECH:-<empty>}')" ;;
+esac
 printf 'alpha\n' > "$f"; sleep 1; printf 'alpha\n' > "$f"
 m2="$(box_mtime "$f")"
 [ "$m2" -ge "$m1" ] && ok "mtime: non-decreasing on a rewrite ($m1 -> $m2)" || bad "mtime: went backwards ($m1 -> $m2)"
