@@ -767,21 +767,39 @@ function heredocLineExecutes(line: string, target: string): boolean {
  *  `dataCharMask`'s `pipedIntoRunner` uses — so the two cannot disagree about what a program is.
  *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout. */
 function heredocPipedIntoProgram(line: string): boolean {
+  // ⛔ SHELL GROUPING IS NOT PART OF THE PROGRAM NAME (#1382-c9 review, measured): a downstream stage
+  // written `(bash)`, `( bash )` or `{ bash; }` runs bash, and the first version compared the raw word
+  // `(bash)` against the runner sets, missed it, and MASKED the body — a fail-open on the same shape
+  // the pipe rule exists to catch. Leading `(`/`{`/`!` and trailing `)`/`}`/`;` are stripped before
+  // the comparison. Only the FIRST word is de-grouped, not every word: matching any word in the
+  // stage would re-break the ordinary `cat x.md | grep -i "sh"`, which is the false positive this
+  // whole change removes.
+  const deGroup = (w: string) => w.replace(/^[({!]+/, "").replace(/[)};]+$/, "");
+  const isRunner = (w: string): boolean =>
+    !!w &&
+    (STDIN_PROGRAM_RUNNERS.has(w) || STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w));
   const stages = line.split(/(?<!\|)\|(?!\|)/);
   for (let i = 1; i < stages.length; i++) {
     const words = stages[i].trim().split(/\s+/);
-    const first = (words[0] ?? "").replace(/["'\\]/g, "");
-    if (!first) continue;
-    if (STDIN_PROGRAM_RUNNERS.has(first)) return true;
-    if (STDIN_PROGRAM_INTERPRETER_RE.test(first)) return true;
-    if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(first)) return true;
+    const firstRaw = (words[0] ?? "").replace(/["'\\]/g, "");
+    const first = deGroup(firstRaw);
+    // `{ bash; }` — the first WORD is nothing but grouping, so the program is the NEXT word. This
+    // second look happens ONLY when the first word de-grouped to nothing; testing every word of a
+    // stage instead would make the ordinary `cat x.md | grep -i "sh"` a program runner and bring
+    // back the false positive this change exists to remove.
+    if (!first) {
+      const next = deGroup((words[1] ?? "").replace(/["'\\]/g, ""));
+      if (isRunner(next)) return true;
+      continue;
+    }
+    if (isRunner(first)) return true;
     // A wrapper word can hide the program one word along (`| env FOO=1 bash`, `| nice -n 5 sh`).
     if (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(first)) {
       for (const w of words.slice(1)) {
-        const bare = w.replace(/["'\\]/g, "");
-        if (!bare || /^[A-Za-z_][A-Za-z0-9_]*=/.test(bare)) continue;
-        if (STDIN_PROGRAM_RUNNERS.has(bare) || STDIN_PROGRAM_INTERPRETER_RE.test(bare)) return true;
-        if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(bare)) return true;
+        const bare = deGroup(w.replace(/["'\\]/g, ""));
+        if (!bare || /^[A-Za-z_][A-Za-z0-9_]*=/.test(bare) || bare.startsWith("-")) continue;
+        if (isRunner(bare)) return true;
       }
     }
   }

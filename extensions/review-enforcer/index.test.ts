@@ -6711,6 +6711,10 @@ test("#1382-c9 (1) P0: a body written to a file and PIPED into a program is stil
     `cat /tmp/x.sh | xargs -I{} sh -c {}`,
     `cat /tmp/x.sh | env X=1 bash`,
     `cat /tmp/x.sh | python3`,
+    // SHELL GROUPING is not part of the program name (measured on this fix's own review):
+    // `(bash)` compared raw against the runner sets, missed, and MASKED the body.
+    `cat /tmp/x.sh | (bash)`,
+    `cat /tmp/x.sh | { bash; }`,
   ]) {
     equal(countMergeVerbs(maskHeredocData(write + run)), 1,
       `a body piped into a program must stay READ: ${run}`);
