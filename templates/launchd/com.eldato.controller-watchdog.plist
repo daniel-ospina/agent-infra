@@ -26,10 +26,11 @@
            N consecutive restart-worthy observations (WEDGED or DOWN — a crash-on-start leaves no pid)
                                    → <VERDICT>_STOPPED: restarting stops for that EPISODE and ONE
                                      crash block is written quoting $O/logs/controller-stdout.log,
-                                     so the repeating crash is visible instead of restarted forever;
-                                     after a further N stopped observations ONE probe restart is
-                                     allowed as a new episode (a dead box must not stay dead for ever,
-                                     and that bounds restarts to ~one per N passes).
+                                     so the repeating crash is visible instead of restarted forever.
+                                     After a further N stopped observations ONE probe restart is
+                                     allowed within the SAME episode, so a dead box is not dead for
+                                     ever: MEASURED steady state, 3 initial restarts then one per 4
+                                     passes at MAX_CONSEC=3 (~20 min at this 300s cadence).
 
          ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
          FRESH box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
@@ -48,9 +49,10 @@
            SETTLE=60     the re-check window after a restart. The loop writes $O/heartbeat as the
                          FIRST act of a cycle, so a restored controller proves itself in seconds and
                          a crash-on-start is still unambiguous at 60s.
-           MAX_CONSEC=3  three consecutive wedges, i.e. three restarts that each failed to restore
-                         cycling, then the restart path is CLOSED and the crash is recorded. Without
-                         this the job is the measured hour, on a timer.
+           MAX_CONSEC=3  three consecutive WEDGED/DOWN observations, i.e. three restarts that each
+                         failed to restore cycling, then restarting STOPS for that episode and the
+                         crash is recorded; one probe restart follows after a further 3 stopped
+                         observations. Without this the job is the measured hour, on a timer.
 
          ⛔ EXIT 0 ALWAYS. launchd's last-exit-status is read by nobody, so a non-zero exit from a
          watchdog is invisible exactly when it matters. The decision is the OUTPUT: one line per pass

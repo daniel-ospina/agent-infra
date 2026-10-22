@@ -28,12 +28,13 @@
 #                                            A crash-on-start leaves no pid, so DOWN is capped too — a
 #                                            cap that only covered WEDGED restarted that forever.
 #                                            ⛔ THE LATCH IS BOUNDED, NOT PERMANENT: after a further N
-#                                            stopped observations ONE probe restart is allowed and a NEW
-#                                            episode begins (a genuinely dead box must not stay dead
-#                                            for ever because a crash was recorded once). That bounds
-#                                            restarts to one per ~N passes in the worst case — slow,
-#                                            never a tight loop — and every episode records its own
-#                                            crash, so a repeated one is still visible.
+#                                            stopped observations ONE probe restart is allowed WITHIN THE
+#                                            SAME EPISODE (the budget stays spent — a genuinely dead box
+#                                            must not stay dead for ever because a crash was recorded
+#                                            once). MEASURED steady state at N=3 over 15 passes: 3
+#                                            initial restarts, then one probe per 4 passes (≈20 min at a
+#                                            300s cadence). The episode's crash record is written once;
+#                                            a NEW episode (and block) needs a HEALTHY pass.
 #
 # ⛔ EXIT 0 ALWAYS. A watchdog that dies loudly into a log nobody reads is worse than none: launchd
 # would record a non-zero status that only a human already suspecting something would look at. The
@@ -59,7 +60,8 @@
 #   HB            heartbeat file        (default: $O/heartbeat)
 #   HB_STALE      fresh window, seconds (default: 780 — the supervisor's own limit)
 #   SETTLE        re-check delay after a restart (default: 60)
-#   MAX_CONSEC    consecutive wedges before restarting STOPS (default: 3)
+#   MAX_CONSEC    consecutive WEDGED/DOWN observations before restarting STOPS (default: 3; < 1 is
+#                 rejected and named — 0 meant "never restart" while the cap fired immediately)
 #   LABEL         macOS launchd label of the stack job (default: com.eldato.orchestrator-stack)
 #   SUPERVISOR    Linux restart verb (default: $O/cloud-cell-supervisor.sh, else this dir's sibling)
 #   WATCHDOG_STATE_DIR / WATCHDOG_LOG  state + decision log (default: $HOME/.pi/agent/state[/controller-watchdog.log])
@@ -283,7 +285,9 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
   sz="$(wc -c < "$CRASH_FILE" 2>/dev/null | tr -d '[:space:]')"
   case "${sz:-}" in ''|*[!0-9]*) ;; *)
     if [ "$sz" -gt 65536 ]; then
-      tail -c 32768 "$CRASH_FILE" > "$CRASH_FILE.tmp" 2>/dev/null \
+      # `sed 1d` drops the PARTIAL first line the byte cut leaves behind, so the oldest retained block
+      # at least starts on a line boundary instead of mid-sentence.
+      tail -c 32768 "$CRASH_FILE" 2>/dev/null | sed '1d' > "$CRASH_FILE.tmp" 2>/dev/null \
         && mv "$CRASH_FILE.tmp" "$CRASH_FILE" 2>/dev/null
     fi ;;
   esac
@@ -296,8 +300,9 @@ status_show() {
   echo "  log:    $LOG"
   echo "  streak: $(cat "$STREAK_FILE" 2>/dev/null || echo 0)  episode: $(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
   if [ -s "$CRASH_FILE" ]; then
-    echo "  ⛔ CRASH RECORDED ($CRASH_FILE) — restarting is stopped for THAT episode:"
-    echo "     (a healthy pass ends the episode and restarting resumes; the record is never erased here)"
+    echo "  ⛔ CRASH RECORDED ($CRASH_FILE):"
+    echo "     (restarting was stopped for that episode; a later probe restart continues it with the"
+    echo "      budget spent, and a healthy pass ends it. The record is never erased here.)"
     sed -n '1,3p' "$CRASH_FILE"
   else
     echo "  crash:  none recorded"
@@ -311,7 +316,10 @@ main() {
   rotate_log
   [ -n "$_bad" ] && say "verdict=BOUND-FALLBACK"$'\t'"note=non-numeric bound(s) ignored, defaults used:$_bad"
 
-  local pid age verdict reason streak=0 restart=0 rc=0
+  # ⛔ `announced` is LOCAL: as a global it was inherited from the environment, and `env announced=1`
+  # made the probe path suppress the generic decision line — a real restart with NO line saying it
+  # happened. Test-only seams are allowed to be read from the environment; a control-flow flag is not.
+  local pid age verdict reason streak=0 restart=0 rc=0 episode=0 announced=0
 
   # ── 1. ONE observation ──────────────────────────────────────────────────────────────────────────
   pid="$(controller_pid)"
@@ -353,18 +361,26 @@ main() {
   #       those when it repeats. A streak that goes 0 -> 1 is a NEW episode (see EPISODE_FILE).
   streak="$(cat "$STREAK_FILE" 2>/dev/null || echo 0)"
   case "${streak:-}" in ''|*[!0-9]*) streak=0 ;; esac
-  if [ "$streak" -eq 0 ]; then
-    episode="$(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
-    case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
-    episode=$(( episode + 1 ))
-    printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null
-  fi
+  local prev_streak="$streak"
   streak=$(( streak + 1 ))
-  # ⛔ A FAILED PERSIST MUST FAIL CLOSED. Every state write used to be `2>/dev/null`, so on a read-only
-  # or root-owned state dir the counter never advanced past 1 and the cap could NEVER engage: the box
-  # restarted once per pass for ever, with the log cheerfully printing `streak=2/2 restart=1`. An
-  # unpersistable counter is treated as "the cap is spent" and said out loud.
-  if ! printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
+  # ⛔ THE PERSIST COMES BEFORE THE EPISODE BUMP, AND THE BUMP IS GATED ON IT. When the streak file
+  # cannot be written the read is ALWAYS 0, so an unguarded `if streak -eq 0` starts a new episode on
+  # every pass — and with it a fresh dedupe key, i.e. one crash block per pass: exactly the symptom the
+  # episode counter exists to prevent, merely moved onto the PERSIST-FAILED path (measured in review:
+  # 4 blocks in 4 passes). A failed persist instead treats the cap as SPENT and says so.
+  if printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
+    if [ "$prev_streak" -eq 0 ]; then
+      episode="$(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
+      case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
+      episode=$(( episode + 1 ))
+      if printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null; then
+        :
+      else
+        say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $EPISODE_FILE — this pass keeps the previous episode number so its evidence is deduped, not duplicated"
+        episode=$(( episode - 1 ))
+      fi
+    fi
+  else
     say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE — the restart cap cannot be counted, so restarting is treated as EXHAUSTED for this pass (fail closed)"
     streak=$(( MAX_CONSEC + 1 ))
   fi
@@ -387,12 +403,16 @@ main() {
       say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; one probe restart is allowed after ${MAX_CONSEC} more stopped observations"
       return 0
     fi
-    # the second budget is spent: this IS a new episode, and the probe is bounded by the same cap
-    episode=$(( episode + 1 ))
-    printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null
-    streak=1
-    printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null
-    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=1/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=the latch had held for $(( MAX_CONSEC * 2 )) consecutive ${verdict} observations — one probe restart, as a NEW episode (a dead box must not stay dead for ever)"
+    # ⛔ THE PROBE DOES NOT RE-ARM A FULL BUDGET. It continues the SAME episode with the budget already
+    # spent (`streak=$MAX_CONSEC`), so the steady state is one restart per `2N+1` passes — what the
+    # header and the plist claim. Re-arming with `streak=1` measured a restart every 2 passes (~10 min
+    # at N=3), twice the documented rate, in a script whose whole point is not to restart in a loop.
+    # A probe that WORKS is what ends the episode: HEALTHY clears the streak, RECOVERED clears it.
+    streak="$MAX_CONSEC"
+    if ! printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
+      say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after the probe — the next pass treats the cap as exhausted (fail closed)"
+    fi
+    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=the latch had held for $(( MAX_CONSEC * 2 )) consecutive ${verdict} observations — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next restart needs another full $((${MAX_CONSEC} * 2)) passes)"
     announced=1          # the decision is already stated; do not state it twice
   fi
 

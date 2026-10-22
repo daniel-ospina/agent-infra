@@ -210,7 +210,7 @@ for _i in 1 2 3 4 5 6 7 8; do
 done
 assert_contains "$seen" "verdict=DOWN_STOPPED" "the cap fires and restarting stops"
 assert_contains "$seen" "verdict=PROBE_RESTART" "…and the latch is BOUNDED: a probe restart follows (a dead box must not stay dead for ever)"
-assert_contains "$seen" "episode=2" "…as a NEW episode"
+assert_contains "$seen" "episode=1" "…continuing the SAME episode (the probe does not re-arm a fresh budget)"
 assert_eq "$(restarts)" "3" "…and exactly one probe was issued (2 capped + 1 probe)"
 assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "…and the SAME episode is still recorded only once"
 
@@ -218,7 +218,7 @@ assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash"
 echo "── 5d. the crash-record dedupe parses its own header, not the controller's output"
 newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
 printf 'worker: starting episode=7\n' > "$C/o/logs/controller-stdout.log"
-run >/dev/null; run >/dev/null; run >/dev/null       # 1 restarts, 2 and 3 stopped in the same episode
+run >/dev/null; run >/dev/null; run >/dev/null       # 1 restarts; 2 is STOPPED (its block); 3 probes
 assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "one episode produces exactly ONE block even when the controller's own log mentions episode=7"
 
 # ═══ 6. the decision log is bounded and rotated with a line saying so ═══════════════════════════
@@ -235,13 +235,13 @@ assert_contains "$(cat "$C/state/controller-watchdog.log")" "LOG-ROTATED" "an ov
 echo "── 7. a non-numeric HB_STALE must not turn a healthy controller into a wedged one"
 newcase; start_ctrl; hb_now
 out="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=abc bash "$WD" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
+        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=abc bash "$WD" >"$C/pass.out" 2>&1; grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)' "$C/pass.out")"
 assert_contains "$out" "verdict=HEALTHY" "HB_STALE=abc falls back to 780 and the controller stays healthy"
 assert_eq "$(restarts)" "0" "…and nothing was restarted"
 # a zero HB_STALE is a legitimate (strict) setting: every non-zero age is stale
 newcase; start_ctrl; echo $(( $(date +%s) - 5 )) > "$C/o/heartbeat"
 out="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=0 bash "$WD" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
+        WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=0 bash "$WD" >"$C/pass.out" 2>&1; grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)' "$C/pass.out")"
 assert_contains "$out" "verdict=WEDGED" "HB_STALE=0 is honoured (a 5s-old heartbeat is stale), not silently defaulted"
 
 # 7b. an unvalidated LOG_MAX_BYTES used to truncate the decision log on EVERY pass
@@ -260,7 +260,14 @@ newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale
 env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
     WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 MAX_CONSEC=0 bash "$WD" >/dev/null 2>&1
 assert_contains "$(cat "$C/state/l")" "MAX_CONSEC=0(<1)" "MAX_CONSEC=0 falls back to 3 and is NAMED in BOUND-FALLBACK"
-assert_eq "$(grep -c 'DOWN_STOPPED' "$C/state/l" || true)" "0" "…so it is not treated as a zero budget (no STOPPED on the first observation)"
+# ⛔ ASSERT WHAT THE BUG WOULD LOOK LIKE, not a word that the bug also produces: with MAX_CONSEC=0
+# accepted, the cap fires on observation 1 and the first pass is STOPPED (or, after the bounded latch,
+# a PROBE) — never an ordinary restart. It is the RESTART that must be present on pass 1.
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale
+env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+    WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 MAX_CONSEC=0 bash "$WD" >/dev/null 2>&1
+assert_contains "$(grep -m1 -E 'verdict=(DOWN|WEDGED)' "$C/state/l")" "restart=1" "…and the first observation is an ordinary RESTART, not a cap fired at zero"
+assert_eq "$(restarts)" "1" "…the stub proves it"
 
 # ═══ 8. exit 0 always ══════════════════════════════════════════════════════════════════════════
 echo "── 8. the watchdog always exits 0"
@@ -302,7 +309,7 @@ if cmp -s "$WD" "$MUT"; then
 else
   newcase; start_ctrl; hb_stale
   mout="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-           WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$MUT" 2>&1 | grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)')"
+           WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$MUT" >"$C/pass.out" 2>&1; grep -m1 -E 'verdict=(HEALTHY|WEDGED|DOWN)' "$C/pass.out")"
   assert_contains "$mout" "verdict=HEALTHY" "MUTANT: with the heartbeat check gone, the wedged controller reads HEALTHY"
   assert_eq "$(restarts)" "0" "MUTANT: …and is never restarted — so case 2 is not passing by accident"
   # the shipped script, same fixture, must disagree
