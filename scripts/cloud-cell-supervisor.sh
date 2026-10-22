@@ -1509,7 +1509,10 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # gate-policy.sh (#2319) is SOURCED by every pi-spawning carrier on this box, which `exit 78`s without
+  # it — the same class: a $O missing it is a cell whose every lane dies at startup while `check` says
+  # "CELL CAN RUN A CONTROLLER".
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"

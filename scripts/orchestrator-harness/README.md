@@ -303,10 +303,13 @@ Status comes from the worker's own exit-status file plus a pid probe — **never
 0 for a worker that is merely WAITING (`docs/ops/fleet-liveness.md`). "launched" is the only success
 this script reports: it cannot tell you the work succeeded.
 
-⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
-`task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
-PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
-never handed to the chain is unreviewed code by default.
+⛔ **Nothing here reviews anything.** The worker's review gate is the PARENT's: a child has no
+`task` tool and cannot satisfy the gates itself, so **hand the PR to `chain-merge.sh`**, which polls
+for it and runs `merge-one.sh`. A background worker whose PR is never handed to the chain is
+unreviewed code by default. ⚠️ Whether the worker runs WITH the gates bypassed is no longer a literal
+export: `gate-policy.sh` probes for the satisfier and, when it is absent, exports the two flags **and
+records one audit line** naming `agent-infra#2319` and the missing component (`logs/gate-policy.jsonl`).
+When the satisfier lands the bypass disappears by itself — see §5.4.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
@@ -1225,10 +1228,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 This harness passes **attacker-controlled text** to language-model agents with shell access. Be
 clear about what is and is not enforced:
 
-- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_SKIP_REVIEW_GATE=1`,
-  `ELDATO_SKIP_VGATE=1`, `AGENT_ALLOW_MAIN_EDITS=1`, `SKILL_ENFORCER_DISABLED=1` and
-  `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`. "Do NOT merge" and "do not touch the
-  main checkout" are **prompt instructions, not controls**.
+- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_ALLOW_MAIN_EDITS=1`,
+  `SKILL_ENFORCER_DISABLED=1` and `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`.
+  Whether `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` are also set is DECIDED AT STARTUP by
+  `gate-policy.sh` (§5.4) and recorded in `logs/gate-policy.jsonl` — never assumed. "Do NOT merge"
+  and "do not touch the main checkout" are **prompt instructions, not controls**.
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
@@ -1248,6 +1252,35 @@ clear about what is and is not enforced:
   merge-scoped token during review, and treating PR content as delimited data rather than
   instructions. Until then, run this on a box whose GitHub token you would accept being used by an
   agent that has read a hostile PR body.
+
+### 5.4 The gate decision is MEASURED: `gate-policy.sh` (agent-infra#2319)
+
+Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
+used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
+flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
+most work.
+
+It could not be deleted in one line, because a lane **cannot** satisfy the review gate by itself —
+`lane.sh` says so to the lane's face: it has no `task` tool, so the parent/harness must obtain the
+head-bound review. So the decision moved into ONE probe:
+
+| probe | asked | today |
+|---|---|---|
+| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | `record-review.sh` yes, `review-pr.sh` (#2288) **no** |
+| VGATE | can a non-interactive session record verification where the gate reads it? | no `record` verb, no lane-satisfiable acceptance (#2313) |
+
+- **Both satisfiable** → nothing is exported, and any INHERITED skip flag is removed from the carrier's
+  environment (a daemon captures its environment once; that is how a stale hatch outlives its reason).
+- **Either missing** → the two flags ARE exported, and **one** audit line naming #2319, the carrier and
+  the missing component is appended to `logs/gate-policy.jsonl`.
+
+⛔ There is no third state: `gate-policy.test.sh` fails if any live carrier exports either flag
+outside the policy, so a silent reintroduction is RED. When the satisfier merges, the probe flips and
+the bypass ends — **no second change and no forgotten flip**. This is the sequencing #2319 asks for:
+the removals are wired, but they take effect when the gate path can satisfy them, because deleting
+them first stops every lane at its first push.
 
 ---
 
@@ -3510,6 +3543,35 @@ now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never trea
 disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
 supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
 reported as `supervisor process`, with the evidence named.
+
+#### The five primitives that differ — `scripts/lib/box.sh` (agent-infra#2271)
+
+Each of these had already been discovered separately, in a different script, AFTER it failed there:
+
+| primitive | BSD (macOS) | GNU (Linux) | why the wrong spelling is dangerous |
+|---|---|---|---|
+| in-place edit | `sed -i '' -e …` | `sed -i'' -e …` | `sed -i 's/a/b/' f` on BSD treats the SCRIPT as the backup suffix: it edits **nothing** and exits **0** |
+| epoch → date | `date -r <epoch>` | `date -d @<epoch>` | the wrong flag is a usage error, so a "timestamp" is silently empty |
+| CPU count | `sysctl -n hw.ncpu` | `nproc` / `getconf _NPROCESSORS_ONLN` | resolved at SOURCE time, so a wrong PATH pinned `_NCPU=4`/`MAX_LOAD=40` for every cell (#1702) |
+| mtime | `stat -f %m` | `stat -c %Y` | `stat -c` on macOS means filesystem status and prints the WRONG NUMBER |
+| supervisor | launchd | systemd unit or a supervisor process | already in the table above |
+
+**One shim, probed, never assumed from `uname`:** every primitive tries its mechanisms in order and
+records which one answered (`box_provenance`), so a Homebrew GNU-userland on macOS or a BSD-flavoured
+container still gets the right answer. `bash scripts/lib/box.sh --selftest` prints the provenance and
+reproduces the BSD `sed -i` hazard as a live assertion; `scripts/lib/box.test.sh` runs on both
+platforms.
+
+#### `scripts/harness-exec.sh` — the RUNTIME half of "the Mac runs from the pin"
+
+`install.sh` refuses to render a plist whose program is not inside the pin (#2271, install time).
+`harness-exec.sh` is the same refusal on every START, for both platforms: it resolves the two pin
+records (`HARNESS-PIN` = commit, `HARNESS_PIN_FILE` = the harness directory the controller execs),
+requires the recorded directory to BE a checkout at that commit inside `<pin root>/<sha12>`, requires
+the entrypoint to exist there, and `exec`s it. **There is no fallback** — not `$O`, not
+`~/orchestrator`, not `origin/main` — because running an unpinned copy INSTEAD of the pin is exactly
+how three fixes existed only in a home-directory copy for weeks (#2231). Every refusal is a named
+`rc=78` and is asserted by name in `scripts/harness-exec.test.sh`.
 
 ### Which instrument answers which question (all three, and they DISAGREE by design)
 

@@ -52,7 +52,12 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
+. "$SELF/gate-policy.sh" 2>/dev/null || { echo "[fix $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a fixer that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy fix-one
+# ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
+# checkout, not a review bypass, and #2319 does not rule on it.
+export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
