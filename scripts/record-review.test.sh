@@ -63,6 +63,13 @@ cleanup() {
     exit 1
 }
 trap cleanup EXIT
+# HERMETICITY: this suite owns a FAKE HOME and a STUBBED gh, so it must not let the
+# ambient shell decide what the subject sees. `GH_REPO` is the sharp one: the script
+# falls back to it whenever no repo is passed, and several repo-less vectors (and
+# §11.13i) exist precisely to assert the REPO-LESS behaviour — with it exported the
+# suite reported 5 failures on an unmodified tree, and with it unset the same tree
+# passed, which is a false red in one direction and a false green in the other.
+unset GH_REPO
 SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 
 # Stubbed gh: answers the stale-sha head query + PR-body read/PATCH + the
@@ -1809,6 +1816,182 @@ assert_eq "$PDH_OUT" "ok${PDH_TAB}${L_SHA}" "11.12f the size-cap fallback mints 
 unset PDH_OUT PDH_RC PDH_TAB PDH_EMPTY_DIGEST PDH_NONDIFF
 
 unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA CAP406_SPLIT CAP406_SPLIT_SHA SPLIT_DIFF SPLIT_DIFF_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
+
+# ─────────────────────────────────────────────────────────────────────────
+# 11.13 #1351 — `--check-carry`: THE LANE'S QUESTION, answered by the gate's own
+#      predicate ("my record's head is stale; is the diff I reviewed still the
+#      diff that would merge?").
+# ─────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS. The local merge gate carries a record across a base move when
+# the recorded `diff_sha256` equals the PR's live normalized three-dot diff. No
+# surface TOLD a lane that, so lanes inferred "the branch moved, therefore the
+# review is stale" and paid for a fresh 20-40 minute review after every base
+# move — while the content was byte-identical. This mode is the ONE way to ask,
+# and it adds NO second definition of "unchanged": it reuses the same
+# `diff_hash_for_pr` the record path and the GitHub gate share, and the gate's
+# own identity rule (full lowercase 64-hex, never the empty-body constant).
+#
+# The negatives carry the weight: a MISSING record, a missing digest, a CHANGED
+# diff and an UNREADABLE diff must each be distinguishable from a carry, because
+# every one of them has a different remedy — and "could not read" must never be
+# reported as "unchanged" (that is the fail-open this whole design forbids).
+echo "── 11.13 #1351: --check-carry (the lane's carry question) ────────"
+CC_REPO="daniel-ospina/agent-infra"
+CC_RDIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$CC_RDIR"
+CC_TAB="$(printf '\t')"
+CC_HEAD="$(printf 'a%.0s' $(seq 1 40))"     # the stub's .head.sha
+CC_STALE="$(printf 'd%.0s' $(seq 1 40))"
+# SELF-CONTAINED fixtures: §11.12's are unset above, and a section that leaned on
+# them would abort under `set -u` (or, worse, silently compare against a digest
+# some other section computed with different bytes).
+CC_DIFF="$T/cc-real.diff"
+printf 'diff --git a/docs/cc.md b/docs/cc.md\nindex 1111111..2222222 100644\n--- a/docs/cc.md\n+++ b/docs/cc.md\n@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n' > "$CC_DIFF"
+# The digest is computed with the ONE shared normalizer (scripts/lib/diff-normalize.py)
+# — the same primitive the producer and the GitHub gate use. A local second
+# implementation here would let the fixture agree with itself and disagree with
+# production, which is the drift the single-implementation rule forbids.
+CC_SHA="$(python3 "$SCRIPT_DIR/lib/diff-normalize.py" < "$CC_DIFF" | openssl dgst -sha256 | awk '{print $NF}')"
+CC_DIFF_B="$(printf '2%.0s' $(seq 1 64))"
+CC_NONDIFF="$T/cc-nondiff.json"
+printf '%s' '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}' > "$CC_NONDIFF"
+CC_CAP406="$T/cc-cap-406.json"
+printf '%s' '{"message":"Sorry, the diff exceeded the maximum number of files (300).","errors":[{"resource":"PullRequest","field":"diff","code":"too_large"}],"documentation_url":"https://docs.github.com/rest/pulls/pulls","status":"406"}' > "$CC_CAP406"
+CC_FILE="$CC_RDIR/daniel-ospina-agent-infra"
+cc_rec() { # <pr> <head> <diff-or-EMPTY>
+    if [ "$3" = "EMPTY" ]; then
+        printf '{"pr":%s,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' "$1" "$2" "$CC_REPO" > "$CC_FILE-$1.json"
+    else
+        printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' "$1" "$2" "$3" "$CC_REPO" > "$CC_FILE-$1.json"
+    fi
+}
+run_check_carry() { # <pr> <repo> [script] -> CC_OUT / CC_RC
+    local sh="${3:-$RECORD}"
+    # ⛔ CC_RC IS RESET *AND* CAPTURED WITH `||`. A bare `CC_OUT=$(…)` assignment
+    # inherits the command's exit status, so under this harness's `set -e` the
+    # FIRST non-zero verdict (a `fresh`, an `unreadable`, a `norecord` — i.e.
+    # every answer this section exists to assert) would abort the whole suite and
+    # the missing summary would be attributed to the next section. The `||` keeps
+    # the compound list's status 0 while still recording the real code.
+    CC_RC=0
+    # GH_REPO="" (not merely unset): the script falls back to it when no repo is
+    # passed, and this suite must answer from what the FIXTURE says, not from the
+    # ambient shell a developer happens to have exported.
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="${STUB_DIFF_FILE:-$CC_DIFF}" STUB_DIFF_FAIL="${STUB_DIFF_FAIL:-0}" \
+        STUB_DIFF_406_FILE="${STUB_DIFF_406_FILE:-}" \
+        STUB_LOCAL_BASE="${STUB_LOCAL_BASE:-}" STUB_LOCAL_HEAD="${STUB_LOCAL_HEAD:-}" \
+        STUB_HEAD_SHA="${STUB_HEAD_SHA:-$CC_HEAD}" \
+        RECORD_REVIEW_LOCAL_REPO="${RECORD_REVIEW_LOCAL_REPO:-.}" \
+        bash "$sh" --check-carry "$1" "$2" 2>"$T/cc-err")" || CC_RC=$?
+}
+
+# (a) a record bound to the CURRENT head is valid with NO digest at all — and it
+#     must report `head`, not `carry`: "nothing is stale" and "the content is
+#     identical" are different statements, and only one of them is true here.
+cc_rec 424901 "$CC_HEAD" EMPTY
+run_check_carry 424901 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13a a record at the current head is accepted (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "head" "11.13a …and reports 'head', not 'carry'"
+
+# (b) THE CARRY: base-only move, diff unchanged. This is the answer that saves the
+#     lane a whole review cycle.
+cc_rec 424902 "$CC_STALE" "$CC_SHA"
+run_check_carry 424902 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13b a stale head with an UNCHANGED diff is a carry (exit 0)"
+assert_eq "$CC_OUT" "carry${CC_TAB}${CC_SHA}${CC_TAB}${CC_SHA}" "11.13b …and prints both digests, so the claim is checkable"
+assert_contains "$(cat "$T/cc-err")" "Do NOT re-review" "11.13b …and says the one thing a lane needs to hear"
+
+# (c) the DIFF CHANGED → a fresh review IS owed. Distinct exit code, distinct advice.
+cc_rec 424903 "$CC_STALE" "$CC_DIFF_B"
+run_check_carry 424903 "$CC_REPO"
+assert_eq "$CC_RC" "1" "11.13c a CHANGED diff is NOT a carry (exit 1)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "fresh" "11.13c …and reports 'fresh'"
+assert_contains "$(cat "$T/cc-err")" "the DIFF CHANGED" "11.13c …and names the finding, not a read failure"
+
+# (d) AN UNREADABLE DIFF IS NEVER A CARRY — checked for every non-ok status the
+#     seam can emit. This is the fail-open the design forbids: "we could not read
+#     it" must not become "it is unchanged".
+cc_rec 424904 "$CC_STALE" "$CC_SHA"
+for cc_status in empty nondiff too_large unavailable; do
+    case "$cc_status" in
+        empty) STUB_DIFF_FILE=/dev/null STUB_DIFF_FAIL=0 run_check_carry 424904 "$CC_REPO" ;;
+        nondiff) STUB_DIFF_FILE="$CC_NONDIFF" STUB_DIFF_FAIL=0 run_check_carry 424904 "$CC_REPO" ;;
+        too_large) STUB_DIFF_406_FILE="$CC_CAP406" RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" run_check_carry 424904 "$CC_REPO" ;;
+        unavailable) STUB_DIFF_FAIL=1 run_check_carry 424904 "$CC_REPO" ;;
+    esac
+    if [ "$CC_RC" = "0" ]; then bad "11.13d an unreadable diff ($cc_status) was reported as a carry (exit 0)";
+    else ok "11.13d an unreadable diff ($cc_status) is refused (exit $CC_RC), never a carry"; fi
+    assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13d …reported as 'unreadable', not 'fresh' (different remedy)"
+    assert_eq "$(printf '%s' "$CC_OUT" | cut -f3)" "$cc_status" "11.13d …and names the seam status ($cc_status)"
+done
+unset STUB_DIFF_FILE STUB_DIFF_FAIL STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD RECORD_REVIEW_LOCAL_REPO
+
+# (e) no record at all → nothing to carry, and it says so rather than guessing.
+rm -f "$CC_FILE-424905.json" "$CC_RDIR/424905.json"
+run_check_carry 424905 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13e no record → exit 4 (nothing to carry)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13e …reports 'norecord'"
+
+# (f) a legacy/degraded record (NO diff_sha256) beside a stale head → `nodigest`,
+#     whose remedy is the RECORDER's own carry arm (a carry, not a review). It
+#     must not be reported as `fresh` — that is the 20-40 minute mistake.
+cc_rec 424906 "$CC_STALE" EMPTY
+run_check_carry 424906 "$CC_REPO"
+assert_eq "$CC_RC" "5" "11.13f a record with no usable digest → exit 5 (nodigest)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13f …reports 'nodigest', not 'fresh'"
+assert_contains "$(cat "$T/cc-err")" "that is a CARRY, not a fresh review" "11.13f …and points at the recorder's carry arms"
+
+# (g) #426: a legacy <pr>.json naming ANOTHER repo is not this PR's record.
+rm -f "$CC_FILE-424907.json"
+printf '{"pr":424907,"head_sha":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" > "$CC_RDIR/424907.json"
+run_check_carry 424907 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g another repo's legacy record is not read (exit 4)"
+rm -f "$CC_RDIR/424907.json"
+
+# (h) READ-ONLY means read-only: a record-minting flag is REFUSED, not ignored —
+#     otherwise a caller believes it recorded something it did not.
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424902 "$CC_REPO" --evidence comment:1 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13h --evidence is refused in --check-carry (exit 2)"
+assert_eq "$CC_OUT" "" "11.13h …and prints no verdict (it did not answer)"
+
+# (i) NO REPO → the diff CANNOT be read (the read is keyed on the repo), so the mode
+#     must FAIL CLOSED: `unreadable`, exit 3 — never a carry, even with a record present.
+#     A verdict that claims "unchanged" without having read the diff is exactly the
+#     fail-open this design forbids.
+printf '{"pr":424908,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh"}\n' "$CC_STALE" "$CC_SHA" > "$CC_RDIR/424908.json"
+run_check_carry 424908 ""
+assert_eq "$CC_RC" "3" "11.13i with no repo the mode fails CLOSED (exit 3, never a carry)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13i …reports 'unreadable', not 'carry'"
+rm -f "$CC_RDIR/424908.json"
+
+# (j) MUTATION PIN — the comparison itself must be load-bearing. A real copy of
+#     the script with the equality replaced by "always equal" must report the
+#     CHANGED-diff case (11.13c) as a CARRY; if it does not, 11.13c proves nothing.
+CC_MUT="$T/record-review-cc-mutant.sh"
+cp "$RECORD" "$CC_MUT"
+if grep -qF 'if [ "$CC_DIFF" = "$DIFF_HASH" ]; then' "$CC_MUT"; then
+    # The anchor allows LEADING WHITESPACE: the comparison sits inside the
+    # `if [ "$CHECK_CARRY" -eq 1 ]` block, so `^if` would never match and the
+    # mutant would silently stay an exact copy of the script — a mutation pin
+    # pinned to a line that never changes proves nothing.
+    sed -i.bak 's/^[[:space:]]*if \[ "\$CC_DIFF" = "\$DIFF_HASH" \]; then$/  if [ -n "$DIFF_HASH" ]; then/' "$CC_MUT"
+    rm -f "$CC_MUT.bak"
+    if cmp -s "$RECORD" "$CC_MUT"; then
+        bad "11.13j the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    run_check_carry 424903 "$CC_REPO" "$CC_MUT"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$CC_TAB"*}" = "carry" ]; then
+        ok "11.13j mutation CAUGHT: with the digest comparison removed the CHANGED-diff case IS reported as a carry — so 11.13c is load-bearing"
+    else
+        bad "11.13j mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13c cannot fail, so it proves nothing"
+    fi
+else
+    bad "11.13j the mutation anchor 'if [ \"\\\$CC_DIFF\" = \"\\\$DIFF_HASH\" ]; then' is gone — re-anchor the mutant rather than dropping the pin"
+fi
+unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED

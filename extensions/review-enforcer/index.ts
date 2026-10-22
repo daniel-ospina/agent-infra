@@ -1931,12 +1931,52 @@ export function parseDiffHashHelperOutput(stdout: string): string | null {
 }
 
 /**
+ * How long the LIVE diff read may take (ms).
+ *
+ * ⛔ THIS BOUND WAS 60s AND THAT WAS A SILENT FALSE NEGATIVE (measured 2026-10-22).
+ * The read is one `gh api` inside `record-review.sh`, and on this fleet every `gh`
+ * invocation first queues at the SHARED gh gate (`~/.pi/agent/shims/gh`), whose
+ * slot-acquire budget alone is 300s by default (`AGENT_GH_GATE_ACQUIRE_TIMEOUT`)
+ * before a single byte of HTTP is sent. So under fleet contention — the exact
+ * condition in which a dozen open PRs are waiting on the carry ARM — the child was
+ * killed at 60s WHILE THE GATE WAS STILL QUEUEING, `execFileSync` threw, and the
+ * caller received `null`.
+ *
+ * `null` is the arm's fail-closed signal, so nothing unsafe happened — but the
+ * refusal it produced was `head_advanced` ("the branch moved — re-review the new
+ * head"), i.e. a QUEUEING DELAY was rendered as a CONTENT CHANGE, and the lane paid
+ * a whole fresh review for a diff that never changed. That is the same speech-act
+ * error #1690 fixed for the head read ("an unreadable head is NOT a claim about
+ * reality"), in the diff dimension — so it gets the same treatment: a bound that
+ * outlasts the queue, and a refusal that says which of the two happened.
+ *
+ * The default mirrors the budget the HEAD read already waits under
+ * (`rateLimitMaxWaitMs`, 10 min): a diff read is the same kind of shared-pool call and
+ * was MEASURED at 399s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
+ * below that class keeps killing reads that were merely queued. Raise it where the
+ * gate is configured with a longer acquire timeout. A genuinely unreachable API still
+ * ends in `null` — bounded, and now legible.
+ */
+export function diffHashReadTimeoutMs(): number {
+  const explicit = parseInt(process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "", 10);
+  if (Number.isInteger(explicit) && explicit > 0) return explicit;
+  const acquire = parseInt(process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT ?? "", 10);
+  const acquireMs = (Number.isInteger(acquire) && acquire > 0 ? acquire : 300) * 1000;
+  return Math.max(600_000, acquireMs + 120_000);
+}
+
+/**
  * The PR's live normalized three-dot diff digest, or null when it cannot be
  * computed. The repo is taken from the SAME resolved context the gate verified
  * the head through, and is RE-VALIDATED here (a `--repo` flag is user-controlled
  * text) before it reaches an argv element. Every failure — no repo, no helper,
  * no `gh`/`openssl`/`python3`, the 300-file cap, a network failure, a timeout —
  * returns null, which the gate reads as "no identity" and blocks on the head.
+ *
+ * ⛔ NULL MEANS "COULD NOT READ", NEVER "READ AND DIFFERS". The two are
+ * different operational events with different remedies (retry vs re-review), so
+ * the caller must not collapse them: `evaluateMergeGate`'s `diffReadFailed`
+ * argument exists to keep them apart at the one point that prints the remedy.
  */
 export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
   if (prDiffHashOverride !== null) return prDiffHashOverride(pr, ctx);
@@ -1949,7 +1989,7 @@ export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
     // element, so no value here can be re-parsed as shell syntax.
     const out = execFileSync("bash", [helper, "--print-diff-hash", String(pr), repo], {
       cwd: ctx.cwd,
-      timeout: 60000,
+      timeout: diffHashReadTimeoutMs(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -2111,6 +2151,15 @@ export function evaluateMergeGate(
   // failure. Every one of those is a FAILED READ, and a failed read is not a
   // matching read, so null blocks on the head binding like any other mismatch.
   currentDiffHash: string | null = null,
+  // #1351 — WHY `currentDiffHash` is null. The caller ATTEMPTED a read (the
+  // record carries a usable digest and the head moved) and it came back null:
+  // either the read failed, or the body was empty/non-diff/over the 300-file
+  // cap. That is NOT a statement that the content changed, and the two remedies
+  // are opposites (RETRY the merge vs pay for a fresh review), so the caller
+  // says which happened rather than letting the arm guess. Defaults to false
+  // because the common null is "never asked" (a matching head, or a legacy
+  // record with no digest), which must keep the unchanged `head_advanced` path.
+  diffReadFailed: boolean = false,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -2245,6 +2294,48 @@ export function evaluateMergeGate(
         `(${record.verdict} review, head moved ${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)} ` +
         `but the reviewed DIFF is unchanged — diff_sha256 ${currentDiffHash.slice(0, 12)} matches the PR's ` +
         `current diff, so the verdict is CARRIED FORWARD on content identity) — allowing merge`,
+    };
+  }
+  if (
+    record.head_sha !== currentHead &&
+    diffReadFailed &&
+    // The flag says the caller ATTEMPTED a read, and a read is only attempted
+    // when the record carries an identity. Requiring it here keeps the branch
+    // self-consistent even for a caller that sets the flag unconditionally: a
+    // record with NO usable digest can never be a "could not read" case, its
+    // remedy is the unchanged one, and the text below quotes the digest.
+    isDiffSha256(record.diff_sha256)
+  ) {
+    // #1351 — A FAILED READ IS NOT A CHANGED DIFF (#1690's speech act, in the
+    // diff dimension). We got here because the record DOES carry a usable
+    // digest and the head moved, i.e. the carry arm was REACHABLE — and then the
+    // live digest could not be read (a shared-gh-gate queue longer than the
+    // read bound, a rate-limit window, an empty/over-cap/non-diff body, a
+    // network failure). Rendering that as `head_advanced` told the lane to pay
+    // 20-40 minutes for a fresh review of content that may be byte-identical.
+    //
+    // FAIL CLOSED, and state the remedy that actually applies: RETRY. The retry
+    // is cheap and it re-asks the only question that decides. The `[diff_unreadable]`
+    // tag exists so the audit trail (gate-events.jsonl) can reconstruct these by
+    // reason — `head_advanced` was two different operational events behind one tag.
+    return {
+      status: "block",
+      reasonTag: "diff_unreadable",
+      reason: [
+        `❌ PR #${pr} head has moved (${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)}) and the`,
+        "   reviewed DIFF could not be READ, so it could not be compared.",
+        "   This is NOT a claim that the content changed — a read that failed is not a diff that differs.",
+        "   → RETRY the merge. A shared gh-gate queue, a rate-limit window or a transient API"
+        + " failure is far cheaper than a re-review, and the carry arm re-decides on every attempt.",
+        "   → Do NOT mint a fresh record for this: an unchanged diff CARRIES on the digest alone",
+        `     (record diff_sha256 ${record.diff_sha256!.slice(0, 12)}…).`,
+        "   → To see which case you are in without merging, compare the two digests:",
+        `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
+        `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
+        "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
+        `     run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} ${pr} ${currentHead.slice(0, 12)}… clean`
+        + " [owner/repo] --evidence comment:<review-comment-id>",
+      ].join("\n"),
     };
   }
   if (record.head_sha !== currentHead) {
@@ -3805,16 +3896,23 @@ export default function (pi: ExtensionAPI) {
         // head block — never to an accept). The read is the SAME normalized
         // digest the record stores and the GitHub gate computes, so the two
         // gates cannot disagree about what "reviewed" means.
-        const currentDiffHash =
-          record && isDiffSha256(record.diff_sha256) &&
+        const diffReadAttempted =
+          !!record && isDiffSha256(record.diff_sha256) &&
           currentHead !== null &&
-          record.head_sha !== currentHead
-            ? getPrLiveDiffHash(prNumber, ctx)
-            : null;
+          record.head_sha !== currentHead;
+        const currentDiffHash = diffReadAttempted
+          ? getPrLiveDiffHash(prNumber, ctx)
+          : null;
+        // #1351: an ATTEMPTED read that came back null is a FAILED READ — never a
+        // changed diff. Without this the arm cannot tell "the content moved" from
+        // "the shared gh gate queued longer than the read bound", and its refusal
+        // told the lane to re-review in both cases (measured 2026-10-22).
+        const diffReadFailed = diffReadAttempted && currentDiffHash === null;
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
-          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash
+          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash,
+          diffReadFailed
         );
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
