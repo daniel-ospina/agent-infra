@@ -621,6 +621,14 @@ FNR == 1 { gdq = 0; gsq = 0 }
   is_comment = ($0 ~ /^[ \t]*#/)
   if (!is_comment) {
   opened = 0
+  # ⛔ MEASURE THE LINE BEFORE ITS HEADER IS TAKEN OFF IT (#2121 review round 8, P0). This call moved
+  # above both header branches: `function name() {` strips the header AND the opening brace, so
+  # measuring afterwards saw a brace-less remainder and then subtracted the consumed brace a second
+  # time — `delta = -1` on the header line, which ENDED the function there, so every line of its body
+  # was scanned at top level and `empty-as-pass` became unreportable for that whole function. Twenty
+  # top-level `function x() {` helpers exist in the scan set, so this printed PASS over shapes the
+  # previous commit caught.
+  LINE_DELTA = brace_delta($0)   # ONE call per line: it advances the quote carry (review round 7)
   # ⛔ FUNCTION BOUNDARIES ARE TRACKED HERE, AFTER the heredoc skip: a fixture body may legitimately
   # contain a function header and a closing brace, and tracking those would attribute fixture lines
   # to a function (and cut a real function short at the closing brace of the fixture).
@@ -644,7 +652,6 @@ FNR == 1 { gdq = 0; gsq = 0 }
   # header-shaped line cannot see its brace, so it is held as PENDING and the region is pushed only
   # if the very next line opens the block (review round 6, P1). Without this, the helper body was read
   # as the OUTER function and its `return "$rc"` became the outer verdict.
-  LINE_DELTA = brace_delta($0)   # ONE call per line: it advances the quote carry (review round 7)
   if (PEND) {
     # A blank line or a comment between a header and its brace does not cancel the pending region —
     # only a real statement that is not the opening brace does (review round 7, P1).
@@ -682,7 +689,13 @@ FNR == 1 { gdq = 0; gsq = 0 }
     if (delta < 0 && newdepth <= 0) {
       # The body ends on THIS line: keep what PRECEDES the closing brace for the line rules, so a
       # one-line body is still scanned (G6) and a `} > file` closer is never read as code.
-      if (BR_END > 0) $0 = substr($0, 1, BR_END - 1)
+      if (opened) {
+        # BR_END is a RAW-line offset and $0 has been cut down to the body, so it cannot be reused:
+        # the last `}` of the remainder is the closer of this one-line body.
+        t2 = $0; p = 0
+        while (match(t2, /}/)) { p += RSTART; t2 = substr(t2, RSTART + 1) }
+        if (p > 0) $0 = substr($0, 1, p - 1)
+      } else if (BR_END > 0) $0 = substr($0, 1, BR_END - 1)
       end_fn = 1; newdepth = 0
     }
     depth = (newdepth < 0 ? 0 : newdepth)
@@ -1102,9 +1115,6 @@ done < "$DECIDED"
 
 # PARTIAL-SCAN NOTES reach the reader here, before the summary: a stderr note that nothing prints is
 # the same silence it was written to break.
-if [ -s "$TMPDIR_RUN/scan-notes" ]; then
-  sed 's/^/partial: /' "$TMPDIR_RUN/scan-notes" | sort -u | head -20 >&2
-fi
 # ⛔ THE COUNT BELONGS IN THE VERDICT LINE, NOT ONLY ON STDERR (review round 7, P2). A partial scan
 # printed a stdout summary byte-identical to a fully scanned tree, and the stderr list was truncated at
 # 20 with no marker — so 25 partial files read as "25 scanned, 0 findings, PASS". The count is part of
@@ -1117,7 +1127,7 @@ if [ -s "$TMPDIR_RUN/scan-notes" ]; then
     echo "partial: … and $((partials - 20)) more partial scan(s) withheld from this list (all counted in the summary)" >&2
   fi
 fi
-echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able  · $partials partial scan(s) ──"
+echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able · $partials partial scan(s) ──"
 if [ "$findings" -gt 0 ] || [ "$unjustified" -gt 0 ] || [ "$malformed" -gt 0 ] || [ "$ungrandfathered" -gt 0 ]; then
   echo "FAIL: no verdict without an observation (#2096). Fix the shape, or exempt one line with '# verified: <why it is not the shape>'."
   exit 1

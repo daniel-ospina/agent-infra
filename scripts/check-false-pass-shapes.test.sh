@@ -968,7 +968,7 @@ f() {
   local bad=0
   out="$(cmd)"
   for x in $out; do printf '%s\n' "$x"; done
-  log()  # appends to LOG_FILE
+  log()  # writes into ${LOG_FILE}
   {
     local rc=0
     check_something || rc=1
@@ -1020,6 +1020,24 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B50 a helper AFTER the verdict cannot launder it (the shape is still reported)"
+# ⛔ ROUND-8, P0: `function name() {` headers were measured AFTER the header branch had already
+# stripped the opening brace off the line, so the consumed brace was subtracted twice — `delta = -1`
+# ended the function ON ITS HEADER LINE and every line of its body was scanned at top level, where
+# neither flaginit[] nor fn_loop can be recorded. `empty-as-pass` was unreportable for the whole
+# function. Every `function` fixture in this suite was a ONE-LINER, which this bug does not affect.
+D="$(fixture b51)"
+cat > "$D/scripts/fiftyone.sh" <<'EOS'
+#!/bin/bash
+function collect() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do echo "$x"; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B51 a MULTI-LINE body of a 'function name() {' header is analysed (the header line does not end it)"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
