@@ -6695,6 +6695,76 @@ test("heredocOpenersIn: `<<<`, arithmetic shifts, quoted mentions and `<<-` tabs
   equal(heredocOpenersIn("sort <<-E-O-F")[0]?.stripTabs, true, "`<<-` strips leading tabs");
 });
 
+test("#1382-c9 (1) P0: a body written to a file and PIPED into a program is still READ — the reader's stdout is a handle", () => {
+  // MEASURED FAIL-OPEN, found by a fresh review of this change and confirmed here before the fix:
+  // `heredocSegmentIsNaming` proved the READER (cat/head) cannot execute its argument, and the first
+  // version concluded the LINE could not either. The reader's STDOUT is a handle: the next pipeline
+  // stage can be a program, and then the body written one line up is executed by this command.
+  // origin/main refused every one of these; the fix ALLOWED them. All four are pinned.
+  const M = "gh pr merge 999 --admin";
+  const write = `cat > /tmp/x.sh <<'EOF'\n${M}\nEOF\n`;
+  for (const run of [
+    `cat /tmp/x.sh | bash`,
+    `head -5 /tmp/x.sh | bash`,
+    `cat /tmp/x.sh | /bin/sh`,
+    `cat /tmp/x.sh | sh -s`,
+    `cat /tmp/x.sh | xargs -I{} sh -c {}`,
+    `cat /tmp/x.sh | env X=1 bash`,
+    `cat /tmp/x.sh | python3`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(write + run)), 1,
+      `a body piped into a program must stay READ: ${run}`);
+  }
+  // …while a reader whose stdout goes to a DATA consumer stays masked: the pipe alone is not the
+  // signal, the PROGRAM at the end of it is. (`grep`/`head`/`sort` are not program runners.)
+  for (const safe of [
+    `cat /tmp/x.md | grep -c merge`,
+    `cat /tmp/x.md | head -1`,
+    `cat /tmp/x.md | sort`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(`cat > /tmp/x.md <<'EOF'\n${M}\nEOF\n${safe}`)), 0,
+      `a pipe into a DATA consumer keeps the body masked: ${safe}`);
+  }
+});
+
+test("#1382-c9 (2) P0: every SPELLING of the written path a runner can reach keeps the body readable", () => {
+  // MEASURED FAIL-OPEN #2, same review. The execution test compared the redirect target to the
+  // later word as a RAW SUBSTRING, so every spelling that reaches the same file was missed: a `./`
+  // prefix, a `cd` on an earlier segment, a doubled slash, an interior `/./`, and a bracket glob.
+  // origin/main refused all of them. Paths are compared NORMALIZED, and the BASENAME counts (a `cd`
+  // cannot be followed through a line-local read, so the file name alone must be enough).
+  const M = "gh pr merge 999 --admin";
+  const body = `\n${M}\nEOF\n`;
+  for (const [write, run] of [
+    [`cat > ./rq.sh <<'EOF'${body}`, `bash rq.sh`],
+    [`cat > /tmp/rq.sh <<'EOF'${body}`, `cd /tmp; bash rq.sh`],
+    [`cat > /tmp/rq.sh <<'EOF'${body}`, `bash /tmp//rq.sh`],
+    [`cat > /tmp/rq.sh <<'EOF'${body}`, `bash /tmp/./rq.sh`],
+    [`cat > /tmp/rq.sh <<'EOF'${body}`, `bash /tmp/sub/../rq.sh`],
+    [`cat > /tmp/e.sh <<'EOF'${body}`, `bash /tmp/e.s[h]`],
+    [`cat > /tmp/e.sh <<'EOF'${body}`, `/bin/bash /tmp/e.sh`],
+  ] as Array<[string, string]>) {
+    equal(countMergeVerbs(maskHeredocData(write + run)), 1,
+      `a path spelling that reaches the written file must stay READ: ${write.split("\n")[0]} … ${run}`);
+  }
+});
+
+test("#1382-c9 (3) the reported DATA shapes stay MASKED — the P0 fixes must not bring the refusal back", () => {
+  // The whole point of the change. If a fix for the fail-opens above re-scanned these, the reported
+  // defect is back and this lane has traded a false negative for the false positive it was filed for.
+  const M = "gh pr merge 999 --admin";
+  for (const cmd of [
+    `cat >> NOTES.md <<'EOF'\n${M}\nEOF`,
+    `cat >> NOTES.md <<'EOF'\n${M}${M}\nEOF`,
+    `cat >> NOTES.md <<'EOF'\n${M}\nEOF\nwc -l NOTES.md`,
+    `cat >> NOTES.md <<'EOF'\n${M}\nEOF\ngrep -c merge NOTES.md`,
+    `cat >> CHANGELOG.md <<'EOF'\n${M}\nEOF\ngit add CHANGELOG.md`,
+    `git commit -F - <<'MSG'\n${M}\nMSG`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(cmd)), 0, `the reported false-positive shape must stay MASKED: ${cmd.slice(0, 34)}`);
+  }
+});
+
 testAsync("#1382 (a): a heredoc that only WRITES A FILE whose prose mentions the rail is ALLOWED", async () => {
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
@@ -6752,7 +6822,13 @@ testAsync("#1382 (b): TWO REAL admin merges are still REFUSED, with the SAME mes
   });
 });
 
-testAsync("#1382 (c): a SPLICED invocation is still REFUSED (the mask must not open a hole)", async () => {
+testAsync("#1382 (c): a spliced invocation is still REFUSED (UNCHANGED by this PR — the mask never sees it)", async () => {
+  // ⛔ WHAT THIS TEST DOES AND DOES NOT PROVE (a fresh review of this change measured the gap): it is
+  // a GATE-STILL-EXISTS guard, not evidence that the mask opened no hole. None of the four commands
+  // contains a heredoc, so `maskHeredocData(c) === c` for each and the test passes identically with
+  // the mask replaced by the identity function. The mask's own fail-open class is pinned by
+  // `#1382-c9 (1)`/`(2)` above, which DO fail when the mask hides an executed body. The title says
+  // UNCHANGED because that is the true claim: these spellings were refused before the mask existed.
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
     const prevMode = process.env.PI_MODE;

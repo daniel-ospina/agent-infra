@@ -742,9 +742,95 @@ function heredocLineExecutes(line: string, target: string): boolean {
   // and the body was masked while bash ran the file. A separator starts a new command, so each
   // segment is judged on its OWN first word — and a GLOB is a mention too (`. /tmp/g1.*`), which is
   // why the mention test lives INSIDE the loop rather than before it.
+  //
+  // ⛔ A READER THAT NAMES THE FILE MAY STILL RUN IT, ONE PIPE LATER (#1382 cycle 9 review, P0 —
+  // measured fail-open introduced by the reader exemption below). `heredocSegmentIsNaming` proves
+  // the READER cannot execute its argument, and the first version concluded the LINE could not
+  // either. That is false: the reader's own STDOUT is a handle. `cat > /tmp/x.sh <<'EOF' … EOF`
+  // followed by `cat /tmp/x.sh | bash` (or `| sh`, `| xargs … sh -c {}`) writes the body to a file
+  // and runs it, while the only segment naming the target starts with `cat` — so the body was
+  // masked and main refused the same command. The pipe is judged on the RAW line, before the
+  // separator split, because the split discards exactly the `|` that carries the meaning.
+  const pipedIntoProgram = heredocPipedIntoProgram(line);
   for (const segment of line.split(/[;|&]+/)) {
-    if (!segment.includes(target) && !heredocGlobMentions(segment, target)) continue;
+    if (!heredocNamesTarget(segment, target) && !heredocGlobMentions(segment, target)) continue;
+    if (pipedIntoProgram) return true;
     if (!heredocSegmentIsNaming(segment)) return true;
+  }
+  return false;
+}
+
+/** Is any stage AFTER the first of this line's pipeline a PROGRAM RUNNER (`… | bash`,
+ *  `… | sh -s`, `… | python3`, `… | xargs … sh -c {}`)?
+ *
+ *  Reuses `STDIN_PROGRAM_RUNNERS` / `STDIN_PROGRAM_INTERPRETER_RE` — the same vocabulary
+ *  `dataCharMask`'s `pipedIntoRunner` uses — so the two cannot disagree about what a program is.
+ *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout. */
+function heredocPipedIntoProgram(line: string): boolean {
+  const stages = line.split(/(?<!\|)\|(?!\|)/);
+  for (let i = 1; i < stages.length; i++) {
+    const words = stages[i].trim().split(/\s+/);
+    const first = (words[0] ?? "").replace(/["'\\]/g, "");
+    if (!first) continue;
+    if (STDIN_PROGRAM_RUNNERS.has(first)) return true;
+    if (STDIN_PROGRAM_INTERPRETER_RE.test(first)) return true;
+    if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(first)) return true;
+    // A wrapper word can hide the program one word along (`| env FOO=1 bash`, `| nice -n 5 sh`).
+    if (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(first)) {
+      for (const w of words.slice(1)) {
+        const bare = w.replace(/["'\\]/g, "");
+        if (!bare || /^[A-Za-z_][A-Za-z0-9_]*=/.test(bare)) continue;
+        if (STDIN_PROGRAM_RUNNERS.has(bare) || STDIN_PROGRAM_INTERPRETER_RE.test(bare)) return true;
+        if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(bare)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** A path as WRITTEN, normalized textually: `./a//b/./c` and `a/b/c` are the same file, and this
+ *  function makes them the same STRING. No filesystem access — the shell may not have run yet. */
+function heredocNormalizePath(p: string): string {
+  const abs = p.startsWith("/");
+  const parts: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  return (abs ? "/" : "") + parts.join("/");
+}
+
+/** Does any word in `text` NAME `target` the file?
+ *
+ *  ⛔ NORMALIZED, NOT SUBSTRING (#1382 cycle 9 review, P0 — second measured fail-open introduced by
+ *  the first version). Comparing the raw redirect target to the raw later word missed every spelling
+ *  that reaches the SAME file: `cat > ./rq.sh …` then `bash rq.sh`; `cat > /tmp/x.sh …` then
+ *  `cd /tmp; bash x.sh`; `bash /tmp//x.sh`; `bash /tmp/./x.sh`. Each was masked at the fix and
+ *  refused by main. So the BASENAME counts as a form too: a `cd` or a `./` prefix changes the word
+ *  without changing the file. Over-matching only keeps a body readable (a refusal), which is the
+ *  direction this file is allowed to be wrong in. */
+function heredocNamesTarget(text: string, target: string): boolean {
+  // ⛔ THE RAW SUBSTRING IS KEPT, on purpose, and it is not redundant with the word walk below: a
+  // path can hide inside a word that no path normalization reaches — `BASH_ENV=CHANGELOG.md bash -c
+  // true` names the file with an assignment prefix, and the normalized word comparison missed it
+  // (measured: an existing suite case went red within this change). Over-matching only keeps a body
+  // readable, which is a refusal, so the crude arm stays and the normalized arms are added ON TOP.
+  if (text.includes(target)) return true;
+  const norm = heredocNormalizePath(target.replace(/["'\\]/g, ""));
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of text.split(/\s+/)) {
+    const w = heredocNormalizePath(rawWord.replace(/["'\\]/g, ""));
+    if (!w) continue;
+    if (w === norm) return true;
+    if (base && w === base) return true;
+    // An ABSOLUTE spelling whose tail is the target's path from some point (`bash sub/x.sh` for
+    // `./sub/x.sh`) — the `cd` that makes it absolute may sit on an earlier line.
+    if (w.endsWith("/" + norm)) return true;
   }
   return false;
 }
@@ -752,9 +838,16 @@ function heredocLineExecutes(line: string, target: string): boolean {
 /** Could a GLOB word on this line reach `target`? `. /tmp/g1.*` runs a file whose exact name the
  *  written-target comparison cannot match, so a glob sharing the target's DIRECTORY counts. */
 function heredocGlobMentions(line: string, target: string): boolean {
-  if (!/[?*]/.test(line) || !target.includes("/")) return false;
-  const dir = target.slice(0, target.lastIndexOf("/") + 1);
-  return dir.length > 1 && line.includes(dir);
+  // `[` is a glob metachar too (`bash /tmp/e.s[h]` runs e.sh) — a measured miss of the first
+  // version, which knew only `?` and `*` (#1382 cycle 9 review, P0).
+  if (!/[?*[]/.test(line) || !target.includes("/")) return false;
+  const dir = heredocNormalizePath(target.slice(0, target.lastIndexOf("/") + 1));
+  if (dir.length < 1) return false;
+  for (const w of line.split(/\s+/)) {
+    const bare = heredocNormalizePath(w.replace(/["'\\]/g, ""));
+    if (bare.startsWith(dir + "/")) return true;
+  }
+  return false;
 }
 
 /** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
@@ -1077,8 +1170,14 @@ export function maskHeredocData(command: string): string {
           break;
         }
       }
-      // An UNTERMINATED heredoc is a bash syntax error — nothing in the command runs — and the body
-      // was masked, never dropped, so no offset moved.
+      // An UNTERMINATED heredoc is NOT a bash syntax error — measured: `printf 'cat <<EOF\nhi\n' > /tmp/u.sh;
+      // bash /tmp/u.sh` WARNS ("here-document at line 1 delimited by end-of-file") and then EXECUTES the
+      // command with the remainder as the body, exit 0 (#1382 cycle 9 review, P2 — the first version of
+      // this comment asserted the opposite, and a later widening to a non-proven consumer would have
+      // leaned on it). Masking the remainder is still sound HERE and for a narrower reason: the opener
+      // passed `heredocBodyIsData`, so whatever follows is the body of a consumer this file proved
+      // cannot execute its stdin, and nothing follows the body. If that proof ever widens, this branch
+      // must stop masking — it is the proof, not the "syntax error", that carries the safety.
       if (!closed) break;
     }
   }
