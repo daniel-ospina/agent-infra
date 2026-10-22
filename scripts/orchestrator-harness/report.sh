@@ -159,7 +159,10 @@ if [ -f "$O/.agent-infra-stamp.json" ]; then
   echo "  harness: ${hc:-UNKNOWN} [${hr:-unknown}]"
   if [ "$dm" = false ]; then
     echo "  ⚠️  the DEPLOYED copy at \$O differs from the recorded source commit — this box is NOT running those bytes"
-    echo "      re-sync and re-record: cp '<checkout>/scripts/orchestrator-harness'/*.sh \"\$O\"/ && O=\"\$O\" bash <checkout>/scripts/orchestrator-harness/install.sh"
+    # ⛔ NOT A BARE DEPTH-1 `cp` (agent-infra#2041): this line is printed whenever the record disagrees
+    # with the deployed bytes, so it is the single command an operator will paste. Name the verified
+    # redeploy, not the unverified copy #2041 measured.
+    echo "      re-sync and re-record: bash <checkout>/scripts/orchestrator-harness/deploy-harness.sh --repo <checkout> --o \"\$O\" && O=\"\$O\" bash <checkout>/scripts/orchestrator-harness/install.sh"
   fi
 else
   echo "  harness: UNKNOWN (no $O/.agent-infra-stamp.json — run install.sh to record it)"
