@@ -12,13 +12,28 @@
 # controller's own last output, which every restart erased.
 #
 # CONTRACT (this file is the implementation of it, and watchdog-loop.test.sh pins it):
-#   heartbeat FRESH   + pid alive   → HEALTHY   (no action, nothing touched)
-#   pid alive         + hb STALE    → WEDGED    (ONE restart, then re-check after SETTLE)
-#   pid gone          + hb STALE    → DOWN      (ONE restart)
-#   hb file missing / unusable      → DOWN      (NEVER healthy: an absent datum is not a fresh one)
-#   N consecutive WEDGED observations → STOP restarting; record ONE durable crash line, quoting the
-#                                    last lines of $O/logs/controller-stdout.log, so a repeating crash
-#                                    is VISIBLE instead of being restarted forever.
+#   heartbeat FRESH + pid alive → HEALTHY   (no action, nothing touched; the streak is cleared)
+#   heartbeat FRESH + NO pid    → UNCERTAIN (the heartbeat proves the loop IS cycling, so it is NOT
+#                                            restarted — killing a cycling controller on a bookkeeping
+#                                            miss is the P0 — but it is not HEALTHY either: the
+#                                            contract requires a pid. The streak is NOT cleared, because
+#                                            a crash-on-start also starts with a fresh heartbeat.)
+#   pid alive + hb STALE        → WEDGED    (ONE restart, then re-check after SETTLE)
+#   no pid    + hb STALE        → DOWN      (ONE restart)
+#   hb absent / not an instant  → DOWN      (NEVER healthy: an absent datum is not a fresh one; and it
+#                                            is never dated from the file's mtime, which `touch` renews)
+#   N consecutive restart-worthy observations (WEDGED *or* DOWN) → <VERDICT>_STOPPED: restarting stops
+#                                            for that EPISODE and ONE crash record block is written,
+#                                            quoting the last lines of $O/logs/controller-stdout.log.
+#                                            A crash-on-start leaves no pid, so DOWN is capped too — a
+#                                            cap that only covered WEDGED restarted that forever.
+#                                            ⛔ THE LATCH IS BOUNDED, NOT PERMANENT: after a further N
+#                                            stopped observations ONE probe restart is allowed and a NEW
+#                                            episode begins (a genuinely dead box must not stay dead
+#                                            for ever because a crash was recorded once). That bounds
+#                                            restarts to one per ~N passes in the worst case — slow,
+#                                            never a tight loop — and every episode records its own
+#                                            crash, so a repeated one is still visible.
 #
 # ⛔ EXIT 0 ALWAYS. A watchdog that dies loudly into a log nobody reads is worse than none: launchd
 # would record a non-zero status that only a human already suspecting something would look at. The
@@ -72,6 +87,11 @@ done
 HB_STALE="${HB_STALE:-780}"; num_ok "$HB_STALE" || HB_STALE=780
 SETTLE="${SETTLE:-60}";       num_ok "$SETTLE"   || SETTLE=60
 MAX_CONSEC="${MAX_CONSEC:-3}"; num_ok "$MAX_CONSEC" || MAX_CONSEC=3
+# ⛔ ZERO IS NOT A SETTING. `MAX_CONSEC=0` used to be accepted, which meant "never restart" — and then
+# the cap fired on the FIRST observation and recorded a crash for a restart that was never attempted,
+# i.e. the one action this job exists to take was disabled by a value that looks like a tightening.
+# Anything below 1 falls back to 3 and is NAMED in BOUND-FALLBACK.
+[ "$MAX_CONSEC" -ge 1 ] || { _bad="$_bad MAX_CONSEC=$MAX_CONSEC(<1)"; MAX_CONSEC=3; }
 
 STATE_DIR="${WATCHDOG_STATE_DIR:-$HOME/.pi/agent/state}"
 LOG="${WATCHDOG_LOG:-$STATE_DIR/controller-watchdog.log}"
@@ -84,6 +104,11 @@ CRASH_FILE="$STATE_DIR/controller-watchdog.crash"
 # streak increments the episode; the crash file records the episode it belongs to; a pass that finds
 # its own episode already there does not rewrite it.
 EPISODE_FILE="$STATE_DIR/controller-watchdog.episode"
+# Which episode the crash record already covers. ⛔ NOT a grep over $CRASH_FILE: the record's body is
+# the controller's own output, so a log line containing `episode=7` made the dedupe read back the
+# WRONG episode and the file grew one block per stopped pass (measured in review: 3 blocks for one
+# episode, 288/day at a 300s cadence, and the crash file — unlike the decision log — is never rotated).
+CRASH_EPISODE_FILE="$STATE_DIR/controller-watchdog.crash-episode"
 # The decision log is APPEND-ONLY and read by humans and by `--status`, so it is TRUNCATED once it
 # passes this size (the same shape as the branch reaper's report log). 1 MiB is ~5,000 decision lines
 # at ~200 bytes: months of passes, and it cannot grow without bound on a box nobody prunes.
@@ -128,11 +153,11 @@ rotate_log() {
 # UNKNOWN and touches nothing): this file's only action is a restart, and refusing to restart a
 # controller whose own liveness record cannot be read is how the measured hour was spent.
 hb_age() {
-  local f="$HB" v now m
+  local f="$HB" v now
   [ -e "$f" ] || { printf 'missing\n'; return 0; }
   [ -f "$f" ] || { printf 'missing\n'; return 0; }
   now="$(date +%s)"
-  # tr strips everything non-numeric, so a garbage file yields the empty string (=> mtime fallback)
+  # tr strips everything non-numeric, so a garbage file yields the empty string => UNKNOWN (below)
   v="$(tr -dc '0-9' < "$f" 2>/dev/null)" || v=""
   if [ -n "$v" ]; then
     [ "${#v}" -le 12 ] || v=""
@@ -230,8 +255,8 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
   # ONCE PER EPISODE, not once per file: a crash loop that ended and a different one that started are
   # two facts, and the second must not be lost behind the first (measured in review: the record still
   # named CRASH ONE through a completely different second crash loop).
-  recorded="$(grep -o 'episode=[0-9]*' "$CRASH_FILE" 2>/dev/null | tail -1)"
-  [ -n "$recorded" ] && [ "$recorded" = "episode=$episode" ] && return 0
+  recorded="$(cat "$CRASH_EPISODE_FILE" 2>/dev/null)"
+  [ -n "$recorded" ] && [ "$recorded" = "$episode" ] && return 0
   # The signature is the first line of output that actually looks like an error, because a crash's
   # cause is usually ONE line and the tail below is 25. `head -1` of a filtered tail, not a grep over
   # the whole file: the whole file is the history, and the crash is the END of it.
@@ -250,7 +275,20 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
     tail -n 25 "$CTRL_STDOUT" 2>/dev/null || printf '(unreadable or absent)\n'
   # ⛔ APPEND per episode, TRUNCATE only when there is no record yet: a second crash loop's evidence
   # must not replace the first, and `>` here did exactly that (measured in review).
-  } >> "$CRASH_FILE" 2>/dev/null
+  } >> "$CRASH_FILE" 2>/dev/null || return 0
+  # ⛔ BOUNDED even across episodes: the record is evidence, not an archive. Past 64 KiB the OLDEST
+  # episodes are dropped so a long-lived crash loop cannot fill the state dir — the most recent evidence
+  # is what a human needs, and the decision log keeps the timeline.
+  local sz
+  sz="$(wc -c < "$CRASH_FILE" 2>/dev/null | tr -d '[:space:]')"
+  case "${sz:-}" in ''|*[!0-9]*) ;; *)
+    if [ "$sz" -gt 65536 ]; then
+      tail -c 32768 "$CRASH_FILE" > "$CRASH_FILE.tmp" 2>/dev/null \
+        && mv "$CRASH_FILE.tmp" "$CRASH_FILE" 2>/dev/null
+    fi ;;
+  esac
+  # Written LAST and only on success: this is the dedupe key for the next pass.
+  printf '%s' "$episode" > "$CRASH_EPISODE_FILE" 2>/dev/null
 }
 
 status_show() {
@@ -322,19 +360,43 @@ main() {
     printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null
   fi
   streak=$(( streak + 1 ))
-  printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null
+  # ⛔ A FAILED PERSIST MUST FAIL CLOSED. Every state write used to be `2>/dev/null`, so on a read-only
+  # or root-owned state dir the counter never advanced past 1 and the cap could NEVER engage: the box
+  # restarted once per pass for ever, with the log cheerfully printing `streak=2/2 restart=1`. An
+  # unpersistable counter is treated as "the cap is spent" and said out loud.
+  if ! printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
+    say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE — the restart cap cannot be counted, so restarting is treated as EXHAUSTED for this pass (fail closed)"
+    streak=$(( MAX_CONSEC + 1 ))
+  fi
 
   # ── 3. the decision. ⛔ THE STOP COMES BEFORE THE RESTART, ALWAYS: `> MAX_CONSEC` must be
   #       unreachable as a restart, or "stop restarting" is a label on a loop that keeps going.
+  # ⛔ THE LATCH IS BOUNDED. A "stopped" state that is only ever released by a HEALTHY pass (which
+  # needs a discoverable pid) can freeze for ever: measured in review — the streak stayed at 3 through
+  # three UNCERTAIN passes while an operator restarted the stack by hand, so a LATER genuine death was
+  # reported STOPPED and never restarted at all (and the reason string claimed four consecutive
+  # observations when there was one). So once a second full budget of stopped observations has passed,
+  # ONE probe restart is allowed and a new episode starts. Worst case that is one restart per ~N passes
+  # (≈20 min at MAX_CONSEC=3 and a 300s cadence) — slow, never a tight loop — and it is the only way a
+  # genuinely dead box gets repaired without a human.
   if [ "$streak" -gt "$MAX_CONSEC" ]; then
     episode="$(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
     case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
     record_crash "$verdict" "$pid" "$age" "$streak" "$episode"
-    say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=${streak} consecutive ${verdict} observations — restarting disabled for this episode; crash at $CRASH_FILE"
-    return 0
+    if [ "$streak" -le "$(( MAX_CONSEC * 2 ))" ]; then
+      say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; one probe restart is allowed after ${MAX_CONSEC} more stopped observations"
+      return 0
+    fi
+    # the second budget is spent: this IS a new episode, and the probe is bounded by the same cap
+    episode=$(( episode + 1 ))
+    printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null
+    streak=1
+    printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null
+    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=1/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=the latch had held for $(( MAX_CONSEC * 2 )) consecutive ${verdict} observations — one probe restart, as a NEW episode (a dead box must not stay dead for ever)"
+    announced=1          # the decision is already stated; do not state it twice
   fi
 
-  say "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
+  [ "${announced:-0}" = "1" ] || say "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
 
   # ── 4. ONE restart, then PROVE it after a settle window. Never a second restart in this pass: a
   #       loop that restarts until something looks healthy is the behaviour this file replaces.

@@ -52,15 +52,20 @@ stop_ctrl() { [ -n "${CPID:-}" ] && kill "$CPID" 2>/dev/null; CPID=""; : > "$C/o
 hb_now()   { date +%s > "$C/o/heartbeat"; }
 hb_stale() { echo $(( $(date +%s) - 900 )) > "$C/o/heartbeat"; }   # HB_STALE default 780 → stale
 # run [extra env…] — one watchdog pass against the current case; prints the decision line.
+# ⛔ NO PIPELINE INTO `grep -m1`. An earlier version read the pass through `grep -m1`, which closes the
+# pipe after the first matching line and SIGPIPEs the watchdog mid-pass — so any assertion about what
+# happens AFTER the decision line (the restart, the settle re-check, the next streak) was silently
+# testing a TRUNCATED run, and pass counts drifted by one. The output goes to a file and is filtered
+# from there: no reader can kill the writer.
 run() {
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
       WATCHDOG_LOG="$C/state/controller-watchdog.log" \
-      WATCHDOG_RESTART_CMD="$STUB" SETTLE=0 HB_STALE=780 MAX_CONSEC="${MAXC:-3}" \
-      WATCHDOG_NO_RESTART=1 ${@:+"/usr/bin/env" "$@"} bash "$WD" 2>&1 \
-    | grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|RESTART-FAILED|RESTART-SUPPRESSED)' || true
+      WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=780 MAX_CONSEC="${MAXC:-3}" \
+      ${@:+"/usr/bin/env" "$@"} bash "$WD" >"$C/pass.out" 2>&1
+  grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|PROBE_RESTART|RESTART-FAILED|RESTART-SUPPRESSED)' "$C/pass.out" || true
 }
 # runall — every line the pass emitted (the post-restart re-check is a SECOND line, and a case about
-# recovery must read it; `run` returns the DECISION line, so a STILL_WEDGED follow-up cannot mask it).
+# recovery must read it; `run` returns the DECISION line, so a STILL_NOT_CYCLING follow-up cannot mask it).
 runall() {
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
       WATCHDOG_LOG="$C/state/controller-watchdog.log" \
@@ -190,6 +195,32 @@ run >/dev/null; run >/dev/null; run >/dev/null
 assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "2" "a SECOND crash episode is appended, not swallowed by the first"
 assert_contains "$(cat "$C/state/controller-watchdog.crash")" "KeyError: worker-missing" "…and it names the SECOND crash (the earlier record named only the first)"
 
+# ═══ 5c. the STOPPED latch is BOUNDED: a dead box must not stay dead for ever ═════════════════════
+echo "── 5c. after a second full budget of stopped observations, ONE probe restart and a new episode"
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=2
+: > "$C/o/logs/controller-stdout.log"
+# ⛔ OBSERVED, NOT INDEXED. The first version hard-coded "the probe is observation 5" and was red for a
+# reason that had nothing to do with the latch (one helper consumed an extra pass). The property under
+# test is "STOPPED appears, then a probe appears, and the probe is ONE restart as a NEW episode" — so it
+# is driven by a bounded loop and asserted on what the passes actually said.
+seen=""
+for _i in 1 2 3 4 5 6 7 8; do
+  _o="$(run)"; seen="$seen$_o"$'\n'
+  case "$_o" in *PROBE_RESTART*) break ;; esac
+done
+assert_contains "$seen" "verdict=DOWN_STOPPED" "the cap fires and restarting stops"
+assert_contains "$seen" "verdict=PROBE_RESTART" "…and the latch is BOUNDED: a probe restart follows (a dead box must not stay dead for ever)"
+assert_contains "$seen" "episode=2" "…as a NEW episode"
+assert_eq "$(restarts)" "3" "…and exactly one probe was issued (2 capped + 1 probe)"
+assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "…and the SAME episode is still recorded only once"
+
+# ═══ 5d. a controller log line containing `episode=<n>` must not reopen the crash record ══════════
+echo "── 5d. the crash-record dedupe parses its own header, not the controller's output"
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
+printf 'worker: starting episode=7\n' > "$C/o/logs/controller-stdout.log"
+run >/dev/null; run >/dev/null; run >/dev/null       # 1 restarts, 2 and 3 stopped in the same episode
+assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "one episode produces exactly ONE block even when the controller's own log mentions episode=7"
+
 # ═══ 6. the decision log is bounded and rotated with a line saying so ═══════════════════════════
 echo "── 6. the decision log cannot grow without bound"
 newcase; start_ctrl; hb_now
@@ -222,6 +253,14 @@ env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/
 assert_contains "$(cat "$C/state/controller-watchdog.log")" "prior decision line" "a typo'd LOG_MAX_BYTES does NOT truncate the log"
 assert_contains "$(cat "$C/state/controller-watchdog.log")" "BOUND-FALLBACK" "…and the ignored bound is said out loud"
 assert_eq "$(env O="$C/o" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" bash "$WD" --bogus >/dev/null 2>&1; echo $?)" "0" "even a mistyped verb exits 0 (the trap covers the parse)"
+# MAX_CONSEC=0 used to be accepted and meant "never restart", which disabled the one action this job
+# exists to take — while the cap fired on the FIRST observation and recorded a crash for a restart that
+# was never attempted.
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale
+env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+    WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 MAX_CONSEC=0 bash "$WD" >/dev/null 2>&1
+assert_contains "$(cat "$C/state/l")" "MAX_CONSEC=0(<1)" "MAX_CONSEC=0 falls back to 3 and is NAMED in BOUND-FALLBACK"
+assert_eq "$(grep -c 'DOWN_STOPPED' "$C/state/l" || true)" "0" "…so it is not treated as a zero budget (no STOPPED on the first observation)"
 
 # ═══ 8. exit 0 always ══════════════════════════════════════════════════════════════════════════
 echo "── 8. the watchdog always exits 0"
@@ -240,10 +279,19 @@ assert_eq "$(env O=/nonexistent/xyz WATCHDOG_STATE_DIR="$C/state2" WATCHDOG_REST
 # ever checking it was taken, so a renamed/moved guard would be both invisible here and live-firing on
 # the operator's box.
 newcase; start_ctrl; hb_stale
+# ⛔ BOTH PROBES. The first version of this case passed no WATCHDOG_RESTART_CMD, so `restarts()` could
+# never move and the "no restart was issued" assertion was a tautology (measured in review: a
+# `launchctl` shim on PATH recorded a real `kickstart -k` while the counter still read 0). The stub
+# proves the SCRIPT's own seam was not taken; the shim proves the PLATFORM verb was not reached, which
+# is the thing that actually matters.
+mkdir -p "$C/bin"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$C/launchctl.calls" > "$C/bin/launchctl"
+chmod +x "$C/bin/launchctl"
+# NO stub here on purpose: the suppression branch sits AFTER the stub seam (a stub IS the restart under
+# test), so this is the only invocation that can reach it — and the shim is what makes a REGRESSION safe.
 env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-    WATCHDOG_NO_RESTART=1 SETTLE=0 bash "$WD" >/dev/null 2>&1
+    WATCHDOG_NO_RESTART=1 SETTLE=0 PATH="$C/bin:$PATH" bash "$WD" >/dev/null 2>&1
 assert_contains "$(grep -m1 RESTART-SUPPRESSED "$C/state/l")" "RESTART-SUPPRESSED" "WATCHDOG_NO_RESTART reaches the platform verb and is taken"
-assert_eq "$(restarts)" "0" "…and the stub proves no restart was issued"
+assert_eq "$([ -f "$C/launchctl.calls" ] && echo 1 || echo 0)" "0" "…and a launchctl shim on PATH records ZERO calls (the live verb was never reached, even though this run had no stub)"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"

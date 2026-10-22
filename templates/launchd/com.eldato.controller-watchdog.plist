@@ -17,12 +17,19 @@
          THE CONTRACT THE SCRIPT IMPLEMENTS (scripts/orchestrator-harness/watchdog-loop.sh, pinned by
          watchdog-loop.test.sh):
            fresh heartbeat + pid   → HEALTHY, nothing touched
+           fresh heartbeat, no pid → UNCERTAIN: NOT restarted (the heartbeat proves the loop is
+                                     cycling; killing it on a bookkeeping miss is the P0) and NOT
+                                     healthy (the contract requires a pid)
            pid alive + stale hb    → WEDGED  → exactly ONE restart, re-checked after SETTLE
            no pid + stale hb       → DOWN    → one restart
-           no usable heartbeat     → DOWN    (never healthy)
-           N consecutive wedges    → STOP restarting and record ONE crash line quoting
-                                     $O/logs/controller-stdout.log, so the repeating crash is visible
-                                     instead of restarted forever.
+           no usable heartbeat     → DOWN    (never healthy, and never dated from the file's mtime)
+           N consecutive restart-worthy observations (WEDGED or DOWN — a crash-on-start leaves no pid)
+                                   → <VERDICT>_STOPPED: restarting stops for that EPISODE and ONE
+                                     crash block is written quoting $O/logs/controller-stdout.log,
+                                     so the repeating crash is visible instead of restarted forever;
+                                     after a further N stopped observations ONE probe restart is
+                                     allowed as a new episode (a dead box must not stay dead for ever,
+                                     and that bounds restarts to ~one per N passes).
 
          ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
          FRESH box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
