@@ -1109,9 +1109,9 @@ _MEASURED_DURATION_RE = re.compile(
     # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
     # masked once == masked twice). The row readers re-normalise what the writer
     # normalised, so a non-idempotent step would make writer≠reader and fail the
-    # subset rule closed. (The only non-idempotent inputs left are a LONG HEX run
-    # emitted immediately before a duration — ``1.21s746b295c`` — where the hex
-    # mask runs first; that shape is not reachable from pytest text.)
+    # subset rule closed. (The only non-idempotent inputs left are a duration
+    # emitted immediately BEFORE a long hex run — ``1.21s746b295c`` → the hex mask
+    # only fires on the second pass; that shape is not reachable from pytest text.)
     r"(?![A-Za-z_])"
 )
 
@@ -1120,6 +1120,14 @@ _MEASURED_DURATION_RE = re.compile(
 #: one (``elapsed=1.21s`` is an interpolation), and the branch is ANCHORED to the
 #: window edge so an earlier ``<`` cannot free a later measurement.
 _BOUND_OPERATOR_RE = re.compile(r"(?:[<>≤≥]=?|==)\s*$")
+
+#: An ALREADY-MASKED token (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<N>``…).
+#: It is stripped from the left window before the operator test, because these
+#: tokens END IN ``>`` — and that ``>`` is the closing delimiter of a mask, not a
+#: comparison: without this, ``0x1f 1.21s`` read ``>`` as an operator and left the
+#: measurement RAW, re-creating the #9331 block for any message where a masked id
+#: precedes the timer (review cycle 6).
+_MASKED_TOKEN_RE = re.compile(r"<[^<>]{1,24}>")
 
 
 def _mask_measured_duration(m: re.Match[str]) -> str:
@@ -1130,7 +1138,9 @@ def _mask_measured_duration(m: re.Match[str]) -> str:
     See the ``_MEASURED_DURATION_RE`` block for the bound rule and every declared
     residual (a noun-phrase bound is masked on purpose).
     """
-    before = m.string[max(0, m.start() - 32):m.start()]
+    before = _MASKED_TOKEN_RE.sub(
+        " ", m.string[max(0, m.start() - 32):m.start()]
+    )
     if _BOUND_OPERATOR_RE.search(before):
         return m.group(0)
     slot = sum(1 for _ in _MEASURED_DURATION_RE.finditer(m.string[:m.start()])) + 1

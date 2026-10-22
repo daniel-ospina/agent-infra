@@ -2834,3 +2834,22 @@ def test_9331_normalisation_is_idempotent_and_never_empties_a_signature():
         assert once, f"normalisation emptied a non-empty text: {text!r}"
     for text in ("1.5s1.7s", "admin 1.2s"):
         assert "<MEAS1:s>" in ci_exemption.normalize_signature(text), text
+
+
+def test_9331_a_masked_token_closing_angle_is_not_a_bound_operator():
+    """A `<ADDR>`/`<HOSTPORT>` mask ENDS IN `>` — that is not a comparison.
+
+    Review cycle 6: the operator test read the closing `>` of an earlier mask as a
+    bound operator, leaving the following measurement RAW — the #9331 block back,
+    for any message where a masked id precedes the timer.
+    """
+    for left, right in [
+        ("0x1f 1.21s", "0x1f 1.47s"),
+        ("127.0.0.1:8080 1.21s", "127.0.0.1:8080 1.47s"),
+        ("team_x 1.21s", "team_x 1.47s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"a mask-closing '>' freed the measurement: {left!r} vs {right!r}"
+    # …while a real operator is still a bound, and still raw.
+    assert ci_exemption.normalize_signature("≤1.5s") != ci_exemption.normalize_signature("≤9.5s")
