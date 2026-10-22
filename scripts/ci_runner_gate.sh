@@ -14,6 +14,14 @@
 #   is the FALLBACK: when GitHub-hosted is unhealthy it re-adds `ubuntu-latest` to the
 #   pool so the same workflows can land locally instead of queueing forever.
 #
+# ⛔ THE FALLBACK-ONLY DECISION ABOVE IS UNCHANGED (agent-infra#2327 did not touch it). The pool
+#   serves CI only while GitHub-hosted is unhealthy — the arch fix below changes WHICH LABEL each
+#   runner accepts, never WHEN the pool is offered to the queue. When the pool gained a second
+#   architecture the marker became per-runner (`self-hosted-arm64` / `self-hosted-x64`), because
+#   one pool-wide body deleted the x86 marker and the capacity silently stopped matching jobs.
+#   The invariant the label code holds: A RUNNER'S LABELS MUST DESCRIBE THAT RUNNER, NOT THE POOL
+#   IT JOINED FIRST.
+#
 # WHY IT RUNS OUTSIDE ACTIONS
 #   If GitHub Actions itself is degraded, anything scheduled INSIDE Actions is dead
 #   exactly when it is needed. This runs from launchd on the Mac. It only helps for
@@ -35,8 +43,20 @@ LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
-# The pool's own distinct label (always present).
-POOL_LABEL="self-hosted-arm64"
+# ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
+# architectures, and each runner carries the marker for ITS OWN: `ARM64` runners keep
+# `self-hosted-arm64`, `X64` runners keep `self-hosted-x64`. Writing one pool-wide body to every
+# runner was harmless only while the pool was homogeneous; it now stamps the ARM64 marker onto an
+# x86 runner AND (because this endpoint REPLACES the custom label set) deletes the x86 marker, so
+# the extra capacity stops matching anything and simply never picks a job — no error, no alert.
+POOL_LABEL_ARM64="self-hosted-arm64"
+POOL_LABEL_X64="self-hosted-x64"
+# GitHub derives these from the HOST at registration; they are not part of the custom label set and
+# cannot be set or removed through it. They are the ONLY trustworthy statement of a runner's arch.
+HOST_LABEL_ARM64="ARM64"
+HOST_LABEL_X64="X64"
+# Never managed here: the scheduler's own automatic labels, and the one label this gate owns.
+AUTO_LABELS=" self-hosted Linux $FALLBACK_LABEL "
 
 DRY=0; STATUS_ONLY=0
 for a in "$@"; do
@@ -147,42 +167,127 @@ print(comp, len(inc))
 # ── label control ───────────────────────────────────────────────────────────────
 # ⛔ --paginate is REQUIRED: `gh api` returns at most 30 runners per page, so a pool larger than
 # that was relabelled only in part, and `set_labels` reported ok=N over a truncated set.
-runner_ids() { gh api --paginate "repos/$REPO/actions/runners" --jq '.runners[].id'; }
+#
+# One `<id> TAB <label>` line per label, not just the ids: the label body is now derived PER RUNNER
+# (agent-infra#2327), so the read has to carry each runner's own labels. TAB is the delimiter
+# because a runner label cannot contain one, so `id<TAB>label` can never be ambiguous; and a
+# newline-separated pair list keeps every field checkable on its own line, unlike a joined string.
+runner_rows() {
+  gh api --paginate "repos/$REPO/actions/runners" \
+    --jq '.runners[] | .id as $id | .labels[] | "\($id)\t\(.name)"'
+}
 
-# set_labels <json-array body> — relabel every runner in the pool.
+# managed_ids <rows> — the runners this gate owns: those carrying a pool marker.
+#
+# ⛔ SELECT THE POOL, NOT "EVERY RUNNER IN THE REPO" (agent-infra#2327). The old code PUT to every
+# id it could enumerate, so any self-hosted runner — this pool's or not — was rewritten. A runner
+# carrying neither marker is not ours to relabel, and leaving it untouched is the conservative
+# reading. (A runner the legacy gate already stamped ARM64 onto carries a marker, so this still
+# selects it and the derivation below repairs it.)
+managed_ids() { # $1 = rows (newline-separated `<id>TAB<label>`)
+  local rid name
+  while IFS=$'\t' read -r rid name; do
+    case "$name" in
+      "$POOL_LABEL_ARM64"|"$POOL_LABEL_X64") printf '%s\n' "$rid" ;;
+    esac
+  done <<<"$1" | awk '!seen[$0]++'
+}
+
+# labels_for <rows> <id> <on|off> — the label body for ONE runner, derived from ITS OWN HOST.
+#
+# ⛔ **A RUNNER'S LABELS MUST DESCRIBE THAT RUNNER, NOT THE POOL IT JOINED FIRST.** That is the
+# invariant this function exists to hold. The architecture is not an opinion the caller supplies:
+# it is the `ARM64` / `X64` label GitHub stamps from the host at registration, and it is the only
+# per-runner fact available here. So:
+#   own = the marker for THIS host's arch  +  any other custom label the runner already carries
+#         (never dropped: a label the gate did not add is not the gate's to remove)
+#   body = own (+ `ubuntu-latest` when the fallback is engaged)
+# The one label this gate owns is `ubuntu-latest`; it is added on fallback and omitted otherwise,
+# so both states are byte-identical to the pre-#2327 body for an ARM64 runner.
+#
+# Returns 1 (and changes nothing) when the runner cannot be classified from its own host label, or
+# carries a custom label that cannot be emitted safely into JSON: an unclassifiable runner is a
+# named failure the caller counts, never a guess. Note the `self-hosted-arm64` marker on an x64 box
+# (what the old code stamped) is NOT consulted — the host label wins, so a stamped runner heals.
+labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
+  local rows="$1" id="$2" eng="$3" rid name arch="" extra="" out="" l json=""
+  while IFS=$'\t' read -r rid name; do
+    [ "$rid" = "$id" ] || continue
+    case "$name" in
+      "$HOST_LABEL_ARM64"|"$HOST_LABEL_X64") arch="$name" ;;      # the host, not the pool
+      "$POOL_LABEL_ARM64"|"$POOL_LABEL_X64") ;;                    # a marker: the host decides which
+      *) case "$AUTO_LABELS" in *" $name "*) ;;                    # automatic label this gate owns
+         *) case "$name" in
+              ''|*[!A-Za-z0-9._-]*) return 1 ;;                      # cannot be emitted safely
+              *) extra="$extra $name" ;;
+            esac ;;
+         esac ;;
+    esac
+  done <<<"$rows"
+  case "$arch" in
+    "$HOST_LABEL_ARM64") out="$POOL_LABEL_ARM64" ;;
+    "$HOST_LABEL_X64")   out="$POOL_LABEL_X64" ;;
+    *) return 1 ;;                                                    # no host arch label: refuse
+  esac
+  for l in $extra; do out="$out $l"; done
+  [ "$eng" = on ] && out="$out $FALLBACK_LABEL"
+  for l in $out; do
+    if [ -z "$json" ]; then json="\"$l\""; else json="$json,\"$l\""; fi
+  done
+  printf '{"labels":[%s]}' "$json"
+}
+
+# set_labels <on|off> — engage or disengage the fallback label, PER RUNNER.
 #
 # ⛔ THE ENUMERATION'S FAILURE MUST SURVIVE TO THE RETURN VALUE (agent-infra#1704). The shape
 # `for id in $(runner_ids)` DISCARDED the command-substitution status, so a failed `gh api` iterated
 # zero ids, left ok=0 fail=0, and `[ "$fail" -eq 0 ]` reported SUCCESS. `main` then wrote the new
 # mode to the state file and sent a TRANSITION notification — as if the pool had been relabelled.
 # So the read is captured FIRST: a non-zero status is a named failure and NOTHING is relabelled,
-# and a payload that is not a list of ids (gh's error text, an API error body) is refused the same
-# way rather than iterated as a runner id. "The pool has zero runners" is still a success — that is
-# a readable zero, not a failed read.
-set_labels() { # $1 = json array body
-  local body="$1" id ok=0 fail=0 ids
-  if ! ids="$(runner_ids 2>&1)"; then
-    log "WARNING: runner enumeration FAILED — no labels changed; ${ids:0:300}"
+# and a payload that is not a list of `<id>TAB<label>` rows (gh's error text, an API error body) is
+# refused the same way rather than iterated as a runner id. "The pool has zero runners" is still a
+# success — that is a readable zero, not a failed read.
+set_labels() { # $1 = on|off
+  local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
+  if ! rows="$(runner_rows 2>&1)"; then
+    log "WARNING: runner enumeration FAILED — no labels changed; ${rows:0:300}"
     return 1
   fi
-  case "$ids" in
-    *[!0-9[:space:]]*)
-      log "WARNING: runner enumeration unreadable — no labels changed; ${ids:0:300}"
-      return 1 ;;
-  esac
-  for id in $ids; do
+  # SHAPE-CHECK EVERY ROW before anything is PUT: `<digits> TAB <label>`. A row without a tab has no
+  # readable runner id (`${row%%$'\t'*}` is then the whole line); a label outside the charset a
+  # runner label can hold would emit a broken JSON body. Either is unreadable, not a runner.
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    case "$row" in *$'\t'*) ;; *) bad=1 ;; esac
+    rid="${row%%$'\t'*}"; name="${row#*$'\t'}"
+    case "$rid" in ''|*[!0-9]*) bad=1 ;; esac
+    case "$name" in ''|*[!A-Za-z0-9._-]*) bad=1 ;; esac
+  done <<<"$rows"
+  if [ "$bad" -eq 1 ]; then
+    log "WARNING: runner enumeration unreadable — no labels changed; ${rows:0:300}"
+    return 1
+  fi
+  for id in $(managed_ids "$rows"); do
+    if ! body="$(labels_for "$rows" "$id" "$eng")"; then
+      log "WARNING: runner $id is not classifiable from its own host label — left as-is"
+      fail=$((fail+1)); continue
+    fi
+    # ⛔ log the DERIVED body per runner: this is what makes "which labels did the gate write to
+    # which runner" answerable from the log, instead of one pool-wide `body=` line that claimed the
+    # same thing about every runner (#2327).
+    log "set_labels runner=$id body=$body"
     if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
       ok=$((ok+1))
     else
       fail=$((fail+1))
     fi
   done
-  log "set_labels ok=$ok fail=$fail body=$body"
+  log "set_labels ok=$ok fail=$fail engagement=$eng"
   [ "$fail" -eq 0 ]
 }
 
-fallback_on()  { set_labels "{\"labels\":[\"$POOL_LABEL\",\"$FALLBACK_LABEL\"]}"; }
-fallback_off() { set_labels "{\"labels\":[\"$POOL_LABEL\"]}"; }
+fallback_on()  { set_labels on; }
+fallback_off() { set_labels off; }
 
 current_mode() {  # github | local | unknown
   # ⛔ PER-PAGE COUNTS, SUMMED. Without --paginate the read stops at the default 30 runners, so a
