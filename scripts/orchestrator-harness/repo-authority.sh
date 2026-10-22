@@ -176,9 +176,13 @@ _gh_named_state() {
   # ⛔ A HALF-WRITTEN FILE IS NOT A MEASUREMENT. `write_state` stages-and-renames, so a torn file means a
   # hand edit / a version skew, and the layer's `json.load` rejects it — while this sed parse happily read
   # `{"at": N, "core": {"remaining": 0, "reset": …` and announced an exhaustion the layer called
-  # `gh-ok` (measured, round 8). Require the document to be closed.
+  # `gh-ok` (measured, round 8).
+  # ⛔ AND THE FILE ENDS WITH A NEWLINE, so `[ "$(tail -c 1 "$f")" = "}" ]` was NEVER TRUE — command
+  # substitution strips it, the branch was dead, and the MEASUREMENT source that is supposed to outrank
+  # every record never ran in the rail at all (measured, round 9: `od -c` ends `} } \n`, `tail -c 1`
+  # yields the empty string). `grep '}$'` tests the last LINE, which is what the writer produces.
   _bp="$dir/budget.json"
-  if [ -f "$_bp" ] && [ "$(tail -c 1 "$_bp" 2>/dev/null)" = "}" ]; then
+  if [ -f "$_bp" ] && grep -q '}$' "$_bp" 2>/dev/null; then
     _bat="$(sed -n 's/^{[[:space:]]*"at"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _brem="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _breset="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"reset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
@@ -218,6 +222,14 @@ _gh_named_state() {
   IFS= read -r line < "$p" 2>/dev/null || return 0
   tok="${line%% *}"
   case "$tok" in gh-*) ;; *) return 0 ;; esac
+  # ⛔ A RECORD ABOUT THE OTHER POOL IS NOT A REASON THE *CORE* PROTECTION READ FAILED. This function's
+  # output is embedded in a sentence about the REST budget, so repeating `gh-graphql-unavailable`
+  # wrapped in “the REST budget is spent” told an operator the wrong pool — while `--health` refused to
+  # vouch for the same box (measured, round 9; the mirror case, a record with no `bucket=` field, made
+  # the rail assert `gh-core-exhausted` while `--health` said `gh-health-unknown`). Only a CORE record,
+  # or a core-named token, is evidence here.
+  case "$line" in *"bucket=core"*) ;; *"bucket="*) return 0 ;; esac
+  case "$tok" in gh-core-*) ;; *) return 0 ;; esac
   reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
   if [ -n "$reset" ] && [ "$reset" -gt 0 ]; then
     [ "$reset" -gt "$now" ] || return 0

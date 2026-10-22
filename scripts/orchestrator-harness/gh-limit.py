@@ -1029,6 +1029,12 @@ API_VALUE_FLAGS = frozenset(METHOD_FLAGS) | frozenset(DATA_FLAGS) | frozenset({
 })
 API_BARE_FLAGS = frozenset({
     "-i", "--include", "--paginate", "--slurp", "--silent", "--silent-errors", "--verbose",
+    # a real `gh api` flag in 2.102.0 (`gh api --allow-escape-sequences` answers “accepts 1 arg(s),
+    # received 0”, i.e. it parses). Absent from this vocabulary it made `api_endpoint` answer None,
+    # which made `makes_request` answer “no API request” and SKIPPED the write guard entirely — one
+    # request into a measured-empty pool, and the headerless refusal then rewrote the dated record as
+    # undated, after which every known-spelling write was sent too (measured, round 9).
+    "--allow-escape-sequences",
 })
 
 
@@ -2132,6 +2138,32 @@ def makes_request(argv):
         if ep is None or ep.strip("/").lower() == "rate_limit":
             return False
     return not any(a in NO_REQUEST_ANY for a in argv)
+
+
+def reaches_api(argv):
+    """Does this invocation SPEND a non-exempt API request?
+
+    ⛔ SEPARATE FROM `makes_request` ON PURPOSE, because the two questions have OPPOSITE safe defaults.
+    `makes_request` answers “may this call be EVIDENCE that a bucket recovered”, where an unattributable
+    argv must be NO evidence (it could be the exempt meter, and counting it erased a live limit). The
+    BUDGET GUARD needs the opposite default: an argv the layer cannot attribute must be TREATED as
+    spending the pool, or a flag nobody listed becomes a way to send a write into an empty pool.
+    Measured, round 9: `gh api --allow-escape-sequences -X POST …` — an argv `api_endpoint` could not
+    attribute — skipped the guard (1 request into a dated-empty pool instead of 0), its headerless
+    refusal rewrote the dated record as UNDATED, and after that every known-spelling write was sent too
+    (0,0,1,1,1 across five identical writes) while the real reset disappeared from the token."""
+    if not argv:
+        return False
+    if any(a in NO_REQUEST_ANY for a in argv):
+        return False
+    if argv[0] == "auth" and len(argv) >= 2 and argv[1] == "token":
+        return False                     # an OFFLINE keyring lookup, not a request
+    if argv[0] == "api":
+        ep = api_endpoint(argv)
+        if ep is not None and ep.strip("/").lower() == "rate_limit":
+            return False                 # exempt by design: the meter itself
+        return True                      # attributable or NOT: assume it spends the pool
+    return argv[0] not in NO_REQUEST
 
 
 def bucket_for(argv):
@@ -3335,6 +3367,10 @@ def _dispatch(real_gh, gh_argv):
     core_reset = None                     # kept so a LATER record cannot erase the reset we acted on
     core_empty = False                    # did the DECISION say the pool was empty (not merely low)?
     core_dated = False                    # …and did it know WHEN the window ends?
+    # ⛔ A SPECULATIVE CONDITIONAL READ IS ALLOWED **ONCE**, NEVER ONCE PER RETRY. See the branch that
+    # sets it: a cached validator offers a POSSIBLE 304, not a free request, so a changed resource must
+    # be refused rather than retried into the pool the layer has measured as empty.
+    _speculative_read = False
     # ⛔ THE GUARD IS NOT `bucket == core`, BECAUSE THE RAIL'S OWN MERGE IS LABELLED `graphql`.
     # `bucket_for` answers `core` only for `REST_SUBCOMMANDS`, so `gh pr merge` → `graphql` — while
     # `gh-rest/gh` TRANSLATES that same command into `api -X PUT repos/…/pulls/N/merge`, which IS a
@@ -3349,7 +3385,7 @@ def _dispatch(real_gh, gh_argv):
     # succeeded during a core-empty window — refused, visible, and re-runnable; the alternative is the
     # burst this layer exists to prevent.)
     _bucket = bucket_for(gh_argv)
-    if makes_request(gh_argv) and (_bucket == "core" or (mutating and _bucket == "graphql")):
+    if reaches_api(gh_argv) and (_bucket == "core" or (mutating and _bucket == "graphql")):
         pressure = core_pressure()
         if pressure is not None:
             reset, remaining, core_dated = pressure
@@ -3394,8 +3430,20 @@ def _dispatch(real_gh, gh_argv):
                     # guarantee that makes polling affordable. Only a call that WOULD spend quota is
                     # refused pre-emptively.
                     if plan is not None and cache_get(cache_key(plan)) is not None:
+                        # ⛔ A CACHED VALIDATOR OFFERS A *POSSIBLE* 304 — IT IS NOT ONE. Sending the
+                        # call is therefore a bet that it spends nothing, and when the resource HAS
+                        # changed the request goes into a pool the layer has MEASURED as empty and
+                        # then enters the ordinary retry ladder. Measured, round 9: the incident's own
+                        # read (`branches/main/protection`) with one cached validator made FOUR
+                        # conditional GETs into the empty pool and reported `waited=599s`, where the
+                        # same box with no validator made ZERO requests and refused by name. So the
+                        # bet is allowed exactly ONCE — a 304 succeeds and costs nothing, anything
+                        # else is refused WITHOUT a retry, which is what “never retry into the limit”
+                        # means here.
+                        _speculative_read = True
                         log_event("pressure: core empty but a validator is cached for `%s` — "
-                                  "attempting the conditional GET (a 304 spends no quota)"
+                                  "attempting the conditional GET ONCE (a 304 spends no quota; a "
+                                  "changed resource is refused, not retried)"
                                   % _flight_label(gh_argv))
                     else:
                         # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it
@@ -3514,6 +3562,18 @@ def _dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err)
             return res.rc
         now = clock()
+        if _speculative_read and attempt >= 1:
+            # the ONE bet was made and did not pay off (no 304): refuse by name, do not retry
+            reset = limit.reset or recorded_reset(limit.bucket)
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
+            log_event("GAVE UP (speculative conditional read) bucket=%s status=%s attempts=%d"
+                      % (limit.bucket, limit.status, attempt))
+            fail_loudly(limit, attempt, waited, reset)
+            if res.out:
+                sys.stdout.buffer.write(res.out)
+            if res.err:
+                sys.stderr.buffer.write(res.err)
+            return res.rc
         if attempt >= MAX_ATTEMPTS:
             # ⛔ CHECKED BEFORE `plan_wait`, because that may spend one more `/rate_limit` request
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
