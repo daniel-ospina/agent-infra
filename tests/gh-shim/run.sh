@@ -355,11 +355,19 @@ esac
 # (present only in the shim processes' argv, never in this script's), and `wait` the leader so the
 # suite cannot race ahead of a half-dead process tree.
 bound_then_reap() {  # $1=pid  $2=argv pattern unique to THIS case  $3=sentinel file to mark on hang
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$1" 2>/dev/null || return 0; sleep 0.5; done
+  local hung=1
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    kill -0 "$1" 2>/dev/null || { hung=0; break; }
+    sleep 0.5
+  done
+  # ⛔ REAP ON EVERY PATH, NOT ONLY ON A HANG (review of #2295). A leader that exits while a
+  # descendant lives on is the SAME leak: the orphan still holds this suite's gate slots, so later
+  # cases burn up to AGENT_GH_GATE_ACQUIRE_TIMEOUT. The first version returned early in the loop
+  # and never reached `pkill` — measured: survivors=1 with a fast-exiting leader.
   kill -9 "$1" 2>/dev/null
   pkill -9 -f "$2" 2>/dev/null
   wait "$1" 2>/dev/null
-  printf 'HUNG' >>"$3"
+  [ "$hung" -eq 1 ] && printf 'HUNG' >>"$3"
   return 0
 }
 
@@ -1199,6 +1207,46 @@ out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/plaingh:/usr/bin:/b
 case "$out" in
   *PLAIN-GH-RAN*) pass "an UNMARKED gh earlier on PATH is used (the skip is a sentinel, not a name)" ;;
   *) fail "an unmarked gh earlier on PATH was not used: $out" ;;
+esac
+
+# (c) THE ENV SEAM REFUSES A HARNESS LAYER TOO (#1988, review of #2295). The seam's third refusal —
+#     an inherited `AGENT_GH_REAL` naming `$O/gh-rest/gh` or `$O/gh-limit/gh` — was silently
+#     missing: the value was accepted as "the real gh", re-entered the shim chain, and the
+#     harness's own depth guard ended EVERY gh call in the tree with rc 127 (measured). (a)/(b)
+#     above pin the PATH half only, and pinning one half is exactly how the halves drifted apart:
+#     the `-f` half of this same seam had the same shape. The harness layer is placed BEFORE the
+#     real-gh stub on PATH, so if the shim wrongly execs it the side-effect file proves it.
+HL4="$TMP/gh-limit-14c"; HRAN4="$TMP/harness-layer-ran-14c"
+rm -f "$HRAN4"
+harness_layer_at "$HL4" "$HRAN4"
+: > "$TMP/a4.out"
+( cd "$TMP" && env AGENT_GH_REAL="$HL4/gh" SCEN= PATH="$TMP/neutral:$HL4:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a4.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a4.out"
+out="$(cat "$TMP/a4.out")"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<a harness layer> HUNG — the env seam re-entered the shim chain" ;;
+  *HARNESS-LAYER-RAN*) fail "AGENT_GH_REAL=<a harness layer> was EXEC'd (#1988) — the env seam does not skip what the PATH walk skips" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<a harness layer> is refused and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<a harness layer> did not reach the real gh: $out" ;;
+esac
+[ -e "$HRAN4" ] \
+  && fail "  …but the harness layer WAS executed (a side-effect file proves it ran, whatever the output looked like)" \
+  || pass "  …and the harness layer was never executed (no side-effect file)"
+
+# (d) ⛔ THE MARKER'S ABSENCE IS LOAD-BEARING, SO PIN IT (review of #2295). `gh-rest/gh` resolves
+#     `REAL_GH` through this same sentinel test and then execs it, so if THIS shim's first 8 KiB
+#     ever carried the marker, gh-rest would skip the shim and mutations would reach the real gh
+#     DIRECTLY — silently bypassing #984's argv-level admin-merge guard. It holds today only by
+#     byte count (the marker sits near byte 15306), so a future comment edit could move it into
+#     the window with nothing failing. No pipe and no command substitution over a binary: this
+#     file is a text script, so `head` here can never emit a null byte.
+_h8="$(head -c 8192 "$SHIM")"
+case "$_h8" in
+  *harness-gh-shim-marker*)
+    fail "THIS SHIM carries the harness marker in its first 8 KiB — gh-rest would SKIP it, so mutations would bypass the admin-merge guard (#984)" ;;
+  *) pass "this shim does not carry the harness marker in its first 8 KiB, so gh-rest still delegates mutations through it" ;;
 esac
 
 

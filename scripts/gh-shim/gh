@@ -203,8 +203,14 @@ VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
 # halves of one decision had drifted apart. No pipe: `head | grep -q` can report failure
 # through SIGPIPE under `pipefail`, and a false negative here means recursion.
 _is_harness_layer() {  # a harness `gh` layer (`gh-rest`/`gh-limit`): its own sentinel line
-  case "$(head -c 8192 "$1" 2>/dev/null)" in *harness-gh-shim-marker*) return 0 ;; esac
-  return 1
+  # ⛔ NO COMMAND SUBSTITUTION OVER A BINARY (#2184/#2305, review of #2295). `$(head -c 8192 …)` on
+  # a 42 MB ELF makes bash >=4.4 print `warning: command substitution: ignored null byte in
+  # input` to THIS shim's stderr on a call that SUCCEEDS. Pre-fix the env seam read nothing, so
+  # that warning is newly reachable on every delegated call (the inherited value IS the genuine
+  # gh) — and #2305 is precisely a gate that grades stderr. `-a` reads a binary safely, `-q`
+  # stops at the first match, there is no pipeline (so no SIGPIPE under `pipefail`), and it
+  # prints nothing. One implementation, so both halves are fixed at once.
+  LC_ALL=C grep -qa 'harness-gh-shim-marker' "$1" 2>/dev/null
 }
 find_real_gh() {
   # ⛔ `-f` TOO. `-x` is true for a SEARCHABLE DIRECTORY, so a directory-valued
