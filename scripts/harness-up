@@ -807,7 +807,11 @@ hu_row_exec() {
   pids="$(hu_any_ctrl_pids)" || { hu_row exec - - "UNKNOWN (the process table could not be read, so what the controller executes cannot be named)"; return 2; }
   n="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
   [ "$n" -gt 0 ] || { hu_row exec - - "MISSING (no controller process to read: the pin describes nothing that is RUNNING)"; return 1; }
-  [ "$n" -eq 1 ] || { hu_row exec - - "DUPLICATE ($n live controllers, so the executing tree is ambiguous)"; return 1; }
+  # ⛔ TWO CONTROLLERS IS THE STATE, NOT NECESSARILY A FAULT: `orchestrator-bringup.sh` distinguishes
+  # OWN from FOREIGN — two repos may legitimately share one harness path on a cell (its `check` splits
+  # them; this row cannot, because "which repo owns this pid" is the registry's answer, not the process's).
+  # So it names the count and stays DEGRADED rather than picking a tree and blessing it (review round 5).
+  [ "$n" -eq 1 ] || { hu_row exec - - "DUPLICATE ($n live controllers — the executing tree is ambiguous; 'loop' is the per-deployment answer, and orchestrator-bringup.sh status splits own/foreign)"; return 1; }
   pid="$pids"
   path="$(hu_exec_path_of "$pid")" || { hu_row exec "$pid" - "UNKNOWN (pid $pid's argv cannot be read, or names no orchestration script, so what it executes cannot be named)"; return 2; }
   dir="$(dirname "$path")"
@@ -1209,7 +1213,16 @@ hu_start_loop() {
         say "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
         return 0
       fi
-      warn "loop: a controller is already running (pid $pid, executing ${path:-an unreadable path}) but NOT from this run's harness ($HARNESS) — left alone, and this start cannot move it: a pin advance needs a deliberate '$0 down' then '$0 up', never a kill"
+      # ⛔ AN UNREADABLE PATH IS NOT A FOREIGN ONE (review round 5). `[ -n "$path" ]` being false is
+      # evidence that the read FAILED (a pid that exited between the census and this read, a restricted
+      # /proc) — asserting "NOT from this run's harness" from it claimed a fact nobody established, and
+      # its remedy (`down` then `up`) is one an operator should not follow on a healthy box. Say only
+      # what is known, and fail closed either way.
+      if [ -z "$path" ]; then
+        warn "loop: a controller is already running (pid $pid) but THIS RUN CANNOT TELL whether it executes this run's harness ($HARNESS) — its argv could not be read. Left alone (a start must not cycle a live controller); check: ps -p $pid -o command="
+        return 1
+      fi
+      warn "loop: a controller is already running (pid $pid, executing $path) but NOT from this run's harness ($HARNESS) — left alone, and this start cannot move it: a pin advance needs a deliberate '$0 down' then '$0 up', never a kill"
       return 1
     fi
     herd="$(printf '%s' "$live" | tr '\n' ' ' | sed 's/ *$//')"

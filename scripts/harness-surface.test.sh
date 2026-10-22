@@ -90,6 +90,7 @@ cat > "$TMP/ps-probe" <<'SH'
 case "$*" in
   *-p\ *|*-p=*) pid=""
     while [ $# -gt 0 ]; do case "$1" in -p) pid="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "${PS_P_EMPTY:-}" ] && exit 0
     [ -n "$pid" ] && awk -v p="$pid" '$1==p { sub(/^[^ ]+ +/, ""); print; exit }' "$PS_TABLE" 2>/dev/null ;;
   *) cat "$PS_TABLE" 2>/dev/null ;;
 esac
@@ -288,6 +289,22 @@ esac
 # a row that returns BROKEN makes a SUCCESSFUL start exit 2. On this layout the exit must be DEGRADED at
 # worst — the row is named, and nothing failed to run.
 ck "(b-mac) …and 'up' on that layout exits DEGRADED at worst (rc=$RC), never 2-after-a-successful-start" "$([ "$RC" -le 1 ] && echo 0 || echo 1)"
+
+# ⛔ AN UNREADABLE PATH IS NOT A FOREIGN ONE (review round 5): when the single-process read answers
+# nothing (a pid that exited between the census and the read, a restricted /proc), `up` used to assert
+# "NOT from this run's harness" — a fact nobody established — with a `down`/`up` remedy an operator
+# should not follow on a healthy box. It must say only what is known and still fail closed.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix3.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-up" PS_P_EMPTY=1 HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FIX/harness-up" up --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+ck "(b) an UNREADABLE controller argv is reported as unknown, not as a foreign harness (rc=$RC, fail closed)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "(b) …and the message says it CANNOT TELL, rather than asserting 'NOT from this run'" \
+   "$(case "$OUT" in *"CANNOT TELL"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(b) …and it never claims a foreign harness it did not observe" \
+   "$(case "$OUT" in *"NOT from this run's harness"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(b) …and it still starts nothing and kills nothing (authority start count unchanged)" \
+   "$([ "$(grep -c '^start$' "$FIXCELL/fix.log" 2>/dev/null || echo 0)" -eq 1 ] && echo 0 || echo 1)"
 
 # ══ (c) CAPACITY: MEASURED, NEVER A FIXED CAP — AND THE PROBE IS capacity.sh's ═════════════════
 # ncpu=4 -> ceiling 8.00 load/cpu = 32.00 load units; 4.00 load units per lane; load 4.00 ->
