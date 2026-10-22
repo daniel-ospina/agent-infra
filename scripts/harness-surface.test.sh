@@ -28,6 +28,16 @@
 #
 # Hermetic: fixture repos, throwaway HOME/CELL_HOME, stubbed tools, no network, no real process read.
 set -u
+# ⛔ THE AMBIENT `REPO` IS NOT THIS SUITE'S INPUT — start from a known-empty one. `harness-up` now
+# PREFERS the caller's `REPO` (the WORK repo) over `--repo` (the HARNESS checkout), which is the whole
+# point of #2356, so a fixture that passes only `--repo` inherits whatever the shell exports. A fleet
+# shell exports `REPO=<its work repo>` and a cell's is a different checkout, so without this the suite
+# grades the ambient value: measured with `REPO=<a dir that is not a checkout>` **52 of 91 assertions
+# fail** for a reason that is not this code, while the same run with `REPO` unset is 0. That is a false
+# RED the next reader would attribute to the launcher — and it would also let an arm pass for the wrong
+# reason. Fixtures that need a work repo set it explicitly (`REPO="$WORK"` in (e)); (a)-(d) pass
+# `--repo` and want the launcher's own fallback answer.
+unset REPO HARNESS_REPO
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0
@@ -662,19 +672,24 @@ ck "(e) …and HARNESS_REPO=<the harness checkout>" \
 # ── the WORK repo's OWN validation (review cycle 2): the split must not accept a REPO it cannot use ─
 # Set-but-wrong is never "unset": a directory that is not a checkout makes `orch-loop.sh` fall back to a
 # hardcoded owner/repo, so the controller grades a repo nobody named. Both arms are REFUSALS (rc 2).
+# ⛔ THESE TWO `rc=2` ARMS ARE REGRESSION GUARDS, NOT DETECTORS OF THIS BUG: `origin/main` already ran
+# `die "$REPO is not a git checkout" 2` and the `-d` guard already exited 2, so both PASS on the
+# pre-change launcher (measured: main + this file = 5 failures, neither arm among them). They exist
+# because the split must not DROP the pre-split validation, which #2356 requires. The signal that the
+# behaviour changed is in the paired MESSAGE arms below — the new text names `REPO=` and the remedy.
 mkdir -p "$TMP/plaindir"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/plaindir" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a REPO that is a directory but NOT a checkout is REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) a REPO that is a directory but NOT a checkout is STILL REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "(e) …and the message says it is not a git checkout" \
    "$(case "$OUT" in *'REPO='*'is not a git checkout'*) echo 0 ;; *) echo 1 ;; esac)"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/no-such-dir" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a REPO that does not exist is REFUSED, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) a REPO that does not exist is STILL REFUSED, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "(e) …and the message says it is not a directory" \
    "$(case "$OUT" in *'REPO='*'is not a directory'*) echo 0 ;; *) echo 1 ;; esac)"
 
