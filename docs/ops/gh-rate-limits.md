@@ -402,11 +402,14 @@ left the next one open: `.name` → `."name"` → `{name}` → `[.]`/`@json`/`to
 `del(.body)` / `.title |= "x"` / `. + {state:.state}` (that last one emitted a 22-key SUBSET with rc 0
 where REST answers 46 keys). A NEGATIVE rule is defeated by the next construct a helpful reader can
 spell; a POSITIVE rule is not. The gate is now a parser over the shapes the fleet actually writes —
-paths, array/object construction, strings with interpolations, parentheses, `//` with a literal, and the
+paths, array/object construction, strings with interpolations, parentheses, `//` with a literal,
+`if <path> then <literal> else <literal> end` (what `atomic-land.sh` reads to turn `.merged` into
+MERGED/OPEN, whose refusal made a LANDED PR read as still open for the whole confirmation wait), and the
 `@tsv`/`@csv`/`@base64`/`tostring` filters **applied to a stage** — with three semantic rules on top:
-every key must be one the encoder reproduces, the LAST key of a path may not be a container the encoder
-reproduces only partly, and a `[]` that ends an expression is refused (an iteration whose RESULT is
-emitted is an identity read). Anything the parser cannot derive fails closed with the named state. A
+every key must be one the encoder reproduces, walking THROUGH a container is allowed only into a name that
+container actually carries (`.user.html_url` passed the flat allow-list and answered `null`, because
+`user` reproduces only `login`), and a `[]` that ends an expression is refused (an iteration whose RESULT
+is emitted is an identity read). Anything the parser cannot derive fails closed with the named state. A
 false refusal costs one read that was going to be refused on an empty pool anyway; a false admission
 costs a confident wrong answer with a success status.
 

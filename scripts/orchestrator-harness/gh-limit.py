@@ -2056,11 +2056,15 @@ class Limit(object):
 # signal is the response header when the refused call carried one, and the label exists so a failure
 # says WHICH pool to look at instead of pointing at whichever counter happens to look healthy.
 # Subcommands gh serves over REST. `repo` and `gist` are here because their WRITES are REST calls
-# (`DELETE /repos/{o}/{r}`, `POST /gists`): leaving them out labelled a `repo delete` as `graphql`, so
-# the refusal was filed against a pool that was fine and the empty CORE pool was never named
-# (review round 5).
+# (`DELETE /repos/{o}/{r}`, `POST /gists`).
 REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable",
                     "repo", "gist"}
+# ⛔ THE DEFAULT FOR AN UNKNOWN VERB IS `core`, NOT `graphql`. Labelling every unlisted verb `graphql`
+# meant `codespace delete`, `ruleset delete`, `ssh-key delete` and their kin were described as a healthy
+# GraphQL READ: unguarded against an empty core pool, and their refusal filed under a pool that was fine
+# (the 2026-10-22 false-healthy line, reachable from any verb nobody had listed). Enumerating the verbs
+# that are genuinely GraphQL is a finite list this file CAN know — gh's own GraphQL-first surface.
+GRAPHQL_SUBCOMMANDS = {"pr", "issue", "search", "project", "browse", "auth", "extension", "alias"}
 
 
 # Subcommands/flag forms that never reach the API. `makes_request()` gates the RECOVERY record: a
@@ -2122,15 +2126,14 @@ def bucket_for(argv):
         sub = api_endpoint(argv) or ""
         return "graphql" if sub.strip("/").lower() == "graphql" else "core"
     # ⛔ ANY MUTATION IS A `core` CALL UNLESS IT GOES THROUGH `api graphql` (handled above). A write has
-    # no second pool, `gh-rest/gh` translates the GraphQL-shaped ones (`pr merge`, `pr comment`,
-    # `issue comment`, `issue close`) into REST writes, and a verb this list has never heard of is not
-    # evidence that it spends GraphQL: labelling `repo delete` / `gist create` as `graphql` spent a
-    # request against an empty core pool AND filed the refusal under the wrong bucket, so `last-limit`
-    # named a pool that was fine and `--health` answered `gh-ok` right afterwards — the 2026-10-22
-    # false-healthy line, reachable from any unlisted write verb (review round 5).
+    # no second pool, and `gh-rest/gh` translates the GraphQL-shaped ones (`pr merge`, `pr comment`,
+    # `issue comment`, `issue close`) into REST writes.
     if is_mutating(argv):
         return "core"
-    return "core" if argv[0] in REST_SUBCOMMANDS else "graphql"
+    if argv[0] in REST_SUBCOMMANDS:
+        return "core"
+    # an UNKNOWN verb is not evidence that it spends GraphQL — see GRAPHQL_SUBCOMMANDS
+    return "graphql" if argv[0] in GRAPHQL_SUBCOMMANDS else "core"
 
 
 def probe_rate_limit(real_gh, bucket):
@@ -2698,6 +2701,16 @@ def health_token():
             return "gh-ok", 0
     reset, dated = health_state()
     if reset is None:
+        # ⛔ THE DURABLE `core` REFUSAL RECORD IS THE LAYER'S OWN MEASUREMENT and `core_pressure()`
+        # already trusts it — reading only the health file here made the two disagree in the window that
+        # matters most: a refused core call is recorded in `last-limit` on EVERY attempt, while the
+        # `health` record is only written when the layer gives up. So mid-backoff (or with the failing
+        # lane killed before it gave up) `core_pressure` refused every WRITE with zero requests and
+        # diverted every READ, while this verb printed `gh-ok` rc 0 — the incident's own false-healthy
+        # line, from the one verb an operator is told to trust (measured, review round 6).
+        rec_reset = core_record_reset()
+        if rec_reset is not None:
+            return "gh-core-exhausted resets_in=%s" % resets_in(rec_reset), 3
         # ⛔ “I COULD NOT READ THE RECORD” IS NOT “THE POOL IS FINE”. A record that exists but cannot be
         # parsed (a truncated write, a hand edit, a version skew) used to be served as `gh-ok` rc 0 — an
         # answer that was never obtained, reported as healthy, from the one verb an operator trusts at
@@ -2722,10 +2735,10 @@ _GQL_PR = ("query($owner:String!,$name:String!,$number:Int!)"
            "changedFiles additions deletions comments{totalCount} author{login}}}}")
 _GQL_ISSUE_COMMENTS = ("query($owner:String!,$name:String!,$number:Int!)"
                        "{repository(owner:$owner,name:$name){issue(number:$number)"
-                       "{comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt url author{login}}}}}}")
+                       "{comments(first:30){pageInfo{hasNextPage} nodes{databaseId body createdAt url author{login}}}}}}")
 _GQL_PR_REVIEWS = ("query($owner:String!,$name:String!,$number:Int!)"
                    "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
-                   "{reviews(first:100){pageInfo{hasNextPage} nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
+                       "{reviews(first:30){pageInfo{hasNextPage} nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
 
 # ⛔ THE NAMES EACH ENCODER CAN ACTUALLY PRODUCE, AND WHY THAT LIST IS A GATE RATHER THAN A COMMENT.
 # `jq` on a field that is ABSENT prints `null` and exits 0, so a partial equivalence is not a small
@@ -2745,6 +2758,17 @@ PULL_NAMES = frozenset({
 # also has head.label/head.repo/head.user). Naming one as the END of a projection therefore asks for a
 # partial object, which is the same defect as asking for an unproduced field.
 FAILOVER_CONTAINERS = frozenset({"head", "base", "user"})
+# ⛔ THE ALLOW-LIST IS FLAT (the encoder produces those names at the ROOT), SO WALKING THROUGH A CONTAINER
+# MUST BE CHECKED AGAINST WHAT THAT CONTAINER ACTUALLY CARRIES. The rule used to look only at the LAST
+# key, so `.user.html_url` was admitted — `user` is a container, `html_url` is a root name, and the
+# encoder's `user` object has only `login`: the read answered `null` with rc 0 where REST returns a real
+# URL (measured; an exhaustive sweep of 490 admitted two-segment programs found 21 divergences, all of
+# this one shape). One map, so a new container cannot be added without saying what it reproduces.
+CONTAINER_CHILDREN = {
+    "head": frozenset({"sha", "ref"}),
+    "base": frozenset({"sha", "ref"}),
+    "user": frozenset({"login"}),
+}
 # ⛔ `merge_commit_sha` IS DELIBERATELY ABSENT, AND THIS IS THE MOST DANGEROUS FIELD TO GET WRONG.
 # For an UNMERGED PR, REST `merge_commit_sha` is the TENTATIVE test-merge commit and GraphQL
 # `mergeCommit` is **null** — the rail's own header says so (“GraphQL `mergeCommit` is NULL for any
@@ -2879,8 +2903,29 @@ class _ProjectionParser(object):
             self.string()
         elif c == ".":
             self.path()
-        elif filters and (c == "@" or _PROJ_IDENT.match(self.s, self.i)):
+        elif c == "@" or (filters and _PROJ_IDENT.match(self.s, self.i)):
             self.filter()
+        elif c == "i" and self.s.startswith("if ", self.i):
+            # ⛔ `if <path> then <literal> else <literal> end` IS A PROJECTION: every branch is a named
+            # field or a constant, and `scripts/atomic-land.sh` reads exactly this to turn `.merged` into
+            # "MERGED"/"OPEN". Refusing it made that caller's poll fall through its own `|| echo OPEN`
+            # and report a LANDED PR as unmerged for the whole wait (review round 6).
+            self.i += 3
+            self.atom()
+            self.ws()
+            if not self.s.startswith("then", self.i):
+                raise _ProjectionRefused("if without then")
+            self.i += 4
+            self.literal()
+            self.ws()
+            if not self.s.startswith("else", self.i):
+                raise _ProjectionRefused("if without else")
+            self.i += 4
+            self.literal()
+            self.ws()
+            if not self.s.startswith("end", self.i):
+                raise _ProjectionRefused("if without end")
+            self.i += 3
         else:
             raise _ProjectionRefused("not a projection atom at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
 
@@ -3012,6 +3057,12 @@ class _ProjectionParser(object):
                 break
         if names and names[-1] in FAILOVER_CONTAINERS:
             raise _ProjectionRefused("field %r is a container the encoder reproduces only partly" % names[-1])
+        # ⛔ EVERY container on the way must be walked INTO a name it actually carries (see
+        # CONTAINER_CHILDREN). `.user.html_url` passes the flat allow-list and would answer `null`.
+        for i, name in enumerate(names[:-1]):
+            kids = CONTAINER_CHILDREN.get(name)
+            if kids is not None and names[i + 1] not in kids:
+                raise _ProjectionRefused("field %r is not reproduced inside %r" % (names[i + 1], name))
         if self.peek() == "/" and self.s[self.i:self.i + 2] == "//":
             self.i += 2
             self.literal()
