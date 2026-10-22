@@ -587,7 +587,18 @@ check_operational_layer() {
   # resolved shim may legitimately live elsewhere (AGENT_GH_SHIM_DIR is a candidate the extension
   # tries first), and a literal path on this line would be a second copy of the layout that nothing
   # derives — a datum an operator would read as measured when it is only typed.
-  ok "merge gate NOT degraded — the argv-level gh shim is installed and verified (#984)"
+  # ⛔ INSTALLED AND VERIFIED IS NOT ARMED (fresh review of this PR, P2). `--verify`'s activation
+  # line is REPORT-ONLY: with `AGENT_GH_SHIM=0` the shim is present and `guard_gh_shim` passes, so
+  # rc=0 and the line above was reached while the DISARMED note sat in `$out` — and the ready path
+  # then stated the opposite of what it had measured. The claim is now conditional on the measured
+  # state. The kill switch stays honoured (it is a documented, audited hatch): a cell that carries
+  # it simply must not also read as "NOT degraded", and the degraded state is named where an
+  # operator greps for readiness.
+  if printf '%s\n' "$out" | grep -q 'gh shim PRESENT .*DISARMED'; then
+    warn "merge gate DEGRADED — the argv-level gh shim is installed, but AGENT_GH_SHIM=0 disarms it: the review-enforcer injects nothing and the string scanner is the only layer the gate has (#984/#2164). Fix the env to arm it, or keep this box out of the landing path."
+  else
+    ok "merge gate NOT degraded — the argv-level gh shim is installed, enabled and verified (#984)"
+  fi
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then

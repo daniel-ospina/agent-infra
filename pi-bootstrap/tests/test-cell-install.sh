@@ -1299,10 +1299,21 @@ grep -q 'activation: gh shim PRESENT' <<<"$out" && grep -q DISARMED <<<"$out" \
   && ok "AGENT_GH_SHIM=0 reports PRESENT but DISARMED — never 'armed'" \
   || fail "the kill switch still reported the shim as armed (the exact false green round 1 found)"
 
+# ⛔ THE FIXTURE MUST ACTUALLY HAVE NO SHIM. `AGENT_GH_SHIM_DIR=` was enough while nothing farmed
+# the shim; since the farm delivers it, `$DEST/scripts/gh-shim` is the resolver's SECOND candidate
+# and resolves — so this arm asserted ABSENT against a state an installed cell no longer has, and
+# the suite went red on a CORRECT install (fresh review of this PR). Drive the state instead:
+# remove the installed copy for the length of the assertion, then let `--install` put it back —
+# the same mechanism §(l)(3) above uses.
+rm -f "$SHIM_DST"
 out="$(AGENT_GH_SHIM_DIR= bash -c 'unset AGENT_GH_SHIM; CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
 grep -q 'activation: gh shim ABSENT' <<<"$out" && ! grep -q 'shim PRESENT' <<<"$out" \
   && ok "no resolvable shim reports ABSENT, and the installed layer is not named armed" \
   || fail "an unresolvable shim was reported as present"
+run_install >/dev/null 2>&1
+[ -x "$SHIM_DST" ] \
+  && ok "the fixture restored the installed shim after the ABSENT arm" \
+  || fail "the ABSENT arm left the cell without an installed shim — later sections would measure the wrong tree"
 
 # -------------------------------------------------------------------------
 hdr "syntax"
