@@ -489,6 +489,7 @@ class Claim:
     lease_state: str = "unknown"   # live | expired | unknown
     scope: str = "unknown"         # local | foreign | unknown
     commit: str = ""               # the claim commit sha (the fence value)
+    age_s: Optional[int] = None    # claim age, from the (pusher-minted) committer date
 
 
 @dataclass(frozen=True)
@@ -808,7 +809,9 @@ def _claim_detail(claim: Optional[Claim]) -> str:
     The issue's ask is that a holder be *reported* with its owner pid and age;
     the owner identity therefore rides here rather than in ``holder_pid``, so
     "who holds this?" is answered without any consumer reading the field as a
-    verified incarnation.
+    verified incarnation. The age comes from the claim commit's committer date,
+    which is pusher-minted, so it is shown as non-liveness detail only — and it is
+    omitted (never invented) when the read had no commit to date (a snapshot).
     """
     if claim is None:
         return ""
@@ -816,6 +819,8 @@ def _claim_detail(claim: Optional[Claim]) -> str:
     if claim.lease_until is not None:
         parts.append("lease_until=%d" % claim.lease_until)
     parts.append("lease=%s" % claim.lease_state)
+    if claim.age_s is not None:
+        parts.append("age_s=%d" % claim.age_s)
     parts.append("scope=%s" % claim.scope)
     if claim.ref:
         parts.append("ref=%s" % claim.ref)

@@ -328,11 +328,12 @@ escalate nor be rendered as a green light by an exit-code consumer:
 The cascade is **ordered and total**: `claims-unreadable` → `no-claim-visible` →
 `claim-owner-unparseable` → `claim-held` → `holder-on-foreign-box` →
 `claim-holder-unverifiable`. The first matching rung wins and the last is a catch-all, so the
-six partition the input space, and L15 pins that with a fixture table over
-{readable}×{present}×{scope}×{lease} whose completeness is **asserted** (the test fails unless
-every rung is exercised — a partition, not a sample) plus an order-independence check over every
-permutation of the holders. An unusable owner therefore outranks an open lease, and an unreadable
-read outranks everything.
+six partition the input space, and L15 pins that with a nine-fixture ordered table whose
+completeness is **asserted** (the test fails unless every rung is exercised — a partition, not a
+sample) plus an order-independence check over every permutation of the holders. T28 walks the full
+{readable}×{present}×{scope}×{lease} cross-product (36 cells) and asserts every verdict there is
+`unknown`, named, and `holder_pid`-free. An unusable owner therefore outranks an open lease, and an
+unreadable read outranks everything.
 
 **A trailing compaction tail abstains rather than asserting `wedged`.** pi writes a
 `compaction` entry **between** turns and immediately starts the next call — measured by the #1254
@@ -642,7 +643,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 31 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (37)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (38)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED

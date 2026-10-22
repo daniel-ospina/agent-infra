@@ -192,8 +192,11 @@ L1 pull-present (local + foreign, live + expired) · L2 pull-unreadable (rc≠0 
 · L4 presence-only (metadata fetch fails) ⇒ `present=True, owner="?"` ⇒ `claim-owner-unparseable` ·
 L5 sibling heads disclosed · L6 snapshot missing ⇒ unreadable · L7 snapshot stale ⇒ unreadable ·
 L8 snapshot drift (≠3 fields) ⇒ unreadable · L9 snapshot empty (0 bytes) ⇒ readable, 0 claims ·
-**L10 lease parity**: drive the **shipped** `claims.sh` (`_claim_commit` + `_lease_of`, the
-`selftest.sh:893` extraction technique) to produce real messages and assert the Python parser agrees
+**L10 lease parity**: drive the **shipped** `claims.sh` (`_claim_commit` + `_lease_of`) to produce
+real messages and assert the Python parser agrees — **not** by extracting the functions, which is how
+`selftest.sh`'s own harness does it and which this citation used to name: L10 **sources the whole
+`claims.sh`** and calls the functions, so the "extraction technique" this line used to cite (and the
+line number a later sweep found unresolvable) was never the mechanism the test uses
 across {future, past, `0`, `-5`, 19-digit, non-digit, absent} · L11 reader emits no state (no
 `STATES`/verdict names in `__all__`) · L12 local refs are never read (a bogus local ref beside an empty
 origin still reads absent) · L13 output hygiene (hostile owner string neutralized in the text
