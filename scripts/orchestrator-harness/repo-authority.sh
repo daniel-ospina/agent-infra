@@ -149,6 +149,13 @@ _override_usable() {
 _gh_named_state() {
   local dir p line tok reset at now _win _alt _bp _brem _breset _bat _ttl
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
+  # ⛔ AN EMPTY `HOME` IS NOT `/tmp`: the layer resolves `~` the way Python does — `expanduser` falls back
+  # to the PASSWD entry — so a shell that computed `${HOME:-/tmp}/.cache` read a directory the layer never
+  # writes, and NO named state ever reached the rail on such a box (measured, round 10). Unquoted `~` is
+  # bash's own getpwuid fallback, i.e. the SAME answer the layer computes.
+  if [ -z "${GH_LIMIT_DIR:-}" ] && [ -z "${XDG_CACHE_HOME:-}" ] && [ -z "${HOME:-}" ]; then
+    dir=~/.cache/gh-limit
+  fi
   p="$dir/health"
   # ⛔ THE LAYER HAS A DEGRADED STATE DIR AND THIS READER DID NOT KNOW ABOUT IT. When the primary dir is
   # UNWRITABLE the layer moves lock/ETag/`last-limit`/`health` to `${TMPDIR}/gh-limit-<uid>` (see
@@ -162,6 +169,12 @@ _gh_named_state() {
     _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}"
     if [ -d "$_alt" ] && [ -w "$_alt" ]; then
       dir="$_alt" && p="$dir/health"
+    elif [ ! -w "$dir" ]; then
+      # ⛔ AN UNWRITABLE PRIMARY WITH NO FALLBACK YET IS NOT AN ANSWER — IT IS THE LAYER'S MOVE IN
+      # PROGRESS. Reading the abandoned primary asserted the stale record the layer had already left
+      # behind (`--health` said `gh-ok`), which is a confident diagnosis the layer refuses to make. Say
+      # nothing; the layer will create the fallback and the next read names it.
+      return 0
     fi
   fi
   now="$(date +%s)"
@@ -187,9 +200,12 @@ _gh_named_state() {
     _brem="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _breset="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"reset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _ttl="${GH_LIMIT_BUDGET_TTL:-30}"
+    # ⛔ CLAMPED LIKE `cfg_secs` (which honours a DECIMAL): a `case` over `[!0-9]` mapped `45.5` to the
+    # 30 s default while the layer honoured 45.5 — the same two-contracts-for-one-rule asymmetry the
+    # health window had.
+    case "$_ttl" in ''|*[!0-9.+-]*) _ttl=30 ;; esac
+    _ttl="$(awk -v v="$_ttl" 'BEGIN { n = v + 0; if (n < 5) n = 5; if (n > 600) n = 600; printf "%d", n }' 2>/dev/null)"
     case "$_ttl" in ''|*[!0-9]*) _ttl=30 ;; esac
-    [ "$_ttl" -ge 5 ] || _ttl=5
-    [ "$_ttl" -le 600 ] || _ttl=600
     if [ -n "$_bat" ] && [ -n "$_brem" ] && [ -n "$_breset" ]; then
       if [ "$(( now - _bat ))" -le "$_ttl" ] && [ "$(( _bat - now ))" -le 60 ]; then
         if [ "$_brem" -eq 0 ] && [ "$_breset" -gt "$now" ]; then
@@ -222,13 +238,14 @@ _gh_named_state() {
   IFS= read -r line < "$p" 2>/dev/null || return 0
   tok="${line%% *}"
   case "$tok" in gh-*) ;; *) return 0 ;; esac
-  # ⛔ A RECORD ABOUT THE OTHER POOL IS NOT A REASON THE *CORE* PROTECTION READ FAILED. This function's
-  # output is embedded in a sentence about the REST budget, so repeating `gh-graphql-unavailable`
-  # wrapped in “the REST budget is spent” told an operator the wrong pool — while `--health` refused to
-  # vouch for the same box (measured, round 9; the mirror case, a record with no `bucket=` field, made
-  # the rail assert `gh-core-exhausted` while `--health` said `gh-health-unknown`). Only a CORE record,
-  # or a core-named token, is evidence here.
-  case "$line" in *"bucket=core"*) ;; *"bucket="*) return 0 ;; esac
+  # ⛔ A RECORD ABOUT THE OTHER POOL IS NOT A REASON THE *CORE* PROTECTION READ FAILED, AND A RECORD THAT
+  # DOES NOT SAY WHICH POOL IT IS ABOUT IS NOT EVIDENCE AT ALL. This output is embedded in a sentence
+  # about the REST budget, so repeating `gh-graphql-unavailable` wrapped in “the REST budget is spent”
+  # named the wrong pool (round 9) — and the previous fix still ADMITTED a bucketless line whose token
+  # started `gh-core-`, so a torn record made the rail assert an exhaustion `--health` refuses to vouch
+  # for (round 10). `record_core_exhausted` always writes `bucket=core`, so requiring it costs nothing and
+  # is the only form this reader can prove.
+  case "$line" in *"bucket=core"*) ;; *) return 0 ;; esac
   case "$tok" in gh-core-*) ;; *) return 0 ;; esac
   reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
   if [ -n "$reset" ] && [ "$reset" -gt 0 ]; then
