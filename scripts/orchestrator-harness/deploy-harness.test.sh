@@ -1112,40 +1112,55 @@ if [ -f "$INSTALL_SH" ]; then
 else
   bad "install.sh is missing from the harness directory — the remedy cannot be pinned"
 fi
-# ⛔ THE CLASS, NOT ONE FILE (review P2, 2026-10-21). The check above looks at install.sh only, so five
-# operator-facing sites in the SAME commit's own edited files kept printing the unverified depth-1 copy
-# — including the two controller-startup FATALs an operator actually sees. They were converted; this is
-# what keeps the class from reappearing in a file the suite does not otherwise look at.
+# ⛔ THE CLASS, NOT ONE FILE, AND NOT ONE MENTION PER FILE (review P2 2026-10-21; site-level
+# 2026-10-22). The check above looks at install.sh only, so five operator-facing sites in the SAME
+# commit's own edited files kept printing the unverified depth-1 copy — including the two
+# controller-startup FATALs an operator actually sees. The first version of THIS loop then asserted
+# only that each file mentioned the helper somewhere, and said so honestly: for `orch-loop.sh` (10
+# remedy sites) reverting ONE of them left the suite GREEN. That is a guard that reports the wrong
+# verdict — the exact class this file exists to catch, one level up (#2041). So the assertion is now
+# **site-level by construction**: a scan for the _effect_ (a bare `cp … *.sh` handed to an operator),
+# not a count of the word we hope replaced it.
+# Scanned: every shipped script in the harness directory and in `scripts/`, EXCEPT test suites and
+# `selftest.sh`. A test fixture that seeds a throwaway runtime with a `cp` is not operator advice, and
+# reddening on it would make this assertion cry wolf until someone deleted it — which is how a real
+# check gets removed. That exclusion is COUNTED AND PRINTED rather than silent, so it cannot quietly
+# grow into a hole: if the excluded count moves, the suite output shows it.
+# ⛔ Only NON-COMMENT lines count. Comments in this tree describe the old `cp` in order to condemn it
+# (`install.sh:817`, `check-deployed-drift.sh:61`); reddening on prose would punish the record of the
+# defect. First non-space character `#` = prose and is skipped.
 # ⚠️ COORDINATION NOTE (open PR #2271 `feat/mac-pin-parity`): that PR rewrites the same two install.sh
 # warning lines and substitutes a pinned tree (`cp '$SHIPPED'/*.sh`). If it lands, the assertion above
 # SHOULD red — a depth-1 glob copy is exactly what this forbids — and the correct resolution is to
 # emit `deploy-harness.sh --src '$SHIPPED' --o '$O'`, not to relax this check. Do not "fix" a red here
 # by deleting the assertion; that re-introduces #2041.
-# Scoped to REMEDY MESSAGES, not to every occurrence: a test fixture that seeds a throwaway runtime
-# with a `cp` (selftest.sh's own `deploy()` helper) is not operator advice, and reddening on it would
-# make this assertion cry wolf until someone deleted it — which is how a real check gets removed.
-# ⛔ SCOPED TO THE SITES THIS CHANGE OWNS — because a repo-wide prose scan cannot be made honest.
-# Cycle 2 asked for the scan to cover "the effect, not one spelling", and the attempt is recorded here
-# rather than silently dropped: an effect-based scan over every shipped script REDS on (a) COMMENTS that
-# describe the old `cp` in order to condemn it (install.sh:817, check-deployed-drift.sh:61) and (b) the
-# deploy IMPLEMENTATIONS this issue explicitly leaves as remaining work (deploy-crossbox.sh:59,
-# cloud-cell-quiesce.sh:78). Excluding those needs the scan to tell prose from code from advice, and each
-# exclusion widens the hole — this repo has already learned that no text parser can prove execution
-# ("each hardened regex just moved the gap", run-bash-shards.sh's own header). A gate whose only failure
-# is wording is also the process-weight trap. So the CLAIM is narrowed to what is measured: the remedy
-# SITES this change converted must name the helper. ⚠️ WHAT THIS IS AND IS NOT (review P2, cycle 3): it
-# is a per-FILE string-presence check. `chain-merge.sh`, `check-deployed-drift.sh` and `report.sh` have
-# exactly one mention each, so for them file-level IS site-level; `orch-loop.sh` (9 mentions),
-# `refresh-candidates.sh` (4), `install.sh` (3) and `dispatch-merge.sh` (2) are not — reverting ONE
-# remedy in those leaves the assertion green. Only `install.sh` additionally gets a site-level check
-# (the `warn .*cp .*\.sh` arm above). A file-level check is what this is, and claiming more would be the
-# same overclaim the case exists to prevent.
-# never touched is not claimed.
-REMEDY_SITES="install.sh orch-loop.sh dispatch-merge.sh chain-merge.sh refresh-candidates.sh check-deployed-drift.sh report.sh"
+REMEDY_SITES="install.sh orch-loop.sh dispatch-merge.sh chain-merge.sh refresh-candidates.sh check-deployed-drift.sh report.sh merge-one.sh cloud-cell-supervisor.sh"
 for _site in $REMEDY_SITES; do
-  [ -f "$HERE/$_site" ] && ok "remedy site present: $_site (the assertion below is not vacuous for it)" || bad "remedy site missing from the harness: $_site"
-  grep -q 'deploy-harness\.sh' "$HERE/$_site" 2>/dev/null && ok "  $_site names the verified redeploy helper" || bad "  $_site does not name deploy-harness.sh — its remedy is the unverified copy again"
+  if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
+  [ -n "$_sp" ] && ok "remedy site present: $_site (the assertion below is not vacuous for it)" || bad "remedy site missing from the harness: $_site"
 done
+
+BARE_PAT='^[[:space:]]*[^#[:space:]].*[[:space:]]cp[[:space:]].*[*]\.sh'
+BARE_HITS=""; SCANNED=0; EXCL=0
+for _f in "$HERE"/*.sh "$HERE"/../*.sh; do
+  [ -f "$_f" ] || continue
+  case "$_f" in *.test.sh) continue ;; esac
+  if [ "$(basename "$_f")" = "selftest.sh" ]; then
+    EXCL=$((EXCL + $(grep -cE "$BARE_PAT" "$_f" 2>/dev/null || true)))
+    continue
+  fi
+  SCANNED=$((SCANNED + 1))
+  _h="$(grep -nE "$BARE_PAT" "$_f" 2>/dev/null || true)"
+  [ -n "$_h" ] && BARE_HITS="$BARE_HITS
+  $(basename "$_f"): $_h"
+done
+[ "$SCANNED" -ge 10 ] && ok "scanned $SCANNED shipped scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED shipped scripts scanned — the bare-cp scan covers almost nothing"
+ok "selftest.sh excluded as a test fixture: $EXCL bare-cp fixture line(s), not operator advice (counted, not silent)"
+if [ -z "$BARE_HITS" ]; then
+  ok "no shipped script hands an operator a bare 'cp *.sh' redeploy — every remedy site names the verified helper"
+else
+  bad "shipped script(s) still hand an operator the unverified depth-1 copy (remedy must name deploy-harness.sh):$BARE_HITS"
+fi
 
 echo
 # ── 21. PRODUCER/CHECKER AGREEMENT — driven from install.sh's OWN fold ───────────────────────

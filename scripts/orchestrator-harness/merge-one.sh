@@ -539,7 +539,7 @@ rail_attempt() {
       # ⛔ A RECORD THAT CANNOT BE WRITTEN IS SAID, NOT SWALLOWED. The controller's red-fixer role
       # reads this record; without it the refusal produces no work — the exact stall this exists to
       # end — so the degraded box must say so loudly, in the log an operator reads.
-      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"; free space). The rail's words are above." >> "$L.log"
+      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O; free space). The rail's words are above." >> "$L.log"
     fi
     # Removed unconditionally: the `/dev/null` fallback that made this unsafe is gone, and a staged
     # temp left behind on the `tail`-failed path is one file per PR, forever (review P3, cycle 4).

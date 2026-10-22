@@ -1500,7 +1500,7 @@ cmd_check() {
   for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
   # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the

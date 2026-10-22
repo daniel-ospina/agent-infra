@@ -3995,7 +3995,7 @@ PY
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
   else
-    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"" >> "$LOG"
+    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >> "$LOG"
   fi
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
