@@ -423,6 +423,24 @@ case "${LAUNCHD_MODE:-running}" in
   # `launchctl print gui/0/x` under root, and of an SSH context with no gui domain).
   bad-domain) printf 'Bad request.\nCould not find domain for user gui: 0\n' >&2; exit 113 ;;
   loaded-no-pid) printf '\tstate = spawn scheduled\n\tlast exit code = 78\n'; exit 0 ;;
+  # A recorded exit that keeps being followed by no process — with the cumulative launch count.
+  crashloop) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n\truns = 7\n'; exit 0 ;;
+  # NO launch count at all: the row may print the code and must invent no count.
+  died) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n'; exit 0 ;;
+  # A CLEAN exit with a climbing launch count: `orch-loop.sh`'s "already running" path does `exit 0`,
+  # so KeepAlive relaunches it cleanly, for ever. This must NOT read as a crash.
+  clean-exit) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 7\n'; exit 0 ;;
+  # Loaded, no process, and launchd has NEVER launched it (runs = 0 settles "never kicked").
+  never-started) printf '\tstate = spawn scheduled\n\truns = 0\n'; exit 0 ;;
+  # ⛔ `last exit code = 0` IS launchd's CALLOC DEFAULT, so a job that never ran reports it too.
+  # `runs = 0` is the decisive datum and must WIN over it (review round 3).
+  default-clean) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 0\n'; exit 0 ;;
+  # A SIGNED status (a signal death). A present datum must not be reported as absent.
+  signed) printf '\tstate = spawn scheduled\n\tlast exit code = -15\n\truns = 3\n'; exit 0 ;;
+  # NON-CANONICAL INTEGER: `00` must normalise to a clean 0, not read as a crash (round 5).
+  zerozero) printf '\tstate = spawn scheduled\n\tlast exit code = 00\n\truns = 5\n'; exit 0 ;;
+  # Loaded with no process AND no exit data at all: the row may not invent one.
+  no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
 esac
 SH
@@ -478,9 +496,106 @@ LAUNCHD_MODE=loaded-no-pid OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH"
         LAUNCHD_MODE=loaded-no-pid HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
         bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
 case "$OUT" in
-  *"launchd"*"LOADED-NO-PROCESS"*) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING')" 0 ;;
-  *) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING') [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
+  *"launchd"*"DIED (last exit 78"*) ck "(d) a job loaded with NO process NAMES launchd's own exit code (78), not a shrug" 0 ;;
+  *) ck "(d) a job loaded with NO process NAMES launchd's own exit code (78) [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
 esac
+# ⛔ THE STATE THIS WHOLE ROW EXISTS FOR (2026-10-22). The Mac's `com.eldato.orchestrator-loop` sat at
+# LAST EXIT 128 — a fork/spawn failure — and the row could only say "it is crashing or was never
+# kicked". The exit code and launchd's own launch count are in the block the row already reads, so
+# the row must CARRY them instead of dropping them.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=crashloop HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a NON-ZERO exit is NAMED DIED with launchd's own code (128) [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and the launch count is carried as EVIDENCE (7 launch(es)) [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in *"7 launch(es)"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs` IS CUMULATIVE AND MAY NOT BECOME A VERDICT (review, 2026-10-22 and again cycle 2). Two
+# assertions, because a vocabulary-only negation is defeatable: a re-add worded `CRASH-LOOP` or
+# `LOOPING` would pass a check that only looked for the literal `PERSISTENT`. So: negate the whole
+# verdict vocabulary in use, AND positively require the CONDITIONAL sentence that makes the count
+# evidence rather than a diagnosis.
+# ⛔ THE `""` ARM IS THE POINT (review round 4): without it an EMPTY row makes every negative
+# assertion pass — the row could stop being emitted entirely and these would stay green.
+ck "(d) …but a cumulative count is NOT turned into any crash/persistence verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in ""|*CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and persistence is stated CONDITIONALLY, so the count is evidence not a verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *"if it STAYS here"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh`'s lock path prints "already running"
+# and `exit 0`; with KeepAlive that is a job that exits IMMEDIATELY and cleanly, every time. Calling
+# it DIED and pointing at `launchd.err` (that message goes to STDOUT) is a named WRONG CAUSE — worse
+# than the old agnostic wording.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=clean-exit HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a CLEAN exit (0) is NAMED EXITED-CLEAN, not DIED [$launchd_row]" \
+   "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
+# code is absent (review cycle 2).
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=never-started HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) 'no exit code + 0 launches' is NAMED NEVER-STARTED, not 'crashing or never kicked' [$launchd_row]" \
+   "$(case "$launchd_row" in *NEVER-STARTED*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs = 0` MUST BEAT A DEFAULT `last exit code = 0` (review round 3). launchd callocs
+# last_exit_status to 0, so a never-launched job reports "last exit code = 0" too; branching on the
+# code first named a lock-contention cause and hid the `kickstart` remedy for a job that never ran.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=default-clean HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) '0 launches' WINS over launchd's default 'last exit code = 0' — NEVER-STARTED, not EXITED-CLEAN [$launchd_row]" \
+   "$(case "$launchd_row" in *NEVER-STARTED*) echo 0 ;; *EXITED-CLEAN*) echo 1 ;; *) echo 1 ;; esac)"
+# ⛔ A SIGNED STATUS IS A PRESENT DATUM. Dropping it would report a signal death as "no exit code".
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=signed HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a SIGNED exit status is carried, not dropped as 'no exit code' [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit -15"*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ⛔ A NON-CANONICAL INTEGER IS NORMALISED, NOT ECHOED (review round 5): `00` is a clean exit, and
+# a lax `[0-9]*` pattern would render `DIED (last exit 00)` — a clean exit named a crash.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=zerozero HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a non-canonical '00' normalises to a CLEAN exit, not a crash [$launchd_row]" \
+   "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
+# An exit with NO launch count still prints the code, and invents no count.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=died HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) an exit with NO launch count still prints the code [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and invents no count when launchd published none [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in ""|*"launch(es)"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AN ABSENT DATUM IS NEVER RENDERED AS A VALUE. With neither an exit code nor a run count the row
+# must fall back to LOADED-NO-PROCESS rather than claim "last exit 0" or "0 launches".
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=no-data HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) with NO exit data the row falls back to LOADED-NO-PROCESS (it never invents a status) [$launchd_row]" \
+   "$(case "$launchd_row" in *LOADED-NO-PROCESS*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and invents neither a code nor a count [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in ""|*"last exit 0"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
 # …and a DOMAIN-level rejection must not become a confident NOT LOADED + re-install remedy (review
 # round 4): rc is not the verdict, the text is — the rule launchd-cycle.sh `lc_probe` and
 # orchestrator-bringup.sh `launchd_job_state` both state.
