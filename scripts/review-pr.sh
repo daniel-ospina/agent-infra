@@ -274,13 +274,12 @@ fi
 # ── 2) never re-record an unchanged head — and say what to do instead ────────
 # record-review.sh names the file `<owner>-<name>-<pr>.json` when the repo is known
 # (#426), with a legacy bare `<pr>.json` for repo-less records.
-# The signing key, resolved EXACTLY as record-review.sh resolves it (env, then the key file) —
-# needed to verify a marker's HMAC before claiming it is signed.
-GATE_KEY="${AI_REVIEW_GATE_KEY:-}"
-if [ -z "$GATE_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
-  GATE_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
-fi
-GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
+# ⛔ THE SIGNING KEY IS NOT READ HERE (P2, dogfood review of this very file). This block used to
+# resolve `~/.pi/agent/.ai-review-gate-key` "needed to verify a marker's HMAC before claiming it is
+# signed" and then NEVER READ IT, while the success check far below states the opposite — that the
+# local HMAC verify was implemented and REVERTED. One file, two contradictory claims about a security
+# control. `record-review.sh` owns the key and the signature; this tool reads the marker's SHAPE only,
+# and deleting the dead resolution is what makes that statement true.
 
 STORE="$HOME/.pi/agent/reviews"
 QUAL="$STORE/${OWNER}-${RNAME}-$PR.json"
@@ -291,7 +290,10 @@ record_at_head() { # <sha> -> 0 iff a clean* record bound to <sha> exists
     [ -f "$f" ] || continue
     txt="$(cat "$f" 2>/dev/null || true)"
     [[ "$txt" == *"\"head_sha\":\"$1\""* ]] || continue
-    case "$txt" in *'"verdict":"clean'*) return 0 ;; esac
+    # ⛔ THE CLOSING QUOTE IS LOAD-BEARING (P3, dogfood review): `"verdict":"clean` is a PREFIX of
+    # `clean-micro` and `clean-low`, so a tiered record at the head was reported as "a clean record
+    # already exists" — the wrong remedy for a caller who wants the normal `clean` record.
+    case "$txt" in *'"verdict":"clean"'*) return 0 ;; esac
   done
   return 1
 }
@@ -430,11 +432,12 @@ $n
 $d
 
 ## How to check anything the diff does not settle
-You have NO checkout of this repo. Read files at the head with:
+You have NO checkout of this repo, and you are NOT inside one: your working directory is a
+scratch directory holding only this prompt. Read files at the head with:
   gh api "repos/$REPO/contents/<path>?ref=$HEAD" --jq .content | base64 -d
   gh pr diff $PR --repo $REPO        # the full diff, if truncated above
 Do NOT clone anything, and do not run \`find\`, \`du\`, \`mdfind\` or a recursive
-\`ls\` outside the repository you are in — a \`find\` over \$HOME blocks for many
+\`ls\` outside that scratch directory — a \`find\` over \$HOME blocks for many
 minutes and has burned entire review budgets with no verdict.
 TEST EXECUTION IS NOT AVAILABLE TO YOU. If a point can only be settled by
 executing code, say UNVERIFIED and name the exact command that would settle it.
@@ -517,7 +520,14 @@ run_reviewer() { # <secs> <log> <prompt-file>
   # has neither failure mode.
   local t="$1" log="$2" pf="$3" pid start elapsed alive_after_cap=0
   start="$(date +%s)"
-  "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" >> "$log" 2>&1 &
+  # ⛔ THE REVIEWER RUNS IN A SCRATCH CWD, NOT THE CALLER'S (P1, dogfood review of this very file).
+  # It used to inherit the caller's directory, so a lane running this from a worktree of the repo
+  # under review handed the reviewer that working tree — a DIFFERENT branch, or uncommitted changes —
+  # while the prompt asserted "You have NO checkout of this repo", and while the record binds the
+  # reviewed head AND the live diff hash. The attestation was false whenever the caller was in a
+  # checkout, and `pi -p` runs with write/edit/bash in whatever directory it is given. `cd` into the
+  # run directory (which holds only this prompt and the transcript) makes the prompt true.
+  ( cd "$RUN_DIR" && exec "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     elapsed=$(( $(date +%s) - start ))
@@ -685,8 +695,13 @@ SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 # ⚠️ AND THE EXEMPTION LIST IS DELIBERATELY NARROW — it is a closed grammar too, and widening it
 # is where a fail-open lives: an earlier shape returned "summary" on a separator WITHOUT re-reading
 # the count that follows, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole.
-# STATED RESIDUAL: a bare, unadorned, mid-sentence `P1` with no noun in front of it and no location
-# (`Found one — P1 the guard returns 0`) is prose to this scanner.
+# STATED RESIDUAL — stated at its TRUE width (P3, dogfood review of this very file, which measured two
+# ADORNED shapes the earlier wording wrongly implied were caught): a label that carries NO location,
+# NO label noun in front of it, and NO slot separator right after it is prose to this scanner, whether
+# it is bare or adorned — `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and
+# `no cwd isolation — [P1]` all pass. What the prompt CONTRACTS to is a label with a location
+# (`scripts/x.sh:12`) or a severity heading, and those are caught; the boundary here is the sentence's
+# meaning, not its shape, which is why it is declared instead of patched again.
 # The suite pins that direction (`No findings at scripts/x.sh:12; severity P2 would be over-calling`
 # must not block), and the boundary between a mention and a label there is not lexical; four rounds
 # of regex are the evidence. A blocker in any LABEL shape — the conventions the PROMPT contracts to

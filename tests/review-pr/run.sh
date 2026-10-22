@@ -23,9 +23,11 @@
 #   §G head moved mid-review    => refusal, NO record against the new head
 #   §H already recorded at head => refusal to re-record an unchanged head
 #   §L a CLEAN verdict contradicted by its own [P1] line => refused, no record
+#   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
+#      guard is what makes §B pass (a suite that only proves the happy path would
+#      let a fail-open land green — the #2148/#1741 lesson).
 #   §I an ambient GH_REPO       => cannot choose the repo; the url does
 #   §J never edits a PR body    => source-level, non-comment lines
-#   §L a CLEAN verdict contradicted by its own blocking finding => refused, no record
 #   §M rc=0 without the PR-BODY marker (the artifact check (c) reads) => exit 9
 #   §N an UNSIGNED marker => exit 9, the missing signing key named
 #   §O a spawn-point load refusal (rc=76) => exit 75, nothing consumed
@@ -52,9 +54,6 @@
 #      head B ("an old verdict reused at a new head"), so §G's refusal is the guard's doing
 #   §AG a blocking token the positional scan cannot see (a noun-prefixed `[P1]`), a hyphenated
 #      `Verdict: CLEAN-UP …` that is not a verdict, and the `### Verdict: CLEAN` heading form
-#   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
-#      guard is what makes §B pass (a suite that only proves the happy path would
-#      let a fail-open land green — the #2148/#1741 lesson).
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -186,6 +185,10 @@ printf '%s\n' "$*" > "$TMP/pi-argv.txt"
 for a in "$@"; do prompt="$a"; done
 printf '%s' "$prompt" > "$TMP/pi-prompt.txt"
 printf 'ran\n' >> "$TMP/pi-runs.txt"
+# ⛔ THE REVIEWER'S CWD IS AN OBSERVABLE (P1, dogfood review of this very file): it used to inherit
+# the caller's checkout while the prompt asserted there was none, so the record could certify a head
+# whose context reads came from a different tree.
+printf '%s\n' "$PWD" > "$TMP/pi-cwd.txt"
 printf 'GHREPO=%s\n' "${GH_REPO:-<unset>}" >> "$TMP/pi-env.txt"
 # A BASE retarget during the review: the head sha is untouched, the three-dot diff is not.
 [ "${FIXTURE_FLIP_DIFF:-0}" = "1" ] && printf 'diff --git a/x b/x\n+BASE RETARGETED\n' > "$TMP/diff-body"
@@ -218,7 +221,9 @@ marker="review recorded: reviews/$pr.json verdict=$verdict @ $sha ($repo)"
 if [ -n "${FIXTURE_SIGN_KEY:-}" ]; then
   # A REAL HMAC, exactly as record-review.sh computes it — so the seam's verification is exercised.
   sig="$(printf '%s' "$marker" | openssl dgst -sha256 -hmac "$FIXTURE_SIGN_KEY" | awk '{print $NF}')"
-  [ "${FIXTURE_BAD_SIG:-0}" = "1" ] && sig="$(printf '%064d' 0)"
+  # (the FIXTURE_BAD_SIG branch went with the dead key resolution it served: review-pr.sh no longer
+  # reads the signing key at all — record-review.sh owns it — so a forged signature is not a case
+  # this tool can see. Its fixture var was reset but never set by any scenario (P3, dogfood review).)
   printf '\n%s sig=%s\n' "$marker" "$sig" >> "$TMP/body.md"
 elif [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
   printf '\n%s\n' "$marker" >> "$TMP/body.md"
@@ -233,14 +238,14 @@ export PATH="$TMP/bin:$PATH"
 
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
-  rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" \
+  rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" "$TMP/pi-cwd.txt" \
         "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
-  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0; FIXTURE_BAD_SIG=0
+  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0
   # Every scenario signs with a FIXTURE key by default: the seam verifies the HMAC locally, and
   # with no key it REFUSES (fail-closed) — so a hermetic default has to have one.
   FIXTURE_SIGN_KEY="fixture-signing-key"
@@ -628,6 +633,20 @@ for prose in 'Severity guide: P0 = data loss; P1 = false PASS; P2 = friction.' '
   run "$SRC" 2284
   [ "$(rc_of)" = "0" ]; ck $? "  a line that only STATES the convention does NOT block (rc=$(rc_of)): '${prose:0:28}…'"
 done
+# ⛔ THE REVIEWER MUST NOT INHERIT THE CALLER'S CHECKOUT (P1, dogfood review of this very file).
+# This suite runs FROM the checkout under review, which is exactly the dangerous case: a reviewer that
+# inherits it reads a working tree that is not the reviewed head (a different branch, uncommitted
+# edits) while the record binds both the head and the live diff hash. Its cwd must be a scratch
+# directory, so the prompt's "you have no checkout" is true.
+reset; printf '**Verdict**: CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a clean review run from the checkout's own directory still completes (rc=$(rc_of))"
+case "$(cat "$TMP/pi-cwd.txt" 2>/dev/null)" in
+  *review-pr-*) pass "the reviewer ran in a SCRATCH directory, not the caller's checkout" ;;
+  *) fail "the reviewer ran in the CALLER's checkout ($(cat "$TMP/pi-cwd.txt" 2>/dev/null)) — a record could certify a head it did not read" ;;
+esac
+
+
 reset; printf '**Verdict**: CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "'**Verdict**: CLEAN' (bold on the word only) parses as a verdict (rc=$(rc_of))"
@@ -975,17 +994,17 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 294, measured on the run that added §Q's label-SHAPE
+# whenever sections are added — this is 296, measured on the run that added §Q's label-SHAPE
 # assertions (any label form: ordinal-in-span, continuation-line slot, code-styled token), the
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 294 here and the RESULT line then
-# prints 295. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 296 here and the RESULT line then
+# prints 297. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 294 ]; ck $? "assertion-count pin: >= 294 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 296 ]; ck $? "assertion-count pin: >= 296 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
