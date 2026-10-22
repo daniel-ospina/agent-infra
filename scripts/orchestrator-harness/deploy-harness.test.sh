@@ -32,7 +32,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY="${DEPLOY_UNDER_TEST:-$HERE/deploy-harness.sh}"
 
 PASS=0; FAIL=0
-# Assertions NOT executed here (root/uid-dependent blocks). Reported in the summary so a partially-run
+# Assertions NOT executed here (root/uid/mkfifo-dependent blocks). Reported so a partially-run
 # suite cannot read as a complete pass — the same doctrine as the deploy verdict itself.
 SKIPPED=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -80,6 +80,12 @@ make_src() { # make_src <dir>
   printf '#!/bin/bash\necho limit-shim\n'     > "$d/gh-limit/gh"
   printf '#!/bin/bash\necho old\n'            > "$d/retired/sweep.sh"
   printf 'plain data\n'                       > "$d/port-provenance.txt"
+  # ⛔ THE DATA FILE'S MODE IS PINNED, NOT INHERITED FROM THE AMBIENT UMASK (review P2, cycle 10).
+  # Under `umask 077` this file was created 0600 — equal to the 0600 the case-18b shims drive the target
+  # to — so the mode branch could not fire, and 18b (and the "mode differs" assertion added for it) went
+  # RED against a CORRECT deploy-harness.sh. A fixture that a non-default umask can turn into a false red
+  # is a fixture that will be "fixed" by weakening the assertion later.
+  chmod 0644 "$d/port-provenance.txt"
   chmod +x "$d"/*.sh "$d"/*.py "$d"/gh-rest/gh "$d"/gh-limit/gh "$d"/retired/sweep.sh
 }
 # A runtime that ALREADY has a full deployment (stale bytes) plus unrelated runtime state. The stale
@@ -1181,7 +1187,7 @@ fi
 echo
 echo "════════════════════════════════════════"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
-[ "$SKIPPED" -gt 0 ] && echo "SKIPPED: $SKIPPED sub-case(s) NOT executed on this host (root/uid-dependent) — this run does not cover them"
+[ "$SKIPPED" -gt 0 ] && echo "SKIPPED: $SKIPPED sub-case(s) NOT executed on this host (root/uid/`mkfifo`-dependent) — this run does not cover them"
 [ "$FAIL" -eq 0 ] && { echo "RESULT: CLEAN"; exit 0; }
 echo "RESULT: $FAIL FAILURE(S)"
 exit 1

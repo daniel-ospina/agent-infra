@@ -121,10 +121,6 @@ if [ "$DO_NOTIFY" -eq 1 ] && [ -z "$NOTIFY" ] && [ -n "$O" ] && [ -f "$O/bg/noti
   NOTIFY="$O/bg/notify.sh"
 fi
 
-# ⛔ THE LEDGER IS THE EVIDENCE, and it is written from THIS run's observations only. It is written
-# to a temp file in the target directory and renamed, so a concurrent reader sees a whole ledger or
-# none — never a half-written one. `check-deployed-drift.sh` hashes only `*.sh`, so this file is
-# invisible to it by construction and cannot perturb the drift answer.
 # Portable octal mode of a path, INCLUDING the setuid/setgid/sticky bits: GNU `stat -c %a` ("4755"),
 # BSD `stat -f %p` ("104755", last four digits). ⛔ NOT `stat -f %Lp` — it is the low NINE bits only
 # ("755" for a 4755 file), which made the mode blind exactly where it claimed to compare (cycle 7).
@@ -155,6 +151,10 @@ mode_of() {
   esac
 }
 
+# ⛔ THE LEDGER IS THE EVIDENCE, and it is written from THIS run's observations only. It is written
+# to a temp file in the target directory and renamed, so a concurrent reader sees a whole ledger or
+# none — never a half-written one. `check-deployed-drift.sh` hashes only `*.sh`, so this file is
+# invisible to it by construction and cannot perturb the drift answer.
 # Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
 # pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
 # cannot suppress the one line that matters.
