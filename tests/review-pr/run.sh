@@ -43,6 +43,7 @@
 #   §AA an EMPTY --repo value is a usage error, never a silent fallback
 #   §AB a prose line after a verdict cannot replace it; 'ISSUES: 2' parses
 #   §AC the reviewed DIFF is re-verified (a base retarget with an unchanged head refuses)
+#   §AD the marker must carry a signature field; an unsigned marker is named (HMAC = the gate's)
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -205,10 +206,17 @@ fi
 # the key is missing). check (c) reads THIS, not the JSON — so the fake must produce it
 # for the seam's post-record verification to be exercised at all.
 if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ] || [ "${FIXTURE_NO_RECORD_FILE:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
-if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
-  printf '\nreview recorded: reviews/%s.json verdict=%s @ %s (%s)\n' "$pr" "$verdict" "$sha" "$repo" >> "$TMP/body.md"
+marker="review recorded: reviews/$pr.json verdict=$verdict @ $sha ($repo)"
+if [ -n "${FIXTURE_SIGN_KEY:-}" ]; then
+  # A REAL HMAC, exactly as record-review.sh computes it — so the seam's verification is exercised.
+  sig="$(printf '%s' "$marker" | openssl dgst -sha256 -hmac "$FIXTURE_SIGN_KEY" | awk '{print $NF}')"
+  [ "${FIXTURE_BAD_SIG:-0}" = "1" ] && sig="$(printf '%064d' 0)"
+  printf '\n%s sig=%s\n' "$marker" "$sig" >> "$TMP/body.md"
+elif [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
+  printf '\n%s\n' "$marker" >> "$TMP/body.md"
 else
-  printf '\nreview recorded: reviews/%s.json verdict=%s @ %s (%s) sig=%064d\n' "$pr" "$verdict" "$sha" "$repo" 0 >> "$TMP/body.md"
+  # shape-valid, UNVERIFIABLE here (no key on the box): the seam must say so, not claim "signed"
+  printf '\n%s sig=%064d\n' "$marker" 0 >> "$TMP/body.md"
 fi
 exit "${FIXTURE_RECORD_RC:-0}"
 EOF
@@ -224,7 +232,10 @@ reset() {
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
-  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0
+  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0; FIXTURE_BAD_SIG=0
+  # Every scenario signs with a FIXTURE key by default: the seam verifies the HMAC locally, and
+  # with no key it REFUSES (fail-closed) — so a hermetic default has to have one.
+  FIXTURE_SIGN_KEY="fixture-signing-key"
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
@@ -242,6 +253,7 @@ reset() {
 run() {
   local script="$1"; shift
   HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" \
+    AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
 }
@@ -646,6 +658,18 @@ reset; printf '[P3] scripts/x.sh:1 — nit\nISSUES 2\nClean-up: remove the dead 
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a trailing 'Clean-up: …' line does not turn ISSUES 2 into clean (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
+# ⛔ THE VERDICT IS THE **LAST** ONE (P1, fourteenth review): taking the FIRST candidate let an
+# early CLEAN shadow a final ISSUES 2 and record a clean verdict.
+reset; printf 'CLEAN is what I hoped for.\nCLEAN\nMore work showed two bugs.\nISSUES 2\n[P1] a.sh:1 — x\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a FINAL ISSUES 2 wins over an earlier CLEAN line (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# ⛔ …AND ONLY A REAL VERDICT SHAPE QUALIFIES (P2, fourteenth review): an uppercase
+# `CLEAN-UP:` note 6 lines after an `ISSUES 2` used to fall inside the window and win.
+reset; printf 'ISSUES 2\n[P1] a.sh:1 — x\nfiller\nfiller\nfiller\nfiller\nfiller\nCLEAN-UP: remove the dead helper\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an uppercase 'CLEAN-UP:' note is not a verdict, even far from ISSUES (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
 reset; printf 'All good.\n**CLEAN — no blocking findings.**\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "an uppercase decorated CLEAN still parses (rc=$(rc_of))"
@@ -661,6 +685,17 @@ run "$SRC" 2284
 err_has "DIFF CHANGED"; ck $? "…naming the diff, not the head"
 no_record; ck $? "…nothing recorded"
 no_comment; ck $? "…and nothing posted"
+
+# ── §AD the marker must carry a SIGNATURE FIELD, and an unsigned one is named ─
+echo; echo "§AD the signed-marker check is shape+signature-field, and unsigned is named (declared residual)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_NO_KEY=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "an UNSIGNED marker is exit 9 (rc=$(rc_of))"
+err_has "AI_REVIEW_GATE_KEY"; ck $? "…naming the missing key"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a signature-bearing marker bound to this head is accepted (rc=$(rc_of))"
+out_has "The HMAC is verified by the gate, not here"; ck $? "…and the success line says it did not verify the HMAC (shape only)"
 
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
@@ -684,10 +719,10 @@ echo
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
 # the very smallest deletion fires. It is still not a coverage claim, and a section smaller
-# than (total - 166) is not caught by it.
+# than (total - 174) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 166 ]; ck $? "assertion-count pin: >= 166 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 174 ]; ck $? "assertion-count pin: >= 174 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

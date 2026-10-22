@@ -271,6 +271,14 @@ fi
 # ── 2) never re-record an unchanged head — and say what to do instead ────────
 # record-review.sh names the file `<owner>-<name>-<pr>.json` when the repo is known
 # (#426), with a legacy bare `<pr>.json` for repo-less records.
+# The signing key, resolved EXACTLY as record-review.sh resolves it (env, then the key file) —
+# needed to verify a marker's HMAC before claiming it is signed.
+GATE_KEY="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$GATE_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  GATE_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
+
 STORE="$HOME/.pi/agent/reviews"
 QUAL="$STORE/${OWNER}-${RNAME}-$PR.json"
 LEGACY="$STORE/$PR.json"
@@ -574,21 +582,21 @@ fi
 # findings`), but not by a bare word: `Clean separation of concerns …` is prose about the
 # code and must never become a verdict (P2, ninth fresh review: a decorated `CLEAN — …`
 # line was rejected as NO VERDICT).
-# ⛔ THE VERDICT TOKEN IS UPPERCASE, AND IT IS THE *FIRST* CANDIDATE IN THE TAIL (P1, thirteenth
-# fresh review). Two defects made this a fail-OPEN:
-#   * taking the LAST matching line let a trailing prose line ("Clean-up: remove the dead
-#     helper") override an `ISSUES 2` verdict and record a signed, head-bound `clean`;
-#   * a case-insensitive `clean` with a separator let that same prose line be a verdict at all.
-# So: the token must be UPPERCASE (that is the contract the prompt states, and it is what
-# distinguishes the verdict from prose), and among the last 5 non-empty lines the FIRST verdict
-# candidate wins — a verdict followed by closing prose still parses, while prose after a verdict
-# can no longer replace it. Our own appended `[review-pr] reviewer pid=…` line is not a verdict
-# and is simply not a candidate.
-VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\)|\])?[[:space:]]*([-–—:.!*,;_]|[[:space:]]*$)'
+# ⛔ THE VERDICT IS THE **LAST** VERDICT-SHAPED LINE, AND ONLY A REAL VERDICT SHAPE QUALIFIES.
+# Both halves are load-bearing, and each was learned the hard way:
+#   * LAST, because the contract says "print nothing after the verdict line" — taking the FIRST
+#     candidate let an early `CLEAN` shadow a final `ISSUES 2` (P1, fourteenth review);
+#   * a STRICT shape, because the earlier widening let PROSE be a verdict: `Clean-up: …`,
+#     `CLEAN-UP: …`, `CLEAN: see below` all matched, so a trailing note could replace an
+#     `ISSUES 2` verdict (P1, thirteenth review). A bare `CLEAN`, bolded/bracketed, `CLEAN.`,
+#     `CLEAN:` and `CLEAN — <prose>` qualify; a HYPHENATED continuation (`CLEAN-UP`) does not,
+#     because the `-` must be followed by a space. The token is UPPERCASE — that is the contract
+#     the prompt states and what separates a verdict from prose.
+VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[—–-][[:space:]]+)'
 VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:space:]]*[0-9]+'
 VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)([^[:alnum:]]|$)'
-LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' | tail -5 \
-             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | head -1 | tr -d '\r')"
+LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
+             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
@@ -858,6 +866,17 @@ fi
 # ANY signed match wins over an earlier unsigned one at the same head: a body can carry
 # both (an unsigned marker from a key-less run, then a signed one from a re-run), and a
 # first-match scan would refuse the run that actually fixed it (P3, third fresh review).
+# ⛔ SHAPE, NOT HMAC — A DECLARED RESIDUAL (raised as P3 in rounds 9, 12 and 14). The PR body is
+# author-writable, so a pre-seeded `sig=<64 hex>` line can mask the unsigned marker this run just
+# posted; verifying the HMAC locally was implemented and REVERTED, because it makes the seam refuse
+# whenever no key is readable in the calling environment — including from a cell whose key is only
+# in the recorder's own environment — which would turn a whole class of legitimate records into
+# "unverifiable" at exactly the moment the reviewer was paid for. What is guaranteed here, and what
+# the success line says, is narrower and true: a marker BOUND TO THIS PR/HEAD/REPO carries a
+# signature field; the HMAC is the ai-review-gate's to verify (it is the only consumer that must,
+# and it does). An UNSIGNED marker — the case where the recorder itself could not mint one — is
+# still its own named failure, because record-review.sh says so loudly on stderr and the marker it
+# appends then has no `sig=`.
 marker_state() { # <body> -> signed | unsigned | absent
   local body="$1" line pr_re head_re repo_lc saw_unsigned=0
   pr_re="$PR"; head_re="$HEAD"
@@ -873,9 +892,6 @@ marker_state() { # <body> -> signed | unsigned | absent
   [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
   printf 'absent'
 }
-# ⛔ A FAILED READ IS NOT AN ABSENT MARKER (P3, tenth fresh review — the same
-# failed-read-vs-absent conflation fixed in read_meta, one endpoint over). If the body cannot
-# be read, say so; do not name a missing artifact as the cause.
 BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
 BODY_RC=$?
 [ "$BODY_RC" -eq 0 ] \
