@@ -627,5 +627,45 @@ for i in 1 2 3; do run coreok pr list --repo o/r; done
 ck "(m5) … while the plain shape still coalesces (3 reads => 1 request) [count=$(reqs 'pr list')]" \
    $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
 
+echo "── (m6) ROUND 2: a DATED record must still REFUSE a write, and the SHORTHAND must not escape ──"
+# (m6) The round-1 fix over-applied: returning `None` for BOTH arms removed the one durable record
+# that survives a GraphQL refusal overwriting `last-limit`, so a known-empty DATED pool started
+# SENDING writes into it (measured: 1 request spent against a record saying remaining=0).
+reset_env m6 core0
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run core0 api -X POST repos/o/r/issues/7/comments -f body=hi
+ck "(m6) a WRITE against a DATED empty record is refused by name" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+ck "(m6) … and it spends NO request (never retried into the empty pool)" \
+   $([ "$(wc -l < "$STUB_LOG")" -eq 0 ] && echo 0 || echo 1)
+
+# (m7) object-construction SHORTHAND `{name}` is `{name: .name}` — a key read with no dot, bracket
+# or quote, so none of the three scans saw it (round-2 finding).
+reset_env m7 core0
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+for prog in '[.state, {labels}]' '[{merge_commit_sha}, .state]' '.state, ([tostream])' '.state, [recurse]'; do
+  run core0 api repos/o/r/pulls/7 --jq "$prog"
+  ck "(m7) shorthand/stream escape is REFUSED: $prog" \
+     $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+done
+run core0 api repos/o/r/pulls/7 --jq '{a: .state}'
+ck "(m7) while a real object construction is still served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qi 'open' && echo 0 || echo 1)
+
+# (m8) “I could not read the record” is not “the pool is fine”.
+reset_env m8 coreok
+printf 'gh-core-exhausted at=%s\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m8) an UNPARSEABLE record fails closed with its own name (was gh-ok rc 0)" \
+   $([ "$RC" -eq 3 ] && [ "$OUT" = "gh-health-unknown" ] && echo 0 || echo 1)
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) - 60 ))" > "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m8) … while a DATED record whose window has PASSED is still gh-ok (that is an answer)" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
