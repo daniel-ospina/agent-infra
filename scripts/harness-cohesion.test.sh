@@ -625,6 +625,20 @@ OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" H
         bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
 claims_row9b="$(printf '%s\n' "$OUT" | grep -E '^claims[[:space:]]' | head -1)"
 case "$claims_row9b" in *LATE*) ck "claims row: an AGED record is LATE, never OK" 0 ;; *) ck "claims row: an AGED record is LATE, never OK [$claims_row9b]" 1 ;; esac
+# ⛔ AND A `notprobed` RECORD NEVER AGES INTO `LATE`. "No target here" is NOT-APPLICABLE: there is no
+# probe whose age could mean anything, so the row must say SKIPPED/4 at any age — the age gate sits below
+# that arm precisely because a targetless box with every other row OK was rendered DEGRADED once this
+# record passed `HU_CLAIMS_STALE` (measured in review).
+printf 'claims=notprobed at=1\n' > "$CELL9/orchestrator/state/harness-claims"
+touch -t 202001010000 "$CELL9/orchestrator/state/harness-claims" 2>/dev/null
+OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HARNESS_UP_CLAIMS_STALE=1 REPO="$REPO_FIX" \
+        bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+claims_row9c="$(printf '%s\n' "$OUT" | grep -E '^claims[[:space:]]' | head -1)"
+case "$claims_row9c" in
+  *SKIPPED*) ck "claims row: an AGED notprobed record stays SKIPPED, never LATE [$claims_row9c]" 0 ;;
+  *) ck "claims row: an AGED notprobed record stays SKIPPED, never LATE [$claims_row9c]" 1 ;;
+esac
 # the refresh RECORD shape: canonical keys, and `fetch=` present (a `--no-fetch` run must not read fresh)
 rm -f "$CELL9/orchestrator/state/harness-refresh"
 OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \

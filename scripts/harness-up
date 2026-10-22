@@ -826,19 +826,22 @@ hu_row_claims() {
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
   fi
+  # ⛔ NOT-APPLICABLE IS NOT CANNOT-VERIFY, AND IT IS NOT STALE EITHER — so this arm lives ABOVE the
+  # age gate. A launcher that resolved no target cannot ask the question at all (the CONTROLLER resolves
+  # its own target: install.sh bakes `REPO` into the launchd plist), and there is no probe whose age
+  # could mean anything. Below the gate, the same record aged past `HU_CLAIMS_STALE` rendered
+  # `LATE (last probe notprobed …)` → rc 1 → DEGRADED on a box whose every other row was OK, and the row
+  # does not re-probe while a record exists, so the state persisted (measured in review). `return 4` is
+  # the same "not applicable" vocabulary the launchd-on-Linux and supervisor-on-Mac rows use.
+  case "$verdict" in
+    notprobed) hu_row claims - - "SKIPPED (no target resolved here — the controller resolves its own registry)"; return 4 ;;
+  esac
   if [ -n "$age" ] && [ "$age" -gt "$HU_CLAIMS_STALE" ]; then
     hu_row claims - "$(hu_age_txt "$age")" "LATE (last probe ${verdict:-none}, older than ${HU_CLAIMS_STALE}s)"; return 1
   fi
   case "$verdict" in
     reachable) hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (refs/claims reachable)"; return 0 ;;
     absent)    hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (registry empty — no claim held right now)"; return 0 ;;
-    # ⛔ NOT-APPLICABLE IS NOT CANNOT-VERIFY. A launcher that resolved no target cannot ask the question
-    # — the CONTROLLER resolves its own target (install.sh bakes `REPO` into the launchd plist) — so the
-    # row says so and does not drag a HEALTHY box's verdict to BROKEN: measured, a targetless box with
-    # `loop/exec/refresh/capacity/supervisor/drift` all OK exited 2 after a SUCCESSFUL start, which is the
-    # state `harness-surface.test.sh`'s (b-mac) arm exists to forbid. `return 4` is the same "not
-    # applicable" vocabulary the launchd-on-Linux and supervisor-on-Mac rows already use.
-    notprobed) hu_row claims - "$(hu_age_txt "${age:-0}")" "SKIPPED (no target resolved here — the controller resolves its own registry)"; return 4 ;;
     *)         hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (verdict=${verdict:-none})"; return 2 ;;
   esac
 }
