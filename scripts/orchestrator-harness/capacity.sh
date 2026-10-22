@@ -36,6 +36,12 @@
 #   disk_free_mb=<int>     free space on the filesystem the repo lives on — the volume that ACTUALLY
 #                          fills. A lane's worktree is ~1.1 GB before its venv (#2159), so disk is a
 #                          placement bound, not a footnote.
+#   fork_headroom=<int>    tasks this box can still create, against the TIGHTEST limit that applies
+#                          (threads-max / RLIMIT_NPROC / cgroup pids.max; kern.maxproc* on macOS) — or
+#                          `unknown` when none could be read. The one bound no load average can see
+#                          (#2293: a box at 0.32x load that could not fork at all).
+#   fork_source=<name>     WHICH limit produced that number, so a reader can tell a per-user rlimit
+#                          from a cgroup ceiling (they differ by 4x on this Linux box).
 #   mem_free_mb=<int>      available memory (MemAvailable / `free`+`inactive`), the same helper the
 #                          controller's own gate uses.
 #   at=<epoch>             when it was measured. A record with no age is a stale flag waiting to be
@@ -105,6 +111,15 @@ CAP_LPC_CEILING="${CAP_LPC_CEILING:-800}"      # hundredths of load-per-CPU => 8
 # moving work OFF a box that is piling up — and it is a load-per-CPU line, never a lane count.
 CAP_YIELD_AT_LPC="${CAP_YIELD_AT_LPC:-400}"    # hundredths of load-per-CPU => 4.00
 CAP_MIN_DISK_MB="${CAP_MIN_DISK_MB:-500}"      # same floor spawn-gate.sh enforces before a spawn
+# ── FORK HEADROOM: THE BOUND NO LOAD AVERAGE CAN SEE (agent-infra#2293) ──────────────────────────
+# Measured on the fleet's own boxes: `pi-cell-*` at 0.32x load could not spawn AT ALL, because fork()
+# returns EAGAIN once a hard TASK limit is reached. Three limits apply, and the tightest wins:
+#   threads-max (system-wide threads) · RLIMIT_NPROC (threads for this uid) · cgroup pids.max.
+# Measured on this Linux box 2026-10-22: cgroup pids 1295/4692 (3397 spare) against RLIMIT_NPROC 15641
+# and threads-max 31282 — the cgroup was 4x tighter than the kernel's own limit and it is invisible to
+# every other field in this record. A fork storm makes it bite in minutes (#2304: 3.4k processes, load
+# 74 on 4 vCPU). So it is recorded, and it is a REFUSAL bound like load and disk, not a diagnostic.
+CAP_MIN_FORK_HEADROOM="${CAP_MIN_FORK_HEADROOM:-800}"   # tasks kept free before "do not place here"
 CAP_MIN_MEM_MB="${CAP_MIN_MEM_MB:-512}"        # same floor the controller's own mem gate uses
 CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STALE, never eligible
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
@@ -120,6 +135,14 @@ cap_host() {
   local h; h="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || h=""
   case "$h" in ''|*[!A-Za-z0-9._-]*) printf 'box'; return 0 ;; esac
   printf '%s' "$h"
+}
+
+# cap_os — which userland's limits this run reads. `CAP_OS` (Darwin|Linux) is the seam, the same idiom
+# harness-up's `HARNESS_UP_OS` uses: a Linux suite cannot otherwise exercise the macOS arm of the fork
+# probe, and an untested platform arm is what ships dead.
+cap_os() {
+  case "${CAP_OS:-}" in Darwin|Linux) printf '%s' "$CAP_OS"; return 0 ;; esac
+  uname -s 2>/dev/null
 }
 
 cap_ncpu() {
@@ -168,11 +191,67 @@ cap_disk_free_mb() { # <path> — MiB free on the filesystem <path> lives on (df
   printf '%s' "$mb"
 }
 
+# cap_fork_headroom -> `<headroom> <source>`; rc 1 when nothing could be measured.
+# One `ps` read per shape; the SMALLEST (limit − used) across the limits that apply wins, because an
+# average would report the loosest limit and the spawn would still die. `CAP_FORK_LIMITS_FILE`
+# (`source limit used` lines) is the fixture seam — a suite cannot change the box's real limits, and
+# the refusal path is only testable if it can supply them.
+cap_fork_headroom() {
+  local f="${CAP_FORK_LIMITS_FILE:-}" bh="" bs=""
+  _cap_take() {
+    local lim="${2:-}" used="${3:-}" h
+    case "$lim" in ''|*[!0-9]*) return 0 ;; esac
+    case "$used" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$lim" -ge 1 ] 2>/dev/null || return 0
+    h=$(( lim - used )); [ "$h" -lt 0 ] && h=0
+    if [ -z "$bh" ] || [ "$h" -lt "$bh" ]; then bh="$h"; bs="${1:-unknown}"; fi
+  }
+  if [ -n "$f" ]; then
+    [ -r "$f" ] || return 1
+    while read -r s l u; do _cap_take "$s" "$l" "$u"; done < "$f"
+  else
+    local ps_cmd="${CAP_PS:-ps}" n_all="" n_uid="" uid rl tm cg _p _mx _cu _mp _mpu
+    uid="$(id -u 2>/dev/null)" || uid=""
+    case "$(cap_os)" in
+      Darwin)
+        n_all="$($ps_cmd -e -o pid= 2>/dev/null | wc -l | tr -d ' ')"
+        [ -n "$uid" ] && n_uid="$($ps_cmd -e -o uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')"
+        rl="$(ulimit -u 2>/dev/null)"; case "$rl" in ''|*[!0-9]*) rl="" ;; esac
+        [ -n "$rl" ] && [ -n "$n_uid" ] && _cap_take rlimit-nproc "$rl" "$n_uid"
+        _mp="$(sysctl -n kern.maxproc 2>/dev/null)"; _mpu="$(sysctl -n kern.maxprocperuid 2>/dev/null)"
+        case "$_mp" in ''|*[!0-9]*) _mp="" ;; esac
+        case "$_mpu" in ''|*[!0-9]*) _mpu="" ;; esac
+        [ -n "$_mp" ] && [ -n "$n_all" ] && _cap_take kern-maxproc "$_mp" "$n_all"
+        [ -n "$_mpu" ] && [ -n "$n_uid" ] && _cap_take kern-maxprocperuid "$_mpu" "$n_uid" ;;
+      *)
+        # Linux: RLIMIT_NPROC and threads-max both count TASKS (threads), so the used count is threads.
+        n_all="$($ps_cmd -eLo pid= 2>/dev/null | wc -l | tr -d ' ')"
+        [ -n "$uid" ] && n_uid="$($ps_cmd -eLo uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')"
+        rl="$(ulimit -u 2>/dev/null)"; case "$rl" in ''|*[!0-9]*) rl="" ;; esac
+        [ -n "$rl" ] && [ -n "$n_uid" ] && _cap_take rlimit-nproc "$rl" "$n_uid"
+        tm="$(cat /proc/sys/kernel/threads-max 2>/dev/null)"
+        case "$tm" in ''|*[!0-9]*) tm="" ;; esac
+        [ -n "$tm" ] && [ -n "$n_all" ] && _cap_take threads-max "$tm" "$n_all"
+        # cgroup v2 (`<mount><self cgroup>/pids.{max,current}`) then v1 (`<mount>/pids/pids.*`).
+        # `max` in the limit file means UNLIMITED — skipping it is not reading it as 0.
+        cg="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | head -1)"
+        for _p in "/sys/fs/cgroup${cg}" "/sys/fs/cgroup/pids"; do
+          [ -r "$_p/pids.max" ] || continue
+          _mx="$(cat "$_p/pids.max" 2>/dev/null)"; _cu="$(cat "$_p/pids.current" 2>/dev/null)"
+          case "$_mx" in ''|max|*[!0-9]*) continue ;; esac
+          _cap_take cgroup-pids "$_mx" "$_cu"
+        done ;;
+    esac
+  fi
+  [ -n "$bh" ] || return 1
+  printf '%s %s' "$bh" "${bs:-unknown}"
+}
+
 # cap_probe_local <repo-path> [lanes] -> one record line; rc 1 (and NO output) if a core field is
 # unreadable. Lanes is passed IN by the controller (it already counts them by evidence); standalone
 # callers get a worktree count.
 cap_probe_local() {
-  local repo="${1:-.}" lanes="${2:-}" ncpu load1 disk mem host at lpc
+  local repo="${1:-.}" lanes="${2:-}" ncpu load1 disk mem host at lpc fork
   ncpu="$(cap_ncpu)"      || return 1
   load1="$(cap_load1_100)" || return 1
   disk="$(cap_disk_free_mb "$repo")" || return 1
@@ -183,8 +262,18 @@ cap_probe_local() {
   case "$lanes" in ''|*[!0-9]*) lanes=0 ;; esac
   host="$(cap_host)"; at="$(cap_now)"
   lpc="$(awk -v l="$load1" -v n="$ncpu" 'BEGIN{printf "%d", l/n}')"
-  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s' \
-    "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "$at"
+  # ⛔ A PROBE THAT CANNOT MEASURE THE FORK LIMIT STILL PRODUCES A RECORD — with `fork_headroom=unknown`,
+  # never a number and never a silent omission. The local launcher refuses on `unknown` (a lane needs
+  # this), while the CROSS-BOX rule keeps working on load/disk for a peer whose writer cannot measure
+  # it: marking every older box ineligible would be a fleet-wide false block, and a peer's own spawn
+  # gate is the final authority for that peer anyway. Named residual, not an oversight.
+  if fork="$(cap_fork_headroom)"; then
+    printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s fork_headroom=%s fork_source=%s at=%s' \
+      "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "${fork%% *}" "${fork##* }" "$at"
+  else
+    printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s fork_headroom=unknown fork_source=unmeasurable at=%s' \
+      "$host" "$ncpu" "$load1" "$lpc" "$lanes" "$disk" "$mem" "$at"
+  fi
 }
 
 # ── record parsing ─────────────────────────────────────────────────────────────
@@ -213,7 +302,7 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 # cap_bound_hit <record> <now> -> the FIRST bound that makes it ineligible, or empty.
 # The order is fixed so a refusal names a STABLE reason for a given fleet state.
 cap_bound_hit() {
-  local r="${1:-}" now="${2:-}" at age lpc disk mem
+  local r="${1:-}" now="${2:-}" at age lpc disk mem fork
   cap_valid_record "$r" || { printf 'probe_unreadable'; return 0; }
   at="$(cap_kv "$r" at)"; age=$(( now - at ))
   [ "$age" -lt 0 ] && age=0
@@ -221,6 +310,11 @@ cap_bound_hit() {
   lpc="$(cap_kv "$r" lpc)";  [ "$lpc"  -ge "$CAP_LPC_CEILING" ] && { printf 'load_per_cpu'; return 0; }
   disk="$(cap_kv "$r" disk_free_mb)"; [ "$disk" -lt "$CAP_MIN_DISK_MB" ] && { printf 'disk'; return 0; }
   mem="$(cap_kv "$r" mem_free_mb)";   [ "$mem"  -lt "$CAP_MIN_MEM_MB" ]  && { printf 'memory'; return 0; }
+  # Fork headroom is checked LAST but it outranks a good reading of the other three: a box with disk and
+  # load to spare still cannot spawn a lane at zero task headroom (#2293). `unknown` is skipped, and
+  # that skip is the declared residual above — never read as "headroom is fine".
+  fork="$(cap_kv "$r" fork_headroom)"
+  case "$fork" in ''|unknown|*[!0-9]*) : ;; *) [ "$fork" -lt "$CAP_MIN_FORK_HEADROOM" ] && { printf 'fork_headroom'; return 0; } ;; esac
   return 0
 }
 
