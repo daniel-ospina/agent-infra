@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was capacity-refused
+cap_refusal_gate() { # -> prints `fork|load|disk` and returns 0 iff THIS dispatch was capacity-refused
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -105,13 +105,16 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
   # of turning the slack negative — it buys no slack, exactly as documented above.
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
-  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 77 disk), not a
-  # gate: an unrecognised value is reported as `load` because the refusal itself is already proven by
-  # fields 1-2, and refusing to end the wait over one corrupt byte is the fleet-wide idleness R8
-  # removes. Field 2 is deliberately NOT consulted here — the yield window is the controller's
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (74 fork / 75 load / 77 disk),
+  # not a gate: an unrecognised value is reported as `load` because the refusal itself is already proven
+  # by fields 1-2, and refusing to end the wait over one corrupt byte is the fleet-wide idleness R8
+  # removes. `fork` is named rather than folded into `load` because its remedy is the OPPOSITE of a load
+  # wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) — and a chain that told
+  # its caller "load" would send the operator to wait for a retry the box cannot even spawn.
+  # Field 2 is deliberately NOT consulted here — the yield window is the controller's
   # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
   # unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; *) printf 'load' ;; esac
+  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; *) printf 'load' ;; esac
   return 0
 }
 
@@ -200,6 +203,9 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
   if _cap_gate="$(cap_refusal_gate)"; then
     case "$_cap_gate" in
       disk) _cap_rc=77 ;;
+      # The fork refusal keeps spawn-gate.sh's caller-facing code, so a chain and a lane name the same
+      # remedy for the same state (agent-infra#2293).
+      fork) _cap_rc=74 ;;
       *)    _cap_rc=75 ;;
     esac
     echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"

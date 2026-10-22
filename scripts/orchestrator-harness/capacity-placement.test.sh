@@ -527,6 +527,41 @@ printf 'start=%s end=%s cycle=7 interval=240 nothing=none fork=ok\n' "$NOW" "$NO
 VOUT3="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
 ck "  …and a healthy record is still HEALTHY (the new arm did not swallow the ordinary case)" \
    "$([ "$RC" -eq 0 ] && q '^HEALTHY ' "$VOUT3" && echo 0 || echo 1)"
+# ⛔ `fork=low` IS HELD TOO (review P2, driven). The writer records `fork=low` on the SAME path that
+# records `placement=fork_held` and `dispatched=0`; grading that HEALTHY said "it is self-dispatching"
+# about a cycle that dispatched NOTHING — the false PASS this verdict exists to close. There was no
+# `fork=low` arm at all, so the gap could not be seen.
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_headroom placement=fork_held bound=fork_headroom fork=low fork_procs=15620 fork_max=15641\n' \
+  "$NOW" "$NOW" > "$VO/state/cycles"
+VOUTL="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "a FRESH record with fork=low (placed on the HELD path, dispatched=0) is FORK-STARVED, never HEALTHY (rc=$RC) [$VOUTL]" \
+   "$([ "$RC" -eq 1 ] && q '^FORK-STARVED ' "$VOUTL" && q 'why=fork_headroom' "$VOUTL" && echo 0 || echo 1)"
+ck "  …and it is DISTINGUISHED from the failed-probe case by its own why= (low headroom, not 'cannot fork')" \
+   "$(! q 'why=fork_exhausted' "$VOUTL" && echo 0 || echo 1)"
+# ⛔ AN UNSTAMPED RECORD IS NOT A STALE ONE (review P1, driven). The writer stamps 0 when it could not
+# read a clock without a fork; aged against epoch 0 that record is "infinitely old", so `harness status`
+# told the operator to START a controller that had just written the record — the wrong remedy on the
+# bash-3.2 box the fork work exists for. UNREADABLE (rc 2) is "cannot answer", which is never a pass.
+printf 'start=0 end=0 cycle=7 interval=240 nothing=fork_headroom placement=fork_held bound=fork_headroom fork=low\n' > "$VO/state/cycles"
+VOUTU="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "an UNSTAMPED record (start=0) is UNREADABLE rc 2 — not DEGRADED, and never HEALTHY (rc=$RC) [$VOUTU]" \
+   "$([ "$RC" -eq 2 ] && q '^UNREADABLE ' "$VOUTU" && q 'newest_record_unstamped' "$VOUTU" && echo 0 || echo 1)"
+# ── THE STARVED WRITE REALLY SPENDS NO FORK (review P1, DRIVEN — the arm that reproduces the defect) ──
+# Under `ulimit -u 1` no process can be created, so ANY `$( )` on the writer's path TERMINATES the
+# shell (bash retries the fork four times, then exits 254) — and the record the starved box needs is
+# never written. Measured on the pre-change writer: rc=254 and NO file. `cap_san`'s per-field
+# substitution was the second offender, found by driving this arm, not by reading the diff.
+SW="$TMP/starved-write"; mkdir -p "$SW/state"
+SWOUT="$( ( ulimit -u 1 2>/dev/null
+  . "$CR"
+  cycle_record_write "$SW" start=1792598400 end=1792598400 cycle=9 nothing=fork_exhausted placement=fork_held bound=fork_probe fork=starved 2>/dev/null
+  printf 'rc=%s' "$?" ) 2>/dev/null )"
+ck "the STARVED write path survives a box that cannot fork at all — no \$( ) anywhere in it (got '${SWOUT:-<the shell died>}')" \
+   "$([ "$SWOUT" = 'rc=0' ] && echo 0 || echo 1)"
+ck "  …and the record is really ON DISK, carrying the fork reading the verdict needs" \
+   "$(q 'fork=starved' "$(cat "$SW/state/cycles" 2>/dev/null)" && q 'placement=fork_held' "$(cat "$SW/state/cycles" 2>/dev/null)" && echo 0 || echo 1)"
+ck "  …and the sanitiser still normalises a hostile value (quotes, spaces and backticks stripped by PARAMETER EXPANSION, not by tr)" \
+   "$([ "$(. "$CR"; cr_san "a b\"c'd\`e")" = 'a_bcde' ] && echo 0 || echo 1)"
 # THE SPAWN POINT: fork before disk before load, with its own refusal code.
 SG="$HERE/spawn-gate.sh"
 ck "the spawn gate declares its OWN fork refusal code (74), distinct from disk (77) and load (75)" \
@@ -536,6 +571,45 @@ _sd="$(grep -n 'dpath="${DISK_GATE_PATH:-$PWD}"' "$SG" | head -1 | cut -d: -f1)"
 _sl="$(grep -n 'if ! can_spawn "$l"; then' "$SG" | head -1 | cut -d: -f1)"
 ck "  …and run_agent evaluates FORK before DISK before LOAD (f=$_sf d=$_sd l=$_sl)" \
    "$([ -n "${_sf:-}" ] && [ -n "${_sd:-}" ] && [ -n "${_sl:-}" ] && [ "$_sf" -lt "$_sd" ] && [ "$_sd" -lt "$_sl" ] && echo 0 || echo 1)"
+
+# ── THE CALLER'S OWN CGROUP, NOT ONLY THE MOUNT ROOT (review P2, DRIVEN) ────────────────────────
+# Reading only /sys/fs/cgroup/pids.max left the arm DEAD wherever processes live in a slice: measured
+# on a fleet cell the root has no pids.max at all, while /proc/self/cgroup names
+# /system.slice/<svc>.service and THAT directory's pids.max is 4692 — so the binding ceiling was never
+# seen and the arm always answered src=uid. Fixture trees drive both hierarchies and the ancestor walk.
+CGF="$TMP/cgfix"; mkdir -p "$CGF/cg/system.slice/anvil.service" "$CGF/cg/pids/docker/abc"
+printf '9999\n' > "$CGF/cg/pids.max";          printf '1\n'  > "$CGF/cg/pids.current"
+printf '50\n'   > "$CGF/cg/system.slice/anvil.service/pids.max"
+printf '40\n'   > "$CGF/cg/system.slice/anvil.service/pids.current"
+printf '0::/system.slice/anvil.service\n' > "$CGF/self2"
+printf '4:pids:/docker/abc\n1:name=systemd:/docker/abc\n' > "$CGF/self1"
+printf '20\n' > "$CGF/cg/pids/docker/abc/pids.max"; printf '5\n' > "$CGF/cg/pids/docker/abc/pids.current"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self2" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "the caller's OWN cgroup dir is read (cgroup v2 fixture: ${CG_M:-?}/${CG_C:-?} = 50/40, NOT the root's 9999/1)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 50 ] && [ "$CG_C" = 40 ] && echo 0 || echo 1)"
+# An ANCESTOR slice: the ceiling is as often set on the slice above the service as on its own dir.
+rm -f "$CGF/cg/system.slice/anvil.service/pids.max" "$CGF/cg/system.slice/anvil.service/pids.current"
+printf '77\n' > "$CGF/cg/system.slice/pids.max"; printf '3\n' > "$CGF/cg/system.slice/pids.current"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self2" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and an ANCESTOR slice is walked to when the service dir carries no ceiling (${CG_M:-?}/${CG_C:-?} = 77/3)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 77 ] && [ "$CG_C" = 3 ] && echo 0 || echo 1)"
+CG_M=""; CG_C=""
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self1" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and cgroup v1 is handled (pids hierarchy under its own mount point: ${CG_M:-?}/${CG_C:-?} = 20/5)" \
+   "$([ "$RC" -eq 0 ] && [ "$CG_M" = 20 ] && [ "$CG_C" = 5 ] && echo 0 || echo 1)"
+CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/absent" cap_cgroup_pair_vars CG_M CG_C; RC=$?
+ck "  …and an unreadable /proc/self/cgroup returns rc 1, so the root-only fallback arms still answer" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+# Fork-free: the resolver runs on a box that cannot fork, because a `$( )` here would be the fork that
+# kills the reader it exists for.
+CG_M=""; CG_C=""
+CGRC="$( ( ulimit -u 1 2>/dev/null
+  CAP_CGROUP_MOUNT="$CGF/cg" CAP_SELF_CGROUP_FILE="$CGF/self1" cap_cgroup_pair_vars CG_M CG_C
+  printf 'rc=%s pair=%s/%s' "$?" "$CG_M" "$CG_C" ) 2>/dev/null )"
+ck "  …and the resolver spawns NOTHING: it answers under \`ulimit -u 1\` ($CGRC)" \
+   "$([ "$CGRC" = 'rc=0 pair=20/5' ] && echo 0 || echo 1)"
 
 # ── §10 self-registration ───────────────────────────────────────────────────────────────────────
 echo

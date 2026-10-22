@@ -364,6 +364,41 @@ got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
 [ "$got" = "rc=75 started=1" ]; rc=$?
 ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want rc=75 started=1, got '${got:-<none>}')" $rc
 
+# ⛔ …AND THE SAME FOR 74, WHICH IS THE CODE THE FORK GATE TRANSLATES TO (review P2, agent-infra#2293).
+# PI_FORK_REFUSED used to BE 74 — the identical value as AGENT_FORK_REFUSED — so run_agent's arm could
+# not tell the shim's refusal from a real `pi` that exited 74 (EX_IOERR): a model run that hit a disk
+# I/O error was reported as "this box could not fork" AND had AGENT_STARTED cleared, which is the
+# #1720 class in the other direction. The spawn-point code is now 78 and the caller-facing one stays
+# 74, mirroring the load pair (76 at the spawn point, 75 for the caller). This arm is RED on the
+# pre-change tree: it produced rc=74 started=0.
+mkdir -p "$TMP/bin74"
+printf '#!/bin/sh\nexit 74\n' > "$TMP/bin74/pi"
+chmod +x "$TMP/bin74/pi"
+# Resolved HERE rather than reused from the later section: the suite runs under `set -u`, so a variable
+# assigned further down is UNBOUND at this point — which made this arm report '<none>' instead of
+# failing for the reason it names.
+_capmod74="$HERE/capacity.sh"
+[ -f "$_capmod74" ] || _capmod74="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+got="$(PATH="$TMP/bin74:$TMP/bin:$PATH" O="$TMP/O" DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1" 2>/dev/null
+  cap_procs_live() { printf "400"; }
+  cap_ulimit_u() { printf "15641"; }
+  cap_maxprocperuid() { return 1; }
+  . "$2"
+  load1() { printf "0"; }
+  MAX_LOAD=10
+  run_agent 1 "$3" "$4" "pi that exits 74 itself" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$_capmod74" "$GATE" "$TMP/log4" "$PROMPT" 2>/dev/null)"
+[ "$got" = "rc=74 started=1" ]; rc=$?
+ck "a pi that itself exits 74 (EX_IOERR) is STARTED, not read as the fork gate's refusal (want rc=74 started=1, got '${got:-<none>}')" $rc
+# …and the two codes are DISTINCT in the shipped source, which is the property that makes the arm
+# above possible at all. A grep of the declaration, so a future re-merge of the two is caught even if
+# the behavioural arm is ever weakened.
+_pf="$(grep -m1 '^PI_FORK_REFUSED=' "$GATE" | cut -d= -f2)"; _af="$(grep -m1 '^AGENT_FORK_REFUSED=' "$GATE" | cut -d= -f2)"
+{ [ -n "${_pf:-}" ] && [ -n "${_af:-}" ] && [ "$_pf" != "$_af" ]; }; rc=$?
+ck "the spawn point's fork code ($_pf) is DISTINCT from the caller-facing one ($_af) — a pi exiting the latter cannot be mistaken for the gate" $rc
+
 # ── 9) the PORTED CALLERS: a refusal must not consume a fixer attempt ───────────
 # The headline behavioural claim of this port is fix-one.sh's REFUND. orch-loop.sh books the attempt
 # (fixcount+1) and DELETES the findings marker when it CREATES the session — UPSTREAM of the gate
@@ -780,7 +815,10 @@ fake_edge() { # fake_edge <procs> <max> — re-declares the leaves, then reports
     printf "COLLIDE:state=%s|detail=%s" "$p" "$m"
     printf " \\n"
     spawn_fork_state _dp _dm _ds
-    printf "NOCLOBBER:state=%s|detail=%s" "$_dp" "$_dm" "_dp" "_dm" "_ds"
+    # Two specifiers, TWO arguments: the names `_dp _dm _ds` used to be passed as well and were never
+    # printed (a five-argument printf against a two-specifier format silently drops the tail, so a
+    # reader of the failure output saw nothing about which variables had been driven) — review P3.
+    printf "NOCLOBBER:state=%s|detail=%s" "$_dp" "$_dm"
   ' _ "$1" "$2" "$cap_abspath" "$GATE"
 }
 edge_out="$(fake_edge 15631 15641)"

@@ -206,11 +206,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
   # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
   #
-  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and the two are OPPOSITE (#1765). A load refusal
-  # clears when the box quietens and the controller re-dispatches next cycle; a DISK refusal never
-  # clears on its own — no amount of waiting frees a filesystem. Naming a disk refusal "load gate"
-  # sends the operator to wait for an event that cannot fix it, which is the instrument false
-  # positive this file's callers exist to avoid.
+  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and they are OPPOSITE (#1765, and agent-infra#2293 for the
+  # third). A load refusal clears when the box quietens and the controller re-dispatches next cycle; a
+  # DISK refusal never clears on its own — no amount of waiting frees a filesystem; a FORK refusal never
+  # clears on its own either AND the box cannot start the retry it is being told to wait for. Naming
+  # either un-clearable one "load gate" sends the operator to wait for an event that cannot fix it,
+  # which is the instrument false positive this file's callers exist to avoid.
   # ⛔ TOLERANT REFERENCE, AND THE REASON IS A REAL SKEW (review round 2, P2 — REPRODUCED). The daemon
   # executes `$O/<script>` and $O is seeded file by file (cloud-cell-supervisor.sh's seed_and_stamp),
   # so a NEW caller can run against an OLD `$O/spawn-gate.sh` — the pre-#1765 helper defines
@@ -220,8 +221,16 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # agent-infra#1720 failure the refund exists to prevent. The default is CORRECT, not merely safe: a
   # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
   # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
-  # survived.
-  if [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
+  # survived. The same tolerant default (74) covers AGENT_FORK_REFUSED: a pre-#2293 helper cannot
+  # return it, so the fork arm is inert on that tree and 74 falls through exactly as before.
+  #
+  # ⛔ FORK FIRST, AND IT IS THE P1 THE REVIEW FOUND: `run_agent` returns AGENT_FORK_REFUSED (74) for a
+  # box that is out of PROCESSES, and before this arm both that code and 75 reported "load gate:
+  # re-dispatched when 1-min load falls below MAX_LOAD" — a remedy for a box that cannot spawn the
+  # retry, and one that says nothing about the external restart that is the only thing that helps.
+  if [ "$ar" = "${AGENT_FORK_REFUSED:-74}" ]; then
+    why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
+  elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"

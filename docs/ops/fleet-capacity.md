@@ -94,6 +94,12 @@ The probe therefore reads, in this order, and refuses by the FIRST bound it hits
 1. **fork headroom** — `procs` (live process count) against `procs_max` (the smallest of `ulimit -u`,
    `kern.maxprocperuid`, and the cgroup `pids.max`), plus a **two-fork probe** (`fork=1|0`). Below
    `CAP_MIN_FORK_HEADROOM=200` spare processes the box is refused.
+   The cgroup arm reads **the caller's own cgroup**, resolved from `/proc/self/cgroup` (walking up to
+   the mount root), not just the mount root — measured on a fleet cell, `/sys/fs/cgroup/pids.max` does
+   not exist while `/system.slice/<svc>.service/pids.max` is `4692`, so a root-only read reports
+   `src=uid` and never sees the ceiling the box is actually bound by. The resolution uses builtins
+   only (`read`, parameter expansion), because it runs on the path whose whole purpose is a box that
+   cannot fork.
 2. **disk** — as §4's floors describe.
 3. **load** — last, because on a box that dies at fork before it gets CPU-busy it is the least
    informative of the three.
@@ -117,6 +123,14 @@ and when a box is starved it takes a builtin-only path: it writes a cycle record
 `fork=starved`) and naps on a FIFO opened at startup (`read -t` — no child process), then retries. The
 box still cannot be repaired from inside; what changes is that it is **alive and named** instead of
 vanishing into a respawn loop that cannot start.
+
+That path is builtins-only in the WRITER too: `cycle_record_write` builds its path and sanitises every
+field with parameter expansion (no `$( )`, no `tr`, no `mkdir` when the state dir already exists).
+Driven: `( ulimit -u 1; cycle_record_write … )` returns 0 and the record is on disk, where a
+substitution-based writer exits **254** having written nothing. A cycle whose clock cannot be read
+without a fork (bash 3.2 has no `printf '%(…)T`) records `start=0`, and `harness status` reports that
+record **UNREADABLE** — never `DEGRADED`-stale, which would tell an operator to restart a controller
+that is alive and writing.
 
 `bin/harness status` gains the verdict for that state:
 

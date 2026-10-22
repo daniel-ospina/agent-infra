@@ -588,6 +588,29 @@ cycle_now() {
   esac
 }
 
+# clock_seed — ANCHOR THE DERIVED CLOCK ONCE, AT STARTUP (review P1, agent-infra#2293).
+# bash 3.2 (macOS — what launchd's `/bin/bash` runs, per launchd.plist.template) has no `printf '%(…)T`,
+# so `cycle_now` DERIVES the epoch from `LAST_EPOCH + SECONDS - LAST_SECONDS`. The anchor used to be set
+# only from a MEASURED stamp — which the starved path cannot take — so a controller whose FIRST cycle
+# was held wrote `start=0` on every held cycle FOREVER (`_ft0` can never leave 0 once 0: setting the
+# anchor is exactly what the missing measurement would have done). Aged against epoch 0 that record is
+# "infinitely old", so `harness status` answered DEGRADED — "start it" — about a controller that was
+# alive and writing, which is the wrong remedy on the box that most needs the right one.
+# One measurement at startup costs nothing new: this script has already forked several times by here
+# (module resolution, mkdir, the FIFO), and NOTHING on the starved path forks after it.
+# A seed that cannot be taken leaves the 0-stamp path in place, which `cycle_verdict` reports as
+# UNREADABLE (`newest_record_unstamped`) — never as a stale record.
+clock_seed() {
+  [ -n "${LAST_EPOCH:-}" ] && [ -n "${LAST_SECONDS:-}" ] && return 0
+  local __s=""
+  printf -v __s '%(%s)T' -1 2>/dev/null || __s=""
+  case "$__s" in ''|*[!0-9]*) __s="$(date +%s 2>/dev/null)" ;; esac
+  case "$__s" in ''|*[!0-9]*|0) return 1 ;; esac
+  LAST_EPOCH="$__s"; LAST_SECONDS="$SECONDS"
+  return 0
+}
+clock_seed || true
+
 # fork_free_sleep <seconds> — wait WITHOUT spawning a process (rc 1 = no fork-free timer available).
 # `read -t` on a FIFO opened read-write blocks in select(2): no child, no exec. Verified under
 # `ulimit -u 5` on a box that could not fork at all: it waited the full 2s and returned 142.
@@ -604,10 +627,14 @@ fork_free_sleep() {
 }
 
 # fork_gate — THE FIRST READ OF THE CYCLE. Sets FORK_STATE (ok|starved|low|unknown) and FORK_WHY.
-# ⛔ ONE parent fork, and that is the design: `cap_procs_pair_vars` reads the count/ceiling in-process,
-# and the PROBE runs in a `( )` child so a refusal inside it costs the CHILD (rc 254) instead of the
-# controller. The single unavoidable risk is the child's own creation, and backoff bounds how often it
-# is attempted.
+# ⛔ THE GATE IS NOT FORK-FREE, AND AN EARLIER VERSION OF THIS COMMENT IMPLIED IT WAS (review P3). What
+# the design guarantees is narrower and is the part that matters: the PROBE runs in a `( )` child, so a
+# refusal inside it costs the CHILD (rc 254) instead of the controller. The PAIR READ spends real forks —
+# each `$( )` around a leaf reader is one, and macOS's process count is a `ps | wc | tr` pipeline — which
+# `capacity.sh` states plainly at `cap_procs_pair_vars` ("It is NOT claimed to be fork-free"). The
+# consequence is not hidden: on a box ALREADY at the wall this gate can die before it answers, which is
+# why the STARVED BRANCH below it is builtins-only and why a held cycle is entered as soon as headroom
+# reads LOW instead of waiting for the probe to fail.
 fork_gate() {
   FORK_STATE=unknown; FORK_WHY=""; FORK_STARVED=0; FORK_PROCS="?"; FORK_MAX="?"; FORK_HEADROOM="?"
   [ "${CAPACITY:-0}" = "1" ] && declare -f cap_procs_pair_vars >/dev/null 2>&1 || return 0
@@ -2119,10 +2146,22 @@ while true; do
   if [ "${FORK_STARVED:-0}" = "1" ]; then
     CYCLE_N=$(( ${CYCLE_N:-0} + 1 ))
     _ft0=""; cycle_now _ft0 || _ft0=0
-    [ -n "${_ft0:-}" ] && [ "${_ft0:-0}" != "0" ] && { LAST_EPOCH="$_ft0"; LAST_SECONDS="$SECONDS"; }
+    # ⛔ A READING OF 0 MEANS "NO CLOCK", NOT "EPOCH ZERO" (review P1). It must never refresh the
+    # anchor — that is what froze the derivation at 0 for the life of a bash-3.2 process — and it must
+    # never be stamped as if it were a measurement.
+    case "${_ft0:-}" in ''|*[!0-9]*|0) _ft0=0 ;; *) LAST_EPOCH="$_ft0"; LAST_SECONDS="$SECONDS" ;; esac
     # The heartbeat is written with a `printf` (a builtin), not `date`: a fresh heartbeat is what stops
     # a supervisor from concluding the controller is GONE and relaunching it into the same fork wall.
-    [ -n "${_ft0:-}" ] && printf '%s\n' "${_ft0}" > "$O/heartbeat" 2>/dev/null || true
+    # ⛔ BUT NEVER WITH A FABRICATED STAMP (review P1). A `0` here reads to every consumer as an epoch-0
+    # heartbeat — infinitely old — so the doctor reports a STALE controller about a box that is alive:
+    # a made-up reading in the one field that exists to prove liveness. No heartbeat, plus a NAMED
+    # reason, is the honest arm; the record still carries `start=0`, which `harness status` calls
+    # UNREADABLE rather than DEGRADED-stale.
+    if [ "$_ft0" != "0" ]; then
+      printf '%s\n' "${_ft0}" > "$O/heartbeat" 2>/dev/null || true
+    else
+      printf '[fork] heartbeat NOT stamped this cycle: no clock could be read without a fork (this shell has no fork-free epoch and this box cannot fork) — the cycle record carries start=0, which `harness status` reports as UNREADABLE, neither HEALTHY nor DEGRADED-stale\n' >> "$LOG" 2>/dev/null || true
+    fi
     _cr_fork="${FORK_STATE:-unknown}"; [ "$_cr_fork" = "ok" ] && _cr_fork="unknown"
     _cr_why="fork_exhausted"; _cr_bound="fork_probe"
     [ "${FORK_STATE:-unknown}" = "low" ] && { _cr_why="fork_headroom"; _cr_bound="fork_headroom"; }

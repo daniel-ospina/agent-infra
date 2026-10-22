@@ -228,7 +228,8 @@ cap_disk_free_mb() { # <path> — MiB free on the filesystem <path> lives on (df
   printf '%s' "$mb"
 }
 
-# ── FORK HEADROOM (agent-infra#2293) — read FIRST, and read so that it survives what it measures ──
+# ── FORK HEADROOM (agent-infra#2293) — read BEFORE the fields that cost a fork, and read so that it
+# survives what it measures ──
 # cap_ulimit_u -> this shell's per-uid process soft limit, or empty when there is none/ unreadable.
 # `ulimit -u` is a bash BUILTIN: it costs no fork, which is what makes it usable on a box that cannot
 # fork. "unlimited" (root on Linux) is NOT a number and is reported as empty = no ceiling.
@@ -304,6 +305,63 @@ cap_procs_pair() {
   printf '%s %s %s' "$_cpp_p" "$_cpp_m" "$_cpp_s"
 }
 
+# cap_cgroup_pair_vars <maxVar> <curVar> — the ATOMIC cgroup pair for THE CALLER'S OWN CGROUP, rc 1
+# when no readable pids.max/pids.current pair was found there.
+# ⛔ THE CALLER'S CGROUP, NOT ONLY THE ROOT (review P2, agent-infra#2293). Reading just
+# `/sys/fs/cgroup/pids.max` leaves this arm DEAD on every box whose processes live in a slice — measured
+# on a fleet cell: the root of the cgroup2 mount has NO pids.max at all, while `/proc/self/cgroup` names
+# `/system.slice/<svc>.service` and THAT directory's pids.max is 4692 (with pids.current beside it). The
+# arm still reported `src=uid` and the cgroup ceiling — the binding one — was never seen.
+# The dir is resolved from `/proc/self/cgroup` with BUILTINS ONLY (`read`, parameter expansion): a `$( )`
+# here would be a fork on the very path that exists for a box that cannot fork. ANCESTORS are walked
+# because a service's ceiling is as often set on the slice above it as on its own directory, and the
+# walk ends at the mount root. Both hierarchies are handled: v1 names the controller in the line
+# (`4:pids:/path`, whose mount is `<mount>/pids`) and v2 leaves it empty (`0::/path`, mounted at `<mount>`).
+# The two path seams exist so a test can drive a FIXTURE tree; both default to the real paths and are
+# read only here.
+cap_cgroup_pair_vars() {
+  local _cgb_mv="${1:-}" _cgb_cv="${2:-}" _cgb_file="${CAP_SELF_CGROUP_FILE:-/proc/self/cgroup}" \
+        _cgb_mount="${CAP_CGROUP_MOUNT:-/sys/fs/cgroup}" _cgb_line="" _cgb_hier="" _cgb_path="" \
+        _cgb_base="" _cgb_dir="" _cgb_f="" _cgb_max="" _cgb_cur="" _cgb_more=1
+  case "$_cgb_mv" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  case "$_cgb_cv" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  [ -r "$_cgb_file" ] || return 1
+  while IFS= read -r _cgb_line || [ -n "$_cgb_line" ]; do
+    [ -n "$_cgb_line" ] || continue
+    _cgb_hier="${_cgb_line#*:}"; _cgb_hier="${_cgb_hier%%:*}"   # v1 controller list; EMPTY on cgroup v2
+    _cgb_path="${_cgb_line##*:}"                                 # the cgroup path, mount-relative
+    # A v1 line for ANOTHER controller describes a tree with no pids files; skip it rather than build
+    # paths under a hierarchy this mount does not hold.
+    case "$_cgb_path" in /*) : ;; *) continue ;; esac
+    _cgb_base="$_cgb_mount"; [ -n "$_cgb_hier" ] && _cgb_base="$_cgb_mount/$_cgb_hier"
+    _cgb_dir="$_cgb_path"; case "$_cgb_dir" in /) _cgb_dir="" ;; esac
+    _cgb_more=1
+    while [ "$_cgb_more" = "1" ]; do
+      _cgb_f="${_cgb_base}${_cgb_dir}/pids.max"
+      if [ -r "$_cgb_f" ]; then
+        _cgb_max=""; read -r _cgb_max < "$_cgb_f" 2>/dev/null || _cgb_max=""
+        case "$_cgb_max" in ''|max|*[!0-9]*) : ;; *)
+          if [ "$_cgb_max" -ge 1 ]; then
+            _cgb_cur=""; read -r _cgb_cur < "${_cgb_f%/*}/pids.current" 2>/dev/null || _cgb_cur=""
+            case "$_cgb_cur" in ''|*[!0-9]*) : ;; *)
+              printf -v "$_cgb_mv" '%s' "$_cgb_max"
+              printf -v "$_cgb_cv" '%s' "$_cgb_cur"
+              return 0 ;;
+            esac
+          fi ;;
+        esac
+      fi
+      # Walk up: a deeper dir is the BINDING one, so the first readable pair wins and the root is
+      # tried last. `case` rather than `[ ]` so an empty dir ends the walk instead of looping.
+      case "$_cgb_dir" in
+        '') _cgb_more=0 ;;
+        *) _cgb_dir="${_cgb_dir%/*}" ;;
+      esac
+    done
+  done < "$_cgb_file"
+  return 1
+}
+
 # cap_procs_pair_vars <procsVar> <maxVar> <srcVar> — the SAME pair, written to variables instead of
 # stdout, so a caller that must not spend a `$( )` per reading still gets an atomic pair. (It is NOT
 # claimed to be fork-free: bash cannot capture a builtin's output — `ulimit -u` — without a subshell.
@@ -319,18 +377,25 @@ cap_procs_pair() {
 # this function with exactly the names the fail-open case used. `capacity-placement.test.sh` drives the
 # SHIPPED caller (`cap_procs_pair`) too: the second round of this bug was THAT caller's `_cp_p`/`_cp_m`
 # out-vars colliding with this function's working locals, which emptied every published record.
+# ⛔ AND THE cgroup ARM ABOVE IS THE FIRST CHOICE: it reads the ceiling the caller is ACTUALLY bound by.
 cap_procs_pair_vars() {
   local _pv="${1:-}" _mv="${2:-}" _sv="${3:-}" _cpv_best="" _cpv_besth="" _cpv_p _cpv_m _cpv_src _cpv_h _cpv_f _cpv_cur _cpv_max _cpv_hard
-  for _cpv_f in /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids/pids.max; do
-    [ -r "$_cpv_f" ] || continue
-    _cpv_max=""; read -r _cpv_max < "$_cpv_f" 2>/dev/null || _cpv_max=""
-    case "$_cpv_max" in ''|max|*[!0-9]*) continue ;; esac
-    [ "$_cpv_max" -ge 1 ] || continue
-    _cpv_cur=""; read -r _cpv_cur < "${_cpv_f%/*}/pids.current" 2>/dev/null || _cpv_cur=""
-    case "$_cpv_cur" in ''|*[!0-9]*) continue ;; esac
+  if cap_cgroup_pair_vars _cpv_max _cpv_cur; then
     _cpv_best="$_cpv_cur $_cpv_max cgroup"; _cpv_besth="$(cap_h_for "$_cpv_cur" "$_cpv_max")" || _cpv_besth=0
-    break
-  done
+  else
+    # The pre-#2293 root-only arms, kept as the fallback for a box with no readable `/proc/self/cgroup`
+    # (a `/proc`-less container, a chroot): they are correct where the caller IS the root cgroup.
+    for _cpv_f in /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids/pids.max; do
+      [ -r "$_cpv_f" ] || continue
+      _cpv_max=""; read -r _cpv_max < "$_cpv_f" 2>/dev/null || _cpv_max=""
+      case "$_cpv_max" in ''|max|*[!0-9]*) continue ;; esac
+      [ "$_cpv_max" -ge 1 ] || continue
+      _cpv_cur=""; read -r _cpv_cur < "${_cpv_f%/*}/pids.current" 2>/dev/null || _cpv_cur=""
+      case "$_cpv_cur" in ''|*[!0-9]*) continue ;; esac
+      _cpv_best="$_cpv_cur $_cpv_max cgroup"; _cpv_besth="$(cap_h_for "$_cpv_cur" "$_cpv_max")" || _cpv_besth=0
+      break
+    done
+  fi
   if _cpv_p="$(cap_procs_live)"; then
     _cpv_m="$(cap_ulimit_u)" || _cpv_m=0
     _cpv_hard="$(cap_maxprocperuid)" || _cpv_hard=""
@@ -409,13 +474,11 @@ cap_fork_bound() {
 # callers get a worktree count.
 cap_probe_local() {
   local repo="${1:-.}" lanes="${2:-}" ncpu load1 disk mem host at lpc fr
-  ncpu="$(cap_ncpu)"      || return 1
-  load1="$(cap_load1_100)" || return 1
-  disk="$(cap_disk_free_mb "$repo")" || return 1
-  mem="$(cap_mem_free_mb)" || return 1
-  # ── FORK HEADROOM FIRST (agent-infra#2293). It is read before the fields above are USED and it is
-  # the one read whose own failure is meaningful: a fork failure inside this substitution kills THIS
-  # probe process with rc 254, which the controller reads as `fork_exhausted`.
+  # ── FORK HEADROOM FIRST — GENUINELY FIRST NOW (review P3, agent-infra#2293). The header above claimed
+  # "read FIRST" while this line sat AFTER ncpu/load/disk/mem, each of which forks (an `awk` or a `df`),
+  # so a box with a few pids of headroom spent them and died before the read it most needed. Moving it
+  # up also makes the failure mode better, not worse: a fork failure inside this substitution kills THIS
+  # probe process with rc 254, which the controller reads as `fork_exhausted` a few forks sooner.
   fr="$(cap_fork_read 2>/dev/null)" || fr=""
   case "$fr" in
     *procs=*procs_max=*fork=*) : ;;
@@ -423,6 +486,10 @@ cap_probe_local() {
     # INELIGIBLE (fork_probe) instead of publishing a record that reads as unmeasured-but-fine.
     *) fr="procs=0 procs_max=0 fork=0 src=unreadable" ;;
   esac
+  ncpu="$(cap_ncpu)"      || return 1
+  load1="$(cap_load1_100)" || return 1
+  disk="$(cap_disk_free_mb "$repo")" || return 1
+  mem="$(cap_mem_free_mb)" || return 1
   if [ -z "$lanes" ]; then
     lanes="$(git -C "$repo" worktree list --porcelain 2>/dev/null | grep -c '^worktree .*lane-')" || lanes=0
   fi

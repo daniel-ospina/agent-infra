@@ -3241,7 +3241,20 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # (agent-infra#1709 rec 4): the shipped sleep is now `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))`,
   # so JIT must be in the extracted driver or the arithmetic fails. A bare `grep 'sleep "$CYC"'`
   # matched the pre-jitter form ONLY and silently extracted nothing once jitter landed.
-  awk '/^  JIT=/{f=1} f{print} f&&/& wait \$!$/{exit}' "$LOOP" > "$TMP/cycsleep.sh"
+  # ⛔ EXTRACT THROUGH THE ENCLOSING `fi`, NOT ONLY TO THE FIRST `& wait $!` (agent-infra#2293). The
+  # shipped nap is now `if [ "${FORK_STARVED:-0}" = "1" ]; then fork_free_sleep … ; else sleep … & wait $!; fi`,
+  # so ending the extraction at the `wait` line handed the driver an UNCLOSED `if` — `bash -n` failed and
+  # this whole section went red (4 checks) on a tree whose shipped code is correct. The lookahead is
+  # BOUNDED: a tree with no `fi` after the wait keeps the old behaviour (extract through the wait line)
+  # rather than swallowing the rest of orch-loop.sh into the driver.
+  awk '
+    /^  JIT=/ { f=1 }
+    f { buf[++n] = $0 }
+    f && /& wait \$!$/ { w = n }
+    f && w && /^  fi$/ { last = n; done = 1; exit }
+    f && w && (n - w) >= 8 { last = w; done = 1; exit }
+    END { m = (done ? last : n); for (i = 1; i <= m; i++) print buf[i] }
+  ' "$LOOP" > "$TMP/cycsleep.sh"
   if need "$TMP/cycsleep.sh" "the interruptible cycle sleep is extracted from the shipped orch-loop.sh"; then
     # The extraction must still carry the JITTER, or a revert to a fixed interval would pass the
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.

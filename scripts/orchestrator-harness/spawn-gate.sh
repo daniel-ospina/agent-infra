@@ -322,10 +322,15 @@ AGENT_DISK_REFUSED=77
 # depends on a `pi` that exits 75 for its own reason being read as STARTED. 76 is that signal, and
 # run_agent below translates it into AGENT_LOAD_REFUSED so no caller has to learn a new code.
 PI_GATE_REFUSED=76
-# The spawn point's FORK refusal. It is a FOURTH code for the third process's second gate: a `pi` that
-# exits 74 for its own reason must not be read as this gate's refusal any more than a 75 should, and
-# run_agent translates it into AGENT_FORK_REFUSED for the caller.
-PI_FORK_REFUSED=74
+# The spawn point's FORK refusal. It is a FOURTH code for the third process's second gate, and it is
+# ⛔ 78, NOT 74 (review P2, agent-infra#2293). 74 is where this file COLLIDES with itself: it is also
+# AGENT_FORK_REFUSED, the caller-facing translation, so `[ "$rc" = "$PI_FORK_REFUSED" ]` in run_agent
+# could not tell the shim's refusal from a real `pi` that simply exited 74 (EX_IOERR) — and a pi that
+# hit a disk I/O error would have been reported as "this box could not fork". The pair mirrors the load
+# gate exactly (76 at the spawn point, 75 for the caller), which is why the two differ by the same
+# margin: the spawn point's code is INTERNAL and run_agent translates it into AGENT_FORK_REFUSED, so no
+# caller ever learns a second code and no caller can collide with one either.
+PI_FORK_REFUSED=78
 # ── the fork reading, from the fleet's ONE instrument ──────────────────────────────────────────
 # ⛔ NOT A SECOND PROBE. `capacity.sh` already reads the process count against the per-uid/cgroup
 # ceiling and proves it with a two-fork probe; this file CONSUMES it. If the module cannot be found

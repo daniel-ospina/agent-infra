@@ -146,20 +146,29 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
-# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
-# exit 75 itself (#1720).
+# A gate refusal reports AGENT_FORK_REFUSED (74), AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77);
+# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
+# namespace and could exit 75 itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `load` and `disk` are the only
-  # two values the gate can refuse on; the disk one is chosen by the same code the exit status
-  # already distinguishes, so the two can never disagree.
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load` and `disk` are the
+  # three values the gate can refuse on, and each is chosen by the same exit status the code already
+  # distinguishes, so the record and the code can never disagree.
   if [ -n "${capacity_record:-}" ]; then
-    if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk; else _cap_gate=load; fi
+    # ⛔ FORK IS CONSUMED, NOT BUCKETED AS LOAD (review P1, agent-infra#2293). `run_agent` returns
+    # AGENT_FORK_REFUSED (74) for a box that is out of PROCESSES, and this branch used to fold every
+    # code except disk into `load` — publishing the remedy "re-dispatched when 1-min load falls" for a
+    # box that cannot even spawn the retry, which is exactly the rule spawn-gate.sh states at its own
+    # fork code ("a caller that reads a fork refusal as a load refusal retries forever on a box that
+    # cannot start a process to retry with"). The tolerant default keeps a pre-#2293
+    # `$O/spawn-gate.sh` — which can never return 74 — routing exactly as it did.
+    if [ "$rc" = "${AGENT_FORK_REFUSED:-74}" ]; then _cap_gate=fork
+    elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
+    else _cap_gate=load; fi
     _cap_now="$(date +%s)"
     if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + CAPACITY_YIELD_SECS ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
       echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
@@ -168,13 +177,17 @@ if [ "$AGENT_STARTED" = "0" ]; then
     fi
   fi
   # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
-  # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
-  # on a full filesystem waits for a remedy that cannot arrive.
+  # cleared by the box quietening, a disk refusal only by reclaiming space, and a FORK refusal only
+  # from OUTSIDE the box (agent-infra#2293). An operator told "load" on a full filesystem waits for a
+  # remedy that cannot arrive; told "load" on a fork-exhausted box, the retry itself cannot start.
   # ⛔ TOLERANT REFERENCE (review round 2, P2). `$O` is seeded file by file, so a NEW lane.sh can run
   # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
   # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
-  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
-  if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
+  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch;
+  # a pre-#2293 one cannot return 74, so the fork default routes there too.
+  if [ "$rc" = "${AGENT_FORK_REFUSED:-74}" ]; then
+    echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   else
     echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"

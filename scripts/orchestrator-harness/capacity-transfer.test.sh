@@ -179,6 +179,43 @@ ck "a DISK refusal (exit 77) records gate='disk' (rc=$l8rc, gate='${dgate:-<none
 { [ -s "$DF_FUNC_MARK" ]; }; rc=$?
 ck "  …and the exported df stub answered (not a real filesystem reading — a PATH stub loses to the scripts' PATH prepend)" $rc
 
+# ── THE FORK REFUSAL IS CONSUMED AS `fork`, NOT BUCKETED AS `load` (review P1, agent-infra#2293) ──
+# `spawn-gate.sh` gained a THIRD refusal code (74, fork) before the disk (77) and load (75) gates, and
+# its own comment states the contract this arm pins: "a caller that reads a fork refusal as a load
+# refusal retries forever on a box that cannot start a process to retry with." Before this arm the
+# writer folded every code except disk into `load`, so a fork refusal published the LOAD remedy and
+# its remedy line said "load gate" — the two failures the issue names.
+# Driven through the SHIPPED lane.sh: only the headroom SOURCE is faked (10 spare pids against the
+# shipped 200 margin), by exporting the two capacity functions the gate consumes, so the gate, the
+# refusal code, the record and the log line are all the real ones.
+rm -f "$O/state/capacity-refused-17"
+( cd "$TMP"
+  # shellcheck shell=bash
+  cap_procs_pair_vars() { printf -v "$1" '%s' 15631; printf -v "$2" '%s' 15641; printf -v "$3" '%s' uid; }
+  cap_h_for_vars() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+    printf -v "$3" '%s' "$(( $2 - $1 ))"
+  }
+  export -f cap_procs_pair_vars cap_h_for_vars
+  O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" CAPACITY_YIELD_SECS=$LANE_YIELD \
+    bash "$LANE" 17 feat/17-tm daniel-ospina/agent-infra
+) > "$TMP/lane17.out" 2>&1
+l17rc=$?
+fgate=""
+[ -f "$O/state/capacity-refused-17" ] && { read -r _fg1 _fg2 fgate < "$O/state/capacity-refused-17"; }
+{ [ "$l17rc" -eq 74 ] && [ "${fgate:-}" = "fork" ]; }; rc=$?
+ck "a FORK refusal (exit 74) records gate='fork', and is NOT bucketed as 'load' (rc=$l17rc, gate='${fgate:-<none>}')" $rc
+L17LOG="$(cat "$O/logs/lane-17.log" 2>/dev/null)"
+grep -q 'FORK gate refused' <<<"$L17LOG"; rc=$?
+ck "  …and the lane log names the FORK remedy (restart or drain the box from outside), not a load wait" $rc
+grep -q 'load gate refused' <<<"$L17LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "  …and it is NOT reported as a load refusal — the remedies are opposite, and one of them cannot work" $rc
+grep -q 'disk-gate' <<<"$L17LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "  …and the disk gate never ran (fork is evaluated first, so the un-clearable cause is the one named)" $rc
+
 # A lane that DOES run supersedes an old refusal: otherwise a later chain for the same issue could
 # read the stale record. (The epoch bound already protects it; this keeps the state dir clean.)
 #
