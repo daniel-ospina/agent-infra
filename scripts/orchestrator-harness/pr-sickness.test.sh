@@ -126,7 +126,7 @@ wait_surface() {
   "details_url":"https://github.com/example/repo/actions/runs/201/job/501"}]}
 J
 }
-pulls_one() { printf '[{"number":%s,"head":{"sha":"%s","ref":"fix/sick-%s"},"draft":false}]\n' "$1" "$2" "$1" > "$FIX/pulls.json"; }
+pulls_one() { printf '[{"number":%s,"head":{"sha":"%s","ref":"fix/sick-%s","repo":{"full_name":"%s"}},"draft":false}]\n' "$1" "$2" "$1" "$OR" > "$FIX/pulls.json"; }
 # ⛔ NO GLOBBED DISCARD ANYWHERE IN THIS FILE: the checkout guard reads a script's discards
 # statically and fails the whole suite closed when one carries a wildcard (#709). Every reset
 # removes an EXPLICIT directory and recreates it.
@@ -273,6 +273,86 @@ c_token="$(token_of "$TMP/mut-nopolarity.sh" "$sha_wait" | cut -f1)"
 tok="$(pol_of "$TMP/mut-nopolarity.sh" "$TMP/rows-empty" 2>/dev/null)"
 [ "$tok" = "NOREAD" ] && bad "(d) still passes on the polarity-deleted mutant (got NOREAD)" \
                       || ok "(d) FAILS on the mutant: the classifier is gone (got '${tok:-<empty>}')"
+
+echo "══ (g) the deferral ledger never resurrects a dead PR, and never starves the enumeration"
+# a row for a MERGED/CLOSED PR (absent from the open listing) must be dropped, not dispatched
+green_surface() { # <sha>
+  printf '{"total_count":1,"check_runs":[{"id":1,"name":"unit","app":{"slug":"github-actions"},"status":"completed","conclusion":"success","details_url":""}]}\n' > "$FIX/surface-$1.json"
+}
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '%s\t%s\t%s\t%s\t%s\n' "$OR" 999 deadbeef1234 docs-lint fix/dead-999 >> "$STATE/prsick-deferred.tsv"
+out="$(run_pass)"
+has "$out" "#999 left the open set" "a deferral row for a PR that is no longer open is DROPPED, and said out loud"
+no "$out" "dispatch fix-999" "no fixer is spawned for a merged/closed PR on a dead head"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "and the live red PR is still dispatched normally"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '%s\t%s\t%s\t%s\t%s\n' "$OR" 77 0000000000aa docs-lint fix/sick-77 >> "$STATE/prsick-deferred.tsv"
+out="$(run_pass)"
+has "$out" "#77 head moved" "a row whose HEAD MOVED is dropped (a new head is new work)"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "and the NEW head is decided by the enumeration"
+# starvation: 10 rows for GREEN PRs must not consume every pass's budget forever
+reset_all
+{ i=1; while [ "$i" -le 10 ]; do printf '%s\t%s\t%s\t%s\t%s\n' "$OR" "$i" "aaaa000$i" "?" "fix/g$i"; green_surface "aaaa000$i"; i=$((i+1)); done; } >> "$STATE/prsick-deferred.tsv"
+{ printf '['; i=1; while [ "$i" -le 10 ]; do printf '{"number":%s,"head":{"sha":"aaaa000%s","ref":"fix/g%s","repo":{"full_name":"%s"}},"draft":false},' "$i" "$i" "$i" "$OR"; i=$((i+1)); done;
+  printf '{"number":11,"head":{"sha":"%s","ref":"fix/sick-11","repo":{"full_name":"%s"}},"draft":false}]\n' "$sha_red" "$OR"; } > "$FIX/pulls.json"
+red_surface "$sha_red"
+run_pass >/dev/null
+n="$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)"
+[ "${n:-0}" -lt 10 ] && ok "decided ledger rows are DROPPED (ledger shrank to ${n:-0} from 10) — they cannot starve the pass" \
+  || bad "the green ledger rows were never dropped (still ${n:-0}) — they will consume the budget every pass"
+out="$(run_pass)"
+has "$out" "dispatch fix-11" "the red PR BEHIND the ledger is reached on the next pass (the cursor advances)"
+
+# ⚠️ the probe above must not depend on the file surviving: reset before the next case
+reset_all
+
+# (h) a SPAWN-GATE refusal is refunded — `fixgate-<PR>-<HEAD>` is `fix-one.sh`'s marker, and only the
+# red-fixer role consumed it before; without the refund two load refusals read as "needs a human".
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+sha12="$(printf '%s' "$sha_red" | cut -c1-12)"
+printf '2\n' > "$STATE/psick-77-$sha12"          # budget already exhausted by two prior attempts
+: > "$STATE/fixgate-77-$sha_red"                  # …both of which were GATE refusals: no agent ran
+out="$(run_pass)"
+has "$out" "a gate refusal at head=$sha12 was not an attempt" "the refusal is REFUNDED and named"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "so the exhausted budget does not become a false 'needs a human'"
+# non-vacuity: without the marker the SAME state is exhausted and nothing is dispatched
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '2\n' > "$STATE/psick-77-$sha12"
+out="$(run_pass)"
+has "$out" "skip #77: budget exhausted" "(control) with no refusal marker the budget binds and nothing is spawned"
+eq "$(spawns)" "0" "(control) no spawn"
+
+# (i) the DELEGATED ci-queue verdict: ciq_verdict's rc IS its contract (0=deep, 1=ok, 2=unknown).
+# Pinned here because ci-queue.sh lives on a sibling branch: a guessed mapping would either defer
+# forever or dispatch INTO a deep queue.
+cat > "$TMP/ciq.sh" <<'CIQ'
+ciq_verdict() {
+  CIQ_QUEUED="${STUB_CIQ_Q:-0}"; CIQ_RUNNERS="${STUB_CIQ_R:-1}"; CIQ_CEILING="${STUB_CIQ_C:-2}"
+  printf '%s\n' "${STUB_CIQ_TOK:-token}"
+  return "${STUB_CIQ_RC:-1}"
+}
+CIQ
+tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=0 STUB_CIQ_Q=100 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
+eq "$(printf '%s' "$tok" | cut -f1)" "deep" "delegated rc=0 (ciq deep) ⇒ DEFER"
+tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=1 STUB_CIQ_Q=2 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
+eq "$(printf '%s' "$tok" | cut -f1)" "ok" "delegated rc=1 (ciq ok) ⇒ SEND"
+tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=2 STUB_CIQ_Q=5 STUB_CIQ_R=5 ps_queue_verdict "$OR" )"
+eq "$(printf '%s' "$tok" | cut -f1)" "unknown" "delegated rc=2 (ciq unknown) ⇒ DEFER (never open the gate)"
+
+# (j) a FORK PR and a shell-ish ref are refused WITH A REASON (fix-one.sh would abort after the
+# attempt was booked, which reads as 'needs a human' for a PR this queue can never fix).
+reset_all; red_surface "$sha_red"
+printf '[{"number":90,"head":{"sha":"%s","ref":"fix/from-a-fork","repo":{"full_name":"someone-else/repo"}},"draft":false}]\n' "$sha_red" > "$FIX/pulls.json"
+out="$(run_pass)"
+has "$out" "skip #90: fork PR" "a FORK PR is skipped, with the reason"
+eq "$(spawns)" "0" "and nothing is spawned for it"
+reset_all; red_surface "$sha_red"
+printf '[{"number":91,"head":{"sha":"%s","ref":"evil;rm -rf /","repo":{"full_name":"%s"}},"draft":false}]\n' "$sha_red" "$OR" > "$FIX/pulls.json"
+out="$(run_pass)"
+has "$out" "skip #91: unsafe or empty branch name" "an unsafe ref is refused with the reason"
+eq "$(spawns)" "0" "and no shell ever sees it"
+
+reset_all
 
 echo "══ per-test non-vacuity: each behaviour has a targeted mutation that reddens it"
 mut() { # <name> <exact-old> <exact-new> -> prints the mutant path

@@ -121,8 +121,9 @@ ps_open_prs() {
       "$repo" "$rc" "${#out}"
     return 2
   fi
-  printf '%s' "$out" | python3 -c '
-import sys, json
+  printf '%s' "$out" | REPO="$repo" python3 -c '
+import sys, json, os
+REPO = os.environ.get("REPO") or ""
 # one object per page: concatenate the streams first, then walk each array
 dec = json.JSONDecoder(); s = sys.stdin.read(); i = 0
 rows = []
@@ -141,7 +142,14 @@ for p in rows:
     head = p.get("head") or {}
     sha = str(head.get("sha") or "")
     br = str(head.get("ref") or "")
-    print("%d\t%s\t%s\t%d" % (n, sha, br.replace("\t","").replace("\n",""), 1 if p.get("draft") else 0))
+    # ⛔ A FORK HEAD REF DOES NOT EXIST IN THIS REPO, so a fixer can never materialise a worktree
+    # for it — fix-one.sh aborts at materialisation AFTER the attempt was booked, which reads as
+    # "still red after N fixes — needs a human" for a PR this queue could never fix. Flagged here so
+    # the selector skips it WITH A REASON instead of paying for the discovery.
+    hr = head.get("repo")
+    # AN ABSENT repo KEY IS NOT EVIDENCE OF A FORK: only a NAMED repo that differs is one.
+    fork = 1 if isinstance(hr, dict) and str(hr.get("full_name") or "") not in ("", REPO) else 0
+    print("%d\t%s\t%s\t%d\t%d" % (n, sha, br.replace("\t","").replace("\n",""), 1 if p.get("draft") else 0, fork))
 ' 2>/dev/null
   return 0
 }
@@ -329,6 +337,13 @@ ps_brief() {
 # ps_held <or> <pr> <sha> -> prints the holder; rc 0 HELD, 1 FREE, 2 UNKNOWN (treated as HELD).
 ps_held() {
   local repo="$1" pr="$2" sha="$3" lock p why rc
+  # ⛔ NO LIVENESS PRIMITIVE IS _UNKNOWN_, NOT FREE. `ps_alive` returning "no" because nothing defines
+  # it would make every PR look unheld and duplicate whatever is actually running — an abstention is
+  # not permission. The controller always defines `wt_alive`; the standalone CLI may not.
+  if ! declare -f wt_alive >/dev/null 2>&1 && ! declare -f ps_alive_stub >/dev/null 2>&1; then
+    printf 'no liveness primitive is loaded (neither wt_alive nor a stub) — cannot tell whether a lane holds PR #%s, so it is treated as held' "$pr"
+    return 2
+  fi
   lock="$(ps_state_dir)/mergeclaim-$pr.lock"
   if [ -f "$lock" ]; then
     p="$(cat "$lock" 2>/dev/null || echo 0)"
@@ -415,15 +430,28 @@ ps_defer_drop() { # <repo> <pr> <sha>
 }
 
 # ── 7. ONE PR'S DECISION, AND THE DISPATCH ────────────────────────────────────────────────────
-# ps_decide <or> <pr> <sha> <branch> -> prints ONE decision line; rc 0 = dispatched.
+# ps_decide <or> <pr> <sha> <branch> [fork] -> prints ONE decision line; rc 0 = dispatched.
 # The four shapes (the operator's grep):
 #   RED #<pr> <check> -> dispatch <tag>
 #   skip #<pr>: in flight
 #   skip #<pr>: held by <lane>
 #   skip #<pr>: backpressure(q=NNN,r=N)
-# plus named refusals for the budget / park / blank / no-verdict cases — never silence.
+# plus named refusals for the budget / park / draft / fork / unsafe-ref / no-verdict cases — never
+# silence.
 ps_decide() {
-  local repo="$1" pr="$2" sha="$3" br="$4" tok rc group rid jid cc reds holder hrc budget bf bcnt tag brief cmd
+  local repo="$1" pr="$2" sha="$3" br="$4" fork="${5:-0}" tok rc group rid jid cc reds holder hrc budget bf bcnt tag brief cmd gatef
+  # ── THE REF MUST NOT BE ABLE TO REACH A SHELL, AND THE FIXER MUST BE ABLE TO CHECK IT OUT ────
+  # The argv file already keeps API data out of the spawn line; this is the OTHER half the sweep
+  # enforces (`safe_ref`): a fork's head ref does not exist in this repo, and a ref with a shell-ish
+  # or git-illegal shape makes fix-one.sh abort at worktree materialisation — AFTER the attempt was
+  # booked, which reads as "needs a human" for a PR we can never fix.
+  if [ "$fork" = "1" ]; then
+    printf 'skip #%s: fork PR (its head branch is not in this repo — a fixer cannot materialise it)\n' "$pr"
+    return 1
+  fi
+  case "${br:-}" in
+    ''|[-.]*|*..*|*[!A-Za-z0-9._/-]*) printf 'skip #%s: unsafe or empty branch name (%s) — not acted on\n' "$pr" "${br:-<empty>}"; return 1 ;;
+  esac
   tok="$(ps_verdict "$repo" "$sha")"; rc=$?
   case "$tok" in
     NOREAD*)
@@ -456,6 +484,21 @@ ps_decide() {
     return 1
   fi
   budget="$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)"
+  # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT. `fix-one.sh` books the marker `fixgate-<PR>-<HEAD>` when a
+  # load/disk gate refused the agent (it is the only party that knows nothing ran) and the controller
+  # is supposed to consume it. The red-fixer role consumes it; THIS role booked the same kind of
+  # head-keyed attempt, so it must refund it too — otherwise two load refusals (the normal state on a
+  # busy box) exhaust the budget and print "needs a human" about a PR where no agent ever started.
+  gatef="$(ps_state_dir)/fixgate-$pr-$sha"
+  if [ -f "$gatef" ]; then
+    bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+    if [ "$bcnt" -gt 0 ]; then
+      printf '%s\n' "$((bcnt - 1))" > "$budget" 2>/dev/null || true
+      printf '[prsick] #%s a gate refusal at head=%s was not an attempt — budget refunded %s -> %s\n' \
+        "$pr" "${sha:0:12}" "$bcnt" "$((bcnt - 1))"
+    fi
+    rm -f "$gatef" 2>/dev/null || true
+  fi
   bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
   if [ "$bcnt" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; then
     printf 'skip #%s: budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
@@ -508,6 +551,11 @@ ps_decide() {
   if declare -f dispreplace >/dev/null 2>&1; then
     dispreplace "$pr" "$sha" "SICK:$group" act "sickness fixer spawned from the failure itself ($group)"
   fi
+  # Prune this PR's superseded per-head budget files with the head we KNOW (never a glob): a new head
+  # is new work, and the old tree's counter can never be reached again.
+  if [ -n "${PS_PREV_HEAD:-}" ] && [ "${PS_PREV_HEAD:-}" != "$sha" ]; then
+    rm -f "$(ps_state_dir)/psick-$pr-$(printf '%s' "$PS_PREV_HEAD" | cut -c1-12)" 2>/dev/null || true
+  fi
   printf 'RED #%s %s -> dispatch %s\n' "$pr" "$group" "$tag"
   return 0
 }
@@ -515,12 +563,22 @@ ps_decide() {
 # ── 8. THE PASS ───────────────────────────────────────────────────────────────────────────────
 # ps_select [--repo OR] [--limit N] [--dry-run] [--max-spawn N] [--verbose]
 # Prints one line per decision. Never spawns two fixers for one PR, and never for a held one.
-# `--max-spawn` is the caller's MEASURED capacity (orch-loop.sh passes `fix_slots`), so this queue
-# adds no lane ceiling of its own: when the allowance is spent the REMAINING red PRs are DEFERRED to
-# disk (they come back on the next pass), never dropped and never spawned past the box's capacity.
+# `--max-spawn` is the caller's MEASURED capacity (orch-loop.sh passes the remaining fix-lane
+# headroom), so this queue adds no lane ceiling of its own: when the allowance is spent the REMAINING
+# red PRs are DEFERRED to disk (they come back on the next pass), never dropped and never spawned past
+# the box's capacity.
+#
+# ⛔ THE ORDER IS ENUMERATE-THEN-DRAIN, AND THAT IS A CORRECTNESS PROPERTY, NOT A PREFERENCE. A
+# deferral row is a memory of a decision, not evidence that the PR is still work: draining it FIRST
+# and trusting it (a) dispatched fixers for MERGED PRs on a dead head — a paid lane against a branch
+# that no longer exists — and (b) let a ledger of rows for green/held PRs consume the whole read
+# budget every pass, so the cursor never advanced and a red PR behind the ledger was never inspected
+# at all. So the OPEN LISTING is the authority: a row whose PR is gone is dropped (and its budget
+# pruned), a row whose head moved is dropped (a new head is new work), and a row that survives is
+# decided only after being REMOVED (re-appended by the decision itself if it is still deferred).
 ps_select() {
-  local repo="" limit="" dry="${PS_DRY_RUN:-0}" verb=0 rows rc n seen=0 dispatched=0 maxspawn=""
-  DISPATCHED_PRS=""
+  local repo="" limit="" dry="${PS_DRY_RUN:-0}" verb=0 rows rc seen=0 dispatched=0 maxspawn=""
+  DISPATCHED_PRS=""; SEEN_PRS=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) repo="${2:-}"; shift 2 ;;
@@ -553,62 +611,86 @@ ps_select() {
     esac
   fi
 
-  # ── deferred items FIRST (they were charged last pass) ────────────────────────────────────
-  local drepo dpr dsha dchk dbr
+  # ── 1. ENUMERATE (the open listing is the authority for what MAY be dispatched) ────────────
+  rows="$(ps_open_prs "$repo")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '[prsick] ENUMERATION FAILED — %s\n' "$rows"
+    return 2
+  fi
+  local total
+  total="$(printf '%s\n' "$rows" | grep -c . 2>/dev/null)"
+  ps_is_num "${total:-}" || total=0
+
+  # ── 2. RECONCILE THE DEFERRAL LEDGER AGAINST IT, THEN DRAIN WHAT SURVIVES ─────────────────
+  local drepo dpr dsha dchk dbr live keptf
+  keptf="$(ps_state_dir)/prsick-kept.$$"
+  : > "$keptf" 2>/dev/null || keptf=/dev/null
   while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
     [ -n "${dpr:-}" ] || continue
     [ "$drepo" = "$repo" ] || continue
     ps_is_num "$dpr" || continue
-    # ⛔ A PR DISPATCHED EARLIER IN THIS PASS IS HELD FOR THE REST OF IT. The deferral queue is drained
-    # first and the enumeration then reaches the same PR again; without this the pass would spawn TWO
-    # fixers for one PR (the only thing a live session would have caught is the one a stub cannot
-    # see). One live fixer per PR is a property of the PASS, not only of the process table.
-    case " ${DISPATCHED_PRS:-} " in *" $dpr "*) continue ;; esac
-    if [ "$qrc" -ne 0 ]; then
-      # still deep: keep it queued, say so once (not once per item: the [prsick] line above owns that)
+    live="$(printf '%s\n' "$rows" | awk -F'\t' -v p="$dpr" '$1==p{print $2; exit}')"
+    if [ -z "${live:-}" ]; then
+      printf '[prsick] #%s left the open set (merged or closed) — its deferral row is dropped and nothing is dispatched for it\n' "$dpr"
+      rm -f "$(ps_state_dir)/psick-$dpr-$(printf '%s' "$dsha" | cut -c1-12)" 2>/dev/null || true
+      ps_defer_drop "$repo" "$dpr" "$dsha"
       continue
     fi
-    if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
-      ps_defer_append "$repo" "$dpr" "$dsha" "$dchk" "$dbr"
-      printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$dpr" "$dispatched" "$maxspawn"
-      seen=$((seen+1))
-      [ "$seen" -ge "$limit" ] && break
+    if [ "${live:-}" != "${dsha:-}" ]; then
+      printf '[prsick] #%s head moved %s -> %s — its old deferral row is dropped (a new head is new work)\n' \
+        "$dpr" "${dsha:0:12}" "${live:0:12}"
+      rm -f "$(ps_state_dir)/psick-$dpr-$(printf '%s' "$dsha" | cut -c1-12)" 2>/dev/null || true
+      ps_defer_drop "$repo" "$dpr" "$dsha"
       continue
     fi
-    if ps_decide "$repo" "$dpr" "$dsha" "$dbr"; then dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS:-} $dpr"; fi
-    seen=$((seen+1))
-    [ "$seen" -ge "$limit" ] && break
-  done <<EOF
-$(ps_defer_list)
-EOF
+    # ⛔ FIXTURE TEST SHIM: keptf is a TAB-delimited row, appended with printf (not a field-join).
+    printf '%s\t%s\t%s\t%s\t%s\n' "$drepo" "$dpr" "$dsha" "$dchk" "$dbr" >> "$keptf" 2>/dev/null || true
+  done < "$(ps_defer_file)"
 
-  # ── then the enumeration ──────────────────────────────────────────────────────────────────
-  rows="$(ps_open_prs "$repo")"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    # (d) at the LISTING level: a failed enumeration is a named error, never "no sick PRs".
-    printf '[prsick] ENUMERATION FAILED — %s\n' "$rows"
-    return 2
+  if [ "$qrc" -eq 0 ]; then
+    while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
+      [ -n "${dpr:-}" ] || continue
+      if [ "$seen" -ge "$limit" ]; then break; fi
+      # REMOVE FIRST, then decide: `ps_decide` re-appends the row when its own gate defers, so the
+      # ledger survives exactly as long as the DEFERRAL does. Draining the row instead let green /
+      # in-flight / held rows live forever and eat the whole budget (measured: a 10-row ledger
+      # starved the enumeration on a 25-PR repo, cursor frozen).
+      ps_defer_drop "$repo" "$dpr" "$dsha"
+      SEEN_PRS="${SEEN_PRS} $dpr"
+      seen=$((seen+1))
+      if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
+        ps_defer_append "$repo" "$dpr" "$dsha" "$dchk" "$dbr"
+        printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$dpr" "$dispatched" "$maxspawn"
+        continue
+      fi
+      if ps_decide "$repo" "$dpr" "$dsha" "$dbr"; then
+        dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS} $dpr"
+      fi
+    done < "$keptf"
   fi
-  local pr sha br draft cursor total start idx
+  [ "$keptf" = "/dev/null" ] || rm -f "$keptf" 2>/dev/null || true
+
+  # ── 3. THEN THE ENUMERATION, ROUND-ROBIN ──────────────────────────────────────────────────
+  local pr sha br draft fork cursor start idx qn rn
   cursor="$(ps_state_dir)/prsick-cursor"
-  total="$(printf '%s\n' "$rows" | grep -c . 2>/dev/null || echo 0)"
   start="$(cat "$cursor" 2>/dev/null || echo 0)"; ps_is_num "${start:-}" || start=0
-  [ "$total" -gt 0 ] && start=$(( start % total )) || start=0
+  if [ "$total" -gt 0 ]; then start=$(( start % total )); else start=0; fi
   idx=0
-  while IFS="$(printf '\t')" read -r pr sha br draft; do
+  while IFS="$(printf '\t')" read -r pr sha br draft fork; do
     [ -n "${pr:-}" ] || continue
     ps_is_num "$pr" || continue
-    case " ${DISPATCHED_PRS:-} " in *" $pr "*) continue ;; esac   # one fixer per PR per PASS
-    # round-robin: skip until the cursor, wrap, and stop at the read budget
-    if [ "$total" -gt 0 ]; then
-      if [ "$idx" -lt "$start" ]; then idx=$((idx+1)); continue; fi
-    fi
+    case " ${DISPATCHED_PRS:-} ${SEEN_PRS:-} " in *" $pr "*) continue ;; esac   # one decision per PR per PASS
+    # round-robin: skip until the cursor, then stop at the read budget
+    if [ "$total" -gt 0 ] && [ "$idx" -lt "$start" ]; then idx=$((idx+1)); continue; fi
     if [ "$seen" -ge "$limit" ]; then break; fi
-    idx=$((idx+1)); seen=$((seen+1))
+    idx=$((idx+1)); seen=$((seen+1)); SEEN_PRS="${SEEN_PRS} $pr"
     [ "${draft:-0}" = "1" ] && { [ "$verb" = "1" ] && printf 'skip #%s: draft (not sick PR work)\n' "$pr"; continue; }
+    if [ "${fork:-0}" = "1" ]; then
+      printf 'skip #%s: fork PR (its head branch is not in this repo — a fixer cannot materialise it)\n' "$pr"
+      continue
+    fi
     if [ "$qrc" -ne 0 ]; then
       # The queue gate already spoke; record the item so it is not lost, and do not read N surfaces.
-      local qn rn
       qn="$(printf '%s' "$qfields" | sed -n 's/.*q=\([0-9]*\).*/\1/p')"
       rn="$(printf '%s' "$qfields" | sed -n 's/.*r=\([0-9~]*\).*/\1/p')"
       ps_defer_append "$repo" "$pr" "$sha" "?" "$br"
@@ -620,13 +702,17 @@ EOF
       printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$pr" "$dispatched" "$maxspawn"
       continue
     fi
-    if ps_decide "$repo" "$pr" "$sha" "$br"; then dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS:-} $pr"; fi
+    if ps_decide "$repo" "$pr" "$sha" "$br" "$fork"; then
+      dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS} $pr"
+    fi
   done <<EOF
 $rows
 EOF
-  printf '%s\n' "$idx" > "$cursor" 2>/dev/null || true
+  # ⛔ THE CURSOR ADVANCES BY WHAT WAS INSPECTED, NOT BY WHERE THE LOOP BROKE. Writing `idx` froze it
+  # whenever the budget ran out before the cursor was reached, so the PRs past it were never visited.
+  if [ "$total" -gt 0 ]; then printf '%s\n' "$(( (start + seen) % total ))" > "$cursor" 2>/dev/null || true; fi
   [ "$verb" = "1" ] && printf '[prsick] pass done: inspected=%s dispatched=%s deferred=%s (queue source: %s)\n' \
-    "$seen" "$dispatched" "$(ps_defer_list | grep -c . 2>/dev/null || echo 0)" "$qsrc"
+    "$seen" "$dispatched" "$(ps_defer_list | wc -l | tr -d ' ')" "$qsrc"
   return 0
 }
 

@@ -3921,6 +3921,35 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   # path stays shut, and named nowhere.
   # ⛔ NO gh CALL HERE. `OPEN_ROWS` is the same row set the count was taken from; a disposition that
   # cost a request per PR would make the honesty repair the most expensive thing in the cycle.
+  # ── THE PR SICKNESS QUEUE — BESIDE THE ISSUE SELECTION, IN THE SAME CYCLE ───────────────────
+  # [prsick-pass:begin] (extracted and DRIVEN by pr-sickness.test.sh — keep the markers)
+  # ⛔ WHY HERE (BEFORE THE LEDGER'S SUMMARISER, NOT AFTER IT). The pass runs after the SWEEP (the
+  # sweep's own arms own the required-red checks and the rail-refusal role owns a refused tree; this
+  # queue's job is what is LEFT), and `dispreplace` SUPERSEDES the "no arm" wait row the sweep wrote
+  # for the PR (one row per PR per cycle, #2126's invariant). It must land BEFORE the `[prsum]` tally
+  # reads the ledger, or the cycle reports "NO UNIT SPAWNED" and `FIRST_PR=-` while an `act` row
+  # exists — the funnel claiming the opposite of what happened, the same #2126 defect mirrored.
+  # ⛔ NOT WHILE AUTHORITY IS UNKNOWN: that is the same fail-closed state the sweep refuses to spawn
+  # in, and a paid lane is the one thing it must not hand out (agent-infra#1764).
+  if [ "${PRSICK:-0}" = "1" ] && [ "${PS_ON:-1}" = "1" ] && [ "${AUTHORITY_UNKNOWN:-0}" != "1" ]; then
+    # ⛔ THE ALLOWANCE IS THE REMAINING HEADROOM, NOT THE CEILING. `fix_slots` is the CONCURRENT
+    # fixer ceiling every other spawn site enforces as `[ "$(wt_count fix-)" -lt "$MF" ]`; passing it
+    # as a per-pass allowance would let one cycle add a full ceiling on top of the fixers the sweep
+    # already started (2x the cap the [cap] line reports, each a paid agent + worktree). Headroom is
+    # a MEASURED read of what is actually running, so this stays a capacity gate and not a lane cap.
+    PS_MAXSPAWN=$(( $(fix_slots "${UPN:-0}") - $(wt_count fix-) ))
+    is_num "${PS_MAXSPAWN:-}" || PS_MAXSPAWN=0
+    [ "$PS_MAXSPAWN" -lt 0 ] && PS_MAXSPAWN=0
+    PS_STATE_DIR="$O/state" PS_OR="$OR" PS_REPO_PATH="$REPO" PS_SPAWN_CWD="$SPAWN_CWD" \
+      ps_select --repo "$OR" --max-spawn "$PS_MAXSPAWN" --verbose >> "$LOG" 2>&1
+    _ps_rc=$?
+    # ⛔ A FAILED PASS IS ITS OWN LINE, never an empty one. `ps_select` already names the cause (its
+    # ENUMERATION FAILED / NOREAD lines land in $LOG above); this records that the QUEUE was not
+    # evaluated, so "no [prsick] decisions" can never be read as "no sick PRs".
+    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION/backpressure line above" >> "$LOG"
+  fi
+  # [prsick-pass:end]
+
   # [prdisp-apply:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
   for _tok in ${OPEN_ROWS:-}; do
     _p="${_tok%%:*}"; _rest="${_tok#*:}"; _osha="${_rest%%:*}"; _obr="${_rest#*:}"
@@ -4002,27 +4031,6 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   if [ -n "${PRDISP_FIRST:-}" ]; then FIRST_PR="$PRDISP_FIRST"; else FIRST_PR="-"; fi
   heartbeat
 
-  # ── THE PR SICKNESS QUEUE — BESIDE THE ISSUE SELECTION, IN THE SAME CYCLE ───────────────────
-  # [prsick-pass:begin] (extracted and DRIVEN by pr-sickness.test.sh — keep the markers)
-  # ⛔ WHY HERE. The pass runs AFTER the sweep, because the sweep's own arms own the required-red
-  # checks and the rail-refusal role owns a refused tree; this queue's job is what is LEFT — hence
-  # `dispreplace` below, which SUPERSEDES the "no arm" wait row the sweep wrote for this PR (one row
-  # per PR per cycle, #2126's invariant). It runs BEFORE the capacity-gated issue dispatch, because
-  # the owner's rule is un-owned PRs first and a red PR is un-owned work of exactly that kind.
-  # ⛔ NOT WHILE AUTHORITY IS UNKNOWN: that is the same fail-closed state the sweep refuses to spawn
-  # in, and a paid lane is the one thing it must not hand out (agent-infra#1764).
-  if [ "${PRSICK:-0}" = "1" ] && [ "${PS_ON:-1}" = "1" ] && [ "${AUTHORITY_UNKNOWN:-0}" != "1" ]; then
-    PS_MAXSPAWN="$(fix_slots "${UPN:-0}")"
-    is_num "${PS_MAXSPAWN:-}" || PS_MAXSPAWN=0
-    PS_STATE_DIR="$O/state" PS_OR="$OR" PS_REPO_PATH="$REPO" PS_SPAWN_CWD="$SPAWN_CWD" \
-      ps_select --repo "$OR" --max-spawn "$PS_MAXSPAWN" --verbose >> "$LOG" 2>&1
-    _ps_rc=$?
-    # ⛔ A FAILED PASS IS ITS OWN LINE, never an empty one. `ps_select` already names the cause (its
-    # ENUMERATION FAILED / NOREAD lines land in $LOG above); this records that the QUEUE was not
-    # evaluated, so "no [prsick] decisions" can never be read as "no sick PRs".
-    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION/backpressure line above" >> "$LOG"
-  fi
-  # [prsick-pass:end]
 
   # ---- 2) capacity-gated dispatch ----------------------------------------
   # prune the backlog of already-dispatched issues (otherwise it reads as non-empty but yields nothing)

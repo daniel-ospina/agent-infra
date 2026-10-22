@@ -1056,19 +1056,18 @@ _claim_status_at() {
 # (INCOMPLETE) is NOT FREE, because an abstention is not permission.
 #  0 CLEAN / 1 COLLISION / 2 INCOMPLETE. Sets CLAIM_RESULT exactly as the issue-keyed sibling does.
 claim_pr_preflight() {
-  _claim_preflight_at "$(claim_pr_ref "$2")" "PR #$2" "$2"
+  _claim_preflight_at "$(claim_pr_ref "$2")" "PR #$2"
 }
 
 claim_issue_preflight() {
-  _claim_preflight_at "$(claim_issue_ref "$1")" "#$1" "$1"
+  _claim_preflight_at "$(claim_issue_ref "$1")" "#$1"
 }
 
-# _claim_preflight_at <ref> <label> <n> — ONE polarity for every keying (per-head, issue, landing).
-# `label` is what the line says ("#123" / "PR #123"), `n` is only the "no claim on …" message. Two
-# copies of this decision is exactly how a reader and a writer of the same datum drift.
+# _claim_preflight_at <ref> <label> — ONE polarity for every keying (per-head, issue, landing).
+# `label` is what the line says ("#123" / "PR #123"). Two copies of this decision is exactly how a
+# reader and a writer of the same datum drift.
 _claim_preflight_at() {
-  local ref="$1" label="$2" n="$3" out rc cur tmp lease owner until now
-  local issue="$n"
+  local ref="$1" label="$2" out rc cur tmp lease owner until now
   # ⛔ THE EXIT STATUS IS THE DISTINCTION THAT MATTERS HERE. `git ls-remote <ref>` exits 0 with
   # EMPTY output when the ref simply does not exist, and NON-ZERO only when the remote itself could
   # not be consulted (measured: rc=128 for an unreachable remote). Collapsing the two — which is
