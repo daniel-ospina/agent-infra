@@ -25,12 +25,21 @@
 #   1. ZERO CPU DELTA over a real sample window, summed over the wrapper AND every descendant. A
 #      sub-0.1s twitch has the same signature as a parked fork child, a human's prompt redraw and a
 #      timer wake, so the tolerance is STATED (CPU_TOL_CS) and the window is a second sample.
-#   2. NO HUMAN ANCESTOR. Walked nearest-first: the FIRST recognised host application decides.
-#      `Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/a `sshd` session means the process belongs
-#      to a HUMAN and is never touched, however parked. `ppid 1` proves nothing (a daemonising
-#      service reparents to 1 BY DESIGN). `login`/`zsh` alone are NOT human: every cmux lane is
-#      `pi → -zsh → login → cmux.app`, so treating them as human would make the reaper inert.
-#   3. A STALENESS CLASSIFICATION, from a file the process ITSELF holds open:
+#   2. POSITIVE FLEET ANCESTRY — a HUMAN ancestor is a hard refusal, and an ancestry the tool cannot
+#      POSITIVELY identify as the fleet also refuses. Walked nearest-first: the FIRST recognised host
+#      application decides. `Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/
+#      `xterm`/`gnome-terminal`/`konsole`/`foot`/`screen`/`tmux`/VS Code/a `sshd` session means the
+#      process belongs to a HUMAN and is never touched, however parked. `ppid 1` proves nothing (a
+#      daemonising service reparents to 1 BY DESIGN). `login`/`zsh` alone are NOT human: every cmux
+#      lane is `pi → -zsh → login → cmux.app`, so treating them as human would make the reaper inert.
+#      ⛔ `unknown` REFUSES (#2163 review, P1). It used to PERMIT, and every host app missing from the
+#      list above — plus a truncated process table, whose empty command read as "no marker" — then
+#      TERMed a live tree. A lane is judged only on POSITIVE fleet evidence (`cmux.app` on the Mac,
+#      which is the only host this gate recognises today). ⚠️ PRODUCT DECISION, NOT A SILENT
+#      BEHAVIOUR: on a Linux cell the supervisor is systemd, so every lane's ancestry is `unknown`
+#      and the ARMED reaper refuses everything (see §11.4 of docs/ops/fleet-liveness.md for the
+#      evidence source a cell would have to supply). The census and `--dry-run` are unaffected.
+#   3. A STALENESS CLASSIFICATION, from a file THIS LANE'S OWN `pi` (or its `tee` writer) holds open:
 #        (a) log present, untouched >= LANE_REAP_IDLE_MIN (default 2h); or
 #        (b) log absent/deleted AND the process has been up >= LANE_REAP_NO_LOG_H (default 12h).
 #      Anything else is REPORTED, never reaped.
@@ -51,12 +60,22 @@
 # when its immediate parent is a shell, that one wrapper shell (the launcher). One wrapper level is
 # summed and signalled — climbing further would swallow a tool shell of a LIVE lane (measured on a
 # cell: a `pi` reviewer under `reviewer-preflight.sh` whose grandparent was another live lane's
-# `pi`), which is a lane-killer. The tree is identified by POSITIVE evidence: the tree's ROOT or one
-# of its DIRECT CHILDREN holds a fleet-namespace log (`L-*.log`, `lane-*.log`, `fix-*.log`,
-# `merge-*.log`, `chain-*.log`) as stdout/stderr. ⛔ Not any process in the subtree — a descendant
-# holding a DIFFERENT lane's log must never supply this lane's evidence (a nested lane would
-# otherwise lend a stale file to a working parent). An interactive `pi` (fds on a tty/socket) is not
-# in the population at all.
+# `pi`), which is a lane-killer. The tree is identified by POSITIVE evidence: THIS LANE's `pi` — the
+# root when it is `pi`, else the root's direct `pi` child — or a `tee` in the root's direct children
+# whose stdin is a PIPE, holds a fleet-namespace log (`L-*.log`, `lane-*.log`, `fix-*.log`,
+# `merge-*.log`, `chain-*.log`) as stdout/stderr. ⛔ Not any process in the subtree, and not even an
+# arbitrary DIRECT CHILD — measured (#2163 review, P1): a wrapper backgrounding a `fix-*` writer and
+# the live `pi` beside it let the writer's 3 h-old log judge the 30 s-old lane, and `--apply` TERMed
+# the working `pi`. A sibling that holds a DIFFERENT lane's log is not this lane's evidence; when a
+# tree presents MORE THAN ONE distinct lane log the answer is `ambiguous-log-evidence` (refused), not
+# a guess. An interactive `pi` (fds on a tty/socket) is not in the population at all.
+#
+# ⛔ THE CENSUS ABSTAINS RATHER THAN REPORT `0/0` (#2163 review, P0). `count` printed
+# `lanes=0/0 zombie=N` with exit 0 when a descriptor could not be read for ANY tree (no /proc, no
+# `lsof`, `lsof` denied) — which `orch-loop.sh` reads as a clean `0`, so the MAX_LANES ceiling was
+# never reached and the controller dispatched MORE onto the box. A tree whose descriptors cannot be
+# read MAY be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors WERE read and
+# hold no fleet log is simply not a lane (`0/0` is then a real answer).
 #
 # WHAT THIS DOES NOT COVER (stated, not silently trusted):
 #   * the owner's own interactive `pi` INSIDE cmux with stdout redirected to a lane-shaped log —
@@ -65,6 +84,15 @@
 #     per lane in the dry run so a human can see it before arming.
 #   * a lane whose log was deleted AND whose age is under 12h is REPORTED, not reaped — that is the
 #     conservative side of the trap above, and it is why the measured reap population is old lanes.
+#   * ⚠️ CELL-INERT, A PRODUCT DECISION FOR THE PR AUTHOR (not a silent behaviour). Gate 2 now
+#     requires POSITIVE fleet evidence, and the ONLY host app this tool recognises as the fleet is
+#     `cmux.app` — a Mac application. A Linux cell's supervisor is systemd / a container, so a cell
+#     lane's ancestry is `pi → bash → systemd → init`: `unknown`, refused. `--apply` on a cell is
+#     therefore INERT today, and the fix is an evidence source a cell can actually supply: the
+#     supervisor's unit/cgroup (`/proc/<pid>/cgroup` naming e.g. `cloud-cell-supervisor.service`) or
+#     a marker in `/proc/<pid>/environ` written by the supervisor at spawn. That is a design change
+#     with a cell-side component and is NOT made here; until it is, the census and the dry run are
+#     the cell's instruments, and the refusal is named per tree (`ancestry-unknown`).
 #   * `--apply` is DRY RUN by default. Arming is a deliberate operator action, same as every other
 #     deletion tool in this tree.
 #   * a leaked lane whose stdout is a PTY/PIPE and whose log name is outside the fleet namespace has
@@ -105,7 +133,11 @@ PS_BIN="${LANE_REAP_PS_BIN:-ps}"
 SLEEP_BIN="${LANE_REAP_SLEEP_BIN:-sleep}"
 KILL_BIN="${LANE_REAP_KILL_BIN:-kill}"
 LSOF_BIN="${LANE_REAP_LSOF_BIN:-lsof}"
-PROC_ROOT="${LANE_REAP_PROC_ROOT:-/proc}"
+# ⛔ `-`, NOT `:-`: the header documents "`LANE_REAP_PROC_ROOT` — /proc-like root (default: /proc;
+# absent → lsof)", so an EMPTY value is a deliberate "do not use /proc" (the macOS shape, and the
+# seam the test suite drives the lsof branch with). `:-` silently rewrote it back to /proc, which made
+# that seam inert — and a seam that cannot express "no /proc" hides the whole lsof path from CI.
+PROC_ROOT="${LANE_REAP_PROC_ROOT-/proc}"
 WINDOW="${LANE_REAP_WINDOW:-30}"
 CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 # NOT `IDLE_MIN`: that name is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh`
@@ -291,22 +323,40 @@ cpu_sum_cs() { # <tablefile> <pidsfile>
   awk -F'\t' 'FNR == NR { sel[$1] = 1; next } ($1 in sel) { s += $4 } END { print s+0 }' "$2" "$1"
 }
 
-ancestry() { # <tablefile> <pid> -> "pid<TAB>cmd" nearest first, bounded
+# ⛔ THE WALK MUST SAY WHETHER IT WAS COMPLETE (#2163 review, P1). It used to break out on a ppid row
+# that was not in the table and let `host_verdict` read the resulting empty command as "no marker" —
+# so an unreadable or truncated process table produced `unknown`, which PERMITTED the kill. Every row
+# is followed by a terminator line, so a caller can tell "I walked to the top and saw nothing" from
+# "I lost the chain". `cloud-cell-doctor.sh`'s `human_above` already refuses (rc 2) on the same
+# input; this is the same rule in this tool's vocabulary.
+ancestry() { # <tablefile> <pid> -> "pid<TAB>cmd" nearest first, then "#complete"|"#incomplete"
   awk -F'\t' -v start="$2" '
     { pp[$1] = $2; cm[$1] = $6 }
     END {
-      p = start
+      p = start; done = 0
       for (i = 0; i < 64 && p != "" && p != 0; i++) {
+        # a missing row (or a pid with no command) is a TRUNCATED TABLE, not the top of the chain
+        if (!(p in cm) || cm[p] == "") { print "#incomplete"; done = 1; break }
         print p "\t" cm[p]
-        if (p == 1) break
-        p = pp[p]
+        if (p == 1) { print "#complete"; done = 1; break }
+        q = pp[p]
+        if (q == 0) { print "#complete"; done = 1; break }
+        if (!(q in cm)) { print "#incomplete"; done = 1; break }
+        p = q
       }
+      if (!done) print "#incomplete"
     }' "$1"
 }
 
 # ── the log the process itself holds open (kernel evidence, never a parsed slug) ──────────────────
-# Accepted names are the fleet's own log namespace. The DIRECTORY does not matter: what matters is
-# that this process has that file open as stdout/stderr, which an interactive session does not.
+# Accepted names are the fleet's own log namespace — EXACTLY the files the shipped writers create:
+#   lane.sh         `$O/logs/lane-$N.log`      → lane-*.log
+#   chain-merge.sh  `$O/logs/chain-$N.log`     → chain-*.log
+#   fix-one.sh      `$O/logs/fix-$PR.log`      → fix-*.log    (`L` is the PREFIX; the file is "$L.log")
+#   merge-one.sh    `$O/logs/merge-$PR.log`    → merge-*.log  (same shape)
+#   the launcher    `/tmp/jobs/L-<slug>.log`   → L-*.log
+# The DIRECTORY does not matter: what matters is that this process has that file open as
+# stdout/stderr, which an interactive session does not.
 is_lane_log_name() {
   case "${1:-}" in
     L-*.log|lane-*.log|fix-*.log|merge-*.log|chain-*.log) return 0 ;;
@@ -337,37 +387,162 @@ _log_candidate() {
   return 0
 }
 
-# resolve_log <root> — LOG_PIDS is the global pid list. Echoes "path<TAB>deleted<TAB>holder_pid".
+# read_targets <pid> [fd…] — one descriptor target per line; rc 0 = the READ WAS TAKEN, 1 = BLIND.
 #
-# ⛔ THE EVIDENCE MUST BELONG TO THIS LANE, NOT TO ANY PROCESS UNDER IT (#2163 review, P0).
-# `resolve_log` used to walk the WHOLE subtree in awk's unordered hash order, so a descendant holding
-# a DIFFERENT lane-shaped log (a nested lane, a child dispatch writing its own `L-*.log`) supplied the
-# staleness evidence — a lane whose own log advanced 60s ago could be reaped on a descendant's 5h-old
-# log. The lane's own artefacts are held by the lane ROOT and its DIRECT children:
-#   `… nohup pi > L-x.log &`        → pi (the root's child) holds it
-#   `… pi | tee L-x.log`            → tee (the root's child) holds it
-#   `run_agent` (`pi >> "$log"`)    → pi (the root's child) holds it
-# so the population is the root's own descriptors, then its direct children in pid order. Deeper
-# processes are another lane's evidence and are never consulted; a lane whose log is not in that set
-# is `no-log-evidence` (refused), not judged on somebody else's file.
+# ⛔ "COULD NOT READ" AND "READ, NOTHING THERE" ARE DIFFERENT FACTS (#2163 review, P0). The census
+# must tell them apart: a process whose descriptors cannot be read MAY be a lane (so the census
+# abstains), while a process whose descriptors WERE read and hold no fleet log is simply not a lane.
+# Collapsing the two is exactly how a blind box printed `lanes=0/0` and licensed more dispatch.
 #
 # On Linux `/proc/<pid>/fd/{1,2}` is read directly; where /proc is absent (macOS) ONE `lsof` per
 # process answers BOTH descriptors (a pass runs every controller cycle; two forks per pid does not).
+read_targets() {
+  local p="$1"; shift
+  local fds="${*:-1 2}" fd path out rc
+  if [ -n "$PROC_ROOT" ] && [ -d "$PROC_ROOT/$p" ]; then
+    # present in the /proc namespace: an unreadable (or missing) fd dir is BLIND, not "no fds"
+    [ -d "$PROC_ROOT/$p/fd" ] && [ -r "$PROC_ROOT/$p/fd" ] || return 1
+    for fd in $fds; do
+      path="$(readlink "$PROC_ROOT/$p/fd/$fd" 2>/dev/null)" || continue
+      printf '%s\n' "$path"
+    done
+    return 0
+  fi
+  # ⛔ A PID THAT VANISHED FROM A REAL /proc IS GONE, NOT BLIND. The population is a SNAPSHOT, so on a
+  # busy box a lane can exit between the table read and this read — calling that "I could not see" would
+  # abstain the whole census every cycle a lane happens to finish, which is how a fail-closed rule turns
+  # into a false block. A real /proc advertises itself with `self`; a synthetic/unmounted root does not,
+  # and there the absence is indistinguishable from a blind read, so it stays blind.
+  if [ -n "$PROC_ROOT" ] && [ -e "$PROC_ROOT/self" ]; then return 0; fi
+  if [ -n "$LSOF_BIN" ] && command -v "$LSOF_BIN" >/dev/null 2>&1; then
+    out="$(bound "$READ_TIMEOUT" "$LSOF_BIN" -n -P -a -p "$p" \
+             -d "$(printf '%s' "$fds" | tr ' ' ',')" -Fn 2>/dev/null)"; rc=$?
+    # lsof exits non-zero (with empty output) when it cannot stat the pid — a denial, not "no fds"
+    [ "$rc" = "0" ] || return 1
+    [ -n "$out" ] && printf '%s\n' "$out" | sed -n 's/^n//p'
+    return 0
+  fi
+  return 1
+}
+
+# collect_evidence <pid> [fd…] — "path<TAB>deleted<TAB>holder" for every lane-namespace fd.
+# rc 0 = read taken, 1 = BLIND (which is NOT "no evidence").
+collect_evidence() {
+  local p="$1"; shift
+  local targets rc path found
+  targets="$(read_targets "$p" "$@")"; rc=$?
+  [ "$rc" = "0" ] || return 1
+  [ -n "$targets" ] || return 0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    found="$(_log_candidate "$path" "$p")" || continue
+    printf '%s\n' "$found"
+  done <<< "$targets"
+  return 0
+}
+
+# lane_pi_pids <table> <root> — the pids that ARE this lane's agent: the root itself when its argv[0]
+# basename is `pi`, else the root's direct children whose argv[0] basename is `pi`, in pid order.
+# Nothing deeper: a descendant `pi` is ANOTHER lane (a reviewer, a tool subagent) and its log is not
+# this lane's evidence (#2163 review, P1).
+lane_pi_pids() {
+  awk -F'\t' -v root="$2" '
+    function base(cmd,   f,g,p) {
+      if (cmd == "") return ""
+      split(cmd, f, /[ \t]+/); g = split(f[1], p, "/")
+      return tolower(p[g])
+    }
+    { pp[$1] = $2; cm[$1] = $6 }
+    END {
+      if (base(cm[root]) == "pi") { print root; exit }
+      n = 0
+      for (p in cm) if (pp[p] == root && base(cm[p]) == "pi") sel[n++] = p
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++)
+        if (sel[j] + 0 < sel[i] + 0) { t = sel[i]; sel[i] = sel[j]; sel[j] = t }
+      for (i = 0; i < n; i++) print sel[i]
+    }' "$1"
+}
+
+# lane_tee_pids <table> <root> — `tee` in the root's direct children, in pid order. A tee is a
+# candidate WRITER for this lane (`… pi | tee L-x.log`), and `resolve_log` accepts it only when its
+# stdin really is a pipe, never a tee that merely shares the wrapper.
+lane_tee_pids() {
+  awk -F'\t' -v root="$2" '
+    function base(cmd,   f,g,p) {
+      if (cmd == "") return ""
+      split(cmd, f, /[ \t]+/); g = split(f[1], p, "/")
+      return tolower(p[g])
+    }
+    { pp[$1] = $2; cm[$1] = $6 }
+    END {
+      n = 0
+      for (p in cm) if (pp[p] == root && base(cm[p]) == "tee") sel[n++] = p
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++)
+        if (sel[j] + 0 < sel[i] + 0) { t = sel[i]; sel[i] = sel[j]; sel[j] = t }
+      for (i = 0; i < n; i++) print sel[i]
+    }' "$1"
+}
+
+# resolve_log <table> <root> — THIS LANE's own evidence, and nothing else's.
+#   rc 0  echoes "path<TAB>deleted<TAB>holder_pid"   — one attributable evidence file
+#   rc 1  the reads were taken and the tree holds no fleet log        — not a lane
+#   rc 2  BLIND: a descriptor read failed, so the tree MAY be a lane  — abstain, never judge
+#   rc 3  AMBIGUOUS: more than one distinct lane log                  — no single file is the evidence
+#
+# ⛔ THE EVIDENCE MUST BELONG TO THIS LANE, NOT TO ANY PROCESS UNDER IT (measured, #2163 review P1).
+# It used to take the FIRST fd whose basename matched the namespace, walking root then every direct
+# child in pid order — with no check that the holder was THIS lane's pi. Reproduced: root 500
+# (`bash lane.sh`), child 501 holding a 3 h-old `fix-9.log`, child 502 = the live pi holding
+# `L-live.log` written 30 s ago ⇒ `REAP root=500 … log-idle=10800s`, and `--apply` TERMed 502 — the
+# WORKING agent. Any wrapper that backgrounds two things (the legacy launcher shape) makes it live.
+# So the evidence set is now:
+#   `… nohup pi > L-x.log &`     → the lane's `pi`
+#   `… pi | tee L-x.log`         → the tee, only when its stdin is a pipe
+#   `run_agent` (`pi >> "$log"`) → the lane's `pi`
+# and nothing else. Two distinct lane logs in that set is ambiguity, not a choice.
 resolve_log() {
-  local p fd path found
-  for p in $LOG_PIDS; do
-    found=""
-    if [ -n "$PROC_ROOT" ] && [ -d "$PROC_ROOT/$p/fd" ]; then
-      for fd in 1 2; do
-        path="$(readlink "$PROC_ROOT/$p/fd/$fd" 2>/dev/null)" || continue
-        if found="$(_log_candidate "$path" "$p")"; then printf '%s' "$found"; return 0; fi
-      done
-    elif [ -n "$LSOF_BIN" ] && command -v "$LSOF_BIN" >/dev/null 2>&1; then
-      while IFS= read -r path; do
-        if found="$(_log_candidate "$path" "$p")"; then printf '%s' "$found"; return 0; fi
-      done < <(bound "$READ_TIMEOUT" "$LSOF_BIN" -n -P -a -p "$p" -d 1,2 -Fn 2>/dev/null \
-               | sed -n 's/^n//p')
-    fi
+  local table="$1" root="$2" p out cands="" blind=0 distinct n
+  for p in $(lane_pi_pids "$table" "$root"); do
+    out="$(collect_evidence "$p")" || { blind=1; continue; }
+    [ -n "$out" ] && cands="$cands$out
+"
+  done
+  for p in $(lane_tee_pids "$table" "$root"); do
+    # `read_targets <pid> 0` on a pipe prints `pipe:[…]`; anything else is not this lane's writer.
+    case "$(read_targets "$p" 0)" in pipe:*) ;; *) continue ;; esac
+    out="$(collect_evidence "$p")" || { blind=1; continue; }
+    [ -n "$out" ] && cands="$cands$out
+"
+  done
+  distinct="$(printf '%s' "$cands" | cut -f1 | awk 'NF && !seen[$0]++')"
+  n="$(printf '%s\n' "$distinct" | awk 'NF { n++ } END { print n + 0 }')"
+  [ "$n" -gt 1 ] && return 3
+  if [ "$n" = "1" ]; then
+    printf '%s\n' "$cands" | awk -F'\t' -v want="$distinct" '$1 == want { print; exit }'
+    return 0
+  fi
+  [ "$blind" = "1" ] && return 2
+  return 1
+}
+
+# instrument_usable <table> <roots…> — 0 when at least ONE descriptor of the trees we must judge can
+# be read. One is enough: the census abstains per-lane on the ones it cannot read, so this is only
+# the up-front "this box is BLIND" probe, and it makes the abstention one named line instead of a
+# full pass of `lsof` denials.
+instrument_usable() {
+  local table="$1"; shift
+  local root p n=0
+  # Our OWN process is the cheapest proof that descriptors can be read at all: a /proc that cannot
+  # answer for `$$` is a /proc this box does not have. `lsof` answers for it too, where /proc does not
+  # exist (macOS).
+  read_targets "$$" >/dev/null 2>&1 && return 0
+  # Then the first few trees we must judge — our own fd dir can be outside a fake/remote root, and a
+  # probe that walks the WHOLE population is exactly the cost this up-front check exists to avoid.
+  for root in "$@"; do
+    for p in $root $(lane_pi_pids "$table" "$root") $(lane_tee_pids "$table" "$root"); do
+      read_targets "$p" >/dev/null 2>&1 && return 0
+      n=$((n + 1)); [ "$n" -ge 8 ] && return 1
+    done
   done
   return 1
 }
@@ -381,8 +556,13 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 }
 
 # ── gate 2: the first recognised HOST APPLICATION in the chain decides ────────────────────────────
-# Returns: human | fleet | unknown. `human` is a hard refusal. `unknown` is acceptable ONLY because
-# the population already requires positive in-tree evidence (the fleet log held open).
+# Returns: human | fleet | unknown | incomplete. `human` is a hard refusal, and so are `incomplete`
+# (a truncated/unreadable process table) and `unknown` — #2163 review, P1: `unknown` used to PERMIT
+# the kill, so every host app missing from the marker set (xterm, wezterm, gnome-terminal, a cloud web
+# console with no sshd, a tmux daemonised from init) and every truncated table read as permission.
+# Only `fleet` licenses judging a tree: a lane is judged on POSITIVE fleet evidence.
+# ⚠️ On a Linux cell every lane is `unknown`, so the ARMED reaper is inert there — see the PRODUCT
+# DECISION note in this file's header.
 #
 # ⛔ THE WALK STARTS AT THE FIRST ANCESTOR, NOT AT THE ROOT (#2163 review, P1). The root's OWN argv
 # is the launcher's: it carries the brief path, a `PATH=/Applications/cmux.app/...` export, even the
@@ -390,31 +570,52 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 # BEFORE the real `Terminal.app` ancestor was ever examined — the verdict decided by prompt text, the
 # exact "never parse a command line for a name" trap this file exists to close. Gate 2 is about
 # ANCESTORS, so `tail -n +2` drops the root and the walk starts where the host app actually lives.
-host_verdict() { # <tablefile> <pid>
-  local apid acmd low exe
+host_verdict() { # <tablefile> <pid> -> human | fleet | unknown | incomplete
+  local apid acmd low exe base complete=0
   while IFS=$'\t' read -r apid acmd; do
+    case "$apid" in
+      '#complete')   complete=1; continue ;;
+      '#incomplete') printf 'incomplete\n'; return 0 ;;
+    esac
     low="$(printf '%s' "$acmd" | tr '[:upper:]' '[:lower:]')"
     # ⛔ THE TWO MARKER SETS HAVE DELIBERATELY DIFFERENT POLARITIES (#2163 review, P2 — and cycle 4
     # corrected this comment, which had claimed both were executable-only).
     # HUMAN is matched ANYWHERE in the ancestor's argv: a prompt or `-c` payload that merely mentions
     # `Terminal.app` then over-REFUSES (the lane is spared), which is the safe direction — and it also
     # covers an executable PATH that contains a space (`/Applications/My Apps/Terminal.app/…`), which
-    # a first-token split would miss and turn into a fail-OPEN `unknown`.
+    # a first-token split would miss and turn into `unknown`.
+    # ⛔ THE HUMAN SET IS EVERY TERMINAL A LANE'S ANCESTRY CAN ACTUALLY HAVE (#2163 review, P1). The
+    # shipped set was the macOS-native handful, so `xterm`/`wezterm`/`ghostty`/`konsole`/
+    # `gnome-terminal-server`/`foot`/VS Code/a bare `screen`/a tmux daemonised from init all fell to
+    # `unknown` — and `unknown` PERMITTED the kill. Over-refusal is the safe direction here (the lane
+    # is spared); a terminal missing from this set is a human's lane a reaper must not touch.
+    # The names below cannot be mistaken for a `TERM=…` value, so they are matched ANYWHERE in argv
+    # (which is also what covers an executable path containing a space).
     case "$low" in
-      *terminal.app*|*iterm*|*warp.app*|*kitty.app*|*alacritty.app*|*hyper.app*|*sshd*)
+      *terminal.app*|*iterm*|*warp.app*|*kitty.app*|*alacritty.app*|*hyper.app*|*sshd*|\
+      *gnome-terminal*|*konsole*|*wezterm*|*ghostty*|*code-server*|*code\ helper*)
         printf 'human\n'; return 0 ;;
+    esac
+    # ⛔ THESE ARE MATCHED ON THE EXECUTABLE BASENAME, NOT ANYWHERE (#2163 review, P1). `xterm`,
+    # `screen` and `tmux` are ALSO `TERM=` spellings (`TERM=xterm-256color` is the commonest value
+    # there is), so an anywhere-match would refuse a fleet lane on an ancestor wrapper that merely
+    # exported its terminal type — a false refusal that reads exactly like an armed reaper being inert.
+    # A basename match still refuses every real xterm/screen/tmux host, which is the safe direction.
+    exe="${acmd%%[[:space:]]*}"
+    exe="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
+    base="${exe##*/}"
+    case "$base" in
+      foot|screen|tmux|xterm|uxterm) printf 'human\n'; return 0 ;;
     esac
     # FLEET is decided on the EXECUTABLE ONLY (the first token): accepting a `/…cmux.app/…` path in
     # an ARGUMENT made an ancestor's `PATH=…`/prompt text return `fleet` and `return` before a real
     # human terminal above it was examined — the kill-path fail-open, reproduced by review. A cmux
-    # path containing a SPACE is therefore classified `unknown`, which is permissive only in the
-    # sense that it does not REFUSE (the population still requires the lane's own log evidence).
-    exe="${acmd%%[[:space:]]*}"
-    exe="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
+    # path containing a SPACE is therefore classified `unknown`, and `unknown` now REFUSES.
     case "$exe" in
       */cmux.app/*|cmuxterm|*/cmuxterm|cmux) printf 'fleet\n'; return 0 ;;
     esac
   done < <(ancestry "$1" "$2" | tail -n +2)
+  [ "$complete" = "1" ] || { printf 'incomplete\n'; return 0; }
   printf 'unknown\n'
 }
 
@@ -446,6 +647,7 @@ zombie_count() { # <tablefile> — the box's corpses, so "busy" cannot hide them
 cmd_count() {
   coerce_limits
   local table roots root live=0 total=0 z live_unknown=0
+  local not_lane=0 blind=0 ambiguous=0 attributed=0
   table="$(mktemp "${TMPDIR:-/tmp}/lane-reap-count.XXXXXX")" || return 3
   read_table > "$table"
   if ! table_readable "$table"; then
@@ -457,6 +659,19 @@ cmd_count() {
   roots="$(lane_roots "$table")"
   local deadline
   deadline=$(( $(now_s) + 10#$PASS_TIMEOUT ))
+  # ⛔ A CENSUS THAT CANNOT SEE A DESCRIPTOR MUST NOT PRINT A NUMBER (#2163 review, P0). The
+  # POPULATION comes from the process table, but every lane's LIVENESS comes from a file descriptor it
+  # holds. When the box cannot read descriptors at all — no /proc and no `lsof`, `lsof -p` denied,
+  # a container whose /proc carries no fds — every tree used to fall out of BOTH `live` and `total`
+  # and this printed `lanes=0/0 zombie=N` with exit 0. `orch-loop.sh` reads that as a clean `0`
+  # (`LANES_UNKNOWN` stays 0, the `lanes_unknown` refusal never fires, `MAX_LANES` is never reached)
+  # and DISPATCHES MORE onto a box whose capacity it cannot see — the #2159 OOM direction.
+  if [ -n "$roots" ] && ! instrument_usable "$table" $roots; then
+    rm -f "$table"
+    printf 'lanes=?/? zombie=%s\n' "$z"
+    logline "census-blind — no descriptor of any lane tree could be read (proc_root=${PROC_ROOT:-none} lsof=${LSOF_BIN:-none})"
+    return 3
+  fi
   for root in $roots; do
     # ⛔ A PARTIAL CENSUS IS NOT A CENSUS. Stopping half-way and printing the lanes seen so far
     # would under-report `total` — the exact direction that hides a leak. Budget spent => `?`, and
@@ -467,14 +682,24 @@ cmd_count() {
       logline "census-budget-expired after ${PASS_TIMEOUT}s"
       return 3
     fi
-    # The lane's OWN evidence: the root, then its direct children in pid order (see resolve_log).
-    # The census needs no other pid: it has no CPU gate and no kill loop, so the whole-tree walk
-    # (one extra full-table awk per lane, on the every-cycle path) is not done here.
-    LOG_PIDS="$root $(awk -F'\t' -v r="$root" '$2 == r { print $1 }' "$table" | sort -n | tr '\n' ' ')"
-    local resolved path del holder age m
-    resolved="$(resolve_log "$root")" || continue   # no fleet log → not a lane (a subagent/tool pi)
-    path="$(printf '%s' "$resolved" | cut -f1)"
-    del="$(printf '%s' "$resolved" | cut -f2)"
+    # The lane's OWN evidence: its `pi` (the root, or the root's direct `pi` child), plus a
+    # pipe-fed `tee` sibling — see resolve_log. The census walks no deeper: it has no CPU gate and
+    # no kill loop, so the whole-tree walk (one extra full-table awk per lane, on the every-cycle
+    # path) is not done here.
+    local logres path del holder age m rc
+    logres="$(resolve_log "$table" "$root")"; rc=$?
+    case "$rc" in
+      0) ;;                                                     # one attributable evidence file
+      1) not_lane=$((not_lane + 1)); continue ;;                 # read taken: no fleet log ⇒ not a lane
+      # ⛔ A BLIND OR AMBIGUOUS TREE MIGHT BE A LANE, so it cannot be dropped from the census: both
+      # the numerator and the total would then be LOWER BOUNDS and the ceiling test would be false —
+      # dispatch more onto a box that may be full. It is counted and the census abstains below.
+      2) blind=$((blind + 1)); continue ;;
+      3) ambiguous=$((ambiguous + 1)); continue ;;
+    esac
+    attributed=$((attributed + 1))
+    path="$(printf '%s' "$logres" | cut -f1)"
+    del="$(printf '%s' "$logres" | cut -f2)"
     # ⛔ A WORKER IS NOT A LANE FOR THIS COUNT. `fix-*`/`merge-*`/`chain-*` wrappers are counted by
     # orch-loop's `workers=` and are gated by their own caps; folding them into `lanes=` would make
     # MAX_LANES refuse dispatch for reviewers, a behaviour change this issue does not ask for. They
@@ -514,6 +739,15 @@ cmd_count() {
     fi
   done
   rm -f "$table"
+  # ⛔ AN UNATTRIBUTABLE TREE ABSTAINS THE WHOLE CENSUS. A tree whose descriptor read failed
+  # (`blind`) or that presents two distinct lane logs (`ambiguous`) may be a lane, so `total` is a
+  # lower bound as well as `live`; printing the number we happened to reach is the fail-open this
+  # fix closes. `zombie=` IS readable and is kept, so the line still says something true.
+  if [ "$blind" -gt 0 ] || [ "$ambiguous" -gt 0 ]; then
+    printf 'lanes=?/? zombie=%s\n' "$z"
+    logline "census-abstained blind=$blind ambiguous=$ambiguous attributed=$attributed not-a-lane=$not_lane"
+    return 3
+  fi
   local live_out="$live"
   [ "$live_unknown" = "1" ] && live_out="?"
   printf 'lanes=%s/%d zombie=%d\n' "$live_out" "$total" "$z"
@@ -551,7 +785,7 @@ cmd_reap() {
   fi
 
   local now total z roots root verdict logres logpath del holder
-  local etime ident_file victims_file candidates=0 reaped=0 refused=0 live=0
+  local etime ident_file victims_file candidates=0 reaped=0 refused=0 live=0 abstained=0
   now="$(now_s)"
   z="$(zombie_count "$t0")"
   roots="$(lane_roots "$t0")"
@@ -580,23 +814,53 @@ cmd_reap() {
       logline "cannot-verify pass-budget-expired"
       return 3
     fi
-    # The lane's OWN evidence: the root, then its direct children in pid order (see resolve_log).
-    LOG_PIDS="$root $(awk -F'\t' -v r="$root" '$2 == r { print $1 }' "$t0" | sort -n | tr '\n' ' ')"
+    # The lane's OWN evidence — its `pi`, plus a pipe-fed `tee` sibling (see resolve_log). NOT the
+    # root's arbitrary children: a wrapper backgrounding a `fix-*` writer beside the live `pi` used
+    # to let the writer's 3 h-old log judge the 30 s-old lane, and `--apply` TERMed the working agent.
     TREE_PIDS="$(tree_pids "$t0" "$root" | cut -f1 | tr '\n' ' ')"
-    logres="$(resolve_log "$root")" || {
-      refused=$((refused + 1))
-      printf '  REFUSE root=%s — no-log-evidence (not a lane, or the log cannot be resolved; never evidence of staleness)\n' "$root"
-      continue
-    }
+    local rrc
+    logres="$(resolve_log "$t0" "$root")"; rrc=$?
+    case "$rrc" in
+      0) ;;
+      1) refused=$((refused + 1))
+         printf '  REFUSE root=%s — no-log-evidence (the tree was read and holds no fleet log: not a lane, and never evidence of staleness)\n' "$root"
+         continue ;;
+      # ⛔ A BLIND READ IS NOT "NO LOG" (#2163 review, P0/P2). The descriptors could not be read at
+      # all, so this tree may well be a lane; it is refused AND abstained, because a pass that says
+      # `refused=0 reaped=0` over it is indistinguishable from an idle one.
+      2) refused=$((refused + 1)); abstained=$((abstained + 1))
+         printf '  REFUSE root=%s — log-evidence-unreadable (the descriptors could not be read; a blind read never becomes "stale")\n' "$root"
+         continue ;;
+      # ⛔ TWO LANE LOGS IN ONE TREE IS AMBIGUITY, NOT A CHOICE (#2163 review, P1). No one of them is
+      # this lane's staleness evidence, so judging it is guessing which file is the lane — refuse.
+      3) refused=$((refused + 1)); abstained=$((abstained + 1))
+         printf '  REFUSE root=%s — ambiguous-log-evidence (the tree holds more than one distinct lane log; none of them is ITS evidence)\n' "$root"
+         continue ;;
+    esac
     logpath="$(printf '%s' "$logres" | cut -f1)"
     del="$(printf '%s' "$logres" | cut -f2)"
     holder="$(printf '%s' "$logres" | cut -f3)"
     verdict="$(host_verdict "$t0" "$root")"
-    if [ "$verdict" = "human" ]; then
-      refused=$((refused + 1))
-      printf '  REFUSE root=%s log=%s — human-ancestor (the first recognised host app is a human terminal/ssh)\n' "$root" "$logpath"
-      continue
-    fi
+    # ⛔ `unknown` AND `incomplete` REFUSE (#2163 review, P1). `unknown` used to PERMIT the kill, so
+    # every host app outside the marker set (xterm, wezterm, gnome-terminal-server, konsole, ghostty,
+    # foot, VS Code/code-server, a bare screen, a cloud web console with no sshd, a tmux daemonised
+    # from init) — and every TRUNCATED process table, whose empty command read as "no marker" — sent
+    # TERM to a live tree. A lane is judged only on POSITIVE fleet evidence; anything else is refused.
+    case "$verdict" in
+      human)
+        refused=$((refused + 1))
+        printf '  REFUSE root=%s log=%s — human-ancestor (the first recognised host app is a human terminal/ssh)\n' "$root" "$logpath"
+        continue ;;
+      fleet) ;;
+      incomplete)
+        refused=$((refused + 1)); abstained=$((abstained + 1))
+        printf '  REFUSE root=%s log=%s — ancestry-unreadable (the ppid walk lost the chain; an unread table cannot be read as "no human above")\n' "$root" "$logpath"
+        continue ;;
+      *)
+        refused=$((refused + 1))
+        printf '  REFUSE root=%s log=%s — ancestry-unknown (no positive fleet evidence in the chain; a lane is judged only on a fleet marker)\n' "$root" "$logpath"
+        continue ;;
+    esac
     etime="$(awk -F'\t' -v r="$root" '$1 == r { print $5 }' "$t0")"
     is_num "${etime:-}" || etime=""
     total=$((total + 1))
@@ -651,20 +915,24 @@ cmd_reap() {
     if [ "$dcs" -lt 0 ]; then
       printf '  SKIP   root=%s log=%s — cpu-unreadable (delta %dcs across the window; a stable subtree cannot lose CPU)\n' \
         "$root" "$logpath" "$dcs"
-      live_unknown=1
+      abstained=$((abstained + 1))
       continue
     fi
     if [ "$dcs" -gt "$CPU_TOL_CS" ]; then
       printf '  SKIP   root=%s log=%s — still working (cpu %d.%02ds over %ss)\n' \
         "$root" "$logpath" "$((dcs / 100))" "$((dcs % 100))" "$WINDOW"
-      live=$((live + 1))
       continue
     fi
     # Gate 3. An unreadable age aborts the lane's judgement (abstain), never "old enough".
+    # ⛔ AN ABSTENTION IS NOT AN IDLE PASS (#2163 review, P2): each of these branches used to leave
+    # every counter untouched, so a pass that could judge NOTHING reported `reaped=0 refused=0` and
+    # exited 0 — `cloud-cell-doctor.sh` only escalates on a literal `CANNOT-VERIFY`, so a silently
+    # abstaining reaper was indistinguishable from an idle one.
     local stale_reason="" age
     if [ "$del" = "1" ]; then
       if ! is_num "${etime:-}"; then
         printf '  SKIP   root=%s log=%s — no-log-age-unreadable (cannot judge; never reap on a guess)\n' "$root" "$logpath"
+        abstained=$((abstained + 1))
         continue
       fi
       age="$etime"
@@ -680,6 +948,7 @@ cmd_reap() {
       m="$(mtime_epoch "$logpath")"
       if ! is_num "${m:-}"; then
         printf '  SKIP   root=%s log=%s — log-age-unreadable (cannot judge; never reap on a guess)\n' "$root" "$logpath"
+        abstained=$((abstained + 1))
         continue
       fi
       age=$(( now - m ))
@@ -687,7 +956,6 @@ cmd_reap() {
         stale_reason="log-idle=${age}s>=$(( 10#$LANE_IDLE_MIN * 60 ))s"
       else
         printf '  SKIP   root=%s log=%s — log advanced %ss ago (under %sm)\n' "$root" "$logpath" "$age" "$LANE_IDLE_MIN"
-        [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
         continue
       fi
     fi
@@ -724,6 +992,7 @@ cmd_reap() {
     else
       printf '  SKIP   root=%s log=%s — fence-abstained (no victim still held its measured incarnation; nothing was signalled)\n' \
         "$root" "$logpath"
+      abstained=$((abstained + 1))
     fi
   done < "$cand_file"
 
@@ -742,19 +1011,33 @@ cmd_reap() {
     done < "$victims_file"
   fi
 
+  # ⛔ `trees=<working>/<judged>` MUST ACCOUNT FOR EVERY JUDGED TREE (#2163 review, P3). `live` was
+  # incremented only for a CPU delta above the tolerance or a log younger than `LIVE_MIN`, so a lane
+  # idle between 45 m and 2 h, or one that abstained, counted as NEITHER working nor a candidate and
+  # `trees=` silently under-reported the box. A judged tree is working unless it is a candidate: the
+  # arithmetic below cannot drift from the branches above.
+  live=$((total - candidates))
+  [ "$live" -lt 0 ] && live=0
   if [ "$json" = "1" ]; then
-    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"apply":%s}\n' \
-      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$([ "$apply" = "1" ] && echo true || echo false)"
+    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"abstained":%d,"apply":%s}\n' \
+      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$abstained" "$([ "$apply" = "1" ] && echo true || echo false)"
   else
     # `trees=<working>/<judged>` — deliberately NOT `lanes=`: this pass judges every fleet tree
     # (`lane-`, `L-`, `fix-`, `merge-`, `chain-`), while `count`'s `lanes=` is the lane census only.
     # Two audiences, two honest labels; a shared one would make the numbers look like a disagreement.
-    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d mode=%s\n' \
-      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" \
+    # `refused` = never judged (no/unreadable/ambiguous evidence, or a human/unknown ancestry).
+    # `abstained` = a SAFETY read failed, so no verdict could be taken (a subset of `refused` for
+    # evidence/ancestry, a subset of `live` for the CPU and age gates). Non-zero ⇒ exit 3.
+    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d abstained=%d mode=%s\n' \
+      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$abstained" \
       "$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   fi
-  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
+  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused abstained=$abstained mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   rm -f "$t0" "$t1" "$ident_file" "$victims_file" "$cand_file"
+  # ⛔ A PASS THAT COULD NOT JUDGE AT LEAST ONE TREE IS NOT A CLEAN PASS (#2163 review, P2). The
+  # human line and `--json` both carry `abstained=`, and the EXIT CODE says it too so a consumer that
+  # never parses the line cannot read an abstention as `reaped=0` means idle.
+  [ "$abstained" -gt 0 ] && return 3
   return 0
 }
 
@@ -767,11 +1050,18 @@ lane-reap.sh — count fleet lanes by evidence, and reap the ones that provably 
   lane-reap.sh reap --apply          signal the lanes that pass all three gates
   lane-reap.sh reap --json           one machine-readable summary line
 
-A lane is a `pi` process tree (the pi and its immediate shell wrapper) holding a fleet-namespace
-log open as stdout/stderr. It is reaped only when ALL hold: zero CPU delta over the sample window
-summed over the whole tree; no human terminal/ssh ancestor; and either its log is untouched past
-LANE_REAP_IDLE_MIN (2h) or it has no log and has been up past LANE_REAP_NO_LOG_H (12h). An
-unresolvable log is `no-log-evidence`: refused, never read as staleness.
+A lane is a `pi` process tree (the pi and its immediate shell wrapper) whose OWN pi — or a pipe-fed
+`tee` beside it — holds a fleet-namespace log open as stdout/stderr. It is reaped only when ALL
+hold: zero CPU delta over the sample window summed over the whole tree; POSITIVE fleet ancestry
+(`cmux.app` today — a human terminal/ssh ancestor refuses, and so does an ancestry that is neither,
+which makes the armed reaper inert on a systemd-scoped cell); and either its log is untouched past
+LANE_REAP_IDLE_MIN (2h) or it has no log and has been up past LANE_REAP_NO_LOG_H (12h). A log that
+cannot be resolved is `no-log-evidence`, and one that cannot be READ is `log-evidence-unreadable`:
+both are refused, never read as staleness. A tree that presents two distinct lane logs is
+`ambiguous-log-evidence` — refused, because no one of them is that tree's evidence.
+
+The summary's `abstained=<n>` counts trees whose SAFETY read failed (descriptors, ancestry, CPU
+delta, log age); a pass with any abstention exits 3, so an abstaining pass never reads as idle.
 EOF
 }
 

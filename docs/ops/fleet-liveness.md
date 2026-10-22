@@ -859,8 +859,8 @@ A lane is reaped only when ALL hold:
 | gate | reading | why it is the gate |
 |---|---|---|
 | 1. zero CPU | cumulative CPU summed over the **whole tree** (wrapper + `pi` + descendants), two samples a real window apart, tolerance stated (`LANE_REAP_CPU_TOL_CS`, 0.10 s) | a sub-0.1 s twitch is indistinguishable from a parked fork child, a human's prompt redraw, or a timer wake |
-| 2. no human | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`sshd` ⇒ human, never touched; `cmux.app` ⇒ fleet). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell |
-| 3. staleness | the log the process **itself holds open** (stdout/stderr, read from the kernel — never a slug parsed out of a command line): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND the process up ≥ 12 h (`LANE_REAP_NO_LOG_H`) | a lane's silence is not proof; a stale ARTEFACT is |
+| 2. **positive fleet ancestry** | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/`xterm`/`gnome-terminal`/`konsole`/`foot`/`screen`/`tmux`/VS Code ⇒ human, never touched; `cmux.app` ⇒ fleet). **`unknown` REFUSES**, and so does an ancestry the walk could not COMPLETE (a missing ppid row). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell — and its inverse, which shipped: `unknown` used to PERMIT, so every host app outside the marker set, and every truncated process table, sent TERM to a live tree |
+| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a pipe-fed `tee` beside it counts as its writer, a `tee` with any other stdin does not): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND the process up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below) |
 
 **⛔ GATE 3 IS ALSO A RULE ABOUT ABSENCE: `no-log-evidence` IS A REFUSAL, NEVER STALENESS.** The first
 dry run flagged 69 lanes and would have killed one that was **7 minutes old**: the worktree slug was
@@ -868,6 +868,13 @@ parsed from the shell command text, which contains escapes (`ciwatch\012[`), the
 and "no log found" was read as "stale". The population and the log are therefore derived from the
 kernel (the process table, and the file descriptors the process holds) — and when no log can be
 resolved at all, the lane is *reported*, never reaped.
+
+**⛔ AND THE ARTEFACT MUST BELONG TO THE LANE IT JUDGES — not to a sibling.** Measured: root 500
+`bash lane.sh`, child 501 a backgrounded `tee` holding a 3 h-old `fix-9.log`, child 502 the LIVE `pi`
+holding `L-live.log` written 30 s ago. Taking "the first fd in the tree whose basename matches" judged
+the lane on 501's file and `--apply` TERMed 502 — the working agent. The evidence set is now the
+lane's `pi` (the root when it is `pi`, else the root's direct `pi` child) plus a `tee` child whose
+stdin is a pipe; nothing else, and two distinct lane logs is ambiguity, not a choice.
 
 ### 11.3 Reading it
 
@@ -882,17 +889,47 @@ lane-reap.sh reap --apply           signal the lanes that pass all three gates
 deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
 count `0` against a capacity gate). The `[cap]` line also carries `lanes_src=census|tmux|unknown`,
 so the old tmux session count (a `$O` that predates the tool) is never printed as a census. **total** = every
-resident tree the census can ATTRIBUTE: a `pi` tree whose root or a direct child holds a
-fleet-namespace log open (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is counted by
-`workers=`, not by `lanes=`; `count` and `reap` share this population predicate, and `reap` alone
-adds the human-ancestor refusal — before the tree is counted). `lanes=?/?` means the census could
-not be read and is never rendered as `0/0`; a `?` live numerator with readable totals is the same
-abstention one lane at a time. An unreadable census makes the controller REFUSE to add work
+resident tree the census can ATTRIBUTE: a `pi` tree whose **own `pi`** (or a pipe-fed `tee` beside
+it) holds a fleet-namespace log open. The namespace is the files the shipped writers actually create
+— `lane-<n>.log` (`lane.sh`), `L-<slug>.log` (the launcher), `chain-<n>.log` (`chain-merge.sh`),
+`fix-<n>.log` (`fix-one.sh`) and `merge-<n>.log` (`merge-one.sh`); a `fix-`/`merge-`/`chain-` wrapper
+is a WORKER and is counted by `workers=`, not by `lanes=`. `count` and `reap` share that population
+predicate and the same evidence set; `reap` alone adds the ancestry gate. `lanes=?/?` means the
+census could not be read and is never rendered as `0/0`; a `?` live numerator with readable totals is
+the same abstention one lane at a time. An unreadable census makes the controller REFUSE to add work
 (`lanes_unknown`) — the gate is capacity, so an under-count must not dispatch more. `--apply` is the
 operator's decision, like every other deletion tool in this tree.
 
+**⛔ A CENSUS WITH NO EYES SAYS `?`, NOT `0/0`.** The POPULATION comes from the process table; every
+lane's LIVENESS comes from a descriptor it holds. When the box cannot read descriptors at all (no
+`/proc` and no `lsof`, `lsof -p` denied), every tree used to fall out of BOTH `live` and `total` and
+the census printed `lanes=0/0 zombie=<n>` with exit 0 — which `orch-loop.sh` reads as a clean `0`:
+`LANES_UNKNOWN` stays 0, the `lanes_unknown` refusal never fires, `MAX_LANES` is never reached, and
+the controller **dispatches more** onto a box whose capacity it cannot see (the #2163/#2159 OOM
+direction). Two distinct facts are now kept apart: a tree whose descriptors **could not be read** may
+be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors **were read** and hold no
+fleet log is simply not a lane, and `0/0` is then a real answer.
+
+The reap summary is `trees=<working>/<judged> zombie=<n> candidates=<n> reaped=<n> refused=<n>
+abstained=<n> mode=…`. `trees=` accounts for **every** judged tree (working = judged − candidates, so
+an idle-but-not-stale lane is never lost), `refused=` is the trees never judged (no/unreadable/
+ambiguous evidence, a human or unknown ancestry), and **`abstained=` is the trees where a SAFETY read
+failed** (descriptors, ancestry, CPU delta, log age) — the field that makes `reaped=0 refused=0`
+over an unreadable box distinguishable from an idle one. A pass with any abstention **exits 3**, and
+`cloud-cell-doctor.sh` counts it as unverifiable.
+
 ### 11.4 Boundaries, stated
 
+- **The armed reaper is INERT on a Linux cell — a product decision, not a silent behaviour.** Gate 2
+  now requires POSITIVE fleet evidence, and the only host application this tool recognises as the
+  fleet is `cmux.app`, a Mac application. A cell lane's ancestry is `pi → bash → systemd → init`:
+  `unknown`, refused, every time. `--apply` therefore judges nothing on a cell; the census and
+  `--dry-run` are its instruments, and every refusal is named (`ancestry-unknown`). Making it act on a
+  cell needs an evidence source a cell can actually supply — the supervisor's unit/cgroup
+  (`/proc/<pid>/cgroup` naming e.g. `cloud-cell-supervisor.service`) or a marker the supervisor writes
+  into `/proc/<pid>/environ` at spawn — which is a design change with a cell-side component. It is
+  recorded here as a DECISION FOR THE PR AUTHOR, deliberately not inferred, because the alternative
+  (accepting `unknown`) is the fail-open that TERMed live trees.
 - The owner's own interactive `pi` **inside cmux** with stdout redirected to a lane-shaped log is not
   separated from a fleet lane by ancestry alone (the residual #1207 and #1244 both name). The
   zero-CPU window and the 2 h idle proof bound it, and the dry run names every candidate so a human
@@ -904,6 +941,11 @@ operator's decision, like every other deletion tool in this tree.
   is outside the population entirely (no artefact to judge): it is invisible to both `lanes=` and the
   reaper by the same rule that makes `no-log-evidence` a refusal. Terminating such a tree is the
   operator's call, from the process table.
+- The human marker set is matched on the ancestor's **argv** (anywhere for the distinctive names —
+  `Terminal.app`, WezTerm, Ghostty, `gnome-terminal`, `konsole`, `code-server`, `sshd`) and on the
+  executable **basename** for the names that are also `TERM=` spellings (`xterm`, `uxterm`, `screen`,
+  `tmux`, `foot`), so a mere mention over-refuses — which is the safe direction, because `unknown`
+  now refuses too. A terminal missing from the list costs a refusal, not a kill.
 - `lane-reap.sh` is **not** `lane-watchdog.py`: that one reaps a *frozen dispatched child* so a
   lane's tool call returns; this one reaps a *finished lane*. They share the identity fence and the
   ancestry vocabulary, not the population.
@@ -911,4 +953,7 @@ operator's decision, like every other deletion tool in this tree.
 Regression contract: `bash scripts/orchestrator-harness/lane-reap.test.sh` (hermetic: fake
 `ps`/`kill`/`sleep`, fake `/proc`, pinned clock). It pins LIVE-never-reaped and FINISHED-always-reaped
 in both directions (TERM then KILL), the `no-log-evidence` refusal, the deleted-log 12 h bound, the
-human refusal, the working-subtree skip, the evidence census, and the `?`/exit-3 unreadable read.
+human refusal (`HUMAN`/`HUMAN-WIDENED`/`HUMAN-UNKNOWN`/`ANCESTRY-INCOMPLETE`), the evidence scope
+(`EVIDENCE-SIBLING`/`EVIDENCE-AMBIGUOUS`/`EVIDENCE-TEE`), the working-subtree skip, the evidence
+census and its blind-box abstention (`COUNT`/`COUNT-NO-EVIDENCE`), the abstention counter
+(`ABSTAINED`), and the `?`/exit-3 unreadable read.

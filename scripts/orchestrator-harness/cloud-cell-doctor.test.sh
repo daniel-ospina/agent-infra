@@ -186,7 +186,10 @@ case "${1:-}" in
   # `lanes=1/2 zombie=0`, deleting the `count` call would still leave the census assertion green —
   # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
   count) printf 'lanes=3/7 zombie=2\n' ;;
-  reap)  printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 mode=%s\n' "${2:-dry-run}" ;;
+  # DOCTOR_TEST_REAP_ABSTAIN models a pass that could not JUDGE every tree: the reaper's own
+  # `abstained=` counter is the only token that distinguishes it from an idle one.
+  reap)  printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 abstained=%s mode=%s\n' \
+           "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
 esac
 exit 0
 SH
@@ -255,6 +258,18 @@ grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap: delegated 
 grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "reap: read the evidence census (count)" || bad "reap: the census was not read"
 result_has "lanes=3/7 zombie=2" && ok "reap: the pass line carries the CENSUS (lanes=<live>/<total> zombie=<n>)" || bad "reap: the census is missing from the pass line — $OUT"
 result_has "trees=1/2" && ok "reap: the process pass's own line is in the pass line too" || bad "reap: the process pass result is missing — $OUT"
+
+# ── 1a2) an ABSTAINING process pass is unverifiable, not a quiet pass ──────────────────────────
+# ⛔ `reaped=0 refused=0` over trees the reaper could not judge is not "nothing to do" (#2163
+# review, P2). Only the literal `CANNOT-VERIFY` token used to escalate, so the reaper's own
+# `abstained=` counter — the one field that says a safety read failed — never reached the pass rc.
+say_case "a process pass that ABSTAINED is unverifiable (rc=3), not an idle pass"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_ABSTAIN=2 doc reap
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap-abstain: the pass was still delegated" || bad "reap-abstain: the process pass was not delegated — $(cat "$T/lane-reap/calls" 2>/dev/null)"
+[ "$RC" -eq 3 ] && ok "reap-abstain: rc=3 (a safety read failed)" || bad "reap-abstain: rc=$RC — an abstaining pass read as clean — $OUT"
+result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pass line" || bad "reap-abstain: the abstention count is missing — $OUT"
 
 # ── 1b) a lane whose log advanced INSIDE the floor is NOT reaped ────────────────────────────────
 # REAP_MIN_S is the whole reason a SCHEDULED reap pass is safe: a lane that spoke recently is between

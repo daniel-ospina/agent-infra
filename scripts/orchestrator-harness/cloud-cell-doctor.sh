@@ -911,6 +911,14 @@ run_reap() {
     fi
     case "$proc_result" in
       *"CANNOT-VERIFY"*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AN ABSTAINING PASS IS NOT AN IDLE ONE (#2163 review, P2). lane-reap.sh counts every tree it
+      # could not judge (a descriptor it could not read, an ancestry it could not classify, a CPU delta
+      # that went backwards, a log age it could not stat) into `abstained=`, and exits 3. Only the
+      # literal CANNOT-VERIFY token used to escalate here, so a pass reporting
+      # `reaped=0 refused=0 abstained=4` was indistinguishable from a quiet, healthy reaper — the
+      # "looks alive while doing nothing" class this role exists to remove.
+      *abstained=0*) ;;
+      *abstained=*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
     esac
     log "[reap] proc: ${proc_result:-<no output>}"
   else
