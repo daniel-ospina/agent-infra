@@ -87,10 +87,12 @@ if [ "$OR_RC" != "0" ]; then
   [ -d "$O" ] && echo "$(date) [startup] $_or_warn" >> "$O/logs/orch-loop.log" 2>/dev/null
 fi
 # ⛔ EXPORTED, AND THAT IS LOAD-BEARING (#2040 review). `refresh-candidates.sh` reads its LISTINGS
-# from $OR, and it runs as a CHILD (`bash "$O/refresh-candidates.sh" 6`). A DERIVED value never
-# reached this script through the environment, so without this export the child re-derives its own
-# default — the pool would come from one repo while the controller graded another. (Before this
-# change the same held true, consistently: both sides used the same literal.)
+# from $OR, and it runs as a CHILD — `bash "$REFRESH_SH" 6`, where `$REFRESH_SH` is the copy
+# `resolve_refresh_sh` RESOLVED for this cycle (the seed in $O when it can record, a recording copy
+# beside the loop when the seed cannot — #2308; the spawn site names no hardcoded path any more).
+# A DERIVED value never reached this script through the environment, so without this export the child
+# re-derives its own default — the pool would come from one repo while the controller graded another.
+# (Before this change the same held true, consistently: both sides used the same literal.)
 export OR
 # ⛔ NO `export REPO` HERE, DELIBERATELY. It would be a no-op for every supported invocation: a
 # value that reached this script through the environment is ALREADY exported to the refresh and
@@ -808,7 +810,14 @@ refresh_can_record() {   # <refresh-script> — 0 when it can WRITE the pass rec
   # pass's output can quote it — so a substring match would report the capability for a script that
   # has none (a false PASS on the probe itself). Same shape as spawn-gate.sh's `run_agent` probe and
   # worker-terminal.sh's `wt_spawn` probe: the controller asks for the function it calls.
-  grep -qE '^[[:space:]]*refresh_record_write[[:space:]]*\(\)' "$1" 2>/dev/null
+  # ⛔ AND THE BODY OPENER, NOT JUST THE SIGNATURE (review P3): excluding `#`-comments answers prose
+  # that is COMMENTED, but any non-comment line that merely STARTS with the name satisfies a
+  # signature-only match — a heredoc body does exactly that
+  # (`why="$(cat <<EOF` / `refresh_record_write() writes the record…` / `EOF` / `)"`), so a box whose
+  # seed only QUOTES the name in captured text would be read as a recorder and the SEED-SKEW verdict
+  # never fires. Requiring the `{` keeps the match on a definition; the shipped definition puts the
+  # brace on the signature line (`refresh_record_write() {      # …`), so this refuses no real copy.
+  grep -qE '^[[:space:]]*refresh_record_write[[:space:]]*\(\)[[:space:]]*\{' "$1" 2>/dev/null
 }
 REFRESH_RESOLVED=0        # 1 once resolution has run THIS cycle (reset per cycle, like _HR_DONE — a
                           # cached answer would keep reporting the skew the remedy just fixed, and a
@@ -1338,9 +1347,22 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     # never reaches this line and a stale one does — which is the point: the frozen content is quoted (so
     # a real past failure, or a real past success, is not lost) and the verdict names the deployment
     # defect plus the paths it tried.
-    printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died; the cause is a stale seed, not a crash. Tried: %s. Fix: re-seed $O from the shipped scripts (cp scripts/orchestrator-harness/*.sh $O/) — a copy that can record would run as %s, and the loop looked beside itself in %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
+    # ⛔ THE CLAUSE MUST AGREE WITH THE RESOLVER'S OWN ANSWER (review P2). With rc=2 the path in
+    # `$REFRESH_SH` is BY DEFINITION a copy that CANNOT record — `resolve_refresh_sh` only falls back
+    # to an incapable copy when no recorder was found anywhere — so the old wording ("a copy that can
+    # record would run as %s") asserted the capability of the one file it had just proved incapable,
+    # and an operator reading it would take the stale seed for healthy. rc=1 names no copy at all.
+    local _skew_run
+    if [ "${REFRESH_RC:-1}" = "2" ] && [ -n "$REFRESH_SH" ]; then
+      _skew_run="the copy this box WOULD run is $REFRESH_SH — it cannot record"
+    elif [ -n "$REFRESH_SH" ]; then
+      _skew_run="a copy that can record would run as $REFRESH_SH"
+    else
+      _skew_run="no refresh copy exists on this box to run"
+    fi
+    printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died; the cause is a stale seed, not a crash. Tried: %s. Fix: re-seed $O from the shipped scripts (cp scripts/orchestrator-harness/*.sh $O/) — %s, and the loop looked beside itself in %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
       "$age" "${result:-<no result= recorded>}" "$(refresh_cause_brief "$rec")" \
-      "${REFRESH_TRIED:-none}" "${REFRESH_SH:-none}" "${REFRESH_SELF_DIR:-?}" \
+      "${REFRESH_TRIED:-none}" "$_skew_run" "${REFRESH_SELF_DIR:-?}" \
       "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
     if [ "$backlog" -gt 0 ]; then
@@ -4198,13 +4220,21 @@ PY
       # whose outcome nothing can record is spawned ONLY if that is disclosed and not repeated for
       # nothing: with no recorder anywhere, spawning buys a full pool read whose result this loop is
       # then forbidden to trust. The skew line names the passed-over copy, so a stale seed cannot sit
-      # invisible behind a healthy-looking pass.
+      # invisible behind a healthy-looking pass — and EVERY arm that picks a copy OTHER than the
+      # seeded one speaks, including the `rc=0`-with-skew case (review P2).
       resolve_refresh_sh; _rrc=$?
       if [ "$_rrc" = "2" ]; then
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
       elif [ "$_rrc" = "1" ]; then
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
         rm -rf "$O/.refresh.lock"
+      elif [ -n "$REFRESH_SH_SKEW" ]; then
+        # ⛔ THE PASSED-OVER SEED IS DISCLOSED, NOT SILENT (review P2) — the `rc=0`-with-skew case is
+        # the MEASURED cell's own remedy (a stale `$O` seed, a recording copy beside the loop), and it
+        # was the one arm that logged only `spawning`: the box ran a DIFFERENT script than the operator
+        # seeded and nothing said so, while this block's own comment and the PR claim disclosure. No
+        # lock removal here — a pass IS being spawned; only the choice of copy is announced.
+        echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
       elif [ -z "$REFRESH_SH" ]; then
         # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
         # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall

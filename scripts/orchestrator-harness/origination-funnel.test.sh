@@ -1039,6 +1039,14 @@ PROBE_OUT="$(O="$SKEW/o" bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" 
 PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/self/refresh-candidates.sh" 2>&1)"; PROBE_RC=$?
 [ "$PROBE_RC" = "0" ] && ok "probe: a script that DEFINES refresh_record_write is capable" \
   || bad "probe: a real writer was not recognised (rc=$PROBE_RC) — the resolver would pass over a good copy"
+# ⛔ AND THE MENTION A COMMENT-ONLY EXCLUSION CANNOT SEE (review P3): a heredoc BODY is not a comment,
+# so any non-comment line merely STARTING with the name satisfied a signature-only match. Captured text
+# that quotes the definition is not the capability — the seed would be read as a recorder and this
+# whole verdict would never fire on the box it exists for.
+printf '%s\n' '#!/usr/bin/env bash' 'why="$(cat <<EOF' 'refresh_record_write() writes the record before this note' 'EOF' ')"' 'echo "$why"' > "$SKEW/prose-heredoc.sh"
+PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/prose-heredoc.sh" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "1" ] && ok "probe: a heredoc body that only QUOTES the name is NOT capable" \
+  || bad "probe: a heredoc body was read as the capability (rc=$PROBE_RC) — a stale copy would look healthy"
 
 # (b) THE MEASURED CELL: $O cannot record, a capable copy sits beside the loop. The controller runs the
 # capable one, so a stale record IS evidence of a dead pass — the DIED bound must NOT be relaxed just
@@ -1067,6 +1075,19 @@ esac
 case "$OUT_DRIVE" in
   *"$SKEW/o/refresh-candidates.sh"*) ok "unwritable: the verdict NAMES the copy it tried (an operator is not sent hunting)" ;;
   *) bad "unwritable: the verdict did not name the path it tried — $OUT_DRIVE" ;;
+esac
+# ⛔ AND WHAT IT SAYS ABOUT THAT PATH MUST AGREE WITH THE RESOLVER (review P2). With rc=2 `$REFRESH_SH`
+# is BY DEFINITION the copy the probe just proved CANNOT record, so the old clause — “a copy that can
+# record would run as <it>” — asserted the capability of the one file it had just disproved, and an
+# operator reading it would take the stale seed for healthy. Both halves are asserted: the wrong claim
+# absent AND the right one present (an absence check alone passes on an empty reading).
+case "$OUT_DRIVE" in
+  *"a copy that can record would run as"*) bad "unwritable: the verdict claims the copy it just proved INCAPABLE can record — $OUT_DRIVE" ;;
+  *) ok "unwritable: the verdict does not claim the incapable copy can record" ;;
+esac
+case "$OUT_DRIVE" in
+  *"the copy this box WOULD run is $SKEW/o/refresh-candidates.sh — it cannot record"*) ok "unwritable: it says of the named path that it CANNOT record (rc-aware clause)" ;;
+  *) bad "unwritable: the rc=2 clause does not match the resolver's own answer — $OUT_DRIVE" ;;
 esac
 # The frozen record's own content is not thrown away: a real past failure is still readable there.
 case "$OUT_DRIVE" in
@@ -1204,6 +1225,47 @@ if grep -Eq '^[^#]*bash "\$REFRESH_SH"' "$LOOPCODE"; then
   ok "wiring: the spawn runs the RESOLVED script (\$REFRESH_SH)"
 else
   bad "wiring: no code line spawns \$REFRESH_SH — the resolution would be decorative"
+fi
+
+# (f) THE SPAWN MUST SAY WHEN IT RUNS A DIFFERENT COPY THAN THE OPERATOR SEEDED (review P2). The
+# `rc=0`-with-skew case is the MEASURED cell's own remedy — a stale `$O` seed passed over in favour of
+# a recorder beside the loop — and it was the one arm that logged only `spawning`: the box silently
+# ran something other than the seed, so the seed could stay stale forever with no operator-visible
+# signal. The shipped block is extracted VERBATIM (the same extractor refresh-scout.test.sh §7 uses)
+# and DRIVEN, because an arm that exists in the text but never fires grades nothing.
+SPAWNBLOCK="$T/refresh-spawn-block.sh"
+{
+  grep -m1 '^is_num()' "$LOOP"
+  awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  cat "$HELPFNS"
+  awk '/^refresh_record_snapshot\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_record_field\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_cause_brief\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
+} > "$SPAWNBLOCK"
+printf '\nwait\n' >> "$SPAWNBLOCK"
+if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep -q '^resolve_refresh_sh()' "$SPAWNBLOCK"; then
+  SP="$T/spawn"; mkdir -p "$SP/o/state" "$SP/self"
+  # The SEEDED copy cannot record; a RECORDER sits beside the loop. Resolvable rc = 0 WITH a skew —
+  # the exact shape whose remedy this PR is.
+  printf '%s\n' '#!/usr/bin/env bash' '# a deployed copy from before #2229: refresh_record_write is only prose here' \
+    'echo "refresh: queued nothing"' > "$SP/o/refresh-candidates.sh"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP/self-invoked'" 'refresh_record_write() { :; }' > "$SP/self/refresh-candidates.sh"
+  : > "$SP/o/candidates.txt"
+  O="$SP/o" LOG="$SP/log" REFRESH_SELF_DIR="$SP/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP/self-invoked" ] && ok "spawn+skew: the RESOLVER's copy is the one that runs (non-vacuity: the arm is reached)" \
+    || bad "spawn+skew: the recording copy was never executed — the driven block did not reach the spawn"
+  if grep -q 'SEED-SKEW' "$SP/log" 2>/dev/null && grep -q "$SP/o/refresh-candidates.sh" "$SP/log" 2>/dev/null; then
+    ok "spawn+skew: the swap is DISCLOSED, naming the passed-over seed"
+  else
+    bad "spawn+skew: the seeded copy was passed over silently (log: $(cat "$SP/log" 2>/dev/null | tr '\n' '|'))"
+  fi
+  grep -q 'cannot record' "$SP/log" 2>/dev/null && ok "spawn+skew: and says WHY the seed was passed over (it cannot record)" \
+    || bad "spawn+skew: the disclosure does not state the seed's defect — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
+  grep -q 'cp scripts/orchestrator-harness/\*.sh' "$SP/log" 2>/dev/null && ok "spawn+skew: and carries the one-line remedy" \
+    || bad "spawn+skew: the disclosure names no remedy"
+else
+  bad "spawn+skew: could not extract the refresh spawn block — the disclosure is ungraded"
 fi
 
 echo
