@@ -378,6 +378,13 @@ this PR into its base"* — a fabricated CI diagnosis, for the whole empty-core 
 merges the failover exists to keep alive. There is no faithful source, so the projection is refused
 (tests `(g2)`), and the rail's read fails closed on the NAMED state instead of blaming CI.
 
+⛔ **A `--jq` IS REQUIRED FOR A FAILOVER.** A raw body (no projection) carries no evidence about which
+fields the caller will read, and the encoder is a **subset** of a REST pull object — the fleet's own
+adapter (`gh-rest/gh`) projects `labels`, `assignees`, `mergeStateStatus`, so a labelled PR read back
+as `[]` with rc 0. A read with no `--jq` is therefore refused by name on an empty core, never answered
+from a partial body. Serving *a projection we can verify* is the contract; `field-for-field` describes
+the listed fields, not the whole REST object.
+
 ⛔ **A `--jq` THAT NAMES A FIELD THE ENCODER DOES NOT PRODUCE IS NOT FAILED OVER.** `jq` prints `null`
 for an absent field **and exits 0**, so a partly-reproduced body is not a near miss — it is an empty
 answer with a success status. Measured in review of this change: `--jq .body` returned `null`/rc 0, and
@@ -454,6 +461,22 @@ a closed window cannot keep asserting itself. `repo-authority.sh` repeats the to
 reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
 the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
 that phrase into `VERDICT=GH-RATE-LIMITED`.
+
+⛔ **THE SECONDARY LIMIT HAS ITS OWN TOKEN, AND IT IS NOT EXHAUSTION.** A burst/concurrency refusal
+arrives as a 403/429 in the same shape as a primary one, but its `x-ratelimit-remaining` is **above
+zero** — so it is named `gh-secondary-rate-limited remaining=<n>`, it writes **no** health record, and
+it never gates a write. Without that distinction a transient burst froze every merge/comment/PATCH on
+the box for up to an hour and told the operator the pool was empty while thousands of requests were
+left. The durable `last-limit` record carries `remaining=` for the same reason.
+
+⛔ **DATED EVIDENCE MAY REFUSE; UNDATED EVIDENCE MAY ONLY DIVERT.** A record whose reset is known is a
+measurement, and it may refuse a read outright. A record written from a refusal that carried **no**
+reset cannot say when the window ends, so it may only *divert* a read to GraphQL — never refuse one —
+and it expires on its own after `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s). Two failures are pinned here:
+the window a reader *invents* must never be written back as if it were observed (that turned one
+headerless refusal into "core empty until T+15m" with no way to clear it, because the only cure is a
+successful core call and none was being attempted), and `--health` must not report `gh-ok` from a
+`reset=0` record.
 
 ⛔ **THE EVIDENCE IS THREE FILES AND NONE OF THEM MAY BE CLOBBERED BY ANOTHER BUCKET'S NEWS.**
 `last-limit` holds ONE record per box (pre-existing design), so a GraphQL refusal overwrites the `core`

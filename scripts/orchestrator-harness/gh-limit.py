@@ -317,12 +317,21 @@ def write_state(name, text):
         return False
 
 
-def record_limit(bucket, reset, attempts, waited, status):
-    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`)."""
+def record_limit(bucket, reset, attempts, waited, status, remaining=None):
+    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`).
+
+    ⛔ AND IT CARRIES THE REMAINING COUNT WHEN THE REFUSED RESPONSE CARRIED ONE. A SECONDARY (burst)
+    refusal on the `core` bucket looks exactly like a primary one, but its `x-ratelimit-remaining` is
+    above zero — and without that number the record is indistinguishable from “the core pool is EMPTY”,
+    so `core_record_reset()` would gate every write on the box for the length of the PRIMARY window
+    (up to an hour) on a pool with thousands of requests left. The field is optional and last, so
+    every reader that only wants `bucket`/`reset` is unaffected.
+    """
+    extra = "" if remaining is None else " remaining=%d" % remaining
     write_state("last-limit",
-                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s"
+                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s%s"
                 % (int(clock()), bucket, ("%d" % reset) if reset else "0", attempts, int(waited),
-                   status if status is not None else "?"))
+                   status if status is not None else "?", extra))
 
 
 def record_recovery(bucket):
@@ -2196,12 +2205,21 @@ def fail_loudly(limit, attempts, waited, reset):
     # ⛔ THE WORDS MATTER: the harness's own classifiers look for "rate limit" (objective.py's
     # TRANSPORT_MARKERS) to turn a refused read into `VERDICT=GH-RATE-LIMITED` instead of
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
-    # boundary this layer exists to make honest. ⛔ AND A CORE REFUSAL CARRIES THE NAMED STATE FIRST,
-    # so a lane has one token to print instead of “branch protection UNREADABLE” — which reads like a
-    # broken repository and sends an operator to check credentials that are fine.
+    # boundary this layer exists to make honest.
+    #
+    # ⛔ AND ONLY EMPTINESS MAY BE CALLED EMPTINESS. A SECONDARY (concurrency/burst) refusal arrives in
+    # the same shape as a primary one and `classify` admits both — but it carries
+    # `x-ratelimit-remaining: 3200`, and naming it `gh-core-exhausted` froze every write on the box for up
+    # to an hour while the pool had thousands of requests left, with a message saying the pool was EMPTY.
+    # A number we can SEE above zero refutes exhaustion, so it gets its own name and writes no health
+    # record at all.
     named = ""
     if limit.bucket == "core":
-        named = "%s — " % record_core_exhausted(reset, None)
+        rem = getattr(limit, "remaining", None)
+        if rem is None or rem == 0:
+            named = "%s — " % record_core_exhausted(reset, rem)
+        else:
+            named = "gh-secondary-rate-limited remaining=%d — " % rem
     sys.stderr.write(
         "gh-limit: %sgh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
         "This is a REFUSED call, not an empty answer%s\n"
@@ -2436,6 +2454,12 @@ def core_record_reset():
         return None
     if parts.get("bucket") != "core" or "recovered" in parts:
         return None
+    # ⛔ A RECORD THAT SHOWS HEADROOM REFUTES ITS OWN EXHAUSTION. `remaining` is written only when the
+    # refused response carried it, and a secondary/burst refusal carries a healthy counter — reading
+    # that as an empty pool parked every write for the primary window (up to an hour).
+    rem = as_int(parts.get("remaining"))
+    if rem is not None and rem > 0:
+        return None
     reset = as_int(parts.get("reset"))
     return reset if reset and reset > clock() else None
 
@@ -2605,7 +2629,7 @@ REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "u
 # jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
 # one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
 PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_unsorted", "tojson",
-                        "paths", "leaf_paths", "map_values", "values", "path", "env")
+                        "paths", "leaf_paths", "map_values", "values", "path", "env", "has")
 _PROJECTION_NAME = re.compile(r"""\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]""")
 
 
@@ -2615,18 +2639,31 @@ def _projection_ok(jq, allowed):
     ⛔ THE FIRST VERSION OF THIS CHECK WAS ESCAPABLE, WHICH MADE ITS OWN DOCSTRING FALSE. It scanned
     only `.name`, so `.["requested_reviewers"]`, `getpath(["url"])`, `keys` and `to_entries` all
     produced a `null`/subset with rc 0 — the same “empty answer with a success status” the check
-    exists to prevent. Three rules now, each erring toward REFUSAL:
-      1. every name it can see — dotted OR bracketed-quoted — must be in the allow-list;
-      2. no recursive descent (`..`);
-      3. no shape operator that enumerates or reaches keys without naming them (`keys`, `to_entries`,
-         `getpath`, `paths`, `map_values`, `tojson`, …); a projection written that way cannot be shown
-         to be reproducible, so it is not served.
+    exists to prevent. The rules now, each erring toward REFUSAL:
+      1. a projection is REQUIRED AT ALL. A raw body (no `--jq`) is answered from an encoder that is a
+         SUBSET of a REST pull object, and the fleet's own adapter parses the raw body — `gh-rest/gh`
+         projects `labels`, `assignees`, `mergeStateStatus`, … so a labelled PR read back as `[]` with
+         rc 0. Serving a projection we can verify is the whole contract; a body we cannot make
+         complete is not served at all.
+      2. every name it can see — dotted OR bracketed-quoted — must be in the allow-list, and a bracket
+         whose content is not a literal quoted name (`.["a"+"b"]`, `.[0]`) is refused;
+      3. no recursive descent (`..`);
+      4. no shape operator that enumerates or reaches keys without naming them (`keys`, `to_entries`,
+         `getpath`, `paths`, `map_values`, `tojson`, `has`, …).
     A false refusal costs a read that fails closed with the named state (and which would have been
     refused anyway on an empty pool); a false admission costs a confident WRONG answer."""
-    if not jq:
-        return True
+    if not jq or not jq.strip():
+        return False
     if ".." in jq:
         return False
+    # A KEY-LOOKUP bracket (`.[…]`) must be a literal quoted name or an iteration (`.[]`). Array
+    # CONSTRUCTION (`[.a,.b]`) is untouched: there the bracket PRECEDES the dot, so it does not match.
+    for m in re.finditer(r"\.\s*\[\s*([^\]]*)\]", jq):
+        inner = m.group(1).strip()
+        if inner == "":
+            continue                   # `.[]` — iteration over a list, not a key
+        if not re.fullmatch(r"""["'][A-Za-z_][A-Za-z0-9_]*["']""", inner):
+            return False               # `.[0]`, `.["a"+"b"]`, `.[$x]` — a computed key we cannot attribute
     for m in _PROJECTION_NAME.finditer(jq):
         name = m.group(1) or m.group(2)
         if name not in allowed:
@@ -2819,7 +2856,7 @@ def _dispatch(real_gh, gh_argv):
             # the read SUCCEEDS. The pool being empty is a fact about the budget that lanes,
             # `repo-authority.sh` and an operator all need to see; a GraphQL-served read does not make
             # it stop being true (only a real `core` success does — see `record_core_ok`).
-            phrase = record_core_exhausted(reset, remaining) if empty else None
+            phrase = record_core_exhausted(reset if core_dated else None, remaining) if empty else None
             if mutating:
                 if empty and core_dated:
                     # ⛔ A WRITE HAS NO SECOND POOL. `merge`, `comment` and `PATCH` have no GraphQL
@@ -2830,7 +2867,7 @@ def _dispatch(real_gh, gh_argv):
                     # ever clear the record if no call were attempted — `record_core_ok` fires on a
                     # SUCCESS, so a box that refuses pre-emptively could never recover itself.
                     _named_core_refusal(
-                        record_core_exhausted(reset, remaining),
+                        record_core_exhausted(reset if core_dated else None, remaining),
                         "This call WRITES (no GraphQL equivalent of the same write) and is NOT retried.")
                     return 1
                 # In the band (or with undated evidence) a WRITE is what the reserve exists for.
@@ -2915,7 +2952,7 @@ def _dispatch(real_gh, gh_argv):
             # and `repo-authority.sh` goes silent. `core_reset` was captured before any of that.
             limit = classify(res, gh_argv, headers)
             if limit is not None:
-                record_limit("graphql", limit.reset, attempt, 0.0, limit.status)
+                record_limit("graphql", limit.reset, attempt, 0.0, limit.status, limit.remaining)
             # ⛔ THE BAND IS NOT EXHAUSTION, ON THIS PATH TOO. `core_empty` is false when the pool still
             # had headroom (the read was moved to GraphQL to PRESERVE that headroom): writing
             # `gh-core-exhausted … remaining=0` here made `health_reset()` report pressure, so every
@@ -2923,7 +2960,7 @@ def _dispatch(real_gh, gh_argv):
             # finding, reintroduced through the failover-failure branch. What actually failed is the
             # GraphQL transport, so that is what gets named.
             if core_empty:
-                phrase = record_core_exhausted(core_reset, 0)
+                phrase = record_core_exhausted(core_reset if core_dated else None, 0)
             else:
                 phrase = "gh-graphql-unavailable resets_in=%s" % resets_in(core_reset)
             _named_core_refusal(
@@ -2958,7 +2995,7 @@ def _dispatch(real_gh, gh_argv):
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
             # refusing calls. `limit.reset` is what the refused response itself carried.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
             log_event("GAVE UP bucket=%s status=%s attempts=%d waited=%ds reset=%s"
                       % (limit.bucket, limit.status, attempt, int(waited), reset))
             fail_loudly(limit, attempt, waited, reset)
@@ -2977,7 +3014,7 @@ def _dispatch(real_gh, gh_argv):
             # skipped too — it may spend a `/rate_limit` probe, and this caller is not going to wait
             # for the answer anyway.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
             log_event("rate_limited bucket=%s status=%s attempt=%d reset=%s — NO_WAIT, returning at once"
                       % (limit.bucket, limit.status, attempt, reset))
             fail_loudly(limit, attempt, waited, reset)
@@ -2987,7 +3024,7 @@ def _dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
         wait, reset, why = plan_wait(limit, attempt, real_gh, now)
-        record_limit(limit.bucket, reset, attempt, waited, limit.status)
+        record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.remaining)
         if wait > MAX_WAIT:
             log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s — failing fast"
                       % (limit.bucket, int(wait), reset))

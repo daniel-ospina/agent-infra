@@ -41,6 +41,8 @@ case "\$1 \$2" in
     # core: EMPTY (the incident). graphql: 4745 of 5000 (the headroom that existed and went unused).
     if [ "\${GH_TEST_SCENARIO:-}" = "coreok" ]; then
       printf '{"resources":{"core":{"limit":5000,"remaining":3000,"reset":$RESET,"used":2000},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
+    elif [ "\${GH_TEST_SCENARIO:-}" = "secondary" ]; then
+      printf '{"resources":{"core":{"limit":5000,"remaining":3200,"reset":$RESET,"used":1800},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
     elif [ "\${GH_TEST_SCENARIO:-}" = "low" ]; then
       # 50 left: inside the low-water band, NOT empty.
       printf '{"resources":{"core":{"limit":5000,"remaining":50,"reset":$RESET,"used":4950},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
@@ -75,8 +77,19 @@ case "\$1 \$2" in
     printf '[{"databaseId":39786847846,"status":"completed","conclusion":"success"}]\n'
     ;;
   "api --include")
-    # `conditional_fetch` frames its GETs (`--include`); a framed 200 with an ETag is what it expects.
-    printf 'HTTP/2.0 200 OK\r\nETag: "e1"\r\nContent-Type: application/json\r\n\r\n{"number":7,"state":"open"}\r\n'
+    # conditional_fetch frames its GETs with --include. The "secondary" scenario answers a BURST
+    # refusal the way GitHub does: 403, a phrase, and x-ratelimit-remaining still ABOVE zero.
+    # NOTE: no backticks in this heredoc — it is unquoted, so they would be command-substituted.
+    if [ "\${GH_TEST_SCENARIO:-}" = "secondary" ]; then
+      # AND IT MUST EXIT NON-ZERO: a real gh fails on a 403, and a 0-exit stub would be read as a
+      # SUCCESS (the body emitted, rc 0) — the exact “a refusal looks like an answer” shape.
+      printf 'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 3200\r\nX-RateLimit-Reset: %s\r\n\r\n{"message":"You have exceeded a secondary rate limit"}\r\n' "$RESET"
+      # a real gh ALSO writes its own error line to stderr; classify() reads the PHRASE from there
+      printf 'gh: You have exceeded a secondary rate limit (HTTP 403)\n' >&2
+      exit 1
+    else
+      printf 'HTTP/2.0 200 OK\r\nETag: "e1"\r\nContent-Type: application/json\r\n\r\n{"number":7,"state":"open"}\r\n'
+    fi
     ;;
   *)
     printf 'stub gh: unexpected argv: %s\n' "\$*" >&2
@@ -420,6 +433,54 @@ printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "
 run core0 api repos/o/r/pulls/7 --jq .head.sha
 ck "(h3) while a read WITH an equivalent is still DIVERTED to GraphQL" \
    $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && [ "$(reqs 'pulls/7')" -eq 0 ] && echo 0 || echo 1)
+
+echo "── (b4) a RAW body (no --jq) is not served: a subset is an absent-field answer ────────────────"
+# Round-3 finding: with no projection the encoder's subset went straight to a raw-body consumer, and
+# `gh-rest/gh` projects `labels`/`assignees`/`mergeStateStatus` — a labelled PR read back as `[]` with
+# rc 0. A body we cannot make complete is refused, not approximated.
+reset_env b4 core0
+budget core0
+run core0 api repos/o/r/pulls/7
+ck "(b4) a --jq-less read is REFUSED (no subset body with rc 0)" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+ck "(b4) … with the named state" $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+
+echo "── (h4) a DIVERTED read must not promote an UNDATED record into a dated one (round-3 B1) ──────"
+# `health_state` returns a synthetic window end so undated evidence can EXPIRE; persisting it turned
+# “I was refused once” into “core is empty until T+15m”, and nothing could clear it (a success is the
+# only cure, and no core call was being attempted).
+reset_env h4 core0
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run core0 api repos/o/r/pulls/7 --jq .head.sha
+ck "(h4) the read is diverted to GraphQL" $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && echo 0 || echo 1)
+ck "(h4) the record is STILL undated (no invented reset was written)" \
+   $(grep -q 'reset=0' "$GH_LIMIT_DIR/health" && echo 0 || echo 1)
+: > "$STUB_LOG"
+run core0 api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
+ck "(h4) so a WRITE is still SENT rather than refused pre-emptively" \
+   $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (k) a SECONDARY refusal on the core bucket is not “exhausted” (round-3 B2) ────────────────"
+# A burst refusal carries `x-ratelimit-remaining: 3200`. Naming it gh-core-exhausted froze every write
+# for up to an hour on a pool with thousands of requests left.
+reset_env k secondary
+export GH_LIMIT_CONDITIONAL=1
+export GH_LIMIT_NO_WAIT=1
+: > "$STUB_LOG"
+run secondary api repos/o/r/pulls/7
+ck "(k) the burst refusal FAILS loudly" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
+ck "(k) it is named as a SECONDARY limit, not as an empty pool" \
+   $(printf '%s' "$ERR" | grep -q 'gh-secondary-rate-limited remaining=3200' && echo 0 || echo 1)
+ck "(k) and it does NOT claim gh-core-exhausted" \
+   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 1 || echo 0)
+health secondary
+ck "(k) --health stays gh-ok (the pool was never empty)" \
+   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+: > "$STUB_LOG"
+run secondary api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
+ck "(k) so the next WRITE is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
+unset GH_LIMIT_CONDITIONAL
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
