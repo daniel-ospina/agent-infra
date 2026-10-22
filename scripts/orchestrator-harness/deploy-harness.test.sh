@@ -975,6 +975,28 @@ OUT="$(PATH="$T/bin18c:$PATH" bash "$DEPLOY" --src "$SRC18c" --o "$O18c" --notif
 grep -qi "mode NOT set from the source" <<< "$OUT" && ok "18c: the verdict says the MODE was not set from the source" || bad "18c: the verdict implies the mode is the source's when it was never read: $OUT"
 cmp -s "$SRC18c/claims.sh" "$O18c/claims.sh" && ok "18c: the bytes still landed and verified" || bad "18c: the bytes did not land"
 
+# ── 18d. THE SPECIAL MODE BITS SURVIVE — `stat -f %Lp` cannot see them, `%p` can ──────────────────
+# Review P2 (cycle 7), REPRODUCED before this case existed: on BSD, `stat -f %Lp` returns the low nine
+# bits, so a 4755 source read as "755". The copy then chmod'd 755 over the source's mode and the verdict
+# compared 755 with 755 — VERIFIED, exit 0, setuid silently stripped (and a correctly-4755 target was
+# DEGRADED by a re-deploy that called itself verified). git only stores 644/755, so no shipped file is
+# affected today; the guard must still not be structurally blind to a mode it claims to compare.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (18d skipped — running as root, where the mode bits are not comparable this way)"
+else
+  say_case "18d. a setuid source keeps its setuid bit through the deploy (BSD %Lp is not enough)"
+  SRC18d="$T/src18d"; O18d="$T/o18d"; make_src "$SRC18d"; make_target "$O18d"
+  chmod 4755 "$SRC18d/claims.sh"   # -rwsr-xr-x
+  notify_reset; deploy "$SRC18d" "$O18d"
+  [ "$RC" -eq 0 ] && ok "18d: a setuid source deploys cleanly (exit 0)" || bad "18d: exited $RC: $OUT"
+  [ -u "$O18d/claims.sh" ] && ok "18d: the deployed file KEPT its setuid bit" || bad "18d: setuid was stripped (mode_of cannot see it — %Lp vs %p)"
+  # and the verdict can SEE a difference in those bits, rather than comparing two truncated values
+  chmod 0755 "$SRC18d/claims.sh"
+  notify_reset; deploy "$SRC18d" "$O18d"
+  [ "$RC" -eq 0 ] && ok "18d: the follow-up deploy (source now 0755) also verifies" || bad "18d: follow-up exit $RC: $OUT"
+  [ -u "$O18d/claims.sh" ] && bad "18d: the target still holds setuid after being redeployed from a 0755 source" || ok "18d: the redeploy removed the stale setuid bit"
+fi
+
 # ── 19. THE IDENTITY RECORD — a redeploy must not make the drift gate cry "hand edit" ────────────
 say_case "19. a stale .agent-infra-stamp.json is NAMED in the verdict, not hidden"
 # install.sh folds $O/*.sh into `payloadSha256`; check-deployed-drift.sh reports a mismatch as its

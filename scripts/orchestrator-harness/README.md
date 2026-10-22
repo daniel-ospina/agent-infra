@@ -755,7 +755,10 @@ flag) happen *before* the notifier is resolved and exit `78` on stderr only — 
 anything about a deploy.
 
 `$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` /
-`STALE-STAMP` / `STAMP-UNCHECKED` per path, plus the verdict line). It is written only once a copy has
+`MODE-UNSET` / `STALE-STAMP` / `STAMP-UNCHECKED` per path, plus the verdict line). `DRIFT` covers a
+byte difference, a lost executable bit, a mode that differs from the source, and a symlink at either
+end; `MODE-UNSET` records a path whose mode could not be read at all (no usable `stat`), which the
+VERIFIED line also says out loud. It is written only once a copy has
 been attempted, so it is never present in a runtime that was refused, and `check-deployed-drift.sh`
 ignores it (it hashes `*.sh`). If the ledger cannot be installed the bytes are still verified, but the
 verdict says the evidence file is missing rather than pointing at one that does not exist.
@@ -774,8 +777,12 @@ comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/
 `$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
 `install.sh`'s `DRIFTED` list (`install.sh:810`) carries exactly two of them — `gh-rest/gh` and
 `gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
-`gh-limit/gh`, the `*.py` and the template against canonical (`check-single-source.sh:260`, `:307-311`),
-but it **skips a missing file** (`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
+`gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
+`launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
+`*.sh` + `*.py` + `gh-rest/gh` + `gh-limit/gh` and nothing else (an earlier draft of this paragraph said
+"the template" and was wrong — a tampered `$O/launchd.plist.template` is MISSED, which matters because
+`install.sh:133` reads that file when install.sh is run from `$O`). It also **skips a missing file**
+(`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
 `$O/gh-limit/gh` is compared by nothing on any path — and a missing shim is exactly what #2041
 measured. So "run both" closes the loop for top-level scripts and for a *differing* shim, and not for a
 *missing* one: more than the bare `cp *.sh` it replaces, less than *every file*.

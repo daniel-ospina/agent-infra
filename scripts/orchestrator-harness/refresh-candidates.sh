@@ -627,9 +627,10 @@ gh_env_verdict() {
 # ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
 # through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
 # seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT `install.sh`, which
-# only REPORTS the drift and prints that `cp` command; corrected 2026-10-16 after a review found the
-# old sentence sent the operator down a path that does not install it), so a deployed cell has it; a
+# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
+# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
+# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
+# remedy it prints is now this same helper), so a deployed cell has it; a
 # box without it cannot take the claim either, and refusing to queue on a missing FILE would make
 # every such box merge-only — a bigger, less reversible failure than the state being removed.
 # Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a

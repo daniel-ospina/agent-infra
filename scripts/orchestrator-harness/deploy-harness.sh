@@ -135,8 +135,17 @@ fi
 # the result is accepted only when it is 3-4 octal digits and is EMPTY otherwise. Empty makes the caller
 # take the executable-bit path AND count the file in MODE_UNSET, so the verdict says the mode is not
 # this run's evidence instead of asserting something it did not measure.
+# ⛔ AND ON BSD THE PERMISSION-ONLY FORMAT IS NOT ENOUGH (review P2, cycle 7). `stat -f %Lp` returns the
+# low NINE bits — a 4755 source reads "755" — so the setuid/setgid/sticky bits were invisible to BOTH
+# the copy and the verdict: the deploy chmod'd 755 over a 4755 target and still printed VERIFIED. `%p`
+# carries the file type and the full mode ("104755"), so the last four digits are taken instead. On GNU
+# `stat -c %a` already includes them ("4755"), which is why the first form is tried first.
 mode_of() {
-  _mo="$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null)"
+  _mo="$(stat -c %a "$1" 2>/dev/null)"
+  if [ -z "$_mo" ]; then
+    _p="$(stat -f %p "$1" 2>/dev/null)"     # BSD: "100644" / "104755" — file type + full mode
+    _mo="${_p#"${_p%????}"}"                 # keep the last four octal digits
+  fi
   case "$_mo" in
     [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s
 ' "$_mo" ;;
