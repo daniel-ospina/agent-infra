@@ -591,9 +591,11 @@ hu_run() { # <secs> <cmd…>
     # reassignment, so skipping `hu_env_add REPO` did NOT keep it out of the child: measured, a dropped
     # target still handed the authority the harness checkout, which then graded agent-infra. origin/main
     # REFUSED that state; inheriting it is the wrong-surface class with a new spelling. One place, both
-    # directions, so no future `hu_env_add` can re-open it.
-    if [ -n "${TARGET_REPO:-}" ]; then export REPO="$TARGET_REPO"; else unset REPO; fi
+    # directions — and it runs AFTER the list, because the list is the last writer of the child's `REPO`
+    # and a future `hu_env_add REPO …` would otherwise be exported over this decision (measured: adding
+    # one to a copy re-opened the wrong surface in (e)/(f)/(h)).
     for _kv in "${HU_ENV[@]}"; do export "$_kv"; done
+    if [ -n "${TARGET_REPO:-}" ]; then export REPO="$TARGET_REPO"; else unset REPO; fi
     hu_bounded "$s" "$@"
   )
 }
