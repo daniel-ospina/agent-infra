@@ -322,6 +322,18 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: pi pool reaper gate suite (zero-dep)
+        # The `pi` session pool had NO owner: the `ppid=1 + our-checkout + testish` orphan class
+        # cannot see a lane's `pi` (bare argv, reparented to launchd or under tmux), so days-old
+        # stopped sessions accumulated while the box's own lanes waited for capacity (measured
+        # 2026-10-22: 64 `pi`, 21 of them 1-9 days old at a 0.00 s CPU delta). `scripts/
+        # orphan-reap.py --pool pi` owns them, and it consumes `tools/fleet/liveness.py::evaluate`
+        # (`idle` is the only kill authorisation) rather than forming a second opinion. The suite
+        # drives the census through injected ps / session-index / stat / clock readers (NO live
+        # process is touched), asserts the four states stay distinguishable, and its --mutations
+        # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
+        # go RED). Its own step, so one verdict cannot suppress another.
+        run: python3.12 scripts/orphan-reap.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had

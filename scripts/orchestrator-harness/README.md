@@ -1289,7 +1289,7 @@ runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reap
 gate is a lane-killer, not a reaper.
 
 **Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
-mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
+mean. `orphan-reap.py` walks to the top (`ancestry()`, cited by symbol (the rule at `:17-19`)) **and** adds the
 two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
 designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
 socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
@@ -1335,7 +1335,7 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
+  `orphan-reap.py` (its `--apply` default, cited by symbol) — with nothing scheduling it. The two that actually run are ARMED:
   `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
   `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
   decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.

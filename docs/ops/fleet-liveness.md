@@ -163,24 +163,46 @@ The mirror failure is real too: a working child was once declared `wedged` with
 > classifier forks it. Adding a second identity probe anywhere is the "two contracts for one
 > safety rule" defect #1178 exists to remove.
 
-**Three consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
+**Four consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
 CLI **at signal time**, immediately before each `os.kill`: it supplies the incarnation it recorded
 when it measured the subtree, and signals only on `holder`. It derives no identity of its own — an
 earlier version signalled by pid alone, which is the superseded form recorded in §6.
+
+**A fourth consumer: the `pi` POOL's owner** (`scripts/orphan-reap.py --pool pi`, 2026-10-22). The
+`ppid=1` orphan class above could not see a lane's `pi` at all — bare argv, reparented to launchd
+or sitting under tmux — so the session pool had no owner and grew without bound. That reaper
+derives the session **from the pid** (the JSONL whose name-stamp is within the canon's
+`FENCE_TOLERANCE_SECONDS` of `now - etime`; an argv `--session` form is left to
+`scripts/lib/pid-identity.sh`, never re-parsed), then calls **`liveness.gather`** — so the store is
+read and its vetoes apply — appends the live pid it is holding as a `HOLDER` candidate (the C2
+direction), and acts **only** when `evaluate` returns `idle`. Three process gates sit in front of
+that verdict — CPU delta < 0.10 s over the printed window, ancestry walked to the top (a
+Terminal/iTerm/login-shell/tmux ancestor is `KEEP-HUMAN`), and progress judged against the
+process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap)) — and the four
+reported states are `LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`. Its declared blind
+spots are the ones §1 leaves it: a `pi` that leaves no bindable session file (a print-mode / `task`
+child, or a resumed session keeping its original name-stamp) reads `UNVERIFIABLE` with that reason,
+never `LIVE` and never "nothing to reap"; and on a box where the hook store is unreadable **every**
+row abstains, because that is what §1 requires of the verdict it consumes.
 
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):
 
 1. **Candidates are a UNION.** The candidate set for a session id is the current store record,
-   **every** `priorProcessGenerations` entry, and every pid whose **argv names the session** in a
-   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`). The union —
+   **every** `priorProcessGenerations` entry, every pid whose **argv names the session** in a
+   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`), and — for
+   the `pi` pool below — the pid that pool's reaper is itself holding (a *positive* observation
+   from a fresh `ps` read; a bare-argv `pi` is invisible to the argv source). The union —
    not the newest, not the first — is what stops a resumed session's stale tag from calling a live
    lane dead. Without the argv source, "the record's incarnation is gone" would be silently
    equated with "the lane is dead".
 
 2. **A pid holds the session its store record names only if the fence matches.** A fresh `ps`
    read must show it present, **not a zombie**, and its `lstart` must be within
-   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. The fence
+   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. ⚠️ The `pi`
+   pool below fences against a DIFFERENT datum on the SAME bound: the session JSONL's
+   **name-stamp** (UTC, ms) against `now - etime`. Same tolerance, different evidence — stated
+   here so the two are not read as one reading. The fence
    exists because second-granularity rounding differs by up to ~1 s; its whole purpose is to make
    an identity *uncertainty* fail safe. An unrelated process that inherits a dead session's pid
    fails the fence and is **not** its holder. A pid whose **argv** names the session is a *direct*
