@@ -785,6 +785,12 @@ hu_exec_path_of() { # <pid> -> the harness script that process executes, resolve
 # `MISSING (no controller)` — "no controller" about wrong code that IS running (found by review round 3).
 # The ARGV shape is the same rule `hu_pids` applies: the script must be its OWN token, so a shell whose
 # text mentions the path is not a controller.
+# ⚠️ STATED LIMIT (review round 4, follow-up rather than a fix): `ps -eo command=` SPACE-JOINS argv, so a
+# controller whose own path contains a space (a macOS `$HOME` like `/Users/First Last`) is invisible to
+# this census — the same accepted limit `hp_proc_argv` documents for the single-process read, and it
+# fails CLOSED (`MISSING`, never a false OK). Closing it means enumerating `/proc/[0-9]*/cmdline` on
+# Linux and keeping the `ps` fallback for macOS, i.e. a second census dialect: worth doing beside
+# `hu_pids` (which has carried the same limit since #2231), not in this change.
 # rc=1 when the process table cannot be read (and an unreadable read is never "no pids").
 hu_any_ctrl_pids() {
   local table
