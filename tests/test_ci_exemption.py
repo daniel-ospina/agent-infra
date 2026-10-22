@@ -2668,6 +2668,20 @@ def test_9331_a_meaningful_number_stays_SIGNAL():
          "orphaned redislite servers after suite: 12 (threshold: 12)"),
         ("reach rate 91.2% is below the 95% floor", "reach rate 88.4% is below the 95% floor"),
         ("coverage of the closure was 12/40 nodes", "coverage of the closure was 9/40 nodes"),
+        # ── the axis the mask actually ADDED: a duration. Each of these is a
+        # GENUINELY different failure that a purely lexical duration mask would
+        # collapse (found in review of the first cut, which masked all of them).
+        # SCALE: the unit rides the token, so 3 orders of magnitude stay signal.
+        ("local EP took 1.21ms — interactive budget", "local EP took 1.21s — interactive budget"),
+        # DECLARED BOUND, not a measurement: an integer duration is a threshold,
+        # and a PR that relaxes it is a different failure.
+        ("local EP took 1.21s — interactive budget is ≤1s",
+         "local EP took 1.21s — interactive budget is ≤9s"),
+        ("the probe overran after 30s", "the probe overran after 300s"),
+        ("timeout was 30s not 5s", "timeout was 5s not 30s"),
+        ("slept 0s vs 5s", "slept 3s vs 9s"),
+        # a written-byte count is data, not substrate
+        ("wrote 4096 bytes", "wrote 8192 bytes"),
     ]
     for left, right in pairs:
         assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
@@ -2700,7 +2714,7 @@ def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
     # …and the mask is actually APPLIED at the door, not merely absent from both
     # sides of the comparison above (a tautology would pass on the unfixed tree).
     (sig,) = sigs
-    assert "<MEAS>" in sig and "1.21s" not in sig, (
+    assert "<MEAS:s>" in sig and "1.21s" not in sig, (
         f"the door stored the raw measurement instead of masking it: {sig!r}"
     )
 
@@ -2718,3 +2732,39 @@ def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
     assert ci_exemption.normalize_signature("assert 1.47 < 1.2") != (
         ci_exemption.normalize_signature("assert 1.21 < 1.2")
     ), "if this now matches, the mask was widened — re-derive the fail-OPEN guard"
+    # …and it is the residual the DOOR actually produces: a message-less
+    # assertion renders ONE `E` line, and the unit-less expansion is it.
+    log = "\n".join([
+        "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
+        "job\tstep\t2026-10-21T09:45:00.0Z ____ test_bare ____",
+        "job\tstep\t2026-10-21T09:45:00.0Z E       assert 1.47 < 1.2",
+        "job\tstep\t2026-10-21T09:45:00.0Z FAILED tests/test_bare.py::test_bare",
+    ])
+    sigs = ci_exemption.parse_pr_failure_text(log).signatures["tests/test_bare.py::test_bare"]
+    assert sigs == frozenset({"assert 1.47 < 1.2"}), (
+        f"the residual changed shape — re-derive the mask: {sigs}"
+    )
+
+
+def test_9331_the_guard_shape_gets_the_same_mask():
+    """The mask feeds guard-step IDENTITIES too — declared, and now pinned.
+
+    `normalize_guard_error` composes `_VOLATILE_NORMALIZERS`, and a guard's
+    normalized shape IS its identity (`guard_step_key`). So a fractional duration
+    in a guard annotation is masked there as well: intended (the axis is the same
+    substrate), but it must be a decision the next lane can see.
+    """
+    shape_a = ci_exemption.normalize_guard_error("slow leg exceeded its 1.50s budget")
+    shape_b = ci_exemption.normalize_guard_error("slow leg exceeded its 2.25s budget")
+    assert "<MEAS:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
+    assert ci_exemption.guard_step_key("Slow leg", shape_a) == ci_exemption.guard_step_key(
+        "Slow leg", shape_b
+    )
+    # …and an INTEGER duration stays SIGNAL in the guard door too — uniformly with
+    # the signature door, and for the same reason (`_GUARD_INT_RE`'s `\b\d+\b`
+    # does not match `90s`, and the fractional-only mask does not either). That is
+    # the fail-closed direction: a bound that moved is a different failure.
+    int_a = ci_exemption.normalize_guard_error("the leg exceeded its 90s budget")
+    int_b = ci_exemption.normalize_guard_error("the leg exceeded its 900s budget")
+    assert int_a == "the leg exceeded its 90s budget", int_a
+    assert int_a != int_b, "an integer duration became masked — re-derive the fail-OPEN guard"

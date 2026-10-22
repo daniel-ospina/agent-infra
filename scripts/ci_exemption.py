@@ -1044,26 +1044,55 @@ _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 #   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
 #           signature differs from main's (1/1 (100%) vs 1/4 (25%))
 #
-# The mask is narrowed to numbers carrying a TIME UNIT, which is what makes it
-# safe in the other direction:
+# The mask is narrowed on THREE axes, each one closing a fail-OPEN direction
+# (a mask that collides two genuinely different failures hands the exemption to a
+# failure main never had — the exact bypass the SUBSET rule exists to prevent):
 #
-#   * a bare number stays SIGNAL — ``expected status 403, got 404``,
-#     ``orphaned servers: 16 (threshold: 12)``, ``91.2%`` and ``12/40`` are the
-#     DATA a failure is about, and collapsing them would hand the exemption to a
-#     failure main never had (the fail-OPEN direction the SUBSET rule closes);
-#   * SIZE units (``KiB``/``bytes``) are NOT masked, for the same reason — a
-#     written-byte count is data, not substrate, until evidence says otherwise;
-#   * DECLARED RESIDUAL: pytest also renders a message-less elapsed assertion as
-#     ``assert 1.47 < 1.2`` — a unit-less number, indistinguishable from data, so
-#     it stays volatile by design. It is pinned as a residual in
-#     ``tests/test_ci_exemption.py::test_9331_the_unitless_assert_expansion_is_a_declared_residual``.
-#     The measured case that filed #9331 carries a message, and pytest renders
-#     the MESSAGE line first (verified against pytest 9.1: the ``E`` line is
-#     ``AssertionError: local EP took 1.47s — …``), so the primary signature is
-#     the masked one.
+#   1. A TIME UNIT must follow the number. A bare number stays SIGNAL —
+#      ``expected status 403, got 404``, ``orphaned servers: 16 (threshold: 12)``,
+#      ``91.2%`` and ``12/40`` are the DATA a failure is about.
+#   2. The value must be FRACTIONAL (``1.21``, ``0.12``). A threshold or budget
+#      is written as an integer (``≤1s``, ``after 30s``, ``budget 300s``), so the
+#      decimal is what distinguishes a MEASUREMENT from a DECLARED BOUND. Without
+#      it, ``budget is ≤1s`` and ``budget is ≤9s`` — a PR that RELAXES the bound
+#      — would compare EQUAL. Perf-counter interpolations are fractional by
+#      construction (``{elapsed:.1f}``/``:.2f``/``:.3f``).
+#   3. The UNIT SURVIVES into the token (``<MEAS:s>`` vs ``<MEAS:ms>``), so a
+#      change of SCALE — ``1.21ms`` vs ``1.21s``, three orders of magnitude — is
+#      still signal. A bare ``<MEAS>`` would erase it.
+#
+# Other deliberate boundaries:
+#
+#   * SIZE units (``KiB``/``bytes``) are NOT masked — a written-byte count is
+#     data, not substrate, until evidence says otherwise;
+#   * INTEGER durations are NOT masked (see 2). That also leaves the rail's own
+#     watchdog banner alone: ``pytest killed after \d+m`` is a CONSTANT timeout,
+#     not a per-run measurement, and its identity is the fixed
+#     ``_PYTEST_KILL_ID`` — so masking it would buy nothing and would merge two
+#     different kill settings;
+#   * no lookbehind: the spaceless interpolation form ``f"took{elapsed:.2f}s"``
+#     renders ``took1.21s`` and must be masked too. The cost is that a token like
+#     ``node_1.5s`` is masked as well; a fractional number carrying a time unit
+#     is a duration wherever it sits, so that cost is accepted rather than
+#     under-masking the case this fix exists for;
+#   * the list feeds BOTH the signatures (§4.6) AND the guard-step shape
+#     (`normalize_guard_error` → `guard_step_key`), so a guard annotation
+#     carrying a fractional duration gets the same masking. Intended, and pinned
+#     by ``test_9331_the_guard_shape_gets_the_same_mask``.
+#
+# DECLARED RESIDUALS (pinned, not surprises):
+#
+#   * pytest renders a message-less elapsed assertion as ``assert 1.47 < 1.2`` —
+#     unit-less, indistinguishable from the data a failure is about, so it stays
+#     volatile by design (``test_9331_the_unitless_assert_expansion_is_a_declared_residual``);
+#   * an integer-rendered measurement (``{elapsed:.0f}s``) stays volatile, by (2);
+#   * uppercase units (``1.2S``) are not matched. The measured case that filed
+#     #9331 carries a message, and pytest renders the MESSAGE line as the primary
+#     ``E`` line (verified against pytest 9.1: ``AssertionError: local EP took
+#     1.47s — …`` then ``assert 1.47 < 1.2``), so the signature is the masked one.
 _MEASURED_DURATION_RE = re.compile(
-    r"(?<![\w.])\d+(?:\.\d+)?\s?"
-    r"(?:ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
+    r"(?P<num>\d+\.\d+)\s?"
+    r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
     r"(?!\w)"
 )
 
@@ -1091,9 +1120,10 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
-    # Last, and unit-anchored: a duration is the machine's, not the assertion's
-    # (#9331). See `_MEASURED_DURATION_RE` for the fail-OPEN reasoning.
-    (_MEASURED_DURATION_RE, "<MEAS>"),
+    # Last, and unit-anchored: a fractional duration is the machine's, not the
+    # assertion's (#9331). The unit rides the token so a SCALE change stays
+    # signal. See `_MEASURED_DURATION_RE` for every fail-OPEN axis.
+    (_MEASURED_DURATION_RE, r"<MEAS:\g<unit>>"),
 )
 
 
