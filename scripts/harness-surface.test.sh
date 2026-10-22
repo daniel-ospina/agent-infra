@@ -645,13 +645,16 @@ ck "(e) a foreign REPO does not poison the pin read: pin is OK, not UNRESOLVABLE
 ck "(e) …and it does NOT claim the pin is unresolvable" \
    "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
 # The child env: REPO stays the WORK repo, HARNESS_REPO is the harness checkout. This is the half that
-# a `--repo <harness>` repair breaks, so it is asserted rather than assumed.
+# a `--repo <harness>` repair breaks, so it is asserted rather than assumed — WITH `--repo` PASSED.
+# #2356 review P2: without `--repo` this arm is vacuous — `REPO="$WORK"` holds identically under the
+# old buggy `REPO="${A_REPO:-${REPO:-}}"`, so a regression restoring `--repo`'s priority over REPO
+# (the silent wrong-backlog retarget this PR exists to fix) would pass every assertion.
 : > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
         HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
-        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --repo "$REPO_FIX" --no-fetch 2>&1 )"
 ck "(e) the controller is told REPO=<work repo> (never the harness repo)" \
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and HARNESS_REPO=<the harness checkout>" \
@@ -680,7 +683,7 @@ BAD="$TMP/cell-badpin"
 mkdir -p "$BAD/.pi/agent/state"
 printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$BAD/.pi/agent/state/HARNESS-PIN"
 printf '%s\n' "$PIN_TREE" > "$BAD/.harness-path"
-OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$BAD" REPO="$WORK" \
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$BAD" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$BAD/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
@@ -698,7 +701,7 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIX
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$BAD/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
-ck "(e) RED control: 'up' REFUSES on an unresolvable pin (rc=$RC)" "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+ck "(e) RED control: 'up' REFUSES on an unresolvable pin (rc=$RC)" "$([ "$RC" -eq 3 ] && echo 0 || echo 1)"
 ck "(e) RED control: …and it says REFUSED (not a warning)" \
    "$(case "$OUT" in *REFUSED*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) RED control: …the refusal is the PIN step, not the capacity step" \
