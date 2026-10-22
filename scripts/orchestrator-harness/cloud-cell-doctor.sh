@@ -925,14 +925,24 @@ run_reap() {
       # `reaped=0 refused=0 abstained=4` was indistinguishable from a quiet, healthy reaper — the
       # "looks alive while doing nothing" class this role exists to remove.
       *abstained=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
-      # ⛔ AND NEITHER IS AN `inert` PASS (#2163 review r3, P2). `inert=` counts the LANES a POLICY
+      # ⛔ …AND NEITHER IS AN `inert` PASS (#2163 review r3, P2). `inert=` counts the LANES a POLICY
       # refused (a resolved lane log under a human or unclassifiable ancestry). On a cell EVERY lane is
       # `ancestry-unknown`, so the armed pass judged zero trees, printed `trees=0/0 … refused=1
       # abstained=0`, exited 0 and this role recorded a healthy reaper every pass. The reaper now
       # exits 3 for that shape too; this arm reads the FIELD as well, so the escalation does not depend
       # on a consumer ever checking the reaper's exit code (the `bounded | tail` shape loses it, and
       # `--json`/summary parsing is what this role actually has in hand).
-      *inert=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ BUT ONLY THE PASS THAT JUDGED NOTHING (#2163 review r4, P2). `inert=` is a POLICY count, not
+      # a failure: `lane-reap.sh` returns 3 for it only when `total == 0 && inert > 0`, and returns 0
+      # for a pass that judged trees while refusing a human-owned one beside them (its own
+      # `INERT-MIXED` leg pins that). Escalating every non-zero `inert=` therefore wrote
+      # `reap FAILED rc=3` every pass over a pass the reaper calls clean — on any box with one
+      # human-owned or `ancestry-unknown` lane. The arm is the INERT PASS's SHAPE (`trees=0/0`: the
+      # same `total == 0` the reaper tests), never the field alone.
+      *inert=[!0]*)
+        case "$proc_result" in
+          *"trees=0/0"*|*'"trees":"0/0"'*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+        esac ;;
       *abstained=0*) ;;
       *) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
     esac

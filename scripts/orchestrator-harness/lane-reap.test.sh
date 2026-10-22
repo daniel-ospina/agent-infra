@@ -19,8 +19,14 @@
 #              the kill); ANCESTRY-INCOMPLETE refuses a truncated ppid walk the same way
 #   EVIDENCE-SIBLING  a SIBLING's log never judges this lane (measured: the live pi was TERMed on a
 #              backgrounded writer's 3 h-old file); EVIDENCE-AMBIGUOUS refuses two lane logs;
-#              EVIDENCE-TEE keeps the shipped `pi | tee L-x.log` shape; EVIDENCE-BLIND separates an
-#              UNREADABLE descriptor from "not a lane"
+#              EVIDENCE-TEE keeps the shipped `pi | tee L-x.log` shape; EVIDENCE-TEE-ALIEN refuses a
+#              tee fed by ANOTHER pipe; EVIDENCE-BLIND separates an UNREADABLE descriptor from
+#              "not a lane"
+#   EVIDENCE-TEE-LSOF  the same tee shape on the lsof branch (macOS's ONLY branch): a per-pipe NAME
+#              (`->0x…`, `pipe:[N]`) that both sides reproduce identifies the writer, a DIFFERENT
+#              address does not (…-LSOF-ALIEN), and a GENERIC spelling (`pipe`, `->0x0` — measured
+#              from lsof 4.95) is not an identity at all, so the tree ABSTAINS instead of borrowing
+#              another pipe's file (…-LSOF-GENERIC)
 #   ACTIVE     a subtree that gains any CPU across the window is never a candidate
 #   COUNT      `lanes=<live>/<total> zombie=<n>` counts by evidence, not by a `ps | grep` string
 #   COUNT-NO-EVIDENCE  a census that cannot read ANY descriptor is `?/?` (never a confident 0/0 that
@@ -461,39 +467,96 @@ eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-TEE-ALIEN:
 # shipped `pi | tee L-x.log` shape therefore resolved rc 1: `reap` refused `no-log-evidence` AND the
 # CENSUS counted the lane `not_lane`, printing `lanes=0/0 zombie=0` with exit 0 while the lane was
 # RESIDENT — a false under-count ⇒ a false MAX_LANES ⇒ dispatch-more, on the only platform where
-# `fleet` ancestry can exist. The identity test compares (kind, name) from BOTH sides, so it holds
-# whatever this platform calls a pipe.
+# `fleet` ancestry can exist.
+# ⛔ …AND A *TYPE* IS NOT AN *IDENTITY* (#2163 review r4, P1). The r3 fixture handed EVERY pid and
+# EVERY fd 0 the same name (`pipe`), so the two pipes in it were the same string BY CONSTRUCTION:
+# the leg could not go red if the identity check were deleted, and there was no alien-tee leg on
+# this branch at all. The double therefore takes the spelling from the leg (`LSOF_PIPE_PI` for the
+# pi's fd 1, `LSOF_PIPE_STDIN` for whatever stdin pipe is read), so a leg can model a platform that
+# prints a real per-pipe name (`->0x…`, `pipe:[N]`) AND one that prints only a generic one
+# (`pipe`, `->0x0`) — which is what lsof 4.95 actually does, and which must ABSTAIN, never accept.
 cat > "$T/bin/lsof-tee" <<'SH'
 #!/usr/bin/env bash
-# REAL lsof SHAPE (4.95, measured): `-Fn` prints `pipe` for a pipe — never /proc's `pipe:[inode]`.
+# REAL lsof SHAPE: `-Ft` is the TYPE, `-Fn` the NAME, one `n` per fd. On Linux lsof 4.95 the name of
+# an anonymous pipe is the literal `pipe` (measured) — the SAME string for both ends of EVERY pipe,
+# so it is a spelling and never an identity; macOS prints an address (`->0x…`).
 pid=""; fds=""; prev=""
 for a in "$@"; do
   [ "$prev" = "-p" ] && pid="$a"
   [ "$prev" = "-d" ] && fds="$a"
   prev="$a"
 done
-[ "$fds" = "0" ] && { printf 'tFIFO\nnpipe\n'; exit 0; }
+if [ "$fds" = "0" ]; then printf 'tFIFO\nn%s\n' "${LSOF_PIPE_STDIN:?}"; exit 0; fi
 case "$pid" in
   "${LSOF_TEE_PID:?}") printf 'tREG\nn%s\n' "${LSOF_TEE_LOG:?}" ;;
-  *) printf 'tFIFO\nnpipe\n' ;;
+  *) printf 'tFIFO\nn%s\n' "${LSOF_PIPE_PI:?}" ;;
 esac
 exit 0
 SH
 chmod +x "$T/bin/lsof-tee"
-echo "== EVIDENCE-TEE-LSOF (a npipe lsof spelling still identifies the lane's own tee)"
+echo "== EVIDENCE-TEE-LSOF (an ADDRESS both sides reproduce identifies the lane's own tee)"
 TEE2_LOG="$(newlog L-tee2.log $((3 * 3600)))"
 : > "$T/t-tee2"; psinit >> "$T/t-tee2"
 psrow 960 400 Ss 00:00:00 05:00:00 "bash -c 'pi | tee $TEE2_LOG'" >> "$T/t-tee2"
 psrow 961 960 Sl 00:00:05 05:00:00 pi >> "$T/t-tee2"
 psrow 962 960 Sl 00:00:05 05:00:00 "tee $TEE2_LOG" >> "$T/t-tee2"
 out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=962 LSOF_TEE_LOG="$TEE2_LOG" \
+       LSOF_PIPE_PI='->0xAAA' LSOF_PIPE_STDIN='->0xAAA' \
        REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-tee2" "" -- --dry-run)"
 has "$out" "WOULD REAP root=960" "EVIDENCE-TEE-LSOF: the tee-held log is the lane's evidence on the lsof branch"
 hasnt "$out" "no-log-evidence" "EVIDENCE-TEE-LSOF: it is never refused as no-log-evidence"
 out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=962 LSOF_TEE_LOG="$TEE2_LOG" \
+       LSOF_PIPE_PI='->0xAAA' LSOF_PIPE_STDIN='->0xAAA' \
        REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_count "$T/t-tee2")"; rc=$?
 eq "$out" "lanes=0/1 zombie=0" "EVIDENCE-TEE-LSOF: the census counts the RESIDENT lane (0/1), never a confident 0/0"
 eq "$rc" "0" "EVIDENCE-TEE-LSOF: …and a readable census is not an abstention"
+# The `pipe:[N]` spelling, seen THROUGH lsof (a build that answers with the kernel's inode): the
+# same pipe at both ends is still an identity, so the acceptance is not tied to the `->0x` shape.
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=962 LSOF_TEE_LOG="$TEE2_LOG" \
+       LSOF_PIPE_PI='pipe:[5150]' LSOF_PIPE_STDIN='pipe:[5150]' \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-tee2" "" -- --dry-run)"
+has "$out" "WOULD REAP root=960" "EVIDENCE-TEE-LSOF: a pipe:[N] identity through lsof is accepted too"
+
+# ── EVIDENCE-TEE-LSOF-ALIEN: a DIFFERENT address is never this lane's writer ─────────────────────
+# The r4 repro's shape (root 500, alien tee 501 fed by 503 `cat brief` on pipe B, the LIVE pi 502
+# piped to a logger on pipe A), on the ONLY branch macOS has. With per-pipe names the two ends differ,
+# so the tee is not this lane's writer and nothing is signalled. (Deleting the identity check makes
+# THIS leg reap the live pi, which is what the r3 fixture could never show.)
+echo "== EVIDENCE-TEE-LSOF-ALIEN (a different pipe address is not this lane's writer)"
+ALIEN3_LOG="$(newlog fix-alien3.log $((3 * 3600)))"
+: > "$T/t-alien3"; psinit >> "$T/t-alien3"
+psrow 500 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-alien3"
+psrow 501 500 Sl 00:05:00 05:00:00 "tee $ALIEN3_LOG" >> "$T/t-alien3"
+psrow 502 500 Sl 00:05:00 00:05:00 "pi --model x" >> "$T/t-alien3"
+psrow 503 500 Sl 00:00:01 05:00:00 "cat brief" >> "$T/t-alien3"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
+       LSOF_PIPE_PI='->0xAAA' LSOF_PIPE_STDIN='->0xBBB' \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-alien3" "" -- --apply)"; rc=$?
+has "$out" "no-log-evidence" "EVIDENCE-TEE-LSOF-ALIEN: the alien tee supplies NO evidence (no-log-evidence)"
+hasnt "$out" "log-idle" "EVIDENCE-TEE-LSOF-ALIEN: the sibling's 3 h-old log never judges the live lane"
+hasnt "$out" "REAP   root=500" "EVIDENCE-TEE-LSOF-ALIEN: the live pi is never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-TEE-LSOF-ALIEN: --apply signals NOTHING"
+eq "$rc" "0" "EVIDENCE-TEE-LSOF-ALIEN: the pass is clean (the reads were taken; this tree is not a lane)"
+
+# ── EVIDENCE-TEE-LSOF-GENERIC: a generic pipe spelling is NOT an identity ⇒ ABSTAIN ────────────
+# ⛔ MEASURED KILL ON THE lsof BRANCH (#2163 review r4, P1). lsof 4.95 prints `pipe` — measured —
+# for BOTH ends of EVERY anonymous pipe, so `_pipe_ident` used to return the same string for the pi's
+# stdout and an unrelated tee's stdin: root 500, child 501 `tee …/fix-9.log` fed by 503 `cat brief`
+# (pipe B), child 502 the LIVE 5-minute-old `pi` piped to a logger (pipe A) ⇒ `REAP root=500`,
+# `-TERM 502`, `-KILL 502`, rc 0. lsof is the ONLY branch on macOS. A generic name cannot prove the
+# tee is the writer and cannot prove it is not, so the tree ABSTAINS (rc 2 ⇒ `abstained=` + exit 3):
+# no evidence is ever borrowed, and a real lane's own writer is not silently dropped either.
+echo "== EVIDENCE-TEE-LSOF-GENERIC (lsof's 'pipe' is a spelling, not an identity: ABSTAIN)"
+for spelling in 'pipe' '->0x0'; do
+  out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
+         LSOF_PIPE_PI="$spelling" LSOF_PIPE_STDIN="$spelling" \
+         REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-alien3" "" -- --apply)"; rc=$?
+  has "$out" "log-evidence-unreadable" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: refused as UNREADABLE, never judged"
+  hasnt "$out" "log-idle" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: the sibling's 3 h-old log never judges the lane"
+  hasnt "$out" "REAP   root=500" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: nothing is reaped on a borrowed identity"
+  eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: --apply signals NOTHING"
+  eq "$rc" "3" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: the pass ABSTAINS (exit 3), never a clean 0"
+done
 
 # ── EVIDENCE-BLIND: a descriptor read that FAILED is an abstention, never "no log" ───────────────
 # ⛔ `no-log-evidence` and `log-evidence-unreadable` look identical in the summary and mean opposite

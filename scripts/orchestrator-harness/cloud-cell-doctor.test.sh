@@ -191,10 +191,13 @@ case "${1:-}" in
   # DOCTOR_TEST_REAP_INERT models the CELL shape: a pass that judged NO tree while refusing every
   # lane it found by POLICY (`trees=0/0 … refused=1 inert=1 abstained=0`). That line is the one the
   # doctor recorded as a healthy reaper, every pass, for ever.
+  # DOCTOR_TEST_REAP_TREES models the OTHER shape the reaper calls clean — a pass that DID judge
+  # trees and refused a human-owned lane beside them (`trees=0/1 … inert=1`, exit 0). `inert=` is a
+  # POLICY count, so the doctor must escalate the INERT PASS (nothing judged), never the field alone.
   # DOCTOR_TEST_REAP_REFUSAL adds the per-tree refusal LINE, which `tail -1` used to discard.
   reap)  [ -n "${DOCTOR_TEST_REAP_REFUSAL:-}" ] && printf '  REFUSE root=99 log=/x/L-a.log — %s\n' "$DOCTOR_TEST_REAP_REFUSAL"
-         printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 inert=%s abstained=%s mode=%s\n' \
-           "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
+         printf 'lane-reap: trees=%s zombie=0 candidates=0 reaped=0 refused=1 inert=%s abstained=%s mode=%s\n' \
+           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
 esac
 exit 0
 SH
@@ -285,12 +288,30 @@ result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pas
 say_case "a process pass that judged NOTHING (inert) is unverifiable (rc=3), not a health record"
 reset_tmux; reset_ps; reset_state
 mk_lane lane-42 4242
-DOCTOR_TEST_REAP_INERT=2 doc reap
+DOCTOR_TEST_REAP_TREES=0/0 DOCTOR_TEST_REAP_INERT=2 doc reap
 [ "$RC" -eq 3 ] && ok "reap-inert: rc=3 (the pass judged nothing)" || bad "reap-inert: rc=$RC — an inert pass read as clean — $OUT"
 result_has "inert=2" && ok "reap-inert: the inert count is in the pass line" || bad "reap-inert: the inert count is missing — $OUT"
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
   && ok "reap-inert: state records the FAILED pass, not a healthy reaper" \
   || bad "reap-inert: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")"
+
+# ── 1a4) an inert count on a pass that DID judge trees is CLEAN, not a failed pass ────────────
+# ⛔ ONE INERT LANE IS NOT A FAILED PASS (#2163 review r4, P2). `inert=` is a POLICY count, not a
+# failure: `lane-reap.sh` returns 3 only when `total == 0 && inert > 0` and returns 0 when it judged
+# lanes while refusing a human-owned one beside them (its own `INERT-MIXED` leg pins that). The
+# doctor's `*inert=[!0]*` arm escalated ANY non-zero `inert=`, so on a box with one human-owned or
+# `ancestry-unknown` lane it wrote `reap FAILED rc=3` every pass over a pass the reaper calls clean
+# — the mirror of the r3 bug, one field too wide.
+say_case "a policy refusal beside a JUDGED lane is not a failed pass (rc=0)"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_TREES=0/1 DOCTOR_TEST_REAP_INERT=1 doc reap
+[ "$RC" -eq 0 ] && ok "reap-inert-mixed: rc=0 (a judged lane keeps the pass clean)" || bad "reap-inert-mixed: rc=$RC — a clean pass was recorded as FAILED — $OUT"
+result_has "inert=1" && ok "reap-inert-mixed: the refusal is still REPORTED in the pass line" || bad "reap-inert-mixed: the inert count is missing — $OUT"
+result_has "trees=0/1" && ok "reap-inert-mixed: …beside the tree that WAS judged" || bad "reap-inert-mixed: the judged-tree count is missing — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "0" ] \
+  && ok "reap-inert-mixed: state records the HEALTHY pass" \
+  || bad "reap-inert-mixed: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") — a clean pass recorded as failed"
 # ⛔ AND THE REASON REACHES THE LOG (#2163 review r3, P2). `tail -1` kept the summary and threw away
 # every per-tree reason, so `[reap]` could not say WHY nothing was judged — and a refusal was
 # indistinguishable from an idle box.
