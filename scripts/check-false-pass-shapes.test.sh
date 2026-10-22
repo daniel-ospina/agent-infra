@@ -1329,20 +1329,22 @@ ck $? "E2 a nonexistent --root is a usage error, never a clean PASS"
 # can never be grandfathered must also be a published rule id (a rule the join refuses that
 # --list-rules does not name is unusable to a consumer).
 out="$(bash "$CHECK" --list-rules 2>&1)"
-# THREE SHAPES plus two kinds that FAIL the run and must therefore be enumerable: the ids are
+# THREE SHAPES plus three kinds that FAIL the run and must therefore be enumerable: the ids are
 # reported by the scanner, so a consumer that classifies findings by rule id cannot represent a kind
-# this list omits. Of the five, the last two can never be grandfathered (E3b).
-[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "5" ] && grep -q '^discarded-status$' <<<"$out" \
+# this list omits. Of the six, the last three can never be grandfathered (E3b).
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "6" ] && grep -q '^discarded-status$' <<<"$out" \
   && grep -q '^empty-as-pass$' <<<"$out" && grep -q '^pre-existing-as-evidence$' <<<"$out" \
-  && grep -q '^marker-without-justification$' <<<"$out" && grep -q '^unterminated-heredoc$' <<<"$out"
+  && grep -q '^marker-without-justification$' <<<"$out" && grep -q '^unterminated-heredoc$' <<<"$out" \
+  && grep -q '^unterminated-quote$' <<<"$out"
 ck $? "E3 --list-rules publishes every rule id the scanner can emit (the doc reads THIS)"
 
 # ⛔ THE SPLIT IS READ FROM THE TOOL, not hardcoded here: a rule the join refuses that no published
 # list names is unusable, and a list that drifts from the join is the two-definitions defect.
 nb="$(bash "$CHECK" --list-nonbaselineable 2>&1)"
-[ "$(printf '%s\n' "$nb" | grep -c .)" = "2" ] && grep -q '^unterminated-heredoc$' <<<"$nb" \
+[ "$(printf '%s\n' "$nb" | grep -c .)" = "3" ] && grep -q '^unterminated-heredoc$' <<<"$nb" \
+  && grep -q '^unterminated-quote$' <<<"$nb" \
   && grep -q '^marker-without-justification$' <<<"$nb" \
-  && [ -z "$(printf '%s\n' "$nb" | grep -v -e '^unterminated-heredoc$' -e '^marker-without-justification$')" ] \
+  && [ -z "$(printf '%s\n' "$nb" | grep -v -e '^unterminated-heredoc$' -e '^unterminated-quote$' -e '^marker-without-justification$')" ] \
   && grep -q 'unterminated-heredoc' <<<"$out"
 ck $? "E3b --list-nonbaselineable names exactly the rules the baseline may never grandfather, and each is a published rule"
 
@@ -2197,6 +2199,239 @@ bash -n "$D/scripts/h24.sh" || fail "H24 fixture is not bash -n clean (the fixtu
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
 ck $? "H24 P1 a very long quoted line does not change what is scanned (a brace and a substitution on it are still data, and the shape after it is reported)"
+
+# ── I. the round-4 review: an open carry is a failure, and heredoc data is never code ───────
+hdr "I. the round-4 review: an open quote carry at EOF is a failure, and heredoc data is never code"
+
+# ⛔ I1 (review round 4, P0) — AN OPENER INSIDE `${…}` IS STILL AN OPENER. skip_param JUMPS the whole
+# expansion, so `note=${NOTE:-$(cat <<EOF … EOF)}` was never recorded: the heredoc body was walked as
+# CODE, the apostrophe in it opened the quote carry, and the open carry made every later header hit
+# TOPPEND — which clears `fn`, so the `empty-as-pass` in the tail was structurally unreportable. This
+# head printed exit 0, `0 finding(s)`, `0 partial scan(s)`, PASS over a REAL shape. A `${…}` that
+# contains a `$(` is now walked (its braces are still not block braces), so the body is data again.
+D="$(fixture i1)"
+cat > "$D/scripts/i1.sh" <<'EOS'
+#!/bin/bash
+note=${NOTE:-$(cat <<EOF
+it's the default
+EOF
+)}
+verify() {
+  local bad=0 t
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+bash -n "$D/scripts/i1.sh" || fail "I1 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out" \
+  && ! grep -q 'unterminated-quote' <<<"$out"
+ck $? "I1 P0 a heredoc opener inside \"\${…:-\$( … )}\" is tracked: its body is data, and the shape after it is reported"
+
+# ⛔ I2 (review round 4, P0) — EVERY OPENER ON A LINE, IN ORDER. `cat <<A <<B` reads the body of A and
+# then the body of B; only the first opener was recorded AND the `after` test rejected the line
+# outright (the second `<` was not an accepted operand boundary), so NEITHER body was recognised and
+# both were walked as code. The bodies are DATA, and the shape after them is still found.
+D="$(fixture i2)"
+cat > "$D/scripts/i2.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 t
+  cat <<A <<B
+A body
+A
+it's just data
+B
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+bash -n "$D/scripts/i2.sh" || fail "I2 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out" \
+  && ! grep -q 'unterminated-quote' <<<"$out"
+ck $? "I2 P0 two openers on one line are BOTH tracked: each body is data, and the shape after them is reported"
+
+# ⛔ I3 (review round 4, P0) — AN OPEN QUOTE CARRY AT END OF FILE IS PROOF THAT THE WALK DESYNCHRONISED,
+# and it is now a LOUD, non-baselineable finding. The round-3 head read this file as a silent PASS
+# (measured: exit 0, `0 finding(s)`, `0 partial scan(s)`) because `depth` was back to 0 and `fn` was
+# empty, so neither the partial net nor any scope-based net could fire — while the file's own contract
+# says a file that cannot be delimited is a FAILURE. The finding names the line where the quote opened,
+# not the last line of the file.
+D="$(fixture i3)"
+cat > "$D/scripts/i3.sh" <<'EOS'
+#!/bin/bash
+x='a quote the walk cannot pair
+verify() {
+  local bad=0 t
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'scripts/i3.sh:2: unterminated-quote' <<<"$out"
+ck $? "I3 P0 an open quote carry at EOF is a LOUD finding at the line that opened it, never a silent PASS"
+
+# ... and it can never be grandfathered (the same reasoning as D10: an absence nobody observed is not
+# a claim the baseline may record), nor manufactured by the sanctioned generator.
+D="$(fixture i4)"
+cp "$TMP/i3/scripts/i3.sh" "$D/scripts/i3.sh"
+printf 'scripts/i3.sh\tunterminated-quote\t1\t#9 — we accept that this file cannot be delimited\n' > "$D/base.tsv"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'can NEVER be grandfathered' <<<"$out" && grep -q 'unterminated-quote' <<<"$out"
+ck $? "I4 a baseline entry for unterminated-quote FAILS (a desynced scan is not clean, however justified)"
+
+D="$(fixture i5)"
+cp "$TMP/i3/scripts/i3.sh" "$D/scripts/i3.sh"
+: > "$D/base.tsv"
+bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline >/dev/null 2>&1
+n="$(grep -c 'unterminated-quote' "$D/base.tsv" 2>/dev/null || true)"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$n" = "0" ] && [ "$rc" -eq 1 ]
+ck $? "I5 --update-baseline never writes unterminated-quote, so a desynced scan stays red"
+
+# ⛔ I6 (review round 4, P1) — A CRLF LINE ENDING IS NOT PART OF THE LINE. On a CRLF file the `\r`
+# survived into every comparison, so `local bad=0\r` failed the `=0` arm, `return "$bad"\r` failed the
+# verdict arm and `EOF\r` never matched the terminator: `empty-as-pass` was reported NOWHERE in the
+# whole file and the run printed PASS. The fixture is written with CRLF endings on purpose (a Windows
+# checkout); `bash -n` cannot validate one, so the read is pinned through the scanner instead.
+D="$(fixture i6)"
+printf '#!/bin/bash\r\nverify() {\r\n  local bad=0 t\r\n  t="$(list_targets)"\r\n  for e in $t; do\r\n    [ -e "$e" ] || bad=1\r\n  done\r\n  return "$bad"\r\n}\r\n' > "$D/scripts/i6.sh"
+grep -q $'\r' "$D/scripts/i6.sh" || fail "I6 fixture lost its CRLF endings (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I6 P1 a CRLF file is read as lines: the verdict and the terminator are still recognised"
+
+# ⛔ I7 (review round 4, P3) — A TRAILING COMMENT AFTER THE OPENER DOES NOT CANCEL IT. The `after` test
+# refused the line, so `cat <<BRIEF   # sticky note` was not recorded, its markdown body was walked as
+# code, and an apostrophe in prose turned a CORRECT file into a loud partial FAIL naming the opener.
+D="$(fixture i7)"
+cat > "$D/scripts/i7.sh" <<'EOS'
+#!/bin/bash
+show_brief() {
+  cat <<BRIEF   # sticky note: the opener carries a trailing comment
+It's a brief whose prose has an apostrophe.
+BRIEF
+  echo done
+}
+show_brief
+EOS
+bash -n "$D/scripts/i7.sh" || fail "I7 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && grep -qE '0 finding\(s\)' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out" && grep -q '^PASS' <<<"$out"
+ck $? "I7 P3 an opener followed by a trailing comment is still an opener: a correct file is not reded"
+
+# ⛔ I8 (review round 4) — A HERESTRING IS CONSUMED WHOLE, INCLUDING ITS OPERAND. The round-3 exclusion
+# kept `<<<` from being recorded at the FIRST `<`, but the walk advanced one character and re-tested at
+# the SECOND, where `<< "operand"` is an ordinary quoted opener: measured on the round-3 head,
+# `read -r e <<< "herestring"` was read as a heredoc whose delimiter was `herestring`, which never
+# terminated — a loud `unterminated-heredoc` FAIL on a `bash -n`-clean file. A false block is how a
+# guard gets deleted, so the token is skipped as a unit.
+D="$(fixture i8)"
+cat > "$D/scripts/i8.sh" <<'EOS'
+#!/bin/bash
+read -r e <<< "herestring"
+read -r f <<<"joined"
+printf '%s%s\n' "$e" "$f"
+EOS
+bash -n "$D/scripts/i8.sh" || fail "I8 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unterminated-heredoc' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I8 a HERESTRING (spaced or joined operand) opens no heredoc: a correct file is not reded"
+
+# ⛔ I9 (review round 4) — A `#` INSIDE AN OPEN QUOTE IS NOT A COMMENT. The whole line used to be skipped
+# whenever it STARTED with `#`, so a multi-line string whose closing quote sat on such a line kept the
+# carry open to EOF: the new `unterminated-quote` finding then reded a CORRECT file. The line is a
+# comment only when the current context has no quote open at its start.
+D="$(fixture i9)"
+cat > "$D/scripts/i9.sh" <<'EOS'
+#!/bin/bash
+banner="first line
+# a banner line whose closing quote is on this very line"
+printf '%s\n' "$banner"
+EOS
+bash -n "$D/scripts/i9.sh" || fail "I9 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unterminated-quote' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I9 a quote that closes on a '# ' line closes the carry: a multi-line string is not reded"
+
+# ⛔ I10 (review round 4, P1) — THE END OF A `${…}` IS THE MATCHING `}`, NOT THE FIRST ONE. skip_param
+# knew neither quotes nor brace EXPANSIONS, so `f=${X:-{a,b}}` ended at the `}` of `{a,b}` and the real
+# closer was then counted as a BLOCK brace: the function ended a line early and a real `empty-as-pass`
+# after it was reported NOWHERE (measured on the round-3 head: silent PASS). Pre-existing, and silent —
+# the worst combination in this file.
+D="$(fixture i10)"
+cat > "$D/scripts/i10.sh" <<'EOS'
+#!/bin/bash
+three() {
+  local bad=0 t
+  f=${X:-{a,b}}
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+bash -n "$D/scripts/i10.sh" || fail "I10 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I10 P1 a brace EXPANSION inside a \"\${…}\" does not end the expansion early: the shape after it is reported"
+
+# ⛔ I11 (review round 4, P1) — A QUOTED `}` IS NOT THE END OF THE EXPANSION EITHER, and this one was a
+# REGRESSION of the new `${…}` walk: `g=${Y:-$(echo "}")}` ended the span inside the quoted string, the
+# leftover `")}` was walked as braces, the function closed early and a real shape went silent. The span
+# end must come from a quote-aware scan.
+D="$(fixture i11)"
+cat > "$D/scripts/i11.sh" <<'EOS'
+#!/bin/bash
+three() {
+  local bad=0 t
+  g=${Y:-$(echo "}")}
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+bash -n "$D/scripts/i11.sh" || fail "I11 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I11 P1 a QUOTED \"}\" inside a \"\${…}\" does not end the expansion: the shape after it is reported"
+
+# ⛔ I12 (review round 4) — AN EXPANSION THAT SPANS PHYSICAL LINES CARRIES ITS NESTING. The braces of
+# `${B:-{` … `}}` live on two lines; a per-line scan that forgot the leftover nesting counted those
+# closers as BLOCK braces and ended the function early, so the shape after it was silent (measured on
+# the round-3 head as well as mid-change). The nesting is now carried in PDEPTH.
+D="$(fixture i12)"
+cat > "$D/scripts/i12.sh" <<'EOS'
+#!/bin/bash
+three() {
+  local bad=0 t
+  y=${B:-{
+    a b
+  }}
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+bash -n "$D/scripts/i12.sh" || fail "I12 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "I12 a \"\${…}\" that spans physical lines keeps its nesting: its closers are not block braces"
 
 # ── F. the real tree ────────────────────────────────────────────────────────hdr "F. the repo's own scan set is clean under the shipped baseline (this is what CI enforces)"
 

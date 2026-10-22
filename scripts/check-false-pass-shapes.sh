@@ -94,10 +94,13 @@
 # s///, a single-quoted span and escaped double quotes, assigned inside a double-quoted substitution —
 # desynchronised the carry, which left the block open for the REST OF THE FILE (`bash -n`-clean, and the
 # run printed PASS over it). Measured at the commit before that fix: 12 of 167 files in the scan set
-# drifted this way. Measured after it: 0. A file that still cannot be delimited is therefore a FAILURE
-# (`partial scan(s)`, exit 1), never a green run with a stderr note, and a shape found in a drifted tail
-# is REPORTED with the drift named rather than gated away by an iteration count that the drift itself
-# made untrustworthy.
+# drifted this way. Measured after it: 0. A file that still cannot be delimited is therefore a FAILURE —
+# `partial scan(s)` for a brace count that never returns, `unterminated-heredoc` for a body that never
+# ends, `unterminated-quote` for a quote carry still open at EOF (review round 4: an open carry is proof
+# of desync on a `bash -n`-clean file, and it used to be the ONE shape that produced neither a finding
+# nor a partial note — `0 finding(s) · 0 partial scan(s) · PASS` over a real `empty-as-pass`) — never a
+# green run with a stderr note, and a shape found in a drifted tail is REPORTED with the drift named
+# rather than gated away by an iteration count that the drift itself made untrustworthy.
 # ⛔ AND ITS COST IS LINEAR IN THE LINE LENGTH, which is a correctness property here, not a nicety: a gate
 # that HANGS cannot report anything, so it is worse than one that reds. Every "identifier followed by an
 # operator" arm used to be an UNANCHORED regex (`/[A-Za-z_][A-Za-z0-9_]*\+\+/` and friends), and awk
@@ -121,30 +124,47 @@
 #     input is a legitimate PASS is not the second shape either. Both ARE reported, and the right
 #     response is ONE `# verified:` marker with the reason, not a rewrite. Named here so the first
 #     encounter is a marker rather than a mystery.
-#   * what quoting model it uses, and what that model still cannot see (#2121 review round 3): the walk
-#     knows a POSIX `'…'` (no escapes), an ANSI-C `$'…'` (backslash escapes; the escaped quote does NOT
-#     terminate it), a `"…"`, a `$( … )`/backtick (a FRESH quoting context), a `$(( … ))` and a bare
-#     `(( … ))` arithmetic command, and a `[[ … ]]` test — so a `<<` in any of those is not an opener.
-#     It still cannot see: an ANSI-C ESCAPE SEQUENCE that PRODUCES a quote character (`$'\x27…'`), a
-#     quote or brace manufactured that way is invisible to a text match; a SECOND heredoc opener on one
-#     line (`cat <<A <<B` — only A is tracked, B's body is read as code); an opener inside a `${…}`
-#     expansion (skip_param jumps the whole expansion, so a heredoc nested there is not seen); and a
-#     bare `(( … ))`/`[[ … ]]` that spans PHYSICAL lines, which is treated as ending at the newline (a
-#     `<<` on the continuation line could be read as an opener).
+#   * what quoting model it uses, and what that model still cannot see (#2121 review round 3; round 4
+#     adds the CONSEQUENCE of each remaining gap, because a blind spot without one is read as a pass):
+#     the walk knows a POSIX `'…'` (no escapes), an ANSI-C `$'…'` (backslash escapes; the escaped quote
+#     does NOT terminate it), a `"…"`, a `$( … )`/backtick (a FRESH quoting context), a `$(( … ))` and a
+#     bare `(( … ))` arithmetic command, a `[[ … ]]` test, EVERY heredoc opener on a line (`<<A <<B`
+#     reads the body of A and then the body of B), a `<<<` herestring (consumed whole, operand
+#     included), and the body of a `${…}` that carries a `$(`. It still cannot see:
+#       – an ANSI-C ESCAPE SEQUENCE that PRODUCES a quote character (`$'\x27…'`) — the manufactured
+#         character is plain text to this scan. CONSEQUENCE: the carry desynchronises there; if it is
+#         still open at end of file the run FAILS LOUDLY (`unterminated-quote`), but if a later real
+#         quote closes it again the tail is mis-attributed with NO note — a SILENT PASS over that
+#         region. That is the one remaining silent direction in the quoting model, stated so a green
+#         run is not read as proof about such a file.
+#       – a `${…}` expansion that spans PHYSICAL lines: its remaining nesting is carried in `PDEPTH`
+#         and its braces are refused until it closes, but the body is only WALKED when it holds a
+#         `$(` (otherwise the rest of the line is skipped, since nothing there can open a heredoc).
+#         CONSEQUENCE: a `<<` inside a multi-line expansion that carries NO `$(` is not seen, so a
+#         heredoc there is walked as code and a quote in its body can desynchronise the carry — a
+#         `partial scan` or `unterminated-quote`, both LOUD, never a silent pass.
+#       – a bare `(( … ))`/`[[ … ]]` that spans PHYSICAL lines, which is treated as ending at the
+#         newline. CONSEQUENCE: a `<<` on the continuation line is read as an opener, so the run reds
+#         with `unterminated-heredoc` — LOUD, and a false red on a `bash -n`-clean file.
 #   * the feeder guard is matched on ANY captured variable in the function, so a guard on a
 #     DIFFERENT substitution (`other="$(b)"; [ -n "$other" ] || return 1`) still suppresses the
 #     finding for an unguarded feeder. Tying the guard to the loop's own feeder needs flow
 #     analysis this text scan does not do.
 #   * a `case` INSIDE a `$( … )` — its arm labels (`a)`, `*)`) are indistinguishable, lexically, from the
 #     `)` that closes the substitution, so the context pops at the FIRST arm label and the rest of the
-#     substitution is walked as shell. A quote left open after that makes the scan partial, which now
-#     FAILS loudly (see `partial scan(s)`) instead of passing quietly; the arm-label walk itself is not
-#     modelled. No live instance in the scanned set.
+#     substitution is walked as shell. CONSEQUENCE: LOUD — a quote left open there makes the scan
+#     partial (or trips `unterminated-quote`), and a partial scan FAILS; the run never passes quietly
+#     over it. The arm-label walk itself is not modelled. No live instance in the scanned set.
 #   * a FUNCTION is delimited by COUNTING braces on each line, outside quotes, trailing comments and
 #     `${…}` expansions. A brace that is only ever opened on one line and closed many lines later as
 #     DATA — inside a multi-line quoted string, or a heredoc whose delimiter is unquoted — is counted
 #     where it appears, so the depth (and with it where the function ends) can drift in that region.
-#     No live instance in the scanned set; stated because a drifted depth is a silent blind spot.
+#     No live instance in the scanned set. CONSEQUENCE: this is the SILENT direction — a depth that
+#     happens to return to zero has no partial note to give it away, so the tail is attributed to the
+#     wrong scope and a shape there can be dropped while the run prints PASS. The quote half of the
+#     same drift is now LOUD (`unterminated-quote`), and nothing else here is: the mitigation for the
+#     brace half is the suite's fixtures plus a per-function reading of any depth anomaly, not a green
+#     run.
 # The near-miss set is the contract in the other direction: every spelling of a correct guard that
 # this repo actually writes must read as a guard, because a linter that reds correct code is deleted
 # from CI within a week — taking the class with it. The suite pins one fixture per spelling
@@ -179,13 +199,16 @@
 #   * an entry with no justification is a FINDING: the baseline is a set of claims, and a
 #     claim without a reason is exactly the class this check exists to catch.
 #
-# TWO RULES CAN NEVER BE GRANDFATHERED (`NON_BASELINEABLE` below), and a baseline entry naming one
+# THREE RULES CAN NEVER BE GRANDFATHERED (`NON_BASELINEABLE` below), and a baseline entry naming one
 # is itself a failure. `unterminated-heredoc` means THE SCAN OF THAT FILE DID NOT HAPPEN — its tail
-# was skipped, so what it holds is UNKNOWN. Baselining it would turn one truncated file into a
+# was skipped, so what it holds is UNKNOWN. `unterminated-quote` is the same fact from the other end:
+# the walk's quote carry was still open at end of file, so every line after the quote that was never
+# recognised was read as quoted — no brace counted, no function flushed — and the tail's findings
+# describe a scope that does not exist. Baselining either would turn one undelimitable file into a
 # permanently blind file under a green check, and the run would still advertise the file as
 # `scanned` — the invariant "no PASS over a scan that did not happen" defeated by one row.
 # `marker-without-justification` is an unreadable exemption: it is not a shape to accept, it is a
-# claim nobody can review. `--update-baseline` therefore never writes those two (they stay
+# claim nobody can review. `--update-baseline` therefore never writes those three (they stay
 # findings), and the join refuses an entry naming them.
 #
 # THE OPT-OUT MARKER — `# verified: <why this is NOT the shape>`
@@ -226,13 +249,13 @@ UPDATE_BASELINE=0
 # is the lane/rail machinery that prints most of the fleet's verdicts. Test suites are
 # INCLUDED on purpose — a false PASS inside a suite is how a broken gate ships green.
 SCAN_GLOBS=("scripts/*.sh" "scripts/orchestrator-harness/*.sh")
-RULES=("discarded-status" "empty-as-pass" "pre-existing-as-evidence" "marker-without-justification" "unterminated-heredoc")
+RULES=("discarded-status" "empty-as-pass" "pre-existing-as-evidence" "marker-without-justification" "unterminated-heredoc" "unterminated-quote")
 # ⛔ THE SPLIT LIVES BESIDE THE LIST, not in a second copy of it (#2121 review round 5, P2). These
 # two are NOT shapes a lane may accept: one is a scan that did not finish (UNKNOWN), the other is an
 # exemption nobody can read. Grandfathering either certifies an absence nobody observed, which is
 # the whole class this check exists to catch — so they are always FINDINGs, and --update-baseline
 # never writes a row for them.
-NON_BASELINEABLE=("unterminated-heredoc" "marker-without-justification")
+NON_BASELINEABLE=("unterminated-heredoc" "unterminated-quote" "marker-without-justification")
 
 # Prints the header block (lines starting with `#`, from line 2) and exits 2 for a USAGE ERROR.
 # The range is COMPUTED, never a hardcoded line window: a window that outruns the header prints
@@ -350,8 +373,43 @@ function heredoc_at(line, p,   i, n, ch, name, after) {
   }
   while (i <= n && (substr(line, i, 1) == " " || substr(line, i, 1) == "\t")) i++
   after = (i > n) ? "" : substr(line, i, 1)
-  if (after != "" && after != ">" && after != "|" && after != ";" && after != ")" && after != "&") return ""
+  # ⛔ A TRAILING COMMENT AFTER THE OPENER DOES NOT CANCEL IT (#2121 review round 4, P3). The `after`
+  # test rejected anything but a redirect/separator, so `cat <<BRIEF   # sticky note` was NOT recorded:
+  # its body was then walked as CODE, and a single apostrophe in prose opened the quote carry — turning
+  # a CORRECT file into a loud partial FAIL that named the wrong opener line. `#` is end-of-line here, on
+  # the SAME word-boundary rule strip_comment uses (so `<<A#B`, where `#` is part of the delimiter
+  # word, is still rejected rather than silently read as delimiter `A`).
+  if (after == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) return name
+  # ⛔ A SECOND OPENER ON THE SAME LINE IS A REDIRECT, NOT A REJECTION (#2121 review round 4, P0).
+  # `cat <<A <<B` was rejected outright, so NEITHER body was recorded and both were walked as code.
+  # `<` is as much an operand boundary as `>` is.
+  if (after != "" && after != ">" && after != "<" && after != "|" && after != ";" && after != ")" && after != "&") return ""
   return name
+}
+function heredoc_push(dm, dash, q, ln) {
+  # ⛔ ONE LINE MAY OPEN MORE THAN ONE HEREDOC, AND THEIR BODIES ARRIVE IN ORDER (#2121 review
+  # round 4, P0). `cat <<A <<B` reads the body of A first and the body of B second, so a single `heredoc` slot
+  # made the second body unrecorded: it was walked as CODE, its prose moved the quote carry and the
+  # scan of the file desynchronised. The openers are therefore QUEUED in the order the walk met them,
+  # and the terminator of one promotes the next to the active slot.
+  if (heredoc == "" && HQN == 0) {
+    heredoc = dm; heredoc_dash = dash; heredoc_quoted = q; heredoc_line = ln
+    return
+  }
+  HQN++; HQ_D[HQN] = dm; HQ_DASH[HQN] = dash; HQ_Q[HQN] = q; HQ_LINE[HQN] = ln
+}
+function heredoc_pop(   k) {
+  # The active heredoc terminated: the next queued one (if any) takes its place. Its body starts on
+  # the FOLLOWING line, which is exactly what the `next` in the caller does.
+  if (HQN > 0) {
+    heredoc = HQ_D[1]; heredoc_dash = HQ_DASH[1]; heredoc_quoted = HQ_Q[1]; heredoc_line = HQ_LINE[1]
+    for (k = 2; k <= HQN; k++) {
+      HQ_D[k - 1] = HQ_D[k]; HQ_DASH[k - 1] = HQ_DASH[k]
+      HQ_Q[k - 1] = HQ_Q[k]; HQ_LINE[k - 1] = HQ_LINE[k]
+    }
+    delete HQ_D[HQN]; delete HQ_DASH[HQN]; delete HQ_Q[HQN]; delete HQ_LINE[HQN]
+    HQN--
+  } else { heredoc = ""; heredoc_dash = 0; heredoc_quoted = 0 }
 }
 function has_listing_cmd(left,   t) {
   # A LISTING COMMAND, at a command position — not the substring `ls` inside `labels`/`signals`
@@ -482,7 +540,7 @@ function guarded_assignment(line,   i, n, j) {
   }
   return 0
 }
-function skip_param(line, i,   n, j, c, d) {
+function skip_param(line, i,   n, j, c, d, qm) {
   # Skip a `${…}` parameter expansion: those braces belong to the EXPANSION, not to the block
   # structure (`${#arr[@]}`, `"${1:-}"`, `${x%%.*}`), and counting them made the brace depth — and
   # with it where a function ends — depend on how a variable was spelled.
@@ -491,15 +549,40 @@ function skip_param(line, i,   n, j, c, d) {
   # counted, the INNER `}` drove `d` to 0, and the recovery returned early: the rest of the line then
   # carried an unmatched `"` and, with it, a brace depth that never came back. `d` is a count of
   # `${`s, so a nested one increments it regardless of what quoting surrounds it.
-  n = length(line); j = i + 2; d = 1
+  #
+  # ⛔ A QUOTED `}` IS NOT THE END OF THE EXPANSION (#2121 review round 4, P1). This walk knew neither
+  # quotes nor brace EXPANSIONS, so it returned at the first `}` character wherever it sat:
+  #   g=${Y:-$(echo "}")}            → ended INSIDE the quoted string, leaving `")}` to be walked as
+  #                                     block braces (the function closed early — with the new `${…}`
+  #                                     walk that made a real `empty-as-pass` a SILENT PASS)
+  #   f=${X:-{a,b}}                  → ended at the `}` of the brace EXPANSION, so the real closer was
+  #                                     counted as a BLOCK brace and the function ended a line early
+  #                                     (pre-existing, measured on the previous head: silent PASS)
+  # Both are the same defect: the end of the expansion is not "the first `}`", it is the `}` that closes
+  # the nesting. Quotes are skipped (POSIX, ANSI-C and double-quoted, escapes included), a nested `${`
+  # counts, and so does a bare `{` — bash requires the braces of an alternate-value WORD to balance.
+  n = length(line); j = i + 2; d = 1; qm = 0
   while (j <= n) {
     c = substr(line, j, 1)
+    if (qm == 1) { if (c == sq) qm = 0; j++; continue }
+    if (qm == 2) { if (c == "\\") { j += 2; continue } if (c == sq) qm = 0; j++; continue }
+    if (qm == 3) { if (c == "\\") { j += 2; continue } if (c == "\"") qm = 0; j++; continue }
     if (c == "\\") { j += 2; continue }
+    if (c == "\"") { qm = 3; j++; continue }
+    if (c == sq) { qm = ((j > 1 && substr(line, j - 1, 1) == "$") ? 2 : 1); j++; continue }
     if (c == "$" && substr(line, j + 1, 1) == "{") { d++; j += 2; continue }
+    if (c == "{") { d++; j++; continue }
     if (c == "}") { d--; if (d == 0) return j + 1 }
     j++
   }
-  return j
+  # ⛔ UNCLOSED IS NOT "ENDED AT THE LINE BOUNDARY" (#2121 review round 4). Returning n+1 was
+  # indistinguishable from an expansion whose closing brace is the LAST character of the line, and the
+  # caller read that as "carries on to the next line" — so a fully closed `${Y:-$(echo "}")}` left the
+  # carry armed and the function brace on the next line went uncounted (a real shape turned into a
+  # partial scan). -1 states the fact, and PARAM_D hands the caller the nesting still open, which is
+  # what a multi-line expansion must carry so its closers are not counted as BLOCK braces.
+  PARAM_D = d
+  return -1
 }
 function push_ctx(k) {
   # ⛔ A QUOTING CONTEXT IS A STACK, NOT TWO BOOLEANS (#2121 review, P0). Bash parses `$( … )` and a
@@ -514,10 +597,10 @@ function push_ctx(k) {
   # the run still printed PASS. Measured: 12-line fixture reported nothing, the same file without the
   # nested quotes reported `empty-as-pass`.
   QN++
-  QK[QN] = k; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0
+  QK[QN] = k; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0; QL[QN] = 0
 }
 function pop_ctx() {
-  if (QN > 1) { QK[QN] = ""; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0; QN-- }
+  if (QN > 1) { QK[QN] = ""; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0; QL[QN] = 0; QN-- }
 }
 function brace_delta(line,   i, n, c, d, qk, has_sh) {
   # Net brace depth change of one scanned line, OUTSIDE quotes, comments and `${…}` expansions.
@@ -534,7 +617,7 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
   # Braces are only counted in the OUTERMOST context: a `{ … }` inside a substitution belongs to that
   # subshell, so it is balanced where it appears and counting it buys nothing but drift.
   d = 0; n = length(line); i = 1
-  BR_END = 0; BR_OPEN = 0; BR_HIDDEN = 0; HD_POS = 0
+  BR_END = 0; BR_OPEN = 0; BR_HIDDEN = 0; HD_N = 0
   # ⛔ `(( … ))` AND `[[ … ]]` ARE ENDED AT THE LINE BOUNDARY (#2121 review round 3, P1). Their state
   # is per CONTEXT but NOT carried across lines: neither can contain a brace, so ending them here costs
   # nothing on real code, while carrying a `((` whose `))` never arrives (it can sit inside a quoted
@@ -563,12 +646,12 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
     if (QS[QN] == 2) { if (c == "\\") { i += 2; continue } if (c == sq) QS[QN] = 0; i++; continue }
     if (QS[QN] == 1) { if (c == sq) QS[QN] = 0; i++; continue }
     if (c == "\\") { i += 2; continue }
-    if (c == "\"" && QS[QN] == 0) { QD[QN] = !QD[QN]; i++; continue }
-    if (c == sq && QD[QN] == 0) { QS[QN] = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1); i++; continue }
+    if (c == "\"" && QS[QN] == 0) { QD[QN] = !QD[QN]; if (QD[QN] && QL[QN] == 0) QL[QN] = FNR; i++; continue }
+    if (c == sq && QD[QN] == 0) { QS[QN] = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1); QL[QN] = FNR; i++; continue }
     # a TRAILING comment: `#` at a word boundary starts prose, and prose is not braces. A `#` inside
     # a `$( … )` that itself sits inside a double-quoted string IS a comment, which is why this tests
     # the quote state of the CURRENT context and not the outermost one.
-    if (QD[QN] == 0 && c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
+    if (QD[QN] == 0 && c == "#" && PDEPTH == 0 && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
     # ⛔ `$((` IS AN ARITHMETIC EXPANSION, NOT A COMMAND SUBSTITUTION, AND IT IS MARKED AS SUCH
     # (#2121 review round 3, P1). Both push a fresh quoting context, but a `<<` inside arithmetic is a
     # BIT-SHIFT and inside a command substitution it is a REAL heredoc — so the opener test needs to
@@ -612,9 +695,18 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
       # review round 3, P1). The CURRENT context must be code — not inside a quote of this context,
       # not inside a `$(( … ))`, a `(( … ))` or a `[[ … ]]` — which is exactly where `<<` is a heredoc.
       # It is recorded in a `$( … )` context too, because `x="$(cat <<EOF … EOF)"` is a real heredoc
-      # inside a command substitution; `${…}` is skipped by skip_param, whose body is declared in the
-      # header as not modelled. `<<<` is a HERESTRING and is excluded by the third-byte test.
-      if (HD_POS == 0 && QA[QN] == 0 && c == "<" && substr(line, i + 1, 1) == "<" && substr(line, i + 2, 1) != "<") { HD_POS = i; i += 2; continue }
+      # inside a command substitution; `${…}` is walked when it carries a `$(` (see below), and its
+      # braces are declared in the header as not modelled as block braces.
+      # ⛔ `<<<` IS A HERESTRING AND IS CONSUMED WHOLE (#2121 review round 4). The third-byte test kept
+      # it from being recorded AT THE FIRST `<` — but the walk then advanced ONE character and re-tested
+      # at the SECOND, where `<< "operand"` looks like a perfectly ordinary quoted opener: measured,
+      # `read -r e <<< "herestring"` was read as a heredoc whose delimiter was `herestring`, which never
+      # terminated — a loud `unterminated-heredoc` FAIL on a `bash -n`-clean file. The token is skipped
+      # as a unit, so there is no second position to misread.
+      if (QA[QN] == 0 && c == "<" && substr(line, i + 1, 1) == "<") {
+        if (substr(line, i + 2, 1) == "<") { i += 3; continue }
+        HD_N++; HD_POSA[HD_N] = i; i += 2; continue
+      }
     }
     if (c == "(" && QK[QN] == "sub" && QD[QN] == 0) { QP[QN]++; i++; continue }
     if (c == ")" && QK[QN] == "sub" && QD[QN] == 0) {
@@ -623,7 +715,40 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
       i++; continue
     }
     if (QN == 1 && QD[1] == 0 && QS[1] == 0) {
-      if (c == "$" && substr(line, i + 1, 1) == "{") { i = skip_param(line, i); continue }
+      if (c == "$" && substr(line, i + 1, 1) == "{") {
+        # ⛔ A `${…}` EXPANSION IS SKIPPED BECAUSE ITS BRACES ARE NOT BLOCK BRACES — BUT ITS BODY IS
+        # STILL CODE WHEN IT CARRIES A COMMAND SUBSTITUTION (#2121 review round 4, P0). Jumping the
+        # whole expansion hid the opener in
+        #     note=${NOTE:-$(cat <<EOF … EOF)}
+        # so the heredoc was never recorded, its BODY was walked as code, a body apostrophe opened the
+        # quote carry and the file ended desynchronised — exit 0, 0 findings, PASS over a real
+        # `empty-as-pass`. When the expansion contains a `$(`, it is now WALKED (the quote/`$(`/
+        # opener arms above all run) with every brace inside it refused: PDEPTH counts the nesting that
+        # is still open inside the expansion, so the braces that made skip_param necessary stay
+        # uncounted — on this line and on any later one the expansion runs into.
+        j = skip_param(line, i)
+        if (j < 0) {
+          # the expansion continues on a later line. Its remaining nesting is carried in PDEPTH; the
+          # body is walked only when it can hold an opener (a `$(`), and skipped otherwise.
+          PDEPTH = PARAM_D
+          if (index(substr(line, i + 2), "$(") > 0) { i += 2; continue }
+          i = n + 1; continue
+        }
+        if (index(substr(line, i + 2, j - i - 2), "$(") > 0) {
+          PDEPTH = 1
+          i += 2; continue
+        }
+        i = j; continue
+      }
+      # inside an expansion the walk is reading: its braces are not BLOCK braces, so `${x:-{a,b}}`,
+      # `${x:-$(echo "}")}` and a nested `${A[@]+"${A[@]}"}` all stay balanced. Quotes and `$( … )` are
+      # handled by the arms ABOVE this one, which is how the opener inside such an expansion is seen.
+      if (PDEPTH > 0) {
+        if (c == "$" && substr(line, i + 1, 1) == "{") { PDEPTH++; i += 2; continue }
+        if (c == "{") { PDEPTH++; i++; continue }
+        if (c == "}") { PDEPTH--; i++; continue }
+        i++; continue
+      }
       if (c == "{") { d++; BR_OPEN++; i++; continue }
       if (c == "}") { d--; BR_END = i; i++; continue }
     } else if (c == "{") BR_HIDDEN = 1
@@ -979,7 +1104,8 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         NESTED_N = 0
         depth = 0; end_fn = 0; BR_END = 0
         heredoc = ""; heredoc_dash = 0; heredoc_line = 0; heredoc_quoted = 0; sq = sprintf("%c", 39)
-        QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0; BR_HIDDEN = 0; in_hbody = 0
+        HQN = 0; HD_N = 0; PDEPTH = 0; PARAM_D = 0
+        QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0; QL[1] = 0; BR_HIDDEN = 0; in_hbody = 0
         split("", fcaptured); split("", farrcap); split("", flistcnt)
         split("", arrcap); split("", listcnt); split("", declared); PARTIAL_SCOPE = 0
         # ⛔ CHARACTER CLASSES AS TABLES, NOT REGEXES (#2121 review round 3, P1). The per-character
@@ -990,7 +1116,10 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         for (ci = 97; ci <= 122; ci++) ALPHA[sprintf("%c", ci)] = 1
         for (ci in ALPHA) NUMCH[ci] = 1
         for (ci = 48; ci <= 57; ci++) NUMCH[sprintf("%c", ci)] = 1 }
-FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0
+FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0; QL[1] = 0
+           # the heredoc queue and the walked-`${…}` carry belong to the FILE as well: a previous
+           # unterminated state must not leak into this one (each file is a fresh scan).
+           heredoc = ""; heredoc_dash = 0; heredoc_quoted = 0; HQN = 0; PDEPTH = 0; PARAM_D = 0
            # the FILE-scope maps belong to the file, not to the function (see is_cap)
            split("", fcaptured); split("", farrcap); split("", flistcnt)
            split("", arrcap); split("", listcnt); split("", declared) }
@@ -1004,12 +1133,22 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH
   # bash. This is the same reasoning as "a comment is not code" and it is stated rather than
   # implied, because it is the one place a shape can hide from this check.
   RAW = $0
+  # ⛔ A CRLF LINE ENDING IS NOT PART OF THE LINE (#2121 review round 4, P1). On a CRLF checkout the
+  # `\r` survived into every comparison: `local bad=0\r` failed the `=0` arm (which requires
+  # `[ \t;]`/EOL next), `return "$bad"\r` failed the verdict arm (which requires `[ \t]*$`), and
+  # `EOF\r` never matched the heredoc terminator — so an `empty-as-pass` in a CRLF file was reported
+  # NOWHERE and the run printed PASS. The carriage return is stripped ONCE, here, before any arm or
+  # terminator compares it.
+  sub(/\r$/, "", RAW)
+  $0 = RAW
   if (heredoc != "") {
     # `<<-` strips leading TABS from the terminator, so the comparison must too — otherwise a
     # tab-indented terminator never matches and the heredoc swallows the rest of the file.
     t = $0
     if (heredoc_dash) sub(/^[ \t]+/, "", t)
-    if (t == heredoc) { heredoc = ""; heredoc_dash = 0; heredoc_quoted = 0; next }
+    # ⛔ THE NEXT QUEUED HEREDOC TAKES OVER HERE (#2121 review round 4, P0): `cat <<A <<B` reads the
+    # body of A and then the body of B, and both must be recognised as DATA.
+    if (t == heredoc) { heredoc_pop(); next }
     # A QUOTED body is DATA (a fixture, a template, a test case) — skipped entirely.
     if (heredoc_quoted) next
     # AN UNQUOTED body is generated bash: the LINE rules still run on it (a shape may genuinely live
@@ -1022,12 +1161,20 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH
   # `<<` is text the compiled script prints, not a redirect. Two failures followed: a body line
   # `printf` whose ARGUMENT carries a `<<` produced `unterminated-heredoc` on a
   # `bash -n`-clean file (loud false red), and a body line could OVERWRITE the real delimiter, so the
-  # phantom one vanished without a note. `HD_POS` is therefore only consulted while no heredoc is
-  # open, and the opener is recorded from the walk itself (brace_delta) — see heredoc_at.
-  HD_POS = 0
+  # `HD_POSA` holds every position at which brace_delta met a `<<` at command position — never in a
+  # comment, a quote, a `$( … )`, a `${…}`, an arithmetic expansion or a `[[ … ]]` test. It is
+  # therefore only consulted while no heredoc is open, and the opener is recorded from the walk itself
+  # (brace_delta) — see heredoc_at.
+  HD_N = 0
   # ⛔ A COMMENT IS NOT CODE, and that is decided HERE — BEFORE the brace bookkeeping — so a comment
   # that merely QUOTES a brace (`# }`) can neither close a function nor open a block.
-  is_comment = ($0 ~ /^[ \t]*#/)
+  # ⛔ BUT A `#` INSIDE AN OPEN QUOTE IS NOT A COMMENT (#2121 review round 4). The whole line used to be
+  # skipped whenever it STARTED with `#`, so a quote that closed on such a line was never seen: the
+  # carry stayed open to EOF and the file was reported as `unterminated-quote` — a false red on a
+  # `bash -n`-clean multi-line string whose last line happens to begin with a hash. The line is a
+  # comment only when the CURRENT context has no quote open at its start (inside a `$( … )` a `#` line
+  # IS a comment, which is why this reads the context rather than the outermost carry).
+  is_comment = ($0 ~ /^[ \t]*#/ && QS[QN] == 0 && QD[QN] == 0)
   if (!is_comment && !in_hbody) {
   opened = 0
   # ⛔ MEASURE THE LINE BEFORE ITS HEADER IS TAKEN OFF IT (#2121 review round 8, P0). This call moved
@@ -1169,16 +1316,22 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH
   }
   }   # end of the non-comment function/brace bookkeeping
   # ⛔ THE OPENER IS TAKEN FROM THE WALK, AFTER IT, ON THE RAW LINE (#2121 review round 3, P1).
-  # `HD_POS` is where brace_delta met a `<<` at command position — never in a comment, a quote, a
+  # `HD_POSA` is where brace_delta met a `<<` at command position — never in a comment, a quote, a
   # `$( … )`, a `${…}`, an arithmetic expansion or a `[[ … ]]` test. The delimiter token is read from
   # `RAW`, the line as it arrived, because the bookkeeping above TRUNCATES `$0` at a header brace or at
   # the closing brace of a one-line body, which would shift the position.
+  # ⛔ EVERY OPENER ON THE LINE, IN ORDER (#2121 review round 4, P0). Only the FIRST was recorded, so
+  # `cat <<A <<B` left the body of B unrecorded and it was walked as code. Each opener is queued; the
+  # terminator of one promotes the next (see heredoc_push/heredoc_pop).
   # ⛔ THE OPENER LINE IS RECORDED, not inferred from FNR in the END block (#2121 review round 5,
   # P2): FNR there is the LAST line of the file, so the row a human was asked to justify pointed at the
   # bottom of the file instead of the heredoc that blinded the scan.
-  if (!is_comment && !in_hbody && HD_POS > 0) {
-    delim = heredoc_at(RAW, HD_POS)
-    if (delim != "") { heredoc = delim; heredoc_dash = (substr(RAW, HD_POS + 2, 1) == "-"); heredoc_line = FNR; heredoc_quoted = HEREDOC_Q }
+  if (!is_comment && !in_hbody && HD_N > 0) {
+    for (hk = 1; hk <= HD_N; hk++) {
+      delim = heredoc_at(RAW, HD_POSA[hk])
+      if (delim == "") continue
+      heredoc_push(delim, (substr(RAW, HD_POSA[hk] + 2, 1) == "-"), HEREDOC_Q, FNR)
+    }
   }
   # ⛔ A COMMENT IS NOT CODE, for the RULES and the bookkeeping too. Bookkeeping over comment text
   # let a comment containing `wc -l` silently DISABLE empty-as-pass for a whole function, while a
@@ -1375,6 +1528,22 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH
   prev_marker = has_marker; prev_marker_bad = marker_bad; prev_marker_line = FNR
 }
 END {
+      # ⛔ AN OPEN QUOTE CARRY AT END OF FILE IS PROOF THAT THE WALK DESYNCHRONISED (#2121 review
+      # round 4, P0). On a `bash -n`-clean file, ending inside a quote means some quote character was
+      # never recognised: every line after it is read as quoted, no brace is counted, no function is
+      # flushed, `TOPPEND` clears `fn` — and the run printed exit 0 with `0 finding(s)`, `0 partial
+      # scan(s)` and PASS over a real `empty-as-pass`. Measured on `${NOTE:-$(cat <<EOF … EOF)}`: the
+      # opener sat inside the expansion skip_param jumped, so an apostrophe in the body opened the carry
+      # and nothing closed it. A file that still cannot be delimited is UNKNOWN, which the contract at
+      # the top of this file calls a FAILURE — hence a FINDING, and a rule that can never be baselined.
+      qopen = 0; qline = 0
+      for (qk = 1; qk <= QN; qk++) if (QS[qk] != 0 || QD[qk] != 0) {
+        qopen = 1
+        if (QL[qk] > 0 && (qline == 0 || QL[qk] < qline)) qline = QL[qk]
+      }
+      if (qopen)
+        printf "%s\t%d\t%s\t%s\n", FILENAME, (qline > 0 ? qline : FNR), "unterminated-quote", \
+          "a quote (or an open `$( … )` context) was still open at end of file, so the walk DESYNCHRONISED: every line after it was read as quoted, no brace was counted and no function was flushed — findings and partial-scan notes in the tail describe a scope that does not exist, and the scan of this file is PARTIAL and cannot be reported as clean"
       # ⛔ A BRACE COUNT THAT NEVER RETURNS TO ZERO IS UNKNOWN, AND UNKNOWN IS NOT CLEAN (#2121 review,
       # P1). A `{` that never closes leaves every later line attributed to the block that swallowed it, and
       # — now that headers inside a body are nested regions — can suppress every later verdict through the
