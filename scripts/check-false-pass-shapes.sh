@@ -90,7 +90,10 @@
 # files in the scan set drift this way (a multi-line quoted region, `case`, or `$(( ))` the walk does not
 # model), so it is reported as a `partial:` NOTE per file — visible, never certified clean — rather than
 # as a finding, because a rule that reds six correct files is the trade this header refuses.
-# STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a SLICE of an array
+# STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a WHOLE FUNCTION WRITTEN
+# ON ONE LINE (`f() { local bad=0; out="$(cmd)"; for x in $out; …; return "$bad"; }`) — its body reaches
+# the line rules, but the verdict is recorded only from a line that IS a `return`, so `empty-as-pass`
+# cannot fire there; a SLICE of an array
 # (`for x in "${arr[@]:1}"` — an empty array sliced from 1 also iterates zero times), a capture written
 # in a `case` arm (`a) names="$(cmd)" ;;`) or after `|`-into-a-subshell, `printf -v`, `mapfile`/
 # `readarray`, and a for-list whose word is an element (`for x in "$arr"). (Deriving from the capture —
@@ -640,7 +643,13 @@ FNR == 1 { gdq = 0; gsq = 0 }
     # the `name()` branch to fall through past the opening brace, but this branch kept `next`, so
     # `function f() { local x=$(cmd); }` was never seen by the line rules while the identical body in
     # the `name()` spelling was. Same treatment: drop the header, keep the body.
-    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
+    # ⛔ `opened` MUST MEAN "THE COUNTED OPENING BRACE WAS CONSUMED" (#2121 review round 9, P1). Raw
+    # text is wrong here for the same reason it was wrong for the nested branch: a header followed by a
+    # comment carrying the only brace (`collect() # builds a { map`) set opened=1 for a brace the walk
+    # ignored, so the new arithmetic gave delta = -1 and the function ENDED on its header line — silent,
+    # because depth returned to 0 and no partial note is printed. BR_OPEN > 0 implies the raw first
+    # brace is the counted one (the walk stops at a comment and skips ${…}).
+    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
   }
   # ⛔ ANY FUNCTION HEADER MET INSIDE AN OPEN BODY IS A NESTED HELPER, NOT A NEW FUNCTION (#2121
   # review round 5, P1). The round-4 fix guarded only the INDENTED spelling, so a helper written at
@@ -672,7 +681,13 @@ FNR == 1 { gdq = 0; gsq = 0 }
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
     # and `next` here made both line rules blind to it (review round 3). Drop the header and fall
     # through to the line rules on whatever follows the opening brace.
-    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
+    # ⛔ `opened` MUST MEAN "THE COUNTED OPENING BRACE WAS CONSUMED" (#2121 review round 9, P1). Raw
+    # text is wrong here for the same reason it was wrong for the nested branch: a header followed by a
+    # comment carrying the only brace (`collect() # builds a { map`) set opened=1 for a brace the walk
+    # ignored, so the new arithmetic gave delta = -1 and the function ENDED on its header line — silent,
+    # because depth returned to 0 and no partial note is printed. BR_OPEN > 0 implies the raw first
+    # brace is the counted one (the walk stops at a comment and skips ${…}).
+    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
   }
   # ⛔ A BRACE GROUP INSIDE A FUNCTION IS NOT THE END OF THE FUNCTION (#2121 review round 4, P1). The
   # rule used to end the function at a `}` at ANY indent, so a nested `{ … }` threw away the

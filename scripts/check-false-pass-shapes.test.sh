@@ -1038,6 +1038,39 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B51 a MULTI-LINE body of a 'function name() {' header is analysed (the header line does not end it)"
+# ⛔ ROUND-9, P1: the TOP-LEVEL header branches still decided `opened` from RAW text, so a header whose
+# only raw brace sat in a trailing comment (`collect() # builds a { map`) consumed a brace the walk had
+# not counted, the depth arithmetic went negative, and the function ENDED on its header line — silently,
+# since depth returned to zero and therefore no `partial:` note is printed either.
+D="$(fixture b52)"
+cat > "$D/scripts/fiftytwo.sh" <<'EOS'
+#!/bin/bash
+collect() # builds a { map
+{
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do echo "$x"; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B52 a header whose only raw brace is in a COMMENT does not end the function on its header line"
+
+D="$(fixture b53)"
+cat > "$D/scripts/fiftythree.sh" <<'EOS'
+#!/bin/bash
+function collect() # builds ${MAP}
+{
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do echo "$x"; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B53 the same in the 'function name()' spelling (with an INTERPOLATED comment)"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
@@ -1484,7 +1517,7 @@ function oneliner() { local x=$(read_config); echo "$x"; }
 EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
-ck $? "G6 a ONE-LINE body under the 'function name' spelling is scanned (same treatment as name())"
+ck $? "G6 a ONE-LINE body under the 'function name' spelling reaches the LINE rules (an empty-as-pass verdict cannot be recorded on a one-line body — declared in the header)"
 
 # Every declared glob must still contribute targets: a renamed/moved subtree silently shrinks the
 # scan set, and the only other signal is a count nobody compares.
