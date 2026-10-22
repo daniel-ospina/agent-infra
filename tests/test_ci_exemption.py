@@ -2682,6 +2682,14 @@ def test_9331_a_meaningful_number_stays_SIGNAL():
         ("slept 0s vs 5s", "slept 3s vs 9s"),
         # a written-byte count is data, not substrate
         ("wrote 4096 bytes", "wrote 8192 bytes"),
+        # ── a DECLARED BOUND is never masked, even when it is fractional: this
+        # repo interpolates float bounds (`bound_s=0.1`, `HEALTH_BUDGET_S`), and
+        # collapsing them would let a PR that MOVES a bound inherit main's
+        # signature (review cycle 2, measured on this repo's own tests).
+        ("the caller was held for 1.2s on a 0.1s bound", "the caller was held for 1.2s on a 0.5s bound"),
+        ("the probe exceeded (budget 3.0s)", "the probe exceeded (budget 30.0s)"),
+        ("local EP took 1.21s — the bound was ≤1.5s", "local EP took 1.21s — the bound was ≤9.5s"),
+        ("the leg ran over its 1.50s timeout", "the leg ran over its 2.50s timeout"),
     ]
     for left, right in pairs:
         assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
@@ -2714,7 +2722,7 @@ def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
     # …and the mask is actually APPLIED at the door, not merely absent from both
     # sides of the comparison above (a tautology would pass on the unfixed tree).
     (sig,) = sigs
-    assert "<MEAS:s>" in sig and "1.21s" not in sig, (
+    assert "<MEAS1:s>" in sig and "1.21s" not in sig, (
         f"the door stored the raw measurement instead of masking it: {sig!r}"
     )
 
@@ -2754,9 +2762,9 @@ def test_9331_the_guard_shape_gets_the_same_mask():
     in a guard annotation is masked there as well: intended (the axis is the same
     substrate), but it must be a decision the next lane can see.
     """
-    shape_a = ci_exemption.normalize_guard_error("slow leg exceeded its 1.50s budget")
-    shape_b = ci_exemption.normalize_guard_error("slow leg exceeded its 2.25s budget")
-    assert "<MEAS:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
+    shape_a = ci_exemption.normalize_guard_error("the slow leg ran over, 1.50s in total")
+    shape_b = ci_exemption.normalize_guard_error("the slow leg ran over, 2.25s in total")
+    assert "<MEAS1:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
     assert ci_exemption.guard_step_key("Slow leg", shape_a) == ci_exemption.guard_step_key(
         "Slow leg", shape_b
     )
@@ -2768,3 +2776,41 @@ def test_9331_the_guard_shape_gets_the_same_mask():
     int_b = ci_exemption.normalize_guard_error("the leg exceeded its 900s budget")
     assert int_a == "the leg exceeded its 90s budget", int_a
     assert int_a != int_b, "an integer duration became masked — re-derive the fail-OPEN guard"
+
+
+def test_9331_a_bound_move_with_the_same_measurement_is_not_the_same_failure():
+    """The end-to-end face of the bound rule: a PR that MOVES a bound must BLOCK.
+
+    Review cycle 2 measured that a purely lexical duration mask exempts exactly
+    this — the id is red on main, the PR's assertion is a DIFFERENT (moved) bound,
+    and the signatures compared equal. The exemption must be unavailable.
+    """
+    main_sig = ci_exemption.normalize_signature(
+        "AssertionError: the caller was held for 1.2s on a 0.1s bound — joined"
+    )
+    pr_sig = ci_exemption.normalize_signature(
+        "AssertionError: the caller was held for 1.2s on a 0.5s bound — joined"
+    )
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(1, 4)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a moved bound must not inherit main's exemption"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_9331_a_duration_used_as_data_is_a_declared_residual():
+    """DECLARED residual: a value in a non-bound DATA slot is still masked.
+
+    ``measured 10.36 s of the control's 10.85 s`` anchors the assertion on a
+    REFERENCE value, and both slots are masked — so a change to the reference
+    alone compares equal. Preserving values would defeat the mask entirely (the
+    value IS what varies per run), so this is the accepted cost, pinned here so
+    the next evidence can decide deliberately.
+    """
+    a = ci_exemption.normalize_signature("measured 10.36 s of the control's 10.85 s")
+    b = ci_exemption.normalize_signature("measured 12.50 s of the control's 19.75 s")
+    assert a == b, "if this now differs, the mask was narrowed — re-derive the residual"
+    assert a == "measured <MEAS1:s> of the control's <MEAS2:s>", a
