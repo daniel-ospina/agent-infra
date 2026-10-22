@@ -938,7 +938,10 @@ the census printed `lanes=0/0 zombie=<n>` with exit 0 — which `orch-loop.sh` r
 the controller **dispatches more** onto a box whose capacity it cannot see (the #2163/#2159 OOM
 direction). Two distinct facts are now kept apart: a tree whose descriptors **could not be read** may
 be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors **were read** and hold no
-fleet log is simply not a lane, and `0/0` is then a real answer.
+fleet log is simply not a lane, and `0/0` is then a real answer. A third cause abstains for the same
+reason: the reads **succeeded** but the platform prints no per-pipe name (`pipe`, `->0x0`), so a `tee`
+beside the tree cannot be shown to be its own writer — it is counted in `unidentifiable=` and the
+census abstains (exit 3), which is *not* a failed read.
 
 The reap summary is `trees=<working>/<judged> zombie=<n> candidates=<n> reaped=<n> refused=<n>
 inert=<n> unidentifiable=<n> abstained=<n> mode=…`. `trees=` accounts for **every** judged tree

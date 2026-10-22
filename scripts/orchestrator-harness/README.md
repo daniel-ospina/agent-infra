@@ -1453,7 +1453,9 @@ lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unkno
 * **`lanes_src=`** — where the number came from: `census` (this instrument), `unknown` (it ran but
   could not answer), `tmux` (the OLD session count, used only while a `$O` predates `lane-reap.sh`;
   named once in the controller log and labelled here, never printed as if it were a census).
-* **`lanes=?/?`** — the census could not be read. `?` is not `0`: "ps is broken" and "nothing is
+* **`lanes=?/?`** — the census cannot be verified: unreadable (`ps`/`lsof` failed), ambiguous (two
+  distinct lane logs), or an unidentifiable pipe identity (the reads succeeded but the platform
+  prints no per-pipe name, so a `tee` cannot be shown to be the lane's own writer). `?` is not `0`: "ps is broken" and "nothing is
   running" must not render identically. ⛔ The polarity here is the OPPOSITE of what an earlier
   version of this section said: an under-count of live lanes makes the `lanes >= max_lanes` gate
   FALSE and **dispatches more**, so it is a fail-OPEN on capacity. An unreadable census therefore
