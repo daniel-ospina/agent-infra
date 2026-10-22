@@ -1257,6 +1257,19 @@ printf 'OK product=0 harness=0\n' > "$T/o9t5/state/product-class"
 OUTT12="$(runblock "$T/o9t5" '42\n43\n' 1 2)"
 case "$OUTT12" in *"product-floor unread"*"ABSENT or not a regular file"*) T12=0 ;; *) T12=1 ;; esac
 ck "P9 [RED→GREEN] the absent-queue disown says 'product-floor unread' too (got '${OUTT12:0:110}')" $T12
+# ⛔ AND A MISSING HARNESS QUEUE HAS NO COUNT, IN THE MET-FLOOR ARM TOO (review cycle 49, P2). That arm's cross-check
+# printed `harness=${_fq_h:-0}` — a MEASUREMENT of a file that does not exist — while its siblings say "ABSENT or not
+# a regular file, so this cycle could not check", AND a record claiming `harness=0` then "agreed" with the absent
+# file, so the disown did not fire at all. Driven with the product queue non-empty (so the met arm is reached) and
+# no harness queue on disk.
+mkdir -p "$T/o9m/state"; printf '42\n43\n' > "$T/o9m/candidates.txt"
+printf '42\n' > "$T/o9m/candidates.product.txt"; rm -f "$T/o9m/candidates.harness.txt"
+printf 'OK product=1 harness=0\n' > "$T/o9m/state/product-class"
+OUTM="$(runblock "$T/o9m" '42\n43\n' 1 2)"
+case "$OUTM" in *"harness=0 ("*"ABSENT or not a regular file"*) M1=0 ;; *) M1=1 ;; esac
+ck "P9 [RED→GREEN] a met-floor disown names the ABSENT harness queue instead of publishing harness=0 (got '${OUTM:0:200}')" $M1
+case "$OUTM" in *"NOT a trustworthy floor measurement"*) M2=0 ;; *) M2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the record is disowned rather than 'agreeing' with a file that was never read" $M2
 # the UNKNOWN arm is a class that was never read, so it says `unread` as well — not `unmet`.
 case "$OUTA" in *"product-floor unread"*) A2b=0 ;; *) A2b=1 ;; esac
 ck "P9 [RED→GREEN] the UNKNOWN arm says 'product-floor unread', not 'unmet' (got '${OUTA:0:110}')" $A2b
@@ -1269,8 +1282,22 @@ ck "P9 [RED→GREEN] ... and does not claim a share was owed and missed" $A2c
 # measured absent), so the two files must not name different tokens for one state.
 grep -q 'product-floor unread' "$REFRESH"
 ck "P12 [RED→GREEN] the writer names the token the loop prints (product-floor unread) in its degrade warnings" $?
-if grep -q 'product floor is unmet' "$REFRESH" 2>/dev/null; then W25=1; else W25=0; fi
-ck "P12 [RED→GREEN] ... and never tells the operator the floor is unmet for a class that was never read" $W25
+# ⛔ AND PER ARM, NOT ONCE IN THE FILE (review cycle 49, P2). A whole-file `grep -q 'product-floor unread'` is
+# satisfied by ONE arm, so any other arm could name a different wrong token — including the `N/A` verdict that
+# cycle 46 called a P1 — and the suite stayed green (measured: the LISTING-FAILED arm rewritten to
+# `product-floor N/A` left 274/1/0). Every reason is pinned by ITS OWN name, which only exists in the arm that
+# records it.
+_missing_tok=""
+for _reason in BUDGET-SKIPPED OUTPUT-UNWRITABLE LISTING-TRUNCATED WRITE-FAILED LISTING-FAILED; do
+  grep -q "product-floor unread … reason=$_reason" "$REFRESH" 2>/dev/null || _missing_tok="$_missing_tok $_reason"
+done
+[ -z "$_missing_tok" ]
+ck "P12 [RED→GREEN] every degrade arm names 'product-floor unread … reason=<ITS OWN ARM>' (missing:${_missing_tok:- none})" $?
+# and the writer must never promise the routine N/A verdict for a class it could not read
+if grep -q 'product-floor N/A' "$REFRESH" 2>/dev/null; then W25=1; else W25=0; fi
+ck "P12 [RED→GREEN] the writer never promises the routine N/A verdict (it never reads the class)" $W25
+if grep -q 'product floor is unmet' "$REFRESH" 2>/dev/null; then W26=1; else W26=0; fi
+ck "P12 [RED→GREEN] ... nor tells the operator the floor is unmet for a class that was never read" $W26
 # ⛔ TWO DISOWNS, TWO MEASUREMENTS (review cycle 43, P2). The membership test cannot run when
 # `candidates.harness.txt` does not exist, and the first version reported that as "a candidate … is NOT in
 # …harness.txt" — a comparison it never made when there was no file. Measured: deleting the `else _ok_sub=0`
@@ -1996,7 +2023,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=274
+MIN_CHECKS=279
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

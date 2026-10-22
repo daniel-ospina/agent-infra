@@ -2955,9 +2955,20 @@ PY
             _rec_h="${_PB_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
             # guarded on existence: a redirect failure is NOT silenced by `2>/dev/null` (measured)
             _fq_p=""; [ -f "$O/candidates.product.txt" ] && _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
-            _fq_h=""; [ -f "$O/candidates.harness.txt" ] && _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
-            if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], and its COUNTS disagree with those files, so it does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
+            # ⛔ AN ABSENT QUEUE HAS NO COUNT (review cycle 49, P2). `_fq_h` stayed empty and `${_fq_h:-0}` printed
+            # `harness=0` — a MEASUREMENT of a file that does not exist — in the very arm whose siblings (the
+            # empty-queue disowns) say "ABSENT or not a regular file, so this cycle could not check". Reachable when
+            # a pass is killed between its two `mv`s, or a restored state dir carries only one queue. The note is
+            # carried beside the number AND makes the record unverifiable on its own: with the file missing, a
+            # record claiming `harness=0` would otherwise "agree" and print nothing at all.
+            _fq_h=""; _fq_h_note=""
+            if [ -f "$O/candidates.harness.txt" ]; then
+              _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            else
+              _fq_h_note=" ($O/candidates.harness.txt is ABSENT or not a regular file, so no harness count was read)"
+            fi
+            if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || [ -n "$_fq_h_note" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0}${_fq_h_note} but state/product-class says [${_PB_WHY}], and its COUNTS disagree with those files, so it does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
             fi ;;
           *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [$(pc_state_note "$O")], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
         esac
