@@ -37,6 +37,8 @@
 #   §U the reviewer CHILD runs with GH_REPO pinned to the resolved repo
 #   §V `ISSUES 0` is clean; `ISSUES n>0` is NEVER converted, even when every line parses P3
 #   §W the no-URL comment fallback must match the body just posted, or refuse
+#   §X recorder rc=0 with no record file on disk => exit 9
+#   §Y a failed claim/issue read refuses (a failed read is not an empty value)
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -73,7 +75,7 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -117,8 +119,10 @@ case "$cmd" in
           "url,headRefOid,title,state,baseRefName")
             printf '%s\t%s\t%s\t%s\t%s\n' "${FIXTURE_URL:-}" "$(cat "$TMP/head")" \
               "${FIXTURE_TITLE:-fixture title}" "${FIXTURE_STATE:-OPEN}" "${FIXTURE_BASE:-main}" ;;
-          body) cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}" ;;
-          closingIssuesReferences) [ -n "${FIXTURE_ISSUE_URL:-}" ] && printf '%s\n' "$FIXTURE_ISSUE_URL"; ;;
+          body) [ "${FIXTURE_READ_FAIL:-}" = "body" ] && { echo "HTTP 503" >&2; exit 1; }
+                cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}" ;;
+          closingIssuesReferences) [ "${FIXTURE_READ_FAIL:-}" = "issues" ] && { echo "HTTP 503" >&2; exit 1; }
+                [ -n "${FIXTURE_ISSUE_URL:-}" ] && printf '%s\n' "$FIXTURE_ISSUE_URL"; ;;
           headRefOid) cat "$TMP/head" ;;
           *) echo "fake-gh: unhandled pr view --json $json" >&2; exit 1 ;;
         esac ;;
@@ -176,12 +180,16 @@ ev=""
 while [ "$#" -gt 0 ]; do case "$1" in --evidence) ev="${2:-}"; shift 2 ;; *) shift ;; esac; done
 owner="${repo%%/*}"; name="${repo##*/}"
 mkdir -p "$HOME/.pi/agent/reviews"
-printf '{"pr":%s,"head_sha":"%s","mint":"fresh","evidence":"%s","verdict":"%s","repo":"%s","reviewed_at":"2026-10-21T00:00:00Z"}\n' \
-  "$pr" "$sha" "$ev" "$verdict" "$repo" > "$HOME/.pi/agent/reviews/${owner}-${name}-${pr}.json"
+# FIXTURE_NO_RECORD_FILE: rc=0 having written NOTHING — the "recorder returned 0 but the
+# artifact is not there" arm has to be drivable, or that guard is untested (§X).
+if [ "${FIXTURE_NO_RECORD_FILE:-0}" != "1" ]; then
+  printf '{"pr":%s,"head_sha":"%s","mint":"fresh","evidence":"%s","verdict":"%s","repo":"%s","reviewed_at":"2026-10-21T00:00:00Z"}\n' \
+    "$pr" "$sha" "$ev" "$verdict" "$repo" > "$HOME/.pi/agent/reviews/${owner}-${name}-${pr}.json"
+fi
 # The recorder's OTHER artifact: the marker it appends to the PR body (signed, unless
 # the key is missing). check (c) reads THIS, not the JSON — so the fake must produce it
 # for the seam's post-record verification to be exercised at all.
-if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
+if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ] || [ "${FIXTURE_NO_RECORD_FILE:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
 if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
   printf '\nreview recorded: reviews/%s.json verdict=%s @ %s (%s)\n' "$pr" "$verdict" "$sha" "$repo" >> "$TMP/body.md"
 else
@@ -201,6 +209,7 @@ reset() {
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
+  FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
@@ -419,13 +428,24 @@ ck $rc "…so the 200 KB payload is not in the prompt at all"
 # The BYTE-budget branch (PROMPT_MAX) is only reachable when the CAP'd diff is multi-byte:
 # 60,000 characters of a 3-byte character is ~180 KB. Without this arm the branch the PR
 # calls "the single-argv fix" would be untested (P3, seventh fresh review).
+# The arm is locale-dependent (${#DIFF} counts CHARACTERS only in a UTF-8 locale), so it runs
+# under an explicit UTF-8 LC_ALL and SKIPS LOUDLY when the box has none — a C-locale runner
+# reddening this suite would be a false signal (P3, eleventh fresh review).
+UTF8_OK=""
+for loc in C.UTF-8 en_US.UTF-8 UTF-8; do
+  if [ "$(LC_ALL="$loc" bash -c 'x=→; printf %s "${#x}"' 2>/dev/null)" = "1" ]; then UTF8_OK="$loc"; break; fi
+done
+if [ -z "$UTF8_OK" ]; then
+  fail "PROMPT_MAX re-compose arm SKIPPED: this box has no UTF-8 locale, so a multi-byte diff cannot be built (the branch is untested here)"
+else
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
-run "$SRC" 2284
+LC_ALL="$UTF8_OK" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
 case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
 ck $rc "…via the no-diff re-compose branch (the PROMPT_MAX byte budget)"
 if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -lt 110001 ]; then rc=0; else rc=1; fi
 ck $rc "…and the re-composed prompt is inside the budget ($(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ') bytes)"
+fi
 
 # ── §Q markdown list/table forms cannot hide a blocking finding from CLEAN ──
 echo; echo "§Q a blocking finding in list/table markup still contradicts CLEAN"
@@ -567,6 +587,26 @@ run "$SRC" 2284
 err_has "someone else"; ck $? "…naming the foreign artifact it refused to use"
 no_record; ck $? "…nothing recorded"
 
+# ── §X rc=0 from the recorder with NO record file on disk ────────────────────
+echo; echo "§X recorder rc=0 but no record file => exit 9 (the local half of the success claim)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_NO_RECORD_FILE=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "exit 9 when the recorder returned 0 and wrote nothing (rc=$(rc_of))"
+err_has "NO clean record bound to head"; ck $? "…naming the missing record, not the marker"
+
+# ── §Y a FAILED claim/issue read is refused, not reviewed as empty ──────────
+echo; echo "§Y an unreadable PR body or issue list refuses (a failed read is not an empty value)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_READ_FAIL=body
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "unreadable PR BODY => exit 3 (rc=$(rc_of))"
+err_has "could not READ the PR body"; ck $? "…naming the read failure"
+no_reviewer; ck $? "no reviewer paid for"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_READ_FAIL=issues
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "unreadable linked-issue list => exit 3 (rc=$(rc_of))"
+err_has "could not READ the linked-issue list"; ck $? "…naming the read failure"
+no_record; ck $? "nothing recorded"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -589,10 +629,10 @@ echo
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
 # the very smallest deletion fires. It is still not a coverage claim, and a section smaller
-# than (total - 140) is not caught by it.
+# than (total - 150) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 140 ]; ck $? "assertion-count pin: >= 140 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 150 ]; ck $? "assertion-count pin: >= 150 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

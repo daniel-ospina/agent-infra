@@ -198,11 +198,11 @@ read_meta() {
   if [ -n "$REPO_IN" ]; then
     out="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO_IN" \
              --json url,headRefOid,title,state,baseRefName \
-             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>"$errf")"
+             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | join("\u001f")' 2>"$errf")"
   else
     out="$(env -u GH_REPO gh pr view "$PR" \
              --json url,headRefOid,title,state,baseRefName \
-             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>"$errf")"
+             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | join("\u001f")' 2>"$errf")"
   fi
   rc=$?
   GH_WARN="$(cat "$errf" 2>/dev/null || true)"
@@ -218,7 +218,11 @@ read_meta() {
     fi
   fi
   [ "$rc" -eq 0 ] || { META_ERR="$GH_WARN"; return 1; }
-  IFS=$'\t' read -r URL HEAD TITLE STATE BASE <<<"$out"
+  # ⛔ TAB IS IFS *WHITESPACE*, so `IFS=$'\t' read` COLLAPSES an empty field: an empty url
+  # became URL=<next field> and the "gh returned an empty url" guard could never fire
+  # (P3, eleventh fresh review; record-review.sh documents the same trap). The delimiter is
+  # a non-whitespace unit separator, and the fields are split explicitly.
+  IFS=$'\x1f' read -r URL HEAD TITLE STATE BASE <<<"$(printf '%s' "$out" | tr '\t' '\037')"
   [ -n "${URL:-}" ] || { META_ERR="gh returned an empty url"; return 1; }
   return 0
 }
@@ -287,7 +291,15 @@ fi
 # Nothing here is inferred from the caller's checkout: this runs for a lander who
 # may have NO checkout of the repo. The reviewer gets the diff, the PR's stated
 # claim, and the commands to read any file at the head for context.
-BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null || true)"
+# ⛔ A FAILED READ IS NOT AN EMPTY VALUE (P2, eleventh fresh review). These were `|| true`
+# reads: a transient failure became an EMPTY "claimed behaviour" section and a false
+# "(the PR body names no issue …)" line, and the reviewer then certified a diff against a claim
+# it never saw — the precise check the prompt exists for, skipped silently. Each read now
+# refuses (exit 3) naming its own source.
+BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
+BODY_META_RC=$?
+[ "$BODY_META_RC" -eq 0 ] \
+  || die "$E_EVIDENCE" "could not READ the PR body of $REPO#$PR (gh rc=$BODY_META_RC) — refusing to review a PR whose claimed behaviour I cannot read (an empty claim is not 'no claim')"
 DIFF="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null || true)"
 [ -n "${DIFF//[[:space:]]/}" ] \
   || die "$E_EVIDENCE" "gh pr diff returned NOTHING for $REPO#$PR at ${HEAD:0:12}… — an empty diff is a failed read, never 'nothing to review' (the reviewer would certify nothing)"
@@ -305,14 +317,20 @@ if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF="${DIFF:0:$DIFF_CAP}"
 fi
 ISSUE_TEXT=""
-ISSUE_URLS="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences --jq '.closingIssuesReferences[]?.url' 2>/dev/null || true)"
+ISSUE_URLS="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences --jq '.closingIssuesReferences[]?.url' 2>/dev/null)"
+ISSUE_URLS_RC=$?
+[ "$ISSUE_URLS_RC" -eq 0 ] \
+  || die "$E_EVIDENCE" "could not READ the linked-issue list of $REPO#$PR (gh rc=$ISSUE_URLS_RC) — refusing to review: an unreadable list is not 'closes no issue'"
 while IFS= read -r iurl; do
   [ -n "$iurl" ] || continue
-  meta="$(env -u GH_REPO gh issue view "$iurl" --json number,title,body --jq '"## #\(.number) \(.title)\n\(.body // "")"' 2>/dev/null || true)"
+  meta="$(env -u GH_REPO gh issue view "$iurl" --json number,title,body --jq '"## #\(.number) \(.title)\n\(.body // "")"' 2>/dev/null)"
+  ISSUE_RC=$?
+  [ "$ISSUE_RC" -eq 0 ] \
+    || die "$E_EVIDENCE" "could not READ linked issue $iurl (gh rc=$ISSUE_RC) — refusing to review against a claim I cannot read"
   # EACH issue is capped, not just the running total: the old form broke only AFTER
   # appending a whole issue, so one 200 KB issue body landed unbounded.
   meta="${meta:0:6000}"
-  [ -n "$meta" ] && ISSUE_TEXT="${ISSUE_TEXT}${meta}
+  ISSUE_TEXT="${ISSUE_TEXT}${meta}
 "
   [ "${#ISSUE_TEXT}" -gt 12000 ] && break
 done <<<"$ISSUE_URLS"
@@ -330,7 +348,11 @@ COMMENT_FILE="$RUN_DIR/comment.md"
 # their refusal messages cite as the audit trail (P3, fresh review of PR #2288).
 # ⛔ `mktemp`, NOT A PREDICTABLE PATH (P3, tenth fresh review): `$TMPDIR/review-pr-<pr>-<pid>.log`
 # in a shared /tmp is a symlink target another user can plant, and the `cp` below follows it.
-TRANSCRIPT="$(mktemp "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX.log" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/review-pr-$PR-$$.log")"
+# ⛔ THE TEMPLATE MUST END IN THE X's (P3, eleventh fresh review): macOS/BSD `mktemp`
+# rejects `…XXXXXX.log`, so the fallback (a PREDICTABLE path) was always taken on the very
+# platform this is farmed to. A temp DIR with a fixed filename works everywhere.
+TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX" 2>/dev/null || true)"
+TRANSCRIPT="${TRANSCRIPT_DIR:-${TMPDIR:-/tmp}}/reviewer.log"
 cleanup() {
   [ -n "${RUN_DIR:-}" ] || return 0
   [ -s "$LOG" ] && cp "$LOG" "$TRANSCRIPT" 2>/dev/null
@@ -544,7 +566,15 @@ ISSUE_N="$(printf '%s' "$LAST_LC" | grep -oiE 'issues[[:space:]]*[([ ]?[[:space:
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
 case "$VWORD" in
   clean)  KIND=clean ;;   # a CLEAN line carries no count
-  issues) KIND=issues; ISSUE_N="${ISSUE_N:-1}" ;;   # no digits => blocking, never clean
+  issues)
+    KIND=issues
+    if [ -z "${ISSUE_N:-}" ]; then
+      # No count right after ISSUES (`**Verdict: ISSUES — 3 × P1**`): use the `N ×` form, then
+      # the number of blocking lines, and only then 1 — never under-report (P3, eleventh review).
+      ISSUE_N="$(printf '%s' "$LAST" | grep -oE '[0-9]+[[:space:]]*[×x]' | head -1 | tr -cd '0-9' || true)"
+      [ -n "${ISSUE_N:-}" ] || ISSUE_N="$(printf '%s\n' "$BLOCKING_FINDINGS" | grep -c . || true)"
+      [ "${ISSUE_N:-0}" -gt 0 ] || ISSUE_N=1
+    fi ;;
   *)
     err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line in its transcript (rc=$AGENT_RC)."
     err "  This is a reviewer failure (crash, wall-clock cap, provider refusal, or a final message that broke the format). Nothing was posted and NO record was written."
@@ -676,7 +706,10 @@ if [ "$KIND" = clean ]; then
     printf '**Verdict:** CLEAN — no blocking findings.\n\n'
     printf '| | |\n|---|---|\n'
     printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (deepseek-v4-flash, `--no-session`) — no shared context with the author |\n| Produced by | `scripts/review-pr.sh %s` |\n\n' "$REPO" "$HEAD" "$PR"
-    printf 'Outcome: clean\n\n'
+    # `**Outcome: clean**`: record-review.sh's explicit-outcome anchor is
+    # `(^|[*[:space:]])outcome:` against the body it receives, and the leading `*` satisfies it
+    # even when the body arrives mid-string (P3, eleventh fresh review).
+    printf '**Outcome: clean**\n\n'
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
     printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n'
     # ⛔ THE NOTES ARE QUOTED BY REFERENCE, NOT BY CONTENT (P3, fresh review of PR #2288).
@@ -696,7 +729,7 @@ else
     printf '**Verdict:** ISSUES (%s) — this revision has NOT been recorded as reviewed clean.\n\n' "${ISSUE_N:-?}"
     printf '| | |\n|---|---|\n'
     printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (deepseek-v4-flash, `--no-session`) |\n\n' "$REPO" "$HEAD"
-    printf 'Outcome: not-clean\n\n'
+    printf '**Outcome: not-clean**\n\n'
     printf '### Findings\n\n'
     if [ -n "$FINDINGS" ]; then printf '%s\n' "$FINDINGS"; else
       printf '(the reviewer printed no `[P<n>]` finding lines — its own output is quoted below)\n\n```\n'
