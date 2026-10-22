@@ -73,3 +73,20 @@
 # no longer exists. It has no plist (never launchd-invoked) and nothing in the repo executes
 # it, so it is declared here as the leg's first real retirement.
 scripts/check-second-model.sh
+
+# `queue-dispatch.py` was farmed by `fleet_srcs=(…)` and RETIRED from the fleet by
+# agent-infra#1874, which deleted the lane-table dispatcher and moved the file to
+# `scripts/orchestrator-harness/retired/queue-dispatch.py` so the history stays readable
+# without the name staying deployable. It has no plist (never launchd-invoked); its last
+# in-repo consumer was `heartbeat-loop.sh`'s dispatch call, removed in the same commit.
+scripts/queue-dispatch.py
+
+# `queue_verdicts.py` was farmed by `fleet_srcs=(…)` as `queue-dispatch.py`'s BY-PATH import and
+# RETIRED in the same landing as the dispatcher (agent-infra#1874; the resolver itself is #1937 /
+# #1563, which landed while the dispatcher was still live). It moved to
+# `scripts/orchestrator-harness/retired/queue_verdicts.py`, BESIDE the dispatcher it serves, so the
+# retired copy still imports it from its own directory. It has no plist (never launchd-invoked).
+# Declared, not merely undelivered: a box that synced between #1937 and this landing holds an
+# executable copy in `$DEST/scripts/`, and leaving the name in neither list orphans it on the next
+# sync, which then refuses to run.
+scripts/queue_verdicts.py

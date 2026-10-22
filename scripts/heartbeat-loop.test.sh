@@ -1,10 +1,17 @@
 #!/bin/bash
-# scripts/heartbeat-loop.test.sh — #1933: the detached children's exit status must be REPORTED.
+# scripts/heartbeat-loop.test.sh — #1933: the detached child's exit status must be REPORTED.
+#
+# ⛔ THE SUBJECT IS NOW ONE CHILD (#1874). When this suite was written the beat launched BOTH
+# ⛔ `queue-dispatch.py` and `pr-doctor.py` detached; the lane-table dispatcher was retired by
+# ⛔ #1874, so `pr-doctor.py` is the only detached dispatch left and every assertion below grades
+# ⛔ it. The dispatcher-specific cases (5, 11b) are retired in place with a note saying what they
+# ⛔ covered and which surviving case carries that coverage; the retired step itself is preserved
+# ⛔ at `scripts/orchestrator-harness/retired/queue-dispatch.py`.
 #
 # THE DEFECT THIS SUITE PINS
 # --------------------------
-#   `heartbeat-loop.sh` launches `queue-dispatch.py` and `pr-doctor.py` DETACHED (deliberately:
-#   a pass must not wait on a full dispatch cycle), and then reported their health with a LITERAL
+#   `heartbeat-loop.sh` launches `pr-doctor.py` DETACHED (deliberately: a pass must not wait on a
+#   full dispatch cycle), and then reported its health with a LITERAL
 #   status: on the base of this worktree the file carries an `rc=0` assignment with no reader at
 #   all, and the `QUEUE-DISPATCH FAILED` report it once gated survives only in comments — #2056
 #   (`838228de`) deleted the branch and left the vestigial assignment behind, so on the base
@@ -59,8 +66,9 @@
 #      child runs again and fails again).
 #   4. DISCRIMINATION — a clean child (rc 0) writes NO failure line. A branch reported
 #      unconditionally would satisfy (2) and be just as useless.
-#   5. THE DISPATCHER — `queue-dispatch.py` gets the same treatment (`QUEUE-DISPATCH FAILED
-#      rc=N`), because the deleted dead branch was ITS report.
+#   5. RETIRED (#1874) — `queue-dispatch.py` got the same treatment (`QUEUE-DISPATCH FAILED
+#      rc=N`), because the deleted dead branch was ITS report. That step no longer launches, so
+#      the case is a note at its old position rather than an assertion on a line nothing writes.
 #   6. AN UNREADABLE SIDECAR IS NAMED, never read as success — and never claimed as a failure
 #      either (it is unverifiable). `[ "garbage" -ne 0 ]` would error, and an error read as
 #      "not a failure" is the same defect in a different coat.
@@ -106,9 +114,14 @@ trap 'rm -rf "$TMP"' EXIT
 # and SCRIPTS in it; `HEARTBEAT_PASS_ONCE` makes one invocation carry exactly ONE pass (the seam
 # is after the pass, so it cannot skip a step inside it).
 #
-# mkfix <case> <pr-doctor-exit> <queue-dispatch-exit>
+# mkfix <case> <pr-doctor-exit>
+#
+# ⛔ ONE DETACHED CHILD, since #1874 retired the lane-table dispatcher: `queue-dispatch.py` is no
+# ⛔ longer launched by the beat, so a fixture that stubbed it (and a sidecar drain it no longer has)
+# ⛔ would be pinning a step that cannot run — the shape `scripts/test_dispatch_wiring.py` exists to
+# ⛔ refuse. The surviving launch, and every assertion below, is `pr-doctor.py`.
 mkfix() {
-  local d="$TMP/$1" pdr="$2" qdr="$3"
+  local d="$TMP/$1" pdr="$2"
   mkdir -p "$d/home" "$d/agent/state/queues" "$d/agent/scripts/lib"
   # The tick (step 1), its fallback scan, and the classifier/nudger steps: all no-ops. `|| true`
   # is not needed — each stub exits 0 by construction. The TICK deliberately writes a line to
@@ -118,16 +131,13 @@ mkfix() {
     > "$d/agent/scripts/orchestrator-heartbeat.sh"
   printf '#!/bin/bash\nexit 0\n' > "$d/agent/scripts/lane-scan-fallback.sh"
   local py
-  for py in lane-actions turn-classify turn-end lane-watchdog refresh-queues; do
+  for py in lane-actions turn-classify turn-end lane-watchdog; do
     printf 'import sys\nsys.exit(0)\n' > "$d/agent/scripts/$py.py"
   done
-  # The two DETACHED children under test. Their exit codes are the input of every case, and each
-  # writes a marker to its OWN stderr so case 2 can prove the report's tail is attributed to it.
+  # The ONE DETACHED child under test. Its exit code is the input of every case, and it writes a
+  # marker to its OWN stderr so case 2 can prove the report's tail is attributed to it.
   printf 'import sys\nsys.stderr.write("PRDOCTOR-OWN-STDERR-MARKER\\n")\nsys.exit(%s)\n' "$pdr" \
     > "$d/agent/scripts/pr-doctor.py"
-  printf 'import sys\nsys.stderr.write("DISPATCH-OWN-STDERR-MARKER\\n")\nsys.exit(%s)\n' "$qdr" \
-    > "$d/agent/scripts/queue-dispatch.py"
-  printf 'import sys\nsys.exit(0)\n' > "$d/agent/state/queues/refresh-queues.py"
   # A FRESH lane snapshot (so the classifier path runs instead of the detached fallback scan)
   # and a FRESH objective cache (so the pass does not spend its objective refresh).
   printf '{"lanes":[]}\n' > "$d/agent/state/lane-status.last.json"
@@ -182,7 +192,7 @@ fi
 
 echo ""
 echo "1-4. a child that REFUSES is captured, reported, consumed, and discriminated"
-FIX="$(mkfix refused 2 0)"; LOG="$(logof "$FIX")"
+FIX="$(mkfix refused 2)"; LOG="$(logof "$FIX")"
 
 run_pass "$FIX"
 if has "$(cat "$LOG" 2>/dev/null)" "PR-DOCTOR launched detached"; then
@@ -266,7 +276,7 @@ echo "3. one-shot: a reported failure is CONSUMED, not re-reported forever"
 # line existed. `PR-DOCTOR-OFF` stops the launch without stopping the DRAIN, so two passes on a
 # seeded failure can only report once if the drain really consumes it. It also pins the drain's
 # PLACEMENT: a drain moved inside the disarm guard reports NOTHING and fails the first assertion.
-FIX3="$(mkfix consumed 0 0)"; LOG3="$(logof "$FIX3")"
+FIX3="$(mkfix consumed 0)"; LOG3="$(logof "$FIX3")"
 printf '2\n' > "$FIX3/agent/state/pr-doctor.rc"
 : > "$FIX3/agent/state/PR-DOCTOR-OFF"
 run_pass "$FIX3"
@@ -291,13 +301,11 @@ fi
 
 echo ""
 echo "4. discrimination: a CLEAN child writes no failure line"
-# Reuse the consumed fixture: both children exit 0 there and the log now has 2 passes in it.
-if [ "$(num_of "$LOG3" 'QUEUE-DISPATCH FAILED')" -eq 0 ]; then
-  pass "a clean dispatcher (rc 0) produces no 'QUEUE-DISPATCH FAILED' line"
-else
-  fail "a clean child reported a failure — the branch is not discriminating"
-fi
-FIX4="$(mkfix clean 0 0)"; LOG4="$(logof "$FIX4")"
+# Reuse the consumed fixture: the child exits 0 there and the log now has 2 passes in it.
+# ⛔ THE DISPATCHER HALF LEFT WITH THE DISPATCHER (#1874). This case used to assert that a clean
+# ⛔ `queue-dispatch.py` produced no `QUEUE-DISPATCH FAILED` line; the beat no longer launches it,
+# ⛔ so the assertion would grade a line that cannot be written either way.
+FIX4="$(mkfix clean 0)"; LOG4="$(logof "$FIX4")"
 run_pass "$FIX4"; sleep 0.5; run_pass "$FIX4"
 if [ "$(num_of "$LOG4" 'PR-DOCTOR REFUSED')" -eq 0 ] && has "$(cat "$LOG4" 2>/dev/null)" "PR-DOCTOR launched"; then
   pass "two passes with a clean pr-doctor: the pass RAN and logged no refusal"
@@ -306,31 +314,18 @@ else
 fi
 
 echo ""
-echo "5. the dispatcher gets the same treatment (its report was the dead branch)"
-FIX5="$(mkfix dispatch 0 2)"; LOG5="$(logof "$FIX5")"
-run_pass "$FIX5"
-if wait_rc "$FIX5/agent/state/queue-dispatch.rc" 2; then
-  pass "the detached dispatcher's rc=2 is captured in its own sidecar"
-else
-  fail "no queue-dispatch sidecar with rc=2 — its exit status is still uncaptured"
-fi
-q_launches_before="$(num_of "$LOG5" 'DISPATCH-STEP launched detached')"
-run_pass "$FIX5"
-# ⛔ THE OTHER HALF OF "ahead of BOTH launches" (review P3-3). The doctor half alone leaves the
-# dispatcher's placement unpinned: with both drains moved BETWEEN the two launches the doctor
-# assertion stays green, and case 5's tail match catches it only incidentally (the launch truncated
-# the child's stderr). Same order helper, applied to the dispatcher's own lines.
-order_pinned "$LOG5" 'QUEUE-DISPATCH FAILED' 'DISPATCH-STEP launched detached' \
-  "$q_launches_before" "$(num_of "$LOG5" 'DISPATCH-STEP launched detached')" "the dispatcher half"
-if has "$(cat "$LOG5" 2>/dev/null)" "QUEUE-DISPATCH FAILED rc=2 :: DISPATCH-OWN-STDERR-MARKER"; then
-  pass "the next pass reports 'QUEUE-DISPATCH FAILED rc=2' with the dispatcher's OWN stderr (the line that could never print)"
-else
-  fail "no 'QUEUE-DISPATCH FAILED rc=2' line — the deleted branch was not replaced by a working one"
-fi
+# 5. RETIRED WITH ITS SUBJECT (#1874): "the dispatcher gets the same treatment" pinned
+# `QUEUE-DISPATCH FAILED rc=N`, its own sidecar drain and the drain-before-launch ordering for
+# `queue-dispatch.py`. The beat no longer launches that step — `scripts/test_dispatch_wiring.py`
+# now REFUSES its re-appearance — so there is no child, no sidecar and no report line left to
+# pin here. The ordering rule it also covered (drain BEFORE this pass's launch) is still pinned
+# for the surviving step by `order_pinned` in case 2; deleting this case removes no coverage of
+# `pr-doctor.py`. The retired source and the record of what it did are in
+# `scripts/orchestrator-harness/retired/queue-dispatch.py` and step 4 of the beat's own note.
 
 echo ""
 echo "6. an unreadable sidecar is NAMED, never read as success or as a failure"
-FIX6="$(mkfix garbage 0 0)"; LOG6="$(logof "$FIX6")"
+FIX6="$(mkfix garbage 0)"; LOG6="$(logof "$FIX6")"
 printf 'not-a-number\n' > "$FIX6/agent/state/pr-doctor.rc"
 run_pass "$FIX6"
 LOG6TXT="$(cat "$LOG6" 2>/dev/null)"
@@ -352,7 +347,7 @@ echo "7. a sidecar written WITHOUT a trailing newline is still a value, not 'UNR
 # sidecar holding `143` with no newline drained as `UNREADABLE (held "")`. The writer appends a
 # newline, so this needs a torn write; the whole point of naming an unreadable sidecar is that a
 # torn write must never be able to erase the failure it was recording.
-FIX7="$(mkfix nonewline 0 0)"; LOG7="$(logof "$FIX7")"
+FIX7="$(mkfix nonewline 0)"; LOG7="$(logof "$FIX7")"
 printf '143' > "$FIX7/agent/state/pr-doctor.rc"
 : > "$FIX7/agent/state/PR-DOCTOR-OFF"
 run_pass "$FIX7"
@@ -371,7 +366,7 @@ echo "8. an UNWRITABLE log does not consume the only copy of the report"
 # outage in the wake of a failing child destroyed the failure permanently). A CONTROL fixture with
 # an identical seed and a writable log proves the drain is reached at all, so the treatment case
 # cannot pass by never running the drain.
-FIX8A="$(mkfix logwritable 0 0)"; LOG8A="$(logof "$FIX8A")"
+FIX8A="$(mkfix logwritable 0)"; LOG8A="$(logof "$FIX8A")"
 printf '2\n' > "$FIX8A/agent/state/pr-doctor.rc"
 : > "$FIX8A/agent/state/PR-DOCTOR-OFF"
 run_pass "$FIX8A"
@@ -380,7 +375,7 @@ if has "$(cat "$LOG8A" 2>/dev/null)" "PR-DOCTOR REFUSED rc=2" && [ ! -f "$FIX8A/
 else
   fail "CONTROL failed — the drain was not reached in this fixture shape, so case 8 proves nothing"
 fi
-FIX8B="$(mkfix logunwritable 0 0)"; LOG8B="$(logof "$FIX8B")"
+FIX8B="$(mkfix logunwritable 0)"; LOG8B="$(logof "$FIX8B")"
 printf '2\n' > "$FIX8B/agent/state/pr-doctor.rc"
 : > "$FIX8B/agent/state/PR-DOCTOR-OFF"
 # Every append to this path now fails (EISDIR): the same outage a full disk produces.
@@ -400,7 +395,7 @@ fi
 # EVERY assertion below passed with the carrier-precedence line deleted — a retry path that never
 # retries graded green (measured: precedence mutant -> exit 0, 0 failures). The child is CLEAN now,
 # which makes the precedence line the only thing that can produce the rc=2 report.
-FIX8C="$(mkfix logunwritablelaunch 0 0)"; LOG8C="$(logof "$FIX8C")"
+FIX8C="$(mkfix logunwritablelaunch 0)"; LOG8C="$(logof "$FIX8C")"
 printf '2\n' > "$FIX8C/agent/state/pr-doctor.rc"
 rm -f "$LOG8C"; mkdir -p "$LOG8C"
 run_pass "$FIX8C"
@@ -422,7 +417,7 @@ fi
 # mutant that drops the gate ONLY in the `''|*[!0-9]*` arm stayed fully green. That arm is where
 # losing the sidecar is least recoverable: the report IS the garbage, so deleting the file destroys
 # the only record of what it held.
-FIX8D="$(mkfix logunwritablegarbage 0 0)"; LOG8D="$(logof "$FIX8D")"
+FIX8D="$(mkfix logunwritablegarbage 0)"; LOG8D="$(logof "$FIX8D")"
 printf 'not-a-number\n' > "$FIX8D/agent/state/pr-doctor.rc"
 : > "$FIX8D/agent/state/PR-DOCTOR-OFF"
 rm -f "$LOG8D"; mkdir -p "$LOG8D"
@@ -435,7 +430,7 @@ fi
 
 echo ""
 echo "9. the WORD is chosen by the rc: a crash is not a refusal (REFUSED is #1872's exit-2 word)"
-FIX9="$(mkfix crash 4 0)"; LOG9="$(logof "$FIX9")"
+FIX9="$(mkfix crash 4)"; LOG9="$(logof "$FIX9")"
 run_pass "$FIX9"
 if has "$(cat "$LOG9" 2>/dev/null)" "PR-DOCTOR launched detached"; then
   : # the non-vacuity floor is asserted below on the report itself
@@ -458,7 +453,7 @@ fi
 
 echo ""
 echo "10. a retained failure is reported with ITS OWN tail, not with a LATER run's stderr"
-FIX10="$(mkfix retainedtail 0 0)"; LOG10="$(logof "$FIX10")"
+FIX10="$(mkfix retainedtail 0)"; LOG10="$(logof "$FIX10")"
 printf '2\n' > "$FIX10/agent/state/pr-doctor.rc"
 printf 'REAL-CAUSE-AT-THE-TIME-OF-THE-FAILURE\n' > "$FIX10/agent/state/pr-doctor.stderr"
 : > "$FIX10/agent/state/PR-DOCTOR-OFF"
@@ -493,7 +488,7 @@ echo "11. a value on disk when a LAUNCH takes the sidecar is preserved, not over
 # which deliberately runs a second child while the first is alive) had its rc destroyed. Seeded here
 # deterministically: an OLDER retained value is drained first, leaving an unreported `.rc` in place
 # when this pass launches.
-FIX11="$(mkfix launchpreserve 0 0)"; LOG11="$(logof "$FIX11")"
+FIX11="$(mkfix launchpreserve 0)"; LOG11="$(logof "$FIX11")"
 printf '4\n' > "$FIX11/agent/state/pr-doctor.rc"
 printf '2\n' > "$FIX11/agent/state/pr-doctor.rc.pending"
 printf 'SEEDED-OLD-CAUSE-LINE\n' > "$FIX11/agent/state/pr-doctor.stderr"
@@ -519,29 +514,14 @@ if has "$(cat "$LOG11" 2>/dev/null)" "PR-DOCTOR RED rc=4 :: SEEDED-OLD-CAUSE-LIN
 else
   fail "the preserved rc=4 was reported without its tail (got: $(grep -m1 'RED rc=4' "$LOG11" 2>/dev/null | cut -c1-140)) — the snapshot ran after the truncation"
 fi
-# ⛔ THE DISPATCHER HALF IS PINNED TOO (re-review P2, MEASURED: deleting the dispatcher's guard left
-# the suite fully green). Every guard in this file comes in twins; a value destroyed at the
-# dispatcher launch is the same silent loss as one destroyed at the doctor launch.
-FIX11B="$(mkfix launchpreserveqd 0 0)"; LOG11B="$(logof "$FIX11B")"
-printf '4\n' > "$FIX11B/agent/state/queue-dispatch.rc"
-printf '2\n' > "$FIX11B/agent/state/queue-dispatch.rc.pending"
-run_pass "$FIX11B"
-wait_rc "$FIX11B/agent/state/queue-dispatch.rc" 0
-if [ "$(cat "$FIX11B/agent/state/queue-dispatch.rc.pending" 2>/dev/null)" = "4" ]; then
-  pass "11b. the DISPATCHER launch preserves an unreported rc too (the twin guard is not decorative)"
-else
-  fail "the dispatcher launch destroyed an unreported rc=4 (pending='$(cat "$FIX11B/agent/state/queue-dispatch.rc.pending" 2>/dev/null)')"
-fi
-run_pass "$FIX11B"
-if has "$(cat "$LOG11B" 2>/dev/null)" "QUEUE-DISPATCH FAILED rc=4"; then
-  pass "...and it is reported on the next pass"
-else
-  fail "the dispatcher's preserved rc=4 was never reported"
-fi
+# ⛔ THE DISPATCHER TWIN IS RETIRED WITH ITS SUBJECT (#1874). `FIX11B` seeded
+# `queue-dispatch.rc` / `.rc.pending` and asserted the SAME preservation for that launch; the beat
+# launches only `pr-doctor.py` now, so the twin has no launch to grade. The surviving guard is
+# still pinned twice over — case 8C/14 for the carrier-vs-launch interaction and case 11 above for
+# the snapshot order — so nothing about `pr-doctor.py`'s preservation is left uncovered.
 
-echo ""
 echo "12. only HEARTBEAT_PASS_ONCE=1 is one-pass — a non-empty value must not kill the heartbeat"
-FIX12="$(mkfix passonce0 0 0)"; LOG12="$(logof "$FIX12")"
+FIX12="$(mkfix passonce0 0)"; LOG12="$(logof "$FIX12")"
 # ⛔ NO HARD DEADLINE FOR THE PASS ITSELF (re-review P1, MEASURED: a 2 s `timeout` reddened this
 # CONTROL twice in 26 runs on a loaded box, with a message blaming the product — a pass is ~200 ms
 # nominally but seconds under load). The question is not "how long may a pass take?" but "did the
@@ -601,7 +581,7 @@ echo "14. a retained carrier is NOT overwritten by the next pass's launch (re-re
 # waiting (its log still down) the next pass's guard replaced it with the clean child's 0, which the
 # drain then consumed as silence: the failure was never reported at all (measured: pass1
 # pending=2 -> pass2 pending=0 -> no rc= line, ever). A retention must outlive the outage.
-FIX14="$(mkfix retainedacrosspasses 0 0)"; LOG14="$(logof "$FIX14")"
+FIX14="$(mkfix retainedacrosspasses 0)"; LOG14="$(logof "$FIX14")"
 printf '2\n' > "$FIX14/agent/state/pr-doctor.rc.pending"
 printf 'THE-REAL-CAUSE\n' > "$FIX14/agent/state/pr-doctor.rc.tail"
 rm -f "$LOG14"; mkdir -p "$LOG14"          # the outage spans TWO passes
@@ -623,7 +603,7 @@ fi
 
 echo ""
 echo "13. <child>.stderr is TRUNCATED at launch — run N's report cannot carry run N-1's line"
-FIX13="$(mkfix truncation 2 0)"; LOG13="$(logof "$FIX13")"
+FIX13="$(mkfix truncation 2)"; LOG13="$(logof "$FIX13")"
 # A child that writes its stderr marker ONLY on its first launch, so a missing truncation is visible:
 # without it, run 2's report would carry run 1's marker (the wrong run's cause).
 printf 'import os, sys\nf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pr-doctor.seen")\nif not os.path.exists(f):\n    open(f, "w").write("1")\n    sys.stderr.write("FIRST-RUN-ONLY-MARKER\\n")\nsys.exit(2)\n' \
