@@ -1003,7 +1003,7 @@ case "$ST" in
       # $HEAD here reported a commit that is not on main. That is the plain-run path a lane hits when it
       # re-runs after the chain already merged, i.e. the common post-change case. Same fallback order as
       # the watch arm: merge_commit_sha, then merged_at, then the head only if neither could be read.
-      verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "$HEAD")"
+      verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-$HEAD}")"
       say "✅ MERGED — PR #$PR at head $HEAD"; exit 0
     fi
     emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was NOT merged" ;;

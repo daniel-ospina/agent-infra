@@ -521,6 +521,15 @@ ISSUE_TTL_EXPECTED="$(sed -n 's/^CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-*\([0-9][0-
 case "$ISSUE_TTL_EXPECTED" in ''|*[!0-9]*)
   ISSUE_TTL_EXPECTED=10800 ;;   # unreadable source: keep the historical default rather than skip the leg
 esac
+# ⛔ AND THE MAGNITUDE MUST STILL BE PINNED (landing-review, P2). Deriving BOTH sides of the
+# comparison from the file under test means a LOWERING moves both — the whole 1801..13589s range stays
+# green, which is exactly the guard the literal used to give and the #1850 duplicate-dispatch class the
+# file exists to prevent. So the shipped value must still COVER the sum its own comment derives; that is
+# an acknowledgement (the same pattern install-launchd.test.sh uses), not a cache: any term moving
+# without the TTL reddens.
+LEASE_TERMS=$(( 3300 + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
+[ "$ISSUE_TTL_EXPECTED" -ge "$LEASE_TERMS" ]
+ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s)" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "$ISSUE_TTL_EXPECTED" ]
 ck "O7 the ISSUE claim's default TTL is the SHIPPED claims.sh value (${ISSUE_TTL_EXPECTED}s, got '$IVAL')" $?
