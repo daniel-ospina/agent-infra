@@ -889,6 +889,73 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
 ck $? "B43 a helper's own 'return \"\$rc\"' is not the enclosing function's verdict"
+# ⛔ ROUND-6 findings. B44 is the P1 the round-5 fix left open: with the helper `{` on the NEXT line
+# (ordinary bash style) the nested region was never registered, so the helper body was scanned as the
+# outer function and its `return "$rc"` became the outer verdict — a red on code whose verdict is a
+# literal `return 0`. B45 is the mirror: prose or a quoted string that contains a statement separator
+# must not manufacture (or erase) a capture.
+D="$(fixture b44)"
+cat > "$D/scripts/fortyfour.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do printf '%s\n' "$x"; done
+  log()
+  {
+    local rc=0
+    check_something || rc=1
+    return "$rc"
+  }
+  return 0
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B44 a helper whose brace is on the NEXT line is still a nested region"
+
+D="$(fixture b45)"
+cat > "$D/scripts/fortyfive.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$1"
+  note "x" # historically; out="$(cmd)" was set here
+  for y in $out; do :; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B45 a semicolon inside a COMMENT does not manufacture a capture"
+
+D="$(fixture b46)"
+cat > "$D/scripts/fortysix.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  echo "path\\"; out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B46 an EVEN run of backslashes before a closing quote does not swallow the rest of the line"
+
+D="$(fixture b47)"
+cat > "$D/scripts/fortyseven.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  local -a arr=( $(git ls-files) )
+  for x in "${arr[@]}"; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B47 the SPACE-PADDED array capture 'arr=( \$(cmd) )' registers (the header claims it does)"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"

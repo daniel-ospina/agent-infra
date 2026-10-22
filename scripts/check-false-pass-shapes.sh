@@ -84,6 +84,12 @@
 # "${arr[@]}"` over an EMPTY ARRAY iterates ZERO times, so the quoted array form IS detected and both
 # `arr=($(cmd))` and `arr=( $(cmd) )` are registered as captures. The earlier note here claimed quoting
 # was safe full stop, which was false for arrays.
+# ⛔ AND THE BRACE COUNT IS A HEURISTIC, NOT A PARSER — declared because it bounds what a finding can
+# mean: a file whose brace depth does not return to zero by EOF has its trailing part attributed to the
+# block that swallowed it, so findings there are approximate. Measured at this commit: six `bash -n`-clean
+# files in the scan set drift this way (a multi-line quoted region, `case`, or `$(( ))` the walk does not
+# model), so it is reported as a `partial:` NOTE per file — visible, never certified clean — rather than
+# as a finding, because a rule that reds six correct files is the trade this header refuses.
 # STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a SLICE of an array
 # (`for x in "${arr[@]:1}"` — an empty array sliced from 1 also iterates zero times), a capture written
 # in a `case` arm (`a) names="$(cmd)" ;;`) or after `|`-into-a-subshell, `printf -v`, `mapfile`/
@@ -400,7 +406,13 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
   # Net brace depth change of one scanned line, OUTSIDE quotes, comments and `${…}` expansions.
   # Sets BR_END to the position of the LAST closing brace seen, which is where a function body
   # that ends on this line ends (the caller truncates there and still scans what precedes it).
-  d = 0; dq = 0; sqn = 0; n = length(line); i = 1
+  # ⛔ QUOTE STATE CARRIES ACROSS LINES (review round 6). Resetting it per line made every `{`/`}`
+  # inside a MULTI-LINE quoted region count as a brace — typically an awk/sed program written across
+  # lines, which is common in this tree — so the counter drifted and a function looked permanently
+  # open. That drift was harmless while nothing read the final depth; once an unclosed block became a
+  # hard finding it turned five correct files RED. gdq/gsq are the carry; they are only cleared by the
+  # matching delimiter or by a change of file.
+  d = 0; dq = gdq; sqn = gsq; n = length(line); i = 1
   BR_END = 0
   while (i <= n) {
     c = substr(line, i, 1)
@@ -416,6 +428,7 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
     }
     i++
   }
+  gdq = dq; gsq = sqn
   return d
 }
 function split_stmts(line,   i, n, ch, prev, dq, sqn, par, cur) {
@@ -431,9 +444,17 @@ function split_stmts(line,   i, n, ch, prev, dq, sqn, par, cur) {
   NSEG = 0; cur = ""; dq = 0; sqn = 0; par = 0; n = length(line)
   for (i = 1; i <= n; i++) {
     ch = substr(line, i, 1); prev = (i > 1 ? substr(line, i - 1, 1) : "")
-    if (dq) { cur = cur ch; if (ch == "\"" && prev != "\\") dq = 0; continue }
+    # ⛔ ESCAPES CONSUME THE NEXT CHARACTER, AND A COMMENT IS NOT CODE (review round 6, P2).
+    # `prev != backslash` is parity-free: an EVEN run of backslashes before a closing quote (a literal
+    # trailing backslash) left the double-quote state OPEN, so nothing after it split and a later
+    # capture on the line was never registered — mirrors the walk in brace_delta(), which had it right.
+    # And the per-segment comment strip cannot see a `;` INSIDE a trailing comment, so the split made a
+    # phantom statement out of prose (prose shaped like a capture registered one that never happened —
+    # red on correct code; prose shaped like a write deregistered a live capture — a real shape lost).
+    if (dq) { cur = cur ch; if (ch == "\\") { cur = cur substr(line, i + 1, 1); i++; continue } if (ch == "\"") dq = 0; continue }
     if (sqn) { cur = cur ch; if (ch == sq) sqn = 0; continue }
     if (ch == "\\") { cur = cur ch substr(line, i + 1, 1); i++; continue }
+    if (ch == "#" && (i == 1 || prev ~ /[ \t;]/)) { cur = cur substr(line, i); break }
     if (ch == "\"") { dq = 1; cur = cur ch; continue }
     if (ch == sq) { sqn = 1; cur = cur ch; continue }
     if (ch == "(") { par++; cur = cur ch; continue }
@@ -562,16 +583,17 @@ function flush_fn() {
   if (fn != "" && fn_loop != "" && fn_flagret != "" && fn_counter == "" && !counter_proof() && (fn_flagret in flaginit))
     printf "%s\t%d\t%s\t%s\n", FILENAME, fn_loop_line, "empty-as-pass", \
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
-  fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+  fn = ""; fn_line = 0; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
   NESTED_N = 0
   split("", captured); split("", flaginit); split("", cnt); split("", numtest)
   depth = 0; end_fn = 0
 }
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
-        fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+        fn = ""; fn_line = 0; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
         NESTED_N = 0
         depth = 0; end_fn = 0; BR_END = 0
-        heredoc = ""; heredoc_dash = 0; heredoc_line = 0; sq = sprintf("%c", 39) }
+        heredoc = ""; heredoc_dash = 0; heredoc_line = 0; sq = sprintf("%c", 39); gdq = 0; gsq = 0 }
+FNR == 1 { gdq = 0; gsq = 0 }
 {
   # ⛔ A QUOTED HEREDOC IS DATA, NOT CODE. A heredoc whose delimiter is quoted (EOS in single
   # quotes, double quotes, or backslash-escaped) suppresses expansion, so
@@ -605,7 +627,7 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   # `function name()` is recognised too, because the awk helpers in this scan set spell their
   # headers that way.
   if ($0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/ && fn == "") {
-    flush_fn(); fn = $0; sub(/^[ \t]*function[ \t]+/, "", fn); sub(/[ \t(].*/, "", fn)
+    flush_fn(); fn = $0; fn_line = FNR; sub(/^[ \t]*function[ \t]+/, "", fn); sub(/[ \t(].*/, "", fn)
     # ⛔ THE ONE-LINE BODY APPLIES TO THIS SPELLING TOO (#2121 review, P2). The round-3 fix taught
     # the `name()` branch to fall through past the opening brace, but this branch kept `next`, so
     # `function f() { local x=$(cmd); }` was never seen by the line rules while the identical body in
@@ -618,11 +640,20 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   # behave the same. The helper body is covered by the BRACE COUNTER like any other brace group, and
   # its depth is recorded so a `return` INSIDE the helper cannot be read as the OUTER verdict (the
   # round-5 P2 that follows from merging the bodies).
-  if (fn != "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/ || $0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
-    NESTED[NESTED_N] = depth; NESTED_N++
+  # A nested header whose `{` sits on the NEXT line (ordinary bash style) must be caught too: the
+  # header-shaped line cannot see its brace, so it is held as PENDING and the region is pushed only
+  # if the very next line opens the block (review round 6, P1). Without this, the helper body was read
+  # as the OUTER function and its `return "$rc"` became the outer verdict.
+  if (PEND) {
+    if ($0 ~ /^[ \t]*\{/) { NESTED[NESTED_N] = PEND_DEPTH; ARMED[NESTED_N] = 1; NESTED_N++ }
+    PEND = 0
+  }
+  if (fn != "" && $0 ~ /^[ \t]*([A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)|function[ \t]+[A-Za-z_])/) {
+    if (index($0, "{") > 0) { NESTED[NESTED_N] = depth; ARMED[NESTED_N] = (brace_delta($0) <= 0 ? 1 : 0); NESTED_N++ }
+    else { PEND = 1; PEND_DEPTH = depth }
   }
   if (fn == "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/)) {
-    flush_fn(); fn = $0; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
+    flush_fn(); fn = $0; fn_line = FNR; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
     # and `next` here made both line rules blind to it (review round 3). Drop the header and fall
     # through to the line rules on whatever follows the opening brace.
@@ -713,7 +744,7 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       # header justified ignoring QUOTED loop expansions by noting that an empty scalar still iterates
       # ONCE — FALSE for `for x in "${arr[@]}"`, where an empty array iterates ZERO times. The
       # space-padded spelling `arr=( $(cmd) )` is as common as the tight one and is accepted here.
-      v = substr(sgl, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
+      v = substr(sgl, RSTART, RLENGTH); sub(/=.*/, "", v); sub(/^.*[ \t]/, "", v)
       # ⛔ `$((` IS ARITHMETIC, NOT A CAPTURE (#2121 review round 5, P2). With the per-statement
       # reach, `local n; n=$(( $(cmd) + 1 ))` registered `n` as a feeder, so a loop over a NUMBER was
       # reported — a false positive the line-anchored arm could not reach. The character after `$(`
@@ -745,7 +776,7 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       # ⛔ AND THE REFERENCE SCAN IS QUOTE-AWARE (#2121 review round 4, P2). A `$name` inside a
       # SINGLE-QUOTED literal — or escaped as `\$name` — is text the shell never expands, so a literal
       # template was read as deriving from the capture and a loop over it was red on correct code.
-      v = substr(sgl, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
+      v = substr(sgl, RSTART, RLENGTH); sub(/=.*/, "", v); sub(/^.*[ \t]/, "", v)
       rhs = substr(sgl, RSTART + RLENGTH)
       gsub(/\\\$/, "", rhs)              # an ESCAPED dollar is literal text, not an expansion
       gsub(sq "[^" sq "]*" sq, "", rhs)  # neither is a single-quoted span
@@ -829,7 +860,18 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   if (end_fn) flush_fn()
   prev_marker = has_marker; prev_marker_bad = marker_bad; prev_marker_line = FNR
 }
-END { flush_fn()
+END {
+      # ⛔ A BRACE COUNT THAT NEVER RETURNS TO ZERO IS LOUD, BUT IT IS NOT A FINDING (review round 6,
+      # P1). A `{` that never closes leaves every later line attributed to the block that swallowed it,
+      # and — now that headers inside a body are nested regions — can suppress every later verdict
+      # through the NESTED_N gates, so a PARTIAL scan must never look clean. It is reported as a NOTE
+      # rather than a finding because the counter is a heuristic: it drifts on six `bash -n`-clean files
+      # in this very tree (a multi-line quoted or `case`/`$(( ))` construct it does not model), and a
+      # rule that reds correct code is the trade this header refuses. The limitation is declared in the
+      # header; the note makes the affected file visible on stderr instead of certifying it silently.
+      if (depth > 0)
+        printf "note: %s: a block opened at line %d did not close by end of file — the scan of this file is PARTIAL (the trailing part is attributed to that block), reported as a note because the brace count is a heuristic and not a parser\n", FILENAME, (fn_line > 0 ? fn_line : FNR) > "/dev/stderr"
+      flush_fn()
       # ⛔ AN UNTERMINATED QUOTED HEREDOC IS A LOUD FAILURE, never a silent blind spot: everything
       # after its opener was skipped, so whatever the scan would have found there is UNKNOWN — and
       # unknown is not clean.
@@ -893,7 +935,7 @@ fi
 
 scanned=0
 scan_failures=0
-: > "$TMPDIR_RUN/scan-errors"
+: > "$TMPDIR_RUN/scan-notes"
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   scanned=$((scanned + 1))
@@ -901,7 +943,10 @@ while IFS= read -r f; do
   # itself exists to catch (#2096): an awk that rejects its own program exits non-zero, and if
   # that status were swallowed every file would read as "no findings" while this gate certified
   # the absence it cannot see. The status is therefore read, and the reason is kept.
-  scan_file "$f" >> "$FINDINGS" 2>> "$TMPDIR_RUN/scan-errors" || {
+  # The scanner writes `note:` lines on stderr for a file whose brace count did not return to zero
+  # (a PARTIAL scan — see the header). Those must reach the reader, so stderr is kept and shown in the
+  # summary rather than discarded into a log that is only read when a scan FAILS.
+  scan_file "$f" >> "$FINDINGS" 2>> "$TMPDIR_RUN/scan-notes" || {
     echo "FAIL: the scanner could not run on $f (awk rejected the program) — a scan that did not happen cannot be a PASS" >&2
     scan_failures=$((scan_failures + 1))
   }
@@ -1045,6 +1090,11 @@ while IFS=$'\t' read -r kind a b c d; do
   esac
 done < "$DECIDED"
 
+# PARTIAL-SCAN NOTES reach the reader here, before the summary: a stderr note that nothing prints is
+# the same silence it was written to break.
+if [ -s "$TMPDIR_RUN/scan-notes" ]; then
+  sed 's/^/partial: /' "$TMPDIR_RUN/scan-notes" | sort -u | head -20 >&2
+fi
 echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able ──"
 if [ "$findings" -gt 0 ] || [ "$unjustified" -gt 0 ] || [ "$malformed" -gt 0 ] || [ "$ungrandfathered" -gt 0 ]; then
   echo "FAIL: no verdict without an observation (#2096). Fix the shape, or exempt one line with '# verified: <why it is not the shape>'."
