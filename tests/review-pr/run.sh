@@ -30,7 +30,9 @@
 #   §N an UNSIGNED marker => exit 9, the missing signing key named
 #   §O a spawn-point load refusal (rc=76) => exit 75, nothing consumed
 #   §P an oversized diff stays out of the single-argv prompt, with a fetch instruction
-#   §Q a blocking finding in LIST/TABLE markup still contradicts CLEAN (§L is one form)
+#   §Q a blocking finding in LIST/TABLE markup still contradicts CLEAN (§L is one form), a mid-line
+#      bold label or a bare token naming a file:line still does, while a prose mention, a bold
+#      sentence, a zero count, a bolded zero row and ANY P3 never do
 #   §R an earlier unsigned marker does not shadow the signed one
 #   §S the reviewer printed CLEAN but EXITED non-zero => no verdict, no record
 #   §T a warning on a SUCCESSFUL gh read is ignored, not a parse error (the #2284 class)
@@ -505,6 +507,147 @@ for form in '**P1** scripts/x.sh:1 — bold' 'P1 — bare' '[p1] lowercase brack
   [ "$(rc_of)" = "7" ]; ck $? "  a line-leading '${form:0:20}…' refuses (rc=$(rc_of))"
   no_record; ck $? "  …nothing recorded"
 done
+# ⛔ AND A **BOLDED** TOKEN IS A FINDING WHEREVER IT SITS (P1, fresh review of the fix). Dropping the
+# bare `**P1**` form to silence the prose refusal was a FAIL-OPEN: `- Severity: **P1** — …` and
+# `Finding 2 (**P1**): …` report blockers that no line-leading scan can see, so CLEAN was recorded
+# over them. And the one-regex replacement had no delimiter PARITY, so it refused a genuinely clean
+# report that merely had a `[P1]` mention BETWEEN two unrelated bold spans — the wall, back again.
+# The rule the shipped awk implements is "the bold span's CONTENT is a severity label"; both
+# directions are pinned here so neither fix can be re-broken in isolation.
+for form in '- Severity: **P1** — scripts/x.sh:12 — the guard returns 0 on a failed read' 'Finding 2 (**P1**): a.sh:3 — unsafe default' 'Bug __P2__ a.sh:4 — reaches production'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a mid-line BOLDED severity label '${form:0:26}…' still blocks CLEAN (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+for prose in 'I found **no** [P1] issues, **nothing** blocking.' '**Note**: the token [P1] appears in the prompt; **confirmed**.' '**No P1 issues** in any changed file.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a mention inside/between bold prose does NOT block: '${prose:0:30}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 3 of the same rule, and both directions again (fresh review of the awk fix). The
+# punctuation that ends a label can sit INSIDE the span (`**P1:**`), a single literal `**` earlier
+# on the line must not shift span parity, and a plain finding introduced by prose still names a
+# location. All three were fail-opens in the first awk draft. And the counter-direction: `**P1**:
+# none.` is a COUNT, `**No P1**` is prose, P3 NEVER blocks (the prompt puts P3 notes under CLEAN),
+# and a bolded zero-count table row is still a summary.
+for form in '- **P1:** a.sh:12 — the guard returns 0' '- **[P1]:** a.sh:12 — the guard returns 0' '`**` is the bold marker; **P1** scripts/x.sh:12 returns 0' '- Finding: [P1] scripts/x.sh:12 — the guard returns 0'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a reported blocker '${form:0:26}…' refuses CLEAN (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+for prose in '**No P1**: none.' '**P0**: none.  **P1**: none.' '**Zero P0** findings.' '- **[P3]** — nit: naming' '**P3** — a non-blocking note' '| **P1** | 0 |'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a count/prose/P3 form does NOT block: '${prose:0:26}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 4 — a count summary is a COUNT SHAPE, not its first word (fresh review).
+# `**P0**: none of the call sites validate the returned error` and `P1: nil pointer dereference` are
+# DESCRIBED FINDINGS whose description merely BEGINS with `none`/`nil`; reading the first word as a
+# zero count dropped them and recorded a CLEAN over a P0. The reverse direction is pinned too: a real
+# count summary (`P1 findings: none`, `P0/P1 findings: none`, `**P1** findings: none`, `P1 count: 0`)
+# must not refuse a clean record. And a finding still counts when its LOCATION is written in
+# backticks, or when the token is bare after a label (`Severity: P1 — a.sh:12`).
+for form in '**P0**: none of the call sites validate the returned error' 'P1: nil pointer dereference when the body is empty' 'P1: 0 tests fail' '- Finding: [P2] `tests/y.sh:7` — the fixture is vacuous' '- Severity: P1 — a.sh:12 — the guard returns 0'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a DESCRIBED blocker '${form:0:30}…' refuses CLEAN (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+for prose in 'P1 findings: none' 'P0/P1 findings: none' 'P1 issues: 0' '**P1** findings: none' 'P1 count: 0' '**P0**: none.  **P1**: none.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a COUNT summary does NOT block: '${prose:0:28}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 5 — an EMPTY remainder is not a zero count (fresh review, and the worst fail-open of the
+# set): a reviewer that lists findings as bare labels (`**P1**` on its own line, then the file and
+# the claim) had every label read as a `P1: none` summary, so `clean` was RECORDED over a P1/P2 list.
+# The reverse direction is pinned too: a zero count that carries a GLOSS (`none (verified against the
+# full diff)`, `0 — nothing blocking`, `| P1 | 0 | no blocking findings |`) is still a summary and
+# must not refuse the record — a reviewer's closing summary is stable across re-runs, so refusing it
+# is a paid loop. And a numbered findings TABLE (`| 1 | P1 | path:12 | …`) must still block.
+reset; printf '**P1**\nscripts/x.sh:12 — the guard returns 0 on a failed read.\n\n**P2**\ntests/y.sh:7 — the fixture is vacuous.\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a bare \`**P1**\` label line is a FINDING, not a 'P1: none' count (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded (this is the fail-open that read an empty remainder as a count)"
+reset; printf '| 1 | P1 | scripts/x.sh:12 | returns 0 |\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a numbered findings TABLE row ('| 1 | P1 | path:12 |') blocks (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+for prose in 'P0/P1: none (verified against the full diff).' 'P1 findings: none (I checked every changed file).' '**P1**: 0 (none found).' 'P1: 0 — nothing blocking.' '| P1 | 0 | no blocking findings |' 'No findings at scripts/x.sh:12; severity P2 would be over-calling.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a QUALIFIED zero count does NOT block: '${prose:0:30}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 6 — the SHAPE rule replaced the label grammar (fresh review, the round that named the
+# class): each earlier round negotiated ONE more literal form, so the fail-open reappeared one form
+# over. `**Finding 1 (P1)**` (an ORDINAL inside the span), `Severity: P1` on a continuation line (no
+# location on THAT line), and a label written in code style (`Severity: \`P1\``) were all invisible.
+# The counter-direction that the same fix created — a heading-per-severity SUMMARY (`**P0**` then
+# `none.`) and a comma/semicolon gloss (`P1: 0, nothing blocking`) — refused a clean record, i.e. the
+# paid loop. Both directions are pinned here so neither can be re-broken alone.
+for form in '- **Finding 1 (P1)**: scripts/x.sh:12 — the guard returns 0 on a failed read' '  Severity: P1 — this ships a red gate that reports green' '- Severity: `P1` — scripts/x.sh:12 — the guard returns 0'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a label in ANY shape '${form:0:28}…' blocks CLEAN (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+reset; printf '**P0**\nnone.\n**P1**\nnone.\n**P2**\nnone.\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a heading-per-severity SUMMARY ('**P0**' then 'none.') does NOT block (rc=$(rc_of))"
+for prose in 'P1: 0, nothing blocking' '**P2** — none, all clean' 'P1: 0; all clean'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a glossed zero count does NOT block: '${prose:0:28}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 8 — the exemption side is a grammar too, and it failed OPEN. `P0: none, P1: 1` and
+# `| P0 | 0 | P1 | 2 |` were exempted whole (a summary line that itself states a NON-ZERO blocking
+# count recorded clean), a bare `P1` after a separator with a `path:12` on the line was never
+# considered a label at all, and a `note:` in the DESCRIPTION dropped a leading `P1 note: …`. Each is
+# pinned below; the count-pair cases are the direction that silently ships.
+for form in '| P0 | 0 | P1 | 2 |' 'P0: none, P1: 1 — the recorder is bypassed when the answer file is empty' 'P0: 0; P1: 2 blocking findings' '**P0**: 0, **P1**: 2 — the recorder is bypassed' '- The recorder can be bypassed when the answer file is empty (scripts/review-pr.sh:1105) — P1' '1. the recorder is bypassed when the answer file is empty — P1, scripts/review-pr.sh:1105' 'P1 note: the recorder is bypassed when the answer file is empty'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a summary that states a NON-ZERO count is a finding (rc=$(rc_of)): '${form:0:32}…'"
+  no_record; ck $? "  …nothing recorded"
+done
+# ⛔ ROUND 7 — the CUE. A label ALONE is not evidence: `No [P1] findings; …` (clean) and
+# `- Finding: [P1] …` (blocking) are structurally identical — decorated token, mid-line, no
+# location — so the previous conjunction (label AND a location/slot/line-lead) missed every
+# decorated label used mid-sentence, and a whole family of clean summaries that merely STATE the
+# convention was refused. Both directions pinned here.
+for form in '- Finding 2 (**P1**): the recorder is bypassed when the answer file is empty' '- Finding: [P1] the recorder is bypassed when the answer file is empty' '- Finding [P1] — nothing re-reads the head after the recorder runs'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a mid-line decorated label with NO location blocks (rc=$(rc_of)): '${form:0:30}…'"
+  no_record; ck $? "  …nothing recorded"
+done
+for prose in 'Severity guide: P0 = data loss; P1 = false PASS; P2 = friction.' 'Per the contract: P0/P1/P2 block; P3 does not.' 'Summary: P0 none found, P1 none found, P2 none found.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a line that only STATES the convention does NOT block (rc=$(rc_of)): '${prose:0:28}…'"
+done
+reset; printf '**Verdict**: CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "'**Verdict**: CLEAN' (bold on the word only) parses as a verdict (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+# ⛔ AND A SCANNER THAT CANNOT RUN IS NOT A CLEAN SCAN (exit 10, no record) — the one fail-open this
+# change introduced and then fixed had no tripwire until here. The suite already puts `$TMP/bin`
+# first on PATH, so a failing `awk` stub is all it takes; every other tool the script needs is real.
+if [ -d "$TMP/bin" ]; then
+  printf '#!/bin/sh\nexit 2\n' > "$TMP/bin/awk"; chmod +x "$TMP/bin/awk"
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "10" ]; ck $? "a FAILING scanner refuses with exit 10, never a silent clean (rc=$(rc_of))"
+  no_record; ck $? "  …no record written on a scanner failure"
+  err_has "SCANNER failed"; ck $? "  …and the failure is named, with the scanner's own rc"
+  err_has "rc=2"; ck $? "  …the REAL rc (the negated-`\$?` bug reported 0)"
+  no_comment; ck $? "  …and nothing was posted as a review artifact"
+  rm -f "$TMP/bin/awk"
+else
+  fail "no \$TMP/bin on PATH — the scanner-failure arm cannot be driven"
+fi
 
 # ── §R a signed marker wins over an earlier unsigned one at the same head ───
 echo; echo "§R an earlier UNSIGNED marker does not shadow the signed one"
@@ -831,16 +974,18 @@ fi
 echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
-# 144 assertions, deleting the LARGEST section (§Q, 23) still passed. The floor is re-set from
-# a MEASURED total whenever sections are added. It is 197 here: the last measured run was 196
-# (before §AG existed), plus the one assertion §AE gained. ⚠️ STATED RESIDUAL: §AG's assertions
-# were added while this box's guard refused local suite execution, so they are NOT yet in a
-# measurement — the floor therefore carries slack, and a section smaller than (total − 197) can
-# still be deleted without firing. The next lane to run this suite must raise the floor from a
-# fresh measurement rather than inherit this one. It is still not a coverage claim.
+# 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
+# whenever sections are added — this is 294, measured on the run that added §Q's label-SHAPE
+# assertions (any label form: ordinal-in-span, continuation-line slot, code-styled token), the
+# heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
+# largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
+# ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 294 here and the RESULT line then
+# prints 295. A floor equal to the printed total could never pass — a permanently red tripwire is
+# worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 197 ]; ck $? "assertion-count pin: >= 197 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 294 ]; ck $? "assertion-count pin: >= 294 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

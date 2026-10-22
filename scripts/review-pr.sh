@@ -73,7 +73,7 @@
 #      before or after a record (a body edit after recording is what wipes the
 #      marker — agent-infra#1224).
 #
-# EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8. Exit 9
+# EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8 and 10. Exit 9
 # is the one that can leave a record behind: it fires when the recorder SUCCEEDED but the
 # artifact check (c) reads is not right (no record bound to the head, no body marker, or an
 # unsigned marker) — the remedy there is to re-run the recorder, not to re-review.
@@ -96,6 +96,9 @@
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
 #      nothing was consumed — re-dispatch when the box is quiet, do NOT read this as a
 #      code verdict (merge-one.sh's code for the same cause)
+#   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
+#      read for blocking findings, so a clean verdict cannot be certified — NOT recorded,
+#      and NOT read as clean (a failed scan is not an empty one)
 #
 # TEST SEAMS (the fixtures in tests/review-pr/run.sh drive exactly these; they are
 # not operational knobs and no production path sets them):
@@ -108,7 +111,7 @@
 set -uo pipefail
 
 PROG="review-pr"
-E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9
+E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -597,7 +600,15 @@ fi
 #     the prompt states and what separates a verdict from prose.
 VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[—–-][[:space:]]+)'
 VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:space:]]*[0-9]+'
-VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)([[:space:]]|$|[.:,;)]|[—–])'
+# The CLOSING decoration is part of the shape, exactly as in VD_CLEAN above: `**Verdict: CLEAN**`
+# is what a model actually emits, and without this group the line failed to parse as a verdict at
+# all (exit 6 = NO VERDICT) while a hyphenated `**Verdict: CLEAN-UP …**` still refuses, because the
+# terminator class carries no `-`.
+# ⛔ AND SO IS THE OPENING ONE ON THE WORD ITSELF (P3, fifth fresh review): `**Verdict**: CLEAN`
+# bolds only `Verdict`, and the `[Vv]erdict[[:space:]]*[:=]` seam could not cross it — a clean review
+# exited 6 "NO VERDICT" and could never be recorded. One asterisk-pair away from the case this
+# comment was already about.
+VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*(\*\*|__)?[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)[[:space:]]*(\*\*|__|\])?([[:space:]]|$|[.:,;)]|[—–])'
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
@@ -607,7 +618,10 @@ LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # long note that used to sit here: the rule is positional ON PURPOSE — a broader scan
 # refused two genuinely clean reviews because their own prose quoted `[P1]`.
 SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
-BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
+# ⛔ THE LINE-LEADING BLOCKING SCAN IS `leads()` IN THE awk PROGRAM BELOW, not a second grep here.
+# It used to be `BLOCK_RE` + a separate grep in the union, and the summary exception ("`**P0**:
+# none.` is a count") could only be applied to one of the two — so a clean reviewer's own P0/P1
+# zero-summary line refused its record. ONE definition of "a blocking finding", one place.
 # ⛔ A BRACKETED/BOLDED BLOCKING TOKEN BLOCKS A CLEAN VERDICT **WHEREVER IT SITS** (P1,
 # fifteenth review). The positional scan above is deliberate (a prose MENTION is not a
 # finding), but it left the contradiction check — the ONLY chokepoint between a reported
@@ -615,13 +629,159 @@ BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
 # `**Finding [P1]**: a.sh:1 — …` has an alnum before the token, so `^[^[:alnum:]]*P[012]`
 # never matched, BLOCKING_FINDINGS was empty, and a CLEAN over two reported blockers was
 # recorded. Measured by the review that filed this line: exactly that transcript exits 0
-# and writes verdict=clean bound to the head. So the token conventions the PROMPT states
-# (`[P0]`, `**P0**`) are matched ANYWHERE on a line for the CONTRADICTION check only;
-# FINDINGS stays positional so the report does not inflate. This is the OVER-BLOCK
-# direction on purpose: a CLEAN whose own prose quotes `[P1]` is now refused and the lane
-# re-runs, which costs one review; the fail-open it replaces costs a false attestation on
-# a revision nobody cleared (#1353/#2148 family).
-BLOCK_TOKEN_RE='\[P[012]\]|\*\*P[012]\*\*|__P[012]__'
+# and writes verdict=clean bound to the head.
+#
+# ⛔ AND THE FIRST FIX WAS A WALL (#2288's own suite, §Q counter-direction). Matching the token
+# ANYWHERE refused two genuinely clean reviews whose own prose QUOTED the convention —
+# `No [P1] findings; I looked at every changed file.` and ``true of `[P1]` markup, not of
+# severity vocabulary`` — so a reviewer that explains itself could never be recorded, and the lane
+# re-ran a PAID review into the same refusal forever. The over-block cost is not "one review": it
+# is an unsatisfiable loop, which is the wall this whole file exists to remove.
+#
+# THE RULE — A LABEL SHAPE, NOT A LABEL GRAMMAR. A transcript line is a BLOCKING FINDING when it
+# carries a P0/P1/P2 **label** AND a CUE that it is being USED as a label rather than MENTIONED as
+# vocabulary. The cues are structural — LEADS the line, NAMES A LOCATION (`path.ext:12`), sits in a
+# TABLE row, carries a label NOUN in front of it (`Finding 2 (P1)`, `Severity: P1`), or is followed
+# by a label SLOT separator (`**P1**:`, `[P1] —`). A label that tags ITSELF as a note (`(nit)`,
+# `note:`) never blocks, and a zero count (`none`, `0` — with an optional count noun, trailing gloss,
+# or, for a bare-label line, inherited from the NEXT line) exempts the line. A zero COUNT after it (`none`,
+# `0`, `nil`, `zero`, with an optional count noun and an optional trailing gloss) exempts the line,
+# and a BARE label whose own line is nothing but the label inherits the count from the NEXT line
+# (`**P0**` / `none.`) — which is how reviewers summarise.
+#
+# ⛔ WHY A SHAPE AND NOT A GRAMMAR (fifth fresh review). Rounds 1-4 each added ONE more literal form
+# — `**P1**`, `**P1:**`, `Finding [P1]`, a table cell — and each time the fail-open reappeared ONE
+# FORM OVER (`**Finding 1 (P1)**`, `Severity: P1` on a continuation line, a token in a code span).
+# The arms below key on the SHAPE SPACE, so a form nobody enumerated still lands inside it. The
+# measured failures that shaped it, in both directions:
+#   FAIL-OPEN (recorded `clean` over a reported blocker): the bare bolded token dropped while
+#     silencing a prose refusal; `[^*]*` pairing a CLOSING `**` with the next OPENING one; a count
+#     word read from the first word of a description (`**P0**: none of the call sites validate`);
+#     and — worst — an EMPTY remainder treated as a zero count, so a bare `**P1**` header line was
+#     read as `P1: none` and a P1/P2 list recorded clean.
+#   WALL (a genuinely clean review that could not be recorded, i.e. a PAID re-run into the same
+#     refusal, forever): a prose QUOTE of the convention (`No [P1] findings…`); `**No P1**`; a
+#     qualified zero (`P1 findings: none (I checked every file)`); and a heading-per-severity
+#     summary (`**P0**` / `none.`) — each pinned by the suite in BOTH directions.
+# P3 NEVER blocks: the prompt puts P3 notes under CLEAN and this file's contract is that a P3 nit
+# never blocks a record (P2, third review).
+# ⛔ SIXTH REVIEW — THE CUE, AND WHY THE NOUN LIST IS CLOSED. A label ALONE is not evidence: the
+# suite pins `No [P1] findings; …` (clean) against `- Finding: [P1] …` (blocking), two lines that are
+# STRUCTURALLY IDENTICAL — decorated token, mid-line, no location. Nothing lexical separates a
+# MENTION from a USE there, so the scanner names the words that INTRODUCE a finding (the `noun()`
+# list) and treats everything else as prose. That is a BOUNDED vocabulary with a stated edge, not a
+# growing grammar: widening it changes policy, which is the ratchet this rule exists to stop. The
+# edge it buys, in both directions, measured: `Severity guide: P0 = …` / `Per the contract:
+# P0/P1/P2 block` / `Summary: P0 none found, …` are prose (no noun introduces the token) while
+# `Severity: P1 — …` and `Severity P1: path:12` block. ⚠️ TWO KNOWN, DELIBERATE WALLS, both
+# over-blocking by design (a wall costs a re-run; a miss records `clean` over a real defect):
+#   (1) a sentence that both states the convention AND writes the noun and separator
+#       (`… severity: P2 would be over-calling`) blocks, one character from its own pinned clean
+#       twin — disambiguating it needs the meaning of the sentence, not its shape;
+#   (2) a zero count followed by a PREPOSITIONAL gloss (`- P2 — no findings in the changed files`,
+#       `P1: none at all; …`) blocks, because the exemption vocabulary admits a count noun and a
+#       gloss but not a following clause. Filed as agent-infra#2337, with the acceptance pinned so
+#       that fixing it cannot re-open `none of the call sites validate` (must keep blocking).
+# ⚠️ AND THE EXEMPTION LIST IS DELIBERATELY NARROW — it is a closed grammar too, and widening it
+# is where a fail-open lives: an earlier shape returned "summary" on a separator WITHOUT re-reading
+# the count that follows, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole.
+# STATED RESIDUAL: a bare, unadorned, mid-sentence `P1` with no noun in front of it and no location
+# (`Found one — P1 the guard returns 0`) is prose to this scanner.
+# The suite pins that direction (`No findings at scripts/x.sh:12; severity P2 would be over-calling`
+# must not block), and the boundary between a mention and a label there is not lexical; four rounds
+# of regex are the evidence. A blocker in any LABEL shape — the conventions the PROMPT contracts to
+# — is caught, and a CLEAN that contradicts one is refused before anything is posted.
+BLOCK_SPAN_AWK='
+function counts_only(r,   guard, seen) {
+  r = tolower(r)
+  guard = 0; seen = 0
+  # ⛔ EVERY LABEL IN THE REMAINDER MUST CARRY A ZERO COUNT (P1, seventh fresh review). The earlier
+  # shape returned "summary" on a separator or a conjunction WITHOUT re-reading the count that
+  # follows it, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole — a summary line
+  # that itself states a NON-ZERO blocking count recorded clean. The loop now consumes each
+  # `label? count` pair and only terminates at end-of-line or a gloss, so the non-zero pair is
+  # always read.
+  while (guard++ < 60) {
+    gsub(/^[^[:alnum:]]+/, "", r)
+    if (seen && match(r, /^(and|or)[[:space:]]+/)) { r = substr(r, RLENGTH + 1); continue }
+    if (r == "") return seen
+    if (seen && r ~ /^p3([^[:alnum:]]|$)/) return 1
+    if (r ~ /^p[0-3]([^[:alnum:]]|$)/) { r = substr(r, 3); continue }
+    if (!match(r, /^((findings?|issues?|nits?|count|total|reported|blockers?)[[:space:]]*:?[[:space:]]*)?(none|nil|zero|0+|no([[:space:]]+blocking)?[[:space:]]+(findings?|issues?|blockers?|nits?)|nothing([[:space:]]+blocking)?|all[[:space:]]+(clean|good|fine))([[:space:]]+(found|reported|remaining|detected|present|blocking|at[[:space:]]+all))*/)) return 0
+    seen = 1
+    r = substr(r, RLENGTH + 1)
+    if (r ~ /^[[:space:]]*$/) return 1
+    # a parenthetical or a dash clause after the count is a GLOSS on it; any other separator (or a
+    # conjunction) opens a NEW segment, whose count the loop then has to read.
+    if (r ~ /^[[:space:]]*[([—–]/) return 1
+    if (r !~ /^[[:space:]]*[.,;:!?|)`*_]/) return 0
+  }
+  return 0
+}
+# The closed LABEL-NOUN vocabulary. It is the ONLY semantic signal in this scanner, and it is
+# closed on purpose: a finding is INTRODUCED by one of these words (`Finding 2 (P1)`,
+# `Severity: P1`), while prose that merely MENTIONS the convention (`Severity guide: P0 = …`,
+# `Per the contract: P0/P1/P2 block`) is not. Widening this list is a policy change, not a patch —
+# which is the ratchet this rule exists to stop. The NIT tags below are the same kind of closed
+# list: a label that tags ITSELF as a note is a note, and P3-class notes never block.
+function noun() { return "(findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major)" }
+function nittag(s) { return (s ~ /^[[:space:]]*[*_`]*(\()?\[(nit|note|optional|informational|suggestion)[)\]][[:space:]]*:/ || s ~ /^[[:space:]]*[*_`]*\((nit|note|optional|informational|suggestion)\)/) }
+function sepafter(s) { return (s ~ /^[[:space:]*_`]*[][):.,;—–-]/) }
+function label(s,   a, b, pre, post) {
+  LS = 0; LE = 0; DEC = 0; NOUN_CUE = 0
+  # (a) DECORATED shapes — bracketed, parenthesised, bolded/italicised
+  if (match(s, /[\[(][Pp][0-2][\])]/)) { LS = RSTART; LE = RSTART + RLENGTH - 1; DEC = 1 }
+  if (match(s, /(\*\*|__)[[:space:]]*[Pp][0-2][[:space:]]*(\*\*|__)/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
+  }
+  # (b) a BARE token — only when a label NOUN introduces it (with a separator on one side), or in
+  # a TABLE row. `Severity: P1` and `Severity P1:` are both introduced; `severity P2 would be…`
+  # (no separator) is prose ABOUT severity and is not.
+  if (DEC == 0 && match(s, /[Pp][0-2]/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    pre = tolower(substr(s, 1, a - 1)); post = substr(s, b + 1)
+    if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1 }
+    else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1 }
+    else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
+    else if (s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1 }
+  }
+  return (LS > 0)
+}
+# is a label NOUN (with an optional ordinal and decoration) immediately before the token?
+function noun_before(s,   pre) {
+  pre = tolower(substr(s, 1, LS - 1))
+  return (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–]?[[:space:]]*[(\[*_`]*$"))
+}
+function leads(s,   after) {
+  DE = 0
+  if (!match(s, /^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?[Pp][0-2]/)) return 0
+  DE = RSTART + RLENGTH - 1
+  after = substr(s, DE + 1)
+  if (after ~ /^[[:alnum:]]/) { DE = 0; return 0 }
+  return 1
+}
+{ L[NR] = $0 }
+END {
+  for (i = 1; i <= NR; i++) {
+    raw = L[i]
+    has = label(raw)
+    lead = leads(raw)
+    if (!has && !lead) continue
+    endpos = 0
+    if (has) endpos = LE
+    if (lead && (endpos == 0 || DE < endpos)) endpos = DE
+    after = substr(raw, endpos + 1)
+    if (nittag(after)) continue
+    if (counts_only(after)) continue
+    if (after ~ /^[[:space:]*_:|.,;—–-]*$/ && L[i + 1] != "" && counts_only(L[i + 1])) continue
+    loc   = (raw ~ /[[:alnum:]_\/.-]+:[0-9]+/)
+    table = (raw ~ /^[[:space:]]*\|/)
+    cue   = (lead || loc || table || NOUN_CUE == 1 || (DEC == 1 && (noun_before(raw) || sepafter(after))))
+    if (cue) print raw
+  }
+}
+'
 # ⛔ A SEVERITY SUMMARY ROW IS NOT A FINDING (P2, ninth fresh review). Reviewers close a
 # report with a table of counts (`| P0 | 0 |`, `| P1 | 0 |`); each row LEADS with a
 # severity token, so the positional rule read them as findings — a clean report refused
@@ -630,14 +790,54 @@ BLOCK_TOKEN_RE='\[P[012]\]|\*\*P[012]\*\*|__P[012]__'
 # and must stay blocking (P2, tenth fresh review: filtering every numeric row recorded clean
 # over a table that said two blocking findings exist — a fail-open introduced by the fix for
 # the false refusal it replaced).
-SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*P[0-3][[:space:]]*\|?[[:space:]]*0+[[:space:]]*\|?[[:space:]]*$'
+# ⛔ AND THE DECORATION IS PART OF THE ROW (P2, third fresh review of the fix): `| **P1** | 0 |`
+# is the same summary with bold cell markup, and the label scan reads it as a finding unless this
+# pattern tolerates the `**`/`__` around the token — a clean report refused for its own table.
+# `| P1 | 2 |` is NOT a summary and still blocks: only a ZERO count is a count.
+SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*(\*\*|__)?[[:space:]]*P[0-3][[:space:]]*(\*\*|__)?[[:space:]]*\|?[[:space:]]*0+[[:space:]]*\|?[[:space:]]*$'
 FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
-# The union is composed HERE, where BLOCKING_FINDINGS is defined — composing it above
-# `SUMMARY_ROW_RE` (the first attempt at this fix) left it assigned before the row filter
-# existed and then silently OVERWRITTEN by the line below, so the widened scan was dead code
-# and the fail-open survived. Caught by the pre-commit [VGATE] verifier, not by the suite:
-# §AG asserts the behaviour, but a suite run was unavailable on that box.
-BLOCKING_FINDINGS="$({ grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null; grep -aiE "$BLOCK_TOKEN_RE" "$LOG" 2>/dev/null; } | grep -avE "$SUMMARY_ROW_RE" | LC_ALL=C sort -u || true)"
+# The union is composed HERE — composing it above `SUMMARY_ROW_RE` (the first attempt at this fix)
+# left it assigned before the row filter existed and then silently OVERWRITTEN, so the widened scan
+# was dead code and the fail-open survived.
+#
+# ⛔ A FAILED SCAN IS NOT AN EMPTY ONE (P2, fourth fresh review of the fix). The scan used to be
+# `awk … 2>/dev/null` inside a pipeline whose stderr was discarded, so an awk that is missing, that
+# rejects the program, or that dies half-way produced NO OUTPUT and the pipeline read that as "no
+# blocking findings" — a `clean` record over a transcript nothing actually read. This is the same
+# class the file already refuses elsewhere ("A FAILED READ IS NOT AN EMPTY VALUE"): the scanner's
+# own exit status is checked, and a non-zero one REFUSES (exit 10, no record) instead of certifying.
+BLOCK_SCAN_FILE="$RUN_DIR/blocking-findings.raw"
+# ⛔ CAPTURE THE STATUS BEFORE NEGATING IT (P3, fifth fresh review): inside `if ! cmd; then`, `$?`
+# is the NEGATED status — 0 — so the one message whose job is to name a tool failure reported
+# "awk rc=0". Measure first, then test.
+awk "$BLOCK_SPAN_AWK" "$LOG" > "$BLOCK_SCAN_FILE" 2>"$RUN_DIR/blocking-findings.err"
+BLOCK_SCAN_RC=$?
+if [ "$BLOCK_SCAN_RC" -ne 0 ]; then
+  err "$PROG: the blocking-finding SCANNER failed (awk rc=$BLOCK_SCAN_RC) — the reviewer's transcript could not be read for P0/P1/P2 findings, so a clean verdict cannot be certified."
+  err "  This is a tool failure, NOT a clean review: no comment was posted and NO record was written."
+  err "  Scanner stderr: $(head -3 "$RUN_DIR/blocking-findings.err" 2>/dev/null | tr '\n' ' ')"
+  die "$E_SCAN" "the P0/P1/P2 scan did not run — re-run where awk works (transcript: $TRANSCRIPT)"
+fi
+# ⛔ AND THE SAME INVARIANT ONE STAGE LATER (P1, seventh fresh review): the post-filter pipeline ended
+# in `|| true`, so a failing `grep` or `sort` produced an EMPTY list that the contradiction check
+# reads as "no blocking findings" — the only chokepoint between a reported blocker and a `clean`
+# record, failing open. Both stages are now measured: `grep` exit 1 is "no line matched", which is a
+# legitimate empty result and is NOT a failure.
+grep -avE "$SUMMARY_ROW_RE" "$BLOCK_SCAN_FILE" > "$RUN_DIR/blocking-findings.pre" 2>"$RUN_DIR/blocking-filter.err"
+BLOCK_FILTER_RC=$?
+if [ "$BLOCK_FILTER_RC" -gt 1 ]; then
+  err "$PROG: the blocking-finding FILTER failed (grep rc=$BLOCK_FILTER_RC) — the scanner's output could not be read, so a clean verdict cannot be certified."
+  err "  This is a tool failure, NOT a clean review: no comment was posted and NO record was written."
+  die "$E_SCAN" "the P0/P1/P2 filter did not run (transcript: $TRANSCRIPT)"
+fi
+LC_ALL=C sort -u "$RUN_DIR/blocking-findings.pre" > "$RUN_DIR/blocking-findings.txt" 2>>"$RUN_DIR/blocking-filter.err"
+BLOCK_SORT_RC=$?
+if [ "$BLOCK_SORT_RC" -ne 0 ]; then
+  err "$PROG: the blocking-finding SORT failed (sort rc=$BLOCK_SORT_RC) — the findings could not be counted, so a clean verdict cannot be certified."
+  err "  This is a tool failure, NOT a clean review: no comment was posted and NO record was written."
+  die "$E_SCAN" "the P0/P1/P2 sort did not run (transcript: $TRANSCRIPT)"
+fi
+BLOCKING_FINDINGS="$(cat "$RUN_DIR/blocking-findings.txt")"
 # ⛔ THE COUNT IS THE NUMBER AFTER `ISSUES` (P3, tenth fresh review): scraping every digit
 # turned `ISSUES — 1 × P1, 2 × P3` into 1123 and told the operator "found 1123 blocking
 # issue(s)" in a public comment.

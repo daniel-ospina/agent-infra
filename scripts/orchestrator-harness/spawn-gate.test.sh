@@ -133,7 +133,12 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+# `scripts/review-pr.sh` is DECLARED here for the same reason (#2288): it spawns the fresh-context
+# reviewer that produces the merge artifact. It carries the bound run_agent() would give it (its own
+# wall-clock watchdog), the SAME posture merge-one.sh's reviewer has — the installed `pi` shim is the
+# load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
+# consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
