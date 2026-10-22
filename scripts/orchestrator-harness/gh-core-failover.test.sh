@@ -68,6 +68,10 @@ case "\$1 \$2" in
       printf '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true},"nodes":[{"databaseId":1,"state":"APPROVED"}]}}}}}\n'
       exit 0
     fi
+    if [ "\${GH_TEST_SCENARIO:-}" = "nopi" ]; then
+      printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"databaseId":1,"state":"APPROVED"}]}}}}}\n'
+      exit 0
+    fi
     if [ "\${GH_TEST_SCENARIO:-}" = "reviewsok" ]; then
       printf '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false},"nodes":[{"databaseId":1,"state":"APPROVED","body":"b","submittedAt":"x","commit":{"oid":"c1"},"author":{"login":"daniel-ospina"}}]}}}}}\n'
       exit 0
@@ -802,6 +806,35 @@ ck "(m16) … and it cannot smuggle an unproducible field in" \
 # where the read it replaces returned 30.
 ck "(m17) the comments/reviews queries ask for REST's default page (first:30)" \
    "$(grep -q 'comments(first:30)' "$HELPER" && grep -q 'reviews(first:30)' "$HELPER" && echo 0 || echo 1)"
+
+echo "── (m18) ROUND 7: an absent pageInfo, a passed meter window, and a write nobody listed ─────────"
+# (m18) the truncation guard tested only `hasNextPage is True`, so an ABSENT/null `pageInfo` read as
+# “complete” and a window truncated at first:30 was emitted as the whole list.
+reset_env m18 core0
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+run nopi api repos/o/r/pulls/7/reviews --jq '.[] | .state'
+ck "(m18) a connection with NO pageInfo is REFUSED (was served as complete)" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run reviewsok api repos/o/r/pulls/7/reviews --jq '.[] | .state'
+ck "(m18) … while an explicit hasNextPage:false is still served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'APPROVED' && echo 0 || echo 1)
+
+# (m19) a FRESH meter whose reset has already passed must still outrank an older dated record, or the
+# operator's trusted verb announces a window the rail and the write guard both treat as closed.
+reset_env m19 coreok
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) - 100 ))" > "$GH_LIMIT_DIR/budget.json"
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m19) a PASSED meter window outranks an older record (--health says gh-ok)" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+# (m20) a write whose verb the table did not know was diagnosed as a READ (“this READ has no exact
+# GraphQL equivalent” about a mutation) and was not PACED, because pacing keys on the same predicate.
+ck "(m20) secret/variable/cache/gist/codespace/ruleset writes are classified as MUTATIONS" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); bad=[a for a in (['secret','set','F','-b','x'],['variable','set','A','-b','1'],['cache','delete','-a'],['gist','create','f'],['codespace','delete','-c','x'],['ruleset','delete','1'],['repo','delete','o/r','--yes']) if not m.is_mutating(a)]; sys.exit(0 if not bad and not m.is_mutating(['pr','view','7']) else 1)" && echo 0 || echo 1)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
