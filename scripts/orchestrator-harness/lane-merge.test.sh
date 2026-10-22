@@ -69,6 +69,8 @@ mk_chain() { # mk_chain <fixture-path>   (writes into the CURRENT case's $OT)
 # Which CHECKOUT was this chain handed? merge-one.sh resolves the merge authority (and the rail's own
 # graders) from \`\$REPO\`, so this is the observable the trusted-checkout case asserts.
 printf '%s\\n' "\$1" >> "${T:?}/chain-repo.txt" 2>/dev/null || true
+# …and its whole argv, so a suite can assert the BRANCH the chain was handed (arg 4).
+printf '%s\\n' "\$*" >> "${T:?}/chain-argv.txt" 2>/dev/null || true
 printf 'rail: MERGED via the rail (stub)\\n'
 printf 'closed|2026-10-18T00:00:00Z|head123|clean\\n' > "$1"
 # MK_MERGED makes this stub behave like merge-one.sh on a real merge: it writes the marker the
@@ -80,8 +82,22 @@ EOF
 
 CASE=0; OT=""
 new_o() { CASE=$((CASE + 1)); OT="$T/o$CASE"; rm -rf "$OT"; mkdir -p "$OT/state" "$OT/logs"; mk_chain "$1"; }
+# ⛔ THE LANE CHECKOUT IS A FIXTURE, NOT THE AMBIENT ONE (landing-review P1, MEASURED IN CI). `ci.yml`'s
+# bash-suites checks out `refs/remotes/pull/<n>/merge` in DETACHED HEAD, where `git rev-parse --abbrev-ref
+# HEAD` is literally "HEAD" — so every case that reaches launch_chain refused with WAITING_NO_BRANCH and
+# the shard reddened on EVERY PR (measured: 83 passed / 8 failed in a detached checkout, 91/0 on a branch
+# checkout). A lane always runs on a branch, so the fixture is a real repo on one; a case that wants a
+# different checkout exports REPO_PATH itself.
+RUN_REPO="$T/run-repo"
+rm -rf "$RUN_REPO"; mkdir -p "$RUN_REPO"
+git -C "$RUN_REPO" init -q
+: > "$RUN_REPO/README"
+git -C "$RUN_REPO" add README
+git -C "$RUN_REPO" -c user.email=t@t -c user.name=t commit -qm fixture
+git -C "$RUN_REPO" checkout -q -b feat/fixture-run
+
 run() { # run <pr> <args…>  → sets RC, OUT
-  OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
         LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
         bash "$SCRIPT" "$@" 2>&1)"; RC=$?
 }
@@ -110,7 +126,7 @@ ck "the ISSUE-keyed verdict exists (that is what chain-merge waits on)" \
 # `merge_commit_sha` — recording the head made the deliverable a commit that is not on main.
 printf 'closed|2026-10-18T00:00:00Z|abc123|clean\n' > "$T/pr-sha.tsv"
 new_o "$T/pr-sha.tsv"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" MERGED_AT_STUB=2026-10-18T00:00:00Z \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" MERGED_AT_STUB=2026-10-18T00:00:00Z \
       MERGE_SHA_STUB=deadbeefcafe LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 8 --repo o/r --pr-tsv "$T/pr-sha.tsv" 2>&1)"; RC=$?
 ck "a merged PR records the MERGE COMMIT as the payload (got: $(verdict_of 8))" \
@@ -209,7 +225,7 @@ ck "round 3 spent + GREEN → the last fix is verified and the chain is launched
 new_o "$T/pr16.tsv"
 mkdir -p "$T/bin2"
 printf '#!/usr/bin/env bash\nprintf "INFLIGHT 0\\n"\n' > "$T/bin2/python3"; chmod +x "$T/bin2/python3"
-OUT="$(PATH="$T/bin2:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_WAIT=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$T/bin2:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_WAIT=0 \
       bash "$SCRIPT" 24 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv" 2>&1)"; RC=$?
 ck "a classifier that printed INFLIGHT but no RED line → exit 2, NO chain launched (a red head is never green)" \
    $([ "$RC" = 2 ] && [ ! -f "$OT/logs/lane-merge-24.log" ] && echo 0 || echo 1)
@@ -225,7 +241,7 @@ printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-25.log" > "$OT/state/lanem
 # `ISSUES <n>`, and the classifier is anchored on that — so a fixture that only writes prose would
 # assert the permissive read we deliberately removed.
 printf 'ISSUES 3\n[merge 25] reviewer recorded 3 findings at head abc123\n' > "$OT/logs/merge-25.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 25 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "a finished chain whose reviewer said ISSUES → exit 10 FIX_REQUIRED with a round spent (the fix list is the review)" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 25 | cut -d' ' -f1)" = FIX_REQUIRED ] && [ "$(cat "$OT/state/lanemerge-25.round")" = 1 ] && echo 0 || echo 1)
@@ -235,7 +251,7 @@ new_o "$T/pr21.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-30.log" > "$OT/state/lanemerge-30.chain"
 : > "$OT/logs/merge-30.log"
 : > "$OT/state/needsfix-30-abc123"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 30 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "a head-keyed needsfix marker alone → FIX_REQUIRED (the durable marker, not log prose, decides)" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 30 | cut -d' ' -f1)" = FIX_REQUIRED ] && echo 0 || echo 1)
@@ -249,7 +265,7 @@ ck "a head-keyed needsfix marker alone → FIX_REQUIRED (the durable marker, not
 new_o "$T/pr22.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-31.log" > "$OT/state/lanemerge-31.chain"
 printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "an UNCONFIRMED 'MERGED via the rail' line is NOT a merge: exit 14 BLOCKED, and the reason names the API read" \
    $([ "$RC" = 14 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = BLOCKED ] \
@@ -258,7 +274,7 @@ ck "an UNCONFIRMED 'MERGED via the rail' line is NOT a merge: exit 14 BLOCKED, a
 new_o "$T/pr22.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-31.log" > "$OT/state/lanemerge-31.chain"
 printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_AT_STUB='2026-10-19T00:00:00Z' \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_AT_STUB='2026-10-19T00:00:00Z' \
       bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "the SAME log line WITH a confirmed merged_at → MERGED exit 0 (the confirmation is what decides)" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
@@ -273,7 +289,7 @@ printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
 printf '3\n' > "$OT/state/lanemerge-31.watch"
 printf '3\n' > "$OT/state/lanemerge-31.round"
 : > "$T/gh.log"   # this case's own log: an earlier case's BODY-BEGIN must not be counted as "a comment"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr-open.tsv" 2>&1)"; RC=$?
 ck "a FAILED confirmation read is WAITING_API (exit 11), spends no chunk and no round, and posts no comment" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_API ] \
@@ -286,7 +302,7 @@ printf 'open||newhead1|clean\n' > "$T/pr-open2.tsv"
 sleep 60 & CH_PID=$!
 printf '%s oldhead %s\n' "$CH_PID" "$OT/logs/lane-merge-40.log" > "$OT/state/lanemerge-40.chain"
 printf 'nothing here\n' > "$OT/logs/lane-merge-40.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-open2.tsv" 2>&1)"; RC1=$?
 OUT2="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-open2.tsv" 2>&1)"; RC2=$?
@@ -306,7 +322,7 @@ printf '1\n' > "$OT/state/lanemerge-41.apiretry"
 # ⛔ THE ADOPTION LIVES ON THE LAUNCH PATH (`launch_chain`), not in --watch — that is where a lane
 # decides whether to start a competitor. So drive the shipped entry point that reaches it, with a green
 # check fixture so it gets that far.
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
       LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr-open3.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
 kill "$LIVEPID" 2>/dev/null || true
@@ -324,7 +340,7 @@ printf '[merge 51] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-51.log"
 printf '%s\n' "15" > "$OT/state/lanemerge-51.watch"          # AT the budget: this pass must be charged
 printf '%s\n' "15" > "$OT/state/lanemerge-51.apiretry"       # …and the refunds are exhausted
 printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-51.lastdisp"   # the last chunk
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=15 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=15 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-open4.tsv" 2>&1)"; RC=$?
 ck "an EXHAUSTED refund allowance CHARGES the chunk, so the budget is reachable (exit 13) — and it says the PR may be merged" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] \
@@ -341,7 +357,7 @@ printf '%s deadbeef %s\n' 999993 "$OT/logs/lane-merge-52.log" > "$OT/state/lanem
 printf '[merge 52] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-52.log"
 printf '%s\n' "3" > "$OT/state/lanemerge-52.watch"
 printf '%s\n' "15" > "$OT/state/lanemerge-52.apiretry"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 52 --watch --repo o/r --pr-tsv "$T/pr-open5.tsv" 2>&1)"; RC=$?
 ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded) and the run says so" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 52 | cut -d' ' -f1)" = WAITING_API ] \
@@ -366,7 +382,7 @@ printf 'reviewer NOT started (load gate)\n' > "$OT/logs/merge-53.log"
 : > "$OT/logs/lane-merge-53.log"
 printf '%s\n' "1" > "$OT/state/lanemerge-53.watch"
 printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-53.lastdisp"
-PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
   bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" >/dev/null 2>&1
 ck "a LOAD chunk OVERWRITES an older WAITING_API disposition (the hand-off may only describe the last chunk)" \
    $([ "$(cat "$OT/state/lanemerge-53.lastdisp" 2>/dev/null)" = "WAITING_LOAD" ] && echo 0 || echo 1)
@@ -375,7 +391,7 @@ printf '%s\n' "15" > "$OT/state/lanemerge-53.watch"
 # assertion on it ("must not say the read failed") is polluted by a PREVIOUS case's legitimate
 # unreadable-read hand-off — measured here as a false FAIL.
 OMIT_LOG="$T/gh-nonies.log"; : > "$OMIT_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$OMIT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$OMIT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" 2>&1)"; RC=$?
 # the BODY goes to gh, not to stdout — assert on the recorded comment, not on the run's output
 ck "…and the budget hand-off names the LOAD gate instead of claiming the merge read failed" \
@@ -392,7 +408,7 @@ printf 'open||newhead1|clean\n' > "$T/pr-open7.tsv"
 printf '%s deadbeef %s\n' 999995 "$OT/logs/lm-54.log" > "$OT/state/lanemerge-54.chain"
 printf '[chain] reviewer NOT CLEAN or reviewer failed (no ISSUES count)\n' > "$OT/logs/merge-54.log"
 NOVERDICT_LOG="$T/gh-decies.log"; : > "$NOVERDICT_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$NOVERDICT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$NOVERDICT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-open7.tsv" 2>&1)"; RC=$?
 ck "a reviewer with NO verdict → exit 11 WAITING_NO_VERDICT, NO fix round spent, and nothing sends the lane to a review that does not exist" \
    $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-54.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] \
@@ -411,7 +427,7 @@ printf '%s deadbeef %s\n' 999996 "$OT/logs/lm-57.log" > "$OT/state/lanemerge-57.
 printf '[chain] reviewer NOT CLEAN or reviewer failed (no ISSUES count)\n' > "$OT/logs/merge-57.log"
 : > "$OT/state/needsfix-57-newhead1"          # ← the marker merge-one writes in BOTH outcomes
 MARKED_LOG="$T/gh-decies-bis.log"; : > "$MARKED_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$MARKED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$MARKED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 57 --watch --repo o/r --pr-tsv "$T/pr-open10.tsv" 2>&1)"; RC=$?
 ck "the PRODUCTION shape (marker + 'reviewer failed', no ISSUES count) → WAITING_NO_VERDICT, no fix round, no phantom review pointer" \
    $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-57.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] \
@@ -422,7 +438,7 @@ printf 'open||newhead1|clean\n' > "$T/pr-open11.tsv"
 printf '%s deadbeef %s\n' 999997 "$OT/logs/lm-58.log" > "$OT/state/lanemerge-58.chain"
 : > "$OT/logs/merge-58.log"
 : > "$OT/state/needsfix-58-newhead1"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 58 --watch --repo o/r --pr-tsv "$T/pr-open11.tsv" 2>&1)"; RC=$?
 ck "a ROTATED log (no reviewer outcome at all) still trusts the durable marker → FIX_REQUIRED" \
    $([ "$RC" = 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-58.verdict" 2>/dev/null)" = FIX_REQUIRED ] && echo 0 || echo 1)
@@ -434,7 +450,7 @@ ck "a ROTATED log (no reviewer outcome at all) still trusts the durable marker �
 new_o "$T/junk-q12.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open12.tsv"
 ABSENT_LOG="$T/gh-absent.log"; : > "$ABSENT_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$ABSENT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ABSENT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 59 --watch --repo o/r --pr-tsv "$T/pr-open12.tsv" 2>&1)"; RC=$?
 ck "no chain record and no claim lock → WAITING_CHAIN_ABSENT (exit 11), NO comment on the PR, and it says how to launch" \
    $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-59.verdict" 2>/dev/null)" = WAITING_CHAIN_ABSENT ] \
@@ -452,7 +468,7 @@ printf '%s newhead1 %s\n' "$CH_PID55" "$OT/logs/lm-55.log" > "$OT/state/lanemerg
 # LAUNCH path instead of the watch path and proved nothing about the disposition.
 printf '%s\n' "$CH_PID55" > "$OT/state/mergeclaim-55.lock"
 echo "still working" > "$OT/logs/lm-55.log"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=1 \
       bash "$SCRIPT" 55 --watch --repo o/r --pr-tsv "$T/pr-open8.tsv" --checks-tsv "$T/checks-ok.tsv" 2>&1)"; RC=$?
 kill "$CH_PID55" 2>/dev/null || true
 ck "a live chain at the deadline → WAITING and it STAMPS WAITING_CHAIN_RUNNING (not a stale earlier reason)" \
@@ -470,7 +486,7 @@ echo "still working" > "$OT/logs/lm-56.log"
 printf '%s\n' "15" > "$OT/state/lanemerge-56.watch"
 printf '%s\n' "WAITING_HEAD_MOVED" > "$OT/state/lanemerge-56.lastdisp"
 HEADMOVED_LOG="$T/gh-tredecies.log"; : > "$HEADMOVED_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 56 --watch --repo o/r --pr-tsv "$T/pr-open9.tsv" 2>&1)"; RC=$?
 kill "$CH_PID56" 2>/dev/null || true
 ck "the head-moved budget hand-off names the REAL pid and never ships the literal placeholder" \
@@ -484,7 +500,7 @@ new_o "$T/junk-q13.tsv"
 printf 'open||abc123|clean\n' > "$T/pr-open13.tsv"
 # an UNFINISHED check: status not `completed`, so there is no conclusion to read — that is "in flight"
 printf 'lint\trunning\t\t11\n' > "$T/checks-inflight.tsv"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=0 \
       bash "$SCRIPT" 60 --repo o/r --pr-tsv "$T/pr-open13.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 ck "checks still in flight at the deadline → it STAMPS WAITING_CHECKS (so the budget hand-off can name it)" \
    $([ "$RC" = 11 ] && [ "$(cat "$OT/state/lanemerge-60.lastdisp" 2>/dev/null)" = "WAITING_CHECKS" ] && echo 0 || echo 1)
@@ -497,7 +513,7 @@ printf 'lint\tcompleted\tsuccess\t11\n' > "$T/checks-any.tsv"
 # nothing. A stub that FAILS is the honest way to reproduce "the classifier could not run".
 NOPY="$T/nopy"; mkdir -p "$NOPY"
 printf '#!/bin/sh\nexit 127\n' > "$NOPY/python3"; chmod +x "$NOPY/python3"
-OUT="$(PATH="$NOPY:$BIN:/usr/bin:/bin" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$NOPY:$BIN:/usr/bin:/bin" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open14.tsv" --checks-tsv "$T/checks-any.tsv" 2>&1)"; RC=$?
 # the exit code is 2 (usage/env: the tool it needs is not there), which the brief already treats as
 # "fix the environment"; the assertion that matters is that the DISPOSITION is recorded rather than a
@@ -517,7 +533,7 @@ printf '%s deadbeef %s\n' 999999 "$OT/logs/lm-62.log" > "$OT/state/lanemerge-62.
 printf '%s\n' "15" > "$OT/state/lanemerge-62.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-62.lastdisp"
 ARM_LOG="$T/gh-sedecies.log"; : > "$ARM_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 62 --watch --repo o/r --pr-tsv "$T/pr-open15.tsv" 2>&1)"; RC=$?
 ck "an exhausted budget whose last chunk found NO verdict says 'nothing to fix', not 'unresolved'" \
    $([ "$RC" = 13 ] && grep -q 'NO reviewer verdict' "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
@@ -532,7 +548,7 @@ printf 'open||newhead1|clean\n' > "$T/pr-open16.tsv"
 printf '%s deadbeef %s\n' 999991 "$OT/logs/lm-63.log" > "$OT/state/lanemerge-63.chain"
 printf 'I found ISSUES 2 in the diff, roughly\n[merge 63] reviewer NOT CLEAN or reviewer failed\n' > "$OT/logs/merge-63.log"
 : > "$OT/state/needsfix-63-newhead1"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 63 --watch --repo o/r --pr-tsv "$T/pr-open16.tsv" 2>&1)"; RC=$?
 ck "reviewer PROSE mentioning 'ISSUES 2' does not become a fix list — only a verdict LINE does" \
    $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-63.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] && echo 0 || echo 1)
@@ -544,7 +560,7 @@ new_o "$T/junk-q18.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open18.tsv"
 printf '%s deadbeef %s\n' 999989 "$OT/logs/lm-66.log" > "$OT/state/lanemerge-66.chain"
 printf 'the reviewer said ISSUES 2 were probably present\n' > "$OT/logs/merge-66.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 66 --watch --repo o/r --pr-tsv "$T/pr-open18.tsv" 2>&1)"; RC=$?
 ck "with NO marker, reviewer prose still cannot become a fix list (the second anchored read)" \
    $([ "$RC" != 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-66.verdict" 2>/dev/null)" != FIX_REQUIRED ] && echo 0 || echo 1)
@@ -560,7 +576,7 @@ printf '%s deadbeef %s\n' 999988 "$OT/logs/lm-67.log" > "$OT/state/lanemerge-67.
 printf '%s\n' "15" > "$OT/state/lanemerge-67.watch"
 printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-67.lastdisp"
 BODY_LOG="$T/gh-body.log"; : > "$BODY_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 67 --watch --repo o/r --pr-tsv "$T/pr-open19.tsv" 2>&1)"; RC=$?
 ck "a 'checks never settled' hand-off does NOT claim CI was driven to terminal" \
    $([ "$RC" = 13 ] && ! grep -q 'driven to terminal' "$BODY_LOG" && echo 0 || echo 1)
@@ -574,7 +590,7 @@ printf '%s\n' "WAITING_API" > "$OT/state/lanemerge-68.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-68.last"
 printf 'newhead1\n' > "$OT/state/lanemerge-68.lasthead"   # the head those names belong to
 API_BODY="$T/gh-body2.log"; : > "$API_BODY"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 68 --watch --repo o/r --pr-tsv "$T/pr-open20.tsv" 2>&1)"; RC=$?
 ck "…and an unreadable-read hand-off DOES record the CI names it actually read (without claiming CI finished)" \
    $([ "$RC" = 13 ] && grep -q 'A CI run was read at THIS head' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" \
@@ -590,7 +606,7 @@ printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-69.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-69.last"
 printf 'anOLDERhead\n' > "$OT/state/lanemerge-69.lasthead"
 STALE_BODY="$T/gh-stale.log"; : > "$STALE_BODY"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$STALE_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$STALE_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 69 --watch --repo o/r --pr-tsv "$T/pr-open21.tsv" 2>&1)"; RC=$?
 ck "CI names recorded at an OLDER head are not presented as 'already done' at this one" \
    $([ "$RC" = 13 ] && ! grep -q 'lint,unit' "$STALE_BODY" && ! grep -q 'read to terminal' "$STALE_BODY" && echo 0 || echo 1)
@@ -602,7 +618,7 @@ ck "CI names recorded at an OLDER head are not presented as 'already done' at th
 new_o "$T/junk-q22.tsv"
 printf 'closed||abc123|clean\n' > "$T/pr-closed22.tsv"   # closed, merged_at EMPTY, head present
 CLOSED_BODY="$T/gh-closed.log"; : > "$CLOSED_BODY"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$CLOSED_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$CLOSED_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 70 --repo o/r --pr-tsv "$T/pr-closed22.tsv" 2>&1)"; RC=$?
 ck "a CLOSED+unmerged PR's hand-off says reopen/re-PR and does NOT tell the next holder to launch a chain" \
    $([ "$RC" = 14 ] && grep -q 'CLOSED' "$CLOSED_BODY" && ! grep -q 'merge-one.sh' "$CLOSED_BODY" \
@@ -621,7 +637,7 @@ printf '%s deadbeef %s\n' 999985 "$OT/logs/lm-71.log" > "$OT/state/lanemerge-71.
 printf '%s\n' "15" > "$OT/state/lanemerge-71.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-71.lastdisp"
 EXEC_BODY="$T/gh-exec.log"; : > "$EXEC_BODY"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 71 --watch --repo o/r --pr-tsv "$T/pr-open23.tsv" 2>&1)"; RC=$?
 ck "a budget hand-off names a PLAIN re-run (not --watch) and its closing line keeps --repo" \
    $([ "$RC" = 13 ] && grep -q -- '--repo o/r' "$EXEC_BODY" && grep -q 'NOT --watch' "$EXEC_BODY" \
@@ -630,7 +646,7 @@ ck "a budget hand-off names a PLAIN re-run (not --watch) and its closing line ke
 new_o "$T/pr9b.tsv"
 printf '3\n' > "$OT/state/lanemerge-64.round"
 CAP_LOG="$T/gh-cap.log"; : > "$CAP_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$CAP_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$CAP_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 64 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv" 2>&1)"; RC=$?
 ck "the cap hand-off renders the GRANTED count in its own body (no 'Rounds spent: 4/3')" \
    $([ "$RC" = 13 ] && grep -q 'Rounds spent: 3/3' "$CAP_LOG" && ! grep -q '4/3' "$CAP_LOG" && echo 0 || echo 1)
@@ -646,7 +662,7 @@ for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS WAITING_CHAIN_RUNNING; do
   printf '%s\n' "15" > "$OT/state/lanemerge-65.watch"
   printf '%s\n' "$_arm" > "$OT/state/lanemerge-65.lastdisp"
   ARM_LOG="$T/gh-arm-$_arm.log"; : > "$ARM_LOG"
-  OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+  OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
         bash "$SCRIPT" 65 --watch --repo o/r --pr-tsv "$T/pr-open17.tsv" 2>&1)"; RC=$?
   case "$_arm" in
     WAITING_CHAIN_ABSENT)   _want='NO chain recorded' ;;
@@ -705,7 +721,7 @@ new_o "$T/junk-q27.tsv"
 printf 'open||abc127|clean\n' > "$T/pr-open27.tsv"
 printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-ok27.tsv"
 OVR_LOG="$T/gh-override.log"; : > "$OVR_LOG"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$OVR_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$OVR_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 75 --repo o/r --branch HEAD --pr-tsv "$T/pr-open27.tsv" --checks-tsv "$T/checks-ok27.tsv" 2>&1)"; RC=$?
 ck "--branch HEAD is REFUSED like no branch at all (exit 2, no launch, and it does not pass HEAD on)" \
    $([ "$RC" = 2 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-75.verdict" 2>/dev/null)" = WAITING_NO_BRANCH ] \
@@ -723,10 +739,32 @@ OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
 ck "with no branch to give it, the script REFUSES to launch a chain (exit 2, and it says how to fix it)" \
    $([ "$RC" = 2 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-74.verdict" 2>/dev/null)" = WAITING_NO_BRANCH ] \
       && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -qi 'pass --branch' <<<"$OUT" && echo 0 || echo 1)
-# …and a real checkout yields its actual branch name in the command (the other half)
-RBR="$(git -C "$RB_REPO" branch --show-current 2>/dev/null)"
-ck "…and a real checkout yields its actual branch name in the command" \
-   $([ -n "$RBR" ] && grep -q "\"$RBR\"" "$T/gh.log" && echo 0 || echo 1)
+# …and a real checkout yields its actual branch name in the command (the other half).
+# ⛔ FROM ITS OWN FIXTURE, NEVER THE AMBIENT CHECKOUT (landing-review P1, MEASURED IN CI). This read
+# `$RB_REPO` — the repo the suite happens to be running in — and `ci.yml`'s `bash-suites` checks out
+# `refs/remotes/pull/<n>/merge` in DETACHED HEAD, where `git branch --show-current` prints nothing. The
+# leg therefore FAILED ON EVERY PR (and passed only on a developer's branch checkout), taking the whole
+# shard — and both CI lanes — red for a suite that is otherwise hermetic. The file's own header already
+# promises "throwaway $O/HOME, stub gh, stub chain"; this is the same pattern the cases below use.
+RBR_REPO="$T/branch-repo"
+rm -rf "$RBR_REPO"; mkdir -p "$RBR_REPO"
+git -C "$RBR_REPO" init -q
+: > "$RBR_REPO/README"
+git -C "$RBR_REPO" add README
+git -C "$RBR_REPO" -c user.email=t@t -c user.name=t commit -qm fixture
+git -C "$RBR_REPO" checkout -q -b feat/fixture-branch
+new_o "$T/junk-q28.tsv"
+: > "$T/gh-branch.log"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh-branch.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      REPO_PATH="$RBR_REPO" \
+      bash "$SCRIPT" 76 --repo o/r --pr-tsv "$T/pr-open27.tsv" --checks-tsv "$T/checks-ok27.tsv" 2>&1)"; RC=$?
+RBR="$(git -C "$RBR_REPO" branch --show-current 2>/dev/null)"
+# ⛔ ASSERT THE CHAIN'S OWN ARGV, NOT THE ACCUMULATING gh LOG. The old form grepped `$T/gh.log` for the
+# branch, which that case never writes — it passed only because an EARLIER case's comment happened to
+# contain the ambient checkout's branch name (a vacuous pass on top of the CI red).
+LM_ARGV="$(tail -n 1 "$T/chain-argv.txt" 2>/dev/null)"
+ck "…and a real checkout yields its actual branch name in the CHAIN's argv (fixture repo, so a DETACHED CI checkout cannot redden it)" \
+   $([ "$RBR" = feat/fixture-branch ] && grep -q "feat/fixture-branch" <<<"$LM_ARGV" && echo 0 || echo 1)
 # A REAL 40-char head: the record store keys on full commit shas, and a 6-char fixture would make
 # the match test vacuous (it would "pass" by never matching anything).
 HSHA=0123456789abcdef0123456789abcdef01234567
@@ -736,7 +774,7 @@ printf '{"head_sha":"%s"}\n' "$HSHA" > "$T/home/.pi/agent/reviews/o-r-32.json"
 new_o "$T/pr40.tsv"
 printf '%s deadbeef %s\n' 999996 "$OT/logs/lane-merge-32.log" > "$OT/state/lanemerge-32.chain"
 printf 'nothing useful\n' > "$OT/logs/lane-merge-32.log"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 bash "$SCRIPT" 32 --watch --repo o/r --pr-tsv "$T/pr40.tsv" 2>&1)"; RC=$?
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 bash "$SCRIPT" 32 --watch --repo o/r --pr-tsv "$T/pr40.tsv" 2>&1)"; RC=$?
 ck "…and a signed review record AT the head changes the outcome to the generic BLOCK (14), not the attestation block (12)" \
    $([ "$RC" = 14 ] && [ "$(verdict_of 32 | cut -d' ' -f1)" = BLOCKED ] && echo 0 || echo 1)
 
@@ -758,7 +796,9 @@ git -C "$LMFR" worktree add -q "$LMWT" -b feat/99-tm
 printf '#!/usr/bin/env bash\n# THE LANE EDIT — a tampered rail that must never be executed\n' > "$LMWT/scripts/admin-merge.sh"
 new_o "$T/junk-q6.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open6.tsv"
-OUT="$(cd "$LMWT" && PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" T="$T" \
+# The LANE's checkout is $LMWT (a real worktree on its own branch, with a TAMPERED admin-merge.sh);
+# REPO_PATH names it explicitly so the fixture drives the real scenario rather than the shared fixture.
+OUT="$(cd "$LMWT" && REPO_PATH="$LMWT" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" T="$T" \
       LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open6.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
 sleep 1   # the chain is DETACHED; give the stub its write
@@ -806,7 +846,7 @@ run '12;rm -rf /' --repo o/r --pr-tsv "$T/pr4.tsv"
 # single remaining argument fails silently and the parser re-enters the same arm forever, so a lane
 # looked wedged for its whole wall clock and no bound in this file could act.
 for _fl in --issue --repo --branch --rounds --checks-tsv --pr-tsv; do
-  _O="$(cd "$OT" && PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+  _O="$(cd "$OT" && REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
         timeout 10 bash "$SCRIPT" 30 "$_fl" 2>&1)"; _RC=$?
   ck "a value-less trailing '$_fl' is REFUSED with exit 2 (got rc=$_RC)" \
      $([ "$_RC" = 2 ] && grep -q "needs a value" <<<"$_O" && echo 0 || echo 1)
@@ -823,7 +863,7 @@ ck "an unreadable PR (no fixture, stub gh answers empty) → exit 2 and it says 
 new_o "$T/pr14.tsv"
 printf '20\n' > "$OT/state/lanemerge-22.watch"
 : > "$T/gh.log"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=20 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=20 \
       bash "$SCRIPT" 22 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "watch budget spent → exit 13 BLOCKED_ATTEMPTS + a handoff comment (supervision cannot loop forever)" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 22 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q "issues/22/comments" "$T/gh.log" && echo 0 || echo 1)
@@ -840,7 +880,7 @@ printf '20\n' > "$OT/state/lanemerge-77.watch"
 printf '999999 head999 %s\n' "$OT/logs/lane-merge-77.log" > "$OT/state/lanemerge-77.chain"
 printf 'head999\n' > "$OT/state/lanemerge-77.head"
 : > "$T/gh.log"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=20 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=20 \
       bash "$SCRIPT" 77 --watch --repo o/r --pr-tsv "$T/pr-merged.tsv" 2>&1)"; RC=$?
 ck "a MERGED PR at a SPENT budget is MERGED (exit 0), not BLOCKED_ATTEMPTS" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 77 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
@@ -851,7 +891,7 @@ ck "…and NO hand-off comment is posted on an already-merged PR" \
 new_o "$T/pr15.tsv"
 sleep 120 & SPID=$!
 printf '%s oldsha %s\n' "$SPID" "$OT/logs/lane-merge-23.log" > "$OT/state/lanemerge-23.chain"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 23 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 disown "$SPID" 2>/dev/null; kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
 ck "a live chain working an OLDER head → exit 11 WAITING_HEAD_MOVED (its verdict cannot be applied to the tip)" \
@@ -871,7 +911,7 @@ ck "a stale lock (dead pid) is cleared and the chain IS launched (a lock's exist
 
 # ── 14. an absurd/impossible cap is coerced, not obeyed (it feeds arithmetic) ───────────────────
 new_o "$T/pr13.tsv"
-OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_MAX_ROUNDS=9223372036854775807 \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_MAX_ROUNDS=9223372036854775807 \
       bash "$SCRIPT" 19 --status 2>&1)"; RC=$?
 ck "an out-of-range LANE_MERGE_MAX_ROUNDS falls back to 3 and says so" \
    $([ "$RC" = 0 ] && grep -q "using 3" <<<"$OUT" && grep -q "/3" <<<"$OUT" && echo 0 || echo 1)
@@ -885,7 +925,7 @@ new_o "$T/pr21.tsv"
 printf 'open||head123|clean\n' > "$T/pr21.tsv"
 printf 'TOTAL\t1\nlonely\tcompleted\tsuccess\t51\tgithub-actions\n' > "$T/checks-total.tsv"
 : > "$T/gh.log"
-OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" CHECKS_STUB="$T/checks-total.tsv" O="$OT" HOME="$T/home" \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" CHECKS_STUB="$T/checks-total.tsv" O="$OT" HOME="$T/home" \
       LANE_MERGE_WAIT=0 LANE_MERGE_INTERVAL=0 bash "$SCRIPT" 30 --repo o/r --pr-tsv "$T/pr21.tsv" 2>&1)"; RC=$?
 ck "the check-run poll sends NO --paginate (so a repeat can answer 304 and cost nothing)" \
    $(grep -q "check-runs" "$T/gh.log" && ! grep -q "paginate" "$T/gh.log" && echo 0 || echo 1)
@@ -932,7 +972,7 @@ ck "a NEW fix round also clears apiretry / headmoved / lastdisp (a stale disposi
 new_o "$T/pr25.tsv"
 sleep 120 & SPID2=$!
 printf '%s %s %s\n' "$SPID2" "head123" "$OT/logs/lane-merge-33.log" > "$OT/state/lanemerge-33.chain"
-OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
       LANE_MERGE_MAX_WATCH=2 LANE_MERGE_POLL=1 bash "$SCRIPT" 33 --watch --repo o/r 2>&1)"; RC=$?
 disown "$SPID2" 2>/dev/null; kill "$SPID2" 2>/dev/null; wait "$SPID2" 2>/dev/null
 # The chunk deadline exits 11 WITHOUT a verdict on purpose (nothing was concluded), so the assertion
@@ -956,7 +996,7 @@ new_o "$T/pr41.tsv"
 printf 'open||head123|clean\n' > "$T/pr41.tsv"
 printf 'allgood\tcompleted\tsuccess\t41\tgithub-actions\n' > "$T/checks-ok.tsv"
 MK_MERGED=1 MERGED_AT_STUB="2026-10-18T00:00:00Z" \
-  PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_WAIT=0 LANE_MERGE_INTERVAL=0 \
+  REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_WAIT=0 LANE_MERGE_INTERVAL=0 \
   bash "$SCRIPT" 41 --issue 941 --repo o/r --pr-tsv "$T/pr41.tsv" --checks-tsv "$T/checks-ok.tsv" >/dev/null 2>&1
 wait_for_file "$OT/state/lanemerge-41.verdict" 8
 ck "a CONFIRMED merge is recorded by the DETACHED wrapper, PR- and issue-keyed (the lane may be gone)" \
@@ -978,13 +1018,13 @@ new_o "$T/pr43.tsv"
 sleep 120 & SPID3=$!
 printf '%s head123 %s\n' "$SPID3" "$OT/logs/lane-merge-43.log" > "$OT/state/lanemerge-43.chain"
 printf 'open||head123|clean\n' > "$T/pq43"
-PATH="$BIN:$PATH" GH_LOG=/dev/null PR_QUEUE="$T/pq43" O="$OT" HOME="$T/home" \
+REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null PR_QUEUE="$T/pq43" O="$OT" HOME="$T/home" \
   LANE_MERGE_MAX_WATCH=3 LANE_MERGE_POLL=0 bash "$SCRIPT" 43 --watch --repo o/r >/dev/null 2>&1
 ck "a good read PERSISTS the head (state/lanemerge-<PR>.head) for a later failing chunk" \
    $([ "$(cat "$OT/state/lanemerge-43.head" 2>/dev/null)" = head123 ] && echo 0 || echo 1)
 printf '3\n' > "$OT/state/lanemerge-43.watch"
 : > "$T/gh2.log"
-PATH="$BIN:$PATH" GH_LOG="$T/gh2.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=3 \
+REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh2.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=3 \
   bash "$SCRIPT" 43 --watch --repo o/r --issue 943 >/dev/null 2>&1
 disown "$SPID3" 2>/dev/null; kill "$SPID3" 2>/dev/null; wait "$SPID3" 2>/dev/null
 marker2="$(sed -n 's/.*lane-merge-handoff: \([^ ]*\) -->.*/\1/p' "$T/gh2.log" 2>/dev/null | tail -1)"
