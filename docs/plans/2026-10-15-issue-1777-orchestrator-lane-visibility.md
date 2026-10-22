@@ -70,7 +70,7 @@ re-derives a verdict.**
 * `__all__` += `"Claim"`, `"ClaimRead"`.
 * New frozen dataclasses `Claim` and `ClaimRead` (immediately before `Evidence`).
 * `Evidence.claim_read: Optional[ClaimRead] = None` (appended, defaulted — both existing construction
-  sites are keyword-only: `liveness.py:985` and `liveness.test.py:100`).
+  sites are keyword-only: the `Evidence(` constructions in `liveness.py` and `liveness.test.py`).
 * **One insertion, inside the existing abstention branch** — the claim refines
   `unknown/no-holder-record`, it does not precede the ladder:
 
@@ -125,7 +125,7 @@ re-derives a verdict.**
   `_lease_of` alone): `owner=<host>:<pid>`, `lease_until=<digits>`, and
   `lease_state ∈ {live, expired, unknown}` where **absent / `0` / non-digit / length > 18 digits ⇒
   `unknown`, and `unknown` is NOT expired** — the fleet's own conservative polarity
-  (`claims.sh:200`, `claims.sh:331`, `orch-loop.sh:273`).
+  (`claims.sh`'s `claim_acquire` and `claim_prune`, `orch-loop.sh`'s `claim_live`).
 * Env seams **reuse the harness names** (`CLAIM_NS`, `CLAIM_REPO`) so a test that isolates the
   namespace isolates the Python reader too. `--repo PATH` / `--remote-url URL` is explicit; the cwd is
   never an implicit target. `GIT_TERMINAL_PROMPT=0`; every `subprocess.run` carries a timeout.
@@ -266,7 +266,7 @@ mints a claim with an arbitrary owner/lease; the snapshot is a file; the hostnam
 | B8 stale local refs | a local `refs/claims/*` disjoint from origin | local refs never consulted | L12 |
 | B9 precedence ambiguity | 2+ claims for one PR (live+expired, local+foreign) | the declared cascade: exactly one, deterministic reason | L15 |
 | **B10 ref-order binding** (added by the VERIFY gate, **extended at cycle 2**) | a `--sha`-only read with a lower-sorting decoy claim in the namespace (`refs/claims/0-…`); a short `--sha` whose whole value equals another PR's `sha12`; two PRs carrying the **same** head `sha12` | the PR is bound from the **match**, never from `git ls-remote`'s order (which is lexicographic and attacker-influencable); a live holder must not be reported as absent; a short sha is a **prefix union** (a decoy cannot consume it); a multi-PR head returns **every** match and declares the ambiguity rather than indexing one by order; the sha is compared case-insensitively; the sibling disclosure must never name another PR's heads | L16, L17, L18 (+4 mutations) |
-| **B11 two key shapes in one namespace** (added by the #1784 review) | `refs/claims/issue-<N>` — the ISSUE key `claim_issue_key` mints into the SAME namespace — plus any other un-minted shape | the key shape is MATCHED (`parse_key`), never split on the first `-`: an issue key is reported (presence) but never matched by `--sha` (the CLI stays 3, not 0), never returned for `--pr`, never a sibling; `--json` publishes `kind`/`issue` with empty `pr`/`sha12` instead of an invented pair; the excluded keys are named in `detail` | L25 (+3 mutations) |
+| **B11 three key shapes in one namespace** (added by the #1784 review) | `refs/claims/issue-<N>` (`claim_issue_key`, the ISSUE key) and `refs/claims/pr-<N>` (`claim_pr_key`, the LANDING key, #1952) — both minted into the SAME namespace — plus any key of no known shape | the key shape is MATCHED (`parse_key`), never split on the first `-`: an issue key is reported (presence) but never matched by `--sha` (the CLI stays 3, not 0), never returned for `--pr`, never a sibling; `--json` publishes `kind`/`issue` with empty `pr`/`sha12` instead of an invented pair; the excluded keys are named in `detail` | L25 (+3 mutations) |
 
 **Out of scope (declared):** whether the *remote* registry is honest (a box lying about its own lease is
 #1709's duplicate-execution matter); session-lane verdicts (T1–T24, unchanged); git transport integrity
@@ -320,11 +320,11 @@ mutation-proven test (30 mutations, all RED-required) plus green suites. Any thi
 Two findings, both accuracy defects rather than fail-open paths, both fixed here:
 
 * **P3 — the key grammar was incomplete.** `claims.sh` puts ISSUE claims in the same namespace
-  (`claim_issue_key` → `refs/claims/issue-<N>`, :219), and `_row` split every ref on the first `-`,
+  (`claim_issue_key` → `refs/claims/issue-<N>`), and `_row` split every ref on the first `-`,
   so `issue-1850` became `pr="issue", sha12="1850"`. Consequences: a short `--sha 1850` (or `18`)
   prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the queried head" — for a head
   nobody holds; and `--json` published `pr`/`sha12` values that are neither. **Fixed** by matching the
-  two shapes explicitly (`parse_key` → `head` | `issue` | `foreign`), excluding non-head keys from the
+  three shapes explicitly (`parse_key` → `head` | `issue` | `foreign`), excluding non-head keys from the
   head match and the sibling disclosure while still REPORTING them, and naming the exclusion in
   `detail`; `Claim.kind`/`Claim.issue` carry the shape to the renderers. Declared as **B11**, pinned by
   **L25** + 3 mutations, and the grammar statement is corrected in all three homes (module docstring,
