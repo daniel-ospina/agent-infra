@@ -323,13 +323,17 @@ run low api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(j) a WRITE in the band is SENT (the reserve is spent by writes)" \
    $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
 
-echo "── (g2) the projections REAL in-tree callers use are admitted (the gate is not an over-block) ──"
+echo "── (g2) the projections REAL in-tree callers use ──────────────────────────────────────────────"
 # Pinned by READING the call sites, so a future tightening of PULL_NAMES cannot silently disable the
-# failover for the rail and the review recorder:
-#   record-review.sh:1117  [.base.sha,.head.sha,.base.ref]|@tsv
-#   record-review.sh:2143  [(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv
-#   admin-merge.sh:2085    "\(.mergeable)" + "\t" + (.merge_commit_sha // "")
-#   admin-merge.sh:7459    .merge_commit_sha // ""
+# failover for the review recorder, and a future loosening cannot serve a WRONG field to the rail:
+#   record-review.sh:1117  [.base.sha,.head.sha,.base.ref]|@tsv              -> served
+#   record-review.sh:2143  [(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv -> served
+#   admin-merge.sh:2085    "\(.mergeable)" + "\t" + (.merge_commit_sha // "")  -> REFUSED
+#   admin-merge.sh:7459    .merge_commit_sha // ""                          -> REFUSED
+# ⛔ The rail's two are refused ON PURPOSE. REST's `merge_commit_sha` for an UNMERGED PR is the
+# tentative test-merge commit and GraphQL's `mergeCommit` is null there, so reproducing the name from
+# that field would report the merge ref as ABSENT for every open PR and the rail would BLOCK with
+# “no CI run has evaluated the merge of this PR into its base” — a fabricated CI diagnosis.
 reset_env g2 core0
 budget core0
 run core0 api repos/o/r/pulls/7 --jq '[.base.sha,.head.sha,.base.ref]|@tsv'
@@ -338,7 +342,84 @@ run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_file
 ck "(g2) record-review.sh:2143 projection (with a jq FUNCTION) is served" \
    $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q '3' && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'
-ck "(g2) admin-merge.sh:2085 projection is served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'true' && echo 0 || echo 1)
+ck "(g2) the rail's merge-ref read is REFUSED (no faithful GraphQL source) rather than answered null" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '.merge_commit_sha // ""'
+ck "(g2) … and so is the bare .merge_commit_sha projection" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
+
+echo "── (g3) the projection gate cannot be escaped by a clever jq ────────────────────────────────"
+# Round-2 finding: the first scan only saw `.name`, so all of these returned null/subsets with rc 0.
+reset_env g3 core0
+budget core0
+i=0
+for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewers"])' 'keys' 'to_entries' '..|.body'; do
+  i=$((i + 1))
+  run core0 api repos/o/r/pulls/7 --jq "$prog"
+  ck "(g3) escaped projection #$i is REFUSED: $prog" \
+     $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+done
+run core0 api repos/o/r/pulls/7 --jq '.["body"]'
+ck "(g3) while an ALLOWED bracketed name is still served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'prbody' && echo 0 || echo 1)
+
+echo "── (h2) a refusal that carried NO reset is still a named state (review finding 4) ────────────"
+# Every GH_LIMIT_NO_WAIT caller skips the probe, so the give-up path can record reset=0. Deriving
+# “healthy” from that made --health say gh-ok exactly while the pool was spent and nothing failed over.
+reset_env h2 core0
+unset GH_LIMIT_NO_WAIT
+export GH_LIMIT_NO_WAIT=1
+run core0 api repos/o/r/pulls/7
+ck "(h2) the headerless refusal is REFUSED by name" \
+   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+health core0
+ck "(h2) --health does NOT report gh-ok for an undated refusal" \
+   $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=' && [ "$RC" -eq 3 ] && echo 0 || echo 1)
+reset_env h2b core0
+budget core0
+: > "$STUB_LOG"
+run core0 api repos/o/r/pulls/7 --jq .head.sha
+ck "(h2) … and a later read still fails over from it" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (j2) the low-water band + a GraphQL failure must NOT fake exhaustion ──────────────────────"
+# Round-2 finding: the failover-FAILURE branch wrote `gh-core-exhausted remaining=0` in the band, so
+# every WRITE on the box was then refused without spending a request while 50 calls remained.
+reset_env j2 low
+budget low
+run low api repos/o/r/pulls/7 --jq .head.sha >/dev/null 2>&1 || true
+health low
+ck "(j2) a read in the band never writes an exhaustion record" \
+   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+unset GH_TEST_SCENARIO
+reset_env j3 low
+budget low
+run graphqldead api repos/o/r/pulls/7 --jq .head.sha
+ck "(j3) band + GraphQL refused => the failure names GRAPHQL, not an empty core pool" \
+   $(printf '%s' "$ERR" | grep -q 'gh-graphql-unavailable' && echo 0 || echo 1)
+health low
+ck "(j3) and it does NOT claim the pool is exhausted" \
+   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+: > "$STUB_LOG"
+run low api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
+ck "(j3) so a WRITE in the band is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (h3) UNDATED evidence DIVERTS a read but must never REFUSE one ────────────────────────────"
+# A refusal that carried no reset cannot say when the window ends. Letting it refuse pre-emptively
+# parks the box for the whole fallback window with no way back: no core call is attempted, so
+# `record_core_ok` never fires and the record cannot clear itself. Attempting the read IS the cure —
+# one request re-records the truth, and a success clears the state.
+reset_env h3 core0
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run core0 api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(h3) a read with NO equivalent is still ATTEMPTED (1 request), not refused pre-emptively" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(h3) … and its success CLEARS the undated record (the box can recover itself)" \
+   $([ ! -f "$GH_LIMIT_DIR/health" ] && echo 0 || echo 1)
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run core0 api repos/o/r/pulls/7 --jq .head.sha
+ck "(h3) while a read WITH an equivalent is still DIVERTED to GraphQL" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && [ "$(reqs 'pulls/7')" -eq 0 ] && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
