@@ -123,7 +123,11 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
 if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
+# The controller is a shell, but every child it spawns INHERITS its environment, so this export used to
+# be the fleet-wide permanent bypass even on carriers that also set it themselves.
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/gate-policy.sh" 2>/dev/null || { echo "orch-loop: FATAL: gate-policy.sh missing — refusing to run a controller that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy orch-loop
 
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
