@@ -355,15 +355,42 @@ esac
 # held. Measured 2026-10-21: 2,543 shim processes, load 12.8, every gh call on the box dead
 # for ~10 hours. Bound it in time (a hang is not a status) and require the FALL-THROUGH: the
 # call must reach the real gh, so refusing the bad value is not enough by itself.
-out="$( cd "$TMP" && env AGENT_GH_REAL="$TMP/neutral/gh" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
-  bash "$TMP/neutral/gh" pr view 1 2>&1 &
-  p=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
-  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+#
+# ⛔ THE TIME BOUND NEEDS A FILE, NOT A CAPTURE PIPE (review of #2295). `out="$( … & …)"`
+# cannot deliver a verdict on the regression this case exists to catch: the recursion's
+# descendants INHERIT the substitution's write end, so after `kill -9 $p` the substitution
+# still waits for an EOF that never comes — the case hangs the suite instead of reporting,
+# and the in-test bound fires too late to be read (measured: rc=137 from an outer timeout,
+# no case output at all). A regular file has no EOF to wait for, so the sentinel is delivered.
+: > "$TMP/a2.out"
+( cd "$TMP" && env AGENT_GH_REAL="$TMP/neutral/gh" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a2.out" 2>&1 &
+p=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG' >>"$TMP/a2.out"; fi
+out="$(cat "$TMP/a2.out")"
 case "$out" in
   *HUNG*) fail "AGENT_GH_REAL=<this shim> re-exec'd ITSELF — a self-recursion ladder, every gh call hangs" ;;
   *REALGH-CALLED*) pass "AGENT_GH_REAL=<this shim> is refused and resolution FALLS THROUGH to the real gh" ;;
   *) fail "AGENT_GH_REAL=<this shim> did not reach the real gh: $out" ;;
+esac
+
+# (a3) `-x` IS TRUE FOR A SEARCHABLE DIRECTORY (review of #2295). The env seam accepted the
+# inherited value on `-x` alone while the PATH walk has always carried `-f`, so the two halves
+# of one decision disagreed: a directory-valued AGENT_GH_REAL was "resolved" and exec'd,
+# giving rc 126 "Is a directory" on EVERY gh call. Same file-redirect reasoning as (a2).
+mkdir -p "$TMP/ghdir"
+: > "$TMP/a3.out"
+( cd "$TMP" && env AGENT_GH_REAL="$TMP/ghdir" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a3.out" 2>&1 &
+p=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG' >>"$TMP/a3.out"; fi
+out="$(cat "$TMP/a3.out")"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<a directory> left the shim spinning/hung" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<a directory> is refused (never exec'd) and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<a directory> did not reach the real gh: $out" ;;
 esac
 
 # (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token

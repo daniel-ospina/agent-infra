@@ -198,7 +198,12 @@ VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
 # that is this script, and resolution falls through to the PATH walk. Fail-closed in the
 # same direction the skip already is: it can only send the call to a real gh.
 find_real_gh() {
-  if [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] \
+  # ⛔ `-f` TOO. `-x` is true for a SEARCHABLE DIRECTORY, so a directory-valued
+  # AGENT_GH_REAL was accepted here and `exec`'d as the real gh — rc 126 "Is a directory"
+  # on EVERY call. The PATH walk below has always carried `-f`; the env seam did not, so
+  # the two halves of one decision disagreed (review of #2295, sibling fix in
+  # scripts/orchestrator-harness/gh-rest/gh).
+  if [ -n "${AGENT_GH_REAL:-}" ] && [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
      && ! [ "${AGENT_GH_REAL}" -ef "$SELF_DIR/$(basename "$self")" ]; then
     printf '%s' "$AGENT_GH_REAL"; return 0
   fi
@@ -240,6 +245,14 @@ REAL="$(find_real_gh)" || {
 # caller of this seam, would reach the same recursion. One check here makes the class
 # unreachable rather than merely unlikely, and it costs one `-ef`. A refusal is loud: silently
 # re-entering is the failure that took the box's gh out for ten hours without a single error.
+# …and a value that is not a REGULAR FILE is refused here too, for the same reason: `-x`
+# is true for a directory, and exec-ing one turns every gh call into rc 126. Cheap, loud, and
+# in the same fail-closed direction as the self-recursion refusal below.
+if ! [ -f "$REAL" ]; then
+  printf 'gh-shim: REFUSING to exec %s — not a regular file (`-x` is true for a directory, and exec-ing one fails rc 126 on every call)\n' "$REAL" >&2
+  printf 'gh-shim: unset AGENT_GH_REAL, or point it at the genuine gh binary (e.g. /usr/bin/gh)\n' >&2
+  exit 127
+fi
 if [ "$REAL" -ef "$SELF_DIR/$(basename "$self")" ]; then
   printf 'gh-shim: REFUSING to exec the shim as the real gh (%s) — that is a self-recursion, not a real gh\n' "$REAL" >&2
   printf 'gh-shim: unset AGENT_GH_REAL, or point it at the genuine gh binary (e.g. /usr/bin/gh)\n' >&2
