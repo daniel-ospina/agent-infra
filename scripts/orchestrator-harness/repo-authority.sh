@@ -147,7 +147,7 @@ _override_usable() {
 # named it). The age bound is the layer's own `HEALTH_UNKNOWN_WINDOW` (900 s) for that shape, and the
 # token says `?` rather than a number nobody measured.
 _gh_named_state() {
-  local dir p line tok reset at now _win _alt
+  local dir p line tok reset at now _win _alt _bp _brem _breset _bat _ttl
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
   p="$dir/health"
   # ⛔ THE LAYER HAS A DEGRADED STATE DIR AND THIS READER DID NOT KNOW ABOUT IT. When the primary dir is
@@ -159,15 +159,60 @@ _gh_named_state() {
   # reader that silently consults a second directory whenever the first has no record would answer from
   # a box-global file an isolated test never wrote).
   if [ ! -f "$p" ] && { [ ! -d "$dir" ] || [ ! -w "$dir" ]; }; then
-    _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}/health"
-    [ -f "$_alt" ] && p="$_alt"
+    _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}"
+    [ -d "$_alt" ] && dir="$_alt" && p="$dir/health"
   fi
+  now="$(date +%s)"
+
+  # ⛔ THE READER MUST CONSULT THE SAME THREE SOURCES, IN THE SAME ORDER, AS `core_pressure()` —
+  # otherwise the rail and `--health` tell two lanes different things about one box (measured, review
+  # round 6: with a FRESH meter reading `core=0` and no refusal yet, `--health` named the state and this
+  # function printed nothing at all; with a fresh meter at 3000 beside an older dated-empty record it
+  # was the other way round). Order: a MEASUREMENT outranks a durable record.
+  #
+  # (1) the shared meter snapshot — `--budget`, free for later readers, TTL `GH_LIMIT_BUDGET_TTL` (30 s)
+  _bp="$dir/budget.json"
+  if [ -f "$_bp" ]; then
+    _bat="$(sed -n 's/^{[[:space:]]*"at"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _brem="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _breset="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"reset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _ttl="${GH_LIMIT_BUDGET_TTL:-30}"
+    case "$_ttl" in ''|*[!0-9]*) _ttl=30 ;; esac
+    [ "$_ttl" -ge 5 ] || _ttl=5
+    [ "$_ttl" -le 600 ] || _ttl=600
+    if [ -n "$_bat" ] && [ -n "$_brem" ] && [ -n "$_breset" ]; then
+      if [ "$(( now - _bat ))" -le "$_ttl" ] && [ "$(( _bat - now ))" -le 60 ]; then
+        if [ "$_brem" -eq 0 ] && [ "$_breset" -gt "$now" ]; then
+          printf 'gh-core-exhausted resets_in=%dm' "$(( (_breset - now + 59) / 60 ))"
+          return 0
+        fi
+        # a FRESH snapshot with headroom (or in the low-water band) outranks every older record
+        return 0
+      fi
+    fi
+  fi
+
+  # (2) the durable `core` refusal record — written by the FIRST refused core call on any lane
+  if [ -f "$dir/last-limit" ]; then
+    if grep -q 'bucket=core' "$dir/last-limit" 2>/dev/null && ! grep -q 'recovered=' "$dir/last-limit" 2>/dev/null; then
+      case "$(sed -n 's/.*[[:space:]]remaining=\([0-9][0-9]*\).*/\1/p' "$dir/last-limit" 2>/dev/null)" in
+        0)
+          reset="$(sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p' "$dir/last-limit" 2>/dev/null)"
+          if [ -n "$reset" ] && [ "$reset" -gt "$now" ]; then
+            printf 'gh-core-exhausted resets_in=%dm' "$(( (reset - now + 59) / 60 ))"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  # (3) the named health record (dated = a measurement, undated = bounded evidence)
   [ -f "$p" ] || return 0
   IFS= read -r line < "$p" 2>/dev/null || return 0
   tok="${line%% *}"
   case "$tok" in gh-*) ;; *) return 0 ;; esac
   reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
-  now="$(date +%s)"
   if [ -n "$reset" ] && [ "$reset" -gt 0 ]; then
     [ "$reset" -gt "$now" ] || return 0
     printf '%s resets_in=%dm' "$tok" "$(( (reset - now + 59) / 60 ))"

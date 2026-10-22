@@ -751,5 +751,57 @@ run reviewsok api repos/o/r/pulls/7/reviews --jq '.[] | .state'
 ck "(m12) … while a COMPLETE connection is still served" \
    $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'APPROVED' && echo 0 || echo 1)
 
+echo "── (m13) ROUND 6: the durable record, the container walk, and a verb nobody listed ─────────────"
+# (m13) `--health` consulted the meter and the health file but NOT `last-limit` — the record every
+# refused core call writes on EVERY attempt, which `core_pressure()` already trusts. So mid-backoff
+# (the health file is written only when the layer gives up) a box refused every WRITE with zero
+# requests and diverted every READ while `--health` printed `gh-ok` rc 0.
+reset_env m13 coreok
+printf 'at=%s bucket=core reset=%s attempts=1 waited=0 status=403 remaining=0\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/last-limit"
+health coreok
+ck "(m13) --health names the durable core refusal (was gh-ok while writes were refused)" \
+   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=[0-9]' && echo 0 || echo 1)
+printf 'at=%s bucket=core reset=%s recovered=%s remaining=0\n' \
+  "$(( $(date +%s) - 5 ))" "$(( $(date +%s) + 700 ))" "$(( $(date +%s) - 1 ))" > "$GH_LIMIT_DIR/last-limit"
+health coreok
+ck "(m13) … while a RECOVERED record is not evidence (gh-ok)" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+# (m14) the allow-list is FLAT (root names), so walking THROUGH a partly-reproduced container reached a
+# root name the container does not carry: `.user.html_url` answered `null` rc 0 where REST returns a URL.
+reset_env m14 core0
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+for prog in '.user.html_url' '.head.user.login' '.base.user.login'; do
+  run core0 api repos/o/r/pulls/7 --jq "$prog"
+  ck "(m14) walking through a container to a name it does NOT carry is REFUSED: $prog" \
+     $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+done
+run core0 api repos/o/r/pulls/7 --jq '.user.login'
+ck "(m14) … while a name the container DOES carry is served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'daniel-ospina' && echo 0 || echo 1)
+
+# (m15) the bucket DEFAULT was `graphql` for any verb the tables had not listed, so an unlisted
+# REST-backed write reached the core pool unguarded and its refusal was filed against a pool that was fine.
+ck "(m15) an UNLISTED verb is bucketed core (the default is not 'graphql')" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['codespace','delete','-c','x'])=='core' and m.bucket_for(['pr','view','7'])=='graphql' else 1)" && echo 0 || echo 1)"
+
+# (m16) `if <path> then <literal> else <literal> end` is a projection and scripts/atomic-land.sh reads
+# exactly that to turn `.merged` into MERGED/OPEN; refusing it made a LANDED PR read as still open for
+# the whole confirmation wait.
+run core0 api repos/o/r/pulls/7 --jq 'if .merged then "MERGED" else "OPEN" end'
+ck "(m16) an if/then/else over a named field is SERVED" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'OPEN' && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq 'if .merge_commit_sha then "M" else "O" end'
+ck "(m16) … and it cannot smuggle an unproducible field in" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+
+# (m17) the connection window must be REST's page, not a wider one: REST's default page is 30, and the
+# GraphQL window is now first:30 with the truncation guard, so the failover cannot answer 31-100 items
+# where the read it replaces returned 30.
+ck "(m17) the comments/reviews queries ask for REST's default page (first:30)" \
+   "$(grep -q 'comments(first:30)' "$HELPER" && grep -q 'reviews(first:30)' "$HELPER" && echo 0 || echo 1)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
