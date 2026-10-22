@@ -1483,8 +1483,28 @@ mkdir -p "$T/o9v5/state"; printf '42\n43\n' > "$T/o9v5/candidates.txt"
 : > "$T/o9v5/candidates.product.txt"; rm -f "$T/o9v5/candidates.harness.txt"
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9v5/state/product-class"
 OUTV7="$(runblock "$T/o9v5")"
-case "$OUTV7" in *"is ABSENT or not a regular file"*) V10=0 ;; *) V10=1 ;; esac
+# (review cycle 54: the arm's sentence now covers an UNREADABLE regular file too — the fifth site of the
+# cycle-53 class, since a mode-000 queue passed `-f` and read as "not a member")
+case "$OUTV7" in *"is ABSENT, not a regular file, or UNREADABLE"*) V10=0 ;; *) V10=1 ;; esac
 ck "P9 [RED→GREEN] a NOT-A-PRODUCT-REPO record with NO harness queue disowns with the state it found (got '${OUTV7:0:180}')" $V10
+# ⛔ AND THE FIFTH SITE: a mode-000 harness queue (review cycle 54, P2). `-f` alone accepted it, `grep` could not
+# open it, and the failure was published as "a candidate … is NOT in candidates.harness.txt" — a membership
+# result the code never measured — over a queue that named EXACTLY the backlog rows.
+mkdir -p "$T/o9za/state"; printf '42\n43\n' > "$T/o9za/candidates.txt"
+: > "$T/o9za/candidates.product.txt"; printf '42\n43\n' > "$T/o9za/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9za/state/product-class"
+chmod 000 "$T/o9za/candidates.harness.txt"
+if [ ! -r "$T/o9za/candidates.harness.txt" ]; then
+  OUTV11="$(runblock "$T/o9za")"
+  case "$OUTV11" in *"UNREADABLE"*) V11=0 ;; *) V11=1 ;; esac
+  ck "P9 [RED→GREEN] a NOT-A-PRODUCT-REPO record with an UNREADABLE harness queue says so (got '${OUTV11:0:200}')" $V11
+  case "$OUTV11" in *"is NOT in"*) V12=1 ;; *) V12=0 ;; esac
+  ck "P9 [RED→GREEN] ... and does not report a membership result it could not measure" $V12
+else
+  ck "P9 (skipped) cannot make the harness queue read-only on this box (running as root?)" 0
+  ck "P9 (skipped) ... and does not report a membership result it could not measure" 0
+fi
+chmod 600 "$T/o9za/candidates.harness.txt" 2>/dev/null || :
 case "$OUTV7" in *"NOT a finding about product work"*) V11=1 ;; *) V11=0 ;; esac
 ck "P9 [RED→GREEN] ... and the masking verdict is not published from a queue that does not exist" $V11
 case "$OUTV7" in *"is NOT in"*) V12=1 ;; *) V12=0 ;; esac
@@ -1897,17 +1917,34 @@ mkdir -p "$T/o9z5/state"; printf '42\n43\n' > "$T/o9z5/candidates.txt"
 # floor is unmet — which is the state whose CAUSE this pins.
 printf '99\n' > "$T/o9z5/candidates.product.txt"; printf '42\n43\n' > "$T/o9z5/candidates.harness.txt"
 printf 'OK product=1 harness=2\n' > "$T/o9z5/state/product-class"
+# ⛔ AND THE CLAUSE MUST CONSULT THE HEAD (review cycle 54, P2). `Y`/`REFUSED` are the LOOP's counters over
+# EVERY candidate it skipped, not product ones, and the first version asserted "although one led the order"
+# without reading `_led`: `o9z5`'s product queue holds `99`, which is NOT in the backlog, so the ledger above
+# prints `floor-order=0 … NO product entry led it` — and the same cycle claimed one DID, attributing a
+# HARNESS candidate's yield to the product share (measured). Each state now has a fixture that can produce it:
+# `o9z5` (no product entry led) must keep the plain cause even with a yield, and `o9z9` (a product entry that
+# led, then skipped) gets the yield clause.
 OUTS5="$( ( Y=1; REFUSED=0; runblock "$T/o9z5" '42\n43\n' 1 2 ) )"
-case "$OUTS5" in *"yielded to peers for capacity"*) S5=0 ;; *) S5=1 ;; esac
-ck "P9 [RED→GREEN] an unmet floor caused by a capacity YIELD names the yield (got '${OUTS5:0:220}')" $S5
-case "$OUTS5" in *"no dispatchable product candidate"*) S6=1 ;; *) S6=0 ;; esac
-ck "P9 [RED→GREEN] ... and does not claim there was none when one led the order" $S6
-OUTS6="$( ( Y=0; REFUSED=2; runblock "$T/o9z5" '42\n43\n' 1 2 ) )"
-case "$OUTS6" in *"refused by the claim registry"*) S7=0 ;; *) S7=1 ;; esac
-ck "P9 [RED→GREEN] an unmet floor caused by CLAIM refusals says so too (got '${OUTS6:0:220}')" $S7
-OUTS7="$(runblock "$T/o9z5" '42\n43\n' 1 2)"
-case "$OUTS7" in *"no dispatchable product candidate"*) S8=0 ;; *) S8=1 ;; esac
-ck "P9 [RED→GREEN] ... and with neither skip counter set it keeps the plain 'no dispatchable candidate' cause" $S8
+case "$OUTS5" in *"no dispatchable product candidate"*) S5=0 ;; *) S5=1 ;; esac
+ck "P9 [RED→GREEN] with NO product entry in the order, a yield keeps the plain cause (got '${OUTS5:0:220}')" $S5
+case "$OUTS5" in *"although"*"led the order"*) S6=1 ;; *) S6=0 ;; esac
+ck "P9 [RED→GREEN] ... and never claims a product entry led it when none did" $S6
+mkdir -p "$T/o9z9/state"; printf '42\n43\n' > "$T/o9z9/candidates.txt"
+printf '42\n' > "$T/o9z9/candidates.product.txt"; printf '42\n43\n' > "$T/o9z9/candidates.harness.txt"
+printf 'OK product=1 harness=2\n' > "$T/o9z9/state/product-class"
+# the head DOES lead the order here (42 is a product entry and is still in the backlog) but the batch holds
+# only 43, so PB=0 — the state the yield/refusal clause exists for.
+OUTS6="$( ( Y=1; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
+case "$OUTS6" in *"1 product entry led the order"*"yielded to peers for capacity"*) S7=0 ;; *) S7=1 ;; esac
+ck "P9 [RED→GREEN] a head that led and was then skipped names the skip and the head (got '${OUTS6:0:260}')" $S7
+case "$OUTS6" in *"none of the skips is known to be a product one"*) S7b=0 ;; *) S7b=1 ;; esac
+ck "P9 [RED→GREEN] ... and does not attribute an unscoped skip count to the product share" $S7b
+OUTS7="$( ( Y=0; REFUSED=2; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
+case "$OUTS7" in *"refused by the claim registry"*) S8=0 ;; *) S8=1 ;; esac
+ck "P9 [RED→GREEN] ... and CLAIM refusals are named too (got '${OUTS7:0:260}')" $S8
+OUTS8="$( ( Y=0; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
+case "$OUTS8" in *"no dispatchable product candidate"*) S8b=0 ;; *) S8b=1 ;; esac
+ck "P9 [RED→GREEN] ... while with no skips at all the plain cause stands" $S8b
 # ⛔ AND THE COUNTERS THE CAUSE READS MUST ACTUALLY BE COUNTED (review cycle 52, measured). The fixture above
 # SUPPLIES `REFUSED`, so deleting the shipped increment left all 297 assertions GREEN — an unpinned production
 # line, and the shape this suite has been burned by before (a fixture supplying the variable the shipped code
@@ -2207,7 +2244,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=305
+MIN_CHECKS=309
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

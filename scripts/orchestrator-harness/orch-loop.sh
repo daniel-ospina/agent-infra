@@ -3049,9 +3049,15 @@ PY
             # registry — in which case the cycle's own log says so two lines above and this one contradicts it.
             # Both counters are the loop's own (`Y`, `REFUSED`); `${…:-0}` is for the reporting block's fixtures,
             # which source this block WITHOUT the loop.
+            # ⛔ AND THE CLAUSE MUST CONSULT THE HEAD AND SAY WHAT IT COUNTED (review cycle 54, P2). `Y` and
+            # `REFUSED` are the LOOP's counters over EVERY candidate it skipped, not product ones — and the first
+            # version asserted "although one led the order" without ever reading `_led`. Measured: a stale product
+            # queue whose rows have left the backlog prints `floor-order=0 … NO product entry led it` and then
+            # claimed one DID, attributing a HARNESS candidate's capacity yield to the product share. The clause
+            # now requires `_led > 0` and names the skips as skips, without claiming they were product ones.
             if [ "$PB" -eq 0 ]; then
-              if [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; then
-                _unmet_why="no product candidate REACHED the batch although one led the order — ${Y:-0} yielded to peers for capacity and ${REFUSED:-0} refused by the claim registry this cycle"
+              if [ "${_led:-0}" -gt 0 ] && { [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; }; then
+                _unmet_why="no product candidate REACHED the batch although $_led product entr$([ "$_led" -eq 1 ] && echo y || echo ies) led the order — ${Y:-0} candidate(s) were skipped this cycle (${Y:-0} yielded to peers for capacity, ${REFUSED:-0} refused by the claim registry: see the lines above), and none of the skips is known to be a product one"
               else
                 _unmet_why="no dispatchable product candidate"
               fi
@@ -3106,7 +3112,11 @@ PY
             # suite green while the masking verdict ("NOT a finding about product work") was published over a
             # record the cycle never checked.
             _napr_ok=1; _napr_missing=0
-            if [ -f "$O/candidates.harness.txt" ]; then
+            # ⛔ THE FIFTH SITE OF THE SAME CLASS (review cycle 54, P2): this membership test kept a bare `-f` while its
+            # siblings ask `-f && -r`, so a mode-000 harness queue passed the guard, `grep` could not open it, and
+            # the failure was published as "a candidate … is NOT in candidates.harness.txt" — a membership result
+            # the code never measured. The `_napr_missing` arm owns the unreadable state, with its own sentence.
+            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               while IFS= read -r _nm; do
                 [ -n "$_nm" ] || continue
                 grep -qx -- "$_nm" "$O/candidates.harness.txt" 2>/dev/null || { _napr_ok=0; break; }
@@ -3144,7 +3154,7 @@ PY
             elif [ "$_napr_stale" = "1" ]; then
               echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY} — and that record's own text says the queues on disk may still hold a previous pass's split, so this cycle cannot claim the files AGREE; this is NOT the N/A verdict and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then
-              echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
+              echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT, not a regular file, or UNREADABLE, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             else
               echo "[dispatch] product-floor unread — the product queue is empty because ${PC_WHY} — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these files; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             fi ;;
