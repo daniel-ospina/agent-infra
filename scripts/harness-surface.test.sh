@@ -142,6 +142,33 @@ case "$OUT" in
   *) ck "(a) RED: the row says WHICH disagreement it is (BEHIND — one restart away) [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
 esac
 
+# ⛔ AND THE MAC'S REAL LAYOUT IS NOT A GIT WORKTREE. `install.sh` deploys a FLAT COPY into `$O` and
+# the plist execs `__O__/orch-loop.sh` (launchd.plist.template:10, install.sh:26), so `git -C` on that
+# dir answers NOTHING — the state that must be CANNOT-VERIFY (BROKEN), never "DIFFERS" (which asserts
+# the code IS different) and never "OK" (which would bless a copy nobody can identify). The arm above
+# uses a worktree and would miss this entirely (found by review).
+printf '4242 bash %s/orchestrator/orch-loop.sh\n' "$CELL" > "$TMP/ps-flat"
+PS_TABLE="$TMP/ps-flat" run_status "$PIN_TREE"
+case "$OUT" in
+  *"exec"*"UNKNOWN (executing $CELL/orchestrator/orch-loop.sh"*"NO git identity"*) ck "(a-mac) a FLAT-copy controller (no .git) is UNKNOWN/cannot-verify, naming the copy" 0 ;;
+  *) ck "(a-mac) a FLAT-copy controller (no .git) is UNKNOWN/cannot-verify, naming the copy [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
+esac
+case "$OUT" in *"exec"*"DIFFERS"*) ck "(a-mac) …and it does NOT claim DIFFERS — an unknown identity is not a verdict" 1 ;; *) ck "(a-mac) …and it does NOT claim DIFFERS — an unknown identity is not a verdict" 0 ;; esac
+ck "(a-mac) …so the screen is BROKEN (rc=$RC), the honest answer for a copy that cannot be identified" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+
+# ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN" (found by review): falling through to the harness dir
+# printed `OK` about a DIFFERENT reference while the pin named a commit nothing could read — a false
+# OK about the wrong tree. Its own verdict has to be UNRESOLVABLE/cannot-verify.
+cp "$CELL/.pi/agent/state/HARNESS-PIN" "$TMP/pin.hold"
+printf '%s\n' "0123456789abcdef0123456789abcdef01234567" > "$CELL/.pi/agent/state/HARNESS-PIN"
+PS_TABLE="$TMP/ps-pinned" run_status "$PIN_TREE"
+case "$OUT" in
+  *"exec"*"UNRESOLVABLE"*) ck "(a) a pin naming a commit this repo does not have is UNRESOLVABLE, not a fall-through" 0 ;;
+  *) ck "(a) a pin naming a commit this repo does not have is UNRESOLVABLE, not a fall-through [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
+esac
+case "$OUT" in *"exec"*"OK (executing"*) ck "(a) …and it never reports OK against a reference the pin did not name" 1 ;; *) ck "(a) …and it never reports OK against a reference the pin did not name" 0 ;; esac
+cp "$TMP/pin.hold" "$CELL/.pi/agent/state/HARNESS-PIN"
+
 # ══ (b) `up` TWICE: ONE CONTROLLER, ONE START, AND THE SECOND RUN SAYS ALREADY UP ═══════════════
 # The fixture is a checkout-shaped copy of the shipped launcher with its SIBLINGS stubbed, because the
 # launcher drives the platform authorities by path — and the authority stub REFUSES a second start the
@@ -229,6 +256,18 @@ run_status_fix() { # uses the caller's PS_TABLE (the fixture launcher)
           bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
   RC=$?
 }
+
+# ⛔ THE MAC'S CONTROLLER RUNS FROM `$O`, NOT FROM `HARNESS` — and `up` deploys to `$O`
+# (install.sh:26). An ALREADY-UP check that accepted only `$HARNESS` reported a healthy Mac's second
+# `up` as a FAILED START, i.e. it re-created the defect this whole arm removes (found by review).
+printf '4242 bash %s/orchestrator/orch-loop.sh\n' "$FIXCELL" > "$TMP/ps-up-o"
+run_up "$TMP/ps-up-o"
+n3="$(grep -c '^start$' "$FIXCELL/fix.log" 2>/dev/null || echo 0)"
+ck "(b-mac) a controller executing the DEPLOYED \$O copy is ALREADY UP (authority starts still $n3)" "$([ "$n3" -eq 1 ] && echo 0 || echo 1)"
+case "$OUT" in
+  *"loop: ALREADY UP"*) ck "(b-mac) …and says so, instead of reporting a healthy Mac as a failed start" 0 ;;
+  *) ck "(b-mac) …and says so, instead of reporting a healthy Mac as a failed start [$(printf '%s' "$OUT" | grep -E 'loop:|FAILED' | cut -c1-200)]" 1 ;;
+esac
 
 # ══ (c) CAPACITY: MEASURED, NEVER A FIXED CAP — AND THE PROBE IS capacity.sh's ═════════════════
 # ncpu=4 -> ceiling 8.00 load/cpu = 32.00 load units; 4.00 load units per lane; load 4.00 ->

@@ -10,9 +10,10 @@
 #
 #   Flags: --harness <dir> --repo <path> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
 #          --no-fetch --skip-selftest --timeout <secs> --plain
-#   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (10), HU_LOAD_PER_LANE (400 → 4.00
-#   load units), HU_DISK_PER_LANE_MB (3000), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED
-#   AND IGNORED as a ceiling — a fixed cap is not a measurement.
+#   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to
+#   capacity.sh's CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units), HU_DISK_PER_LANE_MB
+#   (1100), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a
+#   fixed cap is not a measurement.
 #
 # Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (start refused / cannot-verify) · 3 REFUSED before start.
 #
@@ -253,8 +254,15 @@ hp_launchd_loaded() {
   # ⛔ A here-string, never `printf … | grep -q`: under `pipefail` the writer takes SIGPIPE on the
   # first match and the PIPELINE's status becomes 141 — the #841 idiom this repo gates on.
   out="$(hu_bounded "${HU_LAUNCHCTL_TIMEOUT:-10}" launchctl print "gui/$(id -u)/$label" 2>&1)"; rc=$?
-  [ "$rc" -eq 142 ] && return 142
-  [ "$rc" -eq 0 ] || return 2
+  # ⛔ 142 (the bound fired), 125 (NO USABLE BOUND — perl absent) and 127 (not run) are all
+  # CANNOT-VERIFY, never "the job is not loaded": folding them into 2 prints a definite state with a
+  # wrong remedy ("run install.sh --start") about a question that was never answered.
+  case "$rc" in
+    0) : ;;
+    142) return 142 ;;
+    125|127) return 3 ;;
+    *) return 2 ;;
+  esac
   grep -q '^[[:space:]]*state = running' <<<"$out" && return 0
   grep -Eq '^[[:space:]]*pid = [0-9]+' <<<"$out" && return 0
   return 1
@@ -768,12 +776,30 @@ hu_row_exec() {
   # The reference. ⛔ The PIN first: it is what "which harness is this box on" means. With no pin (a box
   # that has never been installed) the dir this run resolved IS the reference, and SAYING SO is part of
   # the row — an unnamed reference would let a wrong comparison read as a right one.
+  # ⛔ THE PIN'S STATE COMES FROM THE STATE HELPER, never `-r` (measured in review): `-r` is false both
+  # for an ABSENT record and for a mode-000 one / one behind an unsearchable ancestor, so a pin that
+  # could not be READ was silently treated as "no pin" and the comparison fell through to a weaker
+  # reference — the fail-open `hu_verify_pin` exists against. Only ABSENT may fall through.
   ref=""
-  if [ -n "$PIN_SHA_FILE" ] && [ -r "$PIN_SHA_FILE" ]; then
-    ref="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
-    if [ -n "$ref" ]; then ref="$(git -C "$REPO" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)" || ref=""; fi
-    [ -n "$ref" ] && name="the pin ($PIN_SHA_FILE)"
-  fi
+  case "$(hu_path_state "$PIN_SHA_FILE")" in
+    unexaminable)
+      hu_row exec "$pid" - "UNKNOWN (the pin record $PIN_SHA_FILE cannot be examined, so there is no reference to compare $path against)"
+      return 2 ;;
+    path)
+      if [ ! -r "$PIN_SHA_FILE" ]; then
+        hu_row exec "$pid" - "UNKNOWN (the pin record $PIN_SHA_FILE exists but cannot be read, so there is no reference to compare $path against)"
+        return 2
+      fi
+      pinraw="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$pinraw" ]; then
+        ref="$(git -C "$REPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
+        # ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN", AND NOT A LICENCE TO FALL THROUGH: falling
+        # through printed `OK` about the harness dir while the pin named a commit nothing could read
+        # (measured in review). Naming it is the only honest answer.
+        [ -n "$ref" ] || { hu_row exec "$pid" - "UNRESOLVABLE (the pin record $PIN_SHA_FILE names ${pinraw:0:12}, which is not a commit in $REPO, so $path cannot be compared with it)"; return 2; }
+        name="the pin ($PIN_SHA_FILE)"
+      fi ;;
+  esac
   if [ -z "$ref" ]; then
     ref="$(git -C "$HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || ref=""
     [ -n "$ref" ] && name="the harness dir this box resolved ($HARNESS_SRC)"
@@ -783,9 +809,23 @@ hu_row_exec() {
     return 2
   fi
   if [ -z "$head" ]; then
-    hu_row exec "$pid" - "DIFFERS (executing $path, which carries NO git identity; the reference — $name — names ${ref:0:12}, and a copy cannot be proven to be it)"
-    return 1
+    # ⛔ AN UNKNOWN IDENTITY IS CANNOT-VERIFY, NOT A VERDICT (check-deployed-drift.sh:20 — an absent or
+    # unknown identity is UNKNOWN, and cannot-verify is never a pass). This is the Mac's flat-copy
+    # layout ($O/orch-loop.sh, no .git), and reporting it as DIFFERS/DEGRADED asserted a fact (that the
+    # code IS different) nobody had established — while a healthy Mac would then read DEGRADED forever.
+    # The box's own stamp names that directory, so it is NAMED as a record — explicitly not as proof of
+    # what the process runs.
+    st=""
+    if [ -f "$O/.agent-infra-stamp.json" ]; then
+      st="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+    fi
+    case "$st" in ''|UNKNOWN) st="" ;; esac
+    stnote=""
+    [ -n "$st" ] && stnote="; the box's record for $O names ${st:0:12}, which describes a COPY of that directory and not this process"
+    hu_row exec "$pid" - "UNKNOWN (executing $path, which carries NO git identity, so it cannot be proven to be — or not to be — the reference ${ref:0:12} from $name${stnote}. This is the flat-copy layout a Mac has before install.sh writes the pin records)"
+    return 2
   fi
+
   if [ "$head" = "$ref" ]; then
     hu_row exec "$pid" - "OK (executing $path @ ${head:0:12} — the reference: $name)"; return 0
   fi
@@ -1096,7 +1136,12 @@ hu_start_loop() {
     if [ "$n" -eq 1 ]; then
       pid="$live"
       path="$(hu_exec_path_of "$pid" 2>/dev/null)" || path=""
-      if [ -n "$path" ] && [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$HARNESS")" ]; then
+      # ⛔ TWO LOCATIONS ARE "THIS RUN'S TREE", and the second is the Mac's: `install.sh` deploys the
+      # flat copy into `$O` and the plist execs `__O__/orch-loop.sh` (launchd.plist.template:10,
+      # install.sh:26), so on a Mac `HARNESS` (a checkout) and `$O` (the deployed copy) are DIFFERENT
+      # paths for the SAME deployment. Comparing against `$HARNESS` alone reported a healthy Mac's
+      # second `up` as a failed start — the exact defect this arm removes (measured in review).
+      if [ -n "$path" ] && { [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$HARNESS")" ] || [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$O")" ]; }; then
         say "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
         return 0
       fi
