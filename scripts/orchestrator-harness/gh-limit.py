@@ -2530,6 +2530,31 @@ def health_reset():
     return health_state()[0]
 
 
+def _record_is_unreadable():
+    """True when the health file EXISTS with content but yields no state at all.
+
+    ⛔ THE DIFFERENCE BETWEEN “NO RECORD” AND “A RECORD I COULD NOT READ” IS THE DIFFERENCE BETWEEN A
+    HEALTHY POOL AND A BROKEN INSTRUMENT, and `--health` used to print `gh-ok` for both. An absent record
+    is genuinely `gh-ok`; a SPENT dated window is `gh-ok` too (it is an answer). An unparseable one is
+    neither — it is the one verb an operator trusts at the moment nothing else works, answering from a
+    file it could not parse."""
+    try:
+        with open(os.path.join(state_dir(), HEALTH_FILE)) as fh:
+            text = fh.read().strip()
+    except OSError:
+        return False               # no record is not an unreadable record
+    if not text:
+        return False               # an empty file is an absent record
+    parts = dict(kv.split("=", 1) for kv in text.split() if "=" in kv)
+    if parts.get("bucket") != "core":
+        return True                # a record about something else, or a truncated one
+    reset = as_int(parts.get("reset"))
+    at = as_int(parts.get("at"))
+    if reset is not None and reset > 0:
+        return False               # dated (current or spent) — health_state() has the verdict
+    return not (at and at > 0)     # undated and not even datable
+
+
 def core_pressure():
     """(reset, remaining, dated) when the CORE pool is known to be low/empty, else None.
 
@@ -2555,13 +2580,17 @@ def core_pressure():
         return reset, 0, True           # the refused call OBSERVED zero — that IS a measurement
     reset, dated = health_state()
     if reset:
-        # ⛔ `remaining` IS NOT OBSERVED ON THIS PATH, AND 0 IS A NUMBER WE DID NOT MEASURE. The record
-        # behind it may say `remaining=?` (an undated refusal), and returning 0 here did two wrong
-        # things at once: it DECLARED the pool empty on no evidence — refusing writes — and it rewrote
-        # the durable record's `remaining=?` to `remaining=0`, an observation nobody made, in the file
-        # an operator reads. `None` means “unknown”: reads still DIVERT (the safe direction, since a
-        # GraphQL answer is a real answer), nothing is asserted exhausted, and a write is SENT.
-        return reset, None, dated
+        # ⛔ `remaining` IS NOT OBSERVED ON THE UNDATED PATH — and it IS on the dated one. Getting the
+        # two arms backwards broke BOTH directions at once (review round 2, regression of the round-1
+        # fix): hard-coding 0 declared the pool empty on undated evidence (refusing writes), while
+        # hard-coding None removed the ONE durable record that survives a GraphQL refusal overwriting
+        # `last-limit`, so a known-empty DATED pool started SENDING writes into it (measured: 1 request
+        # spent against a record saying `remaining=0 reset=<12m away>`).
+        #   dated   -> the record carries the zero that WAS observed: a measurement, may refuse.
+        #   undated -> `remaining=?`: unknown; reads divert, nothing is asserted, writes are sent.
+        rec = _health_record() or {}
+        rem = as_int(rec.get("remaining"))
+        return reset, (rem if (dated and rem == 0) else None), dated
     return None
 
 
@@ -2637,6 +2666,13 @@ def health_token():
             return "gh-ok", 0
     reset, dated = health_state()
     if reset is None:
+        # ⛔ “I COULD NOT READ THE RECORD” IS NOT “THE POOL IS FINE”. A record that exists but cannot be
+        # parsed (a truncated write, a hand edit, a version skew) used to be served as `gh-ok` rc 0 — an
+        # answer that was never obtained, reported as healthy, from the one verb an operator trusts at
+        # the exact moment nothing else works. A SPENT dated window is different (it is an answer), and
+        # is still `gh-ok`.
+        if _record_is_unreadable():
+            return "gh-health-unknown", 3
         return "gh-ok", 0
     if not dated:
         return "gh-core-exhausted resets_in=?", 3
@@ -2691,7 +2727,11 @@ REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "u
 # jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
 # one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
 PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_unsorted", "tojson",
-                        "paths", "leaf_paths", "map_values", "values", "path", "env", "has")
+                        "paths", "leaf_paths", "map_values", "values", "path", "env", "has",
+                        # the STREAM family and the recursive walkers emit whole subtrees without
+                        # naming a field: `[tostream]` / `[recurse]` both returned the encoder's entire
+                        # subset with rc 0 (review round 2).
+                        "tostream", "truncate_stream", "fromstream", "recurse", "walk")
 PROJECTION_VALUE_FILTERS = ("select", "if", "first", "last", "nth", "until", "while", "recurse", "walk",
                             "input", "inputs")
 def _projection_ok(jq, allowed):
@@ -2765,6 +2805,17 @@ def _projection_ok(jq, allowed):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", q):
             return False               # `."a b"`, an interpolated key — a computed key we cannot attribute
         if q not in allowed or q in FAILOVER_CONTAINERS:
+            return False
+        leaf = True
+    # ⛔ THE FOURTH READING: OBJECT-CONSTRUCTION SHORTHAND. `{name}` IS `{name: .name}` — a key read
+    # with no dot, no bracket and no quote, so none of the scans above see it. `[.state, {labels}]`
+    # answered `["open",{"labels":null}]` rc 0 and `[{merge_commit_sha}, .state]` answered
+    # `[{"merge_commit_sha":null},"open"]` — the fabricated absent merge ref again, one more
+    # spelling along. A shorthand key is held to the same rule as a dotted one: allowed, and not a
+    # container. `{a: .state}` is unaffected (the identifier there is followed by `:`).
+    for m in re.finditer(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?=[,}])", jq):
+        k = m.group(1)
+        if k not in allowed or k in FAILOVER_CONTAINERS:
             return False
         leaf = True
     # dotted paths: every segment allowed, the LAST one not a container

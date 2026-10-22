@@ -422,15 +422,22 @@ spent and nothing failed over (test `(h2)`).
 
 ⛔ **A GAIN, NOT A LAUNDER.** Servings are recorded in `events.log` as
 `failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving \`gh api …\` from the GraphQL pool`.
-A **live** line from the incident itself, in this repo's own checkout:
+A **live** line, produced by this head against the real API (2026-10-22 17:24Z, `GH_LIMIT_CORE_LOW_WATER=4900`
+to enter the band, PR agent-infra#1818):
 
 ```
-1792678353 failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving
-             `gh api repos/daniel-ospina/tortoise/pulls/9134` from the GraphQL pool
+1792689889 failover: core remaining=4490 reset=1792692989 — serving
+             `gh api repos/daniel-ospina/agent-infra/pulls/1818` from the GraphQL pool
+1792689890 failover: served `gh api repos/daniel-ospina/agent-infra/pulls/1818` from GraphQL (core still exhausted)
+$ … --jq '{state,head:.head.sha,mergeable}'
+{"head":"69010c198098fe536b036c40c050a40cda0befcb","mergeable":null,"state":"closed"}   rc=0
 ```
 
-Plain `gh api repos/…/pulls/9134 --jq .head.sha` at the same moment: `HTTP 403 API rate limit
-exceeded`, rc 1. Through the layer: `8600acf1beefb80389e81541e463575388bccf6b`, rc 0.
+⛔ **THESE ARE THE ONLY TWO SHAPES THE LAYER WRITES**, and a quote that mixes them is a quote of a line
+this code cannot produce (found in review: an earlier draft of this paragraph showed
+`gh-core-exhausted resets_in=4m (core remaining=0) — serving …`, which is neither branch). When the
+emptiness has a PHRASE (`gh-core-exhausted …`) the log says so and omits the counts; on the band path it
+prints `core remaining=<n> reset=<epoch>` instead. Read `events.log`, never a transcription of it.
 
 ### 3. The TTL read cache (a companion to single flight)
 
