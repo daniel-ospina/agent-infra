@@ -414,8 +414,9 @@ let branchOwnership: any = null;
 // the `.mjs`. Filed, not done here.
 const _BRANCH_OWNERSHIP_MEMBERS = [
   "acquireRepoLock", "classifyBranchOp", "decideM1", "decideM2", "decideM3",
-  "localBranchExists", "ownershipAllowed", "readBranchState", "releaseRepoLock",
-  "repoKey", "resolveEffectiveRepo", "resolveRepoFromInv",
+  "fastForwardOntoUpstreamProof", "localBranchExists", "ownershipAllowed",
+  "readBranchState", "releaseRepoLock", "repoKey", "resolveEffectiveRepo",
+  "resolveRepoFromInv",
 ] as const;
 try {
   branchOwnership = await import("../shared/branch-ownership.mjs");
@@ -4185,11 +4186,27 @@ function _syncAllowanceEffect(eff: any, baseline: any, det: any) {
   const parsed = det?.syncEffect ?? null;
   if (!parsed) return null;
   const scopeOwnRepo = !!(baseline?.repoKey && eff?.repoKey && baseline.repoKey === eff.repoKey);
+  // #2277: a session with NO baseline for the sync op's repo (a foreign-rooted
+  // lane, a /tmp-rooted lane) can still advance a hub that is PROVABLY behind:
+  // clean tree, on its own default branch, HEAD an ancestor of that branch's
+  // upstream, and no explicit source ref (so the target IS the upstream).
+  // Measured, never inferred — any unmeasurable case fails closed.
+  const foreignProof = (!scopeOwnRepo && eff?.unresolvedTarget !== true && eff?.isWorktree !== true
+    && Array.isArray(parsed.positionals) && parsed.positionals.length === 0
+    && branchOwnership?.fastForwardOntoUpstreamProof)
+    ? branchOwnership.fastForwardOntoUpstreamProof(eff?.effectiveCwd ?? null, eff?.currentBranch ?? null)
+    : null;
+  const syncCwd = eff?.effectiveCwd ?? null;
   return {
     parsedEffect: parsed,
     onlyGitInvocation: det?.syncOnlyInvocation === true,
     scopeOwnRepo,
-    treeClean: _checkoutTreeClean(eff?.effectiveCwd ?? eff?.cwd ?? null),
+    // The clean-tree read must cover the checkout the op MOVES (the sync op's
+    // own resolved repo), not the command-level `eff` — for a `-C` hop those
+    // differ, and a dirty foreign hub is exactly what must stay refused.
+    treeClean: _checkoutTreeClean(syncCwd),
+    foreignHubFastForward: foreignProof?.ok === true,
+    ffProofWhy: foreignProof && foreignProof.ok !== true ? foreignProof.why : undefined,
   };
 }
 
@@ -4289,9 +4306,14 @@ function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: a
     why.push("   The command contains other git operations, so the fast-forward evidence");
     why.push("   cannot cover what else it may do to the branch. → Run the sync on its own.");
   }
-  if (effect && effect.scopeOwnRepo !== true) {
+  if (effect && effect.scopeOwnRepo !== true && effect.foreignHubFastForward !== true) {
     why.push("   It targets a DIFFERENT repository than the one this session's baseline was");
-    why.push("   recorded in.");
+    why.push("   recorded in, and it is not a PROVEN fast-forward onto that checkout's own");
+    why.push("   upstream — the form that needs no ownership (#2277).");
+    if (effect.ffProofWhy) why.push(`   Measured: ${effect.ffProofWhy}.`);
+    why.push("   → To advance a clean hub you do not own, run `git -C <hub> pull --ff-only`");
+    why.push("     on its own, with no source ref, on its default branch, with the hub clean");
+    why.push("     and strictly behind its upstream.");
   }
   if (effect && effect.treeClean !== true) {
     why.push("   This checkout has uncommitted changes — nothing may move the branch now.");
