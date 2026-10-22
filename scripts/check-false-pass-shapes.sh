@@ -413,7 +413,7 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
   # hard finding it turned five correct files RED. gdq/gsq are the carry; they are only cleared by the
   # matching delimiter or by a change of file.
   d = 0; dq = gdq; sqn = gsq; n = length(line); i = 1
-  BR_END = 0
+  BR_END = 0; BR_OPEN = 0
   while (i <= n) {
     c = substr(line, i, 1)
     if (c == "\\") { i += 2; continue }
@@ -423,7 +423,7 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
       # a TRAILING comment: `#` at a word boundary starts prose, and prose is not braces
       if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
       if (c == "$" && substr(line, i + 1, 1) == "{") { i = skip_param(line, i); continue }
-      if (c == "{") { d++; i++; continue }
+      if (c == "{") { d++; BR_OPEN++; i++; continue }
       if (c == "}") { d--; BR_END = i; i++; continue }
     }
     i++
@@ -644,12 +644,20 @@ FNR == 1 { gdq = 0; gsq = 0 }
   # header-shaped line cannot see its brace, so it is held as PENDING and the region is pushed only
   # if the very next line opens the block (review round 6, P1). Without this, the helper body was read
   # as the OUTER function and its `return "$rc"` became the outer verdict.
+  LINE_DELTA = brace_delta($0)   # ONE call per line: it advances the quote carry (review round 7)
   if (PEND) {
-    if ($0 ~ /^[ \t]*\{/) { NESTED[NESTED_N] = PEND_DEPTH; ARMED[NESTED_N] = 1; NESTED_N++ }
-    PEND = 0
+    # A blank line or a comment between a header and its brace does not cancel the pending region —
+    # only a real statement that is not the opening brace does (review round 7, P1).
+    if (BR_OPEN > 0) { NESTED[NESTED_N] = PEND_DEPTH; NESTED_N++; PEND = 0 }
+    else if ($0 !~ /^[ \t]*(#|$)/) PEND = 0
   }
   if (fn != "" && $0 ~ /^[ \t]*([A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)|function[ \t]+[A-Za-z_])/) {
-    if (index($0, "{") > 0) { NESTED[NESTED_N] = depth; ARMED[NESTED_N] = (brace_delta($0) <= 0 ? 1 : 0); NESTED_N++ }
+    # ⛔ DECIDE ON THE BRACES THE COUNTER ACTUALLY SEES, not on raw text (review round 7, P1).
+    # `index($0, "{")` matched a brace inside a trailing comment or a `${…}` that brace_delta ignores,
+    # so the region was pushed and popped on the same line and the helper body was scanned as the
+    # OUTER function — a false positive on a `return 0` function and, with the helper after the
+    # verdict, a FALSE NEGATIVE over a real shape. A header whose counted braces are zero is PENDING.
+    if (BR_OPEN > 0) { NESTED[NESTED_N] = depth; NESTED_N++ }
     else { PEND = 1; PEND_DEPTH = depth }
   }
   if (fn == "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/)) {
@@ -667,7 +675,9 @@ FNR == 1 { gdq = 0; gsq = 0 }
   # of the file — review round 1.) Braces are COUNTED instead, and the function ends only where the
   # depth returns to zero.
   if (fn != "") {
-    delta = brace_delta($0)
+    # LINE_DELTA was computed on the RAW line; when a header branch consumed the opening brace it
+    # already counted it (and set `opened`), so subtract that one to keep the brace counted exactly once.
+    delta = LINE_DELTA - (opened ? 1 : 0)
     newdepth = depth + (opened ? 1 : 0) + delta
     if (delta < 0 && newdepth <= 0) {
       # The body ends on THIS line: keep what PRECEDES the closing brace for the line rules, so a
@@ -1095,7 +1105,19 @@ done < "$DECIDED"
 if [ -s "$TMPDIR_RUN/scan-notes" ]; then
   sed 's/^/partial: /' "$TMPDIR_RUN/scan-notes" | sort -u | head -20 >&2
 fi
-echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able ──"
+# ⛔ THE COUNT BELONGS IN THE VERDICT LINE, NOT ONLY ON STDERR (review round 7, P2). A partial scan
+# printed a stdout summary byte-identical to a fully scanned tree, and the stderr list was truncated at
+# 20 with no marker — so 25 partial files read as "25 scanned, 0 findings, PASS". The count is part of
+# the machine-read summary, and truncation says how many were withheld.
+partials=0
+if [ -s "$TMPDIR_RUN/scan-notes" ]; then
+  partials=$(sort -u "$TMPDIR_RUN/scan-notes" | grep -c . || true)
+  sort -u "$TMPDIR_RUN/scan-notes" | head -20 | sed 's/^/partial: /' >&2
+  if [ "${partials:-0}" -gt 20 ]; then
+    echo "partial: … and $((partials - 20)) more partial scan(s) withheld from this list (all counted in the summary)" >&2
+  fi
+fi
+echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able  · $partials partial scan(s) ──"
 if [ "$findings" -gt 0 ] || [ "$unjustified" -gt 0 ] || [ "$malformed" -gt 0 ] || [ "$ungrandfathered" -gt 0 ]; then
   echo "FAIL: no verdict without an observation (#2096). Fix the shape, or exempt one line with '# verified: <why it is not the shape>'."
   exit 1

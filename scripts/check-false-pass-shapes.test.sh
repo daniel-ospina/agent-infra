@@ -956,6 +956,70 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B47 the SPACE-PADDED array capture 'arr=( \$(cmd) )' registers (the header claims it does)"
+# ⛔ ROUND-7: the nested-region push was decided on RAW text (`index($0, "{")`) while the depth was
+# decided by brace_delta(), so a brace that only appears in a trailing comment or a `${…}` pushed a
+# region and popped it on the same line — the helper body was then scanned as the OUTER function. Both
+# directions were measured: a false positive on a function whose verdict is a literal `return 0`, and a
+# false NEGATIVE over a real shape when the helper sits after the verdict.
+D="$(fixture b48)"
+cat > "$D/scripts/fortyeight.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do printf '%s\n' "$x"; done
+  log()  # appends to LOG_FILE
+  {
+    local rc=0
+    check_something || rc=1
+    return "$rc"
+  }
+  return 0
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B48 a helper header with a COMMENT brace is still a nested region (no false 'success-default' verdict)"
+
+D="$(fixture b49)"
+cat > "$D/scripts/fortynine.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do printf '%s\n' "$x"; done
+  log()
+
+  {
+    local rc=0
+    check_something || rc=1
+    return "$rc"
+  }
+  return 0
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B49 a BLANK LINE between a helper header and its brace does not cancel the nested region"
+
+D="$(fixture b50)"
+cat > "$D/scripts/fifty.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do printf '%s\n' "$x"; done
+  return "$bad"
+  log()
+  {
+    local ok=1
+    return "$ok"
+  }
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B50 a helper AFTER the verdict cannot launder it (the shape is still reported)"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
