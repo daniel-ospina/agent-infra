@@ -351,6 +351,33 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Worktree-reclaim evidence suite (zero-dep)
+        # `tools/fleet/worktree_reclaim.py` is the successor to the scheduled
+        # `pi-reap-worktrees.sh` pass, which on 2026-10-22 reported
+        # `WORKTREES=538 REMOVE=7 DEFERRED=422 REMOVED=0` while 761 worktrees and a
+        # full-core `fseventsd` accumulated — an inert enforcer (the plist ships
+        # `--dry-run`, #1678) whose budget never reached 78% of the estate. Its
+        # gates are the ones a wrong reap already cost work for (agent-infra #1393:
+        # a live worktree and its branch deleted mid-work with 3 uncommitted files),
+        # so they are pinned: merged-into-base, empty `git status --porcelain`, no
+        # commit absent from every remote ref, nothing pinned in the lane-stash
+        # register (`tools/lane_stash.py`, never a bare `git stash`), no open PR or
+        # `refs/claims/*` entry naming it, no process holding it, and an idle bound
+        # (a checkout created minutes ago at the base is vacuously "merged" —
+        # measured: `feat/9660-tm` at 0.0d). Zero-dep by construction: every fixture
+        # is a THROWAWAY `git init` repo in a temp dir with real `git worktree add`
+        # checkouts and a local `refs/remotes/origin/main`, so a mutation that turns
+        # a gate off cannot destroy a lane's work.
+        run: python3.12 tools/fleet/worktree_reclaim.test.py
+      - name: Worktree-reclaim mutation evidence (zero-dep)
+        # The suite above is only a pin if it can FAIL. Seven mutations, each of
+        # which must redden its paired case: drop the clean check, the ancestry
+        # check, the unpushed check, the open-PR gate, the stash gate, the idle
+        # bound, or the primary-checkout guard. A mutation that survives is
+        # reported as a suite failure. Its own step, not a second command in the
+        # step above — sequencing would suppress one verdict when the other fails
+        # (the same rule as every suite here).
+        run: python3.12 tools/fleet/worktree_reclaim.test.py --mutations
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a

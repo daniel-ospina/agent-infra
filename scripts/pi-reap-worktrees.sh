@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 # pi-reap-worktrees.sh — reap provably-reclaimable git worktree checkouts (#1095).
 #
+# ⛔ SUPERSEDED FOR THE ESTATE BY tools/fleet/worktree_reclaim.py — read that file's
+# header FIRST. Measured 2026-10-22: this script's scheduled pass reported
+# `WORKTREES=538 REMOVE=7 PRESERVE=531 DEFERRED=422 REMOVED=0`, i.e. 78% of the
+# estate was never classified (its budget is spent on serial `git status` over 561
+# checkouts) and the job that runs it is shipped `--dry-run` (#1678), so the
+# LaunchAgent `com.tortoise.worktree-reaper` sat at `- 0` while 761 worktrees and
+# a full-core `fseventsd` accumulated. The successor classifies in parallel, reads
+# lane stashes through `tools/lane_stash.py`, gates on open PRs and claims, and
+# PRINTS the deciding predicate per record so a zero pass states why.
+#
+# THE DURABLE RULE (stated here so a reader of THIS file cannot miss it):
+#   A worktree is FINISHED — and only then reclaimable — when every commit it
+#   holds is an ancestor of the base, `git status --porcelain` is empty, no commit
+#   it holds is absent from every remote ref, the lane-stash register shows
+#   nothing pinned to it, no open PR or `refs/claims/*` entry names it, no process
+#   holds it, and it has been idle past the idle bound. Evidence only.
+#
+# THE TWO THINGS NO REAPER HERE MAY EVER DO:
+#   1. touch a primary checkout (`git worktree list` index 0 — the shared checkout
+#      other lanes' git calls resolve against);
+#   2. judge "finished" from a BRANCH NAME alone — `main`/`fix/*`/`feat/*` say
+#      nothing about whether work landed, a branch whose only changes are
+#      UNCOMMITTED is "merged" by ancestry and holds all the work (agent-infra
+#      #1393), and two worktrees can be forced onto one branch.
+
 # Why this exists: on 2026-09-15 the `tortoise` repo had 407 worktrees and
 # `.worktrees/` was 179 GB against ~2 GB of repo content; the working tree held
 # 2,363,772 files and `find . -type f | wc -l` took 188 s. A manual sweep
