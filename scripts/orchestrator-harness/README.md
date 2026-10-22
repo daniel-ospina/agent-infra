@@ -130,7 +130,7 @@ orchestrator and its heartbeat dispatch to exactly one.
 | cmux cloud cell 2 | `daniel-ospina/agent-infra` |
 | cmux cloud cell 3 | `daniel-ospina/tortoise` |
 
-⚠️ **This table is the intended mapping, not a measured one.** Measured 2026-10-17 it does not hold: cell-2 holds *both* checkouts and ran tortoise merges all evening, and **cell-3 has no tortoise checkout at all**. The mapping must be **verified by the box** — agent-infra#1901.
+⚠️ **This table is the intended mapping, not a measured one.** Measured 2026-10-17 it does not hold: cell-2 holds *both* checkouts and ran tortoise merges all evening, and **cell-3 has no tortoise checkout at all**. The mapping must be **verified by the box**: raised in agent-infra#1901 (**closed** 2026-10-17, which made the queue/checkout pair *refusable* instead of silently wrong), with the residue — which machine actually serves which repo — carried by open agent-infra#1906.
 
 A **second controller on one box is harmless, not forbidden**: it exits immediately on the
 single-instance lock. No mechanism is needed for it.
@@ -143,7 +143,7 @@ single-instance lock. No mechanism is needed for it.
 | **R2** | It works **un-owned PRs first**: fix them, or run the merge path, to get them merged. |
 | **R3** | Only when no un-owned PRs remain does it take the next un-owned **issue**, in label order: **P0 → P1 → P2 → P3 → oldest with no P label**. |
 | **R4** | "Un-owned" is decided by **cross-machine coordination**, because several machines work the same repo. |
-| **R5** | **There is no blocked item.** Anything stuck is either fixed automatically or becomes a **user question** (the AGENTS.md question protocol). The same applies to issues. ⚠️ **Sequence:** while the question gate is unbuilt, `parked-*` remains the de-facto terminal state — **fix the question gate first** (agent-infra#1903), then retire the park. |
+| **R5** | **There is no blocked item.** Anything stuck is either fixed automatically or becomes a **user question** (the AGENTS.md question protocol). The same applies to issues. ⚠️ **Sequence:** while the question gate is unbuilt, `parked-*` remains the de-facto terminal state — **build the escalation path first**, then retire the park. (The gate's two language marks landed in agent-infra#1903, closed 2026-10-19; the path itself is still unbuilt, §0.3 R5.) |
 | **R6** | The drain rule is **threshold-free**: while **any** workable un-owned PR remains, the box drains the PR queue and opens no issues (owner ruling 2026-10-18, agent-infra#2099 — `mp_reason`, `orch-loop.sh:1520-1531`). `MERGE_PRIORITY_AT` (default 25) is **not** the gate any more: it survives as the **unreadable-count fallback** (`orch-loop.sh:2354` is the code — `is_num "${UPN:-}" \|\| UPN=$(( 10#${MERGE_PRIORITY_AT:-25} + 1 ))`; the rule it applies, "treat the count as over the line", is stated in the comment at `:220-222`) and as the reviewer/fixer headroom (`review_slots`/`fix_slots`, `:1596-1614`). |
 | **R7** | One repo per orchestrator; the harness is single-repo by construction (`OR`). |
 | **R8** | **Capacity transfer:** when a machine refuses an item for *capacity*, the item remains eligible for **another** machine. Without this, per-machine correctness becomes fleet-wide starvation (agent-infra#1909). |
@@ -158,7 +158,7 @@ single-instance lock. No mechanism is needed for it.
 | R1 | disk is enforced in `spawn-gate.sh` for **spawning**, but it does not reach the controller's own writes (heartbeat `orch-loop.sh:850`, `state/*`) — and a full disk does **not** kill the loop: `orch-loop.sh` sets `set -u` and never `-e` (`:4`), so a failed write fails that write only. The half that stays silent is the heartbeat: an unwritable `$O/state` at least leaves a tombstone the dispatch line reads back as `[dispatch] BLOCKED: a refresh pass finished and could not record its outcome` (`orch-loop.sh:1178-1209`), while `heartbeat()` is a bare `date +%s > "$O/heartbeat"` whose failure nothing reports. ⛔ **And the gate is not source-only any more**: since agent-infra#1884 `spawn-gate.sh` also ships THE SPAWN POINT — installed as `$HOME/.pi/agent/bin/pi`, first on PATH — so every caller that resolves `pi` through PATH is gated without cooperating (`spawn-gate.sh:491-530`), and `merge-one.sh` treats that refusal (rc=76) as *no verdict*, not as a review (`merge-one.sh:717-733`). The residues the code itself names: `merge-one.sh`'s own `run_agent()` copy gets the LOAD gate at the spawn point but **not the DISK gate** (`spawn-gate.sh:15-21`), and **neither `orch-loop.sh` nor `install.sh` sources the file** — but for different reasons, and only one of them keeps all three predicates: the loop keeps its own `is_num`, `is_limit` and `can_spawn` for its four decision sites (`orch-loop.sh:135` / `:142` / `:1459`), while `install.sh` keeps only `is_num` and `is_limit` (`:54` / `:63`), defines **no** `can_spawn`, and gates no spawn at all — it renders `MAX_LOAD` into the plist (`spawn-gate.sh:22-25`). |
 | R8 | ✅ **met** — kept listed so the delivery record stays with the requirement. **Transfer (the yield):** `lane.sh:135` records a capacity refusal and `capacity_yield_live()` (`orch-loop.sh:1634-1652`) makes this box stand down **without consuming the item** — no `dispatched.txt` row, no claim (`:3687-3693`) — so a peer can take it immediately (agent-infra#1909, closed). **Placement (the half this row used to call missing — it ships):** the loop reads the whole fleet and asks `cap_place` which box should take the work (`orch-loop.sh:3424-3433`, which sets `CAP_STATE=place`/`CAP_PLACE`), and hands an item to the least-loaded eligible peer when this box is itself piling up — `CAP_LPC_SELF >= CAP_YIELD_AT_LPC`, default `400` = 4.00 load-per-cpu (`capacity.sh:106`) — left unclaimed and un-consumed so that peer can take it (`orch-loop.sh:3699-3707`; agent-infra#2252, PR #2253 merged). Two limits the code names itself, **not gaps in the requirement**: below the prefer-elsewhere line this box *takes* the work, because yielding every candidate to whichever peer is momentarily a little idler is a thrash machine (`orch-loop.sh:3699-3702`); and a `$O` that predates `capacity.sh` degrades to the LOCAL gates only — which is **loud, not silent**: the loop logs it every cycle (`orch-loop.sh:3436`) and `install.sh`'s whole-surface comparison records `deployedMatchesSource: false` with `capacity.sh(differs-or-missing)` (`:946-948`, `:1001-1003`). |
 
-Filed, and **each carries the obligation to update this section when it is delivered**: R5 → **#1903**, R1 → **#1884**, §0.1 → **#1901**, §0.5 `SCOPE` → **#1908**. **R8 owes nothing: it is delivered** — the yield in **#1909** (closed) and placement in **#2252** (PR #2253, merged) — so it names no open issue; the row above is kept as that delivery record, and an earlier draft's "placement is missing" claim was false against `orch-loop.sh:3424-3433`. ⛔ **R3 and R2 name no issue** — those two gaps are filed nowhere, so nothing carries that obligation for them; an earlier draft of this sentence claimed every gap was tracked, which was false for both.
+**Delivery record — all four issues this paragraph used to call outstanding are CLOSED, and none of them owes an update to this section:** R5 → **#1903** (closed 2026-10-19, delivered by PR #1911: the two `ask-owner` language marks are now mechanical — and the residue is the *destination*, not the marks, since `scripts/ask-owner.py` is still referenced **zero times** by `orch-loop.sh` / `merge-one.sh`, so the escalation path is unbuilt and `parked-*` remains the de-facto terminal state, §0.3 R5) · R1 → **#1884** (closed 2026-10-19: the gate now ships the SPAWN POINT as `$HOME/.pi/agent/bin/pi`, and the residues `spawn-gate.sh`'s own header names remain — `merge-one.sh`'s `run_agent()` copy has no **DISK** gate, and neither `orch-loop.sh` nor `install.sh` sources the file, the loop keeping its own `is_num`/`is_limit`/`can_spawn` for its four DECISION sites) · §0.1 → **#1901** (closed 2026-10-17: the queue/checkout pair is now compared and **refused** as `QUEUE_STATE=mismatch`, so the table above stands as this document's record of the *intended* mapping — and the residue, which box actually serves which repo, is open **#1906**) · §0.5 `SCOPE` → **#1908** (closed 2026-10-17; the measurement it asked for is §7.2d *Does a claim EXCLUDE?*, and the residue is the **landing** row's exclusion REQUIREMENT, which that measurement does not cover). **R8 owes nothing either: it is delivered** — the yield in **#1909** (closed) and placement in **#2252** (PR #2253, merged) — so it names no open issue; the row above is kept as that delivery record, and an earlier draft's "placement is missing" claim was false against `orch-loop.sh:3424-3433`. ⛔ **R3 and R2 name no issue** — those two gaps are filed nowhere, so nothing carries them; an earlier draft of this sentence claimed every gap was tracked, which was false for both.
 
 ### 0.4 Cross-machine coordination — guaranteed, and not
 
@@ -233,27 +233,34 @@ every 120 s.
 
 ### 0.7 The load ceiling
 
-`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 8`, overridable
-per box (`MAX_LOAD` in the plist or `keys.env`), with a hard fallback of **40** when the core probe
-is unusable (`orch-loop.sh:178`, mirrored at `install.sh:72` — an earlier draft of this section said
-32, which is neither the fallback nor the shipped value).
+`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 10` as shipped,
+overridable per box (`MAX_LOAD` in the plist or `keys.env`), with a hard fallback of **40** when the
+core probe is unusable (`orch-loop.sh:177` for the derivation, `:178` for the fallback, mirrored at
+`install.sh:72` — an earlier draft of this section said 32, which is neither the fallback nor the
+shipped value).
 
-> ⚠️ **Landing order.** The `×8` rule is implemented by PR **#1907** (`×10 → ×8`). Until that merges the
-> shipped code still derives `cores × 10` (`orch-loop.sh:177`) and the gate table further down this
-> file still says so — while the **fallback of 40 is already shipped** (`:178`), so the two must not be
-> read as one constant. Land **#1907 before this document**, or land them together.
+> ⚠️ **The `×8` rule is a PROPOSAL with NO CARRIER — not shipped behaviour.** It was written as PR
+> **#1907** (`×10 → ×8`), which was **closed UNMERGED on 2026-10-22**; **no open issue carries the
+> rule** either — searched open issues 2026-10-22, and the only mention (**#1961**) merely *assumes*
+> `cores × 8` while arguing a different defect (RAM binds before load), so it is not a carrier for this
+> change. The rule is therefore **not pending, and nothing has to land before this document** — the
+> document is landable on its own. What ships is the derivation `cores × 10` (`orch-loop.sh:177`),
+> which the **Tuning** table below records, **plus** the already-shipped **fallback of 40**
+> (`orch-loop.sh:178`); those are two different constants and must not be read as one.
 
-| cores | ceiling under ×8 (#1907) | shipped today (×10) |
-|---|---|---|
-| 4 | 32 | 40 ← also the fallback when `_NCPU` cannot be probed |
-| 8 | 64 | 80 |
-| 10 | 80 | 100 |
+| cores | shipped ceiling (`cores × 10`) |
+|---|---|
+| 4 | 40 ← also the fallback when `_NCPU` cannot be probed |
+| 8 | 80 |
+| 10 | 100 |
 
-**Why ×8.** The previous default was `cores × 10` (8 → 80, 10 → 100), which corresponds to the
-highest load observed as tolerable on a 10-core box. ×8 keeps a deliberate margin *below* what was
-seen to work: on a machine that is also somebody's laptop, load is a symptom of contention rather
-than a target to reach. A dedicated box can raise it with the override; the derived value stays
-conservative by design.
+**Why the proposal is ×8.** The shipped derivation `cores × 10` (8 → 80, 10 → 100) corresponds to
+the highest load observed as tolerable on a 10-core box. ×8 (4 → 32, 8 → 64, 10 → 80) keeps a
+deliberate margin *below* what was seen to work: on a machine that is also somebody's laptop, load is
+a symptom of contention rather than a target to reach. A dedicated box can raise the shipped value
+with the override; the derived value stays conservative by design. ⛔ **That is an argument, not a
+delivery**: whoever wants it must open the issue, change `orch-loop.sh:177` and its `install.sh:72`
+mirror, and only then does this section describe the code.
 
 > `MAX_LOAD` and `MERGE_PRIORITY_AT` are different things and are often confused: `MAX_LOAD` is the
 > box's capacity ceiling, while `MERGE_PRIORITY_AT` (default **25**) is **not a gate** — the drain gate
@@ -2590,10 +2597,11 @@ already holding):
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
   (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
-  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
-  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
-  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
-  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+  why a lowering of `MAX_LOAD` — the ×8 change proposed in #1907, closed unmerged 2026-10-22 — could
+  not have moved a single item. ⚠️ NOTE what the record can carry: the WORKER gate binds on **load or
+  disk** only (`spawn-gate.sh`), so those are the only two values field 3 can ever hold; the
+  lanes/swap/memory terms belong to the CONTROLLER's own gate, which refuses *before* any claim is
+  taken and therefore writes no record at all (§1 above).
 - **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
   never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
   for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
