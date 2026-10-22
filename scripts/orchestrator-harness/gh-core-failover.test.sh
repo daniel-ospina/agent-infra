@@ -81,6 +81,11 @@ case "\$1 \$2" in
     # The FIRST-CHECKS poll: byte-identical argv, ~15 times per merge cycle (measured 30 of 41 calls).
     printf '[{"databaseId":39786847846,"status":"completed","conclusion":"success"}]\n'
     ;;
+  "pr list")
+    # The board read: a `pr-list` TTL class (5 s). Without this arm the stub exits 42, so a
+    # "3 reads => 1 request" assertion would be measuring a FAILURE rather than a cache hit.
+    printf '[{"number":1,"title":"t"}]\n'
+    ;;
   "api --include")
     # conditional_fetch frames its GETs with --include. The "secondary" scenario answers a BURST
     # refusal the way GitHub does: 403, a phrase, and x-ratelimit-remaining still ABOVE zero.
@@ -547,6 +552,80 @@ health l
 ck "(l) and --health still names it" $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=' && echo 0 || echo 1)
 ck "(l) the durable core record is NOT annotated recovered" \
    $( { [ ! -f "$GH_LIMIT_DIR/last-limit" ] || ! grep -q 'recovered=' "$GH_LIMIT_DIR/last-limit"; } && echo 0 || echo 1)
+
+echo "── (m) ROUND 6: three spellings, two modelled — and a health verb that ignored the meter ──"
+# ⛔ A REGRESSION SUITE FOR THE DEFECTS FOUND AFTER THE FOUR REQUIRED CASES PASSED. Each one below was
+# reproduced against the layer before it was fixed; the failure each prevents is named in the
+# assertion, because a test whose failure message is the label survives being made vacuous.
+reset_env m core0
+budget core0
+
+# (m1) jq's THIRD key spelling. `.name` and `.["name"]` were modelled; `."name"` set no leaf and
+# refused nothing, so a program naming ONE allowed leaf alongside it was admitted and jq printed null
+# with rc 0 — the confident wrong answer, in the shape of a successful read.
+run core0 api repos/o/r/pulls/7 --jq '[.state, ."requested_reviewers"]'
+ck "(m1) the dot-quoted key is REFUSED (it used to answer [\"open\",null] rc 0)" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '"\(.mergeable)" + "\t" + (."merge_commit_sha" // "")'
+ck "(m1) … so the rail's merge-ref read cannot be reached by QUOTING it (was rc 0 with an empty ref)" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '."requested_reviewers"'
+ck "(m1) … and a quoted UNKNOWN key alone is refused, not silently null" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run core0 api repos/o/r/pulls/7 --jq '."state"'
+ck "(m1) while a quoted ALLOWED key is still served (the refusal is not blanket)" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qi 'open' && echo 0 || echo 1)
+
+# (m2) --health must agree with the meter IN BOTH DIRECTIONS. Reading only the durable record said
+# `gh-ok` on a box whose own `--budget` probe had just measured core=0 — the incident's false-healthy
+# line, printed by the verb an operator is told to trust.
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}, "graphql": {"remaining": 4000, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+rm -f "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m2) a FRESH meter saying core=0 is named by --health (no refusal needed first)" \
+   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=[0-9]' && echo 0 || echo 1)
+printf '{"at": %s, "core": {"remaining": 3000, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 3000 ))" > "$GH_LIMIT_DIR/budget.json"
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m2) … and a meter with headroom OUTRANKS a stale record (was a false 'exhausted')" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+printf '{"at": %s, "core": {"remaining": 50, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+health coreok
+ck "(m2) … and the LOW-WATER BAND (50 left) is not called exhausted" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+# (m3) an UNDATED record names a state WITHOUT a number nobody measured.
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+rm -f "$GH_LIMIT_DIR/budget.json"
+health coreok
+ck "(m3) an undated record is STILL a named state (was gh-ok for the 8 NO_WAIT callers' shape)" \
+   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted' && echo 0 || echo 1)
+ck "(m3) … and it does NOT print an invented resets_in=<Nm> (was 15m for a 12m window)" \
+   $(printf '%s' "$OUT" | grep -q 'resets_in=?$' && echo 0 || echo 1)
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(( $(date +%s) - 1000 ))" > "$GH_LIMIT_DIR/health"
+health coreok
+ck "(m3) … but an undated record outlives its bound, like every other record here" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+# (m4) a DIVERTED read must not rewrite `remaining=?` to an observed `remaining=0`.
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
+run core0 api repos/o/r/pulls/7 --jq '.state'
+ck "(m4) the diverted read is still SERVED from GraphQL" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+ck "(m4) … and the record still says remaining=? (no number invented by the failover path)" \
+   $(grep -q 'remaining=?' "$GH_LIMIT_DIR/health" && echo 0 || echo 1)
+
+# (m5) READ_UNCACHEABLE_FLAGS was declared, documented and never read.
+reset_env m5 coreok
+for i in 1 2 3; do run coreok pr list --repo o/r --template '{{.number}}'; done
+ck "(m5) a --template read is NOT cached (3 reads => 3 requests; was 1)" \
+   $([ "$(reqs 'pr list')" -eq 3 ] && echo 0 || echo 1)
+: > "$STUB_LOG"                       # count the two classes separately: they share one argv prefix
+for i in 1 2 3; do run coreok pr list --repo o/r; done
+ck "(m5) … while the plain shape still coalesces (3 reads => 1 request) [count=$(reqs 'pr list')]" \
+   $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

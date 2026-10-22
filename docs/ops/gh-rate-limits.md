@@ -396,6 +396,17 @@ be shown to stay inside the body. Otherwise the read is **not** failed over, and
 is refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
 confident wrong answer.
 
+⛔ **THE GATE MODELS EVERY SPELLING jq ACCEPTS, OR IT IS NOT A GATE.** jq reads a key three ways —
+`.name`, `.["name"]` and `."name"` — and the first version of this check scanned two of them. That was
+escapable: `[.state, ."requested_reviewers"]` named one allowed leaf, was admitted, and jq printed
+`["open",null]` with **rc 0**; `"\(.mergeable)" + "\t" + (."merge_commit_sha" // "")` came back
+`true\t` — the fabricated “absent merge ref” this gate refuses on purpose one spelling earlier. The
+quoted form now follows the bracket rule (a literal identifier, in the allow-list, never a container)
+and sets the leaf flag only when it IS one; a quoted key nobody recognised is refused rather than
+answered `null` (test `(m1)`). The general rule the four rounds of this check keep re-learning: an
+attempted refusal is worth a false refusal, because an escape here hands a lane a wrong answer with a
+success status.
+
 **The low-water band is not exhaustion.** `CORE_LOW_WATER` (default 100) moves *reads* to GraphQL so
 the tail of the pool is preserved for **writes** — writes are refused ONLY at `remaining == 0`, and no
 `gh-core-exhausted` record is written while the pool still has headroom (including on the
@@ -446,6 +457,17 @@ view` calls cost one request, while two `.body` reads cost two **even with `GH_L
 budget arithmetic below: 30 of the 41 calls in one merge cycle were a single FIRST-CHECKS poll loop
 issuing byte-identical argv 16 times against data that changed zero times.
 
+⛔ **THE ONE CACHED CLASS WITH A DECISION ATTACHED, STATED RATHER THAN IMPLIED.** `pr checks` output
+*authorises* a merge (`merge-one.sh` computes its gate from `gh pr checks --json name,state`), so a
+≤ 10 s stale `SUCCESS` served to a second lane inside the window is a wrong **verdict**, not merely a
+stale display. It is still bounded by the server: GitHub refuses a merge whose required checks are not
+green at merge time, and the rail re-reads the check surface through `admin-merge.sh` before it merges,
+so the failure mode is a misdiagnosis that the next poll corrects — never a red tree merged green.
+`pr-state` is in the same position and for the same reason (a stale head sha is refused by GitHub via
+`--match-head-commit`). Any future class whose answer is a DECISION must carry that argument with it;
+an unlisted shape is never cached, and `READ_UNCACHEABLE_FLAGS` refuses a shape that frames or reshapes
+the output (`--paginate` returns one page per invocation, so a replay answers a different question).
+
 ### 4. The named state (what a lane should SAY)
 
 ```bash
@@ -455,8 +477,14 @@ python3 scripts/orchestrator-harness/gh-limit.py --health
 ```
 
 It reads **local state only** — no request, no credentials, no quota — which is what makes it usable at
-exactly the moment every `gh` call is being refused, and it is age-bounded by the record's own reset so
-a closed window cannot keep asserting itself. `repo-authority.sh` repeats the token verbatim instead of
+exactly the moment every `gh` call is being refused, and it is age-bounded — by the record's own reset
+when the reset is known, and by `GH_LIMIT_HEALTH_UNKNOWN_WINDOW` (900 s) for an UNDATED record, which is
+printed as `resets_in=?` rather than a number nobody measured — so a closed window cannot keep asserting
+itself. It also **agrees with the layer's own decision**: a fresh shared meter snapshot (the `--budget`
+probe) outranks the durable record in both directions, so `core=0` from the meter is named even before
+any call has been refused, and a meter with headroom is not contradicted by a stale record. The
+low-water **band** is not exhaustion and is reported as `gh-ok`. `repo-authority.sh` repeats the token
+verbatim instead of
 reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
 the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
 that phrase into `VERDICT=GH-RATE-LIMITED`.
@@ -470,8 +498,11 @@ pool: the 2026-10-22 misdiagnosis, restored by the one optimisation that is supp
 
 ⛔ **THE SECONDARY LIMIT HAS ITS OWN TOKEN, AND IT IS NOT EXHAUSTION.** A burst/concurrency refusal
 arrives as a 403/429 in the same shape as a primary one, but its `x-ratelimit-remaining` is **above
-zero** — so it is named `gh-secondary-rate-limited remaining=<n>`, it writes **no** health record, and
-it never gates a write. Without that distinction a transient burst froze every merge/comment/PATCH on
+zero** — so it is named `gh-secondary-rate-limited remaining=<n>`, and it never gates a write. The one
+shape that DOES leave a health record is a refusal that carried **no** remaining counter at all: absent
+is UNKNOWN, not zero, so the record is written **undated** (`remaining=? reset=0`), which diverts reads
+but may not refuse a write (see the next rule, and test `(k2)`). Without that distinction a transient
+burst froze every merge/comment/PATCH on
 the box for up to an hour and told the operator the pool was empty while thousands of requests were
 left. The durable `last-limit` record carries `remaining=` for the same reason.
 
@@ -529,8 +560,19 @@ evidence comment, the CI re-run and the base-suite reads are NOT in it. **41 is 
 
 The loop is the duplication: 15 iterations at 10 s each, **two** invocations per iteration, and
 `run list` ran with byte-identical argv **16 times** against data that had not changed once in 150 s.
-The TTL cache now covers `run list` (10 s — the loop's own cadence, so at most one extra poll of
-latency); the `--paginate` half is deliberately not cached and remains a per-iteration request.
+The TTL cache now covers `run list`.
+
+⛔ **MEASURED AGAIN AFTER THE CACHE LANDED, AND THE HONEST NUMBER IS SMALLER THAN “COVERS IT”.** One
+lane's blocked FIRST-CHECKS wait was re-run through this layer with a counting pass-through in front of
+the real `gh` (2026-10-22 17:30Z, PR 2336, `--dry-run --no-rerun`, 700 s): **89 sends, of which 71
+(80 %) were the same byte-identical `run list`** — roughly 1:1, because the loop's cadence and the
+`run-list` TTL are BOTH 10 s, so the next poll lands just after the entry expires. The saving here is
+therefore **cross-lane, not per-lane**: several lanes asking inside the same 10 s window share one call
+(that is the coalescing the incident asks for), while a single lane polling at the TTL's own cadence
+gets almost none. The lever that lowers *this* number is the loop's cadence or its argv, not the
+cache — raising the TTL above the cadence would buy ~half of it back at the price of delaying the
+detection of a finished run by up to one interval. Stated, not tuned. The `--paginate` half is
+deliberately not cached and remains a per-iteration request.
 
 ⛔ **And the merge rail is not the main consumer.** A refresh pass is measured in this repo at **134
 core requests**, of which **72 (54 %)** are the same three fleet-wide answers asked once per candidate.

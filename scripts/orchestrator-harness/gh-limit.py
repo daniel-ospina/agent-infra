@@ -1791,6 +1791,15 @@ def read_class(gh_argv):
         return None
     if gh_argv[0] == "auth" or not makes_request(gh_argv):
         return None
+    # ⛔ THE STATED CONTRACT, IMPLEMENTED. `READ_UNCACHEABLE_FLAGS` was defined and never consulted, so
+    # a shape carrying `--template` / `--include` / `--paginate` was cached anyway — measured: three
+    # `gh pr list --template '{{.number}}'` calls made ONE request and `events.log` recorded two
+    # `pr-list` hits. `--paginate` returns ONE PAGE per invocation, so a cached replay answers a
+    # different question than the caller asked; the rest frame or reshape the output. A future flag
+    # added to that set must take effect, which it only does if something reads it.
+    for a in gh_argv:
+        if a in READ_UNCACHEABLE_FLAGS or any(a.startswith(f + "=") for f in READ_UNCACHEABLE_FLAGS):
+            return None
     if gh_argv[0] == "api":
         # ⛔ `gh api` IS NEVER TTL-CACHED — not an omission, the safety boundary (see the header).
         # It has an ETag validator, and its body is read-modify-written by the review recorder.
@@ -2543,10 +2552,16 @@ def core_pressure():
         return None                    # a FRESH snapshot that says the pool is fine outranks a record
     reset = core_record_reset()
     if reset:
-        return reset, 0, True           # known-empty from the refused call's own record
+        return reset, 0, True           # the refused call OBSERVED zero — that IS a measurement
     reset, dated = health_state()
     if reset:
-        return reset, 0, dated
+        # ⛔ `remaining` IS NOT OBSERVED ON THIS PATH, AND 0 IS A NUMBER WE DID NOT MEASURE. The record
+        # behind it may say `remaining=?` (an undated refusal), and returning 0 here did two wrong
+        # things at once: it DECLARED the pool empty on no evidence — refusing writes — and it rewrote
+        # the durable record's `remaining=?` to `remaining=0`, an observation nobody made, in the file
+        # an operator reads. `None` means “unknown”: reads still DIVERT (the safe direction, since a
+        # GraphQL answer is a real answer), nothing is asserted exhausted, and a write is SENT.
+        return reset, None, dated
     return None
 
 
@@ -2593,10 +2608,38 @@ def health_token():
 
     ⛔ AND IT AGREES WITH `core_pressure`, WHICH IS THE POINT. An undated record (a refusal that carried
     no reset) is a current state for `HEALTH_UNKNOWN_WINDOW`; deriving “healthy” from `reset == 0` made
-    `--health` say `gh-ok` at the exact moment the pool was spent and the failover had stopped."""
-    reset = health_reset()
+    `--health` say `gh-ok` at the exact moment the pool was spent and the failover had stopped.
+
+    ⛔ A FRESH METER OUTRANKS THE RECORD, IN BOTH DIRECTIONS — and reading only the record got both of
+    them wrong (measured, review round 6): a `--budget` probe that had JUST measured `core=0` still
+    read `gh-ok` here, because nothing had been refused yet and so no health record existed. That is
+    the incident's own false-healthy line, printed by the verb an operator is told to trust. The
+    reverse direction lies too: a record from a window that has since cleared read `gh-core-exhausted`
+    beside a meter saying 3000 remaining. `read_budget()` is a FILE READ (no request), so consulting it
+    here costs nothing and cannot be the reason a box polls the meter.
+
+    ⛔ AND IT NEVER REPORTS A NUMBER NOBODY MEASURED. An UNDATED record is a refusal that carried no
+    reset (every `GH_LIMIT_NO_WAIT` caller skips the probe, and eight heartbeat tools set it). Printing
+    the synthetic `HEALTH_UNKNOWN_WINDOW` as `resets_in=<Nm>` stated a 15m window for a refusal that
+    came with a 12m one (measured) — a lane would wait out the wrong number. The window is UNKNOWN, so
+    the token says `?`, in the same slot and the same shape, and callers that only read the TOKEN are
+    unaffected."""
+    snap = read_budget()
+    if snap is not None:
+        core = snap.get("core") or {}
+        rem, mreset = core.get("remaining"), core.get("reset")
+        if isinstance(rem, int) and isinstance(mreset, int) and mreset > clock():
+            if rem == 0:
+                return "gh-core-exhausted resets_in=%s" % resets_in(mreset), 3
+            # ⛔ THE LOW-WATER BAND IS NOT EXHAUSTION — the same distinction `core_pressure` makes for
+            # writes. An operator reading `gh-core-exhausted` at remaining=50 would chase a window that
+            # has not started; the failover is a transport choice, not a pool state.
+            return "gh-ok", 0
+    reset, dated = health_state()
     if reset is None:
         return "gh-ok", 0
+    if not dated:
+        return "gh-core-exhausted resets_in=?", 3
     return "gh-core-exhausted resets_in=%s" % resets_in(reset), 3
 
 
@@ -2647,15 +2690,10 @@ COMMENT_NAMES = frozenset({"id", "body", "created_at", "html_url", "user", "logi
 REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "user", "login"})
 # jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
 # one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
-# jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
-# one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
 PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_unsorted", "tojson",
                         "paths", "leaf_paths", "map_values", "values", "path", "env", "has")
 PROJECTION_VALUE_FILTERS = ("select", "if", "first", "last", "nth", "until", "while", "recurse", "walk",
                             "input", "inputs")
-_PROJECTION_NAME = re.compile(r"""\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]""")
-
-
 def _projection_ok(jq, allowed):
     """Does this `--jq` program stay inside the body the encoder can produce?
 
@@ -2708,6 +2746,25 @@ def _projection_ok(jq, allowed):
         if not q:
             return False               # `.[0]`, `.["a"+"b"]`, `.[$x]` — a computed key we cannot attribute
         if q.group(1) not in allowed or q.group(1) in FAILOVER_CONTAINERS:
+            return False
+        leaf = True
+    # ⛔ THE THIRD KEY SPELLING. jq accepts `."name"` as a key lookup, exactly like `.name` and
+    # `.["name"]` — and the scans above model only the last two, so the quoted form matched NEITHER:
+    # it neither refused the program nor set `leaf`. `[.state, ."requested_reviewers"]` names one
+    # allowed leaf (`.state`), was therefore admitted, and jq printed `null` for the other field with
+    # rc 0 — the confident WRONG answer in the shape of a successful read. Measured against this
+    # layer with `core` at 0: `["open",null]` rc 0, and `"\(.mergeable)" + "\t" +
+    # (."merge_commit_sha" // "")` -> `true\t` rc 0, i.e. the fabricated “absent merge ref” this
+    # gate refuses ON PURPOSE one spelling earlier. A quoted key is held to the bracket rule (a literal
+    # identifier, in the allow-list, never a container) and it sets `leaf` only when it IS one.
+    # NOTE the deliberate over-refusal: a `."name"` that appears inside a jq STRING (as data, not as a
+    # lookup) is read as a lookup and refused. No in-tree caller does that, and a refusal costs a read
+    # that fails closed with the named state, while a false admission costs a confident wrong answer.
+    for m in re.finditer(r'\.\s*"([^"]*)"', jq):
+        q = m.group(1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", q):
+            return False               # `."a b"`, an interpolated key — a computed key we cannot attribute
+        if q not in allowed or q in FAILOVER_CONTAINERS:
             return False
         leaf = True
     # dotted paths: every segment allowed, the LAST one not a container
@@ -2924,7 +2981,8 @@ def _dispatch(real_gh, gh_argv):
                 fo = graphql_plan(read_plan)
                 if fo is not None:
                     log_event("failover: %s — serving `%s` from the GraphQL pool"
-                              % (phrase or "core remaining=%s reset=%s" % (remaining, reset),
+                              % (phrase or "core remaining=%s reset=%s"
+                                 % ("?" if remaining is None else remaining, reset),
                                  _flight_label(gh_argv)))
                 elif empty and core_dated:
                     # ⛔ UNLESS A FREE REVALIDATION IS AVAILABLE. A `gh api` GET with a stored ETag costs
