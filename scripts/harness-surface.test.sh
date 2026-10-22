@@ -678,7 +678,7 @@ run_pin_cell() { # <pin-file> [no-ambient-target] [env-file]; harness derived (N
           HOME="$TMP/home" CELL_HOME="$FIXCELL" ENV_FILE="${3:-$TMP/absent-keys.env}" \
           HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
           HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
-          HU_CLAIMS_TIMEOUT=5 \
+          HU_CLAIMS_TIMEOUT=5 HARNESS_PIN="${1:-$FIXCELL/.pi/agent/state/HARNESS-PIN}" \
           env "${eargs[@]}" bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
   RC=$?
 }
@@ -745,7 +745,7 @@ ck "(f) …and HARNESS_REPO is the harness repo, not the target (got: ${f_har:-<
 # HARNESS registry and recording `claims=absent` renders as `OK (registry empty)`, a false pass on the
 # one row whose purpose is the TARGET's namespace (`orch-loop.sh:2259`). It must also not ABORT the
 # walk: a targetless box is the LOOP's refusal to make, with the authority's own actionable message.
-# So: nothing probed, `claims=unknown` recorded, and the walk continues.
+# So: nothing probed, `claims=notprobed` recorded (the row renders SKIPPED / rc 4), and the walk continues.
 : > "$FIXCELL/fix-e.log"; : > "$FIXCELL/git-e.log"
 run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" no-ambient-target "$TMP/absent-keys.env"
 ck "(g) no target resolved: the claims probe does NOT read the HARNESS registry" \
@@ -753,7 +753,7 @@ ck "(g) no target resolved: the claims probe does NOT read the HARNESS registry"
 ck "(g) …and the verdict is recorded SKIPPED, never 'absent' [$(sed -n 's/^claims=//p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)]" \
    "$([ "$(sed -n 's/^claims=\([a-z]*\).*/\1/p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)" = notprobed ] && echo 0 || echo 1)"
 ck "(g) …and 'up' says SKIPPED instead of printing a claims OK" \
-   "$(printf '%s\n' "$OUT" | grep -qF 'claims: SKIPPED (no target resolved here' && echo 0 || echo 1)"
+   "$(grep -qF 'claims: SKIPPED (no target resolved here' <<<"$OUT" && echo 0 || echo 1)"
 ck "(g) …and the walk CONTINUED past claims (a targetless box is the loop refusal to make)" \
    "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 0 || echo 1)"
 

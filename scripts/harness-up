@@ -1351,7 +1351,7 @@ hu_start_claims() {
   # weaker answer; it is a wrong one. But ⛔ IT IS NOT A REASON TO ABORT THE WALK EITHER: `claims` sits
   # before `loop`, and a targetless box is the LOOP's refusal to make, with the authority's own
   # actionable message — an abort here replaced it with a registry warning. So the verdict is recorded
-  # as `unknown` (the row renders UNKNOWN, never OK) and the walk continues.
+  # as `notprobed` (the row renders SKIPPED / rc 4 — not-applicable, never OK) and the walk continues.
   if [ -z "$probe_repo" ]; then
     warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — recording SKIPPED, not empty"
     mkdir -p "$O/state" 2>/dev/null \
