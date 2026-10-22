@@ -32,6 +32,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY="${DEPLOY_UNDER_TEST:-$HERE/deploy-harness.sh}"
 
 PASS=0; FAIL=0
+# Assertions NOT executed here (root/uid-dependent blocks). Reported in the summary so a partially-run
+# suite cannot read as a complete pass — the same doctrine as the deploy verdict itself.
+SKIPPED=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 say_case() { echo; echo "── $1 ──"; }
@@ -227,6 +230,7 @@ grep -q "$(ls "$O5"/*.sh 2>/dev/null | wc -l | tr -d ' ') of" <<< "$(notify_last
 # unconditionally told an operator their runtime was PARTIAL when nothing had been written at all,
 # which invites a restore/re-kill of a box that is exactly as it was. Branch on the count.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (zero-written sub-case skipped — running as root, where a 0555 target is still writable)"
 else
   SRC5b="$T/src5b"; O5b="$T/o5b"; make_src "$SRC5b"; make_target "$O5b" 2
@@ -245,6 +249,7 @@ fi
 # the word "unchanged" without pinning the measurement behind it. Here every `cp` fails while the
 # target's subdirectories are MISSING, so `mkdir -p` succeeds before the first copy fails.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (directories-created sub-case skipped — running as root, where 0555/000 do not bind)"
 else
   SRC5c="$T/src5c"; O5c="$T/o5c"; make_src "$SRC5c"; make_target "$O5c"
@@ -273,6 +278,7 @@ fi
 # takes the other branch). This is the only case with a writable target, no created directory, and
 # zero copied files.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (ledger-is-a-write sub-case skipped — running as root)"
 else
   SRC5d="$T/src5d"; O5d="$T/o5d"; make_src "$SRC5d"; make_target "$O5d"
@@ -331,6 +337,7 @@ grep -q 'cmp -s "\$SRC/\$rel" "\$O/\$rel"' <<< "$DEPLOY_CODE0" && ok "verificati
 # ── 7. A REAL UNREADABLE SOURCE FILE (the issue's own case (c), non-root only) ───────────────────
 say_case "7. an unreadable source file -> FAILURE, not partial success"
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (skipped — running as root, where chmod 000 is still readable)"
 else
   SRC7="$T/src7"; O7="$T/o7"; make_src "$SRC7"; make_target "$O7"
@@ -418,6 +425,7 @@ say_case "12. an unsearchable source SUBDIRECTORY -> FAILURE (a partial inventor
 # denied") yielded a TRUNCATED file list, every term of the verdict then agreed with itself, and the
 # run printed `VERIFIED — 2/2` + exit 0 while the source's own `gh-limit.py` was never deployed.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (skipped — running as root, where chmod 000 is still searchable)"
 else
   SRC12="$T/src12"; O12="$T/o12"; make_src "$SRC12"; make_target "$O12"
@@ -438,6 +446,7 @@ fi
 # inventory's status read leaves 12 fully green — the recurring "an assertion satisfied by a different
 # guard" pattern. This sub-case fails ONLY the inventory form, by stubbing `find`.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (12b skipped — running as root)"
 else
   SRC12b="$T/src12b"; O12b="$T/o12b"; make_src "$SRC12b"; make_target "$O12b"
@@ -497,6 +506,7 @@ notify_success && bad "a source with an undeployable symlink notified SUCCESS" |
 # symlink arm exists to stop. `! -type f ! -type d` subsumes both.
 say_case "14b. a NON-REGULAR source entry (a FIFO) -> REFUSAL, not a silent omission"
 if ! command -v mkfifo >/dev/null 2>&1; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (FIFO sub-case skipped — no mkfifo on this platform)"
 else
   SRC14b="$T/src14b"; O14b="$T/o14b"; make_src "$SRC14b"; make_target "$O14b"
@@ -810,6 +820,7 @@ grep -q "OUTSIDE-THE-HARNESS" "$O17j/claims.sh" 2>/dev/null && bad "the IMPOSTOR
 # Driven with a `find` stub that fails only when the non-regular probe's arguments are used.
 say_case "17k. the non-regular-entry walk FAILING is a refusal, not an empty result"
 if [ "$(id -u)" = "0" ] && ! command -v mkfifo >/dev/null 2>&1; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (status-read sub-case skipped — no mkfifo on this platform)"
 else
   SRC17k="$T/src17k"; O17k="$T/o17k"; make_src "$SRC17k"; make_target "$O17k"
@@ -950,6 +961,11 @@ notify_reset
 OUT="$(REAL_CP18B="$REAL_CP18B" PATH="$T/bin18b:$PATH" bash "$DEPLOY" --src "$SRC18b" --o "$O18b" --notify "$NOTIFY" 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a lying chmod -> non-zero exit ($RC)" || bad "certified VERIFIED with a mode the source does not have (exit 0)"
 grep -qi "mode differs" <<< "$OUT" && ok "the verdict names the MODE as the reason" || bad "refused without naming the mode: $OUT"
+# ⛔ AND ON A FILE THE EXEC-BIT BRANCH CANNOT MASK (review P2, cycle 9). Every fixture file except
+# port-provenance.txt is executable, so with the mode comparison DELETED the run still failed — via the
+# older `[ -x src ] && [ ! -x dst ]` branch — and this case went RED only on the wording. The 0644 data
+# file is the one whose sole difference is the mode, so naming it is what pins the mode branch itself.
+grep -qi "DRIFT  port-provenance.txt  (mode differs" <<< "$OUT" && ok "18b: port-provenance.txt is DRIFTed for the MODE alone (the exec-bit branch cannot explain it)" || bad "18b: the mode-only mismatch was not reported as a mode DRIFT: $OUT"
 notify_success && bad "notified SUCCESS over a mode that differs from the source" || ok "no success notification"
 
 # ── 18c. NO USABLE `stat` — the deploy still succeeds, and the verdict says the mode is NOT evidence ──
@@ -982,6 +998,7 @@ cmp -s "$SRC18c/claims.sh" "$O18c/claims.sh" && ok "18c: the bytes still landed 
 # DEGRADED by a re-deploy that called itself verified). git only stores 644/755, so no shipped file is
 # affected today; the guard must still not be structurally blind to a mode it claims to compare.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (18d skipped — running as root, where the mode bits are not comparable this way)"
 else
   say_case "18d. a setuid source keeps its setuid bit through the deploy (BSD %Lp is not enough)"
@@ -1021,6 +1038,7 @@ grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported
 # unreadable stamp produced an empty REC and the ENTIRE identity-record arm was skipped in silence —
 # silently deleting the one check whose own contract is that "cannot check" is always said out loud.
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (19c skipped — running as root, where chmod 000 is still readable)"
 else
   say_case "19c. an unreadable stamp is reported as NOT CHECKED, never silently skipped"
@@ -1048,6 +1066,7 @@ fi
 # already implement (install.sh → UNKNOWN, check-deployed-drift.sh → unknown, whose comment records
 # the measurement: a chmod-000 `$O/claims.sh` produced a false DRIFT).
 if [ "$(id -u)" = "0" ]; then
+  SKIPPED=$((SKIPPED + 1))
   echo "  (unreadable-payload sub-case skipped — running as root, where chmod 000 is still readable)"
 else
   SRC19b="$T/src19b"; O19b="$T/o19b"; make_src "$SRC19b"; make_target "$O19b"
@@ -1162,6 +1181,7 @@ fi
 echo
 echo "════════════════════════════════════════"
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
+[ "$SKIPPED" -gt 0 ] && echo "SKIPPED: $SKIPPED sub-case(s) NOT executed on this host (root/uid-dependent) — this run does not cover them"
 [ "$FAIL" -eq 0 ] && { echo "RESULT: CLEAN"; exit 0; }
 echo "RESULT: $FAIL FAILURE(S)"
 exit 1
