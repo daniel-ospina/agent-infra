@@ -2624,6 +2624,21 @@ def test_9331_two_measured_durations_of_one_assertion_are_one_signature():
     """RED before the fix: the two texts normalise to themselves and never match."""
     a = ci_exemption.normalize_signature(_EP_LATENCY_MSG_A)
     b = ci_exemption.normalize_signature(_EP_LATENCY_MSG_B)
+    # A comparison operator EARLIER in the line must not free the measurement: the
+    # bound-operator branch is anchored to the end of its window (review cycle 3:
+    # an unanchored version left `1.47s` raw — the #9331 block back, invisibly).
+    c = ci_exemption.normalize_signature("assert elapsed < 1.2, took 1.21s")
+    d = ci_exemption.normalize_signature("assert elapsed < 1.2, took 1.47s")
+    assert c == d, (
+        "an unanchored bound operator freed the measurement — re-anchor _BOUND_LEFT_RE"
+    )
+    # …and neither must a bound WORD earlier in the line (the vocabulary branch is
+    # anchored for the same reason).
+    e = ci_exemption.normalize_signature("the budget was exceeded, took 1.21s")
+    f = ci_exemption.normalize_signature("the budget was exceeded, took 1.47s")
+    assert e == f, (
+        "an unanchored bound word freed the measurement — re-anchor the vocabulary branch"
+    )
 
     assert a == b, (
         "a measured duration must not be part of the signature — main's\n"
@@ -2690,6 +2705,14 @@ def test_9331_a_meaningful_number_stays_SIGNAL():
         ("the probe exceeded (budget 3.0s)", "the probe exceeded (budget 30.0s)"),
         ("local EP took 1.21s — the bound was ≤1.5s", "local EP took 1.21s — the bound was ≤9.5s"),
         ("the leg ran over its 1.50s timeout", "the leg ran over its 2.50s timeout"),
+        # …including the phrasings review cycle 3 measured as still collapsing:
+        # a copula/preposition tail, and the adjective-between form this repo
+        # really writes (tests/test_notify_offloop_4456.py).
+        ("the budget is 3.0s", "the budget is 30.0s"),
+        ("a limit of 1.5s", "a limit of 9.5s"),
+        ("on a bound of 0.1s", "on a bound of 0.5s"),
+        ("with a 0.1s offload bound", "with a 0.05s offload bound"),
+        ("a ceiling of 1.5s max", "a ceiling of 9.5s max"),
     ]
     for left, right in pairs:
         assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
@@ -2814,3 +2837,17 @@ def test_9331_a_duration_used_as_data_is_a_declared_residual():
     b = ci_exemption.normalize_signature("measured 12.50 s of the control's 19.75 s")
     assert a == b, "if this now differs, the mask was narrowed — re-derive the residual"
     assert a == "measured <MEAS1:s> of the control's <MEAS2:s>", a
+
+
+def test_9331_out_of_list_units_stay_volatile():
+    """DECLARED residuals, pinned so the list cannot be widened (or narrowed) silently.
+
+    Under-masking is the fail-CLOSED direction: a measurement the mask cannot
+    recognise stays volatile, which costs a re-run and never exempts a failure
+    main did not have. So the unit list grows only on evidence — and these are the
+    shapes it deliberately does not cover today.
+    """
+    for text in ("took 1.5m", "took 1.5h", "waited 3 days", "took 1.2S"):
+        assert ci_exemption.normalize_signature(text) == text, (
+            f"{text!r} is now masked — that is a new mask axis, re-derive the residuals"
+        )

@@ -1067,8 +1067,9 @@ _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 #      is left RAW: a different bound is a different failure.
 #   4. The UNIT SURVIVES into the token (``<MEAS1:s>`` vs ``<MEAS1:ms>``), so a
 #      change of SCALE — ``1.21ms`` vs ``1.21s``, three orders of magnitude — is
-#      still signal. The OCCURRENCE INDEX marks the SLOT, so a message that gains
-#      or loses a masked duration keeps a distinct signature. It does NOT
+#      still signal. The OCCURRENCE INDEX (over duration-SHAPED numbers) marks the
+#      SLOT, so a message that gains or loses a duration keeps a distinct
+#      signature. It does NOT
 #      preserve the VALUE of a slot: a pure swap of two measured values
 #      (``held 1.2s then 3.4s`` vs ``held 3.4s then 1.2s``) collapses — declared
 #      below, because preserving values would defeat the mask entirely.
@@ -1104,15 +1105,19 @@ _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 #     and pinned by ``test_9331_a_duration_used_as_data_is_a_declared_residual``;
 #   * units outside the list (``1.5m``, ``1.5h``, ``3 days``) are not masked —
 #     under-masking is the fail-CLOSED direction, so the list grows only on
-#     evidence;
-#   * uppercase units (``1.2S``) are not matched. The measured case that filed
+#     evidence (pinned by ``test_9331_out_of_list_units_stay_volatile``);
+#   * uppercase units (``1.2S``) are not matched (same test). The measured case that filed
 #     #9331 carries a message, and pytest renders the MESSAGE line as the primary
 #     ``E`` line (verified against pytest 9.1: ``AssertionError: local EP took
 #     1.47s — …`` then ``assert 1.47 < 1.2``), so the signature is the masked one.
 _MEASURED_DURATION_RE = re.compile(
     r"(?P<num>\d+\.\d+)\s?"
     r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
-    r"(?!\w)"
+    # ``(?![A-Za-z_])`` rather than ``(?!\w)``: a unit followed by a DIGIT still
+    # masks, so normalisation is IDEMPOTENT (``1.5s1.7s`` masked once == masked
+    # twice). The row readers re-normalise what the writer normalised, so a
+    # non-idempotent step means writer≠reader and the subset rule fails closed.
+    r"(?![A-Za-z_])"
 )
 
 #: Bound CONTEXT, on either side of a duration: a comparison operator or the
@@ -1121,17 +1126,27 @@ _MEASURED_DURATION_RE = re.compile(
 #: expression is never mistaken for a measurement — the fail-OPEN axis that
 #: review cycle 2 measured.
 _BOUND_LEFT_RE = re.compile(
-    # a comparison/bound operator immediately before the value (a bare ``=`` is
-    # NOT one: ``elapsed=1.21s`` is an interpolation, not a declared bound)
+    # a comparison/bound operator immediately before the value, ANCHORED to the
+    # end of the window (a bare ``=`` is NOT one: ``elapsed=1.21s`` is an
+    # interpolation, not a declared bound; and an unanchored operator would make
+    # any earlier ``<`` turn a later measurement raw — the #9331 defect back)
     r"(?:[<>≤≥]=?|==)\s*$"
-    # …or bound vocabulary followed by a short non-word tail (``budget is ``,
-    # ``bound: ``, ``limit of ``), so the noun can carry a copula or punctuation
-    r"|(?:bound|budget|limit|timeout|threshold|cap|ceiling|deadline|allowance"
-    r"|maximum|minimum|max|min|within)\b[^\w]{0,4}$",
+    # …or bound vocabulary (with a leading ``\b``, so a word merely ENDING in a
+    # stem — ``admin 1.2s`` — cannot disable the mask) carrying an optional
+    # copula/preposition tail: ``budget is 3.0s``, ``limit of 1.5s``,
+    # ``bound of 0.1s``, ``cap is 2.0s``, ``bound: ``
+    r"|\b(?:bound|budget|limit|timeout|threshold|cap|ceiling|deadline|allowance"
+    r"|maximum|minimum|max|min|within)\b"
+    r"(?:\s+(?:is|was|are|were|of|at|set|to|about|the|a|an))*\s*[^\w]{0,4}$",
     re.IGNORECASE,
 )
 _BOUND_RIGHT_RE = re.compile(
-    r"^\s*(?:bound|budget|limit|timeout|threshold|cap|ceiling|deadline|allowance)\b",
+    # the noun may follow ONE intervening word, because that is how this repo
+    # writes it: ``with a 0.1s offload bound`` (tests/test_notify_offloop_4456.py).
+    # A measurement followed by a dash/phrase (``… 1.21s — interactive budget``)
+    # does not match: the optional group needs a word, and ``—`` is not one.
+    r"^\s*(?:\w+[^\w]{0,2})?(?:bound|budget|limit|timeout|threshold|cap|ceiling"
+    r"|deadline|allowance|maximum|minimum|max|min)\b",
     re.IGNORECASE,
 )
 
@@ -1139,9 +1154,10 @@ _BOUND_RIGHT_RE = re.compile(
 def _mask_measured_duration(m: re.Match[str]) -> str:
     """``<MEAS<n>:<unit>>`` for a MEASUREMENT; a bound is returned untouched.
 
-    The occurrence index keeps two masked durations in one message distinct, so a
-    swap across slots is not read as the same failure. Bounds are left RAW on
-    purpose — see axis 3 in the ``_MEASURED_DURATION_RE`` block.
+    The slot is the index of the duration-SHAPED number in the message — bounds
+    are counted too, even though they are returned untouched — so a message that
+    gains or loses a duration never collides with the shorter one. Bounds are
+    left RAW on purpose: see axis 3 in the ``_MEASURED_DURATION_RE`` block.
     """
     before = m.string[max(0, m.start() - 32):m.start()]
     after = m.string[m.end():m.end() + 32]
