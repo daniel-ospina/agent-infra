@@ -178,19 +178,27 @@ CLASSIFIER = _objective()
 # objective.py. Without this check the import still succeeds and the failure surfaces only per PR,
 # one swallowed `AttributeError` at a time, AFTER the queue was read. The seam fires BEFORE any read
 # or dispatch and names EVERY stale symbol in one line.
+#
+# ⛔ AND IT IS DEFERRED TO `main()`, NOT RAISED HERE (2026-10-22, review round 3). This used to be a
+# module-level `raise SystemExit("pr-doctor: ... is missing ...")`, which Python exits **1** with and
+# which writes NO status record -- so a stale farm produced launchd=1 while `pr-doctor.status.json`
+# still carried the previous pass's `ok`, and `objective` printed `ok` for a job that could not run
+# at all. That is the SAME false PASS this file's exit contract exists to remove, reached by another
+# door; the contract cannot claim to be a partition while one of its doors bypasses it. A module
+# global is therefore set here and turned into a RECORDED refusal at the top of `main()`, where
+# `record_exit` exists (it is defined below this point, which is why the raise could not record).
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
-if _missing:
-    raise SystemExit(
-        "pr-doctor: %s is missing %s -- it is an older copy than this driver expects. "
-        "Refusing to run rather than report an empty dispatch as success."
-        % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
+SEAM_ERROR = (
+    ("%s is missing %s -- it is an older copy than this driver expects. Refusing to run rather "
+     "than report an empty dispatch as success."
+     % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
+    if _missing else "")
 
-# Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces.
-# The ONE resolver: the queue read (below) and the check-run read (the classifier's) must never
-# disagree about which `gh` they are, and the classifier is the half that knows how to degrade to
-# PATH on a box with no `~/bin/gh`.
-GH = CLASSIFIER.GH_BIN
+# Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces. A missing
+# GH_BIN cannot be dereferenced into a broken loop: `main()` refuses on SEAM_ERROR before any read
+# uses it, and the fallback here keeps this module IMPORTABLE so the refusal can be recorded at all.
+GH = getattr(CLASSIFIER, "GH_BIN", "") or shutil.which("gh") or "gh"
 # ⛔ HAND THE LAYER THE BINARY #1872 PINNED (#1988). `GH` may be `$O/gh-rest/gh`, which then resolves
 # the real gh by walking PATH — the very environment (`~/.pi/agent/shims/gh`, TCC-refused, rc 126)
 # that #1872 pinned a binary for. CLASSIFIER computed the pin; pass it through so this process keeps
@@ -2255,6 +2263,20 @@ def _reading_scanner():
     return p
 
 
+def _valuefree_scanner():
+    """The non-pass flags that need NO value, for when the full scanner cannot parse the argv.
+
+    ⛔ `--dry-run --only abc` IS PROVABLY A DRY RUN (2026-10-22, review round 3). Returning "" on
+    the scanner's SystemExit discarded that fact and stamped rc=64 over the fleet's record -- a
+    false RED on the machine surface, the mirror of the false PASS this file's contract closes, and
+    inconsistent with `--dry-run --max abc` (which was spared) for no visible reason.
+    """
+    p = _QuietParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--status", action="store_true")
+    return p
+
+
 def _prescan_not_a_fleet_reading(argv) -> str:
     """WHY this invocation is not a fleet reading, decided BEFORE the real parse can reject it.
 
@@ -2271,9 +2293,25 @@ def _prescan_not_a_fleet_reading(argv) -> str:
     """
     try:
         args, _ = _reading_scanner().parse_known_args(argv)
+        return _not_a_fleet_reason(args)
+    except SystemExit:
+        pass
+    # The value-carrying flag could not be parsed. A VALUE-FREE flag that DID parse still proves
+    # what this invocation is, so ask again with only those. `--only` takes a value, so its PRESENCE
+    # is all that can be known here -- and a lane that typed it is not speaking for the fleet.
+    try:
+        args, _ = _valuefree_scanner().parse_known_args(argv)
     except SystemExit:
         return ""
-    return _not_a_fleet_reason(args)
+    reason = _not_a_fleet_reason(args)
+    if reason:
+        return reason
+    for tok in argv:
+        if tok == "--only" or tok.startswith("--only="):
+            return "--only is not a fleet reading"
+    # Nothing identifies this as a debug invocation: RECORD it. The pass did not run, and a stale
+    # `ok` left in place is the false PASS this whole change removes.
+    return ""
 
 
 class _UsageParser(argparse.ArgumentParser):
@@ -2319,6 +2357,14 @@ def main() -> int:
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
     NOT_A_FLEET_READING = _not_a_fleet_reason(args)
+    # ⛔ THE SEAM IS A RECORDED REFUSAL, NOT A BARE EXIT (2026-10-22, review round 3). See
+    # SEAM_ERROR above: raising at import time exited 1 and left the previous pass's `ok` in place.
+    # It is `EXIT_REFUSING` (2) because that is exactly the fact -- "I could not read the world, so
+    # nothing was attempted" -- and the fleet already renders that code as REFUSED.
+    if SEAM_ERROR:
+        log("REFUSING: the classifier seam is stale -- %s" % SEAM_ERROR)
+        return record_exit(EXIT_REFUSING, "the classifier seam is stale -- %s" % SEAM_ERROR,
+                           read="seam")
     # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review), and neither is `--dry-run` or
     # `--status`: everything downstream -- the empty-queue exit, `un_owned`, `issue_work` -- is
     # computed from a ONE-PR universe, so recording it would publish `queue is empty` while PRs are

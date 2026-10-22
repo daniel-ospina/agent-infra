@@ -946,19 +946,27 @@ hu_row_exec() {
 # dropped rather than echoed.
 hp_launchd_dead_text() { # <label>
   local label="${1:-}" runs="${HP_LAUNCHD_RUNS:-}" lexit="${HP_LAUNCHD_LAST_EXIT:-}" seen=""
-  # Only a plain integer is quoted back: a garbled field is not evidence of anything.
-  case "$lexit" in ''|*[!0-9]*) lexit="" ;; esac
+  # Only a plain integer is quoted back: a garbled field is not evidence of anything. A SIGNED code
+  # is kept -- a signal death can be reported as a negative status, and dropping it would present a
+  # PRESENT datum as absent, the mirror of the rule this block states.
+  case "$lexit" in ''|-) lexit="" ;; -[0-9]*|[0-9]*) : ;; *) lexit="" ;; esac
   case "$runs" in ''|*[!0-9]*) runs="" ;; esac
   [ -n "$runs" ] && seen="; launchd reports $runs launch(es) since it was loaded"
-  if [ "${lexit:-x}" = "0" ]; then
+  # ⛔ `runs = 0` IS DECISIVE AND IS TESTED FIRST (2026-10-22, review round 3). launchd's
+  # `last_exit_status` is CALLOC'd to 0 and is only overwritten when a run is REAPED, so a job that
+  # has never been launched reports `last exit code = 0` -- the one datum here that cannot prove
+  # anything. Branching on the exit code first made such a job read EXITED-CLEAN and handed the
+  # operator the "second controller holds the lock" remedy instead of `kickstart`, for a job that had
+  # never run at all.
+  if [ "$runs" = "0" ]; then
+    printf 'NEVER-STARTED (%s is loaded with NO process and launchd reports 0 launches — it has never been kicked; start it: launchctl kickstart -k gui/%s/%s)' \
+      "$label" "$(id -u)" "$label"
+  elif [ "$lexit" = "0" ]; then
     printf 'EXITED-CLEAN (last exit 0%s — launchd relaunches it on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing; the documented cause is a second controller holding %s/.orch.lock ("already running", orch-loop.sh) — read %s/logs/launchd.out)' \
       "$seen" "$O" "$O"
   elif [ -n "$lexit" ]; then
     printf 'DIED (last exit %s%s; launchd retries it on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
       "$lexit" "$seen" "$O"
-  elif [ "$runs" = "0" ]; then
-    printf 'NEVER-STARTED (%s is loaded with NO process and launchd reports 0 launches — it has never been kicked; start it: launchctl kickstart -k gui/%s/%s)' \
-      "$label" "$(id -u)" "$label"
   else
     printf 'LOADED-NO-PROCESS (%s is loaded but has NO process%s, and launchd published no exit code to tell why; check: launchctl print gui/%s/%s)' \
       "$label" "$seen" "$(id -u)" "$label"

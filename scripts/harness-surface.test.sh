@@ -432,6 +432,11 @@ case "${LAUNCHD_MODE:-running}" in
   clean-exit) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 7\n'; exit 0 ;;
   # Loaded, no process, and launchd has NEVER launched it (runs = 0 settles "never kicked").
   never-started) printf '\tstate = spawn scheduled\n\truns = 0\n'; exit 0 ;;
+  # ⛔ `last exit code = 0` IS launchd's CALLOC DEFAULT, so a job that never ran reports it too.
+  # `runs = 0` is the decisive datum and must WIN over it (review round 3).
+  default-clean) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 0\n'; exit 0 ;;
+  # A SIGNED status (a signal death). A present datum must not be reported as absent.
+  signed) printf '\tstate = spawn scheduled\n\tlast exit code = -15\n\truns = 3\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -538,6 +543,24 @@ OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME
 launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) 'no exit code + 0 launches' is NAMED NEVER-STARTED, not 'crashing or never kicked' [$launchd_row]" \
    "$(case "$launchd_row" in *NEVER-STARTED*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs = 0` MUST BEAT A DEFAULT `last exit code = 0` (review round 3). launchd callocs
+# last_exit_status to 0, so a never-launched job reports "last exit code = 0" too; branching on the
+# code first named a lock-contention cause and hid the `kickstart` remedy for a job that never ran.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=default-clean HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) '0 launches' WINS over launchd's default 'last exit code = 0' — NEVER-STARTED, not EXITED-CLEAN [$launchd_row]" \
+   "$(case "$launchd_row" in *NEVER-STARTED*) echo 0 ;; *EXITED-CLEAN*) echo 1 ;; *) echo 1 ;; esac)"
+# ⛔ A SIGNED STATUS IS A PRESENT DATUM. Dropping it would report a signal death as "no exit code".
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=signed HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a SIGNED exit status is carried, not dropped as 'no exit code' [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit -15"*) echo 0 ;; *) echo 1 ;; esac)"
 # An exit with NO launch count still prints the code, and invents no count.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \

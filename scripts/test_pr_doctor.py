@@ -3882,17 +3882,65 @@ def test_the_prescan_agrees_with_the_parsed_flags(monkeypatch, argv, expected):
     assert pr.NOT_A_FLEET_READING == expected
 
 
-def test_an_unparseable_scanner_value_still_records(tmp_path):
-    """`--only abc` cannot be classified, so the pass must RECORD rather than leave a stale `ok`.
+def test_an_unparseable_value_still_records_when_the_run_is_not_provably_debug(tmp_path):
+    """`--max abc` cannot be classified as a debug invocation, so the pass must RECORD.
 
-    Silence is only granted when the invocation is provably a debug one; when it is not provable,
+    Silence is only granted when the invocation is PROVABLY a debug one; when it is not provable,
     the conservative direction is the one that cannot hide a broken job.
     """
     status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "x"})
-    r = _run_doctor(["--only", "abc"], tmp_path)
+    r = _run_doctor(["--max", "abc"], tmp_path)
     assert r.returncode == 64, (r.returncode, r.stdout, r.stderr)
     rec = json.loads(status.read_text())
     assert rec["rc"] == 64, rec
+
+
+@pytest.mark.parametrize("argv", [
+    ["--dry-run", "--only", "abc"],   # the dry run PARSED; only --only's value did not
+    ["--only", "abc"],                 # a lane that typed --only is not speaking for the fleet
+    ["--only=abc"],
+])
+def test_a_provable_debug_run_is_spared_even_when_a_value_is_unparseable(argv, tmp_path):
+    """⛔ ROUND 3: the old `except SystemExit: return ""` threw away a PROVABLE dry run.
+
+    Measured before this fix: `--dry-run --only abc` stamped rc=64 over a real record while
+    `--dry-run --max abc` was spared — a false RED on the machine surface, for no reason an operator
+    could see, and inconsistent with this function's own rule ("silence only when PROVABLY a debug
+    run").
+    """
+    status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "x"})
+    before = status.read_text()
+    r = _run_doctor(argv, tmp_path)
+    assert r.returncode == 64, (r.returncode, r.stdout, r.stderr)
+    assert status.read_text() == before, "a provable debug-run typo overwrote the fleet's verdict"
+
+
+def test_the_stale_seam_is_a_RECORDED_refusal_not_a_bare_exit(monkeypatch):
+    """⛔ ROUND 3: a module-level `raise SystemExit(str)` exits 1 and writes no record.
+
+    That left launchd saying 1 while the record still said the previous pass's `ok` — the same false
+    PASS as the argparse path, through a different door, in the one state the fleet most needs told
+    (a stale farm where the driver is newer than `objective.py`).
+    """
+    seen = {}
+    monkeypatch.setattr(pr, "SEAM_ERROR", "objective.py is missing classify_one", raising=False)
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "open_prs",
+                        lambda: pytest.fail("the seam must be refused BEFORE any read"))
+    monkeypatch.setattr(pr, "record_exit",
+                        lambda rc, reason, **k: seen.update(rc=rc, reason=reason, **k) or rc)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_REFUSING == 2
+    assert seen["rc"] == 2, seen
+    assert "seam is stale" in seen["reason"], seen
+
+
+def test_the_valuefree_fallback_names_the_provable_flag():
+    """The scan that CANNOT parse still answers what it can: the value-free flags it did parse."""
+    assert pr._prescan_not_a_fleet_reading(["--dry-run", "--only", "abc"]) == "dry run"
+    assert pr._prescan_not_a_fleet_reading(["--only", "abc"]) == "--only is not a fleet reading"
+    assert pr._prescan_not_a_fleet_reading(["--max", "abc"]) == ""
 
 
 def test_a_closed_stdout_pipe_cannot_rewrite_the_verdict_as_a_crash(tmp_path):
