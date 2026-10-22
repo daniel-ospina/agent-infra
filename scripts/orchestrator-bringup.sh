@@ -7,6 +7,8 @@
 #   bash scripts/orchestrator-bringup.sh restart          # stop, then start, then verify
 #   bash scripts/orchestrator-bringup.sh status           # + the FLEET COMPONENT TABLE
 #   bash scripts/orchestrator-bringup.sh --reseed [verb]  # regenerate the machine-local config, then verb
+#   bash scripts/orchestrator-bringup.sh start --prune    # …and REMOVE unshipped files from $O. Never
+#                                                        # one that something resolves BY PATH (#2059)
 #
 # `start`/`stop`/`status` cover the WHOLE FLEET, not only the controller: the inventory (ONE declared
 # list of components, each with its own liveness predicate) lives in lib/fleet-inventory.sh. `status`
@@ -98,11 +100,15 @@ usage() { # <exit-code>
   exit "${1:-0}"
 }
 
-VERB=""; RESEED=0
+VERB=""; RESEED=0; PRUNE=0
 for a in "$@"; do
   case "$a" in
     check|start|stop|restart|status) VERB="$a" ;;
     --reseed)               RESEED=1 ;;
+    # ⛔ OFF unless asked for. A deploy no longer deletes anything from the live tree by default
+    # (#2059): the mirror ran `rm -f` over every `$O/*.sh` the checkout does not ship, which is
+    # exactly the files this box's launchd job and armed schedules resolve BY PATH.
+    --prune)                PRUNE=1 ;;
     -h|--help)              usage 0 ;;
     *) printf 'bringup: unknown argument %s\n' "$a" >&2; usage 1 ;;
   esac
@@ -561,23 +567,98 @@ check_harness_pin() {
       # nobody can read — that is the rc=2 arm below.
       warn "the deployed harness at $O has drifted from $src_repo ($(printf '%s' "$out" | grep -c '^DRIFT:' ) finding(s); first: $(printf '%s' "$out" | head -1)) — 'start' redeploys $O from $src_repo before launching"
       ;;
-    *) unknown "the deployed harness at $O cannot be verified against $src_repo ($(printf '%s' "$out" | head -1)) — refusing to certify an unknown identity" ;;
+    *)
+      # ⛔ ABSENT AND UNREADABLE ARE DIFFERENT FACTS, and only one of them is this run's to refuse.
+      # A box that was NEVER stamped has no identity record to contradict — and this verb is the one
+      # that CREATES it: `start` deploys $O from $src_repo and install.sh writes the stamp. Refusing
+      # here made the repair unreachable from the only entry point that performs it (measured on this
+      # box 2026-10-21: $O carried no .agent-infra-stamp.json, so `start` exited 2 at check and never
+      # reached its own deploy; the remaining route was a bare `install.sh` run, which is the SECOND
+      # launchd job hazard 2 of this change exists to stop rendering). A stamp that EXISTS and cannot
+      # be read or parsed is the opposite case — a real identity nobody can establish — and stays
+      # rc=2: deploying over it would destroy the record rather than repair it.
+      if [ ! -f "$O/.agent-infra-stamp.json" ]; then
+        warn "the deployed harness at $O carries NO identity record ($O/.agent-infra-stamp.json is absent) — nothing can certify what $O ran BEFORE this run; 'start' deploys $O from $src_repo, which is the repair (#1745)"
+      else
+        unknown "the deployed harness at $O cannot be verified against $src_repo ($(printf '%s' "$out" | head -1)) — refusing to certify an unknown identity"
+      fi
+      ;;
   esac
+}
+
+# ── the RESOLVER SET — files something on this box resolves BY PATH (#2059) ─────────────────────
+# A deploy is a MIRROR: it makes `$O` look like the checkout, and it used to `rm -f` every `$O/*.sh`
+# the checkout does not ship. The predicate "not shipped" is not the same question as "stale".
+#
+# ⛔ MEASURED 2026-10-18: the six live disk reapers ship from `agent-infra:scripts/` — ONE DIRECTORY
+# OVER — so the mirror classified them as "not shipped" and deleted all six, which broke the armed
+# hourly pass and silently reverted every lane teardown to `SKIP … KEPT` (spawn-gate.sh resolves
+# `$O/reap-lane-venvs.sh` FIRST). On THIS box the same loop's first victim is `supervisor.sh`, which
+# ships from NOWHERE: it is the `ProgramArguments` of the loaded job `com.eldato.orchestrator-stack`,
+# so `start` deleted it, then `launchctl unload` + `load` re-loaded a job whose program no longer
+# existed.
+#
+# ⛔ So the rule is not "does the harness ship it" but "does SOMETHING RESOLVE `$O/<name>`": a job's
+# ProgramArguments, an armed schedule, or a sibling that tries `$O/<tool>` before falling back. A file
+# whose only fault is that the checkout does not carry it is DEPLOYED STATE, not a stale copy, and a
+# deploy never removes one. Each entry names its RESOLVER — the thing that would break — not the
+# file's purpose, because that is what an editor has to go and change.
+RESOLVER_SET="\
+supervisor.sh|the ProgramArguments of this box's controller job (com.eldato.orchestrator-stack → /bin/bash $O/supervisor.sh)
+orchestrator-heartbeat.sh|the ProgramArguments of com.eldato.harness-heartbeat, and cadence-nudge.sh's TICK
+disk-reaper.sh|resolved from $O before the shipped copy by cloud-cell-bringup.sh and cloud-cell-supervisor.sh, and the armed reaper schedule
+pi-cache-reap.sh|the pi cache reaper run from $O by the armed schedule
+pi-reap-worktrees.sh|resolved from $O by the worktree/branch reaper schedule
+reap-lane-venvs.sh|resolved FIRST from $O by spawn-gate.sh (:413) — without it every lane teardown keeps its venv"
+
+resolver_reason() { # <basename> → the resolver that names it, or empty
+  local e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    if [ "${e%%|*}" = "$1" ]; then printf '%s\n' "${e#*|}"; return 0; fi
+  done <<RESOLVERS
+$RESOLVER_SET
+RESOLVERS
+  return 0
 }
 
 # deploy_harness — put THIS checkout's harness into $O, atomically, before the daemon is loaded.
 #
-# ⛔ load-bearing: the launchd plist runs `__O__/orch-loop.sh`, and `install.sh` does NOT copy the
+# ⛔ load-bearing: a launchd plist runs `__O__/orch-loop.sh`, and `install.sh` does NOT copy the
 # scripts there — it only WARNS when $O differs from the shipped copy. So a `start` that skipped this
 # step would launch whatever bytes happen to be in $O (on this box: a tree four weeks behind, with a
 # post-install hand edit) and the stamp written afterwards would describe a harness nobody runs. Same
 # discipline as cloud-cell-supervisor.sh's seed_and_stamp: temp file in the same directory, then
 # rename — a running controller's lanes execute `bash $O/<worker>.sh`, and a plain `cp` TRUNCATES the
 # live script before rewriting it, so a spawn landing in that window would run half a worker.
+#
+# ⛔ AND THE OTHER DIRECTION IS NOT A MIRROR UNLESS ASKED (#2059). Nothing is removed from `$O` unless
+# `--prune` says so, the plan is printed BEFORE anything is written, and a resolver-set file is never
+# removed at all — a `--prune` that would have taken one is a CONFLICT: the removals it CAN honour are
+# performed, the resolver set is kept, and this returns non-zero naming what it refused to delete.
+# Returns 1 only in that state — a plain deploy (or one with nothing to remove) returns 0.
 deploy_harness() {
   [ -d "$HARNESS_BRINGUP" ] || unknown "no harness at $HARNESS_BRINGUP — nothing to deploy into $O"
   mkdir -p "$O/logs" "$O/state" "$O/wip" || refuse "cannot create the state dir $O"
-  local src f tmp n=0
+  local src f b tmp n=0 changed="" stale="" keep="" why conflict=0
+  # ── THE PLAN, before anything is written ────────────────────────────────────────────────────────
+  # Two halves, because they are two different risks: a shipped file whose bytes DIFFER is about to be
+  # overwritten (a hand edit in $O is lost), and a file $O carries and the checkout does not is what
+  # the mirror used to delete. An operator reading a plan can stop it; nobody reads an `rm` in a loop.
+  for src in "$HARNESS_BRINGUP"/*.sh; do
+    [ -f "$src" ] || continue
+    b="$(basename "$src")"
+    [ -f "$O/$b" ] || continue
+    cmp -s "$src" "$O/$b" || changed="$changed $b"
+  done
+  [ -z "$changed" ] || say "deploy: plan — replacing $(printf '%s' "$changed" | wc -w | tr -d ' ') file(s) in $O whose bytes differ from the checkout:$changed"
+  for f in "$O"/*.sh; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f")"
+    [ -f "$HARNESS_BRINGUP/$b" ] && continue
+    why="$(resolver_reason "$b")"
+    if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
+  done
   for src in "$HARNESS_BRINGUP"/*.sh; do
     [ -f "$src" ] || continue
     f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
@@ -586,11 +667,23 @@ deploy_harness() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || unknown "no *.sh in $HARNESS_BRINGUP — refusing to load a daemon with nothing to run"
-  # MIRROR, not overlay: a worker RENAMED upstream would otherwise stay live in $O and invocable.
-  for f in "$O"/*.sh; do
-    [ -f "$f" ] || continue
-    [ -f "$HARNESS_BRINGUP/$(basename "$f")" ] || { rm -f "$f"; say "deploy: removed stale $(basename "$f") — the harness no longer ships it"; }
-  done
+  # ── the removal policy ─────────────────────────────────────────────────────────────────────────
+  if [ -n "$stale" ]; then
+    if [ "$PRUNE" = 1 ]; then
+      say "deploy: plan — --prune: removing $(printf '%s' "$stale" | wc -w | tr -d ' ') unshipped file(s) from $O:$stale"
+      for b in $stale; do rm -f "$O/$b" && say "deploy: removed $b"; done
+    else
+      say "deploy: $(printf '%s' "$stale" | wc -w | tr -d ' ') file(s) in $O are not shipped by the harness and are LEFT IN PLACE — a deploy does not delete from the live tree; 'start --prune' removes them:$stale"
+    fi
+  fi
+  if [ -n "$keep" ]; then
+    warn "deploy: KEPT $(printf '%s' "$keep" | wc -w | tr -d ' ') file(s) the harness does not ship, because something on this box resolves them BY PATH (#2059):"
+    for b in $keep; do warn "  · $b — $(resolver_reason "$b")"; done
+    if [ "$PRUNE" = 1 ]; then
+      conflict=1
+      warn "deploy: CONFLICT — --prune asked for a mirror, and a mirror would delete the resolver set named above; that removal was NOT performed. Retire one of those files by changing the resolver that names it, not by pruning $O"
+    fi
+  fi
   if [ -f "$HARNESS_BRINGUP/gh-rest/gh" ]; then
     mkdir -p "$O/gh-rest" || refuse "cannot create $O/gh-rest"
     tmp="$O/gh-rest/.gh.$$"
@@ -598,6 +691,7 @@ deploy_harness() {
       || { rm -f "$tmp"; refuse "cannot install $O/gh-rest/gh"; }
   fi
   ok "deployed $n harness script(s) into $O from $HARNESS_BRINGUP"
+  return "$conflict"
 }
 
 check_registry() {
@@ -648,6 +742,12 @@ check_registry() {
 # both pass the gate; the pending record is removed on any failure, so a refused start never leaves a
 # phantom owner behind.
 PENDING_FILE=""
+# Set by start_mac when the deploy could not honour --prune (a resolver-set file it was asked to
+# remove). Read once, at the end of cmd_start, so the exit code carries it.
+DEPLOY_CONFLICT=0
+# Set by start_mac's ADOPT path: the recorded pid was proven from the strict scope (the lock plus this
+# state dir's own process set) rather than read off the launchd job, whose pid may be a supervisor.
+STARTED_PID_PROVEN=0
 release_pending() {
   [ -n "$PENDING_FILE" ] || return 0
   # Only remove OUR record: if the record now names a real controller pid, a start got through and the
@@ -697,8 +797,12 @@ cmd_start() {
       # A here-string, never a pipe: under `pipefail` a builtin writer piped into a quiet grep is the
       # SIGPIPE false-negative idiom (#841/#864) — `grep -qx` exits at the first match, the writer
       # takes SIGPIPE, and the pipeline's status is the 141, not grep's 1. Caught by sigpipe-grep.
-      if ! grep -qx "$pid" <<<"$owned"; then
-        unknown "launchd reports pid $pid but no $O/orch-loop.sh process runs as it — refusing to record a pid this state dir cannot prove is its own controller; check: launchctl print gui/$(id -u)/$LABEL"
+      # ⛔ AND IT IS NOT ASKED AT ALL when the pid was already PROVEN by the strict scope (start_mac's
+      # ADOPT path): on an adopting box launchd's pid is the SUPERVISOR and this state dir's
+      # controller is its child, so "is launchd's pid an orch-loop.sh" refuses a controller that is
+      # demonstrably running.
+      if [ "${STARTED_PID_PROVEN:-0}" != 1 ] && ! grep -qx "$pid" <<<"$owned"; then
+        unknown "launchd reports pid $pid but no $O/orch-loop.sh process runs as it — refusing to record a pid this state dir cannot prove is its own controller; check: launchctl print gui/$(id -u)/${ACTIVE_LABEL:-$LABEL}"
       fi
       ;;
   esac
@@ -716,8 +820,15 @@ cmd_start() {
   # reconciled by a kill.
   say ""
   say "==> ensuring the rest of the fleet"
-  fleet_ensure_components "$(harness_ctl_path)"
-  return $?
+  fleet_ensure_components "$(harness_ctl_path)"; local frc=$?
+  # ⛔ A DEPLOY THAT COULD NOT HONOUR --prune IS A FACT ABOUT THE EXIT CODE. The conflict is about $O's
+  # resolver set, not about the controller (which is up), so this reports rather than unwinds — but a
+  # run whose mirror was only partly applied must not exit 0 as if nothing had been asked for.
+  if [ "${DEPLOY_CONFLICT:-0}" != 0 ]; then
+    warn "the deploy reported a CONFLICT (see above) — the fleet was still started; the conflict is $O's resolver set, not the controller"
+    [ "$frc" = 0 ] && frc=1
+  fi
+  return "$frc"
 }
 
 registry_claim_or_refuse() { # <file>
@@ -817,14 +928,154 @@ roster_pid_from_status() {
     | sed -n 's/.*controller: RUNNING (pid \([0-9][0-9]*\).*/\1/p' | head -1
 }
 
-plist_path() { printf '%s\n' "$HOME/Library/LaunchAgents/$LABEL.plist"; }
+# ── which launchd job OWNS this state dir? ─────────────────────────────────────────────────────
+# `start` used to render and load ONE hard-coded label, `com.eldato.orchestrator-loop`, on every box.
+# That is one answer for a shape of box that does not include this one: here the loaded job is
+# `com.eldato.orchestrator-stack` → `/bin/bash $O/supervisor.sh`, while `install.sh` renders
+# `com.eldato.orchestrator-loop` → `$O/orch-loop.sh`. So `start` wrote a second plist and
+# `launchctl load -w`'d it BESIDE the running stack: two jobs, one state dir, one of them an
+# unsupervised controller — the duplicate-controller class (#1761), reached by running the canonical
+# entry point (measured in a scratch $O on 2026-10-21: two plists, both loaded).
+#
+# ⛔ THE SAFE DIRECTION IS "OPERATE THE JOB THAT IS ALREADY HERE", never "load a new one": a box's
+# supervision model is deployed state, and an entry point that renders over it is deciding an owner
+# decision about the operating model in passing. So the question is asked FIRST:
+#   none         → first install: render $LABEL and load it (the old, correct path).
+#   exactly one  → ADOPT it: (re)start THAT job; never render $LABEL.
+#   more than one → refuse. Two jobs both name a program in this $O; only a human can say which is
+#                   stale, and starting the wrong one makes a second controller.
+# The scan is textual on purpose: `plutil` is not guaranteed present, the two fields read here
+# (Label, the last ProgramArguments <string>) are exactly the two both templates render, and a test can
+# drive it with fixture plists.
+launchd_job_for_state_dir() {
+  local dir="${FLEET_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}" p prog label job_o
+  [ -d "$dir" ] || return 0
+  for p in "$dir"/*.plist; do
+    [ -f "$p" ] || continue
+    # ⛔ BOTH FIELDS ARE READ FROM THE WHOLE FILE, joined to one line first: a plist may put
+    # `<key>Label</key>` and its `<string>` on one line or on two (the live plists and a rendered
+    # template differ), and a parser that only handles one layout silently reports a DIFFERENT label —
+    # the first version of this function used `awk … {getline}` and produced the job's PROGRAM path as
+    # its label against a one-line fixture, which is exactly the confusion this function exists to end.
+    local flat args
+    flat="$(tr '\n' ' ' < "$p" 2>/dev/null)"
+    args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
+    # The LAST <string> of the array is the program: every job in this fleet is `/bin/bash <script>`,
+    # and a job with no ProgramArguments is not one of ours.
+    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p')"
+    case "$prog" in "$O"/*) ;; *) continue ;; esac
+    # ⛔ A JOB THAT MERELY LIVES IN $O IS NOT THIS STATE DIR'S CONTROLLER JOB. On this box FOUR plists
+    # run a program under $O — the stack supervisor, the heartbeat, `bg/nightwatch.sh`, pr-doctor — and
+    # counting them all as owners made `start` refuse for ambiguity on the one box it has to work on
+    # (measured 2026-10-21; the first version of this function did exactly that). The ownership marker
+    # is the one the controller's own templates write: the job DECLARES this state dir (`O`), or it runs
+    # the loop itself. An auxiliary installed under $O declares neither.
+    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    [ "$job_o" = "$O" ] || [ "$prog" = "$O/orch-loop.sh" ] || continue
+    label="$(printf '%s' "$flat" | sed -n 's:.*<key>Label</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    [ -n "$label" ] || continue
+    printf '%s\t%s\t%s\n' "$label" "$p" "$prog"
+  done
+  return 0
+}
+
+# ACTIVE_* — the job this run operates. ACTIVE_LABEL empty means "no job names a program in $O".
+ACTIVE_LABEL=""; ACTIVE_PLIST=""; ACTIVE_PROG=""; ACTIVE_JOBS=""
+launchd_active_job() { # 0 settled · 2 AMBIGUOUS (ACTIVE_JOBS lists them)
+  local rows label plist prog n=0
+  ACTIVE_LABEL=""; ACTIVE_PLIST=""; ACTIVE_PROG=""; ACTIVE_JOBS=""
+  rows="$(launchd_job_for_state_dir)"
+  while IFS="$(printf '\t')" read -r label plist prog; do
+    [ -n "${label:-}" ] || continue
+    n=$(( n + 1 ))
+    ACTIVE_LABEL="$label"; ACTIVE_PLIST="$plist"; ACTIVE_PROG="$prog"
+    ACTIVE_JOBS="$ACTIVE_JOBS${ACTIVE_JOBS:+, }$label ($plist)"
+  done <<JOBS
+$rows
+JOBS
+  [ "$n" -le 1 ] && return 0
+  return 2
+}
+
+# launchd_job_state <label> → JOB_STATE in {yes,no,unknown}, with JOB_PID set when it is loaded.
+# ⛔ IT WRITES GLOBALS INSTEAD OF PRINTING, and that is not style: a `$(...)` capture runs in a
+# SUBSHELL, so the pid it read would never reach the caller — the first version printed the state and
+# set JOB_PID inside the substitution, and the caller then died on `JOB_PID: unbound variable` (caught
+# in this change's own scratch run).
+# ⛔ Tri-state, and the same rule launchd-cycle.sh's `lc_probe` applies: ONLY launchd's own service-level
+# "no such service" answer proves ABSENT. launchd prints the same `Bad request.` prefix for a
+# DOMAIN-level rejection, which says nothing about the service — reading that as "not loaded" is how a
+# broken domain becomes a confident answer. rc is NOT the verdict: `launchctl print` exits 113 for a
+# missing service.
+JOB_STATE=""; JOB_PID=""
+launchd_job_state() {
+  local out rc
+  JOB_STATE="unknown"; JOB_PID=""
+  out="$(launchctl print "gui/$(id -u)/$1" 2>&1)"; rc=$?
+  if [ "$rc" = 0 ]; then
+    JOB_STATE="yes"
+    JOB_PID="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1)"
+    return 0
+  fi
+  case "$out" in
+    *"Could not find service"*|*"not find service"*|*"service not found"*) JOB_STATE="no" ;;
+  esac
+  return 0
+}
+
+# The CONTROLLER this state dir owns — the loop, never the JOB's pid. On a box whose job runs a
+# supervisor, launchd's pid IS the supervisor: recording it would name a process whose argv is not
+# `orch-loop.sh`, and `status` would then print an owner it cannot attribute. The proof of ownership is
+# the same read `status` uses: the lock's owner plus this state dir's own process set.
+controller_pid_owned() { owned_pids | head -1; }
+
+plist_path() {
+  # The ACTIVE job's plist once this box has one, else the path install.sh would render.
+  printf '%s\n' "${ACTIVE_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+}
 
 start_mac() {
   [ -f "$HARNESS_BRINGUP/install.sh" ] || unknown "no install.sh at $HARNESS_BRINGUP — this machine cannot render the launchd agent"
   # install.sh renders AND validates the plist (plutil, unrendered-token check, daemon PATH probe) and
   # deliberately does not load it. Everything it needs is passed explicitly, so a value in this
   # machine's config file cannot be silently ignored by a launchd process that never sees the file.
-  deploy_harness
+  deploy_harness || DEPLOY_CONFLICT=1
+  launchd_active_job || refuse "TWO launchd jobs name a program in $O: $ACTIVE_JOBS — one of them is stale and only a human can say which, and starting either can put a SECOND controller on $SLUG_REPO's queue. Remove the stale job (launchctl bootout gui/$(id -u)/<label>, then its plist) and re-run: $0 start"
+  # ⛔ ADOPT ONLY WHEN THE JOB IS NOT THE ONE install.sh RENDERS. A box whose controller job IS $LABEL
+  # keeps the old path exactly — install.sh re-renders it (limits, PATH, env) and we reload it — because
+  # skipping the renderer there would freeze every loop box's plist at whatever it was installed with.
+  if [ -n "$ACTIVE_LABEL" ] && [ "$ACTIVE_LABEL" != "$LABEL" ]; then
+    # ── ADOPT the job this box already runs ───────────────────────────────────────────────────────
+    [ -f "$ACTIVE_PROG" ] || unknown "the launchd job $ACTIVE_LABEL runs $ACTIVE_PROG, and that file is not in $O after the deploy — starting it would exec a missing program; restore the file (it is in this box's resolver set, so the deploy never removes it) or fix the job, then re-run: $0 start"
+    say "==> launchd job $ACTIVE_LABEL already owns $O ($ACTIVE_PLIST) — starting THAT job; NOT rendering $LABEL, which would be a second job (and a second controller) for one state dir"
+    local state
+    launchd_job_state "$ACTIVE_LABEL"; state="$JOB_STATE"
+    case "$state" in
+      yes)
+        if [ -n "$JOB_PID" ]; then
+          ok "launchd job $ACTIVE_LABEL is already RUNNING (job pid $JOB_PID) — left alone: it owns this state dir, and cycling a healthy supervisor would only drop supervision for the moment it takes to come back"
+        else
+          launchctl kickstart "gui/$(id -u)/$ACTIVE_LABEL" \
+            || refuse "launchctl kickstart gui/$(id -u)/$ACTIVE_LABEL failed — the job that owns $O is loaded but not running; check: launchctl print gui/$(id -u)/$ACTIVE_LABEL"
+        fi
+        ;;
+      no)
+        launchctl load -w "$ACTIVE_PLIST" \
+          || refuse "launchctl load -w $ACTIVE_PLIST failed — the job that owns $O is installed but not running; check: launchctl print gui/$(id -u)/$ACTIVE_LABEL"
+        ;;
+      *)
+        unknown "launchd's state for $ACTIVE_LABEL could not be read (${JOB_PID:-no pid}) — whether the job that owns $O is running cannot be determined, so nothing was loaded"
+        ;;
+    esac
+    STARTED_PID="$(await_pid controller_pid_owned)"
+    # ⛔ PROVEN, not inferred: this pid came from the lock plus this state dir's own process set, which
+    # is the strict scope. The `grep -qx` proof in cmd_start asks a different question ("is launchd's
+    # pid an orch-loop.sh"), and on an adopting box launchd's pid is the SUPERVISOR — asking it there
+    # refuses a controller that is demonstrably running (measured: pid 32325 is an orch-loop.sh, the
+    # job's pid is its parent).
+    STARTED_PID_PROVEN=1
+    return 0
+  fi
   if ! env -i \
         HOME="$HOME" PATH="$PATH" \
         O="$O" REPO="$REPO" OR="$SLUG_REPO" \
@@ -840,7 +1091,7 @@ start_mac() {
 }
 
 launchd_pid() {
-  launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1
+  launchctl print "gui/$(id -u)/${ACTIVE_LABEL:-$LABEL}" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1
 }
 
 # ── stop ──────────────────────────────────────────────────────────────────────────────────────
@@ -861,6 +1112,12 @@ cmd_stop() {
       bash "$SUPERVISOR" stop || refuse "cloud-cell-supervisor.sh stop failed (see its output above) — the controller may still be running"
       ;;
     mac)
+      # ⛔ SAME QUESTION, SAME ANSWER AS `start`. This branch used to unload `com.eldato.orchestrator-loop`
+      # unconditionally; on a box whose job is named differently that unloads nothing (or worse, a
+      # stale second job), and `stop` then reports "not running" over the stack it never touched.
+      # Ambiguity is a REFUSAL here rather than a silent pick: two jobs own one state dir, and
+      # unloading the wrong one leaves a live controller behind an entry point that no longer knows it.
+      launchd_active_job || refuse "TWO launchd jobs name a program in $O: $ACTIVE_JOBS — only a human can say which one is this state dir's; nothing was stopped. Reconcile by hand: launchctl bootout gui/$(id -u)/<label>"
       local plist live; plist="$(plist_path)"
       if [ -f "$plist" ]; then
         # ⛔ `launchctl unload -w` EXITS 0 WHILE PRINTING "Unload failed" (measured on macOS: a plist

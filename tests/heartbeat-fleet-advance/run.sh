@@ -272,7 +272,17 @@ lint 'block depth at the send' "${_depth_send:-?}" 24
 # is caught by the executable-line count below instead.
 _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:space:]]|;|$)' "$HB" \
   | cksum | cut -d' ' -f1-2 | tr -d ' ')"
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "21188013054935"
+# ⛔ RE-PINNED 2026-10-19 (#1867), DELIBERATELY, WITH THE DIFF CHECKED: the digest moved from
+# 21188013054935 to 40775937054958 because the `WORKING` counter inside this script's Python heredoc
+# went from `if v in ("WORKING",): act+=1` to `if v in ("WORKING", "UNATTRIBUTED-WORKING"): act+=1` —
+# a REWRITE of one matched line, not an added block. Verified when re-pinning: the matched line COUNT
+# is 148 both before and after, and the diff of the matched lines is exactly that one line.
+# THE PIN IS COARSE BY DESIGN, and this is its blind spot worth naming: the pattern matches `if`
+# inside heredoc PYTHON as well as shell, so any heredoc edit that rewrites such a line re-pins here.
+# That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
+# rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
+# place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "40775937054958"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.

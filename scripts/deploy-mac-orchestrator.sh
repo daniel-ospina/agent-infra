@@ -10,8 +10,9 @@
 #   half-read. Every file is installed that way, in BOTH phases.
 #   NOT a reason to wait, and this file previously said so wrongly: "killing the controller kills
 #   the lane-* sessions under it, which hold UNCOMMITTED work" is FALSE. The controller's only trap
-#   is `rm -f "$LOCKF"` (orch-loop.sh:340), and workers are spawned as `tmux new-session -d -s
-#   "merge-$PR" "bash '$O/merge-one.sh' …"` — children of the TMUX SERVER, not of the controller.
+#   is `rm -f "$LOCKF"` (orch-loop.sh:340), and workers are spawned through `worker-terminal.sh` — a
+#   detached tmux session on this Mac, a daemon-owned durable terminal on a cell (agent-infra#1702) —
+#   so they are children of the tmux server or of the cmux daemon, never of the controller.
 #   Killing the controller therefore leaves every in-flight worker running; that false premise made
 #   phase B wait for a zero-in-flight moment on a Mac that merges ~39 PRs/12h and so deferred it
 #   three times (~2.5h of waiting) without protecting anything. `WAIT=1` is now OPT-IN.
