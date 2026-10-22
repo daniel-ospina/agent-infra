@@ -149,10 +149,12 @@ _override_usable() {
 _gh_named_state() {
   local dir p line tok reset at now _win _alt _bp _brem _breset _bat _ttl
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
-  # ⛔ AN EMPTY `HOME` IS NOT `/tmp`: the layer resolves `~` the way Python does — `expanduser` falls back
-  # to the PASSWD entry — so a shell that computed `${HOME:-/tmp}/.cache` read a directory the layer never
-  # writes, and NO named state ever reached the rail on such a box (measured, round 10). Unquoted `~` is
-  # bash's own getpwuid fallback, i.e. the SAME answer the layer computes.
+  # ⛔ AN EMPTY `HOME` IS NOT `/tmp`. A shell that computed `${HOME:-/tmp}/.cache` read a directory the
+  # layer never writes, so NO named state ever reached the rail on such a box (measured, round 10).
+  # Unquoted `~` with `HOME=` expands to the EMPTY string, so the path below becomes
+  # `/.cache/gh-limit` — which is exactly what CPython's `expanduser("~")` yields in the same state
+  # (`posixpath` returns `(userhome + rest) or root`), i.e. the same directory the layer resolves.
+  # Stated as the MEASURED mechanism: bash does NOT consult the passwd entry when `HOME` is set-but-empty.
   if [ -z "${GH_LIMIT_DIR:-}" ] && [ -z "${XDG_CACHE_HOME:-}" ] && [ -z "${HOME:-}" ]; then
     dir=~/.cache/gh-limit
   fi
