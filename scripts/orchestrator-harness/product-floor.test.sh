@@ -1102,12 +1102,48 @@ case "$OUTC2" in *"product-floor unread"*) A6b=0 ;; *) A6b=1 ;; esac
 ck "P9 [RED→GREEN] a NAPR cycle whose harness queue is ABSENT says 'product-floor unread', a third token (got '${OUTC2:0:120}')" $A6b
 case "$OUTC2" in *"product-floor N/A"*) A6c=1 ;; *) A6c=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not print the routine N/A verdict over a class it never read" $A6c
+# ⛔ AND THE RECORD'S OWN DISCLAIMER IS PART OF THE MEASUREMENT (review cycle 50, P2). `N/A` is defined as "the
+# queue files AGREE", but `_napr_ok`'s SUBSET test is satisfied by a STALE SUPERSET — a previous pass's
+# all-harness queue also contains every row of the backlog. The writer's `wpq_degrade` record says, in its own
+# text, that "the queues on disk may still hold a previous pass's split (… do not read that as a class)", and
+# that clause is the ONLY signal distinguishing a completed split from a fallback that could not be written. The
+# arm never read it and published the routine N/A verdict. Driven END-TO-END from the record the shipped writer
+# actually emits (quoted verbatim), with a harness queue that satisfies the subset test.
+mkdir -p "$T/o9n/state"; printf '42\n43\n' > "$T/o9n/candidates.txt"
+: > "$T/o9n/candidates.product.txt"; printf '42\n43\n99\n' > "$T/o9n/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO premise-labs/agent-infra is not in PRODUCT_REPOS (daniel-ospina/tortoise), so every candidate is harness AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass split (dispatch still filters through candidates.txt, but do not read that as a class)\n' > "$T/o9n/state/product-class"
+OUTN="$(runblock "$T/o9n")"
+case "$OUTN" in *"product-floor unread"*) N1=0 ;; *) N1=1 ;; esac
+ck "P9 [RED→GREEN] a stale 'queues may hold a previous split' record says 'product-floor unread' (got '${OUTN:0:130}')" $N1
+case "$OUTN" in *"product-floor N/A"*) N2=1 ;; *) N2=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not wear the routine N/A verdict over files it admits it did not read" $N2
+case "$OUTN" in *"may still hold a previous pass"*) N3=0 ;; *) N3=1 ;; esac
+ck "P9 [RED→GREEN] ... and quotes the writer's own clause as the reason" $N3
 # (d) a class the refresh could not read: UNKNOWN, repeating the RECORDED reason instead of re-asking.
 mkdir -p "$T/o9d/state"; printf '42\n43\n' > "$T/o9d/candidates.txt"
 printf 'BUDGET-SKIPPED the pass had no core budget left\n' > "$T/o9d/state/product-class"
 OUTD="$(runblock "$T/o9d")"
 case "$OUTD" in *"reason=BUDGET-SKIPPED"*) A7=0 ;; *) A7=1 ;; esac
 ck "P9 [RED→GREEN] the UNKNOWN arm repeats the RECORDED reason instead of asking (got '$OUTD')" $A7
+# ⛔ AND NEITHER DOES AN ABSENT QUEUE HERE (review cycle 50, P2). The empty-queue arm's `_pq_n`/`_hq_n` stayed
+# empty and `${_x:-0}` printed `product=0`/`harness=0` as "the file counts" — a MEASUREMENT of a file that does
+# not exist — and on the harness side that invented `0` was ALSO the value that SELECTED the disown, so the
+# printed cause ("its COUNTS disagree with these files") was an artefact of the fallback, not a comparison. The
+# met arm got this in cycle 49; these are the two fields one branch down. Both driven.
+mkdir -p "$T/o9p/state"; printf '42\n43\n' > "$T/o9p/candidates.txt"
+: > "$T/o9p/candidates.product.txt"; rm -f "$T/o9p/candidates.harness.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9p/state/product-class"
+OUTP="$(runblock "$T/o9p")"
+case "$OUTP" in *"no harness-queue count was read"*) P1=0 ;; *) P1=1 ;; esac
+ck "P9 [RED→GREEN] an absent harness queue is named, not printed as harness=0 (got '${OUTP:0:200}')" $P1
+case "$OUTP" in *"COUNTS cannot be matched"*) P2=0 ;; *) P2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the disown says the counts cannot be MATCHED, not that they disagree" $P2
+mkdir -p "$T/o9q/state"; printf '42\n43\n' > "$T/o9q/candidates.txt"
+rm -f "$T/o9q/candidates.product.txt"; printf '44\n45\n' > "$T/o9q/candidates.harness.txt"
+printf 'OK product=0 harness=2\n' > "$T/o9q/state/product-class"
+OUTQ="$(runblock "$T/o9q")"
+case "$OUTQ" in *"no product-queue count was read"*) P3=0 ;; *) P3=1 ;; esac
+ck "P9 [RED→GREEN] an absent PRODUCT queue is named too, not printed as product=0 (got '${OUTQ:0:200}')" $P3
 # The count line is printed only where a product queue EXISTS, so drive it with one: a product candidate
 # that is not in the batch (PB=0), a two-row batch, and BATCH=3 — the denominator must be 2.
 mkdir -p "$T/o9d/state"; printf '42\n43\n' > "$T/o9d/candidates.txt"; printf '99\n' > "$T/o9d/candidates.product.txt"
@@ -1339,8 +1375,10 @@ printf 'OK product=0 harness=2\n' > "$T/o9v/state/product-class"
 OUTV="$(runblock "$T/o9v" '42\n43\n' 1 2)"
 case "$OUTV" in *"No such file or directory"*) V1=1 ;; *) V1=0 ;; esac
 ck "P9 [RED→GREEN] an ABSENT PRODUCT queue reads as 0 and puts no shell error in the log (got '${OUTV:0:150}')" $V1
-case "$OUTV" in *"product-floor unread"*"counts"*) V2=0 ;; *) V2=1 ;; esac
-ck "P9 [RED→GREEN] ... and the arm that disowns the record still reports, with the counts it read" $V2
+# (review cycle 50, P2) the disown now names the queue it could not read instead of publishing `product=0` as a
+# file count, so the pin follows the measurement rather than the old wording.
+case "$OUTV" in *"product-floor unread"*"no product-queue count was read"*) V2=0 ;; *) V2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the arm that disowns the record names the queue whose count it could not read" $V2
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is
@@ -1780,6 +1818,11 @@ ck "P12 [RED→GREEN] ... and the truncated-to-empty case — the one a full dis
 # left every assertion GREEN) — a MEASURED-empty read is exactly the routine all-harness pass a
 # product repo sees every day, so it is the branch most likely to be edited and the last one tested.
 mkdir -p "$T/o9e/state"; printf '42\n43\n' > "$T/o9e/candidates.txt"
+# ⛔ MEASURED-EMPTY MEANS PRESENT AND EMPTY, NOT ABSENT (review cycle 50, P2). This fixture never created the
+# product queue, so it was driving the ABSENT state — which is a different record from `OK product=0` (a queue
+# that could not be written is precisely what the disown exists for) and is now reported as such. The shipped
+# writer produces a 0-byte `candidates.product.txt` on a measured-empty split; the fixture must too.
+: > "$T/o9e/candidates.product.txt"
 printf 'OK product=0 harness=3\n' > "$T/o9e/state/product-class"
 # ⛔ THE RECORD MUST AGREE WITH THE DISK FOR THIS TO BE A MEASUREMENT (review cycle 22, P2): the arm checks BOTH
 # numbers now, so a record claiming harness=3 beside a 0-line file is (correctly) a stale record, not the
@@ -2023,7 +2066,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=279
+MIN_CHECKS=285
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

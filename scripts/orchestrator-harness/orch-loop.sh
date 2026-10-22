@@ -3054,8 +3054,20 @@ PY
             # only when the floor was met, so this token is NOT a met-batch claim (that is the `product=N/K in
             # this batch (floor=N)` line plus the absence of an `unmet` line). Anything printed under one token
             # that the sentence describes as another is the defect.
-            if [ "$_napr_ok" = "1" ]; then
+            # ⛔ AND THE RECORD'S OWN DISCLAIMER MUST BE READ (review cycle 50, P2). `N/A` is defined as "the
+            # queue files AGREE", yet `_napr_ok`'s SUBSET test is satisfied by a STALE SUPERSET — a previous
+            # pass's all-harness queue also contains every row of the backlog — so the routine verdict could be
+            # printed over the writer's `wpq_degrade` record whose own text says "the queues on disk may still
+            # hold a previous pass's split (… do not read that as a class)". That clause is the ONLY signal
+            # distinguishing a completed split from a fallback that could not be written, and it was never
+            # read: measured end-to-end from the shipped writer to this arm. A stale record does not describe
+            # these files, so it is `unread`, exactly like its two disown siblings.
+            _napr_stale=0
+            case "$PC_WHY" in *"do not read that as a class"*) _napr_stale=1 ;; esac
+            if [ "$_napr_ok" = "1" ] && [ "$_napr_stale" = "0" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
+            elif [ "$_napr_stale" = "1" ]; then
+              echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY} — and that record's own text says the queues on disk may still hold a previous pass's split, so this cycle cannot claim the files AGREE; this is NOT the N/A verdict and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then
               echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             else
@@ -3085,8 +3097,24 @@ PY
             # ⛔ GUARDED ON EXISTENCE: a `> file` / `< file` REDIRECT failure is NOT silenced by
             # `2>/dev/null` on the same command (measured — the shell reports it before the command runs), so
             # an ABSENT queue put a `No such file or directory` line in the log instead of reading as 0.
-            _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
-            _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            # ⛔ AND NEITHER DOES A MISSING FILE HERE (review cycle 50, P2). `_pq_n`/`_hq_n` stayed empty and
+            # `${_x:-0}` printed `product=0`/`harness=0` as "the file counts" — a MEASUREMENT of a file that does not
+            # exist, on the line whose job is to say the record does not describe the files, and (for the harness
+            # side) that invented `0` was ALSO the value that SELECTED the disown, so the printed cause "its COUNTS
+            # disagree with these files" was an artefact of the fallback rather than a comparison. The met arm above
+            # got this treatment in cycle 49; these two fields are the same defect one branch down.
+            _pq_n=""; _pq_note=""
+            if [ -f "$O/candidates.product.txt" ]; then
+              _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            else
+              _pq_note=" (no product-queue count was read: $O/candidates.product.txt is ABSENT or not a regular file)"
+            fi
+            _hq_n=""; _hq_note=""
+            if [ -f "$O/candidates.harness.txt" ]; then
+              _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            else
+              _hq_note=" (no harness-queue count was read: $O/candidates.harness.txt is ABSENT or not a regular file)"
+            fi
             # ⛔ AND HERE A MEMBERSHIP TEST *IS* AVAILABLE (review cycle 42, P2). This arm's record claims `product=0`,
             # so — unlike the met-floor arm above — every still-dispatchable candidate must appear in the harness
             # queue, exactly the subset test the `NOT-A-PRODUCT-REPO` arm above already runs. Without it, a stale
@@ -3112,8 +3140,13 @@ PY
             else
               _ok_sub=0; _ok_missing=1
             fi
-            if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product-floor unread (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — its COUNTS disagree with these files, so it does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measurement of product work — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            # ⛔ AND THE HARNESS NOTE IS NOT PART OF THE SELECTION (review cycle 50, measured). Conjoining
+            # `_hq_note` here is REDUNDANT: `_ok_missing` already owns the ABSENT-harness-queue case one branch
+            # down (with its own sentence), and removing the clause left all 285 assertions GREEN — an unpinned
+            # predicate. The PRODUCT note stays, because there it is not redundant: without it an absent product
+            # queue falls through to the arm that prints `product=0` as a matched count (measured: o9q reddens).
+            if [ -n "$_rec_p" ] && { [ -n "$_pq_note" ] || [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}${_pq_note}${_hq_note}, but the record beside them says '${PC_WHY}' — its COUNTS cannot be matched to these files, so it does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measurement of product work — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_missing" = "1" ]; then
               echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_sub" = "0" ]; then
