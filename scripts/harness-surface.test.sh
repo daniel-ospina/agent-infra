@@ -28,6 +28,14 @@
 #
 # Hermetic: fixture repos, throwaway HOME/CELL_HOME, stubbed tools, no network, no real process read.
 set -u
+# ⛔ HERMETIC INCLUDES THE SHELL THE SUITE RUNS IN, not only the tools it stubs. A cell's shell exports
+# `REPO` (its TARGET checkout, from keys.env) and `harness-refresh.sh:223` tells operators to "set
+# HARNESS_REPO" — either one changes what the launcher resolves: `REPO="${A_REPO:-${HARNESS_REPO:-}}"`
+# short-circuits the candidate loop, and an ambient `REPO` becomes `TARGET_REPO`. Measured on a CORRECT
+# tree: 6 failures in (b)/(b-mac) under `HARNESS_REPO=… REPO=/tmp/cell-t3`, because the claim probe then
+# read a real target's origin. A suite that goes red in the shells this repo tells people to use is a
+# false red. The arms that DRIVE either variable set it explicitly on their own command line.
+unset REPO HARNESS_REPO
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0
@@ -60,6 +68,11 @@ printf '#!/usr/bin/env bash\necho fix\n' >> "$REPO_FIX/scripts/orchestrator-harn
   && git -c user.email=t@example.com -c user.name=t commit -qm B \
   && git update-ref refs/remotes/origin/main refs/heads/main ) >/dev/null 2>&1
 SHA_B="$(cd "$REPO_FIX" && git rev-parse HEAD)"
+# ⛔ AND THE TARGET IS PART OF A CELL'S SHELL, so the arms that do not name one get a real checkout:
+# without a target the claims row is honestly UNKNOWN (no registry can be read) and `up` is BROKEN —
+# correct for a box that cannot dispatch, but not what (b)/(b-mac) are measuring (idempotency). The
+# arms that test the ABSENCE of a target — (f) and (g) — unset `REPO` explicitly on their own line.
+REPO="$REPO_FIX"; export REPO
 A12="${SHA_A:0:12}"; B12="${SHA_B:0:12}"
 
 # The PIN: commit B, materialised under the pin root in the shape `hu_verify_pin` requires.
@@ -707,7 +720,7 @@ ck "(e) …and the HARNESS repo as HARNESS_REPO, never the target (got: ${child_
 # never writes and reports `OK (registry empty)` on a box whose target holds claims.
 ck "(e) …and the CLAIMS probe read the TARGET's registry, not the harness's" \
    "$(grep -qF -- "-C $TARGET_FIX ls-remote origin refs/claims/" "$FIXCELL/git-e.log" 2>/dev/null && echo 0 || echo 1)"
-rm -f "$TMP/git"   # the shim is (e)'s instrument; later arms run against the real git
+# ⛔ the shim is (e)'s instrument and (g)'s RED check; removed after (g)
 
 # ⛔ (f) THE TARGET THE CONFIG FILE NAMES IS NOT REPLACED BY THE HARNESS. On the `cmux vm exec` shape
 # the launcher's shell has NO `REPO`; the target lives only in `keys.env`, and `orchestrator-bringup.sh:192`
@@ -727,15 +740,22 @@ f_har="$(sed -n 's/^harness_repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1
 ck "(f) …and HARNESS_REPO is the harness repo, not the target (got: ${f_har:-<none>})" \
    "$([ "$f_har" = "$REPO_FIX" ] && echo 0 || echo 1)"
 
-# ⛔ (g) NO TARGET, NO CLAIM VERDICT. With no target resolved the probe must REFUSE to answer rather
-# than read the HARNESS registry and record `claims=absent` — which `status` renders as
-# `OK (registry empty)`, a false pass on the one row whose purpose is the TARGET's namespace.
-: > "$FIXCELL/fix-e.log"
+# ⛔ (g) NO TARGET, NO CLAIM VERDICT. With no target resolved the probe must NOT answer — reading the
+# HARNESS registry and recording `claims=absent` renders as `OK (registry empty)`, a false pass on the
+# one row whose purpose is the TARGET's namespace (`orch-loop.sh:2259`). It must also not ABORT the
+# walk: a targetless box is the LOOP's refusal to make, with the authority's own actionable message.
+# So: nothing probed, `claims=unknown` recorded, and the walk continues.
+: > "$FIXCELL/fix-e.log"; : > "$FIXCELL/git-e.log"
 run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" no-ambient-target "$TMP/absent-keys.env"
-ck "(g) no target resolved: the claims probe REFUSES to answer about the harness registry" \
-   "$(printf '%s\n' "$OUT" | grep -qF 'no target checkout resolved' && echo 0 || echo 1)"
-ck "(g) …and nothing was started on that box" \
-   "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 1 || echo 0)"
+ck "(g) no target resolved: the claims probe does NOT read the HARNESS registry" \
+   "$(grep -qF 'ls-remote origin refs/claims/' "$FIXCELL/git-e.log" 2>/dev/null && echo 1 || echo 0)"
+ck "(g) …and the verdict is recorded UNKNOWN, never 'absent' [$(sed -n 's/^claims=//p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)]" \
+   "$([ "$(sed -n 's/^claims=\([a-z]*\).*/\1/p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)" = unknown ] && echo 0 || echo 1)"
+ck "(g) …and 'up' says UNKNOWN instead of printing a claims OK" \
+   "$(printf '%s\n' "$OUT" | grep -qF 'claims: UNKNOWN (no target resolved' && echo 0 || echo 1)"
+ck "(g) …and the walk CONTINUED past claims (a targetless box is the loop refusal to make)" \
+   "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 0 || echo 1)"
+rm -f "$TMP/git"   # the shim is (e)/(g)'s instrument; later arms run against the real git
 # …the RED CONTROL that keeps this a check and not a bypass: the same cell shape, a pin naming a
 # commit that exists in NO repo, must still REFUSE before anything starts.
 cp "$FIXCELL/.pi/agent/state/HARNESS-PIN" "$TMP/pin.e.hold"

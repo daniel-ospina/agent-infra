@@ -1330,9 +1330,17 @@ hu_start_claims() {
   # HARNESS) answered about a repository this box never writes and RECORDED `claims=absent`, which
   # `status` renders as `OK (registry empty — no claim held right now)` — the same false PASS this row
   # exists to remove, narrowed to the no-target case. An answer about the wrong repository is not a
-  # weaker answer; it is a wrong one, and the box cannot start a controller without a target anyway.
-  [ -n "$probe_repo" ] \
-    || { warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — UNKNOWN, not empty"; return 1; }
+  # weaker answer; it is a wrong one. But ⛔ IT IS NOT A REASON TO ABORT THE WALK EITHER: `claims` sits
+  # before `loop`, and a targetless box is the LOOP's refusal to make, with the authority's own
+  # actionable message — an abort here replaced it with a registry warning. So the verdict is recorded
+  # as `unknown` (the row renders UNKNOWN, never OK) and the walk continues.
+  if [ -z "$probe_repo" ]; then
+    warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — recording UNKNOWN, not empty"
+    mkdir -p "$O/state" 2>/dev/null \
+      && printf 'claims=unknown at=%s\n' "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null
+    say "claims: UNKNOWN (no target resolved — nothing was probed)"
+    return 0
+  fi
   hu_run "$tmo" git -C "$probe_repo" ls-remote origin 'refs/claims/*' >"$log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
