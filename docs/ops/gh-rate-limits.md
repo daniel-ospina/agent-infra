@@ -343,7 +343,7 @@ dispatcher about to fan out calls it once; every call it then makes reads the sh
 
 ```bash
 python3 scripts/orchestrator-harness/gh-limit.py --budget
-# core=0/5000 resets_in=12m graphql=4745/5000
+# core=0/5000 resets_in=12m graphql=4745/5000 resets_in=22m
 ```
 
 ⛔ **The per-call path never probes.** The first draft read `/rate_limit` from every `core` call; that is
@@ -362,12 +362,26 @@ the layer refuses to intercept can never be failed over either.
 
 | REST read (core) | Served from GraphQL | Notes |
 |---|---|---|
-| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, head.sha, base.ref, user, url, updated_at |
+| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, **body**, head.sha, head.ref, base.sha, base.ref, changed_files, additions, deletions, comments (count), merge_commit_sha, created_at/updated_at/closed_at/merged_at, user, html_url |
 | `repos/{o}/{r}/pulls/{n}/reviews` | ✅ | id, state, body, submitted_at, commit_id, user |
 | `repos/{o}/{r}/issues/{n}/comments` | ✅ | id, body, created_at, html_url, user |
+
+⛔ **A `--jq` THAT NAMES A FIELD THE ENCODER DOES NOT PRODUCE IS NOT FAILED OVER.** `jq` prints `null`
+for an absent field **and exits 0**, so a partly-reproduced body is not a near miss — it is an empty
+answer with a success status. Measured in review of this change: `--jq .body` returned `null`/rc 0, and
+`record-review.sh` reads `.body` precisely to tell "the GET failed" from "the body is empty" before it
+PATCHes a PR description. `_projection_ok()` therefore admits a projection only when every name it
+references is reproducible; otherwise the read is **not** failed over, and with the pool empty it is
+refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
+confident wrong answer.
 | `repos/{o}/{r}/branches/{b}/protection[/…]` | ❌ **no equivalent** | GraphQL has no branch-protection query. Refused with the named state. |
 | `repos/{o}/{r}/commits/{sha}/check-runs`, `/status` | ❌ **deliberately absent** | `statusCheckRollup` mixes `CheckRun` and `StatusContext` nodes; a StatusContext has no `check_run` representation, so a synthesized list would silently drop legacy statuses — a red surface that reads green. Fail closed. |
-| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. |
+| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. (`gh api` mutations are refused by name when `core` is empty; `gh pr merge` is GraphQL-bucketed by `bucket_for`, so it is not gated by the core rule at all — a pre-existing heuristic, stated here rather than implied.) |
+
+**The low-water band is not exhaustion.** `CORE_LOW_WATER` (default 100) moves *reads* to GraphQL so
+the tail of the pool is preserved for **writes** — writes are refused ONLY at `remaining == 0`, and no
+`gh-core-exhausted` record is written while the pool still has headroom. A band that refused writes
+would preserve a reserve no caller could spend, and would assert "EMPTY" about a pool that is not.
 
 ⛔ **A GAIN, NOT A LAUNDER.** Servings are recorded in `events.log` as
 `failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving \`gh api …\` from the GraphQL pool`.
@@ -401,6 +415,11 @@ cache therefore applies exactly where the ETag path cannot reach: **subcommands*
 `pr list`, `pr checks` — all GraphQL, which has no ETag at all) and the `gh api` shapes
 `conditional_plan` refuses (`--paginate`, `-i`, `-H`, `--template`). That is precisely the traffic
 whose only saving today is single flight. Test `(c3)` pins the split.
+⛔ **Consequence, stated so the class table is not read as a claim about default traffic:** with
+`GH_LIMIT_CONDITIONAL=1` every plain `gh api` GET is ETag-revalidated and therefore never TTL-cached, so
+by default the `gh api` classes above are reachable only when the ETag path is off or the shape is one
+it refuses (`--paginate`, `-i`, `-H`, `--template`). The default saving is on **subcommands** —
+`pr view`/`pr list`/`pr checks`/`run list` — which is also where the measured waste was.
 
 ### 4. The named state (what a lane should SAY)
 
@@ -416,6 +435,16 @@ a closed window cannot keep asserting itself. `repo-authority.sh` repeats the to
 reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
 the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
 that phrase into `VERDICT=GH-RATE-LIMITED`.
+
+⛔ **THE EVIDENCE IS THREE FILES AND NONE OF THEM MAY BE CLOBBERED BY ANOTHER BUCKET'S NEWS.**
+`last-limit` holds ONE record per box (pre-existing design), so a GraphQL refusal overwrites the `core`
+observation — and the health record, which is keyed to `core` explicitly, is what keeps the window
+alive afterwards (`health_reset()`). Two measured consequences of getting this wrong, both fixed and
+pinned by tests `(h)`/`(i)`: a both-pools refusal made `--health` say `gh-ok` (the state vanishing
+exactly when it was worst), and a GraphQL-served read annotated the **core** record `recovered=`
+(destroying the free evidence the failover runs on, and making the heartbeat print
+`gh=recovered(bucket=core …)` for a pool that was still refusing calls). A GraphQL success now records
+recovery for `graphql`, and only a real `core` success clears `gh-core-exhausted`.
 
 ### What this does NOT fix
 

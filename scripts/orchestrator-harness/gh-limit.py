@@ -1819,6 +1819,11 @@ def read_cache_get(key, ttl):
             return None            # never trust a stored failure (see the exclusion list)
         if clock() - float(e["at"]) > ttl:
             return None            # too old for THIS class: ask GitHub
+        if float(e["at"]) > clock() + 60:
+            # ⛔ A STAMP FROM THE FUTURE IS NOT A FRESH ENTRY. A clock step backwards (NTP, a VM
+            # resume) would otherwise serve an entry as fresh until wall time catches up — the same
+            # class `pace_mutation` already refuses to honour.
+            return None
         return (0, base64.b64decode(e["out_b64"].encode("ascii")),
                 base64.b64decode(e["err_b64"].encode("ascii")))
     except (OSError, ValueError, KeyError, TypeError, binascii.Error):
@@ -2435,6 +2440,25 @@ def core_record_reset():
     return reset if reset and reset > clock() else None
 
 
+def health_reset():
+    """The reset on a CURRENT health record, or None — the THIRD free source of truth.
+
+    ⛔ WHY IT IS NEEDED EVEN THOUGH `last-limit` EXISTS: `last-limit` is ONE record per box (by
+    design), so a GraphQL refusal overwrites the `core` observation that the failover depends on.
+    The health record is keyed to `core` explicitly, so the named state keeps its window until a core
+    call actually succeeds — which is what stops a both-pools refusal from making the fleet believe
+    the REST pool is healthy (review round 1, blocking finding 2)."""
+    try:
+        with open(os.path.join(state_dir(), HEALTH_FILE)) as fh:
+            parts = dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return None
+    if parts.get("bucket") != "core":
+        return None
+    reset = as_int(parts.get("reset"))
+    return reset if reset and reset > clock() else None
+
+
 def core_pressure():
     """(reset, remaining) when the CORE pool is known to be at/below the low-water line, else None.
 
@@ -2456,6 +2480,9 @@ def core_pressure():
     reset = core_record_reset()
     if reset:
         return reset, 0                # known-empty from the refused call's own record
+    reset = health_reset()
+    if reset:
+        return reset, 0                # the named state still holds: do not go quiet until it is spent
     return None
 
 
@@ -2516,13 +2543,44 @@ def health_token():
 # be the failure this whole file exists to prevent — an EMPTY answer read as a green tree.
 _GQL_PR = ("query($owner:String!,$name:String!,$number:Int!)"
            "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
-           "{number state isDraft merged mergeable headRefOid baseRefName title url updatedAt author{login}}}}")
+           "{number state isDraft merged mergeable headRefOid headRefName baseRefOid baseRefName "
+           "title body url updatedAt createdAt closedAt mergedAt "
+           "changedFiles additions deletions comments{totalCount} mergeCommit{oid} author{login}}}}")
 _GQL_ISSUE_COMMENTS = ("query($owner:String!,$name:String!,$number:Int!)"
                        "{repository(owner:$owner,name:$name){issue(number:$number)"
                        "{comments(first:100){nodes{databaseId body createdAt url author{login}}}}}}")
 _GQL_PR_REVIEWS = ("query($owner:String!,$name:String!,$number:Int!)"
                    "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
                    "{reviews(first:100){nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
+
+# ⛔ THE NAMES EACH ENCODER CAN ACTUALLY PRODUCE, AND WHY THAT LIST IS A GATE RATHER THAN A COMMENT.
+# `jq` on a field that is ABSENT prints `null` and exits 0, so a partial equivalence is not a small
+# imprecision — it is an EMPTY ANSWER WITH A SUCCESS STATUS, which is the one failure this file
+# exists to prevent. Measured during review of this very change: `--jq .body` against a failover
+# returned `null`/rc 0, and `record-review.sh` reads `.body` precisely to tell “the GET failed” from
+# “the body is empty” before it PATCHes a PR description. A caller's `--jq` is therefore admitted only
+# when every name it references is one this encoder produces; otherwise the read is NOT failed over
+# (and, with the pool empty, refused by name instead of answered wrongly). Over-blocking here costs a
+# refusal that would have happened anyway; under-blocking costs a confident wrong answer.
+PULL_NAMES = frozenset({
+    "number", "state", "draft", "merged", "mergeable", "title", "body", "html_url",
+    "updated_at", "created_at", "closed_at", "merged_at", "changed_files", "additions",
+    "deletions", "comments", "merge_commit_sha", "head", "base", "user", "sha", "ref", "login",
+})
+COMMENT_NAMES = frozenset({"id", "body", "created_at", "html_url", "user", "login"})
+REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "user", "login"})
+
+
+def _projection_ok(jq, allowed):
+    """Does this `--jq` program reference ONLY names the encoder can produce?
+
+    A deliberately simple scan (`.` followed by an identifier), not a jq parser: every name it finds
+    must be in the allow-list. `.[]`, `|`, `@tsv`, `//`, `length`, `select(...)` yield no such name
+    and are untouched. A false REFUSAL is a read that fails closed with the named state; a false
+    ADMISSION is a wrong answer, so the scan errs toward refusal."""
+    if not jq:
+        return True
+    return all(n in allowed for n in re.findall(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)", jq))
 
 
 def _enc_pull(doc):
@@ -2536,8 +2594,16 @@ def _enc_pull(doc):
     return json.dumps({
         "number": pr.get("number"), "state": state, "draft": bool(pr.get("isDraft")),
         "merged": bool(pr.get("merged")), "mergeable": mergeable, "title": pr.get("title"),
-        "html_url": pr.get("url"), "updated_at": pr.get("updatedAt"),
-        "head": {"sha": pr.get("headRefOid")}, "base": {"ref": pr.get("baseRefName")},
+        "body": pr.get("body"), "html_url": pr.get("url"),
+        "updated_at": pr.get("updatedAt"), "created_at": pr.get("createdAt"),
+        "closed_at": pr.get("closedAt"), "merged_at": pr.get("mergedAt"),
+        "changed_files": pr.get("changedFiles"), "additions": pr.get("additions"),
+        "deletions": pr.get("deletions"),
+        # REST's `comments` on a PR is a COUNT, not a list — same shape, from totalCount.
+        "comments": (pr.get("comments") or {}).get("totalCount"),
+        "merge_commit_sha": (pr.get("mergeCommit") or {}).get("oid"),
+        "head": {"sha": pr.get("headRefOid"), "ref": pr.get("headRefName")},
+        "base": {"sha": pr.get("baseRefOid"), "ref": pr.get("baseRefName")},
         "user": {"login": (pr.get("author") or {}).get("login")},
     }).encode()
 
@@ -2569,9 +2635,11 @@ def _enc_pr_reviews(doc):
 # status and could turn a red surface into a green one. The honest answer for that path is the named
 # state (fail closed), not a plausible-looking body. Recorded in docs/ops/gh-rate-limits.md.
 GRAPHQL_EQUIVALENTS = (
-    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)$"), _GQL_PR, _enc_pull),
-    (re.compile(r"^repos/([^/]+)/([^/]+)/issues/(\d+)/comments$"), _GQL_ISSUE_COMMENTS, _enc_issue_comments),
-    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$"), _GQL_PR_REVIEWS, _enc_pr_reviews),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)$"), _GQL_PR, _enc_pull, PULL_NAMES),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/issues/(\d+)/comments$"), _GQL_ISSUE_COMMENTS,
+     _enc_issue_comments, COMMENT_NAMES),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$"), _GQL_PR_REVIEWS,
+     _enc_pr_reviews, REVIEW_NAMES),
 )
 
 
@@ -2580,16 +2648,31 @@ def graphql_plan(plan):
 
     ⛔ THE ADMISSION IS `conditional_plan`'S, NOT A SECOND ONE. That function already refuses every
     shape whose output this layer would have to re-create by hand (`--paginate`, `-i`, `-H`, `-f`, a
-    non-GET method, `--template`) and it has already proved the caller's `--jq` is applicable. Taking
-    the plan as input means a shape it refuses can never be failed over — one gate, two transports.
-    A GHES host is refused too: its GraphQL endpoint is not modelled here."""
+    non-GET method, `--template`). Taking the plan as input means a shape it refuses can never be
+    failed over either — one gate, two transports.
+
+    ⛔ AND THE PROJECTION IS ADMITTED SEPARATELY. A REST body we can only PARTLY reproduce is not a
+    near miss: `--jq` prints `null` for a missing field and exits 0, so the caller is told the read
+    succeeded while a field it needed does not exist. `_projection_ok` therefore refuses any `--jq`
+    that names something the encoder does not produce.
+
+    ⛔ A GHES HOST IS REFUSED — BOTH SPELLINGS. `gh` reads the host from `GH_HOST` when `--hostname`
+    is absent, so checking only the flag let a box with `GH_HOST=<ghes>` be failed over to an endpoint
+    this layer has no reason to trust (the same class the ETag cache key already guards)."""
     if plan is None or plan.get("host"):
         return None
+    host_env = (os.environ.get("GH_HOST") or "").strip().lower()
+    if host_env and host_env != "github.com":
+        return None
     path = (plan.get("path") or "").strip("/")
-    for pat, query, enc in GRAPHQL_EQUIVALENTS:
+    for pat, query, enc, allowed in GRAPHQL_EQUIVALENTS:
         m = pat.match(path)
         if not m:
             continue
+        if not _projection_ok(plan.get("jq"), allowed):
+            log_event("failover: NOT attempted for `%s` — the --jq names a field the encoder cannot "
+                      "reproduce, so answering it would return null with a success status" % path)
+            return None
         owner, name, number = m.group(1), m.group(2), m.group(3)
         # ⛔ VARIABLES, NOT INTERPOLATION. The path comes from argv, so a string-substituted query
         # would be an injection surface; gh types `-F number=` as an Int, which is what the query
@@ -2664,33 +2747,50 @@ def _dispatch(real_gh, gh_argv):
     # poll the meter to benefit: the FIRST refused `core` call anywhere writes the record every other
     # lane then reads.
     fo = None
+    core_reset = None                     # kept so a LATER record cannot erase the reset we acted on
     if bucket_for(gh_argv) == "core" and makes_request(gh_argv):
         pressure = core_pressure()
         if pressure is not None:
             reset, remaining = pressure
-            phrase = record_core_exhausted(reset, remaining)
+            core_reset = reset
+            # ⛔ “EXHAUSTED” IS A CLAIM ABOUT THE POOL, AND IT MUST BE TRUE. In the low-water band
+            # (0 < remaining <= CORE_LOW_WATER) the pool is NOT empty: reads move to GraphQL to keep
+            # the reserve, but nothing is asserted exhausted and no write is refused. The earlier
+            # draft refused writes and wrote `gh-core-exhausted` at remaining=50 — a false diagnosis
+            # produced by the very layer that exists to stop false diagnoses.
+            empty = (remaining == 0)
+            # ⛔ THE NAMED STATE IS WRITTEN WHENEVER IT IS TRUE — including on the failover path, where
+            # the read SUCCEEDS. The pool being empty is a fact about the budget that lanes,
+            # `repo-authority.sh` and an operator all need to see; a GraphQL-served read does not make
+            # it stop being true (only a real `core` success does — see `record_core_ok`).
+            phrase = record_core_exhausted(reset, remaining) if empty else None
             if mutating:
-                # ⛔ A WRITE HAS NO SECOND POOL. `merge`, `comment` and `PATCH` have no GraphQL
-                # equivalent that IS the same write, so there is nothing to fail over TO — and
-                # retrying into an empty pool is what turned one limit into a 4,482-fork storm.
-                _named_core_refusal(
-                    phrase,
-                    "This call WRITES (no GraphQL equivalent of the same write) and is NOT retried.")
-                return 1
-            fo = graphql_plan(read_plan)
-            if fo is not None:
-                log_event("failover: %s (core remaining=%s) — serving `%s` from the GraphQL pool"
-                          % (phrase, remaining, _flight_label(gh_argv)))
-            elif remaining == 0:
-                # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it (an empty
-                # `check_runs`, a null protection set) is the one thing that would make a lane read
-                # “nothing is required” — a red tree mistaken for a green one.
-                _named_core_refusal(
-                    phrase,
-                    "This read has NO exact GraphQL equivalent, so it is refused rather than approximated.")
-                return 1
-            # remaining > 0 but low: the read can still succeed, so let it. The reserve is being
-            # preserved for WRITES, not spent on refusing reads that still work.
+                if empty:
+                    # ⛔ A WRITE HAS NO SECOND POOL. `merge`, `comment` and `PATCH` have no GraphQL
+                    # equivalent that IS the same write, so there is nothing to fail over TO — and
+                    # retrying into an empty pool is what turned one limit into a 4,482-fork storm.
+                    _named_core_refusal(
+                        phrase,
+                        "This call WRITES (no GraphQL equivalent of the same write) and is NOT retried.")
+                    return 1
+                # In the band a WRITE is exactly what the reserve exists for — let it through.
+            else:
+                fo = graphql_plan(read_plan)
+                if fo is not None:
+                    log_event("failover: %s — serving `%s` from the GraphQL pool"
+                              % (phrase or "core remaining=%s reset=%s" % (remaining, reset),
+                                 _flight_label(gh_argv)))
+                elif empty:
+                    # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it (an
+                    # empty `check_runs`, a null protection set, a `--jq` of a field we cannot
+                    # produce) is the one thing that would make a lane read “nothing is required” —
+                    # a red tree mistaken for a green one.
+                    _named_core_refusal(
+                        phrase,
+                        "This read has NO exact GraphQL equivalent, so it is refused rather than "
+                        "approximated.")
+                    return 1
+                # remaining > 0 but low and no equivalent: the read can still succeed, so let it.
     while True:
         attempt += 1
         lock = acquire_lock()
@@ -2720,10 +2820,12 @@ def _dispatch(real_gh, gh_argv):
             # through this very layer, so the operator's diagnostic ERASED the evidence it was run
             # to read (review round 8).
             if makes_request(gh_argv):
-                record_recovery(bucket_for(gh_argv))
-                # ⛔ ONLY A `core` CALL THAT ACTUALLY WENT TO CORE CLEARS THE NAMED STATE. A GraphQL
-                # failover succeeding says the OTHER pool recovered, which is exactly the fact the
-                # named state must keep reporting until the REST window resets.
+                # ⛔ THE BUCKET THAT RECOVERS IS THE ONE THAT ANSWERED, NOT THE ONE THE ARGV NAMES.
+                # A failover read is served by GRAPHQL; calling `record_recovery("core")` for it
+                # annotated the `core` record `recovered=` while the REST pool was still empty —
+                # destroying the free evidence the failover itself runs on, and making the heartbeat
+                # print `gh=recovered(bucket=core …)` on a box where every core call was refused.
+                record_recovery("graphql" if fo is not None else bucket_for(gh_argv))
                 if fo is None and bucket_for(gh_argv) == "core":
                     record_core_ok()
             if fo is not None:
@@ -2745,13 +2847,21 @@ def _dispatch(real_gh, gh_argv):
             # ⛔ NO RETRY ACROSS POOLS. The GraphQL pool WAS the alternative and it refused too, so
             # trying again here is precisely the “retry into the limit” this layer forbids: the next
             # honest event is the reset, not another request. Name the state and leave.
+            #
+            # ⛔ THE RESET IS TAKEN FROM THE DECISION, NOT RE-READ AFTER THE RECORD IS OVERWRITTEN.
+            # `record_limit("graphql", …)` replaces `last-limit` (one record per box, by design), so
+            # asking `recorded_reset("core")` afterwards returns None — and a health record written
+            # with `reset=0` makes `--health` report `gh-ok` at the exact moment BOTH pools are empty
+            # and `repo-authority.sh` goes silent. `core_reset` was captured before any of that.
             limit = classify(res, gh_argv, headers)
             if limit is not None:
                 record_limit("graphql", limit.reset, attempt, 0.0, limit.status)
-            phrase = record_core_exhausted(recorded_reset("core"), 0)
+            phrase = record_core_exhausted(core_reset, 0)
             _named_core_refusal(
                 phrase,
-                "The GraphQL failover was refused as well, so BOTH pools are empty for this read.")
+                "The GraphQL failover was refused as well, so BOTH pools are empty for this read."
+                if limit is not None else
+                "The GraphQL failover could not reproduce the REST body, so this read is refused.")
             if res.out:
                 sys.stdout.buffer.write(res.out)
             if res.err:
