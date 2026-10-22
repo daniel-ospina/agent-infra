@@ -81,6 +81,11 @@ case "${1:-}" in
     # A daemon that dies WITHOUT a word: the case where a bare verdict is least usable, so the reason
     # must fall back to the exit status rather than printing an empty cause.
     [ "${CMUX_TREE_SILENT:-0}" = "1" ] && { exit 7; }
+    # FAIL-ONCE: the FIRST call fails and every later one answers — the probe-flip shape (the launcher's
+    # read fails, the reason's read succeeds). Reachable only through that race, so it is driven here.
+    if [ -n "${CMUX_FAIL_ONCE:-}" ]; then
+      if [ -f "$CMUX_FAIL_ONCE" ]; then rm -f "$CMUX_FAIL_ONCE"; else : > "$CMUX_FAIL_ONCE"; echo "cmux: transient probe failure" >&2; exit 1; fi
+    fi
     [ "${CMUX_TREE_FAIL:-0}" = "1" ] && { echo "cmux: cannot read" >&2; exit 1; }
     # A SEQUENCED tree: the daemon answers differently on the nth call (a close is verified against a
     # SECOND read). `$CMUX_TREE_SEQ.1`, `.2`, … with `.last` as the fallback.
@@ -316,7 +321,18 @@ for f in "$LOOP" "$DM"; do
   grep -q 'worker-terminal.sh' "$f" || rc=1
   grep -q 'for _wt_v in wt_spawn' "$f" || rc=1
   grep -q 'command -v "$_wt_v"' "$f" || rc=1
-  grep -q 'wt_close wt_launcher' "$f" || rc=1
+  # ⛔ AN EXACT LIST, not a substring. `grep -q 'wt_close wt_launcher'` was satisfied by
+  # `… wt_close wt_launcher wt_count`, so it stayed green when the list grew a verb a caller needed
+  # (dispatch-merge.sh's `wt_spawn` calls `wt_launcher_why`, and its guard omitted it — a module with
+  # the new `wt_spawn` and no helper then logged `— why: ` EMPTY, the exact #2366 defect).
+  # Each controller's list is asserted EXACTLY as shipped (they differ: orch-loop also calls
+  # `wt_startup_banner` and `wt_table`), so adding a verb to a caller without adding it here reds this.
+  case "$f" in
+    "$LOOP") want='for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_launcher_why wt_startup_banner wt_table; do' ;;
+    "$DM")   want='for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_launcher_why wt_count; do' ;;
+    *)       want='__never__' ;;
+  esac
+  grep -qF "$want" "$f" || rc=1
   [ "$rc" -eq 0 ] || break
 done
 ck "…and both launchers source it and REFUSE to run without EVERY verb they call" $rc
@@ -384,7 +400,7 @@ printf 'export GH_TOKEN=%s\n' "ghp_from_keys_env" > "$TMP/home-c/keys.env"
 cat > "$TMP/c1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"; mkdir -p "$WT_DIR"
-export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5"; : > "$TMUX_LOG"
+export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5" CMUX_LOG="$O/cmux-calls.log"; : > "$TMUX_LOG"; : > "$CMUX_LOG"
 . "$1"
 # The REAL startup emitter (worker-terminal.sh::wt_startup_banner), captured on its own so a matching
 # reason further down this capture cannot satisfy it — the previous version of this assertion was
@@ -1077,6 +1093,13 @@ ck "…and a HOME whose own keys.env carries the token is chosen too (selection 
 ck "…WITHOUT falling back to tmux (the launcher that kills lanes) — tmux was never called" $rc
 grep -q 'REFUSED lane-8' "$TMP/O4/test.log" && rc=0 || rc=1
 ck "…and the refusal reaches the controller's log, not just stderr" $rc
+# ⛔ THE PROBE COST IS A PINNED FACT, not a sentence in a comment (the comment said "one probe" while
+# the banner cost three, then two, as the code changed under it). `none` = the launcher's read + the
+# reason's read on the banner, plus the same two on the refused spawn.
+n_mux="$(grep -c '^CMUX ' "$TMP/O4/cmux-calls.log" 2>/dev/null || echo 0)"
+[ "$n_mux" = "4" ] && rc=0 || rc=1
+printf '      cmux calls for one banner + one refused spawn: %s (want 4)\n' "$n_mux"
+ck "…and the whole refusal costs FOUR probes (2 banner + 2 spawn), not creeping further" $rc
 # ⛔ THE PROBE'S OWN ANSWER MUST REACH THE OPERATOR (agent-infra#2366). `cmux tree --json >/dev/null
 # 2>&1` keeps the decision and discards the reason, so a launcher-less box prints `launcher=none
 # (cmux=yes, uname=Linux)` — a verdict with no cause, indistinguishable from a tty gate, a TERM gate,
@@ -1117,6 +1140,19 @@ ck "a healthy launchd Mac (`tmux`) is NOT stamped with a failed: reason" $rc
 # orch-loop.sh could still emit its own line (or none).
 grep -q '^wt_startup_banner >> "\$LOG"$' "$LOOP" && rc=0 || rc=1
 ck "orch-loop.sh emits the module's banner (the wiring, not just the function)" $rc
+
+# A PROBE FLIP: the launcher's read fails and the reason's read succeeds. Unreachable through any
+# settled surface, and therefore never exercised — it exists so a transient failure does not print a
+# stale cause. Driven here or it is a branch nothing proves.
+cat > "$TMP/c1f.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+. "$1"
+wt_startup_banner
+SH
+out="$(FAKE_UNAME=Linux CMUX_FAIL_ONCE="$TMP/flip.marker" bash "$TMP/c1f.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4f" 2>&1)"
+case "$out" in *"answered on re-probe (it failed on the launcher read): a probe flip"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "a probe flip reports the flip, not a cause it cannot know" $rc
 
 echo
 echo "── D) the launchd surface still uses tmux (the other place it is correct) ──"
