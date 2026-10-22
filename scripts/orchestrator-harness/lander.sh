@@ -70,6 +70,8 @@
 # EXIT  0 = the run completed (merges may or may not have happened; per-PR verdicts are printed)
 #       1 = at least one merge/enqueue command failed (a real error, named)
 #       2 = the open-PR board could not be read — NOTHING was merged (fail-closed)
+#       3 = the repo's merge contract could not be established (unreadable branch protection, an
+#           authority that is neither gate nor rail, or repo-authority.sh missing) — NOTHING merged
 set -uo pipefail
 
 OR=""; DRY=0; MAX=200
@@ -115,13 +117,18 @@ note() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/
 # python3 (not jq) for the same reason merge-one.sh uses it: the gh shims already depend on it, and
 # these payloads carry whole check lists whose names contain anything.
 # modes: list | view | checks
-#   list   -> "<number>\t<draft 0|1>\t<head>" per row
+#   list   -> one "<number>" per line (the candidate set only — everything else is read per PR)
 #   view   -> "<MERGEABLE|CONFLICTING|UNKNOWN>\t<STATE>\t<draft 0|1>\t<head>"
 #   checks -> "<green>\t<pending>\t<failed>\t<failed-names-space-joined>"
 #             rc 3 = the payload was NOT a JSON array (an incomplete read, never "no checks")
 py() { # py <mode>
   python3 -c '
 import sys, json
+# ⛔ A UNIT SEPARATOR, NOT A TAB. The shell builtin `read` treats TAB as IFS WHITESPACE, so a run of separators
+# collapses and an EMPTY field is swallowed: "1\t0\t0\t\tworkflow-drift (cancelled)" read into five
+# names put the cancelled-check text in `names` and left `odd` empty (caught by lander.test.sh case
+# 7b), and an empty mergeStateStatus shifted every field of the `view` payload the same way.
+US = "\x1f"
 mode = sys.argv[1]
 raw = sys.stdin.read()
 try:
@@ -132,10 +139,13 @@ def s(v): return str(v if v is not None else "")
 if mode == "list":
     if not isinstance(d, list): raise SystemExit(3)
     for o in d:
-        print("%s\t%s\t%s" % (s(o.get("number")), "1" if o.get("isDraft") else "0", s(o.get("headRefOid"))))
+        # ONE FIELD: the list only yields the CANDIDATE SET. A per-row multi-field line here was read
+        # back with a whitespace `awk`, which does not split on the unit separator — it handed the
+        # loop a PR "number" made of every field concatenated (caught by lander.test.sh).
+        print(s(o.get("number")))
 elif mode == "view":
     if not isinstance(d, dict): raise SystemExit(3)
-    print("\t".join([s(d.get("mergeable")) or "UNKNOWN", s(d.get("mergeStateStatus")),
+    print(US.join([s(d.get("mergeable")) or "UNKNOWN", s(d.get("mergeStateStatus")),
                      "1" if d.get("isDraft") else "0", s(d.get("headRefOid"))]))
 elif mode == "checks":
     if not isinstance(d, list): raise SystemExit(3)
@@ -144,15 +154,23 @@ elif mode == "checks":
     # would let an unrecognised conclusion (or a null) fall through as "fine".
     green_ok = {"success", "neutral", "skipped"}
     pending  = {"pending", "queued", "in_progress", "waiting", "requested", "expected"}
-    g = p = f = 0; names = []
+    # ⛔ NON-RED IS NOT GREEN, AND NOT A FAILURE EITHER (the fleet s own polarity, measured against
+    # live data 2026-10-21): a CANCELLED or STALE check is non-red — the merge rail does not refuse
+    # on it — but its verification never COMPLETED, so it can never authorise a merge here. It gets
+    # its own bucket and its own words: calling it "failed" would report a red tree that does not
+    # exist (and send a fixer after nothing), while calling it green would merge unverified work.
+    nonred   = {"cancelled", "stale"}
+    g = p = f = 0; names = []; odd = []
     for c in d:
         st = (c.get("state") or "").strip().lower()
         if st in green_ok: g += 1
         elif st in pending: p += 1
+        elif st in nonred:
+            odd.append((c.get("name") or "<unnamed>") + " (" + st + ")")
         else:
             f += 1
             names.append((c.get("name") or "<unnamed>") + ((" (" + st + ")") if st else " (unknown)"))
-    print("\t".join([str(g), str(p), str(f), " ".join(names)]))
+    print(US.join([str(g), str(p), str(f), " ".join(names), " ".join(odd)]))
 ' "$1" 2>/dev/null
 }
 
@@ -173,6 +191,42 @@ lander_queue_depth() {
   fi
 }
 
+# ── the repo's merge contract, ONCE per run (the same module merge-one.sh sources) ───────────
+# ⛔ NOT REIMPLEMENTED. `repo-authority.sh` is the ONE home for "what does this repo require, and
+# which verb may merge it", sourced by BOTH orch-loop.sh and merge-one.sh. Reading it here is what
+# makes "never bypass" true rather than aspirational: on a repo whose authority is its own RAIL, a
+# raw `gh pr merge` lands the PR on the required checks alone, with no head-bound review evidence
+# (#1764) — the exact bypass this component is forbidden to perform. And the refusal below is
+# merge-one.sh's OWN refusal condition, copied rather than invented, so a PR that merge-one would
+# refuse is never landed here by a looser reading of the same branch protection.
+AUTH=""; REQ=""
+lander_authority() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
+  elif [ -f "$here/repo-authority.sh" ]; then . "$here/repo-authority.sh"
+  else AUTH="unknown"; say "merge authority: UNKNOWN — repo-authority.sh was not found (looked in $O and ${here:-<unresolved>}), so nothing merges this run"; return 0
+  fi
+  if ! command -v resolve_required_checks >/dev/null 2>&1 || ! command -v merge_authority >/dev/null 2>&1; then
+    AUTH="unknown"; say "merge authority: UNKNOWN — repo-authority.sh is stale/partial (no resolve_required_checks/merge_authority); nothing merges this run"; return 0
+  fi
+  REQ_OVERRIDE="${REQ_OVERRIDE:-${LANDER_REQ:-}}"
+  resolve_required_checks "$OR"
+  AUTH="$(merge_authority "$REQ")"
+  local why=""
+  [ -z "${REQ:-}" ] && why="the required-check set is EMPTY"
+  case "$AUTH" in gate|rail) : ;; *) why="${why:+$why; }the merge authority is '${AUTH:-<unset>}' (neither gate nor rail)" ;; esac
+  if [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "$REQ_OVERRIDE" ]; then
+    why="${why:+$why; }branch protection was UNREADABLE (REQ_SOURCE=fallback) and no REQ/LANDER_REQ override was supplied"
+  fi
+  if [ -n "$why" ]; then
+    AUTH="unknown"
+    say "merge authority: UNKNOWN — $why. Nothing merges this run (the same fail-closed refusal merge-one.sh makes, agent-infra#1764): an unreadable contract is not a licence to merge."
+    return 0
+  fi
+  say "merge authority: $AUTH (required checks: [${REQ}] source=${REQ_SOURCE:-read}${REQ_OVERRIDE:+ — OPERATOR OVERRIDE})"
+}
+
 # ── merge queue presence, once per run ───────────────────────────────────────────────────────
 # Detected from REST branch rules (a `merge_queue` rule type), NOT GraphQL. A rules read that fails
 # is reported as unknown and falls back to squash: squash is a valid merge on a repo with no queue,
@@ -183,7 +237,7 @@ lander_detect_queue() {
   local n
   n="$(gh api "repos/$OR/rules/branches/main" --jq '[.[]|select(.type=="merge_queue")]|length' 2>/dev/null)"
   case "${n:-}" in
-    ''|*[!0-9]*) say "merge queue: UNKNOWN (the branch-rules read failed) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
+    ''|*[!0-9]*) say "merge queue: UNKNOWN (the branch-rules read failed or answered something that is not a count) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
     0)           say "merge queue: none on main — merging with squash" ;;
     *)           say "merge queue: PRESENT ($n rule) — handing ready PRs to the queue with --auto"; HAS_QUEUE=1 ;;
   esac
@@ -224,12 +278,12 @@ lander_merge() { # <pr> <head>
 # ── one PR: read, classify, act, report ──────────────────────────────────────────────────────
 # Counters are globals (ok/wait/skip/err) so the summary can be written for the inventory row.
 lander_one() { # <pr>
-  local pr="$1" view vrc mergeable mstate draft head ckraw chk crc green pend fail names
+  local pr="$1" view vrc mergeable mstate draft head ckraw chk crc green pend fail names odd
   view="$(gh pr view "$pr" --repo "$OR" --json mergeable,mergeStateStatus,isDraft,headRefOid 2>/dev/null | py view)"; vrc=$?
   if [ "$vrc" -ne 0 ] || [ -z "$view" ]; then
     say "#$pr skipped: could not read the PR (fail-closed — nothing merged for it)"; SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:read-failed"; return 0
   fi
-  IFS="$TAB" read -r mergeable mstate draft head <<<"$view"
+  IFS="$US" read -r mergeable mstate draft head <<<"$view"
 
   # 1) a DRAFT is not a candidate at any state: it is the author's own "not ready" mark.
   if [ "${draft:-0}" = "1" ]; then
@@ -262,10 +316,16 @@ lander_one() { # <pr>
     say "#$pr waiting: the check surface could not be read (incomplete read — retry, never read as green)"
     WAITING=$((WAITING+1)); return 0
   fi
-  IFS="$TAB" read -r green pend fail names <<<"$chk"
+  IFS="$US" read -r green pend fail names odd <<<"$chk"
   if [ "${fail:-0}" -gt 0 ]; then
     say "#$pr skipped: $fail FAILED check(s): ${names# } — never merged with a failing check (green=$green pending=$pend)"
     SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:failed-checks"; return 0
+  fi
+  # ⛔ BEFORE the pending arm: a check that did not complete can never resolve into a merge, so a PR
+  # carrying one is SKIPPED (named, non-red) rather than reported as a CI wait it will never leave.
+  if [ -n "${odd:-}" ]; then
+    say "#$pr skipped: ${odd} did not complete (cancelled/stale) — NOT a red tree and NOT a defect, but verification never finished, so this is never merged (green=$green pending=$pend failed=$fail); re-run the checks or wait for the next push"
+    SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:checks-incomplete"; return 0
   fi
   if [ "${pend:-0}" -gt 0 ]; then
     # ⛔ THE MEASURED CASE. Green so far, CI still running: WAIT, say "waiting-on-CI", and never
@@ -292,7 +352,16 @@ lander_one() { # <pr>
       SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:state-$mstate"; return 0 ;;
   esac
 
-  # 6) READY. Merge (or say what would have been merged, under --dry-run).
+  # 6) READY — but "ready" is about the PR; the MERGE VERB is about the repo. A rail repo's merge
+  # authority is its own rail, so this component does not merge it and says who does.
+  if [ "$AUTH" = "unknown" ]; then
+    say "#$pr waiting: ready (green=$green, mergeStateStatus=$mstate) but the merge contract is UNKNOWN this run — nothing merges until it is readable"
+    WAITING=$((WAITING+1)); return 0
+  fi
+  if [ "$AUTH" = "rail" ]; then
+    say "#$pr skipped: READY, but this repo's merge authority is its own RAIL — merge-one.sh owns this merge; a raw squash here would land it on the required checks alone with no head-bound evidence (#1764)"
+    SKIPPED=$((SKIPPED+1)); SKIP_REASONS="$SKIP_REASONS #$pr:rail-authority"; return 0
+  fi
   lander_merge "$pr" "$head"
   case "$MERGE_RESULT" in
     merged)
@@ -306,11 +375,12 @@ lander_one() { # <pr>
 }
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────
-TAB="$(printf '\t')"
+US=$'\x1f'   # unit separator: NOT an IFS whitespace char, so empty fields survive `read`
 MERGED=0; ENQUEUED=0; WAITING=0; SKIPPED=0; ERRORS=0; WOULD=0; SKIP_REASONS=""
 say "run start: repo=$OR dry_run=$DRY max=$MAX path=$(command -v gh 2>/dev/null)"
 # ONCE PER RUN, BEFORE ANY ACT: the number that explains a slow drain even when nothing is ready.
 lander_queue_depth
+lander_authority
 lander_detect_queue
 
 BOARD="$(gh pr list --repo "$OR" --state open --json number,isDraft,headRefOid --limit "$MAX" 2>/dev/null)"
@@ -340,5 +410,9 @@ say "summary: merged=$MERGED enqueued=$ENQUEUED would_merge=$WOULD waiting=$WAIT
 # say "no run recorded" rather than guess health from an absent file.
 printf '%s %s %s %s %s %s %s %s\n' "$(date +%s)" "${QUEUED:-unreadable}" "${INPROG:-unreadable}" \
   "$MERGED" "$ENQUEUED" "$WAITING" "$SKIPPED" "$ERRORS" > "$O/state/lander-last" 2>/dev/null || true
+# A refusal to merge because the CONTRACT is unreadable is not "nothing to do": rc 3 makes it visible
+# to a launchd/cron last-exit instead of looking like a quiet, healthy run (merge-one.sh uses 5 for
+# the same refusal; the numbers differ per script and neither is a success).
+[ "$AUTH" = "unknown" ] && exit 3
 [ "$ERRORS" -gt 0 ] && exit 1
 exit 0
