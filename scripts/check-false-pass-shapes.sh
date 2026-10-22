@@ -737,10 +737,12 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
         # uncounted — on this line and on any later one the expansion runs into.
         j = skip_param(line, i)
         if (j < 0) {
-          # the expansion continues on a later line. Its remaining nesting is carried in PDEPTH; the
-          # body is walked only when it can hold an opener (a `$(`), and skipped otherwise.
+          # ⛔ THE WALK PATH CARRIES THE OUTER DEPTH, NOT PARAM_D (#2121 review round 5, P1). PARAM_D
+          # already counts every `${`/`{` in the rest of the line; re-walking that same region adds
+          # them a second time, so the carry ended at 2*PARAM_D - 1 and the surplus `}` ate the
+          # enclosing block closer — a LOUD partial FAIL on a correct file.
+          if (index(substr(line, i + 2), "$(") > 0) { PDEPTH = 1; i += 2; continue }
           PDEPTH = PARAM_D
-          if (index(substr(line, i + 2), "$(") > 0) { i += 2; continue }
           i = n + 1; continue
         }
         if (index(substr(line, i + 2, j - i - 2), "$(") > 0) {
