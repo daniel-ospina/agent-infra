@@ -192,7 +192,9 @@ jobs:
         done
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
-        # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
+        # Zero-dep: the one runtime value it needed from pi
+        # (isToolCallEventType) is imported from extensions/shared/tool-call-event.ts,
+        # not inlined here (#1330).
         mark "extensions/sequence-enforcer/sequence-enforcer.test.ts"
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
         # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in
@@ -227,6 +229,16 @@ jobs:
         mark "extensions/verification-gate/index.test.ts"
         (cd extensions/verification-gate && npm ci --no-audit --no-fund --loglevel=error) && \
           npx tsx extensions/verification-gate/index.test.ts || failures=$((failures+1))
+        # #1330 — the SDK-bearing half of the shared tool-call predicate pin: the
+        # repo's ONE copy (extensions/shared/tool-call-event.ts) must agree with the
+        # REAL `isToolCallEventType` export. Runs HERE, off the `npm ci` above, because
+        # it needs the SDK — which is also why the zero-dep `verify` job cannot run it.
+        # Deliberately after that install rather than early in this accumulator: if the
+        # install fails, this line fails loudly too instead of reporting a pass.
+        # The zero-dep half (extensions/shared/tool-call-event.test.ts) is auto-collected
+        # by the `extensions/shared/*.test.ts` glob far above — no line for it here.
+        mark "extensions/verification-gate/tool-call-event-parity.test.ts"
+        npx tsx extensions/verification-gate/tool-call-event-parity.test.ts || failures=$((failures+1))
         mark "extensions/verification-gate/index.e2e.test.ts"
         npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
         # #755 — the merge-scope subtraction suite. SDK-FREE by construction
