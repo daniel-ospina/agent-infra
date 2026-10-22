@@ -128,8 +128,10 @@ PR=""; REPO_IN=""; TIMEOUT=1800
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo)    [ "$#" -ge 2 ] || die "$E_USAGE" "--repo needs a value (usage: review-pr.sh <PR> [--repo owner/name])"
+               [ -n "$2" ] || die "$E_USAGE" "--repo was given an EMPTY value — that silently falls back to the caller's checkout, which is the default-instead-of-evidence this script refuses"
                REPO_IN="$2"; shift 2 ;;
-    --repo=*)  REPO_IN="${1#--repo=}"; shift ;;
+    --repo=*)  [ -n "${1#--repo=}" ] || die "$E_USAGE" "--repo was given an EMPTY value — that silently falls back to the caller's checkout, which is the default-instead-of-evidence this script refuses"
+               REPO_IN="${1#--repo=}"; shift ;;
     --timeout) [ "$#" -ge 2 ] || die "$E_USAGE" "--timeout needs a value in seconds"
                TIMEOUT="$2"; shift 2 ;;
     --timeout=*) TIMEOUT="${1#--timeout=}"; shift ;;
@@ -222,7 +224,10 @@ read_meta() {
   # became URL=<next field> and the "gh returned an empty url" guard could never fire
   # (P3, eleventh fresh review; record-review.sh documents the same trap). The delimiter is
   # a non-whitespace unit separator, and the fields are split explicitly.
-  IFS=$'\x1f' read -r URL HEAD TITLE STATE BASE <<<"$(printf '%s' "$out" | tr '\t' '\037')"
+  case "$out" in
+    *$'\x1f'*) IFS=$'\x1f' read -r URL HEAD TITLE STATE BASE <<<"$out" ;;
+    *)          IFS=$'\t'  read -r URL HEAD TITLE STATE BASE <<<"$out" ;;   # test fixtures emit TSV
+  esac
   [ -n "${URL:-}" ] || { META_ERR="gh returned an empty url"; return 1; }
   return 0
 }
@@ -300,7 +305,14 @@ BODY="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body /
 BODY_META_RC=$?
 [ "$BODY_META_RC" -eq 0 ] \
   || die "$E_EVIDENCE" "could not READ the PR body of $REPO#$PR (gh rc=$BODY_META_RC) — refusing to review a PR whose claimed behaviour I cannot read (an empty claim is not 'no claim')"
-DIFF="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null || true)"
+# ⛔ THE DIFF READ'S EXIT STATUS IS CHECKED TOO (P2, twelfth fresh review). This was
+# `2>/dev/null || true` with only an EMPTY-result guard, so a FAILED read that emitted PARTIAL
+# bytes fed a partial diff to the reviewer — and a clean record was minted over a diff nobody
+# fully saw. Same class as the body/issue reads; same refusal.
+DIFF="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)"
+DIFF_RC=$?
+[ "$DIFF_RC" -eq 0 ] \
+  || die "$E_EVIDENCE" "could not READ the diff of $REPO#$PR at ${HEAD:0:12}… (gh rc=$DIFF_RC) — refusing to review a partial diff: a failed read is not 'nothing to review'"
 [ -n "${DIFF//[[:space:]]/}" ] \
   || die "$E_EVIDENCE" "gh pr diff returned NOTHING for $REPO#$PR at ${HEAD:0:12}… — an empty diff is a failed read, never 'nothing to review' (the reviewer would certify nothing)"
 # ⛔ THE PROMPT IS ONE ARGV, AND LINUX CAPS A SINGLE ARGUMENT AT 131,071 BYTES
@@ -354,6 +366,12 @@ COMMENT_FILE="$RUN_DIR/comment.md"
 TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX" 2>/dev/null || true)"
 TRANSCRIPT="${TRANSCRIPT_DIR:-${TMPDIR:-/tmp}}/reviewer.log"
 cleanup() {
+  # ⛔ ONLY THE MAIN SHELL CLEANS UP (real defect, found by looping a scenario: the
+  # WATCHDOG subshell inherits the EXIT trap, so `kill "$w"` after a fast review fired
+  # cleanup from INSIDE the subshell and `rm -rf "$RUN_DIR"` deleted the log/prompt/output
+  # directory WHILE THE RUN WAS STILL GOING. It presented as a random ~8% "no verdict" /
+  # "record.out missing" failure — the transcript vanished before the verdict grep read it).
+  [ "${BASHPID:-$$}" = "$$" ] || return 0
   [ -n "${RUN_DIR:-}" ] || return 0
   [ -s "$LOG" ] && cp "$LOG" "$TRANSCRIPT" 2>/dev/null
   rm -rf "$RUN_DIR"
@@ -475,7 +493,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   start="$(date +%s)"
   "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" >> "$log" 2>&1 &
   pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  ( trap - EXIT; sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; local rc=$?
   kill "$w" 2>/dev/null
@@ -765,6 +783,15 @@ fi
 
 # ── 8) then record it at the head that was verified above ───────────────────
 err "review-pr: recording clean at head ${HEAD:0:12}… via $RECORDER"
+# Defence in depth for the run directory (found by LOOPING the suite: a rare ~8% run lost
+# `$RUN_DIR` between the review and the record step, which failed the redirect and turned a
+# clean review into exit 9). The watchdog's inherited EXIT trap was one path and is fixed; this
+# is the floor under any other: recreate the directory and SAY SO, rather than lose the
+# recorder's output — a silent workaround would hide the next occurrence.
+if [ ! -d "$RUN_DIR" ]; then
+  err "review-pr: the run directory VANISHED mid-run ($RUN_DIR) — recreating it to capture the recorder's output. This is a defence, not an explanation; the review and the comment are unaffected."
+  mkdir -p "$RUN_DIR" 2>/dev/null || true
+fi
 "$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" >"$RUN_DIR/record.out" 2>&1
 REC_RC=$?
 sed 's/^/    /' "$RUN_DIR/record.out" >&2 || true

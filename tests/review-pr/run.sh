@@ -39,6 +39,8 @@
 #   §W the no-URL comment fallback must match the body just posted, or refuse
 #   §X recorder rc=0 with no record file on disk => exit 9
 #   §Y a failed claim/issue read refuses (a failed read is not an empty value)
+#   §Z a failed DIFF read that emitted partial bytes refuses
+#   §AA an EMPTY --repo value is a usage error, never a silent fallback
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -120,13 +122,20 @@ case "$cmd" in
             printf '%s\t%s\t%s\t%s\t%s\n' "${FIXTURE_URL:-}" "$(cat "$TMP/head")" \
               "${FIXTURE_TITLE:-fixture title}" "${FIXTURE_STATE:-OPEN}" "${FIXTURE_BASE:-main}" ;;
           body) [ "${FIXTURE_READ_FAIL:-}" = "body" ] && { echo "HTTP 503" >&2; exit 1; }
-                cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}" ;;
-          closingIssuesReferences) [ "${FIXTURE_READ_FAIL:-}" = "issues" ] && { echo "HTTP 503" >&2; exit 1; }
-                [ -n "${FIXTURE_ISSUE_URL:-}" ] && printf '%s\n' "$FIXTURE_ISSUE_URL"; ;;
+                cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}"
+                exit 0 ;;
+          closingIssuesReferences)
+                [ "${FIXTURE_READ_FAIL:-}" = "issues" ] && { echo "HTTP 503" >&2; exit 1; }
+                # An EMPTY list is rc=0 with no output, exactly as real `gh` answers — the
+                # `[ -n … ] && printf` form returned 1 for an empty list, which the seam's
+                # new unreadable-list guard correctly refused (found by looping a scenario).
+                if [ -n "${FIXTURE_ISSUE_URL:-}" ]; then printf '%s\n' "$FIXTURE_ISSUE_URL"; fi
+                exit 0 ;;
           headRefOid) cat "$TMP/head" ;;
           *) echo "fake-gh: unhandled pr view --json $json" >&2; exit 1 ;;
         esac ;;
       diff)
+        [ "${FIXTURE_READ_FAIL:-}" = "diff" ] && { printf 'diff --git a/x b/x\n+PARTIAL ONLY\n'; exit 1; }
         # A huge diff is GENERATED here, never carried through the environment: a
         # 200 KB exported variable is itself past the single-string exec limit on this
         # box, which would test the harness instead of the seam (§P).
@@ -607,6 +616,24 @@ run "$SRC" 2284
 err_has "could not READ the linked-issue list"; ck $? "…naming the read failure"
 no_record; ck $? "nothing recorded"
 
+# ── §Z a failed diff read is refused even when it printed PARTIAL bytes ─────
+echo; echo "§Z a FAILED diff read refuses, even with partial output"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_READ_FAIL=diff
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "exit 3 on a failed diff read that emitted partial bytes (rc=$(rc_of))"
+err_has "partial diff"; ck $? "…naming the partial read"
+no_reviewer; ck $? "  the reviewer was never paid for a partial diff"
+no_record; ck $? "  nothing recorded"
+
+# ── §AA an EMPTY --repo value is a usage error ──────────────────────────────
+echo; echo "§AA an EMPTY --repo is refused (no silent fallback to the cwd's repo)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284 --repo ""
+[ "$(rc_of)" = "2" ]; ck $? "exit 2 for '--repo \"\"' (rc=$(rc_of))"
+run "$SRC" 2284 --repo=
+[ "$(rc_of)" = "2" ]; ck $? "exit 2 for '--repo=' (rc=$(rc_of))"
+no_reviewer; ck $? "  no reviewer dispatched on either"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -629,10 +656,10 @@ echo
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
 # the very smallest deletion fires. It is still not a coverage claim, and a section smaller
-# than (total - 150) is not caught by it.
+# than (total - 158) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 150 ]; ck $? "assertion-count pin: >= 150 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 158 ]; ck $? "assertion-count pin: >= 158 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
