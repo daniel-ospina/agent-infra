@@ -1980,6 +1980,47 @@ run_check_carry 424910 "$CC_REPO"
 assert_eq "$CC_RC" "4" "11.13g3 a differently-CASED repo is a different key (exit 4)"
 rm -f "$CC_FILE-424910.json"
 
+# (g4) NO REPO IS A DIFFERENT RULE, NOT A DEGENERATE ONE (review, #2353 P2).
+# With no repo context the gate cannot derive a qualified name, so it trusts a key that
+# PROVES its repo: one uniquely-matching <owner>-<repo>-<pr>.json. This mode looked only
+# at <pr>.json, so in the exact state it exists for — repo auto-detection failing under a
+# contested gh gate — it said "no record … run the review" about a record the gate reads.
+# The record IS found here (so NOT `norecord`); what fails is the diff READ, which needs a
+# repo — and a failed read is `unreadable`, never `norecord` and never a carry.
+cc_rec 424913 "$CC_STALE" "$CC_SHA"
+run_check_carry 424913 ""
+assert_eq "$CC_RC" "3" "11.13g4 with no repo, a UNIQUE qualified record is FOUND (exit 3 = the read failed, not 'no record')"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13g4 …reports 'unreadable', not 'norecord'"
+rm -f "$CC_FILE-424913.json"
+
+# (g5) …while an AMBIGUOUS lookup is genuinely no record: two repos claim #PR, and the
+# gate treats that as absent (it cannot tell which is yours). The remedy must name the
+# missing repo, not "run the review".
+cc_rec 424914 "$CC_STALE" "$CC_SHA"
+printf '{"pr":424914,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_RDIR/someone-else-other-424914.json"
+run_check_carry 424914 ""
+assert_eq "$CC_RC" "4" "11.13g5 with no repo, TWO qualified records are ambiguous (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g5 …reports 'norecord'"
+assert_contains "$(cat "$T/cc-err")" "pass owner/repo" "11.13g5 …and names the actual remedy (a repo), not a re-review"
+rm -f "$CC_FILE-424914.json" "$CC_RDIR/someone-else-other-424914.json"
+
+# (g6) …and a legacy record that EMBEDS a repo is rejected with no repo context (#426
+# review P0-2): it may be another repo's PR with this number.
+printf '{"pr":424915,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424915.json"
+run_check_carry 424915 ""
+assert_eq "$CC_RC" "4" "11.13g6 with no repo, a repo-EMBEDDING legacy record is not trusted (exit 4)"
+rm -f "$CC_RDIR/424915.json"
+
+# (g7) THE POSITIVE LEGACY DIRECTION (review, #2353 round 3 note). With a repo resolved
+# and NO qualified file, a legacy <pr>.json naming THIS repo IS the record — the #426
+# migration fallback. Unpinned, the `elif` could be narrowed away and every pre-#426 lane
+# would be told there is no record.
+printf '{"pr":424916,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424916.json"
+run_check_carry 424916 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13g7 with a repo, the legacy record naming this repo is READ (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13g7 …and carries on the matching digest"
+rm -f "$CC_RDIR/424916.json"
+
 # (f2) `nodigest` NEEDS NO READ, so it must be decided BEFORE the diff read (review,
 # #2353 P2). With a digest-less record AND an unreadable diff, the answer is the one
 # that unsticks the lane (re-run the recorder's carry arms), not an endless RETRY.

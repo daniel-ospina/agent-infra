@@ -30,6 +30,8 @@
 #     fresh       1  the DIFF changed; a fresh review is genuinely owed
 #     unreadable  3  the live diff could not be READ — RETRY, do NOT re-review
 #     norecord    4  no record for this PR/repo — there is no verdict to carry
+#                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
+#                    and no repo-less `<pr>.json` — pass owner/repo)
 #     nodigest    5  the record has no usable digest — re-run the recorder at the
 #                    head and let its carry arms decide (a CARRY, not a review)
 #   A usage/argument error is exit 2. ⛔ It is a PREDICTION, not an authorization:
@@ -1361,7 +1363,12 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     CC_FILE="$CC_DIR/${REPO%/*}-${REPO#*/}-$PR.json"
     CC_LEGACY="$CC_DIR/$PR.json"
   else
-    CC_FILE="$CC_DIR/$PR.json"
+    # NO REPO: the legacy <pr>.json is the ONLY name known in advance — a qualified
+    # record cannot be derived without the repo, so it is discovered by SCAN below
+    # (exactly what the gate does). Using CC_FILE for it made the no-repo path
+    # believe the legacy file WAS the qualified one.
+    CC_FILE=""
+    CC_LEGACY="$CC_DIR/$PR.json"
   fi
   # `|| true` is load-bearing: `head -1` closes the pipe, and under this script's
   # `set -uo pipefail` a sed killed by SIGPIPE makes the whole pipeline 141 — which,
@@ -1384,14 +1391,39 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     [ -z "$r" ] || [ "$r" = "$REPO" ]
   }
   CC_REC=""
-  if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
-    if cc_names_this_repo "$CC_FILE"; then CC_REC="$CC_FILE"; fi
-  elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
-    if cc_names_this_repo "$CC_LEGACY"; then CC_REC="$CC_LEGACY"; fi
+  CC_LOOKUP_HINT="Run the review, then record it."
+  if [ -n "$REPO" ]; then
+    if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
+      if cc_names_this_repo "$CC_FILE"; then CC_REC="$CC_FILE"; fi
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if cc_names_this_repo "$CC_LEGACY"; then CC_REC="$CC_LEGACY"; fi
+    fi
+  else
+    # ⛔ THE NO-REPO BRANCH IS A DIFFERENT RULE, NOT A DEGENERATE ONE (review, #2353 P2).
+    # `readReviewRecord(pr)` with no repo context cannot derive a qualified name, so it
+    # TRUSTS A KEY THAT PROVES ITS REPO: a single uniquely-matching qualified file
+    # (<owner>-<repo>-<pr>.json), and NOTHING ELSE — an ambiguous set is a collision, and
+    # a legacy file that EMBEDS a repo is rejected (#426 review P0-2: it may be another
+    # repo's PR with the same number). This mode read only <pr>.json here, so in the very
+    # state it exists for — repo auto-detection failing under a contested gh gate, REPO
+    # empty — it told a lane "no record … run the review" about a record the gate reads
+    # and would carry: the 20-40 minute re-review, triggered BY the check meant to prevent it.
+    CC_MATCHES=()
+    for _f in "$CC_DIR"/*-"$PR".json; do
+      [ -f "$_f" ] || continue
+      CC_MATCHES+=("$_f")
+    done
+    if [ "${#CC_MATCHES[@]}" -eq 1 ]; then
+      CC_REC="${CC_MATCHES[0]}"
+    elif [ "${#CC_MATCHES[@]}" -gt 1 ]; then
+      CC_LOOKUP_HINT="More than one repo has a record for #$PR (${#CC_MATCHES[@]} files) and no repo was resolved, so the record CANNOT be identified — pass owner/repo: record-review.sh --check-carry $PR owner/repo. (The merge gate treats an ambiguous lookup as NO record, so nothing would carry.)"
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if [ -z "$(cc_field "$CC_LEGACY" repo)" ]; then CC_REC="$CC_LEGACY"; fi
+    fi
   fi
   if [ -z "$CC_REC" ]; then
     printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
-    echo "record-review.sh --check-carry: no review record for $REPO#$PR — there is no verdict to carry. Run the review, then record it." >&2
+    echo "record-review.sh --check-carry: no review record for ${REPO:-<no repo resolved>}#$PR — there is no verdict to carry. $CC_LOOKUP_HINT" >&2
     exit 4
   fi
   CC_HEAD="$(cc_field "$CC_REC" head_sha)"
