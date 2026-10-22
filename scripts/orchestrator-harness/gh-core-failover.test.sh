@@ -258,11 +258,18 @@ ck "(b3) it says the call WRITES and was not retried" \
    $(printf '%s' "$ERR" | grep -q 'WRITES' && echo 0 || echo 1)
 
 echo "── (c) the ETag-free SUBCOMMAND surface is cached: N identical reads => ONE request ───────────"
+# ⛔ THE CACHED CLASS IS A NON-DECISION ONE. `pr view --json headRefOid` is the head a merge and the
+# review evidence are bound to, so it is NOT a TTL class (round 5) — the positive case here is the board
+# listing, whose bounded staleness costs no verdict.
 reset_env c coreok
-for i in 1 2 3 4 5; do run coreok pr view 7 --json headRefOid ; done
-ck "(c) 5 identical 'gh pr view' reads made 1 request" $([ "$(reqs 'pr view 7')" -eq 1 ] && echo 0 || echo 1)
-ck "(c) every one of the 5 returned the answer" $([ "$OUT" = '{"headRefOid":"graphqlsha"}' ] && echo 0 || echo 1)
-ck "(c) the hit is RECORDED in events.log" $(grep -q 'read-cache: pr-state hit' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
+for i in 1 2 3 4 5; do run coreok pr list --repo o/r ; done
+ck "(c) 5 identical 'gh pr list' reads made 1 request" $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
+ck "(c) every one of the 5 returned the answer" $(printf '%s' "$OUT" | grep -q '"number":1' && echo 0 || echo 1)
+ck "(c) the hit is RECORDED in events.log" $(grep -q 'read-cache: pr-list hit' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
+: > "$STUB_LOG"
+for i in 1 2 3; do run coreok pr view 7 --json headRefOid ; done
+ck "(c) while the HEAD (a decision input) is NOT cached: 3 reads => 3 requests" \
+   $([ "$(reqs 'pr view 7')" -eq 3 ] && echo 0 || echo 1)
 
 echo "── (c1) a read-modify-write surface is NEVER TTL-cached (round-5 lost update) ───────────────�"
 # `record-review.sh:2356` reads `pulls/{n}`'s .body and PATCHes it back whole; a 10 s stale body would
@@ -274,11 +281,12 @@ run coreok api repos/o/r/pulls/7 --jq .body >/dev/null 2>&1
 ck "(c1) two .body reads make TWO requests (no stale body to write back)" \
    $([ "$(reqs 'pulls/7')" -eq 2 ] && echo 0 || echo 1)
 
-printf '\n── (c2) the GraphQL SUBCOMMAND path is cached too (it has no ETag at all) ───────────────────\n'
+printf '\n── (c2) the GraphQL SUBCOMMAND path is cached too, for the non-decision class ─────────────────\n'
 reset_env c2 coreok
-for i in 1 2 3; do run coreok pr view 7 --json headRefOid ; done
-ck "(c2) 3 identical 'gh pr view' reads made 1 request" $([ "$(reqs 'pr view 7')" -eq 1 ] && echo 0 || echo 1)
-ck "(c2) all 3 got the answer" $([ "$OUT" = '{"headRefOid":"graphqlsha"}' ] && echo 0 || echo 1)
+for i in 1 2 3; do run coreok pr list --repo o/r ; done
+ck "(c2) 3 identical 'gh pr list' reads made 1 request (GraphQL has no ETag at all)" \
+   $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
+ck "(c2) all 3 got the answer" $(printf '%s' "$OUT" | grep -q '"number":1' && echo 0 || echo 1)
 
 # ⛔ AND THIS HOLDS EVEN WITH THE ETag PATH OFF: the boundary is the API SURFACE, not the switch.
 reset_env c3b coreok
@@ -303,8 +311,8 @@ ck "(c4) every poll got the run list" $(printf '%s' "$OUT" | grep -q '3978684784
 echo "── (d) MUTATION: GH_LIMIT_READ_CACHE=0 must make (c) fail ────────────────────────────────────"
 reset_env d coreok
 export GH_LIMIT_READ_CACHE=0
-for i in 1 2 3 4 5; do run coreok pr view 7 --json headRefOid ; done
-n="$(reqs 'pr view 7')"
+for i in 1 2 3 4 5; do run coreok pr list --repo o/r ; done
+n="$(reqs 'pr list')"
 ck "(d) with the cache disabled the same 5 reads make 5 requests (was 1) — n=$n" \
    $([ "$n" -eq 5 ] && echo 0 || echo 1)
 unset GH_LIMIT_READ_CACHE

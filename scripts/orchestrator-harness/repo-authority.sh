@@ -147,9 +147,21 @@ _override_usable() {
 # named it). The age bound is the layer's own `HEALTH_UNKNOWN_WINDOW` (900 s) for that shape, and the
 # token says `?` rather than a number nobody measured.
 _gh_named_state() {
-  local dir p line tok reset at now _win
+  local dir p line tok reset at now _win _alt
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
   p="$dir/health"
+  # ⛔ THE LAYER HAS A DEGRADED STATE DIR AND THIS READER DID NOT KNOW ABOUT IT. When the primary dir is
+  # UNWRITABLE the layer moves lock/ETag/`last-limit`/`health` to `${TMPDIR}/gh-limit-<uid>` (see
+  # gh-limit.py `state_dir`), so a shell that only reads the primary finds NOTHING on exactly the box
+  # that is already degraded — and the lane loses the named state and falls back to the unexplained
+  # “required checks UNREADABLE”. Follow the same fallback, in the same order — and ONLY when the
+  # configured dir is missing or unwritable, because an operator who SET `GH_LIMIT_DIR` means it (and a
+  # reader that silently consults a second directory whenever the first has no record would answer from
+  # a box-global file an isolated test never wrote).
+  if [ ! -f "$p" ] && { [ ! -d "$dir" ] || [ ! -w "$dir" ]; }; then
+    _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}/health"
+    [ -f "$_alt" ] && p="$_alt"
+  fi
   [ -f "$p" ] || return 0
   IFS= read -r line < "$p" 2>/dev/null || return 0
   tok="${line%% *}"
@@ -175,7 +187,11 @@ _gh_named_state() {
   case "$_win" in ''|*[!0-9.+-]*) _win=900 ;; esac
   _win="$(awk -v v="$_win" 'BEGIN { n = v + 0; if (n < 60) n = 60; if (n > 86400) n = 86400; printf "%d", n }' 2>/dev/null)"
   case "$_win" in ''|*[!0-9]*) _win=900 ;; esac
-  [ "$now" -ge "$at" ] && [ "$(( now - at ))" -le "$_win" ] || return 0
+  # ⛔ A STAMP IN THE FUTURE IS NOT “EXPIRED” — the layer accepts a negative age (`clock() - at` below
+  # the window, including below zero, which a stepped-back clock or a resumed VM produces) and this
+  # reader used to require `now >= at`, so the two readers disagreed about one record in exactly that
+  # case: the rail printed the old unexplained UNREADABLE while `--health` named the state.
+  [ "$(( now - at ))" -le "$_win" ] || return 0
   printf '%s resets_in=?' "$tok"
 }
 
