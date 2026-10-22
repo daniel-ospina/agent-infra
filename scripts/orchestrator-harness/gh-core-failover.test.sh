@@ -836,5 +836,37 @@ ck "(m19) a PASSED meter window outranks an older record (--health says gh-ok)" 
 ck "(m20) secret/variable/cache/gist/codespace/ruleset writes are classified as MUTATIONS" \
    "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); bad=[a for a in (['secret','set','F','-b','x'],['variable','set','A','-b','1'],['cache','delete','-a'],['gist','create','f'],['codespace','delete','-c','x'],['ruleset','delete','1'],['repo','delete','o/r','--yes']) if not m.is_mutating(a)]; sys.exit(0 if not bad and not m.is_mutating(['pr','view','7']) else 1)" && echo 0 || echo 1)"
 
+echo "── (m21) ROUND 8: an undated record that expires, an attached flag, and a null node ────────────"
+# (m21) `record_core_exhausted` compared the meaning-carrying fields and excluded `at=`, so an UNDATED
+# record (the shape every GH_LIMIT_NO_WAIT caller produces) kept its first stamp forever and aged out at
+# at+900s — fifteen minutes into an ONGOING exhaustion `--health` said gh-ok, core_pressure said None,
+# and the read was SENT into the empty pool with the rail back at “contract UNKNOWN”.
+reset_env m21 coreok
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(( $(date +%s) - 1000 ))" > "$GH_LIMIT_DIR/health"
+ck "(m21) a repeated undated refusal RE-STAMPS the record (it must not age out mid-incident)" \
+   "$(python3 -c "import importlib.util,os,sys,time; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.record_core_exhausted(None, None); line=open(os.path.join('$GH_LIMIT_DIR','health')).read().strip(); at=int(line.split('at=')[1].split()[0]); sys.exit(0 if abs(at-int(time.time()))<=3 else 1)" && echo 0 || echo 1)"
+health coreok
+ck "(m21) … so --health still names it instead of reporting gh-ok" \
+   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted' && echo 0 || echo 1)
+
+# (m22) an ATTACHED short data flag before the endpoint (`gh api -fbody=x <path>`, a POST) made
+# api_endpoint answer None, makes_request False, and the core-budget guard never ran: 7 requests and
+# 439 s against a pool measured at zero, where the flag-after form spent nothing.
+ck "(m22) an attached data flag before the endpoint still resolves the endpoint (and counts as a request)" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); a=['api','-fbody=x','repos/o/r/issues']; sys.exit(0 if m.api_endpoint(a)=='repos/o/r/issues' and m.makes_request(a) and m.is_mutating(a) else 1)" && echo 0 || echo 1)"
+
+# (m23) GraphQL returns `null` for a node the viewer cannot see; `.get` on it raised and the caller got a
+# Python traceback instead of the NAMED refusal (so objective.py could not read VERDICT=GH-RATE-LIMITED).
+ck "(m23) a null node in a connection is REFUSED by name, not an AttributeError" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); d={'data':{'repository':{'issue':{'comments':{'pageInfo':{'hasNextPage':False},'nodes':[None]}}}}}; sys.exit(0 if m._enc_issue_comments(d) is None else 1)" && echo 0 || echo 1)"
+
+# (m24) a HALF-WRITTEN budget.json is not a measurement: the sed parse read a torn document the layer's
+# json.load rejects, so the rail announced an exhaustion `--health` called gh-ok.
+reset_env m24 coreok
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s' "$(date +%s)" "$(( $(date +%s) + 600 ))" > "$GH_LIMIT_DIR/budget.json"
+health coreok
+ck "(m24) a TORN budget.json is not a measurement (--health is gh-ok)" \
+   $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

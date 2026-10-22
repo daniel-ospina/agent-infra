@@ -1071,6 +1071,16 @@ def api_endpoint(gh_argv):
                 continue
             return None                     # an unknown flag: we cannot say what the next token is
         if a.startswith("-"):
+            # ⛔ AN ATTACHED DATA FLAG (`-fbody=x`, `-Fbody=x`) IS A VALUE-BEARING FLAG, NOT THE ENDPOINT —
+            # `_data_flag_value` already knows the spelling, and returning None here made
+            # `makes_request()` answer “this call makes no API request”, which SKIPPED the core-budget
+            # guard entirely: `gh api -fbody=x repos/o/r/issues` (a POST, because a field implies it) was
+            # sent into a pool measured at zero and retried to the attempt cap — 7 requests and 439 s —
+            # while the same call with the flag AFTER the endpoint spent nothing (measured, round 8).
+            _is_data, _ = _data_flag_value(a)
+            if _is_data and "=" in a:
+                i += 1
+                continue
             return None
         return a
     return None
@@ -2645,7 +2655,15 @@ def record_core_exhausted(reset, remaining):
 
     ⛔ IT IS REWRITTEN ONLY WHEN IT CHANGES. This is called from the per-call budget check, so on a box
     in the low-water band it would otherwise be a temp-file + rename per gh call — thousands an hour,
-    for a line whose whole content is the same until the reset moves or the count crosses zero."""
+    for a line whose whole content is the same until the reset moves or the count crosses zero.
+
+    ⛔ BUT AN **UNDATED** RECORD MUST STILL BE RE-STAMPED, OR IT EXPIRES MID-INCIDENT. Its `at=` is the
+    ONLY thing that says how old the evidence is, and `health_state()` age-bounds it — so freezing `at=`
+    (which “the fields that carry meaning are equal” did, since it excludes `at=`) meant that fifteen
+    minutes into an ONGOING undated exhaustion the record stopped counting: `--health` said `gh-ok`,
+    `core_pressure` said None, the read was SENT into the empty pool, and the rail went back to “the merge
+    contract is UNKNOWN” while the pool was still empty (measured, round 8: five refusals at T…T+1300 left
+    `at=T`). A refresh is cheap and bounded — once per half-window, not once per call."""
     phrase = "gh-core-exhausted resets_in=%s" % resets_in(reset)
     line = "%s at=%d bucket=core remaining=%s reset=%s" % (
         phrase, int(clock()), remaining if remaining is not None else "?", reset or 0)
@@ -2657,7 +2675,12 @@ def record_core_exhausted(reset, remaining):
         # the whole line: the phrase, the bucket and the reset window.
         keep = [kv for kv in cur.split() if not kv.startswith("at=")]
         if keep == [kv for kv in line.split() if not kv.startswith("at=")]:
-            return phrase
+            # …and an UNDATED record (reset=0) is re-stamped once per half-window so it cannot age out
+            # while the exhaustion continues. A DATED one needs no re-stamp: its `reset` is the bound.
+            cur_at = as_int(next((kv.split("=", 1)[1] for kv in cur.split() if kv.startswith("at=")), None))
+            dated = reset is not None and int(reset or 0) > 0
+            if dated or (cur_at and clock() - cur_at <= HEALTH_UNKNOWN_WINDOW // 2):
+                return phrase
     except OSError:
         pass
     write_state(HEALTH_FILE, line)
@@ -3159,7 +3182,12 @@ def _enc_issue_comments(doc):
     if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
         return None
     nodes = conn.get("nodes")
-    if not isinstance(nodes, list):
+    if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
+        # ⛔ GraphQL returns `null` for a node the viewer cannot see, and `.get` on it raised an
+        # AttributeError — the caller got a Python traceback instead of the named refusal, so
+        # `objective.py`'s TRANSPORT_MARKERS could not turn it into VERDICT=GH-RATE-LIMITED
+        # (measured, round 8). A list we cannot reproduce faithfully is `None`, like every other
+        # unrepresentable shape here.
         return None
     return json.dumps([{"id": n.get("databaseId"), "body": n.get("body"),
                         "created_at": n.get("createdAt"), "html_url": n.get("url"),
@@ -3176,8 +3204,8 @@ def _enc_pr_reviews(doc):
     if (conn.get("pageInfo") or {}).get("hasNextPage") is not False:
         return None                    # absent pageInfo = “I cannot prove this is the whole list”
     nodes = conn.get("nodes")
-    if not isinstance(nodes, list):
-        return None
+    if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
+        return None                    # a null node is not a review we can reproduce (see comments)
     return json.dumps([{"id": n.get("databaseId"), "state": n.get("state"), "body": n.get("body"),
                         "submitted_at": n.get("submittedAt"),
                         "commit_id": (n.get("commit") or {}).get("oid"),
