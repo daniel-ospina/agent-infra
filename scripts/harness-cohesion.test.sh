@@ -520,7 +520,10 @@ ck "start order: the controller authority was invoked exactly once (n=$n4)" "$([
 [ "$n4" -eq 1 ] || printf '    (F4 authority log: %s)\n' "$(tr '\n' ' ' < "$F4/fix.log" 2>/dev/null)"
 # The order is declared in ONE place and the walk follows it: refresh is attempted before the loop.
 case "$OUT" in
-  *"==> 3/3 components, in dependency order: refresh claims loop supervisor"*) # ⛔ THE DELEGATION MUST SEE THE TREE THE LAUNCHER RESOLVED. The self-test gate is the ONLY thing that
+  # ⛔ THE ASSERTION IS THE ORDER, NOT THE STEP NUMBER: the prefix is `N/M` so that inserting a step cannot
+  # silently weaken this check (it was pinned to `3/3` and this change added a capacity step, making the
+  # step 4/4 — the ORDER it exists to pin is unchanged).
+  *"components, in dependency order: refresh claims loop supervisor"*) # ⛔ THE DELEGATION MUST SEE THE TREE THE LAUNCHER RESOLVED. The self-test gate is the ONLY thing that
 # examines the harness before a start, and it used to receive an empty HARNESS on a pin-less box — so it
 # compared nothing and still passed (measured, round 5).
 # The value must be the SAME harness the launcher printed it resolved (F4 resolves it from the pin's

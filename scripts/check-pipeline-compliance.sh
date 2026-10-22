@@ -1069,22 +1069,80 @@ fetch_json() {
     echo "[dry-run] fetch: gh api repos/$repo/$path --jq '$expr'" >&2
     return 0
   fi
-  local out rc
+  local out rc err
+  # stderr is captured SEPARATELY, never merged into the same variable as the
+  # payload. The old `2>&1` had two harms, and the first one is the boring one:
+  #   (i) DATA CORRUPTION — on a SUCCESSFUL call a warning line became the first
+  #       line of the value the gate consumed, so a parsed PR_BODY could begin
+  #       "Warning: API rate limit is near its secondary threshold" (reproduced
+  #       against origin/main).
+  #  (ii) the failure message buried the cause: jq's parse error on a NON-JSON
+  #       body was printed as the whole story, which on CI is indistinguishable
+  #       from a policy violation. (jq runs INSIDE `gh api --jq` on the HTTP
+  #       body, so stderr merging was never what produced that message — the
+  #       body being non-JSON was. An earlier version of this comment claimed
+  #       otherwise; a fresh-context review caught it.)
+  # See #1876 for the general form.
+  # `mktemp` with an explicit TEMPLATE: bare `mktemp` ignores $TMPDIR on BSD/macOS
+  # and always lands in /tmp, so the file escapes the caller's temp root.
+  err="$(mktemp "${TMPDIR:-/tmp}/pc-fetch.XXXXXX")" || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
+  # `cmd && rc=0 || rc=$?` rather than `cmd; rc=$?`: under `set -o posix` or
+  # `shopt -s inherit_errexit` a bare failing assignment exits the shell before
+  # rc is captured — no diagnostic, no verdict, and the caller sees gh's status
+  # instead of the gate's 2. Same idiom as scripts/admin-merge.sh (#1690).
   if [[ "$paginate" == "1" ]]; then
-    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>&1)" || {
-      rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
-    }
+    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>"$err")" && rc=0 || rc=$?
   else
-    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>&1)" || {
-      rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
-    }
+    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>"$err")" && rc=0 || rc=$?
   fi
+  if (( rc != 0 )); then
+    echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
+    [[ -s "$err" ]] && sed 's/^/   stderr: /' "$err" >&2
+    # $out can carry PR/issue-controlled text (page-1 bodies on a failed --paginate),
+    # and it is echoed into the same stream as the VERDICT lines — so flatten it to
+    # one line: a body containing a newline plus a forged "VERDICT:" must not be
+    # able to spoof the log.
+    [[ -n "$out" ]] && printf '   stdout: %s\n' "$(printf '%s' "${out:0:400}" | tr '\n' ' ')" >&2
+    # FOUR classes, ordered by what the operator must DO, because one message for
+    # all of them sent people to the wrong fix (#1690). Order matters and is
+    # asserted by the suite: a rate limit must be caught BEFORE 403/404, since
+    # GitHub answers a rate limit with 403 as well as 429 and treating that as a
+    # permanent access defect is the exact inversion this change exists to fix.
+    #   1. transient: rate limit / 429 / 5xx / abuse detection -> re-run.
+    #   2. the API did not answer with JSON (proxy/5xx page): jq failed to parse it
+    #      and THAT message used to be the whole story.
+    #   3. 403/404 with no transient signature: a reference or access defect.
+    #   4. anything else: unknown tooling failure.
+    # Only $err is classified. $out may contain PR/issue-controlled text — a body
+    # that merely QUOTES one of these messages must never select the class.
+    # The transient class matches a REFUSAL signature, never a mention. A benign
+    # "Warning: API rate limit is near its secondary threshold; continuing" rides
+    # along with ordinary failures, and a bare `rate limit` alternative made that
+    # warning outrank a real 422 — the same wrong-advice defect (#1690) in the
+    # opposite direction. Both genuine refusals contain `exceeded` or `secondary
+    # rate limit`; a permanent 403 says "Resource not accessible".
+    if grep -qiE 'rate limit exceeded|secondary rate limit|too many requests|abuse detection|HTTP 429|HTTP 5[0-9][0-9]' "$err" 2>/dev/null; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the API refused on a TRANSIENT condition (rate limit / 5xx)," >&2
+      echo "   so the gate could not read the PR. This is NOT a policy failure and NOT a defect in the PR:" >&2
+      echo "   wait for the limit window (or the backend) and re-run." >&2
+    elif grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' "$err" 2>/dev/null; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the API did not answer with JSON, so the gate could not read" >&2
+      echo "   the PR. jq reported a PARSE error, which is not a policy verdict: a 5xx/rate-limit/proxy page" >&2
+      echo "   reads the same as a non-compliant PR otherwise. Re-run; if it persists, the endpoint is down." >&2
+    elif grep -qE '(^|[^0-9])(404|403)([^0-9]|$)' "$err" 2>/dev/null; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the path above (404/403)." >&2
+      echo "   With no rate-limit signature, this is a reference or access defect — NOT transient: check" >&2
+      echo "   GH_REPO, PR_NUMBER and the token's access to that repository, then re-run." >&2
+    else
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the PR. This is NOT a policy failure," >&2
+      echo "   and it must not be reported as one: a gh outage may never masquerade as non-compliance." >&2
+      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
+    fi
+    rm -f "$err"; exit 2
+  fi
+  # A successful call may still warn on stderr: surface it, never parse it.
+  [[ -s "$err" ]] && sed 's/^/   warning (ignored, not parsed): /' "$err" >&2
+  rm -f "$err"
   printf '%s' "$out"
 }
 
