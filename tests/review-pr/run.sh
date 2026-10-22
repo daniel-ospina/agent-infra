@@ -44,6 +44,10 @@
 #   §AB a prose line after a verdict cannot replace it; 'ISSUES: 2' parses
 #   §AC the reviewed DIFF is re-verified (a base retarget with an unchanged head refuses)
 #   §AD the marker must carry a signature field; an unsigned marker is named (HMAC = the gate's)
+#   §AE MUTATION: the reviewer SPAWN removed => non-zero and NO record, even with a CLEAN
+#      verdict staged on disk ("no reviewer ran" cannot become an attestation)
+#   §AF MUTATION: the moved-head guard removed => a verdict from head A lands an artifact at
+#      head B ("an old verdict reused at a new head"), so §G's refusal is the guard's doing
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -697,6 +701,78 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a signature-bearing marker bound to this head is accepted (rc=$(rc_of))"
 out_has "The HMAC is verified by the gate, not here"; ck $? "…and the success line says it did not verify the HMAC (shape only)"
 
+# ── §AE MUTATION — no SPAWN, no record, even with a CLEAN verdict on disk ────
+echo; echo "§AE mutation: the reviewer SPAWN removed => non-zero and NO record, even with a CLEAN verdict staged"
+# ⛔ THE WALL THIS SECTION EXISTS FOR (2026-10-22). The seam's entire value is that the
+# record it mints was produced by a reviewer that ACTUALLY RAN at that head. The cheapest
+# way to break that — leaving every other guard green — is to remove the spawn: the code
+# then reads whatever is already lying around (this run's empty log, a cached transcript, a
+# previous run's output) and certifies it. So this mutates the ONE line that spawns the
+# reviewer, stages a CLEAN verdict on disk exactly as a reusing lane would leave it, and
+# asserts the tool still refuses. A suite that only proved the happy path would let that
+# fail-open land green (the #2148/#1741 lesson §K exists for).
+MUT_SPAWN="$TMP/mutant-nospawn.sh"
+cp "$SRC" "$MUT_SPAWN"; chmod +x "$MUT_SPAWN"
+sed 's|^run_reviewer "\$TIMEOUT" "\$LOG" "\$PROMPT"$|: > "$LOG"|' "$SRC" > "$MUT_SPAWN"
+if cmp -s "$SRC" "$MUT_SPAWN"; then
+  fail "the spawn mutation did not apply — the anchored call line changed shape, so this control proves NOTHING"
+else
+  pass "mutation applied (the reviewer spawn replaced by an empty log)"
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$MUT_SPAWN" 2284
+  no_reviewer; ck $? "the MUTANT spawned no reviewer at all (\`pi\` was never executed)"
+  [ "$(rc_of)" != "0" ]; ck $? "…and exits NON-ZERO even with a CLEAN verdict sitting on disk (rc=$(rc_of))"
+  [ "$(rc_of)" = "6" ]; ck $? "…specifically 6 (no verdict from a reviewer that ran), never 0"
+  no_record; ck $? "NO record written — a verdict nobody produced is not an attestation"
+  no_comment; ck $? "…and no review artifact was posted either"
+  [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…so the record store is untouched"
+  # CONTROL: the SAME scenario on the shipped script DOES record, so the mutant's refusal
+  # is the missing spawn's doing and not the fixture's.
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the UNMUTATED script records the same scenario (rc=$(rc_of)) — so the refusal above is the missing spawn"
+  [ -f "$TMP/pi-runs.txt" ]; ck $? "…because it actually spawned the reviewer"
+fi
+
+# ── §AF MUTATION — an OLD verdict cannot reach a NEW head ───────────────────
+echo; echo "§AF mutation: with the moved-head guard removed, a verdict from head A lands an artifact at head B"
+# The other half of the same wall: a review is a statement about ONE revision. A lane that
+# reviews head A and then pushes head B still HOLDS a clean verdict, and the artifact it
+# posts would be ACCEPTED by record-review.sh's evidence arm against B (that arm's only
+# time binding is `created_at >= head commit date`) — certifying code nobody read. §G
+# proves the seam refuses it; this section mutates the guard AWAY and asserts the refusal
+# is the guard's, not the fixture's.
+MUT_MOVE="$TMP/mutant-oldverdict.sh"
+cp "$SRC" "$MUT_MOVE"; chmod +x "$MUT_MOVE"
+sed 's|^[[:space:]]*if \[ "\$HEAD_AFTER" != "\$HEAD" \]; then$|if false; then|' "$SRC" > "$MUT_MOVE"
+if cmp -s "$SRC" "$MUT_MOVE"; then
+  fail "the moved-head mutation did not apply — the anchored guard line changed shape, so this control proves NOTHING"
+else
+  pass "mutation applied (the moved-head guard replaced by an always-false test)"
+  # (a) the shipped script: the head moves mid-review => refused, nothing posted.
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MOVE_HEAD_TO="$HEAD2_FIXTURE"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "8" ]; ck $? "the shipped script REFUSES a verdict captured before the move (rc=$(rc_of))"
+  no_comment; ck $? "  …and posts NO artifact, so none exists that could be bound to the new head"
+  no_record; ck $? "  …and records nothing"
+  # (b) the mutant: the OLD verdict now rides past the guard, and an artifact lands while
+  # the PR's head is HEAD2 — the fail-open the shipped guard prevents.
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MOVE_HEAD_TO="$HEAD2_FIXTURE"
+  run "$MUT_MOVE" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT exits 0 on a verdict captured before the move (rc=$(rc_of))"
+  [ -f "$TMP/comment.md" ]; ck $? "the MUTANT POSTS a clean artifact while the PR's head is HEAD2 — exactly the artifact record-review.sh's evidence arm would accept for HEAD2"
+  grep -q "$HEAD_FIXTURE" "$TMP/comment.md" 2>/dev/null
+  ck $? "…an artifact whose body names the REVIEWED head, while the PR's live head is HEAD2"
+  # ⛔ THE SECOND GUARD, and it is why this mutation is a defect and not a catastrophe: the
+  # seam passes the REVIEWED sha to the recorder, never the live one, so even this mutant
+  # cannot mint a record BOUND to HEAD2 — and `record-review.sh <PR> <HEAD2>` would be
+  # refused by the recorder's own stale-sha guard (#2133). Defence in depth, not a licence
+  # for the seam to stop checking: the artifact above is the input that guard cannot see.
+  case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+    "2284 $HEAD_FIXTURE clean "*) rc=0;; *) rc=1;;
+  esac; ck $rc "…and the MUTANT's record call is still bound to the REVIEWED sha, never the live head"
+fi
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -717,12 +793,13 @@ fi
 echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
-# 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
-# the very smallest deletion fires. It is still not a coverage claim, and a section smaller
-# than (total - 174) is not caught by it.
+# 144 assertions, deleting the LARGEST section (§Q, 23) still passed. The floor is re-set from
+# the MEASURED total whenever sections are added, which is why it now reads 194 against 196:
+# every section but the very smallest deletion fires. It is still not a coverage claim, and a
+# section smaller than (total - 194) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 174 ]; ck $? "assertion-count pin: >= 174 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 194 ]; ck $? "assertion-count pin: >= 194 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
