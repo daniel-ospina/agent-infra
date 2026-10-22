@@ -409,13 +409,41 @@ _target_kind() {
   esac
 }
 
-# _pipe_name <"kind<TAB>name"> — the NAME when that descriptor is a PIPE, else nothing. The one
-# place the platform's pipe spelling is normalised, so callers compare names, never spellings.
-_pipe_name() { # <target-line>
-  local line="${1:-}"
-  case "${line%%$'\t'*}" in
-    pipe) [ "$line" = "pipe" ] || printf '%s' "${line#*$'\t'}" ;;
+# _pipe_ident <"kind<TAB>name"> — this descriptor's pipe IDENTITY, when the platform names a pipe
+# PER PIPE. The one place the platform's pipe spelling is normalised, so callers compare identities.
+#   rc 0  echoes the identity — two reads of THE SAME pipe produce the SAME string
+#   rc 1  not a pipe at all (a file, a socket, no descriptor) — it cannot be a lane's writer
+#   rc 2  a pipe whose NAME is not an identity on this platform — UNIDENTIFIABLE: the caller abstains
+#
+# ⛔ A PIPE'S *TYPE* IS NOT A PIPE'S IDENTITY (#2163 review r4, P1). Normalising the KIND (see
+# `_target_kind`) makes the tee test the same question on every platform, but the NAME it compares
+# has to be a PER-PIPE name, and not every platform prints one: `/proc` prints `pipe:[<inode>]` (the
+# pipe itself — identical at both ends), macOS lsof prints an address (`->0x…`), and **lsof 4.95 on
+# Linux prints `pipe` — the same literal for BOTH ends of EVERY anonymous pipe** (measured). Reading
+# `pipe` as a name made the tee test match *some* pipe in the tree: root 500, child 501
+# `tee …/fix-9.log` fed by 503 `cat brief` (pipe B), child 502 the LIVE 5-minute-old `pi` piped to a
+# logger (pipe A) ⇒ `REAP root=500 log-idle=10800s`, `-TERM 502`, `-KILL 502`. A generic spelling is
+# therefore evidence of NOTHING, and lsof's `->0x0` (its placeholder when it cannot resolve the
+# address) is a generic spelling too. An address form IS distinguishing — two live pipes never share
+# one — but it is accepted only as a name that BOTH SIDES must reproduce, so it can never be borrowed
+# from another pipe. Where the platform cannot do better the tee is unidentifiable, and the pass
+# ABSTAINS rather than accept a guess (accepting borrows evidence; refusing outright would drop a
+# real lane's own writer and re-open the `lanes=0/0` capacity fail-open).
+# RESIDUAL, stated: if a platform's address is the PEER's (the far end's) rather than the pipe's own,
+# the two ends of one pipe print different strings, so a `pi | tee L-x.log` there resolves
+# `no-log-evidence` — an UNDER-count of capacity, never a kill. That is the conservative side of the
+# trade; the pass that cannot name a pipe at all lands on the abstention above.
+_pipe_ident() { # <target-line>
+  local line="${1:-}" kind name
+  kind="${line%%$'\t'*}"
+  [ "$kind" = "pipe" ] || return 1
+  name="${line#*$'\t'}"
+  [ "$name" = "$line" ] && name=""
+  case "$name" in
+    'pipe:['[1-9]*)        printf '%s' "$name"; return 0 ;;   # /proc: pipe:[<inode>]
+    '->0x'[1-9A-Fa-f]*)    printf '%s' "$name"; return 0 ;;   # lsof: a real address, never ->0x0
   esac
+  return 2
 }
 
 # read_targets <pid> [fd…] — one descriptor per line as `<kind><TAB><name>`; rc 0 = the READ WAS
@@ -539,7 +567,8 @@ lane_tee_pids() {
     }' "$1"
 }
 
-# resolve_log <table> <root> — THIS LANE's own evidence, and nothing else's.#   rc 0  echoes "path<TAB>deleted<TAB>holder_pid"   — one attributable evidence file
+# resolve_log <table> <root> — THIS LANE's own evidence, and nothing else's.
+#   rc 0  echoes "path<TAB>deleted<TAB>holder_pid"   — one attributable evidence file
 #   rc 1  the reads were taken and the tree holds no fleet log        — not a lane
 #   rc 2  BLIND: a descriptor read failed, so the tree MAY be a lane  — abstain, never judge
 #   rc 3  AMBIGUOUS: more than one distinct lane log                  — no single file is the evidence
@@ -557,7 +586,7 @@ lane_tee_pids() {
 # and nothing else. Two distinct lane logs in that set is ambiguity, not a choice.
 resolve_log() {
   local table="$1" root="$2" p out cands="" blind=0 distinct n
-  local pis tees pstd tin
+  local pis tees pstd tin pname prc trc
   pis="$(lane_pi_pids "$table" "$root")"
   tees="$(lane_tee_pids "$table" "$root")"
   for p in $pis; do
@@ -571,21 +600,36 @@ resolve_log() {
     # the evidence: root 500 (`bash lane.sh`), child 501 `tee …/fix-9.log` fed by 503 `cat brief`,
     # child 502 the LIVE 5-minute-old `pi` with fd1 on /dev/null ⇒ `REAP root=500 log-idle=10800s`,
     # `-TERM 502`, `-KILL 502`. The identity of the lane's writer is ONE fact: this tee's stdin IS
-    # this lane's pi's stdout. It is read from the kernel on both sides and compared as (kind, name),
-    # which is also what makes the lsof branch work at all (see read_targets).
-    pstd=""
+    # this lane's pi's stdout, read from the kernel on both sides.
+    # ⛔ …AND THAT IDENTITY MUST BE A *PER-PIPE* NAME, NOT A SPELLING (#2163 review r4, P1). The
+    # (kind, name) comparison is only as good as the platform's name: lsof 4.95 prints the literal
+    # `pipe` for both ends of EVERY anonymous pipe, so comparing it matched ANY pipe in the tree and
+    # re-ran the r3 kill on the lsof branch — the only branch macOS has, the only platform where
+    # `fleet` ancestry exists. `_pipe_ident` returns an identity only when the platform prints one;
+    # a tee whose stdin pipe cannot be identified is NOT "not this lane's writer" (refusing it would
+    # drop a real lane's own writer and re-open the `lanes=0/0` capacity fail-open) and is NOT
+    # evidence (accepting it borrows another pipe's file) — so the tree ABSTAINS.
+    pstd=""; pblind=0
     for p in $pis; do
-      tin="$(_pipe_name "$(read_targets "$p" 1 2>/dev/null | head -1)")"
-      [ -n "$tin" ] && pstd="$pstd$tin
-"
+      tin="$(read_targets "$p" 1 2>/dev/null | head -1)"
+      pname="$(_pipe_ident "$tin")"; prc=$?
+      case "$prc" in
+        0) pstd="$pstd$pname
+" ;;
+        2) pblind=1 ;;   # this lane's pi IS piped, but the pipe has no name this platform can tell
+      esac
     done
     for p in $tees; do
       # BLIND on the candidate writer means the tree may hold evidence we cannot see — abstain.
       tin="$(read_targets "$p" 0 2>/dev/null)" || { blind=1; continue; }
-      tin="$(_pipe_name "$(printf '%s\n' "$tin" | head -1)")"
-      [ -n "$tin" ] || continue
+      tin="$(printf '%s\n' "$tin" | head -1)"
+      pname="$(_pipe_ident "$tin")"; trc=$?
+      # stdin is not a pipe ⇒ this tee is not any lane's writer
+      [ "$trc" = "1" ] && continue
+      # stdin IS a pipe but the identity is unusable ⇒ unidentifiable, so ABSTAIN (never accept)
+      if [ "$trc" = "2" ] || [ "$pblind" = "1" ]; then blind=1; continue; fi
       # not this lane's stdout ⇒ this tee is not its writer, whatever log it happens to hold
-      printf '%s\n' "$pstd" | grep -Fxq -e "$tin" || continue
+      printf '%s\n' "$pstd" | grep -Fxq -e "$pname" || continue
       out="$(collect_evidence "$p")" || { blind=1; continue; }
       [ -n "$out" ] && cands="$cands$out
 "
