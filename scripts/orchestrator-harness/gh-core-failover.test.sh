@@ -57,6 +57,21 @@ case "\$1 \$2" in
       printf 'API rate limit exceeded for user ID 81560491.\n' >&2
       exit 1
     fi
+    # Round-4 review: a CONNECTION that is absent, and one that is TRUNCATED, must not be answered as
+    # if it were complete (a missing `reviews` key answered rc 0 with an empty list; 150 reviews
+    # answered the first 100 as if that were all of them).
+    if [ "\${GH_TEST_SCENARIO:-}" = "noreviews" ]; then
+      printf '{"data":{"repository":{"pullRequest":{"number":7,"state":"OPEN"}}}}\n'
+      exit 0
+    fi
+    if [ "\${GH_TEST_SCENARIO:-}" = "reviewsnext" ]; then
+      printf '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":true},"nodes":[{"databaseId":1,"state":"APPROVED"}]}}}}}\n'
+      exit 0
+    fi
+    if [ "\${GH_TEST_SCENARIO:-}" = "reviewsok" ]; then
+      printf '{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasNextPage":false},"nodes":[{"databaseId":1,"state":"APPROVED","body":"b","submittedAt":"x","commit":{"oid":"c1"},"author":{"login":"daniel-ospina"}}]}}}}}\n'
+      exit 0
+    fi
     printf '{"data":{"repository":{"pullRequest":{"number":7,"state":"OPEN","isDraft":false,"merged":false,"mergeable":"MERGEABLE","headRefOid":"abc123","headRefName":"feat","baseRefOid":"basesha","baseRefName":"main","title":"t","body":"prbody","url":"https://example/pull/7","updatedAt":"2026-10-22T00:00:00Z","createdAt":"2026-10-21T00:00:00Z","closedAt":null,"mergedAt":null,"changedFiles":3,"additions":10,"deletions":2,"comments":{"totalCount":4},"mergeCommit":null,"author":{"login":"daniel-ospina"}}}}}\n'
     ;;
   "api repos/o/r/pulls/7")
@@ -697,6 +712,36 @@ done
 run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv'
 ck "(m10) while record-review.sh:2143's real projection is still served" \
    $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'abc123' && echo 0 || echo 1)
+
+echo "── (m11) ROUND 4: the RAIL's own merge shape, and a list that is not the list ──────────────────"
+# (m11) `bucket_for` labels `gh pr merge` as `graphql` (it is not in REST_SUBCOMMANDS), but
+# `gh-rest/gh` TRANSLATES that command into a core REST write — and passes `--admin` through verbatim,
+# which is exactly what `admin-merge.sh` sends. So the write guard, gated on `bucket == core`, never
+# fired for the one write that matters: measured, the merge was SENT into a dated-empty core pool and
+# the refusal was recorded against the wrong bucket, leaving no named state at all.
+reset_env m11 coreok
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run coreok pr merge 7 --admin --squash --match-head-commit abc123
+ck "(m11) the RAIL's merge shape is refused by name against a DATED empty core record" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+ck "(m11) … and it spends NO request (was 1 request + a 64 s wait + a retry)" \
+   $([ ! -s "$STUB_LOG" ] && echo 0 || echo 1)
+
+# (m12) a MISSING connection is not an EMPTY one, and a TRUNCATED list is a different answer.
+reset_env m12 core0
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+run noreviews api repos/o/r/pulls/7/reviews --jq '.[] | .state'
+ck "(m12) a document with NO reviews connection is REFUSED (was rc 0, empty stdout)" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run reviewsnext api repos/o/r/pulls/7/reviews --jq '.[] | .state'
+ck "(m12) a TRUNCATED reviews list is REFUSED (hasNextPage) rather than answered as complete" \
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+run reviewsok api repos/o/r/pulls/7/reviews --jq '.[] | .state'
+ck "(m12) … while a COMPLETE connection is still served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'APPROVED' && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
