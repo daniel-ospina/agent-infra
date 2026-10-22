@@ -550,6 +550,97 @@ fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
+# ── FORK HEADROOM, AND THE ONE PATH THAT MAY NOT FORK (agent-infra#2293) ────────────────────────
+# MEASURED 2026-10-21: local `com.eldato.orchestrator-loop` recorded a last exit of **128** and NEVER
+# CAME BACK. The mechanism is measured on this tree's bash (5.2.21): a failed `fork()` does not return
+# an error to the script — bash prints `fork: retry: …` four times, then `fork: Resource temporarily
+# unavailable`, and THE SCRIPT EXITS (rc 254; a `while` loop dies on its first failed fork). launchd's
+# KeepAlive then relaunches — which needs the very fork that is failing — so a fork-exhausted box has
+# no recovery from inside OR from its supervisor. The only survivable design is: DO NOT MAKE THE FORK.
+#
+# So the cycle reads fork headroom FIRST (before `date`, before `git`, before anything that spawns),
+# and when the box is starved it takes a path built from BUILTINS ONLY: it records the state and naps
+# on FOOTER_FIFO (a `read -t` on a pre-opened FIFO — no child process), then retries afterwards. The
+# box still cannot be repaired from inside (the issue says so), but the controller stays ALIVE and
+# NAMED instead of vanishing into a launchd respawn loop that cannot start.
+#
+# ⛔ THE HEADROOM READ IS `capacity.sh`'S, NEVER A SECOND ONE (`cap_procs_pair_vars` /
+# `cap_fork_bound`). This file already sources that module; a private count here would be the
+# duplication the house rule forbids and it would drift from the number placement refuses on.
+FORK_STATE=unknown; FORK_WHY=""; FORK_PROCS="?"; FORK_MAX="?"; FORK_HEADROOM="?"; FORK_STARVED=0
+FORKFREE_FD_OPEN=0
+
+# cycle_now <varname> — the epoch, WITHOUT FORKING when the shell can do it.
+# `printf '%(%s)T'` is a bash builtin (4.2+); bash 3.2 (macOS) has no such format, so the fallback
+# derives the epoch from the last MEASURED stamp plus bash's own `SECONDS` counter. The derivation is
+# labelled at its use site (`start_src=derived`) so no reader mistakes it for a measured clock.
+LAST_EPOCH=""; LAST_SECONDS=""
+cycle_now() {
+  local __out=""
+  printf -v __out '%(%s)T' -1 2>/dev/null || __out=""
+  case "$__out" in
+    ''|*[!0-9]*)
+      if [ -n "${LAST_EPOCH:-}" ] && [ -n "${LAST_SECONDS:-}" ]; then
+        printf -v "$1" '%s' "$(( LAST_EPOCH + SECONDS - LAST_SECONDS ))"; return 0
+      fi
+      return 1 ;;
+    *) printf -v "$1" '%s' "$__out"; return 0 ;;
+  esac
+}
+
+# fork_free_sleep <seconds> — wait WITHOUT spawning a process (rc 1 = no fork-free timer available).
+# `read -t` on a FIFO opened read-write blocks in select(2): no child, no exec. Verified under
+# `ulimit -u 5` on a box that could not fork at all: it waited the full 2s and returned 142.
+# The FIFO is created ONCE at startup (when forks still work); on the starved path we may not.
+fork_free_sleep() {
+  local secs="${1:-60}" rc=0
+  case "$secs" in ''|*[!0-9]*) secs=60 ;; esac
+  [ "$secs" -ge 1 ] || secs=1
+  [ "${FORKFREE_FD_OPEN:-0}" = "1" ] || return 1
+  read -t "$secs" -r -u 9 _myforkfree_tick 2>/dev/null; rc=$?
+  # 0 = someone wrote (nobody should), >128 = the timeout we asked for: both mean the nap happened.
+  [ "$rc" -eq 0 ] || [ "$rc" -gt 128 ] || return 1
+  return 0
+}
+
+# fork_gate — THE FIRST READ OF THE CYCLE. Sets FORK_STATE (ok|starved|low|unknown) and FORK_WHY.
+# ⛔ ONE parent fork, and that is the design: `cap_procs_pair_vars` reads the count/ceiling in-process,
+# and the PROBE runs in a `( )` child so a refusal inside it costs the CHILD (rc 254) instead of the
+# controller. The single unavoidable risk is the child's own creation, and backoff bounds how often it
+# is attempted.
+fork_gate() {
+  FORK_STATE=unknown; FORK_WHY=""; FORK_STARVED=0; FORK_PROCS="?"; FORK_MAX="?"; FORK_HEADROOM="?"
+  [ "${CAPACITY:-0}" = "1" ] && declare -f cap_procs_pair_vars >/dev/null 2>&1 || return 0
+  if ! cap_procs_pair_vars FORK_PROCS FORK_MAX _fork_src; then
+    FORK_PROCS="?"; FORK_MAX="?"; FORK_HEADROOM="?"
+    # No count and no ceiling: UNKNOWN, not fine. The probe below still answers the only question that
+    # matters (can this box fork at all), so an unreadable pair is not by itself a refusal.
+    FORK_STATE=unknown
+  else
+    cap_h_for_vars "$FORK_PROCS" "$FORK_MAX" FORK_HEADROOM || FORK_HEADROOM="?"
+    if [ "$FORK_HEADROOM" != "?" ] && [ "$FORK_HEADROOM" != "unbounded" ] \
+       && [ "$FORK_HEADROOM" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
+      FORK_STATE=low
+      FORK_WHY="fork_headroom=${FORK_HEADROOM}<min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200}(procs=${FORK_PROCS}/${FORK_MAX}, src=${_fork_src:-?})"
+    fi
+  fi
+  # The two-fork probe, IN A CHILD. rc 254 = the child could not fork => this box cannot spawn.
+  local _prc=0
+  ( cap_fork_probe ) >/dev/null 2>&1 || _prc=$?
+  if [ "$_prc" -eq 254 ]; then
+    FORK_STATE=starved; FORK_STARVED=1
+    FORK_WHY="fork_probe_failed(rc=254_EAGAIN, procs=${FORK_PROCS}/${FORK_MAX})"
+  elif [ "$_prc" -ne 0 ] && [ "$FORK_STATE" = "unknown" ]; then
+    FORK_STATE=unknown; FORK_WHY="fork_probe_unreadable(rc=$_prc)"
+  elif [ "${FORK_STATE:-unknown}" = "low" ]; then
+    # LOW HEADROOM IS TREATED AS STARVED FOR THIS CYCLE'S OWN FORKING, and that is the whole
+    # predictive point: the box can still fork (the probe passed), so the safe move is to spend no
+    # more forks than necessary, not to spend them until the probe starts failing.
+    FORK_STARVED=1
+  fi
+  return 0
+}
+
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
 claim_live() { # claim_live <pr> [<head-sha>] — SPAWN GUARD: a local lock OR a cross-box lease
@@ -798,6 +889,18 @@ fi
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'rm -f "$LOCKF"' EXIT
+
+# ── THE FORK-FREE TIMER IS OPENED HERE, WHILE THE BOX CAN STILL FORK (agent-infra#2293) ─────────
+# The starved path must wait without spawning, and `mkfifo`/`exec` themselves spawn/CREATE — so both
+# happen once, at startup, and the descriptor is kept for the life of the controller. A box that is
+# already starved at startup simply gets no timer (FORKFREE_FD_OPEN=0) and falls back to `sleep`, which
+# is the pre-change behaviour, named in the log rather than silently assumed.
+mkdir -p "$O/state" 2>/dev/null || true
+FORKFREE_FIFO="$O/state/.forkfree.tick"
+if [ -p "$FORKFREE_FIFO" ] || mkfifo -m 600 "$FORKFREE_FIFO" 2>/dev/null; then
+  if exec 9<>"$FORKFREE_FIFO" 2>/dev/null; then FORKFREE_FD_OPEN=1; fi
+fi
+[ "$FORKFREE_FD_OPEN" = "1" ] || echo "[fork] no fork-free timer (no mkfifo, or \$O/state is not writable): a fork-starved cycle will fall back to 'sleep', which itself forks — the backoff is then the only protection" >> "$LOG" 2>/dev/null || true
 
 # A worker whose log has not grown in this many minutes is hung. `pi -p` has no internal
 # timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
@@ -2004,12 +2107,48 @@ unowned_scan() { # <open_prs>
 }
 
 while true; do
+  # ── 0) FORK HEADROOM, BEFORE THE FIRST FORK OF THE CYCLE (agent-infra#2293) ───────────────────
+  # ⛔ THIS BLOCK MUST STAY ABOVE `date`/`git`/`gh`/ANY `$( )`. A box that cannot fork dies on the
+  # first spawn (measured: bash exits, rc 254), so a gate placed after the clock is a gate that never
+  # runs on the box it exists for. `fork_gate` sets FORK_STATE and, when the box is starved or its
+  # headroom is below the margin, FORK_STARVED=1 — which the cycle body and the nap below consult.
+  fork_gate
+  # ── THE STARVED CYCLE: BUILTINS ONLY, NAMED, AND STILL ALIVE ─────────────────────────────────
+  # Nothing here spawns. The record is the ONLY artifact a fork-exhausted box can leave, and it is
+  # what `bin/harness status` reads as FORK-STARVED (never silence, never HEALTHY).
+  if [ "${FORK_STARVED:-0}" = "1" ]; then
+    CYCLE_N=$(( ${CYCLE_N:-0} + 1 ))
+    _ft0=""; cycle_now _ft0 || _ft0=0
+    [ -n "${_ft0:-}" ] && [ "${_ft0:-0}" != "0" ] && { LAST_EPOCH="$_ft0"; LAST_SECONDS="$SECONDS"; }
+    # The heartbeat is written with a `printf` (a builtin), not `date`: a fresh heartbeat is what stops
+    # a supervisor from concluding the controller is GONE and relaunching it into the same fork wall.
+    [ -n "${_ft0:-}" ] && printf '%s\n' "${_ft0}" > "$O/heartbeat" 2>/dev/null || true
+    _cr_fork="${FORK_STATE:-unknown}"; [ "$_cr_fork" = "ok" ] && _cr_fork="unknown"
+    _cr_why="fork_exhausted"; _cr_bound="fork_probe"
+    [ "${FORK_STATE:-unknown}" = "low" ] && { _cr_why="fork_headroom"; _cr_bound="fork_headroom"; }
+    if [ "${CYCREC:-0}" = "1" ]; then
+      cycle_record_write "$O" \
+        start="${_ft0:-0}" end="${_ft0:-0}" cycle="${CYCLE_N}" interval="${CYC:-240}" \
+        selected="none" selected_n=0 dispatched=0 ids=- \
+        nothing="$_cr_why" placement="fork_held" placed_on=none bound="$_cr_bound" \
+        lpc_self="?" shapes=0 fork="$_cr_fork" fork_procs="${FORK_PROCS:-?}" fork_max="${FORK_MAX:-?}" \
+        || printf '[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable) — a fork-starved box with no record is SILENT, which is the failure this file exists to end\n' >> "$LOG" 2>/dev/null || true
+    else
+      printf '[cycle] fork_starved (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
+    fi
+    printf '[fork] HELD cycle %s (%s): %s — this box is below its fork margin or cannot fork right now (procs=%s/%s). NO dispatch, NO refresh, NO git/gh this cycle: every one of them would spend a fork and the next failed fork KILLS this process (measured: bash exits 254). Backing off %ss and retrying. A box in this state cannot be cleaned from inside (agent-infra#2293) — restart it from outside, or let the lanes drain.\n' \
+      "${CYCLE_N}" "${FORK_STATE:-unknown}" "${FORK_WHY:-fork_probe_failed}" "${FORK_PROCS:-?}" "${FORK_MAX:-?}" "${CYC:-240}" >> "$LOG" 2>/dev/null || true
+    _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    continue
+  fi
   # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
   # `CYCLE_T0` is the START of this cycle, not the end: a record stamped at the end reports the
   # whole cycle as if it took no time, and a cycle that HUNG would then look fresh for its whole
   # duration. `CYCLE_N` counts cycles in THIS process's life — a restart starts at 1, which is the
   # honest reading of a record file written by two different processes.
   CYCLE_T0="$(date +%s)"; is_num "${CYCLE_T0:-}" || CYCLE_T0=0
+  LAST_EPOCH="$CYCLE_T0"; LAST_SECONDS="$SECONDS"
   CYCLE_N=$(( ${CYCLE_N:-0} + 1 ))
   # Per-cycle placement state, reset EVERY cycle: a stale `CAP_PLACE` from a cycle that could not
   # measure would otherwise be read as this cycle's decision (the exact stale-flag class this file
@@ -3410,11 +3549,22 @@ PY
   # ⛔ AND IT NEVER TOUCHES THE MERGE PATH. This decides where a NEW LANE goes; the PR sweep above
   # has already run and the red-fixer/merge lanes are gated by the spawn gate, not here.
   if [ "${CAPACITY:-0}" = "1" ]; then
-    CAP_REC="$(cap_probe_local "$REPO" "${LANES:-0}" 2>/dev/null)" || CAP_REC=""
-    if [ -z "${CAP_REC:-}" ]; then
+    # ⛔ THE PROBE'S EXIT STATUS IS PART OF THE READING (agent-infra#2293). rc 254 = the probe's own
+    # child could not fork: bash terminates on a failed fork, so the child dies instead of answering.
+    # Left as `|| CAP_REC=""` this was indistinguishable from "the probe found no numbers", and the
+    # cycle wandered on to `git`/`gh`/`wt_spawn` — spending exactly the forks the box does not have.
+    CAP_REC="$(cap_probe_local "$REPO" "${LANES:-0}" 2>/dev/null)"; CAP_RC=$?
+    CAP_FORK_BOUND_SELF=""
+    if [ "${CAP_RC:-0}" -eq 254 ]; then
+      CAP_REC=""; CAP_STATE=fork_exhausted; FORK_STARVED=1; FORK_STATE=starved
+      FORK_WHY="fork_probe_failed(probe_rc=254, procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"
+      echo "[capacity] THIS BOX COULD NOT FORK (probe rc=254 = EAGAIN): it is INELIGIBLE, nothing is placed on it, and no further work is started this cycle — see [fork]" >> "$LOG"
+    elif [ -z "${CAP_REC:-}" ]; then
       CAP_STATE=unreadable
       echo "[capacity] this box's probe is UNREADABLE (no load/ncpu/disk/mem reading) — it is INELIGIBLE, and it will not place work on itself blind either" >> "$LOG"
     else
+      # THE LOCAL FORK BOUND, from the SAME record placement reads — one implementation, two consumers.
+      CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
       CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
       cap_publish "$REPO" "$CAP_REC" > /dev/null 2>&1 \
         || echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings)" >> "$LOG"
@@ -3482,6 +3632,16 @@ PY
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
   if [ -n "$GATE_WHY" ]; then :
+  # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
+  # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
+  # resource and points the operator at a remedy (wait) that cannot work. The order is
+  # FORK -> DISK -> LOAD here as it is in capacity.sh's `cap_bound_hit`; DISK is not repeated here
+  # because the spawn point (`spawn-gate.sh`) is its ONE implementation and it now runs it after this
+  # same fork read.
+  elif [ "${FORK_STARVED:-0}" = "1" ]; then
+    GATE_WHY="${FORK_WHY:-fork_headroom_below_margin}"
+  elif [ -n "${CAP_FORK_BOUND_SELF:-}" ]; then
+    GATE_WHY="fork_${CAP_FORK_BOUND_SELF#fork_}(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   # ⛔ NO ELIGIBLE BOX ANYWHERE => NO NEW LANE ANYWHERE (measured placement, 2026-10-21). This arm is
   # reachable only when `cap_place` found a fleet with ZERO eligible boxes; it names the BOUND the
@@ -4091,5 +4251,14 @@ PY
   # coerces CYC=08 to 240, but this is defence in depth — this line is where a leading zero used to
   # DISCARD the entire `while true` loop and exit 0 after one cycle (relaunch-per-cycle under
   # KeepAlive). `10#${CYC}` reads it base 10 whatever the predicate did.
-  sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
+  # ⛔ A FORK-STARVED / LOW-HEADROOM CYCLE NAPS ON A BUILTIN (agent-infra#2293): `sleep … & wait`
+  # spawns, and on a box out of pids that spawn is the one that kills the controller (measured: bash
+  # exits on a failed fork, and launchd's relaunch needs the same fork). `fork_free_sleep` blocks in
+  # `read -t` on the FIFO opened at startup — no child at all.
+  if [ "${FORK_STARVED:-0}" = "1" ]; then
+    fork_free_sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) \
+      || sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) 2>/dev/null
+  else
+    sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
+  fi
 done

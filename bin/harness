@@ -26,7 +26,7 @@
 #   bin/harness status --json     # machine-readable
 #
 # EXIT: doctor — 0 healthy · 1 drift · 2 UNKNOWN (cannot verify — never a pass)
-#       status — 0 HEALTHY · 1 DEGRADED · 2 ABSENT/UNREADABLE (no answer is never a pass)
+#       status — 0 HEALTHY · 1 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (no answer is never a pass)
 #
 # ── `status`: THE SELF-DISPATCH PROOF (measured 2026-10-21) ─────────────────────────────────────
 # MEASURED: the controller log on cell-1 was 37h STALE and on the other two cells no log was found
@@ -36,6 +36,10 @@
 # and this verb grades the NEWEST of them:
 #   HEALTHY     the newest record is younger than TWO of the box's own cycles
 #   DEGRADED    it is older than that — the controller is not cycling (rc 1)
+#   FORK-STARVED the controller is alive and fresh, and its own fork reading says the box could not
+#               spawn (rc 1). Added for agent-infra#2293: measured 2026-10-21 a box at 0.32x load could
+#               not fork at all, and this verb could previously only answer "alive" or "not cycling" —
+#               neither of which describes a box that is alive and cannot start anything.
 #   ABSENT      there is no record at all — never healthy, never "nothing to do" (rc 2)
 #   UNREADABLE  the record cannot be parsed or the clock cannot be read (rc 2)
 # A live pane is not evidence of a dispatch; a fresh record is.
@@ -131,6 +135,11 @@ if [ "$cmd" = "status" ]; then
     echo
     case "$_verdict" in
       HEALTHY)  echo "  The controller wrote a record within its last two cycles: it is self-dispatching." ;;
+      FORK-STARVED)
+                echo "  The controller is ALIVE but this box could not FORK: it is not dispatching, and no" ;
+                echo "  amount of waiting for load will change that (agent-infra#2293). Restart or drain the" ;
+                echo "  BOX from outside — it cannot be repaired from inside, which is exactly why the" ;
+                echo "  controller keeps cycling and recording instead of exiting (a relaunch needs the same fork)." ;;
       DEGRADED) echo "  The newest record is older than two cycles — the controller is NOT cycling." ;
                 echo "  Start it (cloud-cell-supervisor.sh start / install.sh) and read its own log for the last stage it reached." ;;
       *)        echo "  No usable record: the controller may never have run on this box, or \$O is not the state" ;

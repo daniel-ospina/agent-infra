@@ -755,6 +755,84 @@ grep -q 'load-gate' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and the load refusal is NOT the only thing logged in that case" $rc
 
+# ⛔ FORK HEADROOM OUTRANKS BOTH, AND IT IS DRIVEN, NOT GREPPED (agent-infra#2293 — this section exists
+# because the verification gate found the first version of the fork arm INERT: it answered `ok` on a box
+# with 10 pids left, and every assertion about it was a grep). The reading is faked at its LEAVES
+# (`cap_procs_live`/`cap_ulimit_u`) so the real `cap_procs_pair_vars`, the real headroom arithmetic and
+# the real `spawn_fork_state` all run.
+# ⛔ THE CALLER'S VARIABLE NAMES BELOW (`p m src`) ARE THE POINT, not decoration: bash `local` is
+# DYNAMIC, so when this function's own locals were named `p`/`m`/`src` the `printf -v` writes landed in
+# the CALLEE's locals and the caller read empty strings — the arm then answered `ok`. Pinning both name
+# shapes makes that collision unrecoverable.
+cap_abspath="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+[ -f "$cap_abspath" ] || cap_abspath="$HERE/capacity.sh"
+# A pair that is out of headroom (10 spare, margin 200) yet PASSES the two-fork probe — the exact
+# condition the arithmetic arm exists for.
+fake_edge() { # fake_edge <procs> <max> — re-declares the leaves, then reports the module's own verdict
+  bash -c '
+    FAKE_PROCS="$1"; FAKE_MAX="$2"
+    . "$3" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$4"
+    spawn_fork_state p m src
+    printf "COLLIDE:state=%s|detail=%s" "$p" "$m"
+    printf " \\n"
+    spawn_fork_state _dp _dm _ds
+    printf "NOCLOBBER:state=%s|detail=%s" "$_dp" "$_dm" "_dp" "_dm" "_ds"
+  ' _ "$1" "$2" "$cap_abspath" "$GATE"
+}
+edge_out="$(fake_edge 15631 15641)"
+case "$edge_out" in *"COLLIDE:state=refused"*"NOCLOBBER:state=refused"*) rc=0 ;; *) rc=1 ;; esac
+ck "a box 10 pids from its ceiling is REFUSED at the spawn point even when the caller names its vars p/m/src (dynamic-scoping collision) [$edge_out]" $rc
+case "$edge_out" in *"detail=headroom=10 < min_fork_headroom=200"*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the refusal NAMES the reading it refused (headroom, the margin, the pair) — not a bare 'busy'" $rc
+ok_out="$(fake_edge 400 15641)"
+case "$ok_out" in *"COLLIDE:state=ok"*) rc=0 ;; *) rc=1 ;; esac
+ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is not a blanket refusal) [$ok_out]" $rc
+
+# END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
+# code (74, not 77/75), and the log says why.
+: > "$LOG"; : > "$PI_LOG"
+run_fork() { # run_fork <procs> <max> [<max-load>] [<disk-floor>]
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD="${3:-999999999}" \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB="${4:-1}" \
+  bash -c '
+    FAKE_PROCS="$5"; FAKE_MAX="$6"
+    . "$1" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$2"
+    LOG="$3"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "fork gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$cap_abspath" "$GATE" "$LOG" "$PROMPT" "$1" "$2"
+}
+ran="$(run_fork 15631 15641)"
+[ "$ran" = "rc=74 started=0" ]; rc=$?
+ck "run_agent REFUSES with the FORK code (74) on a starved box — no agent started ($ran)" $rc
+grep -q 'PI_RAN' "$PI_LOG" 2>/dev/null; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and pi was really NOT invoked (the stub never ran) — not merely 'the function returned non-zero'" $rc
+grep -q '\[fork-gate\] REFUSED' "$LOG"; rc=$?
+ck "...and the lane log names the fork gate and its reading (an operator is not left with a bare code)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and it is NOT reported as a load refusal (the remedies differ: restart the box vs wait for load)" $rc
+# ⛔ FORK OUTRANKS DISK **AND** LOAD: all three would refuse, and the fork is the un-clearable one that
+# must be named first (the same precedence rule the disk-outranks-load arm above pins).
+: > "$LOG"; : > "$PI_LOG"
+both="$(run_fork 15631 15641 0 9999999)"
+[ "$both" = "rc=74 started=0" ]; rc=$?
+ck "a FORK refusal outranks a simultaneous DISK and LOAD refusal — the external-restart one is reported ($both)" $rc
+# …and the positive control through the same path: plenty of pids means the agent RUNS.
+: > "$LOG"; : > "$PI_LOG"
+runs="$(run_fork 400 15641)"
+[ "$runs" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: with headroom the SAME drive starts the agent (rc=0) — the gate is not always closed ($runs)" $rc
+
 # POSITIVE CONTROL for the drives below: with a floor this filesystem meets, the agent RUNS.
 : > "$LOG"; : > "$PI_LOG"
 res="$(drive_disk "$TMP" 1 4)"

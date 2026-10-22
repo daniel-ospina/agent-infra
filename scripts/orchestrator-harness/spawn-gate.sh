@@ -300,6 +300,17 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # #1716/#1720 class). Stated precisely here because this comment used to say the verdict-less case
 # DID write the marker — true before #8602, false after, and this file is what a caller reads.
 AGENT_LOAD_REFUSED=75
+# ── THE FORK REFUSAL (agent-infra#2293) — FIRST, AND ITS OWN CODE ─────────────────────────────
+# MEASURED 2026-10-21: cloud cell-4 (8 vCPU) had load 2.54 (0.32x cpu) and could not spawn AT ALL
+# (`fork: Resource temporarily unavailable`, EAGAIN); the Mac hit the same wall minutes later. A box in
+# that state is not "busy" — it is out of PROCESSES, and no amount of waiting for the load to fall will
+# fix it, while a lane dispatched onto it cannot even be reaped from inside. So this gate runs BEFORE
+# the disk gate and the load gate (which is the order the issue requires everywhere: fork -> disk ->
+# load), and it uses the fleet's ONE instrument — `capacity.sh` — instead of a private process count.
+# ⛔ A NEW CODE, NOT A REUSED ONE: the three remedies differ (restart/drain the BOX, prune the DISK,
+# wait for LOAD), and a caller that reads a fork refusal as a load refusal retries forever on a box
+# that cannot start a process to retry with.
+AGENT_FORK_REFUSED=74
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -311,6 +322,73 @@ AGENT_DISK_REFUSED=77
 # depends on a `pi` that exits 75 for its own reason being read as STARTED. 76 is that signal, and
 # run_agent below translates it into AGENT_LOAD_REFUSED so no caller has to learn a new code.
 PI_GATE_REFUSED=76
+# The spawn point's FORK refusal. It is a FOURTH code for the third process's second gate: a `pi` that
+# exits 74 for its own reason must not be read as this gate's refusal any more than a 75 should, and
+# run_agent translates it into AGENT_FORK_REFUSED for the caller.
+PI_FORK_REFUSED=74
+# ── the fork reading, from the fleet's ONE instrument ──────────────────────────────────────────
+# ⛔ NOT A SECOND PROBE. `capacity.sh` already reads the process count against the per-uid/cgroup
+# ceiling and proves it with a two-fork probe; this file CONSUMES it. If the module cannot be found
+# (a hand-copied shim, a fixture), the gate ABSTAINS and SAYS SO — the same polarity as the disk
+# probe's unreadable arm, and for the same reason: an instrument that cannot run must not be reported
+# as a refusal (that would stop every lane on a healthy box) NOR as a silent pass.
+CAP_GATE_MOD_LOADED=0
+spawn_gate_load_capacity() {
+  [ "${CAP_GATE_MOD_LOADED:-0}" = "1" ] && return 0
+  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  local d cand=""
+  for d in "${O:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+    [ -n "$d" ] || continue
+    [ -f "$d/capacity.sh" ] && { cand="$d/capacity.sh"; break; }
+  done
+  [ -n "$cand" ] || return 1
+  # shellcheck source=/dev/null
+  . "$cand" 2>/dev/null || return 1
+  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  return 1
+}
+
+# spawn_fork_state <stateVar> <detailVar> — sets state = ok | refused | unknown.
+# The arithmetic is `capacity.sh`'s (`cap_procs_pair_vars` + `cap_h_for_vars`), so this gate and the
+# placement decision can never disagree about what "out of headroom" means.
+# spawn_fork_state <stateVar> <detailVar> — sets state = ok | refused | unknown.
+# The arithmetic is `capacity.sh`'s (`cap_procs_pair_vars` + `cap_h_for_vars`), so this gate and the
+# placement decision can never disagree about what "out of headroom" means.
+# ⛔ EVERY WORKING LOCAL IS PREFIXED `_sf_`, for the reason `cap_procs_pair_vars` states: bash `local`
+# is DYNAMIC and this function also writes CALLER-NAMED variables (`printf -v "$_sf_sv"`). Working
+# locals called `p`/`m`/`h`/`src` shadowed a caller that happened to pass those names — the caller
+# read `<UNSET>` and the gate answered `ok` on a box that could not take another lane (verification
+# gate, P0). Both the gate and its test now use non-colliding names AND drive the colliding shape.
+spawn_fork_state() {
+  local _sf_sv="${1:-}" _sf_dv="${2:-}" _sf_p="" _sf_m="" _sf_h="" _sf_prc=0 _sf_src=""
+  printf -v "$_sf_sv" '%s' 'unknown'; printf -v "$_sf_dv" '%s' 'no fork reading was taken'
+  if ! spawn_gate_load_capacity; then
+    printf -v "$_sf_dv" '%s' 'capacity.sh is not reachable from this spawn gate, so fork headroom was NOT read'
+    return 0
+  fi
+  if ! cap_procs_pair_vars _sf_p _sf_m _sf_src; then
+    printf -v "$_sf_dv" '%s' 'neither a process count nor a ceiling could be read'
+    return 0
+  fi
+  cap_h_for_vars "$_sf_p" "$_sf_m" _sf_h || _sf_h='?'
+  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?}"
+  if [ "$_sf_h" != '?' ] && [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
+    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?})"
+    printf -v "$_sf_sv" '%s' 'refused'
+    return 0
+  fi
+  # The two-fork probe, IN A CHILD: a fork failure terminates the shell that attempted it (measured,
+  # rc 254), so the probe must not share fate with the caller it is protecting.
+  ( cap_fork_probe ) >/dev/null 2>&1 || _sf_prc=$?
+  if [ "$_sf_prc" -eq 254 ]; then
+    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m}"
+    printf -v "$_sf_sv" '%s' 'refused'
+    return 0
+  fi
+  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc)"; return 0; }
+  printf -v "$_sf_sv" '%s' 'ok'
+  return 0
+}
 # The spawn-point ledger's rotation cap, in bytes (see pi_gate_ledger). A module constant, NOT an env
 # knob: the size of the box's own measurement is not something a caller should be able to lift.
 PI_GATE_LEDGER_MAX_BYTES=5242880
@@ -343,6 +421,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # so one reading covers both; the override exists for a box that splits them, and it must be GIVEN
   # there rather than assumed.
   local dfree dpath
+  # ── 1) THE FORK GATE (agent-infra#2293), BEFORE THE DISK GATE ─────────────────────────────────
+  # ⛔ ORDER: fork -> disk -> load. A box that cannot spawn cannot even run `df`; and of the three,
+  # only the fork refusal means "this box must be restarted or drained from outside", so reporting a
+  # disk or load refusal first would hand the operator a remedy that cannot work.
+  local _fstate="" _fdetail=""
+  spawn_fork_state _fstate _fdetail
+  case "$_fstate" in
+    refused)
+      echo "[fork-gate] REFUSED $label: $_fdetail — no agent was started, so nothing was consumed. A fork refusal does NOT clear by waiting: this box is out of PROCESSES (agent-infra#2293), and it cannot be cleaned up from inside. Restart it from outside, or let its lanes drain; the controller re-dispatches elsewhere." >> "$log"
+      return "$AGENT_FORK_REFUSED" ;;
+    unknown)
+      echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. Check that capacity.sh sits beside this gate. Proceeding (an unreadable instrument is not a refusal)." >> "$log" ;;
+  esac
   dpath="${DISK_GATE_PATH:-$PWD}"
   dfree="$(disk_free_mb "$dpath")"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
@@ -402,6 +493,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     AGENT_STARTED=0
     echo "[load-gate] REFUSED $label: the pi spawn point refused the launch (load >= max_load=$MAX_LOAD) — no agent started, nothing consumed; the [pi-gate] line above carries the reading and the caller, and the controller re-dispatches when load falls" >> "$log"
     return "$AGENT_LOAD_REFUSED"
+  fi
+  # …and the same for the spawn point's FORK refusal (agent-infra#2293): the band between this gate
+  # and the shim's is milliseconds, and closing it by trusting an env marker would hand the bypass
+  # back. Translated into the FIRST code so callers never learn a second one.
+  if [ "$rc" = "$PI_FORK_REFUSED" ]; then
+    AGENT_STARTED=0
+    echo "[fork-gate] REFUSED $label: the pi spawn point refused the launch (this box could not fork) — no agent started, nothing consumed; the [pi-gate] line above carries the reading, and this box needs an external restart or a drain" >> "$log"
+    return "$AGENT_FORK_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
   # reviewer/fixer/lane wall-time — the load-bearing number for fleet capacity (it was unmeasured).
@@ -643,6 +742,26 @@ pi_shim_main() {
   # runner that never heard of run_agent. Truncated so a long prompt cannot fill the ledger.
   caller="$(ps -o command= -p "${PPID:-0}" 2>/dev/null | cut -c1-200)"
   [ -n "$caller" ] || caller='<unreadable>'
+  # ── THE FORK GATE AT THE SPAWN POINT, BEFORE THE LOAD GATE (agent-infra#2293) ────────────────
+  # This mode exists so that a caller cannot skip the gate by not cooperating; the same is true of
+  # the fork floor. A box out of pids must not spend one on a `pi` it cannot start.
+  local _fstate="" _fdetail=""
+  spawn_fork_state _fstate _fdetail
+  if [ "$_fstate" = "refused" ]; then
+    n="$(pi_gate_refusal_count)"
+    item="${TAG:-${KIND:-untagged}}"
+    printf '[pi-gate] REFUSED fork: %s — item NOT started: %s (cwd=%s, caller=%s)\n' \
+      "$_fdetail" "$item" "$cwd" "$caller" >&2
+    printf '[pi-gate]   refusal #%s, recorded durably in %s/.pi/agent/state/spawn-gate.tsv — nothing was consumed\n' \
+      "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
+    printf '[pi-gate]   remedy: this box is out of PROCESSES, so waiting for load will not help. Restart or drain the BOX from outside (agent-infra#2293); operator rescue is the real pi by absolute path (%s)\n' \
+      "$real" >&2
+    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
+    exit "$PI_FORK_REFUSED"
+  fi
+  if [ "$_fstate" = "unknown" ]; then
+    printf '[pi-gate] WARN fork headroom UNREADABLE: %s — the fork floor cannot be enforced for this launch\n' "$_fdetail" >&2
+  fi
   if ! can_spawn "$load"; then
     n="$(pi_gate_refusal_count)"
     item="${TAG:-${KIND:-untagged}}"

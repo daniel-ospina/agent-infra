@@ -49,9 +49,17 @@ echo "==> capacity-placement self-test ($HERE)"
 
 # ── the model: ONE record per box, in the shipped grammar ────────────────────────────────────────
 # rec <host> <ncpu> <load1-x100> <lanes> <disk_mb> <mem_mb> <at>
+# …in the shipped grammar INCLUDING the fork fields (agent-infra#2293). The defaults describe a healthy
+# box (400 procs against a 15041 ceiling, probe ok), so every arm written before that change keeps the
+# meaning it was written with; arms that need a starved box use `recf` explicitly.
 rec() {
-  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s' \
-    "$1" "$2" "$3" "$(awk -v l="$3" -v n="$2" 'BEGIN{printf "%d", l/n}')" "$4" "$5" "$6" "$7"
+  recf "$1" "$2" "$3" "$4" "$5" "$6" "$7" 400 15041 1
+}
+# recf <host> <ncpu> <load1-x100> <lanes> <disk_mb> <mem_mb> <at> <procs> <procs_max> <fork>
+recf() {
+  printf 'host=%s ncpu=%s load1=%s lpc=%s lanes=%s disk_free_mb=%s mem_free_mb=%s at=%s procs=%s procs_max=%s fork=%s' \
+    "$1" "$2" "$3" "$(awk -v l="$3" -v n="$2" 'BEGIN{printf "%d", l/n}')" "$4" "$5" "$6" "$7" \
+    "$8" "$9" "${10}"
 }
 NOW=1792598400   # fixed clock for the whole suite (the record age is part of every assertion)
 
@@ -64,7 +72,7 @@ CAP_NOW="$NOW"; export CAP_NOW
 CAP_HOST="cell-1"; export CAP_HOST
 P="$(cap_probe_local "$PWD" 7)" || P=""
 ck "the probe returns a record" "$([ -n "$P" ] && echo 0 || echo 1)"
-for k in host ncpu load1 lpc lanes disk_free_mb mem_free_mb at; do
+for k in host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs procs_max fork; do
   v="$(cap_kv "$P" "$k")"
   case "$v" in ''|*[!0-9A-Za-z._-]*) r=1 ;; *) r=0 ;; esac
   ck "  …carrying $k=${v:-<empty>}" "$r"
@@ -373,7 +381,10 @@ ck "…which exits non-zero for DEGRADED (a status verb that always exits 0 is a
    "$(grep -q 'exit "\$_rc"' "$HARNESS_BIN" && echo 0 || echo 1)"
 # ⛔ MUTATION CONTROL: remove the record write from a COPY of the loop and the assertion above must
 # FAIL. Without this, §9 could be satisfied by a comment.
-sed 's/^    cycle_record_write "\$O" \\$/    : cycle_record_write-disabled \\/' "$LOOP" > "$TMP/orch-no-record.sh"
+# ⛔ INDENT-AGNOSTIC, AND THAT IS THE POINT (agent-infra#2293): the loop now has TWO record-write call
+# sites (the ordinary cycle and the fork-starved path, different indents). A mutation that removes only
+# the first leaves the other matching the wiring check, so it would prove nothing about the assertion.
+sed 's/^\( *\)cycle_record_write "\$O" \\$/\1: cycle_record_write-disabled \\/' "$LOOP" > "$TMP/orch-no-record.sh"
 grep -q 'cycle_record_write "\$O"' "$TMP/orch-no-record.sh" && r=1 || r=0
 ck "mutation control: a loop with the record write REMOVED no longer satisfies the wiring check" "$r"
 sed 's/^      if \[ "${CAP_STATE:-unavailable}" = "place" \]/      if false; then #/' "$LOOP" > "$TMP/orch-no-place.sh"
@@ -383,6 +394,148 @@ if [ -n "${_pl:-}" ]; then
   sed -n "$(( _pl - 5 )),$(( _pl + 1 ))p" "$TMP/orch-no-place.sh" | grep -q 'if false; then' && r=0 || r=1
 fi
 ck "mutation control: a loop whose placement arm is disabled FAILS the arm assertion" "$r"
+
+# ── §11 FORK HEADROOM: THE FIRST READ, AND THE ONE THAT STOPS A BOX ────────────────────────────
+echo
+echo "── §11 fork headroom is read BEFORE load, and a faked ceiling REFUSES by name (agent-infra#2293) ──"
+# MEASURED 2026-10-21: cloud cell-4 (8 vCPU) could not spawn at all — `fork: Resource temporarily
+# unavailable`, EAGAIN, rc 128 — at load 2.54/8 = 0.32x, 11 lanes, 16 `pi` procs. Placement read LOAD
+# and would have placed a 12th lane there. Every arm below drives the SHIPPED `cap_place`/`cap_bound_hit`.
+
+# THE FAKED CEILING: 15600 live procs against the box's own 15641 per-uid ceiling = 41 spare, which is
+# under CAP_MIN_FORK_HEADROOM. Load and disk are HEALTHY on purpose — nothing but the fork read refuses.
+EXH="$(recf cell-4 8 56 11 90000 3000 "$NOW" 15600 15641 1)"
+# …and the SAME box with headroom: only the fork fields differ.
+OKR="$(recf cell-4 8 56 11 90000 3000 "$NOW" 400 15641 1)"
+PL_EXH="$(printf '%s\n' "$EXH" | cap_place cell-4)"; RC=$?
+ck "a faked CEILING makes placement REFUSE (rc=1, not a silent place) [$PL_EXH]" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "  …and the refusal NAMES the read that refused: bound=fork_headroom" "$(q 'bound=fork_headroom' "$PL_EXH" && echo 0 || echo 1)"
+ck "  …naming the box and the bound in detail= (a refusal an operator can act on)" \
+   "$(q 'cell-4:fork_headroom' "$PL_EXH" && echo 0 || echo 1)"
+PL_OK="$(printf '%s\n' "$OKR" | cap_place cell-4)"; RC=$?
+ck "the SAME box with headroom places (the refusal is the fork read, not the test's fixtures) [$PL_OK]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cell-4 ' "$PL_OK" && echo 0 || echo 1)"
+# ⛔ DISTINGUISHABLE FROM HIGH LOAD — the whole point of a NAMED bound. Same box, same fixtures, one
+# number changed: load above the ceiling refuses `load_per_cpu`, and the two refusals cannot be confused.
+PL_HOT="$(printf '%s\n' "$(recf cell-4 8 9000 11 90000 3000 "$NOW" 400 15641 1)" | cap_place cell-4)"
+ck "a LOAD-saturated box refuses by its OWN name (bound=load_per_cpu), never fork_headroom" \
+   "$(q 'bound=load_per_cpu' "$PL_HOT" && [ "$(printf '%s' "$PL_HOT" | grep -c fork_headroom)" -eq 0 ] && echo 0 || echo 1)"
+PL_PRB="$(printf '%s\n' "$(recf cell-4 8 56 11 90000 3000 "$NOW" 400 15641 0)" | cap_place cell-4)"
+ck "a box whose two-fork PROBE refused is refused as fork_probe (a different read, a different remedy)" \
+   "$(q 'bound=fork_probe' "$PL_PRB" && echo 0 || echo 1)"
+# ⛔ THE ORDER, ASSERTED ON THE SHIPPED FUNCTION: a record that is out of headroom AND over the load
+# ceiling AND under the disk floor must report the FORK bound first (fork -> disk -> load).
+PL_ALL="$(printf '%s\n' "$(recf cell-4 8 9000 11 100 3000 "$NOW" 15600 15641 1)" | cap_place cell-4)"
+ck "ORDER: out of fork headroom AND over load AND under disk floor => fork_headroom is reported" \
+   "$(q 'bound=fork_headroom' "$PL_ALL" && echo 0 || echo 1)"
+PL_DL="$(printf '%s\n' "$(recf cell-4 8 9000 11 100 3000 "$NOW" 400 15641 1)" | cap_place cell-4)"
+ck "ORDER: healthy fork + under disk floor + over load => DISK is reported (disk before load)" \
+   "$(q 'bound=disk' "$PL_DL" && echo 0 || echo 1)"
+# A record with no fork reading (a peer on a pre-#2293 tree) is `fork_unknown`, never eligible.
+LEGACY="$(rec cell-4 8 56 11 90000 3000 "$NOW" | sed 's/ procs=.*//')"
+ck "a LEGACY record (no fork fields) is refused as fork_unknown, not read as healthy" \
+   "$(printf '%s\n' "$LEGACY" | cap_place cell-4 | grep -q 'bound=fork_unknown' && echo 0 || echo 1)"
+ck "  …and cap_valid_record rejects it while cap_valid_base_record accepts it (a named cause, not a blanket one)" \
+   "$( ( cap_valid_record "$LEGACY"; [ $? -eq 1 ] && cap_valid_base_record "$LEGACY" ) && echo 0 || echo 1)"
+# The arithmetic, on both adapters (ONE implementation): the record path and the in-process path agree.
+_h_rec="$(cap_fork_headroom "$(recf x 8 56 0 90000 3000 "$NOW" 400 15641 1)")"
+cap_h_for_vars 400 15641 _h; RC=$?
+ck "headroom is procs_max - procs (both adapters agree: record=$_h_rec in-process=$_h)" \
+   "$([ "$_h_rec" = "$_h" ] && [ "$_h" = "15241" ] && echo 0 || echo 1)"
+ck "an UNBOUNDED ceiling (procs_max=0) is 'unbounded', never 'zero headroom'" \
+   "$([ "$(cap_fork_headroom "$(recf x 8 56 0 90000 3000 "$NOW" 400 0 1)")" = "unbounded" ] && echo 0 || echo 1)"
+ck "cap_procs_pair_vars returns a NUMERIC pair on this box (the read itself works)" \
+   "$(cap_procs_pair_vars _pp _mm _ss && case "$_pp:$_mm" in *[!0-9:]*|:*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AND THE **SHIPPED CALLER** IS DRIVEN TOO (verification gate, P0). `cap_procs_pair_vars` writes
+# CALLER-NAMED variables using `printf -v`, and bash `local` is DYNAMIC — so a caller whose out-vars
+# collide with the callee's working locals reads EMPTY strings. That happened twice in this very
+# change (first the spawn gate's `p m src`, then this file's own `_cp_p _cp_m`), and both times every
+# record published with an empty `procs=`/`procs_max=` while the suites stayed green because they only
+# drove NON-colliding names. This arm drives the shipped caller, so a future rename on either side is
+# caught here rather than in the fleet.
+_pair="$(cap_procs_pair)"; RC=$?
+_pnf="$(printf '%s' "$_pair" | awk '{print NF}' 2>/dev/null)"
+ck "the SHIPPED caller cap_procs_pair returns THREE non-empty fields (dynamic scoping cannot empty it) [$_pair]" \
+   "$([ "$RC" -eq 0 ] && [ "${_pnf:-0}" -eq 3 ] && [ -n "${_pair// /}" ] && echo 0 || echo 1)"
+_p0="${_pair%% *}"; _p0="${_p0// /}"
+ck "  …and its procs field is a real count, not the empty string that made every record invalid" \
+   "$(case "$_p0" in ''|*[!0-9]*) echo 1 ;; *) [ "$_p0" -ge 1 ] && echo 0 || echo 1 ;; esac)"
+# …and the RECORD the probe publishes must carry them (the caller chain, end to end).
+_rp="$(cap_probe_local "$PWD" 0)"
+ck "the published RECORD carries non-empty procs=/procs_max= (an empty field makes it fork_unknown to every peer)" \
+   "$(case "$(cap_kv "$_rp" procs)" in ''|*[!0-9]*) echo 1 ;; *) case "$(cap_kv "$_rp" procs_max)" in ''|*[!0-9]*) echo 1 ;; *) echo 0 ;; esac ;; esac)"
+# ⛔ THE TWO-FORK PROBE'S REFUSAL IS ITS OWN SIGNAL, measured rather than assumed: under a faked
+# per-uid ceiling of 1 no fork can be made, and bash terminates the shell that tried (rc 254 — the
+# contract `cap_cli probe` and the controller both key on). This is the ONE arm that needs no fixtures.
+( ulimit -u 1 2>/dev/null; cap_fork_probe ) >/dev/null 2>&1; RC=$?
+ck "a box that cannot fork returns 254 from the probe (the signal the controller reads as starved) [rc=$RC]" \
+   "$([ "$RC" -eq 254 ] && echo 0 || echo 1)"
+
+# ── §11b THE MUTATION CONTROL: delete the headroom read and the test above must FAIL ─────────────
+# A gate whose test passes with the gate removed is not a test. The mutant is the SHIPPED file with ONE
+# statement replaced (the bound is never read), and the SAME faked-exhausted record must then PLACE.
+sed 's/^  forkb="\$(cap_fork_bound "\$r")"$/  forkb=""/' "$CAP" > "$TMP/cap-no-forkread.sh"
+ck "mutation control: the mutant really lost the headroom read (no cap_fork_bound call in cap_bound_hit)" \
+   "$([ "$(grep -c 'forkb="$(cap_fork_bound' "$TMP/cap-no-forkread.sh")" -eq 0 ] && echo 0 || echo 1)"
+PL_MUT="$( ( . "$TMP/cap-no-forkread.sh"; printf '%s\n' "$EXH" | cap_place cell-4 ) 2>/dev/null )"; RC=$?
+ck "mutation control: WITHOUT the read the fake-exhausted box is PLACED (the assertion discriminates) [rc=$RC $PL_MUT]" \
+   "$([ "$RC" -eq 0 ] && q '^place=cell-4 ' "$PL_MUT" && echo 0 || echo 1)"
+
+# ── §11c THE CONTROLLER SURVIVES IT: the gate runs BEFORE the first fork, and the state is NAMED ──
+ck "orch-loop.sh defines fork_gate and calls it at the top of the cycle" \
+   "$(grep -q '^fork_gate() {' "$LOOP" && grep -q '^  fork_gate$' "$LOOP" && echo 0 || echo 1)"
+_g_line="$(grep -n '^  fork_gate$' "$LOOP" | head -1 | cut -d: -f1)"
+_first_fork="$(grep -n 'CYCLE_T0="$(date +%s)"' "$LOOP" | head -1 | cut -d: -f1)"
+ck "  …and the gate sits BEFORE the cycle's first fork (gate=$_g_line, date=$_first_fork)" \
+   "$([ -n "${_g_line:-}" ] && [ -n "${_first_fork:-}" ] && [ "$_g_line" -lt "$_first_fork" ] && echo 0 || echo 1)"
+ck "the STARVED cycle naps on the fork-free timer (a \`sleep\` would spawn and kill it)" \
+   "$(grep -qF -- 'fork_free_sleep $(( 10#${CYC}' "$LOOP" && echo 0 || echo 1)"
+ck "  …and the timer is a \`read -t\` on a pre-opened FIFO, not a child process" \
+   "$(grep -q 'read -t "$secs" -r -u 9' "$LOOP" && echo 0 || echo 1)"
+_n_line="$(grep -n 'nothing="$_cr_why"' "$LOOP" | head -1 | cut -d: -f1)"
+_l_line="$(grep -n 'fork="$_cr_fork"' "$LOOP" | head -1 | cut -d: -f1)"
+ck "  …and the starved cycle still WRITES A RECORD (a starved box with no record is silent)" \
+   "$([ -n "${_n_line:-}" ] && [ -n "${_l_line:-}" ] && echo 0 || echo 1)"
+ck "  …carrying the STATE, not a generic skip: fork_exhausted on a failed probe, fork_headroom when low" \
+   "$(grep -q -- '_cr_why="fork_exhausted"' "$LOOP" && grep -q -- '_cr_why="fork_headroom"' "$LOOP" && echo 0 || echo 1)"
+ck "  …and it writes the HEARTBEAT with a builtin, so no supervisor concludes the controller is gone" \
+   "$(grep -qF -- "printf '%s\\n' \"\${_ft0}\" > \"\$O/heartbeat\"" "$LOOP" && echo 0 || echo 1)"
+ck "the probe's rc=254 is read as fork_exhausted, not as 'no numbers from the probe'" \
+   "$(grep -q 'CAP_RC:-0}" -eq 254' "$LOOP" && echo 0 || echo 1)"
+# THE LOCAL GATE ORDER: the fork arm must be evaluated BEFORE the load arm.
+_fk_line="$(grep -n 'elif \[ "${FORK_STARVED:-0}" = "1" \]; then' "$LOOP" | head -1 | cut -d: -f1)"
+_ld_line="$(grep -n 'elif \[ "$L" -ge "$MAX_LOAD" \]; then GATE_WHY="load=' "$LOOP" | head -1 | cut -d: -f1)"
+ck "the controller's OWN chain checks fork BEFORE load (fork=$_fk_line load=$_ld_line)" \
+   "$([ -n "${_fk_line:-}" ] && [ -n "${_ld_line:-}" ] && [ "$_fk_line" -lt "$_ld_line" ] && echo 0 || echo 1)"
+ck "the cycle record carries the fork reading (fork= fork_procs= fork_max=)" \
+   "$(grep -q 'fork="$_cr_fork" fork_procs=' "$LOOP" && echo 0 || echo 1)"
+# THE VERDICT: a fresh record that says fork=starved is FORK-STARVED, rc 1 — driven, not grepped.
+VO="$TMP/verdict-o"; mkdir -p "$VO/state"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_exhausted placement=fork_exhausted bound=fork_probe fork=starved fork_procs=15600 fork_max=15641\n' \
+  "$NOW" "$NOW" > "$VO/state/cycles"
+VOUT="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "a FRESH record with fork=starved is the NAMED non-zero state FORK-STARVED (rc=$RC) [$VOUT]" \
+   "$([ "$RC" -eq 1 ] && q '^FORK-STARVED ' "$VOUT" && echo 0 || echo 1)"
+ck "  …and the verdict NAMES the reads (procs=/procs_max=), not just an adjective" \
+   "$(q 'procs=15600 procs_max=15641' "$VOUT" && echo 0 || echo 1)"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=fork_exhausted fork=starved\n' \
+  "$(( NOW - 100000 ))" "$(( NOW - 100000 ))" > "$VO/state/cycles"
+VOUT2="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "  …but a STALE starved record is DEGRADED (a dead controller is not a live starved one)" \
+   "$([ "$RC" -eq 1 ] && q '^DEGRADED ' "$VOUT2" && echo 0 || echo 1)"
+printf 'start=%s end=%s cycle=7 interval=240 nothing=none fork=ok\n' "$NOW" "$NOW" > "$VO/state/cycles"
+VOUT3="$( CR_NOW="$NOW" cycle_verdict "$VO" )"; RC=$?
+ck "  …and a healthy record is still HEALTHY (the new arm did not swallow the ordinary case)" \
+   "$([ "$RC" -eq 0 ] && q '^HEALTHY ' "$VOUT3" && echo 0 || echo 1)"
+# THE SPAWN POINT: fork before disk before load, with its own refusal code.
+SG="$HERE/spawn-gate.sh"
+ck "the spawn gate declares its OWN fork refusal code (74), distinct from disk (77) and load (75)" \
+   "$(grep -q '^AGENT_FORK_REFUSED=74$' "$SG" && echo 0 || echo 1)"
+_sf="$(grep -n 'spawn_fork_state _fstate _fdetail' "$SG" | head -1 | cut -d: -f1)"
+_sd="$(grep -n 'dpath="${DISK_GATE_PATH:-$PWD}"' "$SG" | head -1 | cut -d: -f1)"
+_sl="$(grep -n 'if ! can_spawn "$l"; then' "$SG" | head -1 | cut -d: -f1)"
+ck "  …and run_agent evaluates FORK before DISK before LOAD (f=$_sf d=$_sd l=$_sl)" \
+   "$([ -n "${_sf:-}" ] && [ -n "${_sd:-}" ] && [ -n "${_sl:-}" ] && [ "$_sf" -lt "$_sd" ] && [ "$_sd" -lt "$_sl" ] && echo 0 || echo 1)"
 
 # ── §10 self-registration ───────────────────────────────────────────────────────────────────────
 echo

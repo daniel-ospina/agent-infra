@@ -48,7 +48,7 @@ the missing half of.
 `bash capacity.sh probe` prints one line; peers publish the same line to the shared origin.
 
 ```
-host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=1792598400
+host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=1792598400 procs=412 procs_max=15641 fork=1 src=uid
 ```
 
 - `lpc` — **load per CPU, in integer hundredths** (bash 3.2 has no floats). This is the number the
@@ -58,13 +58,77 @@ host=cell-4 ncpu=8 load1=56 lpc=7 lanes=0 disk_free_mb=120000 mem_free_mb=14000 
 - `mem_free_mb` — the same helper the controller's own memory gate uses.
 - `at` — the epoch of the reading. A record with no age is a stale flag waiting to be read as
   current.
+- `procs` / `procs_max` / `fork` — fork headroom (§4). `procs_max=0` means **no ceiling was found**
+  (unbounded), never "zero headroom". `src` is the arm that answered (`uid` or `cgroup`) and is local
+  to the box: it is printed by `probe`, not transported in the ref name.
+
+The fork fields are **appended** to the record and the ref name
+(`refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`), so a peer on an
+older tree still parses the leading fields; a six-slot legacy ref is refused as `fork_unknown` rather
+than read as healthy, and it self-heals on that box's next publish.
 
 Transport: the fleet's only shared channel is the queue repo's origin, so a box publishes its
 reading as `refs/boxes/<host>/<reading>` and every box reads the whole fleet with **one**
 `git ls-remote --refs refs/boxes/*` — the same channel and the same read primitive `claims.sh`
 already uses. No new daemon, no new credential, no per-box RPC.
 
-## 4. The ceiling: 8.00 load per CPU — and what it protects
+## 4. The order: FORK HEADROOM, then disk, then load
+
+**Measured 2026-10-21 19:50–20:10 UTC (#2293).** Cloud **cell-4** (8 vCPU) could not spawn at all:
+
+```
+/bin/bash: fork: Resource temporarily unavailable
+spawn /bin/bash EAGAIN          (rc 128; persistent over 75 s)
+last good reading: load=2.54/8 (0.32x)  lanes=11  pi_procs=16
+```
+
+The Mac hit the same wall minutes later, and there it is provable in isolation: `echo ok` (a shell
+builtin, no fork) worked while every spawn failed. So the binding resource was **process/fork
+headroom** — invisible to load average, to memory, and to any lane counter. A 12th lane placed by a
+load-only rule lands on a box with **no pids left**, and that failure is not graceful: the box cannot
+be probed from inside, nothing can be cleaned up locally, and every retry by an already-placed lane
+forks more.
+
+The probe therefore reads, in this order, and refuses by the FIRST bound it hits:
+
+1. **fork headroom** — `procs` (live process count) against `procs_max` (the smallest of `ulimit -u`,
+   `kern.maxprocperuid`, and the cgroup `pids.max`), plus a **two-fork probe** (`fork=1|0`). Below
+   `CAP_MIN_FORK_HEADROOM=200` spare processes the box is refused.
+2. **disk** — as §4's floors describe.
+3. **load** — last, because on a box that dies at fork before it gets CPU-busy it is the least
+   informative of the three.
+
+Why the order matters: the remedies differ and so do their time scales. A fork refusal **never clears
+by waiting** — the remedy is an external restart or letting the box drain. A disk refusal clears by
+pruning. Only a load refusal clears on its own. Reporting `load=` for a box that cannot fork sends an
+operator to wait for an event that cannot arrive.
+
+**A fork failure is fatal to the process that attempts it.** Measured on this tree's bash (5.2.21):
+`ulimit -u 5; ( exit 0 )` prints `fork: retry: …` four times, then `fork: Resource temporarily
+unavailable`, and **the script exits 254** — a `while` loop dies on its first failed fork. That is why
+`bash capacity.sh probe` exits **254** when it could not fork (a named answer, not a crash), why the
+probe runs inside a child, and why the controller treats 254 as `fork_exhausted` and stops forking for
+that cycle.
+
+**The controller survives it.** Measured: the local `com.eldato.orchestrator-loop` recorded a last exit
+of **128** and never came back — launchd's relaunch needs the very fork that is failing. So
+`orch-loop.sh` reads fork headroom **first** (before `date`, `git`, `gh` — before anything that spawns),
+and when a box is starved it takes a builtin-only path: it writes a cycle record (`nothing=fork_exhausted`,
+`fork=starved`) and naps on a FIFO opened at startup (`read -t` — no child process), then retries. The
+box still cannot be repaired from inside; what changes is that it is **alive and named** instead of
+vanishing into a respawn loop that cannot start.
+
+`bin/harness status` gains the verdict for that state:
+
+| verdict | rc | meaning |
+|---|---|---|
+| `FORK-STARVED` | 1 | the controller is fresh and alive, and its own fork reading says the box cannot spawn |
+
+The refusal names the read (`bound=fork_headroom` / `fork_probe` / `fork_unknown`), so "no box is
+eligible" is never a bare fact: `fork_headroom` is a box that needs an external restart, `fork_probe` is
+a box whose own probe refused, `fork_unknown` is a peer that published no fork reading at all.
+
+## 5. The ceiling: 8.00 load per CPU — and what it protects
 
 `CAP_LPC_CEILING=800` (hundredths). Measured, not derived: the fleet's own incident data puts the
 saturation point at **8–10× cpu load**, and the controller's local hard gate is `ncpu*10` (`MAX_LOAD`),
@@ -95,6 +159,9 @@ Every refusal names **which** bound it hit, because the remedies differ:
 | `bound=` | meaning | remedy |
 |---|---|---|
 | `load_per_cpu` | every box is past 8× cpu | the fleet needs more boxes |
+| `fork_headroom` | spare processes below `CAP_MIN_FORK_HEADROOM` (200) | **external restart or drain** — it cannot be cleaned from inside (#2293) |
+| `fork_probe` | the box's two-fork probe refused | the same: the box cannot spawn at all |
+| `fork_unknown` | a peer published no fork reading (a pre-#2293 record) | upgrade that box; it is ineligible until it republishes |
 | `disk` | free space below the floor | `cloud-cell-supervisor.sh prune` on that box |
 | `memory` | available memory below the floor | a leak somewhere on that box |
 | `probe_stale` | a record older than `CAP_PROBE_TTL` (900 s) | that box's controller is not publishing |
@@ -104,7 +171,7 @@ Relation to `docs/ops/load-policy.md`: that policy's per-core thresholds (2.5× 
 background batches** on a host; `MAX_LOAD` (10×, `spawn-gate.sh`) refuses a *local* spawn; this 8×
 ceiling decides **cross-box placement**. Three different decisions, three numbers, each named.
 
-## 5. The rule, and the fail-closed direction
+## 6. The rule, and the fail-closed direction
 
 `cap_place <this-box> <records…>` (or records on stdin) →
 
@@ -125,13 +192,13 @@ In the controller the verdict has three outcomes, and only two of them stop work
   stand-down.
 - `refuse` → `GATE_WHY="capacity-placement(bound=…)"`: nothing is placed, and the bound is named.
 
-## 6. The self-dispatch proof
+## 7. The self-dispatch proof
 
 `orch-loop.sh` appends **one line per cycle** to `$O/state/cycles`:
 
 ```
 start=… end=… cycle=… interval=240 selected=issue:#2216 selected_n=1 dispatched=1 ids=#2216
-nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7
+nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7 fork=ok fork_procs=412 fork_max=15641
 ```
 
 `bin/harness status` prints the last N and grades the **newest** record:
@@ -151,7 +218,7 @@ state that read as fine on cell-1.
 This is what answers "is it self-dispatching" without a human reading a pane: a live pane shows a
 *process*, a fresh record shows a *cycle*.
 
-## 7. Tests
+## 8. Tests
 
 `scripts/orchestrator-harness/capacity-placement.test.sh` (in `scripts/run-bash-shards.sh`, so both
 CI lanes run it): the saturated box skipped and the least-loaded eligible box chosen; an

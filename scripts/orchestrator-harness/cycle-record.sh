@@ -27,12 +27,27 @@
 #   . cycle-record.sh
 #   cycle_record_write "$O" start="$t0" cycle=7 interval=240 selected=issue:#2216 selected_n=2 \
 #                          dispatched=2 ids=#2216,#2232 nothing=none
-#   cycle_verdict "$O"            # prints "HEALTHY …" / "DEGRADED …" / "ABSENT …" / "UNREADABLE …"
-#                                 # rc 0 healthy · 1 degraded · 2 no answer (absent/unreadable)
+#   cycle_verdict "$O"            # prints "HEALTHY …" / "DEGRADED …" / "FORK-STARVED …" / "ABSENT …" /
+#                                 # "UNREADABLE …"
+#                                 # rc 0 healthy · 1 degraded/starved · 2 no answer (absent/unreadable)
 #   cycle_history "$O" 10         # the last 10 cycles, oldest first, each with its age
 #
+# ── FORK-STARVED, AND WHY IT IS A VERDICT OF ITS OWN (agent-infra#2293) ──────────────────────────
+# A box out of PROCESSES is in a state no other verdict describes. It is not DEGRADED (the controller is
+# cycling and writing records), and it is emphatically not HEALTHY: measured 2026-10-21, cell-4 at
+# 0.32x load could not `fork()` at all, and the local `com.eldato.orchestrator-loop` recorded a last
+# exit of 128 and NEVER CAME BACK — because every relaunch needs the fork that is failing. A verdict
+# that can only say "alive" or "not cycling" cannot describe that box, so the controller records the
+# fork reading of every cycle (`fork=ok|starved|unknown`) and this verdict names the starved state:
+#
+#   FORK-STARVED  the newest FRESH record says the controller could not fork (rc 1, never 0)
+#
+# ⛔ FRESHNESS STILL WINS. A stale record is DEGRADED even if it says `fork=starved`: the honest answer
+# to "is the controller alive" is no, and the fix (start it) is different from the fix for a live but
+# fork-starved box (restart or drain the BOX from outside — nothing inside it can be cleaned up).
+#
 # USAGE (CLI)   bash cycle-record.sh status|history [--last N] [--interval S] [--dir O]
-# EXIT          0 HEALTHY · 1 DEGRADED · 2 ABSENT/UNREADABLE (cannot answer — never a pass)
+# EXIT          0 HEALTHY · 1 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (cannot answer — never a pass)
 
 CR_FILE_NAME="${CR_FILE_NAME:-cycles}"
 CR_LAST_N="${CR_LAST_N:-10}"
@@ -43,10 +58,16 @@ cr_now() { if [ -n "${CR_NOW:-}" ]; then printf '%s' "$CR_NOW"; else date +%s; f
 cr_path() { printf '%s/state/%s' "${1:-.}" "$CR_FILE_NAME"; }
 
 # cr_san <s> — one token, no whitespace, no '=' (the record grammar is space-separated k=v).
+# ⛔ BUILTINS ONLY, DELIBERATELY (agent-infra#2293). This used to run TWO `tr` processes per field —
+# eleven fields, twenty-two forks — on the path the controller takes EVERY cycle, including the cycle
+# in which the box cannot fork. A fork there kills the writer (bash terminates on a failed fork), so a
+# sanitiser that forks is a sanitiser that deletes exactly the record the starved box needs to leave.
+# Parameter expansion is the same normalisation with no process at all.
 cr_san() {
   local s="${1:-}"
-  s="$(printf '%s' "$s" | tr ' \t\n\r' '____')"
-  printf '%s' "$s" | tr -d '"'"'"'`'
+  s="${s//$'\n'/_}"; s="${s//$'\t'/_}"; s="${s//$'\r'/_}"; s="${s// /_}"
+  s="${s//\"/}"; s="${s//\'/}"; s="${s//\`/}"
+  printf '%s' "$s"
 }
 
 # cycle_record_write <O> <k=v ...> — append ONE cycle line. rc 1 (with the reason on stdout) when the
@@ -56,7 +77,8 @@ cycle_record_write() {
   local O="${1:-}"; shift 2>/dev/null || true
   [ -n "$O" ] || { printf 'cycle-record: no state dir\n'; return 1; }
   local f; f="$(cr_path "$O")"
-  mkdir -p "$O/state" 2>/dev/null
+  # A builtin test before the mkdir: `mkdir -p` is a FORK on every write, including the starved cycle.
+  [ -d "$O/state" ] || mkdir -p "$O/state" 2>/dev/null
   local kv line="" k v
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
@@ -117,6 +139,19 @@ cycle_verdict() {
   bound=$(( rec_interval * CR_STALE_CYCLES ))
   if [ "$age" -gt "$bound" ]; then
     printf 'DEGRADED age=%s cycles=%s interval=%s bound=%s why=stale_record\n' "$age" "$n" "$rec_interval" "$bound"
+    return 1
+  fi
+  # ── FORK-STARVED (agent-infra#2293): a FRESH record whose own fork reading says the box could not
+  # spawn. Checked AFTER the freshness bound on purpose — a stale starved record is a DEAD controller,
+  # which is DEGRADED, and the remedy differs. The reads ride the record so the verdict can NAME what
+  # refused: `procs=/procs_max=` are the count and the ceiling the box measured, not a bare adjective.
+  local forkv procs pmax
+  forkv="$(printf '%s\n' "$last" | awk '{n=split($0,f," "); for(i=1;i<=n;i++) if (index(f[i],"fork=")==1) {print substr(f[i],6); exit}}')"
+  if [ "${forkv:-}" = "starved" ]; then
+    procs="$(printf '%s\n' "$last" | awk '{n=split($0,f," "); for(i=1;i<=n;i++) if (index(f[i],"fork_procs=")==1) {print substr(f[i],12); exit}}')"
+    pmax="$(printf '%s\n' "$last" | awk '{n=split($0,f," "); for(i=1;i<=n;i++) if (index(f[i],"fork_max=")==1) {print substr(f[i],10); exit}}')"
+    printf 'FORK-STARVED age=%s cycles=%s interval=%s bound=%s why=fork_exhausted procs=%s procs_max=%s\n' \
+      "$age" "$n" "$rec_interval" "$bound" "${procs:-?}" "${pmax:-?}"
     return 1
   fi
   printf 'HEALTHY age=%s cycles=%s interval=%s bound=%s why=fresh\n' "$age" "$n" "$rec_interval" "$bound"
