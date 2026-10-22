@@ -1583,6 +1583,140 @@ export function reviewRecordFile(repo: string | undefined, pr: number): string {
     : resolvePath(dir, `${pr}.json`);
 }
 
+/**
+ * #2287/#2148 (measured 2026-10-22, this lane): the ≥1-dispatch floor counted ONLY
+ * the in-session `task`/`subagent` tool_result, so a lane that obtained its review
+ * from a SPAWNED reviewer PROCESS — `scripts/review-pr.sh`, the harness's
+ * `merge-one.sh` reviewer, any `pi -p` child — was refused at its next git op with
+ * "no reviewers dispatched" even though a reviewer HAD run and its verdict was on
+ * the record. The floor was therefore satisfiable only one way, and the way the
+ * documentation tells a lane to land (`review-pr.sh`, then the rail) was not it.
+ *
+ * The acceptance is a MECHANICAL artifact, not prose: `record-review.sh`'s registry
+ * record (`~/.pi/agent/reviews/…json`) is the one thing a reviewer process leaves
+ * behind, and the merge gate ALREADY trusts it as the attestation. This adds NO new
+ * trust boundary — it reads the same file the rail reads — and it is bound to the
+ * EXACT head being pushed/committed, so a record made at an older head still needs
+ * a fresh review (no record for these bytes ⇒ still refused).
+ *
+ * ⛔ The negative case is the protection: no spawn ⇒ no record ⇒ refuse (pinned by
+ * `index.spawn-evidence.test.ts`; the recorder refuses to mint one without the
+ * evidence artifact, and `tests/review-pr/run.sh` §AE proves the no-spawn mutant
+ * writes nothing). A record whose `repo` disagrees with the op's repo is treated as
+ * absent (the #426 collision class), and ambiguity (two records for one head with
+ * no repo context) is not evidence either.
+ */
+export interface ReviewProcessEvidence {
+  pr: number;
+  head_sha: string;
+  verdict: string;
+  repo?: string;
+  recordPath: string;
+}
+
+/**
+ * A review record bound EXACTLY to `headSha`. `repo` narrows the search when known
+ * (a foreign repo's record must never satisfy this repo — #426). Returns null when
+ * nothing matches, or when the match is ambiguous without repo context.
+ */
+export function headBoundReviewEvidence(headSha: string, repo: string | null): ReviewProcessEvidence | null {
+  if (typeof headSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(headSha.trim())) return null;
+  const want = headSha.trim().toLowerCase();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(reviewsDir()).filter((f) => f.endsWith(".json"));
+  } catch {
+    return null; // no registry → no evidence
+  }
+  const matches: ReviewProcessEvidence[] = [];
+  for (const f of entries) {
+    const path = resolvePath(reviewsDir(), f);
+    const rec = readRecordFile(path);
+    if (rec === null) continue;
+    if (typeof rec.head_sha !== "string" || rec.head_sha.trim().toLowerCase() !== want) continue;
+    if (repo !== null && rec.repo !== undefined && rec.repo !== repo) continue; // foreign record → inert
+    if (repo !== null && rec.repo === undefined) continue; // no repo on the record ⇒ cannot be bound to THIS repo
+    // #426 P0-2 parity: with NO repo context, a record that NAMES a repo cannot be bound to
+    // this op (it may be another repo's PR with the same number); only a repo-less legacy record
+    // is admissible, and only as the unique match (checked below).
+    if (repo === null && rec.repo !== undefined) continue;
+    matches.push({ pr: rec.pr, head_sha: want, verdict: rec.verdict, repo: rec.repo, recordPath: path });
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    // Two records at one head, no way to choose: not evidence. (With repo context
+    // the loop above already filtered to this repo's records; a genuine duplicate
+    // for one repo+head is still ambiguous.)
+    logGateEvent("review_record_collision", { ambiguous: matches.map((m) => m.recordPath), head_sha: want });
+    return null;
+  }
+  return matches[0];
+}
+
+/**
+ * THE COMMITS AN OP ACTUALLY SHIPS - and nothing but the ones it ships.
+ *
+ * #2287 fresh-review P0 (2026-10-22, reproduced): the first revision of this helper asked only
+ * "what is HEAD?", and HEAD is NOT the shipped object in several ordinary shapes. Each of these
+ * authorized a git op from a record that describes other bytes:
+ *
+ *   git push origin side        HEAD is on the reviewed commit; the pushed BRANCH is not.
+ *   git -C <other> push ...     the checkout, HEAD and repo are read from the session cwd.
+ *   git commit -m wip           the committed bytes DO NOT EXIST YET - no record can describe them.
+ *   git push --all / --mirror   many refs ship, one HEAD describes one of them.
+ *
+ * So the evidence path is opened ONLY for the shapes whose shipped commit is exactly HEAD, and is
+ * closed (null => the >=1-dispatch floor applies unchanged) everywhere else. That is the
+ * fail-closed direction: an unrecognised option, a refspec, a redirect, an unresolvable branch
+ * name, or a commit all fall back to the ordinary floor rather than to an accept.
+ */
+export function resolveShippedHeads(
+  command: string,
+  ctx: unknown,
+): { heads: string[]; repo: string | null; cwd: string } | null {
+  // A repo/checkout redirect makes the op's HEAD unattributable from here (the gate has no
+  // `-C` model - see resolveRepoContext) -> no evidence.
+  if (/(^|\s)(-C|--git-dir|--work-tree|--namespace|--super-prefix)(=|\s|$)/.test(command)) return null;
+  if (/(^|\s)(--all|--mirror|--tags|--follow-tags|--delete)([\s=]|$)/.test(command)) return null;
+
+  const opCtx = resolveRepoContext(command, null);
+  const ctxCwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
+  const cwd = opCtx.cwd ?? (typeof ctxCwd === "string" ? ctxCwd : process.cwd());
+
+  const isPush = /(^|\s)git\s+push(\s|$)/.test(command) && !/(^|\s)git\s+commit(\s|$)/.test(command);
+  const isPrCreate = /(^|\s)gh\s+pr\s+create(\s|$)/.test(command) && !/(^|\s)gh\s+pr\s+merge(\s|$)/.test(command);
+  // `git commit` ships bytes that do not exist at hook time - a record can never describe them.
+  if (!isPush && !isPrCreate) return null;
+  // `gh pr create --head <branch>` can open a PR for a branch that is not this checkout's.
+  if (isPrCreate && /(^|\s)--head(=|\s)/.test(command)) return null;
+
+  let head: string;
+  let branch: string;
+  try {
+    head = execSync("git rev-parse HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return null; // not a git checkout / detached lookup failed -> no evidence, floor stands
+  }
+  if (!/^[0-9a-f]{40,64}$/i.test(head)) return null;
+  if (branch === "" || branch === "HEAD") return null; // detached: no named branch to reason about
+
+  if (isPush) {
+    // Accept ONLY `<git push> [remote] [<thisBranch>]` - no refspec (`:`), no forced refspec
+    // (`+`), no extra positionals. Anything else ships something we cannot name here.
+    const pushAt = command.search(/(^|\s)git\s+push(\s|$)/);
+    const tail = pushAt === -1 ? "" : command.slice(pushAt).replace(/^.*?git\s+push\b/, "").trim();
+    const words = tail.split(/\s+/).filter((w) => w.length > 0 && !w.startsWith("-"));
+    if (words.length > 2) return null; // remote + one branch at most
+    if (words.some((w) => w.includes(":"))) return null; // explicit refspec -> not necessarily HEAD
+    if (tail.includes("+")) return null; // forced refspec
+    if (words.length === 2 && words[1] !== branch) return null; // a DIFFERENT branch than this checkout's
+  }
+
+  const repo = opCtx.repo ?? repoFromGitRemote(cwd);
+  return { heads: [head], repo, cwd };
+}
+
 function readRecordFile(path: string): ReviewRecord | null {
   try {
     const raw = fs.readFileSync(path, "utf8");
@@ -3882,6 +4016,12 @@ const BLOCK_MESSAGE = [
   "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
+  // #2287/#2148: a lane whose review came from a SPAWNED reviewer process (review-pr.sh,
+  // the harness reviewer) does not need to re-do it through `task` — the registry record
+  // bound to this op's head is accepted. Naming it here keeps the refusal satisfiable
+  // from EITHER path, which is the whole point of the disclosure.
+  "   → A spawned reviewer PROCESS counts too: a review record bound to this op's current HEAD",
+  "     (`review-pr.sh <PR>`, or record one with the command below) satisfies this floor.",
   // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
   // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
@@ -4171,7 +4311,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
-    pi.on("tool_call", async (event, _ctx) => {
+    pi.on("tool_call", async (event, toolCtx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
       // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
       // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
@@ -4478,6 +4618,35 @@ export default function (pi: ExtensionAPI) {
             : `[review-enforcer] ✅ ${dispatchCount} reviewer dispatch(es) — allowing git op`
         );
         return undefined;
+      }
+
+      // #2287/#2148: a SPAWNED reviewer process is equivalent evidence to an
+      // in-session `task` dispatch. The artifact is `record-review.sh`'s registry
+      // record, bound to the EXACT head this op ships — the same file the merge
+      // registry gate reads as the attestation. No record ⇒ no reviewer verdict ⇒
+      // the floor below still refuses (the protection is unchanged).
+      if (!taskSubAgent && dispatchCount === 0) {
+        const op = resolveShippedHeads(command, toolCtx);
+        // `repo === null` means the op's repo could not be resolved - then a record CANNOT be
+        // bound to it (the #426 P0-2 rule the merge gate already applies: with no repo context
+        // only a repo-less legacy record may match, never one that embeds somebody's repo).
+        const evidence = op === null || op.repo === null
+          ? null
+          : headBoundReviewEvidence(op.heads[0], op.repo);
+        if (evidence !== null) {
+          console.log(
+            `[review-enforcer] ✅ Reviewer process evidenced — review record for ${evidence.repo ?? "<unresolved repo>"}#${evidence.pr} ` +
+              `bound to the pushed head ${evidence.head_sha.slice(0, 12)} (verdict: ${evidence.verdict}) — allowing git op`
+          );
+          logGateEvent("review_dispatch", {
+            dispatch_count: dispatchCount,
+            reason: "review_record_bound_head",
+            pr: evidence.pr,
+            head_sha: evidence.head_sha,
+            record: evidence.recordPath,
+          });
+          return undefined;
+        }
       }
 
       // #485: uniform ≥1-dispatch block — every tier (micro, standard, complex,

@@ -1168,12 +1168,24 @@ test("uppercase hex stored hash matches (case-insensitive)", () => {
   }
 });
 
-test("unknown-length hash (md5, 32-hex) fails closed", () => {
+// ⛔ #1460 (measured 2026-10-22): this used to pin md5 as FAIL-CLOSED — "unknown-length
+// hash is compared as sha256", which for a 32-hex value can never match. That made the gate
+// UNSATISFIABLE for any lane whose verifier ran `md5sum`: every commit touching the file
+// blocked as "mismatched" and re-verifying produced md5 again. The digest algorithm is not
+// the anti-drift property — ANY of md5/sha1/sha256 changes when one byte changes — and the
+// merge path upgrades a matched md5 to the gate's own sha256 (`storedDigestFor`), so a
+// collision-broken digest never becomes the standing record. What must stay fail-closed is a
+// value that is not a digest at all: that can never authorize a commit.
+test("md5 (32-hex) MATCHES when it is the digest of the bytes (#1460); a non-digest length still fails closed", () => {
   const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
   try {
     writeFileSync(join(root, "a.ts"), "content-a\n");
     const md5 = createHash("md5").update("content-a\n").digest("hex");
-    equal(hashMatchesDisk(root, "a.ts", md5), false);
+    equal(hashMatchesDisk(root, "a.ts", md5), true, "md5 of the current bytes is evidence");
+    const otherMd5 = createHash("md5").update("content-b\n").digest("hex");
+    equal(hashMatchesDisk(root, "a.ts", otherMd5), false, "md5 of DIFFERENT bytes is a disagreement");
+    equal(hashMatchesDisk(root, "a.ts", "deadbeef"), false, "not a digest → fail closed");
+    equal(hashMatchesDisk(root, "a.ts", ""), false, "empty → fail closed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
