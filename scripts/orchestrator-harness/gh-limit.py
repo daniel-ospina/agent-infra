@@ -1723,14 +1723,26 @@ def single_flight(real_gh, gh_argv):
 # successful call would corrupt the JSON that `gh-rest/gh` and `rest_list` parse).
 #
 # ⛔ AN UNLISTED SHAPE IS NEVER CACHED. There is deliberately NO default TTL: a default is how a
-# cache silently starts lying about a fact nobody reasoned about. Each admitted class names its own
-# TTL and the reason it is safe:
-#   * `pr-state`  10 s — a stale head sha makes GitHub REFUSE a merge whose `sha` no longer matches
-#                       the head (fail-closed, never the wrong merge);
-#   * `protection` 60 s — a required-check set IS branch protection, whose own convergence is not
-#                       instant; this is the read the rail's `REQ_SOURCE=fallback` lies about today;
-#   * `comments`/`reviews` 15 s — “has the evidence comment landed yet” is polled in a loop;
-#   * `checks`/`pr-list` 10 s / 5 s — a check surface or a board read polled per lane.
+# cache silently starts lying about a fact nobody reasoned about.
+#
+# ⛔ AND THE `gh api` SURFACE IS NOT IN THE LIST AT ALL — THAT BOUNDARY IS THE WHOLE SAFETY ARGUMENT.
+# An unvalidated TTL is only defensible where nothing else validates staleness AND the value is not
+# read-modify-written. `gh api` fails BOTH tests:
+#   * it already HAS a validator — the ETag/`conditional_fetch` path returns the real body on change and
+#     costs no quota on a 304, so a TTL entry there is strictly worse (staler, unvalidated);
+#   * `record-review.sh` and `atomic-land.sh` READ `pulls/{n}`'s `.body` and PATCH it back whole, so a
+#     10 s stale body is a LOST UPDATE — lane A's marker, or a human's edit, silently gone, both lanes
+#     exiting 0 (found in review round 5, reproduced: two reads 1 s apart, one request, the second the
+#     first body); and `admin-merge.sh` reads `commits/…/status` for a merge DECISION, where a 10 s
+#     window can miss a just-landed red.
+#
+# So the TTL cache covers exactly the ETag-free surface: the SUBCOMMANDS below, which are GraphQL (no
+# ETag exists at all) and are the traffic whose only saving today is single flight. Their TTLs are
+# sized to the poll cadence that produces the waste, so the cost of staleness is one poll:
+#   * `pr-state` 10 s — a stale head sha makes GitHub REFUSE a merge whose `sha` no longer matches the
+#                      head (fail-closed, never the wrong merge);
+#   * `checks` 10 s, `pr-list` 5 s — a check surface or a board read polled per lane;
+#   * `run-list` 10 s — the MEASURED hotspot; see its entry below.
 # ⛔ AND ONLY A SUCCESS IS STORED. A failure is evidence about a MOMENT; caching one turns a transient
 # fault into a stable “unreadable” for every lane on the box (the pass cache's rule, restated because
 # it is the same defect class and it has bitten this file before).
@@ -1738,15 +1750,8 @@ READ_CACHE_ENV = "GH_LIMIT_READ_CACHE"        # "0" disables the TTL cache entir
 READ_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_READ_CACHE_MAX_BYTES", 32 << 20, 1024, 1 << 30)
 
 # (class, path pattern, TTL seconds) — matched against the ENDPOINT `api_endpoint` attributes.
-READ_CLASSES = (
-    ("pr-state",   re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+$"), 10),
-    ("protection", re.compile(r"^repos/[^/]+/[^/]+/branches/[^/]+/protection(/.*)?$"), 60),
-    ("protection", re.compile(r"^repos/[^/]+/[^/]+/rulesets(/.*)?$"), 60),
-    ("comments",   re.compile(r"^repos/[^/]+/[^/]+/issues/\d+/comments$"), 15),
-    ("reviews",    re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews$"), 15),
-    ("checks",     re.compile(r"^repos/[^/]+/[^/]+/commits/[^/]+/(check-runs|status)$"), 10),
-    ("pr-list",    re.compile(r"^repos/[^/]+/[^/]+/pulls$"), 5),
-)
+# Subcommand shapes only (GraphQL) — see the boundary argument above. There is intentionally no `gh
+# api` class: that surface is the ETag path's, and caching it unvalidated is a lost-update hazard.
 # The SUBCOMMANDS whose answer is one of those classes. `gh pr view` reaches the GRAPHQL pool, so
 # caching it is just as valuable: GraphQL is the pool the fleet exhausts SECOND, and a bounded
 # staleness argument does not care which pool paid for the answer.
@@ -1787,18 +1792,8 @@ def read_class(gh_argv):
     if gh_argv[0] == "auth" or not makes_request(gh_argv):
         return None
     if gh_argv[0] == "api":
-        ep = api_endpoint(gh_argv)
-        if ep is None or api_is_mutating(gh_argv):
-            return None            # an argv we cannot attribute, or a write: FAIL CLOSED (never cached)
-        low = ep.strip("/").lower()
-        if low == "rate_limit":
-            return None
-        if any(a in READ_UNCACHEABLE_FLAGS or a.startswith("--cache=") for a in gh_argv[1:]):
-            return None
-        path = low.split("?")[0]
-        for name, pat, ttl in READ_CLASSES:
-            if pat.match(path):
-                return name, ttl
+        # ⛔ `gh api` IS NEVER TTL-CACHED — not an omission, the safety boundary (see the header).
+        # It has an ETag validator, and its body is read-modify-written by the review recorder.
         return None
     if len(gh_argv) >= 2:
         for name, pair, ttl in READ_SUBCOMMAND_CLASSES:
@@ -2652,8 +2647,12 @@ COMMENT_NAMES = frozenset({"id", "body", "created_at", "html_url", "user", "logi
 REVIEW_NAMES = frozenset({"id", "state", "body", "submitted_at", "commit_id", "user", "login"})
 # jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
 # one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
+# jq operators/shapes that can reach a field WITHOUT naming it in a `.name` form. A projection using
+# one cannot be shown to stay inside the reproduced body, so it is refused rather than guessed at.
 PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_unsorted", "tojson",
                         "paths", "leaf_paths", "map_values", "values", "path", "env", "has")
+PROJECTION_VALUE_FILTERS = ("select", "if", "first", "last", "nth", "until", "while", "recurse", "walk",
+                            "input", "inputs")
 _PROJECTION_NAME = re.compile(r"""\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]""")
 
 
@@ -2687,6 +2686,17 @@ def _projection_ok(jq, allowed):
         return False
     for op in PROJECTION_SHAPE_OPS:
         if re.search(r"(?<![A-Za-z0-9_.])" + op + r"\b", jq):
+            return False
+    # ⛔ MENTIONING A LEAF IS NOT THE SAME AS EMITTING ONE. `leaf` used to be set by FINDING an allowed
+    # `.name` ANYWHERE, so `. | select(.state=="open")` and `.body, .` passed and emitted the encoder's
+    # whole SUBSET with rc 0 — the identity defect, one token away. So the program may not contain a
+    # bare `.` (identity), or a value-producing filter. Array construction (`[.a,.b]`), object
+    # construction (`{a:.x}`), interpolation (`"\(.x)"`), a pipe to a named path and iteration
+    # (`.[] | .name`) remain legal, and they are what the in-tree callers use.
+    if re.search(r"\.\s*(?:[,|)]|$)", jq):
+        return False               # a bare `.`, or the identity arm of a top-level `,`
+    for op in PROJECTION_VALUE_FILTERS:
+        if re.search(r"(?<![A-Za-z0-9_])" + op + r"\s*[({]", jq):
             return False
     leaf = False
     # bracketed key lookups: a literal quoted name is a leaf, anything computed is refused
@@ -2965,12 +2975,16 @@ def _dispatch(real_gh, gh_argv):
             # still refusing — and `cloud-cell-supervisor.sh`'s `cmd_check` runs `gh --version`
             # through this very layer, so the operator's diagnostic ERASED the evidence it was run
             # to read (review round 8).
-            if makes_request(gh_argv):
-                # ⛔ THE BUCKET THAT RECOVERS IS THE ONE THAT ANSWERED, NOT THE ONE THE ARGV NAMES.
-                # A failover read is served by GRAPHQL; calling `record_recovery("core")` for it
-                # annotated the `core` record `recovered=` while the REST pool was still empty —
-                # destroying the free evidence the failover itself runs on, and making the heartbeat
-                # print `gh=recovered(bucket=core …)` on a box where every core call was refused.
+            if makes_request(gh_argv) and getattr(res, "status", None) != 304:
+                # ⛔ A REVALIDATED `304` IS NOT A SUCCESSFUL CORE CALL. It is exempt from the primary
+                # limit BY DESIGN — the same “exempt, therefore not evidence” class `makes_request`
+                # already excludes for `api rate_limit`. Counting it here made one cached-validation
+                # poll ERASE the exhaustion evidence: `record_core_ok()` unlinked the health record and
+                # `record_recovery("core")` marked `last-limit` recovered, so once the 30 s budget
+                # snapshot expired every lane on the box stopped failing over and `--health` said
+                # `gh-ok` while the pool was spent — the exact 2026-10-22 misdiagnosis this layer
+                # exists to remove, reachable from the one optimisation that is supposed to be free.
+                # The bucket that recovers is the one that ANSWERED, not the one the argv names.
                 record_recovery("graphql" if fo is not None else bucket_for(gh_argv))
                 if fo is None and bucket_for(gh_argv) == "core":
                     record_core_ok()

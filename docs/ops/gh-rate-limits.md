@@ -425,27 +425,26 @@ exceeded`, rc 1. Through the layer: `8600acf1beefb80389e81541e463575388bccf6b`, 
 
 Single flight (#2243) collapses **concurrent** duplicates; it shares only a result that completed after
 the caller arrived, so N lanes asking one question a minute apart still make N requests. A TTL cache
-admitted **per query class** removes those: `pr-state` 10 s, `protection` 60 s, `comments`/`reviews` 15 s,
-`checks` 10 s, `pr-list` 5 s, `run-list` 10 s. An **unlisted shape is never cached — there is
-deliberately no default**. Only a **success** is stored. `GH_LIMIT_READ_CACHE=0` disables it.
+admitted **per query class** removes those: `pr-state` (`gh pr view`) 10 s, `pr-list` 5 s,
+`pr checks` 10 s, `run-list` 10 s. An **unlisted shape is never cached — there is deliberately no
+default**. Only a **success** is stored. `GH_LIMIT_READ_CACHE=0` disables it.
 
-⛔ **`run-list` is in that list because it was MEASURED, not because it seemed reasonable** — see the
+⛔ **THE CACHE COVERS THE SUBCOMMAND (GRAPHQL) SURFACE ONLY, AND THAT BOUNDARY IS THE SAFETY ARGUMENT.**
+`gh api` is excluded outright — not an omission:
+- it already HAS a validator: `conditional_fetch` returns the server-confirmed body on change and costs
+  **no quota** on a `304`, so a TTL entry there is strictly staler and unvalidated;
+- `record-review.sh` and `atomic-land.sh` READ `pulls/{n}`'s `.body` and PATCH it back **whole**, so a
+  10 s stale body is a LOST UPDATE — lane A's marker, or a human's edit, silently gone with both lanes
+  exiting 0 (found and reproduced in review round 5);
+- `admin-merge.sh` reads `commits/…/status` for a merge DECISION, where a 10 s window can miss a
+  just-landed red.
+
+Tests `(c)`/`(c1)`/`(c2)`/`(c3b)`/`(c4)` pin the boundary in both directions: five identical `gh pr
+view` calls cost one request, while two `.body` reads cost two **even with `GH_LIMIT_CONDITIONAL=0`**.
+
+⛔ **`run-list` is in the list because it was MEASURED, not because it seemed reasonable** — see the
 budget arithmetic below: 30 of the 41 calls in one merge cycle were a single FIRST-CHECKS poll loop
 issuing byte-identical argv 16 times against data that changed zero times.
-
-⛔ **One cache per shape, and the ETag path wins its own.** A `gh api` GET that `conditional_fetch` will
-revalidate already has a stronger mechanism: a `304` costs **no quota** and returns a body the server
-just confirmed is current, so wrapping a TTL cache over it would hand out an older body where a fresh
-one was free — and would break the documented "the second poll SENDS if-none-match" guarantee. The TTL
-cache therefore applies exactly where the ETag path cannot reach: **subcommands** (`gh pr view`,
-`pr list`, `pr checks` — all GraphQL, which has no ETag at all) and the `gh api` shapes
-`conditional_plan` refuses (`--paginate`, `-i`, `-H`, `--template`). That is precisely the traffic
-whose only saving today is single flight. Test `(c3)` pins the split.
-⛔ **Consequence, stated so the class table is not read as a claim about default traffic:** with
-`GH_LIMIT_CONDITIONAL=1` every plain `gh api` GET is ETag-revalidated and therefore never TTL-cached, so
-by default the `gh api` classes above are reachable only when the ETag path is off or the shape is one
-it refuses (`--paginate`, `-i`, `-H`, `--template`). The default saving is on **subcommands** —
-`pr view`/`pr list`/`pr checks`/`run list` — which is also where the measured waste was.
 
 ### 4. The named state (what a lane should SAY)
 
@@ -461,6 +460,13 @@ a closed window cannot keep asserting itself. `repo-authority.sh` repeats the to
 reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
 the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
 that phrase into `VERDICT=GH-RATE-LIMITED`.
+
+⛔ **AND A `304` IS NOT A SUCCESSFUL CORE CALL.** It is exempt from the primary limit by design, so it
+is not evidence that the pool recovered — the same rule that keeps `api rate_limit` out of
+`makes_request()`. Counting it as one unlinked the health record and annotated `last-limit`
+`recovered=`, after which no lane on the box failed over and `--health` reported `gh-ok` on a spent
+pool: the 2026-10-22 misdiagnosis, restored by the one optimisation that is supposed to be free
+(test `(l)`).
 
 ⛔ **THE SECONDARY LIMIT HAS ITS OWN TOKEN, AND IT IS NOT EXHAUSTION.** A burst/concurrency refusal
 arrives as a 403/429 in the same shape as a primary one, but its `x-ratelimit-remaining` is **above
