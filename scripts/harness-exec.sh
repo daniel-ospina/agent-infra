@@ -121,20 +121,57 @@ esac
 
 # The layout check, identical to harness-up's identity gate: the checkout IS <pin root>/<sha12> and
 # the harness dir is its scripts/orchestrator-harness.
+# ⛔ WHEN THE PIN ROOT IS UNSET, CONTAINMENT IS STILL PROVEN — from the records' own layout. A
+# conditional check was the defect a review caught: `HARNESS_PIN_DIR` is exported by `harness-up` and
+# the cell supervisor, and NOTHING exports it on a Mac, so the default path skipped the one check that
+# catches #2216's "re-pin into a worktree nobody reads". Absent the root, the tree must still be named
+# after the pinned commit (`<anything>/<sha12>`), and a tree that is not is REFUSED rather than trusted.
+WANT_ROOT=""
 if [ -n "$PIN_DIR_ROOT" ]; then
   ROOT="${PIN_DIR_ROOT%/}"
   ROOT="$(cd "$ROOT" 2>/dev/null && pwd -P)"
   [ -n "$ROOT" ] || refuse "the pin root '$PIN_DIR_ROOT' cannot be resolved, so whether the recorded tree belongs to it is UNKNOWN — nothing was executed."
-  WANT="$ROOT/$SHA12"
-  [ "$TOP" = "$WANT" ] \
-    || refuse "the tree the pin DIR record names is '$TOP' but the pin root resolves commit $SHA12 to '$WANT' — a re-pin into a worktree nobody reads (#2216). Nothing was executed."
-  [ "$PIN_DIR_REAL" = "$WANT/scripts/orchestrator-harness" ] \
-    || refuse "the pin DIR record names '$PIN_DIR_REAL', which is not the harness directory '$WANT/scripts/orchestrator-harness' of the pinned tree — the record and the layout disagree."
+  WANT_ROOT="$ROOT/$SHA12"
+else
+  WANT_ROOT="$(dirname "$TOP")/$SHA12"
 fi
+[ "$TOP" = "$WANT_ROOT" ] \
+  || refuse "the tree the pin DIR record names is '$TOP' but the pin layout for commit $SHA12 is '$WANT_ROOT' — a re-pin into a worktree nobody reads (#2216). Nothing was executed."
+[ "$PIN_DIR_REAL" = "$WANT_ROOT/scripts/orchestrator-harness" ] \
+  || refuse "the pin DIR record names '$PIN_DIR_REAL', which is not the harness directory '$WANT_ROOT/scripts/orchestrator-harness' of the pinned tree — the record and the layout disagree."
 
 ENTRY_PATH="$PIN_DIR/${ENTRY#./}"
+# ⛔ THE ENTRY MAY NOT ESCAPE THE PIN. `--entry ../../../evil.sh` used to resolve outside the tree and
+# be accepted (found by review): the shim exists so the box runs THE PIN, and an entrypoint that walks
+# out of it is not the pin. Rejected on shape first (a `..` segment or an absolute path), then by
+# REALPATH containment, so a symlink inside the harness dir cannot redirect the exec either.
+case "/$ENTRY/" in
+  */../*) refuse "--entry '$ENTRY' contains a '..' segment — an entrypoint that leaves the pinned tree is not the pin." ;;
+esac
+case "$ENTRY" in
+  /*) refuse "--entry '$ENTRY' is absolute — the entrypoint is relative to the pinned harness directory." ;;
+esac
 [ -f "$ENTRY_PATH" ] || refuse "the pin (commit $SHA12, tree $PIN_DIR) does NOT carry '$ENTRY'. The tree that would run is not the harness the pin names."
 [ -r "$ENTRY_PATH" ] || refuse "the pin carries '$ENTRY' at $ENTRY_PATH but it cannot be read — cannot-verify is not a pass."
+# ⛔ THE FILE'S OWN REALPATH, not `dirname` + basename: `cd`-ing to the parent resolves the DIRECTORY
+# and then re-appends the (possibly symlinked) NAME, so a symlink in the harness dir sailed through
+# (found by review, reproduced by arm 13). Perl's Cwd::abs_path resolves the FINAL component too, and
+# perl is on both platforms (the repo already bounds commands with `perl -e 'alarm…'`).
+ENTRY_REAL="$(perl -MCwd -e 'my $p = Cwd::abs_path($ARGV[0]); print defined $p ? $p : "";' "$ENTRY_PATH" 2>/dev/null)"
+[ -n "$ENTRY_REAL" ] || refuse "'$ENTRY_PATH' cannot be resolved to a real path — cannot-verify is not a pass."
+case "$ENTRY_REAL" in
+  "$TOP"/*) : ;;
+  *) refuse "'$ENTRY_PATH' resolves to '$ENTRY_REAL', which is OUTSIDE the pinned tree '$TOP' (a symlink out of the pin) — nothing was executed." ;;
+esac
+
+# ⛔ A DIRTY PIN IS NOT THE PIN. A clean detached worktree is what a cell materialises, and an
+# uncommitted edit inside one runs bytes the record does not name — #2231's own failure mode, one layer
+# in. Scoped to the harness directory so an unrelated dirty path elsewhere in the tree cannot block.
+# Checked AFTER the entry containment so each refusal names its own cause (a symlink added for the
+# containment arm must not report as "dirty" and hide which rule fired).
+DIRTY="$(git -C "$TOP" status --porcelain -- "$PIN_DIR_REAL" 2>/dev/null)"
+[ -z "$DIRTY" ] \
+  || refuse "the pinned tree at '$TOP' has UNCOMMITTED CHANGES under $(basename "$PIN_DIR_REAL") ($(printf '%s' "$DIRTY" | head -3 | tr '\n' ' ')) — the bytes that would run are not commit $SHA12. Nothing was executed."
 
 if [ "$PRINT" = "1" ]; then
   printf 'pin_sha=%s\npin_dir=%s\nprogram=%s\nprovenance=%s\n' \

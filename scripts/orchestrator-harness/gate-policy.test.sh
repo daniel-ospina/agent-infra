@@ -58,9 +58,10 @@ skip "retired/*.sh still carry the old export — out of scope BY DEFINITION (no
 FIX="$TMP/fixrepo"
 mkdir -p "$FIX/scripts" "$FIX/extensions/verification-gate"
 printf 'record-review stub\n' > "$FIX/scripts/record-review.sh"
-printf 'review-pr stub\n' > "$FIX/scripts/review-pr.sh"
-printf 'vgate stub with a recorder verb\n' > "$FIX/scripts/vgate.sh"
-printf 'case "$1" in\n  record) : ;;\nesac\n' >> "$FIX/scripts/vgate.sh"
+printf '#!/usr/bin/env bash\necho review-pr\n' > "$FIX/scripts/review-pr.sh"
+chmod +x "$FIX/scripts/review-pr.sh"
+printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$FIX/scripts/vgate.sh"
+chmod +x "$FIX/scripts/vgate.sh"
 
 # 2. satisfier present -> ENFORCED.
 out="$(GP_REPO="$FIX" GP_LOG="$TMP/enforced.jsonl" GP_QUIET=0 bash -c '
@@ -77,6 +78,49 @@ if [ -f "$TMP/enforced.jsonl" ] && grep -q '"mode":"enforced"' "$TMP/enforced.js
   ok "satisfiable: the decision is recorded (not a silent no-op)"
 else
   bad "satisfiable: no audit line for the enforced decision"
+fi
+
+
+# 2b. THE FLEET-STOPPING REGRESSION (found by review). Existence is not capability: a zero-byte,
+# non-executable `review-pr.sh` used to flip the probe to "satisfiable", which UNSETS the skips — so
+# every lane on every box would be refused at its first push. The probe must keep bypassing + auditing.
+FAKE="$TMP/fakerepo"
+mkdir -p "$FAKE/scripts"
+: > "$FAKE/scripts/record-review.sh"          # exists, empty, not executable
+: > "$FAKE/scripts/review-pr.sh"              # exists, empty, not executable
+printf 'not a recorder\n' > "$FAKE/scripts/vgate.sh"
+out="$(GP_REPO="$FAKE" GP_LOG="$TMP/fake.jsonl" GP_QUIET=0 bash -c '
+  . "$1" || exit 78
+  apply_gate_policy test-carrier
+  printf "skip_review=%s skip_vgate=%s mode=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_MODE"
+' _ "$POLICY" 2>&1)"
+if printf '%s' "$out" | grep -q 'skip_review=1 skip_vgate=1 mode=bypass-audited'; then
+  ok "decoy: files that EXIST but cannot work do NOT enforce the gates (existence is not capability)"
+else
+  bad "decoy: a name-only satisfier flipped the probe to enforced — that stops every lane: $out"
+fi
+if ! grep -q '"mode":"enforced"' "$TMP/fake.jsonl" 2>/dev/null; then
+  ok "decoy: and the audit line does NOT claim enforced"
+else
+  bad "decoy: the audit claims enforced for a name-only satisfier"
+fi
+
+# 2c. AN INHERITED SKIP FLAG IS REMOVED when the gates are enforceable (README §5.4) — the arm that
+# would pass even if the `unset` were deleted did not exist (found by review).
+out="$(AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 GP_REPO="$FIX" GP_LOG="$TMP/ambient.jsonl" GP_QUIET=1 bash -c '
+  . "$1" || exit 78
+  apply_gate_policy test-carrier
+  printf "skip_review=%s skip_vgate=%s ambient_cleared=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_AMBIENT_CLEARED"
+' _ "$POLICY" 2>&1)"
+if printf '%s' "$out" | grep -q 'skip_review=none skip_vgate=none ambient_cleared=1'; then
+  ok "ambient: an INHERITED skip flag is removed from the carrier's environment (the stale hatch cannot outlive its reason)"
+else
+  bad "ambient: an inherited skip flag survived the enforced decision: $out"
+fi
+if grep -q '"ambient_cleared":1' "$TMP/ambient.jsonl"; then
+  ok "ambient: the removal is recorded (ambient_cleared=1), not silent"
+else
+  bad "ambient: the audit does not record the ambient removal"
 fi
 
 # 3. satisfier absent -> AUDITED bypass, naming #2319 and what is missing.
@@ -135,12 +179,16 @@ if grep -q 'mismatched' "$REPO/extensions/verification-gate/index.ts"; then
 else
   bad "(c) mismatched: the refusal is gone"
 fi
-if grep -q 'mismatched' "$REPO/extensions/verification-gate/index.test.ts"; then
-  ok "(c) mismatched: exercised by the gate test"
+# ⛔ THE FIRST VERSION OF THIS ARM GREPPED THE LITERAL `mismatched` AND REPORTED A COVERAGE GAP. That was
+# WRONG (found by review): the gate's suite exercises the same refusal under its own reason name,
+# `head_mismatch` (`extensions/verification-gate/index.test.ts:1059`, "same-repo stale checkout -> skip"),
+# so the "gap" was a trailing-`ed` artifact and the skip told a reader a required property was uncovered.
+# It is asserted as a hard PASS on the name the suite actually uses.
+if grep -q 'mismatched' "$REPO/extensions/verification-gate/index.test.ts" \
+   || grep -q 'head_mismatch' "$REPO/extensions/verification-gate/index.test.ts"; then
+  ok "(c) stale verification: exercised by the gate test (mismatched / head_mismatch)"
 else
-  # ⛔ A COVERAGE GAP, REPORTED NOT SWALLOWED. The refusal exists, and no test in the gate's own suite
-  # names it — so this suite cannot claim (c) is covered while the bypass comes out.
-  skip "(c) mismatched: COVERAGE GAP — the refusal exists but extensions/verification-gate/index.test.ts never names it"
+  bad "(c) stale verification: no test in the gate's own suite exercises the stale-head refusal"
 fi
 
 # The suites that carry (a) must be WIRED, or "CI runs it" is a memory, not a mechanism.

@@ -3567,11 +3567,24 @@ platforms.
 `install.sh` refuses to render a plist whose program is not inside the pin (#2271, install time).
 `harness-exec.sh` is the same refusal on every START, for both platforms: it resolves the two pin
 records (`HARNESS-PIN` = commit, `HARNESS_PIN_FILE` = the harness directory the controller execs),
-requires the recorded directory to BE a checkout at that commit inside `<pin root>/<sha12>`, requires
-the entrypoint to exist there, and `exec`s it. **There is no fallback** — not `$O`, not
-`~/orchestrator`, not `origin/main` — because running an unpinned copy INSTEAD of the pin is exactly
-how three fixes existed only in a home-directory copy for weeks (#2231). Every refusal is a named
-`rc=78` and is asserted by name in `scripts/harness-exec.test.sh`.
+requires the recorded directory to BE a clean checkout at that commit inside `<pin root>/<sha12>`,
+requires the entrypoint to exist **and to resolve inside the tree**, and `exec`s it. **There is no
+fallback** — not `$O`, not `~/orchestrator`, not `origin/main` — because running an unpinned copy
+INSTEAD of the pin is exactly how three fixes existed only in a home-directory copy for weeks
+(#2231). Every refusal is a named `rc=78` and is asserted by name in `scripts/harness-exec.test.sh`:
+not-a-checkout, the two records DISAGREE, EMPTY, not a commit id, not a directory (pruned), the pin
+layout (`<root>/<sha12>`, proven from the records when `HARNESS_PIN_DIR` is unset), UNCOMMITTED
+CHANGES in the pinned harness dir, an entrypoint that walks out with `..` or through a symlink, and an
+entrypoint the pin does not carry.
+
+⛔ **IT IS NOT THE START PATH YET, AND THIS FILE WILL NOT PRETEND OTHERWISE.** Nothing renders or
+execs it today (`rg -ln harness-exec` finds only this shim, its suite and the shard list), so the Mac's
+launchd job still execs `~/orchestrator/launchd-controller.sh` — the home-dir copy #2231 names as its
+worst row. The two changes that put this shim on the start path are **#2271** (install resolves the
+pin and parses `ProgramArguments` back out of the rendered plist) and **#2020** (the TCC wrapper's
+content lifted into a commit). Until both land, the shim is inert: on this Mac it REFUSES (there is no
+pin — measured 2026-10-22), and `harness-exec.test.sh` arm 10 asserts exactly that rather than
+pretending the box is fixed.
 
 ### Which instrument answers which question (all three, and they DISAGREE by design)
 

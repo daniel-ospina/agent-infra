@@ -53,7 +53,7 @@ printf 'echo copy\n' > "$NOTGIT/orch-loop.sh"
 # ⛔ THE WORKTREE RECORDS ARE REMOVED, NOT JUST THE DIRECTORIES: deleting a registered worktree's
 # files leaves a stale record in the source repo's .git/worktrees.
 cleanup() {
-  for wt in "$TREE" "$TMP/side-pin"; do
+  for wt in "$TREE" "$TMP/side-pin" "$TMP/harness-dirty/$SHA12" "$TMP/named-root/$SHA12" "$TMP/plainwt"; do
     [ -e "$wt" ] || continue
     git -C "$SRC" worktree remove --force "$wt" >/dev/null 2>&1 || true
   done
@@ -65,7 +65,15 @@ trap cleanup EXIT
 OUT=""; RC=0
 run_shim() {
   local home="$1"; shift
-  OUT="$(HOME="$home" HARNESS_PIN_DIR="${PINROOT}" HARNESS_PIN="" HARNESS_PIN_FILE="" bash "$SHIM" "$@" 2>&1)"
+  OUT="$(HOME="$home" HARNESS_PIN_DIR="${GP_TEST_ROOT:-$PINROOT}" HARNESS_PIN="" HARNESS_PIN_FILE="" bash "$SHIM" "$@" 2>&1)"
+  RC=$?
+}
+# run_shim_noroot — the DEFAULT on a Mac: nothing exports HARNESS_PIN_DIR, so containment must be
+# proven from the records' own layout instead of being skipped (a review caught that the check was
+# conditional, which made #2216's "worktree nobody reads" untestable on the default path).
+run_shim_noroot() {
+  local home="$1"; shift
+  OUT="$(HOME="$home" HARNESS_PIN="" HARNESS_PIN_FILE="" bash "$SHIM" "$@" 2>&1)"
   RC=$?
 }
 # home_with <dir> <sha-line|-> <dir-line|-> — build a hermetic HOME carrying the two pin records.
@@ -191,6 +199,67 @@ case "$(bash "$BOX" --selftest 2>/dev/null | sed -n 's/^box: os=\([a-z]*\).*/\1/
   darwin) SKIP=$((SKIP+1)); printf 'SKIP scheduler-arm: macOS has launchd, but the live job still names a home-dir program (arm 10 asserts the shim REFUSES it); the install-side fix is #2271\n' ;;
   *)      SKIP=$((SKIP+1)); printf 'SKIP scheduler-arm: %s has no launchctl — answered by `bash %s --selftest` instead\n' "$(uname -s)" "scripts/lib/box.sh" ;;
 esac
+
+# ── arm 12: the ENTRY may not walk out of the pin (found by review: `--entry ../../../evil.sh` was
+# accepted and reported as a program under the harness dir).
+H12="$TMP/home-entry-escape"; home_with "$H12" "$SHA" "$HDIR"
+run_shim "$H12" --print --entry ../../../evil.sh
+if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q "'..' segment"; then
+  ok "entry-escape: a '..' entry is refused (an entrypoint that leaves the pin is not the pin)"
+else
+  bad "entry-escape: expected rc=78 '..' refusal, got rc=$RC out=$OUT"
+fi
+
+# ── arm 13: a SYMLINK inside the harness dir that points outside the pin (realpath containment).
+H13="$TMP/home-symlink"; home_with "$H13" "$SHA" "$HDIR"
+printf 'echo evil\n' > "$TMP/evil.sh"
+ln -sf "$TMP/evil.sh" "$HDIR/linked-entry.sh" 2>/dev/null
+run_shim "$H13" --print --entry linked-entry.sh
+if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q 'OUTSIDE the pinned tree'; then
+  ok "symlink-escape: an entry that RESOLVES outside the pin is refused"
+else
+  bad "symlink-escape: expected rc=78 OUTSIDE, got rc=$RC out=$OUT"
+fi
+rm -f "$HDIR/linked-entry.sh"
+
+# ── arm 14: a DIRTY pin is not the pin — uncommitted bytes inside the harness dir would run while the
+# record still claimed commit $SHA12 (#2231's own failure mode, one layer in).
+# ⛔ ITS OWN WORKTREE: dirtying the shared fixture would make every later arm report "dirty" instead of
+# the condition it exists to test (found the first time this arm was written).
+DROOT="$TMP/harness-dirty"; DW="$DROOT/$SHA12"; WD="$DW/scripts/orchestrator-harness"; mkdir -p "$DROOT"
+git -C "$SRC" worktree add -q --detach "$DW" "$SHA" >/dev/null 2>&1
+H14="$TMP/home-dirty"; home_with "$H14" "$SHA" "$WD"
+printf '\n# local hotfix never committed\n' >> "$WD/orch-loop.sh"
+GP_TEST_ROOT="$DROOT" run_shim "$H14" --print
+if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q 'UNCOMMITTED CHANGES'; then
+  ok "dirty-pin: uncommitted changes in the pinned harness dir are REFUSED"
+else
+  bad "dirty-pin: expected rc=78 UNCOMMITTED, got rc=$RC out=$OUT"
+fi
+# ⛔ NO RESTORE HERE: the fixture worktree is removed wholesale in cleanup, so an in-place revert would
+# be a discard this suite neither needs nor should perform.
+
+# ── arm 15/16: containment with NO pin root exported (the Mac default). A tree NOT named <sha12> is
+# refused; the SAME shape named <sha12> resolves — so the derived rule is a CHECK, not a blanket no.
+PLAIN="$TMP/plainwt"; mkdir -p "$TMP"
+git -C "$SRC" worktree add -q --detach "$PLAIN" "$SHA" >/dev/null 2>&1
+H15="$TMP/home-noroot-bad"; home_with "$H15" "$SHA" "$PLAIN/scripts/orchestrator-harness"
+run_shim_noroot "$H15" --print
+if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q 'worktree nobody reads'; then
+  ok "no-root-layout: with HARNESS_PIN_DIR unset, a tree not named <sha12> is still refused (#2216)"
+else
+  bad "no-root-layout: expected rc=78 layout refusal, got rc=$RC out=$OUT"
+fi
+NAMED="$TMP/named-root/$SHA12"; mkdir -p "$(dirname "$NAMED")"
+git -C "$SRC" worktree add -q --detach "$NAMED" "$SHA" >/dev/null 2>&1
+H16="$TMP/home-noroot-ok"; home_with "$H16" "$SHA" "$NAMED/scripts/orchestrator-harness"
+run_shim_noroot "$H16" --print
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qx "program=$NAMED/scripts/orchestrator-harness/orch-loop.sh"; then
+  ok "no-root-layout: the SAME shape named <sha12> resolves — containment proves, it does not blanket-refuse"
+else
+  bad "no-root-layout: expected rc=0 for a <sha12>-named tree, got rc=$RC out=$OUT"
+fi
+git -C "$SRC" worktree remove --force "$NAMED" >/dev/null 2>&1 || true
 
 printf '\nharness-exec.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1
