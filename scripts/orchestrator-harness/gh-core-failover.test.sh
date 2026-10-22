@@ -128,6 +128,12 @@ case "\$1 \$2" in
     else
       case "\$*" in
         *If-None-Match*)
+          if [ "\${GH_TEST_SCENARIO:-}" = "etagchg" ]; then
+            # the resource CHANGED, so the conditional GET is NOT free: this is the case that used to be
+            # retried into the pool the layer had measured as empty
+            printf 'HTTP/2.0 200 OK\r\nETag: "e2"\r\nContent-Type: application/json\r\n\r\n{"contexts":["pipeline-compliance"]}\r\n'
+            exit 0
+          fi
           # the ETag path's free revalidation: an unchanged resource costs NO quota
           printf 'HTTP/2.0 304 Not Modified\r\nETag: "e1"\r\n\r\n'
           ;;
@@ -867,6 +873,39 @@ printf '{"at": %s, "core": {"remaining": 0, "reset": %s' "$(date +%s)" "$(( $(da
 health coreok
 ck "(m24) a TORN budget.json is not a measurement (--health is gh-ok)" \
    $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+echo "── (m25) ROUND 9: an attributeless flag must not bypass the write guard, and a changed ───────"
+echo "         resource must not be retried into the empty pool ────────────────────────────────────────"
+# (m25) `makes_request` answers False for an argv `api_endpoint` cannot attribute (correct for the
+# RECOVERY question: an unattributable call must be no evidence). Gating the BUDGET GUARD on it made a
+# flag nobody listed a way to send a write into a pool measured at zero — measured: one request, and its
+# headerless refusal rewrote the dated record as undated so every later write was sent too.
+reset_env m25 coreok
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run coreok api --definitely-not-a-listed-flag -X POST repos/o/r/issues -f body=x
+ck "(m25) a WRITE with an unattributable flag is refused by name" \
+   $([ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+ck "(m25) … and it spends NO request" $([ ! -s "$STUB_LOG" ] && echo 0 || echo 1)
+
+# (m26) a cached validator offers a POSSIBLE 304, not a free request: when the resource has CHANGED the
+# conditional GET spends quota, and it must be the LAST thing spent — refused, never retried 4× with a
+# 599 s wait (the measured cost on `branches/main/protection`, the read that broke during the incident).
+reset_env m26 coreok
+unset GH_LIMIT_CONDITIONAL
+run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(m26) the validator is primed (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run etagchg api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(m26) a CHANGED resource costs exactly ONE request, not 4 (never retried into the empty pool) [n=$(reqs 'protection')]" \
+   $([ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(m26) … and the layer recorded that it stopped after one (no retry ladder)" \
+   $(grep -q 'speculative conditional read' "$GH_LIMIT_DIR/events.log" 2>/dev/null && echo 0 || { [ "$(grep -c 'attempt=1/4' "$GH_LIMIT_DIR/events.log")" -le 1 ] && [ "$(wc -l < "$STUB_LOG")" -eq 1 ] && echo 0 || echo 1; })
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
