@@ -763,6 +763,14 @@ function heredocLineExecutes(line: string, target: string, scope = line): boolea
   // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
   // names the target AND carries one is treated as executing it.
   if (/[<>]\(/.test(line) && heredocNamesTarget(line, target)) return true;
+  // FIND RUNS WHAT IT FINDS, so the target need not be named on the line (#1382 cycle 12 review, P0 —
+  // measured: `find . -execdir bash {}` masked the body, and `find` searches a TREE, so the written
+  // file may never appear by name). A NON-runner exec (`-exec rm {}`) is still naming, which is why
+  // the program word decides rather than the primary alone.
+  {
+    const prog = heredocFindExecProgram(line);
+    if (prog !== null && heredocWordIsProgram(prog)) return true;
+  }
   // ⛔ EVERY SEGMENT, not the whole line (#1382 review cycle 2, P1): `git status >/dev/null; bash
   // /tmp/r.sh` starts with `git`, so a whole-line command-word test ruled the LINE a naming command
   // and the body was masked while bash ran the file. A separator starts a new command, so each
@@ -784,6 +792,26 @@ function heredocLineExecutes(line: string, target: string, scope = line): boolea
     if (!heredocSegmentIsNaming(segment, scope)) return true;
   }
   return false;
+}
+
+/** Does this word name a PROGRAM that can run text handed to it? The ONE vocabulary shared by the
+ *  pipe arm and the `find -exec` arm, so the two cannot disagree. */
+function heredocWordIsProgram(w: string): boolean {
+  if (!w) return false;
+  return (
+    STDIN_PROGRAM_RUNNERS.has(w) ||
+    STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+    /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w)
+  );
+}
+
+/** The word after `find`'s exec primaries (`-exec`, `-execdir`, `-ok`, `-okdir`), or null. */
+function heredocFindExecProgram(line: string): string | null {
+  const words = line.trim().split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+  for (let i = 0; i < words.length; i++) {
+    if (/^-(exec|execdir|ok|okdir)$/.test(words[i]) && words[i + 1]) return words[i + 1];
+  }
+  return null;
 }
 
 /** Is any stage AFTER the first of this line's pipeline a PROGRAM RUNNER (`… | bash`,
@@ -809,10 +837,7 @@ function heredocPipedIntoProgram(line: string): boolean {
   // stage would re-break the ordinary `cat x.md | grep -i "sh"`, which is the false positive this
   // whole change removes.
   const deGroup = (w: string) => w.replace(/^[({!]+/, "").replace(/[)};]+$/, "");
-  const isRunner = (w: string): boolean =>
-    !!w &&
-    (STDIN_PROGRAM_RUNNERS.has(w) || STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
-      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w));
+  const isRunner = heredocWordIsProgram;
   // ⛔ A TOKEN BEFORE THE PROGRAM HIDES IT (#1382 cycle 10 review, P0 — measured: `| FOO=1 bash` and
   // `| 2>/dev/null bash` both executed the written file while the body stayed masked). An assignment
   // prefix and a leading redirection are both ordinary spellings, so they are SKIPPED — never the
@@ -1018,6 +1043,11 @@ function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
   // — applying it here is what makes the two halves of the proof agree. The scope is the whole
   // command (over-conservative on ordering), which keeps a body readable, the allowed direction.
   if (heredocReaderIsShadowed(scope, commandWord)) return false;
+  // ⛔ `find` IS NOT A NAMER WHEN IT EXECUTES (#1382 cycle 12 review, P0 — measured: `find x.sh -exec
+  // bash {} \;` ran the body WHILE IT WAS MASKED, and five spellings that were REFUSED at e4e78a6f
+  // — `-exec`, `-exec bash {} +`, `-name … -exec`, `-execdir`, `-ok` — became masks the moment `find`
+  // joined the naming set wholesale). Its other primaries only name a file, which is why the whole
+  // command was tempting; the exec primaries are the exception, and they are the one that matters.
   if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
   if (commandWord !== "git") return false;
   // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).

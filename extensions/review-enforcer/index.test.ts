@@ -6812,6 +6812,29 @@ test("#1382-c11 (1) P0: the naming exemption is not a proof when the NAME is sha
   }
 });
 
+test("#1382-c12 P0: `find` is not a namer when it EXECUTES — and `-execdir` need not name the file", () => {
+  // Cycle 12, measured: `find x.sh -exec bash {} \;` ran the body WHILE IT WAS MASKED, and five
+  // spellings REFUSED at e4e78a6f became masks the moment `find` joined the naming set wholesale.
+  // `find` executes what it FINDS, so the target need not be named on the line (`-execdir bash {}`
+  // over a tree). The decision is the EXEC PROGRAM, not the primary: `-exec rm {}` still only names.
+  const M = "gh pr merge 999 --admin";
+  const w = (t: string) => `cat > ${t} <<'EOF'\n${M}\nEOF\n`;
+  for (const cmd of [
+    `find x.sh -exec bash {} \;`,
+    `find x.sh -exec bash {} +`,
+    `find . -name 'x.*' -exec bash {} \;`,
+    `find . -execdir bash {} \;`,
+    `find x.sh -ok bash {} \;`,
+    `find . -exec sh {} \;`,
+    `find . -exec python3 {} \;`,
+  ]) {
+    ok(countMergeVerbs(maskHeredocData(w("x.sh") + cmd)) > 0, `a find that EXECUTES must keep the body readable: ${cmd}`);
+  }
+  for (const cmd of [`find . -name '*.md'`, `find . -name '*.md' -exec rm {} \;`]) {
+    equal(countMergeVerbs(maskHeredocData(w("notes.md") + cmd)), 0, `a find that only NAMES must still mask: ${cmd}`);
+  }
+});
+
 test("#1382-c11 (2) P1: an invalid glob class must not throw out of the gate", () => {
   // Measured: a run spelling `f.sh[z-a]` after writing `f.sh` threw "Range out of order in character
   // class" from `maskHeredocData` inside the `tool_call` handler. It fails CLOSED today (pi blocks a
