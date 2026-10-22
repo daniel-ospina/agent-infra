@@ -129,14 +129,25 @@ if [ "$cmd" = "status" ]; then
     . "$_ramod"
   fi
   if ! declare -f gh_chain_read merge_contract_read >/dev/null 2>&1; then
-    LAND_GH_DETAIL="repo-authority.sh ${_ramod:+at $_ramod}${_ramod:-is MISSING} defines no gh_chain_read/merge_contract_read — the landing read is UNVERIFIABLE (a stale \$O copy; re-seed it). An unanswered read is not a pass"
+    # ⛔ ONE BRANCH PER FACT. `"${x:+at $x}${x:-is MISSING}"` CONCATENATES both arms when x is set
+    # (fresh review P2): on a pre-#2320 `$O` — the state every deployed box is in until it is re-seeded —
+    # the operator's one diagnostic named `<path><path>`, a file that cannot exist.
+    if [ -n "$_ramod" ]; then
+      LAND_GH_DETAIL="repo-authority.sh at $_ramod defines no gh_chain_read/merge_contract_read — the landing read is UNVERIFIABLE (a stale \$O copy; re-seed it). An unanswered read is not a pass"
+    else
+      LAND_GH_DETAIL="no repo-authority.sh in \$O or beside this command — the landing read is UNVERIFIABLE (an absent module is not a pass)"
+    fi
   else
     _ghline="$(gh_chain_read 2>/dev/null)"; _ghrc=$?
     case "$_ghline" in
       'GH=OK'*)
-        LAND_GH="OK"; LAND_GH_SOURCE="$(printf '%s\n' "$_ghline" | sed -n 's/.* source=\([^ ]*\).*/\1/p')"
-        LAND_GH_PATH="$(printf '%s\n' "$_ghline" | sed -n 's/.* path=\([^ ]*\).*/\1/p')"
-        LAND_GH_VER="$(printf '%s\n' "$_ghline" | sed -n 's/.* ver=\(.*\)$/\1/p')" ;;
+        # `path=` IS LAST in the protocol, so it is taken to end-of-line and a path containing a SPACE
+        # survives (fresh review P2: with the old order `/Volumes/My Passport/…` truncated at the
+        # space, so the printed remedy path and `landing.ghPath` named a file that does not exist).
+        LAND_GH="OK"
+        LAND_GH_SOURCE="$(printf '%s\n' "$_ghline" | sed -n 's/.* source=\([^ ]*\) .*/\1/p')"
+        LAND_GH_VER="$(printf '%s\n' "$_ghline" | sed -n 's/.* ver=\(.*\) path=.*/\1/p')"
+        LAND_GH_PATH="$(printf '%s\n' "$_ghline" | sed -n 's/.* path=//p')" ;;
       'GH=CANNOT-REACH-REAL-GH'*)
         LAND_GH="CANNOT-REACH-REAL-GH"
         LAND_GH_DETAIL="$(printf '%s\n' "$_ghline" | sed -n 's/^GH=CANNOT-REACH-REAL-GH msg=//p')" ;;
@@ -157,14 +168,13 @@ if [ "$cmd" = "status" ]; then
       LAND_REPO="$(derive_or "$REPO_ROOT" "${OR:-}" 2>/dev/null)" || LAND_REPO=""
     fi
     # ⛔ ASKED THROUGH `gh` (the box's chain), NOT the resolved absolute path — see the note on
-    # `merge_contract_read`. The resolved path is exported as the seam's pin for THIS child only, so a
-    # chain whose first hop is the agent shim resolves without walking again; the layers that ignore
-    # the seam walk PATH as they always do, which is exactly the path a worker's call takes.
+    # `merge_contract_read`. No pin is exported for this call: `ensure_agent_gh_real` is the ONLY
+    # place that exports `AGENT_GH_REAL`, and it exports only a COMPILED BINARY (fresh review P1: an
+    # unconditional export here handed a script-valued resolution to the chain, which is exactly the
+    # #2266 re-entry this change exists to prevent). A chain that gets here answered `gh version`, so
+    # it needs no pin to answer the protection read.
     _congh=""
-    if [ "$LAND_GH" = "OK" ]; then
-      _congh="gh"
-      if [ -n "$LAND_GH_PATH" ]; then AGENT_GH_REAL="$LAND_GH_PATH"; export AGENT_GH_REAL; fi
-    fi
+    if [ "$LAND_GH" = "OK" ]; then _congh="gh"; fi
     _conline="$(merge_contract_read "$LAND_REPO" "$_congh" 2>/dev/null)"
     case "$_conline" in
       'CONTRACT=OK'*)

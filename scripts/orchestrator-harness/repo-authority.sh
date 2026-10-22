@@ -292,6 +292,26 @@ _gh_is_agent_shim() {
   return 1
 }
 
+# _gh_is_binary <path> — is this file a COMPILED binary (ELF / Mach-O / PE)?
+# ⛔ THIS IS THE TEST THE PIN NEEDS, AND `head -c 2 … != '#!'` IS NOT IT (fresh review P1). A script
+# without a shebang is a legal wrapper (the shell falls back to running it as sh) and starts with
+# something else, so a two-byte test pinned a WRAPPER — the #2266 recursion — while this module's own
+# comment said a script is never exported. The test is POSITIVE: a real `gh` is a compiled binary on
+# every platform this fleet runs (a Go build: ELF, Mach-O or PE), so magic bytes decide it and an
+# unrecognised file is simply not pinned. `od` is POSIX and yields TEXT, so no NUL byte ever reaches a
+# shell variable (a NUL there would print a warning on the caller's stderr, #2184's class).
+_gh_is_binary() {
+  local m
+  [ -f "${1:-}" ] || return 1
+  m="$(od -A n -t x1 -N 4 "$1" 2>/dev/null | tr -d ' \n')"
+  case "$m" in
+    7f454c46) return 0 ;;   # ELF     (\x7fELF) — Linux
+    4d5a*)    return 0 ;;   # PE/COFF (MZ)     — Windows
+    cffaedfe|feedface|cefaedfe|feedfacf|cafebabe|bebafeca) return 0 ;;  # Mach-O / fat — macOS
+  esac
+  return 1
+}
+
 # _gh_bounded <secs> <cmd…> — `timeout` -> `gtimeout` -> a direct run (see the residual note above).
 _gh_bounded() {
   local s="${1:-}"; shift 2>/dev/null || true
@@ -358,30 +378,45 @@ gh_probe_real() {
 }
 
 # gh_chain_read — THE read. One line on stdout, so a caller can parse it without a second format:
-#   GH=OK path=<resolved> source=<env|path> ver=<version line>          rc 0
-#   GH=CANNOT-REACH-REAL-GH msg=<the chain's own refusal>               rc 1
-#   GH=UNVERIFIABLE why=<token> msg=<detail>                            rc 2
+#   GH=OK source=<env|path> ver=<version line> path=<resolved>          rc 0
+#   GH=CANNOT-REACH-REAL-GH msg=<why>                                  rc 1
+#   GH=UNVERIFIABLE why=<token> msg=<detail>                           rc 2
+# ⛔ `path=` IS LAST, AND THAT IS STRUCTURAL, NOT COSMETIC (fresh review P2). Every other field can
+# then be parsed with `[^ ]*` and the path — the ONE value that may legally contain a SPACE
+# (`/Volumes/My Passport/…` is ordinary on macOS, the platform this incident was measured on) — is
+# taken as everything to end-of-line. With the old order a path with a space was silently truncated,
+# so the operator's remedy line named a file that does not exist and `landing.ghPath` was wrong.
 # ⛔ CANNOT-REACH IS NOT UNVERIFIABLE. The first is a POSITIVE finding — every gh on this box is a
 # shim and a depth guard is what ends the call — and its consequence is stated by the caller ("a box
 # without a real gh cannot land anything"). The second is "the probe could not answer", which is
 # never a pass either.
 gh_chain_read() {
-  local _ifs_save p cand detail rc msg="" seen="" dup
+  local _ifs_save p cand detail rc msg="" seen="" dup _s pmsg="" wmsg=""
   # ⛔ `$IFS` IS ASSIGNED UNCONDITIONALLY, NEVER VIA `${IFS:-}`. Bash always initialises IFS, so a
   # `:-` default can only ever fire when the caller DELETED it — and restoring `IFS=""` there would
   # silently disable word splitting for the REST of that caller's shell (every later `for x in $y`
   # would iterate once). `_ifs_save=$IFS` is the faithful save.
+  # ⛔ EVERY LOOP VARIABLE IS `local` (#fresh review P2: `_s` was not). This module is SOURCED, so a
+  # stray assignment lands in the caller's shell for the rest of a controller cycle.
   _ifs_save=$IFS
   # ── (1) THE SEAM, FIRST — it is what the agent shim itself honours and what the fleet pins per box.
   if [ -n "${AGENT_GH_REAL:-}" ]; then
     if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
        && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}"; then
       if detail="$(gh_probe_real "${AGENT_GH_REAL}")"; then
-        printf 'GH=OK path=%s source=env ver=%s\n' "${AGENT_GH_REAL}" "$detail"; return 0
+        printf 'GH=OK source=env ver=%s path=%s\n' "$detail" "${AGENT_GH_REAL}" ; return 0
       fi
-      msg="AGENT_GH_REAL=${AGENT_GH_REAL} does not answer as a gh ($detail)"
+      pmsg="AGENT_GH_REAL=${AGENT_GH_REAL} does not answer as a gh ($detail)"
+    elif [ ! -f "${AGENT_GH_REAL}" ] || [ ! -x "${AGENT_GH_REAL}" ]; then
+      # ⛔ FOUR DIFFERENT FAILURES, FOUR DIFFERENT SENTENCES (#fresh review P2). The shared arm
+      # called a MISSING file, a non-executable and a directory "a harness shim" — so the issue's own
+      # measured path (`/opt/homebrew/bin/gh`, which does not exist on that Mac) was diagnosed as
+      # shim-ness, sending the operator after a chain problem instead of a missing binary.
+      pmsg="AGENT_GH_REAL=${AGENT_GH_REAL} is not an executable regular file"
+    elif _gh_is_agent_shim "${AGENT_GH_REAL}"; then
+      pmsg="AGENT_GH_REAL=${AGENT_GH_REAL} is the argv-level gh shim, not a real gh — refused, because a value that IS a shim re-enters the chain (#2266)"
     else
-      msg="AGENT_GH_REAL=${AGENT_GH_REAL} is a harness shim, not a real gh — refused, because a value that IS a shim re-enters the chain (#2266)"
+      pmsg="AGENT_GH_REAL=${AGENT_GH_REAL} is a harness gh layer, not a real gh — refused, because a value that IS a shim re-enters the chain (#2266)"
     fi
   fi
   # ── (2) THE PATH WALK — find_real_gh's rules, in its order.
@@ -398,24 +433,32 @@ gh_chain_read() {
     IFS=:
     [ "$dup" -eq 1 ] && continue
     if _gh_is_harness_layer "$cand"; then
-      [ -n "$msg" ] || msg="$cand is a harness gh layer (its own sentinel), not the real binary"
+      [ -n "$wmsg" ] || wmsg="$cand is a harness gh layer (its own sentinel), not the real binary"
       continue
     fi
     if _gh_is_agent_shim "$cand"; then
-      [ -n "$msg" ] || msg="$cand is the argv-level gh shim, not the real binary"
+      [ -n "$wmsg" ] || wmsg="$cand is the argv-level gh shim, not the real binary"
       continue
     fi
     detail="$(gh_probe_real "$cand" 1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       IFS="$_ifs_save"
-      printf 'GH=OK path=%s source=path ver=%s\n' "$cand" "$detail"
+      printf 'GH=OK source=path ver=%s path=%s\n' "$detail" "$cand"
       return 0
     fi
     # rc 1 (refused) is the finding this read exists for; keep the chain's words. rc 2 is a weaker
     # datum — recorded only when nothing better exists.
-    if [ "$rc" -eq 1 ] || [ -z "$msg" ]; then msg="$cand: $detail"; fi
+    if [ "$rc" -eq 1 ] || [ -z "$wmsg" ]; then wmsg="$cand: $detail"; fi
   done
   IFS="$_ifs_save"
+  # ⛔ THE WALK'S DATUM OUTRANKS THE PIN'S DIAGNOSIS, AND NEITHER IS DROPPED (#fresh review P2). They
+  # describe different things — what the PATH found, and why the inherited pin was unusable — and the
+  # previous single slot let a pin diagnosis SUPPRESS the accurate finding (`…/shims/gh is the
+  # argv-level gh shim`), which is the line an operator acts on.
+  msg="$wmsg"
+  if [ -n "$pmsg" ]; then
+    if [ -n "$msg" ]; then msg="$msg (also: $pmsg)"; else msg="$pmsg"; fi
+  fi
   if [ -n "$msg" ]; then
     printf 'GH=CANNOT-REACH-REAL-GH msg=%s\n' "$msg"; return 1
   fi
@@ -458,15 +501,16 @@ merge_contract_read() {
 # ensure_agent_gh_real — export the ONE real gh this box resolves, so no layer can hop back into the
 # chain. rc 0 = a pin is in place (honoured or newly discovered); rc 1 = nothing resolvable, so the
 # box keeps its current behaviour and `bin/harness status` NAMES that state (never silence).
-# ⛔ ONLY A REGULAR, EXECUTABLE **BINARY** IS EVER EXPORTED. A `#!…` file is a wrapper: every harness
-# layer AND the agent shim are scripts, and an `AGENT_GH_REAL` naming one re-enters the chain —
-# measured in #2266 (2,543 shim processes, every gh call on the box dead for ~10 hours) and refused
-# at the seam by PR #2295. A WRONG PIN IS WORSE THAN NO PIN, so a script is skipped, never exported.
+# ⛔ ONLY A COMPILED BINARY IS EVER EXPORTED (`_gh_is_binary`). Every harness layer AND the agent shim
+# are shell scripts, and an `AGENT_GH_REAL` naming one re-enters the chain — measured in #2266 (2,543
+# shim processes, every gh call on the box dead for ~10 hours) and refused at the seam by PR #2295. A
+# WRONG PIN IS WORSE THAN NO PIN, so an unrecognised file is skipped, never exported — and a box whose
+# `gh` IS a script keeps today's behaviour (the read still reports OK; nothing is pinned).
 # ⛔ A PROVABLY-BROKEN INHERITED VALUE IS REPLACED; an operator's working one is not. A value that is
 # a harness layer or the agent shim cannot be a preference — it IS the recursion — so it is dropped
 # and re-resolved. Anything else that is executable is honoured as given.
 ensure_agent_gh_real() {
-  local line p hdr
+  local line p
   if [ -n "${AGENT_GH_REAL:-}" ]; then
     if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
        && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}"; then
@@ -483,10 +527,10 @@ ensure_agent_gh_real() {
   fi
   line="$(gh_chain_read 2>/dev/null)" || return 1
   case "$line" in GH=OK*) ;; *) return 1 ;; esac
-  p="${line#*path=}"; p="${p%% *}"
+  # `path=` is LAST in the protocol, so everything after it IS the path — spaces included.
+  p="${line#* path=}"
   [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ] || return 1
-  hdr="$(head -c 2 "$p" 2>/dev/null)"
-  [ "$hdr" = '#!' ] && return 1
+  _gh_is_binary "$p" || return 1
   AGENT_GH_REAL="$p"; export AGENT_GH_REAL
   return 0
 }

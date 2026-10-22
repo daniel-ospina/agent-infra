@@ -169,7 +169,7 @@ echo "── §4 a real gh that answers: OK, WITH the resolved path printed ─�
 mkdir -p "$TMP/o5"; mko "$TMP/o5" no_candidate
 OUT5="$(status "$TMP/o5" "$GOODD:$MIN")"
 ck "gh=OK with the RESOLVED PATH (an operator can point AGENT_GH_REAL at it)" \
-   "$(q "gh=OK path=$GOODD/gh" "$OUT5" && echo 0 || echo 1)"
+   "$(q "path=$GOODD/gh" "$OUT5" && echo 0 || echo 1)"
 ck "…naming where it came from (source=path)" "$(q 'source=path' "$OUT5" && echo 0 || echo 1)"
 ck "…and the contract OK with its contexts" \
    "$(q 'contract=OK' "$OUT5" && q 'required=\[pipeline-compliance\]' "$OUT5" && echo 0 || echo 1)"
@@ -177,6 +177,42 @@ OUT5J="$(env PATH="$GOODD:$MIN" OR=acme/widget O="$TMP/o5" bash "$HARNESS_BIN" s
 _j5="$(printf '%s' "$OUT5J" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["landing"]["ok"], d["landing"]["ghPath"], d["landing"]["required"], d["landing"]["contractRepo"])' 2>&1)"
 ck "…and the JSON carries ok/path/required/repo (got: $_j5)" \
    "$([ "$_j5" = "True $GOODD/gh pipeline-compliance acme/widget" ] && echo 0 || echo 1)"
+
+# ⛔ A PATH WITH A SPACE MUST SURVIVE THE ROUND TRIP (fresh review P2). `path=` is the LAST field of
+# the one-line protocol for exactly this; with the old order the printed remedy path and the JSON's
+# `ghPath` both stopped at the space — naming a file that does not exist.
+SPACED="$TMP/with space/bin"; mkdir -p "$SPACED"
+cp "$GOODD/gh" "$SPACED/gh"; chmod +x "$SPACED/gh"
+mkdir -p "$TMP/o5b"; mko "$TMP/o5b" no_candidate
+OUT5B="$(status "$TMP/o5b" "$SPACED:$MIN")"
+_printed="$(printf '%s\n' "$OUT5B" | sed -n 's/.* path=//p' | head -1)"
+ck "a resolved path containing a SPACE is printed WHOLE (got: ${_printed:-<none>})" \
+   "$(q "path=$SPACED/gh" "$OUT5B" && echo 0 || echo 1)"
+OUT5BJ="$(env PATH="$SPACED:$MIN" OR=acme/widget O="$TMP/o5b" bash "$HARNESS_BIN" status --json 2>&1)"
+_j5b="$(printf '%s' "$OUT5BJ" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["landing"]["ghPath"])' 2>&1)"
+ck "…and the JSON's ghPath is the same whole path (got: ${_j5b:-<none>})" \
+   "$([ "$_j5b" = "$SPACED/gh" ] && echo 0 || echo 1)"
+
+# ⛔ AND `status` MUST NOT PIN A SCRIPT (fresh review P1). It asks the chain it has just proved
+# answers, so it exports nothing; this stub records the env it was handed on the protection call and
+# the pin must be EMPTY. `ensure_agent_gh_real` is the ONLY exporter, and it exports only a compiled
+# binary — an unconditional export here handed a script-valued resolution to the chain, which is the
+# #2266 re-entry this change exists to prevent.
+RECD="$TMP/recd"; mkdir -p "$RECD"; PINLOG="$TMP/pinlog"
+cat > "$RECD/gh" <<STUBPIN
+#!/usr/bin/env bash
+case "\$*" in
+  *--version*) printf 'gh version 9.9.9 (test-stub)\n' ;;
+  *protection/required_status_checks*) printf '%s' "\${AGENT_GH_REAL-<unset>}" > "$PINLOG"; printf 'pipeline-compliance\n' ;;
+  *) exit 1 ;;
+esac
+STUBPIN
+chmod +x "$RECD/gh"
+mkdir -p "$TMP/o5c"; mko "$TMP/o5c" no_candidate
+env -u AGENT_GH_REAL PATH="$RECD:$MIN" OR=acme/widget O="$TMP/o5c" bash "$HARNESS_BIN" status >/dev/null 2>&1
+_pl="$(cat "$PINLOG" 2>/dev/null)"
+ck "status exports NO pin to the chain it just proved answers (got: '${_pl:-<no call>}', want '<unset>')" \
+   "$([ "$_pl" = "<unset>" ] && echo 0 || echo 1)"
 
 # ── §5 an EMPTY protection read is UNREADABLE ───────────────────────────────────────────────────────
 echo
@@ -210,13 +246,25 @@ ck "a shim-only box exports NOTHING (got: ${_pin_script:-<empty>})" \
 _pin_stub="$(env -u AGENT_GH_REAL PATH="$GOODD:$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
 ck "a gh-shaped SCRIPT is refused as a pin too (a wrapper re-enters the chain, #2266) (got: ${_pin_stub:-<empty>})" \
    "$([ "$_pin_stub" = "<none>" ] && echo 0 || echo 1)"
+# ⛔ A SHEBANG-LESS WRAPPER IS THE CASE THE FIRST FIX MISSED (fresh review P1): the gate was
+# `head -c 2 … != '#!'`, and a script whose shebang is not on byte 1 still EXECUTES (the shell falls
+# back to running it as sh), so it was pinned. The pin now requires a COMPILED BINARY (_gh_is_binary).
+NOSHEBANG="$TMP/noshebang"; mkdir -p "$NOSHEBANG"
+printf '\n#!/usr/bin/env bash\ncase "$*" in *--version*) printf "gh version 9.9.9 (test-stub)\\n" ;; *) exit 1 ;; esac\n' > "$NOSHEBANG/gh"
+chmod +x "$NOSHEBANG/gh"
+_pin_nosheb="$(env -u AGENT_GH_REAL PATH="$NOSHEBANG:$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
+ck "a SHEBANG-LESS wrapper is refused as a pin too (got: ${_pin_nosheb:-<empty>})" \
+   "$([ "$_pin_nosheb" = "<none>" ] && echo 0 || echo 1)"
 _broken_pin="$(env AGENT_GH_REAL="$SHIMD/gh" PATH="$GOODD:$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
 ck "a PROVABLY-BROKEN inherited pin (a shim) is dropped, not honoured (got: ${_broken_pin:-<empty>})" \
    "$([ "$_broken_pin" = "<none>" ] && echo 0 || echo 1)"
 # A REAL binary is the only thing that can be pinned — and only a host that has one can prove it.
+# (The magic-byte test is `_gh_is_binary`, so the probe here uses the same property the code does.)
 REALGH=""
 for d in /usr/bin /bin /usr/local/bin /opt/homebrew/bin; do
-  if [ -x "$d/gh" ] && [ "$(head -c 2 "$d/gh" 2>/dev/null)" != '#!' ]; then REALGH="$d/gh"; break; fi
+  if [ -x "$d/gh" ] && [ -n "$(od -A n -t x1 -N 4 "$d/gh" 2>/dev/null | tr -d ' \n' | grep -E '^(7f454c46|4d5a|cffaedfe|feedface|cefaedfe|feedfacf|cafebabe|bebafeca)')" ]; then
+    REALGH="$d/gh"; break
+  fi
 done
 if [ -n "$REALGH" ]; then
   _real_pin="$(env -u AGENT_GH_REAL PATH="$(dirname "$REALGH"):$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
@@ -225,6 +273,25 @@ if [ -n "$REALGH" ]; then
 else
   echo "  ⏭  skip: this host has no binary gh to pin (the script-refusal arms above still ran)"
 fi
+
+# ── §6b the PIN DIAGNOSIS names the real cause, and never suppresses the walk's finding ─────────────
+# Fresh review P2: one shared sentence called a MISSING file "a harness shim" (the issue's own measured
+# path, `/opt/homebrew/bin/gh`, is a missing file), and a pin diagnosis SUPPRESSED the walk's accurate
+# datum. Both are operator-facing claims, so both are asserted.
+echo
+echo "── §6b an unusable pin is diagnosed by WHAT IT IS, and the walk's datum survives ──"
+_read_pin() { # _read_pin <AGENT_GH_REAL value> <PATH>
+  env AGENT_GH_REAL="$1" PATH="$2" bash -c '. "$1"; gh_chain_read' _ "$RA" 2>&1
+}
+_m1="$(_read_pin /nonexistent/homebrew/bin/gh "$MIN")"
+ck "a MISSING pin is 'not an executable regular file', not 'a harness shim'" \
+   "$(q 'is not an executable regular file' "$_m1" && nq 'harness gh layer' "$_m1" && echo 0 || echo 1)"
+_m2="$(_read_pin "$SHIMD/gh" "$MIN")"
+ck "the AGENT shim as a pin is named AS the agent shim (it is not a 'harness layer')" \
+   "$(q 'argv-level gh shim' "$_m2" && nq 'harness gh layer' "$_m2" && echo 0 || echo 1)"
+_m3="$(_read_pin /nonexistent/homebrew/bin/gh "$SHIMD:$MIN")"
+ck "the WALK's datum is not suppressed by the pin diagnosis (both appear)" \
+   "$(q 'argv-level gh shim' "$_m3" && q 'not an executable regular file' "$_m3" && echo 0 || echo 1)"
 
 # ── §7 MUTATION CONTROLS — prove the assertions are not vacuous ─────────────────────────────────────
 echo
@@ -271,6 +338,25 @@ PY
 mk2_out="$(env PATH="$EMPTYD:$MIN" OR=acme/widget O="$TMP/o6" bash "$MUT/bin/harness" status 2>&1)"
 ck "MUTANT (empty contract = pass): the UNREADABLE verdict is GONE — so §5 is real" \
    "$(nq 'contract=UNREADABLE' "$mk2_out" && q 'contract=OK' "$mk2_out" && echo 0 || echo 1)"
+
+# (c) A PRE-#2320 `$O` COPY must be NAMED, not concatenated (fresh review P2). Every deployed box is in
+# this state until it is re-seeded, so the one diagnostic it gets must name a file that exists.
+STALE="$MUT/scripts/orchestrator-harness/repo-authority.sh"
+python3 - "$STALE" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+before = s
+i = s.index("# THE LANDING READ")
+s = s[:i]
+assert s != before, "mutation target not found — the landing block moved; update this control"
+open(p, "w").write(s)
+PY
+stale_out="$(env PATH="$SHIMD:$MIN" O="$O1" bash "$MUT/bin/harness" status 2>&1)"
+ck "MUTANT (a PRE-#2320 module): the read is UNVERIFIABLE and the reason NAMES the file" \
+   "$(q 'gh=UNVERIFIABLE' "$stale_out" && q "at $STALE" "$stale_out" && echo 0 || echo 1)"
+ck "…and the message does not concatenate the two arms into a path that cannot exist" \
+   "$(nq "$STALE$STALE" "$stale_out" && echo 0 || echo 1)"
 
 echo
 echo "──────── landing-read: $PASS passed, $FAIL failed ────────"
