@@ -111,6 +111,38 @@ export const REVIEWER_PREFLIGHT_RECORD_CMD =
   "~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>";
 export const REVIEWER_PREFLIGHT_RAIL_CMD = "scripts/admin-merge.sh <PR>";
 
+/**
+ * The CARRY, disclosed because the code has supported it all along and the line never said so (#2343).
+ *
+ * Measured 2026-11-19 on two batch-landing lanes: each held a VALID record whose DIFF was unchanged,
+ * read "this lane must dispatch a reviewer" as "pay for a review", and spent 20–40 minutes on one it
+ * did not owe — one lane stopped entirely, because the sentence's own escape hatch ("If your brief
+ * says you have no `task` tool … do NOT merge") read as "I cannot proceed" with nothing saying the
+ * existing record still lands the PR.
+ *
+ * WHY THIS IS NOT A WEAKENING. `record-review.sh` decides the carry itself — `CARRY_ARM="diff"` when
+ * a prior signed diff marker matches the current diff, else `"lane"` when `lane_dimension_carry`
+ * holds (`:1942-1946`), writing `"mint":"carried"` (`:2251`); a carry needs no `--evidence` (`:99-103`,
+ * and the fresh-mint guard it bypasses is `:2008`), and the merge gate's carry arm allows the merge
+ * only when both `diff_sha256` values are full 64-hex and equal (extensions/review-enforcer/index.ts,
+ * `record.diff_sha256 === currentDiffHash`). So this sentence names a path the gate ALREADY takes; it
+ * changes no decision, and its last clause keeps the requirement intact for every fresh mint.
+ *
+ * THREE FACTS THE WORDING MUST CARRY, each verified against the script (a first draft got all three
+ * wrong and a fresh review caught it — the tests pin PROSE, so they could not):
+ *   (i) THE HEAD YOU PASS IS THE RECORDED ONE. The whole carry block sits inside
+ *       `elif [ "$CURRENT_HEAD" != "$SHA" ]` (`:1902`), so passing the LIVE head is not a carry — it is
+ *       a FRESH mint, refused without `--evidence` (`:2008`, exit 3). Say "the head that record
+ *       already names", or the lane is handed a command that cannot work.
+ *   (ii) A "BASE-ONLY MOVE" IS A FORWARD MERGE, NOT A REBASE. `lane_dimension_carry` requires the
+ *       reviewed head to be an ANCESTOR of the live head (`:1377`: "A rewritten/rebased head is a
+ *       DIFFERENT artifact … must never carry this way"), so a rebase does NOT carry.
+ *   (iii) THE TARGET HEAD'S HEALTH VETOES (#1575 clause E, `:1951`). An unchanged artifact on a
+ *       measurably RED head is refused, so "provably unchanged" alone overclaims.
+ */
+export const REVIEWER_PREFLIGHT_CARRY_CLAUSE =
+  'CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head that record already names (the REVIEWED head, not the live one) and record-review.sh re-binds the same verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head and does NOT carry). A FRESH mint still requires the dispatched reviewer';
+
 /** The brief template that a controller copies instead of improvising one (#2148 part 2). */
 export const REVIEWER_PREFLIGHT_BRIEF_TEMPLATE = "templates/LANE-BRIEF.md";
 
@@ -195,7 +227,7 @@ export function reviewerPreflightLine(
   }
   return (
     `${REVIEWER_PREFLIGHT_TAG} #2148 preflight: this lane ${REVIEWER_PREFLIGHT_REQUIREMENT} — ` +
-    `${commandTrail()}. ${HEAD_BINDING}. ${NO_MARKER_HEDGE}${bypass}`
+    `${commandTrail()}. ${HEAD_BINDING}. ${REVIEWER_PREFLIGHT_CARRY_CLAUSE}. ${NO_MARKER_HEDGE}${bypass}`
   );
 }
 
@@ -227,8 +259,9 @@ export function reviewerFirstPushNotice(
   }
   return (
     `${REVIEWER_PREFLIGHT_TAG} #2148 first push: NO reviewer dispatch in this session yet, so the ` +
-    `rail will refuse at the finish line. Do it NOW, while the context is live — ` +
-    `${commandTrail()}. ${HEAD_BINDING}. ${NO_MARKER_HEDGE}${bypass}`
+    `rail will refuse at the finish line UNLESS a valid record already covers this artifact. Do it ` +
+    `NOW, while the context is live — ${commandTrail()}. ${HEAD_BINDING}. ` +
+    `${REVIEWER_PREFLIGHT_CARRY_CLAUSE}. ${NO_MARKER_HEDGE}${bypass}`
   );
 }
 

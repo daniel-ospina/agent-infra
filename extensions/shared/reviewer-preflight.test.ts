@@ -26,6 +26,11 @@
  *       otherwise the lane is handed a command that fails exactly when it is trying to land.
  *   (f) THE TEMPLATE CARRIES THE STEP. The controller-written brief is where the requirement was
  *       omitted by hand three times on 2026-10-19.
+ *   (g) THE CARRY IS NOT OMITTED (#2343). A lane holding a valid record at an unchanged DIFF owes
+ *       no second review — `record-review.sh` re-binds the verdict itself (`mint:"carried"`, no
+ *       `--evidence`) and the merge gate allows an equal diff digest. A disclosure silent about it
+ *       costs a 20–40 minute review per lane; two lanes paid that on 2026-11-19. The pin asserts
+ *       the clause AND that it sits after the trail, so a reflow cannot smuggle it to the front.
  *
  * Zero-dependency (stdlib only): CI runs `extensions/shared/*.test.ts` BEFORE the extensions'
  * npm ci, so this suite must not import a pi-using module.
@@ -44,6 +49,7 @@ import {
   REVIEWER_PREFLIGHT_DISPATCH_CMD,
   REVIEWER_PREFLIGHT_RECORD_CMD,
   REVIEWER_PREFLIGHT_RAIL_CMD,
+  REVIEWER_PREFLIGHT_CARRY_CLAUSE,
   REVIEWER_PREFLIGHT_BRIEF_TEMPLATE,
   reviewerPreflightLine,
   reviewerPreflightMessage,
@@ -101,6 +107,80 @@ ok(
 ok(
   line.includes("post the reviewer's verdict as a PR comment"),
   "it says the verdict must be POSTED as a PR comment (that comment is the --evidence artifact)",
+);
+
+/** The stale-head sentence the carry qualifies — duplicated here (not imported) so the ORDER pin
+ * reads the rendered line rather than trusting the constant it is checking. */
+const HEAD_BINDING_TEXT =
+  "a record bound to an older head is stale and the rail refuses it, so record AFTER the last push";
+
+// ── (a2) THE CARRY IS DISCLOSED (#2343) ──────────────────────────────────────────────────────────
+// Measured 2026-11-19 on two batch-landing lanes: each held a VALID record at an unchanged DIFF,
+// read the line as "you must dispatch a reviewer", and spent 20–40 minutes on a review it did not
+// owe — one lane stopped entirely. The code has always carried in that situation (record-review.sh
+// CARRY_ARM=diff/lane → mint:"carried"; the merge gate allows an equal 64-hex diff), so this pins
+// that the DISCLOSURE names it. These assertions go red the day the sentence is dropped again.
+ok(
+  line.includes(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the self line states the CARRY (an unchanged reviewed artifact is not re-reviewed)",
+);
+ok(
+  line.includes('mint:"carried"'),
+  "…and names what a carried record writes, so the lane can recognise it in the record it holds",
+);
+ok(
+  line.includes("no --evidence") && line.includes("no new reviewer"),
+  "…and that a carry needs no --evidence and no new reviewer (the exact cost the omission caused)",
+);
+ok(
+  line.includes("A FRESH mint still requires the dispatched reviewer"),
+  "⛔ …while a FRESH mint still requires the dispatched reviewer — the carry is never a way to skip a review",
+);
+ok(
+  line.indexOf(REVIEWER_PREFLIGHT_RECORD_CMD) < line.indexOf(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the carry is stated AFTER the dispatch/record/rail trail (it refines the trail, it does not replace it)",
+);
+// ⛔ ORDER MATTERS FOR TRUTH, not tidiness (fresh review, P1). `HEAD_BINDING` says an older-head
+// record is stale and refused; the carry is the exception to exactly that, so it must FOLLOW the
+// stale-head sentence it qualifies — placed before it, the line contradicts itself and a lane
+// resolves the contradiction by paying for the review anyway.
+ok(
+  line.indexOf(HEAD_BINDING_TEXT) < line.indexOf(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the carry follows the stale-head rule it is an exception to (no self-contradiction)",
+);
+// ⛔ THE THREE FACTS A FIRST DRAFT GOT WRONG (fresh review, P1/P2). A green prose pin cannot catch
+// wrong prose, so each fact the recorder actually enforces is asserted by the phrase that carries it:
+//   (i) the head you pass is the RECORDED one — passing the live head is a FRESH mint, refused at
+//       record-review.sh:2008 (exit 3), which is the "command that cannot work" class this module
+//       exists to remove;
+//   (ii) the lane arm is a FORWARD MERGE; a rebase rewrites the head and never carries (:1377);
+//   (iii) a measurably RED target head vetoes the carry (#1575 clause E, :1951).
+ok(
+  line.includes("the REVIEWED head, not the live one"),
+  "it names WHICH head to pass (the recorded one) — the live head is a fresh mint, refused without --evidence",
+);
+ok(
+  line.includes("rebase rewrites the head and does NOT carry"),
+  "it says a REBASE does not carry (the lane arm is a forward merge of the base, not a rewrite)",
+);
+ok(
+  line.includes("not measurably red"),
+  "it keeps the #1575 clause-E veto (a red target head refuses the carry)",
+);
+ok(
+  line.includes("no `task` tool"),
+  "…and the no-`task`-tool escape hatch survives the insertion (content-repo lanes depend on it)",
+);
+// The carry is an instruction to a lane that RECORDS. The harness role records nothing (merge-one.sh
+// mints) and the reviewer role must not record at all — handing either the carry would add a command
+// choice at the one moment they are told not to touch it.
+ok(
+  !reviewerPreflightLine({ role: "harness" }).includes(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the harness role does not carry the carry clause (it never records)",
+);
+ok(
+  !reviewerPreflightLine({ role: "reviewer" }).includes(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "…nor does the reviewer role (it must not record at all)",
 );
 
 // ── (b) the three roles ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -206,6 +286,17 @@ ok(early.includes("first push"), "it names the moment it fired (first push), so 
 ok(early.includes("rail will refuse"), "it says WHY this matters now");
 ok(early.includes(REVIEWER_PREFLIGHT_RECORD_CMD), "it names the record command");
 ok(early.includes(REVIEWER_PREFLIGHT_RAIL_CMD), "it names the rail command");
+// ⛔ THE SIBLING SELF DISCLOSURE, and it claimed the rail would refuse ABSOLUTELY (fresh review, P2):
+// a lane that already holds a valid record at an unchanged diff is not refused, so the first-push
+// notice carried the same false certainty as the pre-flight did. Both are model-visible.
+ok(
+  early.includes(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the first-push notice carries the CARRY too (a re-push with a valid record owes no review)",
+);
+ok(
+  early.includes("UNLESS a valid record already covers this artifact"),
+  "…and stops saying the rail refuses unconditionally",
+);
 ok(
   reviewerFirstPushNotice({ bypassed: true }).includes("the rail is not"),
   "under a bypass it says which gate is off and which is not",
@@ -246,6 +337,7 @@ for (const [name, value] of [
   ["the requirement sentence", REVIEWER_PREFLIGHT_REQUIREMENT],
   ["the dispatch command", REVIEWER_PREFLIGHT_DISPATCH_CMD],
   ["the record command", REVIEWER_PREFLIGHT_RECORD_CMD],
+  ["the carry clause", REVIEWER_PREFLIGHT_CARRY_CLAUSE],
   ["the [gate] tag", REVIEWER_PREFLIGHT_TAG],
 ] as const) {
   ok(
@@ -258,6 +350,17 @@ ok(shell.includes("reviewer_brief_section()"), "the helper exposes the brief sec
 
 const renderedBrief = renderShell("--brief", "self");
 ok(renderedBrief.includes("## Reviewer step"), "the helper's brief section has a findable heading");
+// ⛔ THE BRIEF IS A CHANNEL, NOT A FOOTNOTE (#2343 review, P2). A lane launched by lane.sh reads the
+// BRIEF as its prompt; a brief that omits the carry (and asserts "push again after recording and the
+// record is void") sends that lane into the same 20–40 minute review the line's omission caused.
+ok(
+  renderedBrief.includes(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
+  "the generated brief carries the CARRY clause verbatim (the lane's prompt is the brief)",
+);
+ok(
+  renderedBrief.includes("the record is void UNLESS the CARRY"),
+  "…and no longer states the record is void unconditionally after a push",
+);
 ok(renderedBrief.includes(REVIEWER_PREFLIGHT_RECORD_CMD), "the brief section names the record command");
 ok(renderedBrief.includes(REVIEWER_PREFLIGHT_RAIL_CMD), "the brief section names the rail command");
 ok(
@@ -283,6 +386,14 @@ ok(
 );
 ok(template.includes(REVIEWER_PREFLIGHT_RECORD_CMD), "the template names the SAME record command (with --evidence)");
 ok(template.includes(REVIEWER_PREFLIGHT_RAIL_CMD), "the template names the rail command");
+ok(
+  template.includes("A CARRY IS NOT A RE-REVIEW"),
+  `${REVIEWER_PREFLIGHT_BRIEF_TEMPLATE} carries the carry rule — the template is what a controller copies`,
+);
+ok(
+  template.includes("the REVIEWED head, not the live one"),
+  "…and says WHICH head to pass for a carry (the recorded one)",
+);
 ok(
   template.includes("Never edit the PR body after recording"),
   "the template carries the post-record body-edit rule (an edited body invalidates the evidence artifact)",

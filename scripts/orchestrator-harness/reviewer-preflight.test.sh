@@ -90,6 +90,34 @@ case "$LINE" in *"AFTER the last push"*) rc=0;; *) rc=1;; esac
 ck $rc "…and WHEN to record (a stale record is refused, so 'record' alone is a trap)"
 case "$LINE" in *"post the reviewer's verdict as a PR comment"*) rc=0;; *) rc=1;; esac
 ck $rc "…and that the verdict must be POSTED as a PR comment (the --evidence artifact's referent)"
+# ⛔ THE CARRY IS NOT OMITTED (#2343). A lane holding a valid record at an unchanged DIFF owes no
+# second review: record-review.sh re-binds it itself (mint:"carried", no --evidence) and the merge
+# gate allows an equal 64-hex diff. A line silent about it cost two lanes 20-40 minutes each on
+# 2026-11-19, and one of them stopped. These checks read the RENDERED line, so a reflow that loses
+# the clause cannot pass on the constants alone.
+case "$LINE" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=0;; *) rc=1;; esac
+ck $rc "…and states the CARRY (a valid record at an unchanged artifact is not re-reviewed, #2343)"
+case "$LINE" in *'mint:"carried"'*) rc=0;; *) rc=1;; esac
+ck $rc "…naming what a carried record writes, so the lane recognises the record it already holds"
+case "$LINE" in *"A FRESH mint still requires the dispatched reviewer"*) rc=0;; *) rc=1;; esac
+ck $rc "⛔ …while a FRESH mint still requires the dispatched reviewer (the carry is never a skip)"
+RECORD_AT="${LINE%%"$REVIEWER_PREFLIGHT_RECORD_CMD"*}"
+CARRY_AT="${LINE%%"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*}"
+[ "${#RECORD_AT}" -lt "${#CARRY_AT}" ]; ck $? "the carry sits AFTER the dispatch/record/rail trail (it refines it, not replaces it)"
+# ⛔ ORDER IS A TRUTH CONDITION (#2343 review, P1): the carry is the EXCEPTION to the stale-head
+# sentence, so it must follow the sentence it qualifies. Placed before it, the line contradicts
+# itself and a lane reading both resolves it by paying for the review anyway.
+BIND_AT="${LINE%%"$REVIEWER_HEAD_BINDING"*}"
+[ "${#BIND_AT}" -lt "${#CARRY_AT}" ]; ck $? "…and AFTER the stale-head rule it is the exception to (no self-contradiction)"
+# The three facts the recorder enforces and a first draft got wrong (fresh review, P1/P2):
+# which head to pass (a live head is a FRESH mint, refused at record-review.sh:2008), that the lane
+# arm is a FORWARD MERGE (a rebase never carries, :1377), and the red-target veto (:1951).
+case "$LINE" in *"the REVIEWED head, not the live one"*) rc=0;; *) rc=1;; esac
+ck $rc "…naming WHICH head to pass (the recorded one) — the live head is a fresh mint, refused"
+case "$LINE" in *"rebase rewrites the head and does NOT carry"*) rc=0;; *) rc=1;; esac
+ck $rc "…saying a REBASE does not carry (the lane arm is a forward merge of the base)"
+case "$LINE" in *"not measurably red"*) rc=0;; *) rc=1;; esac
+ck $rc "…keeping the #1575 clause-E veto (a red target head refuses the carry)"
 
 echo
 echo "§B the three roles"
@@ -103,6 +131,8 @@ ck $rc "…without the self line's hedge (this IS the marked harness audience)"
 case "$HARNESS_LINE" in *"~/.pi/agent/scripts/record-review.sh"*) rc=0;; *) rc=1;; esac; ck $rc "…and still names the record command"
 case "$HARNESS_LINE" in *"dispatch: task("*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ the harness role does NOT instruct the lane to dispatch (its brief forbids it — the roles cannot collapse)"
+case "$HARNESS_LINE" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=1;; *) rc=0;; esac
+ck $rc "…and NOT carrying the self line's CARRY clause (this role never records)"
 # The REVIEWER session (merge-one.sh's own) is a third audience: it posts the verdict comment and
 # must not push/record/merge. Giving it the harness line contradicts the prompt it was launched with
 # ("Report only — do not fix code … Do NOT modify code, commit, or merge").
@@ -115,11 +145,20 @@ case "$REVIEWER_LINE" in *"do NOT push"*) rc=0;; *) rc=1;; esac
 ck $rc "⛔ …forbidding the push its launcher forbids"
 case "$REVIEWER_LINE" in *"push your FINAL head"*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ …and NOT carrying the harness role's 'push your FINAL head' (the contradiction this removes)"
+case "$REVIEWER_LINE" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=1;; *) rc=0;; esac
+ck $rc "…and NOT carrying the self line's CARRY clause (the reviewer must not record at all)"
 SELF_BRIEF="$(reviewer_brief_section self)"
 case "$SELF_BRIEF" in *"## Reviewer step"*) rc=0;; *) rc=1;; esac; ck $rc "the self brief has a findable heading"
 case "$SELF_BRIEF" in *"Only then run the rail"*) rc=0;; *) rc=1;; esac; ck $rc "the self brief orders record BEFORE the rail"
 case "$SELF_BRIEF" in *"NEVER edit the PR body after recording"*) rc=0;; *) rc=1;; esac
 ck $rc "the self brief forbids the post-record body edit (it invalidates the evidence artifact)"
+# ⛔ THE BRIEF IS A CHANNEL, NOT A FOOTNOTE (#2343 review, P2): a lane.sh lane's PROMPT is the brief,
+# so a brief that omits the carry and says "push again after recording and the record is void" sends
+# that lane into the same 20-40 minute review the line's omission caused.
+case "$SELF_BRIEF" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=0;; *) rc=1;; esac
+ck $rc "…and the self brief carries the CARRY clause verbatim (the lane's prompt IS the brief)"
+case "$SELF_BRIEF" in *"the record is void UNLESS the CARRY"*) rc=0;; *) rc=1;; esac
+ck $rc "…no longer claiming the record is void unconditionally after a push"
 HARNESS_BRIEF="$(reviewer_brief_section harness)"
 case "$HARNESS_BRIEF" in *"do NOT dispatch it"*) rc=0;; *) rc=1;; esac
 ck $rc "the harness brief says the LANE does not dispatch (it has no task tool — telling it to would waste the run)"
@@ -194,6 +233,9 @@ grep -qF '~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --
 ck $? "…names the record command WITH --evidence (the invocation that actually mints a record)"
 grep -q 'scripts/admin-merge.sh <PR>' "$TEMPLATE" 2>/dev/null; ck $? "…names the rail command"
 grep -q '## Reviewer step' "$TEMPLATE" 2>/dev/null; ck $? "…and carries it as its own section, not a footnote"
+# the carry rule a controller copies (#2343 review, P2 — the template is the controller's artifact)
+grep -q 'A CARRY IS NOT A RE-REVIEW' "$TEMPLATE" 2>/dev/null; ck $? "…and carries the CARRY rule"
+grep -q 'the REVIEWED head, not the live one' "$TEMPLATE" 2>/dev/null; ck $? "…saying WHICH head to pass for a carry"
 
 echo
 echo "§E non-vacuity — the checks above can fail"
@@ -211,6 +253,11 @@ record_cmd_present "$NOFLAG"; rc=$?
 TWO_LINE="$(printf '%s\n%s' "$LINE" extra)"
 [ "$(printf '%s\n' "$TWO_LINE" | wc -l | tr -d ' ')" = "1" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "the one-line assertion FIRES on a two-line disclosure"
+# ...and the CARRY assertion fires when the clause is dropped — the regression this issue exists to
+# prevent (a lane re-disclosing only the requirement pays for a review it does not owe, #2343).
+NOCARRY="$(printf '%s\n' "$LINE" | sed "s# $REVIEWER_PREFLIGHT_CARRY_CLAUSE##")"
+case "$NOCARRY" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "the CARRY assertion FIRES when the clause is stripped from the line (#2343)"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

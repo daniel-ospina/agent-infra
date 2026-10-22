@@ -55,6 +55,19 @@ REVIEWER_PREFLIGHT_DISPATCH_CMD="task(prompt='[REVIEW] review the diff of PR <PR
 REVIEWER_PREFLIGHT_RECORD_CMD='~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>'
 REVIEWER_PREFLIGHT_TAG='[gate]'
 REVIEWER_HEAD_BINDING='a record bound to an older head is stale and the rail refuses it, so record AFTER the last push'
+# ⛔ THE CARRY (#2343, mirrored VERBATIM from the TS `REVIEWER_PREFLIGHT_CARRY_CLAUSE`). The line
+# named dispatch/record/rail and nothing else, so a lane holding a VALID record at an unchanged DIFF
+# read it as "pay for a review": measured 2026-11-19, two batch-landing lanes each spent 20-40
+# minutes on one they did not owe and one stopped entirely. `record-review.sh` decides the carry
+# itself (CARRY_ARM=diff on a matching signed marker, else the lane arm; mint:"carried"; no
+# --evidence needed) and the merge gate's carry arm only allows an exact 64-hex diff match, so this
+# text names a path the gate ALREADY takes. It changes no decision.
+# ⛔ THREE FACTS THE WORDING MUST CARRY (each verified against record-review.sh; a first draft got
+# all three wrong): the head you pass is the RECORDED one (the carry block sits inside
+# `elif CURRENT_HEAD != SHA`, :1902 — passing the live head is a FRESH mint, refused at :2008);
+# a "base-only move" is a FORWARD MERGE, not a rebase (:1377 — a rewritten head never carries);
+# and a measurably RED target head vetoes the carry (#1575 clause E, :1951).
+REVIEWER_PREFLIGHT_CARRY_CLAUSE='CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head that record already names (the REVIEWED head, not the live one) and record-review.sh re-binds the same verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head and does NOT carry). A FRESH mint still requires the dispatched reviewer'
 # ⛔ THE SELF LINE'S HEDGE (review of #2148, P1). `KIND` is exported by THIS repo's launchers, but the
 # content-repo copy (tortoise/operations/orchestrator-harness/lane.sh) exports the bypass bundle and
 # no KIND, while its brief says "you have NO \"task\" tool — do NOT dispatch. The PARENT runs the
@@ -82,9 +95,9 @@ reviewer_preflight_line() {
   local role="${1:-self}"
   case "$role" in
     self)
-      printf '%s #2148 preflight: this lane %s — %s. %s. %s\n' \
+      printf '%s #2148 preflight: this lane %s — %s. %s. %s. %s\n' \
         "$REVIEWER_PREFLIGHT_TAG" "$REVIEWER_PREFLIGHT_REQUIREMENT" \
-        "$(reviewer_command_trail)" "$REVIEWER_HEAD_BINDING" "$REVIEWER_NO_MARKER_HEDGE"
+        "$(reviewer_command_trail)" "$REVIEWER_HEAD_BINDING" "$REVIEWER_PREFLIGHT_CARRY_CLAUSE" "$REVIEWER_NO_MARKER_HEDGE"
       ;;
     harness)
       # The harness reviewer mints the attestation (merge-one.sh), so the lane's duty is to keep
@@ -130,7 +143,9 @@ reviewer_brief_section() {
    \`clean-low\` / \`clean-micro\` do not require it.
 4. Only then run the rail: \`${rail}\`
 
-⛔ ${REVIEWER_HEAD_BINDING}. If you push again after recording, the record is void — re-record.
+⛔ ${REVIEWER_HEAD_BINDING}. If you push again after recording the record is void UNLESS the CARRY
+below applies — re-record, or re-run the recorder naming the RECORDED head so it carries.
+⛔ A CARRY IS NOT A RE-REVIEW (#2343). ${REVIEWER_PREFLIGHT_CARRY_CLAUSE}.
 ⛔ NEVER edit the PR body after recording: \`record-review.sh --evidence\` verifies the artifact, and
 an edited body is a changed artifact the next reader cannot trust.
 ⛔ If the rail refuses, read its reason — it names the command to run. Do not retry at the same head.
