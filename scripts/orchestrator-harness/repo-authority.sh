@@ -147,7 +147,7 @@ _override_usable() {
 # named it). The age bound is the layer's own `HEALTH_UNKNOWN_WINDOW` (900 s) for that shape, and the
 # token says `?` rather than a number nobody measured.
 _gh_named_state() {
-  local dir p line tok reset at now
+  local dir p line tok reset at now _win
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
   p="$dir/health"
   [ -f "$p" ] || return 0
@@ -167,11 +167,14 @@ _gh_named_state() {
   # ⛔ THE BOUND IS CLAMPED EXACTLY AS THE LAYER CLAMPS IT (cfg_secs(…, 60, 86400)). Taking the env
   # verbatim made the two readers DISAGREE about the same record: at window=30 a 45 s-old record
   # printed nothing here while `gh-limit.py --health` named it — the “two contracts for one rule”
-  # defect, in the pair of readers that must agree or the lane is told two different things.
+  # defect, in the pair of readers that must agree or the lane is told two different things. And the
+  # clamp must accept what `cfg_secs` accepts: a DECIMAL (`45.5` → 60) and a NEGATIVE (`-5` → 60)
+  # reach the floor, while a NON-NUMERIC falls back to the default — a digits-only `case`, which is
+  # what this was, sent both of the first two to the 900 s default instead.
   _win="${GH_LIMIT_HEALTH_UNKNOWN_WINDOW:-900}"
+  case "$_win" in ''|*[!0-9.+-]*) _win=900 ;; esac
+  _win="$(awk -v v="$_win" 'BEGIN { n = v + 0; if (n < 60) n = 60; if (n > 86400) n = 86400; printf "%d", n }' 2>/dev/null)"
   case "$_win" in ''|*[!0-9]*) _win=900 ;; esac
-  [ "$_win" -ge 60 ] || _win=60
-  [ "$_win" -le 86400 ] || _win=86400
   [ "$now" -ge "$at" ] && [ "$(( now - at ))" -le "$_win" ] || return 0
   printf '%s resets_in=?' "$tok"
 }
