@@ -203,7 +203,16 @@ read_meta() {
   rc=$?
   GH_WARN="$(cat "$errf" 2>/dev/null || true)"
   rm -f "$errf"
-  [ -n "$GH_WARN" ] && err "review-pr: gh warning during the PR read (IGNORED — this is not a parse error): $GH_WARN"
+  # The warning is IGNORED only when the read SUCCEEDED; on a failure it is the cause and is
+  # reported as such (labelling a failed read's reason "ignored" is a contradiction the
+  # operator would have to resolve by hand).
+  if [ -n "$GH_WARN" ]; then
+    if [ "$rc" -eq 0 ]; then
+      err "review-pr: gh warning during the PR read (IGNORED — this is not a parse error): $GH_WARN"
+    else
+      err "review-pr: gh could not read PR #$PR: $GH_WARN"
+    fi
+  fi
   [ "$rc" -eq 0 ] || { META_ERR="$GH_WARN"; return 1; }
   IFS=$'\t' read -r URL HEAD TITLE STATE BASE <<<"$out"
   [ -n "${URL:-}" ] || { META_ERR="gh returned an empty url"; return 1; }
