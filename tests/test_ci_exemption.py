@@ -2689,12 +2689,17 @@ def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
         ("assert took >= 2.5s", "assert took >= 7.5s"),
         ("assert took > 2.5s", "assert took > 7.5s"),
         ("assert budget == 1.5s", "assert budget == 9.5s"),
-        ("assert waited ≥ 2.5s", "assert waited ≥ 7.5s"),
+        ("assert waited ≤ 2.5s", "assert waited ≥ 7.5s"),
         # A bound that FOLLOWS an earlier `<`/`<=` in the same message: the masked-token
         # strip must not read that ``<`` … ``>`` span as a mask and free the bound.
-        # Cycle 8 measured both of these collapsing into ONE signature (fail-OPEN).
+        # Cycles 8 and 9 each measured a form of this collapsing into ONE signature
+        # (fail-OPEN); the SPACED and the UNSPACED form are both pinned because the
+        # first fix ("the inner text starts with a name") only closed the spaced one —
+        # ``<b and p99 >`` starts with a letter, so the strip ate the operator.
         ("assert waited <= 2.5s and p99 > 7.5s", "assert waited <= 2.5s and p99 > 9.5s"),
         ("assert elapsed < 1.2 and took >= 2.5s", "assert elapsed < 1.2 and took >= 7.5s"),
+        ("assert a<b and p99 >= 2.5s", "assert a<b and p99 >= 9.5s"),
+        ("cost<budget: took >= 2.5s", "cost<budget: took >= 9.5s"),
     ]:
         assert ci_exemption.normalize_signature(left) != (
             ci_exemption.normalize_signature(right)
@@ -2740,12 +2745,61 @@ def test_9331_slot_ordinals_are_one_left_to_right_pass():
     assert ci_exemption.normalize_signature("elapsed=1.21s") == "elapsed=<MEAS1:s>"
 
     # Same message twice must be identical, INCLUDING across an interleaved call on a
-    # different text: the slot table from the first call must not leak into (or be
-    # mutated by) the second (cycle 8: the previous assertion called the same pure
-    # function twice and could not fail on a cache leak).
+    # different text, and the slot table must be BOUND TO THE TEXT it was built from —
+    # asserted directly on the cache contract, because "call the pure function twice"
+    # cannot fail on a leak (cycle 9).
+    ci_exemption._duration_slot_table.cache_clear()
     first = ci_exemption.normalize_signature(dense)
     ci_exemption.normalize_signature("unrelated 2.5s and 3.5s text")
     assert ci_exemption.normalize_signature(dense) == first
+    assert ci_exemption._duration_slot_table.cache_info().hits >= 1, (
+        "the slot table was rebuilt for the same text — the cache is not keyed on it"
+    )
+    assert set(
+        ci_exemption._duration_slot_table("unrelated 2.5s and 3.5s text").values()
+    ) == {1, 2}, "a slot table carries ordinals from a DIFFERENT text"
+
+
+def test_9331_an_arrow_is_not_a_bound_operator():
+    """``->`` / ``=>`` end in an operator character but are not comparisons.
+
+    Cycle 9: ``_BOUND_OPERATOR_RE`` accepted any trailing ``>``/``=``, so
+    ``phase collect -> 1.21s`` left the measurement RAW and the #9331 signature
+    stayed volatile — and ``this test 9.07s -> 0.73s CPU`` (this repo's own
+    wording) masked only the FIRST value, leaving the second volatile forever.
+    """
+    for left, right in [
+        ("phase collect -> 1.21s", "phase collect -> 1.47s"),
+        ("this test 9.07s -> 0.73s CPU", "this test 8.11s -> 1.29s CPU"),
+        ("took => 2.5s", "took => 7.5s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"an arrow was read as a bound: {left!r} vs {right!r}"
+
+
+def test_9331_every_declared_unit_masks_and_the_unit_rides_the_token():
+    """All 13 declared units mask, and the UNIT stays in the token.
+
+    The unit is load-bearing signal: ``1.21ms`` and ``1.21s`` are different
+    measurements. Cycle 9 found that only ``s`` and ``ms`` were exercised, so
+    dropping ``µs``/``μs``/``secs``/``mins`` … from the alternation would have
+    reddened nothing while silently re-opening #9331 for those units.
+    """
+    for unit in (
+        "ns", "us", "µs", "μs", "ms", "seconds", "second", "secs", "sec",
+        "minutes", "minute", "mins", "min", "s",
+    ):
+        one = ci_exemption.normalize_signature(f"took 1.5{unit} here")
+        two = ci_exemption.normalize_signature(f"took 7.5{unit} here")
+        assert one == two, f"unit {unit!r} was not masked: {one!r} vs {two!r}"
+        assert f"<MEAS1:{unit}>" in one, (
+            f"unit {unit!r} did not ride the token: {one!r}"
+        )
+    # SCALE stays signal: same number, different unit → different signature.
+    assert ci_exemption.normalize_signature("took 1.21ms") != (
+        ci_exemption.normalize_signature("took 1.21s")
+    )
 
 
 def test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual():
@@ -2762,6 +2816,11 @@ def test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual():
     once = ci_exemption.normalize_signature("took 1.5s746b295c")
     assert once == "took <MEAS1:s>746b295c", once
     assert ci_exemption.normalize_signature(once) == "took <MEAS1:s><HEX>"
+    # The other reachable member of the family named in the module comment.
+    assert ci_exemption.normalize_signature("took 1.5s0x1f") == "took <MEAS1:s>0x1f"
+    assert ci_exemption.normalize_signature(
+        "took <MEAS1:s>0x1f"
+    ) == "took <MEAS1:s><ADDR>"
 
 
 def test_9331_a_meaningful_number_stays_SIGNAL():

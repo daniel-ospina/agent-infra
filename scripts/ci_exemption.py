@@ -1104,7 +1104,11 @@ _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 #     the list grows only on evidence
 #     (``test_9331_out_of_list_units_stay_volatile``).
 _MEASURED_DURATION_RE = re.compile(
-    r"(?P<num>\d+\.\d+)\s?"
+    # ``(?<![\d.])``: without a left anchor ``\d+`` is RETRIED at every offset
+    # inside a long digit run, so a 40 KB run of digits cost 3.47 s and the cost
+    # quadrupled per doubling (cycle 9). Every other number pattern in this list is
+    # left-bounded for the same reason; this one was not.
+    r"(?<![\d.])(?P<num>\d+\.\d+)\s?"
     r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
     # ``(?![A-Za-z_])`` rather than ``(?!\w)``: a unit followed by a DIGIT still
     # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
@@ -1115,8 +1119,11 @@ _MEASURED_DURATION_RE = re.compile(
     # NON-IDEMPOTENT BY CONSTRUCTION, and declared rather than relied on: a mask
     # anchored on a LEFT NON-WORD boundary becomes applicable only AFTER the
     # duration mask replaces the unit letter with ``>`` — ``1.5s746b295c`` →
-    # ``<MEAS1:s>746b295c`` on pass 1, ``<MEAS1:s><ADDR>`` on pass 2 (same for a
-    # UUID or host:port suffix). This is reachable ONLY when a duration is emitted
+    # ``<MEAS1:s>746b295c`` on pass 1, ``<MEAS1:s><HEX>`` on pass 2, and the same
+    # shape holds for ``1.5s0x1f`` → ``<MEAS1:s><ADDR>``. A host:port suffix is NOT
+    # in this class: its port must be NUMERIC, so ``1.5slocalhost:8080`` never masks
+    # (the unit lookahead rejects the letter that follows) while ``1.5s127.0.0.1:8080``
+    # does. This is reachable ONLY when a duration is emitted
     # immediately before such an id, which pytest text does not do; the two-pass
     # result is pinned by
     # ``test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual`` so a
@@ -1129,7 +1136,11 @@ _MEASURED_DURATION_RE = re.compile(
 #: is a LIMIT, so a PR that moves it is a different failure. A bare ``=`` is NOT
 #: one (``elapsed=1.21s`` is an interpolation), and the branch is ANCHORED to the
 #: window edge so an earlier ``<`` cannot free a later measurement.
-_BOUND_OPERATOR_RE = re.compile(r"(?:[<>≤≥]=?|==)\s*$")
+#: ``_BOUND_OPERATOR_RE``. The ``(?<![-=>])`` guards an ARROW: ``->`` and ``=>``
+#: end in ``>`` and ``=`` but are not comparisons, so without the guard
+#: ``phase collect -> 1.21s`` left the measurement RAW and stayed volatile — an
+#: undeclared residual that kept #9331 open for that phrasing (cycle 9).
+_BOUND_OPERATOR_RE = re.compile(r"(?<![-=>])(?:[<>≤≥]=?|==)\s*$")
 
 #: An ALREADY-MASKED token (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<N>``…).
 #: It is stripped from the left window before the operator test, because these
@@ -1138,14 +1149,18 @@ _BOUND_OPERATOR_RE = re.compile(r"(?:[<>≤≥]=?|==)\s*$")
 #: measurement RAW, re-creating the #9331 block for any message where a masked id
 #: precedes the timer (review cycle 6).
 #:
-#: EVERY token this module can emit has a mask NAME as its first character
-#: (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<HEX>``, ``<N>``), so the inner
-#: text is required to START with a letter or underscore. Without that anchor the
-#: pattern also matched ordinary COMPARISON text (``< 1.2 and taken >``), so a
-#: message with an earlier ``<``/``<=`` had the following genuine ``>``/``>=``
-#: bound stripped — and a MOVED bound was then masked into one signature and
-#: inherited main's exemption, the fail-OPEN direction (review cycle 8).
-_MASKED_TOKEN_RE = re.compile(r"<[A-Za-z_][^<>]{0,23}>")
+#: EVERY token this module can emit is enumerated, because a SHAPE rule cannot
+#: tell a mask from ordinary comparison text. Cycle 8 narrowed the pattern to
+#: ``<[A-Za-z_][^<>]{0,23}>`` ("the inner text starts with a name") and cycle 9
+#: measured that still open: in ``assert a<b and p99 >= 2.5s`` the span
+#: ``<b and p99 >`` starts with a letter, so it was stripped, the operator with it,
+#: and a MOVED bound was masked into one signature — the fail-OPEN direction this
+#: strip exists to prevent. An explicit alternation of the masks actually emitted
+#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<N>``, ``team_<X>``,
+#: ``<MEAS<n>:<unit>>``) is closed, so comparison text can never match it.
+_MASKED_TOKEN_RE = re.compile(
+    r"<(?:ADDR|UUID|HEX|HOSTPORT|N|X|MEAS\d+:[A-Za-zµμ]+)>"
+)
 
 
 def _mask_measured_duration(m: re.Match[str]) -> str:
