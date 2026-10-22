@@ -585,6 +585,14 @@ hu_run() { # <secs> <cmd…>
   local s="$1"; shift
   (
     local _kv
+    # ⛔ THE CHILD'S `REPO` IS ANSWERED HERE, NOT LEFT TO INHERITANCE. The shell variable REPO is now the
+    # HARNESS path, and `TARGET_REPO="${REPO:-}"` may have been DROPPED (a target that does not exist,
+    # or another machine's absolute path) — but an EXPORTED REPO keeps its export attribute across a
+    # reassignment, so skipping `hu_env_add REPO` did NOT keep it out of the child: measured, a dropped
+    # target still handed the authority the harness checkout, which then graded agent-infra. origin/main
+    # REFUSED that state; inheriting it is the wrong-surface class with a new spelling. One place, both
+    # directions, so no future `hu_env_add` can re-open it.
+    if [ -n "${TARGET_REPO:-}" ]; then export REPO="$TARGET_REPO"; else unset REPO; fi
     for _kv in "${HU_ENV[@]}"; do export "$_kv"; done
     hu_bounded "$s" "$@"
   )
@@ -824,6 +832,13 @@ hu_row_claims() {
   case "$verdict" in
     reachable) hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (refs/claims reachable)"; return 0 ;;
     absent)    hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (registry empty — no claim held right now)"; return 0 ;;
+    # ⛔ NOT-APPLICABLE IS NOT CANNOT-VERIFY. A launcher that resolved no target cannot ask the question
+    # — the CONTROLLER resolves its own target (install.sh bakes `REPO` into the launchd plist) — so the
+    # row says so and does not drag a HEALTHY box's verdict to BROKEN: measured, a targetless box with
+    # `loop/exec/refresh/capacity/supervisor/drift` all OK exited 2 after a SUCCESSFUL start, which is the
+    # state `harness-surface.test.sh`'s (b-mac) arm exists to forbid. `return 4` is the same "not
+    # applicable" vocabulary the launchd-on-Linux and supervisor-on-Mac rows already use.
+    notprobed) hu_row claims - "$(hu_age_txt "${age:-0}")" "SKIPPED (no target resolved here — the controller resolves its own registry)"; return 4 ;;
     *)         hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (verdict=${verdict:-none})"; return 2 ;;
   esac
 }
@@ -1335,10 +1350,10 @@ hu_start_claims() {
   # actionable message — an abort here replaced it with a registry warning. So the verdict is recorded
   # as `unknown` (the row renders UNKNOWN, never OK) and the walk continues.
   if [ -z "$probe_repo" ]; then
-    warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — recording UNKNOWN, not empty"
+    warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — recording SKIPPED, not empty"
     mkdir -p "$O/state" 2>/dev/null \
-      && printf 'claims=unknown at=%s\n' "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null
-    say "claims: UNKNOWN (no target resolved — nothing was probed)"
+      && printf 'claims=notprobed at=%s\n' "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null
+    say "claims: SKIPPED (no target resolved here — the controller resolves its own registry)"
     return 0
   fi
   hu_run "$tmo" git -C "$probe_repo" ls-remote origin 'refs/claims/*' >"$log" 2>&1

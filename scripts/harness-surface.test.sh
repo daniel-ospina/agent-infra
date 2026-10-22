@@ -68,11 +68,6 @@ printf '#!/usr/bin/env bash\necho fix\n' >> "$REPO_FIX/scripts/orchestrator-harn
   && git -c user.email=t@example.com -c user.name=t commit -qm B \
   && git update-ref refs/remotes/origin/main refs/heads/main ) >/dev/null 2>&1
 SHA_B="$(cd "$REPO_FIX" && git rev-parse HEAD)"
-# ⛔ AND THE TARGET IS PART OF A CELL'S SHELL, so the arms that do not name one get a real checkout:
-# without a target the claims row is honestly UNKNOWN (no registry can be read) and `up` is BROKEN —
-# correct for a box that cannot dispatch, but not what (b)/(b-mac) are measuring (idempotency). The
-# arms that test the ABSENCE of a target — (f) and (g) — unset `REPO` explicitly on their own line.
-REPO="$REPO_FIX"; export REPO
 A12="${SHA_A:0:12}"; B12="${SHA_B:0:12}"
 
 # The PIN: commit B, materialised under the pin root in the shape `hu_verify_pin` requires.
@@ -672,7 +667,13 @@ run_pin_cell() { # <pin-file> [no-ambient-target] [env-file]; harness derived (N
   # inherited HARNESS_REPO silently DISABLES the very derivation (e)/(e2) exist to prove (measured on
   # the fixed tree: 9 failures with it set). An inherited REPO leaked into (f) the same way.
   local eargs=( -u HARNESS_REPO )
-  if [ "${2:-}" = no-ambient-target ]; then eargs+=( -u REPO ); else eargs+=( "REPO=$TARGET_FIX" ); fi
+  case "${2:-}" in
+    no-ambient-target) eargs+=( -u REPO ) ;;
+    # (h) a TARGET THAT DOES NOT EXIST is dropped by the launcher — it must then reach the child as NO
+    # REPO at all, never as the harness path (an inherited export survives reassignment).
+    dropped-target)    eargs+=( "REPO=$TMP/no-such-target-here" ) ;;
+    *)                 eargs+=( "REPO=$TARGET_FIX" ) ;;
+  esac
   OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e.log" FIX_LIVE="$FIXCELL/live-e" \
           HOME="$TMP/home" CELL_HOME="$FIXCELL" ENV_FILE="${3:-$TMP/absent-keys.env}" \
           HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
@@ -749,12 +750,26 @@ ck "(f) …and HARNESS_REPO is the harness repo, not the target (got: ${f_har:-<
 run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" no-ambient-target "$TMP/absent-keys.env"
 ck "(g) no target resolved: the claims probe does NOT read the HARNESS registry" \
    "$(grep -qF 'ls-remote origin refs/claims/' "$FIXCELL/git-e.log" 2>/dev/null && echo 1 || echo 0)"
-ck "(g) …and the verdict is recorded UNKNOWN, never 'absent' [$(sed -n 's/^claims=//p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)]" \
-   "$([ "$(sed -n 's/^claims=\([a-z]*\).*/\1/p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)" = unknown ] && echo 0 || echo 1)"
-ck "(g) …and 'up' says UNKNOWN instead of printing a claims OK" \
-   "$(printf '%s\n' "$OUT" | grep -qF 'claims: UNKNOWN (no target resolved' && echo 0 || echo 1)"
+ck "(g) …and the verdict is recorded SKIPPED, never 'absent' [$(sed -n 's/^claims=//p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)]" \
+   "$([ "$(sed -n 's/^claims=\([a-z]*\).*/\1/p' "$FIXCELL/orchestrator/state/harness-claims" 2>/dev/null | head -1)" = notprobed ] && echo 0 || echo 1)"
+ck "(g) …and 'up' says SKIPPED instead of printing a claims OK" \
+   "$(printf '%s\n' "$OUT" | grep -qF 'claims: SKIPPED (no target resolved here' && echo 0 || echo 1)"
 ck "(g) …and the walk CONTINUED past claims (a targetless box is the loop refusal to make)" \
    "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 0 || echo 1)"
+
+# ⛔ (h) A DROPPED TARGET IS NOT A HARNESS TARGET. `REPO` is EXPORTED in a cell's shell, and an export
+# attribute survives reassignment — so skipping `hu_env_add REPO` did NOT keep the harness path out of
+# the child. Measured before the fix: an ambient REPO pointing at a path that does not exist (another
+# machine's checkout, the documented state) still handed the authority the harness checkout, which then
+# graded agent-infra. Fixed at the delegation boundary (`hu_run`: export the target, else `unset REPO`).
+: > "$FIXCELL/fix-e.log"
+run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" dropped-target "$TMP/absent-keys.env"
+h_repo="$(sed -n 's/^repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(h) a target that does not exist reaches the child as NO REPO, never the harness (got: '${h_repo}')" \
+   "$([ -z "$h_repo" ] && echo 0 || echo 1)"
+h_har="$(sed -n 's/^harness_repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(h) …and HARNESS_REPO is still the harness repo (got: '${h_har}')" \
+   "$([ "$h_har" = "$REPO_FIX" ] && echo 0 || echo 1)"
 rm -f "$TMP/git"   # the shim is (e)/(g)'s instrument; later arms run against the real git
 # …the RED CONTROL that keeps this a check and not a bypass: the same cell shape, a pin naming a
 # commit that exists in NO repo, must still REFUSE before anything starts.
