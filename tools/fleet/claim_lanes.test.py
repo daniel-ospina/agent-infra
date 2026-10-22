@@ -1120,6 +1120,52 @@ def l25_issue_keys_are_not_head_scoped():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# L26 — the reader's host seam IS the writer's seam (#1784 review, P2-1)
+# ══════════════════════════════════════════════════════════════════════════
+@test("L26 the host seam the READER honours is the one claims.sh STAMPS (#1784)")
+def l26_host_seam_matches_the_writer():
+    """`scope` is the ONE field the reader and the writer share, so the two
+    programs must read the same env var or they silently disagree.
+
+    `claims.sh`'s `claim_host()` stamps `CLAIM_OWNER_HOST` (the var a cell exports to
+    announce itself, #2094). The reader read `CLAIM_HOST`, a name that exists nowhere
+    else in the tree, so a box that announced itself was compared against a host the
+    writer never stamped. Consequence was label-only (every claim verdict is an
+    abstention) — which is exactly why nothing caught it.
+    """
+    saved = {k: os.environ.get(k) for k in ("CLAIM_OWNER_HOST", "CLAIM_HOST")}
+    try:
+        # (a) THE WRITER'S SEAM IS HONOURED. This is the assertion the old reader fails.
+        os.environ.pop("CLAIM_HOST", None)
+        os.environ["CLAIM_OWNER_HOST"] = "writer-box"
+        check(cl.short_host() == "writer-box",
+              "the reader must read CLAIM_OWNER_HOST, the var claims.sh stamps; got %r"
+              % cl.short_host())
+
+        # (b) The writer wins when both are set — the alias must not shadow it.
+        os.environ["CLAIM_HOST"] = "stale-probe-box"
+        check(cl.short_host() == "writer-box",
+              "CLAIM_OWNER_HOST must take precedence over the CLAIM_HOST alias; got %r"
+              % cl.short_host())
+
+        # (c) The alias still works, so a probe written against the earlier name runs.
+        os.environ.pop("CLAIM_OWNER_HOST", None)
+        check(cl.short_host() == "stale-probe-box",
+              "the CLAIM_HOST alias must still be honoured; got %r" % cl.short_host())
+
+        # (d) With neither set, the unflagged path is the writer's `hostname -s`.
+        os.environ.pop("CLAIM_HOST", None)
+        check(cl.short_host("build-07.example.internal") == "build-07",
+              "the fallback must be the short form of the hostname")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The mutation map: each entry reintroduces the defect its test catches.
 # ══════════════════════════════════════════════════════════════════════════
 class Mutation:

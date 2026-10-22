@@ -229,11 +229,24 @@ def sanitize(text: str, limit: int = 300) -> str:
 def short_host(name: Optional[str] = None) -> str:
     """The short hostname, matching ``claims.sh``'s ``hostname -s``.
 
-    ``CLAIM_HOST`` is a test seam (the analogue of ``CLAIM_OWNER_ID``): scope is a
-    HOST comparison, and proving "foreign is never probed" needs two names on one
-    box.
+    ⛔ THE SEAM IS THE WRITER'S SEAM. The registry is stamped by
+    ``claims.sh``'s ``claim_host()``, which reads **``CLAIM_OWNER_HOST``** (the
+    env var a cell exports to announce itself, #2094). The reader therefore
+    reads that same name: a reader honouring a different variable would compare
+    this box's claims against a host the writer never stamped, and scope — the
+    one field these two programs share — would silently disagree. ``CLAIM_HOST``
+    is kept as an alias so a probe written against the earlier name still works.
+
+    Scope is a HOST comparison, and proving "foreign is never probed" needs two
+    names on one box, which is what makes a test seam necessary at all.
+
+    ⚠️ Known residual: ``claims.sh`` also remembers FORMER host names
+    (``$CLAIM_STATE_DIR/claim-hosts``) so a renamed box's own claims stay local;
+    this reader compares only the current name, so such a claim reads
+    ``holder-on-foreign-box``. Consequence is label-only — every claim verdict is
+    an abstention — and it is named here rather than fixed silently.
     """
-    env = os.environ.get("CLAIM_HOST")
+    env = os.environ.get("CLAIM_OWNER_HOST") or os.environ.get("CLAIM_HOST")
     if env:
         return env.strip()
     return (name if name is not None else socket.gethostname()).split(".")[0]
