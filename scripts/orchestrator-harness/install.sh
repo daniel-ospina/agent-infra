@@ -780,7 +780,24 @@ if [ -z "$HARNESS" ]; then
   # controller, and `--pin-only` is precisely the flag that does NOT re-seed `$O`. harness-refresh.sh
   # passes the same pair, for the same reason (it advances the pin every cycle under a live loop).
   pin_say "no pin recorded — materialising $HARNESS_REF through $MAT"
-  if ! HARNESS_REPO="$HARNESS_REPO" HARNESS_REF="$HARNESS_REF" HARNESS_PIN_DIR="$HARNESS_PIN_DIR" \
+  # ⛔ FORCE A PER-COMMIT WORKTREE UNDER THE PIN ROOT, AND DO NOT LET THE MATERIALISER ANSWER
+  # `unchanged` (review finding, P1). `harness_apply` resolves `$HARNESS` most-explicit-first, and when
+  # that tree is ALREADY at the ref it answers `unchanged` and writes NO record — leaving the operator's
+  # own CHECKOUT to be recorded as the pin. On this fleet every checkout lives under `~/Documents/GitHub`,
+  # which macOS TCC protects from a launchd-born bash: a job whose program is that tree cannot open it,
+  # and under KeepAlive that is a silent crash-loop, while every install-time check (run as the installing
+  # user) passes. The pin root is chosen TCC-safe by construction (`~/harness`, see
+  # orchestrator-bringup.sh), so the pin is materialised INTO it: naming the per-commit child as
+  # `$HARNESS` makes `cur` unresolvable, which is exactly the `changed` branch that creates the worktree
+  # and records it.
+  _want_pin="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || true)"
+  _force_tree=""
+  [ -n "$_want_pin" ] && _force_tree="$HARNESS_PIN_DIR/$(printf '%s' "$_want_pin" | cut -c1-12)/scripts/orchestrator-harness"
+  # ⛔ `env`, NOT A `${VAR:+NAME=value}` PREFIX: bash lexes assignments BEFORE expansion, so a
+  # post-expansion `HARNESS=<path>` word is treated as a COMMAND ("No such file or directory"), not as an
+  # assignment — measured with this suite's own diagnostics in the CI log.
+  if ! env HARNESS="${_force_tree:-}" \
+       HARNESS_REPO="$HARNESS_REPO" HARNESS_REF="$HARNESS_REF" HARNESS_PIN_DIR="$HARNESS_PIN_DIR" \
        HARNESS_PIN_FILE="$HARNESS_PIN_FILE" CELL_HOME="$HOME" \
        bash "$MAT" apply --force --pin-only >"${TMPDIR:-/tmp}/pin-apply.$$" 2>&1; then
     sed 's/^/    /' "${TMPDIR:-/tmp}/pin-apply.$$" >&2; rm -f "${TMPDIR:-/tmp}/pin-apply.$$"
@@ -802,7 +819,9 @@ if [ -z "$HARNESS" ]; then
   # it ONLY when its HEAD is exactly the commit the ref names; every check below then still runs on it
   # (a copy, a pruned tree, a wrong commit all keep their refusals), and the records are written below.
   if [ -z "$HARNESS" ]; then
-    # The candidates are the trees the MATERIALISER itself would have resolved, in ITS order (its own
+    # COMPATIBILITY PATH: a materialiser that ignored the explicit `$HARNESS` above can still answer
+    # `unchanged` and write no record. The candidates are the trees that materialiser would have resolved,
+    # in ITS order (its own
     # sibling harness first, then the target repo's), so the fallback names the same tree rather than a
     # plausible one. Each is accepted ONLY at the commit the ref names.
     _want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || true)"
@@ -873,7 +892,7 @@ pin_say "pin: ${PIN_HEAD:0:12} at $HARNESS"
 # refusal in between (`harness-up up` catches it at start; a KeepAlive restart does not). Say it, once,
 # where the operator can act on it.
 if [ "$(git -C "$HARNESS_REPO" rev-parse --show-toplevel 2>/dev/null)" = "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)" ]; then
-  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). Materialise a per-commit tree (cloud-cell-supervisor.sh apply --pin-only) to freeze it."
+  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). Re-run this installer with no explicit HARNESS to materialise a per-commit tree under $HARNESS_PIN_DIR (it forces the worktree), which is what freezes the commit."
 fi
 MAT_FOR_PLIST="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
 [ -f "$MAT_FOR_PLIST" ] || MAT_FOR_PLIST=""

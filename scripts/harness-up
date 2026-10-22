@@ -906,6 +906,12 @@ hu_row_box() { # [strict-pin-dir]
   if [ ! -r "$PIN_SHA_FILE" ]; then
     hu_row box "$host" '?' "BROKEN (the pin record $PIN_SHA_FILE exists but cannot be read)"; return 2
   fi
+  # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` reads nothing — which the row below reported as
+  # "NO PIN (… is EMPTY)", i.e. it described an EMPTY FILE for a record that is not a file at all. Same
+  # rule the rest of this file now applies: an unreadable record is never an absent one.
+  if [ ! -f "$PIN_SHA_FILE" ]; then
+    hu_row box "$host" '?' "BROKEN (the pin record $PIN_SHA_FILE exists but is NOT A REGULAR FILE — cannot-verify is never an empty pin)"; return 2
+  fi
   sha="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [ -z "$sha" ]; then
     hu_row box "$host" - "NO PIN (the pin record $PIN_SHA_FILE is EMPTY: an empty pin reads as current to nothing, so this is not a pass)"; return 1

@@ -211,13 +211,14 @@ out="$(env HOME="$SHOME6" O="$T/o6" REPO="$FX" OR="acme/widget" HARNESS_REPO="$F
 ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "no pin + no materialiser is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "will not fall back to copying" && echo 0 || echo 1)" "…and says it will not fall back to copying"
 
-# A3 — THE `unchanged` FIRST PIN (review P1, BLOCKING). The commonest configuration is an operator
-# checkout that is ALREADY at the ref: the materialiser answers `unchanged` and deliberately writes NO
-# record (it never disturbs a checkout that IS the pin), so the installer had nothing to read and refused
-# with "reported success but … is empty" — the fresher the checkout, the more certain the refusal, and
-# the Mac could never be pinned. The fixture carries the REAL materialiser (so its own sibling harness is
-# the tree it resolves, exactly as on a box), and the arm then asks the PR's own `harness-up` whether the
-# recorded pin is startable — the two halves must agree or "installed" means "not startable".
+# A3 — THE FIRST PIN ON A CHECKOUT THAT *IS* THE REF (review P1) — AND WHY IT MUST NOT BE RECORDED AS THE
+# PIN (review N1). The materialiser answers `unchanged` and writes NO record when its resolved tree is
+# already at the ref, and the installer used to refuse with "reported success but … is empty" — so the
+# fresher the checkout, the more certain the refusal. The fix must NOT simply adopt that tree: on this
+# fleet every clone lives under `~/Documents/GitHub`, which macOS TCC protects from a launchd-born bash,
+# so a job whose program is the checkout cannot open it (a silent KeepAlive crash-loop) while every
+# install-time check — run as the installing user — passes. The pin is therefore materialised INTO the
+# TCC-safe pin root: `$HARNESS` is named as the per-commit child, which forces the `changed` branch.
 FX3="$T/repo3"; mkdir -p "$FX3/scripts/orchestrator-harness"
 ( cd "$FX3" || exit 1
   git init -q -b main . >/dev/null 2>&1
@@ -237,56 +238,41 @@ out="$(env HOME="$SHOME3P" O="$O3P" REPO="$FX3" OR="acme/widget" HARNESS_REPO="$
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
         PATH="$SHOME3P/.local/share/pi-node/current/bin:$BIN:$PATH" \
         bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a FIRST pin on a checkout that IS the ref installs (rc=$rc, was 78)"
-ck "$([ "$(head -1 "$SHOME3P/.harness-path" 2>/dev/null)" = "$FX3H" ] && echo 0 || echo 1)" \
-   "…and the dir record names the tree the materialiser resolved ($(head -1 "$SHOME3P/.harness-path" 2>/dev/null))"
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a FIRST pin on a checkout that IS the ref installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+PIN_DIR_A3="$(head -1 "$SHOME3P/.harness-path" 2>/dev/null)"
+ck "$(has "$PIN_DIR_A3" "$SHOME3P/harness/" && echo 0 || echo 1)" \
+   "…and the dir record names a per-commit tree under the PIN ROOT ($PIN_DIR_A3)"
+ck "$([ "$(git -C "$PIN_DIR_A3" rev-parse HEAD 2>/dev/null)" = "$FX3_SHA" ] && echo 0 || echo 1)" \
+   "…at the ref commit"
+ck "$([ "$PIN_DIR_A3" != "$FX3H" ] && echo 0 || echo 1)" \
+   "…and NOT the operator's checkout (a TCC-protected tree a launchd job cannot read)"
 ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_SHA" ] && echo 0 || echo 1)" \
    "…and the sha record names that commit"
 P3P="$SHOME3P/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
-ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$FX3H/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
+ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
 # The launcher's verdict on the SAME two records: it must not call the box BROKEN.
 hs_out="$(CELL_HOME="$SHOME3P" HOME="$SHOME3P" O="$O3P" REPO="$FX3" HARNESS_PIN_DIR="$SHOME3P/harness" \
-          HARNESS_PIN_FILE="$SHOME3P/.harness-path" HARNESS="$FX3H" \
+          HARNESS_PIN_FILE="$SHOME3P/.harness-path" HARNESS="$PIN_DIR_A3" \
           bash "$REPO_ROOT/scripts/harness-up" status 2>&1)"; hs_rc=$?
 ck "$(has "$hs_out" "NOT MATERIALISED" && echo 1 || echo 0)" "harness-up does NOT report the installed pin NOT MATERIALISED"
-# The verdict as a whole is BROKEN in this fixture because OTHER rows are (no drift checker beside the
-# fixture harness, no worker seed) — that is not this arm's subject. The pin row is: it must read OK, so
-# "installed" and "startable" cannot disagree about the pin.
 ck "$(has "$hs_out" "pin: OK" && echo 0 || echo 1)" "…and its pin row reads OK (rc=$hs_rc; other rows are fixture-incomplete)"
-# ⛔ THE WEAKENED CLAIM IS DISCLOSED (review finding, P3): this pin records a MUTABLE main worktree, so a
-# later pull there makes the job exec a commit the pin does not name (a KeepAlive restart does not ask
-# `harness-up`). Silence was the defect; one line where the operator acts is the fix.
-ck "$(has "$out" "MAIN WORKTREE" && echo 0 || echo 1)" "…and the install discloses that the pin names a MUTABLE main worktree"
+# ⛔ AND THE TCC HAZARD IS NOW UNREACHABLE ON THE DEFAULT ROUTE: with the pin root in place the operator's
+# checkout is never what launchd is told to exec.
+ck "$(has "$out" "MAIN WORKTREE" && echo 1 || echo 0)" "…and the install does not warn about a mutable checkout pin (none was recorded)"
 
-# A4 — A SHA RECORD WITH NO DIR RECORD IS REPAIRED, NOT REFUSED (review finding, P2). `harness-refresh`
-# writes sha then dir, and an interrupted first install leaves exactly this state; the materialise below
-# pins the CURRENT ref, so comparing against a sha read BEFORE that run refused DISAGREE on a box the
-# installer had itself just repaired — and neither printed remedy could clear it.
-FX4="$T/repo4"; mkdir -p "$FX4/scripts/orchestrator-harness"
-( cd "$FX4" || exit 1
-  git init -q -b main . >/dev/null 2>&1
-  printf '.worktrees/\n' > .gitignore
-  printf '#!/bin/bash\necho loop\n' > scripts/orchestrator-harness/orch-loop.sh
-  cp "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" "$REPO_ROOT/scripts/repo-slug.sh" scripts/ 2>/dev/null
-  git add -A >/dev/null 2>&1
-  git -c user.email=t@t -c user.name=t commit -qm base >/dev/null 2>&1
-  git update-ref refs/remotes/origin/main HEAD
-  printf 'old\n' >> scripts/orchestrator-harness/orch-loop.sh
-  git -c user.email=t@t -c user.name=t commit -qam newer >/dev/null 2>&1
-  git update-ref refs/remotes/origin/main HEAD
-) >/dev/null 2>&1
-FX4_OLD="$(git -C "$FX4" rev-parse HEAD^ 2>/dev/null)"
-FX4_NEW="$(git -C "$FX4" rev-parse HEAD 2>/dev/null)"
-SHOME4P="$T/home-a4"; mkdir -p "$SHOME4P/Library/LaunchAgents" "$SHOME4P/.pi/agent/state"
-printf '%s\n' "$FX4_OLD" > "$SHOME4P/.pi/agent/state/HARNESS-PIN"
-out="$(env HOME="$SHOME4P" O="$T/o-a4" REPO="$FX4" OR="acme/widget" HARNESS_REPO="$FX4" \
-        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
-        PATH="$SHOME4P/.local/share/pi-node/current/bin:$BIN:$PATH" \
-        bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a stale sha record + no dir record INSTALLS (rc=$rc, was a post-materialise DISAGREE)"
-ck "$([ "$(head -1 "$SHOME4P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX4_NEW" ] && echo 0 || echo 1)" \
-   "…and the sha record was MENDED to the tree the materialiser pinned"
-ck "$(has "$out" "MENDED after the materialise" && echo 0 || echo 1)" "…and the mend is SAID, not silent"
+# A3b — an EXPLICIT HARNESS (the documented 'pin a deliberate checkout' route) still records THAT tree, and
+# the install says out loud that it is a mutable main worktree (review K5/N2): the weakened claim is
+# disclosed where the operator acts on it.
+SHOME3Q="$T/home-a3b"; mkdir -p "$SHOME3Q/Library/LaunchAgents"
+out="$(env HOME="$SHOME3Q" O="$T/o-a3b" REPO="$FX3" OR="acme/widget" HARNESS="$FX3H" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an EXPLICIT HARNESS installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+ck "$([ "$(head -1 "$SHOME3Q/.harness-path" 2>/dev/null)" = "$FX3H" ] && echo 0 || echo 1)" \
+   "…and records exactly the tree the operator named"
+ck "$(has "$out" "MAIN WORKTREE" && echo 0 || echo 1)" "…and DISCLOSES that the pin names a mutable main worktree"
+ck "$(has "$out" "Re-run this installer with no explicit HARNESS" && echo 0 || echo 1)" \
+   "…with a remedy that actually materialises the per-commit tree"
 
 # B6 — THE HOME-DIR-ONLY ENTRYPOINT. A box that is LIVE on `launchd-controller.sh` (the tmux/Full-Disk-
 # Access wrapper that exists in NO commit — PR #2020 lifts it) must not be silently moved onto the
