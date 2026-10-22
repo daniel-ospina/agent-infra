@@ -121,15 +121,53 @@ _override_usable() {
   return 1
 }
 
+# _gh_named_state — the gh layer's NAMED budget state (`gh-core-exhausted resets_in=12m`), or empty
+# when the budget is fine or the record is stale.
+#
+# ⛔ WHY A LANE MUST SAY THIS INSTEAD OF “branch protection UNREADABLE”: on 2026-10-22 the account's
+# REST pool reached `5000 used / 0 remaining` while GraphQL still held 4769. Every lane read the
+# refused protection endpoint as “the merge contract is UNKNOWN”, and the human-facing diagnosis that
+# follows — wrong token, wrong repo, broken protection — was WRONG in all three parts. A budget the
+# fleet's own polling spent is indistinguishable, from inside a lane, from GitHub being down, so the
+# layer names it and this function repeats the name verbatim.
+#
+# ⛔ IT READS LOCAL STATE, DELIBERATELY: this runs at exactly the moment every gh call is refused, and
+# `gh-limit.py --health` is the surface that answers then (no request, no quota, no credentials). The
+# file is read directly rather than shelling out, because a resolver called once per candidate must
+# not add a process per call.
+# ⛔ AND IT IS AGE-BOUNDED, like `last-limit`: a record whose `reset` has passed is not a CURRENT
+# state, or one exhausted window would keep asserting itself for the rest of the day.
+_gh_named_state() {
+  local dir p line tok reset now
+  dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
+  p="$dir/health"
+  [ -f "$p" ] || return 0
+  IFS= read -r line < "$p" 2>/dev/null || return 0
+  tok="${line%% *}"
+  case "$tok" in gh-*) ;; *) return 0 ;; esac
+  reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
+  now="$(date +%s)"
+  [ -n "$reset" ] && [ "$reset" -gt "$now" ] || return 0
+  printf '%s resets_in=%dm' "$tok" "$(( (reset - now + 59) / 60 ))"
+}
+
 # required_checks <owner/repo> [<gh-binary>]
 # Print the repo's required status-check contexts, space-separated, once each.
 #   rc 0 -> READ from branch protection (the printed set is NON-EMPTY)
 #   rc 1 -> could NOT be read (network / permission / shape); nothing is printed
 # A zero-name read is a FAILED read, never "this repo requires nothing".
 required_checks() {
-  local or="${1:-}" gh="${2:-gh}" raw joined
+  local or="${1:-}" gh="${2:-gh}" raw joined named
   [ -n "$or" ] || return 1
-  raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || return 1
+  raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || {
+    # The read failed. Say WHY when the layer knows: an exhausted budget is a “wait 12 minutes”, not
+    # a “fix your token”. Silence otherwise — the existing fail-closed path is unchanged.
+    named="$(_gh_named_state)"
+    if [ -n "$named" ]; then
+      printf 'repo-authority: %s: required checks UNREAD — %s (the REST budget is spent, not a broken repo, not an invalid token, not GitHub being down). The merge contract is UNKNOWN until the window clears (fail-closed).\n' "$or" "$named" >&2
+    fi
+    return 1
+  }
   # De-duplicate and join on one line: the classifier splits on whitespace, and a newline would
   # otherwise reach it as part of the value rather than as a separator.
   _unrepresentable "$or" "$raw" || return 1
