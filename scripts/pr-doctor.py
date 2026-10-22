@@ -109,6 +109,34 @@ STATUS = os.path.join(STATE_DIR, "pr-doctor.status.json")
 # ELIGIBLE` off a single owned PR). An earlier revision passed `dry_run=` from ONE exit path, so four
 # of six exits still wrote -- a guard that covers the path you tested is not a guard.
 NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be recorded
+
+# ⛔ THE EXIT CONTRACT IS ONE TABLE, AND rc=2 HAS EXACTLY ONE MEANING (2026-10-22).
+#
+# `2` is the code the whole fleet reads as *"this job could not read the world, so it refused"*: the
+# sidecar drain prints `PR-DOCTOR REFUSED rc=2` for it, `objective.py`'s beat line reads it, and
+# `lib/fleet-inventory.sh`'s launchd predicate is "loaded AND last run exited 0" -- so the code is a
+# MACHINE surface, not prose. Two independent producers of `2` make it unreadable:
+#
+#   * `record_exit(EXIT_REFUSING, ...)` -- the sanctioned refusal (a blind open-PR read, or a pass
+#     where not one PR had readable checks). It RECORDS its reason in STATUS. This is `2`'s only
+#     legitimate meaning.
+#   * `argparse` -- a USAGE error exits 2 by default. Measured on this tree 2026-10-22:
+#       `python3 scripts/pr-doctor.py --bogus-flag`  ->  rc=2
+#     and it writes NO status record at all, so launchd reports 2 while the fleet's own record still
+#     carries the PREVIOUS pass's `ok` -- a false PASS manufactured by the instrument, in the exact
+#     shape #2291 is about on rc=3. A typo in a launchd `ProgramArguments` (a home-only plist is
+#     normal on the Mac -- `templates/launchd/` does not ship `com.tortoise.pr-doctor` yet) is then
+#     indistinguishable from a genuine refusal, which is why "find why it exits 2" cannot be
+#     answered from the code alone.
+#
+# So a usage error gets its OWN code, `sysexits.h`'s EX_USAGE (64) -- a real, documented value on
+# macOS AND Linux (`/usr/include/sysexits.h`) -- and it is RECORDED, so the two readers agree about
+# the same pass instead of one of them reporting a stale success.
+EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
+EXIT_REFUSING = 2     # I could not read the world (blind read) -- THE ONLY meaning of 2
+EXIT_UNDELIVERED = 3  # I read it, I placed the work, no worker took it
+EXIT_CRASH = 4        # an uncaught exception (see __main__)
+EXIT_USAGE = 64       # the COMMAND LINE is unusable -- nothing was attempted
 # A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
 # complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
 OWNERSHIP_NOTE = ""
@@ -346,7 +374,16 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
 
 def log(msg: str) -> None:
     line = "[%s] pr-doctor: %s" % (ts(), msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except OSError:
+        # ⛔ A CLOSED PIPE MUST NOT BECOME THE PASS'S VERDICT (2026-10-22, review). `error()` logs
+        # through here, and an exception escaping `error()` reaches `__main__`'s `except
+        # BaseException`, which records EXIT_CRASH and OVERWRITES the code this file just decided.
+        # Measured: `pr-doctor.py --bogus-flag | head -1` turned the intended rc=64 into a broken
+        # pipe and left `"rc": 4` in the record. The file append below is already guarded; this is
+        # the same rule for stdout.
+        pass
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(LOG, "a") as f:
@@ -2161,8 +2198,100 @@ def _surface_how(skipped: dict) -> str:
     return ", ".join(parts) or "no read attempted"
 
 
+def _not_a_fleet_reason(args) -> str:
+    """WHY a parsed invocation is not a fleet reading. THE ONE EXPRESSION, used twice.
+
+    Both callers go through this: the pre-parse (`_prescan_not_a_fleet_reading`) and `main()` after
+    the real parse. Two hand-written copies of this rule disagreed in review on `--dry` (argparse
+    prefix abbreviation), `--only 0` (legal, and falsy, so a REAL pass) and `--status` (prints and
+    returns 0 without ever writing a record) -- the same two-readers-two-answers defect this change
+    exists to remove, reproduced inside the fix.
+    """
+    if getattr(args, "only", 0):
+        return "--only %d is not a fleet reading" % args.only
+    if getattr(args, "dry_run", False):
+        return "dry run"
+    if getattr(args, "status", False):
+        return "--status is not a fleet reading"
+    return ""
+
+
+class _QuietParser(argparse.ArgumentParser):
+    """A parser whose `error()` decides NOTHING and prints NOTHING. For the pre-parse only."""
+
+    def error(self, message):
+        raise SystemExit(1)
+
+
+def _reading_scanner():
+    """The three flags that decide `NOT_A_FLEET_READING`, with the SAME types as the real parser.
+
+    ⛔ IT MUST BE ARGPARSE'S OWN SEMANTICS, NOT A TOKEN SCAN: abbreviation (`--dry`), `=`-form and
+    value arity are argparse's, and a string match silently disagreed with it on all three (review,
+    2026-10-22). `type=int` is load-bearing -- with `str`, `--only 0` would read as truthy here and
+    as a real pass there.
+    """
+    p = _QuietParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--only", type=int, default=0)
+    p.add_argument("--status", action="store_true")
+    return p
+
+
+def _prescan_not_a_fleet_reading(argv) -> str:
+    """WHY this invocation is not a fleet reading, decided BEFORE the real parse can reject it.
+
+    ⛔ THIS RUNS BEFORE `parse_args()` ON PURPOSE. `_UsageParser.error()` records its verdict, and
+    `record_exit` honours `NOT_A_FLEET_READING` -- but on a usage error the parsed flags do not
+    exist yet. Without this prescan, a typo'd debug run would stamp rc=64 over a real pass's
+    record, trading a false PASS for a false RED. Both are wrong; the flags are what distinguish a
+    lane's debugging invocation from the launchd tick.
+
+    ⛔ WHEN THE SCANNER ITSELF CANNOT PARSE (e.g. `--only abc`), IT RETURNS "" -- i.e. DO record.
+    That is deliberate and asymmetric: the pass genuinely did not run, and leaving the PREVIOUS
+    pass's `ok` in place is the false PASS this whole change removes. Silence is only granted when
+    the invocation is provably a debug one.
+    """
+    try:
+        args, _ = _reading_scanner().parse_known_args(argv)
+    except SystemExit:
+        return ""
+    return _not_a_fleet_reason(args)
+
+
+class _UsageParser(argparse.ArgumentParser):
+    """argparse, with the fleet's exit contract applied to a USAGE error.
+
+    ⛔ `argparse` EXITS 2. That is the code this job reserves for REFUSING (see the EXIT_* table),
+    and `argparse` writes no status record -- so `launchctl list` says 2 while STATUS still says
+    `ok`, and `lib/fleet-inventory.sh` reads the record, not launchd. Overriding ONE method is what
+    makes 2 mean exactly one thing without changing any flag this job accepts.
+
+    `--help` still exits 0: it goes through `parser.exit(0)`, never through `error()`.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        reason = "the COMMAND LINE is unusable (%s) -- nothing was attempted" % message
+        # ⛔ THE CODE IS DECIDED HERE AND A BROKEN SINK MAY NOT CHANGE IT (2026-10-22, review).
+        # `log()` writes to stdout, and `record_exit` writes the record; if EITHER raises (a closed
+        # pipe, a full disk, an unwritable state dir) the exception would escape to `__main__`,
+        # which records EXIT_CRASH and overwrites the very verdict this method just produced.
+        try:
+            log("REFUSING: %s" % reason)
+            rc = record_exit(EXIT_USAGE, reason, read="argv")
+        except Exception:
+            rc = EXIT_USAGE
+        raise SystemExit(rc)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    # ⛔ ASSIGNED BEFORE THE PARSE, THEN RE-ASSIGNED FROM THE PARSED FLAGS. `record_exit` can be
+    # reached by `_UsageParser.error()` while no flag has been parsed, so a run whose flags are
+    # UNPARSEABLE must still not stamp the fleet's verdict when the invocation was never a pass.
+    global NOT_A_FLEET_READING
+    NOT_A_FLEET_READING = _prescan_not_a_fleet_reading(sys.argv[1:])
+    ap = _UsageParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=None,
                     help="hard ceiling on dispatches this pass; default is the machine's "
@@ -2170,17 +2299,16 @@ def main() -> int:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--only", type=int, default=0, help="limit to one PR number")
     args = ap.parse_args()
-    global NOT_A_FLEET_READING
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
-    NOT_A_FLEET_READING = "dry run" if args.dry_run else ""
-    if args.only:
-        # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review). Everything downstream -- the
-        # empty-queue exit, `un_owned`, `issue_work` -- is computed from a ONE-PR universe, so
-        # recording it would publish `queue is empty` while PRs are open, or let new issue work
-        # through the gate on the strength of a single owned PR. It may dispatch (that is the point
-        # of the flag); it may not speak for the fleet.
-        NOT_A_FLEET_READING = "--only %d is not a fleet reading" % args.only
+    NOT_A_FLEET_READING = _not_a_fleet_reason(args)
+    # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review), and neither is `--dry-run` or
+    # `--status`: everything downstream -- the empty-queue exit, `un_owned`, `issue_work` -- is
+    # computed from a ONE-PR universe, so recording it would publish `queue is empty` while PRs are
+    # open, or let new issue work through the gate on the strength of a single owned PR. It may
+    # dispatch (that is the point of the flag); it may not speak for the fleet. The RULE lives in
+    # `_not_a_fleet_reason()` -- one expression, also used by the pre-parse -- so this comment is
+    # the rationale and not a second copy of it.
 
     st = load_state()
     if args.status:
@@ -2227,7 +2355,7 @@ def main() -> int:
         log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
         if voided and not args.dry_run:
             save_state(st)
-        return record_exit(2, "the open-PR read FAILED (%s) -- nothing dispatched"
+        return record_exit(EXIT_REFUSING, "the open-PR read FAILED (%s) -- nothing dispatched"
                            % OPEN_PRS_ERROR[:160], read="open_prs")
     prs = [p for p in prs if not p.get("isDraft")]
     if args.only:
@@ -2409,7 +2537,7 @@ def main() -> int:
     if not classified and skipped.get("unreadable") == len(prs):
         log("REFUSING: not ONE of the %d open PR(s) had readable checks -- nothing dispatched"
             % len(prs))
-        return record_exit(2, "not ONE of the %d open PR(s) had readable checks -- nothing "
+        return record_exit(EXIT_REFUSING, "not ONE of the %d open PR(s) had readable checks -- nothing "
                            "dispatched" % len(prs), queued=len(prs), dispatched=0,
                            read="pr_checks")
 
@@ -2597,11 +2725,11 @@ def main() -> int:
         # world (the PR list, the checks); 3 = I read it, I placed the work, and NO WORKER WOULD
         # TAKE IT. Collapsing them (both used to be 2) is why a launcher could not tell "the
         # dispatcher is blind" from "the transport refused the order".
-        code = 0
+        code = EXIT_CLEAN
         if not dispatched and blind:
-            code = 2
+            code = EXIT_REFUSING
         elif not dispatched and undeliv:
-            code = 3
+            code = EXIT_UNDELIVERED
         return record_exit(code, why, queued=queued, dispatched=dispatched, prs=delivered,
                            dry_run=bool(args.dry_run),
                            issue_work=issue_work,
@@ -2720,9 +2848,9 @@ if __name__ == "__main__":
     except BaseException as e:
         import traceback
         traceback.print_exc()
-        record_exit(4, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
+        record_exit(EXIT_CRASH, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
         # ⛔ `raise SystemExit(4)`, NOT a bare re-raise (2026-10-18, review): CPython exits 1 for an
         # uncaught exception, so the sidecar said rc=4 while launchd said 1 -- the two readers this
         # change exists to keep in agreement, disagreeing on the same pass. The traceback is already
         # printed above, so nothing is lost by making the STATUS the exit code.
-        raise SystemExit(4)
+        raise SystemExit(EXIT_CRASH)

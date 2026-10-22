@@ -423,6 +423,12 @@ case "${LAUNCHD_MODE:-running}" in
   # `launchctl print gui/0/x` under root, and of an SSH context with no gui domain).
   bad-domain) printf 'Bad request.\nCould not find domain for user gui: 0\n' >&2; exit 113 ;;
   loaded-no-pid) printf '\tstate = spawn scheduled\n\tlast exit code = 78\n'; exit 0 ;;
+  # A recorded exit that keeps being followed by no process — with the cumulative launch count.
+  crashloop) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n\truns = 7\n'; exit 0 ;;
+  # NO launch count at all: the row may print the code and must invent no count.
+  died) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n'; exit 0 ;;
+  # Loaded with no process AND no exit data at all: the row may not invent one.
+  no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
 esac
 SH
@@ -478,9 +484,57 @@ LAUNCHD_MODE=loaded-no-pid OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH"
         LAUNCHD_MODE=loaded-no-pid HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
         bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
 case "$OUT" in
-  *"launchd"*"LOADED-NO-PROCESS"*) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING')" 0 ;;
-  *) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING') [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
+  *"launchd"*"DIED (last exit 78"*) ck "(d) a job loaded with NO process NAMES launchd's own exit code (78), not a shrug" 0 ;;
+  *) ck "(d) a job loaded with NO process NAMES launchd's own exit code (78) [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
 esac
+# ⛔ THE STATE THIS WHOLE ROW EXISTS FOR (2026-10-22). The Mac's `com.eldato.orchestrator-loop` sat at
+# LAST EXIT 128 — a fork/spawn failure — and the row could only say "it is crashing or was never
+# kicked". The exit code and launchd's own launch count are in the block the row already reads, so
+# the row must CARRY them instead of dropping them.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=crashloop HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a recorded exit is NAMED DIED with launchd's own code (128) [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and the launch count is carried as EVIDENCE (7 time(s)) [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in *"7 time(s)"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs` IS CUMULATIVE AND MAY NOT BECOME A VERDICT (review, 2026-10-22). `launchd-cycle.sh`'s
+# `lc_runs` calls it the job's "cumulative RELAUNCH counter" since LOAD, so `runs = 7` is equally
+# consistent with a crash loop and with a job that ran fine for days and has just exited once. The
+# predicate that can prove a repeat is `lc_assert_stable` (a DELTA over a window) and it is not run
+# on the `status` path, so the row reports the count and must NOT claim persistence from it — the
+# misdiagnosis class this change exists to end, inverted.
+ck "(d) …but a cumulative count is NOT turned into a persistence verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *PERSISTENT*|*"restarting will not help"*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ THE AGGREGATE `status` CODE IS NOT A WITNESS FOR THIS ROW (review finding 1). The fixture's
+# OTHER rows (`loop`, `refresh`) decide VERDICT and therefore RC, so asserting RC here would be
+# asserting them — and asserting 2 (which is what this fixture returns) would pass for a reason that
+# has nothing to do with launchd. The row's own degraded return is the `1)` arm's `return 1`, whose
+# effect on the aggregate is exercised by every row above; the TEXT above is this test's property.
+#
+# An exit with NO launch count still prints the code, and invents no count.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=died HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) an exit with NO launch count still prints the code [$launchd_row]" \
+   "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and invents no count when launchd published none [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in *"time(s)"*|*"0 time"*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AN ABSENT DATUM IS NEVER RENDERED AS A VALUE. With no exit code and no run count the row must
+# fall back to LOADED-NO-PROCESS rather than claim "last exit 0" or "0 launches".
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=no-data HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) with NO exit data the row falls back to LOADED-NO-PROCESS (it never invents a status) [$launchd_row]" \
+   "$(case "$launchd_row" in *LOADED-NO-PROCESS*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and invents neither a code nor a count [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in *"last exit 0"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
 # …and a DOMAIN-level rejection must not become a confident NOT LOADED + re-install remedy (review
 # round 4): rc is not the verdict, the text is — the rule launchd-cycle.sh `lc_probe` and
 # orchestrator-bringup.sh `launchd_job_state` both state.

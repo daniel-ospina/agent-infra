@@ -246,6 +246,28 @@ hp_argv_script() {
 # rc: 0 loaded AND running · 1 loaded with NO process (crashed / never started) · 2 NOT LOADED
 #     · 3 no launchctl on this box · 4 not a macOS box · 5 cannot-verify (the read failed in a way that
 #     says NOTHING about the job) · 142 the bound fired · 125 no usable bound.
+#
+# ⛔ "LOADED, NO PROCESS" IS NOT A DIAGNOSIS — and on this platform it hid a dead controller for a
+# whole night. The brief that produced this row reported `com.eldato.orchestrator-loop` LAST EXIT
+# **128** (a fork/spawn failure: `spawn /bin/bash EAGAIN` is rc 128, measured on this box in #2293)
+# while the row could only say `LOADED-NO-PROCESS … it is crashing or was never kicked`. Those are
+# two different facts with two different responses (NEVER KICKED: kick it · EXITED: read the cause),
+# and launchd ALREADY publishes the discriminator in the block this function has in hand:
+# `last exit code = N`, plus the launch count `runs = N`.
+#
+# So the rc=1 arm PARSES those fields out of the SAME read (never a second `launchctl print`: the
+# header's own rule) into HP_LAUNCHD_LAST_EXIT / HP_LAUNCHD_RUNS, and the row NAMES the state. The
+# parser idiom and the `runs =` field are `launchd-cycle.sh`'s `lc_runs` (:494-504) — this file
+# consumes that shape rather than inventing a second one.
+#
+# ⛔ AND `runs` IS CUMULATIVE, SO IT CANNOT PROVE PERSISTENCE (2026-10-22, review). `lc_runs` calls
+# it the job's "cumulative RELAUNCH counter", counted since the job was LOADED — so `runs = 3` is
+# equally consistent with "restarted twice, running normally since, then one transient `spawn …
+# EAGAIN` now" and with a genuine crash loop. It is therefore REPORTED as evidence and never turned
+# into a verdict: the persistence claim is stated CONDITIONALLY ("if it stays in this state every
+# attempt is failing"), which follows from `KeepAlive` + `ThrottleInterval` alone. The predicate that
+# can actually prove a repeat is `launchd-cycle.sh`'s `lc_assert_stable` — a DELTA over a window —
+# and it is deliberately not run here: it costs a throttle-length wait on the `status` path.
 # ⛔ THE rc IS NOT THE VERDICT — THE TEXT IS, AND THAT RULE IS NOT THIS FILE'S. Two authorities already
 # own "is this launchd job there", and both refuse rc-as-verdict explicitly:
 #   * `launchd-cycle.sh`'s `lc_probe`: "ONLY launchd's own SERVICE-level 'no such service' answer counts
@@ -262,6 +284,10 @@ hp_argv_script() {
 # `PID STATUS LABEL`, and a `-` PID is a state a reader has to remember to catch.)
 hp_launchd_loaded() {
   local label="${1:-}" out="" rc=0
+  # The reason a job that is loaded has no process. Reset on EVERY call so a caller that reads two
+  # jobs can never report the first one's exit code against the second (the stale-global shape).
+  HP_LAUNCHD_LAST_EXIT=""
+  HP_LAUNCHD_RUNS=""
   [ "$(hp_os)" = Darwin ] || return 4
   command -v launchctl >/dev/null 2>&1 || return 3
   out="$(hu_bounded "${HU_LAUNCHCTL_TIMEOUT:-10}" launchctl print "gui/$(id -u)/$label" 2>&1)"; rc=$?
@@ -279,6 +305,11 @@ hp_launchd_loaded() {
   esac
   grep -q '^[[:space:]]*state = running' <<<"$out" && return 0
   grep -Eq '^[[:space:]]*pid = [0-9]+' <<<"$out" && return 0
+  # Loaded with NO process: capture launchd's own explanation before returning the verdict. Both
+  # fields are absent on some job kinds, and an ABSENT datum is never rendered as a value ("last
+  # exit 0" would be a claim launchd did not make).
+  HP_LAUNCHD_LAST_EXIT="$(awk '/^[[:space:]]*last exit code = /{ sub(/^[[:space:]]*last exit code = /, ""); print; exit }' <<<"$out")"
+  HP_LAUNCHD_RUNS="$(awk '/^[[:space:]]*runs = /{ sub(/^[[:space:]]*runs = /, ""); print; exit }' <<<"$out")"
   return 1
 }
 # ══ <<< shim ═════════════════════════════════════════════════════════════════════════════════════
@@ -890,6 +921,41 @@ hu_row_exec() {
   return 1
 }
 
+# hp_launchd_dead_text <label> — NAME the state of a loaded job that has NO process.
+#
+# ⛔ TWO FACTS, TWO REMEDIES:
+#   DIED              launchd recorded an exit status: launchd's KeepAlive will retry it on its
+#                     ThrottleInterval, so a job that STAYS here is failing on every attempt. The
+#                     launch count is printed as EVIDENCE of how many times it has been started
+#                     since load — never as proof that the failure is persistent (see the note on
+#                     `runs` above `hp_launchd_loaded`).
+#   LOADED-NO-PROCESS launchd published no exit code: "it is crashing or was never kicked" really is
+#                     all that is known, and the row says exactly that.
+#
+# ⛔ WHY THE EXIT CODE IS PRINTED: on the Mac this row is the only place an operator meets launchd's
+# judgement, and `LAST EXIT 128` is what a fork/spawn failure looks like (`spawn … EAGAIN` is 128 —
+# #2293). Dropping it forces a human to run `launchctl print` themselves, which is the "silent until
+# you already suspect" shape this file exists against.
+# ⛔ AND AN ABSENT DATUM IS NEVER RENDERED AS A VALUE: no exit code means no code is printed, never
+# "last exit 0"; no `runs` means no count is printed, never "0 launches".
+hp_launchd_dead_text() { # <label>
+  local label="${1:-}" runs="${HP_LAUNCHD_RUNS:-}" lexit="${HP_LAUNCHD_LAST_EXIT:-}" seen=""
+  if [ -n "$lexit" ]; then
+    # Only a plain integer is quoted back: a garbled field is not evidence of anything.
+    case "$lexit" in *[!0-9]*) lexit="" ;; esac
+  fi
+  if [ -n "$runs" ]; then
+    case "$runs" in *[!0-9]*) runs="" ;; *) seen=" — launchd has launched it $runs time(s) since it was loaded" ;; esac
+  fi
+  if [ -n "$lexit" ]; then
+    printf 'DIED (last exit %s%s; launchd retries it on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
+      "$lexit" "$seen" "$O"
+  else
+    printf 'LOADED-NO-PROCESS (%s is loaded but has NO process — it is crashing or was never kicked, and launchd published no exit code to tell which; check: launchctl print gui/%s/%s)' \
+      "$label" "$(id -u)" "$label"
+  fi
+}
+
 # ── the LAUNCHD row: on the Mac, is the job LOADED, and does it HAVE a PROCESS? ─────────────────
 # ⛔ `ps` ALONE CANNOT ANSWER THIS, and the three states have three different remedies: NOT LOADED
 # (load it — `launchctl load`), LOADED WITH NO PROCESS (it is crashing; the job is installed and
@@ -907,7 +973,7 @@ hu_row_launchd() {
   hp_launchd_loaded "$label"; rc=$?
   case "$rc" in
     0) hu_row launchd - - "OK ($label is loaded and has a process)"; return 0 ;;
-    1) hu_row launchd - - "LOADED-NO-PROCESS ($label is loaded but has NO process — it is crashing or was never kicked; check: launchctl print gui/$(id -u)/$label)"; return 1 ;;
+    1) hu_row launchd - - "$(hp_launchd_dead_text "$label")"; return 1 ;;
     2) hu_row launchd - - "NOT LOADED ($label is not in this user's launchd domain — nothing on this box starts the controller: O=$O bash scripts/orchestrator-harness/install.sh --start)"; return 1 ;;
     3) hu_row launchd - - "UNKNOWN (no launchctl on PATH, so the job's state cannot be read)"; return 2 ;;
     4) hu_row launchd - - "SKIPPED (not a macOS box)"; return 4 ;;

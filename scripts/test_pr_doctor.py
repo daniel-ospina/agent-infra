@@ -3723,3 +3723,173 @@ def test_a_surface_pr_is_escalated_to_the_owner_not_landed(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     assert any(m.startswith("ASK-USER #1") for m in logs), logs
+
+
+# ── 10. rc=2 has EXACTLY ONE meaning, and the record always agrees with launchd ────────────
+#
+# ⛔ THE MEASURED DEFECT (agent-infra, found 2026-10-22). `2` is the fleet's machine-readable
+# "this job could not read the world, so it refused" — `lib/fleet-inventory.sh`'s launchd predicate
+# is "loaded AND last run exited 0", and the beat prints `PR-DOCTOR REFUSED rc=2`. `argparse` exits
+# 2 too, on an unusable command line, and writes NO status record. Measured on this tree:
+#
+#     python3 scripts/pr-doctor.py --bogus-flag   ->  rc=2, STATUS still the PREVIOUS pass's `ok`
+#
+# So launchd said "refused" while the fleet's own record said "clean pass" — a false PASS produced
+# by the instrument, and the reason a typo'd launchd ProgramArguments (normal on the Mac: no
+# `com.tortoise.pr-doctor` template ships) is indistinguishable from a real refusal.
+#
+# PLATFORM: every test below is pure Python (in-process, or `sys.executable` as a subprocess) and
+# asserts nothing about launchd itself, so it RUNS ON macOS AND ON LINUX with no skip. The OS-specific
+# half — what launchd reports and how it is named — is pinned by `scripts/harness-surface.test.sh`
+# through its `LAUNCHD_MODE` seam, which exercises the Darwin arm on either platform.
+
+def _run_doctor(argv, home):
+    """The REAL script, as a subprocess, with its own HOME. No network: these argv all fail early."""
+    return subprocess.run([sys.executable, str(_REPO / "scripts" / "pr-doctor.py")] + argv,
+                          capture_output=True, text=True, timeout=120,
+                          env=dict(os.environ, HOME=str(home)))
+
+
+def _seed_status(home, payload):
+    p = pathlib.Path(home) / ".pi" / "agent" / "state" / "pr-doctor.status.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_the_exit_contract_is_one_table_with_five_distinct_codes():
+    """A code that two facts share is a code that answers neither. Each meaning is its own value."""
+    table = {"clean": pr.EXIT_CLEAN, "refusing": pr.EXIT_REFUSING,
+             "undelivered": pr.EXIT_UNDELIVERED, "crash": pr.EXIT_CRASH,
+             "usage": pr.EXIT_USAGE}
+    assert pr.EXIT_CLEAN == 0
+    assert pr.EXIT_REFUSING == 2, "2 is the fleet's refusal code — it may not be reassigned"
+    assert pr.EXIT_USAGE == 64, "usage errors take sysexits.h EX_USAGE (64), not 2"
+    assert len(set(table.values())) == len(table), table
+
+
+def test_no_second_producer_of_rc2_exists_in_the_source():
+    """The mechanical half: a future edit must not reintroduce a bare 2 (or a second parser)."""
+    src = (_REPO / "scripts" / "pr-doctor.py").read_text()
+    assert "record_exit(2," not in src, "rc=2 must be spelled EXIT_REFUSING so it stays one meaning"
+    assert not re.search(r"^\s*code = 2\s*$", src, re.M), "same for the _finish() assignment"
+    assert re.search(r"^\s*ap = _UsageParser\(\)", src, re.M), "main() must use the usage parser"
+    assert "argparse.ArgumentParser(" not in src, (
+        "a plain ArgumentParser exits 2 on a usage error and writes no record")
+
+
+def test_a_usage_error_is_64_and_says_so_aloud(tmp_path):
+    r = _run_doctor(["--bogus-flag"], tmp_path)
+    assert r.returncode == 64, (r.returncode, r.stdout, r.stderr)
+    assert r.returncode != 2, "a usage error is NOT a refusal"
+    assert "COMMAND LINE is unusable" in r.stdout, r.stdout
+    assert "unrecognized arguments: --bogus-flag" in r.stdout, r.stdout
+
+
+def test_a_usage_error_records_its_verdict_instead_of_leaving_a_stale_ok(tmp_path):
+    """THE false-PASS this closes: launchd 2, record `ok` — two readers, opposite answers."""
+    status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "2026-10-21"})
+    r = _run_doctor(["--bogus-flag"], tmp_path)
+    assert r.returncode == 64
+    rec = json.loads(status.read_text())
+    assert rec["rc"] == 64, rec
+    assert "COMMAND LINE is unusable" in rec["reason"], rec
+    assert rec.get("read") == "argv", rec
+
+
+def test_a_usage_error_under_dry_run_does_not_stamp_the_fleet_record(tmp_path):
+    """The other half: a lane's typo'd debug run must not manufacture a fleet RED."""
+    status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "2026-10-21"})
+    before = status.read_text()
+    r = _run_doctor(["--dry-run", "--bogus-flag"], tmp_path)
+    assert r.returncode == 64
+    assert status.read_text() == before, "a non-pass invocation overwrote the fleet's verdict"
+
+
+def test_help_is_not_a_refusal(tmp_path):
+    r = _run_doctor(["--help"], tmp_path)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_a_blind_open_pr_read_still_exits_2(monkeypatch):
+    """The sanctioned refusal keeps its code — the fix NARROWS 2, it does not retire it."""
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "void_refused_rows", lambda st: [])
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "the read blew up", raising=False)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "record_exit", lambda rc, reason, **k: rc)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_REFUSING == 2
+
+
+@pytest.mark.parametrize("argv,expected", [
+    ([], ""),
+    (["--dry-run"], "dry run"),
+    # ⛔ ARGPARSE'S OWN SEMANTICS, NOT A TOKEN SCAN (found in review). All four of these disagreed
+    # with a string match: abbreviations are legal, `--only 0` is legal AND falsy (= a REAL pass),
+    # and `--status` never writes a record at all on success.
+    (["--dry"], "dry run"),
+    (["--only", "7"], "--only 7 is not a fleet reading"),
+    (["--only=7"], "--only 7 is not a fleet reading"),
+    (["--only", "0"], ""),
+    (["--only=0"], ""),
+    (["--status"], "--status is not a fleet reading"),
+    (["--max", "3"], ""),
+])
+def test_the_prescan_agrees_with_the_parsed_flags(monkeypatch, argv, expected):
+    """The prescan duplicates the MEANING of three flags, so it is pinned against the real assignment.
+
+    It exists because `_UsageParser.error()` can fire before any flag is parsed, and it must reach
+    the same conclusion the parsed flags would — otherwise a `--dry` typo stamps rc=64 over a real
+    pass (a false RED) while `--only 0 --typo` leaves a stale `ok` (a false PASS).
+    """
+    assert pr._prescan_not_a_fleet_reading(argv) == expected
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "void_refused_rows", lambda st: [])
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "", raising=False)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "record_exit", lambda rc, reason, **k: rc)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"] + argv)
+    monkeypatch.setattr(pr, "NOT_A_FLEET_READING", "")
+    pr.main()
+    assert pr.NOT_A_FLEET_READING == expected
+
+
+def test_an_unparseable_scanner_value_still_records(tmp_path):
+    """`--only abc` cannot be classified, so the pass must RECORD rather than leave a stale `ok`.
+
+    Silence is only granted when the invocation is provably a debug one; when it is not provable,
+    the conservative direction is the one that cannot hide a broken job.
+    """
+    status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "x"})
+    r = _run_doctor(["--only", "abc"], tmp_path)
+    assert r.returncode == 64, (r.returncode, r.stdout, r.stderr)
+    rec = json.loads(status.read_text())
+    assert rec["rc"] == 64, rec
+
+
+def test_a_closed_stdout_pipe_cannot_rewrite_the_verdict_as_a_crash(tmp_path):
+    """Measured 2026-10-22: `pr-doctor.py --bogus-flag | head -1` left `"rc": 4` in the record.
+
+    `log()` prints, `error()` logged first, the BrokenPipeError escaped, and `__main__`'s
+    `except BaseException` recorded EXIT_CRASH -- overwriting the code the file had just decided.
+    The RECORD is the fleet's datum (`lib/fleet-inventory.sh` reads it), so it must survive a
+    consumer that stops reading.
+
+    ⚠️ The PROCESS status here is 120, which is CPython's own shutdown-flush status for a closed
+    pipe -- it is set after `main()` returns and is not one of this file's verdict codes. Both
+    facts are asserted: the record says 64, and the process did not claim 2 (REFUSING) or 4
+    (CRASH), which are the codes that would mislead a reader.
+    """
+    status = _seed_status(tmp_path, {"rc": 0, "reason": "A PREVIOUS PASS SAID OK", "at": "x"})
+    p = subprocess.Popen([sys.executable, str(_REPO / "scripts" / "pr-doctor.py"), "--bogus-flag"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         env=dict(os.environ, HOME=str(tmp_path)))
+    p.stdout.close()                      # the consumer hangs up immediately
+    rc = p.wait(timeout=120)
+    rec = json.loads(status.read_text())
+    assert rec["rc"] == 64, rec
+    assert "COMMAND LINE is unusable" in rec["reason"], rec
+    assert rc not in (2, 4), (rc, "a closed pipe must not become a refusal or a crash verdict")

@@ -17,6 +17,20 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- ThrottleInterval: THE RETRY INTERVAL IS DECLARED, NOT INHERITED. 10 s is launchd's own
+       documented default and its floor (`man launchd.plist`: "by default, jobs will not be spawned
+       more than once every 10 seconds"), so this changes NO behaviour — it makes the value VISIBLE
+       in the file an operator reads, instead of one they have to know.
+       ⛔ IT DOES NOT FEED THE CRASH-LOOP CHECK. `launchd-cycle.sh`'s `lc_min_runtime` reads
+       `minimum runtime = N` out of `launchctl print` and defaults to 10 — it never reads this key,
+       so removing or changing it here would not move that window. (An earlier draft of this comment
+       claimed otherwise; corrected 2026-10-22, review.)
+       With KeepAlive above, a transient spawn failure (fork exhaustion: `spawn /bin/bash EAGAIN`,
+       rc 128 — #2293) is retried on this interval, and `harness-up`'s launchd row names the job
+       DIED with launchd's own exit code rather than leaving it silent. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
   <key>StandardOutPath</key>
   <string>__O__/logs/launchd.out</string>
   <key>StandardErrorPath</key>
