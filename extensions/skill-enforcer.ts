@@ -79,7 +79,9 @@ export const REPO_DIR = resolve(MODULE_DIR, "..");
 // NOT on the age of the read. persistReadFiles() writes `readAt: now` for EVERY
 // entry in readFiles — a restored one included — and it runs after each tracked
 // read and at session_shutdown. So a skill read once keeps satisfying its gate
-// while a session starts at least once every 24 h, and "read this session" in a
+// while a session RUNS at least once every 24 h — a tracked read, or a clean
+// session_shutdown; session_start itself re-stamps NOTHING (it only restores) — and
+// "read this session" in a
 // gate message means "restored into this session". The window is stated at the
 // gate-description sites a lane reads — the manifest header
 // (enforcement/dangerous-ops.txt) and AGENTS.md §Skill Reading Protocol — so a
@@ -97,8 +99,10 @@ const READ_PERSIST_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 // restored, and `Math.max` below then kept that stamp over every later `now`, which made
 // the prune unable to fire: ONE future entry satisfied this gate FOREVER. The fleet
 // already settled this rule for the same class in
-// `extensions/main-worktree-guard/classify-git.mjs` ("far-future mtime (>60s skew) →
-// inactive (TTL-evasion bound)"), so the skew allowance is the same 60 s.
+// `extensions/main-worktree-guard/classify-git.mjs`, `isAllowMarkerActive`:
+//   "a future-dated mtime (age < 0) would extend the TTL indefinitely … — reject
+//    beyond a 60s clock-skew tolerance instead of trusting any negative age"
+//   (`if (age < -60_000) return false`), so the skew allowance is the same 60 s.
 const READ_PERSIST_FUTURE_SKEW_MS = 60 * 1000;
 
 interface SkillReadEntry {

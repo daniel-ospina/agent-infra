@@ -888,7 +888,9 @@ async function main() {
   // in favour of the persisted value) and this test fails: a read would then
   // expire 24 h after it was taken, which is precisely the mis-statement the
   // issue corrected.
-  await test("T13 — the 24 h window bounds IDLENESS: a restored read is re-stamped at session_shutdown (#1331)", async () => {
+  // ⛔ ID is T13a, not T13: a PRE-EXISTING leg above already owns "T13" (the path-shaped
+  // residual), and two rows of the design record cited the same ambiguous id.
+  await test("T13a — the 24 h window bounds IDLENESS: a restored read is re-stamped at session_shutdown (#1331)", async () => {
     const { pi, reads } = await newSession();
     const seeded = Date.now() - 23 * 60 * 60 * 1000; // inside the TTL → restores
     writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: seeded }]));
@@ -903,7 +905,7 @@ async function main() {
     ok(entry.readAt > seeded + 1000, "the persisted readAt must be strictly newer than the 23 h-old seed — the TTL must not measure the read's age");
   });
 
-  // ⛔ The window is pinned from BELOW by T13 (23 h restores). Without a leg from ABOVE,
+  // ⛔ The window is pinned from BELOW by T13a (23 h restores). Without a leg from ABOVE,
   // `READ_PERSIST_TTL_MS` could be raised to a year — or to `Infinity` — and this suite
   // stayed green while AGENTS.md, templates/AGENTS.base.md and the dangerous-ops manifest
   // all kept asserting "24 h": the exact doc/code divergence #1331 exists to close, one
@@ -923,6 +925,24 @@ async function main() {
     writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() + 365 * 24 * 60 * 60 * 1000 }]));
     await pi.fire("session_start", {});
     equal((await pi.fire("tool_call", COMMIT))?.block, true, "a future stamp is not evidence of a read");
+  });
+
+  // ⛔ T13c proves only that a future stamp does not RESTORE. The claim the design record
+  // makes — "dropped at restore, and not carried into the persisted file by the merge path"
+  // — has a SECOND branch (persistReadFiles()'s `existing` loop). Deleting that branch left
+  // this suite fully green: the file kept the future stamp, so a single hand-written line
+  // could be re-laundered on every persist. This leg fires a real persist and asserts the
+  // written file no longer carries it.
+  await test("T13e — a FUTURE-dated stamp is not carried into the persisted file by the merge path", async () => {
+    const { pi, reads } = await newSession();
+    const future = Date.now() + 365 * 24 * 60 * 60 * 1000;
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: future }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "precondition: the future stamp does not restore");
+    await pi.fire("session_shutdown", {}); // calls persistReadFiles() -> the merge path
+    const written = JSON.parse(readFileSync(reads, "utf-8")) as Array<{ file: string; readAt: number }>;
+    ok(!written.some((e) => e.readAt > Date.now() + 60 * 1000),
+      `the merge path must drop a future-dated entry (written=${JSON.stringify(written)})`);
   });
 
   await test("T13d — a stamp inside the 60 s skew allowance still restores", async () => {

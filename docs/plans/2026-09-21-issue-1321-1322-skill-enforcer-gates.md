@@ -139,9 +139,11 @@ below gets a test.
 | T10 | Duplicate manifest lines | the *real* `enforcement/dangerous-ops.txt` (two lines per skill, two of them) | both lines' patterns survive with their own mode; `git commit` is armed | unit over the real manifest + positive control |
 | T11 | A **nudge** rule must never hard-block | `mcp__tortoise__tortoise_search`, `rg -n 'tortoise_' skills/` | neither blocks; the `hard` verb list still blocks a genuine `tortoise_create_point` | handler-driven fake-`pi` test |
 | T12 | Fixture hermeticity | ambient `PI_MODE=print`, `SKILL_ENFORCER_DISABLED=1`, `AGENT_INFRA_PATH` → another checkout | every child/in-process leg pins or clears those vars, so a control cannot pass vacuously | fixture-level precondition assertion in each leg |
-| T13 | Persisted-read entry | a hand-written `~/.pi/agent/skill-reads.json` naming a skill | narrowed: an entry restores only if it canonicalises to a name a trusted root actually holds a `SKILL.md` for. **Residual, not closed:** a valid name (or a read by a previous session) still satisfies a gate — the 24 h TTL is a bound on **idleness**, not on the age of the read (see the residual bullet) — deliberate #7416 behaviour, pre-existing, filed as a follow-up | unit (seeded + forged file) |
-| T13b | Persisted read is 23 h old / 25 h old | seeded entry at `now-23h` / `now-25h` via `_setSkillReadsFileForTest`-style fixture file (`newSession()` + `reads`) | 23 h **restores**, and `session_shutdown` **re-stamps** it to `now` (so the TTL measures idleness, not the read's age); 25 h **does not restore** — the gate stays blocked | unit, two-sided (T13 / T13b) |
-| T13c | Persisted read dated in the FUTURE | entry at `now + 365 d` | **dropped**, never merged: the gate stays blocked, because a future stamp is not evidence of a read (one-sided age test + `Math.max` would otherwise satisfy it forever) | unit (T13c) |
+| T13 | Persisted-read entry | a hand-written `~/.pi/agent/skill-reads.json` naming a skill | narrowed: an entry restores only if it canonicalises to a name a trusted root actually holds a `SKILL.md` for. **Residual, not closed:** a valid name (or a read by a previous session) still satisfies a gate — the 24 h TTL is a bound on **idleness**, not on the age of the read (see the residual bullet) — deliberate #7416 behaviour, pre-existing, filed as a follow-up | unit (T13 — seeded + forged file) |
+| T13a | The 24 h window bounds IDLENESS, not the read's age | persisted entry at `now-23h`, then `session_start` and `session_shutdown` | restores (the gate clears) and the entry is **re-stamped to `now`** at shutdown, so a read taken 23 h ago is not 23 h closer to expiry | unit (T13a) |
+| T13b | Persisted read is 23 h old / 25 h old | seeded entry at `now-23h` / `now-25h` via `_setSkillReadsFileForTest`-style fixture file (`newSession()` + `reads`) | 23 h **restores**, and `session_shutdown` **re-stamps** it to `now` (so the TTL measures idleness, not the read's age); 25 h **does not restore** — the gate stays blocked | unit, two-sided (T13a / T13b) |
+| T13c | Persisted read dated in the FUTURE | entry at `now + 365 d` | **dropped at restore** — the gate stays blocked, because a future stamp is not evidence of a read (the one-sided age test + `Math.max` would otherwise satisfy it forever); the merge path's half of the claim is pinned separately by T13e | unit (T13c) |
+| T13e | A future stamp is not laundered by the merge path | entry at `now + 365 d` seeded, `session_start`, then a `session_shutdown` (which calls `persistReadFiles()`) | the written file holds **no** future-dated entry — the merge branch drops it, so it can never become the persisted truth | unit (T13e) |
 | T13d | A stamp inside the 60 s skew allowance | entry at `now + 30 s` | **still restores** — ordinary clock skew must not invalidate a read | unit (T13d) |
 
 **Explicitly out of scope** (declared, not chased, filed from cycle 1):
@@ -161,8 +163,11 @@ below gets a test.
   - **Re-measured 2026-10-16 (agent-infra #1331): the bound is on idleness, not on the read's age.**
     `persistReadFiles()` writes `readAt: now` for **every** entry in `readFiles` — a restored entry
     included — and it runs after each tracked read and at `session_shutdown`. So each session that
-    restores an entry re-stamps it: a skill read once keeps clearing its gate while a session starts
-    at least once every 24 h, and the entry is dropped only when 24 h pass with no session. Probe
+    restores an entry re-stamps it: a skill read once keeps clearing its gate while a session RUNS
+    at least once every 24 h — a tracked read, or a clean `session_shutdown`; `session_start`
+    re-stamps NOTHING, so a session killed without either does not extend the window. The entry is
+    dropped when 24 h pass with no such session, or when its stamp is >60 s in the FUTURE
+    (`READ_PERSIST_FUTURE_SKEW_MS`). Probe
     (the shipped handlers, `_setSkillReadsFileForTest` seam): an entry seeded 23 h old clears an
     armed gate at `session_start` and is re-stamped to `now` at `session_shutdown`. The row above
     previously read "≤24 h"; that was the TTL's *restore* condition, not the entry's lifetime.
