@@ -188,6 +188,16 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # value (`4x`, `09`, ten digits) is repaired there to this same derived default.
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
+# ── CI-CONGESTION KNOBS (see `ci_queue_depth` below for the measured defect) ─────────────────────
+# CI_QUEUE_MAX: QUEUED workflow runs above which this cycle's lane ceiling is reduced.
+# CI_QUEUE_LANES: the reduced ceiling. Coerced HERE, like every other limit, because an errored
+# `[ … -gt … ]` is FALSE and would OPEN the very gate these configure. The FLOOR is not a knob: it is
+# 1 (see `ci_lane_ceiling`), because a ceiling of 0 cannot drain anything — that is the starvation
+# this gate exists to avoid, not the shape of it.
+CI_QUEUE_MAX="${CI_QUEUE_MAX:-60}"
+CI_QUEUE_LANES="${CI_QUEUE_LANES:-3}"
+is_limit "${CI_QUEUE_MAX:-}"   || CI_QUEUE_MAX=60
+is_limit "${CI_QUEUE_LANES:-}" || CI_QUEUE_LANES=3
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
 # open count, so a PR mid-review, mid-fix, mid-merge — or held by a claim on another box — read as
@@ -1683,6 +1693,106 @@ review_slots() { # <unowned_prs>
 fix_slots() { # <unowned_prs>
   # Same predicate as review_slots and as the gate (see the note there).
   if is_num "${1:-}" && [ "${1:-0}" -gt 0 ]; then echo $(( 10#${MAX_FIX:-3} + 2 )); else echo "${MAX_FIX:-3}"; fi
+}
+
+# ── CI CONGESTION: THE LEADING SIGNAL THE LANE CEILING WAS BLIND TO ──────────────────────────────
+# ⛔ MEASURED 2026-10-22 on daniel-ospina/tortoise: 29 open PRs, every one `MERGEABLE` with
+# `reviewDecision: null` and ZERO failing checks — `statusCheckRollup: PENDING` on all of them — while
+# 140 workflow runs sat QUEUED against 1 IN PROGRESS. Those are one fact, not two: the fleet
+# out-produced CI verification by two orders of magnitude, so NO PR could ever reach a green tree,
+# nothing merged, and the box then reported `DRAIN STALLED` HOURS LATE. That line is the SYMPTOM.
+#
+# ⛔ WHY NO EXISTING GATE COULD SEE IT. Every dispatch gate measured either THIS BOX (load, memory,
+# swap, lanes) or the PR QUEUE (`unowned`) — and the PR queue is an OUTCOME that LAGS its own cause: an
+# un-owned PR appears only AFTER CI has failed to verify it. Gating on that count is a control loop
+# with the delay on the wrong side of it, so a box with 140 queued runs and 1 runner read EXACTLY like
+# a box with an idle CI that had opened too many lanes. This gate measures the constraint itself.
+#
+# ⛔ FAIL-OPEN ON THROTTLE IS THE SAFE DIRECTION HERE, AND FAIL-CLOSED IS NOT (a deliberate asymmetry).
+# An UNREADABLE queue must never reduce the ceiling. Throttling on a number we could not read turns a
+# brief GitHub outage into a fleet that stops opening any work — the instrument's outage becomes the
+# product's outage, and that failure is silent for exactly as long as the read keeps failing. The
+# places this harness fails CLOSED are the ones where a false PASS ships something wrong (a merge, a
+# review marker, a rail attestation); a false THROTTLE ships nothing, it only costs throughput. So:
+# unreadable ⇒ ceiling UNCHANGED, and the token says `ci=UNREADABLE` so the missing measurement is
+# NAMED rather than silent — fail-open must not mean fail-blind.
+#
+# ⛔ AND IT IS NEVER A CEILING OF ZERO. `CI_QUEUE_LANES` is floored at 1 in `ci_lane_ceiling`: a box
+# with one lane can still review, fix and merge — the ONLY work that can drain a CI queue — so this
+# gate slows NEW work, it never stops the drain. (A deliberate `MAX_LANES=0` is the operator's own
+# "dispatch nothing" and is never RAISED by this gate either.)
+
+# ci_queue_depth — ONE read of the CI queue: REST, both counts, `<queued> <in_progress>`.
+# ⛔ REST, NEVER GraphQL. `gh pr list`/`gh pr view` are GraphQL and are the calls that die FIRST when
+# the 5,000-point hourly budget is spent (#1959/#1762) — the state a congested box is already in.
+# `gh api` is REST, and it rides the same `gh-rest`/`gh-limit` shims every other read in this file
+# uses: no new HTTP path, no new credential, no second budget.
+# ⛔ ANY HALF UNREADABLE IS THE WHOLE READING UNREADABLE (rc 1, no output). A `140/?` token invites a
+# reader to infer a queue from half a measurement, and it would let the gate act on a number the line
+# it prints cannot show — the half-measured claim this file refuses everywhere else.
+ci_queue_depth() {
+  local q p
+  q="$(gh api "repos/${OR}/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)" || return 1
+  is_num "${q:-}" || return 1
+  p="$(gh api "repos/${OR}/actions/runs?status=in_progress&per_page=1" --jq '.total_count' 2>/dev/null)" || return 1
+  is_num "${p:-}" || return 1
+  printf '%s %s\n' "$q" "$p"
+}
+
+# ci_lane_ceiling <configured_max_lanes> <queued> -> the ceiling THIS cycle may use.
+# ⛔ NO STATE IS MUTATED — not MAX_LANES, not anything else. The controller is ONE process that runs
+# every cycle, so lowering MAX_LANES would OUTLIVE the congestion and the box would stay throttled
+# after the queue drained: the "stale flag that records a past state and is never revalidated" class,
+# reproduced in the fix for a stale-signal gate. The configured value stays in MAX_LANES; only this
+# derived ceiling is per-cycle, and it is recomputed from the CURRENT read every time.
+ci_lane_ceiling() { # <max_lanes> <queued>
+  local max="${1:-}" q="${2:-}" reduced
+  # MUT-ANCHOR:ci-ceiling — `ci-queue-cap.test.sh --mutations` rewrites THIS line to disable the
+  # throttle and REQUIRES the above-bound arm to go red. A gate whose case stays green when it is
+  # disabled is not load-bearing and must not ship.
+  is_limit "${max:-}" || max=10
+  # ONE measurement, ONE predicate. An unreadable queued count (including the empty argument of a
+  # failed read) is NOT congestion — see the fail-open note above.
+  is_num "${q:-}" || { printf '%s\n' "$max"; return 0; }
+  [ "$q" -gt "$(( 10#${CI_QUEUE_MAX:-60} ))" ] || { printf '%s\n' "$max"; return 0; }
+  reduced=$(( 10#${CI_QUEUE_LANES:-3} ))
+  [ "$reduced" -ge 1 ] || reduced=1                     # never starvation: the drain needs one lane
+  [ "$max" -gt "$reduced" ] || { printf '%s\n' "$max"; return 0; }   # never RAISE a configured ceiling
+  printf '%s\n' "$reduced"
+}
+
+# ci_congestion_reason <configured_max_lanes> <ceiling> <queued> -> the NAMED gate, or empty.
+# Named exactly like `merge-priority (…)` — `<gate> (<evidence>)` — so a monitor (or a human reading
+# one line) can tell CI congestion from a load ceiling, a lane cap or a swap bound. The evidence
+# carries BOTH numbers (the bound it crossed and the ceiling it moved), because "lanes are reduced"
+# without "from what, to what, against which bound" is the kind of line that sends an operator to the
+# wrong knob.
+ci_congestion_reason() { # <configured_max_lanes> <ceiling> <queued>
+  local max="${1:-}" ceiling="${2:-}" q="${3:-}"
+  is_num "${q:-}" || return 0
+  { is_limit "${max:-}" && is_limit "${ceiling:-}"; } || return 0
+  [ "$ceiling" -lt "$max" ] || return 0                # NOT reduced ⇒ this gate is not the reason
+  printf 'ci-congestion (queued=%s > %s → lanes %s→%s)\n' "$q" "$(( 10#${CI_QUEUE_MAX:-60} ))" "$max" "$ceiling"
+}
+
+
+# ci_cycle_gate — one measurement, one decision, per cycle. Sets (prints nothing):
+#   CI_TOK        the `[cap]` token: `<queued>/<in_progress>`, or `UNREADABLE`
+#   CI_QUEUED     the queued count (the gate's evidence); EMPTY when unreadable
+#   LANE_CEILING  the ceiling this cycle may use (MAX_LANES unless CI is congested)
+#   CI_GATE_WHY   the named reason when the ceiling WAS reduced; empty otherwise
+# ⛔ A FUNCTION, NOT THREE LINES AT THE CALL SITE, because ci-queue-cap.test.sh DRIVES it: the token
+# and the decision are produced together, from ONE read, so a future edit cannot print a depth it did
+# not decide on — or decide on a depth it did not print.
+ci_cycle_gate() {
+  local depth
+  CI_TOK="UNREADABLE"; CI_QUEUED=""; CI_RUNNING=""; LANE_CEILING="${MAX_LANES:-}"; CI_GATE_WHY=""
+  if depth="$(ci_queue_depth)"; then
+    CI_QUEUED="${depth%% *}"; CI_RUNNING="${depth##* }"
+    CI_TOK="${CI_QUEUED}/${CI_RUNNING}"
+  fi
+  LANE_CEILING="$(ci_lane_ceiling "${MAX_LANES:-}" "${CI_QUEUED:-}")"
+  CI_GATE_WHY="$(ci_congestion_reason "${MAX_LANES:-}" "$LANE_CEILING" "${CI_QUEUED:-}")"
 }
 
 # ── CAPACITY TRANSFER (agent-infra#1909, R8) ────────────────────────────────
@@ -3604,10 +3714,34 @@ PY
     [ "$LAND_EPOCH" -gt "$_now_a" ] && LAND_EPOCH="$_now_a"
     LAND_AGE=$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))
   fi
+  # ── CI CONGESTION → THIS CYCLE'S LANE CEILING ──────────────────────────────────────────────────
+  # Read HERE, once, and BEFORE the [cap] line that prints it — the same rule LAND_EPOCH, UPN and
+  # MEMAVAIL_MB above follow: a value read after its own log line prints `?` on the first cycle and
+  # the PREVIOUS cycle's reading on every one after (a stale record presented as current).
+  # Sets CI_TOK / CI_QUEUED / LANE_CEILING / CI_GATE_WHY — see `ci_cycle_gate` for the fail-open rule.
+  ci_cycle_gate
   # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
   # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
   # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # ⛔ `ci=` IS THE CI QUEUE DEPTH (`queued/in_progress`) AND `lanes=` PRINTS THE CEILING THAT WAS
+  # ACTUALLY USED — `${LANE_CEILING:-$MAX_LANES}`, which is MAX_LANES on a normal cycle and the reduced
+  # ceiling on a congested one. Both are on THIS line so one reading answers "why is dispatch
+  # throttled": `load=79/100 lanes=9/3 … ci=140/1` is CI congestion, `load=100/100 lanes=9/25` is a load
+  # ceiling, and they are no longer the same line shape. Appended at the END so no existing field moves
+  # (the line is `key=value` throughout and nothing parses a field POSITION).
+  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/${LANE_CEILING:-$MAX_LANES} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?} ci=${CI_TOK:-UNREADABLE}" >> "$LOG"
+  # [ci-line:begin] (extracted and DRIVEN by ci-queue-cap.test.sh — keep the marker)
+  # ⛔ THE CONGESTION MUST BE NAMED EVEN WHEN ANOTHER GATE WINS THE SKIP LINE, and that is the NORMAL
+  # case, not the edge: `mp_reason` is threshold-free (ONE un-owned PR closes the issue path, owner
+  # ruling 2026-10-18) and a congested box ALWAYS has un-owned PRs — they are un-owned precisely
+  # BECAUSE CI cannot verify them. So `[dispatch] skipped (merge-priority …)` legitimately wins in
+  # exactly the state this gate exists for, and a reader who only saw the winner would see the symptom
+  # named as the reason. This second line is emitted whenever the ceiling was reduced, whatever won
+  # the skip line, so the CAUSE is on the record and the two are distinguishable in one log tail.
+  if [ -n "${CI_GATE_WHY:-}" ]; then
+    echo "[ci] CONGESTED ${CI_GATE_WHY} in_progress=${CI_RUNNING:-?} — the CI QUEUE is the constraint this cycle, not this box's capacity: more lanes add PRs to a queue that is already the bottleneck, while review/fix/merge (the work that actually drains it) are untouched" >> "$LOG"
+  fi
+  # [ci-line:end]
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
@@ -3622,7 +3756,18 @@ PY
   # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
   elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
     GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
-  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
+  # ⛔ CI CONGESTION SITS BEFORE THE LANE ARM, AND BOTH OF ITS CONDITIONS MATTER.
+  # (a) `CI_GATE_WHY` non-empty means the ceiling WAS reduced; (b) `LANES >= LANE_CEILING` means the
+  # reduced ceiling is what BINDS this cycle. Without (b) the arm would fire on "the ceiling was
+  # lowered" and REFUSE dispatch with lanes still free — turning a CAP into a STOP, making
+  # CI_QUEUE_LANES a knob that only edits a log string, and printing `lanes=2/3` beside a refusal to
+  # use lane 3. The pair is exactly the generic arm's predicate, so this arm can never shadow a
+  # different reason when it does not bind; and when it does, it reports the CAUSE (a queue of 140)
+  # instead of the symptom (a ceiling of 3). LANE_CEILING is `${…:-$MAX_LANES}` defensively: if a
+  # future edit forgets the per-cycle assignment, the ceiling is the CONFIGURED one — the pre-change
+  # behaviour, never a zero.
+  elif [ -n "${CI_GATE_WHY:-}" ] && [ "$LANES" -ge "${LANE_CEILING:-$MAX_LANES}" ]; then GATE_WHY="${CI_GATE_WHY}"
+  elif [ "$LANES" -ge "${LANE_CEILING:-$MAX_LANES}" ]; then GATE_WHY="lanes=$LANES>=max_lanes=${LANE_CEILING:-$MAX_LANES}"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
   # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:

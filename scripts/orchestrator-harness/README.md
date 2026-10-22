@@ -921,6 +921,8 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
 | `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m` |
+| `CI_QUEUE_MAX` | `60` | **the CI-congestion bound (§7.2g).** QUEUED workflow runs above which THIS CYCLE's lane ceiling is reduced to `CI_QUEUE_LANES`. Measured 2026-10-22 on `daniel-ospina/tortoise`: **140 queued** against **1 in progress**, with 29 open PRs all `MERGEABLE`/`PENDING` and zero failing checks — the fleet out-produced CI verification by ~100×, so nothing could go green, nothing merged, and the controller reported `DRAIN STALLED` hours late. Read over REST (`gh api …actions/runs?status=…`), never GraphQL. Env/`keys.env` override; **not yet rendered by `install.sh`** (so a plist still pins only the older names — set it in the harness environment) |
+| `CI_QUEUE_LANES` | `3` | the reduced lane ceiling while the queue is over `CI_QUEUE_MAX`. **Floored at 1**, not configurable lower: a box with one lane can still review, fix and merge — the only work that can drain a CI queue — so the gate slows NEW work, it never stops the drain. An UNREADABLE queue never reduces the ceiling at all (fail-open on throttle; see §7.2g for why the direction is not symmetric with the merge paths). Env override; same `install.sh` caveat as `CI_QUEUE_MAX` |
 | `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT |
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
@@ -2732,6 +2734,71 @@ cannot guess:
 **every** stage — and a failure with a leftover queue — must produce no `skipped (` line at all, and the
 assertion is paired with a POSITIVE one (`BLOCKED: refresh failed — stage=<that stage>`) so a driven
 block that silently does nothing reads RED rather than vacuously green.
+
+
+### 7.2g The lane ceiling was blind to the CI QUEUE — **FIXED (2026-10-22)**
+
+Every dispatch gate measured one of two things: **this box** (`load`, `mem_avail`, `swap_free`, `lanes`)
+or the **PR queue** (`unowned`). The second is an OUTCOME that LAGS its own cause — an un-owned PR appears
+only *after* CI has failed to verify it — so gating on that count is a control loop with the delay on the
+wrong side of it. Measured on `daniel-ospina/tortoise`: **29 open PRs, every one `mergeable: MERGEABLE`,
+`reviewDecision: null`, zero failing checks, `statusCheckRollup: PENDING` — and 140 workflow runs QUEUED
+against 1 IN PROGRESS.** One fact, not two: the fleet produced PRs ~100× faster than CI could verify them,
+so no PR could reach a green tree, nothing merged, and `DRAIN STALLED` arrived **hours** later. That line
+is the symptom; the CI queue is the cause, and nothing was measuring it.
+
+The gate:
+
+* **reads the queue over REST** — `gh api repos/<o>/<r>/actions/runs?status=queued` and
+  `?status=in_progress`, `.total_count` from each. REST, never GraphQL: `gh pr list`/`gh pr view` are
+  GraphQL and are the calls that die first when the 5,000-point hourly budget is spent (#1959/#1762) —
+  the state a congested box is already in. It rides the same `gh-rest`/`gh-limit` shims as every other
+  read: no new HTTP path, no new credential, no second budget.
+* **folds the reading into `[cap]` as `ci=queued/in_progress`** (`ci=UNREADABLE` when it could not be
+  read), and prints the ceiling that was ACTUALLY used in `lanes=N/<ceiling>`. One line now separates the
+  two shapes: `load=79/100 lanes=9/3 … ci=140/1` is **CI congestion**; `load=100/100 lanes=9/25` is a
+  **load ceiling**. `ci=` is appended at the end so no existing field moves — nothing parses that line
+  (it is `key=value`, read by humans; the consumers were grepped), so the SHAPE is the contract and
+  `ci-queue-cap.test.sh` §T7 pins it (prefix, one line, key set, order, numeric `lanes=N/M`).
+* **reduces THIS cycle's ceiling** above `CI_QUEUE_MAX`, to `CI_QUEUE_LANES`, **floored at 1**. The
+  configured `MAX_LANES` is never mutated: the controller is ONE process running every cycle, so lowering
+  it would outlive the congestion — the "stale flag that records a past state and is never revalidated"
+  class, reproduced in the fix for a stale-signal gate. A deliberate `MAX_LANES=0` is never raised.
+* **names the gate** exactly as `merge-priority (…)` does:
+  `[dispatch] skipped (ci-congestion (queued=140 > 60 → lanes 25→3)) lanes=9 workers=0 — …`. The arm sits
+  BEFORE the generic `lanes=` arm, because it is what LOWERED the ceiling — the generic arm would report
+  the symptom (a ceiling of 3) and hide the cause (a queue of 140) — and it fires only when the reduced
+  ceiling actually BINDS (`LANES >= ceiling`). Without that second test the arm would fire on "the ceiling
+  was lowered" and REFUSE dispatch with lanes still free: a CAP turned into a STOP, `CI_QUEUE_LANES` reduced
+  to a knob that only edits a log line, and `lanes=2/3` printed beside a refusal to use lane 3.
+* **and it says so on its own line when another gate wins the skip line.** `mp_reason` is threshold-free
+  (ONE un-owned PR closes the issue path — §7.2f, owner ruling 2026-10-18) and a congested box ALWAYS has
+  un-owned PRs, because they are un-owned precisely *because* CI cannot verify them. So in exactly the
+  state this gate exists for, the skip line legitimately says `merge-priority (…)`. Reporting only the
+  winner would name the symptom and hide the cause, so a second line is emitted whenever the ceiling was
+  reduced, whatever won: `[ci] CONGESTED ci-congestion (queued=140 > 60 → lanes 25→3) in_progress=1 — the
+  CI QUEUE is the constraint this cycle, not this box's capacity …`.
+* **fails OPEN on an unreadable queue, and that asymmetry is deliberate.** Unreadable ⇒ ceiling UNCHANGED
+  and `ci=UNREADABLE` on the line, so the missing measurement is NAMED. Throttling on a number we could not
+  read turns a brief GitHub outage into a fleet that stops opening any work — the instrument's outage
+  becomes the product's outage, silently, for as long as the read keeps failing. The places this harness
+  fails CLOSED are the ones where a false PASS ships something wrong (a merge, a review marker, a rail
+  attestation); a false THROTTLE ships nothing, it only costs throughput. Different consequence, different
+  direction. A HALF-read queue (`140/?`) is treated as unreadable rather than throttling on half a
+  measurement.
+
+`ci-queue-cap.test.sh` drives it against a stub `gh`: below the bound (ceiling unchanged, depth still
+printed), above it (reduced AND named in the skip line), the CAP-not-STOP pair (`lanes=2` under a ceiling of
+3 stays OPEN; `lanes=3` closes and names the gate), the floor (never below 1, and `MAX_LANES=0` never
+raised), unreadable (unchanged behaviour, `ci=UNREADABLE`, no throttle — including a 502 and a 200 whose
+body is not a number), the bound read in both directions (`==` is not over it, a non-default bound is used),
+the PRECEDENCE case driven with the REAL `mp_reason` and 29 un-owned PRs (merge-priority wins the skip line,
+`[ci] CONGESTED` still carries the numbers), that the configured `MAX_LANES` is never written back, and the
+REST shape (exactly two `gh api …actions/runs?status=…` calls, no GraphQL). It runs under `set -u` like the
+daemon, and resets its own two knobs so an operator's environment cannot green or redden it. On EVERY run it
+rewrites the throttle to a no-op at `MUT-ANCHOR:ci-ceiling` in a COPY of the loop and REQUIRES the
+above-bound arm to go red — so no assertion can be green on a gate that does not bind, and a missing anchor
+is a failure rather than a skip.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
