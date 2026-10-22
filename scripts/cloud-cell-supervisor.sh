@@ -2383,10 +2383,14 @@ doctor_path() {
 # Where `doctor_path` looked — the SAME list, so a "not found" message cannot name a set of
 # locations the lookup never consulted.
 doctor_paths_searched() {
+  # ⛔ THE SAME EXPRESSION the lookup evaluates, so the printed path is one the lookup actually tried
+  # (a message that renders `"<HARNESS unset>/…"` while the probe used `/scripts/…` names a location
+  # nobody consulted).
   printf '%s\n' "$O/cloud-cell-doctor.sh" \
     "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
     "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh" \
-    "${HARNESS:-<HARNESS unset>}/scripts/orchestrator-harness/cloud-cell-doctor.sh" | tr '\n' ' '
+    "${HARNESS:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh" | tr '\n' ' '
+  [ -n "${HARNESS:-}" ] || printf '(! HARNESS is UNSET, so the last entry was /scripts/orchestrator-harness/cloud-cell-doctor.sh) '
 }
 
 # One role pass, in this cell's own environment. `doctor` and `merge` resolve the queue target first
@@ -2426,8 +2430,15 @@ start_doctor_loop() {
   # a real launch failure got reported as a retired artifact.
   if ! d="$(doctor_path)"; then
     say "⛔ the doctor loop is UNAVAILABLE — cloud-cell-doctor.sh is ABSENT (looked in: $(doctor_paths_searched))"
-    say "    consequence: reap / merge / hygiene will NOT run on this cell — nothing reaps a wedged lane, lands an attested PR, or prunes the disk. The controller keeps dispatching."
-    say "    fix: '$0 apply' (re-seeds \$O from the pinned harness) or '$0 start' (seeds \$O), then: $0 status"
+    # ⛔ A LOOP ALREADY RUNNING KEEPS PASSING (its bash already holds the file), so the consequence
+    # below is only true when there is no live loop. Claiming it otherwise is a false alarm on the one
+    # path that is also the idempotent re-run of `start`.
+    if sup_loop_alive; then
+      say "    a doctor loop IS still running (pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null)) — it keeps reaping/landing/pruning until it restarts; re-seed the artifact now: $0 apply"
+    else
+      say "    consequence: reap / merge / hygiene will NOT run on this cell — nothing reaps a wedged lane, lands an attested PR, or prunes the disk. The controller keeps dispatching."
+      say "    fix: '$0 apply' (re-seeds \$O from the pinned harness) or '$0 start' (seeds \$O), then: $0 status"
+    fi
     return 0
   fi
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
@@ -2474,17 +2485,26 @@ start_doctor_loop() {
   # ⛔ THE LAUNCH'S OWN OUTCOME IS READ, NOT ASSUMED (#2306). `tmux new-session` exiting non-zero
   # (no server, an unwritable socket, a tmux that is not installed) used to have its stderr dropped and
   # its status ignored, so the operator saw only a wrong explanation two seconds later.
-  local out="" lrc=0
+  local out="" lrc=0 i up=0
   out="$(tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'" 2>&1)"; lrc=$?
-  # A bounded wait instead of a blind `sleep 2`: the session is created by a tmux SERVER, and a server
-  # that is starting can be slower than a fixed sleep — which would report a false failure. The bound
-  # is the same wall time as before, spent observationally.
-  local i up=0
-  for i in 1 2 3 4; do
-    if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then up=1; break; fi
-    sleep 0.5
-  done
+  if [ "$lrc" -eq 0 ]; then
+    # (1) APPEARANCE — bounded, because a tmux SERVER that has to be started can be slower than one
+    # instant. `new-session -d` is synchronous in the client, so this normally succeeds first try.
+    for i in 1 2 3 4; do
+      tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && { up=1; break; }
+      sleep 0.25
+    done
+    # (2) SURVIVAL — ⛔ THE CHECK THAT MATTERS, and the one a poll that fires the instant the session
+    # appears CANNOT make (#2306 review P1, measured with real tmux 3.4). A doctor that FATALs at
+    # startup (a bad arg, an unwritable `$O`, a missing dependency) still creates a session, which is
+    # gone a second later. The pre-#2306 code only ever saw this because it slept 2 s before its one
+    # check; dropping the sleep without replacing the OBSERVATION blessed a dead cell as "started".
+    if [ "$up" = 1 ]; then
+      sleep 2
+      tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null || up=2
+    fi
+  fi
   if [ "$up" = 1 ]; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"
     return 0
@@ -2499,8 +2519,10 @@ start_doctor_loop() {
   say "⛔ the doctor loop did NOT start — the doctor IS present at $d (this is not a missing artifact)"
   if [ "$lrc" -ne 0 ]; then
     say "    tmux new-session exited $lrc: ${out:-<no output>}"
+  elif [ "$up" = 2 ]; then
+    say "    tmux created the session but it was GONE 2s later — the loop exited at startup (a startup FATAL: a bad argument, an unwritable \$O, a missing dependency)"
   else
-    say "    tmux accepted the launch but the session '$DOCTOR_SESSION' was gone within 2s — the loop exited at startup"
+    say "    tmux accepted the launch but the session '$DOCTOR_SESSION' never appeared within 1s"
   fi
   say "    consequence: reap / merge / hygiene will NOT run (nothing reaps a wedged lane, lands an attested PR, or prunes the disk). The controller itself keeps running."
   say "    read: $O/logs/cell-doctor.log${tail3:+ (last lines: $tail3)}"

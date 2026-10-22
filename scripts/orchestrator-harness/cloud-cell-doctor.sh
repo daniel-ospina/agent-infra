@@ -1541,23 +1541,25 @@ loop_state() { # sets LOOP_STATE (alive|dead|unknown) + LOOP_STATE_REASON; alway
   return 0
 }
 
-loop_alive() { loop_state; [ "$LOOP_STATE" = alive ]; }
-
 # The loop's OWN transcript (`log()`'s target) — the SECOND signal. A live pid is a process, not a
 # scheduler: WAITING asserts "a pass is in progress", and that assertion needs the loop to have WRITTEN
-# something inside its own worst-case pass window.  0 = fresh, 1 = stale (a veto on WAITING),
-# 2 = absent (no evidence either way — an older tree or a fixture; it does not veto).
+# something. BOTH halves are required (#2306 review P2):
+#   * the log must have been written SINCE THIS INCARNATION STARTED. Without this half the window below
+#     is vacuous for a real loop — `run_loop` logs immediately after writing `loop.started`, so
+#     `mtime >= started` is permanently true and any age test placed behind it can never fire.
+#   * and its age must be inside the loop's own worst-case pass window. Without this half a live but
+#     completely stalled loop keeps a fresh-looking `WAITING` for ever.
+# 0 = fresh, 1 = stale (a veto on WAITING), 2 = absent (no evidence either way — an older tree or a
+# fixture; it does not veto).
 loop_transcript_fresh() {
   local f m age st
   f="$WORKER_LOG_DIR/doctor.log"
   m="$(mtime_epoch "$f")"
   [ -n "$m" ] || return 2
-  # Written since THIS incarnation started is the strongest form (the loop's first act is to log
-  # `loop started pid=…`), so a log predating `loop.started` is somebody else's transcript.
   st="$(cat "$ROLES_DIR/loop.started" 2>/dev/null)"
   case "${st:-}" in
-    ''|*[!0-9]*) : ;;
-    *) [ "$m" -ge "$st" ] && return 0 ;;
+    ''|*[!0-9]*) : ;;                      # no start record: the age half still applies
+    *) [ "$m" -ge "$st" ] || return 1 ;;    # written by a PREVIOUS incarnation
   esac
   age=$(( $(date +%s) - m ))
   [ "$age" -ge 0 ] && [ "$age" -le "$ALL_PASSES_S" ] && return 0

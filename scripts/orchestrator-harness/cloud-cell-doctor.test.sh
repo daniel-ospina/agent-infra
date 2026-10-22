@@ -210,7 +210,7 @@ mk_lane() { # <name> <pid> [<log mtime, `touch -t` form; default ancient>]
   printf '%s 1 00:00:10\n' "$2" > "$T/ps/table"
 }
 killed() { grep -qx "=$1" "$T/tmux/killed" 2>/dev/null; }
-# The ps stub reports a fixed lstart for every pid, so this is the identity `loop_alive` must see.
+# The ps stub reports a fixed lstart for every pid, so this is the identity `loop_state` must see.
 # The identity the code will compute for a REAL pid: /proc starttime when the kernel offers it, else
 # the ps stub's lstart (fake pids like 5050 have no /proc entry).
 ident_of() {
@@ -539,6 +539,26 @@ doc status
 kill "$S_PID" 2>/dev/null || true
 [ "$RC" -eq 0 ] && result_has "WAITING" && ok "control: a fresh transcript restores WAITING (the gate is the transcript)" \
   || bad "control: a fresh transcript did not restore WAITING (rc=$RC) — $OUT"
+
+# ── 11d) a live pid with a RECENT but PREVIOUS-INCARNATION transcript (agent-infra#2306 review P2) ──
+# The transcript half had two conditions and used them as an OR, so `mtime >= loop.started` was satisfied
+# by the loop's own first log line and the age window could never fire — the documented guarantee ("not
+# older than its worst-case pass window") was vacuous. This arm separates them: the log is FRESH BY AGE
+# (60 s, far inside ALL_PASSES_S) but was written BEFORE this incarnation started, so it is a previous
+# loop's transcript and not evidence that the current one is passing. Both numbers are ABSOLUTE epochs,
+# so no filesystem timestamp granularity can blur the ordering the arm depends on.
+say_case "status: a transcript from a PREVIOUS incarnation is UNKNOWN, not WAITING (#2306 review P2)"
+reset_state; : > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 120 & P_PID=$!
+loop_up "$P_PID"
+printf '%s\n' "$(( $(date +%s) - 30 ))" > "$T/o/state/roles/loop.started"   # began 30 s ago (inside the grace)
+mkdir -p "$T/o/logs"; : > "$T/o/logs/doctor.log"
+touch -t "$(date -v-1M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-1 minute' +%Y%m%d%H%M.%S)" "$T/o/logs/doctor.log"
+doc status
+kill "$P_PID" 2>/dev/null || true
+[ "$RC" -ne 0 ] && result_has "UNKNOWN" && ok "status: a pre-incarnation transcript is UNKNOWN (rc=$RC)" \
+  || bad "status: a pre-incarnation transcript read as progress (rc=$RC) — $OUT"
+case "$OUT" in *WAITING*) bad "status: WAITING on a transcript this incarnation never wrote — $OUT" ;; *) : ;; esac
 
 # The FOURTH state must stay distinguishable: a cell nobody started is STOPPED, and its rows must not
 # be dressed up as a running loop either.

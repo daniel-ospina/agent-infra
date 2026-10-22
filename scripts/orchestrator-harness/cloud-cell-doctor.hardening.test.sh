@@ -961,7 +961,7 @@ result_has "NEVER RAN" && ok "status: names the roles that never ran" || bad "st
 # `start && status` must not call that cell dead. The grace is bounded: an OLD loop that still has
 # no pass fails, and a cell with no loop-age record (fail-closed) fails immediately.
 "$REAL_SLEEP" 60 & GRACE_PID=$!
-# ⛔ The shipped `loop_alive` verifies the RECORDED IDENTITY as well as the pid (a recycled pid after
+# ⛔ The shipped `loop_state` verifies the RECORDED IDENTITY as well as the pid (a recycled pid after
 # a tmux restart, an OOM kill or a crash must not read as a live loop — #1178), so a fixture that
 # writes only `loop.pid` is not "a live loop" to the shipped code: it is a dead one. This writes both
 # halves in the shipped format: `pid|<identity>`, where the identity is `/proc` start time where the

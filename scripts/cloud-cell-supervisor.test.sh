@@ -3387,6 +3387,49 @@ case "$DS3_OUT" in
 
 
 
+# ── a session that APPEARS and then DIES is a failure, not "started" (agent-infra#2306 review P1) ──
+# A doctor that FATALs at startup (a bad argument, an unwritable `$O`, a missing dependency) still
+# creates its tmux session, and the session is gone a second later. A poll that reports success the
+# instant the session APPEARS cannot see that — measured on real tmux 3.4: a doctor exiting at 150 ms
+# read as "doctor loop started" (rc 0) while the session was gone by t+2 s and the log had zero lines.
+# The stub below models exactly that sequence deterministically: `has-session` answers yes ONCE (the
+# appearance probe) and no from then on (the survival re-check), with no wall-clock race.
+say_case "start: a doctor session that DIES at startup is a named failure, not 'started' (#2306 review P1)"
+AD="$T/apdeath"; rm -rf "$AD"; mkdir -p "$AD/o/state/roles" "$AD/o/logs" "$AD/bin" "$AD/harness" "$AD/copy" "$AD/st"
+cp "$SUP" "$AD/copy/cloud-cell-supervisor.sh"
+printf '#!/bin/bash\n[ "${1:-}" = loop ] && exit 1\nexit 0\n' > "$AD/o/cloud-cell-doctor.sh"
+chmod +x "$AD/o/cloud-cell-doctor.sh"
+cat > "$AD/bin/tmux" <<'SH'
+#!/bin/bash
+S="${AD_STATE:?}"
+case "${1:-}" in
+  has-session)
+    # present for exactly ONE look, then gone — the appearance/survival split, with no clock involved.
+    if [ -f "$S/appeared" ] && [ ! -f "$S/seen" ]; then : > "$S/seen"; exit 0; fi
+    exit 1 ;;
+  new-session) : > "$S/appeared"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$AD/bin/tmux"
+AD_RC=0
+(
+  set -- status
+  export PATH="$AD/bin:$PATH" AD_STATE="$AD/st" CELL_HOME="$AD/home" O="$AD/o" REPO="$AD/repo" \
+         OR="daniel-ospina/agent-infra" SESSION="orch" DOCTOR_SESSION="cell-doctor" HARNESS="$AD/harness"
+  . "$AD/copy/cloud-cell-supervisor.sh" >/dev/null 2>&1
+  start_doctor_loop
+) >"$AD/out" 2>&1 || AD_RC=$?
+[ "$AD_RC" -ne 0 ] && ok "start: a session that dies at startup FAILS (rc=$AD_RC)" \
+  || bad "start: rc=0 for a doctor that exited at startup — $(tail -2 "$AD/out" | tr '\n' ' ')"
+case "$(cat "$AD/out")" in
+  *"doctor loop started"*) bad "start: claims 'doctor loop started' for a session that was gone — $(tail -2 "$AD/out" | tr '\n' ' ')" ;;
+  *) ok "start: does not claim the loop started" ;; esac
+case "$(cat "$AD/out")" in
+  *"GONE 2s later"*) ok "start: names the exit-at-startup shape and the survival window" ;;
+  *) bad "start: the exit-at-startup case is not named — $(tail -3 "$AD/out" | tr '\n' ' ')" ;; esac
+
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
