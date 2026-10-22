@@ -308,9 +308,9 @@ cat > "$T/cpbin/cp" <<SH
 #!/usr/bin/env bash
 "$REAL_CP" "\$@" || exit \$?
 # append a byte to exactly one destination, reporting success — the silent-drift case.
-# NB the staging name is `mktemp`-generated and no longer carries the file name (cycle 4), so the
+# NB the staging name is \`mktemp\`-generated and no longer carries the file name (cycle 4), so the
 # file is identified from the SOURCE argument and the destination from the arg that is a staging path.
-# `cp -p SRC TMP`: the source is not `$1` (that is `-p`), so match any arg and use the LAST as dest
+# \`cp -p SRC TMP\`: the source is not \`\$1\` (that is \`-p\`), so match any arg and use the LAST as dest
 case "\$*" in *claims.sh*)
   case "\${!#}" in */.deploy-*) printf 'CORRUPTED\n' >> "\${!#}" ;; esac ;;
 esac
@@ -642,9 +642,9 @@ cat > "$T/cpbin17e/cp" <<SH
 #!/usr/bin/env bash
 # Model a writer winning the window between mktemp's create and cp's open: replace the destination (a
 # staging file this run owns) with a link, then WRITE THROUGH IT.
-# ⛔ THE WRITE IS DONE HERE, NOT BY `cp` (cycle 4, found under docker bash:5). BSD `cp` follows a
-# symlink destination and writes through it; GNU `cp` UNLINKS it and writes a fresh regular file. A
-# fixture that delegates to `cp` therefore exercises the vector on macOS and not on Linux, and the
+# ⛔ THE WRITE IS DONE HERE, NOT BY \`cp\` (cycle 4, found under docker bash:5). BSD \`cp\` follows a
+# symlink destination and writes through it; GNU \`cp\` UNLINKS it and writes a fresh regular file. A
+# fixture that delegates to \`cp\` therefore exercises the vector on macOS and not on Linux, and the
 # case silently stops testing anything there. Writing through the link explicitly is the shape being
 # guarded, and it reproduces on both.
 case "\${!#}" in
@@ -938,8 +938,8 @@ args=(); for a in "\$@"; do [ "\$a" = "-p" ] || args+=("\$a"); done
 "$REAL_CP18B" "\${args[@]}" || exit \$?
 # same platform note as case 18: force the mode so the shim does not depend on cp's semantics
 # (NO BACKTICKS in this body — an unquoted heredoc runs them, which is how this line first broke)
-# ⛔ THE ABSOLUTE PATH, NOT `chmod` (cycle 6): the liar shim also answers `chmod 0600`, so a bare
-# `chmod` here was swallowed and the file stayed at the source mode — the case proved nothing.
+# ⛔ THE ABSOLUTE PATH, NOT \`chmod\` (cycle 6): the liar shim also answers \`chmod 0600\`, so a bare
+# \`chmod\` here was swallowed and the file stayed at the source mode — the case proved nothing.
 for a in "\${args[@]}"; do
   case "\$a" in */.deploy-*) "$REAL_CHMOD18B" 0600 "\$a" 2>/dev/null || true ;; esac
 done
@@ -1014,6 +1014,29 @@ STAMP_LIVE="$( ( cd "$O19" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CM
 printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
 notify_reset; deploy "$SRC19" "$O19"
 grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
+
+# ── 19c. AN UNREADABLE STAMP IS "CANNOT CHECK", NOT "NO RECORD" ──────────────────────────────────
+# Review P3 (cycle 8), REPRODUCED before this case existed: the stamp is read with
+# `REC="$(sed … 2>/dev/null | head -1)"` and the assignment's status was never read, so a present but
+# unreadable stamp produced an empty REC and the ENTIRE identity-record arm was skipped in silence —
+# silently deleting the one check whose own contract is that "cannot check" is always said out loud.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (19c skipped — running as root, where chmod 000 is still readable)"
+else
+  say_case "19c. an unreadable stamp is reported as NOT CHECKED, never silently skipped"
+  SRC19c="$T/src19c"; O19c="$T/o19c"; make_src "$SRC19c"; make_target "$O19c"
+  notify_reset; deploy "$SRC19c" "$O19c"
+  [ "$RC" -eq 0 ] && ok "19c: setup deploy verified" || bad "19c: setup exited $RC: $OUT"
+  printf '{"payloadSha256":"deadbeef"}\n' > "$O19c/.agent-infra-stamp.json"
+  chmod 000 "$O19c/.agent-infra-stamp.json"
+  notify_reset; deploy "$SRC19c" "$O19c"
+  chmod 644 "$O19c/.agent-infra-stamp.json"
+  [ "$RC" -eq 0 ] && ok "19c: the bytes still verify with an unreadable stamp (exit 0)" || bad "19c: exit $RC: $OUT"
+  grep -qi "NOT CHECKED" <<< "$OUT" && ok "19c: the verdict says the identity record could NOT be checked" || bad "19c: the arm was skipped in silence: $OUT"
+  grep -qi "UNREADABLE" <<< "$OUT" && ok "19c: and it names the stamp as unreadable" || bad "19c: it does not say why: $OUT"
+  grep -q "STAMP-UNCHECKED" "$O19c/.deploy-ledger.tsv" 2>/dev/null && ok "19c: the ledger records STAMP-UNCHECKED" || bad "19c: no STAMP-UNCHECKED row"
+  grep -qi "identity record STALE" <<< "$OUT" && bad "19c: reported STALE over a record it could not read" || ok "19c: and it did not cry STALE"
+fi
 
 # ── 19b. AN INCOMPLETE FOLD IS NOT A COMPARISON — no false "hand edit" alarm ──────────────────────
 # The fold's `|| exit 3` was INERT: `set -uo pipefail` made the pipeline status 3, but nothing read the

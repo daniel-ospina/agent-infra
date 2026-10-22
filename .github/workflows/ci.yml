@@ -351,6 +351,92 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Outcome-canary suite (fleet outcome assertions, zero-dep)
+        # The fleet's failures are OUTCOMES that are absent while every component is up: a
+        # controller running with a silent log, a queue the refresh could not read, 47 candidates
+        # and 47 refused dispatches, a green PR whose lander expired. Unit tests cannot see any of
+        # them. This step pins the predicates that CAN, and the SIGNAL they raise — the suite drives
+        # the real CLI end-to-end (--live --facts … --capture-dir …) so the assertions are about the
+        # message a controller would receive and the exit code a scheduler sees. Zero-dep by
+        # construction: python3 + stdlib, fixtures only, no network, no process table, no clock.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only required check
+        # (#646). Its own step so one verdict cannot suppress the other.
+        run: python3.12 tools/fleet/outcome_canary.test.py
+      - name: Outcome-canary static evaluation (every fixture, its declared verdict)
+        # The suite imports the module; THIS runs the shipped CLI the way a scheduler would, over
+        # every fixture, and fails (exit 1 — a FAIL, not the exit 3 usage error) if any fixture
+        # grades differently from its declared `_expect` — so a predicate that drifts is visible in the CI log as a named fixture, not
+        # only as a red unit test. Same zero-dep contract: fixtures only, no network, no process
+        # table, no clock.
+        run: python3.12 tools/fleet/outcome_canary.py --static
+      - name: Outcome-canary mutation evidence (zero-dep)
+        # The suite above is only a pin if it can FAIL. Each mutation in `MUTATIONS` reintroduces a
+        # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
+        # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
+        # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on
+        # any non-PASS, INCONCLUSIVE exiting 0, a substring controller census, a refused send
+        # recorded as delivered, a stale dispatch graded fresh, a skipped-line regex that never
+        # matches the real emitter, a delivery that does not supersede the check's sibling shapes,
+        # a TORN (empty) queue record counted as a successful read, an ABSENT queue_state graded
+        # green (deny-list polarity), an ok MEMORY read with no number read as 0 MiB, the vm_stat
+        # guard covering 2 of the 4 fields it sums, the REST merged bound counted on the merged
+        # subset instead of the closed page, fleet activity reading the one-refresh-old header,
+        # a failed read of the queue record passing through the stale header, an UNPARSEABLE record
+        # demoted to the header, the re-measure guard defaulting an absent ok to a successful read,
+        # the REST rollup grouping two workflows by app+name, an empty batch line letting any spawn
+        # vouch, an unread oom_score_adj counted as unprotected, an ok disk read with no number read
+        # as 0 GiB,
+        # an unaged queue record forfeiting its authority, the wired machine not carrying o_dir
+        # (the heartbeat half of the respawn proof), a foreign repo's armed/railed decision counted
+        # as this repo's lander, an empty process table read as absence, an absent controller.ok
+        # read as an empty table, a bad fixture exiting with the FAIL code, a truncated merged page
+        # read as nothing merged,
+        # a spawn from ANOTHER batch vouching for this one, a spawn predating its batch line, the
+        # queue verdict read from the one-refresh-old header token, the two checks reading
+        # DIFFERENT pool tokens, an unreadable memory probe reported as 0 MiB free, an ABSENT
+        # open_pr_count treated as agreement, a rollup at the GraphQL page bound graded anyway,
+        # a dispatch INTENT line graded as the dispatch outcome, an intent-only log passing instead
+        # of abstaining, a spawn-failure line never parsed, a cycle header counted outside the
+        # window, a queue-token age without its unit multiplier, a DRAFT PR dropped with no line,
+        # one headroom floor graded while the other is ignored, `--static --only` certifying checks
+        # it never asserted, a respawn on a verdict it knows is stale, auto-discovery picking a NEVER-DISPATCH pane, an
+        # unreadable process table read as absence, a respawn acting on an unreadable table, "recent
+        # log" accepted as proof a respawn took, the kernel default oom_score_adj 0 counted as
+        # protection, a future-dated event graded fresh, a bash -c wrapper counted as a controller,
+        # a preview writing the real notification state, an ambiguous send blind-retried, a recovery
+        # leaving the ambiguity marker behind, an unscoped controller census (a leaked test fixture or
+        # another cell's controller counted as ours), unread PRs footnoted once one armed PR was found,
+        # a MISSING github surface read as a successful read, an unrecognised send result treated as a
+        # free retry, the respawn evidence composed AFTER the send, an unwritable state path crashing
+        # the run, a lane-busy REFUSAL suppressed as ambiguous (silencing a busy controller for good),
+        # a respawn proved only by the log while the heartbeat advanced, rejected census processes
+        # collected and never shown, an unguarded outbox write, REST's lowercase mergeability state
+        # left un-normalised (landers grading nothing), an unknown mergeability counted as graded, an
+        # incomplete header blessed as a genuinely empty pool, a fixture _expect naming a check that
+        # does not exist, the age of a pool read parsed and never read (a frozen EMPTY read passing as
+        # current), a future-dated log mtime clamped to "0s ago", a fixture with no _expect asserting
+        # nothing, a truncated open-PR page treated as the whole population, an unaged EMPTY pool read
+        # graded as current, a staleness limit that is not a config field, a zero staleness limit
+        # treated as unset, a re-run attempt graded by its OLDEST entry (a flaky job that re-ran green
+        # reading red and leaving the lander population), an armed/railed decision believed however
+        # old or unaged, the REST probe bound declared nowhere so a caller's bound does nothing, an
+        # unread check surface graded red (a green unarmed PR leaving the population), a process that
+        # MENTIONS the pane daemon counted as the daemon, an empty gh response read as zero PRs, a
+        # truncated check-run page graded green, the header timezone dropped for local time, a dry run
+        # persisting the state, a --box run borrowing THIS machine's repo plist, an unparseable header
+        # reported as no header, "idle" reported as "dispatched", a --only exclusion graded as wrong,
+        # the rollup grouped on an `app` the live surface does not emit (workflows collapsing into one
+        # check), the rollup ranked by list position instead of timestamp, an in-flight attempt graded
+        # on the previous attempt's verdict, an absent `probed` key read as probed, an unrecognised
+        # mergeability state skipped instead of abstaining, a future-dated queue-state clamped to the
+        # freshest reading, a fixture asserting a SUBSET of the checks, a deleted outcome-critical
+        # fixture going unnoticed, an age-UNKNOWN non-empty pool read graded READABLE, a moving log
+        # counted as a cycling controller, a partial --only run exiting 0, a usage error exiting with
+        # the INCONCLUSIVE code, crossed labels in pr_created's evidence, an absent/contradictory PR
+        # population graded anyway, a PR skipped for a known reason not counted, an unrecognised
+        # review decision dropping a graded PR — into a TEMP copy, and requires its paired test to go
+        # RED. A mutation that survives is reported as a suite failure.
+        run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Kill-switch / session-escape suite (#1419)

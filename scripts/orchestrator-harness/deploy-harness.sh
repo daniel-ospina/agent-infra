@@ -127,10 +127,16 @@ fi
 # invisible to it by construction and cannot perturb the drift answer.
 # Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
 # pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
-# Portable octal mode of a path: BSD `stat -f %Lp`, GNU `stat -c %a`.
+# cannot suppress the one line that matters.
+
+# Portable octal mode of a path, INCLUDING the setuid/setgid/sticky bits: GNU `stat -c %a` ("4755"),
+# BSD `stat -f %p` ("104755", last four digits). ⛔ NOT `stat -f %Lp` — it is the low NINE bits only
+# ("755" for a 4755 file), which made the mode blind exactly where it claimed to compare (cycle 7).
+# (This line said `%Lp` for a cycle after the code stopped using it; a doc line that re-asserts the
+# blind spot it was written to close is the defect class this file exists for.)
 # ⛔ THE OUTPUT IS VALIDATED, NOT TRUSTED (review P2, cycle 6). Neither form is safe to believe on its
-# own: on GNU, `-f` is the boolean `--file-system` and takes NO argument, so `stat -f %Lp "$1"` treats
-# `%Lp` as a PATH OPERAND and exits 0 whenever a file of that name exists — returning a multi-line
+# own: on GNU, `-f` is the boolean `--file-system` and takes NO argument, so `stat -f %p "$1"` treats
+# `%p` as a PATH OPERAND and exits 0 whenever a file of that name exists — returning a multi-line
 # filesystem dump. Probe ORDER cannot fix that class (a future `stat` can mis-answer either form), so
 # the result is accepted only when it is 3-4 octal digits and is EMPTY otherwise. Empty makes the caller
 # take the executable-bit path AND count the file in MODE_UNSET, so the verdict says the mode is not
@@ -612,6 +618,15 @@ STAMP_NOTE=""
 STAMP="$O/.agent-infra-stamp.json"
 if [ -f "$STAMP" ]; then
   SHA_CMD="sha256sum"; command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
+  # ⛔ AN UNREADABLE STAMP IS "CANNOT CHECK", NOT "NO RECORD" (review P3, cycle 8). The assignment's
+  # status was unread, so a present-but-unreadable stamp yielded an empty REC, the whole arm was skipped,
+  # and the run said nothing — silently deleting the one check whose contract (above) is that "cannot
+  # check" is ALWAYS said out loud. An absent stamp is legitimately silent; an unreadable one is not.
+  if [ ! -r "$STAMP" ]; then
+    say "  ⚠ identity record NOT CHECKED: $STAMP exists but is UNREADABLE, so the record was not compared."
+    say "    The bytes above are still verified. Fix its permissions, then re-run install.sh."
+    detail+=("STAMP-UNCHECKED	.agent-infra-stamp.json	(the stamp exists but is UNREADABLE)")
+  fi
   REC="$(sed -n 's/.*"payloadSha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAMP" 2>/dev/null | head -1)"
   # ⛔ AN INCOMPLETE FOLD IS NOT A COMPARISON — the fold's STATUS IS READ (review P2). The `|| exit 3`
   # below was inert: `set -uo pipefail` makes the pipeline status 3, but nothing read the assignment's
@@ -625,7 +640,7 @@ if [ -f "$STAMP" ]; then
   # DRIFT). The wrong advice also propagates: install.sh's own fold fails on the same file, so the
   # re-stamp it recommends cannot run — "cannot check" is the truthful verdict.
   LIVE=""
-  if [ -n "$REC" ]; then
+  if [ -n "$REC" ] && [ -r "$STAMP" ]; then
     if ! LIVE="$( { set -o pipefail
         ( cd "$O" || exit 3
           for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f" || exit 3; done ) \
