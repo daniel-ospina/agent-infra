@@ -414,6 +414,27 @@ case "$out" in
   *) fail "AGENT_GH_REAL=<a directory> did not reach the real gh: $out" ;;
 esac
 
+# (a4) THE INHERITED VALUE IS USUALLY A REAL ELF, SO THE READ MUST BE SILENT (#2184/#2305, review
+# of #2295). On a delegated call the inherited value IS the genuine gh — a binary full of NUL bytes —
+# and `_is_harness_layer` reads it on EVERY call. The form that leaks is a command substitution over
+# it: bash >=4.4 then prints `warning: command substitution: ignored null byte in input` onto a call
+# that SUCCEEDS, and `gh-rest/gh` parses stderr as JSON (`2>&1 | jq`), so that is a JSONDecodeError on
+# every gh call in the tree — #2305 grades exactly this. The assertion is BYTE-CLEAN stderr, which is
+# the property itself and is form-agnostic: reverting the helper to `case "$(head -c 8192 …)"` fails
+# here (measured 96 stderr bytes on an rc=0 call), while both legitimate outcomes — the value accepted
+# as the real gh, or refused and fallen through — must be silent.
+ELFGH="$TMP/elfgh-$$"; ELFERR="$TMP/elfgh.err"
+if [ -x /bin/true ]; then cp /bin/true "$ELFGH"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$ELFGH"; fi
+chmod +x "$ELFGH"
+: > "$ELFERR"
+( cd "$TMP" && env AGENT_GH_REAL="$ELFGH" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >/dev/null 2>"$ELFERR"
+if [ -s "$ELFERR" ]; then
+  fail "a binary (ELF) AGENT_GH_REAL leaked $(wc -c <"$ELFERR") bytes onto a SUCCESSFUL call's stderr — gh-rest's 2>&1 parse is a JSONDecodeError (#2184/#2305): $(head -1 "$ELFERR")"
+else
+  pass "a binary (ELF) AGENT_GH_REAL leaves a successful call's stderr byte-clean (#2184/#2305)"
+fi
+
 # (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token
 # carries `mergePullRequest`. Refuse rather than assume benign.
 for shape in '-F query=@/tmp/q.graphql' '-f query=@/tmp/q.graphql' '--input /tmp/body.json' '-F query=@-'; do
