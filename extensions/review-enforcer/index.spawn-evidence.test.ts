@@ -32,6 +32,13 @@
  *      #426 parity line)                                        alone is sufficient, so neither
  *                                                               single deletion reddens — which is
  *                                                               why the pair is pinned together.
+ *   M6 drop the `-H` spelling (keep only `--head`)            → §REFUSE--H
+ *   M7 drop the ref-moving-verb guard                         → §REFUSE-ref-moving
+ *
+ * NOT a mutation target, stated so nobody mistakes it for one: `words.length !== 2` is
+ * redundant with the `words[1] !== branch` comparison that follows it (a bare `git push` has
+ * no `words[1]`, so that check refuses it anyway). Both are kept as defence in depth; deleting
+ * either alone does not change the verdict, and the test pins the BEHAVIOUR, not the line.
  *
  * Hermetic: HOME is a temp dir (the reviews registry and the audit log are HOME-derived),
  * the repo is a throwaway checkout with a fake `origin` URL, and no `gh`/network call is made.
@@ -212,6 +219,33 @@ async function main() {
     equal(mod.resolveShippedHeads("git push --mirror", { cwd: repoDir() }), null, "--mirror ships everything");
     equal(mod.resolveShippedHeads(`git -C ${repoDir()} push origin main`, { cwd: repoDir() }), null, "-C is unattributable");
     equal(mod.resolveShippedHeads("gh pr create --head other-branch", { cwd: repoDir() }), null, "--head names another branch");
+  });
+
+  // ⛔ Fresh review round 2 (P0/P1/P2) — each of these was a live accept before the fix.
+  test("§REFUSE — `gh pr create -H <branch>` (the SHORT --head) is the same shape", async () => {
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "gh pr create -H other-branch --title x" } }, { cwd: repoDir() });
+    ok(res?.block === true, "-H is --head: it opens a PR for another branch and must not use this record");
+    equal(mod.resolveShippedHeads("gh pr create -H other-branch", { cwd: repoDir() }), null);
+  });
+
+  test("§REFUSE — a ref-MOVING prefix moves what the push ships after HEAD was read", async () => {
+    for (const cmd of [
+      "git reset --hard side && git push origin main",
+      "git branch -f main side && git push origin main",
+      "git checkout -B main side && git push origin main",
+      "git checkout side && gh pr create -f",
+      "git stash pop && git push origin main",
+    ]) {
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null, `ref-moving prefix must close the evidence path: ${cmd}`);
+    }
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git reset --hard side && git push origin main" } }, { cwd: repoDir() });
+    ok(res?.block === true, "the chained reset+push must fall back to the dispatch floor, not to the record");
+  });
+
+  test("§REFUSE — a bare `git push` ships whatever push.default selects", async () => {
+    equal(mod.resolveShippedHeads("git push", { cwd: repoDir() }), null, "no refspec named → not necessarily HEAD");
+    equal(mod.resolveShippedHeads("git push origin", { cwd: repoDir() }), null, "remote only → push.default decides");
+    ok(mod.resolveShippedHeads("git push origin main", { cwd: repoDir() }) !== null, "control: the exact `<remote> <branch>` form is still accepted");
   });
 
   test("§unit — headBoundReviewEvidence: exact head, repo-scoped, ambiguity is not evidence", async () => {

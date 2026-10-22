@@ -741,7 +741,11 @@ function recoverBridgeForRoot(normRoot: string): number {
       // hash still matches the file on disk (sha1 or sha256, #320). Never
       // recompute a fresh hash — a post-PASS edit must fail closed.
       if (!hashMatchesDisk(parsed.root, relPath, vf.hash)) continue;
-      verifiedSet.set(vf.path, vf.hash);
+      // #1460: the SAME invariant as mergeVerifiedFiles — recovery re-installs the
+      // gate's own sha256 of the matched bytes, never a supplied md5/sha1 verbatim (a
+      // supplied digest is evidence, not the standing identity). `parsed` carries the
+      // root/path this entry is keyed by.
+      verifiedSet.set(vf.path, storedDigestFor(parsed.root, parsed.path, vf.hash));
       blockAttempts.delete(vf.path);
       recovered++;
     } catch {

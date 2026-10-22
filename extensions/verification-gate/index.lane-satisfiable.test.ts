@@ -27,6 +27,9 @@
  *                                                              sha256" assertion
  *   M3 delete the in-batch refusal                          → (d) refusal + split-form tests
  *   M4 make the split non-byte-faithful (append a space)    → the split unit test (pipe/redirect)
+ *   M5 make bridge recovery store the supplied digest        → the bridge-recovery test (the commit's
+ *      verbatim instead of the gate's sha256                    pendingRehash would mask it, so that
+ *                                                              test observes the bridge WITHOUT one)
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and
  * audit log are HOME-derived), and every repo is a throwaway temp checkout.
@@ -258,6 +261,31 @@ test("(d) the refusal names the EXACT two commands, and the split form is ACCEPT
   ok(commit?.block === true, "the pure commit is then gated on the REAL state, not silently allowed");
   await fire("tool_result", hashResult(repo, "a.txt", sha256("x\n")));
   equal(await fire("tool_call", commitOp()), undefined, "verified → the split form lands");
+});
+
+test("(a) bridge recovery re-installs the gate's sha256, not the verifier's md5 (#1460)", async () => {
+  const repo = await freshRepo("a-recovery");
+  const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
+  mkdirSync(bridgeDir, { recursive: true });
+  // Hand-written bridge entry: exactly what a verifier's md5 PASS would have persisted.
+  writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
+    status: "PASS",
+    verified_files: [{ path: `${realpathSync(repo)}::a.txt`, hash: md5("a1\n") }],
+    timestamp: new Date().toISOString(),
+  }));
+  // Recovery runs on session_start AND before every git op; a blocked op still recovers first.
+  await fire("session_shutdown", {});
+  await fire("session_start", {});
+  // Make the recovered registry OBSERVABLE without a commit (a commit's pendingRehash would
+  // re-hash from disk and mask what recovery stored): a PASS for a second, staged file writes
+  // the bridge from the whole registry.
+  writeFileSync(join(repo, "b.txt"), "b1\n");
+  git(repo, "add b.txt");
+  await fire("tool_result", hashResult(repo, "b.txt", sha256("b1\n")));
+  const bridge = JSON.parse(readFileSync(join(bridgeDir, "latest.json"), "utf8"));
+  const entry = (bridge.verified_files as { path: string; hash: string }[]).find((e) => e.path === `${realpathSync(repo)}::a.txt`);
+  ok(entry !== undefined, "the recovered entry is still in the registry (recovery did not drop it)");
+  equal(entry!.hash, sha256("a1\n"), "recovery stored the gate's sha256 of the matched bytes, not the verifier's md5");
 });
 
 // ── direct unit pins (no plugin) ─────────────────────

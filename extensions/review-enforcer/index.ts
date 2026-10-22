@@ -1670,6 +1670,15 @@ export function headBoundReviewEvidence(headSha: string, repo: string | null): R
  * fail-closed direction: an unrecognised option, a refspec, a redirect, an unresolvable branch
  * name, or a commit all fall back to the ordinary floor rather than to an accept.
  */
+/**
+ * Every git verb that can move a ref or rewrite the working tree. A command containing one of
+ * these cannot be certified by a record bound to the HEAD read before it ran (see the call site).
+ * `fetch` is deliberately absent (it moves remote-tracking refs only); `push`/`pr create` are the
+ * ops this resolver exists for.
+ */
+const REF_MOVING_VERB =
+  /(^|\s)git\s+(?:-[^\s]+\s+)*(?:commit|reset|checkout|switch|branch|merge|rebase|cherry-pick|revert|stash|pull|am|apply|restore|rm|mv|tag|update-ref|symbolic-ref|worktree|clean|notes)(?=\s|$)/;
+
 export function resolveShippedHeads(
   command: string,
   ctx: unknown,
@@ -1687,8 +1696,19 @@ export function resolveShippedHeads(
   const isPrCreate = /(^|\s)gh\s+pr\s+create(\s|$)/.test(command) && !/(^|\s)gh\s+pr\s+merge(\s|$)/.test(command);
   // `git commit` ships bytes that do not exist at hook time - a record can never describe them.
   if (!isPush && !isPrCreate) return null;
-  // `gh pr create --head <branch>` can open a PR for a branch that is not this checkout's.
-  if (isPrCreate && /(^|\s)--head(=|\s)/.test(command)) return null;
+
+  // ⛔ REF-MOVING PREFIX (fresh review, P1): HEAD is read BEFORE the command runs, so a same-call
+  // mutator moves the branch that the push/PR then ships. All of these authorized an op on a record
+  // bound to the PRE-mutation HEAD: `git reset --hard side && git push origin main`,
+  // `git branch -f main side && git push origin main`, `git checkout -B main side && git push`,
+  // `git checkout side && gh pr create -f`. Any ref-moving verb anywhere in the command closes the
+  // evidence path (fail-closed: the >=1-dispatch floor applies, nothing is bypassed).
+  if (REF_MOVING_VERB.test(command)) return null;
+  // `gh pr create --head|-H <branch>` can open a PR for a branch that is not this checkout's.
+  // ⛔ BOTH SPELLINGS (fresh review, P0): matching only `--head` left `gh pr create -H other`
+  // opening the evidence path for another branch's commits. `gh pr create --help` lists
+  // `-H, --head branch`.
+  if (isPrCreate && /(^|\s)(-H|--head)(=|\s)/.test(command)) return null;
 
   let head: string;
   let branch: string;
@@ -1707,10 +1727,14 @@ export function resolveShippedHeads(
     const pushAt = command.search(/(^|\s)git\s+push(\s|$)/);
     const tail = pushAt === -1 ? "" : command.slice(pushAt).replace(/^.*?git\s+push\b/, "").trim();
     const words = tail.split(/\s+/).filter((w) => w.length > 0 && !w.startsWith("-"));
-    if (words.length > 2) return null; // remote + one branch at most
+    // ⛔ EXACTLY `<remote> <thisBranch>` (fresh review, P2). A bare `git push` / `git push origin`
+    // ships whatever `push.default` or `remote.<remote>.push` selects — possibly refs that are not
+    // HEAD — while the record is bound to HEAD.
+    if (words.length !== 2) return null;
+    if (words[0] === "" || words[1] === "") return null;
     if (words.some((w) => w.includes(":"))) return null; // explicit refspec -> not necessarily HEAD
     if (tail.includes("+")) return null; // forced refspec
-    if (words.length === 2 && words[1] !== branch) return null; // a DIFFERENT branch than this checkout's
+    if (words[1] !== branch) return null; // a DIFFERENT branch than this checkout's
   }
 
   const repo = opCtx.repo ?? repoFromGitRemote(cwd);
