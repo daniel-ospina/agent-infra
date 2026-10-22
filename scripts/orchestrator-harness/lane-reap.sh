@@ -793,7 +793,7 @@ zombie_count() { # <tablefile> — the box's corpses, so "busy" cannot hide them
 cmd_count() {
   coerce_limits
   local table roots root live=0 total=0 z live_unknown=0
-  local not_lane=0 blind=0 ambiguous=0 attributed=0
+  local not_lane=0 blind=0 ambiguous=0 attributed=0 unidentifiable=0
   table="$(mktemp "${TMPDIR:-/tmp}/lane-reap-count.XXXXXX")" || return 3
   read_table > "$table"
   if ! table_readable "$table"; then
@@ -842,6 +842,11 @@ cmd_count() {
       # dispatch more onto a box that may be full. It is counted and the census abstains below.
       2) blind=$((blind + 1)); continue ;;
       3) ambiguous=$((ambiguous + 1)); continue ;;
+      # ⛔ AN UNUSABLE PIPE IDENTITY IS TAKEN-BUT-UNATTRIBUTABLE, NOT NOT-A-LANE (#2163 review r6,
+      # P1). Without this arm the tree fell through to `attributed` with an empty path, the
+      # lane-log filter dropped it, and the census printed `lanes=0/0` exit 0 over a resident lane
+      # — the fail-open this whole issue closes, reintroduced by the rc-2/rc-4 split.
+      4) unidentifiable=$((unidentifiable + 1)); continue ;;
     esac
     attributed=$((attributed + 1))
     path="$(printf '%s' "$logres" | cut -f1)"
@@ -889,9 +894,9 @@ cmd_count() {
   # (`blind`) or that presents two distinct lane logs (`ambiguous`) may be a lane, so `total` is a
   # lower bound as well as `live`; printing the number we happened to reach is the fail-open this
   # fix closes. `zombie=` IS readable and is kept, so the line still says something true.
-  if [ "$blind" -gt 0 ] || [ "$ambiguous" -gt 0 ]; then
+  if [ "$blind" -gt 0 ] || [ "$ambiguous" -gt 0 ] || [ "$unidentifiable" -gt 0 ]; then
     printf 'lanes=?/? zombie=%s\n' "$z"
-    logline "census-abstained blind=$blind ambiguous=$ambiguous attributed=$attributed not-a-lane=$not_lane"
+    logline "census-abstained blind=$blind ambiguous=$ambiguous unidentifiable=$unidentifiable attributed=$attributed not-a-lane=$not_lane"
     return 3
   fi
   local live_out="$live"
