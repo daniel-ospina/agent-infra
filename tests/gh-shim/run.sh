@@ -1172,15 +1172,21 @@ GHEOF
 }
 
 # (a) a sentinel-marked harness layer sits BETWEEN this shim and the real gh.
+# ⛔ FILE, NOT A CAPTURE PIPE (review of #2295). `out="$( … & … )"` cannot report the very failure
+# it exists to detect: the recursion's descendants INHERIT the substitution's write end, so after
+# `kill -9 $p` the substitution still waits for an EOF that never comes — the CASE HANGS instead of
+# reporting, and the `*HUNG*` arm below is precisely the arm that cannot fire (reproduced: rc=124).
+# Same file + reap shape as (a2)/(a3), which is why they carry this reasoning too.
 HRAN="$TMP/harness-layer-ran-14a"
 rm -f "$HRAN"
 harness_layer_at "$TMP/gh-limit-14a" "$HRAN"
-out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN \
+: > "$TMP/a1.out"
+( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN \
   PATH="$TMP/neutral:$TMP/gh-limit-14a:$TMP/bin:/usr/bin:/bin" \
-  bash "$TMP/neutral/gh" pr view 1 2>&1 &
-  p=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
-  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+  bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a1.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a1.out"
+out="$(cat "$TMP/a1.out")"
 case "$out" in
   *HUNG*) fail "with a harness layer on PATH the shim HUNG — the two wrappers resolve into each other" ;;
   *HARNESS-LAYER-RAN*) fail "the shim EXEC'd the harness gh layer (#1988) — that layer resolves back here, so the pair fork-loops" ;;
