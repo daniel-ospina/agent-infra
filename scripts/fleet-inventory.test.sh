@@ -65,6 +65,7 @@
 #   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
 #       manufactured a duplicate, then read OK over two live loops)
 #   (x) refuse the repair entirely                                         → §9q (2 arms)
+#   (aa) render a STALE lander-drain record as OK (delete the LATE verdict)    → §9u only (2 arms)
 #   (y) hard-code the heartbeat loop's bound instead of reading
 #       `FLEET_HEARTBEAT_LATE_S`                                           → §9t's LATE arm only
 #   (z) hard-code the cadence row's bound instead of reading
@@ -1312,6 +1313,47 @@ st="$(state_of "$ROWS" reaper.worktree-reaper)"
 [ "$st" = "OK" ] && ok "§9t …and FLEET_JOB_SLACK_S=300 reads the same log OK (the slack widened the bound)" \
                  || bad "§9t a 3 s old log under a 302 s bound should read OK, got [$st]"
 rm -f "$STATE/pi-reap-worktrees.log"
+
+# §9u THE DRAIN LOOP ROW (`lander-drain`) — the component that DECIDES what lands. Its failure mode is
+# silence: a loop that is off opens no PR, reds no check and logs nothing, so the row must be able to
+# say (a) nothing has ever run, (b) a fresh run and what it measured, and (c) a run that went stale.
+# The CI queue depth is asserted IN THE ROW because that is the number the row exists to surface.
+say_case "§9u the lander-drain row reports never-run / fresh / stale, with the CI queue depth"
+seed_quiet_box
+LDRAIN="$O/state/lander-last"; mkdir -p "$O/state"
+rm -f "$LDRAIN"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" lander-drain)"
+[ "$st" = "SKIPPED" ] && ok "§9u no run recorded reads SKIPPED (a box with no drain loop is not broken)" \
+                      || bad "§9u no run recorded should read SKIPPED, got [$st]"
+case "$(detail_of "$ROWS" lander-drain)" in
+  *"GREEN PRs THEN WAIT FOR A HUMAN"*) ok "§9u …and the advice names the consequence, not the file path" ;;
+  *) bad "§9u the never-run advice does not name the consequence: $(detail_of "$ROWS" lander-drain)" ;;
+esac
+printf '%s 4 11 2 0 40 15 0\n' "$(date +%s)" > "$LDRAIN"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" lander-drain)"
+# The drain's OUTPUT (counts + queue depth) is the row's ACTUAL column — a fresh run that merged
+# nothing is information, so it belongs beside the freshness, not in an advice string.
+act="$(printf '%s\n' "$ROWS" | awk -F'\t' '$1=="lander-drain"{print $3}')"
+[ "$st" = "OK" ] && ok "§9u a fresh run record reads OK" || bad "§9u a fresh record should read OK, got [$st]"
+case "$act" in
+  *"CI queue 4 queued/11 in progress"*) ok "§9u …and the row carries the CI queue depth ($act)" ;;
+  *) bad "§9u the queue depth is NOT in the row: [$act]" ;;
+esac
+printf '%s 4 11 2 0 40 15 0\n' "$(( $(date +%s) - 7200 ))" > "$LDRAIN"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" lander-drain)"
+[ "$st" = "LATE" ] && ok "§9u a run older than the bound reads LATE (the loop is off)" \
+                   || bad "§9u a stale record should read LATE, got [$st]"
+[ "$(severity_of_row "$ROWS" lander-drain)" = "RC=1" ] && ok "§9u …and a stale drain fails the table" \
+                                                       || bad "§9u a stale drain must fail the table"
+printf 'garbage\n' > "$LDRAIN"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" lander-drain)"
+[ "$st" = "UNKNOWN" ] && ok "§9u an unreadable record reads UNKNOWN, never OK" \
+                      || bad "§9u an unreadable record should read UNKNOWN, got [$st]"
+rm -f "$LDRAIN"
 
 
 printf '\n%s\n' "──────────────────────────────────────────────"
