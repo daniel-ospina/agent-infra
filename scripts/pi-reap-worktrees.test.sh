@@ -283,7 +283,13 @@ cat >"$T/bin/git-fail-remote-probe" <<'SHIM'
 # origin` is the open-PR slug probe and MUST keep working, or the pass aborts
 # fail-closed (exit 3) before classifying anything and this fixture would test
 # the abort instead of gate 3.
-[ "${!#}" = "remote" ] && exit 99
+# ⛔ NOT the bash-4.3-only last-argument expansion (indirect braced `!` `#`):
+# the fleet's macOS boxes run /bin/bash 3.2, where that spelling is a
+# `bad substitution` inside the shim — it would abort EVERY probe and re-create
+# the vacuity this shim exists to remove. The last-arg loop is the spelling the
+# neighbouring shims above already use.
+for _last in "$@"; do :; done
+[ "${_last:-}" = "remote" ] && exit 99
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
 REAL_COMM="$(command -v comm)"
@@ -369,7 +375,7 @@ exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
-         "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
+         "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" "$T/bin/git-fail-remote-probe" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
          "$T/bin/git-list-fail-after-probes" "$T/bin/comm"
@@ -2169,13 +2175,21 @@ WT_M3B="$(add_named_wt "$REPO" "$ENV-wt" feat/m3b)"
 commit_in_wt "$WT_M3B" "$OLD_DATE" m3b
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote-probe" run_reaper $ENV --dry-run --repo "$REPO")"
 # The SAFETY property, asserted here: a broken remote probe must never reap.
-# The exact reason string (`unpushed-unverifiable`) is verified by direct
-# reproduction instead of in-suite, because a GIT_BIN shim that fails `remote`
-# also confuses this suite's own fixture scaffolding — measured: the row is
-# absent and stderr carries `not a git repository: …/M3b/repo`, while the SAME
-# shim against a standalone repo yields `reason=unpushed-unverifiable`, exit 0,
-# empty stderr. Asserting the reason here would be asserting the scaffolding.
-assert_absent "$(row_for "$OUT" "$WT_M3B")" "reason=reclaimable" \
+# ⛔ NON-VACUOUS, BOTH DIRECTIONS (review P1, #2541). This arm was VACUOUS: the
+# shim was never added to the `chmod +x` list above, so its first exec failed
+# EACCES (rc 126), the pass died at `not a git repository` (exit 2) before
+# classifying anything, `row_for` returned "" and `assert_absent "" …` passed
+# unconditionally — it would have passed on a fail-OPEN gate 3 too. The previous
+# comment rationalized that symptom as "scaffolding". It was an executable bit.
+# With the shim executable the row EXISTS, so assert it does (the classification
+# ran at all) and that its reason is the fail-closed one, not merely "not
+# reclaimable" — an absent row can no longer satisfy this arm.
+_M3B_ROW="$(row_for "$OUT" "$WT_M3B")"
+assert_contains "$_M3B_ROW" "$WT_M3B" \
+    "M3b non-vacuity: the pass CLASSIFIED the worktree (an empty row would make the next line pass on anything)"
+assert_contains "$_M3B_ROW" "reason=unpushed-unverifiable" \
+    "M3b fail-closed: a broken remote probe is UNVERIFIABLE, and an unverifiable push state is never reaped (verified safe)"
+assert_absent "$_M3B_ROW" "reason=reclaimable" \
     "M3b fail-closed: a broken remote probe must NOT reap (verified safe)"
 
 ENV=M4; REPO="$(mk_repo_pushable $ENV)"
