@@ -1457,6 +1457,44 @@ reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n'
 printf 'diff-tail: `%s`\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a backticked correct digest is accepted (rc=$(rc_of))"
+# ⛔ THE PROMPT'S OWN PRODUCER LINE IS EXECUTED, NOT EYEBALLED (P2, fresh review of #2288): every
+# truncation arm above synthesised the expected digest with the fixture's helper and never ran the
+# command the prompt hands the reviewer, so a corrupt producer line was invisible — and it WAS
+# corrupt: the unquoted prompt heredoc expanded awk's `$0` to this script's path, so a reviewer that
+# followed the instruction verbatim got `awk: unexpected character '.'` and the digest of EMPTY
+# input, i.e. rc=3 and a discarded review on every diff over DIFF_CAP (this PR's own diff is one).
+# The producer is now extracted from the rendered prompt and RUN, and its output must match.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+run "$SRC" 2284
+# the PRODUCER line, not the shorter "fetch the whole thing" hint (both start with `gh pr diff`)
+PRODUCER="$(sed -n 's/^  \(gh pr diff .*cut -d.*\)$/\1/p' "$TMP/pi-prompt.txt" 2>/dev/null | head -1)"
+[ -n "$PRODUCER" ]; ck $? "the prompt carries the producer command (found: ${PRODUCER:0:60}…)"
+PRODUCED="$(PATH="$TMP/bin:$PATH" bash -c "$PRODUCER" 2>/dev/null)"
+[ "$PRODUCED" = "$EXPECT_DIGEST" ]
+ck $? "…and running it VERBATIM yields this diff's digest (got: ${PRODUCED:0:16}… want: ${EXPECT_DIGEST:0:16}…)"
+# ⛔ A PROMOTED VERDICT IS A FAIL-OPEN (P1, fresh review of #2288): an EARLIER `CLEAN` must never
+# stand in for a final `ISSUES` that the fence map skipped. Measured before the fix: rc=0 plus a
+# signed clean record over a reviewer whose last verdict was ISSUES — 2.
+reset; printf '**Verdict:** CLEAN\n```\n- the guard returns 0 on a failed read\n- a red gate reports green\n**Verdict:** ISSUES — 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a final verdict inside an UNCLOSED fence is not replaced by an earlier CLEAN (rc=$(rc_of))"
+no_record; ck $? "  …nothing was recorded (the earlier CLEAN cannot be promoted)"
+no_comment; ck $? "  …and no artifact was posted"
+reset; printf '**Verdict:** CLEAN\n````\n```\n**Verdict:** ISSUES — 2\n```\n````\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…and the same under a BALANCED 4-backtick wrapper (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded there either"
+# ⛔ NO COMPUTABLE TAIL => REFUSED BEFORE THE REVIEW IS PAID FOR (P3, fresh review of #2288): the
+# refusal used to run only AFTER the reviewer, so a box with neither digest tool paid for a full
+# review and discarded it — and the prompt it had already sent carried an EMPTY producer command.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf 'CLEAN\n' > "$TMP/reviewer-out"
+mkdir -p "$TMP/nosha2"
+for _t in sha256sum shasum; do printf '#!/bin/sh\nexit 1\n' > "$TMP/nosha2/$_t"; chmod +x "$TMP/nosha2/$_t"; done
+PATH="$TMP/nosha2:$TMP/bin:$PATH" run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "neither digest tool installed => exit 3 on a truncated diff (rc=$(rc_of))"
+no_reviewer; ck $? "  …and NO reviewer was spawned (nothing was paid for)"
+no_record; ck $? "  …and no record was attempted"
 # ⛔ A FENCED QUOTE IS NOT A FINDING (P2, sixth fresh review): a clean review that quotes this tool own
 # output contract, or reproduces a fixture, inside a ``` fence was read as a blocking finding and
 # discarded with nothing posted — and a re-run tends to quote it again. Unquoted line-leading tokens
@@ -1552,6 +1590,6 @@ echo
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 430 ]; ck $? "assertion-count pin: >= 430 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 440 ]; ck $? "assertion-count pin: >= 440 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

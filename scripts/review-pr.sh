@@ -408,6 +408,8 @@ compute_diff_tail() {
   DIFF_TAIL_CAUSE=""
   # ⛔ SAME PIPELINE AS THE PROMPT'S COMMAND, byte for byte: `printf '%s\n'` re-adds the newline that
   # the command substitution stripped from the fetch, and `tr -d '\r'` is stated in the prompt too.
+  # ⛔ `$0` HERE IS AWK'S, NOT THE SHELL'S — this function runs in normal code, but the PROMPT body
+  # (an unquoted heredoc) is where the same expr is interpolated, so it must be written `\$0` THERE
   DIFF_LASTLINE="$(printf '%s\n' "$DIFF_FULL" | tr -d '\r' | awk 'NF { last = $0 } END { print last }')"
   if [ -z "$DIFF_LASTLINE" ]; then
     DIFF_TAIL_CAUSE="this diff has no non-empty line to hash"
@@ -568,7 +570,7 @@ The diff inlined above is NOT the whole change. Fetch the remainder yourself, th
 line immediately BEFORE your verdict line, and nothing else on it:
   diff-tail: <the SHA-256 of the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>
 Compute the value YOURSELF with:
-  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=$0} END{print last}' | $SHA_CMD | cut -d' ' -f1
+  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=\$0} END{print last}' | $SHA_CMD | cut -d' ' -f1
 The caller holds the expected value and compares it exactly: a missing or different value means this
 review never covered the rest of the change, so it is DISCARDED — no comment, no record — rather than
 recorded against a diff nobody read. (The value is NOT given to you anywhere in this prompt, so
@@ -669,6 +671,14 @@ run_reviewer() { # <secs> <log> <prompt-file>
   return "$rc"
 }
 say "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
+# ⛔ A TAIL THAT CANNOT BE COMPUTED IS REFUSED BEFORE THE REVIEW IS PAID FOR (P3, fresh review of
+# #2288): the equivalent refusal lived only AFTER run_reviewer, so a box with neither `sha256sum` nor
+# `shasum` paid for a full review and then discarded it — and the prompt it had ALREADY sent carried an
+# empty `$SHA_CMD` in the producer line, which is a broken instruction, not a proof request. This is
+# the same "everything that can fail for free fails HERE" ordering the preflight section states.
+if [ "${DIFF_TRUNCATED:-0}" != 0 ] && [ -z "$DIFF_TAIL" ]; then
+  die "$E_EVIDENCE" "the diff is too large to inline and this box cannot compute the truncation proof — ${DIFF_TAIL_CAUSE:-no reason recorded} — so a reviewer could not be asked to prove it read the rest. Nothing was reviewed and NO record was written."
+fi
 run_reviewer "$TIMEOUT" "$LOG" "$PROMPT"
 AGENT_RC=$?
 cp "$LOG" "$TRANSCRIPT" 2>/dev/null || true
@@ -805,7 +815,7 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 # is allowed (§AB) — closing it would mean requiring the verdict to be the final non-empty line,
 # which changes that decision rather than fixing a bug. Quote it inside a fence or indent it and
 # it is correctly refused; narrate it as plain prose and it is not.
-LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
+LAST_ROW="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | awk '{ ln[NR] = $0 }
                     END {
                       # ── FENCED REGIONS: PAIR THE WAY MARKDOWN DOES, FAIL CLOSED ─────────────
@@ -921,7 +931,30 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                       }
                     }' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
+# ⛔ THE VERDICT MUST BE THE LAST VERDICT-SHAPED LINE IN THE TRANSCRIPT (P1, fresh review of
+# #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
+# silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
+# `**Verdict:** ISSUES — 2` inside it ⇒ rc=0 and a signed clean record over a reviewer that said
+# ISSUES 2, while the same transcript without the stray marker exits 7. The file claimed the only
+# direction this could err was over-skipping; it could err into a clean attestation, which is the
+# one thing the contradiction guard exists to make impossible. So the last verdict-shaped line in
+# the STREAM is compared with the one the map kept: when they differ, the run refuses — a quotation
+# is not a verdict, and neither is a verdict of convenience. (TEXT, not position: a promoted line
+# can only be a defect when it says something DIFFERENT from the one the reviewer wrote last, and a
+# text comparison needs no second copy of the verdict grammar inside awk.)
+# ⛔ THE RAW READ NEEDS NO FILTERING (P1 fix): blank and `[review-pr]` lines never match a verdict
+# pattern, so the last verdict-shaped line in the LOG is the one a text comparison needs — and a
+# filtered intermediate FILE was the wrong shape twice over (a `|` chain under `pipefail` with a
+# non-matching first grep truncated it to empty, so every ordinary CLEAN read as "no verdict").
+RAW_LAST="$(grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+LAST_LINE="$LAST_ROW"
 LAST="$LAST_LINE"
+# ⛔ THE REFUSAL IS DEFERRED, THE FACT IS RECORDED HERE (P1, fresh review of #2288): the decision is
+# made NOW, but it must not preempt the SCANNER-failure arm — a box whose `awk` is broken has no
+# verdict at all and must refuse with exit 10 ("the scan did not run"), not 6 ("a quotation"). So
+# this records the fact and the refusal fires after the scanner has proven it can run.
+VERDICT_QUOTED=0
+[ -n "${RAW_LAST:-}" ] && [ "$LAST_LINE" != "$RAW_LAST" ] && VERDICT_QUOTED=1
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
 # A finding line LEADS with its severity; mid-line mentions are prose, not findings. See the
@@ -1292,6 +1325,23 @@ esac
 # ⛔ THE VERDICT WORD IS THE **FIRST** ONE ON THE LINE (P1, ninth fresh review). Matching
 # `*clean*` anywhere meant `**Verdict: ISSUES — … the code is not clean**` recorded CLEAN:
 # the worst possible reading of a line, from the widest possible pattern.
+# ⛔ A QUOTATION IS NOT A VERDICT, AND NEITHER IS A VERDICT OF CONVENIENCE (P1, fresh review of
+# #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
+# silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
+# `**Verdict:** ISSUES — 2` inside it ⇒ rc=0 and a signed clean record over a reviewer that said
+# ISSUES 2, while the same transcript without the stray marker exits 7. The file claimed the only
+# direction this could err was over-skipping; it could err into a clean attestation, which is the one
+# thing the contradiction guard exists to make impossible. (TEXT comparison, not position: a promoted
+# line is only a defect when it says something DIFFERENT from the one the reviewer wrote last, and a
+# text comparison needs no second copy of the verdict grammar inside awk.)
+if [ "${VERDICT_QUOTED:-0}" = 1 ]; then
+  err "$PROG: the LAST verdict-shaped line in the transcript is inside a quoted/fenced/indented region, and the last verdict this map accepts differs from it — a quotation is not a verdict, and promoting an earlier one would attest a verdict the reviewer did not give last."
+  err "  quoted/fenced last line: $RAW_LAST"
+  err "  accepted (surviving)  : ${LAST_LINE:-<none>}"
+  err "  Last 20 transcript lines:"
+  tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
+  die "$E_NOVERDICT" "the final verdict-shaped line is a quotation — re-run, or ask the reviewer to print its verdict LAST and unquoted (transcript: $TRANSCRIPT)"
+fi
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
 case "$VWORD" in
   clean)  VERDICT=clean ;;   # a CLEAN line carries no count
