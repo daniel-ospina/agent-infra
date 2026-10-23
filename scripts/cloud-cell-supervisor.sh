@@ -2488,24 +2488,30 @@ start_doctor_loop() {
   local out="" lrc=0 i up=0
   out="$(tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'" 2>&1)"; lrc=$?
-  if [ "$lrc" -eq 0 ]; then
-    # (1) APPEARANCE — bounded, because a tmux SERVER that has to be started can be slower than one
-    # instant. `new-session -d` is synchronous in the client, so this normally succeeds first try.
-    for i in 1 2 3 4; do
-      tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && { up=1; break; }
-      sleep 0.25
-    done
-    # (2) SURVIVAL — ⛔ THE CHECK THAT MATTERS, and the one a poll that fires the instant the session
-    # appears CANNOT make (#2306 review P1, measured with real tmux 3.4). A doctor that FATALs at
-    # startup (a bad arg, an unwritable `$O`, a missing dependency) still creates a session, which is
-    # gone a second later. The pre-#2306 code only ever saw this because it slept 2 s before its one
-    # check; dropping the sleep without replacing the OBSERVATION blessed a dead cell as "started".
-    if [ "$up" = 1 ]; then
-      sleep 2
-      tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null || up=2
-    fi
-  fi
+  # (1) APPEARANCE — PROBED REGARDLESS OF $lrc (#2306 review P2). `duplicate session: <name>` is the
+  # BENIGN non-zero: it means the session exists, and it is what a concurrent `start` (an operator
+  # retry, or the doctor's own `run_doctor` -> `$SUPERVISOR start`) produces. Gating the probe on
+  # `lrc = 0` reported a launch that had SUCCEEDED as a failure, and that rc propagates through all
+  # four of cmd_start's heal paths to orchestrator-bringup.sh, which refuses and records NO registry
+  # entry for a cell that is up and dispatching. Only the DIAGNOSIS text below may depend on $lrc.
+  # Bounded, because a tmux SERVER that has to be started can be slower than one instant.
+  # `new-session -d` is synchronous in the client, so this normally succeeds first try.
+  for i in 1 2 3 4; do
+    tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && { up=1; break; }
+    sleep 0.25
+  done
+  # (2) SURVIVAL — ⛔ THE CHECK THAT MATTERS, and the one a poll that fires the instant the session
+  # appears CANNOT make (#2306 review P1, measured with real tmux 3.4). A doctor that FATALs at
+  # startup (a bad arg, an unwritable `$O`, a missing dependency) still creates a session, which is
+  # gone a second later. The pre-#2306 code only ever saw this because it slept 2 s before its one
+  # check; dropping the sleep without replacing the OBSERVATION blessed a dead cell as "started".
   if [ "$up" = 1 ]; then
+    sleep 2
+    tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null || up=2
+  fi
+  # A LIVE LOOP RECORD IS THE LOOP'S OWN EVIDENCE (#2306 review P2): a session that disappears while
+  # the loop lives is the tmux-server-restart state sup_loop_alive() exists for, not a failed launch.
+  if [ "$up" = 1 ] || { [ "$up" = 2 ] && sup_loop_alive; }; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"
     return 0
   fi
@@ -2517,10 +2523,11 @@ start_doctor_loop() {
   local tail3=""
   tail3="$(tail -3 "$O/logs/cell-doctor.log" 2>/dev/null | tr '\n' '|')"
   say "⛔ the doctor loop did NOT start — the doctor IS present at $d (this is not a missing artifact)"
-  if [ "$lrc" -ne 0 ]; then
-    say "    tmux new-session exited $lrc: ${out:-<no output>}"
-  elif [ "$up" = 2 ]; then
+  if [ "$up" = 2 ]; then
     say "    tmux created the session but it was GONE 2s later — the loop exited at startup (a startup FATAL: a bad argument, an unwritable \$O, a missing dependency)"
+    [ "$lrc" -ne 0 ] && say "    (tmux new-session also exited $lrc: ${out:-<no output>})"
+  elif [ "$lrc" -ne 0 ]; then
+    say "    tmux new-session exited $lrc: ${out:-<no output>}"
   else
     say "    tmux accepted the launch but the session '$DOCTOR_SESSION' never appeared within 1s"
   fi

@@ -222,6 +222,16 @@ loop_up() { # <pid>
   printf '%s\n' "$1" > "$T/o/state/roles/loop.pid"
   printf '%s|%s\n' "$1" "$(ident_of "$1")" > "$T/o/state/roles/loop.ident"
 }
+# ⛔ THE FIXTURE MUST WRITE THE TRANSCRIPT THE REAL LOOP WRITES (P2, fresh review of #2335).
+# `run_loop` writes a `loop started …` line to doctor.log immediately after `loop.started`; the
+# fixture wrote the state files only, leaving doctor.log at an EARLIER pass's mtime. The moment that
+# mtime fell in an earlier second, `loop_transcript_fresh` vetoed (`m < st`) and every row became
+# UNKNOWN — measured under load at 1/3 runs, i.e. a coin-flip red CI shard, failing while the code
+# behaved as designed. Call this AFTER writing loop.started: the check is `mtime < started`, so a
+# transcript written at or after the start is never stale.
+loop_transcript() { # <pid>
+  printf '%s  loop started pid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$T/o/logs/doctor.log"
+}
 result_has() { case "$OUT" in *"$1"*) return 0 ;; esac; return 1; }
 
 # ── 1) a WEDGED harness lane is reaped ───────────────────────────────────────────────────────────
@@ -434,6 +444,7 @@ result_has "NEVER RAN" && ok "status: names the roles that never ran" || bad "st
 "$REAL_SLEEP" 60 & GRACE_PID=$!
 loop_up "$GRACE_PID"
 printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+loop_transcript "$GRACE_PID"
 doc status
 kill "$GRACE_PID" 2>/dev/null || true
 [ "$RC" -eq 0 ] && result_has "WAITING" \
@@ -529,8 +540,14 @@ mkdir -p "$T/o/logs"; : > "$T/o/logs/doctor.log"; touch -t 202001010000 "$T/o/lo
 doc status
 [ "$RC" -ne 0 ] && result_has "UNKNOWN" && ok "status: an alive-but-silent loop is UNKNOWN (rc=$RC)" \
   || bad "status: an alive-but-silent loop read as progress (rc=$RC) — $OUT"
-result_has "transcript has not been written" && ok "status: names the transcript as the missing evidence" \
+# ⛔ AND IT NAMES THE MEASUREMENT, NOT THE BOUND (P2, fresh review of #2335). The 2020 mtime makes the
+# transcript PREDATE this incarnation's start, and the row must say THAT — the old text printed the
+# BOUND ("has not been written in over ${ALL_PASSES_S}s") for this veto, a false measurement on the
+# surface an operator uses to choose the repair.
+result_has "transcript predates this incarnation's start" && ok "status: names the transcript as the missing evidence, and WHY" \
   || bad "status: the transcript read is not named — $OUT"
+result_has "has not been written in over" && bad "status: reports the BOUND as if it were the age — $OUT" \
+  || ok "status: does not print the bound as a measurement"
 case "$OUT" in *WAITING*) bad "status: WAITING on an alive pid with no progress evidence — $OUT" ;; *) : ;; esac
 # NON-VACUITY, same live pid, same start record: a transcript written since this incarnation started is
 # progress evidence, and the rows go back to WAITING.

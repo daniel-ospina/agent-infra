@@ -3429,6 +3429,42 @@ case "$(cat "$AD/out")" in
   *"GONE 2s later"*) ok "start: names the exit-at-startup shape and the survival window" ;;
   *) bad "start: the exit-at-startup case is not named — $(tail -3 "$AD/out" | tr '\n' ' ')" ;; esac
 
+# ⛔ AND A BENIGN NON-ZERO IS NOT A FAILED LAUNCH (P1, fresh review of #2335). `tmux new-session`
+# exits 1 with `duplicate session: cell-doctor` when the session ALREADY EXISTS — measured on real
+# tmux 3.4: the second `new-session` rc=1 with `duplicate session`, `has-session` still rc=0. That is
+# what a concurrent `start` (an operator retry, or the doctor's own `run_doctor -> supervisor start`)
+# produces. Gating the appearance/survival probe on `lrc = 0` reported the SUCCEEDED launch as a
+# failure; that rc propagates through cmd_start's heal paths to orchestrator-bringup.sh, which
+# refuses and records no registry entry for a cell that is up and dispatching.
+DU="$T/dupsess"; rm -rf "$DU"; mkdir -p "$DU/o/state/roles" "$DU/o/logs" "$DU/bin" "$DU/harness" "$DU/copy" "$DU/st"
+cp "$SUP" "$DU/copy/cloud-cell-supervisor.sh"
+printf '#!/bin/bash\n[ "${1:-}" = loop ] && exit 1\nexit 0\n' > "$DU/o/cloud-cell-doctor.sh"
+chmod +x "$DU/o/cloud-cell-doctor.sh"
+cat > "$DU/bin/tmux" <<'SH'
+#!/bin/bash
+# has-session is ALWAYS true (the session a concurrent start already created); new-session exits 1
+# with the real tmux message, so only a probe that ignores `lrc` can see the launch is up.
+case "${1:-}" in
+  has-session) exit 0 ;;
+  new-session) printf 'duplicate session: cell-doctor\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$DU/bin/tmux"
+DU_RC=0
+(
+  set -- status
+  export PATH="$DU/bin:$PATH" CELL_HOME="$DU/home" O="$DU/o" REPO="$DU/repo" \
+         OR="daniel-ospina/agent-infra" SESSION="orch" DOCTOR_SESSION="cell-doctor" HARNESS="$DU/harness"
+  . "$DU/copy/cloud-cell-supervisor.sh" >/dev/null 2>&1
+  start_doctor_loop
+) >"$DU/out" 2>&1 || DU_RC=$?
+[ "$DU_RC" -eq 0 ] && ok "start: a 'duplicate session' non-zero is NOT a failed launch (rc=0)" \
+  || bad "start: a benign 'duplicate session' failed the launch (rc=$DU_RC) — $(tail -3 "$DU/out" | tr '\n' ' ')"
+case "$(cat "$DU/out")" in
+  *"doctor loop started"*) ok "start: claims the loop started when the session already existed" ;;
+  *) bad "start: did not claim a launch whose session exists — $(tail -3 "$DU/out" | tr '\n' ' ')" ;; esac
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

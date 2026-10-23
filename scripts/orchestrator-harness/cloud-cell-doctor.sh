@@ -1551,18 +1551,30 @@ loop_state() { # sets LOOP_STATE (alive|dead|unknown) + LOOP_STATE_REASON; alway
 #     completely stalled loop keeps a fresh-looking `WAITING` for ever.
 # 0 = fresh, 1 = stale (a veto on WAITING), 2 = absent (no evidence either way — an older tree or a
 # fixture; it does not veto).
+# ⛔ IT NAMES WHAT IT MEASURED, NOT THE BOUND (P2, fresh review of #2335). The UNKNOWN row used to
+# print "has not been written in over ${ALL_PASSES_S}s" for BOTH vetoes — and ALL_PASSES_S is the
+# BOUND, not the age. Measured: with doctor.log written 10 s ago and loop.started=now the row read
+# "not been written in over 4800s", a demonstrably false measurement on the surface an operator uses
+# to choose the repair (it points at a stalled loop instead of a restart). Sets LOOP_TX_REASON, the
+# way loop_state sets LOOP_STATE_REASON.
+LOOP_TX_REASON=""
 loop_transcript_fresh() {
   local f m age st
+  LOOP_TX_REASON=""
   f="$WORKER_LOG_DIR/doctor.log"
   m="$(mtime_epoch "$f")"
-  [ -n "$m" ] || return 2
+  if [ -n "$m" ]; then :; else LOOP_TX_REASON="it has written no transcript at all"; return 2; fi
   st="$(cat "$ROLES_DIR/loop.started" 2>/dev/null)"
   case "${st:-}" in
     ''|*[!0-9]*) : ;;                      # no start record: the age half still applies
-    *) [ "$m" -ge "$st" ] || return 1 ;;    # written by a PREVIOUS incarnation
+    *) if [ "$m" -lt "$st" ]; then
+         LOOP_TX_REASON="its transcript predates this incarnation's start ($(( st - m ))s before it) — written by a PREVIOUS loop"
+         return 1
+       fi ;;
   esac
   age=$(( $(date +%s) - m ))
-  [ "$age" -ge 0 ] && [ "$age" -le "$ALL_PASSES_S" ] && return 0
+  if [ "$age" -ge 0 ] && [ "$age" -le "$ALL_PASSES_S" ]; then return 0; fi
+  LOOP_TX_REASON="its transcript was last written ${age}s ago, outside the loop's ${ALL_PASSES_S}s worst-case pass window"
   return 1
 }
 
@@ -1572,6 +1584,18 @@ loop_transcript_fresh() {
 # a dead loop are different repairs. A role that never ran is named as NEVER RAN — never as idle.
 role_row() { # <role> <stale-bound-seconds>
   local role="$1" bound="$2" f rc ep age
+  # ⛔ A NOT-STARTED CELL IS `STOPPED`, NOT `UNKNOWN` (P2, fresh review of #2335). With no `.desired`
+  # the cell PROVABLY is not started, so "cannot verify the loop is running" is an abstention where
+  # the answer is known: measured, a clean `O` printed the headline `STOPPED` beside four `UNKNOWN`
+  # rows, which sends an operator hunting a fault — or "healing" a deliberately stopped cell with
+  # `start`. Exit stays 0: `stop` must remain a successful verb. Default 1 (callers that do not set
+  # it keep the previous behaviour).
+  # ⛔ AND ONLY WHEN THE LOOP IS NOT ALIVE: a live loop outranks a missing `.desired` (the record can
+  # be absent on a cell whose loop is up), so the rows must not go blind to a running scheduler.
+  if [ "${CELL_DESIRED:-1}" = 0 ] && [ "${LOOP_STATE:-}" != alive ]; then
+    printf '%-8s STOPPED   the cell is not started, so this role has not run and is not expected to\n' "$role"
+    return 0
+  fi
   f="$ROLES_DIR/$role.state"
   if [ ! -f "$f" ]; then
     # ⛔ NO PASS RECORD IS NOT "IN PROGRESS" (#2306). `WAITING` is a claim that a pass is running, so
@@ -1603,7 +1627,7 @@ role_row() { # <role> <stale-bound-seconds>
           # first pass cannot be claimed to be in progress.
           loop_transcript_fresh; tf=$?
           if [ "$tf" -eq 1 ]; then
-            printf '%-8s UNKNOWN   the loop pid is alive but its own transcript has not been written in over %ss — cannot verify a pass is in progress\n' "$role" "$ALL_PASSES_S"
+            printf '%-8s UNKNOWN   the loop pid is alive but %s — cannot verify a pass is in progress\n' "$role" "${LOOP_TX_REASON:-its own transcript is not fresh}"
             return 1
           fi
           printf '%-8s WAITING   loop started %ss ago; no pass recorded yet\n' "$role" "${LOOP_UP_S:-0}"
@@ -1677,6 +1701,7 @@ run_status() {
   esac
   # ONE loop verdict for the whole table (#2306): every row below is judged from it, so a row can
   # never disagree with the headline about whether the scheduler exists.
+  CELL_DESIRED="$desired"
   loop_state
   if [ "$LOOP_STATE" = alive ]; then
     printf 'loop:    RUNNING (pid %s)\n' "$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
