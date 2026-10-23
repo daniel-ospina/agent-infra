@@ -36,6 +36,27 @@
 // agent-infra ships — same inode (symlink/hard link) or same bytes (folder
 // copy). See `canonicalSkillsRoot`.
 
+// ── THIS GATE IS A COMPLIANCE GATE, NOT A SECURITY BOUNDARY (#1329) ────────
+// The bash branch matches a regex against the command TEXT. That catches the
+// spellings the manifest lists, and (since #1329) also the canonical spelling
+// with a git/gh invocation's GLOBAL options removed — `git -C <dir> commit`,
+// `git --no-pager commit`, `gh -R <owner/name> pr create` — which were
+// measured ALLOWED before, `git -C <dir>` being how this fleet commits in a
+// linked worktree. It does NOT stop an agent that INTENDS to evade it:
+// variable indirection (`g=commit; git $g …`), an alias/function invocation, an
+// `eval` of a variable, quote/escape splicing inside the verb, and arbitrary
+// nesting all bypass every rule when they are spelled as they are listed here.
+// ⛔ SPLICING NEEDS NO INDIRECTION, AND THIS COMMENT USED TO SAY IT DID (#1329
+// review cycle 2, P3): `git com"mit" -m x` is measured ALLOWED with no variable,
+// no alias and no `eval` — the text gate sees `com"mit"`, and re-joining it is
+// the bounded lexing pass the manifest header now calls a TRADE rather than an
+// impossibility. What IS true, and is the reason most evasions still need
+// indirection: the LITERAL text of a git command is matched wherever it appears
+// (`eval 'git commit'` and `echo 'git commit'` are caught). The
+// adopter-facing statement of that boundary — what is closed, what is not, and
+// the sanctioned bypasses — lives in the manifest header
+// (`enforcement/dangerous-ops.txt`), where the rules are read.
+
 import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { resolve, join, dirname, isAbsolute } from "node:path";
@@ -50,6 +71,7 @@ import { register } from "./shared/health.js";
 // would drift under a pi upgrade while the extension kept reporting
 // `✅ Loaded — enforcing N skill gates` with every gate inert (#1330).
 import { isToolCallEventType } from "./shared/tool-call-event.js";
+import { commandSpellings } from "./shared/git-command-parse.js";
 
 // ── Real module location ────────────────────────────
 // See the DEPLOYED LAYOUT note at the top of this file. The try/catch keeps a
@@ -762,6 +784,19 @@ function logNudgeEvent(type: "fired" | "complied" | "bypassed" | "blocked", skil
   console.log(`[skill-enforcer] 📊 ${event}`);
 }
 
+/**
+ * #1329 — match a rule against every SPELLING of the command the shared parser
+ * derives (raw first, then a git/gh invocation with its GLOBAL options removed).
+ * The derivation only DELETES option runs, so this can only ADD a block: a rule
+ * that matched the raw command still matches, and the raw command is always
+ * tried first. See `commandSpellings` (shared/git-command-parse.ts) for the two
+ * load-bearing properties, and the `enforcement/dangerous-ops.txt` header for
+ * what this deliberately does not close.
+ */
+export function commandMatches(pattern: RegExp, spellings: string[]): boolean {
+  return spellings.some((spelling) => pattern.test(spelling));
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, _ctx) => {
     readFiles.clear();
@@ -887,11 +922,19 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
+    // #1329: on the BASH channel the rule is tried against the raw command AND its
+    // option-normalised spellings (`git -C <dir> commit`, `git --no-pager commit`,
+    // `gh -R <o/n> pr create`), computed ONCE per call — every rule shares the list.
+    // #1328: every OTHER tool's subject is a tool NAME, which carries no git/gh global
+    // options, so `p.test(subject)` is the whole rule there. Both channels keep the one
+    // loop below, so a hard rule fires on the channel its pattern names.
+    const spellings = isBash ? commandSpellings(subject) : null;
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(subject) && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
+          const hit = spellings ? commandMatches(p, spellings) : p.test(subject);
+          if (hit && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
         }
       }
     }
