@@ -2722,8 +2722,8 @@ cannot guess:
   Two of those rows are separated by a question the record cannot answer by itself — **can anything on
   this box write it?** `orch-loop.sh --check-refresh` answers that in exit codes, for a monitor or a
   CI job that cannot read prose: `0` the seeded `$O` copy can record (no skew), `1` DIVERGENCE — the
-  seeded copy cannot, so the controller would run a different copy, `2` no script here can record (or
-  none was found), so origination cannot be proven. It takes no lock and writes no record, but it is
+  seeded copy is MISSING or cannot record, so the controller would run a different copy, `2` no script
+  here can record (or none was found), so origination cannot be proven. It takes no lock and writes no record, but it is
   not inert: like every invocation it may create `$O/logs`, `$O/state` and the queue files, append
   the `[startup]` line to `$O/logs/orch-loop.log`, and `chmod +x "$O"/*.sh` — so point it at a box's own
   `$O`. `78` means the controller could not start at all (a startup guard fired), which is never

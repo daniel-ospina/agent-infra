@@ -1226,6 +1226,29 @@ OUT_C="$(check_run "$SKEW/o" "$SKEW/none")"; RC_C=$?
   || bad "check: an unprovable box exited $RC_C, not 2 — $OUT_C"
 case "$OUT_C" in *"relation=unwritable"*) ok "check: and says the record is unwritable" ;; *) bad "check: no relation=unwritable — $OUT_C" ;; esac
 
+# ⛔ AND THE SHIPPED ENTRYPOINT, NOT ONLY AN EXCERPT (#2308 review, P2). `check_run` above RE-CREATES
+# the block in `$T/check-drive.sh`, so it grades the block and not the path a monitor or a CI job runs:
+# a `$1` consumed earlier, a changed default for `O`/`REFRESH_SELF_DIR`, or any guard added above the
+# case leaves every assertion above green while `orch-loop.sh --check-refresh` answers something else —
+# the false-green interface this change exists to give monitors. Each arm below runs the SHIPPED script.
+mkdir -p "$T/repo"
+ship_run() {  # <O> <self-dir> <repo> -> prints the output; exit code in $?
+  REPO="$3" O="$1" REFRESH_SELF_DIR="$2" bash "$LOOP" --check-refresh 2>&1
+}
+OUT_S="$(ship_run "$SKEW/ok/o" "" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "0" ] && ok "ship: the SHIPPED entrypoint exits 0 on an intact seed" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 0 — a monitor reads a healthy box as broken: $OUT_S"
+case "$OUT_S" in *"relation=ok"*) ok "ship: and the shipped entrypoint records relation=ok" ;; *) bad "ship: no relation=ok from the shipped entrypoint — $OUT_S" ;; esac
+OUT_S="$(ship_run "$SKEW/o" "$SKEW/self" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "1" ] && ok "ship: the SHIPPED entrypoint exits 1 on a skewed seed" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 1 — the divergence is invisible to a monitor: $OUT_S"
+OUT_S="$(ship_run "$SKEW/o" "$SKEW/none" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "2" ] && ok "ship: the SHIPPED entrypoint exits 2 when nothing on the box can record" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 2 — $OUT_S"
+OUT_S="$(ship_run "$SKEW/ok/o" "" "")"; RC_S=$?
+[ "$RC_S" = "78" ] && ok "ship: the SHIPPED entrypoint exits 78 when the controller cannot start (REPO unset)" \
+  || bad "ship: the shipped --check-refresh exited $RC_S with REPO unset, not 78 — a startup failure would read as a verdict: $OUT_S"
+
 # (e) THE WIRING: the spawn must use the RESOLVED script, or the fix is inert on the box it was
 # written for (the shipped loop used to hardcode `$O/refresh-candidates.sh`).
 if grep -Eq '^[^#]*bash "\$O/refresh-candidates\.sh"' "$LOOPCODE"; then
@@ -1274,8 +1297,15 @@ if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep
   fi
   grep -q 'cannot record' "$SP/log" 2>/dev/null && ok "spawn+skew: and says WHY the seed was passed over (it cannot record)" \
     || bad "spawn+skew: the disclosure does not state the seed's defect — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
-  grep -q 'cp scripts/orchestrator-harness/\*.sh' "$SP/log" 2>/dev/null && ok "spawn+skew: and carries the one-line remedy" \
-    || bad "spawn+skew: the disclosure names no remedy"
+  # ⛔ THE REMEDY MUST BE THE VERIFYING SEEDER, NOT A BARE `cp *.sh` (#2308 review, P3). `deploy-harness.sh`
+  # is the seeder that reports a per-file verdict; a bare copy is the source of a silently PARTIAL
+  # deployment (agent-infra#2041), so a SEED-SKEW message that prescribes it can leave the operator with
+  # a mixed seed and the same skew firing — with nothing explaining why.
+  if grep -qF 'deploy-harness.sh' "$SP/log" 2>/dev/null && ! grep -qF 'cp scripts/orchestrator-harness/*.sh' "$SP/log" 2>/dev/null; then
+    ok "spawn+skew: and carries the VERIFYING remedy (deploy-harness.sh), never the bare cp"
+  else
+    bad "spawn+skew: the disclosure names no usable remedy — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
+  fi
   # ⛔ AND THE SHAPE THE SKEW FLAG CANNOT SEE (review P2): `$O` was NEVER seeded (or its seed was
   # deleted), so the resolver finds only the copy beside the loop and answers rc=0 with NO skew
   # recorded — `REFRESH_SH_SKEW` names only a copy that EXISTS but cannot record. An arm keyed on that
@@ -1296,8 +1326,11 @@ if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep
   fi
   grep -qF "$SP2/o/refresh-candidates.sh" "$SP2/log" 2>/dev/null && ok "spawn+no-seed: and names the seeded path that is missing (so the remedy is visible)" \
     || bad "spawn+no-seed: the disclosure does not name the missing seeded path — $(cat "$SP2/log" 2>/dev/null | tr '\n' '|')"
-  grep -q 'cp scripts/orchestrator-harness/\*.sh' "$SP2/log" 2>/dev/null && ok "spawn+no-seed: and carries the one-line remedy" \
-    || bad "spawn+no-seed: the disclosure names no remedy"
+  if grep -qF 'deploy-harness.sh' "$SP2/log" 2>/dev/null && ! grep -qF 'cp scripts/orchestrator-harness/*.sh' "$SP2/log" 2>/dev/null; then
+    ok "spawn+no-seed: and carries the VERIFYING remedy (deploy-harness.sh), never the bare cp"
+  else
+    bad "spawn+no-seed: the disclosure names no usable remedy — $(cat "$SP2/log" 2>/dev/null | tr '\n' '|')"
+  fi
   # ...AND THE INTACT BOX STAYS SILENT (the positive paired with the absences above): a disclosure arm
   # that fired on the seeded copy would train an operator to ignore it.
   SP3="$T/spawn-intact"; mkdir -p "$SP3/o/state" "$SP3/self"
