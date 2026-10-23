@@ -1557,6 +1557,12 @@ export interface ReviewRecord {
    * degraded carry none, and their ABSENCE must fall back to the HEAD binding —
    * never to an accept (see evaluateMergeGate's carry arm). */
   diff_sha256?: string;
+  /** Mint provenance written by record-review.sh (tortoise#7391). A `carried`
+   * record is one re-bound to a NEW head after a verified carry; the #2349
+   * DIAGNOSTIC surfaces it so a reader can tell "fresh review at this head" from
+   * "carried from <sha>". OPTIONAL and NEVER read by a decision. */
+  mint?: string;
+  carried_from?: string;
 }
 
 /**
@@ -1590,6 +1596,309 @@ function readRecordFile(path: string): ReviewRecord | null {
   } catch {
     return null; // missing or corrupt record → treated as "no review"
   }
+}
+
+// ── #2349: WHAT THE GATE READ (diagnostics only — NEVER a decision) ──────────
+//
+// Both refusals used to print a CAUSE the gate had not read. The ≥1-dispatch
+// floor said "no reviewers dispatched" while reading NO record at all; the merge
+// and evidence gates said "no review record" / "no evidence" without naming
+// WHICH of several states they were in. The registry is PER-MACHINE
+// (~/.pi/agent/reviews on THIS box), so "no review exists" and "a review exists
+// but its record is on another box" produced byte-identical text — and a lane
+// that cannot tell them apart has no correct next action, so it aborts (measured
+// 2026-10-22: 142 `no_reviewers_dispatch` blocks on one box, 156 local records
+// against 3260 on the Mac, 55 of 104 open PRs visible from any one box).
+//
+// ⛔ NOTHING BELOW DECIDES ANYTHING. `observeReviewRecord` is a second,
+// read-only pass over the same two paths `readReviewRecord` reads; every
+// predicate, return value and exit code of the gate is untouched. The
+// consistency pin in index.test.ts asserts the observer and the reader agree on
+// presence over a fixture matrix, so the observer cannot silently drift.
+
+export type RecordFileState =
+  | { kind: "absent" }
+  | { kind: "present" }
+  | { kind: "foreign-repo"; repo: string | null }
+  | { kind: "corrupt"; reason: string }
+  /** Repo-less read: several repo-keyed candidates matched, so no single file is
+   *  the one that was tried — distinct from "corrupt", which names a REAL file. */
+  | { kind: "ambiguous"; files: string[] };
+
+export interface ReviewRecordObservation {
+  pr: number;
+  repo: string | null;
+  registryDir: string;
+  /** For a repo-less read: the path GENERATOR, since no single file is tried. */
+  qualifiedPath: string;
+  legacyPath: string;
+  qualified: RecordFileState;
+  legacy: RecordFileState;
+  /** Every repo-keyed file matching this PR, when no repo context resolved. */
+  ambiguous: string[];
+  /** What `readReviewRecord` returns for the same inputs (presence, not a decision). */
+  record: ReviewRecord | null;
+  mint?: string;
+  carriedFrom?: string;
+}
+
+/** Read ONE record file and report its state — the reader's parse rules, no verdict. */
+function observeRecordFile(path: string): { state: RecordFileState; rec: ReviewRecord | null } {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (e: any) {
+    // ENOENT is "absent"; anything else (EACCES, EISDIR) is a read we could not
+    // make, and saying "absent" for it would be the very misreport this fixes.
+    if (e?.code === "ENOENT") return { state: { kind: "absent" }, rec: null };
+    return { state: { kind: "corrupt", reason: `unreadable (${e?.code ?? e?.message ?? "unknown"})` }, rec: null };
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e: any) {
+    return { state: { kind: "corrupt", reason: `not JSON (${e?.message ?? "parse error"})` }, rec: null };
+  }
+  if (!parsed || typeof parsed.head_sha !== "string" || typeof parsed.verdict !== "string") {
+    return { state: { kind: "corrupt", reason: "missing head_sha/verdict" }, rec: null };
+  }
+  if (parsed.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(parsed.repo)) {
+    return { state: { kind: "corrupt", reason: `invalid repo field ${JSON.stringify(parsed.repo)}` }, rec: null };
+  }
+  return { state: { kind: "present" }, rec: parsed as ReviewRecord };
+}
+
+/**
+ * Observe the review registry for (pr, repo) WITHOUT deciding anything.
+ *
+ * The RESULT mirrors `readReviewRecord`'s presence/absence and nothing else — the
+ * gate reads the record through `readReviewRecord` exactly as before. This exists
+ * so a refusal can say which of these it is, instead of calling them all "no
+ * review record":
+ *
+ *   • no file on this box at all            → the review may live on ANOTHER box
+ *   • a file that names a DIFFERENT repo    → present but inert (#426)
+ *   • a file that is corrupt/unreadable     → present but unusable
+ *   • several repo-keyed candidates         → ambiguous, trusted by neither
+ *   • a usable record                       → then the HEAD/DIFF question is live
+ */
+export function observeReviewRecord(pr: number, repo?: string): ReviewRecordObservation {
+  const registryDir = reviewsDir();
+  const legacyPath = reviewRecordFile(undefined, pr);
+  const obs: ReviewRecordObservation = {
+    pr,
+    repo: repo ?? null,
+    registryDir,
+    qualifiedPath: repo ? reviewRecordFile(repo, pr) : `${registryDir}/<owner>-<repo>-${pr}.json`,
+    legacyPath,
+    qualified: { kind: "absent" },
+    legacy: { kind: "absent" },
+    ambiguous: [],
+    record: null,
+  };
+  const legacy = observeRecordFile(legacyPath);
+  obs.legacy = legacy.state;
+  if (repo) {
+    const qualified = observeRecordFile(reviewRecordFile(repo, pr));
+    if (qualified.rec) {
+      if (qualified.rec.repo !== undefined && qualified.rec.repo !== repo) {
+        obs.qualified = { kind: "foreign-repo", repo: qualified.rec.repo };
+        // ⛔ MIRROR THE READER EXACTLY: `readReviewRecord` returns null HERE and
+        // never reads the legacy file, so a repo-keyed file that claims another
+        // repo SHADOWS a usable legacy record. Falling through would print
+        // "another repo's record, inert here" AND "record: clean at head …" in the
+        // same block — the self-contradicting diagnostic this change exists to
+        // remove (fresh review of #2349, P1).
+        return finishObservation(obs);
+      }
+      obs.qualified = qualified.state;
+      obs.record = qualified.rec;
+    } else {
+      obs.qualified = qualified.state;
+    }
+    // Legacy migration fallback, exactly as readReviewRecord reads it.
+    if (!obs.record && legacy.rec) {
+      if (legacy.rec.repo !== undefined && legacy.rec.repo !== repo) {
+        obs.legacy = { kind: "foreign-repo", repo: legacy.rec.repo };
+      } else {
+        obs.record = legacy.rec;
+      }
+    }
+  } else {
+    // No repo context: the reader scans the directory for repo-keyed candidates.
+    // Report the candidates so "ambiguous" is visible instead of "absent".
+    try {
+      obs.ambiguous = fs
+        .readdirSync(registryDir)
+        // ⛔ KEEP THIS PATTERN SPELLED EXACTLY LIKE `readReviewRecord`'s. Both sit in a
+        // TEMPLATE literal, where `\.` collapses to `.` — so both are a loose dot and
+        // both match `…-2349Xjson`. That is why they agree; a previous version of this
+        // observer wrote `\\.` (a real escape) and DISAGREED with the reader (reader:
+        // present, observer: "no record on this box"). If you tighten the dot, change
+        // BOTH call sites in one commit, and re-run the observer↔reader matrix.
+        .filter((f) => new RegExp(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-${pr}.json$`).test(f));
+    } catch {
+      obs.ambiguous = []; // registry dir absent — genuinely nothing to list
+    }
+    if (obs.ambiguous.length === 1) {
+      // Name the REAL file: a repo-less read knows the filename, and rendering the
+      // `<owner>-<repo>-<pr>.json` generator instead made the refusal tell a lane to
+      // inspect a path that does not exist (fresh review of #2349, P2).
+      obs.qualifiedPath = resolvePath(registryDir, obs.ambiguous[0]);
+      const rec = readRecordFile(obs.qualifiedPath);
+      if (rec) {
+        obs.qualified = { kind: "present" };
+        obs.record = rec;
+      } else {
+        obs.qualified = { kind: "corrupt", reason: "unreadable record body" };
+      }
+    } else if (obs.ambiguous.length > 1) {
+      obs.qualified = { kind: "ambiguous", files: obs.ambiguous };
+      // ⛔ MIRROR THE READER: `readReviewRecord` returns null at >1 matches and never
+      // reads `<pr>.json`, so an ambiguous PR is UNTRUSTED — restoring a legacy record
+      // here would print "AMBIGUOUS … none is trusted" AND "record: clean at head …"
+      // in one block (fresh review, cycle 3, P1).
+      return finishObservation(obs);
+    }
+    if (!obs.record && legacy.rec) {
+      if (legacy.rec.repo !== undefined) obs.legacy = { kind: "foreign-repo", repo: legacy.rec.repo };
+      else obs.record = legacy.rec;
+    }
+  }
+  return finishObservation(obs);
+}
+
+/** Attach the record's mint provenance (diagnostic only) and return the observation. */
+function finishObservation(obs: ReviewRecordObservation): ReviewRecordObservation {
+  if (obs.record) {
+    if (typeof obs.record.mint === "string") obs.mint = obs.record.mint;
+    if (typeof obs.record.carried_from === "string") obs.carriedFrom = obs.record.carried_from;
+  }
+  return obs;
+}
+
+/**
+ * Which of the four "no usable record" states the observation is in.
+ * Reporting only — `readReviewRecord` decided absence before this is consulted.
+ */
+export function classifyRecordMissState(obs: ReviewRecordObservation): string {
+  if (obs.qualified.kind === "foreign-repo" || obs.legacy.kind === "foreign-repo") return RECORD_STATE_FOREIGN;
+  if (obs.ambiguous.length > 1 || obs.qualified.kind === "ambiguous") return RECORD_STATE_AMBIGUOUS;
+  if (obs.qualified.kind === "corrupt" || obs.legacy.kind === "corrupt") return RECORD_STATE_UNREADABLE;
+  return RECORD_STATE_NO_RECORD;
+}
+
+/**
+ * The "no usable record" diagnosis: what was read, WHICH state that is, and the
+ * remedy for that state alone.
+ *
+ * The distinction is the whole point of #2349: `no record on this box` and `a
+ * record exists on another box` are the same bytes on disk and different situations,
+ * and only one of them is fixed by re-recording. Everything here is appended AFTER
+ * the pre-existing block text, so every pinned remediation line (and the #285
+ * task-sub-agent variant) is unchanged.
+ */
+export function describeRecordMiss(
+  observation: ReviewRecordObservation | null,
+  pr: number,
+  repo: string | undefined
+): string[] {
+  const lines = ["   ⟦WHAT THIS GATE READ — registry observation, NOT a decision⟧"];
+  if (!observation) {
+    // No observation was supplied (a direct unit call). Name the paths it WOULD
+    // read and say the state was not observed — never guess "absent".
+    lines.push(`     repo-keyed   : ${reviewRecordFile(repo, pr)} — state not observed on this call`);
+    lines.push(`     legacy       : ${reviewRecordFile(undefined, pr)} — state not observed on this call`);
+    return lines;
+  }
+  lines.push(...describeRecordObservation(observation));
+  const state = classifyRecordMissState(observation);
+  lines.push(`     ⇒ STATE: ${state}`);
+  const recordCmd = `${RECORD_SH} ${pr} <head_sha> <verdict> ${repo ?? "owner/repo"}`;
+  if (state === RECORD_STATE_FOREIGN) {
+    lines.push("       A record EXISTS and is readable — it names a different repo for the SAME PR number (#426).");
+    lines.push(`     → remedy: record THIS repo's PR (${recordCmd}); the file above cannot be reused.`);
+  } else if (state === RECORD_STATE_AMBIGUOUS) {
+    lines.push("       More than one repo-keyed record matches this PR number and no repo context resolved the");
+    lines.push("       ambiguity, so trusting either would be a guess (#426).");
+    lines.push(`     → remedy: pass --repo owner/name to the merge so the qualified path is unambiguous, then ${recordCmd}.`);
+  } else if (state === RECORD_STATE_UNREADABLE) {
+    lines.push("       A file EXISTS at a registry path but could not be parsed/read — the gate treats it as absent.");
+    lines.push(`     → remedy: inspect the file named above (a truncated write or a bad \`repo\` field), then re-record: ${recordCmd}.`);
+  } else {
+    lines.push("       NO file exists at either path ON THIS BOX. The registry is PER-MACHINE, so this is");
+    lines.push("       \"not visible here\" — NOT necessarily \"no review happened\": a record minted on another box");
+    lines.push("       (or under another HOME) is invisible to this gate, and this box sees only its own.");
+    lines.push("     → remedy (a): if the review ran elsewhere, copy its <owner>-<repo>-<pr>.json into the repo-keyed");
+    lines.push("       path above. → remedy (b): re-record here at the head you are merging:");
+    lines.push(`       ${recordCmd}`);
+  }
+  return lines;
+}
+
+/** Escape a record field for display: JSON.stringify keeps it on ONE line. */
+function displayRecordField(v: unknown, max = 40): string {
+  return JSON.stringify(String(v ?? "").slice(0, max));
+}
+
+/** A record field that is safe to INTERPOLATE mid-sentence: control characters are
+ *  replaced, so a hand-edited record cannot forge a new refusal LINE. The record
+ *  reader validates only `typeof … === "string"` for `head_sha` and `verdict`, so
+ *  neither is trusted as display text (fresh review of #2349, P2). */
+function oneLine(v: unknown, max = 12): string {
+  return String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, max);
+}
+
+/**
+ * The registry file the record ACTUALLY came from.
+ *
+ * `qualifiedPath` is a path GENERATOR in a repo-less read, and on the legacy
+ * migration path the record is `<pr>.json` while the repo-keyed file may not exist
+ * at all — printing `qualifiedPath + "(this is the record read)"` there answered
+ * "which file did the gate read?" falsely in exactly the case #2349 is about.
+ */
+export function recordSourcePath(obs: ReviewRecordObservation): string {
+  if (obs.qualified.kind === "present") return obs.qualifiedPath;
+  if (obs.legacy.kind === "present") return obs.legacyPath;
+  return obs.record ? obs.legacyPath : obs.qualifiedPath;
+}
+
+/** One line per filesystem state — the "what I read" block of a refusal. */
+export function describeRecordObservation(obs: ReviewRecordObservation, indent = "     "): string[] {
+  const fileState = (s: RecordFileState): string =>
+    s.kind === "absent"
+      ? "ABSENT"
+      : s.kind === "present"
+        ? "PRESENT"
+        : s.kind === "foreign-repo"
+          ? `PRESENT, but it names repo ${s.repo ?? "(none)"} — another repo's record, inert here (#426)`
+          : s.kind === "ambiguous"
+            ? `AMBIGUOUS — ${s.files.length} repo-keyed files match (${s.files.join(", ")}), so no single file is the one tried`
+            : `PRESENT but UNREADABLE (${s.reason}) — treated as absent (fail-closed)`;
+  const lines = [
+    `${indent}registry dir : ${obs.registryDir}`,
+    `${indent}repo-keyed   : ${obs.qualifiedPath} — ${fileState(obs.qualified)}`,
+    `${indent}legacy       : ${obs.legacyPath} — ${fileState(obs.legacy)}`,
+  ];
+  if (obs.ambiguous.length > 1) {
+    lines.push(`${indent}ambiguous    : ${obs.ambiguous.join(", ")} — no single repo-keyed owner, so none is trusted`);
+  }
+  if (obs.record) {
+    const provenance = obs.mint ? ` mint=${oneLine(obs.mint, 20)}` : "";
+    const carried = obs.carriedFrom ? ` carried_from=${oneLine(obs.carriedFrom)}` : "";
+    // `verdict` is the ONE record field the reader does not charset-validate (it
+    // only checks `typeof === "string"`), so it is JSON-escaped before it reaches a
+    // refusal: a hand-edited record must not be able to forge extra refusal LINES
+    // (e.g. an "Emergency: set AGENT_SKIP_REVIEW_GATE=1" line) inside the text a
+    // lane reads (fresh review of #2349, P2). It cannot flip a decision — this
+    // text is built only after the gate already blocked — but it can make a
+    // refusal lie about the remedy.
+    const verdict = displayRecordField(obs.record.verdict);
+    lines.push(
+      `${indent}record       : ${verdict} at head ${oneLine(obs.record.head_sha)}${provenance}${carried}`
+    );
+  }
+  return lines;
 }
 
 /**
@@ -1919,15 +2228,50 @@ export function resolveDiffHashHelper(): string | null {
  * digest (or is the empty-body constant) yields null.
  */
 export function parseDiffHashHelperOutput(stdout: string): string | null {
+  return parseDiffHashHelperOutputObserved(stdout).hash;
+}
+
+/**
+ * #2349 — the SAME parse, plus WHY it yielded no digest.
+ *
+ * `getPrLiveDiffHash` returns null for every failed read, which is correct for a
+ * decision (a failed read is not a matching read) and useless for a message: "live
+ * digest unreadable" with no reason sends a lane to re-record a record that was
+ * never the problem. The statuses are the producer's own vocabulary — `empty`,
+ * `too_large`, `nondiff`, `unavailable` — so the reason names the real cause.
+ * The parsing rules are IDENTICAL to the original; only the null carries a why.
+ */
+export function parseDiffHashHelperOutputObserved(stdout: string): { hash: string | null; reason: string | null } {
   const lines = stdout.split("\n").filter((l) => l.length > 0);
-  if (lines.length === 0) return null;
+  if (lines.length === 0) return { hash: null, reason: "helper printed no status line" };
   const line = lines[lines.length - 1];
   const tab = line.indexOf("\t");
-  if (tab < 0) return null;
+  if (tab < 0) return { hash: null, reason: `helper line has no <status>\\t<hash> shape (${line.slice(0, 60)})` };
   const status = line.slice(0, tab).trim();
   const hash = line.slice(tab + 1).trim();
-  if (status !== "ok") return null;
-  return isDiffSha256(hash) ? hash : null;
+  if (status !== "ok") {
+    // `empty`/`nondiff` mean the PR's body carried no diff; `too_large` is the
+    // 300-file API cap; `unavailable` is a failed fetch. All are the producer's
+    // own status words, so no new vocabulary is invented here.
+    return { hash: null, reason: `helper status "${status}" (no diff identity could be read)` };
+  }
+  if (!isDiffSha256(hash)) {
+    // ⛔ NOT `hash.toUpperCase()` here: `isDiffSha256` is a type guard, so the
+    // negative branch narrows `hash` to `never` and any property access is a tsc
+    // error on a branch that can never be reached (fresh review of #2349, P2).
+    // The reason is derived in a helper that sees a plain `string`.
+    return { hash: null, reason: describeNonDiffValue(hash) };
+  }
+  return { hash, reason: null };
+}
+
+/** Why a value is not a diff identity — named without narrowing the caller's value. */
+function describeNonDiffValue(v: string): string {
+  if (v === EMPTY_BYTE_SHA256) return "helper returned the EMPTY-BODY digest — not a diff identity";
+  if (/^[0-9a-fA-F]{64}$/.test(v) && v !== v.toLowerCase()) {
+    return "helper returned an UPPERCASE digest — not a diff identity";
+  }
+  return "helper returned a value that is not a full 64-hex digest";
 }
 
 /**
@@ -1939,11 +2283,30 @@ export function parseDiffHashHelperOutput(stdout: string): string | null {
  * returns null, which the gate reads as "no identity" and blocks on the head.
  */
 export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
-  if (prDiffHashOverride !== null) return prDiffHashOverride(pr, ctx);
+  return getPrLiveDiffHashObserved(pr, ctx).hash;
+}
+
+/**
+ * #2349 — `getPrLiveDiffHash` plus WHY it yielded no digest, for the refusal text.
+ * The read, its guards and its return value are unchanged; the reason is
+ * additional output, and the decision still consumes `hash` only.
+ */
+export function getPrLiveDiffHashObserved(
+  pr: number,
+  ctx: RepoContext
+): { hash: string | null; reason: string | null } {
+  if (prDiffHashOverride !== null) {
+    const h = prDiffHashOverride(pr, ctx);
+    return { hash: h, reason: h === null ? "test seam returned null" : null };
+  }
   const helper = resolveDiffHashHelper();
-  if (helper === null) return null;
+  if (helper === null) {
+    return { hash: null, reason: `${RECORD_SH} (--print-diff-hash) not found next to this extension` };
+  }
   const repo = ctx.repo ?? (ctx.cwd ? repoFromGitRemote(ctx.cwd) : null);
-  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return null;
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    return { hash: null, reason: repo ? `repo ${JSON.stringify(repo)} is not owner/name` : "repo context unresolved" };
+  }
   try {
     // execFileSync, NOT a shell string: every argument is passed as an argv
     // element, so no value here can be re-parsed as shell syntax.
@@ -1953,9 +2316,13 @@ export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    return parseDiffHashHelperOutput(out);
-  } catch {
-    return null;
+    return parseDiffHashHelperOutputObserved(out);
+  } catch (e: any) {
+    const msg = (e?.stderr ?? e?.message ?? "").toString().trim();
+    return {
+      hash: null,
+      reason: `--print-diff-hash failed (${e?.status != null ? `exit ${e.status}` : "no status"}${msg ? `: ${msg.split("\n")[0].slice(0, 120)}` : ""})`,
+    };
   }
 }
 
@@ -2069,6 +2436,74 @@ export function isDiffSha256(v: unknown): v is string {
   return typeof v === "string" && /^[0-9a-f]{64}$/.test(v) && v !== EMPTY_BYTE_SHA256;
 }
 
+// ── #2349: the four states a moved head can be in, and the carry arm's exact text ──
+//
+// One refusal used to cover all of these, so the lane could not pick a next move.
+// Each label below is the string a refusal PRINTS, and each has its own remedy —
+// pinned by index.test.ts, because a message test that cannot fail is decoration.
+export const RECORD_STATE_NO_RECORD = "no record on this box";
+export const RECORD_STATE_FOREIGN = "a record exists but belongs to ANOTHER repo — inert here (#426)";
+export const RECORD_STATE_UNREADABLE = "a record file exists but cannot be read — treated as absent (fail-closed)";
+export const RECORD_STATE_AMBIGUOUS = "several repo-keyed records match this PR — none is trusted (#426)";
+export const RECORD_STATE_HEAD_STALE = "record exists but head is stale";
+export const RECORD_STATE_DIGEST_ABSENT =
+  "record exists, diff digest absent (pre-#2982) — cannot carry";
+export const RECORD_STATE_DIGEST_MISMATCH = "digest mismatch";
+export const RECORD_STATE_LIVE_UNREADABLE = "live digest unreadable";
+export const RECORD_STATE_CARRY_ALLOWED =
+  "a moved head whose reviewed DIFF is unchanged IS allowed (carried, #1351)";
+
+/**
+ * The carry arm's predicate, CONJUNCT BY CONJUNCT, as the refusal prints it.
+ *
+ * #2349 review: a paraphrase of the predicate is how the text starts lying about
+ * the code. The four rows are the four conjuncts of `evaluateMergeGate`'s carry
+ * arm, in source order, and the last line states the consequence a lane most needs
+ * and is least likely to know: ALL FOUR TRUE is an ALLOW, with no re-record.
+ *
+ * The live conjunct is reported as `[ ] not read` when the caller never read it —
+ * true of the code (the caller computes the live digest only when the record
+ * carries a usable one AND the head moved), and saying "unreadable" there would
+ * invent a read that never happened.
+ */
+export function describeCarryConjuncts(
+  record: ReviewRecord,
+  currentHead: string,
+  currentDiffHash: string | null,
+  liveDiffReadReason: string | null,
+  indent = "     "
+): string[] {
+  const rec = oneLine(record.head_sha);
+  const live = oneLine(currentHead);
+  const moved = record.head_sha !== currentHead;
+  const recDigestOk = isDiffSha256(record.diff_sha256);
+  const liveDigestOk = isDiffSha256(currentDiffHash);
+  const equal = recDigestOk && liveDigestOk && record.diff_sha256 === currentDiffHash;
+  const mark = (ok: boolean, read: boolean): string => (read ? (ok ? "[✓]" : "[✗]") : "[ ]");
+  const recDigestNote = recDigestOk
+    ? `${String(record.diff_sha256).slice(0, 12)}`
+    : `ABSENT (pre-#2982 record, or a minted-while-degraded read) — cannot carry`;
+  const liveRead = recDigestOk; // the caller only reads it when the record has one
+  const liveDigestNote = !liveRead
+    ? "NOT READ — the gate only reads the live diff when the record carries a usable digest"
+    : liveDigestOk
+      ? `${String(currentDiffHash).slice(0, 12)}`
+      : `UNREADABLE${liveDiffReadReason ? ` (${liveDiffReadReason})` : ""}`;
+  const equalNote = !liveRead
+    ? "no comparison possible"
+    : !recDigestOk || !liveDigestOk
+      ? "no comparison possible"
+      : `${String(record.diff_sha256).slice(0, 12)} ${equal ? "==" : "!="} ${String(currentDiffHash).slice(0, 12)}`;
+  return [
+    `${indent}carry arm, conjunct by conjunct (evaluateMergeGate, source order):`,
+    `${indent}  ${mark(moved, true)} record.head_sha !== currentHead            recorded ${rec} vs live ${live}`,
+    `${indent}  ${mark(recDigestOk, true)} isDiffSha256(record.diff_sha256)          ${recDigestNote}`,
+    `${indent}  ${mark(liveDigestOk, liveRead)} isDiffSha256(currentDiffHash)           ${liveDigestNote}`,
+    `${indent}  ${mark(equal, liveRead)} record.diff_sha256 === currentDiffHash  ${equalNote}`,
+    `${indent}⇒ ${RECORD_STATE_CARRY_ALLOWED} — all four true carries the verdict forward with NO re-record.`,
+  ];
+}
+
 /**
  * THE ONLY RUNNABLE SPELLING of the recorder, in one place (review of #2148, P1).
  *
@@ -2111,6 +2546,15 @@ export function evaluateMergeGate(
   // failure. Every one of those is a FAILED READ, and a failed read is not a
   // matching read, so null blocks on the head binding like any other mismatch.
   currentDiffHash: string | null = null,
+  // #2349: these two arguments are MESSAGE INPUTS ONLY. They reach a refusal's
+  // text and nothing else — no branch below tests them, and no return value
+  // depends on them (pinned by the "decision code" extraction in index.test.ts).
+  //   observation        — what `observeReviewRecord` saw on disk, for the
+  //                        "no record" arm (absent / foreign-repo / corrupt / ambiguous).
+  //   liveDiffReadReason — why the live digest read yielded nothing, for the
+  //                        moved-head arm (a failed READ is not a failed review).
+  observation: ReviewRecordObservation | null = null,
+  liveDiffReadReason: string | null = null,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -2144,6 +2588,10 @@ export function evaluateMergeGate(
           `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
+    // #2349: append WHAT WAS READ and which state that is — absent / foreign-repo /
+    // corrupt / ambiguous — each with its own remedy. The pre-existing lines above
+    // are untouched (pinned by #285/#513 and their tests).
+    lines.push(...describeRecordMiss(observation, pr, ctx.repo));
     return {
       status: "block",
       reason: lines.join("\n"),
@@ -2244,7 +2692,11 @@ export function evaluateMergeGate(
         `[review-enforcer] ✅ Merge registry gate passed for PR #${pr} ` +
         `(${record.verdict} review, head moved ${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)} ` +
         `but the reviewed DIFF is unchanged — diff_sha256 ${currentDiffHash.slice(0, 12)} matches the PR's ` +
-        `current diff, so the verdict is CARRIED FORWARD on content identity) — allowing merge`,
+        `current diff, so the verdict is CARRIED FORWARD on content identity) — allowing merge\n` +
+        // #2349: the SAME sentence the refusals print (one exported constant, so the
+        // allow and the refusal cannot describe the rule differently). A lane that has
+        // only ever read refusals needs to learn this arm EXISTS.
+        `   ⇒ ${RECORD_STATE_CARRY_ALLOWED}.`,
     };
   }
   if (record.head_sha !== currentHead) {
@@ -2262,11 +2714,58 @@ export function evaluateMergeGate(
       record.verdict === "clean-low"
         ? `   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>).`
         : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] ${EVIDENCE_CAVEAT}`;
+    // #2349 — name WHICH moved-head state this is and its own remedy. These four
+    // failure modes read identically before this: re-record (absent digest), fix the
+    // READ and retry (unreadable live digest), re-review (digest mismatch). Only the
+    // mismatch means the CONTENT changed.
+    const recDigestOk = isDiffSha256(record.diff_sha256);
+    const liveDigestOk = isDiffSha256(currentDiffHash);
+    const staleState = !recDigestOk
+      ? RECORD_STATE_DIGEST_ABSENT
+      : currentDiffHash === null
+        ? `${RECORD_STATE_LIVE_UNREADABLE}${liveDiffReadReason ? ` (${liveDiffReadReason})` : " (no reason reported)"}`
+        : !liveDigestOk
+          ? `${RECORD_STATE_LIVE_UNREADABLE} (the read returned a value that is not a full 64-hex digest)`
+          : `${RECORD_STATE_DIGEST_MISMATCH} (${String(record.diff_sha256).slice(0, 12)} vs ${currentDiffHash.slice(0, 12)})`;
+    const stateRemedy = !recDigestOk
+      ? [
+          "     → remedy: RE-REVIEW the new head — this record cannot show that the CURRENT diff was",
+          "       reviewed at all (a pre-#2982 record carries no content identity, so there is nothing to",
+          "       compare and nothing to carry). Then re-record at the head that will merge:",
+          `       ${RECORD_SH} <PR> <head_sha> <verdict> [owner/repo]  (--evidence … for clean)`,
+          "       ⛔ NOT a substitute: re-recording a `clean-micro`/`clean-low` (which need no --evidence)",
+          "         WITHOUT that fresh review would mint a digest for a diff nobody reviewed.",
+        ]
+      : currentDiffHash === null || !liveDigestOk
+        ? [
+            "     → remedy: the review is fine — the READ failed. Fix the read, do NOT re-record to work",
+            `       around it: \`${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "owner/repo"}\` reports the same status,`,
+            "       then retry the merge.",
+          ]
+        : [
+            "     → remedy: the reviewed CONTENT changed, so this is a genuine RE-REVIEW, not a stale-head",
+            "       nuisance — no digest equality is available to carry the verdict.",
+          ];
+    const recordWhere = observation
+      ? [
+          `   Record file: ${recordSourcePath(observation)}` +
+            (observation.record
+              ? observation.qualified.kind === "present"
+                ? " (this is the record read)"
+                : " (the LEGACY record read — no usable repo-keyed file)"
+              : ""),
+        ]
+      : [];
     return {
       status: "block",
       reason: [
         `❌ PR #${pr} head has advanced since the review was recorded.`,
-        `   Recorded: ${record.head_sha.slice(0, 12)}   Current: ${currentHead.slice(0, 12)}`,
+        `   Recorded: ${oneLine(record.head_sha)}   Current: ${oneLine(currentHead)}`,
+        ...recordWhere,
+        "   ⟦THE ARM THAT ALLOWS A MOVED HEAD — the four conjuncts below, in source order⟧",
+        ...describeCarryConjuncts(record, currentHead, currentDiffHash, liveDiffReadReason),
+        `     ⇒ STATE: ${RECORD_STATE_HEAD_STALE} — ${staleState}`,
+        ...stateRemedy,
         reRecordAdvice,
       ].join("\n"),
       reasonTag: "head_advanced",
@@ -3199,8 +3698,18 @@ export function evidenceBodyIsCertifying(body: string, currentHead: string): boo
 
 
 export type AdminMergeGateResult =
-  | { status: "block"; reason: string }
+  // #2349: `reasonTag` names WHICH of the four block states fired, so the console
+  // line can print the state instead of one sentence covering all of them. It is
+  // added to the result and read ONLY for that line — the decision is the `status`.
+  | { status: "block"; reason: string; reasonTag?: AdminMergeBlockTag }
   | { status: "allow"; message: string };
+
+/** #2349 — the four distinct ways the admin-merge evidence gate blocks. */
+export type AdminMergeBlockTag =
+  | "admin_no_pr"
+  | "admin_head_unreadable"
+  | "admin_comments_unreadable"
+  | "admin_no_evidence";
 
 /**
  * Pure decision for the admin-merge evidence gate.
@@ -3234,9 +3743,13 @@ export function evaluateAdminMergeGate(
   if (pr === null) {
     return {
       status: "block",
+      reasonTag: "admin_no_pr",
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
-        "❌ `gh pr merge --admin` carries no resolvable PR number, so no head-bound evidence can be checked.",
+        "❌ STATE: no resolvable PR number — the command carries no readable admin merge selector, so no",
+        "   head-bound evidence can be checked. (A mention of the admin-merge form inside a heredoc, a jq",
+        "   filter, a PR/issue body or a grep pattern is DATA, not a merge: the text scanner cannot tell",
+        "   those apart, and the argv-level gh shim decides them when it is installed.)",
         ...remediation,
       ].join("\n"),
     };
@@ -3244,9 +3757,10 @@ export function evaluateAdminMergeGate(
   if (currentHead === null) {
     return {
       status: "block",
+      reasonTag: "admin_head_unreadable",
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
-        `❌ Could not verify the current head of PR #${pr} — an admin merge cannot be bound to evidence without it.`,
+        `❌ STATE: PR #${pr} resolved, but its CURRENT head could not be READ (gh/API failure) — an admin merge cannot be bound to evidence without it.`,
         ...remediation,
       ].join("\n"),
     };
@@ -3254,9 +3768,10 @@ export function evaluateAdminMergeGate(
   if (comments === null) {
     return {
       status: "block",
+      reasonTag: "admin_comments_unreadable",
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
-        `❌ Could not read PR #${pr}'s comments to look for head-bound admin-merge evidence — failing CLOSED for a bypass.`,
+        `❌ STATE: PR #${pr}'s head (${currentHead.slice(0, 12)}) is known, but its COMMENTS could not be READ — failing CLOSED for a bypass (a failed fetch is not "no evidence").`,
         ...remediation,
       ].join("\n"),
     };
@@ -3285,14 +3800,44 @@ export function evaluateAdminMergeGate(
   }
   return {
     status: "block",
+    reasonTag: "admin_no_evidence",
     reason: [
       "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
-      `❌ PR #${pr} has no \`admin-merge-safety\` evidence bound to its CURRENT head (${currentHead.slice(0, 12)}).`,
+      `❌ STATE: evidence missing — PR #${pr}'s comments were READ and none carries head-bound admin-merge evidence at the CURRENT head (${currentHead.slice(0, 12)}).`,
       "   Evidence is head-bound: every push to the PR invalidates it, so a stale marker is refused.",
       "   A marker alone is also refused — the evidence body must carry the comparison counts.",
       ...remediation,
     ].join("\n"),
   };
+}
+
+/**
+ * #2349 — the ONE-LINE state the admin-merge evidence gate refused on.
+ *
+ * The gate has four distinct block states and used to print one sentence for all
+ * of them. Measured 2026-10-22 (`gate-events.jsonl:2235`, `pr: null`): a lane running
+ * `gh issue create --body-file` — nothing to merge — was refused with the same
+ * words as a PR with genuinely missing evidence, so the lane could not tell which
+ * fix applied. The tag comes from `evaluateAdminMergeGate` itself, so this line and
+ * the refusal's reason cannot drift apart.
+ */
+export function adminMergeStateText(
+  tag: AdminMergeBlockTag | undefined,
+  pr: number | null,
+  head: string | null,
+): string {
+  switch (tag) {
+    case "admin_no_pr":
+      return "no resolvable PR number — nothing in this command reads as a merge selector, so there is no PR to certify (a mention inside a heredoc/body/jq filter is DATA)";
+    case "admin_head_unreadable":
+      return `PR #${pr} resolved, but its current head could not be READ — evidence cannot be bound to an unknown head`;
+    case "admin_comments_unreadable":
+      return `PR #${pr} head ${head ? head.slice(0, 12) : "(unknown)"} known, but its COMMENTS could not be READ — fail-closed for a bypass`;
+    case "admin_no_evidence":
+      return `evidence MISSING — PR #${pr} comments read, none carries head-bound admin-merge evidence at ${head ? head.slice(0, 12) : "(unknown head)"}`;
+    default:
+      return "unclassified block";
+  }
 }
 
 /** The PR's comment bodies, or null when the fetch failed (fail-closed). */
@@ -3342,6 +3887,16 @@ const BLOCK_MESSAGE = [
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
   "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
   `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
+  // #2349: say WHAT THIS FLOOR READ. It counts dispatches in this process and reads
+  // no record, so "no review exists" and "the record is on another box" are the same
+  // sentence to it (the registry is per-machine). Without this, a lane whose reviewer
+  // ran in the parent (#825) or elsewhere reads the refusal as "the review is missing"
+  // and aborts with no correct next action.
+  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
+  "     It reads NO review record, so it cannot tell \"no review exists\" from \"a review exists but its",
+  "     record is not on this box\": the registry is PER-MACHINE (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json),",
+  "     and a record minted on another box, or by a parent session, is invisible here. A record would not",
+  "     satisfy this floor in any case — the datum it needs is a dispatch IN THIS SESSION.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -3375,6 +3930,60 @@ export function auditCommand(command: string, limit = 2000): string {
   );
 }
 
+// ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
+//
+// The floor counts reviewer dispatches in THIS pi process and reads NO review
+// record. Its text said "no reviewers dispatched" and nothing else, so a lane whose
+// reviewer ran in the parent session (dispatch is parent-enforced, #825) or on
+// another box read it as "the review is missing" — a different fact, with a
+// different next action, which this line now distinguishes explicitly.
+//
+// `recordState` exists so the value lands in the durable audit row: the fleet can
+// then count how many refusals were "no record on this box" (the condition that was
+// hand-measured at 3260-vs-156 records, 55/104 PRs visible) instead of inferring it.
+export function describeDispatchFloorRead(
+  command: string,
+  tier: string,
+  dispatchCount: number
+): { lines: string[]; recordState: string } {
+  const stateText = tier === "" ? "unlabeled" : tier;
+  const lines = [
+    `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
+    "     This floor reads NO review record, so by itself it cannot distinguish \"no review exists\"",
+    "     from \"a review exists but its record is not on this box\" (the registry is PER-MACHINE).",
+  ];
+  // A command that reaches this floor names no PR BY CONSTRUCTION: every `gh pr merge`
+  // and every `gh pr <verb> <n>` came back from the merge-registry branch above, which
+  // always returns. So the honest extra datum is the REGISTRY ITSELF — how much of it is
+  // on this box, and how much of that is even this repo's — because "the registry is
+  // fragmented per machine" was the measured cause of the refusals this text explains.
+  const ctx = resolveRepoContext(command, null);
+  const repo = ctx.repo ?? (ctx.cwd ? repoFromGitRemote(ctx.cwd) : null) ?? repoFromGitRemote(process.cwd());
+  const dir = reviewsDir();
+  let total = 0;
+  let forRepo = 0;
+  try {
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+    total = files.length;
+    if (repo) {
+      const prefix = `${repo.replace("/", "-")}-`;
+      forRepo = files.filter((f) => f.startsWith(prefix)).length;
+    }
+  } catch {
+    total = -1; // registry dir absent — say so rather than reporting a confident 0
+  }
+  lines.push(
+    total < 0
+      ? `     REGISTRY on this box: ${dir} does not exist (0 records can be visible here).`
+      : `     REGISTRY on this box: ${total} record(s) at ${dir}${repo ? `, ${forRepo} for ${repo}` : " (repo unresolved)"}.`
+  );
+  lines.push(
+    "     This command names no PR, so no single record can be attributed to it — the datum this gate" +
+      " needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
+  );
+  return { lines, recordState: `no-pr-named (registry=${total}${repo ? `, repo=${forRepo}` : ""})` };
+}
+
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
 // shape skip (#472) removed the backstop that made that leniency safe (a
 // docs-only micro commit at 0 dispatches cleared every enforced gate). Micro now
@@ -3394,6 +4003,11 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
   `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+  // #2349: same disclosure as the generic message — this floor counts DISPATCHES and
+  // reads no record, so it cannot distinguish "no review" from "not visible here".
+  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
+  "     It reads NO review record, so \"no review exists\" and \"a record exists on another box\" are the",
+  "     same sentence here (the registry is PER-MACHINE). What unlocks this floor is a dispatch NOW.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -3676,7 +4290,12 @@ export default function (pi: ExtensionAPI) {
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
         if (merges > 1) {
-          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)");
+          // #2349: name the count the gate actually read. "more than one merge" told a lane
+          // nothing about WHAT it read; the number does, and the refused command is in the audit row.
+          console.log(
+            `[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge) — STATE: ${merges} ` +
+              "`gh pr merge` invocations read in this one command; the gate certifies ONE PR per call"
+          );
           logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command" });
           return {
             block: true,
@@ -3717,7 +4336,15 @@ export default function (pi: ExtensionAPI) {
             adminPr, adminHead, adminComments, adminOverride
           );
           if (adminResult.status === "block") {
-            console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked");
+            // #2349: four different states used to print this one sentence. The tag comes
+            // from the gate itself, so the console line and the reason cannot disagree.
+            console.log(
+              `[review-enforcer] 🚫 Admin-merge evidence gate blocked — STATE: ${adminMergeStateText(
+                adminResult.reasonTag,
+                adminPr,
+                adminHead,
+              )}`
+            );
             logGateEvent("merge_gate_block", {
               pr: adminPr,
               reason: "admin_merge_no_evidence",
@@ -3805,19 +4432,31 @@ export default function (pi: ExtensionAPI) {
         // head block — never to an accept). The read is the SAME normalized
         // digest the record stores and the GitHub gate computes, so the two
         // gates cannot disagree about what "reviewed" means.
-        const currentDiffHash =
-          record && isDiffSha256(record.diff_sha256) &&
+        // #2349: the live digest read reports WHY it yielded nothing, for the refusal
+        // text only (a failed READ is not a failed review). The DECISION still consumes
+        // `currentDiffHash` and nothing else, through the same predicate as before.
+        const liveDiffRead = record && isDiffSha256(record.diff_sha256) &&
           currentHead !== null &&
           record.head_sha !== currentHead
-            ? getPrLiveDiffHash(prNumber, ctx)
-            : null;
+            ? getPrLiveDiffHashObserved(prNumber, ctx)
+            : { hash: null, reason: null };
+        const currentDiffHash = liveDiffRead.hash;
+        // #2349: the registry observation, taken ONCE and passed to the gate as a
+        // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
+        // the observation is never consulted for a decision.
+        const recordObservation = observeReviewRecord(prNumber, envRepo ?? undefined);
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
-          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash
+          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash,
+          recordObservation, liveDiffRead.reason
         );
         if (result.status === "block") {
-          console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
+          // #2349: name the state in the line the operator reads, reusing the SAME
+          // tag the durable audit row carries (never a second, drifting vocabulary).
+          console.log(
+            `[review-enforcer] 🚫 Merge registry gate blocked merge — STATE: ${result.reasonTag ?? mergeGateBlockReason(record)}`
+          );
           logMergeGateDecision(prNumber, result, record); // #60: durable audit record
           return { block: true, reason: result.reason };
         }
@@ -3863,19 +4502,27 @@ export default function (pi: ExtensionAPI) {
       // blocked op — the docs-only micro class (#485) included — is
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
+        const floor = describeDispatchFloorRead(command, "micro", dispatchCount);
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
+        for (const line of floor.lines) console.log(line);
         logGateEvent("gate_block", {
           reason: "no_reviewers_dispatch",
           tier: "micro",
+          // #2349: WHAT the floor read about the registry, so the fleet can count
+          // "no record on this box" refusals instead of hand-measuring them.
+          record_state: floor.recordState,
           command: auditCommand(command), // #1492: the refused command, not just the reason
         }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
+      const floor = describeDispatchFloorRead(command, tier, dispatchCount);
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
+      for (const line of floor.lines) console.log(line);
       logGateEvent("gate_block", {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
+        record_state: floor.recordState, // #2349
         command: auditCommand(command), // #1492: the refused command, not just the reason
       }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
