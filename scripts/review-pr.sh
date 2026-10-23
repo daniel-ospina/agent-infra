@@ -771,11 +771,26 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 # code block (4+ leading spaces, the other way to quote) is dropped the same way; the blockquote
 # form (`> **Verdict:** …`) never matched, because every pattern anchors after optional WHITESPACE.
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
-             | awk 'BEGIN { f = 0 }
-                    /^[[:space:]]*(```|~~~)/ { f = !f; next }
-                    f == 1 { next }
-                    /^    / { next }
-                    { print }' \
+             | awk '{ ln[NR] = $0 }
+                    END {
+                      n = 0
+                      for (i = 1; i <= NR; i++)
+                        if (ln[i] ~ /^[[:space:]]*(```|~~~)/) { n++; mk[n] = i }
+                      # ⛔ AN UNMATCHED MARKER OPENS NOTHING (the same rule the finding scan uses,
+                      # and the reason a bare toggle is wrong here): with an ODD marker count the
+                      # last one is closed by nothing, so it must not swallow the tail. A toggle
+                      # dropped the real verdict in `… quoted hunk …` + (no closing fence) + `CLEAN`
+                      # and turned a decidable transcript into exit 6.
+                      if (n % 2 == 1) n--
+                      for (i = 1; i <= NR; i++) {
+                        skip = 0
+                        for (k = 1; k <= n; k += 2)
+                          if (i >= mk[k] && i <= mk[k+1]) { skip = 1; break }
+                        if (skip) continue
+                        if (ln[i] ~ /^    /) continue
+                        print ln[i]
+                      }
+                    }' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
