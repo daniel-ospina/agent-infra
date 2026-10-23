@@ -598,8 +598,14 @@ lander_stale_rerun() { # <board-numbers-file>  (one PR number per line, from the
   case "${STALE_RERUN_CAP:-}" in ''|*[!0-9]*) STALE_RERUN_CAP=8 ;; esac
   [ "${#STALE_RERUN_CAP}" -gt 2 ] && STALE_RERUN_CAP=50
   [ "$STALE_RERUN_CAP" -gt 50 ] && STALE_RERUN_CAP=50
+  # ⛔ THE RESERVE NEEDS THE SAME LENGTH GUARD AS THE CAP: bash arithmetic wraps an overflowed integer,
+  # so `STALE_RERUN_RESERVE=18446744073709552116` with rem=1000 computed `n=180` — a POSITIVE n from a
+  # reserve that should have produced 0 (measured). The cap still bounded the spend, but the documented
+  # `min(cap, (remaining-reserve)/5)` was violated and it spent against a bucket with no headroom.
   case "${STALE_RERUN_RESERVE:-}" in ''|*[!0-9]*) STALE_RERUN_RESERVE=500 ;; esac
+  [ "${#STALE_RERUN_RESERVE}" -gt 6 ] && STALE_RERUN_RESERVE=500
   case "${STALE_RERUN_WINDOW:-}" in ''|*[!0-9]*) STALE_RERUN_WINDOW=10800 ;; esac
+  [ "${#STALE_RERUN_WINDOW}" -gt 7 ] && STALE_RERUN_WINDOW=10800
   # ⛔ EVERY CALL THIS STEP MAKES IS BOUNDED (`GH_LIMIT_NO_WAIT=1`). The gh layer backs off for up to
   # MAX_WAIT=300s on a shared-bucket refusal; inside a drain loop that is not patience, it is a STALL
   # of the whole run (measured: the step blocked and the lander had to be killed at 150s). A limited
@@ -720,7 +726,7 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
         fi
         continue ;;
     esac
-    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE"; continue ;; esac
+    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE" 2>/dev/null || say "stale-rerun: #$a $c shares run $b whose POST was refused, but the deferral could NOT be recorded ($STALE_RERUN_STATE) — it will be re-POSTed next pass"; continue ;; esac
     if [ "$DRY" = 1 ]; then
       say "stale-rerun: #$a $c WOULD RE-RUN (check id $d started $e — before the base tip $base_iso; run $b)"
       continue
@@ -739,8 +745,11 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
       # the next pass does not pay another POST to learn the same thing; it is never resolved into
       # an outcome, because nothing ran.
       badruns="$badruns$b "
-      printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE"
-      say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
+      if printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE" 2>/dev/null; then
+        say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
+      else
+        say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — and the deferral could NOT be recorded ($STALE_RERUN_STATE), so the same run may be POSTed again next pass. NOT treated as green"
+      fi
     fi
   done <"$tmp/plan.us"
 
@@ -756,7 +765,7 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     esac
   done <"$tmp/plan.us"
 
-  say "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded run(s)-dropped=$excluded_runs (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun; a RUN carrying one is dropped entirely, because the POST re-runs every failed job in it)"
+  say "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded check(s), run(s)-dropped=$excluded_runs (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun; a RUN carrying one is dropped entirely, because the POST re-runs every failed job in it)"
   note "stale-rerun: base_tip=$base_iso cands=$cands prs=$stale_prs runs=$stale_runs N=$n want=$want ran=$re_ran over=$over outcomes=$outcomes success=$successes still_red=$stillred excl_run=$excluded_runs"
   if [ "${STALE_RERUN_DEBUG:-0}" = 1 ]; then say "stale-rerun: DEBUG kept $tmp (plan, rollup, base)"; else rm -rf "$tmp"; fi
   return 0
