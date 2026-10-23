@@ -1085,7 +1085,8 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
           "an interactive host missing from the HUMAN allowlist (a VS Code `Code Helper` cannot "
           "be matched at all — `ps -Ao comm=` is space-split — so such a session is caught only "
           "through a shell/terminal ancestor, or not at all), "
-          "memory/fd pressure. A row the census cannot decide is UNVERIFIABLE above; a blind "
+          "memory/fd pressure, and a live child of a parked parent it does not enumerate. "
+          "A row the census cannot decide is UNVERIFIABLE above; a blind "
           "spot is NOT uniformly an abstention — a skipped cwd filter can still bind, speak and "
           "score LIVE, and a store-unreadable row under a terminal ancestor is KEEP-HUMAN.")
     if not apply:

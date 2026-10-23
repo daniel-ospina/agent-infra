@@ -1654,8 +1654,9 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
 
 **MUST.** The following stay out of automation, with the reason stated rather than assumed:
 
-- **A candidate with diagnostic value stays.** Evidence beats tidiness — `orphan-reap.py:36`
-  ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
+- **A candidate with diagnostic value stays.** Evidence beats tidiness — the `orphan-reap.py`
+  header line "Reapable != right to reap" (cited by symbol, per the rule above), and
+  `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
   `orphan-reap.py` (its `--apply` default, cited by symbol) — with nothing scheduling it. The process reaper restored by

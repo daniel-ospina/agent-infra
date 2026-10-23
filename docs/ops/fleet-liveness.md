@@ -210,7 +210,11 @@ the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is 
 gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;
 gate 2 supersedes its answer). The safe property holds either way — nothing is reaped — but
 `counts.UNVERIFIABLE == pool size` is **not** a store-health probe, and 0 UNVERIFIABLE does not
-mean the store was readable.
+mean the store was readable. Beyond those three, the pool inherits §1's remaining blind spots
+verbatim: a same-fence start in the same cwd (`ambiguous-binding`), another uid's processes (the
+pid-side cwd filter is skipped and `binding_detail` shows it), memory/fd pressure, and a live child
+of a parked parent it does not enumerate — the runtime `declared blind spots:` line prints the same
+list, so the header, the report and this section name one set.
 
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):

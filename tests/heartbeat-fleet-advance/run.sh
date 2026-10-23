@@ -290,12 +290,23 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "40775937054958"
+# ⛔ RE-PINNED AGAIN 2026-10-23, DELIBERATELY (a base-only merge onto main): `origin/main`'s #2207
+# (`fbbbb31e`) added 7 executable lines to `scripts/orchestrator-heartbeat.sh` and did NOT re-cut this
+# pin, so main itself measured 501 against 494. The base merge brings those 7 under this branch's
+# pre-merge 499, so the measured value here is 506 and the WORKLIST block is still exactly this
+# branch's +5. The block-keyword cksum moves with the same commit; both numbers below are MEASURED at
+# this head, not transcribed. The composed literals the two pins above read are UNCHANGED (the
+# worklist is appended INTO them at run time), and with no worklist file present every golden body
+# stays byte-identical — so the sixteen-state matrix still validates the same bytes.
+# That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
+# rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
+# place to hide a gate).
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "32193281534949"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 499
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 506
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;

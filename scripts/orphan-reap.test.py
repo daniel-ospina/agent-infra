@@ -1227,13 +1227,13 @@ def main(argv=None) -> int:
     for name, fn, expect, _reason, mutation in TESTS:
         if not mutation:
             continue
-        # ⛔ THROUGH THE REOPEN SEAM, like `suite(mutate)` above and for the same reason: under
-        # the shipped default a HOSTLESS row — the shape every mutation fixture produces — is
-        # masked to UNVERIFIABLE, so a mutation that correctly authorises that row would read the
-        # same state either way and the control would silently stop proving anything about the
-        # gate that was dropped. (A non-hostless unrecognised kind is NOT masked by the shipped
-        # default; it is masked by the allow-list, and `unrecognised_host_kind()` pins that
-        # separately — with the seam off.)
+        # ⛔ THROUGH THE REOPEN SEAM, like `suite(mutate)` above and for the same reason: a HOSTLESS
+        # row — the shape every mutation fixture produces — is masked to UNVERIFIABLE under the
+        # shipped default, so a mutation that correctly authorises it would read the same state
+        # either way and the control would silently stop proving anything about the gate that was
+        # dropped. (`unrecognised_host_kind()` deliberately runs with the seam OFF: that row is not
+        # hostless, so it is the ALLOW-LIST — not the host decision — that must abstain on it, and
+        # pinning it under the seam would leave the distinction untested in the shipped config.)
         with _reopen_seam(True):
             out = run_one(fn, mutation)
         got = row_of(out)["state"]
