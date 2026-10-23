@@ -4537,9 +4537,9 @@ already holding):
   event. Load is a symptom of contention rather than a measure of capacity
   (`docs/ops/load-policy.md`), which is also why a lowering of `MAX_LOAD` — the ×8 change proposed in
   #1907, closed unmerged 2026-10-22 — could not have moved a single item. ⚠️ NOTE what the record can
-  carry: the WORKER gate binds on **seven** values — `load`, `disk`, `land`, `fork`, `capability`,
-  `skew` and `key` (`spawn-gate.sh`'s gates plus `key-gate.sh`'s), and `chain-merge.sh`'s
-  `cap_refusal_gate` is the one place that list is written (this sentence said "four" beside a
+  carry: the WORKER gate binds on **eight** values — `load`, `mem`, `disk`, `land`, `fork`, `capability`,
+  `skew` and `key` (`spawn-gate.sh`'s gates plus `key-gate.sh`'s; `mem` is #2387's memory refusal), and
+  `cap_refusal_gate` in `chain-merge.sh` is the one place that list is written (this sentence said "four" beside a
   six-value list before review cycle 1 caught it); the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
   refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
   predates #2409 and knows only `load`/`disk` must treat `land` as `load` (it is non-numeric for its

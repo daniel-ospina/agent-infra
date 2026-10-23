@@ -900,6 +900,15 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
     # operator a full filesystem was the cause when it was not.
     why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
+  elif [ "$ar" = "${AGENT_MEM_REFUSED:-73}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN WORDING (agent-infra#2387), for the reason the disk branch exists: the
+    # remedies differ and the wrong name sends the operator to the wrong number. "load" would have
+    # them watch a 1-min average on a box whose load is fine while the OOM killer takes lanes; the
+    # memory floor clears when resident lanes FINISH, so the action is to let them (or to stop one
+    # deliberately), not to wait for a load reading. Tolerant reference like the disk one, so a
+    # caller run against an older $O/spawn-gate.sh (file-by-file seeding) degrades instead of
+    # aborting under `set -u` before the refund below.
+    why="memory gate: available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured) — this clears when resident lanes finish, NOT by waiting for load"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

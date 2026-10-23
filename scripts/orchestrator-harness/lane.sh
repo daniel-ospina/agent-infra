@@ -942,9 +942,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk`,
-  # `capability`, `skew` and `land` are the six values the gate can refuse on, and each is chosen by the
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`,
+  # `capability`, `skew` and `land` are the seven values the gate can refuse on, and each is chosen by the
   # code its own caller already distinguishes, so the record can never disagree with the exit status.
+  # `mem` (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's
+  # memory floor refused — which is why it takes the capacity-transfer branch below and not the `land`
+  # stand-down one.
   # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
   # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
   # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
@@ -982,6 +985,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # a helper predating the code can never return it.
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
+    elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then _cap_gate=mem
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
     elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
@@ -1039,6 +1043,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # had been MET — a false cause, and the same #1765 class (a remedy for the wrong condition) this
     # block exists to prevent. Both are named, and the refusing line above carries the numbers.
     echo "[lane $N] NOT started: DISK gate refused — either the filesystem is below DISK_MIN_FREE_MB, or it is above the floor but has no headroom for one lane's dependency tree (DISK-NOHEADROOM, agent-infra#2721). The '[disk-gate] REFUSED' line above says which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches; --scratch for /tmp) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
+    # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
+    # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured). This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
