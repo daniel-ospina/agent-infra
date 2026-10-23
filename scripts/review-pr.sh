@@ -359,24 +359,53 @@ DIFF_TRUNCATED=0
 # whitespace (a diff context line, an indented `}`), which no prompt/terminal round trip survives
 # intact, and a fixed-length window silently degenerates (P1, fifth fresh review: bash returns the
 # EMPTY string from `${s: -40}` when the line is shorter than 40 — this PR's own diff ends on an
-# 18-character line, so the proof was skipped for the very change that added it). A digest has no
-# length precondition and no whitespace to trim, and it cannot be guessed without the line.
+# 18-character line, so the proof was skipped for the very change that added it).
+# ⛔ AND THE EXPECTED VALUE IS NEVER PRINTED TO THE REVIEWER (P0, sixth fresh review). The first
+# version interpolated it into the prompt ("diff-tail: $t"), so echoing the instruction line satisfied
+# the check: a reviewer that fetched nothing recorded a clean attestation with rc=0, which is the
+# precise false PASS this handshake exists to prevent. The prompt now states what to COMPUTE and how;
+# only the caller holds the value.
+# ⛔ PORTABLE DIGEST TOOL (P2, sixth fresh review): this file is farmed to macOS boxes (see the
+# `mktemp` and `timeout` notes below), where `sha256sum` does not exist — a hardcoded one yields an
+# empty token for every oversized diff and the run dies AFTER the review was paid for. Resolved once.
+SHA_CMD=""
+# ⛔ RESOLVED BY RUNNING IT, NOT BY `command -v` (P2, sixth fresh review): a sha256sum that exists but
+# FAILS (busybox stub, restrictive sandbox, a shim) would be chosen by a lookup and then yield an empty
+# token for every oversized diff — the run would die after the review was paid for, blaming the diff.
+if printf 'probe\n' | sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif printf 'probe\n' | shasum -a 256 >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+fi
 DIFF_TAIL=""
 DIFF_LASTLINE=""
+DIFF_TAIL_CAUSE=""
+# TAIL_REQUIRED is the PROMPT-side flag: set only by the truncation branches, and it never carries the
+# expected value (the prompt must not disclose what it is checking).
+TAIL_REQUIRED=""
 compute_diff_tail() {
+  DIFF_TAIL=""
+  DIFF_TAIL_CAUSE=""
   # ⛔ SAME PIPELINE AS THE PROMPT'S COMMAND, byte for byte: `printf '%s\n'` re-adds the newline that
   # the command substitution stripped from the fetch, and `tr -d '\r'` is stated in the prompt too.
   DIFF_LASTLINE="$(printf '%s\n' "$DIFF_FULL" | tr -d '\r' | awk 'NF { last = $0 } END { print last }')"
-  DIFF_TAIL=""
-  if [ -n "$DIFF_LASTLINE" ]; then
-    DIFF_TAIL="$(printf '%s\n' "$DIFF_LASTLINE" | sha256sum | cut -d' ' -f1)"
+  if [ -z "$DIFF_LASTLINE" ]; then
+    DIFF_TAIL_CAUSE="this diff has no non-empty line to hash"
+    return
   fi
+  if [ -z "$SHA_CMD" ]; then
+    DIFF_TAIL_CAUSE="neither 'sha256sum' nor 'shasum -a 256' is installed on this box, so the truncation proof cannot be computed"
+    return
+  fi
+  # shellcheck disable=SC2086  # SHA_CMD is a resolved command line, not a single word.
+  DIFF_TAIL="$(printf '%s\n' "$DIFF_LASTLINE" | $SHA_CMD | cut -d' ' -f1)"
 }
 if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
   DIFF="${DIFF:0:$DIFF_CAP}"
   DIFF_TRUNCATED=1
   compute_diff_tail
+  TAIL_REQUIRED=1
 fi
 # The identity of what the reviewer is about to read (the same bytes we inline; the full read
 # for the truncate case is compared by the re-read below using the same truncation).
@@ -517,17 +546,20 @@ $(if [ -n "$t" ]; then cat <<TAIL
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
 The diff inlined above is NOT the whole change. Fetch the remainder yourself, then print ONE
 line immediately BEFORE your verdict line, and nothing else on it:
-  diff-tail: $t
-That is the SHA-256 of the FULL diff's final NON-EMPTY line. Reproduce it EXACTLY with:
-  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=$0} END{print last}' | sha256sum | cut -d' ' -f1
-The caller compares it exactly: a missing or different value means this review never covered the
-rest of the change, so it is DISCARDED — no comment, no record — rather than recorded against a
-diff nobody read.
+  diff-tail: <the SHA-256 of the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>
+Compute the value YOURSELF with:
+  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=$0} END{print last}' | $SHA_CMD | cut -d' ' -f1
+The caller holds the expected value and compares it exactly: a missing or different value means this
+review never covered the rest of the change, so it is DISCARDED — no comment, no record — rather than
+recorded against a diff nobody read. (The value is NOT given to you anywhere in this prompt, so
+echoing these instructions cannot satisfy it.)
 TAIL
 fi)
 EOF
 }
-compose_prompt "$DIFF" "$DIFF_NOTE" "$DIFF_TAIL" > "$PROMPT"
+# ⛔ THE PROMPT CARRIES A FLAG, NEVER THE EXPECTED VALUE (P0, sixth fresh review): passing the digest
+# here is what let a reviewer satisfy the proof by echoing its own instructions.
+compose_prompt "$DIFF" "$DIFF_NOTE" "$TAIL_REQUIRED" > "$PROMPT"
 
 # Byte-budget guard (see DIFF_CAP): if the assembled prompt is still too large for a
 # single argv, drop the INLINE DIFF (the reviewer is told to fetch it) and re-check;
@@ -541,7 +573,8 @@ if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
   # The tail proof is required on this branch too: the prompt carries NO diff at all, so without it
   # there is even less evidence the reviewer read the change it certifies.
   [ -n "$DIFF_TAIL" ] || compute_diff_tail
-  compose_prompt "" "$DIFF_NOTE" "$DIFF_TAIL" > "$PROMPT"
+  TAIL_REQUIRED=1
+  compose_prompt "" "$DIFF_NOTE" "$TAIL_REQUIRED" > "$PROMPT"
   if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
     die "$E_EVIDENCE" "the prompt for $REPO#$PR is $(prompt_bytes "$PROMPT") bytes even WITHOUT the diff — it cannot be passed as a single argument (Linux caps one at 131,071 bytes), so the reviewer would never start. Nothing was reviewed and NO record was written. Shorten the PR body (or file the review against a smaller revision)."
   fi
@@ -666,11 +699,11 @@ fi
 # any comment exists, so a refusal leaves no artifact a later lane could bind.
 if [ "${DIFF_TRUNCATED:-0}" != 0 ]; then
   if [ -z "$DIFF_TAIL" ]; then
-    err "$PROG: the inline diff was TRUNCATED and this diff has NO computable tail (no non-empty line), so the reviewer could not be asked to prove it read the rest — refusing to certify a diff nobody can show was read."
-    die "$E_EVIDENCE" "the truncated diff has no tail token to verify against — refusing (transcript: $TRANSCRIPT)"
+    err "$PROG: the inline diff was TRUNCATED and no tail token could be computed — ${DIFF_TAIL_CAUSE:-no reason recorded} — so the reviewer could not be asked to prove it read the rest, and certifying a diff nobody can show was read is exactly the false PASS this handshake prevents."
+    die "$E_EVIDENCE" "the truncated diff has no computable tail token — refusing (transcript: $TRANSCRIPT)"
   fi
   GOT_TAIL="$(grep -a '^[[:space:]]*diff-tail:' "$LOG" 2>/dev/null | tail -1 \
-              | sed 's/^.*diff-tail:[[:space:]]*//' | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+              | sed 's/^.*diff-tail:[[:space:]]*//' | tr -cd '0-9a-fA-F' | tr 'A-Z' 'a-z')"
   EXPECT_TAIL="$(printf '%s' "$DIFF_TAIL" | tr 'A-Z' 'a-z')"
   if [ -z "$GOT_TAIL" ]; then
     err "$PROG: the inline diff was TRUNCATED and the reviewer printed no 'diff-tail:' line — there is no evidence it read the rest of the change it was asked to certify."
@@ -953,8 +986,29 @@ function leads(s,   after) {
 }
 { L[NR] = $0 }
 END {
+  # ⛔ A FENCED BLOCK IS QUOTATION, NOT A FINDING (P2, sixth fresh review): a genuinely clean review
+  # that quotes this tool own output contract (`  [P0|P1|P2] <file>:<line> — …`) or reproduces a
+  # fixture inside a ``` fence was read as a blocking finding, so its CLEAN contradicted it and the
+  # paid review was discarded with nothing posted — and because the prompt is rebuilt identically, a
+  # re-run tends to quote it again (an unsatisfiable loop).
+  # ⛔ AND ONLY a CLOSED PAIR SKIPS (fail-closed, caught by VGATE before this shipped). A bare toggle
+  # made an UNCLOSED fence swallow every remaining line, so a reviewer who quoted a hunk and forgot the
+  # closing fence had its own `[P1] …` line silently skipped — the record is built from THIS scan alone,
+  # so that is a clean attestation over a stated blocker. An ODD fence count leaves the last marker
+  # unmatched, and that marker therefore opens nothing: the lines after it are scanned as ordinary
+  # text, which is the over-block direction. An UNQUOTED line-leading token still blocks in every case.
+  fence = 0
+  nfence = 0
+  for (i = 1; i <= NR; i++) if (L[i] ~ /^[[:space:]]*```/) nfence++
+  matched = nfence - (nfence % 2)
+  seen = 0
   for (i = 1; i <= NR; i++) {
     raw = L[i]
+    if (raw ~ /^[[:space:]]*```/) {
+      seen++
+      if (seen <= matched) { fence = !fence; continue }
+      # an unmatched (trailing) marker: no skip opens or closes here, so fall through and scan it
+    } else if (fence) continue
     has = label(raw)
     lead = leads(raw)
     if (!has && !lead) continue

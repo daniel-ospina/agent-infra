@@ -65,7 +65,9 @@
 #   §AL a TRUNCATED inline diff must PROVE the reviewer read the rest: a missing or wrong `diff-tail:`
 #      digest is refused (rc=3, nothing posted, nothing recorded) — including when the diff's final
 #      line is SHORTER than the token (the case that silently disabled the handshake) — while an
-#      untruncated diff needs no proof at all
+#      untruncated diff needs no proof at all; the EXPECTED digest is never disclosed in the prompt,
+#      a fenced quote of a severity line is quotation (not a finding), and the digest tool is
+#      resolved by running it (`sha256sum`, falling back to `shasum -a 256`)
 #   §AM an UNCOUNTED `ISSUES` verdict over findings the severity scan cannot label FAILS CLOSED
 #      (`ISSUES` is never read as `ISSUES 0`), and a printed dash-count (`ISSUES — 2`) survives
 #
@@ -1210,6 +1212,60 @@ run "$SRC" 2284
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "…an untruncated diff still records WITHOUT any tail proof (rc=$(rc_of))"
+# ⛔ THE PROMPT MUST NOT DISCLOSE THE VALUE IT IS CHECKING (P0, sixth fresh review). The first version
+# interpolated the expected digest, so a reviewer that fetched NOTHING could echo its instruction line,
+# pass the proof and mint a clean record — the exact false PASS the handshake exists to prevent. The
+# prompt now states what to COMPUTE; the expected value is asserted absent from the prompt bytes.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+EXPECT_DIGEST="$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | sha256sum | cut -d' ' -f1)"
+printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "the computed digest is accepted (rc=$(rc_of))"
+if grep -qF "$EXPECT_DIGEST" "$TMP/pi-prompt.txt"; then rc=1; else rc=0; fi
+ck $rc "…and the expected digest appears NOWHERE in the reviewer prompt (it cannot be echoed)"
+if grep -qF 'diff-tail:' "$TMP/pi-prompt.txt"; then rc=0; else rc=1; fi
+ck $rc "…while the PROOF LINE ITSELF is still requested by name"
+# …and a correct digest WRAPPED IN MARKUP is still correct: the extracted value is normalised to hex
+# (P3, sixth fresh review), so a backticked digest is not misdiagnosed as 'a different change'.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+printf 'diff-tail: `%s`\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a backticked correct digest is accepted (rc=$(rc_of))"
+# ⛔ A FENCED QUOTE IS NOT A FINDING (P2, sixth fresh review): a clean review that quotes this tool own
+# output contract, or reproduces a fixture, inside a ``` fence was read as a blocking finding and
+# discarded with nothing posted — and a re-run tends to quote it again. Unquoted line-leading tokens
+# still block (§Q pins that direction), so only the quoted case moves.
+reset; printf 'Here is the contract I was given:\n```\n  [P0|P1|P2] <file>:<line> — <what is wrong> — <why it matters>\n[P1] scripts/x.sh:42 — the guard returns 0 on a failed read\n```\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a FENCED quote of a severity line does not contradict CLEAN (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the review is recorded"
+reset; printf '```\n[P1] scripts/x.sh:42 — the guard returns 0 on a failed read\n```\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and a fenced-only severity line records too (rc=$(rc_of))"
+# ⛔ AN UNCLOSED FENCE MUST NOT SWALLOW THE REST (fail-closed; VGATE caught the balancing bug before it
+# shipped). A bare toggle made an unterminated fence skip every remaining line — and this scan is the
+# ONLY source of BLOCKING_FINDINGS, so a reviewer who quoted a hunk and forgot the closing fence would
+# have its own `[P1] …` silently dropped, recording a clean attestation over a stated blocker. With an
+# ODD fence count the last marker is unmatched and opens nothing, so the tail is scanned as text.
+reset; printf 'Evaluated against this contract:\n```\n  [P0|P1|P2] <file>:<line> — x\n[P1] scripts/y.sh:99 — the guard returns 0 on a failed read\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an UNCLOSED fence does not swallow a blocking finding after it (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# ⛔ THE DIGEST TOOL IS RESOLVED, NOT HARDCODED (P2, sixth fresh review): macOS ships no `sha256sum`,
+# and this file is farmed there — so the token is resolved to whichever tool exists. Pinned by
+# SHADOWING sha256sum with a failing stub (shasum still answers): the run must still record.
+if command -v shasum >/dev/null 2>&1; then
+  mkdir -p "$TMP/nosha"
+  printf '#!/bin/sh\nexit 1\n' > "$TMP/nosha/sha256sum"; chmod +x "$TMP/nosha/sha256sum"
+  reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+  printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+  PATH="$TMP/nosha:$PATH" run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "a box without sha256sum still computes the proof via shasum (rc=$(rc_of))"
+  if grep -qF 'shasum -a 256' "$TMP/pi-prompt.txt"; then rc=0; else rc=1; fi
+  ck $rc "…and the prompt tells the reviewer the tool this box actually has"
+else
+  fail "shasum fallback arm SKIPPED: this box has no shasum, so the portable-digest path is untested here"
+fi
 
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
@@ -1232,11 +1288,13 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 354, measured after the rebase onto the branch's own §AK
-# (the ISSUES-count separator fix, which took that section number): §AL carries the truncated-diff
-# arms (a truncated diff ending on an 18-character line must still DEMAND the proof, and accept the
-# correct digest), the `Two [P1] …; P1: …` decorated-plus-bare cases, the §AL tail proof (missing
-# proof, wrong proof, and the untruncated control), the §AH later-label cases and
+# whenever sections are added — this is 365, measured after the sixth review's fixes: §AL also pins
+# that the expected digest is ABSENT from the prompt (the P0: it was being echoed), that a fenced
+# quote of a severity line does not contradict CLEAN, that a backticked digest still matches, and
+# that a box without a working `sha256sum` still proves the tail via `shasum -a 256`. It carries the
+# truncated-diff arms (a truncated diff ending on an 18-character line must still DEMAND the proof,
+# and accept the correct digest), the `Two [P1] …; P1: …` decorated-plus-bare cases, the §AL tail
+# proof (missing proof, wrong proof, and the untruncated control), the §AH later-label cases and
 # the `No P0, P1 or P2 findings.` / `I found no P0, P1 or P2 issues …` clean summaries, on top of the
 # §AH separator shapes (a bare `Found a P1: …` / `Found a P1 — …` / `One P1: …` under CLEAN, each
 # plus its no-record arm, and the `P1: 0 — nothing blocking.` counter-direction), which were added
@@ -1248,12 +1306,12 @@ echo
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 353 here and the RESULT line then
-# prints 354. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 374 here and the RESULT line then
+# prints 375. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 353 ]; ck $? "assertion-count pin: >= 353 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 374 ]; ck $? "assertion-count pin: >= 374 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
