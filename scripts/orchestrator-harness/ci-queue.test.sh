@@ -998,6 +998,64 @@ else
   ck "(j5) MUTANT — a deferral without its \`exit 0\` reaches the push (rc=$rc, sentinel=$([ -e "$T/sentinel" ] && echo yes || echo no)), so (j2) is not always-green" \
      "$( { [ "$rc" = 0 ] && [ -e "$T/sentinel" ]; } ; echo $? )"
 fi
+# ⛔ (m) THE CI-RERUN GATE — the one SWEEP act that ADDS queue (#2333 review round 4, P2). The PR
+# names it as "the only other surface in the sweep that ADDS queue", and it was pinned by NOTHING:
+# (e6) counts the `ci-queue(...)` token, and pr-dispatch.test.sh's T3 cycle never reaches this block
+# at all (measured: `gh run rerun` appears in its spy on NEITHER an allowed NOR a refusing queue, so
+# a drive there is vacuous — it was tried and removed rather than kept as decoration).
+# Measured before this arm: replacing `&& ! ciq_push_ok` with `&& false` — the withhold branch
+# becomes dead code, so a rerun enqueues unconditionally behind a backlog — left ci-queue 116/0 and
+# pr-dispatch 36/0 GREEN. The shipped block is EXTRACTED and driven in both polarities.
+printf '\n── (m) the CI-RERUN gate adds queue, so it is DRIVEN ──────────────────────────\n'
+RERUN="$T/rerun.sh"
+awk '/^          if \[ -n "\$\{RID:-\}" \] && \[ ! -f "\$O\/state\/rerun-\$PR-\$RID" \] && ! ciq_push_ok; then$/ {f=1}
+     f{print}
+     f&&/^          fi$/{exit}' "$LOOP" > "$RERUN"
+ck "(m1) the CI-rerun gate was EXTRACTED from orch-loop.sh (not a restatement)" \
+   "$( { [ -s "$RERUN" ] && grep -q 'run rerun' "$RERUN" && grep -q 'ciq_push_ok' "$RERUN"; } ; echo $? )"
+rerun_drive() { # <block-file> <ciq_push_ok rc> -> "rerun=<yes|no> withheld=<yes|no>"
+  (
+    RID=98765; PR=4242; OR="daniel-ospina/agent-infra"; HEAD_N=abc1234; V=CLEAN
+    O="$(mktemp -d "$T/rerunstate.XXXXXX")"; mkdir -p "$O/state"   # PER CALL: (m3) TOUCHES
+    # `$O/state/rerun-<PR>-<RID>` on its successful rerun, so a shared dir made (m5) read "already
+    # rerun" and skip both branches — the mutant then looked withheld and the arm proved nothing.
+    LOG="$T/rerun.log"; PRDISP="$T/rerun.tsv"
+    : > "$LOG"; : > "$PRDISP"
+    GSPY="$T/rerun.gspy"; : > "$GSPY"
+    _pushrc="$2"   # captured BEFORE the stub is defined: inside `ciq_push_ok`, `$2` is the FUNCTION's own
+    ciq_push_ok() { return "$_pushrc"; }
+    ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
+    ciq_verdict() { printf 'deep(queued=99 running=1 runners=2 ceiling=4 state=fresh age=0s)'; }
+    dispreplace() { printf 'DISPREPLACE %s %s\n' "$1" "$5" >> "$LOG"; }
+    gh() { printf 'GH %s\n' "$*" >> "$GSPY"; return 0; }
+    # shellcheck disable=SC1090
+    . "$1" >> "$LOG" 2>&1
+    _rr=no; grep -q 'run rerun' "$GSPY" && _rr=yes
+    _wh=no; grep -q 'rerun withheld' "$LOG" && _wh=yes
+    printf 'rerun=%s withheld=%s' "$_rr" "$_wh"
+  ) 2>/dev/null
+}
+r="$(rerun_drive "$RERUN" 1)"
+ck "(m2) a DEEP/UNKNOWN queue WITHHOLDS the rerun ((m2: $r) = rerun=no withheld=yes) — a rerun would enqueue behind the backlog" \
+   "$( { has "$r" 'rerun=no' && has "$r" 'withheld=yes'; } ; echo $? )"
+r="$(rerun_drive "$RERUN" 0)"
+ck "(m3) CONTROL — an ALLOWED queue DOES rerun ((m3: $r) = rerun=yes), so (m2) is a decision and not a constant withhold" \
+   "$( { has "$r" 'rerun=yes'; } ; echo $? )"
+# …and (m2) is not always-green. THE MUTANT IS `&& ! ciq_push_ok` → `&& false` — the withhold branch
+# goes DEAD, so the rerun fires on a deep queue. (Replacing the WHOLE predicate with nothing turns the
+# withholder into the unconditional branch instead — the opposite defect, and it still withholds, which
+# is why the polarity of the mutation is stated here rather than left to the sed.)
+sed 's/ && ! ciq_push_ok; then/ \&\& false; then/' "$RERUN" > "$T/rerun-mutant.sh"
+if cmp -s "$RERUN" "$T/rerun-mutant.sh"; then
+  bad "(m4) the rerun-gate mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/rerun-mutant.sh" 2>/dev/null; then
+  bad "(m4) the rerun-gate mutant does not parse — a broken mutant proves nothing about the gate"
+else
+  r="$(rerun_drive "$T/rerun-mutant.sh" 1)"
+  ck "(m5) MUTANT — without the predicate a deep queue reruns anyway ((m5: $r) = rerun=yes), so (m2) is not always-green" \
+     "$( { has "$r" 'rerun=yes'; } ; echo $? )"
+fi
+
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"

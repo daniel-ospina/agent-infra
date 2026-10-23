@@ -814,7 +814,13 @@ case "$DOUT" in *"nothing dispatched this run"*) ok "a congested queue defers th
 # DISPATCHED before it calls this script, so a deferral that exits 0 left the funnel printing
 # `-> N dispatched` and the cycle record `dispatched=N nothing=none` on the one cycle the gate
 # stopped everything. Reverting `exit 3` → `exit 0` used to leave every suite green: no arm read the
-# rc (this one captured stdout with `$( )`, which discards it).
+# rc — this arm captured stdout (`DOUT="$( … )"`) and never read `$?` at all. ⛔ THE CAUSE IS THAT
+# NOBODY READ IT, AND THIS BLOCK IS THE COUNTER-EXAMPLE TO THE TWO OBVIOUS MISATTRIBUTIONS: `$( )`
+# does NOT discard a status (`X="$(cmd)"; rc=$?` preserves it — the `DOUT=…/DRC=$?` pair directly
+# above depends on exactly that), and there is no pipe in this block (`| grep 'lane-7'` lives in the
+# separate C2 spawn-line case, and the suite runs `set -uo pipefail` anyway, so a pipeline would
+# propagate a non-zero status). Recording either of those as the cause sends the next author to
+# restructure a capture that was never the problem (#1720: a log naming the wrong cause).
 case "$DRC" in 3) ok "…and it exits 3 — the code the controller reads to record dispatched=0 instead of counting it" ;;
               *) bad "a deferred batch exited $DRC, not 3 — the controller would report the batch as DISPATCHED" ;; esac
 CLAIMS="$(cat "$T/c2b-claims.log" 2>/dev/null | tr '\n' ' ')"
