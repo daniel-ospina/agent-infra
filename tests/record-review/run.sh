@@ -1761,6 +1761,149 @@ else
 fi
 
 
+# ── 30. THE SURFACE CAP: the tier selector is selected by what a change can BREAK ─
+# The verdict vocabulary carried a depth tier long before anything SELECTED it
+# (`clean-micro` from the linked issue's label, `clean-low` from content shape),
+# and neither looked at the changed SURFACES. Measured 2026-10-23 over the live
+# queue: 173 of 178 recorded verdicts are `clean`, and the one mechanically
+# selected tier (clean-low) covers 1 of 70 open agent-infra PRs, because that
+# queue is rails, not prose. Worse, in the other direction the micro tier was
+# reachable for a rail edit: a `complexity:micro` issue whose PR touches
+# `scripts/admin-merge.sh` could record clean-micro, and the micro flow
+# dispatches NO reviewers — a merge-rail change would reach main unreviewed.
+#
+# These fixtures pin BOTH directions through the READ-ONLY seam the lane path
+# reads (`--print-tier`), so they fail if the selector is deleted, if it is
+# inverted, and if it ever starts keying on diff SIZE.
+T30="$TMP/t30"; rm -rf "$T30"; mkdir -p "$T30/bin"
+cat > "$T30/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# Serves the two reads review_surface_rows makes, with their --jq output already
+# rendered: `pulls/<n>` -> head/base/count, `compare/...` -> mb line + rows.
+for x in "$@"; do
+  case "$x" in
+    *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
+    *"/compare/"*)  printf 'mb\t%s\n' "${FIX_MB}"; printf '%s\n' "${FIX_ROWS}"; exit 0 ;;
+  esac
+done
+exit 1
+EOF
+chmod +x "$T30/bin/gh"
+HEX40="0123456789abcdef0123456789abcdef01234567"
+tier_for() { # <changed_files_count> <rows...> → "<status>\t<tier>"
+  local count="$1"; shift
+  PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT="$count" FIX_ROWS="$(printf '%s\n' "$@")" \
+    bash "$SRC" --print-tier 42 owner/repo 2>/dev/null
+}
+
+# (i) THE SHALLOW DIRECTION — a docs-only diff selects the Low tier.
+[ "$(tier_for 1 $'modified\tdocs/ops/fleet-liveness.md\t')" = "$(printf 'ok\tlow')" ] \
+  && pass "(30i) a docs-only diff SELECTS the shallow tier (ok/low) — the selector answers from surfaces, not from size" \
+  || fail "(30i) a docs-only diff did not select the shallow tier (got '$(tier_for 1 $'modified\tdocs/ops/fleet-liveness.md\t')')"
+
+# (ii) THE FULL DIRECTION — a ONE-LINE rail change selects FULL depth. This is
+# the assertion that makes diff size irrelevant by construction: same single
+# file, one line, and the tier is full.
+[ "$(tier_for 1 $'modified\tscripts/admin-merge.sh\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30ii) a ONE-LINE change to scripts/admin-merge.sh selects FULL depth (ok/full) — a rail is high-blast however small the diff" \
+  || fail "(30ii) a one-line scripts/admin-merge.sh change did NOT select full (got '$(tier_for 1 $'modified\tscripts/admin-merge.sh\t')')"
+
+# The rest of the ALWAYS-FULL class, and the inert class beside it.
+for f in scripts/ci-failure-set.sh scripts/atomic-land.sh scripts/check-pipeline-compliance.sh scripts/record-review.sh .github/workflows/ci-main.yml extensions/review-enforcer/index.ts; do
+  [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
+    && pass "(30ii) $f is ALWAYS-FULL" \
+    || fail "(30ii) $f did NOT select full — the always-full class has a hole"
+done
+[ "$(tier_for 1 $'modified\ttests/ci-lane-parity/run.sh\t')" = "$(printf 'ok\tmicro')" ] \
+  && pass "(30iii) a test-only diff selects the micro CEILING (ok/micro) — the exemption is available, the label guard still decides it" \
+  || fail "(30iii) a test-only diff did not select micro (got '$(tier_for 1 $'modified\ttests/ci-lane-parity/run.sh\t')')"
+
+# A MIXED diff takes the HIGHEST surface: docs must never dilute a rail.
+[ "$(tier_for 2 $'modified\tscripts/admin-merge.sh\t' $'modified\tdocs/ops/x.md\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30iv) a docs+rail diff is full — a prose file cannot dilute the rail it ships with" \
+  || fail "(30iv) a docs+rail diff did not select full"
+
+# Path HYGIENE: a traversal path is UNCLASSIFIABLE, which must resolve to full —
+# otherwise `docs/../scripts/admin-merge.sh` would evade every prefix arm.
+[ "$(tier_for 1 $'modified\tdocs/../scripts/admin-merge.sh\t')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30v) a \`docs/../scripts/admin-merge.sh\` path is unclassifiable and resolves to FULL — traversal cannot evade the cap" \
+  || fail "(30v) a traversal path was classified rather than refused (got '$(tier_for 1 $'modified\tdocs/../scripts/admin-merge.sh\t')')"
+
+# FAIL-CLOSED framing: a truncated/inconsistent list, and an unreadable API,
+# both yield an EMPTY tier — a degraded read must never read as a selection.
+T30_TRUNC="$(tier_for 9 $'modified\tdocs/ops/x.md\t')"
+[ "$T30_TRUNC" = "$(printf 'too_large\t')" ] \
+  && pass "(30vi) an inconsistent changed-file count yields too_large and an EMPTY tier — a possibly-truncated list cannot clear a ceiling" \
+  || fail "(30vi) an inconsistent count was not refused (got '$T30_TRUNC')"
+T30_DOWN="$(PATH="$T30/empty:$PATH" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_DOWN" = "$(printf 'unavailable\t')" ] \
+  && pass "(30vii) an unreadable API yields unavailable and an EMPTY tier" \
+  || fail "(30vii) an unreadable API did not yield unavailable/empty (got '$T30_DOWN')"
+
+# MUTATION: delete the rail from the always-full arm and (ii) must go RED — the
+# arm is load-bearing, not decoration.
+M30="$T30/mut-norail.sh"
+python3 - "$SRC" "$M30" <<'PYCAP'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frag = "scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh"
+if src.count(frag) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, "scripts/ci-failure-set.sh|scripts/atomic-land.sh"))
+PYCAP
+if bash -n "$M30" 2>/dev/null; then
+  M30_TIER="$(PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+    FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" bash "$M30" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$M30_TIER" != "$(printf 'ok\tfull')" ] \
+    && pass "mutation NORAIL is caught: without the rail in the class, a rail diff no longer selects full (got '$M30_TIER')" \
+    || fail "mutation NORAIL SURVIVED — the rail entry is not load-bearing"
+else
+  fail "mutation NORAIL could not be built — the always-full arm was not found verbatim"
+fi
+
+# WIRING: the clean-micro record path must CONSULT the cap before writing. If the
+# guard call is deleted, a rail diff records clean-micro — the bypass this exists
+# to close. (The cap is read HERE, in the recorder, so every future lane inherits
+# it without touching the skill.)
+grep -q 'review_surface_rows "\$REPO" "\$PR" "\$SHA"' "$SRC" \
+  && pass "(30viii) the clean-micro guard reads the recorded revision's surfaces (the cap is WIRED, not merely defined)" \
+  || fail "(30viii) the clean-micro guard does not consult the surface cap — a rail diff could record clean-micro"
+
+# WIRING, END-TO-END: run the REAL record path and prove the cap actually refuses.
+# The assertion above only proves the call exists; these two prove its EFFECT and
+# its BOUNDARY — a rail diff refuses (exit 4, NO record written), and an inert
+# diff is NOT refused (the cap is a ceiling, not a blanket block on micro).
+T30H="$T30/home"; rm -rf "$T30H"; mkdir -p "$T30H"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'for x in "$@"; do' \
+  '  case "$x" in' \
+  '    *"/pulls/"*)' \
+  '      case "$*" in' \
+  '        *"@tsv"*) printf "%s\t%s\t%s\n" "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;' \
+  '        *".head.sha"*) printf "%s\n" "${FIX_HEAD}"; exit 0 ;;' \
+  '      esac' \
+  '      exit 1 ;;' \
+  '    *"/compare/"*)  printf "mb\t%s\n" "${FIX_MB}"; printf "%s\n" "${FIX_ROWS}"; exit 0 ;;' \
+  '    *"/diff"*)      exit 1 ;;' \
+  '  esac' \
+  'done' \
+  'exit 1' > "$T30/bin/gh"
+chmod +x "$T30/bin/gh"
+rec_micro() { # <rows> → runs the record path for clean-micro; sets REC_RC
+  HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+    FIX_ROWS="$1" bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
+  REC_RC=$?
+}
+rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t')"
+[ "$REC_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30ix) the RECORD PATH refuses clean-micro for a rail diff: exit 4 and NO record written (the bypass is closed end-to-end)" \
+  || fail "(30ix) clean-micro on a rail diff was NOT refused (rc=$REC_RC, reviews dir: $(ls -d "$T30H/.pi/agent/reviews" 2>/dev/null || echo absent))"
+rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
+[ "$REC_RC" -ne 4 ] \
+  && pass "(30x) the cap does NOT refuse an inert diff — it is a ceiling on the tier, never a blanket block on the micro flow" \
+  || fail "(30x) an inert docs diff was refused clean-micro (rc=$REC_RC) — the cap over-blocks"
+
 # 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
 # "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
 # `|| pass "NOTE ..."` (sections 24, 25 and 26) and section 26 had a bare
@@ -1775,7 +1918,7 @@ fi
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=133
+MIN_ASSERTIONS=150
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
