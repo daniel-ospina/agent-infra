@@ -599,6 +599,13 @@ cmd_restart() {
   # refused here.
   case "$name" in ''|.|..|-*|*/*) err "usage: restart --name <runner-name> — a name must not be empty, start with '-', be '.'/'..', or contain '/'"; return 1 ;; esac
   dir="$RUNNER_ROOT/$name"
+  # ⛔ JUDGE THE ROOT BEFORE CONCLUDING "NO REGISTRATION". Every test on `$RUNNER_ROOT/$name` needs `x`
+  # on the ROOT, so a non-searchable root made this verb report a registration that EXISTS as missing and
+  # send the operator to `add` it (which then refuses rc 4 on the existing directory) — the same false
+  # verdict `status` refuses to print. An ABSENT root still falls through to rc 3 "no registration".
+  if [ -d "$RUNNER_ROOT" ] && { [ ! -r "$RUNNER_ROOT" ] || [ ! -x "$RUNNER_ROOT" ]; }; then
+    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT"; return 2
+  fi
   # ⛔ AN UNREADABLE INSTANCE IS cannot-measure, NOT "no registration": `-f .runner` is FALSE for a
   # registration we cannot read, and the message would send the operator to `add` a runner that is
   # already registered (the same false verdict `status` must never print).
@@ -645,7 +652,13 @@ cmd_reconcile() {
   # `dead=` read a healthy pool.
   local dirs
   if ! dirs="$(registered_dirs)"; then
-    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the restart arm could not enumerate the pool)"
+    cannot=$((cannot + 1))
+    # The REASON was already named by `registered_dirs` (runner-root-unreadable /
+    # runner-root-not-a-directory), so this line does not invent one — and the pass still publishes its
+    # machine-readable summary, as every other cannot-measure exit of this verb does.
+    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=unmeasured ceiling=%s mem_available=unmeasured floor=%s MB dry_run=%s\n' \
+      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$CEILING" "${MEM_FLOOR_MB:-unset}" "$DRY"
+    err "cannot-act why=pool-unreadable (the restart arm could not enumerate the pool; the cause is named on the line above)"
     return 2
   fi
   while read -r d; do

@@ -967,6 +967,17 @@ else
   chmod 700 "$RUNNER_ROOT/pi-runner-locked"
   assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of status)" "3" \
     "and with the mode restored it is a measurable DEAD listener again"
+  # ⛔ THE ROOT IS JUDGED BEFORE "no registration": a non-searchable ROOT makes every test on a child
+  # path fail, so the verb would report a registration that EXISTS as missing (and `add` then refuses it
+  # rc 4). Pinned on the ROOT arm specifically — the mode-000 case above is already caught by `-r`, and
+  # an absent name (not a registered one) keeps this case from starting a listener.
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-absent)" "3" \
+    "baseline: on a healthy root an ABSENT registration is rc 3 (no registration)"
+  chmod 444 "$RUNNER_ROOT"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-absent)"
+  assert_eq "$?" "2" "restart on a non-searchable ROOT is cannot-measure, not 'no registration'"
+  assert_contains "$out" "cannot-measure why=runner-root-unreadable" "and it names the root, not the name"
+  chmod 700 "$RUNNER_ROOT"
   # mode 444: readable but not searchable → `-r` passes, every test on its CONTENTS fails, so the
   # instance was dropped from `slots` (ceiling under-counted → the OVER-add direction).
   chmod 444 "$RUNNER_ROOT/pi-runner-locked"
@@ -987,11 +998,15 @@ assert_eq "$?" "2" "a RUNNER_ROOT that is a regular file is cannot-measure, not 
 assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it says which misconfiguration"
 rm -f "$RUNNER_ROOT"
 
-# ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED. The gate is a SNAPSHOT taken before the token
-#   mint; two passes adding DIFFERENT names both clear it, so the box ends above the owner's bound with
-#   both rc 0 (measured: 4 registrations on a 3-slot box). The gh stub plants the competing
-#   registration at mint time, which is exactly that window.
-echo "── the ceiling cannot be breached by the token-mint window ──"
+# ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED, which is what catches a competing pass that
+#   COMPLETED during this add's token mint — the token mint plus a full install copy is a window of
+#   seconds, and a pass that finished inside it is exactly what the re-read sees (measured incident
+#   shape: 4 registrations on a 3-slot box, both rc 0).
+#   ⚠️ This does NOT cover the in-flight arm of the same race: two passes can still both read `slots`
+#   before EITHER writes its `.runner`, and the listing cannot see a claim that has not registered yet.
+#   That residual is declared in `cmd_add` (the pool-level lock it defers) and is NOT pinned here —
+#   do not read this fixture as "the concurrent-add race is closed".
+echo "── the ceiling is re-read after the claim (a competitor COMPLETED during the mint) ──"
 fresh_pool lateclaim; reset_logs
 register pi-runner-c1; register pi-runner-c2      # slots=2, ceiling=3
 out="$(FIXTURE_GH_LATE_REGISTER=pi-runner-c3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-c4)"
