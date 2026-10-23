@@ -69,7 +69,10 @@
 # Fail-closed, and the reading travels with the verdict: when the index cannot be
 # read (no git, or $ROOT is not the work-tree toplevel) the gate FAILS rather
 # than falling back to the filesystem scan — a fallback would reinstate exactly
-# this bug, silently. resolve_path canonicalizes BOTH sides of the toplevel
+# this bug, silently. A tracked path under extensions/ that CONTAINS A NEWLINE is
+# refused for the same reason: the top-level name is derived line-wise, so such a
+# path would be silently truncated (and could even collide with another name) —
+# better to refuse than to mis-name. resolve_path canonicalizes BOTH sides of the toplevel
 # comparison because git resolves symlinks and $ROOT does not (on macOS
 # /tmp -> /private/tmp). Untracked extension-shaped paths are named in a ⏭️ line
 # instead of being silently ignored, so no reader has to infer what was gated.
@@ -125,7 +128,9 @@ done
 
 # --- tracked set: what CAN ship (see TRACKED, NOT PRESENT in the header) ----
 # TRACKED_EXTENSIONS = top-level names under extensions/ that git tracks, one per
-# line. Empty is a valid answer (a tree with nothing tracked ships nothing).
+# line. Empty is a valid answer for a tree with nothing tracked AND nothing
+# extension-shaped on disk; the vacuity floor below refuses the other empty case
+# (disk shows extensions, the index names none of them).
 TRACKED_EXTENSIONS=""
 index_ok=0
 if ! command -v git >/dev/null 2>&1; then
@@ -140,6 +145,18 @@ else
     # Fail-closed: a filesystem fallback here would reinstate #2425 silently, and
     # enumerating a nested dir's index would answer about the WRONG tree.
     echo "❌ cannot read the git index for $ROOT (not a git work tree, or not its toplevel) — checks 3/4a ask which extensions GIT TRACKS, so their answer would be a guess; refusing to guess"
+    FAILURES=$((FAILURES + 1))
+  elif ! nl_bytes="$(git -C "$ROOT" ls-files -z -- extensions 2>/dev/null | tr -cd '\n' | wc -c)"; then
+    echo "❌ git ls-files failed under $ROOT — checks 3/4a cannot establish which extensions are tracked; refusing to guess"
+    FAILURES=$((FAILURES + 1))
+  elif [ "$(printf '%s' "$nl_bytes" | tr -d '[:space:]')" != "0" ]; then
+    # Newline guard: the top-level name is derived LINE-WISE below, so a tracked
+    # path containing LF would be truncated to a prefix — and because `grep -F`
+    # treats an LF-bearing pattern as several patterns, the empty/prefix name
+    # could even match another entry and hide the directory from the ⏭️ line.
+    # Refuse rather than mis-name it (measured: extensions/ext<LF>ing/index.ts,
+    # tracked, unwired and unlisted, passed the gate silently).
+    echo "❌ a tracked path under extensions/ contains a newline — checks 3/4a derive the extension name line-wise, so the tracked set cannot be represented; refusing to mis-name it"
     FAILURES=$((FAILURES + 1))
   elif TRACKED_EXTENSIONS="$(git -C "$ROOT" ls-files -z -- extensions 2>/dev/null \
       | tr '\0' '\n' | sed -n 's|^extensions/\([^/]*\).*|\1|p' | sort -u)"; then
@@ -194,8 +211,12 @@ if [ "$index_ok" -eq 1 ]; then
       *.test.ts) continue ;;   # test files are not extensions; not shipped
     esac
     # Tracked but absent from the worktree means the index and disk disagree (an
-    # unstaged `rm`); there is nothing to wire, and a farm link to it is caught by
-    # check 2 as unresolvable.
+    # unstaged `rm`): there is nothing to wire, and demanding a manifest row for a
+    # path that is not on disk would report drift that cannot ship. A farm link
+    # that still points here is NOT this loop's business — check 2 compares the
+    # link's resolved target NAME (realpath returns a path even when only the
+    # final component is missing, so it can pass), and check 5 is the liveness arm
+    # on a machine where the farm is materialized.
     [ -e "$DST/$base" ] || continue
     if [ ! -L "$SRC/$base" ]; then
       echo "❌ tracked extension $base exists in extensions/ (git tracks it) but is not wired into pi-config/extensions (fresh machines won't get it)"

@@ -34,6 +34,13 @@
 #      (vacuity floor: if the index names none of the extension-shaped paths
 #      that exist on disk, the READING is wrong — checks 3/4a would otherwise
 #      pass vacuously forever, the "check that cannot fail" class)
+#  17. a tree that is a SUBDIRECTORY of a git repo (not its toplevel)  → BLOCK
+#      (the second fail-closed branch: enumerating the OUTER repo's index would
+#      answer about the wrong tree)
+#  18. a TRACKED path whose name contains a newline                    → BLOCK
+#      (the name is derived line-wise, so such a path would be silently
+#      truncated — and an LF-bearing `grep -F` pattern can match another entry,
+#      hiding the directory from the ⏭️ line; refuse instead of mis-name)
 #
 # Fixture trees mirror the real farm: relative symlinks ../../../extensions/<e>
 # from pi-bootstrap/pi-config/extensions/ into extensions/, plus a manifest.json
@@ -85,7 +92,7 @@ write_manifest() {
 # mode: clean | copy | retarget | broken | unwired | manifest-missing |
 #       manifest-stale | no-manifest | bad-manifest | live-healthy |
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
-#       all-untracked
+#       all-untracked | nested-git | newline-name
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -93,6 +100,9 @@ build_farm() {
   local mode="$1"
   local TMP
   TMP="$(mktemp -d /tmp/pi-config-ext-fixture.XXXXXX)"
+  # The gate copy run_gate executes. `nested-git` moves the whole tree under
+  # $TMP/inner (so ROOT is a subdirectory of a repo), and points this at it.
+  FIXTURE_GATE="$TMP/scripts/check-pi-config-extensions.sh"
   mkdir -p "$TMP/scripts" "$TMP/extensions" "$TMP/pi-bootstrap/pi-config/extensions"
   cp "$GUARD" "$TMP/scripts/check-pi-config-extensions.sh"
 
@@ -137,6 +147,17 @@ build_farm() {
               : > "$TMP/extensions/f/node_modules/foo/package.json"
               printf 'node_modules/\n' > "$TMP/.gitignore" ;;
     no-git)   ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;   # index unreadable on purpose
+    # #2425 review — ROOT is a SUBDIRECTORY of a repo, not its toplevel: the
+    # second fail-closed branch (enumerating the outer index answers about the
+    # wrong tree). Relocated into $TMP/inner after the git block below.
+    nested-git) ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;
+    # #2425 review — a TRACKED extension whose NAME contains a newline. The
+    # top-level name is derived line-wise, so this path would truncate to `ext`
+    # and (via grep -F's multi-pattern reading) could even collide with a real
+    # entry, hiding it from the ⏭️ line. Must refuse, never mis-name.
+    newline-name) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+              mkdir -p "$TMP/extensions/ext"$'\n'"ing"
+              : > "$TMP/extensions/ext"$'\n'"ing/index.ts" ;;
   esac
 
   # manifest.json rows: tree extensions a.ts + d/ always present; b.ts unless
@@ -185,7 +206,20 @@ build_farm() {
     if [ -f "$TMP/.gitignore" ]; then git -C "$TMP" add -- .gitignore || return 1; fi
   fi
 
-  echo "$TMP"
+  # #2425 review — the nested-repo shape: the repo toplevel is $TMP but the gate's
+  # ROOT is $TMP/inner, so the index it can reach describes a DIFFERENT tree.
+  # Relocate the whole fixture tree (the gate derives ROOT from its own path).
+  if [ "$mode" = "nested-git" ]; then
+    mkdir -p "$TMP/inner"
+    mv "$TMP/scripts" "$TMP/extensions" "$TMP/pi-bootstrap" "$TMP/inner/" || return 1
+    if [ -f "$TMP/manifest.json" ]; then mv "$TMP/manifest.json" "$TMP/inner/" || return 1; fi
+    FIXTURE_GATE="$TMP/inner/scripts/check-pi-config-extensions.sh"
+  fi
+
+  # build_farm must NOT run in a command substitution: it sets FIXTURE_GATE
+  # (nested-git relocates the tree), and a subshell would drop that assignment.
+  FIXTURE_TMP="$TMP"
+  return 0
 }
 
 # run_gate <expected-exit> <label> <mode> [grep-for]... — each grep-for must
@@ -195,11 +229,12 @@ run_gate() {
   local label="$1"; shift
   local mode="$1"; shift
   local TMP
-  TMP="$(build_farm "$mode")"
+  build_farm "$mode" || { fail "$label — fixture build failed ($mode)"; return; }
+  TMP="$FIXTURE_TMP"
   # Check 5 is aimed at the fixture dir in every case (see the suite header), so
   # the verdict is hermetic and the real ~/.pi never participates.
   export PI_EXTENSIONS_DIR="$TMP/live-extensions"
-  bash "$TMP/scripts/check-pi-config-extensions.sh" >"$OUT" 2>&1
+  bash "${FIXTURE_GATE:-$TMP/scripts/check-pi-config-extensions.sh}" >"$OUT" 2>&1
   local code=$?
   if [ "$code" -eq "$expected" ]; then
     pass "$label (exit $code)"
@@ -289,6 +324,14 @@ run_gate 1 "unreadable index" no-git "cannot read the git index"
 echo ""
 echo "16. #2425 vacuity floor — a repo whose extensions/ are ALL unindexed cannot pass vacuously"
 run_gate 1 "empty tracked set over a populated tree" all-untracked "tracks NO extension under extensions/"
+
+echo ""
+echo "17. #2425 review — ROOT inside a repo but not its toplevel: refuse (never read the outer index)"
+run_gate 1 "nested tree inside another repo" nested-git "cannot read the git index"
+
+echo ""
+echo "18. #2425 review — a TRACKED path whose name contains a newline: refuse, never mis-name"
+run_gate 1 "tracked newline name" newline-name "contains a newline"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
