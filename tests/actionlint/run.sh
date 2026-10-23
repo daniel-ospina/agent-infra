@@ -168,7 +168,7 @@ root, out = sys.argv[1], sys.argv[2]
 pats = (".github/workflows/*.yml", ".github/workflows/*.yaml",
         "templates/.github/workflows/*.yml", "templates/.github/workflows/*.yaml",
         ".github/actions/**/action.yml", ".github/actions/**/action.yaml",
-        "tests/fixtures/actionlint/**/action.yml")
+        "tests/fixtures/actionlint/**/action.yml", "tests/fixtures/actionlint/**/action.yaml")
 found = []
 skipped = []
 for pat in pats:
@@ -210,7 +210,7 @@ root, out = ARGV
 pats = ['.github/workflows/*.yml', '.github/workflows/*.yaml',
         'templates/.github/workflows/*.yml', 'templates/.github/workflows/*.yaml',
         '.github/actions/**/action.yml', '.github/actions/**/action.yaml',
-        'tests/fixtures/actionlint/**/action.yml']
+        'tests/fixtures/actionlint/**/action.yml', 'tests/fixtures/actionlint/**/action.yaml']
 found = []
 skipped = []
 pats.each do |pat|
@@ -262,19 +262,26 @@ const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const bodies = data.bodies || [];
 const skipped = data.skipped || [];
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-// `actions/github-script` compiles the body with `new AsyncFunction(...Object.keys(args), src)`,
-// where args is this exact set (src/main.ts). Compiling with NO parameters is NOT equivalent:
-// a body that redeclares one of them (`const core = 1;`) is legal here and a SyntaxError in
-// the action — the body would die in production while this check stayed green, which is the
-// fail-open it exists to prevent. Pinned by a control that exercises EVERY name below.
-// ...and the expected set is declared a SECOND time on purpose. Driving the control off the
-// working constant alone is self-referential: dropping a name from it also drops that name's
-// control, so all ten removals would stay green (measured). The two lists must agree, so a
-// removal changes the comparison and fails here.
+// `actions/github-script` compiles the body with `new AsyncFunction(...Object.keys(args), src)`.
+// Compiling with NO parameters is NOT equivalent: a body that redeclares one of them
+// (`const core = 1;`) is legal here and a SyntaxError in the action — the body would die in
+// production while this check stayed green, which is the fail-open it exists to prevent.
+//
+// SNAPSHOT, not a live oracle: this is the argument set of `actions/github-script@v7`
+// (v7.1.0, 9 names — `src/main.ts` -> `callAsyncFunction({...})`). RE-DERIVE IT from that
+// object when the action's major is bumped: the set moved inside v7 already (v7.0.1 passes 8,
+// with no `octokit`), and a name ADDED by a floating `@v7` patch bump would otherwise be
+// missing here — the one direction that is a fail-open. A name that is not really a parameter
+// is the opposite (a false block), so do not pad the list.
 const GH_SCRIPT_PARAMS = ['require', '__original_require__', 'github', 'octokit',
-  'getOctokit', 'context', 'core', 'exec', 'glob', 'io'];
+  'context', 'core', 'exec', 'glob', 'io'];
+// The expected set is declared a SECOND time on purpose. Driving the control off the working
+// list alone is self-referential: dropping a name from it also drops that name's control, so
+// every removal stayed green (measured). The two lists must agree, so removing a name from
+// EITHER ONE alone fails here. Stated limit: removing the same name from BOTH lists is not
+// detected — that is what the re-derivation note above is for.
 const GH_SCRIPT_PARAMS_EXPECTED = ['require', '__original_require__', 'github', 'octokit',
-  'getOctokit', 'context', 'core', 'exec', 'glob', 'io'];
+  'context', 'core', 'exec', 'glob', 'io'];
 
 // The inspector. The control below runs THIS, not a re-implementation of its predicate —
 // an earlier version re-tested String.includes on literals built from the same constant,
@@ -321,13 +328,13 @@ if (syntaxProblems.length !== 1 || !/does not compile/.test(syntaxProblems[0])) 
   process.exit(4);
 }
 
-// ...and the compile must use github-script's PARAMETER LIST, not an empty argument list.
-// This body is legal with no parameters and a SyntaxError with them, so it goes green iff the
-// parameter list is dropped — the case where the check would certify a body that cannot run.
-// EVERY element is load-bearing. A single hand-written probe pins one name, and the other
-// nine can then be dropped from the list with the suite still green — a body redeclaring one
-// of those would compile here and be a SyntaxError in the action. Driving the control from
-// the constant means removing ANY name fails here.
+// ...and the compile must use github-script's PARAMETER LIST, not an empty argument list:
+// `const <name> = 0;` is legal with no parameters and a SyntaxError with them, so it goes
+// green iff the parameter list is dropped — the case where the check would certify a body
+// that cannot run.
+// EVERY name is exercised. A single hand-written probe pins one name and leaves the rest free
+// to be dropped, so the loop walks GH_SCRIPT_PARAMS_EXPECTED; with the drift comparison above,
+// removing a name from either list alone fails here.
 const canon = (a) => a.slice().sort().join(',');
 if (canon(GH_SCRIPT_PARAMS) !== canon(GH_SCRIPT_PARAMS_EXPECTED)) {
   console.log(`      control: the parameter list drifted from actions/github-script's — ` +
