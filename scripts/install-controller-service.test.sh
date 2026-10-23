@@ -129,12 +129,16 @@ case "\${1:-}" in
     [ -f "\$S/mainpid" ] || printf '4242\n' > "\$S/mainpid"
     # ⛔ THE INSTALL VERDICT WAITS FOR PROOF OF A *CONTROLLER*, NOT A PROCESS (review P1, #2402): the process
     # doing cmd_check IS the MainPID until it refuses. The real loop proves itself by taking \$O/.orch.lock
-    # and by writing a heartbeat after its first cycle; the stub models the second, and SC_PROOF=none models a
-    # start that stays up doing nothing (the arm that must be refused).
-    if [ "\${SC_PROOF:-heartbeat}" != none ]; then
-      mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
-      date +%s > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true
-    fi
+    # and by writing a heartbeat after its first cycle; the stub models the second, SC_PROOF=none models a
+    # start that stays up doing nothing (the arm that must be refused), and SC_PROOF=stale models a
+    # heartbeat left behind by a controller that died BEFORE this start (the arm the binding exists for).
+    case "\${SC_PROOF:-heartbeat}" in
+      none)  : ;;
+      stale) mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
+             printf '%s\n' "\$(( \$(date +%s) - 100 ))" > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true ;;
+      *)     mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
+             date +%s > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true ;;
+    esac
     exit 0 ;;
   stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
   status)     printf 'stub: %s\n' "\$*"; exit 3 ;;
@@ -873,6 +877,32 @@ HP_RC=0; HP_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst hp --install 2>
 case "$HP_OUT" in
   *'NO CONTROLLER PROVED ITSELF'*) ok 'install: the refusal names what was missing (the lock, or a heartbeat)' ;;
   *) bad "install: refused without naming the missing proof — $HP_OUT" ;;
+esac
+
+# ⛔ A HEARTBEAT LEFT BY A CONTROLLER THAT DIED BEFORE THIS START IS NOT PROOF (review P1, #2402). `start` is
+# a no-op on an already-running unit and a dead controller's heartbeat stays on disk for up to 2·CYC, so the
+# unbound read certified a unit whose start produced nothing and printed a pid for a controller that was not
+# there. This arm models exactly that: the stub writes a heartbeat 100 s in the past and no lock owner.
+say_case 'install refuses a heartbeat left by a controller that predates its own start'
+HS="$(arm_root hs)"; mk_systemctl "$HS/bin" "$HS/state" "$HS/sc.log"
+HS_RC=0; HS_OUT="$(SC_PROOF=stale CONTROLLER_PROOF_TIMEOUT=4 inst hs --install 2>&1)" || HS_RC=$?
+[ "$HS_RC" -ne 0 ] && ok 'install: a PRE-START heartbeat does not certify the install' \
+                   || bad "install: certified a unit from a heartbeat that predates its start — $HS_OUT"
+
+# ⛔ MainPID 0 WITH A *FRESH* HEARTBEAT IS STILL NOT A CONTROLLER (review P1, #2402). `is-active` reports
+# `activating` during a RestartSec wait, and a loop that ticked 10 s ago then died leaves a readable fresh
+# heartbeat; `--status` returned 0 and printed main_pid=0 — the state the doc says it refuses.
+say_case 'status refuses MainPID 0 even when the heartbeat is fresh'
+HM="$(arm_root hm)"; mk_systemctl "$HM/bin" "$HM/state" "$HM/sc.log"
+: > "$HM/units/eldato-orchestrator.service"; : > "$HM/state/enabled"; : > "$HM/state/active"
+rm -f "$HM/state/mainpid"                                   # the stub answers MainPID=0
+mkdir -p "$HM/o"; date +%s > "$HM/o/heartbeat"              # …with a FRESH heartbeat
+HM_RC=0; HM_OUT="$(inst hm --status 2>&1)" || HM_RC=$?
+[ "$HM_RC" -ne 0 ] && ok 'status: MainPID 0 with a FRESH heartbeat is not green' \
+                   || bad "status: reported a unit with no controller process as healthy — $HM_OUT"
+case "$HM_OUT" in
+  *'MainPID 0'*) ok 'status: the refusal names MainPID 0' ;;
+  *) bad "status: failed without naming MainPID 0 — $HM_OUT" ;;
 esac
 
 # ── never arm a second supervisor in the OTHER scope (review P2, #2402) ───────────────────────────
