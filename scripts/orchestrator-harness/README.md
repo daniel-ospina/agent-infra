@@ -564,9 +564,10 @@ Notes worth keeping:
   merged output. Retries are announced in `$GH_LIMIT_DIR/events.log`; only a FINAL failure writes to
   stderr.
 * **A limited box says so**: `$GH_LIMIT_DIR/last-limit` is printed by `orch-loop.sh`'s cycle line as
-  `gh=rate_limited(bucket=graphql reset=<epoch> <age>)`, age-bounded to 15 minutes so a past limit
-  cannot pass as a current one — and as `gh=recovered(bucket=… <age>)` once a later call succeeded,
-  because a record is not a state. The failure text carries the words "rate limit", which is the
+  `gh=rate_limited(bucket=graphql reset=<epoch> until=<epoch> <age>)`, age-bounded to 15 minutes so a
+  past limit cannot pass as a current one — and as `gh=recovered(bucket=… <age>)` once a later call
+  succeeded, because a record is not a state. `until=` is the window the box honours; `reset=` is the
+  bucket's own. The failure text carries the words "rate limit", which is the
   phrase `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
 * **The waits belong to the call sites that can afford them.** `GH_LIMIT_NO_WAIT=1` makes the layer
   record the limit and return at once (and bounds the LOCK wait to `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s, so
@@ -2881,11 +2882,35 @@ declaration, its argv, and the dispatcher's closed vocabulary).
 scripts that do the work; `prfix` arrives in an argv a **lane can type** (`bash $O/nonblocking-dispatch.sh
 … 300 prfix`), so exempting it on the caller's word was a one-argument bypass — reproduced in review
 cycle 4: a worker started on a repo 5.4× over its ceiling. The gate now proves it from GitHub: an OPEN
-PR must be **this worktree**, either because the branch it has checked out is that PR's head ref, or
-(because a fork PR's worktree is a detached `refs/pull/<n>/head`) because its HEAD commit is the PR's
-head. Neither is available to a creation worker — its HEAD is a commit no PR owns yet. Unprovable (no
-such PR, or the read failed) → **HELD**, with a refusal that says the claim could not be proven rather
-than reporting a backlog reading.
+PR must be **this worktree**, by one of two rules, and the exemption line names the PR it proved —
+
+- the **branch** rule: the PR whose head ref is this worktree's checked-out branch, **and** whose
+  `headRefOid` IS this worktree's `HEAD` (a branch NAME alone is satisfiable by a stale local branch or
+  by a name that collides with some other PR's head, so it is not accepted on its own);
+- the **commit** rule: the base repo's PAGED open-PR listing holds an OPEN PR whose `head.sha` is this
+  worktree's `HEAD` — the only rule that can answer for a FORK PR, whose worktree is a detached
+  `refs/pull/<n>/head`. Two shapes are rejected on measurement, not taste: `gh api
+  repos/<r>/commits/<sha>/pulls` (cycle 6) answers `[]` for a fork head — a fork PR's commit lives in the
+  FORK's network, so the base repo cannot see it: 12 of 12 measured fork PRs (cli/cli, pydantic,
+  home-assistant, vscode) were invisible to it and visible to the listing, which would have made every
+  fork repair unprovable and therefore held on exactly the deep repos this gate exists for. And a bare
+  `pr list` (cycle 5) is newest-first with a silently truncating `--limit`, so an older PR would be
+  unprovable — permanently held — as the backlog deepens. The listing is paged (5 × 100) and a page that
+  comes back exactly full is walked rather than read as “no match”.
+
+Unprovable is **not** a hold by itself: the claim falls through to the ordinary measurement, so under
+the ceiling it runs (nothing is being exempted from anything), over the ceiling the real backlog reason
+is reported, and a P0-blocker / base-red issue keeps its documented precedence. The log says `NOTE … not
+provably an OPEN PR`, never "unprovable, so refused" — a proof failure must not halt the drain on a
+healthy repo.
+
+⚠️ **THE NAMED RESIDUAL, BECAUSE THE EVIDENCE DOES NOT MEAN WHAT IT IS TEMPTING TO CLAIM.** These rules
+prove *"this worktree is an open PR"*, not *"this work is repair"*. A lane standing in a worktree that
+IS an open PR can still spawn arbitrary work there with `prfix`, and the gate will not see it. That is
+accepted rather than closed: the alternative is an ambient switch or a caller-set flag, which is exactly
+what review cycle 4 found opening this gate, and the gate's job is back-pressure on the fleet's DEFAULT
+behaviour, not a security boundary against a lane that already owns a PR. What the rules do close is the
+case that was measured — a lane with no PR at all naming itself `prfix` to skip the gate.
 
 ⚠️ **AND A STALE `$O` COPY WOULD SILENTLY UNDO THE EXEMPTION**, so `pr-doctor` refuses its whole pass
 when the deployed dispatcher predates the kind argument (it would ignore the extra argv and spawn every
@@ -3160,7 +3185,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
-| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. **Plus #2243's coalescing**: 5 identical concurrent reads ⇒ 1 load (byte-identical bodies carrying the first call's answer), 5 different reads ⇒ 5 loads still serialised, a failing leader's error reaching every follower (none seeing success), 2 concurrent mutations ⇒ 2 loads, a waiter past the bound getting `busy` (75) with the holder's age, a stale answer served during a refresh carrying its age, and a dead leader's key taken over with no orphan claim. Fake clock, stub gh, hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. **Plus #2243's coalescing**: 5 identical concurrent reads ⇒ 1 load (byte-identical bodies carrying the first call's answer), 5 different reads ⇒ 5 loads still serialised, a failing leader's error reaching every follower (none seeing success), 2 concurrent mutations ⇒ 2 loads, a waiter past the bound getting `busy` (75) with the holder's age, a stale answer served during a refresh carrying its age, and a dead leader's key taken over with no orphan claim. #2137 ACCOUNT scope: the share is the account budget ÷ declared fleet (N=1,2,4), enforced on the wire; an `unclassified` refusal is classified, waits the ≥60s curve and records a ~60 s window instead of the 43-minute reset; a stale marker is revalidated with one exempt `/rate_limit` read, cleared and annotated; a marker older than the window it recorded (or than `MARKER_MAX_AGE`) blocks nothing and spends no probe; a genuinely exhausted bucket still waits for its reset. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
