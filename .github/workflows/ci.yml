@@ -932,15 +932,19 @@ jobs:
     # that runs nothing, or a neighbour's shards twice, fails its own assertion rather than
     # reporting a green check over a hole.
     runs-on: ubuntu-latest
-    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Derived from the
-    # CI-MEASURED numbers on PR #2412 (job 120365087427), not a guess: the shard step ran 74 shards
-    # in 73.6 min = 59.7 s/shard mean, and the worst single shard is `tests/admin-merge/run.sh` at
-    # ~10.2 min (it waits out a real 600 s stall-detection window by design). With 8 round-robin
-    # slices (sizes 10,10,9,9,9,9,9,9) the mean slice is 9.2 min and the slice that draws
-    # admin-merge is ~19.2 min. 45 min = 2.4x that p100 slice — enough for CI variance and a cold
-    # cache, and it still fails fast against a hang (the defect this bound exists for: the job sat
-    # unbounded for 1h52m).
-    timeout-minutes: 45
+    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
+    # measurements (PR #2412 job 120365087427: 74 shards in 73.6 min, 59.7 s/shard mean; #2483's
+    # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
+    # other 70 shards 26m25s).
+    #
+    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
+    # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
+    # the log cannot see it), so with 8 round-robin slices the worst slice is ≈ 33 min + its 9
+    # siblings ≈ 37 min, and no wider matrix goes below 33. 75 min = ~2.0x that slice: enough for
+    # runner variance, and it still fails fast against the unbounded 1h52m this job shipped with.
+    # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
+    # of shard work) and nothing can make it shorter.
+    timeout-minutes: 75
     strategy:
       # false: every slice reports its own result, so one hang cannot hide the other slices'
       # verdicts — the diagnostic this job lacked, since a single step reported nothing until
