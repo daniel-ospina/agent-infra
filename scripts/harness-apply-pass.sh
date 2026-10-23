@@ -157,7 +157,14 @@ done
 
 CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 O="${O:-$CELL_HOME/orchestrator}"
-REF="${HARNESS_REF:-origin/main}"
+# ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit
+# and launchd plist export `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` (they are the INSTALLER's seams);
+# this file used to read only `HARNESS_REPO` / `HARNESS_REF`, so under the scheduler — where there is no
+# AGENT_INFRA_PATH and the farmed copy has no checkout beside it — the pass could not resolve a repo at
+# all: every tick exited 23, the pin never moved, and the box simply reddened while `list-timers` called
+# it scheduled. Measured in review, with `env -i` and the unit's exact environment. The direct-run names
+# stay first so an operator's `HARNESS_REPO=… bash harness-apply-pass.sh` keeps working.
+REF="${HARNESS_REF:-${HARNESS_APPLY_REF:-origin/main}}"
 FETCH="${HARNESS_FETCH:-1}"
 PIN_SHA_FILE="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
 PIN_PATH_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
@@ -175,12 +182,17 @@ LOG="$STATE_DIR/harness-apply.log"
 main_worktree() {
     git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'
 }
-REPO="${HARNESS_REPO:-}"
+REPO="${HARNESS_REPO:-${HARNESS_APPLY_REPO:-}}"
 if [ -z "$REPO" ]; then
     for cand in "${AGENT_INFRA_PATH:-}" "$(dirname "$HERE")" "$HERE"; do
         [ -n "$cand" ] && [ -d "$cand" ] || continue
-        cand="$(main_worktree "$cand")"
-        [ -n "$cand" ] && { REPO="$cand"; break; }
+        # `rev-parse --git-dir` is the test that this IS a checkout; the worktree listing only prefers
+        # the main one. A listing that cannot be read must not turn a confirmed checkout into "no
+        # checkout" (the same rule the installer and cloud-cell-bringup apply).
+        git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+        _main="$(main_worktree "$cand")"
+        REPO="${_main:-$cand}"
+        break
     done
 fi
 
@@ -332,16 +344,58 @@ relation_of() { # <sha>
 relation_of "$HEAD_SHA"
 RELATION="$R_REL"; BEHIND="$R_BEHIND"; AHEAD="$R_AHEAD"
 
+# ── the dirty path list, NUL-SAFE ──────────────────────────────────────────────────────────────
+# ⛔ `git status --porcelain | cut -c4-` IS NOT A PATH LIST, and using it as one lost work silently:
+#   · a RENAME prints `R  old -> new` — the "path" is that whole sentence, so neither side is in HEAD
+#     (it was reported as "skipped"), the rename stayed staged, the destination was never copied as
+#     untracked, and the pass still printed an `advanced` verdict;
+#   · a path with a space (or any non-ASCII name, under `core.quotePath`) is C-QUOTED, so
+#     `cat-file HEAD:"has space.txt"` fails and the file is simply not restored — while the MANIFEST
+#     records the quotes, which is useless for recovery.
+# `-z` is the machine format: NUL-separated, never quoted, and a rename/Copy record is followed by its
+# ORIGINAL path as one more NUL field, which this consumes so the destination is what is returned.
+list_dirty_paths() { # stdout: one path per NUL; a rename/copy yields BOTH sides
+    local entry st p old
+    git -C "$REPO" status --porcelain -z 2>/dev/null | {
+        while IFS= read -r -d '' entry; do
+            st="${entry:0:2}"
+            p="${entry:3}"
+            case "$st" in
+                R*|C*)
+                    # ⛔ BOTH SIDES, AND THAT IS NOT REDUNDANT. The DESTINATION is what the tree now
+                    # holds (so it is what must be preserved and copied), but the ORIGINAL is the path
+                    # that exists in HEAD and is now MISSING from the worktree — restore only the
+                    # destination and the tree never converges: HEAD's file stays deleted, the
+                    # destination stays an unindexed addition, and the next upstream commit to the old
+                    # path makes the fast-forward refuse for ever.
+                    IFS= read -r -d '' old || true
+                    [ -n "$p" ] && printf '%s\0' "$p"
+                    [ -n "${old:-}" ] && printf '%s\0' "$old"
+                    continue ;;
+            esac
+            [ -n "$p" ] && printf '%s\0' "$p"
+        done
+    }
+}
+list_untracked_paths() { # stdout: one path per NUL
+    local p
+    git -C "$REPO" ls-files --others --exclude-standard -z 2>/dev/null | {
+        while IFS= read -r -d '' p; do [ -n "$p" ] && printf '%s\0' "$p"; done
+    }
+}
+
 # The dirty count, read from the tree this pass will actually MOVE. On the pin path a dirty checkout
 # is harmless BY CONSTRUCTION (the advance creates a NEW per-commit worktree, and `apply` re-pins
 # rather than reusing a dirty tree) — so it is printed and not acted on. On the sync path it is the
 # thing that must be preserved.
-DIRTY_LIST="$(git -C "$REPO" status --porcelain 2>/dev/null)"
-DIRTY_RC=$?
-case "$DIRTY_RC" in
-    0) DIRTY_N="$(printf '%s\n' "$DIRTY_LIST" | awk 'NF' | wc -l | tr -d ' ')" ;;
-    *) DIRTY_N="unknown" ;;    # cannot-verify is never "clean"
-esac
+# ⛔ THE READ'S OWN EXIT STATUS IS PART OF THE READING. `git status … | wc -l` returns 0 entries for a
+# FAILED status (a corrupt index, a full disk — the very conditions this feature runs under), so the
+# record would claim `dirty=0` from a read that never happened. Same rule as the earlier pass-record
+# readers: cannot-verify is never "clean".
+DIRTY_N="unknown"
+if git -C "$REPO" status --porcelain >/dev/null 2>&1; then
+    DIRTY_N="$(list_dirty_paths | tr -cd '\0' | wc -c | tr -d ' ')"
+fi
 case "${DIRTY_N:-unknown}" in ''|*[!0-9]*) DIRTY_N=unknown ;; esac
 
 REC_HEAD="$(short "$HEAD_SHA")"; REC_REF="$(short "$REF_SHA")"
@@ -392,17 +446,17 @@ say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(shor
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
 # identical from a log, and an operator who reads `current` has to be able to see it WAS current.
-finish() { # <ok> <rc> <detail>
-    REC_DETAIL="$3"
-    # ⛔ THE RECORD IS RE-READ FROM THE FINAL STATE, never written from the readings taken before the
-    # move. A record carrying `head=<old> behind=1` next to `action=advanced` told the fleet instrument
-    # the box was STILL behind — the exact false alarm that makes an alarm wallpaper (measured in
-    # review: a cell would have been red for ever, and a Mac green pass would have alarmed).
-    # `deployed=` is the commit the box RUNS: the pin tree on the pin path (where the checkout is never
-    # moved by design), the checkout on the sync path. `behind=` is about that commit.
+finish() { # <ok> <rc> <verdict-phrase>
+    # ⛔ THE READINGS ARE RE-READ FROM THE FINAL STATE, AND SO IS THE SENTENCE. Taking the readings
+    # before the move told the fleet instrument the box was STILL behind on the pass that fixed it
+    # (permanently so on a pin cell, where the checkout is never moved), and expanding `$REC_BEHIND`
+    # inside the VERDICT PHRASE kept the stale number in `detail=` — the field `fleet-health` prints and
+    # `--print-status` dumps verbatim — while the record beside it said `behind=0`. So the phrase is
+    # passed WITHOUT readings and the numbers are appended here, once, after the recompute.
     recompute_deployed
+    REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
     write_record "$1" "$2" || exit 23
-    if [ "$1" = 1 ]; then say "$3"; else err "${3:-pass failed}"; fi
+    if [ "$1" = 1 ]; then say "$REC_DETAIL"; else err "$REC_DETAIL"; fi
     exit "$2"
 }
 
@@ -424,7 +478,7 @@ fi
 # nothing reported it. `sync.sh` aborting is CORRECT — it must not discard work. What was missing is a
 # path that SAVES the work and then completes the advance, and a record that says so.
 preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save everything
-    local dest="$1" p n=0 paths
+    local dest="$1" p n=0
     mkdir -p "$dest" || { err "cannot create the preservation dir $dest"; return 1; }
     # The byte-exact record of every tracked change (staged and unstaged), then one line per path.
     if ! git -C "$REPO" diff --binary HEAD >"$dest/changes.patch" 2>/dev/null; then
@@ -432,28 +486,26 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         return 1
     fi
     : >"$dest/MANIFEST" || return 1
-    # ⛔ THE PATH LIST IS READ ONCE. Reading `git status` again after the restore would describe a
-    # tree that no longer has the changes, and a second read is a second answer to one question.
-    paths="$(git -C "$REPO" status --porcelain 2>/dev/null | cut -c4-)"
-    while IFS= read -r p; do
+    # ⛔ NUL-SAFE AND READ ONCE. `--porcelain` WITHOUT `-z` is the human rendering: quoted names and a
+    # `old -> new` sentence for a rename. Reading it as a path list lost work (see the header of
+    # `list_dirty_paths`), and reading it twice would describe two different trees.
+    while IFS= read -r -d '' p; do
         [ -n "$p" ] || continue
-        printf '%s\n' "$p" >>"$dest/MANIFEST" || return 1
+        # `%q` so a path with a space, quote or newline is still recoverable FROM the manifest; the
+        # destination of a rename is what is listed, because that is what the tree now holds.
+        printf '%q\n' "$p" >>"$dest/MANIFEST" || return 1
         say "preserved: $p -> $dest/changes.patch"
         n=$((n + 1))
-    done <<EOF
-$paths
-EOF
+    done < <(list_dirty_paths)
     # ⛔ UNTRACKED FILES ARE COPIED, not just named: a patch cannot carry them, and they are the
     # likeliest thing on a box to exist in no other place. A path that cannot be copied is a refusal.
-    while IFS= read -r p; do
+    while IFS= read -r -d '' p; do
         [ -n "$p" ] || continue
         case "$p" in /*) continue ;; esac
         mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || return 1
         cp -p "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || { err "cannot preserve untracked $p — refusing to touch the tree"; return 1; }
         say "preserved: $p -> $dest/untracked/$p"
-    done <<EOF
-$(git -C "$REPO" ls-files --others --exclude-standard 2>/dev/null)
-EOF
+    done < <(list_untracked_paths)
     # ── bring the tracked paths back to HEAD so a fast-forward is possible ──────────────────────
     # ⛔ THE TWO OBVIOUS WAYS ARE BOTH WRONG HERE, for different reasons. A branch switch is what this
     # repo blocks inside a cell's main checkout (cloud-cell-supervisor.sh's header records why). A
@@ -462,34 +514,51 @@ EOF
     # would land on the scheduled PASS as well as on the suite. The guard exists to stop an agent
     # discarding a SHARED checkout's work; this runs on the box's own deployment checkout under a
     # scheduler, and every affected byte is already at `$dest` under the names printed above.
-    # So the effect is produced one bounded step at a time, on the paths this pass already listed:
-    #   1. each tracked path is rewritten from the blob HEAD holds, so a path the merge is about to
-    #      modify matches HEAD and cannot block the fast-forward, then
-    #   2. `git add -u` re-stages ONLY tracked paths (never an untracked one), which makes the index
-    #      agree with HEAD for exactly those paths — no staged residue is left to block the merge.
+    # So the effect is produced one bounded step at a time, per path, on the list already read:
+    #   1. the WORKTREE entry is replaced from HEAD — content (via a temp file + rename), the executable
+    #      bit, or the symlink itself, whichever the mode says; and
+    #   2. the INDEX entry for that path is set to HEAD's own (mode, blob) — or REMOVED when the path is
+    #      not in HEAD (a staged addition), so no staged residue is left to block the merge.
     # Nothing is lost that was not first saved, and no untracked file is touched at all.
     #
     # ⛔ THE BLOB GOES TO A TEMP FILE IN THE SAME DIRECTORY AND IS RENAMED OVER THE PATH — never
     # redirected straight at it. `> "$REPO/$p"` FOLLOWS A SYMLINK and writes through it, so restoring a
     # dirty symlink would corrupt the CLEAN file it points at, destroy bytes that were (correctly) never
     # preserved, leave `$p` itself still wrong, and then print "tracked paths match HEAD". This repo
-    # tracks 34 symlinks (`pi-bootstrap/pi-config/extensions/*`), so that is a live shape, not a
-    # hypothetical. A rename REPLACES the directory entry, so a symlink is restored as a symlink.
-    local n_restored=0 n_skipped=0 tmp mode blob
-    while IFS= read -r p; do
+    # tracks 34 symlinks (`pi-bootstrap/pi-config/extensions/*`), so that is a live shape.
+    # ⛔ AND THE MODE IS PART OF THE CONTENT. A blob carries bytes only, so a file restored as 0644 that
+    # HEAD has as 100755 is a MODE CHANGE staged by any `git add` — the tree stays dirty, a later
+    # upstream commit to that path makes the fast-forward refuse for ever, and this repo tracks 207
+    # executable files (one of them is the very file the measured Mac defect was about).
+    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest
+    while IFS= read -r -d '' p; do
         [ -n "$p" ] || continue
         case "$p" in /*) n_skipped=$((n_skipped + 1)); continue ;; esac
-        # A path that is not in HEAD is UNTRACKED (or newly staged) — the untracked copy above owns it.
-        if ! git -C "$REPO" cat-file -e "HEAD:$p" 2>/dev/null; then n_skipped=$((n_skipped + 1)); continue; fi
-        mode="$(git -C "$REPO" ls-tree HEAD -- "$p" 2>/dev/null | awk 'NR==1 {print $1}')"
+        # `ls-tree HEAD -- <path>` prints `<mode> <type> <sha>\t<path>`; a path not in HEAD prints
+        # nothing. Fields 1 and 3 are what this needs, and they are positional even when the path is
+        # quoted or carries a tab.
+        # Captured whole, then read: a `git … | head -1` pipe lets the producer take SIGPIPE under
+        # `pipefail`, which reads as "no output" (the repo's #841/#864 class).
+        _info="$(git -C "$REPO" ls-tree HEAD -- "$p" 2>/dev/null)"
+        read -r mode _type sha _rest <<<"$_info"
+        if [ -z "${mode:-}" ] || [ -z "${sha:-}" ]; then
+            # NOT IN HEAD: a staged addition (or a file this pass is not the owner of). Unstage it if the
+            # index knows it, so the merge is not blocked by a change whose bytes are in the patch. The
+            # FILE is left in the worktree — it was copied as untracked above when it was untracked, and
+            # a staged addition's bytes are in `changes.patch`.
+            git -C "$REPO" update-index --force-remove -- "$p" >/dev/null 2>&1 || true
+            n_skipped=$((n_skipped + 1))
+            continue
+        fi
         case "$mode" in
             120000)
                 # ⛔ A SYMLINK IS RESTORED AS A SYMLINK. Writing its blob (which IS the target string) to
                 # the path would replace the link with a regular FILE holding that text — a type change
                 # `git status` reports as still dirty, and the merge then refuses to proceed.
-                blob="$(git -C "$REPO" cat-file blob "HEAD:$p" 2>/dev/null)" \
+                blob="$(git -C "$REPO" cat-file blob "$sha" 2>/dev/null)" \
                     || { err "cannot bring tracked path $p back to HEAD"; return 1; }
                 mkdir -p "$(dirname "$REPO/$p")" 2>/dev/null || { err "cannot bring tracked path $p back to HEAD"; return 1; }
+                rm -f "$REPO/$p" 2>/dev/null
                 ln -sfn "$blob" "$REPO/$p" 2>/dev/null || { err "cannot bring tracked path $p back to HEAD"; return 1; } ;;
             160000)
                 # A GITLINK (submodule) is not materialised here; it is left alone and counted as
@@ -501,19 +570,21 @@ EOF
                 # ⛔ REDIRECT THE BLOB, NEVER `printf '%s' "$blob"`. Command substitution strips every
                 # trailing newline, so the printf form silently rewrites any text file that ends with one
                 # — i.e. almost all of them — to a version that differs from HEAD.
-                git -C "$REPO" cat-file blob "HEAD:$p" >"$tmp" 2>/dev/null \
+                git -C "$REPO" cat-file blob "$sha" >"$tmp" 2>/dev/null \
                     || { rm -f "$tmp"; err "cannot bring tracked path $p back to HEAD"; return 1; }
+                if [ "$mode" = "100755" ]; then chmod 755 "$tmp" 2>/dev/null || true
+                else chmod 644 "$tmp" 2>/dev/null || true; fi
                 mv -f "$tmp" "$REPO/$p" 2>/dev/null || { rm -f "$tmp"; err "cannot bring tracked path $p back to HEAD"; return 1; } ;;
         esac
+        # INDEX := HEAD for this path. `update-index --cacheinfo` names the (mode, blob) pair explicitly,
+        # which is the only form that also carries the executable bit and the symlink mode.
+        git -C "$REPO" update-index --add --cacheinfo "$mode,$sha,$p" >/dev/null 2>&1 \
+            || { err "cannot move the index entry for $p back to HEAD"; return 1; }
         n_restored=$((n_restored + 1))
-    done <<EOF
-$paths
-EOF
-    git -C "$REPO" add -u >/dev/null 2>&1 || { err "cannot re-stage the tracked paths after preserving the changes"; return 1; }
+    done < <(list_dirty_paths)
     # ⛔ THE CLAIM IS COUNTED, NOT ASSUMED. The unconditional "tracked paths match HEAD" was printed
-    # even when a path had been skipped (`cat-file` could not resolve it, or it was never in HEAD) —
-    # a success line that outran the work it describes.
-    say "restored: $n_restored tracked path(s) brought back to HEAD${n_skipped:+ ($n_skipped skipped: untracked or not in HEAD)}; the hand edits above exist only in the preserved copies"
+    # even when a path had been skipped — a success line that outran the work it describes.
+    say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content)$( [ "$n_skipped" -gt 0 ] && printf ', %s skipped (not in HEAD or a gitlink)' "$n_skipped"); the hand edits above exist only in the preserved copies"
     say "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
     return 0
 }
@@ -652,16 +723,16 @@ case "$REC_ACTION" in
         # 11, the code `harness-refresh.sh` uses for the same event and the one this file's header and
         # the unit's SuccessExitStatus advertise. Folding it into 10 made the vocabulary a lie: a box
         # whose pin had been EMPTY was recorded as "advanced", and anything keyed on 11 was dead code.
-        finish 1 11 "mended: the pin was missing and now names $(short "${PIN_TREE_SHA:-}") (the tree this box runs); head=$(short "$HEAD_SHA") ref=$(short "$REF_SHA")" ;;
+        finish 1 11 "mended: the pin was missing and now names the tree this box runs" ;;
     advanced|pin-repaired)
-        finish 1 10 "$REC_ACTION: head=$(short "$HEAD_SHA") deployed=$REC_DEPLOYED ref=$(short "$REF_SHA") behind=$REC_BEHIND pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}" ;;
+        finish 1 10 "$REC_ACTION: the harness moved onto $REF" ;;
     none)
         # ⛔ CURRENT IS NOT ENOUGH ON ITS OWN. A pin that names the ref tip while the PATH record
         # points at an older tree is `restart-pending` at best and a lie at worst; say which.
         if [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && [ "$REC_PIN_TREE" != "$REC_PIN" ]; then
-            finish 0 25 "current for the checkout, but the pin ($REC_PIN) and the tree this box reads ($REC_PIN_TREE) disagree — harness-up reports this as restart-pending; nothing here restarts a live controller"
+            finish 0 25 "current for the checkout, but the PIN and the tree this box reads disagree — harness-up reports this as restart-pending, and nothing here restarts a live controller"
         fi
-        finish 1 0 "current: pin already names $REF ($(short "$REF_SHA")) — nothing changed (behind=0 ahead=0 dirty=$DIRTY_N)" ;;
+        finish 1 0 "current: the pin already names $REF — nothing changed" ;;
     *)
-        finish 1 0 "$REC_ACTION: behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N" ;;
+        finish 1 0 "$REC_ACTION" ;;
 esac

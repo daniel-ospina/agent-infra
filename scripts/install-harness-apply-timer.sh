@@ -339,8 +339,8 @@ resolve_launcher() {
     local cand
     PY_BIN="${ELDATO_LAUNCHER_PY:-}"
     if [ -z "$PY_BIN" ]; then
-        for cand in "${HARNESS_APPLY_REPO:-}/.venv/bin/python" "${AGENT_INFRA_PATH:-}/.venv/bin/python" \
-                    "${HOME:-}/.pi/agent/.venv/bin/python"; do
+        for cand in "${PASS_REPO:-}/.venv/bin/python" "${HARNESS_APPLY_REPO:-}/.venv/bin/python" \
+                    "${AGENT_INFRA_PATH:-}/.venv/bin/python" "${HOME:-}/.pi/agent/.venv/bin/python"; do
             [ -n "$cand" ] && [ -x "$cand" ] && { PY_BIN="$cand"; break; }
         done
     fi
@@ -496,8 +496,13 @@ do_install_launchd() {
     local tmpd changed=0 loaded=0
     [ -f "$src_plist" ] || { err "plist template missing: $src_plist (set LAUNCHD_TEMPLATES_DIR)"; return 1; }
     choose_target || { err "no scheduler available"; return 1; }
-    resolve_launcher || return 1
+    # ⛔ THE CHECKOUT IS RESOLVED FIRST (refuse_transient_target does it), because the interpreter this
+    # job must run is the CHECKOUT's own — TCC is per-binary. Probing for an interpreter before the repo
+    # existed meant the resolved checkout's `.venv/bin/python` was never a candidate, so a Mac whose
+    # repos live under ~/Documents installed a job that fails closed every ten minutes while
+    # `launchctl list` shows it healthy (the header says exactly that must not happen).
     refuse_transient_target || return 1
+    resolve_launcher || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_plist" "$tmpd/$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
@@ -594,6 +599,13 @@ do_status() {
             active|activating) ;;
             *) err "the timer is '${ACTIVE:-unknown}', not active — the harness will NOT be applied unattended"; return 1 ;;
         esac
+        # ⛔ THE SCHEDULER'S OWN LAST TRIGGER, WHICH IS THE ONLY WITNESS FOR "FIRED AND LEFT NO RECORD".
+        # Without it the systemd arm could not tell a fresh install (first tick pending) from a timer
+        # that has fired and whose pass refuses before it can write anything — and it certified the
+        # second as healthy, while `fleet-health.py` alarmed on the same state: two readers disagreeing
+        # about one record with the readiness gate the lenient one.
+        LAST_RUN="$($SC show -p LastTriggerUSec --value "$UNIT_NAME.timer" 2>/dev/null | tr -d '[:space:]')"
+        say "last_trigger=${LAST_RUN:-unknown}"
     fi
     # The PASS RECORD is the third leg: the scheduler can be armed while every pass fails. Its own
     # `--print-status` applies the staleness bound, so "the timer stopped firing" is an alarm and not
@@ -616,10 +628,23 @@ do_status() {
     # verb records, and for the same reason.
     case "$REC" in
         status=never*)
-            case "${LAST_RUN:-}" in
-                ''|-|0) say "  note=no pass has completed yet (the job runs one at its first tick)" ;;
-                unknown) say "  note=no pass record yet, and the scheduler's last run is unreadable" ;;
-                *) [ "$TARGET" = launchd ] && { err "the job last exited $LAST_RUN and no pass record exists — the pass is refusing before it can record anything"; return 1; } ;;
+            # ⛔ "NEVER" IS TWO DIFFERENT STATES, and conflating them is how a dead timer certifies a
+            # box: (a) the job has NOT FIRED YET — a fresh install, a note; (b) the job HAS fired and
+            # left no record — the pass is refusing before it can write one, a FAILURE. The scheduler's
+            # own last trigger answers which. Both platforms are judged, not just launchd.
+            case "$TARGET" in
+                launchd)
+                    case "${LAST_RUN:-}" in
+                        ''|-|0|unknown) say "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
+                        *) err "the job last exited ${LAST_RUN} and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
+                    esac ;;
+                *)
+                    # `systemctl show -p LastTriggerUSec --value` answers `n/a` when the timer has never
+                    # fired; `0`/`0s` is the same fact spelled as epoch zero (and is what a shim returns).
+                    case "${LAST_RUN:-}" in
+                        ''|n/a|unknown|0|0s|-*) say "  note=no pass has completed yet (the timer has not fired)" ;;
+                        *) err "the timer HAS fired (last trigger ${LAST_RUN}) and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
+                    esac ;;
             esac ;;
         *) [ "$REC_RC" -eq 0 ] || { err "the pass record is not healthy (see above)"; return 1; } ;;
     esac
