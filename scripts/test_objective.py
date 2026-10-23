@@ -1438,9 +1438,20 @@ def test_the_wedge_reason_is_BOUNDED_and_says_how_many_it_hid():
     # the same rows WITHOUT the cap exceed the budget this bound exists to protect
     uncapped = ",".join(f"{objective.evidence_name(n)} {st} {a:.0f}m" for n, st, a in rows)
     assert len(uncapped) > 3 * objective.WEDGE_REASON_MAX_CHARS, len(uncapped)
-    # FOUR OR FEWER: nothing is hidden, so nothing is claimed
+    # FOUR SHORT NAMES FIT THE BUDGET: nothing is hidden, so nothing is claimed. The CHAR
+    # budget can still hide names at or below MAX_NAMES -- see the long-name case below.
     four = objective.wedge_reason(rows[:4])
     assert "+0 more" not in four and "more" not in four, four
+    # ⛔ LONG NAMES: the CHAR budget (not the name cap) is what bites, and this arm needs its own
+    # pin (fresh review, P3): with the cap raised to 10**9 every assertion above still passed, so
+    # the second guard could be deleted without a test noticing. These two names are the shape a
+    # real matrix publishes -- the test fixture above (20-char `ctx-NN`) is the one shape where
+    # "four or fewer is never hidden" happens to hold.
+    long_names = [("python-ci-gate / validate / pytest (3.12, ubuntu-latest)", "in_progress", 150),
+                  ("legal-e2e / integration suite / cartola (desktop)", "in_progress", 140)]
+    budget = objective.wedge_reason(long_names)
+    assert len(budget) <= objective.WEDGE_REASON_MAX_CHARS, budget
+    assert budget.endswith(",+1 more"), budget
     # EMPTY is None, never an empty order
     assert objective.wedge_reason([]) is None
     # ORDER IS DETERMINISTIC: age descending, then name
