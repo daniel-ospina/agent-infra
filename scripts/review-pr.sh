@@ -713,18 +713,20 @@ SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 # ⚠️ AND THE EXEMPTION LIST IS DELIBERATELY NARROW — it is a closed grammar too, and widening it
 # is where a fail-open lives: an earlier shape returned "summary" on a separator WITHOUT re-reading
 # the count that follows, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole.
-# STATED RESIDUAL — stated at its TRUE width (P3 dogfood + P1 fresh review of #2288, which measured the
-# claim below asserting coverage the code did not have): a label that carries NO label noun in front of
-# it, NO slot separator right after it, and NO location AFTER it is prose to this scanner —
-# `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and `no cwd isolation — [P1]`
-# all pass (a location ANYWHERE catches an ADORNED token, but a BARE one needs the location after it).
-# What the prompt CONTRACTS to is a label carrying a location (`P1 in scripts/x.sh:12`,
-# `scripts/x.sh:12 — P1`) or a severity heading, and THOSE are caught, in both orders: the `loc` arm
-# below covers a location before a dash/comma/bracket, and `label()`'s location-AFTER arm covers a bare
-# token that names its own location. A bare token whose ONLY location PRECEDES it
-# (`scripts/x.sh:12 has a P1 that returns 0 early`) stays prose: telling it from the pinned clean twin
-# (`No findings at scripts/x.sh:12; severity P2 would be over-calling`) needs the sentence's MEANING,
-# not its shape, which is why that boundary is declared instead of patched again.
+# STATED RESIDUAL — stated at its TRUE width (P3 dogfood + TWO fresh reviews of #2288, which measured
+# the claim below asserting coverage the code did not have, twice): a label that carries NO label noun
+# in front of it, NO slot separator right after it, and NO location AFTER it is prose to this scanner
+# — `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and `no cwd isolation — [P1]`
+# all pass. What the prompt CONTRACTS to is a label carrying a `path:line` location
+# (`P1 in scripts/x.sh:12`, `P1: scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`, `scripts/x.sh:12 — P1`)
+# or a severity heading, and THOSE are caught, in both orders: the `loc` arm below covers a location
+# before a dash/comma/bracket, and `label()`'s direction arm covers a `path:line` ANYWHERE after a bare
+# token. Exactly two boundaries remain declared, both shape-indistinguishable from prose: a bare token
+# whose only `path:line` PRECEDES it (`scripts/x.sh:12 has a P1 that returns 0 early`), and a remainder
+# whose only `:<digits>` run carries no path character or whose location is prose
+# (`Found one P1 at 10:30 — …`, `P1 at line 12 of scripts/x.sh`). Telling the first from the pinned
+# clean twin (`No findings at scripts/x.sh:12; severity P2 would be over-calling`) needs the sentence's
+# MEANING, not its shape, which is why it is declared instead of patched again.
 # The suite pins that direction (`No findings at scripts/x.sh:12; severity P2 would be over-calling`
 # must not block), and the boundary between a mention and a label there is not lexical; four rounds
 # of regex are the evidence. A blocker in any LABEL shape — the conventions the PROMPT contracts to
@@ -783,13 +785,16 @@ function label(s,   a, b, pre, post) {
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1 }
-    # (c) A bare token that NAMES ITS LOCATION AFTER IT — `Found one P1 in scripts/x.sh:12`,
-    # `Finding P1 at scripts/x.sh:12`. Measured FAIL-OPEN (fresh review of #2288): both shapes
-    # exited 0 and minted a signed `clean` over a reported blocker, while the residual text claimed
-    # a location-bearing label was caught. Structural, and it leaves the pinned clean twin alone:
-    # `No findings at scripts/x.sh:12; severity P2 would be over-calling.` carries its only location
-    # BEFORE the token, so nothing location-bearing follows it.
-    else if (post ~ /^[[:space:]]*[][(`*_—–-]*[[:space:]]*(in|at|on)?[[:space:]]*[`*_]*[[:alnum:]_\/.-]+:[0-9]+/) { LS = a; LE = b; NOUN_CUE = 1 }
+    # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
+    # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
+    # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
+    # of #2288): the first arm listed the bridges it expected (`in|at|on` after a dash/bracket), so
+    # every other bridge recorded `clean` over a reported blocker ONE FORM OVER — the ratchet the
+    # `loc` arm above warns about. The remainder is a location iff it carries a
+    # `:<digits>` run whose token contains a PATH character (a letter, `_` or `/`), which also
+    # keeps a clock time or a ratio (`P1 at 10:30`, `3:1`) out of the label class. The pinned clean
+    # twin keeps its only location BEFORE the token, so nothing location-bearing follows it.
+    else if (post ~ /[[:alnum:]_.\/-]*[[:alpha:]_\/][[:alnum:]_.\/-]*:[0-9]+/) { LS = a; LE = b; NOUN_CUE = 1 }
   }
   return (LS > 0)
 }

@@ -54,9 +54,9 @@
 #      head B ("an old verdict reused at a new head"), so §G's refusal is the guard's doing
 #   §AG a blocking token the positional scan cannot see (a noun-prefixed `[P1]`), a hyphenated
 #      `Verdict: CLEAN-UP …` that is not a verdict, and the `### Verdict: CLEAN` heading form
-#   §AH a BARE P1/P2 that names its location AFTER it (`Found one P1 in scripts/x.sh:12`) still
-#      contradicts CLEAN — the shape that recorded clean over a reported blocker (#2288) — while a
-#      bare P3 and the pinned location-BEFORE clean twin stay non-blocking
+#   §AH a BARE P1/P2 that carries a `path:line` AFTER it still contradicts CLEAN — in EVERY bridge
+#      form (`in`/`at`/`:`/`,`/parenthetical/dash), the class two reviews filed (#2288) — while a bare
+#      P3, a clock time after the token, and the pinned location-BEFORE clean twin stay non-blocking
 #   §AI the existing-record check reads the record's OWN `repo` field: a foreign repo's legacy
 #      `<PR>.json` at the same head cannot block, and a refusal names the file it READ
 #   §AJ a COMPLETED review that quotes `[pi-gate] REFUSED` is not the gate's refusal (rc is the signal)
@@ -993,10 +993,24 @@ reset; printf 'Finding P1 at scripts/x.sh:12 — the early return skips validati
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…and 'Finding P1 at scripts/x.sh:12' (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
+# The SECOND fresh review filed the rest of the class: the first arm listed the bridges it expected
+# (`in|at|on` after a dash/bracket), so every other bridge was the same fail-open ONE FORM OVER —
+# the ratchet this scanner's own comment warns about. The arm now keys on the DIRECTION (a
+# `path:line` after the token), so the bridge alphabet cannot be the thing that decides.
+for bridge in 'P1: scripts/x.sh:12 — the guard returns 0.' 'P1, in scripts/x.sh:12 — the guard returns 0.' 'P1 (see scripts/x.sh:12) — the guard returns 0.' 'P1 — scripts/x.sh:12 returns 0.'; do
+  reset; printf 'Found one %s\nCLEAN\n' "$bridge" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "…and 'Found one $bridge' (rc=$(rc_of))"
+done
 # …while a bare P3 with a location stays a note: the P3 arm must not widen with it.
 reset; printf 'P3 in scripts/x.sh:12 — a style nit.\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a bare P3 with a location is still a note, not a blocker (rc=$(rc_of))"
+# …and a remainder whose only `:digits` run has no PATH character (a clock time) is not a location,
+# so the direction arm does not turn a sentence about a timestamp into a blocking finding.
+reset; printf 'The result is P1 at 10:30 in the log.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a clock time after a bare P1 is not a location (rc=$(rc_of))"
 # …and the pinned clean twin (location BEFORE the token) stays clean — the whole reason the arm
 # keys on what follows the token rather than on the line merely containing a location.
 reset; printf 'No findings at scripts/x.sh:12; severity P2 would be over-calling.\nCLEAN\n' > "$TMP/reviewer-out"
@@ -1065,19 +1079,20 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 310, measured on the run that added §AH (the bare label
-# naming its location AFTER it), §AI (the record's own `repo` field) and §AJ (a quoted gate refusal
+# whenever sections are added — this is 315, measured on the run that added §AH (a bare label with a
+# `path:line` AFTER it, in every bridge form — dash, colon, comma, parenthetical — plus the clock-time
+# counter-direction), §AI (the record's own `repo` field) and §AJ (a quoted gate refusal
 # is not a refusal), plus §Q's label-SHAPE
 # assertions (any label form: ordinal-in-span, continuation-line slot, code-styled token), the
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 310 here and the RESULT line then
-# prints 311. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 315 here and the RESULT line then
+# prints 316. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 310 ]; ck $? "assertion-count pin: >= 310 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 315 ]; ck $? "assertion-count pin: >= 315 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
