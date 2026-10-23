@@ -265,7 +265,13 @@ ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_
 P3P="$SHOME3P/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
 # The launcher's verdict on the SAME two records: it must not call the box BROKEN.
-hs_out="$(CELL_HOME="$SHOME3P" HOME="$SHOME3P" O="$O3P" REPO="$FX3" HARNESS_PIN_DIR="$SHOME3P/harness" \
+# ⛔ `HARNESS_REPO` IS PART OF THE FIXTURE, NOT DECORATION. `harness-up` resolves the repo whose object
+# DB the pin commit is read in from `HARNESS_REPO`, then this machine's config file, then ITS OWN
+# checkout — so without it these arms silently ask the INSTALLER'S checkout (whose object DB does not
+# contain a `git init`'d fixture commit) and the pin row reads `UNRESOLVABLE`, reding every arm here on
+# a tree that is correct. Measured: 100 passed / 3 failed on this suite before this line, with
+# `pin: UNRESOLVABLE — the commit … is not an object in the harness repo <checkout>`.
+hs_out="$(CELL_HOME="$SHOME3P" HOME="$SHOME3P" O="$O3P" REPO="$FX3" HARNESS_REPO="$FX3" HARNESS_PIN_DIR="$SHOME3P/harness" \
           HARNESS_PIN_FILE="$SHOME3P/.harness-path" HARNESS="$PIN_DIR_A3" \
           bash "$REPO_ROOT/scripts/harness-up" status 2>&1)"; hs_rc=$?
 ck "$(has "$hs_out" "NOT MATERIALISED" && echo 1 || echo 0)" "harness-up does NOT report the installed pin NOT MATERIALISED"
@@ -325,7 +331,9 @@ ck "$(has "$out" "MENDED after the materialise" && echo 0 || echo 1)" "…and th
 # commit OUTSIDE the pin root is OK; the same tree with a sha record naming another commit is MISMATCH.
 SHOME4Q="$T/home-a4b"; mkdir -p "$SHOME4Q/Library/LaunchAgents" "$SHOME4Q/.pi/agent/state"
 printf '%s\n' "$S4_NEW" > "$SHOME4Q/.pi/agent/state/HARNESS-PIN"
-_hs4() { CELL_HOME="$SHOME4Q" HOME="$SHOME4Q" O="$T/o-a4b" REPO="$FX3" HARNESS_PIN_DIR="$SHOME4Q/harness" \
+# ⛔ `HARNESS_REPO="$FX3"` for the reason A3's `hs_out` names: without it the launcher resolves the pin
+# in its own checkout and both arms below red with `pin: UNRESOLVABLE` (measured).
+_hs4() { CELL_HOME="$SHOME4Q" HOME="$SHOME4Q" O="$T/o-a4b" REPO="$FX3" HARNESS_REPO="$FX3" HARNESS_PIN_DIR="$SHOME4Q/harness" \
            HARNESS_PIN_FILE="$T/a4-path" HARNESS="$1" bash "$REPO_ROOT/scripts/harness-up" status 2>&1; }
 printf '%s\n' "$FX3H" > "$T/a4-path"
 ck "$(has "$(_hs4 "$FX3H")" "pin: OK" && echo 0 || echo 1)" "a worktree at the pinned commit OUTSIDE the pin root reads pin: OK"
