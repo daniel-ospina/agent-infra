@@ -13,7 +13,17 @@ set -u
 # guard against the DEPLOYED copy, which is its original purpose there.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH="${ORCH:-$HERE/orch-loop.sh}"
-MERGE="$HERE/merge-one.sh"
+# ⛔ THE PRODUCER FOLLOWS THE CONSUMER (review round 1, P3 — agent-infra#2132). ORCH is overridable to
+# point this suite at the DEPLOYED tree (the drift-guard mode this file's header documents), but
+# MERGE was hard-wired to the shipped copy — so in exactly that mode the #2132 section graded a
+# DEPLOYED consumer against a SHIPPED producer, and a deployed merge-one.sh still writing the fixer
+# marker unconditionally was undetectable. Both now resolve against the same tree; when ORCH is not
+# overridden this is the shipped merge-one.sh beside this test, as before.
+MERGE="${MERGE:-$(dirname "$ORCH")/merge-one.sh}"
+# ⛔ …AND SO DOES THE REPORTER (review round 2, P3). The driven `report.sh` assertions were pinned to
+# the SHIPPED copy while the producer followed ORCH, so in drift mode a deployed report.sh still
+# printing a raw file count was undetectable — the same defect one script over.
+REPORT="${REPORT:-$(dirname "$ORCH")/report.sh}"
 PASS=0; FAIL=0
 
 # --- extract the rule functions from the live controller ---
@@ -1260,7 +1270,7 @@ FAKE
   # owned ABOVE the listing (a race between the count and the rows) collapses to 0, never negative
   printf '3:aaa000000000:fix/3-b 4:bbb000000000:fix/4-b\n' > "$O/state/last-open-prs"
   _live 'fix/3-b	/repo/w3	1	/repo/w3' 'fix/4-b	/repo/w4	2	/repo/w4' 'fix/5-b	/repo/w5	3	/repo/w5'
-  eqv "an owned count above the listing collapses to 0, never negative" "0" "$(_own 1)"
+  eqv "an OWNED count above the listing collapses to 0, never negative" "0" "$(_own 1)"
   # (5) a MALFORMED argument must FAIL CLOSED — "fail closed" means EMIT NOTHING, never a number:
   # coercing it to 0 hands the gate the most permissive value there is AND a valid-looking one.
   _mal=0; _out="$(_own abc)" || _mal=1
@@ -2295,6 +2305,550 @@ else
 fi
 
 echo
+echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisation ==="
+# ⛔ THE PRODUCER AND THE CONSUMER ARE EXTRACTED FROM THE LIVE SCRIPTS (merge-one.sh writes the
+# state, orch-loop.sh acts on it), never copied here — a copy would keep passing after the shipped
+# pair drifted apart, which is the defect this section exists to catch. Both are DRIVEN, because a
+# grep cannot tell a live arm from one neutered to `if false` (the inert-enforcer class).
+{
+  grep -m1 '^is_limit() {' "$MERGE"
+  grep -m1 '^is_num() {' "$MERGE"
+  awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+} > "$TMP/reviewstate.sh"
+ex review_gate_state > "$TMP/fn_review_gate_state.sh"
+# ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
+# file exits 0, so a renamed/moved function extracted to nothing and the whole section its `&&` guard
+# then SKIPPED its assertions — a suite that passes by testing nothing, the same false-PASS shape this
+# file's own drifts guards exist for. The definition greps make the extraction falsifiable.
+_rs_sz="$(wc -c < "$TMP/reviewstate.sh" | tr -d ' ')"; _rgs_sz="$(wc -c < "$TMP/fn_review_gate_state.sh" | tr -d ' ')"
+if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
+   && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
+   && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
+  RS="$TMP/rso"; mkdir -p "$RS/state"
+  _vc() { ( . "$TMP/reviewstate.sh"; verdict_class "$1" ); }
+  # _rs <class> <head> [max] — drive the PRODUCER exactly as merge-one.sh's `*)` arm calls it. The
+  # park stub mirrors the REAL park() in merge-one.sh (which writes `parked-<PR>` = the head plus the
+  # reason): a stub that wrote only the reason would let a park pass here and land nowhere in
+  # production, which is the inert-enforcer shape this section exists to catch.
+  _rs() {
+    ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$2"; MAX_REVIEW_TRIES="${3:-3}"
+      park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
+      . "$TMP/reviewstate.sh"; review_state_record "$1" )
+  }
+  # _rgs <pr> <head> — drive the CONSUMER's classifier against the same state dir.
+  _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
+  # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
+  _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
+  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+
+  eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
+  eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "an EMPTY final line is NO-VERDICT, not ISSUES" "NO-VERDICT" "$(_vc '')"
+  eqv "an unparseable final line is NO-VERDICT too" "NO-VERDICT" "$(_vc 'I read it and I think it is fine')"
+  # ⛔ THE COUNT IS PART OF THE VERDICT (review round 3, P3). `ISSUES 0` is a reviewer saying they
+  # found NOTHING — the pre-fix prefix match turned it into a fixer authorisation, spending a
+  # MAX_FIX_TRIES attempt on a head with nothing to fix. A bare `ISSUES` is unparseable, and a
+  # 10-digit count must not reach `-ge` (it errs FALSE on bash 3.2).
+  eqv "ISSUES 0 is NO-VERDICT (nothing to fix, so no fixer)" "NO-VERDICT" "$(_vc 'ISSUES 0')"
+  eqv "a bare ISSUES with no count is NO-VERDICT" "NO-VERDICT" "$(_vc 'ISSUES')"
+  eqv "a two-digit count is still ISSUES" "ISSUES" "$(_vc 'ISSUES 12')"
+  # ⛔ A SEPARATOR BEFORE THE COUNT IS A FORMAT VARIANT, NOT AN ABSENCE (review round 7, P3).
+  eqv "ISSUES: 3 is a verdict with findings" "ISSUES" "$(_vc 'ISSUES: 3')"
+  eqv "ISSUES - 2 is a verdict with findings" "ISSUES" "$(_vc 'ISSUES - 2')"
+  eqv "an absurd count is NO-VERDICT (no arithmetic on an unbounded value)" "NO-VERDICT" "$(_vc 'ISSUES 9999999999999')"
+
+  # ⛔ THE EXTRACTOR IS TAKEN FROM THE SHIPPED SCRIPT AND EVALUATED — NOT RE-TYPED (review round 8,
+  # P2). The first form re-typed the pattern here, so reverting merge-one.sh's expression left the
+  # whole suite green: a pin over a COPY, the exact false PASS the round-8 finding was about. This
+  # evaluates the producer's own `LAST=` line, so the two cannot drift apart again.
+  if grep -q '^LAST="$(grep -aE' "$MERGE"; then
+    _last_of() {
+      ( L="$TMP/extract"; printf '%s\n' "$1" > "$TMP/extract.log"
+        eval "$(grep -m1 '^LAST="$(grep -aE' "$MERGE")"
+        printf '%s' "${LAST:-}" )
+    }
+  else
+    _last_of() { printf '%s' ''; }
+  fi
+  eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
+  eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
+  eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"
+  eqv "…accepts a CLEAN line with its URL" "CLEAN https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "…ignores earlier noise and takes the LAST verdict" "ISSUES 2" "$(_last_of 'ISSUES 5
+noise
+ISSUES 2')"
+  eqv "…and an ISSUES: 3 line now CLASSIFIES as findings (the two halves agree)" "ISSUES" "$(_vc "$(_last_of 'ISSUES: 3')")"
+  # (1) CONTROL: findings at a head authorise a fixer and write NO stale-evidence marker.
+  _clean; _rs ISSUES aaaa1111
+  done_issues=1
+  [ -f "$RS/state/needsfix-2132-aaaa1111" ] && [ ! -f "$RS/state/needsreview-2132-aaaa1111" ] || done_issues=0
+  [ "$done_issues" = "1" ] \
+    && { echo "  ✅ a reviewer's FINDINGS record the fixer marker (and no stale-evidence marker)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ ISSUES did not leave exactly the fixer marker — fixer=$( [ -f "$RS/state/needsfix-2132-aaaa1111" ] && echo yes || echo no) needsreview=$( [ -f "$RS/state/needsreview-2132-aaaa1111" ] && echo yes || echo no)"; FAIL=$((FAIL+1)); }
+  eqv "…and the controller classifies that head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 aaaa1111)"
+
+  # (2) THE DEFECT (#2132): a reviewer that produced NO verdict left a FIXER marker, so the
+  # controller spent a MAX_FIX_TRIES attempt on a head nobody had reviewed — the fixer pushed, the
+  # push invalidated the signed review by design, and the PR could never converge. The remedy for a
+  # no-verdict head is another REVIEW; it must never authorise a fixer.
+  _clean; _rs NO-VERDICT bbbb2222
+  if [ -f "$RS/state/needsreview-2132-bbbb2222" ] && [ ! -f "$RS/state/needsfix-2132-bbbb2222" ]; then
+    echo "  ✅ a reviewer that produced NO verdict records stale evidence — NOT a fixer authorisation"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a no-verdict head wrote the FIXER marker (needsfix=$( [ -f "$RS/state/needsfix-2132-bbbb2222" ] && echo yes || echo no), needsreview=$( [ -f "$RS/state/needsreview-2132-bbbb2222" ] && echo yes || echo no)) — the controller would burn fixer attempts on an unreviewed head"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that head NEEDS-REVIEW" "NEEDS-REVIEW" "$(_rgs 2132 bbbb2222)"
+  # (3) INERT-BY-ABSENCE: with no marker at all the controller must NOT authorise a fixer. "Nothing
+  # says findings exist" is not "findings exist", and the fail-closed direction is the re-review.
+  eqv "no marker at all reads NEEDS-REVIEW (fail-closed, never a fixer)" "NEEDS-REVIEW" "$(_rgs 2132 cccc3333)"
+  # (4) BOUNDED: a reviewer that never returns a verdict must not buy an unbounded run of PAID
+  # reviews (the #1717 class, one input over). The count is per HEAD, so a push re-arms it.
+  _clean; _rs NO-VERDICT dddd4444; _rs NO-VERDICT dddd4444
+  [ -f "$RS/state/needsreview-2132-dddd4444" ] && [ ! -f "$RS/state/parked-2132" ] \
+    && { echo "  ✅ a second no-verdict at the SAME head is still a re-review, not yet a park"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the re-review loop did not survive its second attempt at one head (parked=$( [ -f "$RS/state/parked-2132" ] && echo yes || echo no))"; FAIL=$((FAIL+1)); }
+  _rs NO-VERDICT dddd4444
+  if [ "$(cat "$RS/state/parked-2132" 2>/dev/null)" = "dddd4444" ] && [ ! -f "$RS/state/needsreview-2132-dddd4444" ] \
+     && grep -qi 'no usable verdict' "$RS/parkreason" 2>/dev/null; then
+    echo "  ✅ MAX_REVIEW_TRIES PARKS the head — bounded, with a reason naming that NOTHING was reviewed"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the no-verdict loop is UNBOUNDED (parked=[$(cat "$RS/state/parked-2132" 2>/dev/null)] marker=$( [ -f "$RS/state/needsreview-2132-dddd4444" ] && echo yes || echo no) reason=[$(cat "$RS/parkreason" 2>/dev/null | cut -c1-60)])"; FAIL=$((FAIL+1))
+  fi
+  # (5) …and the bound belongs to the HEAD: a new push retries instead of inheriting the cap.
+  _rs NO-VERDICT eeee5555
+  [ -f "$RS/state/needsreview-2132-eeee5555" ] \
+    && { echo "  ✅ a NEW head re-arms the re-review budget (it does not inherit the previous head's cap)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a new head inherited the old head's re-review count and was parked without an attempt"; FAIL=$((FAIL+1)); }
+  # (5b) ⛔ A PARK MUST NOT LEAVE SUPERSEEDED MARKERS BEHIND (review round 5, P2). The park branch used
+  # to remove only the marker AT the parked head, so residue at another head was counted by report.sh
+  # as "stalled on evidence" while the SAME PR was also counted by the parked line — one PR, two
+  # queues, two remedies. MAX_REVIEW_TRIES=1 makes the first run park; the earlier marker must be gone.
+  _clean; _rs NO-VERDICT 1111aaaa; _rs NO-VERDICT 2222bbbb 1
+  _residue="$(ls "$RS/state/" | grep '^needsreview-2132-' || true)"
+  if [ "$(cat "$RS/state/parked-2132" 2>/dev/null)" = "2222bbbb" ] && [ -z "$_residue" ]; then
+    echo "  ✅ a PARK removes the PR's whole marker set (no superseded-head residue left for report.sh to double-count)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the park left residue (parked=[$(cat "$RS/state/parked-2132" 2>/dev/null)] markers=[${_residue:-none}])"; FAIL=$((FAIL+1))
+  fi
+  # (5b) ⛔ A USABLE VERDICT RESETS THE VERDICT-LESS COUNTER (review round 10, P2). The counter bounds
+  # CONSECUTIVE verdict-less runs; without a reset, N-1 timeouts followed by a verified CLEAN (or by
+  # findings) still parked the head on the next timeout, with a reason claiming nothing had been
+  # reviewed at a head that had been. Both resets are driven.
+  _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
+  _rs NO-VERDICT 9999aaaa
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+    echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
+  rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
+  _rs NO-VERDICT 7777bbbb
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+    echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+  fi
+  # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
+  # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
+  awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
+  awk '/^  CLEAN\*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_clean_arm.sh"
+  if grep -qF 'review_state_record "$(verdict_class "$LAST")"' "$TMP/merge_star_arm.sh" \
+     && ! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"' "$TMP/merge_star_arm.sh"; then
+    echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
+  fi
+  # (7) ⛔ THE CLEAR ARM (#2132 Required item 4): a COMPLETED review at the new head clears the
+  # state. Without this assertion the clear sites could be deleted outright and the suite stayed
+  # green — i.e. the half of the requirement that makes the state temporary was untested.
+  _clean; _rs NO-VERDICT ffff6666
+  _marker_before=$([ -f "$RS/state/needsreview-2132-ffff6666" ] && echo yes || echo no)
+  # ⛔ AND A FINDINGS MARKER AT THAT HEAD MUST GO TOO (review round 6, P2): a CLEAN verdict with a
+  # verified marker is the LATEST verdict at the head, and `review_gate_state()` reads only `needsfix`,
+  # so a leftover findings marker authorised a fixer for a head just reviewed CLEAN.
+  : > "$RS/state/needsfix-2132-ffff6666"
+  _rc ffff6666
+  if [ "$_marker_before" = "yes" ] && [ ! -e "$RS/state/needsreview-2132-ffff6666" ] \
+     && [ ! -e "$RS/state/needsfix-2132-ffff6666" ] \
+     && [ "$(_rgs 2132 ffff6666)" = "NEEDS-REVIEW" ]; then
+    echo "  ✅ verified evidence CLEARS the stale-evidence AND the findings state at that head (the head stops authorising a fixer)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the clear path left state behind (needsreview=$([ -e "$RS/state/needsreview-2132-ffff6666" ] && echo yes || echo no) needsfix=$([ -e "$RS/state/needsfix-2132-ffff6666" ] && echo yes || echo no) class=$(_rgs 2132 ffff6666))"; FAIL=$((FAIL+1))
+  fi
+  # (7c2) ⛔ THE SPEND RECORD DIES WITH THE CLEAR (review round 7, P2): it exists only to authorise
+  # `refund_bailed_fixer` restoring the findings state at that head, so keeping it let a later bail at
+  # the same head MINT a `needsfix` marker at a head with a signed CLEAN marker.
+  _clean; : > "$RS/state/needsreview-2132-5555dddd"; : > "$RS/state/fixspend-2132-5555dddd"
+  _rc 5555dddd
+  if [ ! -e "$RS/state/fixspend-2132-5555dddd" ]; then
+    echo "  ✅ the clear also consumes the spend record (a later bail cannot mint findings at a CLEAN head)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the spend record survived the clear — a later bail would restore a findings marker at a head with a signed CLEAN verdict"; FAIL=$((FAIL+1))
+  fi
+  # (7c) ⛔ A VERDICT-LESS RUN MUST NOT SUPERSEDE FINDINGS AT THE SAME HEAD (review round 6, P3):
+  # nothing was pushed, so it carries no information about the head — and the old code deleted the
+  # findings marker and then parked with a reason claiming nothing had been reviewed.
+  _clean; _rs ISSUES 3333cccc; _rs NO-VERDICT 3333cccc; _rs NO-VERDICT 3333cccc; _rs NO-VERDICT 3333cccc
+  if [ -f "$RS/state/needsfix-2132-3333cccc" ] && [ ! -f "$RS/state/parked-2132" ] \
+     && [ "$(_rgs 2132 3333cccc)" = "NEEDS-FIX" ]; then
+    echo "  ✅ a no-verdict run at a head that already has FINDINGS keeps NEEDS-FIX (and spends no re-review budget)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ no-verdict runs erased the findings state at the same head (needsfix=$([ -f "$RS/state/needsfix-2132-3333cccc" ] && echo yes || echo no) parked=$(cat "$RS/state/parked-2132" 2>/dev/null) class=$(_rgs 2132 3333cccc))"; FAIL=$((FAIL+1))
+  fi
+  # (7b) …and the clear is CALLED, and only AFTER the signed marker verified: a clear above the
+  # `marker_ok` guard would let a bare rc=0 (record-review ran but posted no verifiable marker) read
+  # as a satisfied head and erase the evidence queue's only record of it.
+  _guard_ln="$(grep -n 'if \[ "$marker_ok" -ne 1 \]' "$MERGE" | head -1 | cut -d: -f1)"
+  _clear_ln="$(grep -n '^    review_state_clear$' "$MERGE" | head -1 | cut -d: -f1)"
+  # ⛔ IF, NOT CASE (review round 2, P2). The first form was `case "x:y" in ''*|*:'' )`, and inside a
+  # `case` PATTERN the quotes are stripped — `''*` IS `*`, which matched every value, so the failure
+  # arm always ran: a permanent red over a correct tree, and a real ordering regression would print
+  # the same line. Two explicit emptiness tests are the only way to say "either anchor is missing".
+  # ⛔ AND ARM MEMBERSHIP IS PART OF THE CONTRACT (review round 4, P2). Line order alone accepts the
+  # call ANYWHERE below the guard — including the `*)` arm, where every no-verdict run would delete
+  # the marker it just wrote and a verified review would clear nothing, with the suite green. The
+  # clear must be in the CLEAN arm and absent from the no-verdict arm; both arms are extracted above
+  # from the shipped file, so this cannot be satisfied by a copy.
+  if [ -z "${_guard_ln:-}" ] || [ -z "${_clear_ln:-}" ]; then
+    echo "  ❌ could not locate the marker_ok guard and the review_state_clear call site in merge-one.sh"; FAIL=$((FAIL+1))
+  elif [ "${_clear_ln}" -le "${_guard_ln}" ]; then
+    echo "  ❌ the clear is invoked at line $_clear_ln, not after the marker_ok guard at line $_guard_ln — an unverified record would read as a clean head"; FAIL=$((FAIL+1))
+  elif ! grep -q '^    review_state_clear$' "$TMP/merge_clean_arm.sh"; then
+    echo "  ❌ review_state_clear is NOT in the CLEAN arm — a verified review would clear nothing"; FAIL=$((FAIL+1))
+  elif grep -q '^    review_state_clear$' "$TMP/merge_star_arm.sh"; then
+    echo "  ❌ review_state_clear is in the NO-VERDICT arm — every no-verdict run would delete the marker it just wrote"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the clear is in the CLEAN arm, ABSENT from the no-verdict arm, and reached only AFTER the marker verifies (line $_clear_ln > guard $_guard_ln)"; PASS=$((PASS+1))
+  fi
+  # (8) ⛔ NO ACCUMULATION (#2132 review round 1, P2): the marker set describes NOW. One marker per
+  # PR — a head that advances must not leave the previous head's marker behind for report.sh to
+  # count, or the published number could never fall back to 0.
+  _clean; _rs NO-VERDICT 1111aaaa; _rs NO-VERDICT 2222bbbb
+  _old=$([ -f "$RS/state/needsreview-2132-1111aaaa" ] && echo yes || echo no)
+  _new=$([ -f "$RS/state/needsreview-2132-2222bbbb" ] && echo yes || echo no)
+  if [ "$_old" = "no" ] && [ "$_new" = "yes" ]; then
+    echo "  ✅ a new head REPLACES the previous head's stale-evidence marker (the set cannot only grow)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ stale-evidence markers accumulate: old-head marker=$_old, current-head marker=$_new"; FAIL=$((FAIL+1))
+  fi
+  # (8b) ⛔ THE FINDINGS POPULATION IS ONE PER PR TOO (review rounds 7-9). A PR that collects findings
+  # at several heads used to keep a marker for every head for its whole life — inert (both readers are
+  # head-keyed) but an untested claim until here, and a state directory that only grows. Both writers of
+  # an old head now prune: the ISSUES verdict and a NO-VERDICT run at a NEW head (which must keep the
+  # same-head marker, so it prunes only after its early return).
+  _clean; _rs ISSUES 3333dddd; _rs ISSUES 4444eeee
+  _nf="$(ls "$RS/state/" 2>/dev/null | grep -c '^needsfix-2132-' || true)"
+  if [ "$_nf" = "1" ] && [ -f "$RS/state/needsfix-2132-4444eeee" ] && [ ! -e "$RS/state/needsfix-2132-3333dddd" ]; then
+    echo "  ✅ a new head REPLACES the previous head's FINDINGS marker (one marker per PR)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ findings markers accumulate (count=$_nf kept=$(ls "$RS/state" | tr '\n' ' '))"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs ISSUES 5555gggg; _rs NO-VERDICT 6666hhhh
+  _nf2="$(ls "$RS/state/" 2>/dev/null | grep -c '^needsfix-2132-' || true)"
+  if [ "$_nf2" = "0" ] && [ -f "$RS/state/needsreview-2132-6666hhhh" ]; then
+    echo "  ✅ a NO-VERDICT run at a NEW head prunes the old head's FINDINGS marker (the two writers agree)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an old findings marker survived a no-verdict run at a new head (needsfix count=$_nf2)"; FAIL=$((FAIL+1))
+  fi
+  # (9) ⛔ AND THE PUBLISHED COUNT IS OPEN-PRs-ONLY (#2132 review round 1, P2). Driven against a real
+  # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
+  # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
+  RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
+  # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
+  # The controller used to be able to leave two markers for one PR; report.sh must not report that as
+  # two stalls even if a peer box does it.
+  : > "$RPT/state/needsreview-6001-aaa"; : > "$RPT/state/needsreview-6001-bbb"; : > "$RPT/state/needsreview-6999-ccc"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001:head1\n6002:head2\n' ;; esac
+exit 0
+GHOPEN
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_line="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
+  eqv "report.sh counts STALLED PRs — open, and one per PR (not per marker file)" "  stale evidence (needs re-review): 1" "$_rpt_line"
+  # (9b) …and an UNREADABLE open-PR list must not print a confident 0. A stub that FAILS the list
+  # read stands in for a rate-limited or offline box.
+  cat > "$TMP/ghstub/gh" <<'GHFAIL'
+#!/bin/bash
+exit 1
+GHFAIL
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_fail="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
+  case "$_rpt_fail" in
+    *"could not read"*) echo "  ✅ an unreadable open-PR list prints <could not read> with the raw marker count, never a confident 0"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable open-PR list printed [$_rpt_fail] — a blind read must not read as a clean queue"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (9c2) …and a marker whose PR is PARKED at that head belongs to the line above, not this one
+  # (review round 3, P2): one PR in two queues with two different remedies is how an operator ends up
+  # re-reviewing a PR that is waiting for a human. ⛔ Evaluated over the PR's WHOLE marker set (review
+  # round 4, P3): checking only the first marker the glob visits let a superseded marker plus a marker
+  # at the parked head be counted in BOTH queues.
+  : > "$RPT/state/needsreview-6002-aaa"; : > "$RPT/state/needsreview-6002-ddd"
+  printf '%s\n' ddd > "$RPT/state/parked-6002"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN2'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001:head1\n6002:ddd\n' ;; esac
+exit 0
+GHOPEN2
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
+  eqv "…and a PR parked at ANY of its marked heads is counted as parked, not as stalled on evidence" "  stale evidence (needs re-review): 1" "$_rpt_parked"
+  # (9c2b) ⛔ THE PARKED COUNT IS PINNED TOO (review round 7, P3 — the suite was blind to a
+  # regression of exactly the attribution round 9 fixed: case b must read 1, not 0).
+  eqv "a park at the LIVE head counts as parked" "1" "$(printf '%s\n' "$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null)" | sed -n 's/^  parked (needs a human): \([0-9][0-9]*\).*/\1/p' | head -1)"
+  # (9c3) ⛔ AND THE PARKED LINE IS PRINTED EXACTLY ONCE (review round 7, P2): the superseded-park fix
+  # left the raw echo above the adjusted one, so two contradictory numbers for one quantity appeared
+  # in the same block — and NOTHING pinned that line, which is why the suite was green over it.
+  # A park at a head no marker names is superseded (re-armed): counted under the parked line with its
+  # own number, NOT as a stall.
+  printf '%s\n' oldhead > "$RPT/state/parked-6002"
+  # 6002 carries a marker at a NEW head while its park names an OLD one, so the PR is being worked;
+  # 6001's markers are removed so the stale count isolates this case. The stub must report 6002's LIVE
+  # head as `newhead` — the classification compares the park against the listed head (review round 7).
+  rm -f "$RPT/state/needsreview-6001-aaa" "$RPT/state/needsreview-6001-bbb"
+  : > "$RPT/state/needsreview-6002-newhead"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN3'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001:head1\n6002:newhead\n' ;; esac
+exit 0
+GHOPEN3
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_superseded="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null )"
+  eqv "the parked line is printed EXACTLY once" "1" "$(printf '%s\n' "$_rpt_superseded" | grep -c 'parked (needs a human)')"
+  case "$_rpt_superseded" in
+    *"parked (needs a human): 0 (1 at a superseded head"*)
+      echo "  ✅ a park at a head no marker names is SUPERSEDED, not 'needs a human'"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the superseded park was not attributed correctly: [$(printf '%s\n' "$_rpt_superseded" | grep 'parked (needs' | tr '\n' '|')] stale=[$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')]"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ AND IT IS NOT COUNTED AS STALE EITHER (review round 10 final pass): the message claimed "the
+  # stale count stays 0" while only the parked prefix was matched, so a regression that counted a
+  # parked-at-one-head, marked-at-another PR in BOTH queues stayed green. Both lines are asserted now.
+  eqv "…and a SUPERSEDED park is not counted as stale evidence" "  stale evidence (needs re-review): 0" "$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')"
+  rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-newhead"
+  rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-aaa" "$RPT/state/needsreview-6002-ddd"
+  # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
+  # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
+  # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
+  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
+  case "$_rpt_norepo" in
+    *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
+    *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (9c4) ⛔ AND ON THE DEGRADED PATHS THE PARKED COUNT NAMES ITS OWN PROVENANCE (landing-review note,
+  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so with no
+  # checkout, or with an unreadable listing, the number that gets printed is the raw `parked-*` FILE
+  # count and a superseded park is indistinguishable from a current one. Printing it UNLABELLED
+  # presents an inflated human queue as a measured one; the stale line on these same two paths already
+  # names its degradation, so the parked line must too. Driven, not grepped: two parks exist, NEITHER
+  # of which can be attributed on these paths (that is the whole reason the count is raw).
+  printf '%s\n' livehead > "$RPT/state/parked-6001"
+  printf '%s\n' oldhead > "$RPT/state/parked-6999"
+  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  case "$_rpt_norepo_parked" in
+    *" 2  (raw marker count"*) echo "  ✅ with no repo checkout the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+  esac
+  cat > "$TMP/ghstub/gh" <<'GHFAIL2'
+#!/bin/bash
+exit 1
+GHFAIL2
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_unread_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  case "$_rpt_unread_parked" in
+    *" 2  (raw marker count"*) echo "  ✅ with an unreadable open-PR list the parked line keeps the count (2) and says it is RAW too"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with an unreadable open-PR list the parked line printed [$_rpt_unread_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+  esac
+  rm -f "$RPT/state/parked-6001" "$RPT/state/parked-6999"
+  wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
+  wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
+  # ⛔ ONE WRITER (review round 3, P2; widened round 4, P3): the controller must never WRITE the
+  # stale-evidence state — it cannot see the review store, so a marker from there asserts a property
+  # it cannot measure (it published the state for brand-new unreviewed PRs and for heads whose signed
+  # marker had just verified). Pinning the `touch` IDIOM left `printf … > path`, `: > path` and `>>`
+  # free to reintroduce it, so this pins the target PATH: every non-comment line in orch-loop.sh that
+  # names `needsreview` must be an `rm -f` (a delete, which is allowed).
+  _sr_bad="$(grep -nE '(touch|>>|>|:)[[:space:]]*"?\$O/state/needsreview|(cp|install|ln)[^;|&]*needsreview' "$ORCH" | grep -v '^[0-9]*: *#' || true)"
+  if [ -n "$_sr_bad" ]; then
+    echo "  ❌ orch-loop.sh WRITES needsreview state — the controller cannot see whether evidence exists, so that marker asserts an unmeasured property: [$(printf '%s' "$_sr_bad" | head -1)]"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ orch-loop.sh never writes the stale-evidence state (no write redirect/touch/copy targets it; merge-one.sh is the single writer)"; PASS=$((PASS+1))
+  fi
+  # (9d) ⛔ AND ON THE GREEN ARM THE EVIDENCE SWEEP IS AUTHORITY-GUARDED (review round 5, P1 — a
+  # regression this branch introduced and this assertion now pins).
+  # ⛔ POLARITY, NOT PRESENCE (review round 6, P3): the first form only asked whether the WORD
+  # `MERGE_AUTHORITY` appeared on the line, so `= "rail"` (the inverse — deletes exactly where GREEN
+  # does not imply evidence) and the `||` typo both passed. The exact form is pinned.
+  awk '/^      GREEN\)$/{f=1} f&&/^        if \[ "\$MERGE_AUTHORITY" = "rail" \]/{exit} f' "$ORCH" > "$TMP/green_arm.sh"
+  if ! grep -qF '[ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"*' "$TMP/green_arm.sh"; then
+    echo "  ❌ the GREEN arm's needsreview sweep is not the exact gate-authority form (inverted, \`||\`, or missing) — on a rail repo GREEN does not imply evidence, so any other polarity deletes a TRUE state"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the GREEN arm's stale-evidence sweep is exactly the gate-authority form"; PASS=$((PASS+1))
+  fi
+  # (9d2) …and the prune is CALLED (review round 6, P3): the function is defined and driven by (12),
+  # but deleting its one call site left every assertion green — an inert enforcer.
+  wpin "the orphan prune is CALLED once per cycle, against the listing the cycle already read" "$ORCH" 'prune_orphan_markers "$OPEN_ROWS" "${_nrows:-0}"'
+  # (10) ⛔ A BAIL MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). `refund_bailed_fixer … 1`
+  # used to `touch needsfix-*` unconditionally, so a bail written by the CI-red or CONFLICTING arm —
+  # neither of which consumes a findings marker — refunded on a later gate-red cycle INVENTED one, and
+  # since #2132 that marker is the sole fixer authorisation. The restore is now gated on
+  # `fixspend-<PR>-<head>`, which only the consuming spawn writes. Driven, both ways.
+  { grep -m1 '^is_num() {' "$ORCH"; ex refund_bailed_fixer; } > "$TMP/refund_fix.sh"
+  if grep -q 'refund_bailed_fixer()' "$TMP/refund_fix.sh"; then
+    RF="$TMP/rfx"; mkdir -p "$RF/state"
+    _rf() { ( O="$RF"; LOG="$RF/log"; . "$TMP/refund_fix.sh"; refund_bailed_fixer 4242 cafe0001 "$1" ); }
+    rm -f "$RF/state/"*; : > "$RF/state/fixbail-4242-cafe0001"; echo 2 > "$RF/state/fixcount-4242"
+    _rf 1
+    if [ -f "$RF/state/needsfix-4242-cafe0001" ]; then
+      echo "  ❌ a bail with NO recorded spend still manufactured a findings marker"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ a bail that consumed no findings marker does NOT manufacture one"; PASS=$((PASS+1))
+    fi
+    rm -f "$RF/state/"*; : > "$RF/state/fixbail-4242-cafe0001"; : > "$RF/state/fixspend-4242-cafe0001"; echo 2 > "$RF/state/fixcount-4242"
+    _rf 1
+    if [ -f "$RF/state/needsfix-4242-cafe0001" ] && [ ! -f "$RF/state/fixspend-4242-cafe0001" ]; then
+      echo "  ✅ …and a bail that DID consume one restores it, consuming the spend record"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a bail with a recorded spend did not restore the findings marker (or left the spend record)"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract refund_bailed_fixer from orch-loop.sh"; FAIL=$((FAIL+1))
+  fi
+  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).  # `fix-one.sh` starts concurrently inside the spawn and can write `fixbail-*` in its first
+  # milliseconds; `refund_bailed_fixer` then refuses a restore (no spend on record) and withholds the
+  # findings marker — fail-closed, but one review paid for nothing. A comment cannot hold that order,
+  # so the SOURCE order is pinned: the write is the first line of that arm, the spawn within 3 lines.
+  # ⛔ THE PIN MATCHES THE SPAWN *ARM*, NOT THE LAUNCHER (merge of origin/main, #2170): main replaced
+  # `tmux new-session -d -s fix-<PR>` with `wt_spawn "fix-$PR"` (the durable worker terminal), and a
+  # pattern pinned to the retired launcher found NO spawn at all — the assertion then failed for the
+  # wrong reason and, worse, would have stopped constraining the ORDER the moment the form changed
+  # again. Both forms are accepted so the property (write strictly precedes spawn, within 3 lines) is
+  # what is pinned, not the launcher's name.
+  _fs_w="$(grep -n '^ *: > "$O/state/fixspend-$PR-$HEAD_N"$' "$ORCH" | head -1 | cut -d: -f1)"
+  _fs_s=""
+  if [ -n "${_fs_w:-}" ]; then
+    _fs_s="$(awk -v w="$_fs_w" 'NR>w && (/if tmux new-session -d -s "fix-\$PR"/ || /if wt_spawn "fix-\$PR"/){print NR; exit}' "$ORCH")"
+  fi
+  if [ -z "${_fs_w:-}" ] || [ -z "${_fs_s:-}" ] || [ "$(( _fs_s - _fs_w ))" -gt 3 ]; then
+    echo "  ❌ the fixspend record is not written immediately BEFORE the fixer spawn (write=${_fs_w:-<none>} spawn=${_fs_s:-<none>}) — a concurrent fix-one.sh can record its bail first and the findings marker is then withheld"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the spend record is written BEFORE the spawn (write line $_fs_w, spawn line $_fs_s) — a concurrent bail cannot race it"; PASS=$((PASS+1))
+  fi
+  # (12) ⛔ THE ORPHAN PRUNE, DRIVEN (review round 5, residual 1 — it was unpinned and a future edit
+  # that dropped the row-count guard would turn "unreadable listing" into "delete every marker").
+  ex prune_orphan_markers > "$TMP/fn_prune_orphan.sh"
+  if grep -q '^prune_orphan_markers() {' "$TMP/fn_prune_orphan.sh"; then
+    PO="$TMP/pruneO"; mkdir -p "$PO/state"
+    : > "$PO/state/needsreview-6001-aaa"; : > "$PO/state/needsreview-6999-bbb"; : > "$PO/state/fixspend-6001-ccc"
+    # The listing is written AFTER these markers, so they are all older than it (the cycle boundary).
+    sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ -f "$PO/state/needsreview-6001-aaa" ] && [ -f "$PO/state/fixspend-6001-ccc" ] && [ ! -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ the orphan prune keeps an OPEN PR's markers and deletes a PR that left the listing"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the orphan prune kept=$(ls "$PO/state" | tr '\n' ' ') — expected 6001's two markers kept and 6999 deleted"; FAIL=$((FAIL+1))
+    fi
+    # (12b) ⛔ A FAILED LISTING DELETES NOTHING. Two independent guards spare the markers when the
+    # listing is absent — the explicit `-e last-open-prs` early return AND the `-ot` test (POSIX: `-ot`
+    # against a missing file is FALSE, so every marker is skipped). This assertion pins the OUTCOME,
+    # not which line produced it: an early return only optimises, and the outcome is what must hold.
+    rm -f "$PO/state/last-open-prs"; : > "$PO/state/needsreview-6999-bbb"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ -f "$PO/state/needsreview-6999-bbb" ] && [ -f "$PO/state/needsreview-6001-aaa" ]; then
+      echo "  ✅ …and a FAILED listing (no last-open-prs) deletes NOTHING — an unreadable read is not 'no PRs open'"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a failed listing deleted markers (kept=$(ls "$PO/state" | tr '\n' ' ')) — a blind read would wipe the whole queue"; FAIL=$((FAIL+1))
+    fi
+    # (12c) ⛔ A MARKER WRITTEN AFTER THE LISTING MUST SURVIVE (review round 6, P3): the prune runs
+    # hundreds of lines after the listing is read, so a marker for a PR that appeared in between (a
+    # lane's brand-new PR via chain-merge.sh → merge-one.sh) is TRUE and the rows cannot contain it.
+    # ⛔ THE LISTING MUST EXIST FOR THIS TO TEST ANYTHING (review round 8, P2): the first form wrote
+    # `last-open-prs.keep`, so `prune_orphan_markers` returned at its missing-file guard and the `-ot`
+    # freshness guard was never reached — deleting that guard left the suite green. The listing is
+    # created AFTER the fresh marker now, and its inverse is driven too (an OLD marker absent from the
+    # rows IS deleted).
+    : > "$PO/state/last-open-prs"
+    sleep 1; : > "$PO/state/needsreview-7777-late"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ -f "$PO/state/needsreview-7777-late" ]; then
+      echo "  ✅ a marker written AFTER the listing is read survives the prune (the listing could not have seen it)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the prune deleted a marker newer than the listing — a same-cycle true state was lost"; FAIL=$((FAIL+1))
+    fi
+    # …and the inverse: an OLD marker for a PR absent from the rows IS removed, so the `-ot` guard is
+    # doing the sparing in the case above rather than shielding everything.
+    : > "$PO/state/needsreview-8888-old"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ ! -e "$PO/state/needsreview-8888-old" ]; then
+      echo "  ✅ …while an OLD marker for a PR absent from the rows IS deleted (the freshness guard is the one sparing markers)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ an old orphan marker survived — the prune is shielding everything, not just same-cycle markers"; FAIL=$((FAIL+1))
+    fi
+    # (12f) ⛔ `needsfix-*` IS ORPHAN-PRUNED TOO (review round 9): it was the one marker family the glob
+    # omitted, so a PR that closed out of band kept its findings marker for the life of `$O`.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-6999-eee"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ ! -e "$PO/state/needsfix-6999-eee" ]; then
+      echo "  ✅ the orphan prune also deletes a departed PR's FINDINGS marker"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a departed PR's needsfix marker survived the prune (the family leaks)"; FAIL=$((FAIL+1))
+    fi
+    # (12g) …and a MALFORMED row count refuses to prune (fail closed, not "empty set").
+    : > "$PO/state/needsreview-6999-fff"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 'x1' )
+    if [ -e "$PO/state/needsreview-6999-fff" ]; then
+      echo "  ✅ a MALFORMED row count prunes nothing (garbage is not read as 'no open PRs')"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a malformed row count deleted markers — garbage was coerced to the destructive reading"; FAIL=$((FAIL+1))
+    fi
+    # (12h) ⛔ A NAME OUTSIDE THE FAMILIES IS SPARED (review round 10 final pass): `sed` without `-n`
+    # echoed every non-matching basename as if it were a PR id, so such a file was DELETED as an
+    # orphan — a delete-direction bug in the one function that is supposed to fail closed.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ]; then
+      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount IS pruned"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
+    fi
+    # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
+    # present means "this repo has no open PRs", where every marker is orphaned — the drained state.
+    # (12e) …and a TRUNCATED listing (n at the 300-row cap) prunes NOTHING, because the rows may omit
+    # open PRs.
+    rm -f "$PO/state/"*; : > "$PO/state/needsreview-6999-bbb"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ ! -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ an EMPTY but SUCCESSFUL listing prunes orphans (the drained state does not leak)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ an empty successful listing pruned nothing — markers leak forever on a drained box"; FAIL=$((FAIL+1))
+    fi
+    # (12e): the marker is OLDER than the listing, so only the 300-row cap can spare it.
+    : > "$PO/state/needsreview-6999-bbb"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:h:br' 300 )
+    if [ -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ a TRUNCATED listing (row count at the 300 cap) prunes NOTHING — an omitted open PR keeps its marker"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a truncated listing pruned a marker — an open PR outside the cap lost its state"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract prune_orphan_markers from orch-loop.sh"; FAIL=$((FAIL+1))
+  fi
+  # (13) …and the SPEND sweep still exists on the GREEN arm (review round 5, residual 2): losing it
+  # silently restores the monotonic state/ growth round 5 fixed, and nothing else would notice.
+  wpin "the GREEN arm still sweeps the local spend record" "$TMP/green_arm.sh" 'rm -f "$O/state/fixspend-$PR-"*'
+
+  wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
+else
+  echo "  ❌ the verdict/state functions did not extract to syntactically valid shell from merge-one.sh / orch-loop.sh"; FAIL=$((FAIL+1))
+fi
+
 echo "=== the WRITER's funnel arithmetic: every unroutable row has its own bucket (review P2-1) ==="
 # ⛔ THE READER ABOVE GRADES A HAND-WRITTEN RECORD. That leaves the WRITER ungraded on the one
 # property the reader renders: `not_reached` is DERIVED (listed − the skip buckets − judged), so an
