@@ -46,6 +46,19 @@
 #      terminator: without it a dash-leading pattern is parsed as an OPTION,
 #      grep exits 2, and the membership test reads that as "not tracked" —
 #      reporting a tracked extension as untracked, the #2425 class inverted)
+#  20. a TRACKED dangling symlink under extensions/                    → BLOCK.
+#      `-e` alone treats it as absent (`-L` true, `-e` false), so a tracked entry
+#      that ships and loads NOTHING passed and was not even named — falsifying
+#      the "nothing is silently ignored" claim. Checks 1/2 already draw this
+#      distinction; checks 3/4a now do too.
+#  21. a TRACKED dotfile under extensions/ (`.gitkeep`)                   → PASS and
+#      NOT named: switching from the shell glob to the index made dotfiles
+#      gateable for the first time, a latent false-block over repo furniture
+#  22. a TRACKED *extension-shaped* dot entry (`.hidden.ts`, `.adapter/index.ts`)
+#      → BLOCK, and named: pi's loader has NO dot filter (measured — dot-named
+#      .ts files load) and bin/agent-infra.js farms a dot-named manifest row
+#      verbatim, so exempting it would make this suite bless a false PASS. The
+#      furniture exemption is narrowed to dot names with no extension shape
 #
 # Fixture trees mirror the real farm: relative symlinks ../../../extensions/<e>
 # from pi-bootstrap/pi-config/extensions/ into extensions/, plus a manifest.json
@@ -98,7 +111,8 @@ write_manifest() {
 # mode: clean | copy | retarget | broken | unwired | manifest-missing |
 #       manifest-stale | no-manifest | bad-manifest | live-healthy |
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
-#       all-untracked | nested-git | newline-name | dash-name
+#       all-untracked | nested-git | newline-name | dash-name |
+#       dangling-ext | dotfile-ext | dot-extension
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -169,6 +183,19 @@ build_farm() {
     # exits 2, and the membership test reads a TRACKED name as UNTRACKED.
     dash-name) ln -s ../../../extensions/b.ts "$FARM/b.ts"
               : > "$TMP/extensions/-e" ;;
+    # #2425 review — a TRACKED DANGLING symlink under extensions/ (ships, loads
+    # nothing). `-e` alone treats it as absent, so it used to pass unnamed.
+    dangling-ext) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+              ln -s ./does-not-exist "$TMP/extensions/ghost" ;;
+    # #2425 review — a TRACKED dotfile. Repo furniture, not an extension.
+    dotfile-ext) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+              : > "$TMP/extensions/.gitkeep" ;;
+    # #2425 review — dot-named BUT extension-shaped: loadable by pi, therefore
+    # gated. Both a dot-named file and a dot-named directory extension.
+    dot-extension) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+              : > "$TMP/extensions/.hidden.ts"
+              mkdir -p "$TMP/extensions/.adapter"
+              : > "$TMP/extensions/.adapter/index.ts" ;;
   esac
 
   # manifest.json rows: tree extensions a.ts + d/ always present; b.ts unless
@@ -372,6 +399,26 @@ run_gate 1 "dash-leading tracked name" dash-name \
   "tracked extension -e exists in extensions/" \
   "!not gated (UNTRACKED" \
   "!option requires an argument"
+
+echo ""
+echo "20. #2425 review — a TRACKED dangling symlink under extensions/ is a shipped entry that loads nothing"
+run_gate 1 "tracked dangling symlink" dangling-ext \
+  "tracked extension ghost exists in extensions/" \
+  "has no manifest.json files.extensions.entries row"
+
+echo ""
+echo "21. #2425 review — a TRACKED dotfile is repo furniture, not an extension"
+run_gate 0 "tracked dotfile is not an extension" dotfile-ext \
+  "symlink farm into extensions/" \
+  "!not gated (UNTRACKED" \
+  "!gitkeep"
+
+echo ""
+echo "22. #2425 review — a dot-named EXTENSION (.hidden.ts / .adapter/index.ts) is still gated"
+run_gate 1 "dot-named extension-shaped entries" dot-extension \
+  "tracked extension .hidden.ts exists in extensions/" \
+  "tracked extension .adapter exists in extensions/" \
+  "has no manifest.json files.extensions.entries row"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

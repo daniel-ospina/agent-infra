@@ -19,9 +19,13 @@
 #      row (a new extension with no manifest row ships on NO consumer), and 4b
 #      asks every row for an entry that EXISTS on disk (a stale row for a
 #      deleted extension breaks every consumer bootstrap). 4b is deliberately
-#      not tracked-scoped: a row for a present-but-untracked path is a
-#      machine-local inconsistency, not a ship defect, and failing it here would
-#      reinstate the false red this issue fixes. Dirs normalized (the manifest
+#      ON-DISK scoped, not tracked-scoped: its job is that every SHIPPED row has a
+#      target, and a row for a present-but-untracked path passes on the machine
+#      that has that path while 4b itself reds it on a clean checkout. Demanding
+#      trackedness here would red the developer machine for a machine-local
+#      inconsistency — the #2425 false-block family — without adding a ship
+#      guarantee, because the row itself ships and the fresh-checkout run
+#      already fails on the missing entry. Dirs normalized (the manifest
 #      records "dir/", the tree "dir"), *.test.ts excluded from both sides
 #      (#498 staleness class).
 #   5. LIVE-FARM LIVENESS (machine-local — checks 1-4 gate the repo, this one
@@ -68,8 +72,24 @@
 # it cannot be "not wired". Both error directions stay intact and are pinned by
 # tests/pi-config-extensions/run.sh — a TRACKED extension with no farm link fails
 # (check 3), and a TRACKED extension with no manifest row fails (check 4a). The
-# index is read ONLY for those two loops; checks 1, 2, 4b and 5 remain
+# index is read for checks 3/4a AND for the two guards that keep that reading
+# honest (the ⏭️ naming line and the vacuity floor); checks 1, 2, 4b and 5 remain
 # filesystem/live-farm checks, which is what they are for.
+#
+# DOT-NAMED FURNITURE. Switching from the shell glob to the index made
+# `extensions/.gitkeep` gated for the first time (the glob could never match a
+# leading dot), which would red a machine over repo furniture — the same
+# false-block family this issue fixes. The exemption is therefore NARROW: an
+# entry is furniture only when it is dot-named AND not extension-shaped — no
+# `.ts`/`.js` file name, and (for a directory) no `index.ts`/`index.js`/
+# `package.json`. A dot-named entry that IS extension-shaped is a LOADABLE
+# extension, not furniture: pi's loader has NO dot filter (measured —
+# `.hidden.ts`, `.backup.ts` and a normal `.ts` in one agent dir all loaded;
+# `bin/agent-infra.js` farms a manifest row verbatim, dot name included), so
+# skipping `extensions/.hidden.ts` or `extensions/.adapter/index.ts` would be a
+# false PASS in a ship gate. Those are gated and named like any other extension;
+# only furniture is skipped, and it is skipped silently on every side (it is not
+# a ship artefact, so naming it in the ⏭️ line would be noise).
 #
 # Fail-closed, and the reading travels with the verdict: when the index cannot be
 # read (no git, or $ROOT is not the work-tree toplevel) the gate FAILS rather
@@ -101,6 +121,25 @@ resolve_path() {
   else
     echo ""
   fi
+}
+
+# is_furniture <path> — true (0) only for a DOT-NAMED entry that is NOT
+# extension-shaped: no .ts/.js file name, and for a directory no
+# index.ts/index.js/package.json. See "DOT-NAMED FURNITURE" in the header — a
+# dot-named extension IS loadable by pi, so it must never be exempted.
+is_furniture() {
+  case "$(basename "$1")" in
+    .*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *.ts|*.js) return 1 ;;   # extension-shaped file — gated like any other
+  esac
+  if [ -d "$1" ] \
+      && { [ -e "$1/index.ts" ] || [ -e "$1/index.js" ] || [ -e "$1/package.json" ]; }; then
+    return 1                 # extension-shaped directory — gated like any other
+  fi
+  return 0
 }
 
 if [ ! -d "$SRC" ]; then
@@ -184,12 +223,16 @@ fi
 if [ "$index_ok" -eq 1 ]; then
   untracked_exts=""
   present_exts=""
-  for e in "$DST"/*; do
-    [ -e "$e" ] || continue
+  for e in "$DST"/* "$DST"/.[!.]*; do
+    # `-L` too: a DANGLING SYMLINK is a tracked entry that ships and loads
+    # nothing, so it must be examined (and named), not treated as absent — the
+    # checks 1/2 loops already make this distinction.
+    [ -e "$e" ] || [ -L "$e" ] || continue
     base="$(basename "$e")"
     case "$base" in
       *.test.ts) continue ;;
     esac
+    if is_furniture "$e"; then continue; fi   # dot-named, not extension-shaped
     present_exts="${present_exts:+$present_exts }$base"
     grep -Fqx -- "$base" <<<"$TRACKED_EXTENSIONS" || untracked_exts="${untracked_exts:+$untracked_exts }$base"
   done
@@ -215,14 +258,17 @@ if [ "$index_ok" -eq 1 ]; then
     case "$base" in
       *.test.ts) continue ;;   # test files are not extensions; not shipped
     esac
-    # Tracked but absent from the worktree means the index and disk disagree (an
+    if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
+    # Tracked but ABSENT from the worktree means the index and disk disagree (an
     # unstaged `rm`): there is nothing to wire, and demanding a manifest row for a
-    # path that is not on disk would report drift that cannot ship. A farm link
-    # that still points here is NOT this loop's business — check 2 compares the
-    # link's resolved target NAME (realpath returns a path even when only the
+    # path that is not on disk would report drift that cannot ship. A DANGLING
+    # SYMLINK is NOT absent — `-L` makes it pass this guard, because a tracked link
+    # ships and loads nothing, which is exactly what this gate must report. A farm
+    # link that still points here is not this loop's business — check 2 compares
+    # the link's resolved target NAME (realpath returns a path even when only the
     # final component is missing, so it can pass), and check 5 is the liveness arm
     # on a machine where the farm is materialized.
-    [ -e "$DST/$base" ] || continue
+    [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue
     if [ ! -L "$SRC/$base" ]; then
       echo "❌ tracked extension $base exists in extensions/ (git tracks it) but is not wired into pi-config/extensions (fresh machines won't get it)"
       FAILURES=$((FAILURES + 1))
@@ -288,7 +334,8 @@ if [ "$parse_ok" -eq 1 ]; then
       case "$base" in
         *.test.ts) continue ;;   # test files are not shipped; never in manifest
       esac
-      [ -e "$DST/$base" ] || continue   # index/disk disagreement — see check 3
+      if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
+      [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue   # index/disk disagreement — see check 3
       if ! grep -Fqx -- "$base" <<<"$manifest_rows"; then
         echo "❌ tracked extension $base exists in extensions/ (git tracks it) but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
         FAILURES=$((FAILURES + 1))
