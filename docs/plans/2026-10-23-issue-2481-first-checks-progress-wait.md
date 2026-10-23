@@ -1,3 +1,14 @@
+---
+title: "Plan — #2481: the FIRST-CHECKS wait becomes progress-aware (SLOW vs STUCK)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-10-23
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, issue-2481, admin-merge, first-checks-wait
+---
+
 # Plan — #2481: the FIRST-CHECKS wait becomes progress-aware
 
 **Issue:** agent-infra#2481 — *bug(rail): the FIRST-CHECKS wait is a fixed 3900s window
@@ -78,7 +89,7 @@ neither manufacture a stall nor extend a wait.
 
 * the same checks, the same classification (§1b), the same refusal for a genuinely red check;
 * every non-terminal exit still BLOCKS with no evidence posted and nothing merged;
-* elapsed time can never turn a red into a green — pinned by §77(d) and by the pre-existing §76(d).
+* elapsed time can never turn a red into a green — pinned by §78(d) and by the pre-existing §76(d).
 
 ## 5. Scope boundaries (explicit, to avoid collisions)
 
@@ -93,12 +104,12 @@ neither manufacture a stall nor extend a wait.
 
 | Surface | Layer | Expected |
 |---|---|---|
-| slow but progressing past the old window | integration §77(a) | keeps waiting, quotes the transitions, then **lands** on the real classification (evidence + merge) |
-| wedged run (frozen steps) | integration §77(b) | `STALL` verdict, naming the last transition + elapsed stall; no ceiling wording |
-| progressing but out of ceiling | integration §77(c) | `TIMEOUT, not a stall`, `it WAS PROGRESSING`; no `STALLED` |
-| gate not weakened | integration §77(d) | wait clears, classification runs, a genuine red still refuses, no merge/evidence |
-| missing signal | integration §77(e) | names the unavailable signal, no stall claim |
-| bounds derived / promoted / seamed | unit §77(f), §43 | 8760 / 18064 / 3900 / 60 printed with their derivation; a 5000s step promotes to 10000s; leading zeros refused |
+| slow but progressing past the old window | integration §78(a) | keeps waiting, quotes the transitions, then **lands** on the real classification (evidence + merge) |
+| wedged run (frozen steps) | integration §78(b) | `STALL` verdict, naming the last transition + elapsed stall; no ceiling wording |
+| progressing but out of ceiling | integration §78(c) | `TIMEOUT, not a stall`, `it WAS PROGRESSING`; no `STALLED` |
+| gate not weakened | integration §78(d) | wait clears, classification runs, a genuine red still refuses, no merge/evidence |
+| missing signal | integration §78(e) | names the unavailable signal, no stall claim |
+| bounds derived / promoted / seamed | unit §78(f), §43 | 8760 / 18064 / 3900 / 60 printed with their derivation; a 5000s step promotes to 10000s; leading zeros refused |
 
 ## 7. Research
 
@@ -161,11 +172,11 @@ Unobservable intervals advance the `missing` budget instead — which is what bo
 that never recovers, and which is now reported honestly as *cumulative and consecutive* time
 (`unreadable for 6s … in total, 6s consecutively`) rather than as one continuous silence.
 
-**Proof both ways.** New case §77(g) drives interleaved failed and successful reads: with the fix,
+**Proof both ways.** New case §78(g) drives interleaved failed and successful reads: with the fix,
 the same healthy run is never called stalled and lands; with only the two `quiet` increments
-restored, §77(g) fails 3 of its 5 assertions and the rail blocks with the message above. No fixture
+restored, §78(g) fails 3 of its 5 assertions and the rail blocks with the message above. No fixture
 change was made between the two runs — the only difference is the two lines.
 
 **The tell that it was a real gap and not a taste question:** the suite was green at 1607
-assertions both before and after, because §77(e) exits on the 1s legacy window before any
+assertions both before and after, because §78(e) exits on the 1s legacy window before any
 accumulation can occur. A green suite is not evidence about a clock it never let run.

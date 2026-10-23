@@ -1093,13 +1093,16 @@ run_admin_here() {
 
 # ── the virtual-clock scenarios must not REAL-sleep (agent-infra#2483) ──────────
 # `wait_for_run` accumulates its own clock arithmetically — `waited=$((waited + adv))` at
-# scripts/admin-merge.sh:4698 — and never reads the wall clock. The step is clamped at :4652
+# scripts/admin-merge.sh:5189 — and never reads the wall clock. The step is clamped at :5143
 # (`step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1`), so the `ADMIN_MERGE_POLL_INTERVAL=0`
 # this suite already passes still means ONE arithmetic second per poll; the only real time is
-# `sleep "$adv"` at :4699, which merely PACES a `gh` that is stubbed here. Three scenarios drive
+# `sleep "$adv"` at :5188, which merely PACES a `gh` that is stubbed here. Three scenarios drive
 # that clock across a bound by issuing 605/60/60 polls, which used to cost 614 s + 62 s + 62 s of
 # real sleeping for an arithmetic clock — ~13 of this shard's ~17 minutes, i.e. ~22% of the whole
 # `bash-suites` step (measured 2026-10-22, run 39857849778).
+#
+# (Line numbers re-pointed for this tree: #2481 adds ~640 lines to admin-merge.sh ABOVE
+# `wait_for_run`, so the citations that were correct on main landed elsewhere here.)
 # This stub removes the pacing and nothing else: the poll COUNT, the accumulated clock and every
 # assertion are unchanged, which is why (a2) below asserts the clock still passes 600 s. Same shape
 # as the `sleep() { :; }` probes in this file, but on PATH because the rail is a child process.
