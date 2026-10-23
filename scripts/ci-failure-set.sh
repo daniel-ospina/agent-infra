@@ -51,7 +51,17 @@
 #   --exclude <sha>           (--main-union / --main-union-rates /
 #                             --main-union-signatures) drop runs whose headSha is
 #                             <sha> (full or short; matched against the run's headSha)
-#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N runs:
+#
+#   ⚠️ WHAT [N] MEANS ON MAIN (#9689). N is a STARTING WIDTH, not the size of the
+#   window: the listing is widened (doubling, bounded at 200 runs) until the
+#   window holds N runs that actually FINISHED A MEASUREMENT, because a
+#   `completed/cancelled` run that never expanded a job would otherwise spend
+#   one of the N and a push burst can spend all of them — leaving `tested=0` and
+#   making admin-merge.sh report "the lane never TESTED main" about a main that
+#   simply had not been READ deep enough. A `--runs-report` therefore shows
+#   `completed`/`tested` over a wider listing than N, and says so on stderr.
+#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N MEASURED
+#                             runs (see "WHAT [N] MEANS" above):
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
@@ -59,8 +69,8 @@
 #                             NOTHING when no run exercised the suite (fail-closed).
 #   --main-union-signatures [N]
 #                             (#3756) main's per-id stable SIGNATURE over the last
-#                             N runs: `<nodeid>\t<signature>`. The rate table alone
-#                             leaves `main_signatures` empty, so the decision's
+#                             N MEASURED runs: `<nodeid>\t<signature>`. The rate table
+#                             alone leaves `main_signatures` empty, so the decision's
 #                             subset rule fails CLOSED and nothing is ever exempt;
 #                             this is the other half of the same measurement.
 #   --per-run <file>          (--commit-rows) write one line per FAILING run with
@@ -187,6 +197,10 @@ set -uo pipefail
 
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
+#: The largest window the #9689 widening may read — the same 200-run ceiling
+#: admin-merge.sh applies to `--main-runs`, because every run in the window may
+#: cost one Jobs API read and, when it FAILED, one failed-log fetch.
+MAIN_RUNS_MAX=200
 DEFAULT_WORKFLOW="python-ci.yml"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
@@ -415,6 +429,122 @@ list_lane_runs() {
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} \
     --json databaseId,status,conclusion,headSha,workflowDatabaseId,workflowName,event \
     --jq "$LANE_RUN_RAW_JQ" | drop_superseded_runs
+}
+
+# ── #9689: THE MAIN-SIDE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ──────────
+#
+# `--main-runs N` is a STARTING WIDTH, and it used to be applied to the RAW
+# listing, so a run that measured NOTHING spent one of the N — and a push burst
+# spends all of them at once. Measured on daniel-ospina/tortoise main
+# (2026-10-23, default lane, default N=10): the 10 newest `python-ci.yml` runs
+# were 1 queued + 9 `completed/cancelled`, each with ZERO jobs (GitHub keeps ONE
+# pending run per concurrency group, so every new push to main cancels the
+# pending one and it never expands). `tested=0` followed, and admin-merge.sh
+# refused EVERY merge with "the lane never TESTED main, so there is no
+# baseline" — a statement about the WINDOW, not about the lane: the same query
+# read 20 runs wide found a measured run at position 14.
+#
+# So the listing WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until the
+# exclusion-filtered window holds the requested number of MEASURED runs, or the
+# history is exhausted, or the bound is reached. This is the rule the rail's
+# lane-coverage gate already follows for its own reference window (#4844,
+# #7734: "N is a STARTING WIDTH, not a stopping rule"); the baseline pass was
+# the one place still reading N as a stopping rule.
+#
+# ⛔ THE WIDENING CRITERION IS NOT THE GATE. `measured_run_count` reads only the
+# listing's status/conclusion, so it cannot see a zero-job `success` — but it
+# decides only whether to read MORE, never that a baseline exists. The gate
+# stays `collect_union_rates`/`collect_union_signatures`'s own `tested` counter,
+# which takes the credit back for a zero-job run (#1482). A wrong widening
+# answer therefore costs one extra listing read, never a false PASS.
+#
+# ⚠️ STATED RESIDUAL, `--any-workflow` (#9689 follow-up): the criterion counts a
+# completed run of ANY workflow, exactly as the gate's `tested` credit does. So in
+# the union mode a chatty non-test lane can fill the requested width and keep a
+# test lane's deeper failures out of the baseline. Fixing that needs LANE
+# ATTRIBUTION the union listing does not carry (the workflow column is dropped by
+# `drop_superseded_runs`, and a trigger-split repo has no single lane name to
+# attribute to), so it is a design question and NOT part of this window fix. The
+# symptom this change does cure in that mode is the `completed=0, tested=0`
+# reading, where the width is spent on runs that never expanded at all.
+
+# measured_run_count <lane-file> → how many listed runs FINISHED A MEASUREMENT
+# (completed with conclusion success|failure|timed_out). A widening criterion
+# only — see the block above.
+measured_run_count() {
+  awk -F'\t' '$1 == "completed" && ($2 == "success" || $2 == "failure" || $2 == "timed_out") { n++ } END { print n + 0 }' "$1"
+}
+
+# exclude_runs <in> <sha|''> <out> → the listing minus runs whose headSha IS
+# <sha>, prefix-tolerant both ways (callers pass a full sha, the API may return
+# either). A line whose sha is EMPTY is KEPT: dropping runs we cannot identify
+# would shrink the baseline and manufacture "unique" failures.
+#
+# It reads the TAGGED projection's sha field ($3) — never a bare `$1`. `$1` of a
+# `status<TAB>conclusion<TAB>sha:id` line is `status<TAB>conclusion<TAB>sha`, so a
+# blind `-F: '$1 != x'` matches nothing and `--exclude` becomes a silent no-op:
+# the merged commit's own run stays in main's baseline, its failures equal the
+# PR's, and the post-merge detector can never fire (review P0, cycle 2). ONE
+# implementation, because the pre-merge and post-merge paths must not disagree
+# about what `--exclude` removed.
+exclude_runs() {
+  local in="$1" x="$2" out="$3"
+  if [ -n "$x" ]; then
+    awk -F'\t' -v x="$x" '
+      {
+        n = split($3, a, ":")
+        sha = a[1]
+        if (sha == "") print
+        else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
+      }' "$in" > "$out"
+  else
+    cp "$in" "$out"
+  fi
+}
+
+# list_main_baseline <requested-width> <exclude> <raw-out> <filtered-out>
+#
+# Lists main's lane runs at <requested-width> and WIDENS it (doubling, bounded
+# by $MAIN_RUNS_MAX) until the exclusion-filtered listing holds at least the
+# requested number of MEASURED runs. The ORDINARY case — a requested window that
+# already holds that many — reads exactly ONE listing, byte-identical to before.
+# Returns 1 when a listing read fails (fail-closed: an unreadable run list must
+# never read as "nothing ran").
+list_main_baseline() {
+  local want="$1" exclude="$2" raw="$3" out="$4"
+  local width="$want" measured=0 listed=0 prev=0 read_once=0
+  while :; do
+    list_lane_runs --branch main "$width" > "$raw" || return 1
+    exclude_runs "$raw" "$exclude" "$out"
+    measured="$(measured_run_count "$out")"
+    listed="$(awk 'END { print NR + 0 }' "$raw")"
+    [ "$measured" -ge "$want" ] && break
+    # STOP when more width cannot help. An EMPTY listing stays empty at any
+    # width — main has no run of this lane at all — so there is nothing to widen
+    # into and the announcement below would be noise. The policy bound is the
+    # other hard stop.
+    [ "$listed" -eq 0 ] && break
+    [ "$width" -ge "$MAIN_RUNS_MAX" ] && break
+    # …and when the history is exhausted: this read listed no more runs than the
+    # last one, so a wider window would re-read the same runs forever. This is
+    # checked on the LISTING (post-supersede, pre-exclusion) rather than by
+    # comparing `listed` to `width`, because `drop_superseded_runs` may legitimately
+    # return fewer lines than the window asked for while the history goes on —
+    # stopping there would under-widen and re-create the very false block this
+    # fixes. The price is one extra listing read on a short history, and that is
+    # the correct side of the trade: an extra read costs time, a premature stop
+    # costs a blocked merge.
+    { [ "$read_once" -gt 0 ] && [ "$listed" -le "$prev" ]; } && break
+    read_once=1; prev="$listed"
+    width=$((width * 2))
+    [ "$width" -gt "$MAIN_RUNS_MAX" ] && width="$MAIN_RUNS_MAX"
+    # NAME the numbers, not a cause: `listed` is counted BEFORE `--exclude` while
+    # `measured` is counted AFTER it, so "the rest measured nothing" would be a
+    # false statement on the ordinary rail path (which always excludes the PR's
+    # own head run).
+    say_err "ci-failure-set: · main's ${want}-run baseline window held ${measured} MEASURED run(s) of ${listed} listed — widening to ${width} (#9689)"
+  done
+  return 0
 }
 
 # extract_failed_tests <run-id> → sorted-unique nodeids, one per line.
@@ -1133,18 +1263,7 @@ main() {
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      list_main_baseline "$main_runs" "$exclude" "$runs" "$filtered" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       collect_union_rates "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
@@ -1162,18 +1281,7 @@ main() {
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      list_main_baseline "$main_runs" "$exclude" "$runs" "$filtered" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       collect_union_signatures "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
@@ -1182,26 +1290,12 @@ main() {
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
-      if [ -n "$exclude" ]; then
-        # Parse the TAGGED projection's sha field — never a bare `$1`. `$1` of a
-        # `status<TAB>conclusion<TAB>sha:id` line is `status<TAB>conclusion<TAB>sha`,
-        # so a blind `-F: '$1 != x'` matches nothing and `--exclude` becomes a
-        # silent no-op: the merged commit's own run stays in main's baseline, its
-        # failures equal the PR's, and the post-merge detector can never fire
-        # (review P0, cycle 2). Prefix-tolerant both ways: callers pass a full sha
-        # from an event payload, the API may return either. A line with an EMPTY
-        # sha is KEPT — dropping runs we cannot identify would shrink the baseline
-        # and manufacture "unique" failures (VGATE cycle 2).
-        awk -F'\t' -v x="$exclude" '
-          {
-            n = split($3, a, ":")
-            sha = a[1]
-            if (sha == "") print
-            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
-          }' "$runs" > "$filtered"
-      else
-        cp "$runs" "$filtered"
-      fi
+      # ONE exclusion rule for every main mode (exclude_runs). The rule itself is
+      # documented at its definition, and it is shared rather than re-written here
+      # so a correction cannot land on this side only: `--main-union` feeds the
+      # POST-merge detector while the widened modes feed the PRE-merge rail, and
+      # the two must not disagree about what `--exclude` removed.
+      exclude_runs "$runs" "$exclude" "$filtered"
       collect_union "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;

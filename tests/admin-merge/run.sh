@@ -12786,6 +12786,154 @@ grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" \
   || pass "(d) no merge attempted on a red"
 [ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
 
+# ── 77. #9689: THE BASELINE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ───
+# A push burst to main spends the requested `--main-runs` window on runs that
+# MEASURED NOTHING. GitHub keeps ONE pending run per concurrency group, so on a
+# repo whose main lane must not cancel-in-progress each new push cancels the
+# PENDING one, and a cancelled-before-expansion run has ZERO jobs. Measured on
+# daniel-ospina/tortoise main (2026-10-23, default lane, default N=10): the 10
+# newest `python-ci.yml` runs were 1 queued + 9 `completed/cancelled`, so
+# `tested=0` — and admin-merge.sh refused EVERY merge with "the lane never
+# TESTED main, so there is no baseline". That is a statement about the WINDOW,
+# not about the lane: the same query read 20 wide found a measured run at
+# position 14. The listing now WIDENS (doubling, bounded by the 200-run policy
+# ceiling) until it holds the REQUESTED number of measured runs.
+#
+# Every assertion about the MEASURED WINDOW below is RED on the pre-#9689 parser:
+# a fixed 2-wide window over a diluted history yields tested=0, an EMPTY rate
+# table, and the block. (c) is the one deliberate exception — it is GREEN on both
+# revisions BY DESIGN, because it pins the false-PASS guard on the change rather
+# than the regression: a history with no measured run must still block.
+echo "== 77. #9689: the baseline window is a count of MEASUREMENTS =="
+new_scen dilutedbaseline
+HEAD_DW="dddd000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DW" > "$SCEN/head"
+lane_pass "$HEAD_DW" 8801 > "$SCEN/runs-$HEAD_DW"
+OLD_ID='tests/test_old.py::test_red_on_main'
+# main, NEWEST FIRST: three runs cancelled before they expanded a job (the
+# dilution), then two runs that MEASURED and failed a PRE-EXISTING id. A
+# `--main-runs 2` window therefore sees only cancelled runs — the #9689 window
+# — and the measured runs sit one widening deeper.
+{
+  lane_line completed cancelled dwc1 8811
+  lane_line completed cancelled dwc2 8812
+  lane_line completed cancelled dwc3 8813
+  lane_fail dww1 8814
+  lane_fail dww2 8815
+} > "$SCEN/runs-main"
+lane_jobs 8811   # zero jobs: cancelled before expansion, not "readable and green"
+lane_jobs 8812
+lane_jobs 8813
+lane_jobset 8814 failure 'test (a)'
+lane_jobset 8815 failure 'test (a)'
+log_failed "$OLD_ID" > "$SCEN/log-8814"
+log_failed "$OLD_ID" > "$SCEN/log-8815"
+
+# (a) THE PARSER measures a baseline it would have called "absent".
+cfs_run --main-union-rates 2 --runs-report "$TMP/dw-report.txt"
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "the rate pass succeeds over a diluted window (exit 0)" \
+  || fail "expected exit 0, got $rc: $(head -2 "$TMP/cfs-err")"
+WANT_RATE_ROW="$(printf '%s\t2\t2' "$OLD_ID")"
+grep -qxF "$WANT_RATE_ROW" "$TMP/cfs-out" \
+  && pass "and main's rate table MEASURES the pre-existing id (2 failures of 2 measured runs) instead of emitting nothing" \
+  || fail "the widened window did not measure the baseline: $(tr '\n' ' ' < "$TMP/cfs-out")"
+grep -qx 'tested=2' "$TMP/dw-report.txt" \
+  && pass "and the report says tested=2, so admin-merge's no-baseline block cannot fire" \
+  || fail "expected tested=2 in the report, got: $(tr '\n' ' ' < "$TMP/dw-report.txt")"
+grep -qF '#9689' "$TMP/cfs-err" && grep -qF 'widening to 4' "$TMP/cfs-err" \
+  && pass "and the WIDENING is announced, so a reader can tell the width was not the requested one" \
+  || fail "the widening was not announced: $(head -2 "$TMP/cfs-err")"
+
+# (a2) THE SAME HELPER SERVES THE UNION MODE. `--any-workflow` is this listing
+# with no workflow filter, so the widening is reached identically. READ THIS
+# ASSERTION FOR WHAT IT IS: the fake serves `runs-main` for BOTH modes, so this
+# pins the SHARED CODE PATH, not union lane composition (a chatty non-test lane
+# filling the width is the stated residual in the script's #9689 block).
+cfs_run --main-union-rates 2 --any-workflow --runs-report "$TMP/dw-any.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'tested=2' "$TMP/dw-any.txt"; then
+  pass "the union lane reads the same measured window (tested=2 with --any-workflow)"
+else
+  fail "the union lane still measured nothing (exit $rc): $(tr '\n' ' ' < "$TMP/dw-any.txt")"
+fi
+
+# (b) …and its SIGNATURE twin reads the SAME window: an empty `main_signatures`
+# makes the decision's subset rule fail CLOSED, so a rate table with no signature
+# half exempts nothing and the merge stays blocked for a second reason.
+cfs_run --main-union-signatures 2
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^$OLD_ID" "$TMP/cfs-out"; then
+  pass "the signature pass reads the same widened window (exit 0, the id is present)"
+else
+  fail "the signature pass did not reach the widened window (exit $rc): $(tr '\n' ' ' < "$TMP/cfs-out")"
+fi
+
+# (e) END TO END: the rail MERGES a green PR against that diluted window. This is
+# the defect as it was measured — a fully reviewed, green PR refused with "the
+# lane 'python-ci.yml' never TESTED main" for a reason that has nothing to do
+# with the PR. It runs BEFORE the new_scen calls below, so it keeps THIS
+# scenario's fixtures.
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "admin-merge.sh MERGES (exit 0) over a diluted main window — the #9689 false block is gone"
+else
+  fail "expected exit 0 for a green PR over a diluted window, got $rc"
+  sed 's/^/      /' "$SCEN/err" | head -8
+fi
+grep -q 'never TESTED main' "$SCEN/err" \
+  && fail "the rail STILL reports no baseline over a window that measured runs exist beneath" \
+  || pass "and the no-baseline block does not fire"
+[ -f "$SCEN/comment" ] && pass "and the head-bound evidence is posted" \
+                     || fail "no evidence comment posted for the merged PR"
+
+# (c) THE WIDENING CANNOT MANUFACTURE A BASELINE. A history that holds NO
+# measured run is still no baseline, however wide it is read — this is the
+# false-PASS guard on the whole change.
+new_scen dilutednever
+{
+  lane_line completed cancelled dwn1 8821
+  lane_line completed cancelled dwn2 8822
+  lane_line completed cancelled dwn3 8823
+} > "$SCEN/runs-main"
+lane_jobs 8821
+lane_jobs 8822
+lane_jobs 8823
+cfs_run --main-union-rates 2 --runs-report "$TMP/dn-report.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -s "$TMP/cfs-out" ]; then
+  pass "an all-unmeasured history yields an EMPTY rate table (exit 0): widening a window never invents a measurement"
+else
+  fail "a never-measured history emitted a baseline (exit $rc): $(tr '\n' ' ' < "$TMP/cfs-out")"
+fi
+grep -qx 'tested=0' "$TMP/dn-report.txt" \
+  && pass "and the report still says tested=0, so the rail still BLOCKS" \
+  || fail "expected tested=0, got: $(tr '\n' ' ' < "$TMP/dn-report.txt")"
+
+# (d) THE HISTORY IS THE CEILING, NOT THE POLICY BOUND. With one measured run in
+# existence the widening STOPS at the end of the history and reports what it
+# measured — it does not read to 200, and it does not call the shortfall a
+# baseline of the requested width.
+new_scen dilutedoneshort
+{
+  lane_line completed cancelled dwo1 8831
+  lane_line completed cancelled dwo2 8832
+  lane_fail dwo3 8833
+} > "$SCEN/runs-main"
+lane_jobs 8831
+lane_jobs 8832
+lane_jobset 8833 failure 'test (a)'
+log_failed "$OLD_ID" > "$SCEN/log-8833"
+cfs_run --main-union-rates 2 --runs-report "$TMP/do-report.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'tested=1' "$TMP/do-report.txt"; then
+  pass "a history holding ONE measured run reports tested=1, not a fabricated 2"
+else
+  fail "expected tested=1 from the exhausted history, got: $(tr '\n' ' ' < "$TMP/do-report.txt")"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
