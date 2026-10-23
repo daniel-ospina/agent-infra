@@ -98,7 +98,7 @@ usage() { # <exit-code>
 }
 
 VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1
-A_HARNESS=""; A_REPO=""; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
+A_HARNESS=""; A_REPO=""; A_REPO_SEEN=0; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
 BOUND="${HARNESS_UP_TIMEOUT:-900}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,7 +112,7 @@ while [ $# -gt 0 ]; do
         fi
         VERB="$1"; shift ;;
     --harness)             [ $# -ge 2 ] || die "--harness needs a path"; A_HARNESS="$2"; shift 2 ;;
-    --repo)                [ $# -ge 2 ] || die "--repo needs a path"; A_REPO="$2"; shift 2 ;;
+    --repo)                [ $# -ge 2 ] || die "--repo needs a path"; A_REPO="$2"; A_REPO_SEEN=1; shift 2 ;;
     --ref)                 [ $# -ge 2 ] || die "--ref needs a git ref"; A_REF="$2"; shift 2 ;;
     --pin)                 [ $# -ge 2 ] || die "--pin needs a file"; A_PIN="$2"; shift 2 ;;
     --pin-dir)             [ $# -ge 2 ] || die "--pin-dir needs a path"; A_PINDIR="$2"; shift 2 ;;
@@ -473,6 +473,14 @@ cfg_value() { # <key> <file>
 # SAY SO on stderr, and continue.
 HREPO=""
 HREPO_BAD=""
+# ⛔ `--repo ""` IS AN OPERATOR ASSERTION THAT NAMES NOTHING, so it is REFUSED like any other unusable
+# assertion — never read as "no flag". `[ -n "$A_REPO" ]` treated an empty value as absent and then
+# resolved the harness from HARNESS_REPO / the launcher's own checkout, i.e. the run answered about a
+# checkout the operator never named — the silent-substitution class this block exists to remove. It is
+# reachable in the ordinary way (`--repo "$SOME_UNSET_VAR"`). (#2351 review)
+if [ "${A_REPO_SEEN:-0}" = 1 ] && [ -z "${A_REPO:-}" ]; then
+  die "--repo '' is empty — it must name the HARNESS checkout (the repo the pin commit and --ref are commits OF); an empty value is refused, never read as 'no flag'" 2
+fi
 if [ -n "${A_REPO:-}" ]; then
   HREPO="$A_REPO"
   [ -d "$HREPO" ] || die "--repo $HREPO is not a directory — --repo names the HARNESS checkout, the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
@@ -682,6 +690,17 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
 # anything else = MISMATCH.
 HU_PIN_PENDING=0
 hu_real() { ( cd "${1:-/nonexistent}" 2>/dev/null && pwd -P ); }
+# ⛔ TWO PATHS ARE THE SAME REPO ONLY WHEN BOTH RESOLVE AND THE RESULTS MATCH. `hu_real` prints NOTHING
+# for a path that does not exist, so a bare `[ "$(hu_real a)" = "$(hu_real b)" ]` declares two MISSING
+# paths EQUAL — and in the claims row that means a record about a repo this box does not drain is reused
+# as an answer (`OK (refs/claims reachable)`) with no probe run, which is the exact false PASS that row
+# exists to prevent. An EMPTY resolution is the ABSENCE of an identity, never an identity shared by two
+# paths (#2351 review, reproduced: both-missing read OK and the record was left untouched).
+hu_same_repo() { # <a> <b> — resolved equality; an empty resolution on either side is NOT equality
+  local ra rb
+  ra="$(hu_real "${1:-}")"; rb="$(hu_real "${2:-}")"
+  [ -n "$ra" ] && [ -n "$rb" ] && [ "$ra" = "$rb" ]
+}
 hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (used after a start)
   local strict="${1:-0}" sha want got real_want real_got got_head got_root
   HU_PIN_PENDING=0
@@ -867,13 +886,13 @@ hu_row_claims() {
     if [ -z "$REPO" ]; then
       hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, and no work repo is resolved to attribute it)"; return 2
     fi
-    if [ "$(hu_real "$rec_repo")" != "$(hu_real "$REPO")" ]; then
+    if ! hu_same_repo "$rec_repo" "$REPO"; then
       # Re-probe and re-read; the row is the FRESH answer, or UNKNOWN with the probe's reason.
       hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the record probed $rec_repo, not the work repo $REPO, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
       verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
       age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
       rec_repo="$(sed -n 's/^claims=[^ ]* repo=\(.*\) at=[^ ]*$/\1/p' "$f" 2>/dev/null | head -1)"
-      if [ -n "$rec_repo" ] && [ "$(hu_real "$rec_repo")" != "$(hu_real "$REPO")" ]; then
+      if [ -n "$rec_repo" ] && ! hu_same_repo "$rec_repo" "$REPO"; then
         hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record still names $rec_repo, not the work repo $REPO)"; return 2
       fi
     fi

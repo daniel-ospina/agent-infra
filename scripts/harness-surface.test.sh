@@ -1112,6 +1112,30 @@ ck "(e) a trailing-slash spelling of the SAME repo is not a mismatch (no re-prob
    "$([ "$(cat "$FRESHCELL/orchestrator/state/harness-claims")" = "$before_slash" ] && echo 0 || echo 1)"
 ck "(e) …and that record reads OK, not a mismatched repo" \
    "$(case "$spacerow" in *'OK ('*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ TWO MISSING PATHS ARE NOT "THE SAME REPO" (review P1, fail-open): `hu_real` prints NOTHING for a path
+# that does not exist, so a bare `hu_real`-vs-`hu_real` compare declared two DIFFERENT nonexistent paths
+# EQUAL. In this row that reused a record written about a repo this box does not drain and printed
+# `OK (refs/claims reachable)` WITHOUT probing — a false OK feeding `status`'s single verdict. Both paths
+# are gone on purpose: the resolved-empty identity is the observable, and REPO_BAD is only a warning on a
+# non-`up` verb (so the row is reached, exactly the box shape #1856 exists for).
+GONEOLD="$TMP/gone-old-checkout"; GONENEW="$TMP/gone-new-checkout"
+printf 'claims=reachable repo=%s at=%s\n' "$GONEOLD" "$(date +%s)" \
+  > "$FRESHCELL/orchestrator/state/harness-claims"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$GONENEW" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+gonerow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) two MISSING paths are not the same repo — the row never reuses the record as OK [$gonerow]" \
+   "$(case "$gonerow" in *'OK ('*) echo 1 ;; *'UNKNOWN'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND AN EXPLICITLY EMPTY `--repo` IS REFUSED, never read as "no flag" (review P2): `[ -n "$A_REPO" ]`
+# read `--repo ""` as absent, then resolved the harness from HARNESS_REPO / the launcher's own checkout —
+# answering about a checkout the operator never named. Reachable in the ordinary way (`--repo "$UNSET"`).
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$WORK" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --repo "" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) '--repo \"\"' is REFUSED (rc=$RC), never silently resolved from another candidate" \
+   "$(if [ "$RC" -eq 2 ]; then case "$OUT" in *"--repo '' is empty"*) echo 0 ;; *) echo 1 ;; esac; else echo 1; fi)"
 # ⛔ AND THE EXEC ROW FAILS CLOSED TOO (review P1, fail-open): a controller IS running on the pin worktree,
 # the harness does not resolve, and the CWD is a checkout that HOLDS the pin commit — i.e. exactly where
 # `git -C ""` would answer. Without the guard this row printed `OK (executing …)`, a false row feeding the
