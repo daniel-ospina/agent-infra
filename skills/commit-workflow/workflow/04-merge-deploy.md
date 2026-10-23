@@ -64,10 +64,13 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    surface (the merge/land/repair rails `scripts/admin-merge.sh`,
    `scripts/ci-failure-set.sh`, `scripts/atomic-land.sh`,
    `scripts/check-pipeline-compliance.sh`, the recorder `scripts/record-review.sh`,
-   `.github/workflows/**`, `.github/actions/**`, `extensions/**`, `skills/**`,
-   `templates/**`, `enforcement/**` — the last three because they are
-   agent-executable instructions), `record-review.sh` REFUSES (exit 4) a
-   `clean-micro` record — a `complexity:micro` label does not make a merge-rail
+   `.github/workflows/**`, `.github/actions/**`, `.husky/**`, `extensions/**`,
+   `skills/**`, `templates/**`, `enforcement/**`, `scripts/check-*`,
+   `scripts/lib/diff-normalize.py` — the last five because they are
+   agent-executable instructions or gate bodies), `record-review.sh` REFUSES
+   (exit 4) a `clean-micro` record whose readable diff touches one; a TRANSPORT
+   failure only warns, and a payload the API answered with but the classifier
+   cannot certify refuses. A `complexity:micro` label does not make a merge-rail
    edit reviewable at micro depth. Ask first with
    `record-review.sh --print-tier <pr> [owner/repo]` → `<status>\t<full|low|micro>`
    (only `ok` carries a tier; see `proportional-gates` §Review Cycles, "The
