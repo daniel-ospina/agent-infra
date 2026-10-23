@@ -422,6 +422,15 @@ reset; printf 'The PR carries this from an earlier head:\n```\n**Verdict:** CLEA
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "…while a REAL verdict after the quote still records (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+# ⛔ A TAB IS AN INDENT (P2, fresh review of #2288): a markdown indented code block is FOUR
+# COLUMNS and a tab reaches the second stop, so the four-space fix left a `\t**Verdict:** CLEAN …`
+# quotation working (rc 0, artifact posted, signed clean record) while the same line with four
+# spaces exited 6. Pinned as an A/B pair so the next literal-form fix cannot regress the other.
+reset; printf 'Quoting the earlier report:\n\n\t**Verdict:** CLEAN — no blocking findings.\n\nCould not finish.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a TAB-indented quotation is not a verdict either (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+no_comment; ck $? "  …and nothing posted"
 # ⛔ THE COUNT GRAMMAR MUST ALSO BE A FINDING GRAMMAR (P2, fresh review of #2288): the count
 # extractor reads `2 × P1` as the verdict's own count (§AM), while the severity cross-check had no
 # cue for it at all — so `Blocking: 2 × P1` followed by `CLEAN` recorded clean. The one check
@@ -1102,6 +1111,22 @@ reset; printf 'Two blockers.\n**Verdict: ISSUES — 2**\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "a PRINTED dash-count ('ISSUES — 2') blocks (rc=$(rc_of))"
 err_has "found 2 blocking issue(s)"; ck $? "  …reporting 2, not silently lowered to the scan's 0"
+# ⛔ …AND THE SHAPE ITSELF MUST ACCEPT THE DASH FORM (P2, fresh review of #2288). The count
+# reader and its comments name `ISSUES — 2` as the realistic closer, but `VD_ISSUES` accepted only
+# `(`, `[` and `:` — so the BARE dash form was not verdict-shaped, the count reader was
+# unreachable for it, and a reviewer closing with `ISSUES — 2` was answered "NO VERDICT" and told
+# to re-run into the same refusal. The digits stay mandatory: `ISSUES —` is still no verdict.
+reset; printf 'Two blockers.\nISSUES — 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "the BARE dash form 'ISSUES — 2' parses and blocks (rc=$(rc_of))"
+err_has "found 2 blocking issue(s)"; ck $? "  …reporting its own count"
+reset; printf 'Nothing blocks.\nISSUES — 0 × P1\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and the bare 'ISSUES — 0 × P1' is CLEAN (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+reset; printf 'Something.\nISSUES —\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…while 'ISSUES —' with NO count is still not a verdict (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
 reset; printf 'Problems.\nVerdict = ISSUES\n' > "$TMP/reviewer-out"
 run "$SRC" 2284

@@ -747,7 +747,15 @@ fi
 #     because the `-` must be followed by a space. The token is UPPERCASE — that is the contract
 #     the prompt states and what separates a verdict from prose.
 VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[—–-][[:space:]]+)'
-VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:space:]]*[0-9]+'
+# ⛔ THE SHAPE MUST ACCEPT WHAT THE COUNT READER DOCUMENTS (P2, fresh review of #2288). The
+# count reader (`${LAST_LC#*issues}` + the separator class) and the comments in the count block
+# both name `ISSUES — 2` / `ISSUES — 0 × P1` as the realistic report closer, but THIS shape
+# accepted only `(`, `[` and `:` — so the bare dash form was not verdict-shaped at all, the count
+# reader was unreachable for it, and a reviewer closing with `ISSUES — 2` had its paid review
+# discarded as NO VERDICT and was told to re-run into the same refusal. That is the same
+# two-readers-drift class this file already filed for the colon form, one shape over. The digits
+# stay MANDATORY, so `ISSUES —` with no count is still not a verdict (pin in §AM).
+VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*[][(:,—–,-]*[[:space:]]*[0-9]+'
 # The CLOSING decoration is part of the shape, exactly as in VD_CLEAN above: `**Verdict: CLEAN**`
 # is what a model actually emits, and without this group the line failed to parse as a verdict at
 # all (exit 6 = NO VERDICT) while a hyphenated `**Verdict: CLEAN-UP …**` still refuses, because the
@@ -770,6 +778,13 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 # non-review and an attestation. Fence state is therefore tracked here, and a markdown INDENTED
 # code block (4+ leading spaces, the other way to quote) is dropped the same way; the blockquote
 # form (`> **Verdict:** …`) never matched, because every pattern anchors after optional WHITESPACE.
+# ⚠️ DECLARED RESIDUAL, so that no later reviewer reads the fence/indent fix as full coverage: a
+# verdict-shaped line on a PLAIN, unfenced, unindented line, quoted and then followed by NO later
+# verdict, is still read as the verdict. That is not shape-distinguishable from a real conclusion
+# under this file's deliberate decision that the LAST verdict-shaped line wins and trailing prose
+# is allowed (§AB) — closing it would mean requiring the verdict to be the final non-empty line,
+# which changes that decision rather than fixing a bug. Quote it inside a fence or indent it and
+# it is correctly refused; narrate it as plain prose and it is not.
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | awk '{ ln[NR] = $0 }
                     END {
@@ -787,7 +802,14 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                         for (k = 1; k <= n; k += 2)
                           if (i >= mk[k] && i <= mk[k+1]) { skip = 1; break }
                         if (skip) continue
-                        if (ln[i] ~ /^    /) continue
+                        # ⛔ A TAB IS THE INDENTATION IT IS (P2, fresh review of #2288): a
+                        # markdown indented code block is FOUR COLUMNS, and a tab reaches the
+                        # second stop, so `\t**Verdict:** CLEAN …` quoted a previous head
+                        # successfully — rc 0, artifact posted, signed clean record — while the
+                        # same line with four spaces correctly exited 6. Expand tabs on a COPY
+                        # (the printed line keeps the text as the reviewer wrote it).
+                        t = ln[i]; gsub(/\t/, "    ", t)
+                        if (t ~ /^    /) continue
                         print ln[i]
                       }
                     }' \
