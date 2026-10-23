@@ -45,11 +45,11 @@ probe "$TMP/s1"
 ck "(1) the read still FAILS (fail-closed, unchanged)" $([ "$RC" -eq 1 ] && echo 0 || echo 1)
 ck "(1) nothing was printed as a context set" $([ -z "$OUT" ] && echo 0 || echo 1)
 ck "(1) stderr names gh-core-exhausted resets_in=<Nm>" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=12m' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=12m' <<<"$ERR" && echo 0 || echo 1)
 ck "(1) the window is computed from the record, not restated from the file (12m of 700s)" \
-   $(printf '%s' "$ERR" | grep -q 'resets_in=12m' && echo 0 || echo 1)
+   $(grep -q 'resets_in=12m' <<<"$ERR" && echo 0 || echo 1)
 ck "(1) it says the budget is the problem, not the repo/token/GitHub" \
-   $(printf '%s' "$ERR" | grep -q 'not a broken repo' && echo 0 || echo 1)
+   $(grep -q 'not a broken repo' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (2) no record => silent (an ordinary unreadable read adds no noise) ───────────────────────"
 mkdir -p "$TMP/s2"
@@ -81,9 +81,9 @@ mkdir -p "$TMP/s5"
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$NOW" > "$TMP/s5/health"
 probe "$TMP/s5"
 ck "(5a) an undated record still NAMES the state" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=?' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=?' <<<"$ERR" && echo 0 || echo 1)
 ck "(5a) … and prints no number nobody measured" \
-   $(printf '%s' "$ERR" | grep -q 'resets_in=?' && echo 0 || echo 1)
+   $(grep -q 'resets_in=?' <<<"$ERR" && echo 0 || echo 1)
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$((NOW - 1000))" > "$TMP/s5/health"
 probe "$TMP/s5"
 ck "(5b) an undated record past its bound is SILENT (age-bounded, like every record here)" \
@@ -103,7 +103,7 @@ ck "(5c) window=-5 clamps to the 60 s floor too (was sent to the 900 s default)"
 export GH_LIMIT_HEALTH_UNKNOWN_WINDOW=abc
 probe "$TMP/s5"
 ck "(5c) window=abc falls back to the default => the record is NAMED (not silently dropped)" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=?' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=?' <<<"$ERR" && echo 0 || echo 1)
 unset GH_LIMIT_HEALTH_UNKNOWN_WINDOW
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

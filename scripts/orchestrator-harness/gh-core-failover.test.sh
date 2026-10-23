@@ -11,6 +11,11 @@
 #                                      required” — a red tree mistaken for a green one);
 #   (c) N identical reads inside the TTL => ONE upstream request (asserted against the stub's log);
 #   (d) mutations: GH_LIMIT_READ_CACHE=0 makes (c) fail; GH_LIMIT_FAILOVER=0 makes (a) fail.
+#   (n) the FLOOR (#2342): below `GH_LIMIT_CORE_FLOOR` a read that cannot fail over is refused BY
+#       NAME — empty stdout, no request spent, no claim that the pool is empty — and a read that CAN
+#       fail over is still served; `GH_LIMIT_ESSENTIAL=1` spends the reserve (the landing path).
+#   (o) the INSTRUMENT (#2342): `--stats` reports the hits/misses/coalesced shares the calls
+#       actually wrote, and an empty box says `no-reads-counted` instead of inventing `averted=0`.
 #
 # ⛔ NO REAL SLEEP: every path asserted here fails fast or answers immediately, so the suite needs no
 # fake clock. `GH_LIMIT_NO_WAIT=1` is set for the refusal cases so a real backoff cannot turn this
@@ -48,6 +53,10 @@ case "\$1 \$2" in
     elif [ "\${GH_TEST_SCENARIO:-}" = "low" ]; then
       # 50 left: inside the low-water band, NOT empty.
       printf '{"resources":{"core":{"limit":5000,"remaining":50,"reset":$RESET,"used":4950},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
+    elif [ "\${GH_TEST_SCENARIO:-}" = "floor" ]; then
+      # 400 left: ABOVE the pre-#2342 reserve (100) and BELOW the #2342 floor (800) — exactly the
+      # window in which the fleet used to spend the reserve on polling (#2342).
+      printf '{"resources":{"core":{"limit":5000,"remaining":400,"reset":$RESET,"used":4600},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
     else
       printf '{"resources":{"core":{"limit":5000,"remaining":0,"reset":$RESET,"used":5000},"graphql":{"limit":5000,"remaining":4745,"reset":$RESET,"used":255}}}\n'
     fi
@@ -163,6 +172,7 @@ reset_env() {
   export GH_LIMIT_CONDITIONAL=0
   export GH_LIMIT_NO_WAIT=1
   unset GH_LIMIT_READ_CACHE GH_LIMIT_FAILOVER 2>/dev/null || true
+  unset GH_LIMIT_ESSENTIAL GH_LIMIT_CORE_FLOOR GH_LIMIT_CORE_LOW_WATER 2>/dev/null || true
   export GH_TEST_SCENARIO="$2"
 }
 
@@ -189,13 +199,20 @@ budget() {  # the --budget VERB: ONE exempt read of both pools, recorded for eve
   ERR="$(cat "$TMP/err")"
 }
 
+stats() {  # the --stats VERB: local counters only — no request, no credentials, no quota
+  python3 "$HELPER" --stats >"$TMP/out" 2>"$TMP/err"
+  RC=$?
+  OUT="$(cat "$TMP/out")"
+  ERR="$(cat "$TMP/err")"
+}
+
 echo "── (a) core=0 + GraphQL available: the read SUCCEEDS and the failover is LOGGED ──────────────"
 reset_env a core0
 # ONE exempt read of BOTH pools — the burst's own meter call, which is what a dispatcher does before
 # it fans out. Every call after this reads the shared snapshot instead of probing.
 budget core0
 ck "(a) --budget names BOTH pools and their windows" \
-   $(printf '%s' "$OUT" | grep -q '^core=0/5000 resets_in=12m graphql=4745/5000' && echo 0 || echo 1)
+   $(grep -q '^core=0/5000 resets_in=12m graphql=4745/5000' <<<"$OUT" && echo 0 || echo 1)
 ck "(a) --budget exits 0" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
 : > "$STUB_LOG"                    # counters start after the meter call: they describe the READ
 run core0 api repos/o/r/pulls/7 --jq .head.sha
@@ -209,7 +226,7 @@ ck "(a) the failover is RECORDED (events.log names it)" \
 ck "(a) nothing on the caller's stderr (the streams stay sacred on success)" $([ -s "$TMP/err" ] && echo 1 || echo 0)
 health core0
 ck "(a) --health still reports the core pool as EMPTY after a GraphQL-served read" \
-   $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=12m$' && echo 0 || echo 1)
+   $(grep -q '^gh-core-exhausted resets_in=12m$' <<<"$OUT" && echo 0 || echo 1)
 ck "(a) --health exits 3 (a NAMED state, not a generic failure)" $([ "$RC" -eq 3 ] && echo 0 || echo 1)
 
 echo "── (a2) the fleet LEARNS: ONE refusal + ONE exempt probe makes every later lane fail over ────"
@@ -225,7 +242,7 @@ ck "(a2) lane A's read was REFUSED" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
 ck "(a2) the refusal cost exactly ONE exempt meter read, which recorded both pools" \
    $([ "$(reqs 'api rate_limit')" -eq 1 ] && [ -f "$GH_LIMIT_DIR/budget.json" ] && echo 0 || echo 1)
 ck "(a2) lane A did NOT wait out a 12-minute reset (the in-call bound holds)" \
-   $(printf '%s' "$ERR" | grep -q 'beyond the 300s in-call bound' && echo 0 || echo 1)
+   $(grep -q 'beyond the 300s in-call bound' <<<"$ERR" && echo 0 || echo 1)
 export GH_LIMIT_NO_WAIT=1                        # lane B is bounded: it may not sleep, and need not
 run core0 api repos/o/r/pulls/7 --jq .head.sha   # lane B: same box, later process
 ck "(a2) lane B's read SUCCEEDED from GraphQL" \
@@ -240,11 +257,11 @@ run graphqldead api repos/o/r/pulls/7
 ck "(b) the call FAILS (never a green tree)" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
 ck "(b) stdout is EMPTY (no empty body that a lane could read as data)" $([ ! -s "$TMP/out" ] && echo 0 || echo 1)
 ck "(b) stderr carries the NAMED state gh-core-exhausted resets_in=<Nm>" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
 ck "(b) stderr also keeps the classifier's marker ('rate limit')" \
-   $(printf '%s' "$ERR" | grep -qi 'rate limit' && echo 0 || echo 1)
+   $(grep -qi 'rate limit' <<<"$ERR" && echo 0 || echo 1)
 ck "(b) the message says it is NOT a broken repo/token (no false diagnosis)" \
-   $(printf '%s' "$ERR" | grep -q 'not a broken repo' && echo 0 || echo 1)
+   $(grep -q 'not a broken repo' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (b2) a read with NO exact GraphQL equivalent is REFUSED, not approximated ─────────────────"
 reset_env b2 core0
@@ -253,9 +270,9 @@ budget core0
 run core0 api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
 ck "(b2) the protection read FAILS instead of answering an empty context set" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
-ck "(b2) it was NEVER SENT (no request for a call that cannot succeed)" $([ "$(reqs 'protection')" -eq 0 ] && echo 0 || echo 1)
+ck "(b2) it was NEVER SENT (no request for a call that cannot succeed)" $([ "$(reqs 'required_status_checks')" -eq 0 ] && echo 0 || echo 1)
 ck "(b2) stderr NAMES the state and says why it was not approximated" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && printf '%s' "$ERR" | grep -q 'NO exact GraphQL equivalent' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted' <<<"$ERR" && grep -q 'NO exact GraphQL equivalent' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (b3) a WRITE is never failed over and never retried into the empty pool ───────────────────"
 reset_env b3 core0
@@ -263,9 +280,9 @@ budget core0
 : > "$STUB_LOG"
 run core0 api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(b3) the merge attempt FAILS, named, with no request spent" \
-   $([ "$RC" -ne 0 ] && [ "$(reqs 'merge')" -eq 0 ] && printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+   $([ "$RC" -ne 0 ] && [ "$(reqs 'merge')" -eq 0 ] && grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
 ck "(b3) it says the call WRITES and was not retried" \
-   $(printf '%s' "$ERR" | grep -q 'WRITES' && echo 0 || echo 1)
+   $(grep -q 'WRITES' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (c) the ETag-free SUBCOMMAND surface is cached: N identical reads => ONE request ───────────"
 # ⛔ THE CACHED CLASS IS A NON-DECISION ONE. `pr view --json headRefOid` is the head a merge and the
@@ -274,7 +291,7 @@ echo "── (c) the ETag-free SUBCOMMAND surface is cached: N identical reads =
 reset_env c coreok
 for i in 1 2 3 4 5; do run coreok pr list --repo o/r ; done
 ck "(c) 5 identical 'gh pr list' reads made 1 request" $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
-ck "(c) every one of the 5 returned the answer" $(printf '%s' "$OUT" | grep -q '"number":1' && echo 0 || echo 1)
+ck "(c) every one of the 5 returned the answer" $(grep -q '"number":1' <<<"$OUT" && echo 0 || echo 1)
 ck "(c) the hit is RECORDED in events.log" $(grep -q 'read-cache: pr-list hit' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
 : > "$STUB_LOG"
 for i in 1 2 3; do run coreok pr view 7 --json headRefOid ; done
@@ -296,7 +313,7 @@ reset_env c2 coreok
 for i in 1 2 3; do run coreok pr list --repo o/r ; done
 ck "(c2) 3 identical 'gh pr list' reads made 1 request (GraphQL has no ETag at all)" \
    $([ "$(reqs 'pr list')" -eq 1 ] && echo 0 || echo 1)
-ck "(c2) all 3 got the answer" $(printf '%s' "$OUT" | grep -q '"number":1' && echo 0 || echo 1)
+ck "(c2) all 3 got the answer" $(grep -q '"number":1' <<<"$OUT" && echo 0 || echo 1)
 
 # ⛔ AND THIS HOLDS EVEN WITH THE ETag PATH OFF: the boundary is the API SURFACE, not the switch.
 reset_env c3b coreok
@@ -316,7 +333,7 @@ while [ "$i" -lt 15 ]; do
 done
 ck "(c4) 15 polls of identical argv made 1 request (measured loop: 30 of 41 calls)" \
    $([ "$(reqs 'run list')" -eq 1 ] && echo 0 || echo 1)
-ck "(c4) every poll got the run list" $(printf '%s' "$OUT" | grep -q '39786847846' && echo 0 || echo 1)
+ck "(c4) every poll got the run list" $(grep -q '39786847846' <<<"$OUT" && echo 0 || echo 1)
 
 echo "── (d) MUTATION: GH_LIMIT_READ_CACHE=0 must make (c) fail ────────────────────────────────────"
 reset_env d coreok
@@ -333,7 +350,7 @@ export GH_LIMIT_FAILOVER=0
 run core0 api repos/o/r/pulls/7 --jq .head.sha
 ck "(e) with the failover disabled the core-exhausted read fails" $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 ck "(e) and it says the right thing (named state, not a generic unreadable)" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
 unset GH_LIMIT_FAILOVER
 
 echo "── (f) the healthy path is unchanged and clears the named state ──────────────────────────────"
@@ -342,7 +359,7 @@ run coreok api repos/o/r/pulls/7
 ck "(f) a normal core read still succeeds through the plain path" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
 run coreok --health >/dev/null 2>&1 || true
 health coreok
-ck "(f) --health reports gh-ok and exits 0" $(printf '%s' "$OUT" | grep -q '^gh-ok$' && [ "$RC" -eq 0 ] && echo 0 || echo 1)
+ck "(f) --health reports gh-ok and exits 0" $(grep -q '^gh-ok$' <<<"$OUT" && [ "$RC" -eq 0 ] && echo 0 || echo 1)
 
 echo "── (g) a PARTIAL equivalence must never answer with null+0 (review finding 1) ─────────────────"
 # `jq` prints null for a field that is absent and exits 0, so a partly-reproduced REST body is an
@@ -358,17 +375,17 @@ ck "(g) … and it says why (the field is not reproducible)" \
    $(grep -q 'encoder cannot' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq '[.base.sha,.head.sha,.base.ref,.body]|@tsv'
 ck "(g) the DEEP fields in-tree callers read (.base.sha/.base.ref/.body) ARE reproduced" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'basesha' && printf '%s' "$OUT" | grep -q 'prbody' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'basesha' <<<"$OUT" && grep -q 'prbody' <<<"$OUT" && echo 0 || echo 1)
 
 echo "── (h) BOTH pools empty keeps the NAMED state (review finding 2) ─────────────────────────────"
 reset_env h graphqldead
 budget graphqldead
 run graphqldead api repos/o/r/pulls/7
 ck "(h) the both-pools refusal still names the state" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
 health graphqldead
 ck "(h) --health does NOT report gh-ok while the core record is still live" \
-   $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=12m$' && [ "$RC" -eq 3 ] && echo 0 || echo 1)
+   $(grep -q '^gh-core-exhausted resets_in=12m$' <<<"$OUT" && [ "$RC" -eq 3 ] && echo 0 || echo 1)
 run graphqldead api repos/o/r/pulls/7 --jq .head.sha
 ck "(h) the SECOND core read still fails over rather than being sent to the empty pool" \
    $([ "$(reqs 'api graphql')" -ge 1 ] && echo 0 || echo 1)
@@ -399,7 +416,7 @@ ck "(j) a read in the band moves to GraphQL (the tail is preserved)" \
    $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && echo 0 || echo 1)
 health low
 ck "(j) and it does NOT claim the pool is exhausted" \
-   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+   $(grep -q '^gh-ok$' <<<"$OUT" && echo 0 || echo 1)
 run low api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(j) a WRITE in the band is SENT (the reserve is spent by writes)" \
    $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
@@ -418,10 +435,10 @@ echo "── (g2) the projections REAL in-tree callers use ───────
 reset_env g2 core0
 budget core0
 run core0 api repos/o/r/pulls/7 --jq '[.base.sha,.head.sha,.base.ref]|@tsv'
-ck "(g2) record-review.sh:1117 projection is served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'basesha' && echo 0 || echo 1)
+ck "(g2) record-review.sh:1117 projection is served" $([ "$RC" -eq 0 ] && grep -q 'basesha' <<<"$OUT" && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv'
 ck "(g2) record-review.sh:2143 projection (with a jq FUNCTION) is served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q '3' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q '3' <<<"$OUT" && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'
 ck "(g2) the rail's merge-ref read is REFUSED (no faithful GraphQL source) rather than answered null" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
@@ -440,7 +457,7 @@ for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewe
      $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 done
 run core0 api repos/o/r/pulls/7 --jq '.["body"]'
-ck "(g3) while an ALLOWED bracketed name is still served" $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'prbody' && echo 0 || echo 1)
+ck "(g3) while an ALLOWED bracketed name is still served" $([ "$RC" -eq 0 ] && grep -q 'prbody' <<<"$OUT" && echo 0 || echo 1)
 
 echo "── (h2) a refusal that carried NO reset is still a named state (review finding 4) ────────────"
 # Every GH_LIMIT_NO_WAIT caller skips the probe, so the give-up path can record reset=0. Deriving
@@ -450,10 +467,10 @@ unset GH_LIMIT_NO_WAIT
 export GH_LIMIT_NO_WAIT=1
 run core0 api repos/o/r/pulls/7
 ck "(h2) the headerless refusal is REFUSED by name" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+   $(grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
 health core0
 ck "(h2) --health does NOT report gh-ok for an undated refusal" \
-   $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=' && [ "$RC" -eq 3 ] && echo 0 || echo 1)
+   $(grep -q '^gh-core-exhausted resets_in=' <<<"$OUT" && [ "$RC" -eq 3 ] && echo 0 || echo 1)
 reset_env h2b core0
 budget core0
 : > "$STUB_LOG"
@@ -469,16 +486,16 @@ budget low
 run low api repos/o/r/pulls/7 --jq .head.sha >/dev/null 2>&1 || true
 health low
 ck "(j2) a read in the band never writes an exhaustion record" \
-   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+   $(grep -q '^gh-ok$' <<<"$OUT" && echo 0 || echo 1)
 unset GH_TEST_SCENARIO
 reset_env j3 low
 budget low
 run graphqldead api repos/o/r/pulls/7 --jq .head.sha
 ck "(j3) band + GraphQL refused => the failure names GRAPHQL, not an empty core pool" \
-   $(printf '%s' "$ERR" | grep -q 'gh-graphql-unavailable' && echo 0 || echo 1)
+   $(grep -q 'gh-graphql-unavailable' <<<"$ERR" && echo 0 || echo 1)
 health low
 ck "(j3) and it does NOT claim the pool is exhausted" \
-   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+   $(grep -q '^gh-ok$' <<<"$OUT" && echo 0 || echo 1)
 : > "$STUB_LOG"
 run low api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(j3) so a WRITE in the band is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
@@ -493,7 +510,7 @@ printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "
 : > "$STUB_LOG"
 run core0 api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
 ck "(h3) a read with NO equivalent is still ATTEMPTED (1 request), not refused pre-emptively" \
-   $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 ck "(h3) … and its success CLEARS the undated record (the box can recover itself)" \
    $([ ! -f "$GH_LIMIT_DIR/health" ] && echo 0 || echo 1)
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
@@ -511,7 +528,7 @@ budget core0
 run core0 api repos/o/r/pulls/7
 ck "(b4) a --jq-less read is REFUSED (no subset body with rc 0)" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
-ck "(b4) … with the named state" $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+ck "(b4) … with the named state" $(grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
 
 echo "── (h4) a DIVERTED read must not promote an UNDATED record into a dated one (round-3 B1) ──────"
 # `health_state` returns a synthetic window end so undated evidence can EXPIRE; persisting it turned
@@ -539,12 +556,12 @@ export GH_LIMIT_NO_WAIT=1
 run secondary api repos/o/r/pulls/7
 ck "(k) the burst refusal FAILS loudly" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
 ck "(k) it is named as a SECONDARY limit, not as an empty pool" \
-   $(printf '%s' "$ERR" | grep -q 'gh-secondary-rate-limited remaining=3200' && echo 0 || echo 1)
+   $(grep -q 'gh-secondary-rate-limited remaining=3200' <<<"$ERR" && echo 0 || echo 1)
 ck "(k) and it does NOT claim gh-core-exhausted" \
-   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 1 || echo 0)
+   $(grep -q 'gh-core-exhausted' <<<"$ERR" && echo 1 || echo 0)
 health secondary
 ck "(k) --health stays gh-ok (the pool was never empty)" \
-   $(printf '%s' "$OUT" | grep -q '^gh-ok$' && echo 0 || echo 1)
+   $(grep -q '^gh-ok$' <<<"$OUT" && echo 0 || echo 1)
 : > "$STUB_LOG"
 run secondary api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(k) so the next WRITE is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
@@ -574,19 +591,19 @@ reset_env l coreok
 unset GH_LIMIT_CONDITIONAL              # exercise the ETag path
 : > "$STUB_LOG"
 run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
-ck "(l) the first read primes the ETag cache (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(l) the first read primes the ETag cache (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 # now make the budget say core is EMPTY, dated, and named
 printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
 printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
 : > "$STUB_LOG"
 run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
 ck "(l) the cached validator is used (the request is SENT, not refused pre-emptively)" \
-   $([ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+   $([ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 ck "(l) the answer is rc 0 (a 304 is a success for the caller)" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
 ck "(l) BUT the exhaustion evidence SURVIVES (health not unlinked)" \
    $([ -f "$GH_LIMIT_DIR/health" ] && echo 0 || echo 1)
 health l
-ck "(l) and --health still names it" $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=' && echo 0 || echo 1)
+ck "(l) and --health still names it" $(grep -q '^gh-core-exhausted resets_in=' <<<"$OUT" && echo 0 || echo 1)
 ck "(l) the durable core record is NOT annotated recovered" \
    $( { [ ! -f "$GH_LIMIT_DIR/last-limit" ] || ! grep -q 'recovered=' "$GH_LIMIT_DIR/last-limit"; } && echo 0 || echo 1)
 
@@ -611,7 +628,7 @@ ck "(m1) … and a quoted UNKNOWN key alone is refused, not silently null" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq '."state"'
 ck "(m1) while a quoted ALLOWED key is still served (the refusal is not blanket)" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qi 'open' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -qi 'open' <<<"$OUT" && echo 0 || echo 1)
 
 # (m2) --health must agree with the meter IN BOTH DIRECTIONS. Reading only the durable record said
 # `gh-ok` on a box whose own `--budget` probe had just measured core=0 — the incident's false-healthy
@@ -621,7 +638,7 @@ printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}, "graphq
 rm -f "$GH_LIMIT_DIR/health"
 health coreok
 ck "(m2) a FRESH meter saying core=0 is named by --health (no refusal needed first)" \
-   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=[0-9]' && echo 0 || echo 1)
+   $([ "$RC" -eq 3 ] && grep -q '^gh-core-exhausted resets_in=[0-9]' <<<"$OUT" && echo 0 || echo 1)
 printf '{"at": %s, "core": {"remaining": 3000, "reset": %s, "limit": 5000}}' \
   "$(date +%s)" "$(( $(date +%s) + 3000 ))" > "$GH_LIMIT_DIR/budget.json"
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(date +%s)" > "$GH_LIMIT_DIR/health"
@@ -639,9 +656,9 @@ printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "
 rm -f "$GH_LIMIT_DIR/budget.json"
 health coreok
 ck "(m3) an undated record is STILL a named state (was gh-ok for the 8 NO_WAIT callers' shape)" \
-   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted' && echo 0 || echo 1)
+   $([ "$RC" -eq 3 ] && grep -q '^gh-core-exhausted' <<<"$OUT" && echo 0 || echo 1)
 ck "(m3) … and it does NOT print an invented resets_in=<Nm> (was 15m for a 12m window)" \
-   $(printf '%s' "$OUT" | grep -q 'resets_in=?$' && echo 0 || echo 1)
+   $(grep -q 'resets_in=?$' <<<"$OUT" && echo 0 || echo 1)
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(( $(date +%s) - 1000 ))" > "$GH_LIMIT_DIR/health"
 health coreok
 ck "(m3) … but an undated record outlives its bound, like every other record here" \
@@ -690,7 +707,7 @@ for prog in '[.state, {labels}]' '[{merge_commit_sha}, .state]' '.state, ([tostr
 done
 run core0 api repos/o/r/pulls/7 --jq '{a: .state}'
 ck "(m7) while a real object construction is still served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qi 'open' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -qi 'open' <<<"$OUT" && echo 0 || echo 1)
 
 # (m8) “I could not read the record” is not “the pool is fine”.
 reset_env m8 coreok
@@ -729,7 +746,7 @@ for prog in '[.state, [.]]' '[.state, @json]' '[.state, tostring]' '[.state, len
 done
 run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv'
 ck "(m10) while record-review.sh:2143's real projection is still served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'abc123' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'abc123' <<<"$OUT" && echo 0 || echo 1)
 
 echo "── (m11) ROUND 4: the RAIL's own merge shape, and a list that is not the list ──────────────────"
 # (m11) `bucket_for` labels `gh pr merge` as `graphql` (it is not in REST_SUBCOMMANDS), but
@@ -743,7 +760,7 @@ printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n
 : > "$STUB_LOG"
 run coreok pr merge 7 --admin --squash --match-head-commit abc123
 ck "(m11) the RAIL's merge shape is refused by name against a DATED empty core record" \
-   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+   $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
 ck "(m11) … and it spends NO request (was 1 request + a 64 s wait + a retry)" \
    $([ ! -s "$STUB_LOG" ] && echo 0 || echo 1)
 
@@ -759,7 +776,7 @@ ck "(m12) a TRUNCATED reviews list is REFUSED (hasNextPage) rather than answered
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 run reviewsok api repos/o/r/pulls/7/reviews --jq '.[] | .state'
 ck "(m12) … while a COMPLETE connection is still served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'APPROVED' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'APPROVED' <<<"$OUT" && echo 0 || echo 1)
 
 echo "── (m13) ROUND 6: the durable record, the container walk, and a verb nobody listed ─────────────"
 # (m13) `--health` consulted the meter and the health file but NOT `last-limit` — the record every
@@ -771,7 +788,7 @@ printf 'at=%s bucket=core reset=%s attempts=1 waited=0 status=403 remaining=0\n'
   "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/last-limit"
 health coreok
 ck "(m13) --health names the durable core refusal (was gh-ok while writes were refused)" \
-   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=[0-9]' && echo 0 || echo 1)
+   $([ "$RC" -eq 3 ] && grep -q '^gh-core-exhausted resets_in=[0-9]' <<<"$OUT" && echo 0 || echo 1)
 printf 'at=%s bucket=core reset=%s recovered=%s remaining=0\n' \
   "$(( $(date +%s) - 5 ))" "$(( $(date +%s) + 700 ))" "$(( $(date +%s) - 1 ))" > "$GH_LIMIT_DIR/last-limit"
 health coreok
@@ -790,7 +807,7 @@ for prog in '.user.html_url' '.head.user.login' '.base.user.login'; do
 done
 run core0 api repos/o/r/pulls/7 --jq '.user.login'
 ck "(m14) … while a name the container DOES carry is served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'daniel-ospina' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'daniel-ospina' <<<"$OUT" && echo 0 || echo 1)
 
 # (m15) the bucket DEFAULT was `graphql` for any verb the tables had not listed, so an unlisted
 # REST-backed write reached the core pool unguarded and its refusal was filed against a pool that was fine.
@@ -802,7 +819,7 @@ ck "(m15) an UNLISTED verb is bucketed core (the default is not 'graphql')" \
 # the whole confirmation wait.
 run core0 api repos/o/r/pulls/7 --jq 'if .merged then "MERGED" else "OPEN" end'
 ck "(m16) an if/then/else over a named field is SERVED" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'OPEN' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'OPEN' <<<"$OUT" && echo 0 || echo 1)
 run core0 api repos/o/r/pulls/7 --jq 'if .merge_commit_sha then "M" else "O" end'
 ck "(m16) … and it cannot smuggle an unproducible field in" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
@@ -824,7 +841,7 @@ ck "(m18) a connection with NO pageInfo is REFUSED (was served as complete)" \
    $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 run reviewsok api repos/o/r/pulls/7/reviews --jq '.[] | .state'
 ck "(m18) … while an explicit hasNextPage:false is still served" \
-   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'APPROVED' && echo 0 || echo 1)
+   $([ "$RC" -eq 0 ] && grep -q 'APPROVED' <<<"$OUT" && echo 0 || echo 1)
 
 # (m19) a FRESH meter whose reset has already passed must still outrank an older dated record, or the
 # operator's trusted verb announces a window the rail and the write guard both treat as closed.
@@ -853,7 +870,7 @@ ck "(m21) a repeated undated refusal RE-STAMPS the record (it must not age out m
    "$(python3 -c "import importlib.util,os,sys,time; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.record_core_exhausted(None, None); line=open(os.path.join('$GH_LIMIT_DIR','health')).read().strip(); at=int(line.split('at=')[1].split()[0]); sys.exit(0 if abs(at-int(time.time()))<=3 else 1)" && echo 0 || echo 1)"
 health coreok
 ck "(m21) … so --health still names it instead of reporting gh-ok" \
-   $([ "$RC" -eq 3 ] && printf '%s' "$OUT" | grep -q '^gh-core-exhausted' && echo 0 || echo 1)
+   $([ "$RC" -eq 3 ] && grep -q '^gh-core-exhausted' <<<"$OUT" && echo 0 || echo 1)
 
 # (m22) an ATTACHED short data flag before the endpoint (`gh api -fbody=x <path>`, a POST) made
 # api_endpoint answer None, makes_request False, and the core-budget guard never ran: 7 requests and
@@ -886,7 +903,7 @@ printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n
 : > "$STUB_LOG"
 run coreok api --definitely-not-a-listed-flag -X POST repos/o/r/issues -f body=x
 ck "(m25) a WRITE with an unattributable flag is refused by name" \
-   $([ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -q 'gh-core-exhausted' && echo 0 || echo 1)
+   $([ "$RC" -ne 0 ] && grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
 ck "(m25) … and it spends NO request" $([ ! -s "$STUB_LOG" ] && echo 0 || echo 1)
 
 # (m26) a cached validator offers a POSSIBLE 304, not a free request: when the resource has CHANGED the
@@ -895,17 +912,79 @@ ck "(m25) … and it spends NO request" $([ ! -s "$STUB_LOG" ] && echo 0 || echo
 reset_env m26 coreok
 unset GH_LIMIT_CONDITIONAL
 run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
-ck "(m26) the validator is primed (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(m26) the validator is primed (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
   "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
 printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' \
   "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
 : > "$STUB_LOG"
 run etagchg api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
-ck "(m26) a CHANGED resource costs exactly ONE request, not 4 (never retried into the empty pool) [n=$(reqs 'protection')]" \
-   $([ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(m26) a CHANGED resource costs exactly ONE request, not 4 (never retried into the empty pool) [n=$(reqs 'required_status_checks')]" \
+   $([ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
 ck "(m26) … and the layer recorded that it stopped after one (no retry ladder)" \
    $(grep -q 'speculative conditional read' "$GH_LIMIT_DIR/events.log" 2>/dev/null && echo 0 || { [ "$(grep -c 'attempt=1/4' "$GH_LIMIT_DIR/events.log")" -le 1 ] && [ "$(wc -l < "$STUB_LOG")" -eq 1 ] && echo 0 || echo 1; })
+
+
+echo "── (n) THE FLOOR (#2342): the reserve is not spent on reads, and nothing is called empty ─────"
+# 400 remaining is ABOVE the pre-#2342 reserve (100) and BELOW the #2342 floor (800) — the window in
+# which the fleet used to spend the reserve on polling and then lose every WRITE with it. Measured
+# 2026-10-23 04:11Z: one identity, `core remaining=0` for the Mac and all three cells at once.
+reset_env n floor
+budget floor
+: > "$STUB_LOG"
+run floor api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts'
+ck "(n) below the floor, a read with NO exact GraphQL equivalent is REFUSED" \
+   $([ "$RC" -ne 0 ] && echo 0 || echo 1)
+ck "(n) … BY NAME, carrying the measured remaining and the floor" \
+   $(grep -q 'gh-core-floor remaining=400 floor=800' <<<"$ERR" && echo 0 || echo 1)
+ck "(n) … and the classifier's marker survives (the cycle reads as limited, not idle)" \
+   $(grep -qi 'gh rate limit' <<<"$ERR" && echo 0 || echo 1)
+ck "(n) … and it spends NO request at all" $([ ! -s "$STUB_LOG" ] && echo 0 || echo 1)
+ck "(n) … and STDOUT IS EMPTY — a refusal is never served as an empty list or object" \
+   $([ ! -s "$TMP/out" ] && echo 0 || echo 1)
+ck "(n) … and it does NOT claim exhaustion (the pool still has 400)" \
+   $(grep -q 'gh-core-exhausted' <<<"$ERR" && echo 1 || echo 0)
+health floor
+ck "(n) … and --health stays gh-ok: a floor refusal is not a measurement of an empty pool" \
+   $(grep -q '^gh-ok$' <<<"$OUT" && echo 0 || echo 1)
+: > "$STUB_LOG"
+run floor api repos/o/r/pulls/7 --jq .head.sha
+ck "(n) … while a read WITH an exact equivalent is still SERVED (from GraphQL), never blocked" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'api graphql')" -eq 1 ] && echo 0 || echo 1)
+: > "$STUB_LOG"
+export GH_LIMIT_ESSENTIAL=1
+run floor api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts'
+ck "(n) GH_LIMIT_ESSENTIAL=1 spends the reserve — the escape hatch a LANDING needs" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
+unset GH_LIMIT_ESSENTIAL
+reset_env n2 coreok
+budget coreok
+: > "$STUB_LOG"
+run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts'
+ck "(n) ABOVE the floor the same read is SENT — the guard must not block a healthy box" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
+
+echo "── (o) THE INSTRUMENT (#2342): --stats PROVES the saving instead of asserting it ──────────────"
+reset_env o coreok
+: > "$STUB_LOG"
+for i in 1 2 3; do run coreok pr list --repo o/r; done
+ck "(o) three reads inside the TTL made ONE request (the saving is real, not claimed)" \
+   $([ "$(wc -l < "$STUB_LOG")" -eq 1 ] && echo 0 || echo 1)
+stats
+ck "(o) --stats exits 0 and names the class it counted" \
+   $([ "$RC" -eq 0 ] && grep -q 'pr-list' <<<"$OUT" && echo 0 || echo 1)
+ck "(o) … it reports the counters the calls actually wrote (2 hits, 1 miss)" \
+   $(grep -q 'pr-list *hit=2 *miss=1' <<<"$OUT" && echo 0 || echo 1)
+ck "(o) … and the averted REQUESTS (2), which is the number the brief asks to prove" \
+   $(grep -q 'averted=2' <<<"$OUT" && echo 0 || echo 1)
+ck "(o) … and reading the instrument itself spends no request" \
+   $([ "$(wc -l < "$STUB_LOG")" -eq 1 ] && echo 0 || echo 1)
+reset_env o2 coreok
+stats
+ck "(o) an EMPTY box says no-reads-counted — an invented averted=0 would be a measurement nobody made" \
+   $(grep -q '^gh-read-cache no-reads-counted$' <<<"$OUT" && echo 0 || echo 1)
+ck "(o) … and still exits 0 (nothing to report is not an error)" \
+   $([ "$RC" -eq 0 ] && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
