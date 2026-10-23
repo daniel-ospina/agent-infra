@@ -1403,7 +1403,14 @@ function label(s,   a, b, pre, post, sl) {
       # was invisible until the numeral-zero cue below made the sibling form (`0 P1, 2 P2`) reach this
       # token at all: the comma arm used to fire on the FIRST token and block the line for the wrong
       # reason, so the missing arm had no failing case. Non-zero only — `0` is the cue, not a count.
-      if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # ⛔ A WORD NUMERAL COUNTS TOO (P2, cycle-3 re-review at ce2218a — FAIL-OPEN class, MEASURED).
+      # This arm read DIGITS only, so its word-numeral mirror was invisible: `**Verdict:** CLEAN — one
+      # P1 remains.`, `CLEAN — a P2 remains outside the diff.` and `CLEAN — two P1 issues were noted
+      # but they are pre-existing.` all recorded clean, while the digit twin `CLEAN — 2 P1 findings.`
+      # was refused. This is the ONE arm that catches a count stated before a severity token without
+      # depending on the finding-NOUN vocabulary, so leaving its word channel dark left the same class
+      # open one spelling over. `negpre` already excludes `no/not/none/nil/zero/without/0`.
+      if (!negpre && pre ~ /(^|[^[:alnum:]])([1-9][0-9]*|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many|single)[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
@@ -1639,16 +1646,29 @@ fi
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
 refuse_counted_clean() {
-  local _cm _cn
+  local _cm _cn _num _countline
+  # ⛔ THE TRACKED-WORK-ITEM SENSE OF `issue` IS NOT A FINDING (P3, cycle-3 re-review at ce2218a): a
+  # clean line that names the issue this PR closes — `… 0 blocking findings; the PR closes a single
+  # issue.` — reports no finding, and the widened qualifier run made it refuse (rc 7, a paid review
+  # discarded). A finding count is never introduced by closes/fixes/resolves/addresses/linked/of/for,
+  # so that shape is stripped from a LOWERCASED COPY used only for detection before the finding
+  # grammar runs. `sed -E` without the GNU-only `I` flag, and `tr` for case, so this stays portable.
+  _countline="$(printf '%s' "$LAST" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/(closes|close|fixes|fix|resolves|resolve|addresses|address|linked|of|for)[[:space:]]+(a|an|one|two|three|four|five|six|[0-9]+)[[:space:]]+(single[[:space:]]+|blocking[[:space:]]+)?(issues?|bugs?)/ /g' 2>/dev/null || printf '%s' "$LAST")"
+  [ -n "$_countline" ] || _countline="$(printf '%s' "$LAST" | tr '[:upper:]' '[:lower:]')"
   CLEAN_COUNT_WORDS=""
   while IFS= read -r _cm; do
     [ -n "$_cm" ] || continue
-    _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
-    [ -n "$_cn" ] || _cn=1      # a WORD numeral is a non-zero count by definition
-    [ "${_cn:-0}" -gt 0 ] || continue
+    # ⛔ A PARENTHESISED NUMERAL IS STILL A NUMERAL (P1, cycle-3 re-review): `three (3) blocking
+    # findings remain` and `1 (one) blocking finding` put the numeral in brackets, which the qualifier
+    # run now accepts (`(3)` / `(one)`), so the match is found; the count is then read from the match
+    # with any decoration stripped, once, rather than taught to every branch of the grammar.
+    _num="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
+    [ -n "$_num" ] || _num=1      # a WORD numeral is a non-zero count by definition
+    [ "${_num:-0}" -gt 0 ] || continue
     CLEAN_COUNT_WORDS="$_cm"; break
-  done <<<"$(printf '%s' "$LAST" \
-    | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|issues?|blockers?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+  done <<<"$(printf '%s' "$_countline" \
+    | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|single|couple([[:space:]-]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)([[:space:]-]+\(?([0-9]+|[[:alpha:]][[:alpha:]-]*)\)?){0,6}[[:space:]-]+(findings?|issues?|blockers?|problems?|bugs?|defects?|regressions?|failures?|errors?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
     | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
     err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and the same line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."

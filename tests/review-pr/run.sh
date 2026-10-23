@@ -2057,6 +2057,14 @@ ISSUES 0 — an outstanding blocking finding
 ISSUES 0 — one outstanding blocking finding
 ISSUES 0 — one-blocking-finding remains
 **Verdict:** CLEAN — a single blocking finding remains.
+ISSUES 0 — one blocking defect remains.
+**Verdict:** CLEAN — two blocking bugs remain.
+**Verdict:** CLEAN — a regression remains in scripts/x.sh.
+**Verdict:** CLEAN — single blocking finding remains.
+ISSUES 0 — one truly very outstanding blocking finding remains
+**Verdict:** CLEAN — three (3) blocking findings remain.
+**Verdict:** CLEAN — one P1 remains.
+**Verdict:** CLEAN — two P1 issues were noted but they are pre-existing.
 SPELLINGS
 # ⛔ AND THE RESOLVED-PARTICIPLE EXEMPTION ACCEPTS A COPULA (P3, same re-review — an over-block the
 # P0 fix INTRODUCED). `ISSUES 0` now reaches this guard for the first time, and the line the guard's
@@ -2069,6 +2077,7 @@ while IFS= read -r _sp; do
 done <<'FIXEDSPELLINGS'
 ISSUES 0 — one blocking finding was fixed.
 **Verdict:** CLEAN — two issues were resolved.
+**Verdict:** CLEAN — 0 blocking findings; the PR closes a single issue.
 FIXEDSPELLINGS
 # ⛔ MUTATION: the count arm made unfindable => the scenario above RECORDS. Without it, "1 blocking
 # finding remains" could pass because the line happened to fail some other check.
@@ -2172,6 +2181,11 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 579 ]; ck $? "assertion-count pin: >= 579 assertions executed (section loss tripwire)"
+# ⛔ THE FLOOR IS RE-MEASURED WHENEVER A SECTION IS ADDED (P3, cycle-3 re-review at ce2218a): the
+# pin still read 579 after the count-word spellings block was added, so DELETING that whole block left
+# the suite green (measured: 589 passed, pin passed) — exactly the "a whole section was deleted and
+# the suite still said ALL PASSED" failure this pin exists to catch. 622 is the measured PASS count
+# immediately before this line at the head that added the cycle-3 spellings (623 with the pin).
+[ "$PASS" -ge 622 ]; ck $? "assertion-count pin: >= 622 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
