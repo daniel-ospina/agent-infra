@@ -826,6 +826,15 @@ async function main() {
     ["gh -R owner/name pr create --fill", "commit-workflow"],
     ["gh --repo=owner/name pr merge 42", "commit-workflow"],
     ["git -C /x worktree add /tmp/w", "using-git-worktrees"],
+    // ⛔ THE SEPARATOR IS NOT A TOKEN BOUNDARY (#1329 review, P2). These were ALLOWED at
+    // the head that DECLARED the class closed — measured — because the rule is the literal
+    // `git commit` with ONE space and the derivation left the original separator in place.
+    // A header that declares a class closed must be true of the class, not of one spelling
+    // of it; the tab form is the one a fleet lane produces from a table-driven command.
+    ["git -C /x\tcommit -m x", "commit-workflow"],
+    ["git\tcommit -m x", "commit-workflow"],
+    ["git  commit -m x", "commit-workflow"],
+    ["git -C /x  \t stash pop", "commit-workflow"],
   ];
 
   await test("#1329 — git/gh GLOBAL options between the command word and the verb are CLOSED", async () => {

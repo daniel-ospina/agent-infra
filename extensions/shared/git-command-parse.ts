@@ -305,13 +305,52 @@ function gitGhGlobalOptionRuns(command: string): Array<[number, number]> {
 }
 
 /**
+ * The command with every UNQUOTED whitespace run (space/tab) collapsed to one
+ * space; quoted text is untouched, so a payload's own spacing is preserved.
+ *
+ * ⛔ THIS EXISTS BECAUSE DELETING AN OPTION RUN LEAVES THE SEPARATOR BEHIND (#1329
+ * review, P2). `git -C /x<TAB>commit -m x` derives the CORRECT spelling
+ * `git<TAB>commit -m x` — the run is gone, exactly as intended — and then fails to
+ * match, because the rule is the literal `git commit`: ONE SPACE. The derivation
+ * computed the right answer and threw it away on a separator shell tokenisation
+ * makes meaningless. Measured pre-fix: `git -C /x<TAB>commit`, `git<TAB>commit`
+ * and `git` + two spaces + `commit` were ALL ALLOWED while the header declared
+ * that class CLOSED.
+ *
+ * Reuses `unquotedMask`, the module's single quote model, so a quoted mention's
+ * spacing cannot be normalised into a match (`rg -n 'git<TAB><TAB>commit'` keeps
+ * its own whitespace and stays a mention).
+ */
+export function collapseUnquotedWhitespace(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (mask[i] && (ch === " " || ch === "\t")) {
+      while (i + 1 < command.length && mask[i + 1]
+             && (command[i + 1] === " " || command[i + 1] === "\t")) i++;
+      out += " ";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * Every spelling of `command` a text gate should try: the command itself, and
  * — when a git/gh invocation carries GLOBAL options — the same command with
  * those option runs removed, so `git -C <dir> commit` reads like `git commit`.
  *
  * Two load-bearing properties:
  *   1. NOTHING IS FABRICATED. Every returned string is the input with spans
- *      DELETED, so it is a subsequence of the input (pinned in the suite).
+ *      DELETED — so a subsequence of the input — with ONE declared exception:
+ *      the LAST spelling additionally collapses unquoted whitespace runs to a
+ *      single space (`collapseUnquotedWhitespace`). That normalisation is not a
+ *      deletion, so that one spelling is not a subsequence; it is the same
+ *      tokens separated by the separator width a shell does not distinguish.
+ *      The suite pins both halves, by name, rather than claiming one property
+ *      for all of them.
  *   2. MATCHING CAN ONLY ADD. The raw command is always returned FIRST, so a
  *      caller that ORs across the spellings can never lose a hit it had before.
  *      The only new hits are commands that really do run `git <verb>` with
@@ -326,12 +365,24 @@ function gitGhGlobalOptionRuns(command: string): Array<[number, number]> {
 export function commandSpellings(command: string): string[] {
   if (!command) return [command];
   const runs = gitGhGlobalOptionRuns(command);
-  if (runs.length === 0) return [command];
-  let out = "";
-  let cursor = 0;
-  for (const [start, end] of runs) { out += command.slice(cursor, start); cursor = end; }
-  out += command.slice(cursor);
-  return out === command ? [command] : [command, out];
+  // The option run is deleted when there is one; otherwise this is the command itself.
+  let out = command;
+  if (runs.length > 0) {
+    out = "";
+    let cursor = 0;
+    for (const [start, end] of runs) { out += command.slice(cursor, start); cursor = end; }
+    out += command.slice(cursor);
+  }
+  const spellings = [command];
+  if (out !== command) spellings.push(out);
+  // #1329 review (P2): the separator is not a token boundary -- a tab, or a
+  // two-space run, is the same separator as one space to the shell. Emitted even
+  // when there was NO option run: `git<TAB>commit` is a pre-existing raw-match
+  // gap of the same class, and the header's CLOSED list must not be false about
+  // either form. Quoted text is untouched, so a mention keeps its own spacing.
+  const collapsed = collapseUnquotedWhitespace(out);
+  if (collapsed !== out && collapsed !== command) spellings.push(collapsed);
+  return spellings;
 }
 
 // ── PR number ────────────────────────────────────────────────────────────
