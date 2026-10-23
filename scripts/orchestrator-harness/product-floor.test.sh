@@ -271,7 +271,11 @@ ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is n
 # window reject a POST-CALL state reset: the CI-queue deferral's `K=0; : > "$O/.batch"` is a fact about
 # a call that already returned 3, not a mutation of what the call is about to do. Splitting is not a
 # loosening — the pre-call half keeps the FULL pattern set (batch truncation, K reset, exit, floor
-# terms), the post-call half keeps the floor terms, and it gains a STRICTER rule: a reset there is
+# terms), the post-call half keeps the floor terms AND `exit` (measured, #2333 review: dropping `exit`
+# here was a real loosening — an `exit 0` inserted between the call and the body's closing `fi` (e.g.
+# right after the call, before `heartbeat` and the cycle record) left this suite 213/0 GREEN where the
+# pre-split window red'd it; the four `exit` occurrences in that region today are all in comments, so
+# re-adding the term costs nothing and re-arms the arm), and it gains a STRICTER rule: a reset there is
 # admissible only inside the exit-code contract's arm, which is asserted to EXIST (deleting the arm
 # leaves `dispatch-merge.sh`'s exit 3 unhandled, and that now reds instead of passing silently).
 _dcall="$(grep -n '^[[:space:]]*bash "\$O/dispatch-merge.sh"' "$LOOP" | head -1 | cut -d: -f1)"
@@ -280,9 +284,9 @@ ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
 _body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
 ck "P6 [RED→GREEN] from the end of the report to the DISPATCH CALL nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
-_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
 [ -z "$_post" ]
-ck "P6 [RED→GREEN] …and AFTER the call the floor still cannot reach the batch (got '${_post:-'<none>'}')" $?
+ck "P6 [RED→GREEN] …and AFTER the call nothing refreshes the product batch, reads the floor, or EXITS (got '${_post:-'<none>'}')" $?
 _guard="$(grep -nF 'if [ "$_dmrc" = "3" ]; then' "$LOOP" | head -1 | cut -d: -f1)"
 _resets="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/) {print NR}' "$LOOP")"
 _unguarded=""

@@ -295,10 +295,20 @@ ciq_read() {
     # is parallelism that demonstrably exists — bounded by the allowance, because a garbled count must
     # not become a ceiling the gate can never reach (9 digits pass `ciq_is_count` and would yield
     # ceiling 999999998, switching back-pressure off while the token still reads like a measurement).
+    # ⛔ CLAMPED, NEVER DISCARDED (#2333 review, P2). This test used to DISCARD a measured count that
+    # exceeded the allowance, which is not what the sentence above asks for and carried a 20x CLIFF with
+    # no disclosure: on the unmeasured branches ((b) declared-but-offline, (c) refused) a repo running 19
+    # or 20 concurrent jobs derived ceiling 38/40 and ALLOWED, while 21 — ONE MORE executing job — fell to
+    # `runners=~1`/ceiling 2 and DEFERRED every CI-spending act on the box, still printing `state=fresh` as
+    # though 1 runner were the measurement. That is the fleet-wide stop this module's header names as
+    # unacceptable, reached by a change of one digit, and arm (b6c) encoded it while its own label said
+    # "bounded by the allowance". Clamping keeps the garble bound and bounds it at the module's OWN
+    # accepted maximum ceiling (2x the hosted allowance — the same width the allowance path already
+    # yields), so `running=21` derives 42 and a 9-digit garble derives 40, never 999999998.
     floor=1
-    if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ] \
-       && [ "${running:-0}" -le "$(ciq_hosted_concurrency)" ]; then
+    if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
       floor="$running"
+      if [ "$floor" -gt "$(ciq_hosted_concurrency)" ]; then floor="$(ciq_hosted_concurrency)"; fi
     fi
     # ⛔ THE ALLOWANCE DEMANDS POSITIVE EVIDENCE: A **PARSED** `total_count == 0` (#2333 review
     # cycle 12, P1). Until this cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and

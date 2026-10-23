@@ -192,8 +192,8 @@ ck "(b6b) a refused runner read falls back to the measured floor, never the allo
 feed 5 499999999 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
-ck "(b6c) an absurd `running` is bounded by the allowance, never made the ceiling (got: ${v})" \
-   "$( case "$v" in *'runners=~1'*'ceiling=2'*) echo 0 ;; *) echo 1 ;; esac )"
+ck "(b6c) an absurd \`running\` is CLAMPED by the allowance, never made the ceiling (got: ${v})" \
+   "$( case "$v" in *'runners=~20'*'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
 feed 97 7 0
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
@@ -202,7 +202,7 @@ ciq_read "$OR" >/dev/null 2>&1
 ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" \
    "$( case "${CIQ_RUNNERS:-}" in '~'*) echo 0 ;; *) echo 1 ;; esac )"
 v="$(ciq_eval)"
-ck "(b9) the ceiling comes from the allowance, not from `running` (ceiling=40, got: ${v})" \
+ck "(b9) the ceiling comes from the allowance, not from \`running\` (ceiling=40, got: ${v})" \
    "$( case "$v" in *'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
 # ⛔ A DECLARED FLEET THAT IS ENTIRELY OFFLINE IS NOT THE HOSTED ZERO (#2333 review P1). Collapsing
 # `total_count>=1 with nothing online` into "no fleet" claims the allowance and ALLOWS the incident's
@@ -219,7 +219,7 @@ ck "(b11) …and it is recorded as inferred from a fleet, never as the hosted al
 # a 4-deep queue DEFERRED for ever — "a rule that defers on 4 would be a fleet-wide stop".
 feed 4 7 5 true 1
 ciq_ci_allowed "$OR"; d0=$?
-ck "(b12) declared-but-offline still honours `running` (4 queued, 7 running => ceiling 14 => ALLOWED)" \
+ck "(b12) declared-but-offline still honours \`running\` (4 queued, 7 running => ceiling 14 => ALLOWED)" \
    "$( [ "$d0" -eq 0 ]; echo $? )"
 # ⛔ AN ANSWERED PAGE WITH NO PARSEABLE `total_count` IS BRANCH (c), NOT THE HOSTED ZERO (#2333 review
 # cycle 12, P1). `declared` is EMPTY exactly when the answered body carried no readable count — the
@@ -381,8 +381,34 @@ grep -q 'fixbail-\$PR-\$HEAD' "$FIX"
 ck "(e8) fix-one.sh's deferral writes the bail marker, so no attempt is consumed" "$?"
 grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note_here "the whole batch' "$DISPATCH"
 ck "(e9) dispatch-merge.sh (the batch stampede) reads the same module and defers the batch" "$?"
-grep -qE 'LANES[^a-z]*-ge|MAX_LANES=' "$MOD"
-ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner ruling)" "$( [ $? -ne 0 ]; echo $? )"
+# ⛔ THE OWNER RULING IS PINNED BEHAVIOURALLY, NOT BY VOCABULARY (#2333 review, P1). The arm this
+# replaces grepped the module for two literal substrings (`LANES…-ge`, `MAX_LANES=`). Measured in both
+# directions and both were wrong: a lane cap under ANY other identifier — or in one of the three WIRING
+# files, which is where `wt_count fix-` actually lives — stayed GREEN, while DOCUMENTING the ruling in
+# the module header (a comment naming `MAX_LANES`) turned it RED, so the cheapest way to clear a red was
+# to delete the explanation of the decision. The owner ruled 2026-10-17 that dispatch is gated on
+# CAPACITY, not on the number of lanes; that is a property of the VERDICT, so it is DRIVEN here — an
+# implausible lane fleet must not move the verdict in either direction. The stubs are shell FUNCTIONS
+# because the harness counts lanes with `wt_count` (a sourced function, invisible to a PATH stub) as
+# well as `tmux ls`.
+_lanestub() {
+  wt_count() { echo 99; }
+  tmux() { echo "fix-a"; echo "fix-b"; echo "merge-c"; }
+}
+feed 4 5 5
+_lanestub
+ciq_ci_allowed "$OR"; d0=$?
+unset -f wt_count tmux
+ck "(e10) an implausible LANE fleet does not defer a SHALLOW queue — the verdict is the queue's, per the owner ruling" "$( [ "$d0" -eq 0 ]; echo $? )"
+feed 97 5 5
+_lanestub
+ciq_ci_allowed "$OR"; d0=$?
+unset -f wt_count tmux
+ck "(e10b) …and the same lane stub cannot ALLOW a DEEP queue (the queue alone decides)" "$( [ "$d0" -eq 1 ]; echo $? )"
+# The lexical tripwire is KEPT, RENAMED to what it actually checks, and scoped to EXECUTABLE lines so it
+# can no longer red on the comment that documents the ruling.
+_lex="$(grep -vE '^[[:space:]]*#' "$MOD" | grep -nE 'LANES[^a-z]*-ge|MAX_LANES=' || true)"
+ck "(e10c) the module contains no lane-cap COMPARISON in executable lines (got '${_lex:-<none>}')" "$( [ -z "$_lex" ]; echo $? )"
 # ⛔ THE NOTE MUST EVALUATE THE DECISION'S OWN READING (#2333 review P1). `ciq_defer_note` re-reads;
 # on a queue that moved between the decision and the note it could DISAGREE and print NOTHING — a
 # deferral with no line, the one failure the module exists to prevent — and it cost three extra `gh`
