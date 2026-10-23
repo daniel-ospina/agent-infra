@@ -114,7 +114,7 @@ run_pass() {
     HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_MODE="${MODE_P:-}" \
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
     HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="$d/home" O="$d/home/orchestrator" \
-    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+    HARNESS_APPLY_SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$T/sync-stub.sh}" \
     bash "$PASS_SH" "$@"
 }
 
@@ -248,42 +248,107 @@ for tok in 'pkill' 'killall' 'systemctl restart' 'launchctl kickstart' \
            'kill -TERM' 'kill -KILL' 'kill -9'; do
     assert_absent "$BODY" "$tok" "T7 the pass does not contain '$tok'"
 done
-# `kill -0` is a LIVENESS PROBE, not a signal: the pass reads the controller's pid with it to decide
-# between `--pin-only` and a seeding `apply`. It must be the ONLY use of kill in this file.
-assert_eq "$(printf '%s\n' "$BODY" | grep -c 'kill ' | tr -d ' ')" "$(printf '%s\n' "$BODY" | grep -c 'kill -0 ' | tr -d ' ')" \
-    "T7 every 'kill' in the pass is the 'kill -0' liveness probe (no signal is ever sent)"
+# ⛔ THE PASS CONTAINS NO `kill` AT ALL — not even a `kill -0` probe. It needs none: the advance is
+# ALWAYS `apply --force --pin-only`, so no branch depends on whether a controller is live. (An earlier
+# draft DID probe with `kill -0`; the probe went away with the live/no-live branch, and the assertion
+# that compared `grep -c 'kill '` to `grep -c 'kill -0 '` then passed as 0 == 0 — a guard whose stated
+# rationale had become fiction. It is a plain zero now.)
+assert_eq "$(printf '%s\n' "$BODY" | grep -c 'kill ' | tr -d ' ')" "0" \
+    "T7 the pass contains NO kill of any kind (no signal, and no liveness probe either)"
 assert_contains "$BODY" "--pin-only" "T7 and it DOES use the non-disturbing advance while a controller is live"
 
-# ── T7b: the advance calls the materialiser the ONE way `apply` accepts on a live cell ─────────
+# ── T7b: the advance calls the materialiser the ONE way `apply` accepts, and only claims a move ──
 # MEASURED IN REVIEW: `apply --pin-only` alone is REFUSED whenever a controller is live ("re-run with
 # --force") — `--pin-only` does not relax that guard. The pass therefore never advanced on any running
 # cell, recorded rc=23, and reddened the unit every ten minutes while the pin stayed put. The stub here
-# reproduces the supervisor's refusal, so a regression that drops either flag goes red.
-say_case "T7b the materialiser is called with --force --pin-only"
+# reproduces the supervisor's refusal, and it MOVES the pin like the real thing does: a stub that exits 0
+# without moving anything is the other half of the same defect (a green `advanced` over an unchanged
+# pin), and the second case pins that too.
+say_case "T7b the materialiser is called with --force --pin-only, and a no-move is not 'advanced'"
 mk_origin t7; mk_clone t7
 REPO_P="$CLONE"; MODE_P=pin
-advance_origin t7 A.txt "upstream for the pin advance" >/dev/null
 mkdir -p "$T/t7/home/.pi/agent/state"
+# The pin TREE is a detached worktree of the checkout at the OLD commit, so the stub below has somewhere
+# real to advance it to. The harness directory is created INSIDE it, after the worktree exists: a
+# `worktree add` into a directory that already holds anything but an empty tree refuses.
+OLD7="$(git -C "$CLONE" rev-parse HEAD)"
+git -C "$CLONE" worktree add --detach "$T/t7/pin" "$OLD7" >/dev/null 2>&1
+mkdir -p "$T/t7/pin/scripts/orchestrator-harness"
+advance_origin t7 A.txt "upstream for the pin advance" >/dev/null
 cat >"$T/t7/materialiser.sh" <<'MAT'
 #!/usr/bin/env bash
-# The REAL supervisor's contract, reduced to the two flags this pass must pass. Two separate tests on
-# purpose: a single `case` pattern made of three globs is easy to get subtly wrong, and a fixture that
-# silently never matches would make this case pass for the wrong reason.
+# The REAL supervisor's contract, reduced: both flags are required, and a successful run LEAVES THE PIN
+# AT THE REF TIP (that is what `apply` does — it creates the per-commit worktree and writes the path
+# record). `MOVE=0` reproduces `apply` exiting 0 without moving anything.
 a=" $* "
 f=0; p=0
 case "$a" in *" --force "*) f=1 ;; esac
 case "$a" in *" --pin-only "*) p=1 ;; esac
-if [ "$f" = 1 ] && [ "$p" = 1 ]; then echo "PINNED (force+pin-only)"; exit 0; fi
-echo "FATAL: a controller is RUNNING — re-run with --force (got: $*)" >&2
-exit 1
+if [ "$f" != 1 ] || [ "$p" != 1 ]; then
+    echo "FATAL: a controller is RUNNING — re-run with --force (got: $*)" >&2
+    exit 1
+fi
+echo "PINNED (force+pin-only)"
+[ "${MOVE:-1}" = 1 ] || exit 0
+git -C "$PIN_DIR" fetch --quiet origin main && git -C "$PIN_DIR" merge --ff-only origin/main >/dev/null 2>&1 || exit 1
+exit 0
 MAT
 chmod +x "$T/t7/materialiser.sh"
-printf '%s\n' "$CLONE" >"$T/t7/home/.harness-path"
-printf '%s\n' "$(git -C "$CLONE" rev-parse HEAD)" >"$T/t7/home/.pi/agent/state/HARNESS-PIN"
-OUT="$(HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass "$T/t7" 2>&1)"; RC=$?
+printf '%s\n' "$T/t7/pin/scripts/orchestrator-harness" >"$T/t7/home/.harness-path"
+printf '%s\n' "$OLD7" >"$T/t7/home/.pi/agent/state/HARNESS-PIN"
+OUT="$(PIN_DIR="$T/t7/pin" HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass "$T/t7" 2>&1)"; RC=$?
 assert_eq "$RC" "10" "T7b a live-cell advance succeeds against a materialiser that enforces the flags"
 assert_contains "$OUT" "PINNED (force+pin-only)" "T7b and the call it made carried BOTH flags"
-assert_contains "$(cat "$PASS_SH")" "apply --force --pin-only" "T7b the pass pins that form in its source (the stub above enforces it at runtime)"
+# The stub moves the TREE but (like the real `apply`) does not write the sha RECORD — writing that is
+# the pass's own repair step, so the verdict is `pin-repaired` (exit 10) rather than `advanced`.
+# Both mean "the harness moved", which is what this asserts.
+assert_contains "$OUT" "the harness moved" "T7b and the verdict says it moved"
+assert_contains "$(cat "$PASS_SH")" "apply --force --pin-only" "T7b the pass pins that form in its source (the stub enforces it at runtime)"
+# THE NO-MOVE CASE: the verb exits 0, the pin does not move, the box is still behind → a NAMED failure,
+# never a green `advanced`.
+OUT="$(MOVE=0 PIN_DIR="$T/t7/pin" HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass "$T/t7n" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T7b a verb that exits 0 WITHOUT moving the pin is a named failure (25)"
+assert_contains "$OUT" "nothing moved this box" "T7b and it says the pin did not move"
+
+# ── T18: the refusals and skips a scheduled pass must never confuse with success ────────────────
+# Three states no case reached before (measured in review: they behave correctly — this pins it):
+# DIVERGED, a sync verb that exits 0 without moving the checkout, and the pin-mode NO-OP the cadence
+# depends on (a converged PIN with a lagging checkout, which every cell is in between advances).
+say_case "T18 diverged, sync-skipped, and the pin-mode no-op"
+mk_origin t18; mk_clone t18; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+printf 'local\n' >>"$CLONE/B.txt"
+git -C "$CLONE" add -A >/dev/null 2>&1
+git -C "$CLONE" -c user.email=t@example.test -c user.name=t commit -q -m "local work" >/dev/null 2>&1
+advance_origin t18 A.txt "upstream elsewhere" >/dev/null
+OUT="$(run_pass "$T/t18" 2>&1)"; RC=$?
+assert_eq "$RC" "22" "T18 a DIVERGED box is refused with 22"
+assert_contains "$OUT" "REFUSED diverged" "T18 and the refusal names the state"
+# A sync verb that exits 0 without moving HEAD: `sync.sh` does exactly this when the checkout is not on
+# main (its branch-ownership guard). The pass re-reads HEAD and refuses to call that an advance.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$T/t18/nosync.sh"; chmod +x "$T/t18/nosync.sh"
+mk_origin t18b; mk_clone t18b
+REPO_P="$CLONE"; MODE_P=sync
+advance_origin t18b A.txt "upstream for the skip case" >/dev/null
+OUT="$(HARNESS_APPLY_SYNC_CMD="$T/t18/nosync.sh" run_pass "$T/t18b" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T18 a sync verb that exits 0 without moving the checkout is a named failure (25)"
+assert_contains "$OUT" "the checkout was not moved" "T18 and it says the checkout did not move"
+# THE PIN-MODE NO-OP.
+mk_origin t18c; mk_clone t18c
+REPO_P="$CLONE"; MODE_P=pin
+WANT18="$(advance_origin t18c A.txt "upstream for the no-op case")"
+mkdir -p "$T/t18c/home/.pi/agent/state"
+# The commit exists in ORIGIN; the checkout must FETCH it before a tree can be created at it.
+git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
+git -C "$CLONE" worktree add --detach "$T/t18c/pin" "$WANT18" >/dev/null 2>&1
+mkdir -p "$T/t18c/pin/scripts/orchestrator-harness"
+printf '%s\n' "$WANT18" >"$T/t18c/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t18c/pin/scripts/orchestrator-harness" >"$T/t18c/home/.harness-path"
+printf '#!/usr/bin/env bash\necho "SHOULD NOT RUN" >&2; exit 9\n' >"$T/t18c/mat.sh"; chmod +x "$T/t18c/mat.sh"
+OUT="$(HARNESS_MATERIALISER="$T/t18c/mat.sh" run_pass "$T/t18c" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T18 a converged PIN with a lagging checkout is a NO-OP (exit 0)"
+assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called at all"
+assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
 # ── T15: a dirty TRACKED SYMLINK is restored as a symlink, never written THROUGH ─────────────
 # MEASURED IN REVIEW: redirecting the blob at `$REPO/$p` followed the symlink and overwrote the CLEAN
@@ -375,6 +440,28 @@ assert_eq "$(git -C "$CLONE" status --porcelain | grep -c '^ M tool.sh' | tr -d 
 assert_eq "$(cat "$CLONE/has space.txt")" "spaced" \
     "T17 the path with a space was restored from HEAD (not skipped as an unresolvable pathspec)"
 
+# ── T19: the pass survives the macOS entry point (`bash -s`, NO BASH_SOURCE) ───────────────────
+# MEASURED IN REVIEW: the plist runs the pass through pi-reap-worktrees-launchd.py, which pipes it to
+# `bash -s`. There is no BASH_SOURCE[0] there, so under `set -u` the unguarded expansion printed
+# "BASH_SOURCE[0]: unbound variable" on EVERY tick, left $HERE empty (silently degrading the repo
+# fallback to `.`) and broke `--help`. The pass still worked because the unit pins the repo, which is
+# exactly why no assertion noticed: T11 only checked that the plist CARRIES the launcher.
+say_case "T19 the pass runs through the launchd launcher with nothing on stderr"
+mk_origin t19; mk_clone t19; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t19/state"
+PYLAN="$(command -v python3 2>/dev/null || printf '/usr/bin/python3')"
+LAUNCHER_PY="$HERE/pi-reap-worktrees-launchd.py"
+env -i HOME="$T/t19/home" PATH="$PATH" HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
+    HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19/state" \
+    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+    "$PYLAN" "$LAUNCHER_PY" --script "$PASS_SH" >"$T/t19/out" 2>"$T/t19/err"; RC=$?
+assert_eq "$RC" "0" "T19 the launcher run succeeds"
+assert_eq "$(wc -c <"$T/t19/err" | tr -d ' ')" "0" \
+    "T19 NOTHING on stderr under bash -s (BASH_SOURCE is unset there; set -u used to print it every tick)"
+assert_contains "$(cat "$T/t19/out" 2>/dev/null || true)" "harness: mode=sync" "T19 and the pass really ran"
+assert_contains "$(cat "$T/t19/state/harness-apply.status" 2>/dev/null || true)" "rc=0" "T19 and it recorded a pass"
+
 # ── T3 + T5 + T8-T13: the INSTALLER ───────────────────────────────────────────────────────────
 # A shim that records every call, so "enabled" and "bootstrapped" are asserted on what the installer
 # DID, not on what it printed.
@@ -389,6 +476,8 @@ case "$*" in
   *show-environment*) [ "${SYSTEMD_USER_OK:-1}" = 1 ] && exit 0 || exit 1 ;;
   # `systemctl show -p LastTriggerUSec --value` — empty means "never fired" (a fresh install).
   *show*LastTriggerUSec*) [ -n "${SYSTEMCTL_LAST_TRIGGER:-}" ] && echo "$SYSTEMCTL_LAST_TRIGGER" ; exit 0 ;;
+  # `systemctl show -p ExecMainStatus --value <service>` — 0 for a service that has not run yet.
+  *show*ExecMainStatus*) echo "${SYSTEMCTL_MAIN_STATUS:-0}" ; exit 0 ;;
   # `status` reads installation from the unit FILE, so the shim must too — a shim that answers 0 for
   # everything would make T10's post-uninstall check pass without the removal having happened.
   cat*) f="${*: -1}"; [ -f "${SYSTEMD_UNIT_DIR:-/nonexistent}/$f" ] && exit 0 || exit 1 ;;

@@ -589,7 +589,15 @@ do_status() {
             return 1
         fi
         say "installed=yes"
-        say "enabled=$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
+        ENABLED="$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
+        say "enabled=$ENABLED"
+        # ⛔ ENABLED IS GATED, NOT JUST PRINTED. A timer that is active now but NOT enabled does not
+        # come back at the next reboot, so the box stops being advanced at the first restart — and the
+        # install path checks this while the STATUS path did not (measured in review).
+        case "${ENABLED:-no}" in
+            enabled|static) ;;
+            *) err "the timer is '${ENABLED:-no}', not enabled — it will not survive a reboot, so the harness stops being applied"; return 1 ;;
+        esac
         ACTIVE="$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo no)"
         say "timer_active=$ACTIVE"
         say "next_run=$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
@@ -606,6 +614,18 @@ do_status() {
         # about one record with the readiness gate the lenient one.
         LAST_RUN="$($SC show -p LastTriggerUSec --value "$UNIT_NAME.timer" 2>/dev/null | tr -d '[:space:]')"
         say "last_trigger=${LAST_RUN:-unknown}"
+        # ⛔ THE SERVICE'S OWN LAST EXIT, WHICH IS THE ONLY WITNESS FOR A PASS THAT REFUSES AT STARTUP.
+        # A pass that cannot run (a missing ExecStart after a worktree reap, an unwritable state dir, an
+        # unresolvable repo) writes NO record, so the previous `ok=1` record stays fresh for up to
+        # HARNESS_APPLY_STALE_SECONDS and this gate returned 0 for a box that was not being advanced at
+        # all. The disk reaper's installer carries exactly this leg for exactly this reason.
+        EXEC_MAIN="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null | tr -d '[:space:]')"
+        say "last_service_exit=${EXEC_MAIN:-unknown}"
+        case "${EXEC_MAIN:-unknown}" in
+            0|10|11) ;;
+            unknown|'') err "cannot read the pass service's last exit (systemctl show refused) — cannot determine whether the pass is completing"; return 1 ;;
+            *) err "the pass service's last run exited ${EXEC_MAIN} — the harness is not being applied; see $STATE_DIR/harness-apply.log"; return 1 ;;
+        esac
     fi
     # The PASS RECORD is the third leg: the scheduler can be armed while every pass fails. Its own
     # `--print-status` applies the staleness bound, so "the timer stopped firing" is an alarm and not
