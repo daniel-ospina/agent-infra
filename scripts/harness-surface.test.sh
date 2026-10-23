@@ -1038,7 +1038,7 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIX
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_CLAIMS_TIMEOUT=5 bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
 ck "(e) 'up' REFUSES when no harness resolves (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
-ck "(e) …and it prescribes `set HARNESS_REPO`, never `set REPO`, for a harness that did not resolve" \
+ck "(e) …and it prescribes \`set HARNESS_REPO\`, never \`set REPO\`, for a harness that did not resolve" \
    "$(case "$OUT" in *'set HARNESS_REPO'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …says NOTHING WAS STARTED, and started nothing" \
    "$(HU_S=0; case "$OUT" in *'no agent-infra checkout resolved'*'Nothing was started'*) HU_S=1 ;; esac; if [ "$HU_S" -eq 1 ] && [ ! -s "$FIXCELL/fix.log" ]; then echo 0; else echo 1; fi)"
