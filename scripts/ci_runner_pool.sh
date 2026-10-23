@@ -69,7 +69,14 @@
 # FAIL-CLOSED. An unreadable memory reading, core count, floor, cores-per-slot, arch, process table
 #   or label is `cannot-measure` (rc 2) and changes NOTHING — never read as "probably fine". The
 #   memory read is `orchestrator-harness/capacity.sh`'s, so this file adds no fourth /proc/meminfo
-#   parser.
+#   parser. ⛔ **THE POOL IS EVERY RUNNER ON THE BOX, NOT EVERY DIRECTORY UNDER ONE ROOT**: the same
+#   process table is read for LIVE listeners whose instance dir sits OUTSIDE `RUNNER_ROOT` (measured
+#   on the box this was written for: three live registrations under `/opt/gh-runner-*` while the
+#   default root is `/tmp/actions-runner`). A listing that excludes them is a PARTIAL count of a
+#   per-box budget, so `add` refuses (`why=pool-root-incomplete`) instead of putting a fourth runner
+#   on a three-slot box, and `restart` refuses instead of calling an existing registration missing.
+#   `RUNNER_ROOT` must be the directory that CONTAINS the instance dirs; set it to `/opt` and the same
+#   box reports its real slots and can restart its real registrations.
 #
 # USAGE
 #   ci_runner_pool.sh status  [--all]              # per-runner rows + this box's readings
@@ -82,18 +89,23 @@
 #   ci_runner_pool.sh restart  --name <name> [--dry-run]
 #   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, add to ceiling
 #
-# ENV: RUNNER_ROOT (one complete install per runner; default /tmp/actions-runner, the measured
-#        layout) · RUNNER_TEMPLATE (pristine unpacked release to copy; default $RUNNER_ROOT/_template)
+# ENV: RUNNER_ROOT (the directory that CONTAINS the instance dirs, one level above them; default
+#        /tmp/actions-runner, where this tool puts what it creates — a root that excludes a LIVE
+#        listener is refused as pool-root-incomplete)
+#      RUNNER_TEMPLATE (pristine unpacked release to copy; default $RUNNER_ROOT/_template)
 #      RUNNER_MEM_FLOOR_MB (3584 = the 3.5 GB the gate refused at) · RUNNER_CORES_PER_SLOT (3)
 #      RUNNER_POOL_REPO (owner/name — BOTH the registration-token's scope and the URL the runner is
-#        registered at, so it must be bare `owner/name`; a URL form is refused) · RUNNER_TOKEN (skip gh)
+#        registered at, so it must be bare `owner/name`; a URL form is refused) · RUNNER_TOKEN (skip gh;
+#        SINGLE-USE, so it serves one `add` — `reconcile` refuses it rather than spending it on the
+#        first name and failing the rest)
 #      RUNNER_LABELS (overrides the derived self-hosted-<arch> marker; must still contain it)
 #      POOL_PREFIX (default pi-runner-<host>) · RUNNER_START_SETTLE_S (5)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
 #       nothing changed — `add`: a gate verdict (a floor/ceiling refusal); `restart`: that name has no
-#       registration under $RUNNER_ROOT (NOT a capacity verdict — it needs `add`); `status`: the report
+#       registration under $RUNNER_ROOT, or its dir exists without a `.runner` (NOT a capacity verdict —
+#       the message names the state and the action that clears it); `status`: the report
 #       it produced contains a DEAD listener (see below) · 4 name not available (that name is taken;
 #       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
@@ -102,7 +114,9 @@
 #
 # `status` exits 3 when it produced a report in which at least one listener is DEAD — a report is
 # still a report, but a dead listener is a fact a caller must be able to branch on without parsing
-# the table. It exits 2 (never 0, never 3) when it could not measure.
+# the table. It exits 2 (never 0, never 3) when it could not measure — including a pool it can only
+# PARTLY see (a live listener outside `RUNNER_ROOT`, `why=pool-root-incomplete`), because the rows and
+# the slot count it prints would then describe part of the box as if it were all of it.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -344,6 +358,52 @@ listener_pid() {
   return 0
 }
 
+# outside_listener_dirs — instance dirs with a LIVE listener that sit OUTSIDE $RUNNER_ROOT.
+# rc 0 = measured (one dir per line, possibly none) · rc 2 = CANNOT MEASURE.
+# ⛔ THE POOL IS EVERY RUNNER ON THE BOX, NOT EVERY DIRECTORY UNDER ONE ROOT (#2381 review, P1).
+# A box whose registrations live under a DIFFERENT parent (measured: three live listeners under
+# /opt/gh-runner-*, while the shipped default root is /tmp/actions-runner) made `slots` read 1 where
+# the box carried 3 — so `reconcile` would ADD onto a box already at the owner's 3-slot ceiling
+# (memory and cores are per BOX, not per root), and `restart` answered "no registration … (add it
+# first)" for a registration that was right there. Both are ACTIONS taken from a listing that was
+# not the pool — the class this file refuses everywhere else. The process table is the one reading
+# that holds regardless of where the installs live, and it is already this file's liveness evidence.
+outside_listener_dirs() {
+  local out pid args dir root
+  if ! out="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
+    err "cannot-measure why=process-table-unreadable (ps -ww -eo pid=,args= failed)"; return 2
+  fi
+  [ -n "$out" ] || { err "cannot-measure why=process-table-empty (ps listed no processes)"; return 2; }
+  # The PHYSICAL root when it resolves, the literal one otherwise: a symlinked root must not report
+  # every registration under it as "outside".
+  root="$(cd "$RUNNER_ROOT" 2>/dev/null && pwd -P)" || root="${RUNNER_ROOT%/}"
+  while read -r pid args; do
+    [ -n "${pid:-}" ] || continue
+    # Same invocation anchor as `listener_pid`: the ` run` after the binary is what separates a
+    # LISTENER from any process that merely names the file.
+    case "$args" in *"/bin/Runner.Listener run"*) ;; *) continue ;; esac
+    dir="${args%%/bin/Runner.Listener run*}"
+    case "$dir" in /*) ;; *) continue ;; esac   # only an ABSOLUTE path is an instance dir
+    dir="${dir%/}"
+    [ "$dir" = "$root" ] && continue
+    case "$dir" in "$root"/*) continue ;; esac
+    printf '%s\n' "$dir"
+  done <<<"$out"
+  return 0
+}
+
+# require_pool_complete <verb> — rc 0 = the listing under $RUNNER_ROOT IS the box's pool.
+# rc 2 = a LIVE listener runs from an instance dir OUTSIDE it, so the listing (and the ceiling
+# counted from it) is INCOMPLETE and no action may be taken from it. Fails closed: an unreadable
+# process table is rc 2 here too, never "nothing outside".
+require_pool_complete() {
+  local outside
+  outside="$(outside_listener_dirs)" || return 2
+  [ -z "$outside" ] && return 0
+  err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so the pool listing (and the ceiling counted from it) is incomplete; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) — $1 NOT attempted"
+  return 2
+}
+
 # probe_listener <dir> — sets LISTENER_PID. rc 0 alive · 1 dead · 2 cannot-measure.
 # The third state is the point: "no listeners" and "I could not look" must never be the same value,
 # because one of them starts a second listener.
@@ -383,7 +443,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 d rc dirs
+  local dead=0 live=0 d rc dirs outside
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -392,6 +452,9 @@ cmd_status() {
     case "$1" in --all) shift ;; *) err "usage: status [--all]"; return 1 ;; esac
   done
   readings || return 2
+  # ⛔ THE INCOMPLETE-POOL READ IS ITS OWN REFUSAL (#2381 review, P1): a report that counts only
+  # `$RUNNER_ROOT` while live listeners run elsewhere is a partial count printed as the box's pool.
+  outside="$(outside_listener_dirs)" || return 2
   # ONE listing, one count: `slots` (listing #1) and `dirs` (listing #2) could disagree while
   # registrations appeared, and the report then printed more DEAD rows than `slots=` (measured:
   # `live=0 dead=30 slots=17`). The rows and the count now come from the SAME read.
@@ -414,6 +477,12 @@ cmd_status() {
     esac
   done <<<"$dirs"
   printf 'summary live=%s dead=%s slots=%s ceiling=%s\n' "$live" "$dead" "$SLOTS" "$CEILING"
+  # After the measured rows, so the report is visible — but the count it publishes is NOT this box's
+  # pool, so the rc must not claim a complete measurement.
+  if [ -n "$outside" ]; then
+    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read"
+    return 2
+  fi
   [ "$dead" -eq 0 ] || return 3
   return 0
 }
@@ -455,6 +524,10 @@ cmd_add() {
     return 3
   fi
   slots || return 2
+  # ⛔ A CEILING COUNTED FROM PART OF THE BOX IS NOT THE CEILING (#2381 review, P1). This gate is the
+  # last thing between the pass and a registration, so it refuses rather than trusting a listing that
+  # provably excludes a live listener.
+  require_pool_complete add || return 2
   if [ "$SLOTS" -ge "$CEILING" ]; then
     err "REFUSED add name=$name slots=$SLOTS ceiling=$CEILING ncpu=$NCPU cores_per_slot=$CORES_PER_SLOT MemAvailable=$(mb_as_gb "$MEM_MB") GB floor=$(mb_as_gb "$MEM_FLOOR_MB") GB — above the core-aware ceiling, nothing added"
     return 3
@@ -524,6 +597,10 @@ cmd_add() {
     rm -rf "$dir"
     err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the ceiling could not be re-read after claiming $name; the claim was released)"; return 2
   fi
+  # The SAME completeness check as the pre-claim gate: an outside listener can appear (a hand add, a
+  # peer pass with a different root) between the two reads, and the claim is released rather than
+  # turned into a registration the ceiling never counted.
+  if ! require_pool_complete add; then rm -rf "$dir"; return 2; fi
   if [ "$SLOTS" -ge "$CEILING" ]; then
     rm -rf "$dir"
     err "REFUSED add name=$name slots=$SLOTS ceiling=$CEILING — another pass took the free slot while this add ran; nothing added"
@@ -622,6 +699,11 @@ cmd_restart() {
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2
     fi
+    # ⛔ BEFORE CONCLUDING "NO REGISTRATION", ASK WHERE THE POOL ACTUALLY LIVES (#2381 review, P1).
+    # A registration under another parent is not missing, and "add it first" is the one remedy that
+    # cannot help (add refuses a name it cannot see, and the operator is sent to re-register a runner
+    # that already exists).
+    require_pool_complete restart || return 2
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
   fi
   # ⛔ ONE REGISTRATION, ONE DEFINITION (#2381 review, P2). The listing (`registered_dirs`) and `add`
@@ -634,7 +716,10 @@ cmd_restart() {
   # refuses to print, arrived at by a different predicate: a registration we cannot inspect is
   # `cannot-measure`, never "no registration".
   if [ ! -e "$dir/.runner" ] && [ ! -L "$dir/.runner" ]; then
-    err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
+    # ⛔ "ADD IT FIRST" IS NOT A REMEDY HERE (#2381 review, P2): the directory EXISTS, so `add`
+    # refuses this same path as unavailable (rc 4) and the operator bounces between two verbs forever.
+    # Name the state that was measured and the action that actually clears it.
+    err "REFUSED restart name=$name path=$dir exists but carries no .runner registration (a file, a symlink, or a directory without one) — clear it, or pick another name; nothing changed"; return 3
   fi
   # ⛔ NO MEMORY FLOOR ON THIS PATH, DELIBERATELY (#2373). The floor gates ADDING a new runner. A
   # dead listener for an EXISTING registration costs ~200 MB to bring back and is capacity the box has
@@ -656,7 +741,7 @@ cmd_restart() {
 }
 
 cmd_reconcile() {
-  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0
+  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0 outside
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
@@ -720,6 +805,17 @@ cmd_reconcile() {
     esac
   done <<<"$dirs"
 
+  # ⛔ THE RESTART ARM CANNOT ENUMERATE A POOL THAT IS NOT UNDER $RUNNER_ROOT (#2381 review, P1).
+  # Reporting `dead=0 restarted=0` over listeners it never listed is a false healthy reading, and the
+  # ADD arm downstream counts its ceiling from the same partial listing — so the pass names the gap
+  # and exits 2 rather than publishing a clean summary over part of the box.
+  if ! outside="$(outside_listener_dirs)"; then
+    cannot=$((cannot + 1))
+  elif [ -n "$outside" ]; then
+    cannot=$((cannot + 1))
+    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT: this pass could not enumerate it (the restart arm covers RUNNER_ROOT alone) and the ADD arm refuses on the same reading; set RUNNER_ROOT to the directory that CONTAINS every instance dir"
+  fi
+
   # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no
   # capacity reading at all — no floor, no ceiling (see cmd_restart) — so gating the WHOLE pass on
   # `readings` refused the one action this tool exists for, on exactly the box that needs it: dead
@@ -742,6 +838,14 @@ cmd_reconcile() {
   # add at all. Held names are normal after a `/tmp` wipe (every local `.runner` gone, every
   # registration still on GitHub), so the slack is sized for that, not for a hypothetical bug.
   budget=$((CEILING * 4 + 20))
+  # ⛔ A CALLER-SUPPLIED TOKEN CANNOT SERVE A PASS (#2381 review, P2). A registration token is
+  # SINGLE-USE and expires in ~1h — both this file's own premises — so an inherited $RUNNER_TOKEN
+  # covers exactly ONE add: every later name would fail config.sh (rc 5) and the pass would burn its
+  # whole attempt budget reporting `failed=N added=0`. A dry run spends nothing, so it may preview.
+  if [ "$DRY" = 0 ] && [ -n "${RUNNER_TOKEN:-}" ]; then
+    cannot=$((cannot + 1)); budget=0
+    err "cannot-act why=runner-token-single-use (RUNNER_TOKEN is single-use, so it covers ONE add; this pass can add several — the ADD arm did not run, the RESTART arm already did; unset RUNNER_TOKEN and authenticate $GH_CMD so each add mints its own)"
+  fi
 
   # (b)+(c) add only ABOVE the floor and BELOW the ceiling. A gate verdict (rc 3) ENDS the pass — it
   #        is a measurement of this box, not a per-name accident — while an UNAVAILABLE name (rc 4)

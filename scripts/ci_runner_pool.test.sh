@@ -68,8 +68,16 @@ listener_pids_for() { pgrep -f -- "$1/bin/Runner.Listener" 2>/dev/null | sort | 
 slots() { local n; n="$(ls -d "$RUNNER_ROOT"/*/.runner 2>/dev/null | wc -l)" || n=0; printf '%s' "$((n))"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-pool-test.XXXXXX")"
+# The ps shim filters the host table to fixture processes, so it needs the fixture root.
+export FIXTURE_T="$T"
 cleanup() {
-  pkill -f "$T/root-" 2>/dev/null || true
+  # ⛔ ONE PATTERN FOR EVERY LISTENER SHAPE, NOT JUST `root-` (#2381 review, P2): the
+  # symlinked-instance case starts a listener from `$T/real/pi-runner-sym`, which no `$T/root-`
+  # pattern matches — so one listener (and its `sleep 600`) leaked past cleanup on EVERY run, with the
+  # instance dir deleted underneath it (measured: 5 orphans after 5 runs, each ppid=1). The suite runs
+  # in both CI lanes, i.e. on the very boxes this tool manages. `bin/Runner.Listener` is the shape
+  # every fixture listener has, and it matches no part of the suite's own command line.
+  pkill -f "$T/.*bin/Runner\.Listener" 2>/dev/null || true
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -117,7 +125,18 @@ cat >"$BIN/ps" <<'STUB'
 # `cannot-measure` — never "no listeners", which would double-start a listener.
 [ "${FIXTURE_PS_FAIL:-0}" = 1 ] && { echo "ps: cannot read /proc" >&2; exit 1; }
 [ "${FIXTURE_PS_EMPTY:-0}" = 1 ] && exit 0
-exec /bin/ps "$@"
+# ⛔ THE FIXTURE TABLE IS THE SUITE'S OWN PROCESSES ONLY (#2381 review, P1). The suite models a
+# listener with a real process under $T, but the HOST also runs runners (measured: three live
+# listeners under /opt/gh-runner-* on the boxes this suite runs on). Reading the whole host table
+# would make the new outside-the-root arm fire in every case — "the pool is complete" would fail on
+# exactly the boxes this tool manages. Filtering to lines that name a fixture path keeps the fixture
+# hermetic; FIXTURE_PS_EXTRA is the only way to plant a listener elsewhere.
+out="$(/bin/ps "$@")" || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" | while IFS= read -r line; do
+  case "$line" in *"${FIXTURE_T:?}/"*) printf '%s\n' "$line" ;; esac
+done
+[ -n "${FIXTURE_PS_EXTRA:-}" ] && printf '%s\n' "$FIXTURE_PS_EXTRA"
+exit 0
 STUB
 cat >"$BIN/hostname" <<'STUB'
 #!/usr/bin/env bash
@@ -934,6 +953,60 @@ assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EMPTY=1 rc_of status
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dies)"
 assert_eq "$?" "2" "a listener that never appears is cannot-act (rc 2)"
 assert_contains "$out" "cannot-act why=listener-never-appeared" "the wait is bounded and named"
+
+# ══ OUTSIDE-THE-ROOT ARMS (#2381 review, P1) ══════════════════════════════════════════════
+# The measured shape this exists for: three LIVE registrations under /opt/gh-runner-* while
+# RUNNER_ROOT defaulted to /tmp/actions-runner. Both the ceiling and the restart verdict were read
+# from a listing that was not the box's pool, so `add` would have put a 4th runner on a 3-slot box and
+# `restart` called an existing registration missing. The reading is the PROCESS TABLE, which does not
+# care where the installs live — and it fails closed: the outside dir is named, never silently ignored.
+fresh_pool outside
+OUTSIDE_DIR="$T/elsewhere/pi-runner-elsewhere"
+mkdir -p "$OUTSIDE_DIR/bin" "$OUTSIDE_DIR/_work"
+cp -a "$TEMPLATE/bin/Runner.Listener" "$OUTSIDE_DIR/bin/"
+: >"$OUTSIDE_DIR/.runner"
+EXTRA="424242 $OUTSIDE_DIR/bin/Runner.Listener run --startuptype service"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run status --all)"
+assert_eq "$?" "2" "status refuses a pool it can only partially enumerate (rc 2, never a clean report)"
+assert_contains "$out" "cannot-measure why=pool-root-incomplete" "it names the reading that failed"
+assert_contains "$out" "outside=$OUTSIDE_DIR" "and names the instance dir it cannot count"
+
+reset_logs
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run add --name pi-runner-outside-add)"
+assert_eq "$?" "2" "add REFUSES on an incomplete pool — no runner added onto a box already at its ceiling"
+assert_contains "$out" "why=pool-root-incomplete" "the refusal prints the reading it used"
+assert_eq "$(count_lines "$GH_LOG")" "0" "no registration token was minted for the refused add"
+assert_absent "$RUNNER_ROOT/pi-runner-outside-add" "no instance dir was claimed"
+
+# The same box WITHOUT the outside listener is clean — so the arm fires on the reading, not a fixture.
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of status --all)" "0" \
+  "the same box with no outside listener reports a complete pool (control)"
+
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" rc_of restart --name pi-runner-elsewhere)" "2" \
+  "restart of a registration outside the root is cannot-measure, NOT a false 'no registration'"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run restart --name pi-runner-elsewhere)"
+assert_absent "$OUTSIDE_DIR/listener.log" "and it started nothing for it"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reconcile)"
+assert_eq "$?" "2" "reconcile does not publish a clean summary over part of the box"
+assert_contains "$out" "why=pool-root-incomplete" "naming the same reading"
+
+# ⛔ THE RESTART REMEDY MUST NOT BE ONE THAT ALWAYS REFUSES (#2381 review, P2): a directory that
+# exists without a registration is not "add it first" — `add` refuses that same path as unavailable,
+# so the operator bounced between two verbs forever.
+fresh_pool remedy
+mkdir -p "$RUNNER_ROOT/pi-runner-noinstall"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-noinstall)"
+assert_eq "$?" "3" "a directory without a .runner registration is still a refusal (rc 3)"
+assert_contains "$out" "carries no .runner registration" "the message names what was measured"
+assert_contains "$out" "clear it, or pick another name" "and the remedy that actually clears it"
+
+# ⛔ A SINGLE-USE TOKEN CANNOT SERVE A PASS (#2381 review, P2): every add after the first would fail
+# config.sh and the pass would burn its whole attempt budget reporting failed=N added=0.
+fresh_pool token
+out="$(RUNNER_TOKEN=tok-fixture FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "2" "reconcile refuses an inherited single-use RUNNER_TOKEN (rc 2)"
+assert_contains "$out" "why=runner-token-single-use" "naming the reason the ADD arm did not run"
+assert_eq "$(slots)" "0" "nothing was added"
 
 # ══ 10. MUTATION: removing the floor check must break the suite ═════════════════════════════
 # The floor is the owner-mandated predicate (#2344 comment 6347825624). A copy with the comparison

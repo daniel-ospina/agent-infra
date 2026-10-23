@@ -185,7 +185,10 @@ Rules, each measured rather than preferred:
 `daniel-ospina/tortoise`) is **both** the registration-token's scope and the URL the runner registers
 at; a URL form is `cannot-measure why=repo-unreadable`, not a runner. `add` needs `RUNNER_TOKEN` or an
 authenticated `gh` (a token is single-use and expires in ~1h, so one is minted per add and never
-stored). `bash scripts/ci_runner_pool.sh --help` prints every seam and the full EXIT contract.
+stored) — ⛔ which is why a token supplied in the ENVIRONMENT serves exactly ONE add: `reconcile`
+refuses to run its ADD arm with `RUNNER_TOKEN` set (`cannot-act why=runner-token-single-use`, rc 2)
+rather than spend it on the first name and fail every later one as `name-failed`.
+`bash scripts/ci_runner_pool.sh --help` prints every seam and the full EXIT contract.
 
 - **The memory floor gates ADDING, never RESTARTING.** An add below `RUNNER_MEM_FLOOR_MB` (3584 =
 the 3.5 GB the gate refused at) is REFUSED and **prints the reading it used** — the owner made that
@@ -203,6 +206,17 @@ ruling that there is no lane ceiling tied to cpu count.
   the measured `/tmp/actions-runner`, `RUNNER_TEMPLATE` holds one pristine unpacked release, and each
   `add` **copies** it — a shared install with per-name dirs would register runners whose `.runner`
   never appears where the tool looks.
+- **The pool is every runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
+the directory that **CONTAINS** the instance dirs (one level above them) — its default
+`/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the
+installs may live elsewhere (measured: three live listeners under `/opt/gh-runner-*` while the
+default root held one dir). A listing under a root that excludes a LIVE listener is a **partial**
+count of a per-BOX budget — memory and cores do not partition by directory — so the tool reads the
+process table for instance dirs outside `RUNNER_ROOT` and refuses with
+`cannot-measure why=pool-root-incomplete … outside=<dirs>`: `add` would otherwise put a fourth runner
+on a three-slot box, and `restart` would call an existing registration "no registration … (add it
+first)". Set `RUNNER_ROOT` to the parent (`RUNNER_ROOT=/opt` above) and the same box reports its real
+slots and can restart its real registrations.
 - **Liveness is the process table, not a pid file.** A pid file records a past state and is never
   revalidated; a recycled pid reads "live" forever, and on a box without `/proc` it cannot be
   revalidated at all. The runner's argv (`<dir>/bin/Runner.Listener run`) cannot go stale, and it is
@@ -244,7 +258,9 @@ box, and the flag exists because #2373's clause names it.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: that
-name has no registration under `RUNNER_ROOT` (NOT a capacity verdict — it needs `add`); `status`: the
+name has no registration under `RUNNER_ROOT`, or its directory exists but carries no `.runner` (NOT a
+capacity verdict — in each case the message names the state and the action that clears it; "add it
+first" is only said when there is no directory at all) · 3 `status`: the
 report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
@@ -253,9 +269,11 @@ always taken). ⛔ **4 is checked before 3**: a name that is already taken repor
 is also at a gate, because the name condition is a fact about the request, not about the box — a
 caller that branches on 4 to try another name must be able to see it. `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it
-could not measure, which includes an unreadable **process table** AND an unreadable **pool listing**:
+could not measure, which includes an unreadable **process table** AND an unreadable **pool listing**
+AND a pool that only PARTLY matches `RUNNER_ROOT` (`pool-root-incomplete`):
 they are the unreadable inputs whose absence would produce an action (a second listener; an add above a
-ceiling counted from a listing that failed) instead of a refusal, so both fail closed. An unreadable
+ceiling counted from a listing that failed, or from one that excludes live runners elsewhere on the box)
+instead of a refusal, so all fail closed. An unreadable
 **instance dir** is counted as a slot and reported `cannot-measure why=instance-unreadable`, never DEAD
 — the third unreadable input whose absence would produce an action (a start) instead of a refusal. A
 root that exists but is **not a directory** is `cannot-measure why=runner-root-not-a-directory`, not an
