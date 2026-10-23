@@ -240,13 +240,20 @@ wt_launcher_home() {
 # three spaces, and `gh auth status` answers `Failed to log in to github.com using token (GH_TOKEN)` for
 # that value — the same defect the keys.env arm refuses statically. Every arm of this gate now applies
 # one rule: a credential is a value containing a non-space character.
-wt_tmux_server_token() {
+wt_tmux_server_token() { wt_tmux_server_token_value >/dev/null 2>&1; }
+
+# `wt_tmux_server_token_value` — the VALUE, when the server's global environment carries one (the
+# predicate above is this question with the answer thrown away). `wt_spawn` needs the value, not just
+# the verdict: on the server-token arm the launch line neither exports a token nor reads a file for it
+# — the pane inherits it from the SERVER — so the caller-side pre-flight of the launch line has to be
+# given what the pane would inherit, or it would judge an arm it cannot see (`wt_spawn`, the P1 fix).
+wt_tmux_server_token_value() {
   local n v
   command -v tmux >/dev/null 2>&1 || return 1
   for n in GH_TOKEN GITHUB_TOKEN; do
     v="$(tmux show-environment -g "$n" 2>/dev/null)" || continue
     case "$v" in
-      "$n="*) case "${v#"$n="}" in *[![:space:]]*) return 0 ;; esac ;;
+      "$n="*) case "${v#"$n="}" in *[![:space:]]*) printf '%s\n' "${v#"$n="}"; return 0 ;; esac ;;
     esac
   done
   return 1
@@ -425,23 +432,21 @@ wt_launcher_env() {
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
   # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
   # the STORE — and never the question it just answered NO to.
-  # ⛔ AND IT MUST ASK THE **SAME TWO QUESTIONS THE GATE ASKED** (P2 review finding, 2026-10-23,
-  # measured): the guard used to know only `gh auth token`, while the gate can also credit through the
-  # FILE predicate (no gh on PATH — the fallback one function up). A box credited that way returned to
-  # `wt_launcher_env` rc=0, wrote its record, and the worker then died with `exit 98` on its first
-  # statement — a silently dead lane, which is exactly the class this gate exists to remove. So the
-  # guard takes gh's answer from an ABSOLUTE path resolved at BUILD time (a `PATH=` line inside
-  # `keys.env` cannot move it) and falls back to the same credential-file predicate the probe uses;
-  # `gh` itself stays bounded (see `wt_gh_token`).
-  if [ -f "$keys" ]; then
-    _hosts_f="$(wt_gh_hosts "$home")"
-    _guard="grep -qE $(wt_q "$WT_OAUTH_TOKEN_RX") $(wt_q "$_hosts_f") 2>/dev/null"
-    _ghbin="$(command -v gh 2>/dev/null || true)"
-    if [ -n "$_ghbin" ] && command -v perl >/dev/null 2>&1; then
-      _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1 || $_guard"
-    fi
-    printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
+  # ⛔ AND IT MUST ASK THE **SAME QUESTION THE GATE ASKED, WITH THE SAME gh** (P2 review finding,
+  # 2026-10-23, measured): the guard used to resolve `gh` through the PANE's PATH, which a `PATH=` line
+  # inside `keys.env` can rewrite (measured: gate rc=0, record written, worker `exit 98` on its first
+  # statement — a silently dead lane). It now takes gh's answer from an ABSOLUTE path resolved at BUILD
+  # time, and stays bounded (`wt_gh_token`): a hung `gh auth token` on the pane side is the same freeze
+  # as on the gate side. Where NO gh can be resolved at build time the guard REFUSES (`false`): a box
+  # with no gh anywhere cannot run a lane at all, and refusing loudly — before the session starts, via
+  # `wt_spawn`'s caller-side pre-flight — is the documented fail-closed policy for that shape, not a
+  # file credit the worker's own gh could never spend.
+  _guard="false"
+  _ghbin="$(command -v gh 2>/dev/null || true)"
+  if [ -n "$_ghbin" ] && command -v perl >/dev/null 2>&1; then
+    _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1"
   fi
+  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
   return 0
 }
 
@@ -778,7 +783,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val pre_rc preout
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   case "$name" in
@@ -817,6 +822,34 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value), this caller's own GH_TOKEN/GITHUB_TOKEN (only when this spawn creates the server) and the tmux server's GH_TOKEN/GITHUB_TOKEN; found none in any of them. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
         return 1
       }
+      # ⛔ THE LAUNCH LINE IS EXECUTED ONCE ON THE CALLER'S SIDE, BEFORE `new-session` (P1 review finding,
+      # 2026-10-23, MEASURED). Every guard inside the prefix — the `[ -r ]`/`bash -n` check, the
+      # post-source blank clear, and the `gh auth token` fallback — runs INSIDE the pane, and
+      # `tmux new-session -d` returns 0 as soon as the SESSION OBJECT exists. Measured on the pre-fix
+      # head, twice: (i) a token-bearing hosts.yml on a box whose PATH has no `gh` — the store credit was
+      # granted, the pane exited 98 at the fallback, and `wt_spawn` returned 0 and wrote `kind=tmux`;
+      # (ii) a keys.env line that the static grep credits but the source never executes — same outcome.
+      # That is the dead-lane-reported-provisioned this change exists to remove, one layer below the
+      # launcher: the refusal was real, and INVISIBLE. So the prefix runs once here and a non-zero
+      # REFUSES the spawn before any session is created.
+      # ⛔ THE PROBE MUST SEE WHAT THE PANE WOULD INHERIT, not what the caller happens to hold. On the
+      # server-token arm the credential comes from the tmux SERVER's global environment (the prefix
+      # neither exports it nor reads a file for it), so the server's value is injected here; on every
+      # other arm the prefix pins or clears the names itself, which makes the injection inert.
+      # Declared residual: PATH. The caller's PATH decides where `gh` is found, so a pane inheriting a
+      # DIFFERENT PATH from a pre-existing server is over-refused (fail-closed) rather than blessed.
+      srv_val="$(wt_tmux_server_token_value 2>/dev/null)" || srv_val=""
+      pre_rc=0
+      if [ -n "$srv_val" ]; then
+        preout="$(GH_TOKEN="$srv_val" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+      else
+        preout="$(bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+      fi
+      if [ "$pre_rc" -ne 0 ]; then
+        premsg="${preout//$'\n'/ }"
+        wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed (rc=$pre_rc), so the worker would die at once and be recorded as a started lane: ${premsg:0:300}"
+        return 1
+      fi
       # ⛔ THE SHELL-COMMAND MUST BE ONE ARGUMENT (P0 review finding, 2026-10-23, MEASURED). tmux runs
       # a SINGLE shell-command argument through the shell, but a MULTI-argument command is exec'd
       # DIRECTLY — so the three-word form `bash -c "'<line>'"` handed bash a literally single-quoted
