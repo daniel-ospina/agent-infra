@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """orphan-reap.test.py — the gate suite for the `pi` pool (scripts/orphan-reap.py).
 
-TWELVE tests, each with its own fixture, and THREE MUTATIONS that must go RED when a gate is
-dropped. No live process is touched and nothing here can signal a pid: `ps`, the session index,
+Each test has its own fixture, and a MUTATION per gate that must go RED when that
+gate is dropped. No live process is touched and nothing here can signal a pid: `ps`, the session index,
 `stat`, the clock and the cmux hook store are all injected, and the only thing read back is the
 census's own `--json` output (the census runs IN-PROCESS with `as_json=True`, so its JSON contract
 is exercised; the ARGUMENT PARSER — `--pool`, `--pool all`, `--json` on the orphan pool — is not,
 which is a named follow-up rather than a claim).
-On top of those: EIGHT apply-path assertions (the only code here that signals), a
+On top of those: an assertion per GUARD on the apply path (the only code here that signals), a
 four-states-reachable pin, the name-stamp-is-UTC pin (four timezones), an empty-pool JSON
-contract check, an UNREADABLE-`ps`-still-speaks-JSON check, and the fence-default pin against
-the canon.
+contract check, an UNREADABLE-`ps`-still-speaks-JSON check, an unparseable-`etime`-row check, and
+the fence-default pin against the canon.
+(Counts are deliberately NOT stated: the header carried "TWELVE tests" and "EIGHT apply-path
+assertions" while the tables held 15 tests and 11 apply assertions — stale numbers in a file whose
+job is to make claims verifiable. Name the property, not the tally.)
 ⚠️ ONE READER IS REAL, ON PURPOSE: `canon_verdict` calls the canon's `gather`, which forks the
 fleet's identity probe (`scripts/lib/pid-identity.sh`) for the store record it is given. That is
 the RULE under test, not a fixture, so a provider machine without a working probe CLI fails these
@@ -47,7 +50,12 @@ which is why the CI step depends on it.
 (k) NO bindable session file, the lane BUSY                        => LIVE (`cpu-advancing`)
     ─ (j)+(k) together are the doc's claim: the transcript gate abstains only on the PARKED row,
     because gate 1 is evaluated first. One row alone could be reordered without contradiction.
-plus: every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
+    (m) `etime` moved BACKWARDS between the two census reads — recycled inside the window
+        => UNVERIFIABLE: recycled-mid-read
+(n) a 25 h-frozen transcript whose OWN median gap is 1000 s => LIVE: progress-within-own-expected
+    (its own bound, 27.8 h, is what keeps it LIVE; the canon's 24 h floor alone would say parked)
+plus: one UNPARSEABLE `etime` ROW abstains without killing the census (the JSON still speaks),
+and every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
 UNREACHABLE under the shipped default (the host decision), and the name-stamp parser is UTC.
 """
 from __future__ import annotations
@@ -278,6 +286,38 @@ def case_grew(tmp) -> Box:
 
     box.stat = stat_grows_at_signal
     return box
+
+
+def case_bad_etime(tmp) -> Box:
+    """One row whose `etime` is UNPARSEABLE beside a healthy one — an abstention, not a crash.
+
+    `bind_session` carries a per-row arm for exactly this datum (`start-unreadable`), and it was
+    UNREACHABLE: the census's sort key parsed `etime` unguarded, so one bad row raised out of
+    `pi_census` before any row was scored — `--json` emitted no document, the four-state census
+    was lost, and the run exited 1 (this file's code for "an applied target survived").
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1), "300": _row(300, 1, etime="garbage")}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+
+
+def case_gate3_own_gap(tmp) -> Box:
+    """Gate 3's OWN-DISTRIBUTION arm, made load-bearing on its own.
+
+    This session's entries are 1000 s apart, so its own bound is `100 x that` = 27.8 h and a
+    25 h-old transcript is still WITHIN its own expected interval — the canon's 24 h idle floor
+    would call the same transcript parked. The row reads LIVE *only* because gate 3's comparison
+    runs, which is what makes the comparison itself pinnable: making `age < bound` inert (or
+    replacing the unestablished-distribution abstention with `100 * (own_gap or 0.0)`) flips this
+    case, while before it the GROWTH arm alone carried gate 3's mutation.
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 25 * 3600, n=9, gap=1000.0)
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
 
 
 def case_store_fresh_at_signal(tmp) -> Box:
@@ -566,6 +606,8 @@ TESTS = [
      case_zombie, "UNVERIFIABLE", "zombie", None),
     ("(m) `etime` moved BACKWARDS between the two census reads — recycled inside the window",
      case_recycled_mid_read, "UNVERIFIABLE", "recycled-mid-read", None),
+    ("(n) 25 h frozen, but its OWN 1000 s median gap makes the bound 27.8 h",
+     case_gate3_own_gap, "LIVE", "progress-within-own-expected", {"3": False}),
 ]
 
 
@@ -639,7 +681,7 @@ def _apply_run(box, live=None, post=None):
 
 
 def apply_path() -> int:
-    """EIGHT assertions on the only code in this file that can send a signal.
+    """One assertion per GUARD on the only code in this file that can send a signal.
 
     Every other case runs `apply=False`, so the kill path — its incarnation/recycle refusals,
     and the two guards that keep an UNREADABLE `ps` read from reading as success — had no test
@@ -718,6 +760,26 @@ def apply_path() -> int:
         check("(g8) the pid is a NEWER incarnation (etime moved backwards)", rc, out, kills, 0, [],
               must=("REFUSED: incarnation changed",),
               must_not=("SIGTERM ->", "STILL ALIVE"))
+
+        # (g12) a HUMAN ancestor appears between the census and the signal. Gate 2 is re-asked at
+        # signal time and it must be the SAME question the census asked (#1696). Before this case
+        # every apply fixture was hostless under the seam, so the whole re-check block could be
+        # deleted with the suite fully green.
+        rc, out, kills = _apply_run(
+            case_a(tmp),
+            live={"1": _init(),
+                  "200": _row(200, 1, comm="/usr/bin/login", args="-pflogin"),
+                  "100": _row(100, 200)})
+        check("(g12) a login ancestor appeared before the signal", rc, out, kills, 0, [],
+              must=("REFUSED: human ancestor", "not signalled: 100"),
+              must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
+
+        # (g13) the signal-time chain cannot be walked (a hop is missing from the read):
+        # `unknown-incomplete` is report-only, never a licence to signal.
+        rc, out, kills = _apply_run(case_a(tmp), live={"100": _row(100, 1)})
+        check("(g13) the ancestry is INCOMPLETE at signal time", rc, out, kills, 0, [],
+              must=("REFUSED: ancestry INCOMPLETE", "not signalled: 100"),
+              must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
 
         # (g9) the target survives but is a ZOMBIE: it keeps its comm and `etime`, and `os.kill`
         # on a `Z` returns 0, so presence + `is_pi` alone would report a process that has ALREADY
@@ -940,6 +1002,31 @@ def unreadable_json() -> int:
     return fails
 
 
+def bad_etime_row() -> int:
+    """One UNPARSEABLE `etime` row must ABSTAIN — a bad value is never a crashed census.
+
+    Pins the reachability of `bind_session`'s `start-unreadable` arm. While the census's sort key
+    parsed `etime` unguarded, this input raised `ValueError` out of `pi_census` before any row was
+    scored: no JSON on stdout, the four-state census lost, exit 1 (the code reserved for "an
+    applied target survived"). The NEIGHBOURING row must still be scored and decided, so the
+    check asserts both — an abstention, not a hole where the census used to be.
+    """
+    tmp = tempfile.mkdtemp(prefix="orphan-reap-etime-")
+    try:
+        out = case_bad_etime(tmp).census()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    bad = row_of(out, "300")
+    healthy = row_of(out, "100")
+    ok = (bad["state"] == "UNVERIFIABLE"
+          and "start-unreadable" in (bad["reason"] or "")
+          and healthy["reason"] == "host-decision-hostless")
+    print(f"{'PASS' if ok else 'FAIL'} an unparseable `etime` row abstains and the census still "
+          f"speaks (bad={bad['state']}/{bad['reason']}, "
+          f"healthy={healthy['state']}/{healthy['reason']})")
+    return 0 if ok else 1
+
+
 def fence_matches_canon() -> int:
     """The fence default is the CANON's, and the two are pinned together.
 
@@ -969,7 +1056,7 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
     fails = (suite(None) + four_states_reachable() + utc_stamp() + apply_path()
-             + empty_pool_json() + unreadable_json() + fence_matches_canon())
+             + empty_pool_json() + unreadable_json() + bad_etime_row() + fence_matches_canon())
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1
