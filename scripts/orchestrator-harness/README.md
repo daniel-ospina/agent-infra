@@ -100,7 +100,6 @@ doc_status: draft
 > | `orch-loop.sh` moves the sweep's PR **listing** to a conditional REST call (`gh api --paginate -i` + `If-None-Match`, ETag in `state/sweep-etag`, age floor `SWEEP_MAX_AGE`) and takes its rate-limit signal from the **response headers** (`x-ratelimit-remaining`/`-reset`/`Retry-After`) rather than `/rate_limit`; the `# BEGIN sweep-quota` helper block (`sweep_fail_kind`/`sweep_defer_until`) and the new `sweep-quota.test.sh` are agent-infra-only (and the ported `selftest.sh` gains the section that runs it, with its coercion-count pin) | a `304` is not charged to the primary rate limit, so the listing is free, and the `/rate_limit` counter was measured reporting `graphql 4933/5000` while **every** GraphQL call failed — a cell that cannot list PRs cannot merge and read as idle-but-fine (agent-infra#1762). tortoise still carries the polling sweep, so a faithful port must not delete this block as "unported work": port it or keep it |
 >
 > The upstream-logic defects found in the same review are **not** diverged here; they are tracked
-> The upstream-logic defects found in the same review are **not** diverged here; they are tracked
 > instead — `fix-one.sh`'s spaced-check-name word-splitting (agent-infra#1703) and the classifier's
 > inert `(app, name)` grouping (agent-infra#1733) are still present, matching tortoise.
 > `can_spawn()`'s load-only gate (agent-infra#1732) is the one that is now DIVERGED: the memory arm
@@ -991,7 +990,8 @@ The six spawn sites above used to be load-gated only, while lane dispatch was bo
 kills this box consulted on only one of them. `can_spawn()` now ANDs `mem_spawn_ok()`, which refuses at
 `mem_avail <= MIN_MEM_FREE_MB` — the dispatch gate's own boundary **for that one arm**, so the two
 cannot disagree about the `mem_avail` reading itself — and refuses when the probe is UNKNOWN:
-**fail-CLOSED, unlike the load reading's fail-open** (§8). A probe we could not take is not evidence of
+**fail-CLOSED, unlike the load reading's fail-open** (the note below, "A load reading that is
+*unreadable* stays the documented fail-open"). A probe we could not take is not evidence of
 capacity. ⚠️ The dispatch gate carries arms the spawn gate does not (`lanes=`, `swap_free=`, and the
 swap-joint `mem_avail <= 2*MIN_MEM_FREE_MB` that only arms when swap is also tight), so a box in the
 swap-joint band can still be refused a *dispatch* while the spawn sites proceed — those are different
@@ -1008,8 +1008,10 @@ cell-3, `MemAvailable` reached **653 MB** with 14 lanes and the box OOM-killed i
 pool oscillated 12→8 three times in one night). At 653 MB **the new gate is still TRUE** — 653 > 512
 — so that exact reading remains permitted by both gates. What the change removes is the structural
 gap: the spawn sites previously read *no* memory figure at all, so no floor — not even a raised
-`MIN_MEM_FREE_MB` — could bind them, while the dispatch gate 1,300 lines below was already honouring
-one. An operator who wants 653 MB to refuse now sets `MIN_MEM_FREE_MB` above it and BOTH populations
+`MIN_MEM_FREE_MB` — could bind them, while the dispatch gate below was already honouring one (the
+pre-fix inline read sat ~620 lines below the FIRST spawn site, ~225 below the last, and ~2,000 below
+`can_spawn()`'s own definition — measured on `origin/main`, not estimated). An operator who wants
+653 MB to refuse now sets `MIN_MEM_FREE_MB` above it and BOTH populations
 obey; raising the default floor is a separate decision (it is a capacity policy, not a wiring bug)
 and is deliberately not made here.
 
@@ -1086,7 +1088,7 @@ unchanged — only its Linux measurability is.
 A load reading that is *unreadable* stays the documented **fail-open** (`can_spawn()` defaults it to
 `0`): both supported platforms are measurable now, and failing closed on an unreadable probe would
 turn "no load back-pressure" into a permanent controller outage. ⛔ **That licence covers LOAD ONLY.**
-The memory half of the same gate is fail-**CLOSED** (§4): a memory probe that cannot answer refuses
+The memory half of the same gate is fail-**CLOSED**: a memory probe that cannot answer refuses
 the spawn, because the cost of a wrong "ample" is the box OOM-killing its own runners. Do not read
 `can_spawn()`'s load default as covering the memory arm, and do not "fix" a refusing memory gate by
 making `MEMAVAIL_MB` default to a large number — `measure_mem()` zeroes it on a failed probe for

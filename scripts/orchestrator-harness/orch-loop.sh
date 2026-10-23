@@ -460,8 +460,9 @@ mem_avail_mb() { # [<meminfo-file>]
 # measure_mem — the ONE place MEMAVAIL_MB / MEM_UNKNOWN are SET (agent-infra#1732).
 #
 # ⛔ ONE SEAM, TWO DECISION POINTS, NO SECOND DERIVATION. It read this pair INLINE in the [cap] block
-# only, which is ~1,300 lines BELOW the controller's spawn sites — so a gate that "consults" these
-# values is reading the PREVIOUS cycle's figure, or (cycle 1) nothing at all. Both are a stale record
+# only — measured on the pre-fix tree: ~620 lines BELOW the FIRST of the six spawn sites, ~225 below
+# the last, and ~2,000 below `can_spawn()`'s own definition — so a gate that "consults" these values is
+# reading the PREVIOUS cycle's figure, or (cycle 1) nothing at all. Both are a stale record
 # presented as current, the exact class this file keeps removing. The function is called at the cycle
 # prologue (before the FIRST spawn site) and again at the [cap] block (dispatch decides on a fresh
 # reading); the coercion lives HERE so the two cannot disagree about what a failed probe means.
