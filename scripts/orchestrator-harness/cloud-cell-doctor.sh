@@ -1380,6 +1380,43 @@ run_hygiene() {
 #   * session UP but the heartbeat is STALE                 -> REPORT, never kill. A controller that
 #     is alive-but-slow may be mid-merge/mid-spawn; stopping it is a P0-consequence action
 #     (destroying live work) and stays human (README §6.5.5, AGENTS.md P0 rule).
+# ⛔ THE HEARTBEAT VERDICT IS ONE IMPLEMENTATION, TWO SUPERVISORS (review P1, #2402). A service-managed
+# controller has NO tmux session by design, so the session branch below can never evaluate it — and the
+# doctor's ABSENT branch would log `controller RESTARTED` every pass (the supervisor answers "already
+# running") while `CONTROLLER STALE` became unreachable on exactly the box shape #2402 creates. `$who`
+# names what is up so the log stays true in both modes. Sets the caller's `result` (bash dynamic scope).
+controller_heartbeat_verdict() { # <who>
+  local who="$1" hb age
+  hb="$(cat "$O/heartbeat" 2>/dev/null)"
+  case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
+  if [ "$hb" -gt 0 ]; then
+    age=$(( $(date +%s) - hb ))
+    [ "$age" -ge 0 ] || age=0
+    if [ "$age" -gt "$CONTROLLER_STALE_S" ]; then
+      log "[doctor] ⛔ CONTROLLER STALE: $who is up but its heartbeat is ${age}s old (> ${CONTROLLER_STALE_S}s). NOT killing it (a live controller may be mid-merge); reap and the independent merge role continue. Fix by hand if this persists."
+      result="$result; CONTROLLER STALE ${age}s (not killed)"
+    else
+      result="$result; controller RUNNING (heartbeat ${age}s)"
+    fi
+  else
+    result="$result; controller RUNNING (no heartbeat recorded yet)"
+  fi
+}
+
+# Is a controller OF THIS STATE DIR running with no session? The harness's own single-instance lock
+# ($O/.orch.lock, taken by orch-loop.sh) is the authority; identity is checked as well as liveness, and
+# the loop's own record is the second witness. FALSE is safe here: a false negative falls through to the
+# pre-existing ABSENT→restart arm, which is what the doctor did before services existed.
+service_controller_present() {
+  local pid
+  pid="$(tr -dc '0-9' < "$O/.orch.lock" 2>/dev/null || true)"
+  if num_ok "${pid:-}" && kill -0 "$pid" 2>/dev/null \
+     && ps -o args= -p "$pid" 2>/dev/null | grep -qF "$O/orch-loop.sh"; then
+    return 0
+  fi
+  loop_alive
+}
+
 run_doctor() {
   begin_pass
   local dry="$1" rc hb age result="" tmp rpid
@@ -1416,19 +1453,15 @@ run_doctor() {
     return 3
   fi
   if [ "$csp" -eq 0 ]; then
-    hb="$(cat "$O/heartbeat" 2>/dev/null)"
-    case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
-    if [ "$hb" -gt 0 ]; then
-      age=$(( $(date +%s) - hb ))
-      if [ "$age" -gt "$CONTROLLER_STALE_S" ]; then
-        log "[doctor] ⛔ CONTROLLER STALE: tmux '$SESSION' is up but its heartbeat is ${age}s old (> ${CONTROLLER_STALE_S}s). NOT killing it (a live controller may be mid-merge); reap and the independent merge role continue. Fix by hand if this persists."
-        result="$result; CONTROLLER STALE ${age}s (not killed)"
-      else
-        result="$result; controller RUNNING (heartbeat ${age}s)"
-      fi
-    else
-      result="$result; controller RUNNING (no heartbeat recorded yet)"
-    fi
+    controller_heartbeat_verdict "tmux '$SESSION'"
+  elif service_controller_present; then
+    # ⛔ SERVICE-MANAGED, AND THE SESSION ARM CANNOT SEE IT (review P1, #2402). No session exists by
+    # design (`exec`s the loop before the tmux launch), so without this branch every pass logged
+    # "controller restarted" from a start that answered "already running", and a WEDGED controller —
+    # alive, heartbeat stale — was never reported: the one signal that tells "dispatches nothing" from
+    # "idle" was dead on exactly the box shape this PR creates.
+    log "[doctor] controller is up WITHOUT a tmux session (service-managed) — evaluating its heartbeat instead of restarting it"
+    controller_heartbeat_verdict "the controller (service-managed)"
   elif [ "$dry" = "--dry-run" ]; then
     log "[doctor] WOULD restart the controller (tmux '$SESSION' absent, cell is started)"
     result="$result; would restart controller"

@@ -725,20 +725,31 @@ check_controller_service() {
   fi
   for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \
               "${HOME:-}/.pi/agent/scripts/install-controller-service.sh" \
+              "${LAYER_ROOT:-}/scripts/install-controller-service.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-controller-service.sh"; do
     [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
   done
-  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$HOME/.pi/agent/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
+  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$HOME/.pi/agent/scripts, \$LAYER_ROOT/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
+  # ⛔ THE LAYER THE BRING-UP ALREADY TRUSTS IS THE ONE TO RUN (review P1, #2402). This script is normally
+  # pushed STANDALONE into /tmp, so "beside this script" proves nothing, and the installer is not in the
+  # farm list — a cell provisioned the documented way therefore found nothing here and DIED at this check
+  # (killing every bring-up). $LAYER_ROOT/scripts is the checkout check_operational_layer just installed.
+  # The supervisor is resolved from the SAME checkout: the installer prefers $HOME/.pi/agent/scripts, and a
+  # stale copy there predating ORCH_FOREGROUND would hand the unit a launcher that exits 0.
+  local layer_sup="${LAYER_ROOT:+$LAYER_ROOT/scripts/cloud-cell-supervisor.sh}"
+  [ -n "$layer_sup" ] && [ -f "$layer_sup" ] || layer_sup=""
+  local -a cenv=(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}")
+  [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR=$layer_sup")
 
   rc=0
   # TEMPLATES_DIR from the SAME checkout the layer came from (the farmed installer copy lives at
   # $HOME/.pi/agent/scripts, whose ../templates does not exist) — same rule as check_disk_reaper.
-  out="$(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" bash "$installer" --install 2>&1)" || rc=$?
+  out="$(env "${cenv[@]}" bash "$installer" --install 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
   [ "$rc" -eq 0 ] || die "the controller service could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager with linger) before this cell is used; an unsupervised controller dies with the last lane"
 
   rc=0
-  out="$(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" bash "$installer" --status 2>&1)" || rc=$?
+  out="$(env "${cenv[@]}" bash "$installer" --status 2>&1)" || rc=$?
   [ "$rc" -eq 0 ] || die "the controller service is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
   ok "controller supervised — eldato-orchestrator.service is enabled and active (Restart=always: a dead controller comes back without a human; stop it with 'cloud-cell-supervisor.sh stop')"
 }

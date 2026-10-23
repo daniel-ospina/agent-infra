@@ -1854,14 +1854,31 @@ cmd_start() {
   # and a `failed` unit, i.e. the P1 this wait exists to remove, in the state the migration itself
   # produces. The branch-level returns are therefore not reachable in service mode (they hand over).
   foreground_handover() {
-    local _own _saidd=0
+    local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}"
     while :; do
       _own="$(owned_controller_pids 2>/dev/null)" \
         || die "cannot read the process table (ps) — refusing to start on an unreadable read"
       if [ -z "$_own" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then break; fi
+      # ⛔ A SESSION THAT IS NOT OURS IS NOT A HANDOVER, IT IS A DUPLICATE (review P2, #2402). `$SESSION`
+      # names one machine-scoped session (`orch` by default), so a PEER repo's controller holds the same
+      # name — the #1856 shape this file refuses loudly everywhere else ("not provably this state dir's").
+      # Waiting on it parks the unit's ExecStart forever: start never returns, nothing reaches cmd_check or
+      # that refusal, and `--status` reads the unit as enabled+active with a live MainPID while the cell
+      # dispatches nothing. So: no owned controller + a SEE-able one that is not ours = die, as the
+      # non-service path does.
+      if [ -z "$_own" ]; then
+        _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
+        if [ -n "$_seen" ]; then
+          die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
+        fi
+      fi
+      # ⛔ AND THE WAIT IS BOUNDED (review P2). An orphaned session (the pane's `bash … | tee` outliving the
+      # loop — the shape cmd_stop documents) never ends, and an unbounded wait is an inert supervisor.
+      # At the bound, refuse and name what was still there, so systemd's StartLimit makes it operator-visible.
+      [ "$_waited" -lt "$_bound" ] || die "still waiting for the controller that was running ${_waited}s ago (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — refusing to become a second dispatcher; raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge"
       [ "$_saidd" = 1 ] || say "controller already running (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
-      sleep 5
+      sleep 5; _waited=$((_waited + 5))
       superseded && return 1
     done
     return 0
