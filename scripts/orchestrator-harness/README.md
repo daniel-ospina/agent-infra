@@ -2966,7 +2966,11 @@ the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
 whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes). ⛔ The FOURTH
 fixer spawn arm — the RED-TREE one — is NOT gated yet: it books its attempt and spawns before any
 `ciq_push_ok` call, so a deep queue still starts that lane and `fix-one.sh` defers its first push.
-Disclosed rather than implied; home agent-infra #2408.
+Disclosed rather than implied; home agent-infra #2408. ⛔ That census is the SWEEP's, not the
+fleet's: `pr-doctor`'s `prfix` workers are a **second** ungated pusher and are not an orch-loop arm
+at all — `pr-doctor.py` spawns up to `MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or
+`gh run rerun`) with no queue read (`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd
+job still adds CI behind a deep queue; wiring that surface is agent-infra #2540.
 
 Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work

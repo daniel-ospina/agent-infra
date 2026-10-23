@@ -16,7 +16,17 @@
 # the attempt back through `fixbail` on a later cycle. The cost is CHURN — a fixer spawned to do work
 # it then declines to push — not added CI; the refund line names BOTH causes (`another box holds the
 # claim, or the CI-queue gate deferred the push`), so it does not misdirect anyone to a lease that
-# never existed. It is the fourth pusher and the only ungated one; home agent-infra #2408.
+# never existed. It is the fourth fixer spawn arm; home agent-infra #2408.
+# ⛔ AND IT IS NOT THE ONLY UNGATED PUSHER — this paragraph used to claim it was, which is the class
+# of coverage claim a reader trusts and then stops checking (#2540). `pr-doctor`'s `prfix` workers
+# are the other one, and they are not an orch-loop arm at all: `pr-doctor.py` spawns up to `MAX_FIX`
+# of them (`spawn_argv(..., "prfix")`, :2151) with briefs that end in `git push origin …`
+# (:1723-1733) or `gh run rerun …` (:1898), through `nonblocking-dispatch.sh`/`spawn-gate.sh`,
+# neither of which reads this module — `rg -c 'ciq|ci-queue' scripts/pr-doctor.py` is 0. The `prfix`
+# kind is declared for the CREATION back-pressure gate (#2409), not this one, so on the repo whose
+# 92-deep queue this header opens with, a launchd job still adds CI behind it. Wiring that surface
+# is agent-infra #2540; the standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so
+# a caller that is not bash can branch on it.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
