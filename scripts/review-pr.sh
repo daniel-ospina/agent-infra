@@ -757,7 +757,25 @@ VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:
 # exited 6 "NO VERDICT" and could never be recorded. One asterisk-pair away from the case this
 # comment was already about.
 VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*(\*\*|__)?[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)[[:space:]]*(\*\*|__|\])?([[:space:]]|$|[.:,;)]|[—–])'
+# ⛔ A VERDICT INSIDE A CODE FENCE IS A QUOTATION, NOT A VERDICT (P1, fresh review of #2288).
+# The scan took the last verdict-SHAPED line anywhere in the transcript, so a transcript that
+# QUOTED a verdict — the most natural thing in the world, because the clean artifact this tool
+# itself posts is literally `**Verdict:** CLEAN — no blocking findings.` — certified clean even
+# though the reviewer never concluded anything: measured end-to-end, a transcript of "The PR
+# already carries this from an earlier head:" + a fenced CLEAN + "I could not complete the deep
+# pass." exited 0, posted the CLEAN artifact and wrote a signed head-bound `clean` record. The
+# identical transcript with the fenced line removed correctly exits 6, so the ONLY difference was
+# a line the reviewer was quoting. That is the exit-6 refusal ("a transcript with no verdict line
+# is a failure, never an inference") being defeated by formatting, on the one chokepoint between a
+# non-review and an attestation. Fence state is therefore tracked here, and a markdown INDENTED
+# code block (4+ leading spaces, the other way to quote) is dropped the same way; the blockquote
+# form (`> **Verdict:** …`) never matched, because every pattern anchors after optional WHITESPACE.
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
+             | awk 'BEGIN { f = 0 }
+                    /^[[:space:]]*(```|~~~)/ { f = !f; next }
+                    f == 1 { next }
+                    /^    / { next }
+                    { print }' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
@@ -956,6 +974,20 @@ function label(s,   a, b, pre, post) {
       # fail-open direction. A wall costs a re-run; a miss records clean over a real defect.
       if (!negpre && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       if (!negpre && s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # (b3) A NUMERIC MULTIPLIER DIRECTLY ON THE TOKEN — `2 × P1`, `3x P2` (P2, fresh review of
+      # #2288). The COUNT extractor already reads this form as the own count of the verdict
+      # (`grep -oE '[0-9]+[[:space:]]*[×x]'`, pinned by §AM (`ISSUES — 2`)), while the severity
+      # cross-check had no cue for it at all — so `Blocking: 2 × P1` followed by `CLEAN` recorded
+      # clean, and the one check that exists to refuse a self-contradicting verdict could not see
+      # the contradiction written in the count grammar THIS TOOL OWNS. That is the same
+      # two-grammars drift MEMORY.md records for `VD_ISSUES`, one grammar over; a non-zero
+      # multiplier on a P0/P1/P2 token is a USE, never a mention.
+      # ⛔ THE MULTIPLIER IS MATCHED BY CLASS AND BOUNDARY, NOT BY CHARACTER. The `×` is TWO BYTES
+      # and this scanner runs under `LC_ALL=C` (mawk), where the `grep -E '[×x]'` the count reader
+      # uses one file over does not behave the same — a literal `[×x]` never fires here. The
+      # preceding boundary matters just as much: without it the `1` of `P0/P1/P2` read as a
+      # multiplier and a pinned CLEAN (`Per the contract: P0/P1/P2 block.`) started to block.
+      if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*([^[:alnum:][:space:]]+|[xX])[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews

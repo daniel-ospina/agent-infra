@@ -403,6 +403,41 @@ reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC=1
 run "$SRC" 2284
 [ "$(rc_of)" = "6" ]; ck $? "a crashed reviewer (rc!=0, empty transcript) is exit 6, never read as a verdict"
 no_record; ck $? "…and writes no record"
+# ⛔ A QUOTED VERDICT IS NOT A VERDICT (P1, fresh review of #2288). The scan took the last
+# verdict-SHAPED line anywhere, so a transcript that QUOTED the clean form — this tool's own
+# artifact text is literally `**Verdict:** CLEAN — no blocking findings.` — certified clean while
+# the reviewer had concluded nothing (`I could not complete the deep pass.`). The fenced variant
+# exited 0 and wrote a signed head-bound clean record; the same transcript without the quote exits
+# 6. Both directions below, plus the indented-block form (the other way to quote).
+reset; printf 'The PR already carries this from an earlier head:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a verdict QUOTED inside a code fence is NOT a verdict (rc=$(rc_of))"
+no_record; ck $? "  …NO record — a quotation is not an attestation"
+no_comment; ck $? "  …and nothing posted"
+reset; printf 'Quoting the earlier report:\n\n    **Verdict:** CLEAN — no blocking findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…and the INDENTED code-block form is not a verdict either (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'The PR carries this from an earlier head:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\n**Verdict:** CLEAN — no blocking findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…while a REAL verdict after the quote still records (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+# ⛔ THE COUNT GRAMMAR MUST ALSO BE A FINDING GRAMMAR (P2, fresh review of #2288): the count
+# extractor reads `2 × P1` as the verdict's own count (§AM), while the severity cross-check had no
+# cue for it at all — so `Blocking: 2 × P1` followed by `CLEAN` recorded clean. The one check
+# that exists to refuse a self-contradicting verdict could not see the contradiction written in
+# the tool's OWN count syntax: the two-grammars drift MEMORY.md records for `VD_ISSUES`, one over.
+reset; printf 'Blocking: 2 × P1
+CLEAN
+' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "'Blocking: 2 × P1' contradicts CLEAN => refused (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'Summary: 0 × P3 notes, nothing blocking.
+CLEAN
+' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…while a ZERO-multiplier P3 summary stays clean (rc=$(rc_of))"
 
 # ── §G the head moved during the review ─────────────────────────────────────
 echo; echo "§G head moved mid-review => refuse, never certify an unreviewed head"
