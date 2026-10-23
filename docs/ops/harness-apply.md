@@ -200,6 +200,8 @@ can be dead while looking alive:
   can write a record (its previous `ok=1` record would otherwise stay fresh for an hour);
 - **the pass record** — refusing, stale, dated in the future, `behind>0`, or written from
   a comparison that was not fresh;
+- **never having fired at all** past the grace period (two intervals) — a job that has been
+  armed for hours and produced no record is inert, not fresh;
 - **a comparison that could not be made** — a failed `git fetch` is `cannot-verify`
   (exit 23), never `current` against a stale ref.
 
@@ -247,7 +249,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 188 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 192 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -270,7 +272,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
-| T17 | the dirty set survives an **executable bit**, a **path with a space**, and **three renames** (one rename passes even when the destination set is read through a command substitution, which drops NULs and joins the names into one word), and the checkout is **clean** afterwards; a later upstream commit to the renamed path still merges (a leftover untracked copy would block it for ever) |
+| T17 | the dirty set survives an **executable bit**, a **path with a space**, **three `git mv` renames** (one rename passes even when the destination set is read through a command substitution, which drops NULs) and a **plain `mv`** (which git reports as a deletion + an untracked file, not as a rename), and the checkout is **clean** afterwards; a later upstream commit to a renamed path still merges |
 | T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
 | T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
 | T20 | an **unpreservable** dirty tree is REFUSED (20) and nothing moves — the other half of the DIRTY pair, which had no fixture |
@@ -278,6 +280,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T21 | a **failed `git fetch`** is `cannot-verify` (23), recorded as `fetch=failed`, refused by `--print-status` — and the same fixture is green once the origin is reachable (the control) |
 | T22 | the **user-scope** install (no sudo, user manager answering): it REFUSES when lingering cannot be enabled, succeeds with `linger: enabled` once it can, and `--status` fails when lingering is cleared afterwards |
 | T8a | an installed-but-**disabled** timer fails readiness (it will not survive a reboot), and so does `is-enabled=static` (no `[Install]` section: gone at the next boot) |
+| T8b2 | the **fresh-install grace is bounded**: a timer armed past two intervals that has never fired and has no record fails readiness — otherwise a silently inert job read as "fresh" for ever |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`

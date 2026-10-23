@@ -665,6 +665,24 @@ do_status() {
     # The PASS RECORD is the third leg: the scheduler can be armed while every pass fails. Its own
     # `--print-status` applies the staleness bound, so "the timer stopped firing" is an alarm and not
     # a quiet absence.
+    # ⛔ THE FRESH-INSTALL NOTE IS BOUNDED. "The first tick is still running" justifies a grace period,
+    # not a permanent green: an enabled+active job that has NEVER triggered and has no record passes this
+    # gate for ever, while a box that HAS a record is correctly failed once it goes stale — an asymmetry a
+    # silent no-op lives in. The installed artifact's own age is the bound both platforms have.
+    if [ ! -f "$STATE_DIR/harness-apply.status" ] 2>/dev/null || [ ! -s "$STATE_DIR/harness-apply.status" ]; then
+        _unit_file="$UNIT_DIR/$LABEL.plist"
+        [ "$TARGET" = launchd ] || _unit_file="$UNIT_DIR/$UNIT_NAME.timer"
+        if [ -f "$_unit_file" ]; then
+            _mt="$(stat -c %Y "$_unit_file" 2>/dev/null || stat -f %m "$_unit_file" 2>/dev/null || true)"
+            case "${_mt:-}" in
+                ''|*[!0-9]*) : ;;
+                *) _armed_age=$(( $(date +%s) - _mt ))
+                   if [ "$_armed_age" -gt $(( INTERVAL_MIN * 60 * 2 )) ] && [ ! -s "$STATE_DIR/harness-apply.status" ]; then
+                       say "armed_for=${_armed_age}s"
+                   fi ;;
+            esac
+        fi
+    fi
     say "--- pass record ---"
     # ⛔ NOT `REC="$(cond && bash … || printf …)"`. The `||` arm fires on a NON-ZERO rc — which is
     # exactly the answer this leg exists to read — so it replaced a `status=failed rc=21` line with
@@ -700,7 +718,12 @@ do_status() {
                     #   a pass that COMPLETED       -> its exit decides (0/10/11 = the record is written
                     #                                 elsewhere; anything else = it is refusing)
                     case "$(printf '%s' "${LAST_RUN:-}" | tr -d '[:space:]')" in
-                        ''|n/a|unknown|0|0s|-*) say "  note=no pass has completed yet (the timer has not fired)" ;;
+                        ''|n/a|unknown|0|0s|-*)
+                            if [ "${_armed_age:-0}" -gt $(( INTERVAL_MIN * 60 * 2 )) ]; then
+                                err "the timer has been armed for ${_armed_age}s (two intervals) and has NEVER fired, and no pass record exists — the job is inert, not fresh"
+                                return 1
+                            fi
+                            say "  note=no pass has completed yet (the timer has not fired)" ;;
                         *) case "$(printf '%s' "${EXEC_TS:-}" | tr -d '[:space:]')" in
                                ''|n/a|unknown|0|0s|-*) say "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
                                *) case "$(printf '%s' "${EXEC_MAIN:-}" | tr -d '[:space:]')" in

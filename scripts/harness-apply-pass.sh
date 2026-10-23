@@ -422,6 +422,19 @@ list_dirty_paths() { # stdout: one path per NUL; a rename/copy yields BOTH sides
         done
     }
 }
+list_deleted_paths() { # stdout: every path whose status carries a D, one per NUL
+    local entry st p
+    git -C "$REPO" status --porcelain -z 2>/dev/null | {
+        while IFS= read -r -d '' entry; do
+            st="${entry:0:2}"
+            p="${entry:3}"
+            case "$st" in
+                R*|C*) IFS= read -r -d '' _old || true ;;
+                *D*)   [ -n "$p" ] && printf '%s\0' "$p" ;;
+            esac
+        done
+    }
+}
 list_rename_dests() { # stdout: the DESTINATION of every rename/copy record, one per NUL
     local entry st p
     git -C "$REPO" status --porcelain -z 2>/dev/null | {
@@ -622,7 +635,7 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # HEAD has as 100755 is a MODE CHANGE staged by any `git add` — the tree stays dirty, a later
     # upstream commit to that path makes the fast-forward refuse for ever, and this repo tracks 207
     # executable files (one of them is the very file the measured Mac defect was about).
-    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest d dests=""
+    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest d dests="" _h
     # ⛔ THE RENAME-DESTINATION SET IS BUILT NUL-SAFELY, ONCE, BEFORE THE LOOP. `$(list_rename_dests)`
     # DROPS every NUL (bash warns "ignored null byte in input") and concatenates the destinations into
     # ONE WORD, so with two or more renames nothing matched: the destinations stayed untracked (the tree
@@ -630,6 +643,16 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # recorded `advanced`/rc=10 — GREEN — over it. Measured in review; a single-rename fixture passes,
     # which is why the suite did not see it.
     while IFS= read -r -d '' d; do dests="${dests}${d}"$'\n'; done < <(list_rename_dests)
+    # ⛔ A PLAIN `mv` IS NOT A RENAME RECORD, and leaving it out was the same defect one shape over: git
+    # reports it as ` D old` + `?? new`, so the destination was treated as a keep-in-worktree addition —
+    # the tree stayed dirty for ever, and the moment upstream added that path every later merge was
+    # refused while the pass re-preserved the whole dirty set on each tick. A file whose CONTENT is the
+    # blob a deleted tracked path had is a move: its bytes are preserved, so it converges like a rename.
+    local del_blobs="" _dsha
+    while IFS= read -r -d '' d; do
+        _dsha="$(git -C "$REPO" rev-parse --verify --quiet "HEAD:$d" 2>/dev/null)" || continue
+        [ -n "$_dsha" ] && del_blobs="${del_blobs}${_dsha}"$'\n'
+    done < <(list_deleted_paths)
     while IFS= read -r -d '' p; do
         [ -n "$p" ] || continue
         case "$p" in /*) n_skipped=$((n_skipped + 1)); continue ;; esac
@@ -652,6 +675,10 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
             # in the worktree (its bytes are in the patch, and it is reported as dirty in the record).
             # bash 3.2-safe membership test (macOS ships 3.2): no array expansion under `set -u`, no grep.
             case $'\n'"$dests" in *$'\n'"$p"$'\n'*) _is_rename_dest=1 ;; *) _is_rename_dest=0 ;; esac
+            if [ "$_is_rename_dest" = 0 ] && [ -n "$del_blobs" ] && [ -f "$REPO/$p" ]; then
+                _h="$(git -C "$REPO" hash-object -- "$REPO/$p" 2>/dev/null)"
+                case $'\n'"$del_blobs" in *$'\n'"$_h"$'\n'*) _is_rename_dest=1 ;; esac
+            fi
             if [ "$_is_rename_dest" = 1 ]; then
                 mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || true
                 cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || true
@@ -695,7 +722,15 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     done < <(list_dirty_paths)
     # ⛔ THE CLAIM IS COUNTED, NOT ASSUMED. The unconditional "tracked paths match HEAD" was printed
     # even when a path had been skipped — a success line that outran the work it describes.
-    say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content)$( [ "$n_skipped" -gt 0 ] && printf ', %s skipped (not in HEAD or a gitlink)' "$n_skipped"); the hand edits above exist only in the preserved copies"
+    # ⛔ THE SENTENCE MUST MATCH THE TREE. "the hand edits exist only in the preserved copies" was false
+    # whenever a path was skipped: a skipped staged addition (or a gitlink) is STILL IN THE WORKTREE and
+    # keeps the tree dirty, which the record then reports — two contradictory statements about the same
+    # edit, in the message an operator reads when recovering work.
+    if [ "$n_skipped" -gt 0 ]; then
+        say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); the hand edits of THOSE paths exist only in the preserved copies. $n_skipped path(s) were SKIPPED (not in HEAD, or a gitlink) and remain in the worktree — they are what keeps the tree dirty."
+    else
+        say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); the hand edits above exist only in the preserved copies"
+    fi
     say "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
     return 0
 }
