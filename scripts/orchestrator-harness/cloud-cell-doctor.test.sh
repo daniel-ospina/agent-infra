@@ -1165,14 +1165,43 @@ reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
 # bug). The `.desired`-absent fixture above could NOT see it: that loop exits BEFORE its first
 # dispatch, which is exactly why the crash survived three recorded instances on cell-4.
 # ⛔ A SUBCOMMAND-DRIVING test is VACUOUS here: the CLI always binds `$1` (to ""), so only driving
-# `loop` exercises the ABSENT-argument shape. And "it did not crash" is not the criterion either —
-# a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE pass.
+# `loop` exercises the shape the scheduler produces. And "it did not crash" is not the criterion
+# either — a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE
+# pass.
+# ⛔ WHICH HALF THIS CASE PINS, EXACTLY (review, 2026-10-23): the fix has TWO independent halves —
+# the loop now passes an explicit `""` at its call sites, AND the declarations read `${1:-}`.
+# The loop-driving assertions below pin the CALL-SITE half: with explicit `""` the positional is
+# BOUND, so reverting the declarations alone leaves this case green (measured: 136/0). That is
+# correct but it means the declarations are defence-in-depth for a FUTURE argless call site, and the
+# second assertion below pins them statically so a later "simplification" back to `local dry="$1"`
+# cannot pass silently. Two halves, two mutants — reverting BOTH is what reproduces #2424
+# (measured: PASS 136 -> 127, with `line 1385: $1: unbound variable` and four missing role records).
 say_case "loop: the first tick dispatches, and an absent mode is a LIVE pass (#2424)"
+# The declarations are the defence-in-depth half: name the exact line the bug was, so a revert reds
+# here instead of surviving on a green suite.
+if grep -q 'local dry="\$1"' "$DOCTOR"; then
+  bad "declarations: a role still reads \`local dry=\"\$1\"\` — unbound under \`set -u\` on an argless call (#2424)"
+else
+  ok "declarations: every role reads \${1:-}, so an argless call is a LIVE pass (#2424)"
+fi
 reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
 : > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not exit
 : > "$T/tmux/sessions"
-OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
-       timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
+# ⛔ A host without timeout(1) cannot run this loop at all (rc=127, the loop never starts), and the
+# role assertions below would then fire four times as "recorded NO pass" — which reads to a macOS
+# operator as "the fix is broken". Skip the live half BY NAME instead of reddening on a missing tool.
+# (Case 18 at :1071 has the same dependency, pre-existing; this case names it rather than adding a
+# fifth red.)
+HAVE_TIMEOUT=1
+command -v timeout >/dev/null 2>&1 || HAVE_TIMEOUT=0
+OUT=""
+if [ "$HAVE_TIMEOUT" -eq 1 ]; then
+  OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
+         timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
+else
+  echo "  ⏭  skipped: no timeout(1) on this host — the live loop tick cannot be bounded here"
+fi
+if [ "$HAVE_TIMEOUT" -eq 1 ]; then
 case "$OUT" in
   *"unbound variable"*) bad "loop: DIED on its first tick (the #2424 abort) — $OUT" ;;
   *)                    ok "loop: the first tick dispatches with no unbound-variable abort" ;;
@@ -1190,6 +1219,7 @@ for r in reap doctor merge hygiene; do
     *)               ok "loop: role '$r' ran LIVE (absent mode ≠ --dry-run)" ;;
   esac
 done
+fi
 reset_state; rm -f "$T/o/state/roles/.desired"
 
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
