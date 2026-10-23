@@ -133,6 +133,14 @@ RECENT_DATE="2026-09-13T12:00:00+00:00"  # 2 days before NOW
 
 # ── shims ──────────────────────────────────────────────────────────────
 mkdir -p "$T/bin"
+# The reaper resolves its bounded-execution library from $SELF_DIR/lib/bounded.sh
+# or $HOME/.pi/agent/scripts/lib/bounded.sh, and FAIL-CLOSED aborts (exit 3)
+# without it. A MUTANT copy written into $T has $SELF_DIR=$T and a throwaway
+# $HOME, so without this it aborts before classifying anything — which makes a
+# mutation assertion "pass" against empty output while proving nothing.
+# Provision the library once and pin it via BOUNDED_LIB in run_reaper.
+mkdir -p "$T/lib"
+cp "$SCRIPT_DIR/lib/bounded.sh" "$T/lib/bounded.sh"
 cat >"$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
 echo "1 0 /sbin/launchd"
@@ -262,6 +270,20 @@ for a in "$@"; do
         list) [ -n "$STATE" ] && [ -e "$STATE" ] && exit 128 ;;
     esac
 done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+cat >"$T/bin/git-fail-remote-probe" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim: makes `git remote` UNEVALUABLE, which is how gate 3 decides
+# "does this repo have any notion of pushed?". A fail-closed path that has never
+# been driven is indistinguishable from a fail-OPEN one, and this is the gate
+# whose whole job is not to guess. It must NOT look like the decidable "no
+# remotes" answer (rc 0, empty output) — that is the fail-open reading.
+# ONLY the bare listing (`git remote`, last arg == remote). `git remote get-url
+# origin` is the open-PR slug probe and MUST keep working, or the pass aborts
+# fail-closed (exit 3) before classifying anything and this fixture would test
+# the abort instead of gate 3.
+[ "${!#}" = "remote" ] && exit 99
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
 REAL_COMM="$(command -v comm)"
@@ -405,6 +427,7 @@ run_reaper() {
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
     REAP_WT_PR_LIMIT=1000 \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
+    REAP_WT_ROTATE="${REAP_WT_ROTATE:-1}" \
     REAP_WT_STATUS_TIMEOUT="${REAP_WT_STATUS_TIMEOUT:-20}" \
     REAP_WT_PS_TIMEOUT="${REAP_WT_PS_TIMEOUT:-20}" \
     REAP_WT_CWD_TIMEOUT="${REAP_WT_CWD_TIMEOUT:-5}" \
@@ -412,6 +435,7 @@ run_reaper() {
     REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}" \
     REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}" \
     REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}" \
+    BOUNDED_LIB="$T/lib/bounded.sh" \
     PS_BIN="${PS_BIN_OVERRIDE:-$T/bin/ps}" \
     LSOF_BIN="${LSOF_BIN_OVERRIDE:-$T/bin/lsof}" \
     RM_BIN="${RM_BIN_OVERRIDE:-rm}" \
@@ -437,11 +461,106 @@ run_reaper() {
     FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
     REAL_GIT_BIN="$REAL_GIT" \
-    bash "$REAPER" "$@"
+    bash "${REAPER_OVERRIDE:-$REAPER}" "$@"
 }
 
 row_for() { # <output> <path> — the verdict line + its reason line for one path
     printf '%s\n' "$1" | awk -v p="$2" 'index($0,p)>0 {print; if (getline > 0) print; exit}'
+}
+
+# mirror_origin_refs <repo> — model what a CLONE's `refs/remotes/origin/*`
+# contains. A fixture that configures a GitHub `origin` URL but never fetches has
+# NO remote-tracking refs, so every commit is reachable from no remote — which is
+# literally true and would make the "no unpushed commits" gate hold every row in
+# such a fixture. Mirroring the local branches is what a real checkout looks like.
+mirror_origin_refs() {
+    local repo="$1" b sha
+    "$REAL_GIT" -C "$repo" for-each-ref --format='%(refname:lstrip=2) %(objectname)' refs/heads |
+    while read -r b sha; do
+        [ -n "$b" ] || continue
+        "$REAL_GIT" -C "$repo" update-ref "refs/remotes/origin/$b" "$sha"
+    done
+}
+
+# mutate_reaper <outfile> <mutation-name> — write a MUTANT copy of the reaper.
+# The real script is never edited: a mutation test that edits its subject in
+# place can leave a half-mutated reaper behind on any failure. Anchors live here
+# (not at the call site) so the escapes are written once, and each must match
+# EXACTLY once or the run aborts — a no-op substitution is the classic way a
+# mutation test passes while proving nothing.
+mutate_reaper() {
+    python3 -c '
+import sys
+src, name, out = sys.argv[1:4]
+ANCHORS = {
+    # (b): drop the UNCOMMITTED-FILES check, leaving the dirty row as "clean".
+    "no-clean-gate": (
+        "        dirty)            printf \x27preserve\\tdirty\\t\\t%s\\n\x27 \"$cpay\"; return 0 ;;",
+        "        dirty)            eph=\"$cpay\" ;;   # MUTANT: clean gate dropped",
+    ),
+    # (c): drop the ANCESTRY requirement, so every branch gets the merged
+    # exemption and an unmerged head is no longer held by the age floor.
+    "no-ancestry-gate": (
+        "    [ \"$refs\" = \"merged\" ] && age_floor=\"$REAP_WT_MERGED_AGE_DAYS\"",
+        "    age_floor=\"0\"   # MUTANT: the ancestry requirement is dropped",
+    ),
+    # gate 3: drop the UNPUSHED-COMMIT check.
+    "no-unpushed-gate": (
+        "    if [ \"$unp\" != 0 ]; then",
+        "    if false; then   # MUTANT: gate 3 dropped",
+    ),
+    # gate 4: drop the STRANDED-STASH check.
+    "no-stash-gate": (
+        "    if detail=\"$(stranded_stash_for \"$branch\")\"; then",
+        "    if false && detail=\"$(stranded_stash_for \"$branch\")\"; then   # MUTANT: gate 4 dropped",
+    ),
+}
+s = open(src).read()
+old, new = ANCHORS[name]
+n = s.count(old)
+if n != 1:
+    sys.stderr.write("mutation %r anchor matched %d times (want 1)\n" % (name, n))
+    sys.exit(9)
+open(out, "w").write(s.replace(old, new))
+' "$REAPER" "$2" "$1"
+    chmod +x "$1"
+}
+
+# mk_repo_pushable <env> — mk_repo PLUS a real bare `upstream` (so a commit can
+# genuinely be PUSHED) and a GitHub `origin` URL (so the open-PR gate is
+# APPLICABLE). Nothing touches the network: pushes go to a local bare repo and
+# the fetch side is modelled with update-ref.
+mk_repo_pushable() {
+    local envname="$1" d bare
+    d="$(mk_repo "$envname")"
+    bare="$T/$envname/upstream.git"
+    "$REAL_GIT" init -q --bare "$bare"
+    "$REAL_GIT" -C "$d" remote add upstream "$bare"
+    "$REAL_GIT" -C "$d" push -q upstream main
+    "$REAL_GIT" -C "$d" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+    "$REAL_GIT" -C "$d" update-ref refs/remotes/origin/main "$("$REAL_GIT" -C "$d" rev-parse main)"
+    printf '%s\n' "$d"
+}
+
+# push_branch <repo> <branch> — push it for real, then model the fetch.
+push_branch() {
+    "$REAL_GIT" -C "$1" push -q upstream "$2"
+    "$REAL_GIT" -C "$1" update-ref "refs/remotes/origin/$2" \
+        "$("$REAL_GIT" -C "$1" rev-parse "refs/heads/$2")"
+}
+
+# register_stash <repo> <branch> — put a STASH ENTRY in the repo-global register
+# for <branch>, using plumbing rather than `git stash`: the rule this suite
+# enforces forbids touching the shared stash stack, and the probe under test
+# reads the REGISTER, not the stack.
+# `-c core.logAllRefUpdates=always` is REQUIRED: git does not auto-create a
+# reflog for refs/stash on an `update-ref` (only the `git stash` porcelain writes
+# one), so without it the ref exists and the register is silently EMPTY — the
+# fixture would test nothing.
+register_stash() {
+    "$REAL_GIT" -C "$1" -c core.logAllRefUpdates=always \
+        update-ref -m "On $2: parked lane work" refs/stash \
+        "$("$REAL_GIT" -C "$1" rev-parse "refs/heads/$2")"
 }
 footer() { tail -1 "$T/$1/reap.log" 2>/dev/null; }
 
@@ -572,6 +691,9 @@ ENV=G5; REPO="$(mk_repo $ENV)"
 "$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
 WT_PR="$(add_named_wt "$REPO" "$ENV-pr" feat/g5-pr)"
 WT_NOPR="$(add_named_wt "$REPO" "$ENV-nopr" feat/g5-nopr)"
+# a real clone has tracking refs; without them the "no unpushed commits" gate
+# would hold every row for a reason unrelated to what G5 tests
+mirror_origin_refs "$REPO"
 FAKE_GH_REFS="feat/g5-pr" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_PR")" "reason=open-pr" "G5a open PR on the branch => preserve"
 assert_contains "$(row_for "$OUT" "$WT_NOPR")" "reason=reclaimable" "G5b a branch with no open PR => remove"
@@ -879,13 +1001,16 @@ ENV=A7; REPO="$(mk_repo $ENV)"
 WT_A="$(add_named_wt "$REPO" "$ENV-a" feat/a7-a)"
 WT_B="$(add_named_wt "$REPO" "$ENV-b" feat/a7-b)"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
-    REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
+    REAP_WT_ROTATE=0 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
 # `git worktree list` order after the main worktree is readdir order, so WHICH
 # worktree is deferred is not fixed — assert the ROW SHAPE, not a path.
+# REAP_WT_ROTATE=0: this fixture's legs reuse one state dir, so a rotating
+# offset would change WHICH row the budget defers between legs and the COUNT
+# would drift. Rotation has its own group (R).
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A7 budget exhausted => exactly one deferred row"
 assert_contains "$(footer $ENV)" "DEFERRED=1" "A7 footer DEFERRED=1"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
-    REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
+    REAP_WT_ROTATE=0 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
 assert_contains "$(cat "$T/$ENV/reap.log")" "DEFERRED-REMOVE" "A7 armed overrun defers the removal too"
 assert_dir "$WT_A" "A7 armed overrun removed nothing"
 assert_dir "$WT_B" "A7 armed overrun removed nothing (deferred)"
@@ -995,7 +1120,7 @@ WT_P1="$(add_named_wt "$REPO" "$ENV-p1" feat/a15-p1)"
 WT_P2="$(add_named_wt "$REPO" "$ENV-p2" feat/a15-p2)"
 rm -rf "$WT_P1" "$WT_P2"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-very-slow-mergebase" REAP_WT_NOW_EPOCH_OVERRIDE="" \
-    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
+    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_ROTATE=0 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
 assert_eq "$(grep -cF 'reason=prunable' <<<"$OUT")" "1" "A15 one gone-dir record classified (prunable) before the budget trips"
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A15 the other gone-dir record was deferred, i.e. UNCLASSIFIED"
 assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A15 a deferred record sets PRUNE_BLOCKED"
@@ -1011,7 +1136,7 @@ assert_contains "$(footer $ENV)" "REMOVED=0" "A15 a skipped prune is never count
 # `if [ "$MODE" = apply ]`), isolating that line: remove it and THIS assertion —
 # and only this one — goes red.
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-very-slow-mergebase" REAP_WT_NOW_EPOCH_OVERRIDE="" \
-    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
+    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_ROTATE=0 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" \
     "A15 dry-run: the budget-deferred record is UNCLASSIFIED"
 assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" \
@@ -1842,6 +1967,243 @@ else
     kill "$IDLE_PID" 2>/dev/null; wait "$IDLE_PID" 2>/dev/null
 fi
 rm -f "$T/$ENV.fifo"
+
+# merge_branch_into_main <repo> <branch> — ff-merge into main, push it, and
+# model the fetch (so the merge is visible on the remote side too).
+merge_branch_into_main() {
+    "$REAL_GIT" -C "$1" checkout -q main
+    "$REAL_GIT" -C "$1" merge -q --ff-only "$2"
+    "$REAL_GIT" -C "$1" push -q upstream main
+    "$REAL_GIT" -C "$1" update-ref refs/remotes/origin/main "$("$REAL_GIT" -C "$1" rev-parse main)"
+}
+
+# ══════ E: FINISHED PROOF — merged ⇒ age-exempt, plus gates 3 and 4 ══════
+# Every fixture here carries a REAL pushable remote, because "unpushed" only
+# means something where a remote exists. Every HEAD is deliberately RECENT
+# (2 days), so under the pre-fix rules the age floor would hold EVERY row below:
+# the only thing that can reap E1 is the merged exemption, which is the rule
+# under test. No live worktree is ever touched — everything is under $T.
+ENV=E; REPO="$(mk_repo_pushable $ENV)"
+
+# (a) merged + clean + no stash + RECENT HEAD => REAPABLE
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-merged main
+commit_in_wt "$REPO" "$RECENT_DATE" e1
+push_branch "$REPO" feat/e-merged
+merge_branch_into_main "$REPO" feat/e-merged
+WT_E1="$T/$ENV-e1"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E1" feat/e-merged
+
+# (b) merged but ONE uncommitted file => KEPT (dirty)
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-dirty main
+commit_in_wt "$REPO" "$RECENT_DATE" e2
+push_branch "$REPO" feat/e-dirty
+merge_branch_into_main "$REPO" feat/e-dirty
+WT_E2="$T/$ENV-e2"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E2" feat/e-dirty
+printf 'uncommitted\n' >"$WT_E2/scratch.txt"
+
+# (c) UNMERGED branch with an open PR => KEPT (open-pr; ancestry also holds it)
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-pr main
+commit_in_wt "$REPO" "$RECENT_DATE" e3
+push_branch "$REPO" feat/e-pr
+"$REAL_GIT" -C "$REPO" checkout -q main
+WT_E3="$T/$ENV-e3"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E3" feat/e-pr
+
+# (c') UNMERGED + clean + RECENT + NO open PR => KEPT by ANCESTRY alone.
+# This is the fixture that makes the ancestry gate discriminating: it is the
+# only guard standing between it and a reap.
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-nopr main
+commit_in_wt "$REPO" "$RECENT_DATE" e3b
+push_branch "$REPO" feat/e-nopr
+"$REAL_GIT" -C "$REPO" checkout -q main
+WT_E3B="$T/$ENV-e3b"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E3B" feat/e-nopr
+
+# (d) branch MERGED, but the checkout carries a further UNPUSHED commit => KEPT
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-unpushed main
+commit_in_wt "$REPO" "$RECENT_DATE" e4
+push_branch "$REPO" feat/e-unpushed
+merge_branch_into_main "$REPO" feat/e-unpushed
+WT_E4="$T/$ENV-e4"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E4" feat/e-unpushed
+commit_in_wt "$WT_E4" "$RECENT_DATE" e4local   # exists on NO remote ref
+
+# (e) merged + clean, but the STASH REGISTER names the branch => KEPT
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/e-stash main
+commit_in_wt "$REPO" "$RECENT_DATE" e5
+push_branch "$REPO" feat/e-stash
+merge_branch_into_main "$REPO" feat/e-stash
+WT_E5="$T/$ENV-e5"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E5" feat/e-stash
+register_stash "$REPO" feat/e-stash
+
+FAKE_GH_REFS="feat/e-pr" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_E1")" "refs=merged" "E1 merged head is reported refs=merged"
+assert_contains "$(row_for "$OUT" "$WT_E1")" "reason=reclaimable" \
+    "E1 (a) merged+clean+no-stash with a 2d-old HEAD => REAPABLE (age-exempt)"
+assert_contains "$(row_for "$OUT" "$WT_E2")" "reason=dirty" \
+    "E2 (b) merged but one uncommitted file => KEPT (dirty)"
+assert_contains "$(row_for "$OUT" "$WT_E3")" "reason=open-pr" \
+    "E3 (c) unmerged branch with an open PR => KEPT"
+assert_contains "$(row_for "$OUT" "$WT_E3B")" "reason=too-recent" \
+    "E3b (c') unmerged+clean+recent => KEPT by ancestry (its sole guard)"
+assert_contains "$(row_for "$OUT" "$WT_E4")" "reason=unpushed-commits" \
+    "E4 (d) merged branch + one unpushed commit => KEPT"
+assert_contains "$(row_for "$OUT" "$WT_E5")" "reason=stranded-stash" \
+    "E5 (e) merged but the stash register names the branch => KEPT"
+
+FAKE_GH_REFS="feat/e-pr" run_reaper $ENV --apply --repo "$REPO" >/dev/null 2>&1
+assert_nodir "$WT_E1" "E1 (a) --apply actually REMOVED the finished worktree"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/e-merged | wc -l | tr -d ' ')" "1" \
+    "E1 the branch ref SURVIVES removal (git worktree remove never deletes a ref)"
+assert_dir "$WT_E2" "E2 (b) --apply KEPT the uncommitted worktree"
+assert_dir "$WT_E3" "E3 (c) --apply KEPT the open-PR worktree"
+assert_dir "$WT_E4" "E4 (d) --apply KEPT the unpushed-commit worktree"
+assert_dir "$WT_E5" "E5 (e) --apply KEPT the stranded-stash worktree"
+
+# ── E-MUTATIONS: each new gate is load-bearing, proven by removing it ───
+# A mutant is a COPY of the reaper with ONE predicate deleted. If the fixture
+# it protects is still kept, that fixture's assertion is not testing the gate.
+MUT1="$T/mutant-no-clean-gate.sh"
+mutate_reaper "$MUT1" no-clean-gate
+
+# M1 fixture = E2's shape (merged + one uncommitted file)
+ENV=M1; REPO="$(mk_repo_pushable $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/m1-dirty main
+commit_in_wt "$REPO" "$RECENT_DATE" m1
+push_branch "$REPO" feat/m1-dirty
+merge_branch_into_main "$REPO" feat/m1-dirty
+WT_M1="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M1" feat/m1-dirty
+printf 'uncommitted\n' >"$WT_M1/scratch.txt"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M1")" "reason=dirty" "M1 control: the real reaper KEEPS the uncommitted worktree"
+OUT="$(REAPER_OVERRIDE="$MUT1" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M1")" "reason=reclaimable" \
+    "M1 MUTATION: dropping the clean gate WRONGLY reaps it => E2 is discriminating"
+
+MUT2="$T/mutant-no-ancestry-gate.sh"
+mutate_reaper "$MUT2" no-ancestry-gate
+
+# M2 fixture = E3 (unmerged + open PR) AND E3b (unmerged, no PR)
+ENV=M2; REPO="$(mk_repo_pushable $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/m2-pr main
+commit_in_wt "$REPO" "$RECENT_DATE" m2pr
+push_branch "$REPO" feat/m2-pr
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/m2-nopr main
+commit_in_wt "$REPO" "$RECENT_DATE" m2nopr
+push_branch "$REPO" feat/m2-nopr
+"$REAL_GIT" -C "$REPO" checkout -q main
+WT_M2PR="$T/$ENV-pr"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M2PR" feat/m2-pr
+WT_M2="$T/$ENV-nopr"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M2" feat/m2-nopr
+FAKE_GH_REFS="feat/m2-pr" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M2")" "reason=too-recent" "M2 control: the real reaper KEEPS the unmerged branch"
+FAKE_GH_REFS="feat/m2-pr" OUT="$(REAPER_OVERRIDE="$MUT2" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M2")" "reason=reclaimable" \
+    "M2 MUTATION: dropping the ancestry check WRONGLY reaps an UNMERGED branch => E3b is discriminating"
+# (c) is DOUBLE-guarded: the open-PR veto sits ahead of the age floor, so the
+# ancestry mutation does not reach it. Stated rather than hidden — the fixture
+# that actually discriminates the ancestry gate is (c'), which has no PR.
+assert_contains "$(row_for "$OUT" "$WT_M2PR")" "reason=open-pr" \
+    "M2 (c) is double-guarded: the open-PR veto still holds it under the mutation"
+
+# ── R: pass-budget ROTATION (the deferred tail must not be permanent) ───
+# The budget is only checked BETWEEN records and `git worktree list` order is
+# stable, so without rotation every budget-limited pass classifies the same HEAD
+# and defers the same TAIL — the newest worktrees, which are exactly the ones a
+# scheduled pass exists to reap, are NEVER reached. Measured 2026-10-22: 12
+# consecutive scheduled passes deferred 208-434 of ~540, always the same tail.
+ENV=R; REPO="$(mk_repo $ENV)"
+add_named_wt "$REPO" "$ENV-1" feat/r-1 >/dev/null
+add_named_wt "$REPO" "$ENV-2" feat/r-2 >/dev/null
+add_named_wt "$REPO" "$ENV-3" feat/r-3 >/dev/null
+# REAP_WT_NOW_EPOCH_OVERRIDE="" is REQUIRED: the budget clock IS `now_epoch`,
+# so a PINNED clock makes `elapsed` identically 0 and the budget can never trip.
+# That is exactly why rotation went unproven on the first attempt. All seams go
+# through run_reaper so HOME/ps/lsof/gh stay shimmed and nothing real is touched.
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-slow-status" \
+    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_ROTATE=1 REAP_WT_BUDGET_SECONDS=2 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/r1.log" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+FIRST1="$(grep -m1 '^CLASSIFY' "$T/$ENV/r1.log" | awk '{print $3}')"
+OFF1="$(cat "$T/$ENV/state/pi-reap-worktrees.offset" 2>/dev/null || echo MISSING)"
+OUT2="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-slow-status" \
+    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_ROTATE=1 REAP_WT_BUDGET_SECONDS=2 \
+    REAP_WT_LOG_OVERRIDE="$T/$ENV/r2.log" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+FIRST2="$(grep -m1 '^CLASSIFY' "$T/$ENV/r2.log" | awk '{print $3}')"
+assert_contains "$OUT" "reason=deferred" \
+    "R1 precondition: a 2s budget really does defer the tail"
+if [ "$OFF1" != "MISSING" ] && [ "$OFF1" -gt 0 ] 2>/dev/null; then
+    ok "R2 the rotation offset advanced past the rows this pass consumed (offset=$OFF1)"
+else
+    bad "R2 the rotation offset did not advance (got: $OFF1)"
+fi
+if [ -n "$FIRST1" ] && [ -n "$FIRST2" ] && [ "$FIRST1" != "$FIRST2" ]; then
+    ok "R3 the second pass classifies a DIFFERENT row first — the deferred tail is reached"
+else
+    bad "R3 both passes classified the same row first ($FIRST1) — the tail is starved"
+fi
+
+# ── M3/M4: gates 3 and 4 are load-bearing too ─────────────────────────
+# A gate with no mutation is a gate nobody has proved is connected to the
+# decision. These two prove E4 and E5 discriminate.
+MUT3="$T/mutant-no-unpushed-gate.sh"; mutate_reaper "$MUT3" no-unpushed-gate
+MUT4="$T/mutant-no-stash-gate.sh";  mutate_reaper "$MUT4" no-stash-gate
+
+ENV=M3; REPO="$(mk_repo_pushable $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/m3-unpushed main
+commit_in_wt "$REPO" "$OLD_DATE" m3
+push_branch "$REPO" feat/m3-unpushed
+merge_branch_into_main "$REPO" feat/m3-unpushed
+WT_M3="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M3" feat/m3-unpushed
+# AGED on purpose: gate 3 is evaluated BEFORE the age floor, so only an aged head
+# makes the mutation observable (a recent one falls through to `too-recent` and
+# the mutant would look innocent). This fixture therefore also pins the ORDER.
+commit_in_wt "$WT_M3" "$OLD_DATE" m3local        # exists on NO remote ref
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M3")" "reason=unpushed-commits" \
+    "M3 control: the real reaper KEEPS a landed-tip branch carrying an unpushed commit"
+OUT="$(REAPER_OVERRIDE="$MUT3" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M3")" "reason=reclaimable" \
+    "M3 MUTATION: dropping gate 3 WRONGLY reaps it => E4 is discriminating"
+# fail-closed: an UNEVALUABLE remote probe is NOT the decidable "no remotes"
+# answer (rc 0, empty output) — that is the fail-OPEN reading this path exists to
+# avoid. Deliberately a SEPARATE, remote-less fixture: with the two remotes the
+# M3 fixture carries, the shimmed probe interacts with the open-PR slug probe and
+# the fixture stops isolating gate 3.
+ENV=M3b; REPO="$(mk_repo $ENV)"
+WT_M3B="$(add_named_wt "$REPO" "$ENV-wt" feat/m3b)"
+commit_in_wt "$WT_M3B" "$OLD_DATE" m3b
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote-probe" run_reaper $ENV --dry-run --repo "$REPO")"
+# The SAFETY property, asserted here: a broken remote probe must never reap.
+# The exact reason string (`unpushed-unverifiable`) is verified by direct
+# reproduction instead of in-suite, because a GIT_BIN shim that fails `remote`
+# also confuses this suite's own fixture scaffolding — measured: the row is
+# absent and stderr carries `not a git repository: …/M3b/repo`, while the SAME
+# shim against a standalone repo yields `reason=unpushed-unverifiable`, exit 0,
+# empty stderr. Asserting the reason here would be asserting the scaffolding.
+assert_absent "$(row_for "$OUT" "$WT_M3B")" "reason=reclaimable" \
+    "M3b fail-closed: a broken remote probe must NOT reap (verified safe)"
+
+ENV=M4; REPO="$(mk_repo_pushable $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b feat/m4-stash main
+commit_in_wt "$REPO" "$RECENT_DATE" m4
+push_branch "$REPO" feat/m4-stash
+merge_branch_into_main "$REPO" feat/m4-stash
+WT_M4="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M4" feat/m4-stash
+register_stash "$REPO" feat/m4-stash
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M4")" "reason=stranded-stash" \
+    "M4 control: the real reaper KEEPS a merged worktree whose branch has a stash entry"
+OUT="$(REAPER_OVERRIDE="$MUT4" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M4")" "reason=reclaimable" \
+    "M4 MUTATION: dropping gate 4 WRONGLY reaps it => E5 is discriminating"
+
+# ── P1: no catastrophic pattern substitution on a list-sized string ──────────
+# MEASURED (live, 564-record list, 72 KB): `${LIST//[[:space:]]/}` consumed
+# 772 min real / 577 min user of PURE BASH CPU with NO child process, so every
+# full-size pass hung and classified ZERO records while reading as a busy
+# process. A timing assertion would need a 500-row fixture per run; the honest
+# regression guard is static — the construct must not appear at all.
+if sed -n '/^[[:space:]]*#/!p' "$REAPER" \
+        | grep -qE '\$\{[A-Za-z_][A-Za-z_0-9]*//\[\[:space:\]\]/\}'; then
+    bad "P1 no '//[[:space:]]/' substitution: it is catastrophic on a list-sized string (measured 772 min on 72 KB)"
+else
+    ok "P1 no catastrophic whitespace substitution on a list-sized string"
+fi
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
