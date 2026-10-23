@@ -682,6 +682,41 @@ has "$out" "unidentifiable=0" "EVIDENCE-BLIND: …in the READ-FAILURE counter, n
 eq "$rc" "3" "EVIDENCE-BLIND: the pass exits 3"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-BLIND: --apply signals NOTHING"
 
+# ── EVIDENCE-BLIND-PARTIAL: one readable candidate does not outvote a sibling read that FAILED ───
+# ⛔ THE SAME FAIL-OPEN, ONE CANDIDATE AT A TIME (#2163 review, P1). `blind` used to be tested BELOW
+# the single-candidate return, so a tree holding one readable 3 h-old lane log BESIDE a sibling whose
+# descriptors could not be read resolved to that log, judged the WHOLE tree stale, and TERMed/KILLed it
+# — including the process nobody had read — while printing `abstained=0` and exiting 0. One readable
+# file is not an answer about a tree that is partly invisible: the unread sibling may be the LIVE lane
+# and the readable file may belong to the one that finished.
+echo "== EVIDENCE-BLIND-PARTIAL (a readable lane log beside an unreadable sibling ABSTAINS)"
+cat > "$T/bin/lsof-partial" <<'SH'
+#!/usr/bin/env bash
+# 701's descriptors read normally (a stale lane log); 702's read FAILS, so that sibling is BLIND.
+pid=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-p" ] && pid="$a"
+  prev="$a"
+done
+case "$pid" in
+  701) printf 'tREG\nn%s\ntREG\nn%s\n' "${PARTIAL_STALE_LOG:?}" "${PARTIAL_STALE_LOG:?}" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$T/bin/lsof-partial"
+PARTIAL_STALE_LOG="$(newlog L-partial-stale.log $((3 * 3600)))"
+: > "$T/t-partial"; psinit >> "$T/t-partial"
+psrow 700 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-partial"
+psrow 701 700 Sl 00:00:00 05:00:00 "pi --model x" >> "$T/t-partial"
+psrow 702 700 Sl 00:00:05 05:00:00 "pi --model x" >> "$T/t-partial"
+out="$(REAP_PROC_ROOT_OVERRIDE="" PARTIAL_STALE_LOG="$PARTIAL_STALE_LOG" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-partial" run_reap "$T/t-partial" "" -- --apply)"; rc=$?
+has "$out" "log-evidence-unreadable" "EVIDENCE-BLIND-PARTIAL: the tree abstains on the unreadable sibling"
+hasnt "$out" "REAP   root=700" "EVIDENCE-BLIND-PARTIAL: the readable log never licenses a kill"
+has "$out" "abstained=1" "EVIDENCE-BLIND-PARTIAL: the abstention is counted"
+eq "$rc" "3" "EVIDENCE-BLIND-PARTIAL: the pass exits 3"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-BLIND-PARTIAL: --apply signals NOTHING"
+
 # ── DELETED: a resolved-but-deleted log is judged by the 12h bound only ─────────────────────────
 echo "== DELETED (no-log needs the 12h age bound; young lanes are spared)"
 : > "$T/t-del"; psinit >> "$T/t-del"
@@ -928,6 +963,20 @@ has "$out" "ancestry-unknown" "SURFACE-TMUX-ORPHAN: no fleet evidence above the 
 hasnt "$out" "human-ancestor" "SURFACE-TMUX-ORPHAN: still never classified as a HUMAN ancestor"
 hasnt "$out" "REAP   root=972" "SURFACE-TMUX-ORPHAN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "SURFACE-TMUX-ORPHAN: no signal"
+echo "== ORPHAN-PARENTLESS (a pi reparented to init is ancestry-unknown, and refuses)"
+# ⛔ THE ORPHAN BOUNDARY IS PINNED HERE, NOT ONLY IN PROSE (#2163 review, P2). When the launcher
+# wrapper exits, the surviving `pi` is reparented to init and its only ancestor is `/sbin/init`, so
+# `host_verdict` reads `unknown` and cmd_reap refuses it for ever — the exact residue #2163 exists to
+# remove survives on any box without a fleet marker above the orphan. That is a declared boundary
+# (`docs/ops/fleet-liveness.md` §11.4) and NOT a licence to let `unknown` through, so this leg pins
+# the refusal: the orphan must not become a kill by accident when someone later widens the marker set.
+: > "$T/t-orphan"; psinit >> "$T/t-orphan"
+psrow 9601 1 Sl 00:00:00 20:00:00 "pi --model x" >> "$T/t-orphan"
+fdlink 9601 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-orphan" "" -- --apply)"; rc=$?
+has "$out" "ancestry-unknown" "ORPHAN-PARENTLESS: a ppid-1 pi has no fleet evidence ⇒ ancestry-unknown"
+hasnt "$out" "REAP   root=9601" "ORPHAN-PARENTLESS: never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "ORPHAN-PARENTLESS: no signal"
 
 # ── HUMAN-UNKNOWN: an ancestry that is neither fleet nor a known HUMAN refuses ───────────────────
 # ⛔ `unknown` REFUSES (#2163 review, P1). It used to PERMIT, so ANY host app the marker set did not

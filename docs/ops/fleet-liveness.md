@@ -1006,6 +1006,17 @@ see §11.4.)
   **Residual, stated:** on a cell the armed reaper still judges nothing, so a wedged cell lane is
   ended by the operator or by the session pass, not by this gate, until the evidence source above
   exists.
+- **A lane whose launcher has EXITED is never reaped — the orphan boundary, stated.** When the
+  `bash -c '… nohup pi … &'` wrapper finishes (or is killed), the surviving `pi` is reparented to
+  `init`: its only ancestor is `/sbin/init`, `host_verdict` reads `unknown`, and `cmd_reap` refuses it
+  as `ancestry-unknown` for ever, however stale its log and however long its zero CPU window. **This
+  is the residue #2163 exists to remove**, and it survives on any box without a fleet marker above the
+  orphan — including a Mac whose `cmux.app` pane died with the wrapper. Reaping it needs a positive
+  fleet marker that SURVIVES reparenting — the supervisor's unit/cgroup (`/proc/<pid>/cgroup`), a
+  marker written into `/proc/<pid>/environ` at spawn, or a lane-written identity file — which is the
+  same design change the cell bullet above names, NOT a loosened gate: letting `unknown` permit is the
+  fail-open that TERMed live trees. Until that marker exists the orphan is counted (`lanes=<live>/<total>`)
+  and refused by name. Pinned by `lane-reap.test.sh`'s `ORPHAN-PARENTLESS` leg.
 - **`tmux`/`screen` are NOT human markers — a product decision, stated.** They are the fleet's own
   launch surface: `worker-terminal.sh` selects tmux as THE launcher on macOS whenever
   `cmux tree --json` cannot answer (the launchd controller, measured in

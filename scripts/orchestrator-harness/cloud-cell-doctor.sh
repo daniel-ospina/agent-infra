@@ -883,14 +883,11 @@ run_reap() {
   # verified to have taken effect"), named separately in the record so an operator can tell an
   # unreadable read from a refused kill.
   [ "$failed" -gt 0 ] && pass_rc=3
-  # ⛔ A REHEARSAL IS NOT A VERDICT: in `--dry-run` this pass did not kill anything, so its rc=0 says
-  # nothing about the lane a previous real pass recorded `KILL FAILED` (or an unreadable read) for.
-  if [ "$dry" = "--dry-run" ]; then
-    state_write_rehearsal reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
-  else
-    state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
-  fi
-  log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed"
+  # ⛔ ONE `state_write` PER PASS, AND IT CARRIES THE CENSUS (#2163 review, P3). A pre-census write sat
+  # here and was superseded by the one below, so `passes=` (which `state_write` INCREMENTS) advanced
+  # twice per pass, and the FIRST `[reap]` line an operator reads omitted `lanes=`/`zombie=`/
+  # `unidentifiable=` — the three readings this role exists to publish. The rehearsal rule
+  # (`--dry-run` never records a verdict) is applied at that single write below.
   # ── the census: lanes by EVIDENCE, and the box's zombies (#2163) ────────────────────────────────
   # `lanes=<live>/<total>` is the reading a session count cannot produce: a leaked wrapper + pi whose
   # pane died is invisible to `tmux ls`, and the string count (`ps | grep -c 'pi --model'`) counted
