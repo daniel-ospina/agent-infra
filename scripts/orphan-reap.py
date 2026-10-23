@@ -101,19 +101,22 @@ DECLARED BLIND SPOTS (a report must say what it CANNOT see — `lane-status.py`'
   * a `pi` started inside another's fence in the same cwd (`ambiguous-binding`);
   * any process of another uid — but NOT by abstaining: `_cwd_of_pid` returns None on a refused
     read and `bind_session` then SKIPS the cwd filter, so such a pid can still bind a
-    same-fence session file and vote on it. The skipped filter is recorded NOWHERE —
-    `binding_detail` reports only the fence/ambiguity outcome — so the row does not even show that
-    its cwd was never checked; the FILE side of the same filter IS fail-closed: a session file
-    whose own first lines carry no readable `cwd` is dropped from the candidates, never accepted
-    for any pid;
+    same-fence session file and vote on it. `binding_detail` records that the pid side went
+    UNCHECKED, so the row shows it; and the FILE side of the same filter IS fail-closed: a session
+    file whose own first lines carry no readable `cwd` is dropped from the candidates, never
+    accepted for any pid — including when the pid's own `cwd` could not be read, which is the case
+    that matters, since the pid side is then skipped entirely;
   * a box where the cmux hook store is unreadable — every row that reaches the canon abstains as
     `store-unreadable` (the canon's own rule), but a row under a terminal/login-shell ancestor is
     decided `KEEP-HUMAN` by gate 2 BEFORE the canon VERDICT is consulted (the canon is still
     read; gate 2 supersedes its answer) and so does not abstain. The
     safe property (nothing reaped) holds; the count is not "every row";
   * memory pressure, fd pressure, or a live child of a parked parent it does not enumerate;
-  * an interactive host missing from `HUMAN` (WezTerm/Ghostty/Zed/VS Code's `Code Helper` are
-    covered, but the list is an allowlist of owners and a new host is a real gap).
+  * an interactive host missing from `HUMAN` (WezTerm/Ghostty/Zed are covered; VS Code's
+    `Code Helper` CANNOT be matched — `ps -Ao comm=` is space-split, so a helper name containing a
+    space never matches any entry, and a VS Code session is caught only through its shell /
+    terminal ancestor, or not at all if that ancestor is a bare `-sh`). The list is an allowlist of
+    owners, so a new host is a real gap.
 ⛔ A blind spot is NOT uniformly an abstention. Where the census cannot decide, it is reported as
 UNVERIFIABLE with its reason. But two bullets above do not abstain: an unreadable cwd means
 `bind_session` SKIPS the filter, so the row can bind, speak, and be scored LIVE on the fence
@@ -181,6 +184,13 @@ assert not [h for h in HUMAN if " " in h], "a HUMAN entry with a space can never
 #     human terminal / login-shell anywhere on the walk -> KEEP-HUMAN (never signal)
 #     a cmux node                                       -> report-only
 #     unrecognised / unresolvable / empty                -> unknown: REPORT ONLY, NEVER REAP
+# ⚠️ THE `cmux` CLASS HAS NO BRANCH OF ITS OWN, and this comment must not be read as if it had one.
+# `cmux.app` is a `HUMAN` entry, so a chain under it returns kind `human` (never signalled — the
+# SAFE outcome) but the census LABELS it KEEP-HUMAN, "belongs to a human", which is not the
+# recorded rule's distinct report-only class; a bare `cmux` node (no `.app` bundle component)
+# matches nothing and falls to `hostless`. Both refuse to signal, so this is a census-accuracy
+# defect, not a kill path. Collapsing the two classes is recorded as a follow-up rather than
+# fixed here; if a `cmux` kind is ever added, it must stay report-only.
 # #1207 states the literal clause this file had ignored: "Unknown/unparseable chain ⇒ report
 # only, never reap." TWO shapes are `unknown` here, and both must abstain:
 #   * `ancestry()` hit a hop missing from the snapshot -> `<pid N not visible>`;
@@ -526,6 +536,14 @@ def bind_session(pid: str, row: dict, ref_s: float, index: List[Tuple[str, float
         # gate-3 age and own gap. The rest of this file reads a missing datum as an ABSTENTION
         # (`_stat` -> None => UNVERIFIABLE); this was the one place that read it as consent.
         near = [(p, ts) for p, ts in near if _session_cwd(p) == cwd]
+    else:
+        # ⛔ THE FILE SIDE IS FAIL-CLOSED EVEN WHEN THE PID SIDE CANNOT BE READ. `_cwd_of_pid`
+        # returns None for another uid or a refused `lsof`, and the filter above was SKIPPED for
+        # BOTH sides in that case — so a `cwd`-less transcript (which `session_index` will happily
+        # offer, since it globs every project subdirectory) was still accepted for any pid and
+        # could supply this row's gate-3 age and own gap. The pid side cannot be checked here, so
+        # the file side must be: a session file with no readable `cwd` is never a candidate.
+        near = [(p, ts) for p, ts in near if _session_cwd(p) is not None]
     near = [(p, ts) for p, ts in near if p not in taken]
     if not near:
         return None, "no-session-file", (f"no session file within ±{FENCE_S:g}s of start "
@@ -535,7 +553,10 @@ def bind_session(pid: str, row: dict, ref_s: float, index: List[Tuple[str, float
         return None, "ambiguous-binding", ("%d sessions within ±%gs: %s" % (
             len(near), FENCE_S, ", ".join(os.path.basename(p)[:19] for p, _ in near[:4])))
     path, ts = near[0]
-    return path, "fence", f"start ±{abs(ts - start):.1f}s of the file's name-stamp"
+    detail = f"start ±{abs(ts - start):.1f}s of the file's name-stamp"
+    if cwd is None:
+        detail += "; pid cwd UNCHECKED (unreadable) — matched on fence + file cwd present only"
+    return path, "fence", detail
 
 
 _CWD_CACHE: Dict[str, Optional[str]] = {}

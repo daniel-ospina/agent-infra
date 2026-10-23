@@ -430,6 +430,58 @@ def case_foreign_cwd(tmp) -> Box:
                sessions_index=[(t, start), (foreign, start)])
 
 
+def case_foreign_cwd_unreadable(tmp) -> Box:
+    """The pid's OWN `cwd` cannot be read (another uid / a refused `lsof`) — the file side must
+    STILL be fail-closed, so a `cwd`-less same-fence file is never bound.
+
+    The cwd filter used to sit INSIDE `if cwd is not None:`, so an unreadable pid cwd skipped it
+    for BOTH sides: a transcript with no readable `cwd` — which `session_index` offers from every
+    project subdirectory — was accepted for any pid and could supply this row's gate-3 age and own
+    gap, while `binding_detail` showed nothing about the unchecked cwd. Case (i) covers the pid
+    side when it IS readable (`pid_cwd=tmp`); this is the branch it could not see.
+
+    The REASON is the pin: with the file dropped the row abstains `no-progress-channel:` +
+    `no-session-file`; while the filter was skipped the foreign file bound and the row abstained
+    for the host decision instead (`host-decision-hostless`) — a bound file is a different reason.
+    `pid_cwd=None` is exactly the injected `_cwd_of_pid -> None` read.
+    """
+    now = time.time()
+    start = now - 5 * 3600
+    t = write_transcript(tmp, now - 30 * 3600)
+    foreign = os.path.join(tmp, "%s_%s.jsonl" % (
+        _stamp_name(start), "eeeeeeee-0000-0000-0000-000000000000"))
+    with open(t, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    first = json.loads(lines[0])
+    first.pop("cwd", None)          # the foreign file records no checkout
+    lines[0] = json.dumps(first) + "\n"
+    with open(foreign, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    os.utime(foreign, (now - 30 * 3600, now - 30 * 3600))
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, start,
+               store=write_store(tmp, pid=100, start_s=start, cwd=tmp, fresh=False),
+               sessions_dir=tmp, pid_cwd=None,
+               sessions_index=[(foreign, start)])
+
+
+def case_zombie(tmp) -> Box:
+    """The after-sample row is a ZOMBIE (`stat` starts with `Z`) — an abstention, never a verdict.
+
+    A zombie keeps its comm and its `etime` and `os.kill` on it returns 0, so every other reading
+    in this file would accept it as a live process. `pi_verdict`'s `zombie_after` arm exists for
+    exactly that, and until this case NO fixture ever set `stat="Z"` — deleting the arm left the
+    suite green. The survivor check's matching zombie leg is pinned by (g9).
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    after = {"1": _init(), "100": _row(100, 1, stat="Z")}
+    return Box(before, after, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False),
+               sessions_dir=tmp)
+
+
 def case_unbound(tmp) -> Box:
     """NO bindable session file and a ZERO CPU delta — the documented blind spot, PARKED half.
 
@@ -483,10 +535,14 @@ TESTS = [
      case_nested, "UNVERIFIABLE", "host-decision-hostless", None),
     ("(i) a same-fence file with no readable `cwd` is NOT bound",
      case_foreign_cwd, "UNVERIFIABLE", "host-decision-hostless", None),
+    ("(i2) …and it is STILL not bound when the pid's own `cwd` is UNREADABLE",
+     case_foreign_cwd_unreadable, "UNVERIFIABLE", "no-progress-channel:no-session-file", None),
     ("(j) no bindable session file, PARKED (the documented blind spot)",
      case_unbound, "UNVERIFIABLE", "no-progress-channel:no-session-file", None),
     ("(k) no bindable session file, BUSY — gate 1 still reads LIVE",
      case_unbound_busy, "LIVE", "cpu-advancing", None),
+    ("(l) the after-sample row is a ZOMBIE (`stat` = Z) — abstain, never a verdict",
+     case_zombie, "UNVERIFIABLE", "zombie", None),
 ]
 
 
@@ -639,6 +695,16 @@ def apply_path() -> int:
         check("(g8) the pid is a NEWER incarnation (etime moved backwards)", rc, out, kills, 0, [],
               must=("REFUSED: incarnation changed",),
               must_not=("SIGTERM ->", "STILL ALIVE"))
+
+        # (g9) the target survives but is a ZOMBIE: it keeps its comm and `etime`, and `os.kill`
+        # on a `Z` returns 0, so presence + `is_pi` alone would report a process that has ALREADY
+        # EXITED as a survivor and exit 1. Pins the `not stat.startswith("Z")` leg — before this
+        # case no fixture set `stat="Z"`, so that leg could be deleted with the suite green.
+        rc, out, kills = _apply_run(
+            case_a(tmp), post={"1": _init(), "100": _row(100, 1, stat="Z")})
+        check("(g9) the survivor is a ZOMBIE (already exited)", rc, out, kills, 0, [(100, 15)],
+              must=("verified gone: 100",),
+              must_not=("STILL ALIVE", "survived SIGTERM"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return fails
