@@ -1157,6 +1157,15 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
     rec_rc=$?
     if [ "$rec_rc" -eq 4 ]; then
       say "atomic-land: [1/4] update — the record step refused on the CURRENT head's HEALTH (#1575 clause (E)), not on content: the artifact WAS proven unchanged and the head is measurably red. The refresh is the only remedy this rail has for a drift-caused red (#1533), so the update PROCEEDS; step [3/4] re-runs the same veto at the new head, and a red the head itself owns will be refused THERE."
+    elif [ "$rec_rc" -eq 5 ]; then
+      # #1362 D1, the other half. `do_record` reaches its B8 binding arms whenever the
+      # producer EXITED 0 but left no record naming this head — `record-review.sh` fails
+      # OPEN on a transient head read, which is exactly why B8 exists. That is not a
+      # refusal of the artifact and not a demand for a fresh review: the reviewed content
+      # may be unchanged and the recorded verdict may be intact. Calling it "REFUSED"
+      # here would send the lane to re-review an unchanged artifact — the false
+      # obligation this whole block exists to remove.
+      stop "the record step exited WITHOUT binding the CURRENT head ${HEAD:0:12}… (reason above) — the branch was NOT updated and nothing was merged. This is not a review refusal: the reviewed artifact may be unchanged, so do NOT re-review on this message alone. Re-run the rail; if it repeats, re-record at ${HEAD:0:12}…"
     elif [ "$rec_rc" -ne 0 ]; then
       stop "a FRESH review is required at ${HEAD} before $REPO#$PR can be updated — the record is stale (${RECORD_HEAD:0:12}…) and the record step REFUSED that artifact at the CURRENT head (reason above). The branch was NOT updated and nothing was merged: a head move would only spend a full CI cycle on a PR whose record could not be carried (#2369). Review ${HEAD:0:12}… and record it, then re-run."
     fi
@@ -1261,7 +1270,8 @@ wait_terminal() {
 }
 
 # ── step 3: record (carry the existing verdict forward, or STOP) ─────────
-do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-health refusal
+do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-health refusal,
+              # 5 = the producer exited 0 without binding the head (preflight only)
   # The STEP LABEL is the caller's, not this function's: the same code runs as step
   # [3/4] after the update and as the [1/4] precondition BEFORE it (#2369), and a log
   # that says [3/4] during step 1 — or names a "new head" that does not exist yet —
@@ -1353,18 +1363,36 @@ do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-hea
   # the decision itself stays with the script that owns the record — the rail is a
   # sequencer, not the equivalence authority.)
   read_record || {
+    if [ "${1:-}" = "preflight" ]; then
+      err "atomic-land: the record could not be RE-READ at the CURRENT head ${HEAD:0:12}… — the branch was NOT updated and nothing was merged. The record step exited 0, so this is not (necessarily) a refusal of the artifact: re-run the rail."
+      rm -f "$log"
+      return 5
+    fi
     err "atomic-land: the record could not be re-read after the record step — refusing to land unrecorded"
     rm -f "$log"
     return 1
   }
   if [ "$RECORD_HEAD" != "$HEAD" ]; then
+    if [ "${1:-}" = "preflight" ]; then
+      # The FAIL-OPEN delegate at the [1/4] precondition. The landing wording below is
+      # false here — no head has moved, nothing was going to be landed, and the producer
+      # exited 0. Returned as 5 so the caller cannot turn it into "a FRESH review is
+      # required" (scenario 2b-ix pins the distinction).
+      err "atomic-land: the record step exited WITHOUT binding the CURRENT head (record names ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…) — the branch was NOT updated and nothing was merged. The reviewed artifact may be unchanged; this is not a demand for a fresh review."
+      rm -f "$log"
+      return 5
+    fi
     err "atomic-land: the record names ${RECORD_HEAD:0:12}… but the head is ${HEAD:0:12}… — this unit has NO record for the head it would land."
     err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is content-unchanged). Nothing was merged."
     rm -f "$log"
     return 1
   fi
   if ! verdict_accepted "$RECORD_VERDICT"; then
-    err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — refusing to land (B2)"
+    if [ "${1:-}" = "preflight" ]; then
+      err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — the branch was NOT updated and nothing was merged (B2)"
+    else
+      err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — refusing to land (B2)"
+    fi
     rm -f "$log"
     return 1
   fi

@@ -810,6 +810,36 @@ grep -q "refusing to land without a record" "$SCEN/err" \
   && fail "a preflight failure claimed a LANDING was refused — no landing was in question" \
   || pass "and it does NOT claim a landing was refused"
 
+# ═══ 2b-ix. the FAIL-OPEN delegate at the preflight is not a refusal ═════
+# The B8 binding arms are reachable from the [1/4] precondition, and there the producer
+# exited 0 — it did not refuse the artifact, it failed OPEN on a transient head read
+# (the reason B8 exists at all). Calling that "REFUSED" would print, at a step where no
+# head has moved and no landing was in question, both "the head it would LAND" and "a
+# FRESH review is required" — the #1362 D1 false obligation (re-review an unchanged
+# artifact) in the same transcript that admits nothing was written. Measured before
+# this scenario existed: with `return 5` reverted to `return 1` on the preflight path,
+# the whole suite stayed green and the transcript said "REFUSED that artifact".
+echo "── 2b-ix. #2369 — a zero-exit-without-binding at the preflight is not a review refusal"
+new_scen stalerecordnowrite
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+# The FAIL-OPEN delegate: exit 0, write nothing — the record stays at HEAD_STALE.
+SCEN_RECORD_NO_WRITE=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch" && fail "the head was MOVED although no record could follow it" || pass "the head was NOT moved"
+called "admin-merge" && fail "landed with no record for the head" || pass "the land step did NOT run"
+grep -q "exited WITHOUT binding the CURRENT head" "$SCEN/err" \
+  && pass "the refusal names what actually happened (no binding), not a refusal of the artifact" \
+  || fail "the preflight did not name the missing binding ($(tail -2 "$SCEN/err"))"
+grep -q "a FRESH review is required" "$SCEN/err" \
+  && fail "a fail-open delegate was reported as a REFUSAL — the lane is sent to re-review an unchanged artifact" \
+  || pass "and it does NOT demand a fresh review (the artifact may be unchanged)"
+grep -q "the head it would land" "$SCEN/err" \
+  && fail "landing wording at the [1/4] precondition — nothing was going to be landed" \
+  || pass "and it does not use landing wording at the precondition"
+
 # ═══ 3. no record → refuse before any mutation ═══════════════════════════
 echo "── 3. no review record: refuse before ANY mutation"
 new_scen norec
