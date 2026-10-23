@@ -27,21 +27,29 @@
 
          STILL SHIPS DRY-RUN — DELIBERATELY, AND THE RULING IS #1678.
          "The reaper may run unattended; arming it may not" (owner ruling
-         2026-10-11). Do NOT commit a literal `--apply` here: install-launchd.sh
+         2026-10-11). Do NOT commit a literal `apply` flag here: install-launchd.sh
          with no arguments installs EVERY template and pi-bootstrap/setup.sh
          runs exactly that on every Darwin box, so a literal in a shared template
          arms a fleet with no human step. Arming is a separate, dated, reversible
          step, rendered from THIS box's own record by
-         `install-launchd.sh --arm-worktree-hygiene` (see the
+         `install-launchd.sh`'s `arm-worktree-hygiene` verb (see the
          {{WORKTREE_HYGIENE_MODE}} mechanism in install-launchd.sh).
          Removing the flag is also NOT arming: with no mode flag the reaper
          falls back to REAP_WT_DRY_RUN, whose default is 1.
+         ⚠️ FLAG NAMES ARE SPELLED WITHOUT THEIR LEADING DASHES THROUGHOUT THIS
+         COMMENT, as in the sibling com.tortoise.worktree-hygiene.plist. An XML
+         comment may not contain a double hyphen (the only legal occurrence is
+         its own closing delimiter), so a literal flag spelling here makes the
+         template unparseable: plutil/launchctl reject the unit, and
+         install-launchd.sh's plist_program_args swallows the parse error, so the
+         job would install with EMPTY program arguments instead of failing loudly.
+         Keep the prose, keep the dashes out (#2041 review).
 
          MEASURED 2026-10-22 — why this job reported exit 0 and reclaimed
          nothing for months. 748 worktrees (551 tortoise + 197 agent-infra),
          load 222, `fseventsd` 100% CPU, ~150 MB free; last pass
          `WORKTREES=538 REMOVE=7 REMOVED=0 DEFERRED=422`. THREE causes:
-           1. the installed unit ran `--dry-run`, so REMOVED=0 was structural;
+           1. the installed unit ran the `dry-run` flag, so REMOVED=0 was structural;
            2. the FARMED script was ~190 diff lines BEHIND `origin/main` — the
               merged-age exemption had shipped but was never deployed, so the
               box ran rules that held every merged worktree for 7 days. (The
