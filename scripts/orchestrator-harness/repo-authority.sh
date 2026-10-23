@@ -285,7 +285,12 @@ _gh_named_state() {
 required_checks() {
   local or="${1:-}" gh="${2:-gh}" raw joined named
   [ -n "$or" ] || return 1
-  raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || {
+  # ⛔ ESSENTIAL (#2342). A landing cannot proceed without the merge contract, and this endpoint has
+  # NO exact GraphQL equivalent — so it is the one read in the harness allowed to spend the RESERVE
+  # below the layer's floor. Without this line the floor would refuse it, `REQ_SOURCE=fallback` would
+  # follow, and the rail would tell every lane “the merge contract is UNKNOWN” for the last minutes of
+  # every window — the exact misdiagnosis the named state was added to remove.
+  raw="$(GH_LIMIT_ESSENTIAL=1 "$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || {
     # The read failed. Say WHY when the layer knows: an exhausted budget is a “wait 12 minutes”, not
     # a “fix your token”. Silence otherwise — the existing fail-closed path is unchanged.
     named="$(_gh_named_state)"
