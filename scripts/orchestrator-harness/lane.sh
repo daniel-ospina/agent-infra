@@ -414,9 +414,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk` and
-  # `land` are the four values the gate can refuse on, and each is chosen by the code its own caller
-  # already distinguishes, so the record can never disagree with the exit status.
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`
+  # and `land` are the five values the gate can refuse on, and each is chosen by the code its own
+  # caller already distinguishes, so the record can never disagree with the exit status. `mem`
+  # (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's memory
+  # floor refused — which is why it takes the capacity-transfer branch below and not the `land`
+  # stand-down one.
   # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
   # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
   # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
@@ -443,10 +446,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # ⛔ FORK IS 73, NOT 74 (#2293 x #2409): 74 is the LAND-BACKLOG gate below, whose remedy is the
     # opposite of a fork refusal's, so one code for both made this very case statement label one gate
     # with the other's remedy (the integration batch's review caught it as a P0).
+    # ⛔ MEMORY IS 81, NOT 73 (#2387 x #2293). 73 was free when this change was authored and the memory
+    # arm took it; main then took 73 for AGENT_FORK_REFUSED (#2552), so on rebase the two collided and
+    # a FORK refusal — a box out of PROCESSES, remedied from OUTSIDE — would have been recorded and
+    # reported as a MEMORY refusal, whose remedy is to wait for resident lanes to finish. Opposite
+    # causes, opposite remedies, so one had to move; it cannot be the shipped fork code, so the
+    # newcomer moves. 81 is outside the sysexits band the rest borrow (like 80), i.e. a code no
+    # third-party process can produce by accident.
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
+    elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then _cap_gate=mem
     else _cap_gate=load; fi
+
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
     # README §7.2 says it in as many words ("**The yield is gate-independent, deliberately**"), and
     # ARCHITECTURE repeats it. A `land` refusal looks like it wants a SHORT window: it is repo-wide,
@@ -488,6 +500,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
     echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
+    # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
+    # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured). This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
