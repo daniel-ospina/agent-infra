@@ -722,7 +722,15 @@ for base in "${merge_gate_srcs[@]}"; do
     rm -f "$dest"
   fi
   cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
+  # ⛔ A SWALLOWED `chmod` FAILURE IS A SILENTLY NON-EXECUTABLE LANDER SEAM (P3, fresh review of
+  # #2288). The lane brief and the code-review skill tell a lander to TYPE this path
+  # (`~/.pi/agent/scripts/review-pr.sh <PR>`, no `bash`), so a `cp -f` that inherits a restrictive
+  # umask without `x` — with the failure discarded by `|| true` — ships a seam nobody can invoke,
+  # and the farm test (existence + byte-equality only) stays green. Assert it instead.
+  if ! chmod +x "$dest" 2>/dev/null; then
+    echo "    ⚠️  could not chmod +x $dest — the lander seam would not be executable" >&2
+    farm_missing+="scripts/$base (chmod +x failed)"$'\n'
+  fi
   merge_gate_copied=$((merge_gate_copied+1))
 done
 echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh + review-pr.sh, #562)"

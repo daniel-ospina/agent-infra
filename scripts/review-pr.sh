@@ -112,6 +112,8 @@
 #      reads: no record bound to this head, no marker in the PR body, or a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
 #      so "recorded" without it is a green report over a red check)
+#   143 terminated by a signal (INT/TERM/HUP): the trap kills the paid reviewer child and exits
+#      143 — NOTHING was posted and NO record was written (the child is not orphaned)
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
 #      nothing was consumed — re-dispatch when the box is quiet, do NOT read this as a
 #      code verdict (merge-one.sh's code for the same cause)
@@ -487,9 +489,19 @@ COMMENT_FILE="$RUN_DIR/comment.md"
 # comment with no redaction: one stripped variable closed the marker-minting key and left every
 # other credential in place. The channel is therefore closed at the PUBLISHING CHOKEPOINT
 # (`post_comment`), not by enumerating what a child may keep: values of secret-shaped variables are
-# scrubbed by VALUE (whatever they are), and GitHub token FORMATS by SHAPE (recognisable without
-# knowing the value). Values under 8 characters are skipped so a short variable cannot redact the
-# prose it appears in; the token shapes carry their own minimum length.
+# scrubbed by VALUE (whatever they are), and token FORMATS by SHAPE (recognisable without knowing
+# the value: GitHub/Slack/Google/AWS/OpenAI keys, JWTs, and PEM private-key blocks). Values under 8
+# characters are skipped so a short variable cannot redact the prose it appears in; the token shapes
+# carry their own minimum length.
+# ⛔ WHAT THIS IS NOT (P2, fresh review of #2288 — corrected claim): SHAPE-BASED SCRUBBING IS NOT A
+# GUARANTEE. A credential in a shape this list does not know — an arbitrary base64 blob, a bespoke
+# internal token, a `config.ini` line with an unfamiliar key name — still publishes if the reviewer
+# prints it. The mechanism that keeps that out of a public comment is the reviewer prompt (the child
+# is told the PR text is untrusted and that its output is published) plus this list; a lane that
+# needs a hard boundary should not spawn a reviewer with `bash` and `HOME` in the first place. The
+# earlier wording here claimed "NOTHING REVIEWER-CONTROLLED IS PUBLISHED UNREDACTED", which this
+# review measured to be false (`-----BEGIN OPENSSH PRIVATE KEY-----` and `aws_access_key_id = AKIA…`
+# both reached the comment verbatim before the shapes above were added).
 SECRET_VALUES=()
 for _sv in $(compgen -e 2>/dev/null || true); do
   case "$_sv" in
@@ -511,7 +523,14 @@ redact_file() { # <src> <dst> -> 0, or 1 when the body could not be built
   blob="$(cat "$src" 2>/dev/null)" || return 1
   blob="$(printf '%s' "$blob" | sed -E \
     -e 's/gh[pousr]_[A-Za-z0-9]{20,}/[REDACTED:github-token]/g' \
-    -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED:github-pat]/g' 2>/dev/null)" || return 1
+    -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED:github-pat]/g' \
+    -e 's/(AKIA|ASIA)[0-9A-Z]{16}/[REDACTED:aws-key]/g' \
+    -e 's/sk-[A-Za-z0-9_-]{20,}/[REDACTED:api-key]/g' \
+    -e 's/xox[baprs]-[A-Za-z0-9-]{10,}/[REDACTED:slack-token]/g' \
+    -e 's/AIza[0-9A-Za-z_-]{30,}/[REDACTED:google-key]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/[REDACTED:jwt]/g' \
+    -e '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c\[REDACTED:private-key-block]' \
+    2>/dev/null)" || return 1
   for v in ${SECRET_VALUES[@]+"${SECRET_VALUES[@]}"}; do
     [ "${#v}" -ge 8 ] || continue
     n=0
@@ -1288,6 +1307,17 @@ function label(s,   a, b, pre, post, sl) {
     a = RSTART; b = RSTART + RLENGTH - 1
     if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
   }
+  # ⛔ A LABEL NOUN WITH A SLOT SEPARATOR AND A LOCATION IS A LABEL (P3, fresh review of #2288).
+  # `Blocker: scripts/x.sh:12 — the guard returns 0 on a failed read.` is the scanner-own `noun()` vocabulary in its most natural spelling, and it
+  # was invisible: the arms above want DECORATION
+  # (`[Blocker]`, `**Blocker**`) or a literal `severity:`/`priority:` slot, so the CLEAN that closed
+  # this report was recorded. The cue is the same two-part one the P<n> slot arm uses — the WORD,
+  # a colon, and a LOCATION after it — so a clean summary that merely uses the word (`High: nothing
+  # blocking`) still has no location and stays a mention.
+  if (match(sl, /(^|[^[:alnum:]])(critical|blocker|blocking|major|high)[[:space:]]*:[[:space:]]*[`*_]*[[:alnum:]_\/.-]+:[0-9]+/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
+  }
   # (b)/(b2)/(c) a BARE token — introduced by a label NOUN, carrying a slot separator, a
   # `path:line` after it, or sitting in a TABLE row.
   # ⛔ EVERY BARE TOKEN ON THE LINE IS EXAMINED, NOT JUST THE FIRST (P1, fourth fresh review of
@@ -1595,13 +1625,22 @@ case "$VWORD" in
     # makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
     # never a count.
     CLEAN_COUNT_WORDS=""
+    # ⛔ A COUNT IS NOT ONLY A NUMERAL (P1, fresh review of PR #2288). The DIGIT alternation below
+    # left the WORD channel wide open: `**Verdict:** CLEAN — one blocking finding remains, in a file
+    # outside this diff.` recorded clean (rc 0, comment posted, a signed head-bound record written)
+    # while the artifact the recorder accepted as evidence said `CLEAN — no blocking findings.` The
+    # `ISSUES`-token channel needs the literal word `issues`, and no P-token is on the line, so the
+    # severity scan had nothing to see either — the same fail-open this guard exists to close, one
+    # GRAMMAR over, while the comment above claimed EVERY shape. A word numeral maps to a NON-ZERO
+    # count; `no` / `none` / `zero` are absent from the alternation, so the zero report stays clean.
     while IFS= read -r _cm; do
       [ -n "$_cm" ] || continue
       _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
+      [ -n "$_cn" ] || _cn=1      # a WORD numeral is a non-zero count by definition
       [ "${_cn:-0}" -gt 0 ] || continue
       CLEAN_COUNT_WORDS="$_cm"; break
     done <<<"$(printf '%s' "$LAST" \
-      | grep -oiE '(^|[^[:alnum:]])[0-9]+[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
       | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
     if [ -n "$CLEAN_COUNT_WORDS" ]; then
       err "$PROG: the verdict line says CLEAN and ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
@@ -1950,4 +1989,12 @@ case "$MARKER_STATE" in
     die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its append is idempotent)." ;;
 esac
 say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
+# ⛔ THE CLEAN PATH DOES NOT LEAVE THE SCRATCH TRANSCRIPT BEHIND (P3, fresh review of #2288):
+# `cleanup` removes only $RUN_DIR, so every invocation — success included — left
+# `$TMPDIR/review-pr-<PR>.XXXXXX/reviewer.log` with the reviewer's FULL, UNREDACTED output on disk,
+# i.e. the exact material the redaction chokepoint exists to keep out of a public comment. On the
+# clean path the artifact (the posted comment, which carries the reviewer's own output) IS the audit
+# trail — there is no refusal message pointing at this file — so it is removed here. A REFUSAL keeps
+# it, because every refusal message names it as the audit trail.
+rm -rf "$TRANSCRIPT_DIR" 2>/dev/null || true
 exit 0

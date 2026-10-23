@@ -160,6 +160,12 @@ check_record_review_farmed() {
       || { fail "$label: merge_gate_srcs declares '$entry' but scripts/$entry does not exist"; continue; }
     [ -f "$dest" ] \
       || { fail "$label: $entry not farmed into scripts/ (merge-gate farm missing or silently skipped)"; continue; }
+    # ⛔ THE BIT IS PART OF THE CONTRACT (P3, fresh review of #2288): the lane brief and the
+    # code-review skill tell a lander to TYPE this path, so a farmed-but-not-executable copy is a
+    # seam nobody can invoke — and existence + byte-equality alone reported it clean, while
+    # setup.sh discarded a failing `chmod +x` with `|| true`.
+    [ -x "$dest" ] \
+      || fail "$label: $entry is farmed but NOT EXECUTABLE ($dest) — a lander cannot type it"
     if diff -q "$ROOT/scripts/$entry" "$dest" >/dev/null 2>&1; then
       checked=$((checked+1))
     else

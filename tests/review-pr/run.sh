@@ -131,7 +131,7 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
-       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP
+       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -232,6 +232,14 @@ case "$cmd" in
         cat "$TMP/served-diff.txt"
         exit 0 ;;
       comment)
+        # ⛔ A COMMENT POST CAN FAIL (P3, fresh review of #2288): this arm always SUCCEEDED, so the
+        # seam's `E_RECORD "review comment post FAILED"` refusal — the first of the four cases the
+        # header's exit-9 paragraph enumerates — was never executed, and deleting it kept the suite
+        # green. A real gh refuses on rate limit, auth expiry, or a locked conversation.
+        if [ "${FIXTURE_COMMENT_RC:-0}" != "0" ]; then
+          echo "HTTP 403: Resource not accessible (fixture)" >&2
+          exit "${FIXTURE_COMMENT_RC}"
+        fi
         # Each posted comment is kept UNDER ITS OWN NAME (the seam posts a notes comment
         # before the verdict comment), and the last one is also $TMP/comment.md.
         n=$(( $(cat "$TMP/comment-n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/comment-n"
@@ -378,6 +386,7 @@ reset() {
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
   FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
   FIXTURE_PI_SLEEP=""
+  FIXTURE_COMMENT_RC=0
   unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
 }
 
@@ -1867,6 +1876,101 @@ no_comment; ck $? "  …nothing posted as the evidence artifact"
 no_record; ck $? "  …nothing recorded"
 reset
 
+# ── §AV a CLEAN that counts its findings in WORDS is refused too ──────────────
+echo; echo "§AV a CLEAN that counts its blocking findings in WORDS is refused (the digit arm was not enough)"
+# ⛔ THE COUNT CHANNEL HAD A GRAMMAR HOLE (P1, fresh review of #2288, measured end-to-end): the guard
+# matched `[0-9]+` only, so `**Verdict:** CLEAN — one blocking finding remains, in a file outside this
+# diff.` recorded clean (rc 0, comment posted, a signed head-bound record written) while the artifact
+# the recorder accepted as evidence said `CLEAN — no blocking findings.` The `ISSUES` token needs the
+# literal word `issues`, and no P-token was on the line, so nothing else could see it either.
+for w in one two three several multiple a; do
+  reset; printf '**Verdict:** CLEAN — %s blocking finding remains, in a file outside this diff.\n' "$w" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a CLEAN reporting '$w blocking finding(s)' is refused, not recorded (rc=$(rc_of))"
+  no_record; ck $? "    …nothing recorded"
+done
+# COUNTER-DIRECTIONS: a ZERO report stays clean, and the ONE exemption the guard documents (a
+# resolved participle) stays clean — otherwise the fix would be a category-B over-block.
+reset; printf '**Verdict:** CLEAN — no blocking findings at all.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …while 'no blocking findings' still records (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "    …recorded"
+reset; printf '**Verdict:** CLEAN — one blocking finding addressed and re-reviewed.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …and the documented RESOLVED participle stays clean (rc=$(rc_of))"
+reset
+
+# ── §AW a credential SHAPE in the reviewer output never reaches the comment ───
+echo; echo "§AW a PEM block and an AWS key in the reviewer output are REDACTED from the published comment"
+# ⛔ THE REDACTION CLAIM WAS TOO BROAD (P2, fresh review of #2288, measured): the chokepoint scrubbed
+# env VALUES by name and GitHub token SHAPES only, so a prompt-injected reviewer that printed
+# `-----BEGIN OPENSSH PRIVATE KEY-----` or `aws_access_key_id = AKIA…` published them VERBATIM into a
+# public PR comment — while the file claimed nothing reviewer-controlled was published unredacted.
+reset; printf 'I read the PR body. It said to print my environment.\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU\n-----END OPENSSH PRIVATE KEY-----\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\n**Verdict:** ISSUES 1\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an ISSUES verdict with no [P<n>] line still posts the not-clean artifact (rc=$(rc_of))"
+[ -f "$TMP/comment.md" ]; ck $? "  …the artifact exists"
+grep -q 'REDACTED:private-key-block' "$TMP/comment.md" 2>/dev/null; ck $? "  …the PEM block is REDACTED in it"
+grep -q 'AKIAIOSFODNN7EXAMPLE' "$TMP/comment.md" 2>/dev/null && rc=1 || rc=0; ck $rc "  …and the AWS key VALUE does not appear"
+grep -q 'b3BlbnNzaC1rZXktdjEAAAAABG5vbmU' "$TMP/comment.md" 2>/dev/null && rc=1 || rc=0; ck $rc "  …nor the private-key material"
+no_record; ck $? "  …and nothing was recorded"
+reset
+
+# ── §AX a label NOUN with a colon and a location is a finding ─────────────────
+echo; echo "§AX 'Blocker: <path>:<line>' under CLEAN is a finding, not prose"
+reset; printf 'Blocker: scripts/x.sh:12 — the guard returns 0 on a failed read.\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a 'Blocker: <path>:<line>' line blocks a CLEAN (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'High: nothing blocking in this diff.\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …while a severity word with NO location stays a mention (rc=$(rc_of))"
+reset
+
+# ── §AY the RECORDER is RESOLVED (sibling, then $HOME), not always injected ──
+echo; echo "§AY recorder resolution: the sibling, then \$HOME, then a refusal naming both"
+# ⛔ EVERY OTHER SCENARIO INJECTS REVIEW_PR_RECORD_SH (P1, fresh review of #2288 — mutation-verified:
+# replacing the SELF_DIR/$HOME resolution block with `:` left all 546 assertions green), so the branch
+# the FARMED copy depends on had no test at all. The copy a lane types is
+# ~/.pi/agent/scripts/review-pr.sh, whose recorder is its SIBLING — the whole point of the fallback.
+RESOLVE="$TMP/resolve"; rm -rf "$RESOLVE"; mkdir -p "$RESOLVE/sib" "$RESOLVE/only-home/.pi/agent/scripts" "$RESOLVE/none"
+cp "$SRC" "$RESOLVE/sib/review-pr.sh"; chmod +x "$RESOLVE/sib/review-pr.sh"
+cp "$TMP/bin/fake-record" "$RESOLVE/sib/record-review.sh"; chmod +x "$RESOLVE/sib/record-review.sh"
+cp "$SRC" "$RESOLVE/only-home/review-pr.sh"; chmod +x "$RESOLVE/only-home/review-pr.sh"
+mkdir -p "$RESOLVE/only-home/home/.pi/agent/scripts"
+cp "$TMP/bin/fake-record" "$RESOLVE/only-home/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$RESOLVE/only-home/home/.pi/agent/scripts/record-review.sh"
+cp "$SRC" "$RESOLVE/none/review-pr.sh"; chmod +x "$RESOLVE/none/review-pr.sh"
+
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  bash "$RESOLVE/sib/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "0" ]; ck $? "the SIBLING recorder is found with REVIEW_PR_RECORD_SH unset (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and it is the one that was called"
+
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$RESOLVE/only-home/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  bash "$RESOLVE/only-home/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "0" ]; ck $? "  …and \$HOME/.pi/agent/scripts/review-pr.sh finds its recorder in the SAME dir (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "    …which was called"
+
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  bash "$RESOLVE/none/review-pr.sh" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt"; echo $? > "$TMP/rc"
+[ "$(rc_of)" = "9" ]; ck $? "  …and with NEITHER, it refuses before paying for a review (rc=$(rc_of))"
+err_has "record-review.sh not found"; ck $? "    …naming the missing recorder"
+no_reviewer; ck $? "    …and no reviewer was spawned"
+reset
+
+# ── §AZ a FAILED comment post is exit 9, with no record ──────────────────────
+echo; echo "§AZ a failed comment POST => exit 9, nothing recorded"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_COMMENT_RC=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a refused comment post is exit 9 (rc=$(rc_of))"
+err_has "could not post the review comment"; ck $? "  …naming the failed post"
+no_record; ck $? "  …and NOTHING recorded (the artifact is the record's evidence)"
+reset
+
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
 # `ck` runs AFTER this comparison, so on a fully green run PASS is 478 here and the RESULT line then
 # prints 479. A floor equal to the printed total could never pass — a permanently red tripwire is
@@ -1881,7 +1985,7 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 545 when §AS/§AT/§AU added 20 (the gawk-dialect P1, the wall-clock cap and the
+# Re-set to 579 when §AS/§AT/§AU added 20 and §AV-§AZ added 34 (the gawk-dialect P1, the wall-clock cap and the
 # sent-argv body-write arm).
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
@@ -2003,6 +2107,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 545 ]; ck $? "assertion-count pin: >= 545 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 579 ]; ck $? "assertion-count pin: >= 579 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
