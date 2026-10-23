@@ -895,6 +895,15 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
         else:
             log("apply: no PARKED-REAPABLE rows — nothing signalled")
         return 0
+    if not live:
+        # ⛔ AN UNREADABLE `ps` IS NOT A CLEAN TABLE. The census already refuses this shape
+        # ("`ps` returned nothing; no census was read" -> exit 2); the apply path must too.
+        # Without this guard every target below falls to `cur is None` and the run reports
+        # "nothing done" with exit 0 — a success minted from an absent reading.
+        log("apply: UNVERIFIABLE — the pre-signal `ps` read returned nothing, so no target's "
+            "identity can be re-verified at signal time; NOTHING signalled (a pid/comm check "
+            "against an absent reading is not a check)")
+        return 2
     log(f"apply: {len(target)} PARKED-REAPABLE")
     for row in target:
         pid = row["pid"]
@@ -935,6 +944,15 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
             log(f"  {pid} EPERM — not ours to kill; REPORTING")
     time.sleep(3)
     still = ps_pi_fields()
+    if not still:
+        # ⛔ THE SAME RULE ON THE OTHER SIDE OF THE SIGNAL. A failed/empty read would make the
+        # loop below print `verified gone` for EVERY target and return 0 — a reap that did not
+        # happen, reported as verified. Absence of a reading is not evidence of absence (the
+        # census's own rule), and `verified gone` is a claim about live processes.
+        log("apply: UNVERIFIABLE — the post-signal `ps` read returned nothing; the signalled "
+            "set was NOT verified (an absent reading is not evidence of death). Nothing below "
+            "is reported as `verified gone`")
+        return 2
     stuck = 0
     for row in target:
         pid = row["pid"]

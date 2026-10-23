@@ -308,6 +308,95 @@ def run_one(fn, gates=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── the APPLY path — the only code here that can signal a pid ─────────────────────────────
+def _apply_run(box, live=None, post=None):
+    """Exercise `_apply_parked` with `os.kill` REPLACED, so no real pid can be signalled.
+
+    Three reads are controllable, because each has its own guard: the census's `before`, the
+    pre-signal re-verification (`live`), and the post-signal verification (`post`). `{}` means
+    an UNREADABLE read — the shape that used to print `verified gone` for every target.
+    """
+    # FOUR reads, in this order: the census's `before` and CPU-window `after`, then the
+    # pre-signal re-verification (`live`) and the post-signal verification (`post`). `{}` means
+    # an UNREADABLE read — the shape that used to print `verified gone` for every target.
+    snaps = [box.rows[0], box.rows[1],
+             box.rows[1] if live is None else live,
+             box.rows[1] if post is None else post]
+    calls = {"n": 0}
+
+    def ps():
+        snap = snaps[min(calls["n"], len(snaps) - 1)]
+        calls["n"] += 1
+        return {pid: dict(r) for pid, r in snap.items()}
+
+    kills = []
+    names = ("ps_pi_fields", "session_index", "_cwd_of_pid", "_stat", "time",
+             "SESSIONS_DIR", "STORE_PATH")
+    saved = {n: getattr(mod, n) for n in names}
+    real_kill = os.kill
+    mod.ps_pi_fields = ps
+    mod.session_index = lambda sessions_dir=None: [(box.transcript, box.start_ts)]
+    mod._cwd_of_pid = lambda pid: None
+    mod._stat = box.stat
+    mod.time = box.clock
+    mod.SESSIONS_DIR = os.path.dirname(box.transcript)
+    mod.STORE_PATH = box.store
+    os.kill = lambda pid, sig: kills.append((int(pid), sig))
+    buf = io.StringIO()
+    try:
+        with _reopen_seam(True), contextlib.redirect_stdout(buf):
+            rc = mod.pi_census(20.0, apply=True, store_path=box.store)
+    finally:
+        os.kill = real_kill
+        for n, v in saved.items():
+            setattr(mod, n, v)
+    return rc, buf.getvalue(), kills
+
+
+def apply_path() -> int:
+    """FOUR assertions on the only code in this file that can send a signal.
+
+    Every other case runs `apply=False`, so the kill path — its incarnation/recycle refusals,
+    and the two guards that keep an UNREADABLE `ps` read from reading as success — had no test
+    that could go red if the guard were deleted. `os.kill` is replaced, so no pid is touched.
+    """
+    fails = 0
+    tmp = tempfile.mkdtemp(prefix="orphan-reap-apply-")
+    try:
+        def check(name, rc, out, kills, want_rc, want_kills, must=(), must_not=()):
+            nonlocal fails
+            bad = [m for m in must if m not in out] + [m for m in must_not if m in out]
+            ok = rc == want_rc and kills == want_kills and not bad
+            print(f"{'PASS' if ok else 'FAIL'} {name}: rc={rc} (want {want_rc}), "
+                  f"kills={kills} " + (f"— wrong: {bad}" if bad else ""))
+            if not ok:
+                fails += 1
+
+        # (g1) the target is STILL in the post-signal read: rc 1, and never `verified gone`
+        rc, out, kills = _apply_run(case_a(tmp), post=None)
+        check("(g1) a target still present after the signal", rc, out, kills, 1, [(100, 15)],
+              must=("STILL ALIVE",), must_not=("verified gone: 100",))
+
+        # (g2) a readable post-signal read that no longer carries it: the one `verified gone`
+        rc, out, kills = _apply_run(case_a(tmp), post={"1": _init()})
+        check("(g2) a target verified gone", rc, out, kills, 0, [(100, 15)],
+              must=("verified gone: 100",), must_not=("UNVERIFIABLE — the post-signal",))
+
+        # (g3) an UNREADABLE post-signal read is NOT a reap: rc 2, no `verified gone`
+        rc, out, kills = _apply_run(case_a(tmp), post={})
+        check("(g3) the POST-signal read returned nothing", rc, out, kills, 2, [(100, 15)],
+              must=("UNVERIFIABLE — the post-signal",), must_not=("verified gone: 100",))
+
+        # (g4) an UNREADABLE pre-signal read cannot re-verify identity: nothing is signalled
+        rc, out, kills = _apply_run(case_a(tmp), live={})
+        check("(g4) the PRE-signal read returned nothing", rc, out, kills, 2, [],
+              must=("UNVERIFIABLE — the pre-signal",),
+              must_not=("verified gone: 100", "SIGTERM ->"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return fails
+
+
 def suite(mutate: dict | None = None) -> int:
     # the mutation control only means something where a signal is POSSIBLE, so it runs through
     # the reopen seam; the plain suite runs with the shipped default (seam OFF).
@@ -397,11 +486,11 @@ def utc_stamp() -> int:
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
-    fails = suite(None) + four_states_reachable() + utc_stamp()
+    fails = suite(None) + four_states_reachable() + utc_stamp() + apply_path()
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1
-    print("\nall 6 gate tests PASS")
+    print("\nall 10 gate tests PASS")
 
     if "--mutations" not in argv:
         print("(run with --mutations to prove each gate is load-bearing)")
