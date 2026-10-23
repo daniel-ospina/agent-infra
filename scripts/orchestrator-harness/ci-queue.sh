@@ -196,12 +196,16 @@ ciq_read() {
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
   running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || running=""
-  busy=""; runners=""
-  # ⛔ `--paginate`: the endpoint returns ONE page by default (30 objects), so a fleet with more
-  # self-hosted runners than that had its count TRUNCATED — an under-derived ceiling that defers a
-  # queue which would have drained inside the horizon (#2333 review P2). Concatenated pages still
-  # count correctly: the objects are counted, never `total_count` (which would double-count).
-  if _rn="$(ciq_gh --paginate "repos/$repo/actions/runners")"; then
+  busy=""; runners=""; declared=""
+  # ⛔ `--paginate` LAST, AFTER THE ENDPOINT (#2333 review P1). The endpoint returns ONE page by
+  # default (30 objects), so a fleet bigger than that had its count TRUNCATED into an under-derived
+  # ceiling that defers a queue which would have drained inside the horizon. The flag MUST come after
+  # the endpoint: the rigs' `gh` stubs dispatch on `$2` (`case "$2" in … *actions/runners*)` in
+  # ci-queue.test.sh, harness-refresh.test.sh, spawn-gate.test.sh and test-crossbox.sh), so a leading
+  # flag shifts the URL into `$3`, every stub takes its `*) exit 1` arm, and the count would silently
+  # go unmeasured — with the suite red for a reason that hides the parse it exists to cover.
+  # Concatenated pages still count correctly: the OBJECTS are counted, never `total_count`.
+  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate)"; then
     # Count the online/busy runner objects. The endpoint returns `{"total_count":N,"runners":[…]}`;
     # a repo with no runners of its own (agent-infra, measured) yields 0 and is NOT an error — it
     # simply does not answer the question, so the inference below takes over.
@@ -213,6 +217,10 @@ ciq_read() {
     # have caught it; one stub now emits the pretty shape on purpose.
     runners="$(printf '%s' "$_rn" | tr ',' '\n' | grep -cE '"status":[[:space:]]*"online"' 2>/dev/null || true)"
     busy="$(printf '%s' "$_rn" | tr ',' '\n' | grep -cE '"busy":[[:space:]]*true' 2>/dev/null || true)"
+    # The DECLARED fleet size, which distinguishes the two different zeroes below (#2333 review P1).
+    declared="$(printf '%s' "$_rn" | tr ',' '\n' \
+      | sed -n 's/.*"total_count":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+    ciq_is_num "${declared:-}" || declared=""
     ciq_is_num "${runners:-}" || runners=""
     ciq_is_num "${busy:-}" || busy=""
     [ "${runners:-0}" -ge 1 ] 2>/dev/null || { runners=""; busy=""; }
@@ -249,25 +257,33 @@ ciq_read() {
     return 2
   fi
   if [ -z "${runners:-}" ]; then
-    # ⛔ AN UNANSWERED RUNNER ENDPOINT IS NOT A `<in_progress>`-RUNNER FLEET (#2333 review P1).
+    # ⛔ TWO DIFFERENT ZEROES, AND COLLAPSING THEM IS A FAIL-OPEN (#2333 review P1).
     #
-    # The repo endpoint answering `{"total_count":0,"runners":[]}` is the HOSTED-CI shape, and it is
-    # agent-infra's MEASURED shape (empty while 7 runs executed: its jobs run on GitHub-hosted
+    # (i) `total_count >= 1` with nothing online: a SELF-HOSTED FLEET EXISTS AND CANNOT RUN. The
+    #     honest reading is "nothing drains this queue", i.e. the fail-CLOSED direction — the ceiling
+    #     floors at 1 runner (ceiling 2). Claiming the hosted allowance here would quadruple the
+    #     ceiling and ALLOW the incident's own 31-deep queue with nothing able to drain it, destroying
+    #     head-bound review attestations: measured on `{"total_count":5,"runners":[{"status":"offline"}]}`.
+    #
+    # An unanswerable endpoint is the HOSTED-CI shape, and it is agent-infra's MEASURED shape
+    # (`{"total_count":0,"runners":[]}` while 7 runs executed: those jobs run on GitHub-hosted
     # runners, which never appear in this list). Deriving the runner count from `in_progress` there
-    # was wrong in the fail-CLOSED direction: `in_progress` is a lower bound on CONCURRENCY at one
-    # instant, not on the fleet, so the ceiling came out SMALLEST exactly when the box was idle.
-    # Measured against the shipped bytes: queued=4 running=1 => ceiling 2 => DEFERRED — the
-    # "a rule that defers on 4 would be a fleet-wide stop" failure this module's header names as
-    # unacceptable, on the very repo the gate was built for.
-    #
-    # An unmeasurable self-hosted count means the throughput is the account's CONCURRENT-JOB
-    # ALLOWANCE, so derive from that (declared and overridable here, like every other tuning value).
+    # made the ceiling SMALLEST exactly when the box was idle — measured against the shipped bytes:
+    # queued=4 running=1 => ceiling 2 => DEFERRED, the "a rule that defers on 4 would be a fleet-wide
+    # stop" failure this module's header names as unacceptable, on the very repo the gate was built
+    # for. Hosted throughput is the account's CONCURRENT-JOB ALLOWANCE, so derive from that (declared
+    # and overridable here, like every other tuning value).
     # `max(allowance, running)` keeps the one property `in_progress` really does carry: at least that
-    # many jobs demonstrably execute at once, so a busy hosted fleet is never under-derived either.
-    runners="$(ciq_hosted_concurrency)"
-    if ciq_is_num "${running:-}" && [ "${running:-0}" -gt "$runners" ]; then runners="$running"; fi
-    [ "$runners" -ge 1 ] || runners=1
-    runners="~$runners"
+    # many jobs demonstrably execute at once, so a busy hosted fleet is never under-derived either —
+    # and `ciq_is_count` (not `ciq_is_num`) bounds it, because an absurd reading must not become a
+    # ceiling the gate can never reach.
+    if ciq_is_num "${declared:-}" && [ "$declared" -ge 1 ]; then
+      runners="~1"
+    else
+      runners="$(ciq_hosted_concurrency)"
+      if ciq_is_count "${running:-}" && [ "${running:-0}" -gt "$runners" ]; then runners="$running"; fi
+      runners="~$runners"
+    fi
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
   CIQ_STATE=fresh; CIQ_AGE=0

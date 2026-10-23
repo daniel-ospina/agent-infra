@@ -564,7 +564,7 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_ciq_mod" ] || [ ! -f "$_dir/ci-queue.sh" ] || _ciq_mod="$_dir/ci-queue.sh"
 done
 [ -n "$_ciq_mod" ] && . "$_ciq_mod"
-if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then CIQ=1; else
+if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then CIQ=1; else
   CIQ=0
   [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi

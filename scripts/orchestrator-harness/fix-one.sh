@@ -95,7 +95,7 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 if [ -f "$SELF/ci-queue.sh" ]; then
   # shellcheck source=/dev/null
   . "$SELF/ci-queue.sh"
-  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then
     if ! ciq_ci_allowed "$OR"; then
       # `ciq_defer_note_here` evaluates the record the predicate JUST made in this shell — a second
       # read could disagree with the decision and (before #2333's review) print no line at all.

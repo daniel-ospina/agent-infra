@@ -63,11 +63,14 @@ case "$2" in
     # stop). The feed below is the shape the reader actually meets.
     [ "${CIQ_TEST_RUNNERS:-0}" = "-" ] && exit 1
     n="${CIQ_TEST_RUNNERS:-0}"; i=0
+    # CIQ_TEST_OFFLINE=1 emits a DECLARED-but-offline fleet (`total_count > 0`, nothing online) — the
+    # shape that must NOT be confused with the hosted zero (ci-queue.sh, "two different zeroes").
+    st=online; [ "${CIQ_TEST_OFFLINE:-0}" = "1" ] && st=offline
     printf '{\n  "total_count": %s,\n  "runners": [\n' "$n"
     while [ "$i" -lt "$n" ]; do
       [ "$i" -gt 0 ] && printf ',\n'
-      printf '    {\n      "id": %s,\n      "name": "r%s",\n      "status": "online",\n      "busy": %s\n    }' \
-        "$i" "$i" "${CIQ_TEST_BUSY:-true}"
+      printf '    {\n      "id": %s,\n      "name": "r%s",\n      "status": "%s",\n      "busy": %s\n    }' \
+        "$i" "$i" "$st" "${CIQ_TEST_BUSY:-true}"
       i=$((i+1))
     done
     printf '\n  ]\n}\n' ;;
@@ -85,13 +88,13 @@ qenv() { # <gh> <ttl> <stale_max>
   export CIQ_GH CIQ_TTL CIQ_STALE_MAX
 }
 
-feed() { # <queued> <running> <runners> [busy]
+feed() { # <queued> <running> <runners> [busy] [offline]
   state
   qenv "$STUB" 0 900
   CIQ_STATE_DIR="$T/state"; export CIQ_STATE_DIR
   CIQ_TEST_QUEUED="${1:-0}"; CIQ_TEST_RUNNING="${2:-0}"
-  CIQ_TEST_RUNNERS="${3:-0}"; CIQ_TEST_BUSY="${4:-true}"
-  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY
+  CIQ_TEST_RUNNERS="${3:-0}"; CIQ_TEST_BUSY="${4:-true}"; CIQ_TEST_OFFLINE="${5:-0}"
+  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY CIQ_TEST_OFFLINE
   OR="daniel-ospina/agent-infra"; export OR
 }
 
@@ -127,7 +130,13 @@ has "$msg" 'queued=31';                ck "(a2) the line names the queue depth v
 has "$msg" 'runners=5';                ck "(a3) the line names the runner count (5)" "$?"
 has "$msg" 'ceiling=10';               ck "(a4) the line names the ceiling it was measured against (10)" "$?"
 has "$msg" 'CONFLICTED fixer for #1234'; ck "(a5) the line names WHAT was deferred" "$?"
-ck "(a6) it is ONE line, not a paragraph" "$( [ "$(printf '%s' "$msg" | wc -l | tr -d ' ')" = 0 ]; echo $? )"
+ck "(a6) it is ONE line, not a paragraph — and never EMPTY (a silent deferral is the bug)" \
+   "$( { [ -n "$msg" ] && [ "$(printf '%s' "$msg" | wc -l | tr -d ' ')" = 0 ]; } ; echo $? )"
+# ⛔ THE MEASURED-FLEET TOKEN PRINTS `busy=`, WHICH ONLY HAPPENS WHEN THE PAGE WAS GENUINELY PARSED
+# (#2333 review P1). Every arm that fed a readable runner page could still pass on a FAILED read —
+# the inference path degrades to a plausible ceiling — so this single assertion is what pins the
+# pretty-printed `"status": "online"` parse the gate's accuracy depends on.
+has "$msg" 'busy=5';                    ck "(a8) the runner page was genuinely parsed (busy=5 in the token)" "$?"
 ciq_read "$OR" >/dev/null 2>&1
 ciq_ci_allowed "$OR"; d0=$?
 ck "(a7) the predicate the wiring branches on refuses (ciq_ci_allowed = 1)" "$( [ "$d0" -eq 1 ]; echo $? )"
@@ -168,6 +177,16 @@ ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=
 v="$(ciq_eval)"
 ck "(b9) the ceiling comes from the allowance, not from `running` (ceiling=40, got: ${v})" \
    "$( case "$v" in *'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
+# ⛔ A DECLARED FLEET THAT IS ENTIRELY OFFLINE IS NOT THE HOSTED ZERO (#2333 review P1). Collapsing
+# `total_count>=1 with nothing online` into "no fleet" claims the allowance and ALLOWS the incident's
+# own 31-deep queue with nothing able to drain it. Fail CLOSED: ceiling floors at 1 runner = 2.
+feed 31 5 5 true 1
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b10) a DECLARED-but-offline fleet defers a 31-deep queue (fail closed)" "$( [ "$d0" -eq 1 ]; echo $? )"
+feed 0 0 5 true 1
+ciq_read "$OR" >/dev/null 2>&1
+ck "(b11) …and it is recorded as inferred from a fleet, never as the hosted allowance (runners=${CIQ_RUNNERS:-?})" \
+   "$( [ "${CIQ_RUNNERS:-}" = '~1' ]; echo $? )"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5

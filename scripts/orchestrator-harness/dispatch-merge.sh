@@ -115,7 +115,7 @@ if [ -f "$CIQ_MOD" ]; then
   # COMPLETE and printed no INCOMPLETE line — every fixer, rerun and batch stopped for ever by a
   # half-stale copy. A guard that under-specifies its module is the same permanent-stop class as an
   # unguarded call, reached through the guard instead.
-  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then
     if ! ciq_ci_allowed "$OR"; then
       echo "dispatch-merge: nothing dispatched this run"
       ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
