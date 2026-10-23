@@ -112,19 +112,20 @@ PATH="$TMP/bin:$PATH"; export PATH
 #   lbgh-p0     lbgh-deep + issue labelled P0-blocker    -> EXEMPT
 #   lbgh-basered lbgh-deep + issue title 'main is red…'  -> EXEMPT
 #   lbgh-paged 250 open in 3 pages / 10 landings last 24h, 40 the 24h before -> OK (both rules)
-#   lbgh-nopr   lbgh-deep with ZERO open PRs on the branch -> a `prfix` claim is UNPROVABLE -> HOLD
+#   lbgh-nopr   lbgh-deep with NO PR at this worktree    -> a `prfix` claim is UNPROVABLE, so the
+#               RATIO decides (deep backlog here -> HOLD); the same claim UNDER the ceiling RUNS
 lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title] [branch-rule PR#] [PR-head-sha] [commit-rule PR#]
   local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}"
-  local prn="${8:-1}" prhead="${9:-HEAD}" cprn="${10:-}"
-  # The commit-rule count defaults to the branch-rule one (the common shape); a shape that must prove
-  # ONE rule only passes an explicit 0 for the other, which is what makes the two rules separable.
-  [ -n "$cprn" ] || cprn="$prn"
+  local prn="${8:-1}" prhead="${9:-HEAD}" pstate="${10:-open}"
+  # @PSTATE@ is the FIRST open-listing object's state: `closed` is the shape that proves the gate's
+  # `select(.state=="open")` is load-bearing (without it, a commit on `main` "proves" itself via the
+  # MERGED PR that introduced it — measured, and it left the suite green before this arm existed).
   # A QUOTED heredoc, so nothing here is expanded by the test shell; the @TOKENS@ are the only
   # substitutions. `\001` is the field separator the reader cuts on, and bash's printf interprets it
   # in the FORMAT string (the stub's shebang is bash), so the label/title pair arrives verbatim.
   sed -e "s|@O1@|$o1|g" -e "s|@O2@|$o2|g" -e "s|@L24@|$l24|g" -e "s|@P24@|$p24|g" \
       -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" -e "s|@PRN@|$prn|g" -e "s|@PRHEAD@|$prhead|g" \
-      > "$f.raw" <<'STUB'
+      -e "s|@PSTATE@|$pstate|g" > "$f.raw" <<'STUB'
 #!/usr/bin/env bash
 # ⛔ THE EVIDENCE ARMS MUST APPLY THE GATE'S OWN `--jq`, OR THEY TEST PLUMBING INSTEAD OF LOGIC.
 # A stub that prints a fixed answer regardless of the filter makes the gate's selection UNEXERCISED:
@@ -140,17 +141,30 @@ case "$*" in
   #   rule 1 (branch): `gh pr list --head <br> --json number,headRefOid` -> "<pr#> <headRefOid>"
   #                                       → @PRN@ @PRHEAD@   (the gate compares the sha to this HEAD)
   *pr\ list*headRefOid*) cjq "[{\"number\":@PRN@,\"headRefOid\":\"@PRHEAD@\"}]" "$@"; exit 0 ;;
-  #   rule 2 (commit): `gh api repos/<r>/commits/<sha>/pulls`   -> @CPRN@ or EMPTY
-  *"/commits/"*pulls*)
-    if [ "@CPRN@" = "0" ]; then cjq '[]' "$@"; else cjq "[{\"number\":@CPRN@,\"state\":\"open\"}]" "$@"; fi
-    exit 0 ;;
+  #   rule 2 (commit): the BASE repo's open-PR listing, ONE PAGE, filtered by the gate's own jq. The
+  #   FIRST object is the controllable one: number @PRN@, state @PSTATE@, head.sha @PRHEAD@. The rest
+  #   are decoys with an unrelated sha, so "found a PR" can never stand in for "found THIS head".
+  #   ⛔ THE COUNT READER HITS THE SAME URL with `--jq length`, so the array IS the count — which is
+  #   what makes the state/head selects testable at all (dropping `select(.state=="open")` was
+  #   measured GREEN before this shape existed: a commit on `main` "proved" itself via the MERGED PR
+  #   that introduced it).
   *pr\ list*) printf '%s\n' "@PRN@"; exit 0 ;;
   *"/issues/"*) printf '%s\001%s\n' "@LAB@" "@TITLE@"; exit 0 ;;
   # ⛔ `&page=1 ` — WITH THE TRAILING SPACE: the URL also carries `per_page=100`, which CONTAINS the
   # substring `page=1`, so a loose glob served page 1 for every page (measured: 5 x 100 = "500 open"
   # for a 150-PR fixture, and the reader could not tell it from a real 500).
-  *state=open*'&page=1 '*) printf '%s\n' "@O1@"; exit 0 ;;
-  *state=open*) printf '%s\n' "@O2@"; exit 0 ;;
+  *state=open*'&page=1 '*)
+    js=""; i=0
+    if [ "@O1@" -gt 0 ]; then
+      js="{\"number\":$(( @PRN@ > 0 ? @PRN@ : 9000 )),\"state\":\"@PSTATE@\",\"head\":{\"sha\":\"@PRHEAD@\"}}"
+      i=1
+      while [ "$i" -lt "@O1@" ]; do js="$js,{\"number\":$(( 9100 + i )),\"state\":\"open\",\"head\":{\"sha\":\"dddddddddddddddddddddddddddddddddddddddd\"}}"; i=$(( i + 1 )); done
+    fi
+    cjq "[$js]" "$@"; exit 0 ;;
+  *state=open*)
+    js=""; i=0
+    while [ "$i" -lt "@O2@" ]; do js="$js${js:+,}{\"number\":$(( 9200 + i )),\"state\":\"open\",\"head\":{\"sha\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"; i=$(( i + 1 )); done
+    cjq "[$js]" "$@"; exit 0 ;;
   # PAGE 2 HAS NOTHING: the real listing is paged, and a stub that re-served page 1 doubled every
   # count, which the reader cannot tell from a genuinely longer list (measured: it did).
   *state=closed*page=2*) exit 0 ;;
@@ -161,7 +175,7 @@ case "$*" in
   *) exit 0 ;;
 esac
 STUB
-  sed -e "s|@CPRN@|$cprn|g" "$f.raw" > "$f"; rm -f "$f.raw"
+  mv "$f.raw" "$f"
   chmod +x "$f"
 }
 # Install/uninstall the adapter the tested scripts actually resolve (see above).
@@ -811,8 +825,11 @@ ck "§LB pr-doctor's repair workers declare prfix, and the gate PROVES it (branc
 #   d) no proof at all, UNDER the ceiling                 -> RUNS (it is measured, not held)
 #   e) DETACHED worktree (a fork PR's shape), commit rule -> EXEMPT
 LB2SHA="$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)"
-lbgh_shape "$TMP/lbgh-prfix-yes"    81 0 15 0 "bug" "a normal issue" 7 "$LB2SHA" 0
-lbgh_shape "$TMP/lbgh-prfix-name"   81 0 15 0 "bug" "a normal issue" 7 "0123456789abcdef0123456789abcdef01234567" 0
+# a) BRANCH rule: the PR named by this branch whose headRefOid IS this HEAD.
+lbgh_shape "$TMP/lbgh-prfix-yes"    81 0 15 0 "bug" "a normal issue" 7 "$LB2SHA" open
+# b) a branch NAME alone is not proof: the PR it names is at a DIFFERENT commit, and the listing
+#    holds no PR at this HEAD either.
+lbgh_shape "$TMP/lbgh-prfix-name"   81 0 15 0 "bug" "a normal issue" 7 "0123456789abcdef0123456789abcdef01234567" open
 # a) the branch rule, tied to this HEAD
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-yes"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=78 \
@@ -844,11 +861,26 @@ ck "§LB …and the reason reported is the BACKLOG, not an unprovable claim (the
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pi.log" "$2/pi.txt" "prfix 80"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pirc=$?
+# ⛔ THREE ASSERTIONS, not one: the spawn, the NOTE that records the failed proof, and the ABSENCE
+# of an exemption. `lbgh-ok`'s listing answers a PR at a DIFFERENT head and its `pr list` names a PR
+# whose headRefOid is not this HEAD, so the claim is genuinely unprovable — measured: with a shape
+# that happened to prove via the commit rule this arm stayed green even with the fall-through reverted,
+# i.e. it pinned nothing (review cycle 6, P2-4).
 { [ "$pirc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
 ck "§LB …and unprovable prfix UNDER the ceiling RUNS (rc=$pirc) — a proof failure must not halt the drain on a healthy repo" $rc
+grep -q 'NOTE.*not provably an OPEN PR' "$TMP/pi.log"; rc=$?
+ck "§LB …and the failed proof is RECORDED (NOTE), so it is visible rather than assumed" $rc
+{ ! grep -q 'EXEMPT' "$TMP/pi.log"; }; rc=$?
+ck "§LB …and it was NOT exempted — it ran because the RATIO allowed it, which is the distinction" $rc
 # e) a DETACHED worktree is a FORK PR's shape: only the commit rule can answer, and it must
 git -C "$LBWT2" worktree add -q --detach "$TMP/lbdet" HEAD >/dev/null 2>&1
-lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 0 "" 9
+# e) the COMMIT rule: a detached (fork-shape) worktree, where only the listing can answer. The
+#    listing's first object IS this head; the branch rule cannot apply (HEAD is detached).
+lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)" open
+# f) …and the SAME listing with that object CLOSED must NOT exempt: dropping the gate's
+#    `select(.state=="open")` would let a commit on `main` prove itself via the MERGED PR that
+#    introduced it (measured), so this shape is the arm that makes the select load-bearing.
+lbgh_shape "$TMP/lbgh-prfix-closed" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)" closed
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-fork"
 ( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=81 \
     bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pk.txt"; \
@@ -857,6 +889,16 @@ lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 0 "" 9
 pkrc=$?
 { [ "$pkrc" -eq 0 ] && [ -s "$PI_LOG" ] && grep -q 'OPEN PR #9' "$TMP/pk.log"; }; rc=$?
 ck "§LB …and a DETACHED (fork-shape) worktree is proven by its COMMIT (rc=$pkrc) — the rule that keeps fork repairs running" $rc
+# f) the SAME listing, same head sha, but the PR is CLOSED — the gate's `select(.state=="open")` is
+#    load-bearing (a commit on `main` otherwise "proves" itself via the MERGED PR that introduced it).
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-closed"
+( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=82 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pl.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/pl.log" "$2/pl.txt" "prfix 82"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+plrc=$?
+{ [ "$plrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB …and a CLOSED PR at this head does NOT exempt (rc=$plrc): the state select is load-bearing" $rc
 # c) no proof and over the ceiling — the arm that keeps the bypass shut
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-nopr"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \

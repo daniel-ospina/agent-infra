@@ -2878,10 +2878,16 @@ PR must be **this worktree**, by one of two rules, and the exemption line names 
 - the **branch** rule: the PR whose head ref is this worktree's checked-out branch, **and** whose
   `headRefOid` IS this worktree's `HEAD` (a branch NAME alone is satisfiable by a stale local branch or
   by a name that collides with some other PR's head, so it is not accepted on its own);
-- the **commit** rule: `gh api repos/<r>/commits/<sha>/pulls` finds an OPEN PR at this `HEAD` — the only
-  rule that can answer for a FORK PR, whose worktree is a detached `refs/pull/<n>/head`. It is an API
-  lookup rather than a listing on purpose: a `pr list` is newest-first and truncated, so an older fork PR
-  would be unprovable — and therefore permanently held — exactly as the backlog deepens.
+- the **commit** rule: the base repo's PAGED open-PR listing holds an OPEN PR whose `head.sha` is this
+  worktree's `HEAD` — the only rule that can answer for a FORK PR, whose worktree is a detached
+  `refs/pull/<n>/head`. Two shapes are rejected on measurement, not taste: `gh api
+  repos/<r>/commits/<sha>/pulls` (cycle 6) answers `[]` for a fork head — a fork PR's commit lives in the
+  FORK's network, so the base repo cannot see it: 12 of 12 measured fork PRs (cli/cli, pydantic,
+  home-assistant, vscode) were invisible to it and visible to the listing, which would have made every
+  fork repair unprovable and therefore held on exactly the deep repos this gate exists for. And a bare
+  `pr list` (cycle 5) is newest-first with a silently truncating `--limit`, so an older PR would be
+  unprovable — permanently held — as the backlog deepens. The listing is paged (5 × 100) and a page that
+  comes back exactly full is walked rather than read as “no match”.
 
 Unprovable is **not** a hold by itself: the claim falls through to the ordinary measurement, so under
 the ceiling it runs (nothing is being exempted from anything), over the ceiling the real backlog reason
