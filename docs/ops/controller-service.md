@@ -50,6 +50,7 @@ is not a launcher for a session:
 | `After=network-online.target`, `Wants=` | the first cycle reads GitHub and the candidate board; started early it records "no work" and sleeps a whole `CYC` |
 | `StartLimitIntervalSec=300` / `StartLimitBurst=3` | systemd's **default 10 s window can never fill** at one start per 15 s, so a configuration fault (no key, foreign controller, bad pin) would restart the box forever, re-running `cmd_check`'s network reads each time. 3-in-5-minutes converges to `failed`, which `--status` prints |
 | `KillMode=process`, `TimeoutStopSec=30` | `orch-loop.sh` traps TERM and exits in ~0.1 s (#1715), so the controller stops on its own. **Not `mixed`**: with no tmux server running (the measured #2402 shape) the doctor's session forks the *server* inside this unit's cgroup, and `mixed` would SIGKILL every session on that per-user server — peer repos' controllers and operators' shells included — before `stop`'s ownership proof could run |
+| `TimeoutStartSec=120` | `ExecStart` runs the **whole** of `start`, and service mode **waits** for a controller that is already running (`CONTROLLER_HANDOVER_TIMEOUT`). Stated, not inherited: the bound must sit **below** `StartLimitIntervalSec` so a start that can never succeed is killed by its supervisor and the start limit converges the unit to `failed`, instead of parking the job forever while `--status` reads active (`ORCH_START_TIMEOUT_SEC` overrides; refused at ≥ 300) |
 | `StandardOutput/Error=journal` | `journalctl -u eldato-orchestrator.service` is the controller's log in service mode |
 
 ## Install targets
@@ -86,6 +87,20 @@ A service-managed controller must not fight its own verbs:
 
 An installed but **disabled** unit falls through to the tmux path: "disabled" is an operator saying this
 box is not service-managed.
+
+**A unit belongs to ONE state dir, and the verbs read that rather than assume it.** The unit name is
+machine-scoped, so "the first unit file on the box" can be another cell's. Every unit this installer
+renders carries `Environment=O=<state dir>`, and `start` / `stop` / `status` resolve the copy that declares
+**this** `O` — preferring the one that is enabled or active when two of them exist. A copy that declares
+another state dir is reported and **never stopped on this cell's behalf**; `status` names it and the state
+dir it belongs to. A unit with no `Environment=O=` line (hand-written) is *unprovable*: it is still
+addressed — treating it as foreign would launch a session beside the very unit that may be enabled
+(#1761) — and `status` says the ownership is UNKNOWN rather than guessing.
+
+The installer's install verdict rests on **two** witnesses and both must be able to fire: a heartbeat
+written after this start, and the harness's own single-instance lock (`$O/.orch.lock`) held by a live
+`<shell> …/orch-loop.sh`. The lock witness matches the argv **shape**, not a path prefix, because the
+controller a cell runs execs `$HARNESS/orch-loop.sh` — measured on `pi-cell-2` (#2402).
 
 ## Verifying an install (what the issue asks an operator to run)
 

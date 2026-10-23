@@ -566,22 +566,93 @@ CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
 # that is the cell's shape, because the cells have passwordless sudo and no queryable user manager).
 # A unit file's PRESENCE answers "is this box service-managed?"; whether it is ENABLED is a second
 # question, and only "enabled" means the manager will bring the controller back.
-controller_unit_path() {
+# ⛔ A UNIT FILE'S PRESENCE IS NOT AN OWNERSHIP CLAIM (review P1, #2402), and this file refuses that
+# inference everywhere else — by the SYMBOL the rule lives in, not by a line number (a number here went
+# stale the moment this comment grew the file): `seen_controller_pids`'s "$HARNESS LEG IS NOT AN
+# OWNERSHIP CLAIM", `cmd_stop`'s "refusing to kill a session this state dir cannot prove it owns", and
+# `doctor_session_foreign` for the doctor session. The unit name
+# is MACHINE-scoped, so "the first copy found" can be another cell's — measured with two state dirs: B's
+# `stop` stopped A's unit, reported `controller stopped`, and B's `--status` called A's unit "installed but
+# NOT ACTIVE — nothing will restart a dead controller". The rendered unit CARRIES its owner
+# (`Environment=O=`), so ownership is a READ, not a guess.
+controller_unit_copies() { # every copy on the box, system then user
   local d
   for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
            "${CONTROLLER_USER_UNIT_DIR:-$HOME/.config/systemd/user}"; do
-    [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && { printf '%s\n' "$d/$CONTROLLER_UNIT"; return 0; }
+    [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
   done
+  return 0
+}
+# The state dir a rendered unit supervises — its `Environment=O=` line (verify_unit REQUIRES that line on
+# every unit this repo installs). Prints nothing when the unit carries none, which is a HAND-WRITTEN unit:
+# unprovable either way, and treated as this state dir's (the pre-#2402 behaviour — the fail-safe side for
+# #1761 is "assume it may be ours, never launch a session beside it").
+unit_owner_dir() { # <unit file>
+  local v
+  [ -f "$1" ] || return 1
+  v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
+  [ -n "${v:-}" ] || return 1
+  printf '%s\n' "$v"
+}
+# The copy the VERBS address, resolved once and remembered: `_UNIT_PATH` (empty = none of ours), plus the
+# FIRST copy that is NOT this state dir's (`_UNIT_FOREIGN`, provably another state dir) and the FIRST that
+# proves nothing (`_UNIT_UNPROVABLE`, no O= line). One report line each — a box carries at most one copy per
+# scope (system, user) — and the reports need them to be truthful.
+_UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
+controller_unit_path() {
+  local f own="" first="" unp=""
+  _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
+  while IFS= read -r f; do
+    if ! own="$(unit_owner_dir "$f")"; then
+      [ -n "$unp" ] || unp="$f"
+      [ -n "$_UNIT_UNPROVABLE" ] || _UNIT_UNPROVABLE="$f"
+      continue
+    fi
+    if [ "$own" != "$O" ]; then
+      [ -n "$_UNIT_FOREIGN" ] || _UNIT_FOREIGN="$f"
+      continue
+    fi
+    [ -n "$first" ] || first="$f"
+    # ⛔ ADDRESS THE COPY THE MANAGER WILL BRING BACK (review P1, #2402). With two of OUR copies — the
+    # state the code's own note names, "an image-baked disabled system unit plus the live user unit" —
+    # addressing the first made every read answer "disabled", so `stop` took the pid-teardown shortcut,
+    # printed success, and the enabled unit's Restart=always re-created the controller within RestartSec.
+    _UNIT_PATH="$f"
+    if controller_unit_active_state >/dev/null 2>&1 || controller_unit_state >/dev/null 2>&1; then
+      printf '%s\n' "$f"; return 0
+    fi
+  done < <(controller_unit_copies)
+  if [ -n "$first" ]; then _UNIT_PATH="$first"; printf '%s\n' "$first"; return 0; fi
+  # ⛔ AN UNPROVABLE COPY IS ADDRESSED, NOT IGNORED (review P1, #2402). A hand-written unit with no
+  # `Environment=O=` line proves nothing either way, and the fail-safe side for #1761 is "assume it may be
+  # ours": treating it as foreign would launch a tmux controller beside the very unit that may be
+  # enabled and will start at boot — the duplicate this file refuses everywhere else. `_UNIT_UNPROVABLE`
+  # carries it so `status`/`stop` can say the ownership was NOT proven.
+  if [ -n "$unp" ]; then _UNIT_PATH="$unp"; printf '%s\n' "$unp"; return 0; fi
+  _UNIT_PATH=""
   return 1
 }
 # The scope is decided by WHERE the unit lives, never by $EUID: the cell's unit is a SYSTEM unit owned by
 # the operator's sudo, while the controller runs as the operator. SYSTEMCTL is the test seam (a shim),
 # exactly as install-disk-reaper-timer.sh spells it.
+# ⛔ THE SCOPE FOLLOWS THE COPY THE VERB RESOLVED (review P1, #2402). Re-deriving it by "does a SYSTEM copy
+# exist" addressed the wrong manager whenever two copies existed: a disabled system copy made every read
+# answer for the system scope and the enabled USER unit was never asked — the wrong-unit stop above.
 sup_systemctl() { # <systemctl verb…>
-  local sc
-  if [ -n "${SYSTEMCTL:-}" ]; then sc="$SYSTEMCTL"
-  elif [ -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then sc="sudo -n systemctl"
-  else sc="systemctl --user"
+  local sc user_scope=0
+  if [ -n "${_UNIT_PATH:-}" ]; then
+    [ "$(dirname "$_UNIT_PATH")" = "${CONTROLLER_USER_UNIT_DIR:-$HOME/.config/systemd/user}" ] && user_scope=1
+  elif [ ! -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then
+    user_scope=1
+  fi
+  # ⛔ THE SCOPE IS A WORD ON THE SHIM TOO (review P1, #2402). `SYSTEMCTL` replaces the whole command string,
+  # so dropping the scope with it made a scope-aware shim answer for the SYSTEM manager even when the copy the
+  # verb resolved lives in the USER one — the wrong-unit read/stop, hidden from every test whose stub keys on
+  # `--user`. Independent of whether the scope was resolved or inferred (the `elif` above).
+  if [ -n "${SYSTEMCTL:-}" ]; then
+    if [ "$user_scope" -eq 1 ]; then sc="$SYSTEMCTL --user"; else sc="$SYSTEMCTL"; fi
+  elif [ "$user_scope" -eq 1 ]; then sc="systemctl --user"
+  else sc="sudo -n systemctl"
   fi
   # shellcheck disable=SC2086  # deliberate word splitting: $sc may be "sudo -n systemctl"
   $sc "$@"
@@ -1861,6 +1932,12 @@ cmd_start() {
   # "already running" branches below and returned 0. Under `Restart=always` that is three orderly exits
   # and a `failed` unit, i.e. the P1 this wait exists to remove, in the state the migration itself
   # produces. The branch-level returns are therefore not reachable in service mode (they hand over).
+  # ⛔ THE WAIT'S BOUND IS THE UNIT'S, NOT THIS DEFAULT (review P2, #2402). The bound below (3600 s) is for
+  # a MANUAL foreground run; under the unit from install-controller-service.sh the start is bounded by the
+  # rendered `TimeoutStartSec` (120 s, required to be below `StartLimitIntervalSec=300`), so a handover that
+  # never completes is killed by its supervisor and the start limit converges the unit to `failed` — it does
+  # NOT park ExecStart for an hour. One bound would be the better design, and that is what the unit now
+  # states; do not read this default as the supervised box's bound.
   foreground_handover() {
     local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}"
     while :; do
@@ -2021,6 +2098,12 @@ cmd_start() {
       superseded && return 1
       return 0
     fi
+  fi
+  # ⛔ A UNIT THAT IS ANOTHER STATE DIR'S IS NOT THIS CELL'S SUPERVISOR (review P1, #2402), so the tmux
+  # path below is the RIGHT answer — but silently ignoring it would hide the only unit on the box from the
+  # operator whose cell has just lost its controller. Say it, once, and start this cell normally.
+  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && [ -z "${_UNIT_PATH:-}" ] && [ -n "$_UNIT_FOREIGN" ]; then
+    say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — starting this cell's controller as a session; nothing on this box will restart IT (#2402). Install a unit for this state dir: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
@@ -2304,25 +2387,50 @@ cmd_stop() {
   # controller already gone instead of racing its restart; an INSTALLED-but-not-written-down unit is
   # stopped anyway (stopping an inactive unit is a no-op), because the durable state must be "stopped"
   # whatever the job was doing.
-  local stop_unit=""
-  if controller_unit_path >/dev/null 2>&1; then
+  local stop_unit="" have_unit=0
+  controller_unit_path >/dev/null 2>&1 && have_unit=1
+  # ⛔ OWNERSHIP IS REPORTED WHETHER OR NOT A COPY WAS ADDRESSED (verification P1, #2402). The resolver
+  # ADDRESSES an unprovable copy (a hand-written unit with no `Environment=O=` line) instead of ignoring it,
+  # so the warnings below used to live in the `else` of the stop block — a branch an unprovable copy can
+  # never reach, because resolving it returns 0. They were therefore dead code, and `stop` quietly stopped a
+  # unit whose ownership it could not prove: the report has to sit beside the DECISION, not beside a
+  # non-zero rc.
+  if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" = "$_UNIT_UNPROVABLE" ]; then
+    say "warn: $_UNIT_UNPROVABLE carries no Environment=O= line, so it cannot be proven to be this state dir's ($O) — it is addressed because treating it as foreign would launch a second dispatcher beside it (#1761); re-render it (install-controller-service.sh --install) so ownership is readable"
+  fi
+  # ⛔ A UNIT THAT IS ANOTHER STATE DIR'S IS NOT THIS CELL'S SUPERVISOR (review P1, #2402), so it is never
+  # stopped on this cell's behalf — but it is NAMED: before ownership was read, this verb stopped whatever
+  # copy the box happened to carry, so B's `stop` stopped A's unit and reported `controller stopped` for a
+  # controller it never touched.
+  if [ -n "$_UNIT_FOREIGN" ]; then
+    if [ "$have_unit" -eq 1 ]; then
+      say "note: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — left alone"
+    else
+      say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — it is not this cell's supervisor, so this stop leaves it alone; the pid teardown below is what stops this cell"
+    fi
+  fi
+  if [ "$have_unit" -eq 1 ]; then
     if sup_systemctl stop "$CONTROLLER_UNIT" 2>/dev/null; then
       stop_unit="$CONTROLLER_UNIT"
       # ⛔ A SUCCESSFUL `stop` ON THE UNIT WE ADDRESSED IS NOT PROOF THE CONTROLLER IS GONE (review P3,
-      # #2402). The scope is "the first unit FILE found", which is not necessarily "the unit that is
-      # running": with two unit files on the box (an image-baked disabled system unit plus the live user
-      # unit) the stop lands on the wrong manager, the live unit's `Restart=always` brings the controller
-      # straight back, and the pid reads below can conclude before the new controller writes its lock —
-      # so this verb would print "controller stopped (systemd …)" over a live dispatcher. The EFFECT is
-      # therefore read — but AT THE END, AFTER THE TEARDOWN (see the note at the post-kill assertion),
-      # never here. Reading it here cannot work: in the state the migration doc calls normal (a unit
-      # installed but DISABLED, controller in tmux) the stop above is a deliberate NO-OP, so this read
-      # would sleep the whole window over a controller this function has not killed yet and fail a stop
-      # that then succeeds. Gating on the unit's own state does not separate the two cases either, because
-      # in the wrong-scope case the ADDRESSED unit is equally disabled+inactive.
+      # #2402). The scope is the unit FILE this verb RESOLVED — a copy proven to be this state dir's, and
+      # the enabled/active one when two of ours exist (`controller_unit_path`) — which is not necessarily
+      # "the unit that is running": with two unit files on the box (an image-baked disabled system unit
+      # plus the live user unit) the stop can land on the wrong manager, the live unit's `Restart=always`
+      # brings the controller straight back, and the pid reads below can conclude before the new
+      # controller writes its lock — so this verb would print "controller stopped (systemd …)" over a live
+      # dispatcher. The EFFECT is therefore read — but AT THE END, AFTER THE TEARDOWN (see the note at the
+      # post-kill assertion), never here. Reading it here cannot work: in the state the migration doc
+      # calls normal (a unit installed but DISABLED, controller in tmux) the stop above is a deliberate
+      # NO-OP, so this read would sleep the whole window over a controller this function has not killed
+      # yet and fail a stop that then succeeds. Gating on the unit's own state does not separate the two
+      # cases either, because in the wrong-scope case the ADDRESSED unit is equally disabled+inactive.
     else
       say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
     fi
+  fi
+  if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" != "$_UNIT_UNPROVABLE" ]; then
+    say "warn: a second copy, $_UNIT_UNPROVABLE, carries no Environment=O= line — its ownership is UNKNOWN, not proven; this verb addressed $_UNIT_PATH"
   fi
   # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
   # signals), then the restart child, then the doctor loop, then its pid backstop, then the marker is
@@ -2504,8 +2612,13 @@ cmd_status() {
   # idle box print the same `controller: STOPPED` / `lanes: 0`, so "who would restart this" belongs in
   # this output and not in an operator's memory. Reported, never refused: `status` must stay answerable
   # on a box that has no service at all — that is exactly the box this line is for.
-  local _svc
-  if _svc="$(controller_unit_path)"; then
+  local _svc=""
+  # ⛔ A DIRECT CALL, NOT `_svc="$(controller_unit_path)"` (review P1, #2402): a command substitution
+  # runs in a SUBSHELL, so the resolved `_UNIT_PATH`/`_UNIT_FOREIGN`/`_UNIT_UNPROVABLE` would be lost in
+  # this shell — and `sup_systemctl` below derives its SCOPE from `_UNIT_PATH`. The row would then be
+  # read through the wrong manager and report the copy this verb did not resolve.
+  controller_unit_path >/dev/null 2>&1 && _svc="$_UNIT_PATH"
+  if [ -n "$_svc" ]; then
     # ⛔ THE ROW NAMES WHICH ANSWER IT GOT (review P2, #2402). `is-active --quiet` says "no" for both
     # `inactive` and "could not read", and printing "nothing will restart a dead controller" over an
     # unreadable read is a false verdict about the one thing this row exists to be true about.
@@ -2516,8 +2629,18 @@ cmd_status() {
       1) say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
       *) say "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
     esac
+    # ⛔ AND THE ROW SAYS WHETHER OWNERSHIP WAS PROVEN (review P1, #2402): a unit of ANOTHER state dir's
+    # must never be reported as this cell's supervision, and a unit that declares no owner at all is
+    # UNKNOWN rather than either answer.
+    [ "${_UNIT_UNPROVABLE:-}" != "$_svc" ] || say "supervision: ⚠ ownership NOT proven — $_svc carries no Environment=O= line, so whether it supervises this state dir ($O) is UNKNOWN; the row above describes the copy this verb addressed"
+    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O)"
   else
     say "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
+    # ⛔ "NONE" IS A CLAIM ABOUT THIS STATE DIR, not about the box (review P1, #2402). A unit for another
+    # cell is not this cell's supervision, and printing only NONE left an operator with no way to see
+    # that the box DOES have a unit — pointed at a different state dir.
+    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O), so it will not restart this cell's controller"
+    [ -z "$_UNIT_UNPROVABLE" ] || say "supervision: ⚠ $_UNIT_UNPROVABLE carries no Environment=O= line — whether it supervises this state dir ($O) is UNKNOWN, not 'no'"
   fi
   say "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
