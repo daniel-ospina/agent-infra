@@ -54,6 +54,12 @@
 #      head B ("an old verdict reused at a new head"), so §G's refusal is the guard's doing
 #   §AG a blocking token the positional scan cannot see (a noun-prefixed `[P1]`), a hyphenated
 #      `Verdict: CLEAN-UP …` that is not a verdict, and the `### Verdict: CLEAN` heading form
+#   §AH a BARE P1/P2 that names its location AFTER it (`Found one P1 in scripts/x.sh:12`) still
+#      contradicts CLEAN — the shape that recorded clean over a reported blocker (#2288) — while a
+#      bare P3 and the pinned location-BEFORE clean twin stay non-blocking
+#   §AI the existing-record check reads the record's OWN `repo` field: a foreign repo's legacy
+#      `<PR>.json` at the same head cannot block, and a refusal names the file it READ
+#   §AJ a COMPLETED review that quotes `[pi-gate] REFUSED` is not the gate's refusal (rc is the signal)
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -973,6 +979,71 @@ reset; printf '| P0 | 0 |\n| P1 | 0 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-o
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a zero-count severity table still does not block CLEAN (rc=$(rc_of))"
 
+# ── §AH the bare label that NAMES ITS LOCATION AFTER IT (the filed P1) ───────
+echo; echo "§AH a bare P1 with a location after it cannot hide from CLEAN"
+# The fresh review of #2288 filed this fail-open: `label()`'s bare-token arm only accepted a
+# `path:line` when the token was PRECEDED by a dash/comma/bracket, and `leads()` needed the token at
+# line start, so both shapes below exited 0 and minted a signed `clean` over a reported blocker —
+# while the residual text claimed a location-bearing label was caught. This section is the pin.
+reset; printf 'Found one P1 in scripts/x.sh:12 — the guard returns 0 on a failed read.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "'Found one P1 in scripts/x.sh:12' under CLEAN is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'Finding P1 at scripts/x.sh:12 — the early return skips validation.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and 'Finding P1 at scripts/x.sh:12' (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# …while a bare P3 with a location stays a note: the P3 arm must not widen with it.
+reset; printf 'P3 in scripts/x.sh:12 — a style nit.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a bare P3 with a location is still a note, not a blocker (rc=$(rc_of))"
+# …and the pinned clean twin (location BEFORE the token) stays clean — the whole reason the arm
+# keys on what follows the token rather than on the line merely containing a location.
+reset; printf 'No findings at scripts/x.sh:12; severity P2 would be over-calling.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and the pinned clean twin still records (rc=$(rc_of))"
+
+# ── §AI a FOREIGN repo's legacy record at the same PR number+head is not evidence ──
+echo; echo "§AI the existing-record check reads the record's OWN repo field"
+# `$LEGACY` (`<PR>.json`) is repo-blind. A fork's record at a coinciding number AND sha used to
+# block every review of this PR with a false cause, and the same predicate is step 8's proof that
+# THIS repo's record landed. Both directions are pinned here.
+reset
+printf '{"pr":2284,"head_sha":"%s","verdict":"clean","repo":"some-fork/agent-infra"}\n' "$HEAD_FIXTURE" \
+  > "$TMP/home/.pi/agent/reviews/2284.json"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a LEGACY record naming a FOREIGN repo does not block the review (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and this repo's own record is written"
+reset
+printf '{"pr":2284,"head_sha":"%s","verdict":"clean"}\n' "$HEAD_FIXTURE" \
+  > "$TMP/home/.pi/agent/reviews/2284.json"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "5" ]; ck $? "a LEGACY record with NO repo field is treated as this repo's (rc=$(rc_of))"
+# The refusal must name a file that EXISTS: it used to print the repo-qualified path while the
+# only matching file was the legacy one (the #2349 class — a refusal says what it read).
+if err_has "reviews/2284.json"; then rc=0; else rc=1; fi
+ck $rc "  …naming the record it actually READ (the legacy path)"
+if err_has "daniel-ospina-agent-infra-2284.json"; then rc=1; else rc=0; fi
+ck $rc "  …and not a repo-qualified path that is absent"
+reset
+printf '{"pr":2284,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_FIXTURE" "$REPO_FIXTURE" \
+  > "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "5" ]; ck $? "…and THIS repo's qualified clean record at the head refuses (rc=$(rc_of))"
+
+# ── §AJ a COMPLETED review that QUOTES the gate's refusal is not a gate refusal ──
+echo; echo "§AJ a quoted '[pi-gate] REFUSED' line does not turn a paid review into a refusal"
+# The arm matched the string anywhere in the log, so a reviewer reviewing the gate itself was told
+# "the reviewer was NOT STARTED … nothing was paid for" and the lane re-ran into the same refusal.
+reset; printf '[pi-gate] REFUSED load=141 ceiling=100 (quoted from spawn-gate.sh:651)\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a completed review quoting the refusal line records (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+# …and the REAL refusal signal (rc=76) is still §O's arm.
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -994,17 +1065,19 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 296, measured on the run that added §Q's label-SHAPE
+# whenever sections are added — this is 310, measured on the run that added §AH (the bare label
+# naming its location AFTER it), §AI (the record's own `repo` field) and §AJ (a quoted gate refusal
+# is not a refusal), plus §Q's label-SHAPE
 # assertions (any label form: ordinal-in-span, continuation-line slot, code-styled token), the
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 296 here and the RESULT line then
-# prints 297. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 310 here and the RESULT line then
+# prints 311. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 296 ]; ck $? "assertion-count pin: >= 296 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 310 ]; ck $? "assertion-count pin: >= 310 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

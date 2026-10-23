@@ -284,21 +284,32 @@ fi
 STORE="$HOME/.pi/agent/reviews"
 QUAL="$STORE/${OWNER}-${RNAME}-$PR.json"
 LEGACY="$STORE/$PR.json"
-record_at_head() { # <sha> -> 0 iff a clean* record bound to <sha> exists
-  local f txt
+record_at_head() { # <sha> -> 0 iff a clean* record bound to <sha> for THIS repo exists
+  local f txt r
+  MATCHED_RECORD=""
   for f in "$QUAL" "$LEGACY"; do
     [ -f "$f" ] || continue
     txt="$(cat "$f" 2>/dev/null || true)"
     [[ "$txt" == *"\"head_sha\":\"$1\""* ]] || continue
+    # ⛔ THE RECORD'S OWN `repo` FIELD IS LOAD-BEARING (P2, fresh review of #2288). `$LEGACY`
+    # (`<PR>.json`) is REPO-BLIND: a fork/mirror's record at a coinciding PR number AND head sha
+    # is not evidence about THIS repo. Accept a record that names this repo, or one that names none
+    # (a genuinely repo-less legacy write); skip a foreign repo's. The same predicate is the step-8
+    # proof that the recorder wrote THIS repo's record, so a foreign file must not satisfy it.
+    case "$txt" in
+      *'"repo":'*)
+        r="$(printf '%s' "$txt" | sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' | command head -1)"
+        if [ -n "$r" ] && [ "$r" != "$REPO" ]; then continue; fi ;;
+    esac
     # ⛔ THE CLOSING QUOTE IS LOAD-BEARING (P3, dogfood review): `"verdict":"clean` is a PREFIX of
     # `clean-micro` and `clean-low`, so a tiered record at the head was reported as "a clean record
     # already exists" — the wrong remedy for a caller who wants the normal `clean` record.
-    case "$txt" in *'"verdict":"clean"'*) return 0 ;; esac
+    case "$txt" in *'"verdict":"clean"'*) MATCHED_RECORD="$f"; return 0 ;; esac
   done
   return 1
 }
 if record_at_head "$HEAD"; then
-  err "$PROG: a clean record ALREADY EXISTS at head ${HEAD:0:12}… for $REPO#$PR ($QUAL) — refusing to review and re-record an unchanged head."
+  err "$PROG: a clean record ALREADY EXISTS at head ${HEAD:0:12}… for $REPO#$PR ($MATCHED_RECORD) — refusing to review and re-record an unchanged head."
   err "  A second record at the same head dilutes the audit trail instead of adding evidence, so this is a refusal, not a no-op."
   err "  If that record's marker is missing from the PR body (its evidence post is best-effort), the documented remedy is to re-run the recorder — its same-head write is idempotent and its marker append is too:"
   err "    $RECORDER $PR $HEAD clean $REPO --evidence comment:<id>"
@@ -565,11 +576,18 @@ err "review-pr: reviewer finished rc=$AGENT_RC (transcript: $TRANSCRIPT)"
 # the one that happened — and tells the operator to "re-run" straight back into the same
 # load window. merge-one.sh exits 75 here for exactly this reason; the caller re-dispatches
 # when the box quietens.
-if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ] || grep -aqE '^\[pi-gate\] REFUSED' "$LOG" 2>/dev/null; then
+if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn-point load gate refused (rc=$AGENT_RC, PI_GATE_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a capacity event, not a code verdict. Re-run when the box is quieter (the gate's own ceiling is MAX_LOAD)."
   exit 75
 fi
+# ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
+# arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the
+# gate's own refusal line while reviewing the gate — completing and exiting 0 — was reported as "the
+# reviewer was NOT STARTED … nothing was paid for", and the lane re-ran a paid review into the same
+# false refusal. A gate refusal IS rc=76 (`spawn-gate.sh` exits PI_GATE_REFUSED having printed
+# nothing else); a completed transcript that merely contains the string is not evidence against the
+# exit status the reviewer actually returned.
 
 # ⛔ A NON-ZERO REVIEWER EXIT IS A REVIEWER FAILURE, WHATEVER IT PRINTED (P2 note of the
 # third fresh review: only the gate's 76 was inspected, so a reviewer killed while writing
@@ -695,13 +713,18 @@ SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 # ⚠️ AND THE EXEMPTION LIST IS DELIBERATELY NARROW — it is a closed grammar too, and widening it
 # is where a fail-open lives: an earlier shape returned "summary" on a separator WITHOUT re-reading
 # the count that follows, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole.
-# STATED RESIDUAL — stated at its TRUE width (P3, dogfood review of this very file, which measured two
-# ADORNED shapes the earlier wording wrongly implied were caught): a label that carries NO location,
-# NO label noun in front of it, and NO slot separator right after it is prose to this scanner, whether
-# it is bare or adorned — `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and
-# `no cwd isolation — [P1]` all pass. What the prompt CONTRACTS to is a label with a location
-# (`scripts/x.sh:12`) or a severity heading, and those are caught; the boundary here is the sentence's
-# meaning, not its shape, which is why it is declared instead of patched again.
+# STATED RESIDUAL — stated at its TRUE width (P3 dogfood + P1 fresh review of #2288, which measured the
+# claim below asserting coverage the code did not have): a label that carries NO label noun in front of
+# it, NO slot separator right after it, and NO location AFTER it is prose to this scanner —
+# `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and `no cwd isolation — [P1]`
+# all pass (a location ANYWHERE catches an ADORNED token, but a BARE one needs the location after it).
+# What the prompt CONTRACTS to is a label carrying a location (`P1 in scripts/x.sh:12`,
+# `scripts/x.sh:12 — P1`) or a severity heading, and THOSE are caught, in both orders: the `loc` arm
+# below covers a location before a dash/comma/bracket, and `label()`'s location-AFTER arm covers a bare
+# token that names its own location. A bare token whose ONLY location PRECEDES it
+# (`scripts/x.sh:12 has a P1 that returns 0 early`) stays prose: telling it from the pinned clean twin
+# (`No findings at scripts/x.sh:12; severity P2 would be over-calling`) needs the sentence's MEANING,
+# not its shape, which is why that boundary is declared instead of patched again.
 # The suite pins that direction (`No findings at scripts/x.sh:12; severity P2 would be over-calling`
 # must not block), and the boundary between a mention and a label there is not lexical; four rounds
 # of regex are the evidence. A blocker in any LABEL shape — the conventions the PROMPT contracts to
@@ -760,6 +783,13 @@ function label(s,   a, b, pre, post) {
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1 }
+    # (c) A bare token that NAMES ITS LOCATION AFTER IT — `Found one P1 in scripts/x.sh:12`,
+    # `Finding P1 at scripts/x.sh:12`. Measured FAIL-OPEN (fresh review of #2288): both shapes
+    # exited 0 and minted a signed `clean` over a reported blocker, while the residual text claimed
+    # a location-bearing label was caught. Structural, and it leaves the pinned clean twin alone:
+    # `No findings at scripts/x.sh:12; severity P2 would be over-calling.` carries its only location
+    # BEFORE the token, so nothing location-bearing follows it.
+    else if (post ~ /^[[:space:]]*[][(`*_—–-]*[[:space:]]*(in|at|on)?[[:space:]]*[`*_]*[[:alnum:]_\/.-]+:[0-9]+/) { LS = a; LE = b; NOUN_CUE = 1 }
   }
   return (LS > 0)
 }

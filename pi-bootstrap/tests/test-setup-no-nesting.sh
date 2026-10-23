@@ -137,19 +137,37 @@ check_fix_markers() {
     || fail "$label: installed builtin-tools missing #36 PATH augmentation"
 }
 
-# #562 — merge-gate scripts farm parity: record-review.sh must be farmed to
+# #562 — merge-gate scripts farm parity: EVERY entry of `merge_gate_srcs` must be farmed to
 # $DEST/scripts/ and byte-match the repo copy (the repo copy is CI-tested;
 # production mints execute the ~/.pi copy — drift is a silent partial
 # deployment of an enforcement-critical script).
+# ⛔ THE ARRAY IS THE LIST, NOT THIS FUNCTION (P3, fresh review of #2288): this used to hard-code
+# `record-review.sh`, so the SECOND member of the farm it was extended for (`review-pr.sh`, the seam
+# that mints every `clean` record) drifted undetected by the very suite that exists to catch it.
+# `farm_array_entries` is the one reader of a declared array (#1872), so a third member is covered
+# the day it is declared.
 check_record_review_farmed() {
   local label="$1"
-  local dest="$DEST/scripts/record-review.sh"
-  [ -f "$dest" ] \
-    || { fail "$label: record-review.sh not farmed into scripts/ (merge-gate farm missing)"; return; }
-  if diff -q "$ROOT/scripts/record-review.sh" "$dest" >/dev/null 2>&1; then
-    echo "ok: $label farmed record-review.sh == repo copy (#562)"
-  else
-    fail "$label: farmed record-review.sh differs from scripts/record-review.sh (stale copy!)"
+  local entry dest declared=0 checked=0
+  local line
+  line="$(farm_array_entries merge_gate_srcs)"
+  [ -n "$line" ] \
+    || { fail "$label: could not read the merge_gate_srcs array from setup.sh (wrapped across lines?) — 0 declared entries must never read as clean"; return; }
+  for entry in $line; do
+    declared=$((declared+1))
+    dest="$DEST/scripts/$entry"
+    [ -f "$ROOT/scripts/$entry" ] \
+      || { fail "$label: merge_gate_srcs declares '$entry' but scripts/$entry does not exist"; continue; }
+    [ -f "$dest" ] \
+      || { fail "$label: $entry not farmed into scripts/ (merge-gate farm missing or silently skipped)"; continue; }
+    if diff -q "$ROOT/scripts/$entry" "$dest" >/dev/null 2>&1; then
+      checked=$((checked+1))
+    else
+      fail "$label: farmed $entry differs from scripts/$entry (stale copy!)"
+    fi
+  done
+  if [ "$checked" -eq "$declared" ] && [ "$checked" -gt 0 ]; then
+    echo "ok: $label merge_gate_srcs farm byte-identical for $checked/$declared declared entries (#562)"
   fi
   # #1362 D1 — record-review.sh resolves its diff normalizer from a SIBLING
   # directory (`<script dir>/lib/diff-normalize.py`). Farming the producer
@@ -1973,6 +1991,7 @@ rm -rf "$DEST/tools"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+echo "# stale farm mutation" >> "$DEST/scripts/review-pr.sh"       # #562 farm refresh (the seam, P3 #2288)
 if [ -f "$DEST/scripts/ci_runner_gate.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/ci_runner_gate.sh"  # #1719 farm refresh
 fi
@@ -2062,6 +2081,11 @@ if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
   echo "ok: farmed record-review.sh refreshed on re-run (#562)"
+fi
+if grep -q "stale farm mutation" "$DEST/scripts/review-pr.sh"; then
+  fail "stale farm mutation survived re-run (farmed review-pr.sh was not refreshed)"
+else
+  echo "ok: farmed review-pr.sh refreshed on re-run (#562, #2288)"
 fi
 if [ ! -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   : # already reported by check_identity_lib_farmed "run2" (missing file is not "refreshed")
