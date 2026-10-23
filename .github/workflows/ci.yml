@@ -932,11 +932,15 @@ jobs:
     # that runs nothing, or a neighbour's shards twice, fails its own assertion rather than
     # reporting a green check over a hole.
     runs-on: ubuntu-latest
-    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Chosen from the
-    # measured p95 slice wall (the arithmetic is in the PR body), not a guess: 3x the measured
-    # worst slice, floored at 20 min — room for runner variance and a cold cache, and far below
-    # the multi-hour stall this job shipped with.
-    timeout-minutes: 25
+    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Derived from the
+    # CI-MEASURED numbers on PR #2412 (job 120365087427), not a guess: the shard step ran 74 shards
+    # in 73.6 min = 59.7 s/shard mean, and the worst single shard is `tests/admin-merge/run.sh` at
+    # ~10.2 min (it waits out a real 600 s stall-detection window by design). With 8 round-robin
+    # slices (sizes 10,10,9,9,9,9,9,9) the mean slice is 9.2 min and the slice that draws
+    # admin-merge is ~19.2 min. 45 min = 2.4x that p100 slice — enough for CI variance and a cold
+    # cache, and it still fails fast against a hang (the defect this bound exists for: the job sat
+    # unbounded for 1h52m).
+    timeout-minutes: 45
     strategy:
       # false: every slice reports its own result, so one hang cannot hide the other slices'
       # verdicts — the diagnostic this job lacked, since a single step reported nothing until
@@ -975,10 +979,13 @@ jobs:
     # while it never runs. This job is a plain sibling: it runs on every PR, and its failure reds
     # the PR like any other. `bash-suites` still makes the bare call the guard asserts.
     runs-on: ubuntu-latest
-    # #2055: the bound this job never had. The self-test's wall time tracks the fast copy of the
-    # shard list (measured; the fast copy drops the ~11 longest shards), so a bound sized to one
-    # slice would false-block it. This is the largest of the three bounds by design.
-    timeout-minutes: 40
+    # #2055: the bound this job never had, sized to CI's own measurement. The self-test ran
+    # 38m41s on PR #2412 (job 120365087427, step 5: 10:25:08Z → 11:03:49Z) — it drives the
+    # runner's FAST copy of the shard list several times, so its wall tracks that copy. 75 min is
+    # ~1.9x the measured value: generous, because a bound BELOW the measured run would false-block
+    # every PR (a red that is not a defect is how a gate loses its authority), while still failing
+    # fast against the multi-hour stall this PR exists to stop.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

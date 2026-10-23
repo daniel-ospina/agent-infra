@@ -375,15 +375,20 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
-    # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` (this job calls the one
-    # runner below, unsharded — main runs once per merge, so the queue a hang would starve is
-    # smaller than the PR lane's 80 open PRs). The bound is deliberately larger than the PR
-    # lane's per-slice bound: this job, not one slice, is what must fit inside it — 71 shards
-    # serially, measured at ~2x the per-slice wall of ci.yml's 8-way matrix. Before this line the
-    # job had no bound at all, so a hung shard could hold a runner indefinitely (#2055) and
-    # redden main without naming itself. ci.yml's `bash-suites` was measured at ~2h46m without a
-    # bound on PR #2412 and failed — this is the same sweep, same runner, same failure mode.
-    timeout-minutes: 60
+    # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
+    # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
+    # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
+    # self-test. Bound from CI's own measurement of that body of work on PR #2412 (job
+    # 120365087427 on ubuntu-latest): shard step 73m37s + parity self-test 38m41s + the syntax
+    # sweeps ≈ 115 min. 180 min is ~1.6x that.
+    #
+    # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
+    # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
+    # only to catch a HANG (which, before this line, could hold a runner indefinitely — #2055);
+    # the real fix for the main lane's duration is sharding it like the PR lane, which is a
+    # separate change (it needs its own parity-guard review: `check-ci-lane-parity` asserts THIS
+    # job makes the bare call).
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
