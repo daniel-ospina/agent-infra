@@ -656,7 +656,7 @@ ck "(e) the work-repo fixture does NOT contain the pin commit (a foreign object 
 # proves one candidate while its comment claims another.
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
-        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPAU=4 HU_NCPU=4 \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HARNESS_UP_OS= bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
 ck "(e) a foreign REPO does not poison the pin read: the pin resolves in HARNESS_REPO (pin: OK)" \
    "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
@@ -691,6 +691,26 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIX
 ck "(e) the controller is told REPO=<work repo> (never the harness repo)" \
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and HARNESS_REPO=<the harness checkout>" \
+   "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ── CANDIDATE 2 OF REPO's PRECEDENCE: THIS MACHINE'S CONFIG FILE ─────────────────────────────────
+# `REPO` is "the caller's `REPO`, then the config file, then the harness checkout", and the config file
+# is the CELL path, not a theoretical one: `docs/ops/fleet-harness-baseline.md` shows `keys.env` carrying
+# `REPO=/tmp/cell-t3`, and `keys.env` is exactly `ENV_FILE`. Without this arm the MIDDLE candidate is
+# untested — deleting `$(cfg_value REPO "$ENV_FILE")` from the launcher leaves every other assertion
+# green (measured), and the regression exports `REPO=<the harness checkout>` to the controller on the
+# boxes that configure their work repo here: the wrong-backlog retarget this split exists to remove.
+# ⛔ NOT VACUOUS UNDER THE OLD CODE: `REPO="${A_REPO:-${REPO:-}}"` read `--repo` as REPO, so with no
+# `REPO` in the shell the child was told `REPO=<the harness>` and this arm fails on that tree.
+printf 'REPO=%s\n' "$WORK" > "$TMP/bringup.env"
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" ENV_FILE="$TMP/bringup.env" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --repo "$REPO_FIX" --no-fetch 2>&1 )"
+ck "(e) with no REPO in the shell, the config file's REPO is the work repo the controller is told" \
+   "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and the harness repo still resolves from --repo/HARNESS_REPO, never from the config file" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 # ── the WORK repo's OWN validation (review cycle 2): the split must not accept a REPO it cannot use ─
 # Set-but-wrong is never "unset": a directory that is not a checkout makes `orch-loop.sh` fall back to a

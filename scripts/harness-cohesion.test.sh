@@ -17,6 +17,14 @@
 #         dir the RUNNING controller executes that main does not carry, and — fail-closed — an
 #         unreadable one is BROKEN (exit 2), never OK. Plus: no candidate dir at all is exit 2.
 set -u
+# ⛔ THE AMBIENT ENVIRONMENT IS NOT THIS SUITE'S INPUT — `harness-up` now PREFERS the caller's `REPO`
+# (the WORK repo, #2356) over `--repo` (the HARNESS checkout), so an arm that passes only `--repo`
+# inherits whatever the shell exports as `REPO`. A fleet shell exports `REPO=<its work repo>`; a STALE
+# one (a deleted or mistyped path) is now REFUSED by the launcher (rc 2), which surfaced here as 25
+# pin/start failures about a tree this suite never named — measured `REPO=/tmp/plaindir-stale`: **25
+# failed** here against **1 failed** on the pre-#2356 tree, i.e. a false RED the next reader attributes
+# to the launcher. Arms that need a work repo set `REPO` explicitly.
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every
