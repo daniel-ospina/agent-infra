@@ -428,9 +428,18 @@ fi
 # ⛔ ITS OWN DIRECTORY, NOT `$SELF_DIR` (P1, this lane — the first version read `$SELF_DIR`, which is
 # only assigned LATER, inside the recorder-resolution branch, so under the fixture override the
 # normalizer was never found and the very P1 this fixes would have survived on the clean path).
+# ⛔ THE NORMALIZER IS THE RECORDER'S, SO LOOK BESIDE THE RECORDER FIRST (P2, fifth fresh review of
+# #2288 — MEASURED: with the seam copied away from `scripts/lib` (or reached through the supported
+# `REVIEW_PR_RECORD_SH` seam / the `$HOME/.pi/agent/scripts` fallback), the seam's three seam-relative
+# candidates found nothing, so the normalized arm was skipped and a real recorder's normalized digest
+# was refused with a message blaming the BASE — on the only success path, with the comment already
+# posted and the record already written). `$RECORDER` is resolved above; the seam-relative candidates
+# stay as fallbacks for a fixture that stubs the recorder.
 _D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 DIFF_NORMALIZER=""
-for _cand in "$_D/lib/diff-normalize.py" "$_D/../scripts/lib/diff-normalize.py" "$_D/../lib/diff-normalize.py"; do
+_RD=""
+[ -n "${RECORDER:-}" ] && _RD="$(cd "$(dirname "$RECORDER")" 2>/dev/null && pwd || true)"
+for _cand in "${_RD:+$_RD/lib/diff-normalize.py}" "$_D/lib/diff-normalize.py" "$_D/../scripts/lib/diff-normalize.py" "$_D/../lib/diff-normalize.py"; do
   if [ -s "$_cand" ]; then DIFF_NORMALIZER="$(cd "$(dirname "$_cand")" && pwd)/$(basename "$_cand")"; break; fi
 done
 DIFF_NORMALIZER_OK=""
@@ -1707,7 +1716,7 @@ fi
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
 refuse_counted_clean() {
-  local _vl _vw _hit _hit2 _one _dig _bare _src
+  local _vl _vw _hit _hit2 _one _dig _bare _scan _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -1774,7 +1783,19 @@ refuse_counted_clean() {
     # done unless the sentence says the findings are still there — `remain(s|ing)`, `unresolved`,
     # `still`, `left`, `open`, `outstanding`, `blocking`, `found`, `located`. Both measured fail-opens
     # from the third review (`I found two blocking issues:`, `2 defects remain`) carry a cue.
-    _hit="$(printf '%s' "$_vl" \
+    # ⛔ THE NOUN CAN BE ATTRIBUTIVE, AND THEN IT IS NOT A COUNT (P2, fifth fresh review of #2288 —
+    # MEASURED over-block: `CLEAN — 2 bug fixes applied.`, `CLEAN — 3 regression tests added.`,
+    # `CLEAN — 1 bug report reviewed, no defects.` all refused, each burning a PAID reviewer run — and
+    # this is NOT the later-sentence-repair residual, no repair clause is involved). `bug fixes` is work
+    # done, `bug report` is a document: the noun there qualifies the next word instead of counting a
+    # finding. The pair is blanked OUT of a COPY of the line before matching, so a line that also
+    # reports a real count keeps it (`1 defect remains; 3 bug fixes applied` still refuses).
+    # (the noun is DROPPED, not merely separated — keeping it would leave `1 finding NOUNWORDed`, whose
+    # `1 finding` still matches the count grammar; and the attributive word needs a right-hand boundary,
+    # or `fix` matches the `fix` inside `fixed` and eats a genuine repair participle)
+    _scan="$(printf '%s' "$_vl" | sed -E 's/(bug|bugs|regression|regressions|defect|defects|issue|issues|finding|findings|problem|problems|violation|violations)[[:space:]-]+(fix|fixes|fixup|fixups|report|reports|test|tests|suite|suites|scan|scans|class|classes|count|counts|free|coverage|pass|passes|series)([^[:alnum:]]|$)/\2\3/g' 2>/dev/null)"
+    [ -n "$_scan" ] || _scan="$_vl"
+    _hit="$(printf '%s' "$_scan" \
       | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
       | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
     # ⛔ THE INVERSE COUNT FORM (P2, fourth fresh review of #2288 — PRE-EXISTING on main, MEASURED:
@@ -1782,8 +1803,16 @@ refuse_counted_clean() {
     # already PARSES the `3 × P1` spelling for an ISSUES verdict, so the multiplier is a count the
     # reviewer is entitled to write). `<severity> × <n>` puts the number where the `<count> <noun>`
     # grammar cannot see it, so it gets its own arm rather than a wider bridge.
-    _hit2="$(printf '%s' "$_vl" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+[[:space:]]*×[[:space:]]*P[0-3]|P[0-3][[:space:]]*×[[:space:]]*[0-9]+)' 2>/dev/null || true)"
+    # ⛔ THE MULTIPLIER IS NOT ONLY THE `×` GLYPH (P1, fifth fresh review of #2288 — MEASURED fail-OPEN:
+    # `**Verdict:** CLEAN — P1 x 2 in scripts/x.sh.` recorded a SIGNED clean record while the `×` twin
+    # refused, and `P1 * 2` did too). This file's own ISSUES reader already honours `3x P2` and
+    # `[0-9]+[[:space:]]*[×x]`, so `x`/`X`/`*` and the word `times` are counts a reviewer may write.
+    # ⛔ THE MULTIPLIER IS AN ALTERNATION, NOT A BRACKET EXPRESSION (P2, this lane — MEASURED under
+    # `LANG=C LC_ALL=`): inside `[...]` the multi-byte `×` is a pair of BYTES that a C-locale regcomp
+    # does not match, so the very form this arm exists for went silent exactly where the suite was
+    # already being run in the C locale. As a plain alternative it matches in both locales.
+    _hit2="$(printf '%s' "$_scan" \
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+[[:space:]]*(×|x|X|\*|times)[[:space:]]*P[0-3]|P[0-3][[:space:]]*(×|x|X|\*|times)[[:space:]]*[0-9]+)' 2>/dev/null || true)"
     if [ -n "$_hit2" ]; then _hit="${_hit:+$_hit
 }$_hit2"; fi
     [ -n "$_hit" ] || continue
@@ -2240,6 +2269,14 @@ if [ -n "${MARKER_DIFF:-}" ]; then
   DIFF_NORM_HASH=""
   if [ -n "$DIFF_NORMALIZER_OK" ]; then
     DIFF_NORM_HASH="$(printf '%s\n' "$DIFF_FULL" | python3 "$DIFF_NORMALIZER" 2>/dev/null | $_SHA_CMD | cut -d' ' -f1 2>/dev/null)"
+  fi
+  # ⛔ AND SAY SO WHEN THE COMPARISON COULD NOT RUN (P2, fifth fresh review of #2288): without the
+  # normalizer only the recorder's RAW fallback form can be matched, so a recorder that DID normalize
+  # is unverifiable here — that must name its own cause ("could not be computed"), not accuse the base
+  # of having moved, which sends the operator to a re-run that cannot succeed.
+  if [ -z "$DIFF_NORM_HASH" ]; then
+    [ -n "$DIFF_RAW_HASH" ] && [ "$MARKER_DIFF" != "$DIFF_RAW_HASH" ] \
+      && err "$PROG: ⚠️ the record's diff= is not the RAW digest of the reviewed diff, and the shared diff normalizer (scripts/lib/diff-normalize.py, looked for beside the recorder and beside this script) could not be run — so the recorder's NORMALIZED digest could not be computed here. This is an unverifiable comparison, not proof that the base moved."
   fi
   if [ -z "$DIFF_RAW_HASH" ] && [ -z "$DIFF_NORM_HASH" ]; then
     die "$E_SCAN" "no portable sha256 tool could digest the reviewed diff (tried sha256sum, shasum -a 256), so the record's diff identity cannot be checked — refusing to report success on an unverified attestation ($(printf '%s' "$SHA_CMD" | sed 's/^$/none resolved/'))"

@@ -2189,15 +2189,42 @@ reset
 # and uses `fixture_sha256` (macOS has no `sha256sum`).
 _NORM="$ROOT/scripts/lib/diff-normalize.py"
 [ -s "$_NORM" ]; ck $? "the shared diff normalizer is where the seam looks for it"
-DH="$(printf '%s\n' "$(cat "$TMP/diff-body" 2>/dev/null || printf '%s' "$FIXTURE_DIFF")" | python3 "$_NORM" | fixture_sha256)"
-reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$DH"
+# ⛔ THE FIXTURE DIFF MUST BE ONE THE NORMALIZER REWRITES (P2, fifth fresh review of #2288 — MEASURED:
+# the default fixture diff has no `index` line and no `@@` hunk header, so the normalizer returned it
+# byte-identical, the "normalized" and "raw" fixtures were the SAME digest, and deleting the seam's
+# normalized arm left both assertions green — the arm could not see the P1 it was added for). This diff
+# carries both, so raw and normalized digests differ, which is what gives the arm its teeth.
+_PATCH='diff --git a/scripts/x.sh b/scripts/x.sh
+index 1111111..2222222 100644
+--- a/scripts/x.sh
++++ b/scripts/x.sh
+@@ -10,3 +10,4 @@
+ line one
++added line
+ line three'
+_RAW_DH="$(printf '%s\n' "$_PATCH" | fixture_sha256)"
+_NORM_DH="$(printf '%s\n' "$_PATCH" | python3 "$_NORM" | fixture_sha256)"
+[ "$_RAW_DH" != "$_NORM_DH" ]; ck $? "the fixture diff really is rewritten by the normalizer (raw $_RAW_DH is not normalized $_NORM_DH)"
+DH="$_NORM_DH"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF="$_PATCH"; FIXTURE_MARKER_DIFF="$DH"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a RECORDER-SHAPED marker diff= (normalized) records (rc=$(rc_of))"
 # …and the recorder's raw fallback form (no python3 / no normalizer on the box) is accepted too.
-reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
-FIXTURE_MARKER_DIFF="$(printf '%s\n' "$FIXTURE_DIFF" | fixture_sha256)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF="$_PATCH"; FIXTURE_MARKER_DIFF="$_RAW_DH"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "  ...and the recorder's RAW fallback digest is accepted (rc=$(rc_of))"
+# ⛔ MUTATION: with the normalized arm deleted, a normalized marker must REFUSE — otherwise nothing
+# proves the seam reproduces the recorder's normalization rather than merely hashing raw bytes twice.
+MN="$TMP/mutant-norm.sh"; cp "$SRC" "$MN"; chmod +x "$MN"
+sed 's/^    DIFF_NORM_HASH="\$(printf .*$/    DIFF_NORM_HASH=""/' "$SRC" > "$MN"
+if cmp -s "$SRC" "$MN"; then
+  fail "the normalized-arm mutation did not apply — this control proves NOTHING"
+else
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF="$_PATCH"; FIXTURE_MARKER_DIFF="$DH"
+  run "$MN" 2284
+  [ "$(rc_of)" = "8" ]; ck $? "the MUTANT (normalized arm deleted) refuses a normalized marker (rc=$(rc_of))"
+fi
+reset
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$(printf '%064d' 1)"
 run "$SRC" 2284
 [ "$(rc_of)" = "8" ]; ck $? "  ...and a marker whose diff= is NOT the reviewed diff is exit 8 (rc=$(rc_of))"
@@ -2256,6 +2283,38 @@ no_record; ck $? "  ...nothing recorded"
 reset; printf '**Verdict:** CLEAN — 2 × P2 in scripts/x.sh.\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "  ...and so is '2 × P2' (rc=$(rc_of))"
+# ⛔ AND THE MULTIPLIER IS NOT ONLY THE `×` GLYPH (P1, fifth fresh review of #2288 — MEASURED fail-OPEN:
+# `P1 x 2` recorded a SIGNED clean record while its `×` twin refused; the file's own ISSUES reader
+# already honours `3x P2`). `x`, `*` and `times` are spellings a reviewer may write.
+for _mv in 'P1 x 2' 'P1 * 2' 'P1 times 2' '3x P2' 'P2 X 4'
+do
+  reset; printf '**Verdict:** CLEAN — %s in scripts/x.sh.\n' "$_mv" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  ...'$_mv' is a count too (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# COUNTER-DIRECTION: a zero multiplier stays clean in the ASCII spelling as well.
+reset; printf '**Verdict:** CLEAN — 0 x P1 in scripts/x.sh.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...while '0 x P1' still records (rc=$(rc_of))"
+# ⛔ AND AN ATTRIBUTIVE NOUN IS NOT A COUNT (P2, fifth fresh review of #2288 — MEASURED over-block,
+# each case burning a PAID reviewer run): `bug fixes` is work done and `bug report` is a document, so
+# the noun qualifies the next word instead of counting a finding.
+for _cl in \
+  '**Verdict:** CLEAN — 2 bug fixes applied.' \
+  '**Verdict:** CLEAN — 3 regression tests added.' \
+  '**Verdict:** CLEAN — 2 regression suites re-run green.' \
+  '**Verdict:** CLEAN — 1 bug report reviewed, no defects.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "records clean (attributive noun): $_cl (rc=$(rc_of))"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+done
+# …and the blanking must not swallow a REAL count on the same line.
+reset; printf '**Verdict:** CLEAN — 1 defect remains; 3 bug fixes applied.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  ...while a real count beside an attributive pair still refuses (rc=$(rc_of))"
 reset
 
 # ══ §BI-2 the count vocabulary cannot silently drift from the severity scanner's ══
@@ -2269,7 +2328,13 @@ _NOUN_LINE="$(grep -n '^function noun()' "$SRC" | head -1 | cut -d: -f1)"
 [ -n "$_NOUN_LINE" ]; ck $? "the severity scanner's noun() was located (line ${_NOUN_LINE:-<none>})"
 _NOUNS="$(sed -n "${_NOUN_LINE}p" "$SRC" | sed -n 's/.*return "(\([^"]*\))".*/\1/p' | tr '|' ' ')"
 [ -n "$_NOUNS" ]; ck $? "…and its alternation was extracted"
-_COUNT_LINE="$(grep -n 'findings?|blockers?|issues?' "$SRC" | grep -v '^[0-9]*:function noun' | head -1 | cut -d: -f1)"
+# ⛔ THE LINE MUST BE THE LIVE REGEX, NOT A COMMENT THAT QUOTES IT (P2, fifth fresh review of #2288 —
+# MEASURED: the first version resolved to the prose comment above the regex, so deleting `defects?` from
+# the real alternation still printed `missing: none`). The count list lives on the `| grep -oiE` line
+# that follows the `_hit="$(printf` assignment.
+_HIT_LINE="$(grep -nF 'half([[:space:]-]+a)?' "$SRC" | grep -F 'grep -oiE' | head -1 | cut -d: -f1)"
+[ -n "$_HIT_LINE" ]; ck $? "the count guard's LIVE regex line was located (line ${_HIT_LINE:-<none>})"
+_COUNT_LINE="$_HIT_LINE"
 [ -n "$_COUNT_LINE" ]; ck $? "the count guard's noun list was located (line ${_COUNT_LINE:-<none>})"
 _COUNT_TXT="$(sed -n "${_COUNT_LINE}p" "$SRC")"
 _missing=""
@@ -2299,7 +2364,8 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
+# Re-set to 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
+# normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
 # was 661 when §BH (noun vocabulary, the survivor-set count channel, the marker diff=) added 22
 # assertions and §AT/§P/§AP were repaired (third fresh review). It was 634 (concurrent-fixer merge) when §AS/§AT/§AU added 20, §AV-§AZ added 34, §BA-§BG added 30 and the concurrent-fix merge added 9 (the gawk-dialect P1, the wall-clock cap and the
@@ -2484,6 +2550,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 683 ]; ck $? "assertion-count pin: >= 683 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 706 ]; ck $? "assertion-count pin: >= 706 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
