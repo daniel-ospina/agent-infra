@@ -1965,6 +1965,81 @@ $list
 MPEOF
   printf '%s\n' "$newest"
 }
+# ── WHAT THIS PASS ACTUALLY STARTED (agent-infra#2590) ───────────────────────────────────────────
+# ⛔ `act` IS NOT `spawn` (MEASURED 2026-10-23). A disposition row is `act` for a spawned worker, for
+# `gh pr merge`, for `gh run rerun`, for a draft ready and for an auto-merge ARM — so `2 acted` was
+# printed beside `#9528 auto-armed` + `#9812 re-record`, and the funnel then said "dispatching
+# PR-takeover" on the strength of a button press. `N acted` could never answer "did the fleet move?".
+# ⛔ SO THE COUNT IS READ FROM AN ARTIFACT, NEVER FROM A CLAIM: `wt_spawn` writes `state/worker-<tag>`
+# with `created=<epoch>` and nothing else creates those records. A spawn that was REFUSED leaves no
+# record (PR #2383 measures those separately, in `spawn-refused.tsv`), and a record is what the
+# census, the caps and the reaper bind to — so "a record with created >= this cycle's start" is the
+# only population that means "a worker of ours is (or was) running because of this pass".
+# ⛔ AN UNREADABLE ANSWER IS EMPTY, NOT ZERO: a path we cannot enumerate must not print `NONE`, which
+# would be the same lie sign-reversed (a measured negative from no measurement at all).
+spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n == UNMEASURED)
+  local since="${1:-}" dir f name cre n=0 tags=""
+  is_num "${since:-}" && [ "$since" -gt 0 ] || return 0
+  dir="${WT_DIR:-${O:-$HOME/orchestrator}/state}"
+  [ -d "$dir" ] && [ -r "$dir" ] || return 0
+  for f in "$dir"/worker-*; do
+    [ -f "$f" ] || continue
+    name="${f##*/worker-}"
+    # Same name predicate the module refuses on: anything else was never a wt_spawn record.
+    case "$name" in ''|*[!A-Za-z0-9-]*) continue ;; esac
+    cre="$(sed -n 's/^created=//p' "$f" 2>/dev/null | head -1)"
+    is_num "${cre:-}" || continue
+    [ "$cre" -ge "$since" ] || continue
+    n=$((n+1)); tags="${tags:+$tags,}$name"
+  done
+  printf '%s\t%s\n' "$n" "$tags"
+}
+# ── THE DRAIN'S PERSISTENT STATE TOKEN (agent-infra#2590) ────────────────────────────────────────
+# The stall line is a LOG line, and a log line is read by nobody until someone goes looking — the
+# measured cost was a box at `DRAIN STALLED` for 8 passes while its operator read `lanes=0` as "idle".
+# The artifact `state/drain-stall` carries the escalation ACROSS passes, and this token puts it on the
+# cycle status line, which is the one line every reader already parses.
+# ⛔ IT SELF-HEALS ON A LAND: a marker that outlives the condition it names is the "stale flag that
+# records a past state and is never revalidated" failure this file keeps removing, so a land newer
+# than the marker deletes it here — the writer does not have to remember to.
+drain_stall_token() {
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl
+  [ -f "$f" ] || return 0
+  at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
+  if is_num "${at:-}"; then
+    m="$(mp_recent_land 2>/dev/null || true)"
+    if is_num "${m:-}" && [ "$m" -gt "$at" ]; then rm -f "$f" 2>/dev/null; return 0; fi
+  fi
+  passes="$(sed -n 's/^passes=//p' "$f" 2>/dev/null | head -1)"
+  spawns="$(sed -n 's/^spawns=//p' "$f" 2>/dev/null | head -1)"
+  unowned="$(sed -n 's/^unowned=//p' "$f" 2>/dev/null | head -1)"
+  lage="$(sed -n 's/^age=//p' "$f" 2>/dev/null | head -1)"
+  lbl="$(drain_stall_label "$f")"
+  printf ' drain=%s(passes=%s,unowned=%s,no_land=%sm,spawns=%s)' \
+    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${lage:--}" "${spawns:-?}"
+}
+# ── THE ESCALATION'S LABEL, DERIVED FROM ITS OWN MEASUREMENT (review c-1, 2026-10-23) ─────────────
+# ⛔ THE MARKER IS WRITTEN BY BOTH STALL ARMS, SO ITS *EXISTENCE* CANNOT MEAN "DEADLOCK". A STALLED
+# pass records `spawns=4` ("the workers run and nothing lands — a LAND problem, not an idle one"), and
+# a token that keyed on the file existing printed `drain=DEADLOCK(…,spawns=4)` for it — a deadlock
+# claim over a pass that started four workers. That is precisely the claim-with-no-measurement class
+# this change deletes, and it would have ridden the one line every reader parses.
+# ⛔ SO THE LABEL IS THE MARKER'S OWN `spawns` FIELD, and the polarity is the same one the log arms use:
+# a measured 0 is the deadlock (nothing started AND nothing landing), a measured positive is a stall
+# with work in flight, and an ABSENT/garbled count is neither — it is UNMEASURED, never DEADLOCK
+# (a deadlock claim from no measurement is the defect sign-reversed).
+# ⛔ ONE DEFINITION, TWO READERS: the status-line token and `cycle-record.sh`'s `drain=` field both call
+# this, so the two surfaces cannot disagree about what the box is in.
+drain_stall_label() { # [<marker>]  -> DEADLOCK | STALLED | UNMEASURED (empty when there is no marker)
+  local f="${1:-$O/state/drain-stall}" sp
+  [ -f "$f" ] || return 0
+  sp="$(sed -n 's/^spawns=//p' "$f" 2>/dev/null | head -1)"
+  case "$sp" in
+    ''|*[!0-9]*) printf 'UNMEASURED' ;;
+    0)           printf 'DEADLOCK' ;;
+    *)           printf 'STALLED' ;;
+  esac
+}
 res_line() {
   local idle pmem f i w cmp avail swapfree swaptotal dline duse procs runnable svcs rate _sw
   # CPU
@@ -2492,7 +2567,7 @@ while true; do
   measure_mem
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
-  echo "=== $(date) load=$L lanes=$(wt_count lane-) backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL}${HARNESS_TOKEN:+ harness=$HARNESS_TOKEN} ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes=$(wt_count lane-) backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL}${HARNESS_TOKEN:+ harness=$HARNESS_TOKEN}$(drain_stall_token) ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -3922,6 +3997,26 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     is_num "${PRDISP_WAITS:-}" || PRDISP_WAITS=0
     PRDISP_TOP="$(awk -F'\t' '$4=="wait"{print $5}' "$PRDISP" 2>/dev/null | sort | uniq -c | sort -rn | head -1 | sed 's/^ *//')"
   fi
+  # ── THE TERMINAL OUTCOME OF THIS PASS'S PR WORK (agent-infra#2590) ─────────────────────────────
+  # Exactly ONE of these three lines is printed, and it answers "what did this pass START?" from the
+  # worker records `wt_spawn` wrote — never from a count of dispositions, which an arm or a rerun
+  # inflates without starting anything. `PRDISP_SPAWNS` is what the funnel and the drain guard read.
+  # ⛔ THREE STATES, THREE READINGS: a measured zero (NONE), a measured positive (SPAWNED), and no
+  # measurement at all (UNMEASURED). Collapsing the third into NONE is the same defect sign-reversed
+  # — and the drain guard must not manufacture a deadlock claim out of an unread directory.
+  PRDISP_SPAWNS=""; PRDISP_SPAWN_TAGS=""
+  _spl="$(spawns_since "${CYCLE_T0:-0}" 2>/dev/null || true)"
+  _spn="${_spl%%	*}"; _spt="${_spl#*	}"
+  [ "$_spt" = "$_spl" ] && _spt=""
+  if ! is_num "${_spn:-}"; then
+    echo "[spawn] UNMEASURED — this pass cannot say what it started (state/ cannot be enumerated or the cycle clock is unreadable), so the ${PRDISP_ACTS:-?} act row(s) below are actions, NOT spawns; do not read them as work in flight" >>"$LOG"
+  elif [ "$_spn" -gt 0 ]; then
+    PRDISP_SPAWNS="$_spn"; PRDISP_SPAWN_TAGS="$_spt"
+    echo "[spawn] SPAWNED $_spn worker(s) this pass: ${_spt:--} (each is a state/worker-<tag> record wt_spawn wrote at created>=${CYCLE_T0:-0}; the tag is the handle the census, the caps and the reaper use)" >>"$LOG"
+  else
+    PRDISP_SPAWNS=0
+    echo "[spawn] NONE — no worker was started by this pass (0 state/worker-* records with created>=${CYCLE_T0:-0}); ${PRDISP_ACTS:-0} act row(s) may still exist — an arm, a rerun or a draft-ready — and those start nothing" >>"$LOG"
+  fi
   # ⛔ THE POPULATION CAVEAT IS NOT OPTIONAL. `OPEN_ROWS` is the only enumerable list of the COUNTED
   # set; without it (GraphQL failed and `open_pr_count` deleted its rows, or the fallback fired) the
   # ledger covers the SWEPT set only, while the gate is reading the listing count. Saying "N named
@@ -3940,7 +4035,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight; spawned=${PRDISP_SPAWNS:-UNMEASURED} this pass (see the [spawn] line: acted counts ACTIONS, only a spawn starts a worker)" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -3948,7 +4043,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # one: no unit ran, and the dominant reason is named rather than inferred. It does NOT claim what
     # the issue path will do — the gate is decided further down, and a forward claim here would be the
     # same defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
-    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}" >>"$LOG"
+    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)" >>"$LOG"
     PR_FIRST_TOK="none acted — see the [pr] line"
   fi
   # ⛔ THE FUNNEL TAKES THE SAME THREE FACTS, INCLUDING WHETHER THEY WERE MEASURED AT ALL: 0 acts with a
@@ -4147,7 +4242,7 @@ PY
   declare -f lo_select >/dev/null 2>&1 && LO_SELECT_DEFINED=1
   SEL_LINE=""
   if [ "$LO_SELECT_DEFINED" = "1" ]; then
-    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" > "$SELFILE" 2>/dev/null || true
+    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}" > "$SELFILE" 2>/dev/null || true
     SEL_LINE="$(cat "$SELFILE" 2>/dev/null)"
   fi
   rm -f "$SELFILE"
@@ -4216,9 +4311,56 @@ PY
       if [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
       elif [ "$_lage" -ge "$_stallmin" ]; then
-        echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
+        # ── THE STALL IS ALSO AN ESCALATION (agent-infra#2590) ───────────────────────────────
+        # The stall line alone escalated to nobody: it was printed 8 times on a live box that sat at
+        # `lanes=0`, 9 un-owned, nothing landing for 3.4h, and its operator read the log as normal.
+        # So a stall now ALSO writes an artifact that outlives the pass and puts a token on the cycle
+        # status line — the one line every reader already parses — and it NAMES what the PR path did
+        # in this very pass, because "nothing landed and we started nothing" and "nothing landed and
+        # we started six workers" are different faults with the same symptom.
+        # ⛔ THE ISSUE PATH STAYS CLOSED. The owner ruling (2026-10-18) is that a stalled drain is a
+        # land/capacity problem and opening new work is how it gets hidden. This escalation must never
+        # grow a release valve — it exists to make the promise VERIFIABLE, not to break it.
+        # ⛔ AN UNMEASURED SPAWN COUNT IS NOT ZERO: with `PRDISP_SPAWNS` empty the line reports
+        # UNMEASURED and the deadlock claim is about the LAND only, which is the measurement we have.
+        _spk="${PRDISP_SPAWNS:-}"; is_num "${_spk:-}" || _spk=""
+        _spn_txt="spawned UNMEASURED (the worker record could not be read)"
+        is_num "${_spk:-}" && _spn_txt="spawned ${_spk} worker(s) this pass"
+        _dpass=0
+        [ -f "$O/state/drain-stall" ] && { _p="$(sed -n 's/^passes=//p' "$O/state/drain-stall" 2>/dev/null | head -1)"; is_num "${_p:-}" && _dpass="$_p"; }
+        _dpass=$(( _dpass + 1 ))
+        # ⛔ THE RECORD IS WRITE-CHECKED, like every other record this loop trusts: an escalation the
+        # box cannot persist is an escalation that dies with the pass it was printed in.
+        if printf 'at=%s\npasses=%s\nage=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
+             "$(date +%s)" "$_dpass" "$_lage" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
+             > "$O/state/drain-stall" 2>/dev/null; then
+          _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=DEADLOCK until a PR lands"
+        else
+          _esc="ESCALATION COULD NOT BE RECORDED (state/ is unwritable) — this line is the only trace"
+        fi
+        # ⛔ THE POPULATION IS NAMED, BECAUSE THIS BOX IS NOT ALWAYS THE LANDER (MEASURED 2026-10-23).
+        # `mp_recent_land` reads `state/merged-<PR>.done` and merge-one.sh is its ONLY writer, so the age
+        # answers "when did THIS box last land", NOT "when did the queue last move". Measured here: 7 PRs
+        # merged on the repo between 21:31Z and 22:40Z while this line said "no PR merged in 264m" — the
+        # peer box held the landing claims (merge-9812.log: "landing claim REFUSED: held by … another box
+        # is landing this PR"). Unqualified, the escalation names a land/capacity problem on a box whose
+        # only "problem" is that it is not the lander — and an escalation that misdiagnoses is one an
+        # operator learns to ignore, which is how this whole defect stayed invisible for 3.4h.
+        # ⛔ AND THE PASS'S OWN LEDGER IS QUOTED: when it spawned nothing, the dominant NAMED wait IS the
+        # reason, and it is already computed above (`PRDISP_TOP`). A datum the line holds and does not
+        # read is the "tool that cannot answer its own question" class.
+        _whysrc=" (land markers are THIS box's own merge-one successes only — a peer box landing these is invisible here"
+        [ -n "${PRDISP_TOP:-}" ] && _whysrc="$_whysrc; dominant named wait: \"${PRDISP_TOP:0:140}\""
+        _whysrc="$_whysrc)"
+        if [ "${_spk:-}" = "0" ]; then
+          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}." >> "$LOG"
+        else
+          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — the workers run and nothing lands, which is a LAND problem, not an idle one. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}." >> "$LOG"
+        fi
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
+        # A land clears the escalation: a marker that outlives its condition is a stale flag.
+        rm -f "$O/state/drain-stall" 2>/dev/null || true
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
@@ -4597,8 +4739,8 @@ PY
     # about a cycle nobody recorded (#2126 review).
     if [ "${PRDISP_OK:-1}" != "1" ]; then _prtail="record UNWRITABLE — PR actions UNKNOWN, not zero"
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
-    elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
-    else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
+    elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s), spawned ${PRDISP_SPAWNS:-UNMEASURED}"
+    else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s), spawned ${PRDISP_SPAWNS:-UNMEASURED} — see the [pr] line"; fi
     dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
@@ -4625,11 +4767,20 @@ PY
     elif [ -n "${GATE_WHY:-}" ]; then _cr_nothing="gate:${GATE_WHY}"
     elif [ "${Y:-0}" -gt 0 ]; then _cr_nothing="placed_elsewhere:${Y}"
     else _cr_nothing="no_candidate"; fi
+    # The drain field is the marker's own reading, through the SAME helper the status-line token
+    # uses (agent-infra#2590 review c-1): a marker that records spawned workers is STALLED, not
+    # DEADLOCK, and an unreadable count is UNMEASURED. `draining` is the no-marker state.
+    _cr_drain="${LO_CHOICE:-none}"
+    if [ "${LO_CHOICE:-none}" = "pr" ]; then
+      _cr_drain="$(drain_stall_label)"; [ -n "$_cr_drain" ] || _cr_drain="draining"
+    fi
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
+      spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="${PRDISP_SPAWN_TAGS:-none}" \
+      drain="$_cr_drain" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
   else
     echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"" >> "$LOG"

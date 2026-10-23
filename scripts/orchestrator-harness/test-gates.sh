@@ -1449,9 +1449,13 @@ FAKE
     sed -n '/^mp_recent_land() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
-  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN]
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
     ( set -u
       O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
+      PRDISP_ACTS=3
+      PRDISP_TOP=""
+      if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
+      if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1491,6 +1495,137 @@ PYEOF
     *"drain alive"*|*"DRAIN STALLED"*) echo "  ok a NON-NUMERIC MERGE_STALL_MIN falls back to 180 and still decides"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a non-numeric MERGE_STALL_MIN produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
   esac
+  # ── THE DRAIN'S PROMISE IS VERIFIED, AND A STALL ESCALATES (agent-infra#2590) ────────────────
+  # ⛔ THE DEFECT: the issue path closes on the PR path working, and a stall only printed a log line
+  # — 8 of them on a live box at `lanes=0` with 9 un-owned and nothing landing for 3.4h, which read as
+  # normal. These drives pin the three readings apart, and pin that the escalation SURVIVES the pass.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain 200 180 0)"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a stalled drain that spawned NOTHING escalates as a DEADLOCK (the policy's promise failed)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a stall with 0 spawns did not escalate: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"issues stays CLOSED"*|*"issue path stays CLOSED"*) echo "  ok …and it does NOT reopen the issue path (owner ruling 2026-10-18 preserved)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the escalation lost the closed issue path: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if [ -s "$DO/state/drain-stall" ] && grep -q '^passes=1$' "$DO/state/drain-stall"; then
+    echo "  ok …and the escalation is RECORDED (it outlives the pass, so the next cycle still knows)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the escalation left no artifact: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  _out="$(_drain 200 180 0)"
+  grep -q '^passes=2$' "$DO/state/drain-stall" \
+    && { echo "  ok …and a second stalled pass COUNTS itself (pass 2) rather than restarting at 1"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the pass counter did not advance: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  _out="$(_drain 200 180 4)"
+  case "$_out" in
+    *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
+    *"DRAIN DEADLOCK"*) echo "  ❌ a stall with 4 spawns was reported as a deadlock: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a stall with 4 spawns lost the spawn count: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"UNMEASURED"*) echo "  ❌ a MEASURED 4 spawns was rendered UNMEASURED: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok …and a measured count is never rendered as UNMEASURED"; PASS=$((PASS+1)) ;;
+  esac
+  # An UNMEASURED spawn count must not manufacture a deadlock claim — a claim from no measurement.
+  _out="$(_drain 200 180 '')"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*) echo "  ❌ an UNMEASURED spawn count produced a deadlock claim: $_out"; FAIL=$((FAIL+1)) ;;
+    *"UNMEASURED"*) echo "  ok an unreadable spawn count says UNMEASURED and claims no deadlock"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable spawn count produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ THE LAND POPULATION IS NOT "THE QUEUE" (MEASURED 2026-10-23). `state/merged-*.done` is written by
+  # merge-one.sh ONLY, i.e. by THIS box's own merge workers, so the age says "when did this box last
+  # land" — not "when did the queue last move". On a live box 7 PRs merged in 69 minutes while this
+  # line printed "no PR merged in 264m", because a PEER box held the landing claims. An escalation that
+  # names a land/capacity problem on a box that is merely not the lander is one an operator ignores.
+  _out="$(_drain 200 180 0 'no arm: no red check in this class is in this repo')"
+  case "$_out" in
+    *"THIS box's own merge-one successes only"*) echo "  ok the stall NAMES its land population (a peer box's merges are invisible here)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the stall presented this box's land age as the queue's: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *'dominant named wait: "no arm: no red check in this class is in this repo"'*) echo "  ok …and it quotes the dominant NAMED wait the ledger already held (the reason nothing spawned)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the deadlock did not quote the pass's own dominant wait: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # No named wait -> no empty quote (an invented citation is worse than none).
+  _out="$(_drain 200 180 0 '')"
+  case "$_out" in
+    *'dominant named wait'*) echo "  ❌ an ABSENT wait reason was rendered as a quote: $_out"; FAIL=$((FAIL+1)) ;;
+    *"THIS box's own merge-one successes only"*) echo "  ok …while an absent wait reason is left out (no invented quote)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the stall lost its population note with no wait reason: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # A LAND CLEARS IT. A marker that outlives its condition is the stale-flag class this harness hunts.
+  _out="$(_drain 5 180 0)"
+  if [ -e "$DO/state/drain-stall" ]; then
+    echo "  ❌ a fresh land left the escalation marker behind (a stale flag): $(cat "$DO/state/drain-stall")"; FAIL=$((FAIL+1))
+  else
+    echo "  ok a fresh land CLEARS the escalation marker"; PASS=$((PASS+1))
+  fi
+  # …and the status-line token reads that marker, so the stall cannot be silent.
+  _tk() { ( set -u; O="$DO"; . "$TMP/drain_helpers.sh"; . "$TMP/dt.sh"; drain_stall_token ); }
+  # ⛔ THE LABEL HELPER IS EXTRACTED WITH THE TOKEN (review c-1). The token calls
+  # `drain_stall_label`; a suite that extracted only the token would get a 127 inside the command
+  # substitution, an EMPTY label, and the `UNMEASURED` fallback would keep every assertion below
+  # green while the shipped label was broken — the same unextracted-helper trap `spawns_since` has
+  # in pr-dispatch.test.sh.
+  { sed -n '/^drain_stall_token() {/,/^}/p' "$ORCH"; sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"; } > "$TMP/dt.sh"
+  grep -qF 'drain_stall_label() {' "$TMP/dt.sh" \
+    || { echo "  ❌ drain_stall_label() is missing — the token cannot derive its label"; FAIL=$((FAIL+1)); }
+  if [ -s "$TMP/dt.sh" ]; then
+    _g="$(_tk)"; [ -z "$_g" ] \
+      && { echo "  ok no marker -> the status line carries NO drain token"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ a deleted marker still produced a token: $_g"; FAIL=$((FAIL+1)); }
+    printf 'at=%s\npasses=3\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK(passes=3"*"no_land=240m"*"spawns=0"*) echo "  ok the cycle status line carries the escalation (passes, land age, spawns)"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the status token lost its evidence: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
+    # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
+    # DID start. A token keyed on the file existing printed `drain=DEADLOCK(…,spawns=4)` over a pass that
+    # started four workers — the claim-without-a-measurement class this change deletes, on the one line
+    # every reader parses.
+    printf 'at=%s\npasses=4\nage=240\nunowned=9\nspawns=4\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK"*) echo "  ❌ a marker recording 4 spawned workers was reported as a DEADLOCK: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"drain=STALLED("*"spawns=4"*) echo "  ok a marker recording spawned workers reads STALLED, never DEADLOCK"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the token lost the spawns>0 reading: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # …and an UNREADABLE count is neither a deadlock nor a stall: it is unmeasured.
+    printf 'at=%s\npasses=5\nage=240\nunowned=9\nspawns=UNMEASURED\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"drain=DEADLOCK"*) echo "  ❌ an UNMEASURED spawn count produced a DEADLOCK label: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"drain=UNMEASURED("*) echo "  ok an unmeasurable marker reads UNMEASURED — a deadlock claim needs a measurement"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ an unmeasurable marker produced no honest label: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ ONE DEFINITION, TWO READERS: the cycle record's `drain=` field must go through the same helper,
+    # or the status line and the durable record can disagree about what the box is in.
+    wpin "the cycle record's drain= field is the SAME helper the status token reads" "$ORCH" '_cr_drain="$(drain_stall_label)"'
+    wpin "…and a PR cycle with NO marker says 'draining', not an empty field" "$ORCH" '_cr_drain="draining"'
+    # ⛔ A LAND NEWER THAN THE MARKER CLEARS IT, and the token must not need the writer to remember.
+    # ⛔ THE MARKER IS STAMPED IN THE PAST, ON PURPOSE. The real ordering is "pass N writes the marker
+    # at T, a later pass lands a PR at T+n" — so the land is STRICTLY newer. Stamping both `at` and the
+    # land in the same wall-clock second made this drive a coin flip on a strict `-gt` (measured: it
+    # failed on a same-second run), and the shipped comparison is deliberately strict: a land at the
+    # exact second the marker was written cannot be shown to postdate it, and an escalation that
+    # survives one extra pass is fail-closed, while deleting on an unprovable land is fail-open.
+    : > "$DO/state/merged-8888.done"
+    printf 'at=%s\npasses=3\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(( $(date +%s) - 5 ))" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    if [ -z "$_g" ] && [ ! -e "$DO/state/drain-stall" ]; then
+      echo "  ok a land newer than the marker deletes it (self-healing, not a stale flag)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a land did not clear the escalation: token='$_g' marker=$([ -e "$DO/state/drain-stall" ] && echo present || echo gone)"; FAIL=$((FAIL+1))
+    fi
+    rm -f "$DO/state/merged-8888.done" "$DO/state/drain-stall"
+  else
+    echo "  ❌ drain_stall_token() is missing — the escalation can be silent again"; FAIL=$((FAIL+1))
+  fi
   # ⛔ A FUTURE LAND STAMP IS UNMEASURABLE, NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N`
   # passes a future-stamped file, so clamping the negative age to 0 rendered a clock step-back as
   # "drain alive" — and after the release valve was removed this line is a stall's only signal.
