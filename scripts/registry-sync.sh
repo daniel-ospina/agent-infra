@@ -164,8 +164,32 @@ git_b() { # <git args…>
 # sed, not jq: record-review.sh WRITES a record with one printf in a fixed field order and reads
 # its own fields back the same way, so a second JSON parser here would be a second definition of
 # the record's shape (the same reason that script's record_identity() is an exact-string compare).
+# ⛔ THE READER'S OWN PARSE, NEVER sed (review #2386 cycle 1, P1). `read_record` (atomic-land.sh) and
+# review-enforcer parse a record as STRICT JSON and take its TOP-LEVEL value. A greedy sed that takes
+# the LAST match on the line can instead return a NESTED value — a `repo`/`pr`/`reviewed_at` sitting
+# inside, say, an `evidence` object — so the two parsers would define ONE record's shape differently,
+# and every rule below (ordering by `reviewed_at`, rule 3's key verification, the carry lineage) is
+# only as trustworthy as that comparison. The old sed was right for the records THIS repo writes
+# (record-review.sh emits one flat line, fixed field order) and wrong for any other byte sequence,
+# which is exactly the class rule 1 must not lose a newer record to.
+# No python3 ⇒ EMPTY, which every caller already treats as UNREADABLE — so the run fails CLOSED and
+# nothing is overwritten. That is deliberate and matches `record_usable`'s posture: an unreadable
+# record is not a newer one.
 field() { # <file> <name>
-  sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | command head -1
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[2], "") if isinstance(d, dict) else ""
+if v is None:
+    v = ""
+if isinstance(v, bool):
+    v = "true" if v else "false"
+print(v if isinstance(v, str) else str(v))
+PY
 }
 
 # ── what the CONSUMER can actually use ───────────────────────────────────────────────────
@@ -318,6 +342,38 @@ registry_names() { # one filename per line (absent dir → nothing)
   done | LC_ALL=C sort
 }
 
+# ── serialising compare+write ───────────────────────────────────────────────────────────
+# `pull` reads this box's record, decides, then writes. Without a lock a record MINTED between the
+# comparison and the rename is silently replaced by the peer's older bytes — rule 1 lost to a race,
+# and unrecoverably (the store keeps one record per PR and there is no delete path). The rail's
+# per-PR lock does not cover this: a `record-review.sh` mint, an operator `pull`/`push` and
+# `cloud-cell-bringup.sh`'s union all write this directory without it (review #2386 cycle 1, P2).
+#
+# mkdir, not flock: flock is absent on stock macOS (this file already avoids `timeout` for the same
+# reason). Bounded (~5s) so a landing can never hang on it, and reclaimable: a lock whose recorded
+# holder pid is GONE is a killed run, and reclaimed rather than allowed to wedge every future pull.
+reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
+  local i=0 pidf pid
+  mkdir -p "$REG_DIR" 2>/dev/null || return 1
+  LOCKDIR="$REG_DIR/.registry-sync.lock"
+  while [ "$i" -lt 50 ]; do
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null || true
+      return 0
+    fi
+    pidf="$LOCKDIR/pid"; pid=""
+    [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      warn "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)."
+      rm -rf "$LOCKDIR" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+reg_unlock() { [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR" 2>/dev/null; LOCKDIR=""; return 0; }
+
 write_local() { # <key> <content-file>
   mkdir -p "$REG_DIR" || { warn "registry-sync.sh: cannot create $REG_DIR"; return 1; }
   # A registry entry is data, never a pointer into another tree: refuse to write through a symlink
@@ -334,6 +390,7 @@ write_local() { # <key> <content-file>
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
 PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0
+LOCKDIR=""
 CONFLICT_KEYS=""
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
@@ -477,6 +534,21 @@ push_one() { # <key> <source-file>
 }
 
 pull_one() { # <key>
+  # The lock covers the COMPARE and the WRITE (see reg_lock). The wrapper exists so every one of
+  # pull_one's early returns releases it — a lock leaked on an early return would wedge the next
+  # run, which is a worse failure than the race it prevents.
+  if ! reg_lock; then
+    warn "  ⚠️ skip $1 — could not serialise the registry (another run holds $REG_DIR/.registry-sync.lock);"
+    warn "     NOTHING was written, so no record was overwritten with an older one. Re-run to retry."
+    FAILED=$((FAILED + 1)); return 0
+  fi
+  pull_one_locked "$1"
+  local rc=$?
+  reg_unlock
+  return "$rc"
+}
+
+pull_one_locked() { # <key>
   local key="$1" tmp lf rat lat pull_reason=""
   tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { FAILED=$((FAILED + 1)); return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
@@ -495,15 +567,19 @@ pull_one() { # <key>
     fi
     rm -f "$tmp"; return 0
   fi
+  # ⛔ USABILITY BEFORE ANY FIELD READ, AND BEFORE ORDERING. A record the rail cannot read must never
+  # win the comparison: it would replace a usable local record with bytes `read_record` refuses (see
+  # `record_usable`). It is checked FIRST because `field()` is now the READER'S parse (strict JSON):
+  # for a record that is not strict JSON there is no readable `reviewed_at` either, so the
+  # ordering arm below would report "no readable reviewed_at" for a file whose real defect is that it
+  # is unusable — a less accurate reason for the same skip (measured: review #2386 cycle 1).
+  if ! record_usable "$tmp"; then
+    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
+    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
+  fi
   rat="$(field "$tmp" reviewed_at)"
   if [ -z "$rat" ]; then
     warn "  ⚠️ skip $key — the peer's record carries no readable reviewed_at."
-    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
-  fi
-  # ⛔ USABILITY BEFORE ORDERING. A record the rail cannot read must never win the comparison: it
-  # would replace a usable local record with bytes `read_record` refuses (see `record_usable`).
-  if ! record_usable "$tmp"; then
-    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
     rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
   # ⛔ THE KEY MUST MATCH WHAT THE RECORD SAYS IT IS, on the way IN as well as out. `push` refuses
@@ -543,6 +619,18 @@ pull_one() { # <key>
       warn "  ⚠️ skip $key — this box's record carries no readable reviewed_at; refusing to overwrite an unknown-order record (#2374 rule 1)."
       UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
     fi
+    # ⛔ A local record that is NEWER but that this box's own reader cannot USE wins the comparison
+    # for ever, and `pull` is named as the remedy on the very refusal it causes (atomic-land.sh's
+    # "no review record" message) — so a lane was told to run a verb that can never help. Rule 1 is
+    # not relaxed (the newer bytes are NOT overwritten); what changes is that the run NAMES the real
+    # state and the real remedy instead of reporting a converged-looking `keep` (review #2386
+    # cycle 1, P2).
+    if ! record_usable "$lf"; then
+      warn "  ⚠️ skip $key — this box's record is NEWER ($lat > $rat) but is NOT one its own rail can use"
+      warn "     (no 40-hex head_sha, no verdict, or not strict JSON). It is NOT overwritten (#2374 rule 1)"
+      warn "     and \`pull\` cannot repair it — remove/re-mint $lf, or the lane keeps reading the older one."
+      UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+    fi
     if [ "$lat" = "$rat" ]; then
       # The peer's record supersedes this box's only when it is a CARRY of it (same mint time, and
       # `carried_from` names the head this box holds) — the carry arm keeps the stamp, so treating
@@ -564,6 +652,19 @@ pull_one() { # <key>
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac
       fi
+    fi
+  fi
+  # A record for a DIFFERENT head is the normal case after a push (the peer reviewed the newer
+  # head), but it is also how a force-push back to an older reviewed head makes this box's record
+  # for the CURRENT head disappear — the rail then refuses with "the record names X but the head is
+  # Y" and nothing said why. Name the divergence rather than install it silently (review #2386
+  # cycle 1, P2). Fail-closed either way: the ordering rule still decides WHICH record wins.
+  if [ -n "$lf" ]; then
+    local lh rh
+    lh="$(field "$lf" head_sha)"; rh="$(field "$tmp" head_sha)"
+    if [ -n "$lh" ] && [ -n "$rh" ] && [ "$lh" != "$rh" ]; then
+      warn "  ⚠️ $key — the peer's newer record names head ${rh:0:12}… but this box's names ${lh:0:12}…;"
+      warn "     installing it (rule 1: newer reviewed_at wins). If that head is not the PR's current one, the rail will refuse."
     fi
   fi
   if write_local "$key" "$tmp"; then

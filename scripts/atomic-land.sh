@@ -821,7 +821,13 @@ sync_review_registry() {
     say "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
     return 0
   fi
-  out="$(bash "$sync" union 2>&1)" || rc=$?
+  # ⛔ `--dir` IS PASSED EXPLICITLY: without it the union takes `REGISTRY_SYNC_DIR` from AMBIENT env
+  # while `read_record` below reads `$HOME/.pi/agent/reviews` unconditionally. An exported
+  # `REGISTRY_SYNC_DIR` in a lane shell would then converge a directory the gate NEVER READS and
+  # still report `wrote=N` at rc 0 — a false "synced" about the gate's own registry, which is the
+  # false-converged class this whole change exists to delete (review #2386 cycle 1, P2).
+  # `cloud-cell-bringup.sh` passes it explicitly for the same reason.
+  out="$(bash "$sync" union --dir "$HOME/.pi/agent/reviews" 2>&1)" || rc=$?
   case "$rc" in
     0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of

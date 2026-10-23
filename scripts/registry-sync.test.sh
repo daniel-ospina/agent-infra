@@ -292,7 +292,16 @@ print(n)
 PY
 )" \
   "§13 ...and the local record COUNT matches the attributable files (a subshell loses it to 0)"
-assert_contains "$OUT" "origin records=" "§13 status reports the origin line too"
+# ⛔ NOT `printf | grep -q` (scripts/check-no-sigpipe-grep.sh, #841): under `pipefail` an early
+# grep exit gives the writer SIGPIPE (141) and the pipeline turns non-zero, so the `if` would take
+# its ELSE branch on content that IS present — a false negative in the very arm that exists to
+# catch a placeholder. Capture first, then test the captured value.
+ORIGIN_LINE="$(printf '%s\n' "$OUT" | grep '^origin records=')"
+if [[ "$ORIGIN_LINE" =~ ^origin\ records=[0-9]+\ newest_reviewed_at= ]]; then
+  ok "§13 status reports the origin line with a REAL count and stamp, not a placeholder"
+else
+  bad "§13 status reports the origin line with a REAL count and stamp (got: ${ORIGIN_LINE:-<no origin line>})"
+fi
 # 0, and that is the point of the reader-aware test: this box holds BOTH of those records under a
 # LEGACY name the reader accepts (`8888.json` from §12, and the repo-less `441.json`), so reporting
 # them as missing would contradict every other verb — `pull` correctly refuses to materialise them.
@@ -660,7 +669,16 @@ chmod +x "$SHIM2/git"
 RS_LAST="$(PATH="$SHIM2:$PATH" bash "$SYNC" pull --repo "$STORE5" --dir "$BOX7" --remote origin --timeout 10 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§26 a store whose objects could not be fetched is NOT converged (exit 4)"
 assert_contains "$RS_LAST" "not readable here" "§26 ...and each such key is NAMED, not silently dropped"
-assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
+# ⛔ A LABEL-ONLY assertion is vacuous: `summary` always prints `unreadable=%s`, so the old
+# `assert_contains "$RS_LAST" "unreadable="` was true no matter what the run did — it read as a
+# guard while asserting a constant (review #2386 cycle 1, P2). Assert the VALUE is a real counter.
+# ⛔ NOT `printf | grep -q` (see §13 above and scripts/check-no-sigpipe-grep.sh, #841).
+UNREADABLE_LINE="$(printf '%s\n' "$RS_LAST" | grep -oE 'unreadable=[0-9]+' | command head -1)"
+if [ -n "$UNREADABLE_LINE" ]; then
+  ok "§26 ...and counted (a numeric counter, not a placeholder: $UNREADABLE_LINE)"
+else
+  bad "§26 ...and counted (no numeric unreadable counter in the run output)"
+fi
 assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
 if grep -qE 'unreadable=0' <<<"$RS_LAST"; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
 
