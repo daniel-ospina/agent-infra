@@ -41,7 +41,8 @@
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
-#   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 120; a whole number, below the 300s
+#   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
+#                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install)
 #                          StartLimitIntervalSec so a start that can never succeed converges to `failed`).
 #                          Rendered as CONTROLLER_ORPHAN_TIMEOUT, and as TimeoutStartSec — its systemd-side
 #                          counterpart (this unit is Type=simple, where that directive does not bound start)
@@ -88,11 +89,12 @@ RESTART_SEC="${ORCH_RESTART_SEC:-15}"
 # earlier claim that it did was inert, and the wait fell back to the supervisor's 3600 s default. Both
 # bounds are now rendered into the unit's ENVIRONMENT, where the supervisor actually reads them:
 #   CONTROLLER_ORPHAN_TIMEOUT (START_TIMEOUT_SEC) — a session outlived its loop. An orphan never exits, so
-#     that start can never succeed: this value must sit BELOW StartLimitIntervalSec so the burst fills and
-#     the unit converges to `failed` instead of reading active forever.
+#     that start can never succeed: StartLimitBurst of them must fit INSIDE StartLimitIntervalSec
+#     (`burst × (orphan + RestartSec) < interval`, enforced in do_install) so the burst is exceeded and the
+#     unit converges to `failed` instead of restarting forever.
 #   CONTROLLER_HANDOVER_TIMEOUT (HANDOVER_TIMEOUT_SEC) — an owned controller is still running, which is the
 #     migration path and is landing work. A long bound is correct here; a short one would fail the upgrade.
-START_TIMEOUT_SEC="${ORCH_START_TIMEOUT_SEC:-120}"
+START_TIMEOUT_SEC="${ORCH_START_TIMEOUT_SEC:-60}"
 HANDOVER_TIMEOUT_SEC="${ORCH_HANDOVER_TIMEOUT_SEC:-3600}"
 CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
@@ -335,7 +337,7 @@ controller_proof() { # [<not_before_epoch>] — a heartbeat older than this star
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
 do_install() {
-    local tpl tmpd changed=0 linger=0 pid rc pre_active=0 started_at="" proof_since=0
+    local tpl tmpd changed=0 linger=0 pid rc pre_active=0 started_at="" proof_since=0 sl_iv sl_burst
     # ⛔ REFUSE AN ELEVATED INSTALL (review P2, #2402). `sudo bash install-controller-service.sh` renders
     # User=root / HOME=/root / O=/root/orchestrator, and verify_unit *requires* that — so the unit is green,
     # runs as root with root's keys.env and gh auth, and, because it is ENABLED, a later `start` delegates
@@ -353,24 +355,40 @@ do_install() {
     esac
     [ "$RESTART_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_RESTART_SEC must be >= 1 (got '$RESTART_SEC') — 0 is not a delay"; return 1; }
-    # ⛔ THE START TIMEOUT MUST BE BELOW THE START-LIMIT WINDOW (review P2, #2402). A start bound at or above
-    # StartLimitIntervalSec can be attempted at most once per window, so the 3-in-5-minutes burst never fills
-    # and a start that can never succeed parks forever while `--status` reads active.
+    # ⛔ THE ORPHAN CEILING MUST FIT `StartLimitBurst` ATTEMPTS INSIDE `StartLimitIntervalSec` — NOT MERELY
+    # SIT BELOW IT (review P2, #2402). systemd refuses the start AFTER the burst is exceeded
+    # (`systemd.unit(5)`: units "started more than burst times within an interval time span are not
+    # permitted to start any more"), so an impossible start converges to `failed` only when `burst`
+    # failures fit inside ONE window. Each attempt costs the orphan ceiling (the wait, then the failure)
+    # PLUS `RestartSec`, so the relation is
+    #     StartLimitBurst × (CONTROLLER_ORPHAN_TIMEOUT + RestartSec) < StartLimitIntervalSec
+    # and the earlier "orphan < interval" test was satisfied by the OLD 120 s default: 120 + 15 = 135 s per
+    # attempt, three failures span 405 s > the 300 s window, the oldest start ages out before the fourth is
+    # refused — so the unit restarted FOREVER, parking 120 s per cycle and re-running cmd_check's network
+    # reads, while the template, this installer, the doc and §J all claimed it converged to `failed` (which
+    # is the state `--status` prints and `reset-failed` acts on). 60 s is the supervisor's OWN default
+    # (CONTROLLER_ORPHAN_TIMEOUT), so the two instruments now agree as well as the arithmetic working.
+    # Both limits are READ FROM THE TEMPLATE: the template owns the numbers (verify_unit asserts them), and a
+    # second copy of 300/3 here is how the two would drift apart.
+    tpl="$TEMPLATES_DIR/$UNIT_NAME"
+    [ -f "$tpl" ] || { err "template missing: $tpl (set TEMPLATES_DIR)"; return 1; }
+    sl_iv="$(sed -n 's/^StartLimitIntervalSec=//p' "$tpl" 2>/dev/null | head -1)"
+    sl_burst="$(sed -n 's/^StartLimitBurst=//p' "$tpl" 2>/dev/null | head -1)"
+    case "${sl_iv:-}" in ''|*[!0-9]*) sl_iv=300 ;; esac
+    case "${sl_burst:-}" in ''|*[!0-9]*) sl_burst=3 ;; esac
     case "${START_TIMEOUT_SEC:-}" in
         ''|*[!0-9]*) err "REFUSING: ORCH_START_TIMEOUT_SEC must be a whole number of seconds (got '$START_TIMEOUT_SEC')"; return 1 ;;
     esac
     [ "$START_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be >= 1 (got '$START_TIMEOUT_SEC')"; return 1; }
-    [ "$START_TIMEOUT_SEC" -lt 300 ] \
-        || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC is not below StartLimitIntervalSec=300 — an orphaned session never exits, so this start can never succeed and the burst would never fill, leaving the unit to look supervised forever"; return 1; }
+    [ "$(( sl_burst * (START_TIMEOUT_SEC + RESTART_SEC) ))" -lt "$sl_iv" ] \
+        || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC does not fit StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s — each attempt costs the orphan ceiling plus RestartSec (${RESTART_SEC}s), so $sl_burst failures span $(( sl_burst * (START_TIMEOUT_SEC + RESTART_SEC) ))s, the oldest start ages out of the window before the burst is exceeded, and the unit restarts forever over a start that can never succeed while --status reads supervised. Use ORCH_START_TIMEOUT_SEC <= $(( sl_iv / sl_burst - RESTART_SEC ))s."; return 1; }
     case "${HANDOVER_TIMEOUT_SEC:-}" in
         ''|*[!0-9]*) err "REFUSING: ORCH_HANDOVER_TIMEOUT_SEC must be a whole number of seconds (got '$HANDOVER_TIMEOUT_SEC')"; return 1 ;;
     esac
     [ "$HANDOVER_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_HANDOVER_TIMEOUT_SEC must be >= 1 (got '$HANDOVER_TIMEOUT_SEC') — a handover that is given no time at all fails every upgrade"; return 1; }
     resolve_supervisor || return 1
-    tpl="$TEMPLATES_DIR/$UNIT_NAME"
-    [ -f "$tpl" ] || { err "template missing: $tpl (set TEMPLATES_DIR)"; return 1; }
     choose_target || return 1
     # ⛔ NEVER ARM A SECOND SUPERVISOR IN THE OTHER SCOPE (review P2, #2402). `enable` is unconditional, so a
     # box that installed a USER unit and later gained passwordless sudo would get a SYSTEM unit too — both

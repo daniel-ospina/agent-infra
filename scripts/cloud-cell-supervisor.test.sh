@@ -2296,6 +2296,75 @@ esac
 [ -f "$S2/o/.orch.lock" ] && ok "stop: left the lock in place (its owner was alive — #1761's duplicate)" \
                           || bad "stop: released a lock whose owner was alive"
 S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; } 2>/dev/null || true
+
+# ── #2402 review round 6 P1: a unit is OURS when its keys.env repoints $O ─────────────────────────
+# The unit renders the INSTALLER's $O, and the controller re-sources $ENV_FILE, which may repoint $O —
+# both files say so in their own words ("this installer's $O and the controller's can legitimately
+# differ"). Ownership read as a bare string comparison against the rendered value therefore called this
+# cell's OWN installed, enabled unit ANOTHER state dir's the moment keys.env carried an `O=` line: `stop`
+# skipped `systemctl stop`, killed the pid, printed "released lock", and `Restart=always` re-created the
+# controller within RestartSec — the "reported stopped, still running" false pass this PR exists to
+# remove — while `status` printed "nothing will restart it" over a supervised cell.
+say_case "unit ownership survives a keys.env that repoints \$O, and a genuinely foreign unit is still foreign"
+S3="$T/svc3"; rm -rf "$S3"; mkdir -p "$S3/units" "$S3/o" "$S3/home" "$S3/repo" "$S3/bin" "$T/no-user-units"
+printf 'O=%s/o\n' "$S3" > "$S3/home/keys.env"
+# the installer rendered ITS OWN $O — a different path from the one keys.env resolves the controller to
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+cat > "$S3/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S3/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S3/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S3/o/orch-loop.sh"
+svc3_sup() { # <verb>
+  PATH="$S3/bin:$PATH" SYSTEMCTL="$S3/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S3/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S3/home" ENV_FILE="$S3/home/keys.env" SESSION="svc2402b-$$" O="$S3/o" REPO="$S3/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3P=$!
+printf '%s\n' "$S3P" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3_OUT="$(svc3_sup stop)"
+# ⛔ THE DISCRIMINATOR IS `systemctl stop`, NOT rc: a kill alone returns 0 over a controller that returns.
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: addressed the UNIT of a cell whose keys.env repoints $O (the rendered O is not the owner — the resolution is)' \
+  || bad "stop: never called 'systemctl stop' — this cell's own unit was read as another state dir's, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3_OUT"
+kill -9 "$S3P" 2>/dev/null || true
+S3C="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3C" ] && kill -9 "$S3C"; } 2>/dev/null || true
+# NEGATIVE CONTROL: the SAME rendered shape, but its env file does NOT resolve to this cell's $O. Ownership
+# must stay PROVEN-foreign (the resolution must not become "any unit on the box is ours", which would stop
+# another cell's dispatcher).
+printf 'OTHER=1\n' > "$S3/home/other-keys.env"
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; : > "$S3/sc.log"
+S3N_OUT="$(svc3_sup stop)"; S3N_RC=$?
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && bad "stop: stopped a unit whose env file resolves a DIFFERENT state dir — the widened ownership would stop another cell's controller — $S3N_OUT" \
+  || ok 'stop: a unit whose env file resolves another state dir stays FOREIGN and is left alone (the negative control)'
+case "$S3N_OUT" in
+  *"NOT this one"*) ok 'stop: the foreign unit is NAMED, not silently skipped' ;;
+  *) bad "stop: left the foreign unit alone without naming it — $S3N_OUT" ;;
+esac
+rm -f "$S3/units/eldato-orchestrator.service"
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
