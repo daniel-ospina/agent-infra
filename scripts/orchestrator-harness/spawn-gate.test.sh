@@ -382,6 +382,43 @@ got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
 [ "$got" = "rc=75 started=1" ]; rc=$?
 ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want rc=75 started=1, got '${got:-<none>}')" $rc
 
+# ⛔ …AND THE SAME FOR 74 AND 73 (review P2, agent-infra#2293; renumbered by the #2293x#2409 batch).
+# PI_FORK_REFUSED used to BE 74 — the identical value as AGENT_FORK_REFUSED then — so run_agent's arm could
+# not tell the shim's refusal from a real `pi` that exited 74 (EX_IOERR): a model run that hit a disk
+# I/O error was reported as "this box could not fork" AND had AGENT_STARTED cleared, which is the
+# #1720 class in the other direction. The spawn-point code is now 78 and the caller-facing one stays
+# 73, mirroring the load pair (76 at the spawn point, 75 for the caller). ⛔ 73 and NOT 74: 74 is
+# AGENT_LAND_BACKLOG, whose remedy is the opposite of a fork refusal's, so "stays 74" here was
+# stale pre-renumber prose that stated the very collision the renumber removes.
+# pre-change tree: it produced rc=74 started=0.
+mkdir -p "$TMP/bin74"
+printf '#!/bin/sh\nexit 74\n' > "$TMP/bin74/pi"
+chmod +x "$TMP/bin74/pi"
+# Resolved HERE rather than reused from the later section: the suite runs under `set -u`, so a variable
+# assigned further down is UNBOUND at this point — which made this arm report '<none>' instead of
+# failing for the reason it names.
+_capmod74="$HERE/capacity.sh"
+[ -f "$_capmod74" ] || _capmod74="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+got="$(PATH="$TMP/bin74:$TMP/bin:$PATH" O="$TMP/O" DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1" 2>/dev/null
+  cap_procs_live() { printf "400"; }
+  cap_ulimit_u() { printf "15641"; }
+  cap_maxprocperuid() { return 1; }
+  . "$2"
+  load1() { printf "0"; }
+  MAX_LOAD=10
+  run_agent 1 "$3" "$4" "pi that exits 74 itself" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$_capmod74" "$GATE" "$TMP/log4" "$PROMPT" 2>/dev/null)"
+[ "$got" = "rc=74 started=1" ]; rc=$?
+ck "a pi that itself exits 74 (EX_IOERR) is STARTED, not read as the fork gate's refusal (want rc=74 started=1, got '${got:-<none>}')" $rc
+# …and the two codes are DISTINCT in the shipped source, which is the property that makes the arm
+# above possible at all. A grep of the declaration, so a future re-merge of the two is caught even if
+# the behavioural arm is ever weakened.
+_pf="$(grep -m1 '^PI_FORK_REFUSED=' "$GATE" | cut -d= -f2)"; _af="$(grep -m1 '^AGENT_FORK_REFUSED=' "$GATE" | cut -d= -f2)"
+{ [ -n "${_pf:-}" ] && [ -n "${_af:-}" ] && [ "$_pf" != "$_af" ]; }; rc=$?
+ck "the spawn point's fork code ($_pf) is DISTINCT from the caller-facing one ($_af) — a pi exiting the latter cannot be mistaken for the gate" $rc
+
 # ── 9) the PORTED CALLERS: a refusal must not consume a fixer attempt ───────────
 # The headline behavioural claim of this port is fix-one.sh's REFUND. orch-loop.sh books the attempt
 # (fixcount+1) and DELETES the findings marker when it CREATES the session — UPSTREAM of the gate
@@ -773,6 +810,87 @@ ck "a DISK refusal outranks a simultaneous LOAD refusal — the un-clearable one
 grep -q 'load-gate' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and the load refusal is NOT the only thing logged in that case" $rc
+
+# ⛔ FORK HEADROOM OUTRANKS BOTH, AND IT IS DRIVEN, NOT GREPPED (agent-infra#2293 — this section exists
+# because the verification gate found the first version of the fork arm INERT: it answered `ok` on a box
+# with 10 pids left, and every assertion about it was a grep). The reading is faked at its LEAVES
+# (`cap_procs_live`/`cap_ulimit_u`) so the real `cap_procs_pair_vars`, the real headroom arithmetic and
+# the real `spawn_fork_state` all run.
+# ⛔ THE CALLER'S VARIABLE NAMES BELOW (`p m src`) ARE THE POINT, not decoration: bash `local` is
+# DYNAMIC, so when this function's own locals were named `p`/`m`/`src` the `printf -v` writes landed in
+# the CALLEE's locals and the caller read empty strings — the arm then answered `ok`. Pinning both name
+# shapes makes that collision unrecoverable.
+cap_abspath="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
+[ -f "$cap_abspath" ] || cap_abspath="$HERE/capacity.sh"
+# A pair that is out of headroom (10 spare, margin 200) yet PASSES the two-fork probe — the exact
+# condition the arithmetic arm exists for.
+fake_edge() { # fake_edge <procs> <max> — re-declares the leaves, then reports the module's own verdict
+  bash -c '
+    FAKE_PROCS="$1"; FAKE_MAX="$2"
+    . "$3" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$4"
+    spawn_fork_state p m src
+    printf "COLLIDE:state=%s|detail=%s" "$p" "$m"
+    printf " \\n"
+    spawn_fork_state _dp _dm _ds
+    # Two specifiers, TWO arguments: the names `_dp _dm _ds` used to be passed as well and were never
+    # printed (a five-argument printf against a two-specifier format silently drops the tail, so a
+    # reader of the failure output saw nothing about which variables had been driven) — review P3.
+    printf "NOCLOBBER:state=%s|detail=%s" "$_dp" "$_dm"
+  ' _ "$1" "$2" "$cap_abspath" "$GATE"
+}
+edge_out="$(fake_edge 15631 15641)"
+case "$edge_out" in *"COLLIDE:state=refused"*"NOCLOBBER:state=refused"*) rc=0 ;; *) rc=1 ;; esac
+ck "a box 10 pids from its ceiling is REFUSED at the spawn point even when the caller names its vars p/m/src (dynamic-scoping collision) [$edge_out]" $rc
+case "$edge_out" in *"detail=headroom=10 < min_fork_headroom=200"*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the refusal NAMES the reading it refused (headroom, the margin, the pair) — not a bare 'busy'" $rc
+ok_out="$(fake_edge 400 15641)"
+case "$ok_out" in *"COLLIDE:state=ok"*) rc=0 ;; *) rc=1 ;; esac
+ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is not a blanket refusal) [$ok_out]" $rc
+
+# END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
+# code (74, not 77/75), and the log says why.
+: > "$LOG"; : > "$PI_LOG"
+run_fork() { # run_fork <procs> <max> [<max-load>] [<disk-floor>]
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD="${3:-999999999}" \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB="${4:-1}" \
+  bash -c '
+    FAKE_PROCS="$5"; FAKE_MAX="$6"
+    . "$1" 2>/dev/null
+    cap_procs_live() { printf "%s" "$FAKE_PROCS"; }
+    cap_ulimit_u() { printf "%s" "$FAKE_MAX"; }
+    cap_maxprocperuid() { return 1; }
+    . "$2"
+    LOG="$3"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "fork gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$cap_abspath" "$GATE" "$LOG" "$PROMPT" "$1" "$2"
+}
+ran="$(run_fork 15631 15641)"
+[ "$ran" = "rc=73 started=0" ]; rc=$?
+ck "run_agent REFUSES with the FORK code (73) on a starved box — no agent started ($ran)" $rc
+grep -q 'PI_RAN' "$PI_LOG" 2>/dev/null; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and pi was really NOT invoked (the stub never ran) — not merely 'the function returned non-zero'" $rc
+grep -q '\[fork-gate\] REFUSED' "$LOG"; rc=$?
+ck "...and the lane log names the fork gate and its reading (an operator is not left with a bare code)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and it is NOT reported as a load refusal (the remedies differ: restart the box vs wait for load)" $rc
+# ⛔ FORK OUTRANKS DISK **AND** LOAD: all three would refuse, and the fork is the un-clearable one that
+# must be named first (the same precedence rule the disk-outranks-load arm above pins).
+: > "$LOG"; : > "$PI_LOG"
+both="$(run_fork 15631 15641 0 9999999)"
+[ "$both" = "rc=73 started=0" ]; rc=$?
+ck "a FORK refusal outranks a simultaneous DISK and LOAD refusal — the external-restart one is reported ($both)" $rc
+# …and the positive control through the same path: plenty of pids means the agent RUNS.
+: > "$LOG"; : > "$PI_LOG"
+runs="$(run_fork 400 15641)"
+[ "$runs" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: with headroom the SAME drive starts the agent (rc=0) — the gate is not always closed ($runs)" $rc
 
 # POSITIVE CONTROL for the drives below: with a floor this filesystem meets, the agent RUNS.
 : > "$LOG"; : > "$PI_LOG"
