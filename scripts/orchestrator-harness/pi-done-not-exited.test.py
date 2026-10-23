@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-done-not-exited.test.py — nine real process trees, plus the controls the review demanded.
+"""pi-done-not-exited.test.py — fifteen real process trees, plus the controls the review demanded.
 
 WHY PROCESS FIXTURES AND NOT MOCKS
 The bug is a property of REAL PROCESSES — a `pi` whose launcher is blocked on it, a log on its fd 1,
@@ -24,6 +24,15 @@ THE CASES — each guards a different way to be wrong
   7. CHILD       DONE-shaped but holding a live child ⇒ LIVE (a child may be real work).
   8. SURVIVE     DONE-shaped but ignores SIGTERM ⇒ the run exits 1 and says `survived 1`.
   9. NO-OWNER    a `pi` under a plain `bash -c` ⇒ UNATTRIBUTABLE `no-owner`, survives.
+ 10. WEAK        a launcher that INTERPOLATES (`TAG="$N"`, `lane-$N.log` — the shipped shape) names
+                 the tag by no basis ⇒ `weak-owner`, report-only.
+ 11. FRESHLOG    no transcript, a log YOUNGER than `--min-idle` ⇒ not DONE (the bound covers the
+                 log-only arm too).
+ 12. ARGV        the tag ONLY on the launcher's argv (`bash lane-argytag.sh argytag` — `lane.sh <N>`)
+                 ⇒ rung `tag`, reaped: the basis that matches every shipped launcher.
+ 13. INTERACTIVE a lane-shaped `pi` whose launcher does NOT invoke print mode ⇒ refused: an agent at a
+                 human's prompt also reaches turn-ended and frozen CPU.
+ 14. BOUND       a control lane the first pass never reaps (the `--min-idle` bound, both directions).
 
 THREE SEQUENTIAL CONTROLS (not fixtures):
   * BOUND      a DONE-shaped lane that the first pass never reaps: not reaped at `--min-idle 100000`,
@@ -33,7 +42,7 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against SIX mutated copies of the tool and requires each to go RED
+`--mutations` re-runs this suite against EIGHT mutated copies of the tool and requires each to go RED
 (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
 arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
 suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
@@ -64,17 +73,22 @@ TOOL = os.path.join(HERE, "pi-done-not-exited.py")
 SCRIPTS = os.path.abspath(os.path.join(HERE, os.pardir))
 UUID = "01a1%010x" % os.getpid()
 LEADERS: dict = {}          # tag -> launcher pid (a session leader); cleaned up on EVERY exit path
+ROOT: list = []             # the temp root, so cleanup() removes it on failure/SIGTERM too (cycle 4)
 
 
 def cleanup() -> None:
-    """Kill each fixture's whole process group. Runs on success AND on a failed assertion: the
-    cycle-1 mutation runs leaked six fixtures because `fail()` exited before the cleanup loop."""
+    """Kill each fixture's process group AND remove the temp root. Runs on success, on a failed
+    assertion, and on SIGTERM: cycle 1 leaked fixtures because `fail()` exited before the cleanup
+    loop, and cycle 4 measured `--mutations` leaving six `/tmp/pi-dne-*` roots behind, because the
+    root was only removed on the success path."""
     for pid in list(LEADERS.values()):
         try:
             os.killpg(int(pid), signal.SIGKILL)
         except OSError:
             pass
     LEADERS.clear()
+    while ROOT:
+        shutil.rmtree(ROOT.pop(), ignore_errors=True)
 
 
 atexit.register(cleanup)
@@ -131,29 +145,32 @@ MARKER = ("[reflect-hook] Hosted tortoise capture OFF (cloud-not-enabled) — se
 
 
 def launcher_script(root: str, tag: str, cwd: str, logname: str, *, append: bool = False,
-                    ignore_term: bool = False, child: bool = False) -> str:
+                    ignore_term: bool = False, child: bool = False,
+                    no_print: bool = False) -> str:
     """A real lane launcher: TAG exported AND ASSIGNED, `pi` on fd 1, `.rc` written AFTER it exits."""
     log = os.path.join(root, "logs", logname + ".log")
     rc = os.path.join(root, "logs", tag + ".rc")
     trap = "trap '' TERM\n" if ignore_term else ""
     redirect = ">>" if append else ">"
     arg = " child" if child else ""
+    pm = "" if no_print else "-p "
     path = os.path.join(root, "lane-%s.sh" % tag)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/bash\n"
                  "export TAG=%s\n"
                  "cd %s || exit 4\n"
                  "%s"
-                 "%s/pi 300%s %s %s 2>&1\n"
+                 "%s/pi %s300%s %s %s 2>&1\n"
                  "rc=$?\n"
                  "printf 'EXIT rc=%%s\\n' \"$rc\" >> %s\n"
                  "printf '%%s %%s\\n' \"$rc\" \"$(date -u +%%FT%%TZ)\" > %s\n"
-                 % (tag, cwd, trap, root, arg, redirect, log, log, rc))
+                 % (tag, cwd, trap, root, pm, arg, redirect, log, log, rc))
     return path
 
 
 def launcher_interpolating(root: str, tag: str, cwd: str, logname: str, *,
-                           child: bool = False, inherit_tag: bool = False) -> str:
+                           child: bool = False, inherit_tag: bool = False,
+                           positional: bool = False) -> str:
     """A launcher shaped like the SHIPPED ones: `TAG="$N"`, redirect `lane-$N.log`.
 
     ⛔ This is the fixture cycle 3 was missing. `lane.sh` and `nonblocking-dispatch.sh` INTERPOLATE,
@@ -166,12 +183,15 @@ def launcher_interpolating(root: str, tag: str, cwd: str, logname: str, *,
     arg = " child" if child else ""
     path = os.path.join(root, "lane-%s.sh" % tag)
     lines = ["#!/bin/bash"]
-    if not inherit_tag:
+    if positional:
+        # `lane.sh`'s own shape: the tag arrives as `$1` and everything else interpolates.
+        lines += ['N="$1"', 'TAG="$N"', "export TAG"]
+    elif not inherit_tag:
         lines += ["N=%s" % logname, 'TAG="$N"', "export TAG"]
     lines += ["cd %s || exit 4" % cwd,
               # ⛔ EVERY redirection interpolates: `lane-$N.log`, `lane-$N.rc`. That is the shipped
               # shape, and it is why no text basis in `ownership()` can name the tag.
-              "%s/pi 300%s >> %s/logs/lane-$N.log 2>&1" % (root, arg, root),
+              "%s/pi -p 300%s >> %s/logs/lane-$N.log 2>&1" % (root, arg, root),
               "rc=$?",
               "echo \"$rc\" > %s/logs/lane-$N.rc" % root]
     with open(path, "w", encoding="utf-8") as fh:
@@ -179,11 +199,16 @@ def launcher_interpolating(root: str, tag: str, cwd: str, logname: str, *,
     return path
 
 
-def launch_detached(script: str, cwd: str, pidfile: str, env=None) -> int:
-    """Run the launcher as a session leader reparented to init (ambient ancestry insulation)."""
+def launch_detached(script: str, cwd: str, pidfile: str, env=None, arg: str = None) -> int:
+    """Run the launcher as a session leader reparented to init (ambient ancestry insulation).
+
+    `arg` is passed as the launcher's `$1` — the shipped `lane.sh <N>` shape, where the tag reaches
+    the launcher ONLY on its argv.
+    """
     subprocess.run(["setsid", "--fork", "bash", "-c",
-                    "echo $$ > %s; exec bash %s" % (pidfile, script)],
-                   cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    "echo $$ > %s; exec bash %s%s" % (pidfile, script, (" " + arg) if arg else "")],
+                   cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                   env=env)
     end = time.time() + 10
     while time.time() < end:
         try:
@@ -235,6 +260,7 @@ def run_tool(sessions: str, pids, extra, apply: bool = True):
 
 def main() -> int:
     root = tempfile.mkdtemp(prefix="pi-dne-")
+    ROOT.append(root)
     sessions = os.path.join(root, "sessions")
     os.makedirs(os.path.join(root, "logs"))
     os.makedirs(sessions)
@@ -252,21 +278,24 @@ def main() -> int:
 
     def case(tag: str, entry, marker: bool = True, transcript: bool = True, logname: str = None,
              append: bool = False, ignore_term: bool = False, child: bool = False,
-             fresh_log: bool = False, interpolate: bool = False) -> int:
+             fresh_log: bool = False, interpolate: bool = False, positional: bool = False,
+             no_print: bool = False) -> int:
         cwd = os.path.join(root, "wt-" + tag)
         os.makedirs(cwd)
         started = time.time()
         ln = tag if logname is None else logname
-        script = (launcher_interpolating(root, tag, cwd, ln, child=child, inherit_tag=interpolate) if interpolate
+        script = (launcher_interpolating(root, tag, cwd, ln, child=child, inherit_tag=interpolate,
+                                         positional=positional) if interpolate
                   else launcher_script(root, tag, cwd, ln, append=append, ignore_term=ignore_term,
-                                       child=child))
+                                       child=child, no_print=no_print))
         # ⛔ WEAK: the TAG is INHERITED from this process, never named by the launcher — the shape
         # cycle 2 measured (`TAG=zombiepi` on a `lane-railprobe.sh` row). A launcher that names the
         # tag (argv, `TAG=`, `<tag>.rc`, or the log it redirects) is `tag`, and correctly so.
         # `N` comes from the environment too, so the launcher's own text interpolates the log's
         # name and never contains it — the shape `lane.sh` has when its worktree slug is not the tag.
-        menv = dict(os.environ, TAG=tag, N=ln) if interpolate else None
-        leaders[tag] = launch_detached(script, cwd, os.path.join(root, tag + ".leader"), menv)
+        menv = dict(os.environ, TAG=tag, N=ln) if (interpolate and not positional) else None
+        leaders[tag] = launch_detached(script, cwd, os.path.join(root, tag + ".leader"), menv,
+                                       ln if positional else None)
         pi_pid = child_pi(leaders[tag])
         procs[tag] = pi_pid
         # the interpolating shape writes `lane-<name>.log`, so the marker must land THERE
@@ -297,6 +326,10 @@ def main() -> int:
     case("survive", TURN_ENDED, ignore_term=True)            # ignores SIGTERM
     case("bound", TURN_ENDED)                                # control: never reaped by pass 1
     weak_pid = case("weak", TURN_ENDED, transcript=False, interpolate=True)   # interpolating launcher ⇒ weak owner
+    # ARGV: the ONLY basis is the tag on the launcher's own argv (`bash lane-argv.sh argvtag`),
+    # which is the shipped `lane.sh <N>` shape and the basis cycle 3 added.
+    argv_pid = case("argvtag", TURN_ENDED, transcript=False, interpolate=True, positional=True)
+    case("interactive", TURN_ENDED, transcript=False, no_print=True)   # `pi` with no -p: refused
     case("freshlog", TURN_ENDED, transcript=False, fresh_log=True)
 
     # no-owner: a `pi` under a plain `bash -c`, no launcher script anywhere in the chain
@@ -305,7 +338,7 @@ def main() -> int:
     started = time.time()
     leaderfile = os.path.join(root, "noowner.leader")
     subprocess.run(["setsid", "--fork", "bash", "-c",
-                    "echo $$ > %s; exec bash -c '%s/pi 300 > %s/logs/noowner.log 2>&1'"
+                    "echo $$ > %s; exec bash -c '%s/pi -p 300 > %s/logs/noowner.log 2>&1'"
                     % (leaderfile, root, root)],
                    cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     end = time.time() + 10
@@ -341,7 +374,7 @@ def main() -> int:
     writer.start()
 
     tags = ["done", "live", "hung", "abstain", "nosession", "shared", "shared2", "child", "survive",
-            "noowner", "weak", "freshlog"]
+            "noowner", "weak", "freshlog", "argvtag", "interactive"]
     pids = [procs[t] for t in tags]
     proc, rows = run_tool(sessions, pids, ["--authorise-hostless"])
     writer.join(timeout=5)
@@ -356,72 +389,86 @@ def main() -> int:
         return rows.get(procs[tag], {}).get("why", "")
 
     check(cls("done") == "DONE-NOT-EXITED",
-          "1/9 DONE: completion line + turn-ended transcript + frozen CPU → DONE-NOT-EXITED "
+          "1/14 DONE: completion line + turn-ended transcript + frozen CPU → DONE-NOT-EXITED "
           "(got %r: %r)" % (cls("done"), why("done")))
-    check("turn ENDED" in why("done"), "1/9 DONE: the row names the transcript channel")
+    check("turn ENDED" in why("done"), "1/14 DONE: the row names the transcript channel")
     time.sleep(0.5)
-    check(not os.path.exists("/proc/%d" % procs["done"]), "1/9 DONE: --apply removed the process")
+    check(not os.path.exists("/proc/%d" % procs["done"]), "1/14 DONE: --apply removed the process")
     rc = os.path.join(root, "logs", "done.rc")
     check(os.path.exists(rc) and open(rc).read().strip(),
-          "1/9 DONE: the launcher left `wait` and wrote its .rc (it completed, it did not crash)")
+          "1/14 DONE: the launcher left `wait` and wrote its .rc (it completed, it did not crash)")
 
     check(cls("live") == "LIVE" and "GREW" in why("live"),
-          "2/9 LIVE: a log growing inside the window is LIVE and says why (got %r: %r)"
+          "2/14 LIVE: a log growing inside the window is LIVE and says why (got %r: %r)"
           % (cls("live"), why("live")))
     check(os.path.exists("/proc/%d" % procs["live"]),
-          "2/9 LIVE: --apply did NOT touch it — a reap-everything detector fails here")
+          "2/14 LIVE: --apply did NOT touch it — a reap-everything detector fails here")
 
     check(cls("hung") == "HUNG",
-          "3/9 HUNG: a completion line does not override an OPEN turn (got %r)" % cls("hung"))
+          "3/14 HUNG: a completion line does not override an OPEN turn (got %r)" % cls("hung"))
     check(os.path.exists("/proc/%d" % procs["hung"]),
-          "3/9 HUNG: --apply did NOT touch a `pi` that is mid-turn")
+          "3/14 HUNG: --apply did NOT touch a `pi` that is mid-turn")
 
     check(cls("abstain") == "UNATTRIBUTABLE",
-          "4/9 ABSTAIN: an ABSTAINING boundary (tail-after-compaction) is NOT `turn-ended` "
+          "4/14 ABSTAIN: an ABSTAINING boundary (tail-after-compaction) is NOT `turn-ended` "
           "(got %r)" % cls("abstain"))
     check(os.path.exists("/proc/%d" % procs["abstain"]),
-          "4/9 ABSTAIN: --apply did NOT touch it (the canon's abstention is not a kill licence)")
+          "4/14 ABSTAIN: --apply did NOT touch it (the canon's abstention is not a kill licence)")
 
     check(cls("nosession") == "DONE-NOT-EXITED" and "exclusive log" in why("nosession"),
-          "5/9 NOSESSION: with NO transcript, an exclusively-held completion log decides — and the "
+          "5/14 NOSESSION: with NO transcript, an exclusively-held completion log decides — and the "
           "row says so (got %r: %r)" % (cls("nosession"), why("nosession")))
 
     check(cls("shared") != "DONE-NOT-EXITED" and cls("shared2") != "DONE-NOT-EXITED",
-          "6/9 SHARED: two `pi` on one log authorise nothing, both ways round (got %r/%r)"
+          "6/14 SHARED: two `pi` on one log authorise nothing, both ways round (got %r/%r)"
           % (cls("shared"), cls("shared2")))
     check(os.path.exists("/proc/%d" % procs["shared"]) and
           os.path.exists("/proc/%d" % procs["shared2"]),
-          "6/9 SHARED: neither was reaped")
+          "6/14 SHARED: neither was reaped")
 
     check(cls("child") == "LIVE",
-          "7/9 CHILD: a `pi` holding a live child is LIVE (got %r)" % cls("child"))
+          "7/14 CHILD: a `pi` holding a live child is LIVE (got %r)" % cls("child"))
     check(os.path.exists("/proc/%d" % procs["child"]),
-          "7/9 CHILD: --apply did NOT touch it")
+          "7/14 CHILD: --apply did NOT touch it")
 
-    check(proc.returncode == 1, "8/9 SURVIVE: a target that ignored SIGTERM makes the run exit 1 "
+    check(proc.returncode == 1, "8/14 SURVIVE: a target that ignored SIGTERM makes the run exit 1 "
                                 "(got %d)" % proc.returncode)
-    check("survived 1" in proc.stdout, "8/9 SURVIVE: the summary says `survived 1`, not `reaped N`")
-    check(os.path.exists("/proc/%d" % procs["survive"]), "8/9 SURVIVE: it is still there (as reported)")
+    check("survived 1" in proc.stdout, "8/14 SURVIVE: the summary says `survived 1`, not `reaped N`")
+    check(os.path.exists("/proc/%d" % procs["survive"]), "8/14 SURVIVE: it is still there (as reported)")
 
     check(cls("noowner") == "UNATTRIBUTABLE" and "no-owner" in why("noowner"),
-          "9/9 REFUSE: a `pi` under no launcher script is UNATTRIBUTABLE `no-owner` (got %r)"
+          "9/14 REFUSE: a `pi` under no launcher script is UNATTRIBUTABLE `no-owner` (got %r)"
           % cls("noowner"))
-    check(os.path.exists("/proc/%d" % procs["noowner"]), "9/9 REFUSE: --apply did NOT touch it")
+    check(os.path.exists("/proc/%d" % procs["noowner"]), "9/14 REFUSE: --apply did NOT touch it")
 
     check(cls("weak") == "UNATTRIBUTABLE" and "weak-owner" in why("weak"),
-          "10/11 WEAK: a launcher that INTERPOLATES (`TAG=\"$N\"`, `lane-$N.log` — the shipped "
+          "10/14 WEAK: a launcher that INTERPOLATES (`TAG=\"$N\"`, `lane-$N.log` — the shipped "
           "shape) leaves no basis naming the tag, so ownership is `weak-owner` and the row is "
           "report-only on BOTH DONE arms (got %r: %r)" % (cls("weak"), why("weak")))
-    check(os.path.exists("/proc/%d" % procs["weak"]), "10/11 WEAK: --apply did NOT touch it")
+    check(os.path.exists("/proc/%d" % procs["weak"]), "10/14 WEAK: --apply did NOT touch it")
 
     check(cls("freshlog") != "DONE-NOT-EXITED",
-          "11/11 FRESHLOG: no transcript + a log YOUNGER than --min-idle is not DONE — the silence "
+          "11/14 FRESHLOG: no transcript + a log YOUNGER than --min-idle is not DONE — the silence "
           "bound applies to the log-only arm too (got %r)" % cls("freshlog"))
-    check(os.path.exists("/proc/%d" % procs["freshlog"]), "11/11 FRESHLOG: --apply did NOT touch it")
+    check(os.path.exists("/proc/%d" % procs["freshlog"]), "11/14 FRESHLOG: --apply did NOT touch it")
 
-    check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 3,
-          "exactly 3 of the12 fixtures were DONE-NOT-EXITED (done + nosession + survive, and the "
-          "last of those ignored SIGTERM): a detector that reaped all, or none, fails here")
+    check(cls("interactive") == "UNATTRIBUTABLE" and "interactive-or-unknown-mode" in why("interactive"),
+          "13/14 PRINT-MODE: a lane-shaped `pi` whose launcher does NOT invoke print mode is refused — "
+          "an agent waiting at a human's prompt also reaches turn-ended and frozen CPU (got %r)"
+          % cls("interactive"))
+    check(os.path.exists("/proc/%d" % procs["interactive"]),
+          "13/14 PRINT-MODE: --apply did NOT touch it")
+
+    check(rows.get(procs["argvtag"], {}).get("owner") == "tag"
+          and cls("argvtag") == "DONE-NOT-EXITED",
+          "12/14 ARGV: a launcher whose ONLY basis is the tag on its own argv (`bash lane-argvtag.sh "
+          "argvtag` — the shipped `lane.sh <N>` shape) is ownership rung `tag` and is reaped "
+          "(got %r: %r)" % (rows.get(procs["argvtag"], {}).get("owner"), cls("argvtag")))
+
+    check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 4,
+          "exactly 4 of the 14 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
+          "survive, and the last of those ignored SIGTERM): a detector that reaped all, or none, "
+          "fails here")
 
     # ── CONTROL: the --min-idle bound is real, in BOTH directions ──
     proc2, rows2 = run_tool(sessions, [procs["bound"]],
@@ -498,10 +545,9 @@ def main() -> int:
     check(ok_still, "C6 VERIFY: the same row with a QUIET log still verifies (%r) — so C6 is not "
                     "always-false" % why_still)
 
-    cleanup()
-    shutil.rmtree(root, ignore_errors=True)
-    print("\nALL ASSERTIONS HELD (12 fixtures + a control lane: 3 DONE-NOT-EXITED, one of which "
-          "ignored SIGTERM; 8 refused for eight different reasons; plus the bound in both "
+    cleanup()                     # kills the groups AND removes the root
+    print("\nALL ASSERTIONS HELD (14 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
+          "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
           "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
     return 0
 
@@ -538,6 +584,15 @@ def run_mutations() -> int:
         ("ownership grants `tag` for ANY tag",
          "        if tag_on_argv:",
          '        if True:'),
+        # cycle 4 measured this one staying GREEN: the argv basis is the only one a shipped
+        # `lane.sh <N>` lane satisfies, and no fixture used it.
+        ("the argv ownership rung deleted",
+         "        if tag_on_argv:",
+         "        if False:"),
+        # cycle 4: the only local discriminator between "lane finished" and "agent at a prompt".
+        ("the print-mode predicate deleted",
+         '    if rung is not None and not PRINT_MODE.search(_read(launcher) or ""):',
+         "    if False:"),
     ]
     for label, old, new in mutations:
         tmp = tempfile.mkdtemp(prefix="pi-dne-mut-")

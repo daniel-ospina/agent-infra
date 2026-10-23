@@ -159,10 +159,21 @@ COMPLETION_FAILED = (            # the same extension's three failure shapes
     "[reflect-hook] Attribution resolution failed",
 )
 STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
+# ⛔ PRINT MODE, read from the LAUNCHER's text. An interactive `pi` waiting at a human's prompt also
+# reaches `turn-ended` + frozen CPU + no child, so without this predicate the tool would signal an
+# agent that is simply idle — the one local discriminator between that and "the lane finished and
+# never exited" (cycle 4, P2). The CHILD's own argv cannot answer it here: pi rewrites its argv to
+# the bare word `pi` on a cell (measured: `/proc/<pid>/cmdline` == "pi"), so the launcher's text is
+# the evidence — `pi -p`, `pi --print`, or `run_agent`, whose contract in spawn-gate.sh IS print mode.
+PRINT_MODE = re.compile(r"(?m)(^|[\s;/])pi\s+(?:[^\n]*?\s)?(?:-p|--print)(?=\s|$)|"
+                        r"(^|[\s;])run_agent(\s|$)")
 MIN_IDLE_S = 120                  # see the derivation in classify()'s guard, and the docstring
 LAUNCHER_SCRIPT = r"(?:^|\s)(/\S+\.sh)(?:\s|$)"   # a shell running a SCRIPT, not a `-c` one-liner
 RUNNERS = ("lane.sh", "nonblocking-dispatch.sh", "merge-one.sh", "chain-merge.sh", "fix-one.sh")
-CPU_TOL_S = 0.10                  # FALLBACK ONLY — `orphan-reap.TOLERANCE_S` wins at runtime
+# ⛔ There is deliberately NO local CPU tolerance: `orphan-reap.TOLERANCE_S` is read at runtime
+# (`tol = pool.TOLERANCE_S`), so a retune in the canon reaches this kill path. A constant here would
+# be the "one rule, two copies" defect (§3 of docs/ops/fleet-liveness.md) — an earlier draft had one
+# and a reviewer was right to call it dead.
 
 
 # ── the two imports this tool refuses to exist without ─────────────────────────────────────
@@ -347,7 +358,10 @@ def ownership(pid: str, launcher: Optional[str], log: Optional[str],
         os.path.basename(t.strip("'\"")) == os.path.basename(log)
         for t in re.findall(r">>?\s*(\S+)", text or ""))
     # ⛔ A TAG IS NOT A SUBSTRING: `TAG=1` must not match `lane-12.sh`. Whole-token on both sides.
-    tag_on_argv = bool(tag) and bool(re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(tag or ""),
+    # ⛔ `/` IS PART OF THE TOKEN: without it a tag equal to ANY path component (`home`, `tmp`,
+    # `orchestrator`) or to `argv[0]` (`bash`) matches, which grants strong ownership on a path
+    # fragment (cycle 4, P2). Only a whole ARGUMENT may name the tag.
+    tag_on_argv = bool(tag) and bool(re.search(r"(?<![\w./-])%s(?![\w./-])" % re.escape(tag or ""),
                                               launcher_argv or ""))
     if tag:
         if tag_on_argv:
@@ -558,6 +572,12 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
         return out
 
     rung, why = ownership(pid, launcher, log, _lacmd)
+    if rung is not None and not PRINT_MODE.search(_read(launcher) or ""):
+        out.update(cls="UNATTRIBUTABLE",
+                   why="interactive-or-unknown-mode: the launcher's text does not show a PRINT-mode "
+                       "invocation, so this `pi` may be an agent waiting at a prompt — which also "
+                       "reaches turn-ended and frozen CPU, and is never ours to signal")
+        return out
     if rung is None:
         out.update(cls="UNATTRIBUTABLE", why=why)
         return out
@@ -851,7 +871,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     pool.SESSIONS_DIR = opts.sessions_dir or pool.SESSIONS_DIR
 
-    pids = sorted([p for p, r in rows.items() if pool.is_pi(r)], key=int)
+    all_pids = sorted([p for p, r in rows.items() if pool.is_pi(r)], key=int)
+    pids = all_pids
     if opts.pid:
         foreign = [str(p) for p in opts.pid if str(p) not in rows or not pool.is_pi(rows[str(p)])]
         if foreign:
@@ -860,7 +881,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
         pids = [str(p) for p in opts.pid]
 
-    binds, peers = bind_map(pool, rows, pids, opts.ref_s)
+    # ⛔ OVER THE WHOLE POPULATION, not the selected subset: `--pid` must not silently disable the
+    # peer-claimed guard (cycle 4, P2), which is the mirror of the `holders` check that already reads
+    # the full snapshot.
+    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)
     obs = observe(pool, rows, pids, opts.sample, binds)
     if obs[0] is None:
         print("%s: CANNOT-VERIFY — a sample reading failed; nothing was judged" % PROG,
