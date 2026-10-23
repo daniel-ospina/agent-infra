@@ -84,6 +84,15 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf '   ✅ %s\n' "$*"; }
 fail() { FAIL=$((FAIL+1)); printf '   ❌ %s\n' "$*"; }
 ck()   { if [ "$1" -eq 0 ]; then pass "$2"; else fail "$2"; fi; }
+# ⛔ THE FIXTURE'S DIGEST MUST RESOLVE LIKE THE SUT'S (P3, fresh review of #2288): macOS ships no
+# `sha256sum`, so an unguarded one made every truncated-diff expectation an EMPTY digest there and
+# those assertions inverted to red — while the SUT itself resolves the tool (`sha256sum`, else
+# `shasum -a 256`, pinned by §AL). A fixture that hardcodes one of the two tests the box, not the
+# seam. Same resolution order as the script, in one place.
+fixture_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  else shasum -a 256 | cut -d' ' -f1; fi;
+}
 
 [ -f "$SRC" ] || { echo "❌ no review-pr.sh at $SRC"; exit 2; }
 
@@ -140,6 +149,11 @@ case "$cmd" in
   pr)
     sub="${1:-}"; shift || true
     prnum="${1:-}"; shift || true
+    # ⛔ THE WHOLE INVOCATION IS LOGGED (P3, fresh review of #2288): logging only `--repo` let a mutant
+    # that dropped `--repo` from the META read stay green, because later calls (`gh pr view --json
+    # body`, `gh pr diff`) pass the same flag and the log line looked identical. §A2 asserts the META
+    # read's own full argv prefix instead, which no other call can reproduce.
+    printf 'ARGV:pr %s %s %s\n' "$sub" "$prnum" "$*" >> "$TMP/pr-repo.log"
     json=""; body_file=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
@@ -291,7 +305,7 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" "$TMP/pi-cwd.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body" "$TMP/pr-repo.log"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
@@ -313,19 +327,25 @@ reset() {
   FIXTURE_ISSUE_BODY="the linked issue body"
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
   FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
-  unset GH_REPO
+  unset RECORDER_OVERRIDE GH_REPO
 }
 
 # run <script> [args...] — drives the REAL script under the fakes.
+# ⛔ RECORDER_OVERRIDE LETS A SCENARIO POINT THE PREFLIGHT AT SOMETHING ELSE (P2, fresh review of
+# #2288): every other scenario hardwired the fake recorder, so the preflight that refuses a
+# missing/non-executable recorder — the guard that stops a review being paid for when the record step
+# cannot run — had NO assertion behind it, and deleting it left the suite green.
 run() {
   local script="$1"; shift
-  HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" \
+  HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" \
+    REVIEW_PR_RECORD_SH="${RECORDER_OVERRIDE:-$TMP/bin/fake-record}" \
     AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
 }
 rc_of() { cat "$TMP/rc"; }
 out_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
+out_not_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 1;; *) return 0;; esac; }
 err_has() { case "$(cat "$TMP/err.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
 no_record() { [ ! -f "$TMP/record-argv.txt" ]; }
 no_comment() { [ ! -f "$TMP/comment.md" ]; }
@@ -349,6 +369,12 @@ ck $? "…with <PR> <reviewed-head> clean <repo-from-url> --evidence comment:<id
 case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
   *"--evidence comment:9001"*) rc=1 ;;
   *"--evidence comment:9002"*) rc=0 ;;
+  # ⛔ NO DEFAULT ARM LEFT `rc` UNSET (P3, fresh review of #2288): a recorded argv that matched
+  # NEITHER arm (an empty `--evidence comment:`, or no recorder call at all) left `rc` unbound, and
+  # the suite runs under `set -u`, so `ck $rc` died with "unbound variable" after 3 of §A's
+  # assertions — every later section, including the §K/§AE/§AF mutation controls, never executed and
+  # no RESULT line was printed. A mismatch is a FAILED assertion, never a dead suite.
+  *) rc=1 ;;
 esac
 ck $rc "…and it names the VERDICT comment (9002), never the non-blocking notes comment (9001)"
 rec="$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
@@ -371,6 +397,33 @@ case "$P" in *"This PR fixes the thing"*) rc=0;; *) rc=1;; esac; ck $rc "…and 
 case "$P" in *"the linked issue body"*) rc=0;; *) rc=1;; esac; ck $rc "…and the linked issue"
 case "$P" in *'web_search(model="sonar")'*) rc=0;; *) rc=1;; esac; ck $rc "…and names research rung 2 explicitly (web_search model=\"sonar\")"
 case "$(cat "$TMP/pi-argv.txt")" in *"--no-session"*) rc=0;; *) rc=1;; esac; ck $rc "…spawned with --no-session (a genuinely fresh context)"
+
+# ── §A2 the RECORD step's own failure arms, and the --repo mode ───────────────
+# ⛔ (P2, fresh review of #2288) THREE GUARDS HAD NO ASSERTION BEHIND THEM and each could be
+# deleted with the suite fully green: the recorder's non-zero exit check, the recorder preflight
+# ("everything that can fail for FREE fails HERE, before a review is paid for"), and `--repo`
+# actually reaching gh. The first is the only thing between "the recorder failed" and the
+# `✅ recorded clean` line — the false-success class this seam exists to prevent.
+echo; echo "§A2 the record step's failure arms + --repo mode are driven"
+# (1) --repo is passed THROUGH to gh (a lander outside the checkout is told to use it)
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284 --repo "$REPO_FIXTURE"
+[ "$(rc_of)" = "0" ]; ck $? "--repo owner/name mode reviews clean (rc=$(rc_of))"
+grep -q "^ARGV:pr view 2284 --repo $REPO_FIXTURE --json url,headRefOid" "$TMP/pr-repo.log" 2>/dev/null
+ck $? "…and the META read itself carried --repo $REPO_FIXTURE (a dropped flag would resolve another repo's PR of the same number)"
+# (2) the RECORDER said rc=1 => exit 9, and NO success is claimed
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_RECORD_RC=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a recorder that exits 1 => exit 9, never success (rc=$(rc_of))"
+out_not_has "recorded clean"; ck $? "…and the success line is NOT printed (the review was not recorded)"
+err_has "record"; ck $? "…the failure is named on stderr"
+# (3) the recorder is MISSING/NOT EXECUTABLE => refused BEFORE the review is paid for
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/not-executable"; chmod -x "$TMP/bin/not-executable"
+RECORDER_OVERRIDE="$TMP/bin/not-executable" run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a non-executable recorder => exit 9 (rc=$(rc_of))"
+no_reviewer; ck $? "…and NO reviewer was spawned (nothing was paid for)"
+no_record; ck $? "…and no record was attempted"
 
 # ── §B findings => NO record, non-zero, findings printed ─────────────────────
 echo; echo "§B verdict with findings => NO record"
@@ -635,7 +688,7 @@ no_comment; ck $? "no comment posted"
 
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(head -c 200000 /dev/zero | tr '\0' 'x')" | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
+reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(head -c 200000 /dev/zero | tr '\0' 'x')" | fixture_sha256)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "still reviews (rc=$(rc_of)) — a huge diff is not fatal"
 # The PROPERTY is what matters, not which branch delivered it: the oversized payload
@@ -661,7 +714,7 @@ done
 if [ -z "$UTF8_OK" ]; then
   fail "PROMPT_MAX re-compose arm SKIPPED: this box has no UTF-8 locale, so a multi-byte diff cannot be built (the branch is untested here)"
 else
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(awk 'BEGIN { for (i = 0; i < 60000; i++) printf "\342\206\222" }')" | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
+reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(awk 'BEGIN { for (i = 0; i < 60000; i++) printf "\342\206\222" }')" | fixture_sha256)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
 LC_ALL="$UTF8_OK" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
 case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
@@ -1396,7 +1449,7 @@ run "$SRC" 2284
 [ "$(rc_of)" = "3" ]; ck $? "a truncated diff ending on a SHORT line still DEMANDS the proof (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
 reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"
+printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | fixture_sha256)" > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "…and the correct SHORT-line digest records (rc=$(rc_of))"
 # …while a diff that FITS needs no proof at all: the requirement is scoped to truncation, not to
@@ -1409,7 +1462,7 @@ run "$SRC" 2284
 # pass the proof and mint a clean record — the exact false PASS the handshake exists to prevent. The
 # prompt now states what to COMPUTE; the expected value is asserted absent from the prompt bytes.
 reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-EXPECT_DIGEST="$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | sha256sum | cut -d' ' -f1)"
+EXPECT_DIGEST="$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | fixture_sha256)"
 printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "the computed digest is accepted (rc=$(rc_of))"
@@ -1489,7 +1542,8 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 365, measured after the sixth review's fixes: §AL also pins
+# whenever sections are added — this is 431, measured after the seventh review's fixes (§A2 drives the
+# recorder's rc!=0 arm, the recorder preflight, and the --repo pass-through): §AL also pins
 # that the expected digest is ABSENT from the prompt (the P0: it was being echoed), that a fenced
 # quote of a severity line does not contradict CLEAN, that a backticked digest still matches, and
 # that a box without a working `sha256sum` still proves the tail via `shasum -a 256`. It carries the
@@ -1507,12 +1561,16 @@ echo
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 374 here and the RESULT line then
-# prints 375. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 430 here and the RESULT line then
+# prints 431. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
+# ⛔ THE MARGIN WAS 49 ASSERTIONS AND IS NOW 1 (P3, fresh review of #2288): at 374 against 423, deleting
+# §AH + §AL (48 assertions) still left 375 >= 374 and the suite reported green — the exact
+# "a whole section was deleted and the suite still said ALL PASSED" failure the pin exists for. Re-set
+# from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 374 ]; ck $? "assertion-count pin: >= 374 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 430 ]; ck $? "assertion-count pin: >= 430 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
