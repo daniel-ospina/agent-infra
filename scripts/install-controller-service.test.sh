@@ -155,12 +155,16 @@ case "\${1:-}" in
     # and by writing a heartbeat after its first cycle; the stub models the second, SC_PROOF=none models a
     # start that stays up doing nothing (the arm that must be refused), and SC_PROOF=stale models a
     # heartbeat left behind by a controller that died BEFORE this start (the arm the binding exists for).
+    # ⛔ SC_PROOF_DIR MOVES WHERE THE HEARTBEAT LANDS (review P1 round 9, #2402): the real supervisor sources
+    # keys.env, so an `O=` line puts the controller's heartbeat in the RESOLVED state dir, not in the
+    # installer's \$O. Unset keeps every pre-existing arm writing to \$O, exactly as before.
+    _pdir="\$(dirname "\$S")/o"; [ -z "\${SC_PROOF_DIR:-}" ] || _pdir="\$SC_PROOF_DIR"
     case "\${SC_PROOF:-heartbeat}" in
       none)  : ;;
-      stale) mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
-             printf '%s\n' "\$(( \$(date +%s) - 100 ))" > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true ;;
-      *)     mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
-             date +%s > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true ;;
+      stale) mkdir -p "\$_pdir" 2>/dev/null
+             printf '%s\n' "\$(( \$(date +%s) - 100 ))" > "\$_pdir/heartbeat" 2>/dev/null || true ;;
+      *)     mkdir -p "\$_pdir" 2>/dev/null
+             date +%s > "\$_pdir/heartbeat" 2>/dev/null || true ;;
     esac
     exit 0 ;;
   stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
@@ -1286,6 +1290,61 @@ JR4_RC=0; JR4_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=84 inst j4 --install 2>&1)
   && ok 'install: ACCEPTS the boundary value the refusal names (84 s — the relation is enforced exactly, not tightened into a new refusal)' \
   || bad "install: refused the very value its own refusal recommends (84 s) — the bound and the message disagree — $JR4_OUT"
 
+# ⛔ THE RECOGNITION OF A FALSIFIED FINDING IS NOT A TEST — the arms below pin a HEAD-SIDE defect the round-9
+# review caught and the fix closed. Each one goes RED on a revert (stated in the comment) so it is a pin, not
+# an anecdote.
+
+# ⛔ THE PROOF FOLLOWS THE UNIT, NOT THE INSTALLER (review P1 round 9, #2402). The installer never sources
+# `$ENV_FILE`; the SUPERVISOR does (`set -a`), so a `keys.env` `O=` line puts the controller's lock and
+# heartbeat in the RESOLVED dir. Polling only `$O` made a correctly supervised cell fail the install after
+# the full proof timeout. RED on revert: deleting the second leg of `controller_proof` makes this arm time
+# out with "NO CONTROLLER PROVED ITSELF".
+say_case 'the controller proof follows the state dir the UNIT resolves to, not the installer $O'
+PR1="$(arm_root pr1)"; mk_systemctl "$PR1/bin" "$PR1/state" "$PR1/sc.log"; mkdir -p "$PR1/resolved"
+printf 'O=%s/resolved\n' "$PR1" > "$PR1/home/keys.env"
+PR1_RC=0; PR1_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR1/resolved" inst pr1 --install 2>&1)" || PR1_RC=$?
+[ "$PR1_RC" -eq 0 ] \
+  && ok 'install: a controller heartbeating in the RESOLVED state dir proves the unit (the installer never sources keys.env)' \
+  || bad "install: failed a correctly supervised cell whose keys.env repoints O — the proof only looked at the installer's \$O: $PR1_OUT"
+
+# ⛔ INSTALL MUST CONVERGE ON A CELL WHOSE keys.env REPOINTS `O` (review P1 round 9, #2402). The write path
+# used to re-apply the RESOLUTION-ONLY ownership test after the union had let this cell's OWN copy through,
+# so the SECOND `--install` (which the bring-up runs on every `--check`) refused, named its own unit as
+# another state dir's, and told the operator to UNINSTALL a healthy cell. RED on revert: reinstate the
+# resolution-only block and the second call exits 1.
+say_case 'a second --install on a cell whose keys.env repoints O still converges (the union, not the resolution)'
+PR2="$(arm_root pr2)"; mk_systemctl "$PR2/bin" "$PR2/state" "$PR2/sc.log"; mkdir -p "$PR2/resolved"
+printf 'O=%s/resolved\n' "$PR2" > "$PR2/home/keys.env"
+PR2A_RC=0; PR2A_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR2/resolved" inst pr2 --install 2>&1)" || PR2A_RC=$?
+[ "$PR2A_RC" -eq 0 ] \
+  && ok 'install: the first install succeeds (nothing to compare against yet)' \
+  || bad "install: the FIRST install of a legitimately repointed cell failed: $PR2A_OUT"
+PR2B_RC=0; PR2B_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR2/resolved" inst pr2 --install 2>&1)" || PR2B_RC=$?
+[ "$PR2B_RC" -eq 0 ] \
+  && ok 'install: RE-INSTALLING its own unit converges (the write path uses the union too)' \
+  || bad "install: refused its OWN unit on re-install — the resolution-only test came back: $PR2B_OUT"
+case "$PR2B_OUT" in
+  *'DIFFERENT state dir'*) bad 'install: named its own unit as another state dir’s — the remedy would tell the operator to uninstall a healthy cell' ;;
+  *) ok 'install: never claims its own unit belongs to another state dir' ;;
+esac
+
+# ⛔ `activating` IS THE RESTART WINDOW, NOT A RUNNING CONTROLLER (review P2 round 9, #2402).
+# `controller_unit_active_state` scores `activating` as running, so the automated fence fell through to
+# `reset-failed`, which also ZEROES the start rate limit — and the doctor does this every 120 s inside a
+# 300 s window, so convergence to `failed` became probabilistic. RED on revert: drop the word check and the
+# stub's `reset-failed` call appears.
+say_case 'an automated restart does NOT clear the start limit while the unit is activating'
+PR3="$(arm_root pr3)"; mk_systemctl "$PR3/bin" "$PR3/state" "$PR3/sc.log"; mk_tmux "$PR3/bin" "$PR3/tmux.log"
+: > "$PR3/units/eldato-orchestrator.service"; : > "$PR3/state/enabled"; printf 'activating\n' > "$PR3/state/isactive_word"
+: > "$PR3/sc.log"
+SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup pr3 start > "$T/pr3.out" 2>&1; PR3_RC=$?
+[ "$PR3_RC" -eq 4 ] \
+  && ok 'start: an `activating` unit is NOT re-armed (rc=4 — the RestartSec window is not a running controller)' \
+  || bad "start: re-armed/continued on an `activating` unit — rc=$PR3_RC $(tail -3 "$T/pr3.out")"
+grep -q 'reset-failed' "$PR3/sc.log" 2>/dev/null \
+  && bad 'start: CLEARED the start limit while the unit was still activating — every 120 s doctor pass re-opens the endless retry' \
+  || ok 'start: the start limit is left alone while the unit is activating (convergence to failed stays reachable)'
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1516,6 +1575,34 @@ OLROOT2_OWNER="$(stat -c %U -- "$OLROOT/home/keys.env")"
 [ -s "$OLROOT/runuser.log" ] && [ -z "$(grep -vxF "$OLROOT2_OWNER" "$OLROOT/runuser.log" 2>/dev/null)" ] \
   && ok 'root: EVERY runner call used the FILE’S OWNER — the file never ran with root authority' \
   || bad "root: the runner was invoked as '$(tr '\n' ' ' < "$OLROOT/runuser.log" 2>/dev/null)' instead of the file's owner ($OLROOT2_OWNER)"
+# ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). A `keys.env` OWNED by
+# root but group/other-WRITABLE — the shape `sudo tee`/`sudo cp` leaves with umask 002 in a shared group —
+# passed as its own "owner" and was sourced with root's authority. It must not be evaluated at all now, and
+# the caller falls back to the RENDERED `O=`. RED on revert: drop the permission test and the SOURCED
+# marker appears. (The directory is deliberately NOT tested — a replaced file's owner is the replacer, which
+# the owner/SUDO_USER rule already refuses to run as root.)
+say_case 'as root, a group-writable keys.env is never executed, even through a privileged runner'
+OLWRITE="$(arm_root l8)"; mk_systemctl "$OLWRITE/bin" "$OLWRITE/state" "$OLWRITE/sc.log"
+printf '#!/bin/bash\n[ "${1:-}" = "-u" ] && { printf "0\\n"; exit 0; }\nexec /usr/bin/id "$@"\n' > "$OLWRITE/bin/id"
+printf '#!/bin/bash\nshift 3\nexec "$@"\n' > "$OLWRITE/bin/runuser"
+chmod +x "$OLWRITE/bin/id" "$OLWRITE/bin/runuser"
+printf 'O=%s/o\n: > %s/SOURCED-BY-ROOT\n' "$OLWRITE" "$OLWRITE" > "$OLWRITE/home/keys.env"
+chmod 0664 "$OLWRITE/home/keys.env"
+case "$(stat -c %A -- "$OLWRITE/home/keys.env" 2>/dev/null)" in
+  ?????w*|????????w) : ;;
+  *) bad 'root: could not build the group-writable fixture (chmod did not take) — the arm below would be vacuous' ;;
+esac
+cat > "$OLWRITE/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLWRITE/home
+Environment=ENV_FILE=$OLWRITE/home/keys.env
+Environment=O=$OLWRITE/installer-orchestrator
+Restart=always
+SH
+OLWRITE_RC=0; OLWRITE_OUT="$(EXTRA_ENV="PATH=$OLWRITE/bin:/usr/bin:/bin" inst l8 --status 2>&1)" || OLWRITE_RC=$?
+[ ! -f "$OLWRITE/SOURCED-BY-ROOT" ] \
+  && ok 'root: a GROUP-WRITABLE keys.env is NOT evaluated (an account that can write it never runs code as root)' \
+  || bad 'root: sourced a group/other-writable keys.env as root — the escalation this guard closes is one permission bit away'
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §M — the lock witness needs SHAPE *AND AGE* (review P1, #2402)

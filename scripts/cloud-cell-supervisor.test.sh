@@ -3665,6 +3665,12 @@ done
 grep -q 'ORCH_AUTOMATED_RESTART' "$SUP" && grep -q '          return 4' "$SUP" \
   && ok 'automated restart: the supervisor carries the fence and its rc=4 outcome' \
   || bad 'automated restart: the ORCH_AUTOMATED_RESTART fence (or its rc=4 outcome) is gone from the supervisor'
+# ⏱ THE DOCTOR'S `ORCH_FOREGROUND=0` PIN MUST BE EXPORTED (review P2 round 9, #2402). A bare assignment
+# holds only by two accidents — an inherited export attribute (the case the pin exists to defeat) or the
+# child's own `:-0` default — so neither is the guarantee. RED on revert: `export` removed → the grep misses.
+grep -q 'set +a; export ORCH_FOREGROUND=0;' "$SUP" \
+  && ok 'doctor: the ORCH_FOREGROUND=0 pin is EXPORTED, so an inherited =1 cannot ride into the doctor session' \
+  || bad 'doctor: ORCH_FOREGROUND=0 is a bare assignment — it holds only by an inherited export attribute or the child default, neither of which is the pin'
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

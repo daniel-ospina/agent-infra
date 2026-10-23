@@ -660,7 +660,24 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
   local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
   [ -n "${f:-}" ] && [ -r "$f" ] || return 1
   if [ "$(id -u)" = "0" ]; then
-    owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+    # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). Ownership alone missed
+    # the shape `sudo tee`/`sudo cp` leaves behind: a `keys.env` OWNED by root and group- or other-WRITABLE
+    # (`-rw-rw-r-- root:staff`, umask 002 in a shared group) was used as its own "owner", ran as root, and
+    # executed with root's authority — the escalation this guard exists to close, one permission bit away.
+    # Two changes, both fail-closed: evaluate as the INVOKING operator when sudo can name one (`SUDO_USER`),
+    # and do not evaluate the file AT ALL when any account but its owner can write it, or the directory that
+    # holds it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and lossless for
+    # ownership because ownership is the UNION. Keep this body identical to the installer's.
+    local fmode
+    fmode="$(stat -c %A -- "$f" 2>/dev/null)" || return 1
+    [ -n "${fmode:-}" ] || return 1
+    # Group/other WRITE on the file itself. (The directory is deliberately not tested: if another account
+    # can REPLACE the file, the replacement's owner is that account — which the owner/SUDO_USER rule below
+    # already refuses to run as root — so a directory test would only cause false refusals on shared-group
+    # cells without closing anything additional.)
+    case "${fmode:5:1}${fmode:8:1}" in *w*) return 1 ;; esac
+    owner="${SUDO_USER:-}"
+    [ -n "${owner:-}" ] || owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
     [ -n "${owner:-}" ] || return 1
     if [ "$owner" != "root" ]; then
       command -v runuser >/dev/null 2>&1 || return 1
@@ -2225,7 +2242,9 @@ cmd_start() {
       # reading supervised. A HUMAN running `$0 start` is asking for exactly one more attempt, so the fence
       # is scoped to the automated caller and reported as its own outcome (rc 4), never as a failure.
       if [ "${ORCH_AUTOMATED_RESTART:-0}" = 1 ]; then
-        local ast=0; controller_unit_active_state || ast=$?
+        local ast=0 _ast_word=""
+        _ast_word="$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || true)"
+        controller_unit_active_state || ast=$?
         # ⛔ rc 3 IS CANNOT-READ, NOT "STOPPED" (review P1, #2402). `is-active` answers with an empty or
         # unrecognised word when it could not ASK — an expired `sudo -n` timestamp, a user-scope manager with
         # no DBus from inside the doctor's session, a transient — and folding that into the rc-4 outcome made
@@ -2235,7 +2254,15 @@ cmd_start() {
         if [ "$ast" -eq 3 ]; then
           die "cannot read whether $CONTROLLER_UNIT is active — refusing to re-arm it on a guess (systemctl is-active $CONTROLLER_UNIT)"
         fi
-        if [ "$ast" -eq 1 ]; then
+        # ⛔ `activating` IS THE RESTART WINDOW, NOT A RUNNING CONTROLLER (review P2 round 9, #2402).
+        # `controller_unit_active_state` maps `active|reloading|ACTIVATING` to 0, and `activating` is exactly
+        # what `Restart=always` reports inside its RestartSec — the state a configuration-faulting unit spends
+        # its life in. Scoring that as "running" let the fence fall through to the `reset-failed` below, which
+        # ALSO ZEROES the per-unit start rate limit, and the doctor runs this every DOCTOR_INTERVAL (120 s)
+        # against a 300 s window: two passes inside one window cleared the counter twice, so convergence to
+        # `failed` became probabilistic instead of guaranteed — the endless retry the arithmetic exists to
+        # stop. Only a literal `active`/`reloading` (a process that exists) takes the re-arm path.
+        if [ "$ast" -eq 1 ] || [ "$_ast_word" = "activating" ]; then
           say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop, or a start limit that converged to failed, is the operator's decision. Run '$0 start' to re-arm it."
           return 4
         fi

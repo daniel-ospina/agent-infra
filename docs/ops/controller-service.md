@@ -99,8 +99,12 @@ removes — and (b) clear the start-limit counter that is supposed to converge a
 `failed`, so a keyless cell would retry forever with every surface reading supervised. A human
 `cloud-cell-supervisor.sh start` **is** asking for exactly one more attempt: it clears the counter and
 starts the unit. Only another unit name can be installed beside another state dir's copy — `--install`
-**refuses** to overwrite a unit that provably supervises a different state dir, naming that dir and the
-override (`CONTROLLER_UNIT=…`) to use instead.
+**refuses** to overwrite a unit that provably supervises a different state dir, naming that dir. Installing
+beside it needs BOTH the override and a template **of that name** (`CONTROLLER_UNIT` is the template's file
+name too, so the override alone refuses with `template missing`): `CONTROLLER_UNIT=eldato-orchestrator-<cell>.service`
+with a matching template in `TEMPLATES_DIR`. Discovery is keyed on the unit NAME (see #2602), so a copy
+installed under such an override is not yet seen by the default name's `--status`/`--uninstall`/install guard
+— retire the other copy deliberately instead of relying on a second name.
 
 **A unit belongs to ONE state dir, and the verbs read that rather than assume it.** The unit name is
 machine-scoped, so "the first unit file on the box" can be another cell's. Every unit this installer

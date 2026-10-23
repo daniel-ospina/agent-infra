@@ -352,23 +352,33 @@ _proc_began_after() {
 # the loop's pid; identity is checked as well as liveness, because a recycled pid is not our loop (#1178).
 # A plausible heartbeat is the second witness (the loop's own first cycle), so a cell whose lock the loop
 # has not taken YET — harness_apply + cmd_check run first — is not refused for the seconds it needs.
-controller_proof() { # [<not_before_epoch>] — a heartbeat older than this start proves nothing
-    local pid hb now since="${1:-0}"
+controller_proof() { # [<not_before_epoch>] [<resolved state dir>] — a heartbeat older than this start proves nothing
+    _controller_proof_dir "$O" "${1:-0}" && return 0
+    # ⛔ THE CONTROLLER MAY NOT WRITE TO THE INSTALLER'S `$O` (review P1 round 9, #2402). The installer never
+    # sources `$ENV_FILE`, but the SUPERVISOR does (`set -a`), so a `keys.env` carrying an `O=` line moves the
+    # controller's state dir — its lock and its heartbeat land in the RESOLVED dir, not in this installer's.
+    # Polling only `$O` therefore failed a correctly supervised cell after the full proof timeout, while
+    # `--status` called the same cell healthy: two instruments disagreeing, which is the class this PR keeps
+    # removing. Both are polled; the union makes "which one is authoritative" unnecessary.
+    [ -n "${2:-}" ] && [ "${2%/}" != "${O%/}" ] && _controller_proof_dir "${2%/}" "${1:-0}"
+}
+_controller_proof_dir() { # <state dir> <not_before_epoch>
+    local pid hb now since="${2:-0}" o="$1"
     local lt rc
     pid=""
-    [ ! -f "$O/.orch.lock" ] || pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
+    [ ! -f "$o/.orch.lock" ] || pid="$(tr -dc '0-9' <"$o/.orch.lock" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && argv_is_orch_loop "$pid"; then
         # ⛔ SHAPE IS NOT OWNERSHIP (review P1, #2402). Every controller on this box is a shell followed by
         # a shared-harness orch-loop.sh, so a recycled pid — a PEER repo's controller — passes the shape
         # test. A controller always writes $LOCK AFTER it starts, so a process that BEGAN after the lock
         # was written cannot be its owner. Unprovable age (ps/date that cannot answer) is NOT a proof
         # either: fall through to the heartbeat leg rather than certify.
-        lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null || true)"
+        lt="$(date -r "$o/.orch.lock" +%s 2>/dev/null || true)"
         _proc_began_after "$pid" "${lt:-}"; rc=$?
         [ "$rc" -eq 1 ] && return 0
     fi
     hb=""
-    [ ! -f "$O/heartbeat" ] || hb="$(tr -dc '0-9' <"$O/heartbeat" 2>/dev/null || true)"
+    [ ! -f "$o/heartbeat" ] || hb="$(tr -dc '0-9' <"$o/heartbeat" 2>/dev/null || true)"
     case "${hb:-}" in ''|*[!0-9]*) return 1 ;; esac
     [ "${#hb}" -le 12 ] || return 1
     hb=$(( 10#$hb ))
@@ -446,6 +456,13 @@ do_install() {
     # ONCE so the refusal can only quote the number the test enforced. (It used to print `300/3-15` = 85 s
     # while the test required at most 84: a remedy the guard then refused.)
     sl_maxtime=$(( (sl_iv - 1) / sl_burst - RESTART_SEC ))
+    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY (review P2 round 9, #2402): when the template's own RestartSec
+    # alone exceeds the window there is no value to recommend, and the old sentence still printed one
+    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."). Name the real cause instead.
+    if [ "$sl_maxtime" -lt 1 ]; then
+        err "REFUSING: the template cannot satisfy its own start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave no room for RestartSec=${RESTART_SEC}s, so even a 1 s orphan ceiling never fits and NO configuration converges to failed. Fix the template (StartLimitIntervalSec= needs to exceed ${RESTART_SEC}×${sl_burst}s) rather than ORCH_START_TIMEOUT_SEC."
+        return 1
+    fi
     [ "$START_TIMEOUT_SEC" -le "$sl_maxtime" ] \
         || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC does not fit StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s — each attempt costs the orphan ceiling plus RestartSec (${RESTART_SEC}s), and $sl_burst of them must fit inside the window. Past that bound the oldest start ages out before the burst is exceeded, so the unit restarts for ever over a start that can never succeed while --status reads supervised. Use ORCH_START_TIMEOUT_SEC <= ${sl_maxtime}s."; return 1; }
     case "${HANDOVER_TIMEOUT_SEC:-}" in
@@ -479,30 +496,19 @@ do_install() {
         err "REFUSING: $UNIT_DIR/$UNIT_NAME already exists and supervises state dir '$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null)', NOT this one ($O)."
         err "  Overwriting it would replace that cell's supervisor with this one — its controller would then run on"
         err "  this state dir's queue (two dispatchers on one queue, #1761) or on none, with its Restart=always gone."
-        err "  Leave it alone and install this cell's unit under its own name: CONTROLLER_UNIT=eldato-orchestrator-$(basename "$O").service bash $0 --install"
-        err "  (or remove it from the cell that owns it: bash $0 --uninstall, run by that state dir)."
+        err "  Leave it alone and remove it only from the cell that owns it: bash $0 --uninstall, run by THAT state dir."
+        err "  (A second unit under its own name needs a template OF THAT NAME in TEMPLATES_DIR — CONTROLLER_UNIT"
+        err "  is the template's file name too, so the override alone would refuse with 'template missing'.)"
         return 1
     fi
 
-    # ⛔ A FOREIGN COPY AT *THIS* PATH IS NOT OURS TO REPLACE (review P2, #2402). `installed_units` lists only
-    # copies that are OURS, so a unit that provably supervises ANOTHER state dir is invisible there and the
-    # write below silently replaced it: it repointed that cell's supervisor at this state dir and disarmed
-    # its `Restart=always`, with nothing in the output naming it — one cell's verb breaking another's, the
-    # class this installer exists to remove. The bring-up runs `--install` on every `--check`, so this is a
-    # routine collision, not an exotic one. `do_status`/`do_uninstall` already refuse a foreign copy; the
-    # write path is the one that can destroy it, so it refuses too.
-    if [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
-        local fown
-        if ! fown="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME")"; then
-            : # no O= line: unprovable, and #1761's fail-safe side says assume it may be ours
-        elif [ "$fown" != "$O" ]; then
-            err "REFUSING: $UNIT_DIR/$UNIT_NAME is installed and supervises a DIFFERENT state dir:"
-            err "    owner: $fown"
-            err "  Overwriting it would repoint that cell's supervisor here and disarm its Restart=always."
-            err "  Remove it deliberately first (from THAT state dir): bash $0 --uninstall"
-            return 1
-        fi
-    fi
+    # ⛔ ONE DECISION POINT, NOT TWO (review P1 round 9, #2402). This block used to REPEAT the ownership test
+    # as `unit_owner_dir != $O`, i.e. the RESOLUTION alone, while the guard above is the UNION (rendered `O=`
+    # OR resolution). On a cell whose `keys.env` carries an `O=` line — the state the union exists for — the
+    # union let the cell's OWN copy through and this block then refused it, unforgeably: `--install` never
+    # converged, `changed=0` was unreachable, and the remedy it printed told the operator to UNINSTALL the
+    # supervisor of a healthy cell. The union above already refuses every provably-foreign copy (and its
+    # message names the owner), so a second test could only disagree with it. Deleted deliberately.
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/controller-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$tpl" "$tmpd/$UNIT_NAME" || { rm -rf "$tmpd"; return 1; }
@@ -593,15 +599,21 @@ do_install() {
     pid="$(unit_main_pid)" || { err "cannot read $UNIT_NAME's MainPID — the unit answers is-active but nothing here can say a controller is running"; return 1; }
     [ "${pid:-0}" != "0" ] || { err "$UNIT_NAME is active with MainPID 0 — no controller process; read: journalctl -u $UNIT_NAME -n 40"; return 1; }
     local waited=0
+    # ⛔ THE PROOF POLLS THE STATE DIR THE UNIT RESOLVES TO, as well as this installer's `$O` (review P1
+    # round 9, #2402): the supervisor sources `$ENV_FILE` (`set -a`), so a `keys.env` `O=` line moves the
+    # controller's lock and heartbeat there while this installer never sources the file. Resolved from the
+    # INSTALLED copy, so the proof asks about the same unit the manager is running.
+    local proof_o=""
+    proof_o="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
     while [ "$waited" -lt "${CONTROLLER_PROOF_TIMEOUT:-240}" ]; do
-        controller_proof "$proof_since" && break
+        controller_proof "$proof_since" "$proof_o" && break
         # a unit that has already converged to `failed` will not produce a controller — stop waiting
         case "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" in failed) break ;; esac
         sleep 2; waited=$((waited + 2))
     done
-    controller_proof "$proof_since" || {
+    controller_proof "$proof_since" "$proof_o" || {
         err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s:"
-        err "  expected the harness's lock ($O/.orch.lock) held by a live orch-loop.sh, or a heartbeat at $O/heartbeat."
+        err "  expected the harness's lock ($O/.orch.lock$([ -n "$proof_o" ] && [ "${proof_o%/}" != "${O%/}" ] && printf ' or %s/.orch.lock' "${proof_o%/}")) held by a live orch-loop.sh, or a heartbeat in the same state dir."
         err "  An active unit whose start is about to die (no key, a foreign controller, a bad pin) converges to"
         err "  'failed' at StartLimitBurst — the #2402 defect, with a green install on top of it. Read:"
         sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
@@ -824,7 +836,25 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
     local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
     [ -n "${f:-}" ] && [ -r "$f" ] || return 1
     if [ "$(id -u)" = "0" ]; then
-        owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+        # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). Ownership alone
+        # missed the shape `sudo tee`/`sudo cp` leaves behind: a `keys.env` OWNED by root and group- or
+        # other-WRITABLE (`-rw-rw-r-- root:staff`, umask 002 in a shared group) was used as its own "owner",
+        # ran as root, and executed with root's authority — the escalation this guard exists to close, one
+        # permission bit away. Two changes, both fail-closed: evaluate as the INVOKING operator when sudo can
+        # name one (`SUDO_USER` — the account that could have written the file and the account the controller
+        # runs as), and do not evaluate the file AT ALL when any account but its owner can write it, or the
+        # directory that holds it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and
+        # lossless for ownership because ownership is the UNION.
+        local fmode
+        fmode="$(stat -c %A -- "$f" 2>/dev/null)" || return 1
+        [ -n "${fmode:-}" ] || return 1
+        # Group/other WRITE on the file itself. (The directory is deliberately not tested: if another
+        # account can REPLACE the file, the replacement's owner is that account — which the owner/SUDO_USER
+        # rule below already refuses to run as root — so a directory test would only cause false refusals
+        # on shared-group cells without closing anything additional.)
+        case "${fmode:5:1}${fmode:8:1}" in *w*) return 1 ;; esac
+        owner="${SUDO_USER:-}"
+        [ -n "${owner:-}" ] || owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
         [ -n "${owner:-}" ] || return 1
         if [ "$owner" != "root" ]; then
             command -v runuser >/dev/null 2>&1 || return 1
