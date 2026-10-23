@@ -472,19 +472,30 @@ fi
 git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "$HREPO is not a git checkout" 2
 # The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
 # only then the harness checkout — the pre-split behaviour for a box that configures neither.
-REPO="${REPO:-$(cfg_value REPO "$ENV_FILE")}"
+# ⛔ NAME WHERE THE REFUSED VALUE CAME FROM. `--repo` sets the HARNESS and can no longer change REPO, and
+# when the value came from the config file `unset REPO` is not even a change — the next run re-reads the
+# same value. Both remedies in the old text were INERT for the value it refused (measured: `--repo
+# <harness>` on a REPO from `ENV_FILE` gives the identical rc 2), which is the same "a refusal that steers
+# the reader somewhere unhelpful" class this block exists to remove.
+REPO_SRC=""
+if [ -n "${REPO:-}" ]; then
+  REPO_SRC="the environment"
+else
+  REPO="$(cfg_value REPO "$ENV_FILE")"
+  if [ -n "$REPO" ]; then REPO_SRC="the config file $ENV_FILE"; fi
+fi
 # ⛔ UNSET AND SET-BUT-WRONG ARE NOT THE SAME STATE. Unset legitimately falls back to the harness checkout
 # (a box that configures neither — the pre-split behaviour). A REPO that is SET and is not a directory is a
 # CONFIGURATION ERROR and is refused, because substituting the harness here would export
 # `REPO=<agent-infra>` to the controller and `orch-loop.sh` would derive `$OR` from agent-infra's origin —
 # the silent wrong-backlog retarget this whole block exists to prevent, one case further down.
 if [ -z "$REPO" ]; then REPO="$HREPO"
-elif [ ! -d "$REPO" ]; then die "REPO=$REPO is set but is not a directory — REPO names the WORK repo the controller drains (not the harness); pass --repo <agent-infra checkout> for the harness, or unset REPO to fall back to it" 2
+elif [ ! -d "$REPO" ]; then die "REPO=$REPO is set (by $REPO_SRC) but is not a directory — REPO names the WORK repo the controller drains, not the harness; --repo sets the HARNESS checkout and cannot change REPO — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness" 2
 # ⛔ A DIRECTORY IS NOT A CHECKOUT. The controller derives its owner/repo from `$REPO`'s ORIGIN
 # (`orch-loop.sh` `derive_or`); handed a directory that is not a repo it WARNS and falls back to a
 # hardcoded literal — a controller grading a repo nobody named, while this launcher reports it started.
 # The pre-split code validated this (it was the only repo it had); the split must not lose it.
-elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then die "REPO=$REPO is set but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo" 2
+elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then die "REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo" 2
 fi
 
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.

@@ -24,7 +24,13 @@ set -u
 # pin/start failures about a tree this suite never named — measured `REPO=/tmp/plaindir-stale`: **25
 # failed** here against **1 failed** on the pre-#2356 tree, i.e. a false RED the next reader attributes
 # to the launcher. Arms that need a work repo set `REPO` explicitly.
-unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE
+# ⛔ …AND THE SAME FALSE RED ARRIVES THROUGH THE OTHER KNOBS, so clearing only `REPO` was an over-claim
+# (measured before this line was widened): `HARNESS_REF=origin/nope` -> **17 failed** (every embedded
+# `check-deployed-drift.sh --surface` arm), `HARNESS=/tmp/nope` -> 5, `HARNESS_PIN_DIR=/tmp/nope` -> 3.
+# `HARNESS_REF` in particular is a value a real cell shell carries. Arms that exercise one of these set
+# it per-arm, so clearing them here costs nothing.
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS \
+      HU_LOAD_PER_CPU HU_LOAD_PER_LANE HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every

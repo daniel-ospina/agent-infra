@@ -121,8 +121,21 @@ printf '#!/bin/sh\nexit 0\n' > "$TMP/tmux"; chmod +x "$TMP/tmux"
 # A load fixture: `HU_LOADAVG_FILE` is the seam (a suite cannot change the box's load).
 printf '4.00 1.00 0.50 1/100 4242\n' > "$TMP/load"
 
+# ── THE WORK REPO FIXTURE: a checkout that does NOT contain the pin commit ───────────────────────
+# #2356: the harness repo and the work repo are two different things, and on a cell they are two
+# different PATHS. Every arm that proves the split needs a repo that is a real checkout, is NOT the
+# harness, and cannot resolve the pin commit — so it is built here, before the arms that use it.
+WORK="$TMP/work"
+mkdir -p "$WORK"
+( cd "$WORK" && git init -q -b main . \
+  && printf 'x\n' > README && git add README \
+  && git -c user.email=t@example.com -c user.name=t commit -qm work \
+  && git update-ref refs/remotes/origin/main refs/heads/main \
+  && git remote add origin "$WORK" ) >/dev/null 2>&1
+
 run_status() { # <harness-dir>; knobs via the exported shell vars read below
   OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+          REPO="${REPV:-}" \
           HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
           HU_PS="$TMP/ps-probe" PS_TABLE="${PS_TABLE:-$TMP/ps-none}" \
           HU_LOADAVG_FILE="${LOADFILE-$TMP/load}" HU_NCPU="${NCPUV:-4}" \
@@ -146,8 +159,12 @@ case "$OUT" in *"VERDICT: HEALTHY"*) ck "(a) GREEN: the verdict is HEALTHY" 0 ;;
 # RED: the SAME box, one fact changed — the controller executes the OLD tree (A) while the pin is B.
 # This is the real restart-pending state a pin advance creates (#2216/#2278), and the state the screen
 # reported OK about before this row existed.
+# ⛔ WITH A WORK REPO IN THE SHELL. `merge-base --is-ancestor` is a HARNESS-repo question: asked of the
+# work repo (the conflation #2356 removes) the harness objects are simply absent, so every real BEHIND
+# degrades to "NOT on the reference's line" and names the wrong remedy. Reverting that one `-C "$HREPO"`
+# left this arm green while `REPV` was unset (measured), so the arm now carries a foreign work repo.
 printf '4242 bash %s/scripts/orchestrator-harness/orch-loop.sh\n4243 bash %s/scripts/orchestrator-harness/cloud-cell-doctor.sh\n' "$OLD" "$OLD" > "$TMP/ps-old"
-PS_TABLE="$TMP/ps-old" run_status "$OLD/scripts/orchestrator-harness"
+PS_TABLE="$TMP/ps-old" REPV="$WORK" run_status "$OLD/scripts/orchestrator-harness"
 ck "(a) RED control: a controller executing a tree that is NOT the pin is DEGRADED (rc=$RC)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 case "$OUT" in *"VERDICT: HEALTHY"*) ck "(a) RED: the verdict is NOT HEALTHY" 1 ;; *) ck "(a) RED: the verdict is NOT HEALTHY" 0 ;; esac
 case "$OUT" in
@@ -249,7 +266,16 @@ FH="$FIX/orchestrator-harness"
 for t in selftest.sh check-single-source.sh check-deployed-drift.sh; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$FH/$t"
 done
-printf '#!/usr/bin/env bash\nprintf "harness relation=current running=x ref=y pin=z action=none fetch=ok\\n"\nexit 0\n' > "$FH/harness-refresh.sh"
+# ⛔ THE REFRESH STUB RECORDS ITS ARGV. `--repo <X>` must name the HARNESS checkout; without this line
+# the argument is unobservable, and reverting the launcher to `--repo "$REPO"` (the conflation #2356
+# removes) left the whole suite green (measured). Reverted, the refresh resolves `$REF` in the WORK repo,
+# reads `relation=unknown` and REFUSES the start — #2356's own symptom, one component further along.
+cat > "$FH/harness-refresh.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'refreshargv %s\n' "$*" >> "$FIX_LOG"
+printf 'harness relation=current running=x ref=y pin=z action=none fetch=ok\n'
+exit 0
+SH
 printf '#!/usr/bin/env bash\n: # the controller the authority starts\n' > "$FH/orch-loop.sh"
 chmod +x "$FH"/*.sh
 run_up() { # <ps-table>
@@ -641,13 +667,8 @@ esac
 # pin in the work repo refuses a perfectly good pin, and the obvious repair (`--repo <agent-infra>`)
 # writes REPO=<agent-infra> into the child and silently retargets the controller. Both halves are
 # asserted here, and the RED control below is what keeps the refusal alive rather than muted.
-WORK="$TMP/work"
-mkdir -p "$WORK"
-( cd "$WORK" && git init -q -b main . \
-  && printf 'x\n' > README && git add README \
-  && git -c user.email=t@example.com -c user.name=t commit -qm work \
-  && git update-ref refs/remotes/origin/main refs/heads/main \
-  && git remote add origin "$WORK" ) >/dev/null 2>&1
+# ⛔ THE WORK FIXTURE IS BUILT EARLY (see `WORK` above the run_status seam) because the (a) arms use it
+# too: the harness-repo ancestry question is only discriminating with a foreign work repo in the shell.
 ck "(e) the work-repo fixture does NOT contain the pin commit (a foreign object DB)" \
    "$([ -n "$WORK" ] && ! git -C "$WORK" rev-parse --verify --quiet "$SHA_B^{commit}" >/dev/null 2>&1 && echo 0 || echo 1)"
 # CANDIDATE 2 (`HARNESS_REPO`, which the fleet may export): the pin is read in the HARNESS repo, never in
@@ -712,6 +733,34 @@ ck "(e) with no REPO in the shell, the config file's REPO is the work repo the c
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and the harness repo still resolves from --repo/HARNESS_REPO, never from the config file" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ── THE REFRESH IS A HARNESS QUESTION TOO (review: its argv was unobservable) ─────────────────────
+# `up` starts `harness-refresh.sh --repo <X> --ref <REF>`, and X must be the HARNESS checkout. With the
+# WORK repo there the refresh resolves `$REF` in the wrong object DB, reads relation=unknown and REFUSES
+# the start — a correct cell refused, #2356's own symptom one component further along. The stub above
+# records its argv, so reverting that one argument reds this arm instead of passing silently (measured).
+ck "(e) the refresh is asked to read the HARNESS repo (harness-refresh --repo <harness>)" \
+   "$(grep -q '^refreshargv ' "$FIXCELL/fix.log" 2>/dev/null \
+      && grep -Fq -- "--repo $REPO_FIX " "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+
+# ── THE THIRD RESOLUTION SITE: PIN-ABSENT, WHERE THE REF TIP IS READ ─────────────────────────────
+# With no `HARNESS-PIN` record the launcher resolves `$REF`'s tip and says `pin: ABSENT … resolved
+# <sha>`. That is a HARNESS question: asked of a foreign WORK repo it is UNRESOLVABLE (the work
+# fixture's tip is a different sha), so this arm asserts the ABSENT path AND proves which repo answered.
+NOPIN="$TMP/cell-nopin"
+mkdir -p "$NOPIN/.pi/agent/state"
+printf '%s\n' "$PIN_TREE" > "$NOPIN/.harness-path"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$NOPIN" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$NOPIN/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+# ⛔ ASSERT ON THE PIN LINE ITSELF, NOT ON THE WHOLE SCREEN: `$B12` also appears in the harness PATH
+# that `status` prints, so "the output contains $B12" is TRUE whatever the pin line says (measured — the
+# vacuous form stayed green with the resolution reverted to `$REPO`).
+pinline="$(printf '%s\n' "$OUT" | grep -m1 'pin: ABSENT')"
+ck "(e) with no HARNESS-PIN the REF tip is resolved in the harness repo (pin: ABSENT … $B12)" \
+   "$(case "$pinline" in *"resolved $B12 from"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and it is never UNRESOLVABLE for a ref the harness repo does hold" \
+   "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
 # ── the WORK repo's OWN validation (review cycle 2): the split must not accept a REPO it cannot use ─
 # Set-but-wrong is never "unset": a directory that is not a checkout makes `orch-loop.sh` fall back to a
 # hardcoded owner/repo, so the controller grades a repo nobody named. Both arms are REFUSALS (rc 2).
