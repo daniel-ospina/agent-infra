@@ -459,17 +459,37 @@ cfg_value() { # <key> <file>
 # then wrote `REPO=<agent-infra>` into the child's environment, silently RETARGETING the controller
 # at the harness repo's backlog. One variable can never mean both: the pin is a harness-repo commit,
 # and REPO is what the lanes work on.
-HREPO="${A_REPO:-${HARNESS_REPO:-}}"
-if [ -z "$HREPO" ]; then
-  HREPO="$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+# ⛔ NAME THE VALUE, AND SEPARATE THE TWO WAYS IT CAN BE WRONG. `--repo` is an operator's assertion
+# about THIS run, so a mistyped one is REFUSED and NAMED — never silently replaced by a different
+# checkout, which is how the pre-split launcher lost the harness/ work distinction in the first place.
+# An INHERITED candidate (`HARNESS_REPO`, the config file, the launcher's own checkout) is not an
+# assertion about this run: the supervisor PRUNES pin worktrees, so a candidate that has since moved is
+# ordinary wear, and the pre-split launcher skipped such a candidate. Refusing EVERY verb on it —
+# `down` included — would leave a live controller with no sanctioned way to stop it, which is a worse
+# answer than resolving the harness from the next candidate. So: explicit → refuse; inherited → skip,
+# SAY SO on stderr, and continue.
+HREPO=""
+if [ -n "${A_REPO:-}" ]; then
+  HREPO="$A_REPO"
+  [ -d "$HREPO" ] || die "--repo $HREPO is not a directory — --repo names the HARNESS checkout, the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
+  git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "--repo $HREPO is not a git checkout — the pin commit and --ref must be commits OF it" 2
+else
+  # The candidates, in order: the environment, this machine's config file, then the launcher's OWN
+  # checkout — the operative cell path, because a cell's `keys.env` carries `REPO`/`OR` but NOT
+  # `HARNESS_REPO` (docs/ops/fleet-harness-baseline.md), so the fallback is what resolves it there.
+  # ⛔ THE CONFIG KEY IS `HARNESS_REPO`, NEVER `REPO`: `REPO` is the WORK repo (read below), and taking
+  # it here is precisely the conflation this block removes — the flat-copy layout (a deployed copy
+  # outside any checkout) still has a way to name its harness, under a key that means one thing.
+  for cand in "${HARNESS_REPO:-}" "$(cfg_value HARNESS_REPO "$ENV_FILE")" \
+              "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
+    [ -n "$cand" ] || continue
+    [ -d "$cand" ] || { warn "harness: ignoring '$cand' (not a directory) — trying the next candidate"; continue; }
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 \
+      || { warn "harness: ignoring '$cand' (not a git checkout) — trying the next candidate"; continue; }
+    HREPO="$cand"; break
+  done
+  [ -n "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
 fi
-[ -n "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
-# ⛔ NAME THE VALUE. The empty case and the wrong-value case are DIFFERENT answers, and prescribing
-# "pass --repo" to an operator who just passed a mistyped `--repo` is the failure this launcher is
-# already being fixed for: a refusal that steers the reader somewhere unhelpful. (`$HREPO is not a git
-# checkout` below already names its value; this one now does too.)
-[ -d "$HREPO" ] || die "$HREPO is not a directory — the HARNESS checkout is the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
-git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "$HREPO is not a git checkout" 2
 # The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
 # only then the harness checkout — the pre-split behaviour for a box that configures neither.
 # ⛔ NAME WHERE THE REFUSED VALUE CAME FROM. `--repo` sets the HARNESS and can no longer change REPO, and
@@ -1416,7 +1436,11 @@ hu_start_component() { # <name>
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────────
 cmd_up() {
   local c rc pin_rc=0 bad=0 cap="" cap_rc=0 cap_lanes="" cap_fixed="none"
-  say "==> harness-up ($PLATFORM) — repo $REPO, harness repo $HREPO, ref $REF"
+  # ⛔ NAME WHERE `REPO` CAME FROM. `--repo` can no longer set it, so the only ways to have a wrong
+  # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
+  # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
+  # screen instead of implied by a path the reader must recognise.
+  say "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
   say "    state dir : $O"
   say "    harness   : $HARNESS (from $HARNESS_SRC)"
 

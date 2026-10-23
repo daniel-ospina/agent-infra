@@ -41,9 +41,15 @@ set -u
 # `HARNESS_UP_SELFTESTS=<bogus>` -> **12 fail**, `HARNESS_UP_OS=Darwin` -> **6**, `HU_LOAD_PER_CPU=1` or
 # `HU_LOAD_PER_LANE=1` -> **3** each — and every fixture depends on their DEFAULTS, so they are cleared
 # as well; arms that exercise them set them per-command (`HARNESS_UP_OS=Darwin` in (d)).
+# ⛔ AND THE HARNESS-SIDE KNOBS ARE AMBIENT TOO — the sibling suite clears exactly these and says why
+# (`harness-cohesion.test.sh`: `HARNESS_REF` in particular is a value a real cell shell carries).
+# Clearing only the work-repo knobs was an over-claim: measured, `HARNESS_REF=origin/nope` -> **2
+# failed** here, both of them this suite's own (e) assertions — the same false RED the block above
+# exists to remove, one knob over.
 # Fixtures that need a work repo set it explicitly (`REPO="$WORK"` in (e)); (a)-(d) pass `--repo` and
 # want the launcher's own fallback answer.
-unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE \
+      HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0
@@ -704,7 +710,11 @@ ck "(e) …and it does NOT claim the pin is unresolvable" \
 # fixture's worktree — `git worktree list` names the MAIN worktree first, so its own checkout IS the
 # harness repo — and the pin must resolve there. Without this arm, making the fallback revert to the work
 # repo (the exact conflation #2356 removes) left the suite at 0 failed.
-OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+# ⛔ AND IT MUST CARRY THE FOREIGN WORK REPO (review P1): with `REPO` unset this arm is VACUOUS about the
+# one regression it claims to guard — adding `REPO` back as an `HREPO` candidate (or as the fallback)
+# left all 100 assertions green, because no arm supplied a work repo for the launcher to prefer. The
+# cell shape IS "an ambient REPO that is not the harness", so `REPO="$WORK"` is what makes it that.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" \
         HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --harness "$FH" --no-fetch 2>&1 )"
@@ -747,6 +757,27 @@ ck "(e) with no REPO in the shell, the config file's REPO is the work repo the c
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and the harness repo still resolves from --repo/HARNESS_REPO, never from the config file" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ THE SOURCE IS ON THE SCREEN. With `--repo` unable to set `REPO` any more, an inherited-but-unintended
+# work repo is accepted silently, and a path alone does not say whether it came from the shell, the config
+# file, or the fallback. The banner names it; reverting that interpolation reds this line.
+ck "(e) …and the banner names WHERE the work repo came from (not just its path)" \
+   "$(case "$OUT" in *"repo $WORK (the config file"*) echo 0 ;; *) echo 1 ;; esac)"
+# ── THE PRECEDENCE CONFLICT: the caller's REPO BEATS the config file's ──────────────────────────────
+# The documented order is "the caller's `REPO`, then the config file", and no other arm tests the case
+# where BOTH are set and differ — the case a cell is actually in (a shell export plus `keys.env`). A
+# regression that reads the config FIRST silently discards the caller's checkout and drains the other
+# repo's backlog, which is the wrong-backlog class this split removes, one precedence step over.
+printf 'REPO=%s\n' "$TMP/nowhere-repo" > "$TMP/conflict.env"
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" ENV_FILE="$TMP/conflict.env" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --repo "$REPO_FIX" --no-fetch 2>&1 )"
+ck "(e) with BOTH an env REPO and a DIFFERENT one in the config file, the caller's REPO wins" \
+   "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and the losing config value is never what the controller is told (and nothing was started on it)" \
+   "$(grep -q 'nowhere-repo' "$FIXCELL/fix.log" 2>/dev/null && echo 1 || echo 0)"
 # ── THE REFRESH IS A HARNESS QUESTION TOO (review: its argv was unobservable) ─────────────────────
 # `up` starts `harness-refresh.sh --repo <X> --ref <REF>`, and X must be the HARNESS checkout. With the
 # WORK repo there the refresh resolves `$REF` in the wrong object DB, reads relation=unknown and REFUSES
@@ -798,6 +829,51 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="
 ck "(e) a REPO that does not exist is STILL REFUSED, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "(e) …and the message says it is not a directory" \
    "$(case "$OUT" in *'REPO='*'is not a directory'*) echo 0 ;; *) echo 1 ;; esac)"
+# ── THE HARNESS SIDE: an EXPLICIT bad `--repo` is refused, an INHERITED bad candidate is skipped ─────
+# Two different answers, and both are load-bearing. `--repo` is the operator's assertion about this run:
+# refusing it (naming the value) is what stops a mistyped flag from being silently answered by a
+# different checkout. An inherited `HARNESS_REPO` is not — the supervisor PRUNES pin worktrees, so a
+# candidate that moved is ordinary wear, and a launcher that refuses EVERY verb on it (rc=2) leaves a
+# live controller with no sanctioned way to stop it. Both were measured as having NO assertion at all
+# (review): removing either refusal, or leaving a stale candidate fatal, kept the suite at 0 failed.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --repo "$TMP/no-such-dir" --no-fetch 2>&1 )"; RC=$?
+ck "(e) an unusable --repo is REFUSED (rc=$RC), never silently replaced by another checkout" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and the refusal NAMES the flag and the value it refused" \
+   "$(case "$OUT" in *"--repo $TMP/no-such-dir is not a directory"*) echo 0 ;; *) echo 1 ;; esac)"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --repo "$TMP/plaindir" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a --repo that is a directory but NOT a checkout is REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and the message names it as not a git checkout" \
+   "$(case "$OUT" in *"--repo $TMP/plaindir is not a git checkout"*) echo 0 ;; *) echo 1 ;; esac)"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_REPO="$TMP/pruned-pin-worktree" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a STALE ambient HARNESS_REPO (a pruned pin worktree) is SKIPPED, not fatal (rc=$RC, not a refusal)" "$([ "$RC" -ne 2 ] && echo 0 || echo 1)"
+ck "(e) …so the pin still resolves in the next candidate (the launcher's own checkout)" \
+   "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and the skip is SAID, not silent" \
+   "$(case "$OUT" in *"ignoring '$TMP/pruned-pin-worktree'"*) echo 0 ;; *) echo 1 ;; esac)"
+# ── THE FLAT-COPY LAYOUT CAN STILL NAME ITS HARNESS — under the key that means ONE thing ───────────
+# A deployed copy lives outside any checkout (`install.sh` writes a flat copy; a plist execs it), so the
+# own-checkout fallback has nothing to read. The config file is that box's only statement of where its
+# harness lives, and it must be `HARNESS_REPO=` — the pre-split `REPO=` key is the WORK repo now, and
+# reading it here is exactly the conflation #2356 removes. No other arm covers this candidate, so a
+# regression dropping it would ship green.
+FLAT="$TMP/flat"; mkdir -p "$FLAT"; cp "$UP" "$FLAT/harness-up"
+printf 'HARNESS_REPO=%s\n' "$REPO_FIX" > "$TMP/harness.env"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ENV_FILE="$TMP/harness.env" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a flat copy outside any checkout resolves its harness from the config file's HARNESS_REPO (rc=$RC, not a refusal)" "$([ "$RC" -ne 2 ] && echo 0 || echo 1)"
+ck "(e) …and the pin resolves there (pin: OK, never UNRESOLVABLE)" \
+   "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── the RED control: the check still REFUSES a pin that names nothing this box can resolve ───────
 BAD="$TMP/cell-badpin"
