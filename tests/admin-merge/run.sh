@@ -547,6 +547,22 @@ case "$key" in
         printf 'could not find the log for run %s: log not found\n' "$id" >&2
         exit 1
       fi
+      # #1574: a TRANSIENT transport failure that CLEARS. `flaky-log-<id>` holds
+      # how many leading reads fail; the counter (`flaky-count-<id>`) advances per
+      # read, and once it passes that number the log is served from `log-<id>`.
+      # The stderr deliberately names no reason `fetch_failed_log` recognises: a
+      # real transient is auth/network/5xx text, NOT `log not found` — and the
+      # whole point of the split is that only the latter stops the retry.
+      if [ -f "$SCEN/flaky-log-$id" ]; then
+        n=$(( $(cat "$SCEN/flaky-count-$id" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$SCEN/flaky-count-$id"
+        if [ "$n" -le "$(cat "$SCEN/flaky-log-$id")" ]; then
+          printf 'HTTP 502: Bad Gateway (transient)\n' >&2
+          exit 1
+        fi
+        [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
+        exit 0
+      fi
       [ -f "$SCEN/fail-log-$id" ] && exit 1
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
@@ -1504,7 +1520,11 @@ cfs_diff() { bash "$CFS" --diff "$1" "$2"; }
 # parser script itself and capture its streams for assertions. The extraction is
 # its OWN unit — the admin-merge rail is a separate consumer (#3756).
 cfs_run() {
-  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  # CI_FAILURE_SET_LOG_BACKOFF_S=0 — the suite must not SLEEP. The retry itself is
+  # exercised (attempts default to 3); only the wall-clock wait is removed, so a
+  # scenario that exhausts the retry does not add ~6s of dead time each.
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" CI_FAILURE_SET_LOG_BACKOFF_S=0 \
+    bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
   return $?
 }
 
@@ -2221,6 +2241,11 @@ rc=$?
 [ "$rc" -ne 0 ] && pass "a run with jobs and an unreadable log still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
 grep -q "could not fetch the failed-step log" "$TMP/cfs-err" && pass "the refusal is surfaced" || fail "expected the refusal on stderr"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a zero-job note must not be printed for a run that HAS jobs" || pass "no zero-job note for a run that has jobs"
+# #1574: the retry must be BOUNDED. A retry loop that never gives up would turn
+# this refusal into a hang, which is a worse failure than the one it replaces.
+n=$(grep -c '^run view 7778 ' "$SCEN/calls")
+[ "$n" -eq 3 ] && pass "the transient retry is bounded at 3 attempts before refusing" \
+  || fail "expected exactly 3 log-fetch attempts before the refusal, got $n"
 
 # The jobs-API slug must carry the RESOLVED repo (review cycle 5, P2). Forcing the
 # `{owner}/{repo}` placeholder unconditionally left the suite GREEN, because the
@@ -3001,6 +3026,65 @@ rc=$?
 [ "$rc" -eq 0 ] && pass "--help exits 0" || fail "--help expected exit 0, got $rc"
 grep -q 'usage:\|--main-union' "$TMP/cfs-out" && pass "--help prints the usage text" \
   || fail "--help did not print usage"
+
+# ── 5o. #1574: a TRANSIENT log-fetch error is retried ────────────────────
+# MEASURED, not hypothetical (2026-10-23): one `--log-failed` fetch of a 27-job
+# run is ~2.3 s and ~620 KB, and a widened baseline pass fetches EVERY failing run
+# in the window — the tortoise main window that hit this defect held 15, so one
+# pass makes 15 independent log fetches. ONE transient among them aborted the whole
+# pass with `BLOCK — could not extract main's rate table`, and the doctor then
+# recorded it as a PR refusal (`class=other`) cooling that head down for
+# MERGE_RETRY_S=3600. This scenario fails the first TWO reads and serves the
+# third, so on the retry-free code it refuses — the test is non-vacuous.
+echo "== 5o. a transient log-fetch error is retried and the baseline is read =="
+new_scen transientlog
+{ main_red_n main7795 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7795 7795
+} > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7795"
+printf '2\n' > "$SCEN/flaky-log-7795"          # the first 2 reads fail, the 3rd serves
+printf '3\n' > "$SCEN/jobs-count-7795"
+cfs_run --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -eq 0 ] && pass "a transient log-fetch error no longer aborts the baseline (exit 0)" \
+  || { fail "expected exit 0 — the transient read was not retried (got $rc)"; tail -4 "$TMP/cfs-err" | sed 's/^/       /'; }
+grep -q 'could not fetch the failed-step log' "$TMP/cfs-err" \
+  && fail "a RECOVERED read was still reported as a refusal" \
+  || pass "no refusal was reported for a recovered read"
+grep -q 'TRANSIENT error and SUCCEEDED on attempt 3' "$TMP/cfs-err" \
+  && pass "the recovery is DISCLOSED (attempt 3 of 3), never silent" \
+  || fail "expected the recovery to be disclosed on stderr"
+n=$(grep -c '^run view 7795 ' "$SCEN/calls")
+[ "$n" -eq 3 ] && pass "exactly 3 attempts were made (bounded, not a loop)" \
+  || fail "expected 3 log-fetch attempts for run 7795, got $n"
+grep -q 'tests/test_other.py::test_red_on_main' "$TMP/cfs-out" \
+  && pass "the rate table carries the recovered run's row" \
+  || fail "the rate table is missing the recovered row"
+
+# ── 5p. #1574: a PROVEN-ABSENT log is NOT retried ─────────────────────────
+# `log not found` is GitHub saying the log does not exist. Waiting cannot create
+# it, so the retry must be skipped and the #7131 job-level degradation must happen
+# on the FIRST read. Without this, every pruned run in every baseline pass pays
+# the full retry cost for a certainty — and on main that is not rare: the measured
+# window held 2 pruned runs out of 15.
+echo "== 5p. a PROVEN-ABSENT log is degraded on the FIRST read, never retried =="
+new_scen prunednoretry
+{ main_red_n main7796 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7796 7796
+} > "$SCEN/runs-main"
+: > "$SCEN/pruned-log-7796"            # the fake emits `log not found` and exits 1
+printf '3\n' > "$SCEN/jobs-count-7796"
+printf 'test (d)\n' > "$SCEN/jobs-failed-7796"   # the job-level fallback surface
+cfs_run --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -eq 0 ] && pass "a pruned log is attributed at job level, not refused (#7131)" \
+  || fail "expected exit 0 for the pruned-log degradation, got $rc"
+n=$(grep -c '^run view 7796 ' "$SCEN/calls")
+[ "$n" -eq 1 ] && pass "a PROVEN-ABSENT log is attempted ONCE (a retry cannot create it)" \
+  || fail "expected exactly 1 attempt for a pruned log, got $n — the retry is spending time on the permanent branch"
+grep -q 'has NO LOG (GitHub pruned it)' "$TMP/cfs-err" \
+  && pass "the pruned cause is still named" \
+  || fail "expected the pruned-log note on stderr"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="

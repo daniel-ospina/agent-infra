@@ -212,11 +212,34 @@
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
 #   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
+#   CI_FAILURE_SET_LOG_ATTEMPTS   attempts at a TRANSPORT-failed --log-failed
+#                             fetch, including the first (default: 3, #1574)
+#   CI_FAILURE_SET_LOG_BACKOFF_S  seconds of backoff before attempt N is
+#                             `N-1` times this (default: 2 → 2s then 4s)
 
 set -uo pipefail
 
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
+
+# #1574 — A TRANSPORT-FAILED LOG FETCH IS RETRIED, A PRUNED LOG IS NOT.
+# Measured on this defect, so the numbers are not a guess: one `--log-failed`
+# fetch of a 27-job run takes ~2.3 s and returns ~620 KB, and a widened baseline
+# pass fetches EVERY failing run in the window — the tortoise main window that hit
+# the defect held 15 failed runs, so a single pass makes 15 separate log fetches
+# and ANY ONE of them returning a transient error used to abort the whole rail
+# (`BLOCK … could not extract main's rate table`) and cost that PR an hour
+# (MERGE_RETRY_S=3600) with no defect in it.
+#
+# The retry is bounded and offline-safe: three attempts over ~6 s of backoff, and
+# only on the branch that is NOT proven-absent. `log not found` never retries —
+# that is GitHub saying the log does not exist, which the existing #7131
+# discrimination turns into a job-level attribution, not a refusal.
+LOG_FETCH_ATTEMPTS="${CI_FAILURE_SET_LOG_ATTEMPTS:-3}"
+LOG_FETCH_BACKOFF_S="${CI_FAILURE_SET_LOG_BACKOFF_S:-2}"
+case "$LOG_FETCH_ATTEMPTS" in ''|*[!0-9]*) LOG_FETCH_ATTEMPTS=3 ;; esac
+[ "$LOG_FETCH_ATTEMPTS" -ge 1 ] || LOG_FETCH_ATTEMPTS=1
+case "$LOG_FETCH_BACKOFF_S" in ''|*[!0-9]*) LOG_FETCH_BACKOFF_S=2 ;; esac
 #: The largest window the #9689 widening may read — the same 200-run ceiling
 #: admin-merge.sh applies to `--main-runs`, because every run in the window may
 #: cost one Jobs API read and, when it FAILED, one failed-log fetch.
@@ -780,6 +803,15 @@ run_failed_job_ids() {
 # because for those the log may well exist and a retry can recover it — treating
 # them as pruned would trade a recoverable refusal for a permanent one.
 #
+# ⛔ #1574 — THE RETRY ACTS ON THAT SPLIT, AND ONLY ON THAT SPLIT. A transport
+# failure is retried $LOG_FETCH_ATTEMPTS times (with backoff), because the split
+# above already ESTABLISHES that such a failure is recoverable; a PROVEN-ABSENT
+# log is never retried, because no amount of waiting creates it. Exhaustion is
+# unchanged: the refusal below still fires, so `unreadable ⇒ refuse` — which is
+# what stops a clipped baseline certifying a comparison — is NOT weakened. The
+# retry changes HOW LONG the rail tries to read, never WHETHER an unread read is
+# allowed to certify anything.
+#
 # ⚠ ONE MESSAGE PER RUN, EMITTED AFTER the discrimination. Printing the refusal
 # first and then the exemption made the rail say "the failure set is UNKNOWABLE,
 # refusing" and "contributing an EMPTY set" about the SAME run — the exact
@@ -790,11 +822,26 @@ run_failed_job_ids() {
 # auth/network for a run whose logs GitHub had simply pruned — so the natural
 # responses (re-auth, retry, wait out a rate limit) could not possibly work.
 fetch_failed_log() {
-  local run_id="$1" out="$2" err jobs
-  # shellcheck disable=SC2086
-  if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
-    return 0
-  fi
+  local run_id="$1" out="$2" err jobs attempt=1
+  while :; do
+    # shellcheck disable=SC2086
+    if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
+      if [ "$attempt" -gt 1 ]; then
+        # NAME the recovery. A silent retry would hide a sick read surface for
+        # exactly as long as it keeps happening to work, and the operator's next
+        # question is always "was this baseline actually readable?".
+        say_err "ci-failure-set: · run $run_id — the failed-step log fetch failed $((attempt - 1)) attempt(s) with a TRANSIENT error and SUCCEEDED on attempt $attempt of ${LOG_FETCH_ATTEMPTS}; the log was read, so this is not a refusal (#1574)"
+      fi
+      return 0
+    fi
+    # PROVEN ABSENT is not a transient: GitHub said the log does not exist, so a
+    # retry cannot produce it. Break out and let the #7131 discrimination below
+    # attribute the run at job level.
+    case "$err" in *"log not found"*) break ;; esac
+    [ "$attempt" -lt "$LOG_FETCH_ATTEMPTS" ] || break
+    attempt=$((attempt + 1))
+    [ "$LOG_FETCH_BACKOFF_S" -gt 0 ] && sleep $(( LOG_FETCH_BACKOFF_S * (attempt - 1) ))
+  done
   # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
   # failure in an unreadable log; a run with none contributes nothing.
   if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
@@ -815,7 +862,7 @@ fetch_failed_log() {
       say_err "ci-failure-set: · run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — falling back to the JOB-LEVEL failure set (#7131): the test-level identity does not exist on any surface, so the run is attributed by failed JOB NAME and, carrying no signature, cannot be exempted"
       return 3 ;;
     *)
-      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error); its job count $jobs_note — refusing to read this as an empty failing set" ;;
+      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error; ${attempt} attempt(s) made of ${LOG_FETCH_ATTEMPTS} — a transient error is retried, see #1574); its job count $jobs_note — refusing to read this as an empty failing set" ;;
   esac
   return 1
 }
