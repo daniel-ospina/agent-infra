@@ -1035,7 +1035,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE=""
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" _repo_sv="" SKIP_NOTE=""
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1077,18 +1077,26 @@ reap_worktree() {
         # forge class the newline-in-a-label defect was. An rc=0 pass has no skip by construction, and
         # the token must still have the shape this delegate emits (`name` or `name(rc=N)`).
         _skip=""
-        if [ "$rc" != 0 ]; then
+        # ⛔ rc=3 EXACTLY, not "non-zero". Only the open-PR abort (exit 3) emits a SKIPPED-REPO line; on
+        # rc=4 (a removal FAILED), 5 or 124 the delegate has ALREADY printed every worktree path
+        # verbatim, so a checkout named `x<newline>SKIPPED-REPO: skipped=y reason=gh-not-authenticated(rc=4)`
+        # could forge a skip on a pass that removed nothing by PR-gate (and would send the operator to
+        # `gh auth` instead of the removal failure). The delegate strips newlines from its own line; the
+        # entry point must not trust the rest of the stream either.
+        if [ "$rc" = 3 ]; then
             _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
-            case "$_skip" in
-                # The token alphabet only: name, optional `(rc=N)`. Anything else is echoed path
-                # text, not a verdict this delegate emits.
-                ''|*[!A-Za-z0-9._:\(\)=-]*) _skip="" ;;
-            esac
+            # The token alphabet only (name, optional `(rc=N)`). `tr -d` rather than a `case` bracket:
+            # bash's case parser rejects `(` inside `[...]`, and escaping it silently ADMITS a backslash.
+            if [ -n "$(printf '%s' "$_skip" | tr -d 'A-Za-z0-9._:()=-')" ]; then _skip=""; fi
         fi
         if [ -n "$_skip" ]; then
             SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
-            SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
-            say "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
+            # ⛔ FLATTEN THE PATH, like `repos=` already does: this value is written into the pass record
+            # as `key=value`, and a `--repo` path containing a newline would otherwise write a SECOND
+            # line — a forged `verdict_worktree=ok` in the channel `--print-status` and the supervisor read.
+            _repo_sv="$(printf '%s' "$repo" | tr -d '\n\r')"
+            SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${_repo_sv}[${_skip}]"
+            say "disk-reaper: class=worktree skipped=$_repo_sv reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
         fi
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.

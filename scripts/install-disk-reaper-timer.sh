@@ -505,7 +505,7 @@ GH_PREFLIGHT=""
 gh_preflight_summary() {
     case "${GH_PREFLIGHT:-}" in
         '')            printf 'authenticated via HOME=%s — the open-PR gate can run' "$HOME" ;;
-        probe-timeout) printf 'UNKNOWN — the auth probe timed out; the worktree class may skip every repo (see the WARNING above)' ;;
+        probe-timeout|probe-error) printf 'UNKNOWN — the auth probe could not answer (%s); the worktree class may skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
         *)             printf '%s — the worktree class will skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
     esac
 }
@@ -546,10 +546,17 @@ gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated 
         HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
     fi
+    # ⛔ THE EXIT STATUS IS THE DIAGNOSIS, and the arms must not collapse into one remedy. gh answers 1
+    # for "not logged in" and 4 for "requires authentication"; 126/127 mean the BINARY could not be
+    # executed at all (a wrapper with a missing interpreter, a GH_BIN off this host, an unusable
+    # TB_TIMEOUT_BIN pin from bounded.sh) — telling that operator to run `gh auth login` sends them to
+    # a remedy that cannot fix rc 127, which is the cause-conflation this whole change removes.
     case "$rc" in
-        0)   printf '' ;;
-        124) printf 'probe-timeout' ;;
-        *)   printf 'unauthenticated' ;;
+        0)       printf '' ;;
+        124)     printf 'probe-timeout' ;;
+        126|127) printf 'missing' ;;
+        1|4)     printf 'unauthenticated' ;;
+        *)       printf 'probe-error' ;;
     esac
 }
 
@@ -565,6 +572,9 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
         probe-timeout)
             err "WARNING: gh did not answer 'auth status' within 10s, so this installer CANNOT say whether the worktree class will run on this box"
             err "  install anyway and check later: bash $REAPER --print-status, or  gh auth status  by hand" ;;
+        probe-error)
+            err "WARNING: gh answered 'auth status' with an unexpected status, so this installer CANNOT say whether the worktree class will run on this box"
+            err "  check by hand: HOME=$home gh auth status" ;;
         *)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
             err "  the credential store is per-HOME (\$HOME/.config/gh, or GH_TOKEN), and the rendered HOME decides it"

@@ -1973,6 +1973,61 @@ assert_eq "$RC" "0" "T56 a box with no gh still installs (its uv/venv classes ar
 assert_contains "$OUT" "WILL SKIP EVERY REPO" "T56 ... and is warned that the worktree class will skip every repo"
 assert_contains "$OUT" "gh is not installed" "T56 ... naming the MISSING cause, not an auth one"
 assert_contains "$OUT" "gh:     missing" "T56 the summary distinguishes missing from unauthenticated"
+# ⛔ A `gh` THAT CANNOT EXECUTE IS NOT AN UNAUTHENTICATED `gh`. `command -v` succeeds for a wrapper
+# whose interpreter is missing, and running it gives 127 — reporting that as "not authenticated" tells
+# the operator to run `gh auth login`, which cannot fix a broken binary (the cause-conflation this
+# change removes, one layer up).
+mkdir -p "$T/t56/bin-broken"
+printf '#!/nonexistent/interp\nexit 0\n' >"$T/t56/bin-broken/gh"
+chmod +x "$T/t56/bin-broken/gh"
+# ⛔ BY ABSOLUTE PATH, NOT BY PATH ORDER: execvp SKIPS a candidate whose interpreter is missing (ENOENT
+# continues the search), so a PATH-based fixture silently runs the box's real gh and asserts nothing.
+OUT="$(GH_BIN="$T/t56/bin-broken/gh" inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a gh that cannot execute still installs"
+assert_contains "$OUT" "gh:     missing" "T56 an unrunnable gh is reported as MISSING (127 is not an auth answer)"
+assert_absent "$OUT" "NOT AUTHENTICATED" "T56 ... and never as an authentication failure"
+
+
+# ── T57: a SKIPPED-REPO line is only believed from a FAIL-CLOSED (3) delegate (#2443) ────────────
+# The token is parsed out of the delegate's MERGED output, and that same stream carries worktree paths
+# verbatim — so a checkout whose directory name contains a newline followed by a forged
+# `SKIPPED-REPO: …` line could mint a skip on a pass that did not skip. Both arms are asserted with the
+# SAME forged stream: rc=3 (the honest fail-closed case) must still be believed, rc=4 (a removal FAILED)
+# must not be, because there the real subject is the removal failure and the operator must be sent to it.
+ENVNAME=t57
+mkdir -p "$T/t57/bin"
+cat >"$T/t57/bin/wt-forge.sh" <<'SHIM'
+#!/usr/bin/env bash
+printf 'remove /tmp/not-a-real-worktree\n'
+printf 'SKIPPED-REPO: skipped=/forged reason=gh-not-authenticated(rc=4)\n'
+exit "${FORGE_RC:-4}"
+SHIM
+chmod +x "$T/t57/bin/wt-forge.sh"
+REPO="$(mk_repo t57)"
+OUT="$(WORKTREE_REAPER="$T/t57/bin/wt-forge.sh" FORGE_RC=4 run_reaper --dry-run --repo "$REPO" --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "4" "T57 precondition: the forged stream rides an rc=4 (removal FAILED) delegate"
+assert_absent "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "gh-not-authenticated" \
+    "T57 an rc=4 delegate cannot mint a skip (its subject is the FAILED removal, not the PR gate)"
+assert_absent "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "open-PR gate unverifiable" \
+    "T57 ... and the cause is not mislabelled as the PR gate"
+ENVNAME=t57b
+OUT="$(WORKTREE_REAPER="$T/t57/bin/wt-forge.sh" FORGE_RC=3 run_reaper --dry-run --repo "$REPO" --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T57b control: the SAME stream from an rc=3 (fail-closed) delegate still reads as a skip"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "skipped_worktree=$REPO[gh-not-authenticated(rc=4)]" \
+    "T57b ... so the rc gate did not disable the feature it protects"
+# a token outside the delegate's alphabet is echoed text, never a verdict
+ENVNAME=t57c
+cat >"$T/t57/bin/wt-badtoken.sh" <<'SHIM'
+#!/usr/bin/env bash
+printf 'SKIPPED-REPO: skipped=/x reason=not a token with spaces\n'
+exit 3
+SHIM
+chmod +x "$T/t57/bin/wt-badtoken.sh"
+OUT="$(WORKTREE_REAPER="$T/t57/bin/wt-badtoken.sh" run_reaper --dry-run --repo "$REPO" --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T57c an unshaped token still leaves the class fail-closed"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "skipped_worktree=
+" \
+    "T57c ... but an unshaped token is never recorded as a named skip (the field stays empty)"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
