@@ -2040,6 +2040,36 @@ reset; printf '**Verdict:** CLEAN — 1 finding fixed and re-reviewed.\n' > "$TM
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "  ...and a REPAIRED one (resolved participle) is still clean (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+# ⛔ THE QUANTIFIER REACHES THE NOUN ACROSS A QUALIFIER RUN (P1, fresh re-review at c838ed8 — the
+# SAME fail-OPEN class the P0 above closed, one grammar over). The old shape allowed exactly ONE
+# intervening word and only the literal `blocking`, so each spelling below exited 0 and wrote a
+# signed clean record over a reported blocker. Every one is pinned, because the previous round is
+# what proves a SINGLE pinned form teaches the grammar nothing.
+while IFS= read -r _sp; do
+  reset; printf '%s\n' "$_sp" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "a CLEAN that reports a blocker as '$_sp' is refused (rc=$(rc_of))"
+  no_record; ck $? "  ...nothing recorded"
+done <<'SPELLINGS'
+ISSUES 0 — a single blocking finding remains.
+ISSUES 0 — a lone blocking finding remains
+ISSUES 0 — an outstanding blocking finding
+ISSUES 0 — one outstanding blocking finding
+ISSUES 0 — one-blocking-finding remains
+**Verdict:** CLEAN — a single blocking finding remains.
+SPELLINGS
+# ⛔ AND THE RESOLVED-PARTICIPLE EXEMPTION ACCEPTS A COPULA (P3, same re-review — an over-block the
+# P0 fix INTRODUCED). `ISSUES 0` now reaches this guard for the first time, and the line the guard's
+# own remedy tells a reviewer to write was refused. The two directions are pinned together.
+while IFS= read -r _sp; do
+  reset; printf '%s\n' "$_sp" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "a REPAIRED count ('$_sp') still records clean (rc=$(rc_of))"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+done <<'FIXEDSPELLINGS'
+ISSUES 0 — one blocking finding was fixed.
+**Verdict:** CLEAN — two issues were resolved.
+FIXEDSPELLINGS
 # ⛔ MUTATION: the count arm made unfindable => the scenario above RECORDS. Without it, "1 blocking
 # finding remains" could pass because the line happened to fail some other check.
 MC="$TMP/mutant-count.sh"
