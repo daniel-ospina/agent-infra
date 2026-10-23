@@ -655,7 +655,7 @@ human_above() { # 0 = a human is above; 1 = none; 2 = the ancestry could not be 
 
 run_reap() {
   begin_pass
-  local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
+  local dry="${1:-}" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
   local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 failed=0 result=""
   note() { log "[reap] $*"; result="${result}${result:+; }$*"; }
   started="$(date +%s)"
@@ -948,7 +948,7 @@ attempt_record() { # <pr> <head> [<rc>]
 
 run_merge() {
   begin_pass
-  local dry="$1" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started
+  local dry="${1:-}" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started
   local candidates=0 attempted=0 landed=0 skipped=0 unverifiable=0 result="" out rc
   if [ -z "$OR" ]; then
     log "[merge] CANNOT-VERIFY: \$OR is unset (the queue target is resolved by the supervisor)"
@@ -1214,7 +1214,7 @@ for p in d:
 # shipped tools and the shipped gates — this role adds the SCHEDULE, not another reaper.
 run_hygiene() {
   begin_pass
-  local dry="$1" before after mb rc wt mode out result="" h_rc=0 prev
+  local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev
   # 1) the package cache. `uv cache prune` removes UNUSED entries (safe while lanes resolve); it is
   #    NOT `uv cache clean` — emptying a cache a live lane is reading is the class #1987 forbids.
   if command -v uv >/dev/null 2>&1; then
@@ -1481,7 +1481,7 @@ service_controller_present() {
 
 run_doctor() {
   begin_pass
-  local dry="$1" rc hb age result="" tmp rpid
+  local dry="${1:-}" rc hb age result="" tmp rpid
   # Through the ROLED PASS, not run_reap directly: a nested reap must take the reap role lock like
   # any other pass, or an operator's concurrent `reap` and this one would sample each other's lanes
   # and could both decide the same session is wedged (two kills, one corpse — the double-act the
@@ -1916,9 +1916,9 @@ run_loop() {
       return 0
     fi
     now="$(date +%s)"
-    if [ $(( now - last_d )) -ge "$DOCTOR_INTERVAL" ]; then run_role_pass doctor; last_d=$now; fi
-    if [ $(( now - last_m )) -ge "$MERGE_INTERVAL" ]; then run_role_pass merge; last_m=$now; fi
-    if [ $(( now - last_h )) -ge "$HYGIENE_INTERVAL" ]; then run_role_pass hygiene; last_h=$now; fi
+    if [ $(( now - last_d )) -ge "$DOCTOR_INTERVAL" ]; then run_role_pass doctor ""; last_d=$now; fi
+    if [ $(( now - last_m )) -ge "$MERGE_INTERVAL" ]; then run_role_pass merge ""; last_m=$now; fi
+    if [ $(( now - last_h )) -ge "$HYGIENE_INTERVAL" ]; then run_role_pass hygiene ""; last_h=$now; fi
     # `sleep & wait`: bash runs a trap only after the foreground command returns, and a foreground
     # `sleep 600` would defer `stop` for its whole duration (orch-loop.sh's measured note).
     "$SLEEP_BIN" "$LOOP_TICK" & wait $! || true
