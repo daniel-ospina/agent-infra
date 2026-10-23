@@ -392,8 +392,16 @@ def log_event(line):
 
 
 # ── single flight ───────────────────────────────────────────────────────────────────────────────
-def acquire_lock():
+def acquire_lock(strict=False):
     """One gh call in flight per box. Returns the fd to hold (or None when re-entrant/unavailable).
+
+    ⛔ `strict=True` IS FOR THE METER PROBES ONLY (#2342 review P1). The permissive path deliberately
+    PROCEEDS UNSERIALISED once its bound expires — that is right for an ordinary call, whose caller
+    would otherwise be killed inside the layer — but it returns a real fd anyway, so `if lock is None`
+    never fires for contention. A probe that rides the permissive path therefore issues a request the
+    file says it never issues unserialised, past the very bound NO_WAIT exists to keep. In strict mode
+    a wait that expires (or a lock this process cannot use) returns None, and the caller skips the
+    request entirely: no snapshot is a legitimate answer, an unserialised meter call is not.
 
     `flock` is a KERNEL lock, so a holder that dies (killed worker, crashed lane) releases it —
     there is no stale-lock state to reap. `flock(1)` is NOT portable to macOS, which is why this
@@ -428,11 +436,23 @@ def acquire_lock():
                 # LOCK_TIMEOUT on EVERY gh call and then proceed unserialised anyway: a 10-minute
                 # stall on the box that looks like a slow network.
                 log_event("WARNING gh.lock unusable (%s) — proceeding UNSERIALISED" % exc)
+                if strict:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None
                 break
             if time.monotonic() >= deadline:
                 # Bounded, and announced in the evidence log rather than blocking for ever: an
                 # unbounded wait behind one slow gh call would park the whole box's merge sweep.
                 log_event("WARNING gh.lock not acquired within %ds — proceeding UNSERIALISED" % int(budget))
+                if strict:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None            # strict callers must NOT issue an unserialised request
                 break
             time.sleep(0.02)
     os.set_inheritable(fd, False)
@@ -2010,6 +2030,20 @@ def stats_fold():
             lines = fh.readlines()
     except OSError:
         lines = []
+    # ⛔ A CORRUPT CARRY IS NOT A ZERO (review P2). Overwriting it with a carry built only from the
+    # live file made the reported total DROP while `--stats` stopped saying UNREADABLE — the exact
+    # symptom the fold exists to prevent, reachable one rotation later. Skip the fold and let the
+    # instrument report UNREADABLE until a human clears it.
+    carry_path = os.path.join(state_dir(), STATS_CARRY_FILE)
+    if os.path.exists(carry_path):
+        try:
+            with open(carry_path) as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            log_event("stats: the cumulative carry is unparseable — fold SKIPPED, counters kept in %s"
+                      % folded)
+            os.rename(folded, p + ".unreadable-carry")
+            return
     doc = stats_carry()
     for line in lines:
         try:
@@ -2024,6 +2058,19 @@ def stats_fold():
             os.unlink(folded)
         except OSError:
             pass
+    else:
+        # ⛔ A FAILED CARRY WRITE MUST NOT EAT THE EVENTS (review P2). Put them back where the reader
+        # looks; an orphan `*.folding-<pid>` is invisible to `stats_report`, so ENOSPC/EACCES/a kill
+        # would silently shrink every later total.
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, "".join(lines).encode())
+            finally:
+                os.close(fd)
+            os.unlink(folded)
+        except OSError:
+            pass                       # the `.folding-*` copy remains the only record; do not lose it
 
 
 def stats_record(cls, kind):
@@ -2398,7 +2445,9 @@ def probe_rate_limit(real_gh, bucket):
     attempt lock (a caller must not hold the box while it sleeps 60s), so without this it would be
     the ONE gh request the layer issues unserialised — during backoff, exactly when the other boxes
     and the other lanes are most likely to be issuing their own. One invariant, no exemptions."""
-    lock = acquire_lock()
+    lock = acquire_lock(strict=True)
+    if lock is None:
+        return None, None          # no serialised slot, no probe (never unserialised)
     try:
         r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
@@ -2797,9 +2846,9 @@ def write_budget(doc):
 
 def probe_budget(real_gh):
     """ONE exempt `/rate_limit` read, under the single-flight lock (the `--budget` verb's work)."""
-    lock = acquire_lock()
+    lock = acquire_lock(strict=True)
     if lock is None:
-        return None                    # no lock, no probe (the same rule every other meter call keeps)
+        return None                    # no serialised slot, no probe (never unserialised)
     try:
         r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
@@ -2855,12 +2904,14 @@ def budget_snapshot_or_probe(real_gh):
         return snap
     if not (real_gh and os.path.isfile(real_gh)):
         return None
-    lock = acquire_lock()
+    lock = acquire_lock(strict=True)
     if lock is None:
-        # ⛔ NO LOCK, NO PROBE (#2342 review P2). A bounded caller (`GH_LIMIT_NO_WAIT`) that could not
+        # ⛔ NO LOCK, NO PROBE (#2342 review P1). A bounded caller (`GH_LIMIT_NO_WAIT`) that could not
         # take the box lock has already spent its budget waiting; issuing the meter call anyway would
         # put ONE gh request in flight UNSERIALISED — the single invariant this layer exists to keep —
-        # and would outlive the bound the caller asked for. No snapshot is a legitimate answer.
+        # and would outlive the bound the caller asked for. No snapshot is a legitimate answer. (Strict
+        # mode is what makes this true under CONTENTION: the permissive path returns a real fd after
+        # logging "proceeding UNSERIALISED", so `is None` alone never fires for a held lock.)
         return None
     try:
         snap = read_budget()           # a peer may have probed while we waited for the lock

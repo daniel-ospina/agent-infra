@@ -200,6 +200,11 @@ whose pid is gone, is taken over), `GH_LIMIT_FLIGHT_KEEP_S` (30 s — how long a
 on record), `GH_LIMIT_FLIGHT_STALE_SERVE=1` (serve a previous answer while a refresh is in flight,
 WITH its age on stderr; off by default), `GH_LIMIT_FLIGHT_STALE_MAX_AGE` (30 s), and
 `GH_LIMIT_FLIGHT_MAX_ENTRY` (4 MiB — a larger outcome is not shared; waiters take the key over).
+`GH_LIMIT_PROBE_TIMEOUT` (20 s, clamped 1–120 — the bound on the exempt `/rate_limit` meter probe,
+which runs while the BOX-WIDE LOCK is held; a timeout costs one window with no snapshot, never a
+stalled box), `GH_LIMIT_BUDGET_TTL` (30 s — how long a snapshot is trusted), `GH_LIMIT_CORE_FLOOR`
+(800 — the reserve; `--stats` prints which knob supplied it) and `GH_LIMIT_ESSENTIAL=1` (this read
+cannot be deferred — set by the landing scripts, never by a poll).
 Every knob
 is range-clamped, and `nan`/`inf` fall back to the documented default rather than disabling a bound
 (an `inf` lock timeout would be a hang, a `nan` wait a traceback).
