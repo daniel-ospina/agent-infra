@@ -1427,12 +1427,32 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # shellcheck disable=SC1090
   . "$TMP/refund-all.sh"
   # (a) reviewer-findings arm: booked to 2, findings marker deleted at spawn, bail recorded.
+  # ⛔ THE SPEND RECORD IS PART OF THE FIXTURE (review round 4, P3). `refund_bailed_fixer … 1` now
+  # restores only what the dispatch ACTUALLY TOOK, and `fixspend-<PR>-<head>` is the record of that
+  # take — written by the one spawn site that deletes a findings marker. A fixture WITHOUT it drove
+  # the "another arm bailed" case by accident, so this arm asserted the wrong contract (selftest went
+  # RED at round 5 while test-gates stayed green). The spend file is now seeded here and asserted
+  # CONSUMED below; the no-spend contract is driven separately in (a2).
+  rm -f "$O/state/needsfix-77-abc" "$O/state/fixspend-77-abc"
   echo 2 > "$O/state/fixcount-77"; : > "$O/state/fixbail-77-abc"; : > "$O/state/parked-77"
+  : > "$O/state/fixspend-77-abc"
   refund_bailed_fixer 77 abc 1
   if [ "$(cat "$O/state/fixcount-77" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-77-abc" ] \
-     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ]; then rc=0
-  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no)"; fi
-  ck "a bailed fixer refunds the attempt AND restores the findings marker" $rc
+     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ] \
+     && [ ! -f "$O/state/fixspend-77-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no) spend=$([ -f "$O/state/fixspend-77-abc" ] && echo yes || echo no)"; fi
+  ck "a bailed fixer refunds the attempt AND restores the findings marker (spend consumed)" $rc
+  # (a2) ⛔ A BAIL WITH NO SPEND MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). The
+  # bail may have been written by the CI-red or CONFLICTING arm, which never delete a findings marker;
+  # refunded on a later gate-red cycle, an unconditional touch invented a fixer authorisation for a
+  # head no reviewer reported on. The attempt is still refunded — only the marker is withheld.
+  rm -f "$O/state/needsfix-78-abc" "$O/state/fixspend-78-abc"
+  echo 2 > "$O/state/fixcount-78"; : > "$O/state/fixbail-78-abc"
+  refund_bailed_fixer 78 abc 1
+  if [ "$(cat "$O/state/fixcount-78" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-78-abc" ] \
+     && [ ! -f "$O/state/needsfix-78-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-78" 2>/dev/null) bail=$([ -f "$O/state/fixbail-78-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-78-abc" ] && echo yes || echo no)  <- a findings marker was MANUFACTURED"; fi
+  ck "a bail that consumed NO findings marker is refunded WITHOUT manufacturing one" $rc
   # (b) CI-red / CONFLICTING arm: no findings marker was deleted, so NONE may be invented.
   rm -f "$O/state/needsfix-88-abc" "$O/state/parked-88"; echo 1 > "$O/state/fixcount-88"; : > "$O/state/fixbail-88-abc"
   refund_bailed_fixer 88 abc 0
@@ -4114,40 +4134,51 @@ ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub
 # keeps its single `.pool` artifact, and that IS covered by the #8465 ordering check above.
 
 # ── the reviewer's verdict classifies into THREE outcomes, and only one authorises a fixer ────
-# Ported IN from the tortoise fork (agent-infra#8602): a verdict-less run (stall/crash/timeout) and a
-# real `ISSUES` verdict must never share an arm, because `needsfix-<PR>-<head>` is the only thing that
-# spawns a FIXER. Sharing it burnt a MAX_FIX_TRIES attempt per stall and parked PRs that had never
-# been reviewed. These drive the SHIPPED functions; a grep would stay green if an arm were deleted.
+# agent-infra#2132 (superseding the #8602 port this section used to drive): a verdict-less run
+# (stall/crash/timeout) and a real `ISSUES` verdict must never share an arm, because
+# `needsfix-<PR>-<head>` is the only thing that spawns a FIXER — and the two remedies differ (a fixer
+# vs another REVIEW). The pre-#2132 arm wrote the FIXER marker for BOTH, which burnt a MAX_FIX_TRIES
+# attempt per stall and parked PRs that had never been reviewed. These drive the SHIPPED functions;
+# a grep would stay green if an arm were deleted. The producer is now the #2132 pair
+# (`verdict_class` + `review_state_record`), so the SAME contracts are pinned at the new API:
+#   empty/unrecognised -> NO-VERDICT    |   `ISSUES 0` -> NO-VERDICT (the count is part of the verdict)
+#   ISSUES -> needsfix marker           |   NO-VERDICT -> needsreview marker and NO needsfix
+#   an empty head writes nothing (a marker must name a head)
 if [ -s "$MERGE" ]; then
-  { awk '/^verdict_kind\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
-    awk '/^apply_verdict_marker\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
-  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_kind' "$TMP/verdict.sh"; then
-    vk() { ( . "$TMP/verdict.sh"; verdict_kind "$1" ); }
-    [ "$(vk 'CLEAN https://x/1')" = clean ] && rc=0 || rc=1
-    ck "verdict_kind: a CLEAN verdict classifies as clean" $rc
-    [ "$(vk 'ISSUES 3')" = issues ] && rc=0 || rc=1
-    ck "verdict_kind: an ISSUES verdict classifies as issues" $rc
-    [ "$(vk '')" = none ] && rc=0 || rc=1
-    ck "verdict_kind: an EMPTY verdict is 'none' (a stall is not a finding)" $rc
-    [ "$(vk 'garbage without a verdict')" = none ] && rc=0 || rc=1
-    ck "verdict_kind: an unrecognised line is 'none', never 'issues'" $rc
+  { awk '/^verdict_class\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
+    awk '/^review_state_record\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
+  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_class' "$TMP/verdict.sh" \
+     && grep -q 'review_state_record' "$TMP/verdict.sh"; then
+    vk() { ( . "$TMP/verdict.sh"; verdict_class "$1" ); }
+    [ "$(vk 'CLEAN https://x/1')" = CLEAN ] && rc=0 || rc=1
+    ck "verdict_class: a CLEAN verdict classifies as CLEAN" $rc
+    [ "$(vk 'ISSUES 3')" = ISSUES ] && rc=0 || rc=1
+    ck "verdict_class: an ISSUES verdict classifies as ISSUES" $rc
+    [ "$(vk '')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: an EMPTY verdict is NO-VERDICT (a stall is not a finding)" $rc
+    [ "$(vk 'garbage without a verdict')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: an unrecognised line is NO-VERDICT, never ISSUES" $rc
+    [ "$(vk 'ISSUES 0')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: ISSUES 0 is NO-VERDICT (a zero count authorises no fixer)" $rc
 
     # The marker is what authorises the fixer, so drive its WRITE behaviour, not just its name.
     vdir="$TMP/vmark"; mkdir -p "$vdir/state"
     # ⛔ A VAR IN FRONT OF `.` APPLIES ONLY TO THE SOURCE, not to the function called after it — so
     # `O=… . file; fn` runs fn with O UNSET (the same per-command-env trap that bit an earlier test).
     # The whole call is one subshell here.
-    m1="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker issues abc123' _ "$TMP/verdict.sh" )"
-    [ -n "$m1" ] && [ -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
-    m2="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker none abc123' _ "$TMP/verdict.sh" )"
-    [ -z "$m2" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: a verdict-LESS run writes NO marker (no burnt retry, no false park)" $rc
-    m3="$( O="$vdir" PR=43 bash -c '. "$1"; apply_verdict_marker issues ""' _ "$TMP/verdict.sh" )"
-    [ -z "$m3" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: an empty head writes no marker (a marker must name a head)" $rc
+    m1="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/needsfix-42-abc123" ] && [ ! -f "$vdir/state/needsreview-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/reviewcount-* 2>/dev/null
+    m2="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record NO-VERDICT' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/needsreview-42-abc123" ] && [ ! -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: a verdict-LESS run writes needsreview (another REVIEW), never needsfix (no fixer)" $rc
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/reviewcount-* 2>/dev/null
+    m3="$( O="$vdir" PR=43 HEAD="" L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES' _ "$TMP/verdict.sh" )"
+    [ -z "$(ls -A "$vdir/state" 2>/dev/null)" ] && rc=0 || rc=1
+    ck "review_state_record: an empty head writes no marker (a marker must name a head)" $rc
   else
-    ck "merge-one.sh carries verdict_kind/apply_verdict_marker (#8602 port)" 1
+    ck "merge-one.sh carries verdict_class/review_state_record (#2132)" 1
   fi
 fi
 
