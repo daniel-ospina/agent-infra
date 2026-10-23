@@ -550,9 +550,12 @@ gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated 
         HOME="$home" tb_timeout 10 env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
     else
-        # No helper anywhere (a farmed installer without ../lib, which the install arm refuses anyway).
-        # Say so rather than implying a bound that is not there.
-        INSTALL_GH_PROBE_UNBOUNDED=1
+        # No helper anywhere: a farmed installer without ../lib reaches here BEFORE refuse_transient_target
+        # refuses the install, so this path is real. ⛔ THE DISCLOSURE GOES TO STDERR FROM INSIDE THIS
+        # FUNCTION: it runs in `$( )`, so a flag set here is lost in the parent — which is how the
+        # previous "this probe ran UNBOUNDED" line became dead code. `err` writes to fd 2, which the
+        # substitution does not capture.
+        err "WARNING: no bounded-execution helper beside the reaper (${lib}), so the gh auth probe below runs UNBOUNDED — a hanging gh can block this install"
         HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
     fi
@@ -596,12 +599,8 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
             err "  remedy: sudo -u $user -H gh auth login   (or install with the HOME the lanes actually use), then re-run this installer" ;;
     esac
     err "  the uv and venv classes are unaffected; each pass reports skipped=<repo> reason=<why> (#2443)"
-    [ "${INSTALL_GH_PROBE_UNBOUNDED:-0}" = 1 ] && \
-        err "  note: no bounded-execution helper was found beside the reaper, so this probe ran UNBOUNDED"
     return 0
 }
-
-# A probe that could not be run at all (no helper) is still a probe; the flag only describes it.
 
 
 # ── actions ────────────────────────────────────────────────────────────────────────────────────
@@ -622,10 +621,19 @@ do_install() {
     # working fallback (the delegate resolves `gh` from PATH). Refusing would be a false block; rendering
     # it would install a unit that answers gh-missing(rc=127) for ever. A plist value is its own
     # <string>, so macOS keeps it.
+    # ⛔ TWO UNREPRESENTABLE CLASSES, both dropped for the same reason: the unit must be able to RUN the
+    # value the preflight just validated, or the preflight is a false PASS.
+    #  • whitespace — systemd splits an unquoted Environment= value.
+    #  • `&`, `<`, `>` — the renderer pushes EVERY value through xml_sed_repl, which XML-escapes those
+    #    for the plist; systemd does no XML unescaping, so `GH_BIN=/opt/a&b/gh` renders
+    #    `/opt/a&amp;b/gh` and the pass answers gh-missing(rc=127) for ever while the install looked fine.
     if [ "$PLATFORM" != "Darwin" ]; then
         case "${GH_BIN:-}" in
             *[[:space:]]*)
                 err "WARNING: GH_BIN='${GH_BIN}' contains whitespace, which systemd splits in the rendered unit — it is DROPPED and the unit will resolve gh from PATH (the install is not refused)"
+                GH_BIN="" ;;
+            *[\&\<\>]*)
+                err "WARNING: GH_BIN='${GH_BIN}' contains & < or > , which the renderer XML-escapes for the plist and systemd does not unescape — it is DROPPED and the unit will resolve gh from PATH (the install is not refused)"
                 GH_BIN="" ;;
         esac
     fi

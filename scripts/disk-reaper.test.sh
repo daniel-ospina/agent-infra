@@ -1991,6 +1991,15 @@ assert_contains "$OUT" "is DROPPED and the unit will resolve gh from PATH" "T56 
 assert_eq "$(sed -n 's/^Environment=GH_BIN=//p' "$T/t56/units/eldato-disk-reaper.service")" "" \
     "T56 ... and the rendered unit carries an EMPTY pin (the delegate's PATH fallback), never a split value"
 assert_contains "$OUT" "gh:     authenticated" "T56 the verdict then describes what the unit will actually run"
+# ⛔ AND THE SAME RULE FOR THE CHARACTERS THE RENDERER ESCAPES. Every value goes through xml_sed_repl,
+# which XML-escapes & < > for the plist; systemd does no XML unescaping, so an un-dropped `&` would
+# render `/opt/a&amp;b/gh` — a unit that answers gh-missing(rc=127) for ever while the preflight, which
+# validated the REAL path, said the gate can run.
+OUT="$(GH_BIN="$T/t56/with&and/gh" inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a GH_BIN the renderer would XML-escape does NOT refuse the install"
+assert_contains "$OUT" "XML-escapes" "T56 ... it is dropped with a warning naming the reason"
+assert_eq "$(sed -n 's/^Environment=GH_BIN=//p' "$T/t56/units/eldato-disk-reaper.service")" "" \
+    "T56 ... and no un-runnable GH_BIN reaches the unit"
 OUT="$(GH_BIN="$T/t56/bin-broken/gh" inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T56 a gh that cannot execute still installs"
 assert_contains "$OUT" "gh:     missing" "T56 an unrunnable gh is reported as MISSING (127 is not an auth answer)"
