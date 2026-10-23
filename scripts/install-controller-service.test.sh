@@ -103,7 +103,7 @@ mk_systemctl() { # <bin dir> <state dir> <log>
   cat > "$bin/systemctl" <<STUB
 #!/bin/bash
 printf '%s\n' "\$*" >> "$log"
-# The USER scope calls `systemctl --user <verb>`; the stub is scope-agnostic, so the verb is what counts.
+# The USER scope calls \`systemctl --user <verb>\`; the stub is scope-agnostic, so the verb is what counts.
 [ "\${1:-}" = "--user" ] && shift
 S="$st"
 has() { [ -f "\$S/\$1" ]; }
@@ -751,6 +751,105 @@ GU2_RC=0; GU2_OUT="$(inst g --uninstall 2>&1)" || GU2_RC=$?
   *"not installed"*) ok 'uninstall: a second uninstall is a REPORTED no-op' ;;
   *) bad "uninstall: a second run does not say it was already absent — $GU2_OUT" ;;
 esac || bad "uninstall: a second run failed rc=$GU2_RC"
+
+# ── an ELEVATED install is refused (review P2, #2402) ─────────────────────────────────────────────
+# `sudo bash install-controller-service.sh` renders User=root / HOME=/root / O=/root/orchestrator, and
+# verify_unit REQUIRES that — so the unit is green, runs as root with root's keys and gh auth, and stays
+# ENABLED after it fails, which makes the supervisor's `start` delegate to it forever. `id` is stubbed
+# rather than assumed: the suite must not need real root, and the refusal must be exercised.
+GRT="$(arm_root gr)"; mk_systemctl "$GRT/bin" "$GRT/state" "$GRT/sc.log"
+printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$GRT/bin/id"
+chmod +x "$GRT/bin/id"
+GRT_RC=0; GRT_OUT="$(EXTRA_ENV=SUDO_USER=operator inst gr --install 2>&1)" || GRT_RC=$?
+[ "$GRT_RC" -ne 0 ] && ok 'install: refuses an ELEVATED (sudo) invocation' \
+                    || bad "install: installed a root-owned unit under sudo — $GRT_OUT"
+case "$GRT_OUT" in
+  *"REFUSING to install as root"*) ok 'install: the root refusal names the reason and the operator re-run' ;;
+  *) bad "install: refused without naming the root cause — $GRT_OUT" ;;
+esac
+[ -f "$GRT/units/eldato-orchestrator.service" ] && bad 'install: the root refusal WROTE a unit' \
+                                              || ok 'install: the root refusal wrote nothing'
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §H — `--status`: the documented verification verb must not answer from a read it did not get
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ⛔ THREE FALSE VERDICTS MEASURED ON THE PREVIOUS HEAD (review P2, #2402):
+#   (a) a heartbeat in the FUTURE made `now - t` negative, and `[ -N -le bound ]` is true for every
+#       negative N — so a box whose controller was NOT cycling exited 0 with a "fresh" heartbeat;
+#   (b) a LEADING-ZERO heartbeat was compared as DECIMAL and subtracted as OCTAL, yielding a FABRICATED
+#       ~1.79e9 s age and the prescription "the unit is up but the loop is not cycling" on a healthy one;
+#   (c) the scope was RE-DERIVED instead of read from the installed copy, so a healthy USER-scope install
+#       was reported as "NOT active — nothing is supervising the controller" (exit 1) on a box that had
+#       since gained passwordless sudo. `--status` is what the docs tell an operator to run.
+say_case 'status reads the artifact: future/zero-led heartbeats, an installed user unit, an unreadable state'
+H="$(arm_root h)"; mk_systemctl "$H/bin" "$H/state" "$H/sc.log"
+: > "$H/units/eldato-orchestrator.service"; : > "$H/state/enabled"; : > "$H/state/active"
+mkdir -p "$H/o"; printf '%s\n' "$(( $(date +%s) + 600 ))" > "$H/o/heartbeat"
+# MainPID 0 = the controller the unit says it is running does not exist. Pre-fix this was a GREEN status.
+H1_RC=0; H1_OUT="$(inst h --status 2>&1)" || H1_RC=$?
+[ "$H1_RC" -ne 0 ] && ok 'status: a FUTURE heartbeat together with MainPID 0 is NOT green (the false pass)' \
+                   || bad "status: reported a dead-but-future-heartbeat unit as healthy — $H1_OUT"
+case "$H1_OUT" in
+  *'heartbeat_age_s=-'*) bad 'status: printed a NEGATIVE age as a freshness answer' ;;
+  *) ok 'status: never prints a negative heartbeat age' ;;
+esac
+printf '%s\n' 1234 > "$H/state/mainpid"
+printf '%s\n' '0001234567' > "$H/o/heartbeat"
+H2_RC=0; H2_OUT="$(inst h --status 2>&1)" || H2_RC=$?
+if printf '%s\n' "$H2_OUT" | grep -qE 'heartbeat_age_s=1[0-9]{9}'; then
+  bad 'status: subtracted a LEADING-ZERO heartbeat as octal and printed a fabricated epoch-sized age'
+fi
+case "$H2_OUT" in
+  *UNREADABLE*) ok 'status: a leading-zero heartbeat is UNREADABLE, not an octal-subtracted "stale" age' ;;
+  *) bad "status: a leading-zero heartbeat produced neither a refusal nor an unreadable answer — $H2_OUT" ;;
+esac
+
+# (c) the installed USER copy is the evidence — even on a box where `sudo` now appears available.
+HU="$(arm_root hu)"; mk_systemctl "$HU/bin" "$HU/state" "$HU/sc.log"
+mkdir -p "$HU/home/.config/systemd/user" "$HU/sysunits"
+: > "$HU/home/.config/systemd/user/eldato-orchestrator.service"
+: > "$HU/state/enabled"; : > "$HU/state/active"; printf '%s\n' 1234 > "$HU/state/mainpid"
+# SUDO=true makes a system target look reachable; CONTROLLER_SYSTEM_UNIT_DIR is empty so only the USER
+# copy exists. The pre-fix status therefore resolved target=system and printed a false red.
+HU_RC=0
+HU_OUT="$(bnd env SUDO=true SYSTEMCTL="$HU/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$HU/sysunits" \
+          ORCH_SUPERVISOR="$SUP" TEMPLATES_DIR="$(dirname "$TPL")" HOME="$HU/home" CELL_HOME="$HU/home" \
+          ENV_FILE="$HU/home/keys.env" O="$HU/o" PATH="$HU/bin:/usr/bin:/bin" \
+          ELDATO_PLATFORM=Linux bash "$INST" --status 2>&1)" || HU_RC=$?
+[ "$HU_RC" -eq 0 ] && ok 'status: a healthy USER-scope install is GREEN (the installed copy decides the scope)' \
+                   || bad "status: reported a false red over an installed, enabled, active user unit — $HU_OUT"
+case "$HU_OUT" in
+  *'target=user'*) ok 'status: reports the scope it READ (user), not the one it would choose now (system)' ;;
+  *) bad "status: reports a scope it did not read — $HU_OUT" ;;
+esac
+case "$HU_OUT" in
+  *'NOT active'*|*'NOT enabled'*) bad 'status: claimed a definite negative over a healthy user unit' ;;
+  *) ok 'status: makes no definite negative claim about the healthy user unit' ;;
+esac
+
+# (d) an unreadable is-active is UNKNOWN, never "nothing is supervising the controller".
+HN="$(arm_root hn)"; mk_systemctl "$HN/bin" "$HN/state" "$HN/sc.log"
+: > "$HN/units/eldato-orchestrator.service"
+printf '%s\n' '#!/bin/bash' \
+  'case "$*" in' \
+  '  *is-enabled*) echo enabled ;;' \
+  '  *is-active*) exit 3 ;;' \
+  '  *MainPID*) echo "MainPID=1234" ;;' \
+  '  *NRestarts*) echo "NRestarts=0" ;;' \
+  '  *) exit 0 ;;' \
+  'esac' > "$HN/bin/systemctl"
+chmod +x "$HN/bin/systemctl"
+HN_RC=0; HN_OUT="$(inst hn --status 2>&1)" || HN_RC=$?
+[ "$HN_RC" -ne 0 ] && ok 'status: an unreadable is-active is not green' \
+                   || bad 'status: returned 0 on a state it could not read'
+case "$HN_OUT" in
+  *'UNKNOWN'*) ok 'status: an unreadable active state is reported as UNKNOWN, not as "nothing is supervising"' ;;
+  *) bad "status: folded an unreadable is-active into a definite verdict — $HN_OUT" ;;
+esac
+case "$HN_OUT" in
+  *'the unit is NOT active'*) bad 'status: asserted "NOT active" from a read that did not answer' ;;
+  *) ok 'status: does not assert "NOT active" from an unreadable read' ;;
+esac
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

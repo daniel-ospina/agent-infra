@@ -13,6 +13,9 @@ aboutObjects: agent-infra, issue-2402, orchestrator-controller, systemd, cloud-c
 
 The cell's orchestrator controller is started by `scripts/install-controller-service.sh`, which renders
 and installs **`eldato-orchestrator.service`** — a systemd unit whose main process *is* the controller.
+The cloud-cell bring-up **runs that installer and reads it back** (`scripts/cloud-cell-bringup.sh` →
+`check_controller_service`), so a provisioned cell is never certified `CELL READY` with nothing above
+its controller; macOS is skipped there because the launchd agent already has `KeepAlive`.
 
 ## Failure mode this exists for
 
@@ -66,6 +69,11 @@ Tried in order, and the reason is named in the output:
 (`scripts/orchestrator-harness/install.sh` + `launchd.plist.template`); a second supervisor there would
 be a second dispatcher on one queue.
 
+**`sudo` is refused, not degraded.** Run the installer as the operator, not with `sudo bash …`: the
+rendered unit takes `User=`, `HOME=`, `CELL_HOME=` and `O=` from the invoking shell, so an elevated run
+would install a root-owned controller with root's `keys.env` and `gh` auth — and, because it is
+enabled, `start` would delegate to it and the cell's own controller could never come up.
+
 ## The cooperation contract (`cloud-cell-supervisor.sh`)
 
 A service-managed controller must not fight its own verbs:
@@ -81,16 +89,25 @@ box is not service-managed.
 
 ## Verifying an install (what the issue asks an operator to run)
 
+`--status` resolves the **installed** copy first, so it is correct in both scopes — use it as the verdict.
+The systemd commands below are shown for the default **system** scope; on a box that installed the
+**user** unit, add `--user` to each (`systemctl --user …`, `journalctl --user -u …`):
+
 ```
+bash scripts/install-controller-service.sh --status    # the verdict: scope, enabled, active, pid, restarts, heartbeat
+
 systemctl is-active eldato-orchestrator.service        # active
 systemctl show -p MainPID eldato-orchestrator.service  # the controller, not a launcher
-systemctl show -p NRestarts eldato-orchestrator.service# it came back on its own
+systemctl show -p NRestarts eldato-orchestrator.service # it came back on its own
 journalctl -u eldato-orchestrator.service -n 40        # a fresh [dispatch] line with lanes=0 moving on
-bash scripts/install-controller-service.sh --status    # unit + heartbeat freshness, with the verdict
 ```
 
-`--status` is stricter than `is-active`: it also requires a **fresh heartbeat** (`$O/heartbeat`), because
-a unit can be `active` while its controller died before taking the lock.
+`--status` is stricter than `is-active` in the direction that matters: it requires **both** that the unit
+is active/enabled **and** that a controller `MainPID` exists, and it reports an **unreadable** state as
+UNKNOWN rather than as `not active` / `nothing will restart it`. When `$O/heartbeat` is present it also
+reports its age and refuses a stale one (a unit can be `active` while its controller died before taking
+the lock); a missing heartbeat is tolerated only while a `MainPID` exists, because the first cycle writes
+the file after one `CYC` and a `keys.env` `O=` line can move the controller's state dir.
 
 ## Tests
 
