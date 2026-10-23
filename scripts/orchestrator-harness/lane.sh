@@ -168,15 +168,16 @@ if [ "$AGENT_STARTED" = "0" ]; then
       "${AGENT_LAND_BACKLOG:-74}") _cap_gate=land ;;
       *)                          _cap_gate=load ;;
     esac
-    # ⛔ A `land` REFUSAL GETS A SHORT STAND-DOWN, AND THE REASON IS THE POINT OF THE WHOLE RECORD.
-    # For load/disk the window is a CAPACITY TRANSFER: this box is short, a peer may not be, so standing
-    # down long is the useful thing. A `land` refusal is REPO-WIDE — every box measures the same open
-    # count against the same landing rate, so a long yield would only circulate the issue through every
-    # peer's claim/spawn/measure cycle for an answer that cannot differ (review cycle 1, P3). 120s is
-    # enough to cover the chain's ordering slack (CAPACITY_REFUSAL_GRACE_SECS, 60) and to let a landing
-    # that is already in flight change the ratio, which is the one event that can clear it.
+    # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
+    # README §7.2 says it in as many words ("**The yield is gate-independent, deliberately**"), and
+    # ARCHITECTURE repeats it. A `land` refusal looks like it wants a SHORT window: it is repo-wide,
+    # so every box measures the same ratio and a long stand-down only circulates the same answer.
+    # That reasoning is correct and it was still REFUSED here (review cycle 2, P2), because reversing
+    # a recorded decision belongs in that decision's own home with the evidence in front of the owner
+    # — not in a lane's commit. What the change DOES do about it: chain-merge.sh ends the chain on
+    # exit 74 immediately (no 90-minute wait), and the refusal line below says plainly that waiting
+    # will not clear it. The window itself stays uniform.
     _cap_yield="$CAPACITY_YIELD_SECS"
-    [ "$_cap_gate" = "land" ] && _cap_yield=120
     _cap_now="$(date +%s)"
     if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + _cap_yield ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
       echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"

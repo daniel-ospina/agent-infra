@@ -2436,12 +2436,15 @@ already holding):
 **Decisions worth not re-litigating.**
 
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
-  (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
-  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
-  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
-  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
-  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
-  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+  (`load` or `disk` — opposite remedies — and, since #2409, `land`: the creation gate's refusal, whose
+  remedy is on neither this box nor any peer's), and the transfer is driven by the refusal event. Load
+  is a symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is
+  also why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **load, disk or land** (`spawn-gate.sh`), so those are the three
+  values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
+  refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
+  predates #2409 and knows only two values must treat `land` as `load` (it is non-numeric for its
+  purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal".
 - **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
   never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
   for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
@@ -2457,8 +2460,8 @@ already holding):
   corrupt byte. Past that, each consumes the fields it needs and no others:
   - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
     this chain's start minus the ordering slack, and not older than the record's own yield window).
-    It reports **field 3** as the exit code (75 load / 77 disk) and maps an unrecognised value to
-    `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
+    It reports **field 3** as the exit code (75 load / 77 disk / 74 land) and maps an unrecognised value
+    to `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
     one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
     yield window must not make a proven refusal unreadable.
   - `orch-loop.sh`'s `capacity_yield_live()` uses **fields 1 and 2 together**, and only a COHERENT pair
@@ -2769,12 +2772,22 @@ Little's law, L = λW**: the ceiling is the repo's OWN measured landing rate tim
 ceiling and a repo that has landed nothing cannot collapse to zero).
 
 Where it acts: `run_agent` (spawn-gate.sh), **after** the disk and load gates and **for every KIND
-except `fixer` and `reviewer`** — a deny-list, so `lane.sh` (KIND=lane) *and* `nonblocking-dispatch.sh`
-(KIND=bg) are both measured, and a KIND nobody has written yet is gated by default rather than
-silently exempt. It acts at the moment a CREATION worker is spawned, before any work exists.
-`fix-one.sh` runs with `KIND=fixer` and its product IS a push to an open PR, and no merge path calls
+except `fixer`, `reviewer` and `prfix`** — a deny-list, so `lane.sh` (KIND=lane) *and*
+`nonblocking-dispatch.sh` (KIND=bg) are both measured, and a KIND nobody has written yet is gated by
+default rather than silently exempt. It acts at the moment a CREATION worker is spawned, before any work
+exists.
+
+⛔ **`KIND` IS NOT A CREATION/REPAIR DISCRIMINATOR, WHICH IS WHY THE EXEMPT SET HAS `prfix`.**
+`pr-doctor` dispatches every PR repair through `nonblocking-dispatch.sh`, so a hardcoded `KIND=bg` put
+those repairs under the gate in exactly the state that triggers it (review cycle 2, P1: the gate held
+the work that drains it). The dispatcher now takes the kind as an **argument** —
+`nonblocking-dispatch.sh <name> <wt> <brief> <timeout> [bg|prfix]`, default `bg` — and refuses any other
+value, so a caller DECLARES what it spawns and an undeclared caller still gets the refusing default.
+The exempt set is therefore: `fixer` (fix-one.sh: pushes to an open PR), `reviewer` (merge-one.sh: the
+verdict that lets one land), `prfix` (pr-doctor: rebases/fixes an already-open PR). No merge path calls
 `run_agent`, so a deep backlog can never stop the work that drains it (`capacity-transfer.test.sh`
-asserts that structurally, over all five landing scripts).
+asserts the shell paths AND the non-shell ones — the pr-doctor declaration, its argv, and the
+dispatcher's closed vocabulary).
 
 The verdict is a **named state, never a silent pass** — exactly one line, first word the state:
 

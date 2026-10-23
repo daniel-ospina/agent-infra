@@ -578,11 +578,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   #   * A DENY-LIST, not an allow-list (review cycle 1, P2). It read `KIND = lane` at first, so
   #     `nonblocking-dispatch.sh`'s background worker (`KIND=bg`) — "a fleet lane in every respect
   #     except that nobody waits for it" by its own header — was never measured, and every future
-  #     KIND would inherit the hole. The two kinds this gate must never hold are named instead,
-  #     because their product IS the drain: `fixer` pushes to an open PR and `reviewer` produces the
-  #     verdict that lets one land. No merge path calls run_agent at all, so they need no entry.
+  #     KIND would inherit the hole. The kinds this gate must never hold are named instead, because
+  #     their product IS the drain: `fixer` pushes to an open PR, `reviewer` produces the verdict
+  #     that lets one land, and `prfix` (pr-doctor's repair worker) rebases/fixes an ALREADY OPEN PR.
+  #     No merge path calls run_agent at all, so they need no entry.
+  # ⛔ `prfix` EXISTS BECAUSE `KIND` IS NOT A CREATION/REPAIR DISCRIMINATOR (review cycle 2, P1).
+  # pr-doctor dispatches EVERY repair through nonblocking-dispatch.sh, which hardcoded `KIND=bg` —
+  # so gating `bg` refused the very workers that repair the backlog, in exactly the state that
+  # triggers the gate. The dispatcher now takes the kind as an ARGUMENT (`nonblocking-dispatch.sh
+  # <name> <wt> <brief> <timeout> [bg|prfix]`, default `bg`), so a caller DECLARES what it is
+  # spawning instead of the spawn inheriting a creation label. An undeclared caller still gets
+  # `bg` and is still gated: the default is the refusing direction.
   case "${KIND:-}" in
-    fixer|reviewer) : ;;
+    fixer|reviewer|prfix) : ;;
     *)
     local lb_repo lb_line lb_rc lb_why=""
     if ! lb_repo="$(land_backlog_repo)"; then

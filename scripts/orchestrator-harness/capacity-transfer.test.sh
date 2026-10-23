@@ -656,7 +656,7 @@ lb_drive() { # <shape-file> <lead-hours> <min-ceiling>
 lane_run() { # <shape-file> <issue> -> sets LANE_RC, never spawns a real agent
   lbgh_install "$1"
   ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
-      LANE_TIMEOUT=5 bash "$LANE" "$2" "feat/$2-tm" daniel-ospina/agent-infra ) > "$TMP/lane-$2.out" 2>&1
+      CAPACITY_YIELD_SECS=$LANE_YIELD LANE_TIMEOUT=5 bash "$LANE" "$2" "feat/$2-tm" daniel-ospina/agent-infra ) > "$TMP/lane-$2.out" 2>&1
   LANE_RC=$?
 }
 : > "$PI_LOG"; rm -f "$O/logs/lane-101.log" "$O/state/capacity-refused-101"
@@ -669,6 +669,13 @@ grep -q 'NOT started: LAND-BACKLOG' "$O/logs/lane-101.log"; rc=$?
 ck "§LB …and the lane log names it as LAND-BACKLOG, not as a load/disk capacity refusal" $rc
 { read -r _le _lu lblgate < "$O/state/capacity-refused-101" 2>/dev/null; [ "${lblgate:-}" = "land" ]; }; rc=$?
 ck "§LB …and the durable refusal record carries gate='land' (got '${lblgate:-<none>}') so chain-merge stops waiting" $rc
+# ⛔ THE YIELD STAYS GATE-INDEPENDENT, AND IT IS PINNED (review cycle 2, P2). A `land` refusal looks
+# like it wants a short window (repo-wide: every box measures the same ratio), and that reasoning was
+# REFUSED because README §7.2 records the opposite decision — reversing it belongs in that decision's
+# own home, not in a lane's commit. This arm makes a future "optimization" of the window visible
+# instead of silent. LANE_YIELD is passed in, so this cannot be satisfied by the 900 default.
+[ "$(( ${_lu:-0} - ${_le:-0} ))" -eq "$LANE_YIELD" ]; rc=$?
+ck "§LB …and its yield is the SAME gate-independent CAPACITY_YIELD_SECS ($LANE_YIELD), not a shortened land window" $rc
 
 : > "$PI_LOG"; rm -f "$O/logs/lane-102.log"
 lane_run "$TMP/lbgh-ok" 102
@@ -747,6 +754,21 @@ for f in orch-loop.sh merge-one.sh fix-one.sh dispatch-merge.sh chain-merge.sh; 
 done
 [ -z "$lb_on_landing" ]; rc=$?
 ck "§LB no landing/merge script references the gate (checked:$([ -n "$lb_on_landing" ] && echo "$lb_on_landing" || echo ' none, as intended'))" $rc
+# ⛔ AND THE REPAIR INGRESSES THAT ARE NOT SHELL ARE COVERED TOO (review cycle 2, P1). The grep above
+# proves nothing about `pr-doctor.py`, and that is exactly where the gate was refusing the drain: every
+# PR repair goes through `nonblocking-dispatch.sh`, whose KIND was hardcoded `bg` — a CREATION label —
+# so at the first hold the workers that rebase and fix the open PRs were refused. Assert the two halves
+# that make it a drain: pr-doctor DECLARES `prfix` on the spawn, and spawn-gate EXEMPTS it.
+{ grep -q '"prfix"' "$HERE/../pr-doctor.py" && grep -q 'fixer|reviewer|prfix' "$HERE/spawn-gate.sh"; }; rc=$?
+ck "§LB pr-doctor's repair workers declare the kind the gate EXEMPTS (prfix) - the drain is not gated" $rc
+# …and the declaration reaches the dispatcher as an ARGUMENT, not an ambient `KIND`. An env value would
+# be lane-writable, i.e. a bypass; the argv is visible in the one command pr-doctor builds.
+{ grep -q 'str(SPAWN_TIMEOUT_S), "prfix"' "$HERE/../pr-doctor.py"; }; rc=$?
+ck "§LB …and it travels as the dispatcher's ARGV (a lane cannot set it), not as an inherited KIND" $rc
+# The dispatcher must also REFUSE an invented kind: the exempt set is what the gate switches on, so a
+# free-text kind would let a caller name itself out of the gate.
+{ grep -q 'bg|prfix)' "$HERE/nonblocking-dispatch.sh" && grep -q 'is not bg or prfix' "$HERE/nonblocking-dispatch.sh"; }; rc=$?
+ck "§LB …and nonblocking-dispatch.sh only accepts bg|prfix — an invented kind is a usage error, not an exemption" $rc
 
 # …and the AWAIT side maps `land` to its own exit code and its own words, because the remedy is not a
 # capacity transfer: no peer box can clear a repo-wide backlog.

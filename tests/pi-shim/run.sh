@@ -286,6 +286,13 @@ kill "$w8" 2>/dev/null
 mkdir -p "$TMP/bin76"
 printf '#!/usr/bin/env bash\nexit 76\n' > "$TMP/bin76/pi"
 chmod +x "$TMP/bin76/pi"
+# ⛔ THE CREATION BACK-PRESSURE GATE IS SUPPLIED A READING, NOT SWITCHED OFF (#2409). `run_agent`
+# now measures the repo's landing ratio before any spawn, through `gh`. This arm drives it from the
+# harness checkout (whose origin IS agent-infra), so the SYSTEM gh would answer LAND-BACKLOG and the
+# arm would return 74 before reaching the 76 -> 75 translation it exists to test (measured: 2 of 29
+# red). The calm answer goes where the gate reads; nothing here disables the gate.
+printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin76/gh"
+chmod +x "$TMP/bin76/gh"
 : > "$TMP/agent.log"; rm -f "$TMP/O/state/walltime.tsv"
 res="$(PATH="$TMP/bin76:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 bash -c '
   . "$1"
