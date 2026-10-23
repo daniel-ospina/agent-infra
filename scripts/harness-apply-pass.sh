@@ -132,20 +132,26 @@ say()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 help_text() {
-    local n
-    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
-    # NO CONSTANT FALLBACK (the same rule install-disk-reaper-timer.sh records): a magic range
-    # silently truncates the header the moment a line is added, and a piped start cannot derive it.
-    if [ -z "$n" ]; then
-        err "cannot derive the help range (invoke this FILE, not a pipe: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help')"
-        return 2
-    fi
-    # ⛔ ONE PROCESS, NO PIPELINE. The obvious `sed -n "2,Np" "$0" | sed …` reads the FILE through
-    # `$0`, and a static discard guard cannot resolve that producer — it fails closed on the payload
-    # and refuses the whole invocation, which would make this script unrunnable by the very lanes it
-    # must never disturb (measured). `awk` answers the same question in one process: print the header
-    # lines up to the `set -uo pipefail` sentinel, dropping the leading `# `.
-    awk 'NR == 1 { next } /^set -uo pipefail/ { exit } { sub(/^# ?/, ""); print }' "$0"
+    local line n=0 seen=0
+    # ⛔ NO EXTERNAL PRODUCER AT ALL. `sed -n "2,Np" "$0" | sed …` reads the file through `$0` and
+    # `awk … "$0"` does the same: a static discard guard cannot resolve that producer, fails closed on
+    # the payload, and refuses the whole invocation — which makes the script unrunnable by the very
+    # lanes it must never disturb (measured, twice). A builtin read loop answers the same question with
+    # no producer and no pipe, and it also carries the NO-CONSTANT-FALLBACK rule the sibling installer
+    # records: the header is found by its own sentinel, so adding a line cannot truncate `--help`.
+    [ -r "$0" ] || { err "cannot read my own header (a piped start has no file) — invoke this FILE: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help'"; return 2; }
+    while IFS= read -r line; do
+        n=$((n + 1))
+        [ "$n" = 1 ] && continue
+        case "$line" in
+            'set -uo pipefail'*) seen=1; break ;;
+            '#'*) printf '%s\n' "${line#\# }" ;;
+            '') printf '\n' ;;
+            *) break ;;
+        esac
+    done <"$0"
+    [ "$seen" = 1 ] || { err "could not find the header sentinel ('set -uo pipefail') in $0"; return 2; }
+    return 0
 }
 usage() { help_text; exit 2; }
 
@@ -242,6 +248,7 @@ write_record() { # <ok> <rc>
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
+        printf 'fetch=%s\n' "${FETCH_STATE:-notfetched}"
         printf 'detail=%s\n' "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ' | cut -c1-240)"
     } >"$tmp" 2>/dev/null \
         || { rm -f "$tmp"; err "cannot stage the pass record in $STATE_DIR"; return 1; }
@@ -263,6 +270,8 @@ print_status() {
     body="$(cat "$RECORD" 2>/dev/null)"
     epoch="$(printf '%s\n' "$body" | sed -n 's/^epoch=\([0-9]*\)$/\1/p' | head -1)"
     rc="$(printf '%s\n' "$body" | sed -n 's/^rc=\([0-9]*\)$/\1/p' | head -1)"
+    behind="$(printf '%s\n' "$body" | sed -n 's/^behind=//p' | head -1)"
+    fetchs="$(printf '%s\n' "$body" | sed -n 's/^fetch=//p' | head -1)"
     case "${epoch:-}" in
         ''|*[!0-9]*)
             say "status=unreadable rc=${rc:-?} — the record carries no usable epoch, so its age cannot be judged (cannot-verify is not fresh)"
@@ -282,8 +291,21 @@ print_status() {
         printf '%s\n' "$body" | sed 's/^/  /'
         return 3
     fi
+    # ⛔ A GREEN CODE IS NOT A HEALTHY BOX. `behind>0` must not be certified here: fleet-health alarms
+    # on that number, so a gate that ignored it gave TWO ANSWERS for one record — with the readiness gate
+    # the lenient one (measured in review: `status=ok rc=10` beside `alarm=True behind=3`). Likewise a
+    # record written from a FAILED fetch compared against a stale ref: cannot-verify is not fresh.
     case "${rc:-}" in
-        0|10|11) say "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
+        0|10|11)
+            case "${behind:-unknown}" in
+                0) ;;
+                *) say "status=behind rc=$rc behind=${behind:-unknown} age=${age}s — the pass exited cleanly but the box is NOT on $REF"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+            esac
+            case "${fetchs:-}" in
+                ok|'') ;;
+                *) say "status=cannot-verify rc=$rc fetch=$fetchs age=${age}s — the comparison was not fresh"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+            esac
+            say "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
         *)       say "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
     esac
 }
@@ -433,6 +455,13 @@ recompute_deployed() {
     [ "$PASS_MODE" = pin ] && read_pin
     if [ "$PASS_MODE" = pin ] && [ -n "$PIN_TREE_SHA" ]; then
         DEPLOYED_SHA="$PIN_TREE_SHA"
+    elif [ "$PASS_MODE" = pin ] && [ -s "$PIN_PATH_FILE" ]; then
+        # ⛔ THE PATH RECORD NAMES A TREE, AND THAT TREE IS GONE. Falling back to the checkout's HEAD
+        # claimed the box runs main while `cloud-cell-supervisor.sh` DIES on the same state ("harness not
+        # found at … that is the path RECORDED in .harness-path and it no longer exists"). `deployed` is
+        # the field the whole alarm is keyed on, so it must say UNKNOWN here, not borrow a fact from
+        # another tree.
+        DEPLOYED_SHA=""
     else
         DEPLOYED_SHA="$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
     fi
@@ -454,7 +483,6 @@ recompute_deployed() {
 say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") ref_sha=$(short "$REF_SHA") relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     say "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
-[ "$FETCH_STATE" = failed ] && err "WARNING: git fetch failed — the comparison is against the ref as of the last successful fetch, not against origin now"
 
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
@@ -472,6 +500,19 @@ finish() { # <ok> <rc> <verdict-phrase>
     if [ "$1" = 1 ]; then say "$REC_DETAIL"; else err "$REC_DETAIL"; fi
     exit "$2"
 }
+
+# ── PREDICATE 0: THE COMPARISON MUST BE FRESH ─────────────────────────────────────────────────
+# ⛔ A FAILED FETCH IS `cannot-verify`, NOT `current`. The old code warned on stderr and carried on
+# against the STALE remote-tracking ref, so a box that lost egress (or whose origin moved) saw
+# `relation=current`, wrote `behind=0 action=none ok=1 rc=0`, exited 0 (green in the unit's
+# SuccessExitStatus), reported `status=ok` and raised no alarm in fleet-health — every signal saying
+# "auto" while the box aged. That is precisely the defect this feature exists to delete, and the file's
+# own vocabulary already has the answer: 23 cannot-verify. A transient blip costs one red tick and heals
+# on the next; being wrong about drift costs the whole point of the feature.
+if [ "$FETCH_STATE" = failed ]; then
+    REC_ACTION=cannot-verify-fetch
+    finish 0 23 "REFUSED cannot-verify: git fetch from origin failed in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched."
+fi
 
 # ── PREDICATE 1: AHEAD / DIVERGED — refuse before anything is touched ──────────────────────────
 # ⛔ THIS IS THE c4 DEFECT. Its local commits existed in no other place; an advance would have
@@ -762,6 +803,10 @@ read_pin_done=0
 [ "$PASS_MODE" = pin ] && read_pin_done=1
 [ "$read_pin_done" = 1 ] && read_pin
 REC_ACTION="${REC_ACTION:-none}"
+# Read the DEPLOYED state once here, so the verdict's own branches see the same numbers `finish` will
+# record (before this, a branch tested `REC_DEPLOYED` while it was still the initial "unknown" and
+# refused a perfectly healthy sync-mode box).
+recompute_deployed || true
 case "$REC_ACTION" in
     mended)
         # 11, the code `harness-refresh.sh` uses for the same event and the one this file's header and
@@ -769,14 +814,30 @@ case "$REC_ACTION" in
         # whose pin had been EMPTY was recorded as "advanced", and anything keyed on 11 was dead code.
         finish 1 11 "mended: the pin was missing and now names the tree this box runs" ;;
     advanced|pin-repaired)
-        finish 1 10 "$REC_ACTION: the harness moved onto $REF" ;;
+        if [ "$REC_ACTION" = "pin-repaired" ]; then
+            # Neutral on purpose: the RECORD was the thing that disagreed. Whether the tree moved is a
+            # separate fact, and this arm fires when the record lagged a tree the materialiser DID move.
+            finish 1 10 "pin-repaired: the PIN RECORD now names the tree this box runs"
+        fi
+        finish 1 10 "advanced: the harness moved onto $REF" ;;
     none)
         # ⛔ CURRENT IS NOT ENOUGH ON ITS OWN. A pin that names the ref tip while the PATH record
         # points at an older tree is `restart-pending` at best and a lie at worst; say which.
+        # A pin path record that names nothing resolvable: the box cannot start from it, and this pass
+        # must not call that "current" (see recompute_deployed).
+        if [ "$REC_DEPLOYED" = "unknown" ] || [ -z "${DEPLOYED_SHA:-}" ]; then
+            finish 0 23 "cannot-verify: $PIN_PATH_FILE names a tree that is not resolvable, so what this box would RUN is unknown — nothing was touched"
+        fi
         if [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && [ "$REC_PIN_TREE" != "$REC_PIN" ]; then
             finish 0 25 "current for the checkout, but the PIN and the tree this box reads disagree — harness-up reports this as restart-pending, and nothing here restarts a live controller"
         fi
-        finish 1 0 "current: the pin already names $REF — nothing changed" ;;
+        if [ "$PASS_MODE" = pin ]; then
+            finish 1 0 "current: the pin already names $REF — nothing changed"
+        fi
+        finish 1 0 "current: the checkout already matches $REF — nothing changed" ;;
     *)
-        finish 1 0 "$REC_ACTION" ;;
+        # ⛔ THE DEFAULT ARM IS RED. It used to be `finish 1 0` — any action this case statement did not
+        # enumerate would be recorded ok=1 rc=0 with a bare action name, i.e. a fail-open default for
+        # every state a future edit might add.
+        finish 0 25 "UNRECOGNISED action '$REC_ACTION' — this pass does not know whether that is success, so it will not claim it" ;;
 esac

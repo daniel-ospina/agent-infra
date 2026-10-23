@@ -300,9 +300,11 @@ OUT="$(PIN_DIR="$T/t7/pin" HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass
 assert_eq "$RC" "10" "T7b a live-cell advance succeeds against a materialiser that enforces the flags"
 assert_contains "$OUT" "PINNED (force+pin-only)" "T7b and the call it made carried BOTH flags"
 # The stub moves the TREE but (like the real `apply`) does not write the sha RECORD — writing that is
-# the pass's own repair step, so the verdict is `pin-repaired` (exit 10) rather than `advanced`.
-# Both mean "the harness moved", which is what this asserts.
-assert_contains "$OUT" "the harness moved" "T7b and the verdict says it moved"
+# the pass's own repair step, so the verdict is `pin-repaired` (exit 10) rather than `advanced`. What this
+# asserts is that a move happened at all: the pin record now names the ref tip.
+assert_contains "$OUT" "pin-repaired" "T7b the verdict says the pin was repaired onto the tree it moved"
+assert_contains "$(cat "$T/t7/state/harness-apply.status" 2>/dev/null || true)" "behind=0" \
+    "T7b and the record says the box is on the ref afterwards"
 assert_contains "$(cat "$PASS_SH")" "apply --force --pin-only" "T7b the pass pins that form in its source (the stub enforces it at runtime)"
 # THE NO-MOVE CASE: the verb exits 0, the pin does not move, the box is still behind → a NAMED failure,
 # never a green `advanced`.
@@ -439,6 +441,12 @@ assert_eq "$(git -C "$CLONE" status --porcelain | grep -c '^ M tool.sh' | tr -d 
     "T17 the executable is no longer reported dirty"
 assert_eq "$(cat "$CLONE/has space.txt")" "spaced" \
     "T17 the path with a space was restored from HEAD (not skipped as an unresolvable pathspec)"
+# ⛔ THE RECORD'S OWN `dirty=` MUST AGREE WITH THE TREE. A bare `git status | wc -l` produced 0 for a
+# FAILED status and counted porcelain LINES rather than entries, so a rename read as 1 there and 2 in
+# the printed reading — two numbers for one tree. This is the only assertion that reads the field.
+assert_eq "$(sed -n 's/^dirty=//p' "$T/t17/state/harness-apply.status" 2>/dev/null | head -1)" \
+    "$(git -C "$CLONE" status --porcelain -z | tr -cd '\0' | wc -c | tr -d ' ')" \
+    "T17 the record's dirty= is the tree's real dirty-entry count (NUL entries, guarded read)"
 
 # ── T19: the pass survives the macOS entry point (`bash -s`, NO BASH_SOURCE) ───────────────────
 # MEASURED IN REVIEW: the plist runs the pass through pi-reap-worktrees-launchd.py, which pipes it to
@@ -478,6 +486,9 @@ case "$*" in
   *show*LastTriggerUSec*) [ -n "${SYSTEMCTL_LAST_TRIGGER:-}" ] && echo "$SYSTEMCTL_LAST_TRIGGER" ; exit 0 ;;
   # `systemctl show -p ExecMainStatus --value <service>` — 0 for a service that has not run yet.
   *show*ExecMainStatus*) echo "${SYSTEMCTL_MAIN_STATUS:-0}" ; exit 0 ;;
+  # `systemctl show -p ExecMainExitTimestamp --value <service>` — empty means a pass has NEVER
+  # completed (the first tick is still running), which is what a fresh install looks like.
+  *show*ExecMainExitTimestamp*) [ -n "${SYSTEMCTL_EXEC_TS:-}" ] && echo "$SYSTEMCTL_EXEC_TS" ; exit 0 ;;
   # `status` reads installation from the unit FILE, so the shim must too — a shim that answers 0 for
   # everything would make T10's post-uninstall check pass without the removal having happened.
   cat*) f="${*: -1}"; [ -f "${SYSTEMD_UNIT_DIR:-/nonexistent}/$f" ] && exit 0 || exit 1 ;;
@@ -501,6 +512,25 @@ case "$1" in
 esac
 LC
 chmod +x "$T/bin/launchctl"
+
+say_case "T20 an unpreservable dirty tree is REFUSED (exit 20), and nothing moves"
+# The DIRTY predicate's other half: `docs/ops/harness-apply.md` says "Each predicate is a pair — the
+# refusal, and the same fixture moving once the condition is gone", and the refusal arm had no fixture
+# at all. A read-only preservation PARENT makes `mkdir` fail without touching the state dir's own
+# writability (the pass must still be able to write its record of the refusal).
+mk_origin t20; mk_clone t20; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+advance_origin t20 A.txt "upstream for the refusal case" >/dev/null
+printf 'dirty\n' >>"$CLONE/B.txt"
+mkdir -p "$T/t20/state"
+: >"$T/t20/state/harness-apply-preserved"      # a FILE where the pass needs a directory
+HEAD20="$(git -C "$CLONE" rev-parse HEAD)"
+OUT="$(run_pass "$T/t20" 2>&1)"; RC=$?
+assert_eq "$RC" "20" "T20 an unpreservable dirty tree is refused with 20"
+assert_contains "$OUT" "REFUSED dirty" "T20 and the refusal says why"
+assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$HEAD20" "T20 and the checkout was NOT moved"
+assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null || true)" "action=refused-dirty" \
+    "T20 the refusal is recorded (the unit goes red, and the record says which predicate fired)"
 
 say_case "T3 the install converges and a second run is a no-op"
 mk_origin t3; mk_clone t3
@@ -557,6 +587,19 @@ OUT="$(inst3 --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8 --status fails when the last pass recorded a refusal"
 assert_contains "$OUT" "action=refused-ahead" "T8 and it shows the pass record it judged from"
 
+say_case "T8a an installed-but-DISABLED timer is not a schedule either"
+# A timer that is active now but NOT enabled does not come back at the next reboot, so the box stops
+# being advanced at the first restart. The install path always checked `is-enabled`; the status path
+# did not.
+printf '#!/usr/bin/env bash\ncase "$*" in *is-enabled*) echo disabled ;; *is-active*) echo active ;; *cat*) exit 0 ;; *) exit 0 ;; esac\n' \
+    >"$T/bin/systemctl-disabled"
+chmod +x "$T/bin/systemctl-disabled"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t3/home/.pi/agent/state" SYSTEMD_UNIT_DIR="$T/t3/units" \
+    SYSTEMCTL="$T/bin/systemctl-disabled" bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8a --status FAILS when the timer is not enabled"
+assert_contains "$OUT" "not enabled" "T8a and it says the timer will not survive a reboot"
+
 say_case "T8b a timer that HAS fired with no record is a failure, not a fresh install"
 # ⛔ THE OTHER HALF OF "status=never". A fresh install has no record because the first tick is pending —
 # a note. A timer whose OWN last trigger exists and which still has no record has a pass refusing before
@@ -572,12 +615,34 @@ OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO
     HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
     SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T8b --status passes when the timer has never fired and no record exists"
+# A trigger exists but NO PASS HAS COMPLETED (a fresh install's first tick is in flight — the state a
+# real systemd box reaches immediately, because OnBootSec has long elapsed by the time you install).
+# ⛔ That is a NOTE, not a failure: gating on the trigger alone made the installer's own success path
+# fail its own readiness gate.
 OUT="$(SYSTEMCTL_LAST_TRIGGER="Thu 2026-10-23 05:00:00 UTC" HOME="$T/t3/home" \
     HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
     HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
     SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T8b --status FAILS when the timer fired and left no record"
-assert_contains "$OUT" "HAS fired" "T8b and it says the timer fired with no record"
+assert_eq "$RC" "0" "T8b --status passes while the first tick is still running (trigger set, no pass completed)"
+assert_contains "$OUT" "no pass has COMPLETED yet" "T8b and it says exactly that"
+# A pass that HAS completed with a refusing exit and no record: the box is not being advanced.
+OUT="$(SYSTEMCTL_LAST_TRIGGER="Thu 2026-10-23 05:00:00 UTC" SYSTEMCTL_EXEC_TS="Thu 2026-10-23 05:00:01 UTC" \
+    SYSTEMCTL_MAIN_STATUS=23 HOME="$T/t3/home" \
+    HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8b --status FAILS when the last pass completed with 23 and left no record"
+# The SERVICE's own exit is the witness that fires first (and it names the log), which is the right
+# message: the record branch would be a second way to learn the same thing.
+assert_contains "$OUT" "last run exited 23" "T8b and it names the exit"
+# And a healthy completed pass whose record is elsewhere: a note that names the seam, not a verdict.
+OUT="$(SYSTEMCTL_LAST_TRIGGER="Thu 2026-10-23 05:00:00 UTC" SYSTEMCTL_EXEC_TS="Thu 2026-10-23 05:00:01 UTC" \
+    SYSTEMCTL_MAIN_STATUS=0 HOME="$T/t3/home" \
+    HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b a completed pass with exit 0 and no record here is a note (names HARNESS_APPLY_STATE_DIR)"
+assert_contains "$OUT" "HARNESS_APPLY_STATE_DIR" "T8b and the note names the seam to check"
 
 say_case "T14 a STALE pass record is an alarm, not a healthy silence"
 mk_origin t14; mk_clone t14; write_sync_stub
@@ -720,6 +785,14 @@ printf '4242\t10\tcom.eldato.harness-apply\n' >"$T/t11/loaded"
 OUT="$(inst11 --status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T11 --status accepts last exit 10 (advanced) as healthy"
 assert_contains "$OUT" "installed=yes" "T11 and reports the agent installed"
+# ⛔ A LOADED JOB IS NOT AN INSTALLED ONE: launchd keeps it loaded after the plist is deleted, and the
+# plist is what comes back at the next login. Reading `installed=yes` off the loaded list alone certified
+# a box that stops being advanced at the next logout.
+mv "$T/t11/agents/com.eldato.harness-apply.plist" "$T/t11/plist.bak"
+OUT="$(inst11 --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T11 --status fails when the plist is gone although the job is still loaded"
+assert_contains "$OUT" "will not come back at the next login" "T11 and it says what that means"
+mv "$T/t11/plist.bak" "$T/t11/agents/com.eldato.harness-apply.plist"
 OUT="$(inst11 --uninstall 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T11 --uninstall on macOS exits 0"
 assert_eq "$(ls -A "$T/t11/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" "T11 and the plist is gone"

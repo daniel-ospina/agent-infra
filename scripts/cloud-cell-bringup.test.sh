@@ -296,6 +296,24 @@ case "$BR_OUT" in
   *"disk reaper scheduled"*) ok "bring-up INSTALLS and reports the disk reaper timer (#2032)" ;;
   *) bad "bring-up does not schedule the disk reaper — the sinks are unbounded again: $BR_OUT" ;;
 esac
+# #2416 — harness ACTIVATION is scheduled by the same pass, and the bring-up refuses `CELL READY`
+# without it. A cell that runs whatever code it had at its last start is the drift the pass exists to
+# stop, and this step was the only one whose failure mode (an unscheduled clock) is invisible in
+# `status`: the box looks healthy and simply stops receiving every merged harness fix.
+case "$BR_OUT" in
+  *"harness activation scheduled"*) ok "bring-up INSTALLS and reports the harness-apply timer (#2416)" ;;
+  *) bad "bring-up does not schedule harness activation — the cell will run stale code: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-harness-apply.timer" ]; then
+  ok "the harness-apply timer unit was rendered and installed"
+else
+  bad "no harness-apply timer unit was installed under $T/systemd-units"
+fi
+if grep -q 'ExecStart=/bin/bash .*harness-apply-pass.sh' "$T/systemd-units/eldato-harness-apply.service" 2>/dev/null; then
+  ok "and it runs the pass, not the scheduler's own copy of the logic"
+else
+  bad "the harness-apply unit does not name the pass"
+fi
 if [ -f "$T/systemd-units/eldato-disk-reaper.timer" ]; then
   ok "the timer unit was rendered and installed"
 else

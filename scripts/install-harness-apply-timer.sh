@@ -139,20 +139,26 @@ say() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 help_text() {
-    local n
-    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
-    # NO CONSTANT FALLBACK: a hand-maintained range silently truncated the disk-reaper installer's
-    # help every time its header grew (measured there), and a piped start cannot derive it at all.
-    if [ -z "$n" ]; then
-        err "cannot derive the help range (invoke this FILE, not a pipe: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help')"
-        return 2
-    fi
-    # ⛔ ONE PROCESS, NO PIPELINE. The obvious `sed -n "2,Np" "$0" | sed …` reads the FILE through
-    # `$0`, and a static discard guard cannot resolve that producer — it fails closed on the payload
-    # and refuses the whole invocation, which would make this script unrunnable by the very lanes it
-    # must never disturb (measured). `awk` answers the same question in one process: print the header
-    # lines up to the `set -uo pipefail` sentinel, dropping the leading `# `.
-    awk 'NR == 1 { next } /^set -uo pipefail/ { exit } { sub(/^# ?/, ""); print }' "$0"
+    local line n=0 seen=0
+    # ⛔ NO EXTERNAL PRODUCER AT ALL. `sed -n "2,Np" "$0" | sed …` reads the file through `$0` and
+    # `awk … "$0"` does the same: a static discard guard cannot resolve that producer, fails closed on
+    # the payload, and refuses the whole invocation — which makes the script unrunnable by the very
+    # lanes it must never disturb (measured, twice). A builtin read loop answers the same question with
+    # no producer and no pipe, and it also carries the NO-CONSTANT-FALLBACK rule the sibling installer
+    # records: the header is found by its own sentinel, so adding a line cannot truncate `--help`.
+    [ -r "$0" ] || { err "cannot read my own header (a piped start has no file) — invoke this FILE: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help'"; return 2; }
+    while IFS= read -r line; do
+        n=$((n + 1))
+        [ "$n" = 1 ] && continue
+        case "$line" in
+            'set -uo pipefail'*) seen=1; break ;;
+            '#'*) printf '%s\n' "${line#\# }" ;;
+            '') printf '\n' ;;
+            *) break ;;
+        esac
+    done <"$0"
+    [ "$seen" = 1 ] || { err "could not find the header sentinel ('set -uo pipefail') in $0"; return 2; }
+    return 0
 }
 usage() { help_text; exit 2; }
 
@@ -567,6 +573,15 @@ do_status() {
             [ -f "$UNIT_DIR/$LABEL.plist" ] && say "note=plist present at $UNIT_DIR/$LABEL.plist but the agent is NOT loaded"
             return 1
         fi
+        # ⛔ A LOADED JOB IS NOT AN INSTALLED ONE. launchd keeps a job loaded after its plist is deleted,
+        # and the PLIST is what comes back at the next login — so "installed=yes" read off the loaded list
+        # alone certified a box that stops being advanced at the next logout (the mirror of the systemd
+        # `is-enabled` gate).
+        if [ ! -f "$UNIT_DIR/$LABEL.plist" ]; then
+            say "installed=no"
+            say "note=the job IS loaded but $UNIT_DIR/$LABEL.plist is missing — it will not come back at the next login; re-run --install"
+            return 1
+        fi
         say "installed=yes"
         say "loaded=yes"
         LAST_RUN="$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $2; exit}')"
@@ -612,13 +627,27 @@ do_status() {
         # that has fired and whose pass refuses before it can write anything — and it certified the
         # second as healthy, while `fleet-health.py` alarmed on the same state: two readers disagreeing
         # about one record with the readiness gate the lenient one.
-        LAST_RUN="$($SC show -p LastTriggerUSec --value "$UNIT_NAME.timer" 2>/dev/null | tr -d '[:space:]')"
+        LAST_RUN="$($SC show -p LastTriggerUSec --value "$UNIT_NAME.timer" 2>/dev/null)"
         say "last_trigger=${LAST_RUN:-unknown}"
+        # ⛔ "THE TIMER HAS FIRED" IS NOT "A PASS HAS COMPLETED", AND ONLY THE LATTER CAN BE JUDGED.
+        # A timer enabled on a box that has been up longer than `OnBootSec` (i.e. every box) elapses
+        # IMMEDIATELY, so on a fresh install the trigger exists while the first pass is still running —
+        # and gating on the trigger alone made the installer's own success path FAIL its readiness gate
+        # (measured in review). `ExecMainExitTimestamp` is the witness that a pass finished at all.
+        EXEC_TS="$($SC show -p ExecMainExitTimestamp --value "$UNIT_NAME.service" 2>/dev/null)"
+        say "last_service_run=${EXEC_TS:-unknown}"
         # ⛔ THE SERVICE'S OWN LAST EXIT, WHICH IS THE ONLY WITNESS FOR A PASS THAT REFUSES AT STARTUP.
         # A pass that cannot run (a missing ExecStart after a worktree reap, an unwritable state dir, an
         # unresolvable repo) writes NO record, so the previous `ok=1` record stays fresh for up to
         # HARNESS_APPLY_STALE_SECONDS and this gate returned 0 for a box that was not being advanced at
         # all. The disk reaper's installer carries exactly this leg for exactly this reason.
+        # ⛔ A USER UNIT WITHOUT LINGERING DIES WITH THE LAST SESSION, so the status verb re-checks what
+        # the install path checked (lingering can be cleared later by an operator or an image rebuild).
+        if [ "$TARGET" = "user" ]; then
+            linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+            say "linger=${linger:-unknown}"
+            [ "$linger" = "yes" ] || { err "the user timer will NOT fire after this session ends (linger=${linger:-unknown}) — enable it: sudo loginctl enable-linger $(id -un)"; return 1; }
+        fi
         EXEC_MAIN="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null | tr -d '[:space:]')"
         say "last_service_exit=${EXEC_MAIN:-unknown}"
         case "${EXEC_MAIN:-unknown}" in
@@ -659,11 +688,20 @@ do_status() {
                         *) err "the job last exited ${LAST_RUN} and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
                     esac ;;
                 *)
-                    # `systemctl show -p LastTriggerUSec --value` answers `n/a` when the timer has never
-                    # fired; `0`/`0s` is the same fact spelled as epoch zero (and is what a shim returns).
-                    case "${LAST_RUN:-}" in
+                    # Three states, and only the last is a failure:
+                    #   no trigger at all           -> the timer has not fired (a fresh install)
+                    #   a pass that NEVER COMPLETED -> the first tick is in flight; a note, not a verdict
+                    #   a pass that COMPLETED       -> its exit decides (0/10/11 = the record is written
+                    #                                 elsewhere; anything else = it is refusing)
+                    case "$(printf '%s' "${LAST_RUN:-}" | tr -d '[:space:]')" in
                         ''|n/a|unknown|0|0s|-*) say "  note=no pass has completed yet (the timer has not fired)" ;;
-                        *) err "the timer HAS fired (last trigger ${LAST_RUN}) and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
+                        *) case "$(printf '%s' "${EXEC_TS:-}" | tr -d '[:space:]')" in
+                               ''|n/a|unknown|0|0s|-*) say "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
+                               *) case "$(printf '%s' "${EXEC_MAIN:-}" | tr -d '[:space:]')" in
+                                      0|10|11) say "  note=a pass completed with ${EXEC_MAIN} but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
+                                      *) err "the pass has completed and its last exit was ${EXEC_MAIN}, with no record — it is refusing before it can record anything"; return 1 ;;
+                                  esac ;;
+                           esac ;;
                     esac ;;
             esac ;;
         *) [ "$REC_RC" -eq 0 ] || { err "the pass record is not healthy (see above)"; return 1; } ;;
