@@ -35,7 +35,7 @@ eqv() { # eqv <label> <want> <got>
 ex() { sed -n "/^$1()/,/^}/p" "$ORCH"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/lo-suite.XXXXXX")" || { echo "❌ mktemp failed"; exit 1; }
 OWN_FNS="$T/own.sh"
-{ ex pr_owned; ex claim_foreign_live; ex claim_live; ex claim_lease_live; grep -E '^_this_host\(\) \{' "$ORCH"; } > "$OWN_FNS"
+{ ex pr_owned; ex claim_foreign_live; ex claim_selection_verdict; ex claim_live; ex claim_lease_live; grep -E '^_this_host\(\) \{' "$ORCH"; } > "$OWN_FNS"
 SPIDS=""
 cleanup() {
   local p
@@ -43,7 +43,7 @@ cleanup() {
   rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
-for _f in pr_owned claim_foreign_live claim_live claim_lease_live; do
+for _f in pr_owned claim_foreign_live claim_selection_verdict claim_live claim_lease_live; do
   grep -q "^$_f() {" "$OWN_FNS" || { echo "❌ could not extract $_f() from $ORCH — the rule moved or was reformatted"; exit 1; }
 done
 bash -n "$OWN_FNS" 2>/dev/null || { echo "❌ the extracted ownership functions do not parse"; exit 1; }
@@ -132,6 +132,12 @@ LO_SCAN=1; LO_LIVE="$T/live2.tsv"
 is_num() { lo_num "$1"; }
 # shellcheck source=/dev/null
 . "$OWN_FNS"
+# ⛔ THE VERDICT ITSELF IS SOURCED FROM claims.sh (agent-infra#2466), for the same reason test-gates.sh
+# does: `claim_selection_verdict` is a thin policy wrapper over ONE reader, and extracting the wrapper
+# without the reader left every "unowned" fixture reading owned (a missing reader exits 127, which is
+# fail-closed). Sourcing the shipped file keeps this suite grading the shipped polarity.
+# shellcheck source=/dev/null
+. "$HERE/claims.sh"
 touch "$O/state/needsfix-9007-sha"             # a findings marker agrees with the sessions
 if pr_owned 9007 sha fix/9007-thing; then
   bad "pr_owned() counted a DEAD PR as owned from a session name + a marker — the exact defect measured"
