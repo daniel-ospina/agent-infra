@@ -474,8 +474,10 @@ jobs:
         # and health-check called it loaded. #1322 — read identity was keyed by a
         # path prefix pi never serves, so a skill read through
         # `~/.pi/agent/skills/...` never cleared its own gate. Zero-dep by
-        # construction (the pi SDK import is TYPE-only and its predicate is
-        # inlined), so it MUST run in THIS job, which performs no `npm ci`. The
+        # construction (the pi SDK import is TYPE-only and its predicate is not
+        # inlined here — it is imported from ./shared/tool-call-event.ts, which is
+        # zero-dep and pinned against the real export by the `pi-sdk-parity` job),
+        # so it MUST run in THIS job, which performs no `npm ci`. The
         # deployed layout is reproduced in temp farms via
         # `tsx --preserve-symlinks` — whose `__dirname` semantics the fixture
         # asserts as a PRECONDITION before trusting any verdict — and through real
@@ -806,6 +808,28 @@ jobs:
         # by tsx; node stdlib otherwise), so it runs in THIS job, which performs
         # no `npm ci`.
         run: npx tsx extensions/cmux-session.test.ts
+      - name: Shared tool-call predicate (#1330, zero-dep half)
+        # #1330 — pi's `isToolCallEventType` was copied PRIVATELY into each extension
+        # that needed it (skill-enforcer, sequence-enforcer, and the two test-side
+        # SDK stubs). A copy of an SDK function has no pin unless someone writes
+        # one: an upgrade that moved the tool name would make the copy return
+        # `false` for EVERY event, so the gate branches are never reached and the
+        # extension keeps printing `✅ Loaded — enforcing N skill gates` with every
+        # gate inert — an enforcer reporting success while enforcing nothing.
+        #
+        # This is the ZERO-DEP half: the copy's own semantics (including the
+        # malformed-event case, where upstream THROWS and the old copy's
+        # `event?.toolName` silently returned false) plus the SINGLE-HOME scan —
+        # exactly one definition under extensions/, the consumers importing it, and
+        # the two loader-hook SDK stubs re-exporting it rather than re-declaring it.
+        # The SDK-BEARING half (agreement with the real export) is the
+        # `pi-sdk-parity` job below: it cannot run here, because THIS job performs
+        # no `npm ci` — which is the reason the copy exists at all.
+        # Zero-dep (`node:*` only), no `npm ci`, ~1s. VISIBLE, not merge-blocking
+        # (`pipeline-compliance` is the repo's only required check, #646); the
+        # BLOCKING backstop is the post-merge ci-main.yml `extensions/shared/*.test.ts`
+        # glob, which collects this file automatically.
+        run: npx tsx extensions/shared/tool-call-event.test.ts
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
@@ -836,6 +860,45 @@ jobs:
           npm install --no-save --no-audit --no-fund --prefix "$tmp" undici@8.9.0
       - name: http-pool-hygiene suite (real transport REQUIRED)
         run: PI_HTTP_POOL_REQUIRE_UNDICI=1 node "$RUNNER_TEMP/pool-hygiene-ext/test-pool-hygiene.mjs"
+
+  pi-sdk-parity:
+    # #1330 — the SDK-BEARING half of the shared tool-call predicate pin.
+    #
+    # WHAT IT PINS: extensions/shared/tool-call-event.ts (the repo's ONE copy of
+    # pi's `isToolCallEventType`) must agree with the REAL export installed from
+    # the locked @earendil-works/pi-coding-agent devDependency — on the return
+    # value AND on thrown-ness, over a matrix of event shapes including the
+    # relocated-name shapes an upgrade would produce.
+    #
+    # WHY ITS OWN JOB: this needs the SDK installed. `verify` performs no `npm ci`
+    # BY DESIGN and each of its steps asserts that property (the zero-dep gate
+    # suites are exactly what the copy exists for), so installing the SDK there
+    # would retire the property for the suites that rely on it. Same reason
+    # `http-pool-hygiene` is a job. The zero-dep half of this pin
+    # (extensions/shared/tool-call-event.test.ts) runs in `verify`.
+    #
+    # WHY PER-PR, NOT ci-main ONLY: the drift arrives with the PR that bumps
+    # PI_VERSION_PIN (scripts/check-pi-pin-lockstep.mjs forces the pins to move in
+    # lockstep) or with a PR that edits the copy. A suite wired only into
+    # ci-main.yml reports that on main AFTER the merge — the #1250 shape.
+    #
+    # NO NEW VERSION LITERAL: the install takes the pin from
+    # extensions/verification-gate/package.json, which guard (h) of
+    # scripts/check-pi-pin-lockstep.mjs already holds equal to PI_VERSION_PIN.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install the pinned pi SDK (test-only)
+        # The parity suite is SDK-bearing by construction; the pin it asserts is
+        # the locked devDependency of the directory it lives in. `--prefix` rather
+        # than a `cd` subshell so the command does not change the step's cwd for
+        # anything after it.
+        run: npm ci --prefix extensions/verification-gate --no-audit --no-fund --loglevel=error
+      - name: Shared-predicate parity pin (#1330)
+        run: npx tsx extensions/verification-gate/tool-call-event-parity.test.ts
 
   setup-suite:
     # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
