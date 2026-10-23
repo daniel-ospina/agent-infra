@@ -60,6 +60,8 @@
 #   §AI the existing-record check reads the record's OWN `repo` field: a foreign repo's legacy
 #      `<PR>.json` at the same head cannot block, and a refusal names the file it READ
 #   §AJ a COMPLETED review that quotes `[pi-gate] REFUSED` is not the gate's refusal (rc is the signal)
+#   §AK the ISSUES COUNT accepts every separator the verdict SHAPE accepts (`ISSUES: 0` is clean),
+#      and a count the reviewer PRINTED is never raised — the clamp defaults only an UNPARSED one
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -990,6 +992,42 @@ run "$SRC" 2284
 reset; printf '| P0 | 0 |\n| P1 | 0 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a zero-count severity table still does not block CLEAN (rc=$(rc_of))"
+
+# ── §AK the COUNT accepts every separator the verdict SHAPE already accepts ───
+echo; echo "§AK the ISSUES count reads the separator VD_ISSUES accepts, and a printed ZERO stays zero"
+# The fresh review of #2288 filed this as its one blocking issue. `VD_ISSUES` accepts
+# `ISSUES: 2` (§AB pins the colon form as supported input), but the count extractor's
+# character class carried only `(`, `[` and a space — so the colon form parsed NO count, fell
+# through to the `N ×` arm, and the clamp there (`-gt 0 || ISSUE_N=1`) raised a legitimately
+# parsed ZERO to 1. A reviewer reporting ZERO blocking findings (`ISSUES: 0`) therefore exited
+# 7, recorded nothing, and posted an artifact asserting a blocking finding that did not exist —
+# the paid-review-into-the-same-refusal loop this file exists to remove, committed by the CLEAN
+# branch. Both halves are pinned, each with its counter-direction.
+reset; printf 'Nothing blocks.\nISSUES: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "'ISSUES: 0' is CLEAN and records (rc=$(rc_of) — 7 before the fix)"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+reset; printf 'Nothing blocks.\n**Verdict: ISSUES — 0 × P1**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…'**Verdict: ISSUES — 0 × P1**' is CLEAN (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
+reset; printf 'Nothing blocks.\n**Verdict: ISSUES: 0**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…'**Verdict: ISSUES: 0**' is CLEAN (rc=$(rc_of))"
+reset; printf 'Nothing blocks.\nISSUES (0)\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and the already-supported 'ISSUES (0)' stays CLEAN (rc=$(rc_of))"
+# COUNTER-DIRECTION: the separator fix must not ZERO a real count — the colon form still blocks,
+# and it reports the number the reviewer PRINTED (it used to be raised to the default 1).
+reset; printf 'Two blockers.\nISSUES: 2\n[P1] a.sh:1 — x\n[P2] b.sh:2 — y\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "'ISSUES: 2' over two findings still blocks (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+err_has "found 2 blocking issue(s)"; ck $? "  …reporting 2, not the raised default 1"
+reset; printf 'Two blockers, no lines.\nISSUES: 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and 'ISSUES: 2' with NO finding lines still blocks (rc=$(rc_of))"
+err_has "found 2 blocking issue(s)"; ck $? "  …reporting the count the reviewer printed"
 
 # ── §AH the bare label that NAMES ITS LOCATION AFTER IT (the filed P1) ───────
 echo; echo "§AH a bare P1 with a location after it cannot hide from CLEAN"
