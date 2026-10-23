@@ -450,6 +450,11 @@ WANT17="$(advance_origin t17 A.txt "upstream for the dirty-set case")"
 git -C "$CLONE" mv A.txt RENAMED.txt >/dev/null 2>&1
 git -C "$CLONE" mv B.txt RENAMED-B.txt >/dev/null 2>&1
 git -C "$CLONE" mv C.txt RENAMED-C.txt >/dev/null 2>&1
+# ⛔ AND A PLAIN `mv`, which is what a human or a lane produces: git reports it as ` D D.txt` +
+# `?? MOVED-D.txt`, NOT as a rename record — so keying only off `R`/`C` left the destination in the
+# worktree as an addition, restored the source, and left the tree dirty for ever (and blocked the next
+# merge the moment upstream added that path). A same-content copy of a deleted tracked path is a move.
+mv "$CLONE/D.txt" "$CLONE/MOVED-D.txt"
 printf 'changed\n' >>"$CLONE/tool.sh"
 printf 'edited\n' >>"$CLONE/has space.txt"
 OUT="$(run_pass "$T/t17" 2>&1)"; RC=$?
@@ -767,6 +772,26 @@ OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO
     SYSTEMCTL="$T/bin/systemctl-static" bash "$INST" --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8a2 --status FAILS for is-enabled=static (no [Install] section: gone at the next boot)"
 assert_contains "$OUT" "not enabled" "T8a2 and it says the timer is not enabled"
+
+say_case "T8b2 an armed-but-never-fired timer fails once the grace period is over"
+# ⛔ THE FRESH-INSTALL NOTE MUST BE BOUNDED. Without a bound, an enabled+active job that has NEVER fired
+# (and has no record) passes this gate for ever, while a box that HAS a record is failed once it goes
+# stale — exactly the asymmetry a silent no-op hides in. The installed artifact's own age is the bound.
+GRACE="$T/t8b2-units"; STATE8B2="$T/t8b2-state"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$STATE8B2" SYSTEMD_UNIT_DIR="$GRACE" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b2 the install succeeds"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$STATE8B2" SYSTEMD_UNIT_DIR="$GRACE" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b2 --status passes inside the grace period (the first tick may still be running)"
+touch -d '2 hours ago' "$GRACE/eldato-harness-apply.timer" 2>/dev/null || touch -t 202001010000 "$GRACE/eldato-harness-apply.timer"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$STATE8B2" SYSTEMD_UNIT_DIR="$GRACE" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8b2 --status FAILS once the timer has been armed past the grace with no pass"
+assert_contains "$OUT" "NEVER fired" "T8b2 and it says the job is inert, not fresh"
 
 say_case "T8b a timer that HAS fired with no record is a failure, not a fresh install"
 # ⛔ THE OTHER HALF OF "status=never". A fresh install has no record because the first tick is pending —
