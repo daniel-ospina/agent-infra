@@ -65,7 +65,15 @@ import json, os, re, subprocess, sys, time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-REPO = "daniel-ospina/tortoise"
+# ⛔ THE REPO IS READ, NOT ASSUMED, AND IT MUST BE READ HERE FIRST (agent-infra#1989). This file is
+# the fleet's ONE classifier -- `pr-doctor.py` calls `classify_one()` here rather than carrying a
+# second predicate (#1872) -- but it hardcoded tortoise, so a consumer standing in ANY other repo
+# read a DIFFERENT repo's check-runs and attestations: every agent-infra PR came back
+# `rerun-checks`, or `record-review` forever because it looked for tortoise's attestation file. The
+# repo is therefore an INPUT: such a consumer supplies it as `OBJECTIVE_REPO`. ⚠️ NOTHING SHIPPED
+# SETS IT TODAY, so every shipped caller gets the default below and answers exactly as before --
+# which is the property the first test in `test_objective.py`'s seam block pins.
+REPO = os.environ.get("OBJECTIVE_REPO") or "daniel-ospina/tortoise"
 STATE = os.path.expanduser("~/.pi/agent/state")
 CACHE = os.path.join(STATE, "objective.last")
 
@@ -102,8 +110,27 @@ QUEUE_GROWTH_WINDOW_S = 3600
 # MERGEABLE, because `lint` is NOT required and is NOT a `needs:` of `python-ci-gate`.
 # So `main=GREEN` here means "every REQUIRED context is green" -- it does NOT mean "main's
 # tree is healthy". Read it as the former or not at all.
-REQUIRED = ("pricing-artifact", "docs", "test-isolation", "license-surface",
-            "legal-e2e", "python-ci-gate", "ai-review-gate")
+REQUIRED_DEFAULT = ("pricing-artifact", "docs", "test-isolation", "license-surface",
+                    "legal-e2e", "python-ci-gate", "ai-review-gate")
+
+
+# ⛔ THE REQUIRED SET BELONGS TO THE REPO UNDER TEST, NOT TO THIS FILE (agent-infra#1989). The comment
+# above is the record of what a hardcoded set costs: it can only be silently wrong. MEASURED on a
+# consumer standing in agent-infra: every name above is absent from that repo's PR check surface, so
+# `classify_pr` fell through to its `gated_absent` arms and told the cell to `rerun-checks` every PR
+# it looked at -- a verdict about the wrong repo delivered with full confidence. The set is therefore
+# an INPUT: a consumer that resolved it from branch protection
+# (`scripts/orchestrator-harness/repo-authority.sh`, the shipped resolver) supplies it as
+# `OBJECTIVE_REQUIRED` (comma-separated).
+# ⚠️ An EMPTY or whitespace-only value is "not supplied", NOT "no required checks": the latter would
+# make every PR `call-rail`-eligible. Same rule as `classify_pr`'s "cannot-verify is never a pass".
+def _required_from_env():
+    raw = os.environ.get("OBJECTIVE_REQUIRED") or ""
+    names = tuple(n.strip() for n in raw.split(",") if n.strip())
+    return names or REQUIRED_DEFAULT
+
+
+REQUIRED = _required_from_env()
 
 GREEN = {"success", "neutral", "skipped"}
 NON_RED = {"cancelled", "stale"}          # not green, but not evidence of failure
@@ -354,8 +381,18 @@ def gql_commit_checks(sha):
     repository, and it must not be allowed to stop the fleet when the other transport is up.
     """
     q = GQL_CHECKS % sha
+    # ⛔ THE FALLBACK ASKS THE SAME REPOSITORY THE REST READ DID. `REPO` became an INPUT in #1989, and
+    # the owner/name here stayed tortoise's: on a cell pointed at another repo the fallback asked
+    # tortoise for a sha it does not have (`repository.object` null → no data), so the exact scenario
+    # this transport exists for — REST blocked while GraphQL is healthy, measured 2026-09-29 — degraded
+    # to "unreadable" instead of recovering. Fail-closed either way, but it silently removed one of the
+    # two transports on every non-tortoise box.
+    _owner, _name = (REPO.split("/", 1) + [""])[:2]
     r = subprocess.run([GH_BIN, "api", "graphql", "-f", f"query={q}",
-                        "-f", "owner=daniel-ospina", "-f", "name=tortoise"],
+                        # ⛔ THE REPO COMES FROM `REPO` (this change), AND THE CALL STILL GOES THROUGH THE
+                        # SHARED gh LAYER (origin/main, #1988/#2010): the two sides of this conflict are
+                        # independent facts about one call, so both are kept.
+                        "-f", f"owner={_owner}", "-f", f"name={_name}"],
                        capture_output=True, text=True, timeout=90,
                        env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     global GH_LAST_ERROR
@@ -648,8 +685,25 @@ def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
     return last
 
 
-SURFACE_PATHS = ("tortoise/sdk.py", "tortoise/tool_registry.py",
-                 "config/surface-manifest.yml")
+# ⛔ THE HUMAN GATE IS A PER-REPO FACT, exactly like `REQUIRED` above — and for the same reason.
+# `touches_surface()` decides whether a diff goes to the OWNER instead of to an automated landing
+# worker. Hardcoded to tortoise's paths it is ALWAYS FALSE on any other repo, so a consumer standing
+# in one would hand a surface-touching diff to the landing worker while the predicate's own comment
+# promises the opposite. A repo supplies its own list as `OBJECTIVE_SURFACE` (comma-separated);
+# unset/empty means "not supplied" and the shipped default is kept, so the laptop's answer does not
+# change. ⚠️ The seam removes the hardcoded path list, NOT the obligation to supply one: a repo that
+# never sets it is still gated on tortoise's paths, which on that repo is nothing.
+SURFACE_PATHS_DEFAULT = ("tortoise/sdk.py", "tortoise/tool_registry.py",
+                         "config/surface-manifest.yml")
+
+
+def _surface_from_env():
+    raw = os.environ.get("OBJECTIVE_SURFACE") or ""
+    paths = tuple(p.strip() for p in raw.split(",") if p.strip())
+    return paths or SURFACE_PATHS_DEFAULT
+
+
+SURFACE_PATHS = _surface_from_env()
 # The owner-designed class vocabulary (2026-10-10): the ACTION classes in
 # cheapest-and-highest-payoff FIRST, plus `running`, which is a first-match STATE and never an
 # action. Reading this tuple as a class->action map is what sent lanes to "fix" a suite that was
