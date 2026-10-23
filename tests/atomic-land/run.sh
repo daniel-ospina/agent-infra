@@ -612,16 +612,18 @@ echo "── 2b-ii. #2369 — a stale record the carry CAN re-bind still updates
 new_scen stalerecordcarry
 printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
   > "$SCEN_RECORD_FILE"
-# ⛔ THE MARKER BELONGS TO THE REVIEWED COMMIT, NOT THE LIVE HEAD (review, cycle 4). The population
-# this scenario exists to protect is the one the rail's own comment names — "a lane that updated and
-# then died at verify", i.e. record AND marker at the reviewed/before head, with the live head a
-# clean re-merge of it. `new_scen`'s default marker is bound to HEAD_OLD (the LIVE head), so the
-# faithful state was modelled by no scenario: a tightening that also required the artifact to be
-# IDENTIFIED AT THE CURRENT HEAD before the head may move — it reads like B5's authority test — left
-# this suite fully green while false-blocking the rail's own recovery path. Binding the marker here
-# reddens that mutant, and the unmodified rail stays green (the delegated probe reads the RECORD, and
-# the DIFF carry re-binds it).
-marker_fixture 42 clean "$HEAD_STALE" > "$SCEN/pr-body"
+# ⚠️ NO PR-BODY MARKER HERE, deliberately (review, cycle 5). Cycle 4 added one bound to HEAD_STALE
+# to model the population this scenario protects — "a lane that updated and then died at verify",
+# record AND marker at the reviewed/before head — and claimed it reddens a tightening that required
+# the artifact to be IDENTIFIED AT THE CURRENT HEAD. It does not, and it could not: with
+# RECORD_HEAD=HEAD_STALE != HEAD=HEAD_OLD, B5's
+# `[ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence` short-circuits, so the rail never reads
+# the PR body here, and the producer double reads `$SCEN/head`/`$SCEN_RECORD_FILE`, never
+# `$SCEN/pr-body` (measured). A fixture nothing reads is not coverage and a comment claiming it is
+# is worse than none — this repo's own rule, one repo down. The state this scenario really models is
+# stated by its inputs: a STALE record plus a producer whose carry SUCCEEDS, which is what the
+# precondition must not block. If a future guard makes the rail read the body at the precondition,
+# the marker belongs back here — WITH the mutant that reads it.
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
@@ -702,9 +704,13 @@ echo "── 2b-vi. the clause-(E) discriminator is a pinned cross-script contra
 grep -qE '^[[:space:]]*echo "⛔ \(#1575 clause E\)' "$ROOT/scripts/record-review.sh" \
   && pass "the producer still EMITS the literal the rail greps for" \
   || fail "scripts/record-review.sh no longer EMITS '(#1575 clause E)' (a comment mentioning it is not the emitter) — the rail would read a red head as a changed artifact"
-grep -qF "grep -qF '(#1575 clause E)'" "$ROOT/scripts/atomic-land.sh" \
+# …and the CONSUMER half is anchored to the code line for the SAME reason (review, cycle 5):
+# a whole-file `grep -qF` is satisfied by the CONSUMER CONTRACT comment above the grep, so it
+# could stay green after the grep itself was reworded — the exact defect the emitter anchor
+# above was given, left in place on the other end.
+grep -qE '^[[:space:]]*if grep -qF .\(#1575 clause E\).*"\$log"; then' "$ROOT/scripts/atomic-land.sh" \
   && pass "and the rail still greps that literal for the head-health classification" \
-  || fail "scripts/atomic-land.sh stopped grepping the clause-(E) literal — the proceed/stop split is gone"
+  || fail "scripts/atomic-land.sh stopped grepping the clause-(E) literal (a comment mentioning it is not the grep) — the proceed/stop split is gone"
 # ═══ 2b-vii. a clause-(E) veto at step [3/4] still blocks the landing ═════
 # The landing side of the `return 4` contract. The preflight proceeds on this code;
 # step 3 must NOT. A caller that accepted 4 there would merge a measurably red head —

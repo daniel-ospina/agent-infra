@@ -1130,6 +1130,25 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   # refusal nothing has been mutated and the refusal names the head a review must
   # cover. A DRY RUN reaches do_record's own dry-run arm, so it prints the record
   # step it would take and still writes nothing.
+  #
+  # ⚠️ ONE MUTATION CAN OUTLIVE A STOPPED UNIT — stated, because "nothing has been
+  # mutated" above is scoped to the CONTENT refusal (review, cycle 5). A SUCCESSFUL
+  # probe WRITES: `do_record` runs the producer, which re-binds the signed record —
+  # and its PR-body marker — to the CURRENT head before any update is attempted. If
+  # `gh pr update-branch` then fails, or the ref poll never observes a new head, the
+  # unit stops with the record naming the CURRENT head. That binding is materially
+  # TRUE (the carry arms proved the reviewed artifact unchanged) and it is the same
+  # posture every step-[3/4] carry already has: the rail stamps a head whose checks
+  # are still in flight, and the producer's clause (E) reads an in-flight or
+  # unreadable surface as "not shown red" by its own documented contract. It is NOT
+  # a fail-open on a red head: clause (E) "can only ADD a refusal, it can never
+  # authorise one", and the land-time red classification is `admin-merge.sh`'s
+  # (#930), which reads the head's own surface and refuses a failure the PR carries
+  # whether or not any record names it. Rolling the write back is not the remedy it
+  # looks like either: the PR-body marker cannot be un-posted (editing the body wipes
+  # the attestation, #1224), so a restored record file would contradict the signed
+  # marker left behind. Named here so the next reader cannot take "nothing has been
+  # mutated" as covering the success-then-update-failure path.
   stale_record=0
   [ "$RECORD_HEAD" = "$HEAD" ] || stale_record=1
   if [ "$stale_record" -eq 1 ]; then
@@ -1312,6 +1331,13 @@ do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-hea
   fi
   if [ "$rc" -ne 0 ]; then
     rm -f "$log"
+    # The step label again (#1362 D1): a producer failure reachable from the [1/4]
+    # precondition (any exit the two branches above do not own — a usage error, the
+    # clean-micro tier refusal) must not claim a LANDING was refused when no head
+    # has moved and no landing was ever in question.
+    if [ "${1:-}" = "preflight" ]; then
+      stop "record-review.sh exited $rc — refusing to move the head without a record: the branch was NOT updated and nothing was merged"
+    fi
     stop "record-review.sh exited $rc — refusing to land without a record"
   fi
   # B8 — the delegated record must ACTUALLY name THIS head. A zero exit is not
