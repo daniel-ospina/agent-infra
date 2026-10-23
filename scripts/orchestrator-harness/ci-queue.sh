@@ -97,8 +97,11 @@
 #   * The ONE fail-open is the CACHE: a read that succeeded within `CIQ_TTL` seconds is used for free
 #     (a burst of N dispatches in one cycle must not become N reads), and a read that FAILS falls
 #     back to the last successful record for up to `CIQ_STALE_MAX` seconds — reported as
-#     `cache(<age>s)` in every line it produces, so a stale reading is never presented as a fresh
-#     one. Past that window the record is dropped and the verdict is UNKNOWN again.
+#     `state=cache age=<n>s` in every line it produces, so a stale reading is never presented as a
+#     fresh one. (This sentence used to promise a `cache(<age>s)` form that NO line emits: the
+#     tokens are `deep(… state=cache age=Ns)` and `ok(… state=cache age=Ns)`, and the CLI line is
+#     `state=cache source=record(cache) age=Ns` — a grep for `cache(` matched only this comment.
+#     #2333 review, P2.) Past that window the record is dropped and the verdict is UNKNOWN again.
 #   * `runners` is MEASURED when the repo endpoint answers with an online runner count. When no count
 #     is measured there are THREE cases and they do not share one answer (#2333 review cycles 9-11):
 #     the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners never
@@ -238,7 +241,13 @@ ciq_record_usable() {
 #               one `ci-queue-*` file and one repo's queue would otherwise answer for the other's
 #               (#2333 review, P2: this field was documented as the guard while nothing read it)
 ciq_read() {
-  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor=""
+  # ⛔ EVERY NAME THIS FUNCTION ASSIGNS IS `local` (#2333 review, P2). `_errf` and `_sf` were the two
+  # that were not, so a sourced `ciq_read` leaked them into the CALLER's shell — and this module is
+  # sourced into `orch-loop.sh`'s single 4,600-line cycle body plus `fix-one.sh` and
+  # `dispatch-merge.sh`. Nothing collides today; the module's own contract ("a sourced library must
+  # not mutate its caller's shell") is what this list exists to honour, and a future local in the
+  # caller would be silently clobbered mid-cycle.
+  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _sf=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
   CIQ_STREAK=""; CIQ_CAUSE=""
   [ -n "$repo" ] || return 2
@@ -558,7 +567,7 @@ ciq_ci_allowed() {
 # Prints the verdict, the record and the derivation. Exit code follows the verdict (0 deep, 1 ok,
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
-  local repo="" verb="${1:-status}" operand=""
+  local repo="" verb="${1:-status}" operand="" v drc rc
   # ⛔ `shift 2>/dev/null` IS NOT `shift 2` WITH STDERR SILENCED (#2333 review cycle 2, P2): bash parses
   # `2>` as an FD redirect, so that spelling shifts ONE positional and drops the verb — accidentally
   # right here, and a trap for the next editor who adds a second `shift`. Drop the verb explicitly.
