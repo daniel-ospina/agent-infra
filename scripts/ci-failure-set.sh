@@ -57,9 +57,11 @@
 #   a STARTING WIDTH, not the size of the window: the listing is widened (doubling,
 #   bounded at 200 runs) until the window holds AT LEAST N runs that FINISHED A
 #   MEASUREMENT — so the doubling can OVERSHOOT N — and it can also stop EARLY,
-#   holding FEWER than N, when the history is exhausted (`--limit 2 → 4 → 8` on a
-#   3-run main stops at 8) or the 200-run bound is reached. The window is therefore
-#   never pinned to N: ≥ N when the sufficiency rule fires, < N on an early stop.
+#   holding FEWER than N, when the listing is EMPTY, the history is exhausted
+#   (`--limit 2 → 4 → 8` on a 3-run main where fewer than N runs measured: the
+#   wider reads return no NEW run, so it stops at 8), or the 200-run bound is
+#   reached. The window is therefore never pinned to N: ≥ N when the sufficiency
+#   rule fires, < N on an early stop.
 #   Without the widening, a `completed/cancelled` run that never expanded a job
 #   spends one of the N, a push burst can spend all of them, and `tested=0` makes
 #   admin-merge.sh report "the lane never TESTED main" about a main that simply had
@@ -464,11 +466,12 @@ list_lane_runs() {
 #
 # So the listing WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until the
 # exclusion-filtered window holds AT LEAST the requested number of MEASURED runs
-# (a doubling step may OVERSHOOT it), or the history is exhausted, or the bound is
-# reached — an early stop can leave the window holding FEWER than requested. This
-# is the rule the rail's lane-coverage gate already follows for its own reference
-# window (#4844, #7734: "N is a STARTING WIDTH, not a stopping rule"); the baseline
-# pass was the one place still reading N as a stopping rule.
+# (a doubling step may OVERSHOOT it), or the listing is empty, or the history is
+# exhausted, or the bound is reached — an early stop can leave the window holding
+# FEWER than requested. This is the rule the rail's lane-coverage gate already
+# follows for its own reference window (#4844, #7734: "N is a STARTING WIDTH, not a
+# stopping rule"); the baseline pass was the one place still reading N as a
+# stopping rule.
 #
 # ⛔ THE WIDENING CRITERION IS NOT THE GATE. `measured_run_count` reads only the
 # listing's status/conclusion, so it cannot see a run's JOBS — but it decides only
