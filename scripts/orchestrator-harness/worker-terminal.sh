@@ -186,16 +186,20 @@ wt_launcher_home() {
   return 1
 }
 
-# `wt_tmux_server_token` — 0 when the tmux SERVER's global environment carries a NON-EMPTY token
-# variable. This is the only credential a worker against an ALREADY-RUNNING server can inherit (see
+# `wt_tmux_server_token` — 0 when the tmux SERVER's global environment carries a token VARIABLE with a
+# VALUE. This is the only credential a worker against an ALREADY-RUNNING server can inherit (see
 # `wt_launcher_env`), so it is probed for both names, and an empty value is not provision.
+# ⛔ A BLANK VALUE IS NOT A VALUE, on every arm (review finding, 2026-10-23, measured): `-n "$v"` credited
+# three spaces, and `gh auth status` answers `Failed to log in to github.com using token (GH_TOKEN)` for
+# that value — the same defect the keys.env arm refuses statically. Every arm of this gate now applies
+# one rule: a credential is a value containing a non-space character.
 wt_tmux_server_token() {
   local n v
   command -v tmux >/dev/null 2>&1 || return 1
   for n in GH_TOKEN GITHUB_TOKEN; do
     v="$(tmux show-environment -g "$n" 2>/dev/null)" || continue
     case "$v" in
-      "$n="*) [ -n "${v#"$n="}" ] && return 0 ;;
+      "$n="*) case "${v#"$n="}" in *[![:space:]]*) return 0 ;; esac ;;
     esac
   done
   return 1
@@ -231,9 +235,10 @@ wt_tmux_has_server() {
 # counts only when it carries a VALUE; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
 # (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
-  local home="${1:-}" keys have=0
+  local home="${1:-}" keys have=0 keys_credit=0 caller_val=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
+  case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) caller_val=1 ;; esac
   wt_gh_hosts_token "$home" && have=1
   # ⛔ A VALUE IS NOT A QUOTED EMPTY (review finding, measured 2026-10-23). `=[^[:space:]]` counted
   # `GH_TOKEN=""` as provision — the character after `=` is a quote — so the file exported an EMPTY
@@ -242,11 +247,17 @@ wt_launcher_env() {
   # an optional opening quote rejects `=`, `=""` and `=''` and keeps `=ghp_x` / `="ghp_x"`.
   # Residual: `GH_TOKEN="$SOMETHING"` is counted — a variable reference cannot be evaluated without
   # sourcing the file here, and an operator who writes one is asserting it resolves.
+  # ⛔ A STATIC GREP IS NOT PROOF THE SOURCE EXPORTS IT (review finding, 2026-10-23, measured). A line the
+  # file never executes — `if [ -n "$X" ]; then export GH_TOKEN=…; fi`, or an assignment in a function
+  # nobody calls — matches this grep, so the gate reports provisioned while the worker gets nothing. The
+  # credit is therefore remembered (`keys_credit`) and VERIFIED in the launch line after the source: a
+  # file-only credit must leave a non-blank token in the environment, or the worker is refused. That is
+  # the same dynamic check the broken-file guard uses, applied where the credit came from the file.
   if [ "$have" = "0" ] && [ -f "$keys" ] \
      && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=["'\'']?[^[:space:]"'\'']' "$keys" 2>/dev/null; then
-    have=1
+    have=1; keys_credit=1
   fi
-  if [ "$have" = "0" ] && [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+  if [ "$have" = "0" ] && [ "$caller_val" = "1" ]; then
     # ... but only if this spawn will CREATE the server (see above), and that is decided by a
     # POSITIVE server probe, never by an empty session list (see `wt_tmux_has_server`).
     command -v tmux >/dev/null 2>&1 || return 1
@@ -254,7 +265,7 @@ wt_launcher_env() {
   fi
   if [ "$have" = "0" ]; then
     # nothing in the HOME or a credit-bearing caller: the tmux SERVER's global env may still carry one,
-    # and a worker against that server inherits it. Probe it — non-empty, either name.
+    # and a worker against that server inherits it. Probe it — non-blank value, either name.
     wt_tmux_server_token || return 1
   fi
   printf 'export HOME=%s' "$(wt_q "$home")"
@@ -269,8 +280,8 @@ wt_launcher_env() {
     # own launch line is bash-shaped — so a `sh -n` check is an over-block on a perfectly good cell, which
     # is the #2210 refusal loop in a new disguise. bash is what the harness runs and what the cell's own
     # supervisor sources this file with, so bash decides when it exists; `sh -n` is the last resort.
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; wsrc=$?; set +a' \
-      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; wsrc=$?; set +a; kcredit=%s' \
+      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$keys_credit"
   fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
   # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
@@ -325,7 +336,7 @@ wt_launcher_env() {
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
   # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
   # the STORE — and never the question it just answered NO to.
-  [ -f "$keys" ] && printf '; if [ "${wsrc:-0}" -ne 0 ]; then case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac; fi'
+  [ -f "$keys" ] && printf '; if [ "${kcredit:-0}" = 1 ] || [ "${wsrc:-0}" -ne 0 ]; then case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac; fi'
   return 0
 }
 

@@ -491,6 +491,34 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return2" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a keys.env that aborts AFTER exporting the token still runs the worker (a credential is present)" $rc
+# ⛔ A GREP MATCH IS NOT PROOF THE SOURCE EXPORTS IT (review finding, 2026-10-23, measured). A token line
+# the file never EXECUTES — inside an `if` that is false, or a function nobody calls — matches the static
+# grep, so the gate reports provisioned while the worker gets nothing and stops at its first `gh` call.
+# The file-only credit is therefore verified after the source: no non-blank token in the environment and
+# no other store ⇒ exit 98.
+rm -rf "$TMP/home-cond" "$TMP/O4t7"; mkdir -p "$TMP/home-cond"
+printf 'if [ -n "${NEVER_SET:-}" ]; then\n  export GH_TOKEN=ghp_never_executed\nfi\n' > "$TMP/home-cond/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t7" "$TMP/home-cond" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-cond" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a keys.env whose token line never EXECUTES exits 98 (the file credit is verified, not grepped)" $rc
+# ⛔ `wt_gh_hosts` RESOLUTION ORDER, PINNED DIRECTLY (review finding): its two consumers are the no-gh
+# fallback and the refusal message, and the spawn-level pins never reach it because the gh arm answers
+# first — a mutant that deleted the GH_CONFIG_DIR arm survived the whole suite. Pure function, no gh.
+hosts_rc() { ( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts "$1" ); }
+( export GH_CONFIG_DIR=/tmp/ghcd-2396; [ "$(hosts_rc /tmp/h-2396)" = "/tmp/ghcd-2396/hosts.yml" ] ) && rc=0 || rc=1
+ck "wt_gh_hosts: GH_CONFIG_DIR wins when set" $rc
+( export XDG_CONFIG_HOME=/tmp/xdg-2396; [ "$(hosts_rc /tmp/h-2396)" = "/tmp/xdg-2396/gh/hosts.yml" ] ) && rc=0 || rc=1
+ck "wt_gh_hosts: \$XDG_CONFIG_HOME/gh/hosts.yml when only XDG_CONFIG_HOME is set" $rc
+[ "$(hosts_rc /tmp/h-2396)" = "/tmp/h-2396/.config/gh/hosts.yml" ] && rc=0 || rc=1
+ck "wt_gh_hosts: \$HOME/.config/gh/hosts.yml when neither is set" $rc
+# ⛔ AND `wt_launcher_env` REFUSES AN EMPTY HOME BY ITSELF (review finding: the spawn pin passed for a
+# different reason — the server probe refused first — so the guard was unpinned).
+env_empty_rc() { ( set -u; PATH="$TMP/bin-absent:$PATH"; export TMUX_STATE="$TMP/srv-sessions" TMUX_SERVER_GH_TOKEN=1
+                    . "$LIB" >/dev/null 2>&1; wt_launcher_env "" >/dev/null 2>&1; printf '%s' "$?" ); }
+[ "$(env_empty_rc)" != "0" ] && rc=0 || rc=1
+ck "wt_launcher_env with no HOME refuses even when the SERVER carries a token (there is nothing to export)" $rc
 # ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE TWO HALVES OF THIS GATE MUST AGREE ON THAT (review
 # finding, 2026-10-23, measured). `[ -z "$GH_TOKEN$GITHUB_TOKEN" ]` counted `GH_TOKEN='   '` as provision,
 # while the STATIC keys.env arm refuses whitespace (`[^[:space:]]`) — and gh rejects it at the first call.
@@ -541,6 +569,19 @@ rm -rf "$TMP/O4l"
 out="$(FAKE_UNAME=Linux TMUX_STATE="$TMP/srv-sessions" TMUX_SERVER_GH_TOKEN=1 TMUX_SERVER_TOKEN_VAL='' bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4l" "$TMP/tmux4l.log" "$TMP/home-nocred" 2>&1)"
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "an empty server variable is REFUSED too (presence is not provision on the server side)" $rc
+# ⛔ …AND A BLANK ONE (review finding, 2026-10-23, measured): `-n "$v"` credited three spaces, and gh
+# rejects that value (`Failed to log in to github.com using token (GH_TOKEN)`), so the gate blessed a
+# worker that could never authenticate. Every arm now asks for a non-SPACE character, not for bytes.
+rm -rf "$TMP/O4l2"
+out="$(FAKE_UNAME=Linux TMUX_STATE="$TMP/srv-sessions" TMUX_SERVER_GH_TOKEN=1 TMUX_SERVER_TOKEN_VAL='   ' bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4l2" "$TMP/tmux4l2.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a WHITESPACE-only server variable is REFUSED (blank is not a credential on the server side either)" $rc
+# ⛔ AND A BLANK CALLER TOKEN, on the arm that credits the caller's own environment (review finding):
+# `[ -n "$GH_TOKEN$GITHUB_TOKEN" ]` credited spaces, and the spawn then handed the worker no usable token.
+rm -rf "$TMP/O4l3"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN='   ' bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4l3" "$TMP/tmux4l3.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a WHITESPACE-only CALLER token is REFUSED (the caller arm asks for a value, like every other arm)" $rc
 # ⛔ A `HOME=` LINE INSIDE keys.env MUST NOT REPOINT THE VALIDATED HOME (review finding 2, measured:
 # the worker ended with `worker_HOME=/home/cmux`, where no hosts.yml exists — the exact credential-less
 # worker this gate exists to refuse, reported as provisioned). Driven: the prefix is EXECUTED and $HOME
