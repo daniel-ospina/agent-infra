@@ -927,9 +927,12 @@ ok "pinned scripts parse ($HARNESS)"
 # commit" (measured: 793 consecutive refusals beside healthy `[cap]` lines; full record in
 # docs/ops/fleet-harness-baseline.md §3.1). The live workaround is a small entrypoint that keeps the
 # controller inside the tmux pane that holds the Full Disk Access grant.
-# ⛔ AS OF THIS CHANGE THAT ENTRYPOINT (`launchd-controller.sh`) IS NOT ON MAIN — it exists only in
-# `~/orchestrator` (docs/ops/ACTIVATION-MATRIX.md row 7 records the installed plist naming it, and
-# `git ls-tree origin/main` → absent). PR #2020 lifts it; it is not merged. So the installer does the
+# ⛔ WHEN THIS WAS WRITTEN that entrypoint (`launchd-controller.sh`) was NOT on main — it existed only
+# in `~/orchestrator` (docs/ops/ACTIVATION-MATRIX.md row 7 records the installed plist naming it, and
+# `git ls-tree origin/main` → absent). agent-infra#2020 has since LANDED it (this branch rewrites it),
+# so the pin now carries the file and the first arm below wins on every box. The clause is kept
+# because the arms still have to hold for a box whose INSTALLED plist names a program the pinned tree
+# does not carry. The installer does the
 # ONLY thing that neither loses it nor keeps running a home-dir copy silently:
 #   · if the PINNED tree carries an entrypoint, that is the program (pin wins, same as every other file);
 #   · if it does not, and this box is LIVE on a home-dir entrypoint the repo does not carry, REFUSE and
@@ -1232,6 +1235,14 @@ DRIFTED=""
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
+# ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
+# The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
+# `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
+# 7,633 launches while every other instrument read the box as merely idle. A stale $O copy of the
+# entry point is therefore the most expensive drift on the box, and the one verb an operator actually
+# runs (`install.sh`) must say so. (#2020 has since landed the file on main and already carries it in
+# this list; the row is kept, and is NOT redundant, because the REASON is what makes a future removal
+# look deliberate instead of like dead weight.)
 for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"

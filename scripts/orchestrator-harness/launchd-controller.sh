@@ -2,9 +2,12 @@
 # launchd-controller.sh — the launchd ENTRY POINT for the orchestrator: it supervises the controller
 # as a tmux session, and BLOCKS while that session lives so `KeepAlive` is real supervision.
 #
-# It is the plist's `ProgramArguments` on a macOS box (`launchd.plist.template`), it is shipped from
-# HERE (`scripts/orchestrator-harness/`), and it is deliberately the only place that knows how a Mac
-# starts a controller.
+# It is what the plist's `ProgramArguments` must point at on a macOS box — the INSTALLED plist on the
+# Mac that carried this defect does point here (`/bin/bash $O/launchd-controller.sh`), while main's
+# `launchd.plist.template` still renders `__O__/orch-loop.sh`; flipping the shipped template is PR
+# #2020's hunk, deliberately not duplicated here. It is shipped from HERE
+# (`scripts/orchestrator-harness/`) and it is the only place that knows how a Mac starts a
+# controller. ⛔ SO ON A FRESH `install.sh` RENDER THIS FILE IS INSTALLED BUT NOT YET SELECTED.
 #
 # ⛔ WHY THIS FILE IS IN THE REPO AT ALL (agent-infra#2098, the live-only-overlay class).
 # It lived ONLY in `~/orchestrator` on the Mac for weeks: `git grep -l launchd-controller` found
@@ -42,7 +45,9 @@
 # cannot even `getcwd()` (bash: `getcwd: cannot access parent directories: Operation not permitted`),
 # which breaks python3 (`PermissionError`) and therefore the refresh's reap pass — that is how one
 # candidate queue froze for six hours while reporting `queue=READ(237)(6h)`. `$O` is outside the
-# protected tree, and the plist renders `WorkingDirectory` as `__O__`.
+# protected tree, so the job's `WorkingDirectory` must be `$O` — and NOTE that main's template does
+# not render that key at all (a launchd job with no WorkingDirectory inherits `/`, the #1996 class);
+# PR #2020 adds it, and this file is correct either way because it never assumes a cwd.
 #
 # ⛔ `-A` IS NOT AN IDEMPOTENT NO-OP WHEN THERE IS NO TERMINAL — THE 7,633-LAUNCH DEFECT.
 # The entry point used to be one line:
@@ -142,13 +147,21 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # template cannot silently fail to reach the controller.
 CONTROLLER_ENV="PATH HOME OR REPO O SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
 
+# ⛔ FORWARD ON PRESENCE, NEVER ON NON-EMPTINESS (review P1). An EMPTY value in the plist is a
+# MEANING, not an absence: `install.sh` deliberately renders `OR` empty (#2040), which tells
+# `orch-loop.sh` to DERIVE the repo slug from `$REPO`'s origin instead of using a literal. Skip an
+# empty value and the pane inherits `OR` from the tmux SERVER — an operator's shell, or an earlier
+# controller — and the box silently grades one repo's PR queue while dispatching into another, which
+# is #2040's exact measured symptom. `${_v+x}` distinguishes "set to empty" (forward it) from
+# "absent from this job" (leave it to the server), and only the first is ours to decide.
 ENV_PREFIX=""
 for _v in $CONTROLLER_ENV; do
-  eval "_val=\${$_v-}"
-  if [ -n "${_val:-}" ]; then
+  eval "_set=\${$_v+x}"
+  if [ -n "${_set:-}" ]; then
+    eval "_val=\${$_v-}"
     ENV_PREFIX="$ENV_PREFIX $_v=$(_shq "$_val")"
   fi
-  unset _val
+  unset _set _val
 done
 
 # ── the guard: create ONLY when there is no session, never attach ────────────────────────────────

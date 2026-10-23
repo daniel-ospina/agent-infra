@@ -79,7 +79,8 @@ paragraphs and no script. So:
 | a deploy INSTALLS the file | `deploy-harness.sh`'s inventory is `find "$SRC" -type f` — **the source tree IS the manifest**; there is no list to add a line to (adding one would create the second list this repo fights) | `deploy-harness.sh --src …/orchestrator-harness --o /tmp/dep-scratch --no-notify` → `VERIFIED — 86/86 file(s) written by this run and byte-identical`; `launchd-controller.sh` present, same blob sha as the source, executable bit preserved |
 | drift SEES the file | `check-deployed-drift.sh` derives its shipped set from `git ls-tree -r … "$REL" \| grep -E "^REL/[^/]+\.sh$"` and pins BOTH directions (shipped-but-MISSING, and present-but-unshipped) | after this commit: shipped-but-missing and present-but-unshipped both name `launchd-controller.sh` |
 | the suite RUNS in CI | `run-bash-shards.sh` is the single shard list both lanes call; an unwired `*.test.sh` reds `bash-suites` by design (`spawn-gate.test.sh` asserts the unwired population is exactly the two documented non-loop suites) | `run-bash-shards.sh --list` lists the suite; `spawn-gate.test.sh` 96/0 |
-| the plist → pane hand-off cannot rot | the suite derives `<key>`s under `EnvironmentVariables` and compares to `CONTROLLER_ENV`, with a drop-one non-vacuity control | suite case E |
+| the plist → pane hand-off cannot rot | the suite derives `<key>`s under `EnvironmentVariables` and compares to `CONTROLLER_ENV`, with a drop-one non-vacuity control — and case H pins the VALUE side (an empty value is a meaning) | suite cases E and H |
+| the operator's OWN verb sees a stale entry point | `install.sh`'s `DRIFTED` list now carries `launchd-controller.sh` — the installed plist executes it, so its stale bytes are the most expensive drift on the box | `install.sh:817` |
 
 ## Tests (cases A–G)
 
@@ -92,12 +93,28 @@ network), 23 checks, ~20 s:
 - **C** **the regression**: the OLD `-A` form must FAIL in the same tty-less conditions B uses, with
   `open terminal failed: not a terminal`. ⛔ C is a **positive control** — if the harness could reach a
   terminal, C would pass and B would prove nothing, so C succeeding is a RED by design;
-- **D** the restart-rate floor is measured on the clock (a 2 s floor holds), and a non-numeric floor is
-  refused by name;
+- **D** the restart-rate floor is measured on the clock: a 10 s floor with a ~4 s session forces a
+  ≥ 12 s total, which a floorless build cannot reach; a non-numeric floor is refused by name;
 - **E** plist↔pane environment parity, both directions, with a drop-one non-vacuity control;
 - **F** a lane-prefixed session name is refused;
 - **G** a static arm (no `new-session` line carries `-A`, comments stripped) **plus a mutant control**,
   so the regression is still pinned on a runner without tmux.
+- **H** an EMPTY plist value still reaches the pane — `install.sh` renders `OR` empty on purpose
+  (#2040), so forwarding on non-emptiness loses it;
+
+## Review round 1 — findings and dispositions
+
+Fresh-context reviewer at the first head; every finding verified against the source before it was
+applied (a finding is a claim, not a fact).
+
+| # | finding | disposition |
+|---|---|---|
+| **P1** | The env loop forwarded on **non-emptiness**, so a plist value rendered EMPTY was dropped and the pane could take that name from the tmux SERVER. `install.sh` renders `OR` empty **on purpose** (#2040), so this is the #2040 symptom returning silently. | **FIXED**: forward on **presence** (`${var+x}`), and case H pins it. Confirmed against `install.sh:37` (`OR="${OR:-}"`) before the fix was made. |
+| **P2** | Case D's floor assertion was **inert**: it took `D_T0` before a `sleep 4`, then asserted `>= 2`, so deleting the floor still passed. | **FIXED**: a 10 s floor with a ~4 s session forces a ≥ 12 s total, which a floorless build cannot reach (measured: 12–13 s). |
+| **P2** | The header claimed the file *is* the plist's `ProgramArguments`, which main's template does not render. | **FIXED**: the header now says what is true — the installed Mac plist points here, main's template still renders `__O__/orch-loop.sh`, and flipping it is #2020's hunk. |
+| **P3** | The header claimed the plist renders `WorkingDirectory`; main's does not. | **FIXED**: the comment now states the requirement and that main renders no such key (a job with none inherits `/`, #1996). |
+| **P3** | `install.sh`'s operator-visible `DRIFTED` list did not carry the entry point. | **FIXED**: added, with the reason (its stale bytes ARE this defect). |
+| **P3** | The supervise loop's `has-session` read is unbounded: a wedged tmux server pins the job running with a dead controller. | **NOT FIXED HERE — follow-up: #2531.** A portable bounded read in bash 3.2 is real work (no coreutils `timeout` on macOS), and the exposure is the one the live file already has; changing it in this PR would trade a known state for an unproven one. |
 
 ## Residuals / what this does not do
 

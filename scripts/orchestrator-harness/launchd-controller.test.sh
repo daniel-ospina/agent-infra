@@ -16,7 +16,8 @@
 #                               reach a terminal, C would pass and B would prove nothing. C failing to
 #                               fail is a RED, by design — that is how the environment is proven
 #                               tty-less instead of assumed.
-#   D  the restart-rate floor is real (a 2 s floor is measured, not read)
+#   D  the restart-rate floor is REAL: a 10 s floor with a ~4 s session forces a >= 12 s total, which a
+#      floorless build cannot reach (a first version asserted "-ge 2" and could never fire)
 #   E  the plist -> pane environment hand-off is COMPLETE: every `<key>` under `EnvironmentVariables`
 #      is forwarded by CONTROLLER_ENV and nothing else is (a rendered-but-dropped limit reverts to the
 #      loop's default without a word — `MAX_RED_FIX_TRIES=0` becoming 2)
@@ -24,6 +25,8 @@
 #   G  STATIC `-A` arm with a non-vacuity control: no `new-session` line carries `-A`, on this tree
 #      and on a mutant that re-adds it. This one needs no tmux, so the regression is still covered on
 #      a runner without it.
+#   H  an EMPTY plist value is a MEANING, not an absence: `install.sh` renders OR empty on purpose
+#      (#2040: "derive it from $REPO's origin"), so forwarding only NON-EMPTY values loses it
 #
 # HERMETIC: its own `TMUX_TMPDIR` (so it can never touch, count or reap a real session), its own
 # HOME, its own scratch `$O`, and a stub `orch-loop.sh`. No network. Run: bash launchd-controller.test.sh
@@ -64,6 +67,11 @@ export HOME="$TMP/home"
 mkdir -p "$HOME"
 unset TMUX TMUX_PANE 2>/dev/null || true
 export CONTROLLER_RESTART_FLOOR=0
+# A STALE OR IS PUT IN THIS SUITE'S OWN ENVIRONMENT BEFORE ANY TMUX CALL, so the tmux SERVER (which is
+# what a new pane inherits its environment from) carries it. Case H then proves an EMPTY plist value
+# still reaches the pane instead of being silently replaced by this. install.sh renders OR empty on
+# purpose (#2040: "derive it from $REPO's origin").
+export OR="stale-repo-from-the-server"
 
 TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
 export TMUX_BIN
@@ -74,6 +82,9 @@ O="$TMP/o"
 mkdir -p "$O"
 cat > "$O/orch-loop.sh" <<'SH'
 #!/bin/bash
+# Record the environment this PANE actually started with (case H's evidence), then stay alive so the
+# entry point's settle window (2 s) sees a live controller. $O is forwarded, so the path resolves.
+{ printf 'OR=[%s] REPO=[%s]\n' "${OR-<unset>}" "${REPO-<unset>}"; } > "$O/pane-env" 2>/dev/null
 sleep 300
 SH
 chmod +x "$O/orch-loop.sh"
@@ -248,6 +259,30 @@ else
   bad "case A: exit $A_RC (want 0) — stderr: $(head -3 "$A_ERR")"
 fi
 
+# ── H. an EMPTY plist value still reaches the pane ──────────────────────────────────────────────
+say "H. an EMPTY plist value is FORWARDED, not dropped (the pane must not inherit the tmux SERVER's)"
+# install.sh renders OR empty ON PURPOSE (#2040: derive it from $REPO's origin). If the entry point
+# forwards only NON-EMPTY values, the pane silently inherits the server's OR, and the controller grades
+# one repo's queue while dispatching into another -- #2040's measured symptom, and invisible.
+: > "$O/pane-env"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+OR= REPO=the-real-repo-value bash "$TARGET" >"$TMP/h.out" 2>"$TMP/h.err" &
+H_PID=$!
+_w=0; while [ "$_w" -lt 100 ] && [ ! -s "$O/pane-env" ]; do sleep 0.1; _w=$(( _w + 1 )); done
+sleep 3   # past the 2 s settle window, so the kill lands in the supervise phase
+H_ENV="$(cat "$O/pane-env" 2>/dev/null)"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+wait "$H_PID" 2>/dev/null
+if grep -q 'OR=\[\]' <<<"$H_ENV"; then
+  ok "case H: OR rendered empty by the plist arrives EMPTY in the pane (not the server's stale value)"
+else
+  bad "case H: the pane did not get OR empty — got: $H_ENV"
+fi
+if grep -q 'REPO=\[the-real-repo-value\]' <<<"$H_ENV"; then
+  ok "case H: a non-empty value is still forwarded (REPO)"
+else
+  bad "case H: REPO did not reach the pane — got: $H_ENV"
+fi
 # ── B. session already exists -> exit 0, no attach, no second controller ────────────────────────
 say "B. session ALREADY EXISTS -> exit 0, NO attach, and NOT a second controller"
 "$TMUX_BIN" new-session -d -s "$S" "exec /bin/sleep 300" || bad "could not create the case-B fixture"
@@ -301,8 +336,13 @@ else
   bad "case D: a non-numeric floor was not refused"
 fi
 D_ERR="$TMP/d.err"
+# THE FLOOR MUST BE ARITHMETICALLY UNAVOIDABLE, OR THE ASSERTION IS INERT (review P2). The wrapper's
+# own lifetime here is: ~2 s settle + up to one 5 s poll after the kill = at most ~7 s of wall clock
+# with NO floor applied. A 10 s floor therefore forces >= 12 s (2 s settle + 10 s floor), and deleting
+# the floor line drops the total to <= 7 s. A first version asserted "-ge 2", which could never fire.
+FLOOR_S=10
 D_T0="$(date +%s)"
-CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/d.out" 2>"$D_ERR" &
+CONTROLLER_RESTART_FLOOR=$FLOOR_S bash "$TARGET" >"$TMP/d.out" 2>"$D_ERR" &
 D_PID=$!
 _w=0; while [ "$_w" -lt 100 ] && ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; do sleep 0.1; _w=$(( _w + 1 )); done
 sleep 4   # clear the entry point's own 2 s settle window, then end the session in its supervise phase
@@ -314,10 +354,10 @@ if [ "$D_RC" -eq 0 ]; then
 else
   bad "case D: exit $D_RC — stderr: $(head -2 "$D_ERR")"
 fi
-if [ "$D_ELAPSED" -ge 2 ]; then
-  ok "case D: it held for ${D_ELAPSED}s (>= the 2 s floor) — a controller that dies at once cannot spin the job"
+if [ "$D_ELAPSED" -ge $(( FLOOR_S + 2 )) ]; then
+  ok "case D: total ${D_ELAPSED}s with a ${FLOOR_S}s floor (the session lived ~4 s) — the floor is real, not declarative"
 else
-  bad "case D: it returned after ${D_ELAPSED}s, faster than its own 2 s floor"
+  bad "case D: returned after ${D_ELAPSED}s with a ${FLOOR_S}s floor and a ~4 s session — the floor did NOT engage (a floorless build would land here)"
 fi
 
 # ── summary ────────────────────────────────────────────────────────────────────────────────────
