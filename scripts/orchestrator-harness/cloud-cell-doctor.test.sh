@@ -667,6 +667,7 @@ esac
 git -C "$R/hub/.worktrees/registry-sync" rev-parse --git-dir >/dev/null 2>&1 \
   && ok "registry: the store worktree exists as a real git worktree of the hub" \
   || bad "registry: no worktree was provisioned at \$hub/.worktrees/registry-sync"
+
 # AFTER: the merge role now OFFERS the PR to the rail — the whole point of the sync.
 OUT="$(DOCTOR_ADMIN_MERGE="$T/bin/rail.sh" DOCTOR_TEST_RAIL="$T/rail" DOCTOR_REGISTRY_SYNC=off \
         bash "$DOCTOR" merge --dry-run 2>&1)"
@@ -809,6 +810,33 @@ OUT="$(DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" DOCTOR_REGISTRY_STORE="$
 result_has "refusing to push review records to it" \
   && ok "registry: the refusal says what it prevented (a cross-repo push)" \
   || bad "registry: the refusal does not name the hazard — $OUT"
+
+say_case "hygiene: a PLAIN directory where the store worktree belongs is refused (the hub is never the store)"
+# ⛔ `git -C <dir>` walks UPWARD, so `is_work_tree(<hub>/.worktrees/registry-sync)` is TRUE for an
+# ordinary leftover directory — it reports the HUB. Accepting one therefore runs the verb against the
+# hub checkout (the one thing "never the hub" forbids) while the convergence line names that path as
+# "the worktree", silently and self-perpetuatingly (provisioning never re-runs). Reachable without
+# hand-editing: a provisioning killed at its bound, or an out-of-band delete, leaves exactly this.
+reset_state
+git -C "$R/hub" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+mkdir -p "$R/hub/.worktrees/registry-sync"          # plain, UNREGISTERED
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a plain dir where the worktree belongs is REFUSED" \
+  || bad "registry: a plain directory was accepted as the store worktree (rc=$RC) — $OUT"
+result_has "is not the root of a git worktree" \
+  && ok "registry: the refusal is LOGGED (that branch is reachable)" \
+  || bad "registry: the refusal is silent — $OUT"
+[ ! -e "$REC" ] && ok "registry: nothing was synced through the hub path" \
+  || bad "registry: the pass used the hub as its store — $REC exists"
+rm -rf "$R/hub/.worktrees/registry-sync"
 
 say_case "hygiene: no registry-sync.sh anywhere is a SKIP (not cannot-verify, unlike every other step)"
 reset_state

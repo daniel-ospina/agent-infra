@@ -1279,6 +1279,18 @@ registry_sync_path() { # → the shipped converging verb, or nothing
 
 is_work_tree() { [ -n "${1:-}" ] && [ -d "$1" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
 
+# ⛔ THE DIRECTORY ITSELF MUST BE THE ROOT git reports — `is_work_tree` alone does NOT answer that:
+# `git -C <dir>` walks UPWARD, so any plain leftover directory inside a checkout reports a git dir and
+# a toplevel of the ENCLOSING checkout. Measured: a stray `<hub>/.worktrees/registry-sync` (a leftover
+# from a provisioning killed at its bound, or from an out-of-band delete) made `is_work_tree` true, and
+# the store resolved to that path — i.e. the verb ran against the HUB, and the convergence line named a
+# path `git worktree list` does not know as "the worktree". `pwd -P` because git reports a PHYSICAL
+# toplevel, and a symlinked worktree path would otherwise never compare equal.
+is_worktree_root() { # <path>
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 1
+  [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$1" 2>/dev/null && pwd -P)" ]
+}
+
 # A WORKTREE (a linked one) rather than the PRIMARY checkout — the hub. `--git-common-dir` may come
 # back RELATIVE to the worktree (`.git`), so it is resolved before the comparison: an unresolved
 # relative path never equals an absolute one, which would call every checkout "linked".
@@ -1374,11 +1386,13 @@ registry_store() { # → the worktree to sync from (may provision one), or empty
   # A harness materialised INTO a worktree (a cell's layout) already IS the worktree this role has.
   if is_linked_worktree "$hub"; then printf '%s\n' "$hub"; return 0; fi
   wt="$hub/.worktrees/registry-sync"
-  if is_work_tree "$wt"; then printf '%s\n' "$wt"; return 0; fi
+  if is_worktree_root "$wt"; then printf '%s\n' "$wt"; return 0; fi
   if [ -e "$wt" ]; then
     # ⛔ No `rm -rf` here. A directory that is not a worktree is NOT this role's to delete — that is
     # the destructive-verb class this file's reap gates exist to prevent — so it is named and skipped.
-    log "[hygiene] registry: $wt exists but is not a git worktree — not syncing from it (remove it, or set DOCTOR_REGISTRY_STORE)" >&2
+    # ⛔ And this branch is REACHABLE now: with a plain `is_work_tree` test it could never fire, so the
+    # hub was used as "the worktree" in silence (see `is_worktree_root`).
+    log "[hygiene] registry: $wt exists but is not the root of a git worktree — not syncing from it (remove it, or set DOCTOR_REGISTRY_STORE)" >&2
     return 1
   fi
   mkdir -p "$hub/.worktrees" 2>/dev/null || true
@@ -1490,10 +1504,10 @@ sync_registry() {
     3)
       # rule 4: two records share a `reviewed_at` and disagree. NOTHING was overwritten, and this is
       # not a failure of the pass — it is a state a human reconciles (or two boxes recording one revision).
-      log "[hygiene] registry: DIVERGENCE — ${summary:-union: (no summary line)}. Two records share a reviewed_at and disagree, so neither side was overwritten (rule 4). Not fatal; reconcile by hand on $host if this is not two boxes recording one revision."
+      log "[hygiene] registry: DIVERGENCE on $host rc=$rc — ${summary:-union: (no summary line)}; store=$store. Two records share a reviewed_at and disagree, so neither side was overwritten (rule 4). Not fatal; reconcile by hand if this is not two boxes recording one revision."
       REGISTRY_RESULT="registry DIVERGES (rule 4, nothing overwritten)" ;;
     4)
-      log "[hygiene] registry: the store holds records $host cannot use — ${summary:-union: (no summary line)}. They were SKIPPED and nothing was overwritten, but this is NOT a converged state. Not fatal."
+      log "[hygiene] registry: SYNC INCOMPLETE on $host rc=$rc — ${summary:-union: (no summary line)}; store=$store. Records the store holds were SKIPPED and nothing was overwritten, but this is NOT a converged state. Not fatal."
       REGISTRY_RESULT="registry INCOMPLETE (rc=4, records skipped)" ;;
     *)
       # ONE attempt, once per hourly pass: the verb itself never retries, so a dark or rate-limited
