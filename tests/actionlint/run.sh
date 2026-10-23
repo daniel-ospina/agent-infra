@@ -307,11 +307,22 @@ const inspect = (list) => {
 // POSITIVE CONTROL — both directions, through the real inspector, so deleting or inverting
 // the rule exits 4 (control failure) instead of passing forever green, and never as exit 1
 // (a finding), which would be indistinguishable from a real defect.
-const badProblems = inspect([
-  { file: '<control>', job: '<control>', step: 0, script: '// NEEDS is `' + OPEN + ' toJSON(needs) }}`' },
-]);
-if (badProblems.length !== 1) {
-  console.log(`      control: a known-bad body produced ${badProblems.length} finding(s), want 1`);
+// The samples cover EVERY position the rule claims to be blind to. A single line-1 `//`
+// sample would let a future "tightening" to a line-comment-anchored regex pass the control
+// while missing a later line, a block comment, a string and a template literal — measured:
+// narrowing the rule to /^\s*\/\/.*\$\{\{/ kept the single-sample control green AND reported the
+// real pre-fix ci-main.yml body as clean, which is the #2454 fail-open shipping behind a ✅.
+const badSamples = [
+  '// NEEDS is `' + OPEN + ' toJSON(needs) }}`',          // line 1, line comment
+  'const a = 1;\n// later line ' + OPEN + ' x }}',        // NOT on line 1
+  '/* block ' + OPEN + ' x }} */',                        // block comment
+  'const u = "s/' + OPEN + ' x }}";',                     // string literal
+  'const t = `t ' + OPEN + ' x }}`;',                     // template literal
+];
+const badProblems = inspect(badSamples.map((script) =>
+  ({ file: '<control>', job: '<control>', step: 0, script })));
+if (badProblems.length !== badSamples.length) {
+  console.log(`      control: ${badSamples.length} known-bad bodies produced ${badProblems.length} finding(s), want ${badSamples.length}`);
   process.exit(4);
 }
 const cleanProblems = inspect([{ file: '<control>', job: '<control>', step: 0, script: 'const x = 1;' }]);
