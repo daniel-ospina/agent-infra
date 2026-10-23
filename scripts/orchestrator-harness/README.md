@@ -145,7 +145,7 @@ single-instance lock. No mechanism is needed for it.
 | **R4** | "Un-owned" is decided by **cross-machine coordination**, because several machines work the same repo. |
 | **R5** | **There is no blocked item.** Anything stuck is either fixed automatically or becomes a **user question** (the AGENTS.md question protocol). The same applies to issues. ⚠️ **Sequence:** while the question gate is unbuilt, `parked-*` remains the de-facto terminal state — **build the escalation path first**, then retire the park. (The gate's two language marks landed in agent-infra#1903, closed 2026-10-19; the path itself is still unbuilt, §0.3 R5.) |
 | **R6** | The drain rule is **threshold-free**: while **any** workable un-owned PR remains, the box drains the PR queue and opens no issues (owner ruling 2026-10-18, agent-infra#2099 — `mp_reason`, `orch-loop.sh:1520-1531`). `MERGE_PRIORITY_AT` (default 25) is **not** the gate any more: it survives as the **unreadable-count fallback** (`orch-loop.sh:2354` is the code — `is_num "${UPN:-}" \|\| UPN=$(( 10#${MERGE_PRIORITY_AT:-25} + 1 ))`; the rule it applies, "treat the count as over the line", is stated in the comment at `:220-222`) and as the reviewer/fixer headroom (`review_slots`/`fix_slots`, `:1596-1614`). |
-| **R7** | One repo per orchestrator; the harness is single-repo by construction (`OR`). |
+| **R7** | One repo per orchestrator; the harness is single-repo by construction (`REPO`, which has **no default** and is refused when unset — `orch-loop.sh:15`). ⚠️ `OR` is **derived from `REPO`'s origin** at `orch-loop.sh:59` and is deliberately **overridable** (an explicit `OR=` still wins, for a cell that must grade another repo's queue), so `OR` is not the construction. |
 | **R8** | **Capacity transfer:** when a machine refuses an item for *capacity*, the item remains eligible for **another** machine. Without this, per-machine correctness becomes fleet-wide starvation (agent-infra#1909). |
 
 ### 0.3 Where the current code does not meet them
@@ -162,10 +162,19 @@ single-instance lock. No mechanism is needed for it.
 
 ### 0.4 Cross-machine coordination — guaranteed, and not
 
-Guaranteed: a claim is an **atomic CAS in the shared repo** — `refs/claims/<PR>-<head-sha12>` for
-reviews, `issue-<N>` for dispatches. The lease is **data, not liveness**, so a dead box's claim
-expires; every release/reclaim is fenced with `--force-with-lease`; each box reads a snapshot
-refreshed in one fetch per cycle.
+Guaranteed: a claim is an **atomic CAS in the shared repo**. There are **three key shapes**, and the
+third is the one that fences landing:
+
+| key | taken by | for |
+|---|---|---|
+| `refs/claims/<PR>-<head-sha12>` | a reviewing lane (the paid reviewer, via `merge-one.sh`) | reviewing **this head** of a PR |
+| `refs/claims/issue-<N>` | a dispatching lane | opening a lane for an issue |
+| `refs/claims/pr-<N>` | the landing path (`claim_pr_key`, `claims.sh:682`; `claim_pr_acquire`, `:772`; taken by `merge-one.sh` **first**, before the per-head claim) | landing **this PR**, whichever head it is on |
+
+The lease is **data, not liveness**, so a dead box's claim expires; every release/reclaim is fenced
+with `--force-with-lease`; each box reads a snapshot refreshed in one fetch per cycle. ⛔ The
+per-head key **cannot express "this PR"**: two heads of one PR are two CASes and **both acquire**,
+which is why the per-PR key exists on top of it.
 
 **Not** guaranteed: exactly-once execution. The promise is **at-least-once with idempotent side
 effects**, and that promise is **not uniform across operations** — the distinction decides whether a
@@ -174,7 +183,7 @@ duplicate is merely wasteful or destructive:
 | operation | a duplicate means | verdict |
 |---|---|---|
 | **dispatch** (opening a lane for an issue) | a wasted worker; the side effect is idempotent per issue | tolerable |
-| **landing** (merging a PR) | a **second landing attempt against a moved head** — the reviewed diff is no longer the diff being merged | **not tolerable**; the head-bound record is why |
+| **landing** (merging a PR) | a **second landing attempt against a moved head** — the reviewed diff is no longer the diff being merged | **not tolerable**; which is why landing also takes the per-PR key `refs/claims/pr-<N>` (measured excluding, #1952/M6) — the per-head key cannot express "this PR" (M3) |
 
 A claim *reduces* duplicate work; it does not prove mutual exclusion. Any design that assumes "a claim
 means it runs once" is wrong (research: agent-infra#1709).
@@ -214,22 +223,40 @@ means it runs once" is wrong (research: agent-infra#1709).
 |---|---|
 | **the `SCOPE=own` partition** ("exactly one BROAD box, others OWN") — its **safety role** | **Retired for dispatch and review, where the measurement reaches it; the landing row keeps an exclusion REQUIREMENT.** A claim was measured **excluding** for **dispatch** and for **review** (3/3 laps × 6 racers, exactly one winner per lap) — those two rows measure the *operation*, so the pin's safety role is retired there (§7.2d *Does a claim EXCLUDE?*, agent-infra#1908). ⛔ **Landing must NOT be retired on that measurement**: M6 shows the per-PR key (`refs/claims/pr-<N>`) excluding, and landing takes that key — but M6 measures the **claim**, not the merge, because `gh pr merge` is not pinned to a sha and the guard there is a read, not a fence. So the requirement stays, met by the per-PR key; §7.2d *Does a claim EXCLUDE?* says exactly this in its own closing note — the `SCOPE=own` row "may move … for the first two and must not for the third". `SCOPE=own` was never what excluded any of them. ⛔ **What survives is a caveat, not the safety claim: this is a partition, not coordination.** It selects which *PR branches* the sweep looks at (`*-tm`, `*-cap`, `fix/*`) by a naming convention every box shares, so it is not a claim registry and must not be mistaken for one (§5 item 3). `install.sh` still renders the value |
 
+**Deprecated, still live — do NOT remove yet:**
+
+| component | status |
+|---|---|
+| `parked-*` / `parkreason-*` as a terminal state | **written and read on every cycle** — `park_ctrl` (`orch-loop.sh:1503`) is called from the red-tree caps (`:2727`, `:2793`, `:2799`, `:2821`, `:2881`), the conflicted cap (`:3008`) and the needs-fix cap (`:3170`), and `:2899` reads the park back each sweep. It becomes retired **only** when `ask-owner.py` is wired into the loop (R5) — until then `parked-*` **is** the terminal state, and ripping it out early leaves a stuck PR with no destination at all |
+
 **Legacy — retired, must not run:**
 
 | component | why retired |
 |---|---|
-| `parked-*` / `parkreason-*` as a terminal state | to be replaced by the ask-user escalation (R5) |
 | swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo's `origin/main` has had **no commits since 2026-09-18** (checked against the remote, not a local checkout — a local one here was 283 commits behind) |
 | the `content-inspiration` job | its entry point was an uncommitted file; the `.mjs` pipeline survives on its branch |
 | `retired/` (10 files: six `.sh`, four `.py`) | earlier iterations, kept for the record only — and `retired/` is outside the depth-1 `*.sh` drift gate (§4.1) |
 
 ### 0.6 Activation is part of the design, not an afterthought
 
-Having the right code and **running** the right code are different problems. `install.sh` renders
-the plist and deliberately does not start anything, and nothing parks the legacy jobs. Until an
-`activate.sh` declares the intended running set, "which system is this box running?" has no single
-answer — measured 2026-10-16: this harness was **dormant** while six swarm-era dispatchers fired
-every 120 s.
+Having the right code and **running** the right code are different problems. Measured 2026-10-16:
+this harness was **dormant** while six swarm-era dispatchers fired every 120 s. Two mechanisms now
+answer the question, and neither is a separate script to invent:
+
+* **"Is this box up, and on which tree?"** — `scripts/harness-up status` prints one line per
+  component (pid + age) and **ONE verdict**; `harness-up` / `harness-down` bring the stack up and
+  down in dependency order, and re-running `up` is a no-op on an already-running tree
+  (`scripts/harness-up:2-6`). `install.sh` is not a substitute: it renders config, refuses
+  out-of-range values, and never touches a loaded job unless asked — its `--start` / `--restart`
+  render + install **then prove it started** (pid + heartbeat, `install.sh:8-10`).
+* **"Which system is this box provisioned for?"** — `docs/ops/ACTIVATION-MATRIX.md` is the measured
+  provisioned-vs-improvised record, Mac and cell, with a per-row re-measurement recipe.
+
+**Retiring a legacy job is a declared list, not a new script.** Add the label to
+`templates/launchd/RETIRED`; `install-launchd.sh` unloads and removes any job listed there
+(`is_retired`, `:571`; `:584` prints `RETIRED (unloaded + removed)`) and **refuses** a label that
+still has a template in the directory (`:594`). A label in `RETIRED` must not also have a `.plist`
+template.
 
 ### 0.7 The load ceiling
 
