@@ -716,6 +716,21 @@ boundary below is stated rather than implied. It lives in **`scripts/lib/fleet-i
 point — `scripts/orchestrator-bringup.sh` (`check | start | stop | restart | status`), the same script
 that owns the per-`(machine, repo)` redundancy guard. No fourth launcher.
 
+### The same doctrine on the CELL DOCTOR loop (#2306)
+
+`scripts/orchestrator-harness/cloud-cell-doctor.sh status` derives every role row from ONE three-valued
+read of the loop's record — `alive` / `dead:<reason>` / `unknown:<reason>` / `absent:<reason>` — because
+its predecessor answered yes/no, so `return 1` folded "the recorded incarnation is GONE" and "I could
+not read the record" into one no, and the rows ignored it entirely: `loop: NOT RUNNING` printed *beside*
+four `WAITING … 274s ago` rows that quoted the dead loop's start time as if it were progressing. The
+states are this document's, not a new vocabulary — identity decides first and is the only source of
+`dead`; an unreadable read is a NAMED abstention (`UNKNOWN`, exit 3), never a death witness; `absent`
+(no record at all) is neither, because nothing was unreadable *and* there is no incarnation whose death
+could be witnessed. `WAITING` — a promise that something is in progress — is only printed under an
+`alive` loop with a transcript that moved inside the worst-case pass window: a live pid is a process,
+not a scheduler. `DEAD` never falls through to a clean last pass: a dead scheduler means no further
+pass, whatever the last one said.
+
 **`status` prints one table and its exit code is the worst row:**
 
 ```
@@ -741,7 +756,7 @@ the abstention doctrine of §4 applied to this surface: an unreadable read is ne
 | component | predicate |
 |---|---|
 | `controller` | lock owner cross-checked against an `orch-loop.sh` invocation, plus `$O/heartbeat` age (a live pid with a frozen heartbeat is *wedged*, not healthy) |
-| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**: both invoke the same idempotent `watchdog.sh` (check → load → log → exit), so they cannot disagree about the desired state, and the plain loop is the deliberate stopgap that survives the launchctl being defeated (`watchdog-loop.sh`'s own header; #1976). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
+| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**, and the reason is not the one this line used to give. Before #2303 BOTH mechanisms ran the same idempotent `watchdog.sh` (check → load → log → exit) and could not disagree about the desired state; the TRACKED launchd job (`com.eldato.controller-watchdog`) now runs `watchdog-loop.sh`, whose restart is a NON-idempotent `launchctl kickstart -k`. What bounds the pair is therefore the SHARED ON-DISK RESTART BUDGET (`$HOME/.pi/agent/state/controller-watchdog.streak`): both runners spend the same cap, so the restarts per episode stay within `MAX_CONSEC` — never a tight loop. ⛔ The one job that COULD disagree — the hand-provisioned `com.eldato.orchestrator-watchdog`, a *different* script (`~/orchestrator/watchdog.sh`) on its own 20 s timer — is listed in `templates/launchd/RETIRED`, so the installer unloads it and **this watchdog's restarts disabled**: the pair is never two mutating watchdogs (see `docs/ops/ACTIVATION-MATRIX.md` row 8). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
 | `heartbeat-loop`, `cadence-timer` | the pid its OWN pidfile names, cross-checked against a process whose argv is that script (a recycled pid is `FAILING`, not alive), plus that loop's **own** freshness signal — and "own" is load-bearing: the cadence timer used to be judged by `orchestrator-heartbeat.log`, which the *heartbeat loop* appends to every pass, so its `LATE` branch could only fire if BOTH loops stopped. It now writes `cadence-timer.beat` per tick, and that beacon is what the row reads. A copy of the script installed **before** the beacon (farmed copies lag the repo) logs `CADENCE-TIMER started pid=…` and no beacon, and the row says so — `LATE`, with the stale copy named and the re-sync named, rather than a permanent red whose reason blames a healthy loop |
 | `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one |
 | `cell-supervisor` | applicable on a cell ONLY (`SKIPPED` on a Mac with the reason; `UNKNOWN` when the platform is *unset*, because "cannot answer" is not a pass); the process plus its tmux session, because an OOM-killed `cmux-tui` leaves a live supervisor with a gone session. A **cell** is a box that carries a cell's identity that was **provisioned**, not defaulted: an explicit `$STATE/.cell` marker, or a cell home that actually holds one (`keys.env`, `.harness-path`). `bringup` defaults `CELL_HOME=/tmp/cell-home`, so "the variable is set" is not evidence — and the kernel alone certainly is not, since `uname -s = Linux` is what `bringup` maps to `PLATFORM=cell`; keying on either would make every Linux dev box and CI runner permanently red for a supervisor it does not have |
@@ -750,9 +765,13 @@ the abstention doctrine of §4 applied to this surface: an unreadable read is ne
 **Three states, and "not installed" is not one of them when the code is here.** A component whose
 **job definition is absent** has two very different causes, and rendering both as `SKIPPED` (a pass) is
 how the component that motivated this file stayed green by absence: `com.tortoise.pr-doctor` and
-`com.eldato.orchestrator-watchdog` are installed by **no surface in this repo** (they are
+`com.eldato.orchestrator-watchdog` were installed by **no surface in this repo** (they were
 hand-provisioned), so on a box built by the repo's own installers both rows hit `SKIPPED` *and* `start`
-could not act on them (`fleet_component_has_start` needs the plist). The rule is now: **if the
+could not act on them (`fleet_component_has_start` needs the plist). That measurement is now history and
+is what forced the fix: both ship a template (`templates/launchd/com.tortoise.pr-doctor.plist`; and
+`com.eldato.controller-watchdog.plist` as the TRACKED replacement for the hand-provisioned
+`com.eldato.orchestrator-watchdog`, which moved to `templates/launchd/RETIRED`). The rule it produced
+stands: **if the
 component's own code exists on the box, something is expected to run it**, and a missing job is
 `MISSING` (actionable, and it fails the table). `SKIPPED` is reserved for a component whose code is
 absent too — it genuinely does not exist here — and it always carries its reason.

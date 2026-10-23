@@ -58,9 +58,11 @@ release_issue_claim_unspawned() { # <issue>
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ── the worker launcher (worker-terminal.sh) ─────────────────────────────────────────────────────
 # Lanes and chains are WORKERS, so they are started by the same module orch-loop.sh uses — a durable
-# terminal on a cmux surface, tmux only on the launchd surface. A tmux lane on a cloud cell dies at
-# ~21 log lines (measured on all three cells, 2026-10-20); this is the lane-spawning path, so leaving
-# it on tmux would have fixed the fixers and left the lanes dying.
+# terminal where the cmux daemon answers, tmux (with an explicit HOME + keys.env contract) where it does
+# not. ⛔ The `~21 log lines` death that agent-infra#2210 first attributed to tmux is an ENVIRONMENT
+# failure (agent-infra#2210, reopened 2026-10-22): `gh`'s credential is HOME-bound, and the pre-fix tmux
+# arm passed no HOME, so a lane stopped at its first `gh` call. Leaving this path on `none` on a Linux
+# cell is what made the controller refuse every spawn, every cycle.
 for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
   [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
 done
@@ -94,7 +96,8 @@ for N in "$@"; do
   # same line — the launcher names HOW it was spawned (durable terminal vs tmux), the token names
   # WHAT it was spawned from.
   # ⛔ THE DISCLOSURE IS NOT CONDITIONAL ON THE SPAWN SUCCEEDING (agent-infra#2215's C2 arm drives a
-  # box where the launcher REFUSES — Linux with no cmux surface — and a refusal that says nothing
+  # box where the launcher REFUSES — no surface at all (no cmux answer AND no tmux), or a spawn the
+  # credential contract refuses — and a refusal that says nothing
   # about the harness is the case where the operator most needs it: "why did this box not start a
   # lane?" and "which tree is it running?" are one question. So BOTH outcomes carry the token, and
   # the success line still only appears when the lane really started.

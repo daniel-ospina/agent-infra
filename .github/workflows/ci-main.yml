@@ -450,10 +450,13 @@ jobs:
 
   pi-config-extensions-guard:
     # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
-    # (issue #95 invariant): every extensions/ top-level entry except
-    # *.test.ts must be farm-wired into pi-bootstrap/pi-config/extensions AND
+    # (issue #95 invariant): every TRACKED extensions/ top-level entry except
+    # *.test.ts, and except dot-named repo furniture such as .gitkeep, must be
+    # farm-wired into pi-bootstrap/pi-config/extensions AND
     # listed in manifest.json files.extensions.entries (consumer ship-list —
     # #502 closes the manifest↔tree drift class; #498 fixed one stale row).
+    # #2425: "tracked" = git lists it under extensions/; an untracked, ignored
+    # node_modules-only directory is not an extension and cannot false-block.
     # Catches the "PR merged without wiring" drift class that per-PR CI cannot
     # see when the farm edit and the extension land on different branches.
     runs-on: ubuntu-latest
@@ -536,7 +539,8 @@ jobs:
             // enforce-skills.yml:109), so an issue stays open after main recovers and later
             // same-set failures append to it. Both are bounded and disclosed rather than fixed
             // here — close-on-success is a new mechanism, not a dedup fix.
-            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // `|| {}` after the parse too: NEEDS is the JSON rendering of `needs` (the
+            // `toJSON` env injection in the `env:` block above), and a literal `null`
             // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
             // error out having filed nothing. Not reachable today (all 7 jobs are wired into
             // `needs:`, so it is always a populated object) — but it is the only throw-before-filing
