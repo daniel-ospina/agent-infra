@@ -2599,3 +2599,121 @@ def test_an_unread_queue_is_never_cached_even_without_a_gh_claim(monkeypatch, tm
     objective.main()
     assert cache.exists(), "a good read must be cached, or part (1) proves nothing"
     assert "queue=UNREADABLE" not in cache.read_text()
+
+
+# ── the REPO and the REQUIRED SET are INPUTS, not this file's opinion (agent-infra#1989) ──────────
+# WHY THESE EXIST. The classifier is the fleet's ONE predicate: `pr-doctor.py` reads it rather than
+# carrying a second one (#1872). But it hardcoded tortoise — `REPO` and the seven branch-protection
+# context names — so a consumer standing in ANY other repo read a different repo's check-runs and
+# asked for tortoise's attestation file: every agent-infra PR came back `rerun-checks`, which is a
+# verdict about the wrong repo delivered with full confidence. These pin the two seams that make the
+# same predicate usable elsewhere, in BOTH directions: the shipped default is unchanged, and an
+# explicitly supplied value is honoured.
+def test_the_shipped_default_repo_and_required_set_are_unchanged(monkeypatch):
+    """No consumer that supplies nothing may see a behaviour change: the beat on the laptop reads
+    tortoise, exactly as before."""
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "objective_defaults", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REPO == "daniel-ospina/tortoise", mod.REPO
+    assert mod.REQUIRED == mod.REQUIRED_DEFAULT
+    assert "python-ci-gate" in mod.REQUIRED
+
+
+def test_OBJECTIVE_REPO_is_honoured(monkeypatch):
+    """A cell standing in another repo must read THAT repo's check-runs and attestations."""
+    monkeypatch.setenv("OBJECTIVE_REPO", "daniel-ospina/agent-infra")
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "objective_repo", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REPO == "daniel-ospina/agent-infra", mod.REPO
+
+
+def test_OBJECTIVE_REQUIRED_is_read_as_a_comma_separated_set(monkeypatch):
+    monkeypatch.setenv("OBJECTIVE_REQUIRED", "verify, test ,ai-review-gate")
+    spec = importlib.util.spec_from_file_location(
+        "objective_req", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REQUIRED == ("verify", "test", "ai-review-gate"), mod.REQUIRED
+
+
+@pytest.mark.parametrize("value", ["", "   ", ",", " , "])
+def test_an_EMPTY_required_set_is_NOT_SUPPLIED_rather_than_no_checks(monkeypatch, value):
+    """⛔ The dangerous reading. `OBJECTIVE_REQUIRED=""` most plausibly means "the resolver printed
+    nothing", NOT "this repo requires nothing" — and an empty required set makes EVERY PR look
+    gated-green, i.e. `call-rail`-eligible for a landing worker. So an empty/whitespace value falls
+    back to the shipped set: cannot-verify is never a pass, applied to the input itself."""
+    monkeypatch.setenv("OBJECTIVE_REQUIRED", value)
+    spec = importlib.util.spec_from_file_location(
+        "objective_req_empty", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REQUIRED == mod.REQUIRED_DEFAULT, mod.REQUIRED
+
+
+# ── the SURFACE set is an input too (agent-infra#1989 review round 2) ────────────────────────────
+# The one HUMAN GATE: `touches_surface()` decides whether a diff goes to the owner instead of to an
+# automated landing worker. Hardcoded to tortoise's paths it is ALWAYS FALSE on any other repo, so a
+# cell standing in one would hand a surface-touching diff to the landing worker while the predicate's
+# own comment promises the opposite.
+def test_the_shipped_default_surface_set_is_unchanged(monkeypatch):
+    monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "objective_surface_default", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.SURFACE_PATHS == mod.SURFACE_PATHS_DEFAULT
+    assert "tortoise/sdk.py" in mod.SURFACE_PATHS
+
+
+def test_OBJECTIVE_SURFACE_is_read_as_a_comma_separated_path_list(monkeypatch):
+    monkeypatch.setenv("OBJECTIVE_SURFACE", "sdk/index.ts, config/surface-manifest.yml")
+    spec = importlib.util.spec_from_file_location(
+        "objective_surface_env", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.SURFACE_PATHS == ("sdk/index.ts", "config/surface-manifest.yml"), mod.SURFACE_PATHS
+    assert mod.touches_surface({"files": [{"path": "sdk/index.ts"}]}) is True
+    assert mod.touches_surface({"files": [{"path": "docs/x.md"}]}) is False
+
+
+@pytest.mark.parametrize("value", ["", "  ", ","])
+def test_an_EMPTY_surface_set_falls_back_to_the_default(monkeypatch, value):
+    """Same rule as REQUIRED: an empty value is "not supplied", never "nothing is gated" — the latter
+    would silently disable the human gate, which is the failure mode the seam exists to remove."""
+    monkeypatch.setenv("OBJECTIVE_SURFACE", value)
+    spec = importlib.util.spec_from_file_location(
+        "objective_surface_empty", pathlib.Path(__file__).with_name("objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.SURFACE_PATHS == mod.SURFACE_PATHS_DEFAULT, mod.SURFACE_PATHS
+
+
+# ── the SAME seam's second half: the GraphQL fallback's repository (agent-infra#1989) ─────────────
+# `REPO` above is the REST read's repository and the attestation file's repo. The GraphQL fallback
+# kept `owner=daniel-ospina name=tortoise` LITERAL, so the two transports of ONE read disagreed the
+# moment `REPO` was supplied: the fallback asked tortoise for a sha it does not have
+# (`repository.object` null -> no data), which is exactly the case the transport exists for (REST
+# blocked, GraphQL healthy, measured 2026-09-29). The assertion is on the ARGV actually sent --
+# that is where the defect lived, so a test over the return value alone would pass either way.
+def test_the_graphql_fallback_asks_the_SAME_repo_the_rest_read_does(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return _gql_ok()
+
+    monkeypatch.setattr(objective, "REPO", "daniel-ospina/agent-infra")
+    monkeypatch.setattr(objective.subprocess, "run", fake_run)
+    objective.gql_commit_checks(SHA)
+    argv = seen.get("cmd") or []
+    assert "owner=daniel-ospina" in argv, argv
+    assert "name=agent-infra" in argv, argv
+    # ...and the shipped default cannot leak back in beside the derived one.
+    assert "name=tortoise" not in argv, argv
