@@ -800,6 +800,25 @@ for form in '| P0 | 0 | P1 | 2 |' 'P0: none, P1: 1 — the recorder is bypassed 
   [ "$(rc_of)" = "7" ]; ck $? "  a summary that states a NON-ZERO count is a finding (rc=$(rc_of)): '${form:0:32}…'"
   no_record; ck $? "  …nothing recorded"
 done
+# ⛔ ROUND 9 — THE GLOSS AND THE P3 NOTE ARE NOT END-OF-LINE (P0, ninth fresh review of #2288). Both
+# exemption arms returned "summary" for the whole remainder, so a NON-ZERO blocking pair after them
+# was never read: measured at 7261f57e these four forms recorded `clean` with a comment posted while
+# the reviewer's own text stated two blockers. The fourth is the table form of the same mistake.
+# The counter-direction stays pinned: a gloss or a P3 tail that states NO blocking pair is still a
+# summary (a reviewer's closing line is stable across re-runs, and refusing it is a paid loop), and
+# a gloss that only DESCRIBES a clean check names no label at all.
+for form in 'P0: 0 — none. P1: 2 blockers.' 'P1: 0 (none), P2: 3 real bugs.' 'P2: 0, P3: 1 note, P1: 2' '| P0 | 0 | P3 | 1 | P1 | 1 |'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a non-zero pair AFTER a gloss/note segment blocks (rc=$(rc_of)): '${form:0:34}…'"
+  no_record; ck $? "  …nothing recorded"
+  [ ! -s "$TMP/posted" ] || ! grep -q 'Verdict:\*\* CLEAN' "$TMP/posted" 2>/dev/null; ck $? "  …and no clean artifact posted"
+done
+for prose in 'P0: 0 — none.' 'P1: 0 (verified against the full diff).' 'P1: 0 — nothing blocking.' 'P2: 0, P3: 12 nits.' 'P3: 4 nits.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a gloss/note tail with NO blocking pair does NOT block: '${prose:0:30}…' (rc=$(rc_of))"
+done
 # ⛔ ROUND 7 — the CUE. A label ALONE is not evidence: `No [P1] findings; …` (clean) and
 # `- Finding: [P1] …` (blocking) are structurally identical — decorated token, mid-line, no
 # location — so the previous conjunction (label AND a location/slot/line-lead) missed every
