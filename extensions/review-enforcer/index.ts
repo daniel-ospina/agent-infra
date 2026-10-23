@@ -4113,9 +4113,14 @@ export function floorRecordBinding(record: ReviewRecord, facts: FloorRecordFacts
     return "unverifiable"; // tier unreadable → the exemption is unproven
   }
   // "low-shape": the producer's content binding, both halves.
-  if (!isDiffSha256(record.diff_sha256)) return "failed";
+  // ⛔ An ABSENT/ill-formed digest or base is UNVERIFIABLE, never "failed": the
+  // record type's own contract says "their ABSENCE must fall back to the HEAD
+  // binding — never to an accept", and `record-review.sh` mints exactly such a
+  // record on a degraded read (406 / empty body / transient failure). "failed" is
+  // reserved for a POSITIVELY READ disagreement (a well-formed base that moved).
+  if (!isDiffSha256(record.diff_sha256)) return "unverifiable";
   if (typeof record.merge_base_sha !== "string" || !/^[0-9a-f]{40}$/.test(record.merge_base_sha)) {
-    return "failed";
+    return "unverifiable";
   }
   if (facts.liveMergeBase === null) return "unverifiable";
   return facts.liveMergeBase === record.merge_base_sha ? "ok" : "failed";
@@ -4144,6 +4149,11 @@ export const VERDICT_BINDING: ReadonlyMap<string, VerdictBindingKind> = new Map<
  * previous head). The message has to state the difference it detected.
  */
 function shaDivergenceNote(recorded: string, published: string): string {
+  // ⛔ Both values are RECORD-FIELD text (or the published sha): strip control
+  // characters before naming a differing character, so a hand-edited record cannot
+  // forge a refusal line through the diagnostic itself (review cycle 1, E6).
+  const clean = (c: string | undefined): string =>
+    c === undefined ? "" : /[\u0000-\u001f\u007f]/.test(c) ? "\uFFFD" : c;
   const n = Math.min(recorded.length, published.length);
   let i = 0;
   while (i < n && recorded[i] === published[i]) i++;
@@ -4152,7 +4162,7 @@ function shaDivergenceNote(recorded: string, published: string): string {
       ? "the two values are IDENTICAL — the mismatch is elsewhere in the record"
       : `one value is TRUNCATED (${recorded.length} vs ${published.length} chars)`;
   }
-  return `first difference at character ${i + 1} of ${recorded.length}: "${recorded[i] ?? ""}" (record) vs "${published[i] ?? ""}" (published)`;
+  return `first difference at character ${i + 1} of ${recorded.length}: "${clean(recorded[i])}" (record) vs "${clean(published[i])}" (published)`;
 }
 
 /**
@@ -4223,8 +4233,8 @@ export function evaluateDispatchFloorRecordArm(
         `     HEAD-BOUND RECORD: ${facts.prRecord.file} exists for PR #${facts.pr} but records a DIFFERENT head —`,
         // FULL shas, not a 12-char prefix: a one-character alteration is the exact
         // case this line exists to name, and a prefix truncation hides it.
-        `       recorded  ${String(facts.prRecord.record.head_sha)}`,
-        `       published ${String(facts.headSha)}`,
+        `       recorded  ${oneLine(facts.prRecord.record.head_sha, 40)}`,
+        `       published ${oneLine(facts.headSha, 40)}`,
         `       ${shaDivergenceNote(String(facts.prRecord.record.head_sha), String(facts.headSha))}`,
         "       A record bound to an older head is STALE (the review certified a different revision), so it is" +
           " exactly as blocking as no record.",
@@ -4307,6 +4317,12 @@ export function parsePushSourceRef(
    *  reviewed one (round-4 VGATE, measured). The caller requires all of them to
    *  resolve to ONE sha. */
   extraSources?: string[];
+  /** The published ref is the IMPLICIT current branch (bare push, or a lone
+   *  remote token). The caller must then read `push.default` — `matching`
+   *  publishes every matching branch (review cycle 1, B2/E1). */
+  implicitHead?: boolean;
+  /** The lone token, when it may be a REMOTE (candidate for remote.<r>.push). */
+  remote?: string;
 } {
   // ⛔ THE WHOLE-COMMAND GATE FIRST, through the MASKED predicate (#966): a
   // `git push` written inside a commit message, a quoted string or a heredoc body
@@ -4315,22 +4331,26 @@ export function parsePushSourceRef(
   // a push, the argv scan found none, and the fall-through below returned HEAD —
   // which let that commit clear the floor at 0 dispatches.
   if (!isPushOrPrCreateCommand(command)) return { source: null, reason: "not a push or pr-create" };
-  const isCreate = GH_PR_CREATE_PATTERN.test(command);
-  if (isCreate) {
-    // ⛔ A pr-create that NAMES a head or a repo creates a PR this gate cannot see:
-    // `--head other` opens a PR from another branch (the local HEAD is not its
-    // head), and `--repo someone/else` targets another repo. Both were introduced
-    // by this arm (pre-change they blocked at 0 dispatches), so both refuse.
-    const masked = unquotedOnly(stripHeredocBodies(command));
-    if (/(^|\s)--head(=|\s)|(^|\s)-H(\s|$)|(^|\s)--repo(=|\s)|(^|\s)-R(\s|$)/.test(masked)) {
+  // ⛔ PUSH SEGMENTS ARE ANALYSED FIRST, and the pr-create test runs on the MASKED
+  // text (review cycle 1, B1/E5 — measured fail-open): `git push origin other:main
+  // && gh pr create --fill` bound HEAD through the `gh pr create` branch while the
+  // push published `other`, an unreviewed commit. A `gh pr create` that appears in
+  // a heredoc body is data, exactly like a `git push` there.
+  const maskedText = unquotedOnly(stripHeredocBodies(command));
+  const isCreate = GH_PR_CREATE_PATTERN.test(maskedText);
+  const segments = command.split(/&&|;|\n/);
+  // Segment detection is MASKED too — the same reason, one level down.
+  const pushSegments = segments.filter((s) => GIT_PUSH_PATTERN.test(unquotedOnly(stripHeredocBodies(s))));
+  if (pushSegments.length === 0) {
+    if (!isCreate) return { source: null, reason: "no readable push invocation" };
+    // A pr-create NAMES a head or a repo the gate cannot see: `--head other` opens a
+    // PR from another branch (the local HEAD is not its head), `--repo someone/else`
+    // targets another repo. Both were introduced by this arm, so both refuse.
+    if (/(^|\s)--head(=|\s)|(^|\s)-H\S|(^|\s)--repo(=|\s)|(^|\s)-R\S/.test(maskedText)) {
       return { source: null, reason: "a pr-create that names --head/--repo creates a PR this gate cannot bind" };
     }
     return { source: "HEAD", reason: null };
   }
-  const segments = command.split(/&&|;|\n/);
-  // Segment detection is MASKED too — the same reason, one level down.
-  const pushSegments = segments.filter((s) => GIT_PUSH_PATTERN.test(unquotedOnly(stripHeredocBodies(s))));
-  if (pushSegments.length === 0) return { source: null, reason: "no readable push invocation" };
   const multi = pushSegments.length > 1;
   // ⛔ An argv scan that finds no `git push` token returns NULL, never `HEAD`:
   // "I could not read the invocation" is not "it publishes HEAD".
@@ -4369,8 +4389,16 @@ export function parsePushSourceRef(
     if (w.startsWith("-")) continue; // --force, -u, --force-with-lease=<ref>:<sha>, …
     rest.push(w.replace(/^\+/, ""));
   }
-  if (rest.length === 0) return { source: "HEAD", reason: null };
+  if (rest.length === 0) {
+    // ⛔ `implicitHead` is reported so the caller reads `push.default` for THIS
+    // spelling too (review cycle 1, B2/E1 — measured fail-open: with
+    // push.default=matching, a bare `git push` published every matching branch
+    // while the arm bound HEAD).
+    return { source: "HEAD", reason: null, implicitHead: true };
+  }
   if (rest.length === 1) {
+    // (a lone token + a pr-create is handled after the token is classified: the
+    // create publishes HEAD, so only a HEAD-ish token is consistent with it.)
     // ⛔ ONE token is ambiguous: `git push origin` names a REMOTE (publishes HEAD),
     // while `git push feature` names a refspec. The parser stays pure and reports
     // the ambiguity; the caller resolves it by asking git (a remote name is not a
@@ -4378,7 +4406,16 @@ export function parsePushSourceRef(
     const only = rest[0];
     if (only.includes("*")) return { source: null, reason: "a glob refspec publishes many refs" };
     if (only.startsWith(":")) return { source: null, reason: "a delete refspec publishes nothing to review" };
-    return { source: only.split(":")[0] || "HEAD", reason: null, ambiguousRemote: !only.includes(":") };
+    // An EXPLICIT refspec (anything with a `:`, or a lone branch token) overrides
+    // push.default/remote.<r>.push, so it is not an "implicit HEAD" push — only the
+    // BARE spelling is (review round 9, R1: `git push HEAD:x` was falsely blocked
+    // under push.default=matching).
+    return {
+      source: only.split(":")[0] || "HEAD",
+      reason: null,
+      ambiguousRemote: !only.includes(":"),
+      remote: !only.includes(":") ? only : undefined,
+    };
   }
   // two or more tokens: the FIRST is the remote, EVERY remaining token is a
   // refspec — and all of them are published.
@@ -4389,6 +4426,11 @@ export function parsePushSourceRef(
     if (refspec.startsWith(":")) return { source: null, reason: "a delete refspec publishes nothing to review" };
     const src = refspec.split(":")[0];
     sources.push(src === "" ? "HEAD" : src);
+  }
+  if (isCreate && !(sources.length === 1 && sources[0] === "HEAD")) {
+    // This command also CREATES a PR from HEAD, so it publishes the push's ref AND
+    // HEAD. Binding one of them would be a guess (review cycle 1, B1).
+    return { source: null, reason: "a command that both pushes a non-HEAD ref and creates a PR binds no single commit" };
   }
   return { source: sources[0], extraSources: sources.slice(1), reason: null };
 }
@@ -4403,6 +4445,16 @@ export function parsePushSourceRef(
 const COMMAND_SCOPED_CONFIG =
   /\bGIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+|GLOBAL|SYSTEM|NOSYSTEM|PARAMETERS)\b|(^|\s)-c\s+[A-Za-z0-9_.-]+=/;
 
+/**
+ * Env vars that change WHICH REPOSITORY git operates on — the same class as a
+ * command-scoped config, and the same reason: a child process the gate spawns
+ * reads repo A while the command publishes repo B (review cycle 1, E3 — measured:
+ * `cd A && GIT_DIR=<B>/.git git push origin main` bound A's reviewed head and
+ * allowed, while git published B's unreviewed head).
+ */
+const REPO_SELECTING_ENV =
+  /\bGIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CEILING_DIRECTORIES|GRAFT_FILE|SHALLOW_FILE)\s*=/;
+
 /** Resolve the commit a ref names, in `dir`. Local only — no network. */
 function resolveRefSha(dir: string, ref: string): string | null {
   try {
@@ -4415,6 +4467,108 @@ function resolveRefSha(dir: string, ref: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The remote a BARE `git push` sends to: `branch.<current>.remote` when set, else
+ * `origin` (git's own default). Returns null when the current branch cannot be
+ * read — the caller then cannot know which remote's refspec list applies.
+ */
+function effectivePushRemote(dir: string): string | null {
+  // ⛔ ARGV ONLY — nothing here is interpolated into a shell string, so a name the
+  // charset gates elsewhere would reject (`feat+x` IS a legal branch) is safe here.
+  // Guessing "origin" for such a name is what let `branch.feat+x.remote=upstream`
+  // go unread (round-10 VGATE, measured fail-open).
+  const read = (args: string[]): { ok: boolean; value: string } => {
+    try {
+      return {
+        ok: true,
+        value: execFileSync("git", ["-C", dir, "config", ...args], {
+          timeout: 3000,
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+        }).trim(),
+      };
+    } catch (e: any) {
+      if (e?.status === 1) return { ok: true, value: "" }; // UNSET — a real answer
+      return { ok: false, value: "" };
+    }
+  };
+  let branch = "";
+  try {
+    branch = execFileSync("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"], {
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return null;
+  }
+  // Detached HEAD: `git push` itself refuses, and no branch-scoped remote applies.
+  if (!branch) return null;
+  if (branch === "HEAD") return "origin";
+  const configured = read(["--get", `branch.${branch}.remote`]);
+  if (!configured.ok) return null; // could not READ (≠ unset) → refuse
+  if (configured.value !== "") return configured.value;
+  return "origin"; // unset → git's own default
+}
+
+/**
+ * Can an IMPLICIT-head push (`git push`, `git push <remote>`) be bound to ONE sha?
+ *
+ * It publishes the current branch ONLY IF the effective config says so. Three
+ * things can silently widen it — each measured as a fail-open in review cycle 1:
+ *   • `push.default=matching`  → every matching branch (B2/E1);
+ *   • `remote.<r>.push=<refs>` → the remote's OWN refspec list overrides
+ *     push.default entirely (E2);
+ *   • `push.followTags=true`   → an annotated tag is published as well (E2).
+ * A config READ THAT FAILS is not "the default": only an UNSET key may mean
+ * `simple` (git exits 1 for unset, which execFileSync reports as status 1).
+ * Returns the reason it cannot be bound, or null when it can.
+ */
+function implicitHeadUnbindable(dir: string, remote: string | null): string | null {
+  const read = (args: string[]): { ok: boolean; value: string } => {
+    try {
+      return { ok: true, value: execFileSync("git", ["-C", dir, "config", ...args], {
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+      }).trim() };
+    } catch (e: any) {
+      // git config exits 1 for an UNSET key — that is a successful "not set".
+      if (e?.status === 1) return { ok: true, value: "" };
+      return { ok: false, value: "" };
+    }
+  };
+  const pushDefault = read(["--get", "push.default"]);
+  if (!pushDefault.ok) {
+    return "the git config could not be read, so what `git push` would publish is unknown";
+  }
+  if (pushDefault.value === "matching") {
+    return "push.default=matching means this push publishes EVERY matching branch";
+  }
+  if (remote === null) {
+    // We could not read which remote a bare push targets, so its refspec list is
+    // unknown — and `remote.<r>.push` overrides push.default completely.
+    return "the remote this push targets could not be resolved, so what it publishes is unknown";
+  }
+  {
+    const remotePush = read(["--get-all", `remote.${remote}.push`]);
+    if (!remotePush.ok) {
+      return `the config of remote \`${remote}\` could not be read, so what this push publishes is unknown`;
+    }
+    if (remotePush.value !== "") {
+      return `remote.${remote}.push overrides push.default, so this push publishes that refspec list, not just HEAD`;
+    }
+  }
+  const followTags = read(["--bool", "push.followTags"]);
+  if (!followTags.ok) {
+    return "push.followTags could not be read, so whether this push publishes tags is unknown";
+  }
+  if (followTags.value === "true") {
+    return "push.followTags=true publishes annotated tags as well, so this push is not one commit";
+  }
+  return null;
 }
 
 /** Is `name` a configured remote of `dir`? Local only — a remote name is not a commit. */
@@ -4448,7 +4602,15 @@ function ghJson(cmd: string): any | null {
  * Read the facts the arm needs. Every read either succeeds or lands as `null`
  * (unverifiable); NOTHING here decides anything.
  */
-export async function readFloorRecordFacts(command: string): Promise<FloorRecordFacts> {
+export async function readFloorRecordFacts(
+  command: string,
+  // ⛔ `mayGrantAllow === false` (dispatchCount > 0) means a record can only
+  // TIGHTEN; with no bound record every branch abstains, so the PR/binding reads
+  // cannot change the verdict and must not spend API calls or block the event
+  // loop inside a `tool_call` hook (review cycle 1, E8).
+  opts: { needDiagnostics?: boolean } = {}
+): Promise<FloorRecordFacts> {
+  const needDiagnostics = opts.needDiagnostics !== false;
   const facts: FloorRecordFacts = {
     repo: null,
     headSha: null,
@@ -4495,6 +4657,14 @@ export async function readFloorRecordFacts(command: string): Promise<FloorRecord
       "so what it would publish cannot be read from here";
     return facts;
   }
+  if (REPO_SELECTING_ENV.test(command)) {
+    // ⛔ The same class one flag over (review cycle 1, E3 — measured: `GIT_DIR=<B>
+    // git push` bound A's reviewed head and allowed while git published B's head).
+    facts.unattributableReason =
+      "the command selects a DIFFERENT repository through GIT_DIR/GIT_WORK_TREE/GIT_* for this call, so the " +
+      "refs this gate reads are not the refs the op would publish";
+    return facts;
+  }
 
   // ⛔ GIT'S GRAMMAR FIRST (round-5 VGATE, measured fail-open). The FIRST
   // positional of `git push` is the REPOSITORY, not a refspec: `git push up`
@@ -4527,31 +4697,31 @@ export async function readFloorRecordFacts(command: string): Promise<FloorRecord
       return facts;
     }
     if (asRepository) {
-      // `git push <remote>`. What that publishes depends on push.default:
-      // `matching` pushes EVERY matching branch, so it cannot be bound.
-      let pushDefault = "simple";
-      try {
-        pushDefault =
-          execFileSync("git", ["-C", dir, "config", "--get", "push.default"], {
-            timeout: 3000,
-            stdio: ["ignore", "pipe", "ignore"],
-            encoding: "utf8",
-          }).trim() || "simple";
-      } catch {
-        pushDefault = "simple"; // unset → git's default (simple): the current branch
-      }
-      if (pushDefault === "matching") {
-        facts.unattributableReason =
-          "push.default=matching means `git push <remote>` publishes EVERY matching branch";
+      const reason = implicitHeadUnbindable(dir, ref.source);
+      if (reason !== null) {
+        facts.unattributableReason = reason;
         return facts;
       }
       sha = resolveRefSha(dir, "HEAD");
     } else {
       sha = asRef;
     }
+  } else if (ref.implicitHead) {
+    // ⛔ A BARE `git push` publishes the current branch to its EFFECTIVE remote, so
+    // it needs the SAME config reads — including `remote.<effective>.push`, which
+    // OVERRIDES push.default entirely (review round 9, F1: passing `null` here
+    // skipped that read, and `remote.origin.push=refs/heads/other:…` + a bare push
+    // published the unreviewed branch while the arm allowed).
+    const reason = implicitHeadUnbindable(dir, effectivePushRemote(dir));
+    if (reason !== null) {
+      facts.unattributableReason = reason;
+      return facts;
+    }
+    sha = resolveRefSha(dir, "HEAD");
   } else {
     sha = resolveRefSha(dir, ref.source);
   }
+
   const extra = ref.extraSources ?? [];
   if (sha !== null && extra.length > 0) {
     // ⛔ A push may publish SEVERAL refs. Every one of them must resolve to the
@@ -4606,7 +4776,7 @@ export async function readFloorRecordFacts(command: string): Promise<FloorRecord
   // 5. The PR — resolved ONLY when it can change the answer: no bound record at
   //    all (the mismatch/corrupt diagnostics need the PR), or a bound record
   //    whose verdict carries a binding (`clean-micro` tier, `clean-low` base).
-  if (facts.bound.length === 0 || needsBinding) {
+  if (needsBinding || (needDiagnostics && facts.bound.length === 0)) {
     let branch = ref.source;
     if (branch === "HEAD") {
       try {
@@ -4634,10 +4804,12 @@ export async function readFloorRecordFacts(command: string): Promise<FloorRecord
       if (own) facts.prRecord = { file: own.file, record: own.record };
       for (const u of unparsed) if (u.prOfFile === facts.pr) facts.corruptFiles.push(u.file);
     }
-    // With no PR resolved, a SINGLE unparseable repo-keyed file is still named:
-    // "unparseable" must never be reported as "no record" (fail closed).
-    if (facts.pr === null && facts.corruptFiles.length === 0 && unparsed.length === 1) {
-      facts.corruptFiles.push(unparsed[0].file);
+    // With no PR resolved, a repo-keyed file that could not be parsed is still
+    // named — SEVERAL of them included (review cycle 1, C6: the previous
+    // `length === 1` guard reported a partial #2400 sync as "no record", sending
+    // the lane to re-record when the correct action is to repair the file).
+    if (facts.pr === null && facts.corruptFiles.length === 0) {
+      for (const u of unparsed) facts.corruptFiles.push(u.file);
     }
   }
 
@@ -4647,18 +4819,31 @@ export async function readFloorRecordFacts(command: string): Promise<FloorRecord
   const needsBase = facts.bound.some((b) => b.record.verdict === "clean-low");
   if ((needsTier || needsBase) && facts.pr !== null) {
     if (needsTier) {
+      // ⛔ THREE reads, and every one must be POSITIVE to produce a tier
+      // (review cycle 1, C1/E4). `null` = unverifiable, which still blocks the
+      // 0-dispatch path but abstains on the dispatched one — the pre-change
+      // behaviour. Producing "other" from an unreadable/failed/cross-repo read
+      // hard-blocked a legitimately-micro lane that had already dispatched.
       const view = ghJson(`gh pr view ${facts.pr} --repo ${repo} --json closingIssuesReferences`);
-      const issueNum = view?.closingIssuesReferences?.[0]?.number;
-      if (typeof issueNum === "number") {
+      const ref0 = view?.closingIssuesReferences?.[0];
+      const issueNum = typeof ref0?.number === "number" ? ref0.number : null;
+      const refRepo = typeof ref0?.repository?.nameWithOwner === "string"
+        ? ref0.repository.nameWithOwner
+        : null;
+      if (issueNum !== null && (refRepo === null || refRepo === repo)) {
         const issue = ghJson(`gh issue view ${issueNum} --repo ${repo} --json labels`);
-        const labels: string[] = Array.isArray(issue?.labels)
+        const labels: string[] | null = Array.isArray(issue?.labels)
           ? issue.labels.map((l: any) => String(l?.name ?? ""))
-          : [];
-        // check (c)'s own rule: `complexity:micro` present -> micro.
-        facts.prTier = labels.includes("complexity:micro") ? "micro" : "other";
-      } else if (view !== null) {
-        facts.prTier = "other"; // readable PR with NO linked issue -> not micro
+          : null;
+        if (labels !== null) {
+          // check (c)'s own rule: `complexity:micro` present -> micro.
+          facts.prTier = labels.includes("complexity:micro") ? "micro" : "other";
+        }
       }
+      // else: no closing ref / cross-repo ref / unreadable labels -> prTier stays
+      // null (unverifiable). `check-pipeline-compliance.sh` resolves the linked
+      // issue from the PR BODY (incl. the traceability form), which this read does
+      // not model — so "no closing ref" is not evidence of "not micro".
     }
     if (needsBase) {
       const ctx: RepoContext = { repo, cwd: dir, source: "cd" };
@@ -5191,15 +5376,28 @@ export default function (pi: ExtensionAPI) {
       // (a commit that does not exist yet, an unattributable refspec, a box whose
       // registry does not carry the record), so NEITHER signal becomes optional
       // and #485's zero-gate net stays closed.
-      const floorRecordArm = await readFloorRecordFacts(command).then((facts) =>
-        evaluateDispatchFloorRecordArm(facts, dispatchCount === 0)
+      // The tier marker is read here (message + audit only, never allow/block) so the
+      // arm's audit row carries the SAME tier vocabulary the floor's rows do.
+      let tier = "";
+      try {
+        if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
+          tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
+        }
+      } catch (_err) { /* best-effort */ }
+      const mayGrantAllow = dispatchCount === 0;
+      const floorRecordArm = await readFloorRecordFacts(command, { needDiagnostics: mayGrantAllow }).then(
+        (facts) => evaluateDispatchFloorRecordArm(facts, mayGrantAllow)
       );
       if (floorRecordArm.status === "block") {
         console.log("[review-enforcer] 🚫 Blocked — the durable review record at this head does not allow it");
         for (const line of floorRecordArm.lines) console.log(line);
         logGateEvent("gate_block", {
-          reason: "no_reviewers_dispatch",
-          tier: "record-arm",
+          // ⛔ NOT `no_reviewers_dispatch`: this row can be emitted with
+          // dispatchCount > 0 (the strictness arm), and a block-rate measurement
+          // keyed on that reason would count reviewers that WERE dispatched
+          // (review cycle 1, E7).
+          reason: "record_binding_failed",
+          tier: tier === "" ? "unlabeled" : tier,
           record_state: floorRecordArm.state,
           command: auditCommand(command),
         });
@@ -5221,6 +5419,15 @@ export default function (pi: ExtensionAPI) {
               ? "   → The dispatch counter cannot overrule a record BOUND to this commit (#2471)."
               : "   → A record must bind the EXACT head being published to count (#2471); a record for another" +
                 " head, another repo, or an unreadable file is exactly as blocking as none.",
+            // ⛔ THE NEXT ACTION (review cycle 1, C5/E5): the standing messages carry
+            // these lines and this refusal must not be the one that omits them — a
+            // lane told only "mint a record" is being invited to hand-write one,
+            // which is the #1209/#3788 class, not a review.
+            "   → Dispatch a reviewer sub-agent that returns a verdict on this diff — that ALWAYS clears this floor:",
+            "     task(prompt='[REVIEW] review the diff at this head; return NO ISSUES FOUND or list issues')",
+            "   → Then record the attestation at the FINAL head:",
+            `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
+            "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
           ].join("\n"),
         };
       }
@@ -5235,23 +5442,23 @@ export default function (pi: ExtensionAPI) {
           pr: floorRecordArm.pr,
           reason: "head_bound_record",
           record_state: FLOOR_RECORD_STATE_ACCEPTED,
+          // The audit-log union documents this event as naming "file + sha": an
+          // allow-without-dispatch must be joinable to the commit it cleared.
+          file: floorRecordArm.file,
+          sha: floorRecordArm.sha,
+          verdict: floorRecordArm.verdict,
           command: auditCommand(command),
         });
         return undefined;
       }
 
       // #485: uniform ≥1-dispatch block — every tier (micro, standard, complex,
-      // unlabeled) blocks at 0 dispatches. The tier read survives ONLY for
-      // message selection: micro skips the multi-agent code-review gate
-      // (03-code-review.md), so its remediation differs from BLOCK_MESSAGE.
-      // Pinned by index.test.ts (behavioral T1/T1b + fence drift T2 + source
-      // shape T3). The #285 task-sub-agent early return above is untouched.
-      let tier = "";
-      try {
-        if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
-          tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
-        }
-      } catch (_err) { /* best-effort */ }
+      // unlabeled) blocks at 0 dispatches. The tier read (hoisted above the arm)
+      // survives ONLY for message selection: micro skips the multi-agent
+      // code-review gate (03-code-review.md), so its remediation differs from
+      // BLOCK_MESSAGE. Pinned by index.test.ts (behavioral T1/T1b + fence drift
+      // T2 + source shape T3). The #285 task-sub-agent early return above is
+      // untouched.
       // #516: BOTH block returns below must emit a durable audit entry — the
       // pre-#516 dispatch-count block wrote console only (no appendJsonl),
       // unlike the merge-registry gate's logMergeGateDecision trail, so

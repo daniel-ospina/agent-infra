@@ -31,6 +31,12 @@ delete process.env.PI_MODE;
 // worth writing down: a green CI is not evidence that the suite is hermetic. The role tests below
 // set `KIND` EXPLICITLY and restore it, so deleting the inherited one changes nothing for them.
 delete process.env.KIND;
+// ⛔ SAME CLASS, one var over (round-11 VGATE, test hermeticity): the suite toggles
+// `AGENT_SKIP_REVIEW_GATE` inside one case and restores it in a `finally`, so an
+// AMBIENT value inherited from the launcher would make the block-expectation cases
+// order-dependent (measured: a fresh-process harness inverted three of them).
+delete process.env.AGENT_SKIP_REVIEW_GATE;
+delete process.env.ELDATO_SKIP_REVIEW_GATE;
 
 import {
   extractPrNumber,
@@ -5501,8 +5507,20 @@ testAsync("#1776: the text gate stands down when the argv layer will enforce (th
       // negative. This command reaches no merge, so the DISPATCH gate is the refuser, and
       // its durable audit tag is the contract (the prose below is only the message).
       ok(res && res.block === true, "…and the command is still REFUSED, by another gate");
-      ok(tempAuditLines().some((l) => l.event === "gate_block" && l.reason === "no_reviewers_dispatch"),
-        "…the dispatch gate, by its durable audit tag");
+      // #2471: two durable tags now cover this command — `no_reviewers_dispatch`
+      // (the counter floor) and `record_binding_failed` (the head-bound arm, which
+      // can block even when the session DID dispatch, so it must not borrow the
+      // counter's tag). The pinned contract is "a gate_block row exists for this
+      // command, under one of the two floor tags" — an early return after the PATH
+      // injection emits NEITHER and still fails here.
+      ok(
+        tempAuditLines().some(
+          (l) =>
+            l.event === "gate_block" &&
+            (l.reason === "no_reviewers_dispatch" || l.reason === "record_binding_failed")
+        ),
+        "…the dispatch gate, by its durable audit tag"
+      );
       ok(!/admin-merge|admin merge|resolvable PR number/i.test(reason),
         `the ADMIN-MERGE gate is not what refused it (reason: ${reason || "<none>"})`);
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
@@ -7764,6 +7782,230 @@ testAsync("#2471 (xix) `gh pr create --head/--repo` is not bound to the local HE
       input: { command: `cd "${f.repoDir}" && gh pr create --title t --body x` },
     });
     equal(okRes, undefined, "a plain pr-create still publishes HEAD and is bound as before");
+  });
+});
+
+// ── Review cycle 1 regression pins (each named a measured wrong outcome) ──────
+testAsync("#2471 (xx) a push PLUS a pr-create binds only when the push publishes HEAD", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    // B1, measured: the pr-create test ran on RAW text and returned before the
+    // push was analysed, so this bound HEAD while the push published `other`.
+    const bad = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin other:main && gh pr create --fill` },
+    });
+    ok(bad && bad.block, "a push of a NON-HEAD ref alongside a pr-create is not bound to HEAD");
+    const good = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe && gh pr create --fill` },
+    });
+    equal(good, undefined, "a HEAD push alongside a pr-create is consistent → allowed");
+  });
+});
+
+testAsync("#2471 (xxi) a BARE push under push.default=matching is not bound to HEAD", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    execSync(`git -C "${f.repoDir}" config push.default matching`, { stdio: "ignore" });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push` },
+    });
+    ok(res && res.block, "B2/E1: a bare push publishes every matching branch under `matching` → block");
+  });
+});
+
+testAsync("#2471 (xxii) remote.<r>.push / push.followTags widen a remote push → not bound", async () => {
+  for (const [key, value] of [
+    ["remote.origin.push", "refs/heads/other:refs/heads/main"],
+    ["push.followTags", "true"],
+  ] as Array<[string, string]>) {
+    await withFloorFixture({}, async (f) => {
+      writeReviewFile(f.recordFile, floorRecord(f.head));
+      execSync(`git -C "${f.repoDir}" config ${key} ${value}`, { stdio: "ignore" });
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `cd "${f.repoDir}" && git push origin` },
+      });
+      ok(res && res.block, `E2: ${key}=${value} means the push publishes more than HEAD → block`);
+    });
+  }
+});
+
+testAsync("#2471 (xxx) a BARE push honours remote.<effective>.push too", async () => {
+  for (const refspec of ["refs/heads/other:refs/heads/main", "+refs/heads/*:refs/heads/*"]) {
+    await withFloorFixture({}, async (f) => {
+      writeReviewFile(f.recordFile, floorRecord(f.head));
+      execSync(`git -C "${f.repoDir}" config remote.origin.push '${refspec}'`, { stdio: "ignore" });
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `cd "${f.repoDir}" && git push` },
+      });
+      ok(
+        res && res.block,
+        `round-9 F1: remote.origin.push='${refspec}' makes a BARE push publish other refs → block`
+      );
+    });
+  }
+});
+
+testAsync("#2471 (xxxi) a LEGAL but unusual branch name does not make the arm guess a remote", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    // Round-10 VGATE, measured: `feat+x` is a legal branch name; the charset gate
+    // guessed "origin" instead of reading branch.feat+x.remote, so the widening
+    // `remote.upstream.push` refspec list was never consulted.
+    execSync(`git -C "${f.repoDir}" checkout -q -b 'feat+x'`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" remote add upstream /tmp/does-not-exist-upstream`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" config 'branch.feat+x.remote' upstream`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" config 'remote.upstream.push' '+refs/heads/*:refs/heads/*'`, {
+      stdio: "ignore",
+    });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push` },
+    });
+    ok(res && res.block, "the effective remote's refspec list is read for ANY legal branch name → block");
+  });
+});
+
+testAsync("#2471 (xxiii) a repo-selecting env (GIT_DIR) is not attributed", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: {
+        command: `cd "${f.repoDir}" && GIT_DIR=/tmp/elsewhere/.git git push origin HEAD:fix/probe`,
+      },
+    });
+    ok(res && res.block, "E3: GIT_DIR makes the gate and the op read different repos → block");
+  });
+});
+
+testAsync("#2471 (xxiv) an unreadable/missing clean-micro tier ABSTAINS on the dispatched path", async () => {
+  // E4/C1: a failed labels read (or no closing ref) is UNVERIFIABLE, not "not micro":
+  // it must block the 0-dispatch path and abstain on the dispatched one.
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head, { verdict: "clean-micro" }));
+    _setRunGhOverride((cmd: string) => {
+      if (/pr list/.test(cmd)) return JSON.stringify([{ number: FLOOR_PR, headRefOid: f.head }]);
+      if (/pr view/.test(cmd)) return JSON.stringify({ closingIssuesReferences: [] }); // no closing ref
+      throw new Error("gh: HTTP 429"); // an unreadable issue read
+    });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const zero = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe` },
+    });
+    ok(zero && zero.block, "0 dispatches + an unverifiable clean-micro binding → block (fail closed)");
+    await fire("tool_result", { toolName: "task", input: { prompt: "review" }, details: {} });
+    const dispatched = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe` },
+    });
+    equal(dispatched, undefined, "a DISPATCHED session abstains (pre-change behaviour) — no hard block");
+  });
+});
+
+testAsync("#2471 (xxv) a degraded-mint clean-low (no digest) abstains on the dispatched path", async () => {
+  // C2: `record-review.sh` legitimately mints a sha-only record on a degraded read;
+  // its ABSENCE is unverifiable, never "positively wrong".
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(
+      f.recordFile,
+      floorRecord(f.head, { verdict: "clean-low", merge_base_sha: FLOOR_MERGE_BASE, diff_sha256: undefined })
+    );
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const zero = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe` },
+    });
+    ok(zero && zero.block, "0 dispatches → block (an unverified binding is not a pass)");
+    await fire("tool_result", { toolName: "task", input: { prompt: "review" }, details: {} });
+    const dispatched = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe` },
+    });
+    equal(dispatched, undefined, "a dispatched session is NOT hard-blocked by a degraded-mint record");
+  });
+});
+
+testAsync("#2471 (xxvi) TWO OR MORE unparseable records are still reported as unparseable", async () => {
+  await withFloorFixture({}, async (f) => {
+    const dir = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(resolvePath(dir, "owner-repo-900403.json"), "{ truncated");
+    fs.writeFileSync(resolvePath(dir, "owner-repo-900404.json"), "{ truncated");
+    _setRunGhOverride(() => "[]"); // no PR resolvable
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin HEAD:fix/probe` },
+    });
+    ok(res && res.block, "blocked");
+    ok(
+      String(res.reason).includes("could not be parsed"),
+      `C6: a partial registry sync must not be reported as "no record": ${String(res.reason).slice(0, 260)}`
+    );
+  });
+});
+
+testAsync("#2471 (xxvii) the arm's refusal hands the lane a NEXT ACTION (dispatch + record + escape)", async () => {
+  await withFloorFixture({}, async (f) => {
+    const res = await f.push(); // no record, 0 dispatches
+    ok(res && res.block, "blocked");
+    const reason = String(res.reason);
+    ok(reason.includes("Dispatch a reviewer sub-agent"), "C5/E5: names the action that ALWAYS clears the floor");
+    ok(reason.includes("record-review.sh"), "…and the recorder (never a hand-written JSON)");
+    ok(reason.includes("AGENT_SKIP_REVIEW_GATE=1"), "…and the documented escape hatch");
+  });
+});
+
+testAsync("#2471 (xxviii) the allow audit row names the file, the sha and the verdict", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    await f.push();
+    const row = tempAuditLines().find((l) => l.event === "review_record_allow");
+    ok(row, "the allow is audited");
+    equal(row?.file, f.recordFile, "E7: the row carries the file");
+    equal(row?.sha, f.head, "…the sha it bound");
+    equal(row?.verdict, "clean", "…and the verdict, so a later measurement can join on it");
+  });
+});
+
+testAsync("#2471 (xxix) a control character in a record's head_sha cannot forge a refusal line", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(`${"a".repeat(39)}\nFAKE: forged line`));
+    const res = await f.push();
+    ok(res && res.block, "blocked");
+    const reason = String(res.reason);
+    ok(!/^FAKE: forged line$/m.test(reason), "E6: the diagnostic does not emit the record's newline as a line");
+    ok(reason.includes("DIFFERENT head"), "…and still states the real finding");
   });
 });
 
