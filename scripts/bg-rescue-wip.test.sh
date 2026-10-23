@@ -464,10 +464,12 @@ if [ "$ispush" -eq 1 ]; then
   printf '%s\n' "$@" > "$SHDIR/argv.$n"
   if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
   case "$MODE" in
-    wf_then_ok) [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
-    wf_always)  wf_reject; exit 1 ;;
-    other)      [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
-    authfail)   auth_reject; exit 1 ;;
+    wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
+    wf_always)    wf_reject; exit 1 ;;
+    wf_then_auth) if [ "$iskey" -eq 1 ]; then auth_reject; exit 1; else wf_reject; exit 1; fi ;;
+    plain_ok)     : ;;
+    other)        [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
+    authfail)     auth_reject; exit 1 ;;
   esac
 fi
 exec "$REAL" "$@"
@@ -497,7 +499,7 @@ try_rescue() { # try_rescue <name> <mode> <branch>
   # what makes the "workflow-NAMED branch" arm a genuine test of the matcher.
   local slug; slug="$(printf '%s' "$br" | tr '/' '-')"
   mk_pushshim "$d/shim" "$mode" "$slug" || { echo "❌ shim failed ($n)"; return 1; }
-  CFG_BEFORE="$(git -C "$d/wt" config --local --list 2>/dev/null | sort)"
+  CFG_BEFORE="$(git -C "$d/wt" config --list --show-origin 2>/dev/null | sort)"
   OUT="$(PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
   ATTEMPTS=0; [ -f "$d/shim/attempts" ] && ATTEMPTS="$(cat "$d/shim/attempts")"
   WHO=""; [ -f "$d/shim/attempts.who" ] && WHO="$(tr '\n' ' ' < "$d/shim/attempts.who")"
@@ -524,26 +526,43 @@ WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
   || bad "wfretry: the lane's work is missing from the published snapshot"
 # ⛔ A rescue may never FORCE, and may never write credential config. Both are asserted on the
 # recorded argv and on the repo's own config, not on the message that claims it.
+# ⛔ THE ORDERED PAIR, NOT THE PRESENCE OF EACH FLAG. `-c credential.helper=` CLEARS the configured
+# helper list and `-c credential.helper=osxkeychain` then names the one to use; the order is the whole
+# mechanism. This arm had two `ok` branches, so deleting the clear (the retry then re-uses the SAME
+# scope-less PAT and #2292 is unchanged) and reversing the pair (the retry ends with an EMPTY helper
+# list) both stayed GREEN — found by two independent fresh reviewers, each by mutation. Every shape
+# except clear-then-name is now a failure.
 if [ -f "$T/wfretry/shim/argv.2" ]; then
   ARGV2="$(tr '\n' ' ' < "$T/wfretry/shim/argv.2")"
   case "$ARGV2" in
     *"--force"*|*" -f "*|*"+refs/"*) bad "wfretry: the retry used a FORCE form — it may only publish the same fast-forward: $ARGV2" ;;
-    *"credential.helper=osxkeychain"*)
-      case "$ARGV2" in
-        *"credential.helper= "*|*"credential.helper=  "*) ok "wfretry: the retry clears the configured helpers for THAT invocation only (no force, no config write)" ;;
-        *) ok "wfretry: the retry names the keychain helper, and carries no force" ;;
-      esac ;;
-    *) bad "wfretry: the second attempt did not name the keychain helper — $ARGV2" ;;
+    *"-c credential.helper= -c credential.helper=osxkeychain"*)
+      ok "wfretry: the retry CLEARS the configured helpers and then names the keychain one, in that order (no force, no config write)" ;;
+    *) bad "wfretry: the retry does not clear-then-name the helper (no clear re-uses the scope-less token; a reversed pair leaves an EMPTY helper list) — $ARGV2" ;;
   esac
 else
   bad "wfretry: no recorded argv for the second attempt — the retry cannot be inspected"
 fi
-[ "$(git -C "$T/wfretry/wt" config --local --list 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
-  && ok "wfretry: the repo's credential/config state is byte-identical after the retry (read-only rescue)" \
-  || bad "wfretry: the rescue WROTE to .git/config — a rescue must not change the state it is rescuing"
+# ⛔ ALL SCOPES, not `--local`: a write to `$HOME/.gitconfig` would be invisible to `--local` and would
+# also PERSIST on the machine that ran the suite. `--show-origin` names the file it came from.
+[ "$(git -C "$T/wfretry/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
+  && ok "wfretry: git config is byte-identical at EVERY scope after the retry (read-only rescue, global included)" \
+  || bad "wfretry: the rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
 case "$OUT" in
   *OSXKEYCHAIN*|*osxkeychain*) ok "wfretry: says WHICH credential published it (a clean run must not imply the PAT worked)" ;;
   *) bad "wfretry: the success message does not name the credential used — $OUT" ;;
+esac
+
+# (1b) ⛔ THE OPPOSITE DIRECTION OF THE SUCCESS MESSAGE. A plain first-attempt push must NOT be reported
+# as a keychain push: an implementation that prints the keychain claim on BOTH success branches passed
+# the arm above, and would tell an operator the scope-less token works on a run where it was never used.
+try_rescue plainok plain_ok
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "plainok: a first-attempt success is one attempt, exit 0" \
+  || bad "plainok: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 1)"
+case "$OUT" in
+  *OSXKEYCHAIN*|*osxkeychain*) bad "plainok: a push that was NEVER retried claims the keychain credential — $OUT" ;;
+  *) ok "plainok: a non-retried push does not claim the keychain credential (the claim is evidence, not decoration)" ;;
 esac
 
 # (2) ⛔ A NON-WORKFLOW rejection is NOT retried. The stub would SUCCEED on the keychain attempt, so a
@@ -594,6 +613,27 @@ case "$OUT" in
   *"rescued"*) bad "wfalways: claimed a rescue that did not happen — $OUT" ;;
   *) ok "wfalways: does not claim a rescue it did not perform" ;;
 esac
+
+# (3b) ⛔ THE FIRST CAUSE SURVIVES THE RETRY. The stub refuses the first attempt for WORKFLOW SCOPE and
+# the retry for AUTHENTICATION — a different reason. Reporting only the LAST cause sends the operator
+# after a keychain entry that is fine while the real blocker (the token's scope) goes unnamed; that
+# implementation passed the `wfalways` arm, where both attempts fail for the SAME reason.
+try_rescue wfthenauth wf_then_auth
+[ "$RC" -eq 2 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfthenauth: exit 2 after exactly one retry" \
+  || bad "wfthenauth: rc=$RC attempts=${ATTEMPTS:-0} (want 2 and 2)"
+case "$OUT" in
+  *"cause: WORKFLOW SCOPE"*) ok "wfthenauth: the FIRST cause (workflow scope) is still named" ;;
+  *) bad "wfthenauth: the first cause was overwritten by the retry's — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*AUTHENTICATION*|*AUTHENTICATION*"ALSO failed"*)
+    ok "wfthenauth: the retry's DIFFERENT cause is reported separately (both reasons reachable to the operator)" ;;
+  *) bad "wfthenauth: the retry's own cause is not reported alongside the first — $OUT" ;;
+esac
+[ -z "$(ref_of "$T/wfthenauth/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "wfthenauth: nothing published, consistent with the failure" \
+  || bad "wfthenauth: a ref landed while the run reported failure"
 
 # (4) the cause is NAMED for the ordinary failures too (#2292, item 2) — 'the push failed' is what sent a
 # diagnosis cycle after the wrong cause.

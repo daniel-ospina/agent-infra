@@ -39,9 +39,11 @@
 #     falls back to per-path and reports what it had to skip;
 #   - commits already on the branch but NOT pushed are out of scope — this tool archives uncommitted
 #     work. The clean exit says so rather than implying the lane is safe.
-#   - ONE credential retry is attempted, and only for a github.com WORKFLOW-SCOPE refusal of a snapshot
-#     that touches `.github/workflows/` (the configured token often lacks `Workflows: write` while the
-#     keychain credential has it, #2292). Every other refusal is reported as-is — see section 6.
+#   - ONE credential retry is attempted, and only when the remote's own refusal says WORKFLOW SCOPE
+#     (the configured token often lacks `Workflows: write` while the keychain credential has it,
+#     #2292). The predicate is the refusal TEXT, not the remote host or the snapshot's paths: any host
+#     whose pre-receive output matches that wording takes the retry, and a host that words it
+#     differently does not. Every other refusal is reported as-is — see section 6.
 #
 # Exit: 0 = nothing at risk, or rescued and pushed (prints the ref + sha)
 #       1 = the path is not the root of a git worktree
@@ -354,7 +356,7 @@ fi
 
 if [ "$PUSHED" -eq 1 ]; then
   if [ "$RETRIED" -eq 1 ]; then
-    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with the OSXKEYCHAIN credential (the configured credential lacks workflow scope)"
+    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with the OSXKEYCHAIN credential after the configured one was refused for workflow scope"
   else
     echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
   fi
