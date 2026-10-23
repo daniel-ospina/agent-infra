@@ -216,19 +216,52 @@ prlock_defer() { # prlock_defer <why>
   fi
   exit 0
 }
+# ⛔ A REFUSAL THAT CANNOT CLEAR BY ITSELF IS NOT REFUNDABLE (review of PR #2576, cycle 2 — P2). Every
+# arm above writes the bail marker, so the controller refunds the attempt and re-decides — which is
+# right for a lock a LANDER holds or one whose owner is dead (the reclaim at the next dispatch clears
+# it). It is WRONG for a lock state that no re-dispatch can change: a `$PRLOCK` that is not a regular
+# file (a directory, an unreadable object) or a `$O/state` this box cannot write. There the refund
+# makes spawn -> defer -> refund a PERMANENT SPIN: `fixcount` nets to zero every cycle, so MAX_FIX_TRIES
+# never trips, nothing parks, and nothing surfaces — the same shape `orch-loop.sh` documents for a
+# deferral that cannot clear itself. Those two arms therefore consume the attempt (no bail marker) and
+# name the repair, so the cap parks the PR in front of a human instead of hiding the state forever.
+prlock_refuse() { # prlock_refuse <why> — NOT refundable: re-dispatching cannot change this state
+  echo "[fix $PR] REFUSED (NOT refundable — a re-dispatch cannot clear this): ${1} — nothing pushed" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] this attempt is CONSUMED so MAX_FIX_TRIES parks the PR in front of a human; no bail marker was written" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: nothing was consumed" >> "$L.log"
+  fi
+  exit 0
+}
+PL_NOTE=""
 if PL_OWNER="$(prlock_live_owner)"; then
   prlock_defer "the LANDER owns this PR (state/mergeclaim-$PR.lock held by live pid $PL_OWNER) — a push now would move the head out from under the attestation it is landing"
-fi
-# ONE CAS, NO RECLAIM. A failed take means an owner exists (live, or dead-but-not-yet-reclaimed by
-# `claim_live`/the doctor). Either way this lane defers: see the block comment above for why a
-# reclaim is unsafe and why a deferred fixer costs nothing.
-if ! prlock_take; then
+elif prlock_take; then
+  :   # this lane owns the PR for the whole run
+else
+  # ⛔ A FAILED CAS IS NOT PROOF THAT AN OWNER EXISTS (review of PR #2576, cycle 2 — P3). It also fails
+  # when the path is a directory or `$O/state` is unwritable, and the re-read below cannot tell an
+  # ABSENT lock from a stale one — so each condition is named for what it is instead of being reported
+  # as "the owner is not live", which sent an operator to wait for the reclaim of nothing.
   if PL_OWNER="$(prlock_live_owner)"; then
     prlock_defer "the LANDER claimed this PR while this lane was starting (state/mergeclaim-$PR.lock held by live pid $PL_OWNER)"
   fi
-  prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) exists and its owner is not live — a stale claim is reclaimed by the controller's next dispatch (claim_live) or by the doctor's merge role, never deleted from here, because the delete is not a CAS and could take a live holder's lock"
+  if [ -e "$PRLOCK" ] || [ -L "$PRLOCK" ]; then
+    if [ ! -f "$PRLOCK" ]; then
+      prlock_refuse "state/mergeclaim-$PR.lock exists but is NOT a regular file (a directory, a dangling symlink, or an object this box cannot read), so no owner can be read and no claim can be taken. REPAIR: inspect it (ls -ld '$PRLOCK'), confirm no lander is running for #$PR, then rm -f (or rmdir) it"
+    fi
+    prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) exists and its owner is not live — a stale claim is reclaimed by the controller's next dispatch (claim_live) or by the doctor's merge role, never deleted from here, because the delete is not a CAS and could take a live holder's lock. If NOTHING is dispatching this PR (a manual adopt-fix run), that reclaim never comes: REPAIR: confirm no lander is live for it (pgrep -af 'merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock"
+  fi
+  # The file is ABSENT at the re-read: its owner released it between the CAS and this read (a fast
+  # lander exit runs its EXIT trap). That is not a stale claim — retry ONCE rather than reporting one.
+  if prlock_take; then
+    PL_NOTE=" (an earlier holder released it while this lane was starting)"
+  else
+    prlock_refuse "state/mergeclaim-$PR.lock could not be CREATED although no file exists there — $O/state is unwritable, full, or not a directory. REPAIR: check the permissions and free space of '$O/state'"
+  fi
 fi
-echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (no lander is in flight on this PR)" >> "$L.log"
+echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock${PL_NOTE} (no lander is in flight on this PR)" >> "$L.log"
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a

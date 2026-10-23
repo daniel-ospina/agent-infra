@@ -640,6 +640,31 @@ ck "...and does NOT delete the claim it did not take — a non-CAS reclaim can d
 [ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
 ck "...and the deferral is refundable (bail marker for the head it saw)" $rc
 rm -f "$PRLOCK7"
+# ⛔ THE STALE DEFERRAL NAMES THE REPAIR (review of PR #2576, cycle 2 — P2). Its reclaim is the
+# CONTROLLER's next dispatch, and `adopt-fix.sh` is the surface used when nothing is dispatching the
+# PR — so without the command an operator retries for ever and is told to wait for a reclaim that
+# never comes. The line must be actionable, not merely descriptive.
+grep -q 'REPAIR: confirm no lander is live.*rm -f state/mergeclaim-7.lock' "$RO/logs/fix-7.log"; rc=$?
+ck "...and the stale deferral NAMES THE REPAIR (rm -f the lock once no lander is live)" $rc
+
+# ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
+# `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
+# refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
+# zero, so `MAX_FIX_TRIES` would never park the PR and nothing would surface.
+rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
+{ [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
+grep -q 'REFUSED (NOT refundable' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable, so the cap can park the PR" $rc
+[ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes NO bail marker — a refundable spin would net fixcount to zero for ever" $rc
+grep -q 'REPAIR: inspect it' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the repair for the unusable path" $rc
+rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
 
 # POSITIVE CONTROL, and the assertion that pins the property the change exists for: with NO lock the
 # fixer runs, the lock is HELD WHILE THE AGENT RUNS, and it is RELEASED before the merge-one handoff
@@ -709,6 +734,17 @@ printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
 [ "$arc79" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
+# ... and the UNUSABLE-lock refusal: also rc=0 with nothing pushed, and also invisible to an operator
+# who reads only adopt-<PR>.log unless this wrapper names it.
+rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
+[ "$arc79b" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc
+grep -q 'PR-OWNER lock, UNUSABLE' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it (UNUSABLE, with the repair pointer) in the operator's log" $rc
+rmdir "$RO/state/mergeclaim-7.lock" 2>/dev/null || rm -rf "$RO/state/mergeclaim-7.lock"
 grep -q 'PR-OWNER lock' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and NAMES it in the log the operator reads" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?

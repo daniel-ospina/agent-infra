@@ -53,7 +53,18 @@ elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the LANDER' "$O/logs/fix-$PR.log" 2>/
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock) — a lander owns this PR right now (review/record/merge in flight), so nothing was pushed and no attempt was consumed; the holder and the reason are in $O/logs/fix-$PR.log. Re-run once the lander finishes (it lands the PR, or refuses and releases)." >> "$O/logs/adopt-$PR.log"
   exit 79
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.log" 2>/dev/null; then
-  echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, STALE) — the lock exists and its owner is not live; this fixer does not reclaim it (a reclaim is not a CAS and could delete a live holder's lock), so nothing was pushed and no attempt was consumed. The controller's next dispatch reclaims a dead owner's claim; re-run then." >> "$O/logs/adopt-$PR.log"
+  # ⛔ THE REPAIR IS NAMED (review of PR #2576, cycle 2 — P2). The reclaim this deferral waits for is
+  # `claim_live()` at the CONTROLLER's next dispatch — and this script exists for the case where no
+  # controller pass is coming (its own header: nothing in the controller reads this status). Without
+  # the command, `adopt-fix <PR>` returns 79 on every retry for ever, citing a reclaim that never
+  # happens. `fix-$PR.log` carries the lock path and the same REPAIR line.
+  echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, STALE) — the lock exists and its owner is not live; this fixer does not reclaim it (a reclaim is not a CAS and could delete a live holder's lock), so nothing was pushed and no attempt was consumed. The controller reclaims a dead owner's claim at its next dispatch; if nothing is dispatching this PR, REPAIR: confirm no lander is live (pgrep -af 'merge-one.sh|cloud-cell-doctor.sh'), then rm -f \"$O/state/mergeclaim-$PR.lock\" and re-run. The exact line is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+  exit 79
+# ... and a REFUSAL that can never clear by itself is named here too, with its own repair. It is NOT
+# refundable in fix-one.sh (a re-dispatch cannot change a lock path that is not a lock file, or an
+# unwritable state dir), so an operator who only sees "success" would re-run it for ever.
+elif [ "$rc" = "0" ] && grep -q 'REFUSED (NOT refundable' "$O/logs/fix-$PR.log" 2>/dev/null; then
+  echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, UNUSABLE) — the lock path cannot be read or created, which no re-dispatch can change, so fix-one.sh CONSUMED the attempt (a controller will park this PR for a human) instead of refunding it. Nothing was pushed. The repair command is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
   exit 79
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
