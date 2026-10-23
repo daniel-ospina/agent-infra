@@ -125,9 +125,14 @@ ciq_hosted_concurrency() { # GitHub-HOSTED CI's concurrent-job allowance, jobs (
 # Prints nothing and returns 1 on an unusable runner count, so a caller can distinguish "no ceiling
 # could be derived" from "the ceiling is 0" (which would be a lane-cap in disguise and is refused:
 # a 0 ceiling would defer every push forever, so the floor is 1 runner).
+# ⛔ THE MAGNITUDE BOUND, NOT JUST THE SHAPE (#2333 review round 2, P2). `is_num` accepts any number
+# of digits, so `ciq_ceiling 9223372036854775807` overflowed `r * h` and PRINTED `-1` (rc 0) — the
+# operator's sanity-check verb reporting a ceiling the arithmetic never produced, contradicting this
+# function's own contract. Every gate path pre-validates with `ciq_is_count`, so the blast radius was
+# the operator surface — which is the one surface that exists to verify the derivation.
 ciq_ceiling() {
   local r="${1:-}" h j
-  ciq_is_num "$r" || return 1
+  ciq_is_count "$r" || return 1
   [ "$r" -ge 1 ] || r=1
   h="$(ciq_horizon_min)" || return 1
   j="$(ciq_job_p90_min)" || return 1

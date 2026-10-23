@@ -283,6 +283,49 @@ qenv /nonexistent-gh 900 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c4c) a FUTURE-stamped record is NOT served (rc=$rc state=${CIQ_STATE:-?}) — no unbounded cache" \
    "$( { [ "$rc" -eq 2 ] && [ "${CIQ_STATE:-}" = unknown ]; } ; echo $? )"
+# ⛔ THE TTL BOUND ITSELF WAS PINNED BY NOTHING (#2333 review round 2, P1 — a FALSE PASS). (c4) asserts
+# that a TTL hit is LABELLED cache and carries an age; it never drives a record OLDER than the TTL, so
+# deleting the `[ "$age" -le "$ttl" ]` bound left this suite 103 passed / 0 failed CLEAN while the
+# module's ONE documented fail-open became UNBOUNDED: a record stamped 1000s ago with CIQ_TTL=90 kept
+# answering `ok(...)` from the cache on a gh OUTAGE — back-pressure silently inert, and CIQ_TTL (a
+# documented operator knob) inert with it. The stale record is driven, and the mutant below proves the
+# arm can go red.
+old=$(( $(ciq_now) - 1000 ))
+printf 'queued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$old" > "$REC"
+qenv /nonexistent-gh 90 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+ck "(c4d) a record OLDER than the TTL is NOT served (rc=$rc state=${CIQ_STATE:-?}) — the cache cannot outlive its bound" \
+   "$( { [ "$rc" -eq 2 ] && [ "${CIQ_STATE:-}" = unknown ]; } ; echo $? )"
+mutcad="$T/mutant-cache"
+mkdir -p "$mutcad"
+drive_read() { # <module> <state-dir> -> "<rc>|<state>" for a 1000s-old record with the live read failing
+  ( unset -f ciq_is_num ciq_is_count ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency \
+             ciq_ceiling ciq_slug ciq_state_dir ciq_gh ciq_now ciq_read ciq_eval ciq_verdict \
+             ciq_defer_line ciq_defer_note ciq_defer_note_here ciq_ci_allowed 2>/dev/null
+    mkdir -p "$2"
+    CIQ_GH=/nonexistent-ciq-gh; CIQ_TTL=90; CIQ_STALE_MAX=900; CIQ_STATE_DIR="$2"
+    export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+    printf 'queued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$(( $(date +%s) - 1000 ))" \
+      > "$2/ci-queue-daniel-ospina_agent-infra"
+    # shellcheck source=/dev/null
+    . "$1" >/dev/null 2>&1 || { printf 'NO-LOAD|'; return; }
+    ciq_read "daniel-ospina/agent-infra" >/dev/null 2>&1; local rc=$?
+    printf '%s|%s' "$rc" "${CIQ_STATE:-}"
+  ) 2>/dev/null
+}
+got="$(drive_read "$MOD" "$T/cache-shipped")"
+ck "(c4d2) CONTROL — the SHIPPED module answers '$got' through the same driver, so (c4e) is a mutation and not a restatement" \
+   "$( [ "$got" = '2|unknown' ]; echo $? )"
+sed 's/&& \[ "\$age" -le "\$ttl" \]; then/; then/' "$MOD" > "$mutcad/ci-queue.sh"
+if cmp -s "$MOD" "$mutcad/ci-queue.sh"; then
+  bad "(c4e) the cache-bound mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$mutcad/ci-queue.sh" 2>/dev/null; then
+  bad "(c4e) the cache-bound mutant does not parse — a broken mutant proves nothing"
+else
+  mgot="$(drive_read "$mutcad/ci-queue.sh" "$T/cache-mutant")"
+  ck "(c4e) MUTANT — an UNBOUNDED ttl SERVES the stale record (got '$mgot'), so (c4d) is not always-green" \
+     "$( [ "${mgot%%|*}" = 0 ]; echo $? )"
+fi
 # A record stamped in 1970, past a 0-second staleness window, with the live read failing: the queue
 # is UNREADABLE, and an unreadable queue is never "empty".
 feed 31 5 5
@@ -666,6 +709,15 @@ CIQ_CEILING=10; CIQ_AGE=0
 v="$(ciq_eval)"; rc=$?
 ck "(f1) a queued count too large to compare is UNKNOWN (rc=$rc), never allowed" \
    "$( { [ "$rc" -eq 2 ] && has "$v" 'not a comparable reading'; } ; echo $? )"
+# ⛔ THE BOUNDARY, NOT ONE FAR VALUE (#2333 review round 2, P2). `ciq_is_count`'s guard is `-le 9`
+# digits and (f1) probed only a 20-digit value, so widening it to `-le 19` kept the suite 103/0 CLEAN
+# while a 19-digit reading — above intmax, and producible from a garbled `total_count` — made `[ -gt ]`
+# ERROR, which is FALSE, which printed `ok(...)`: the gate OPENING on the one value it could not compare.
+CIQ_STATE=fresh; CIQ_QUEUED=9999999999999999999; CIQ_RUNNING=0; CIQ_RUNNERS=5; CIQ_BUSY=""
+CIQ_CEILING=10; CIQ_AGE=0
+v="$(ciq_eval)"; rc=$?
+ck "(f1b) …and a 19-digit count (above intmax, one below the 20-digit probe) is UNKNOWN too (rc=$rc)" \
+   "$( { [ "$rc" -eq 2 ] && has "$v" 'not a comparable reading'; } ; echo $? )"
 CIQ_QUEUED=31; CIQ_CEILING=99999999999999999999
 v="$(ciq_eval)"; rc=$?
 ck "(f2) …and so is an uncomparable CEILING (rc=$rc) — the same direction" \
@@ -727,6 +779,18 @@ else
   ck "(g7) MUTANT — a hard-printed 'return 0' makes UNKNOWN report DEEP (rc=$mc), so (g4)-(g6) are not always-green" \
      "$( [ "$mc" = 0 ]; echo $? )"
 fi
+# ⛔ THE SANITY-CHECK VERB MUST NOT PRINT A CEILING THE ARITHMETIC DID NOT PRODUCE (#2333 review round 2,
+# P2). `ciq_ceiling` validated the shape with the UNBOUNDED `ciq_is_num`, so `--runners 9223372036854775807`
+# overflowed `r * h` and printed `-1` with rc 0; `--runners 4611686018427387904` printed `0`. Both are
+# numbers an operator would believe, on the one surface that exists to verify the derivation. The fix is
+# the MAGNITUDE predicate the gate paths already use, so this arm pins it from the operator side.
+bash "$MOD" ceiling --runners 9223372036854775807 > "$T/g8.out" 2>/dev/null; rc=$?
+n="$(tr -d '\n' < "$T/g8.out")"
+ck "(g8) 'ceiling --runners <intmax>' is REFUSED (rc=$rc, printed '${n:-<nothing>}') — never a negative or zero ceiling" \
+   "$( { [ "$rc" -ne 0 ] && [ -z "$n" ]; } ; echo $? )"
+n="$(bash "$MOD" ceiling 5 2>/dev/null | tr -d '\n')"
+ck "(g8b) CONTROL — a plausible runner count still derives 10 ('$n'), so (g8) is not a blanket refusal" \
+   "$( [ "$n" = 10 ]; echo $? )"
 
 printf '\n── (i) the note the WIRING calls is EXECUTED — and can go red ─────────────────\n'
 # ⛔ EXECUTED, NOT GREPPED (#2333 merge review, P2). (a)/(b)/(c) drive `ciq_defer_note`, the
