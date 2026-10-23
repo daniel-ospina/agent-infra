@@ -1281,6 +1281,83 @@ case "$OLNEG_U_OUT" in
   *) bad "uninstall: left the foreign unit alone without naming it: $OLNEG_U_OUT" ;;
 esac
 
+# — §L-iv: the REVERSE direction — this installer's OWN unit keeps its RENDERED O= (review P1 round 9) ———
+# `verify_unit` REQUIRES `Environment=O=$O`, so a unit THIS installer rendered ALWAYS carries the installer's
+# own $O — while the controller it starts runs in the state dir `keys.env` resolves. Reading ownership from
+# the RESOLUTION ALONE (which is what §L-iii above introduced) therefore called this installer's OWN unit
+# another state dir's as soon as `keys.env` carried an `O=` line: `--status` exited 1 without asking the
+# manager at all (cloud-cell-bringup treats that as a dead cell), `--uninstall` printed "not installed for
+# $O … nothing to do" over an ENABLED unit that `Restart=always` keeps supervising, and `--install` could not
+# see the copy its "never arm a second supervisor in the other scope" guard keys on (#1761).
+# The two reads answer the unit's own two claims, so ownership is the UNION — this arm pins the side §L-iii
+# alone would have broken, and §L-iii's negative control still pins the case that must stay foreign.
+say_case 'a unit this installer rendered stays OURS when keys.env repoints $O (rendered read, not resolution only)'
+OLREV="$(arm_root l5)"; mk_systemctl "$OLREV/bin" "$OLREV/state" "$OLREV/sc.log"
+printf 'O=%s/elsewhere\n' "$OLREV" > "$OLREV/home/keys.env"
+cat > "$OLREV/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLREV/home
+Environment=ENV_FILE=$OLREV/home/keys.env
+Environment=O=$OLREV/o
+Restart=always
+SH
+: > "$OLREV/state/enabled"; : > "$OLREV/state/active"; printf '4242\n' > "$OLREV/state/mainpid"
+printf '%s\n' "$(( $(date +%s) - 30 ))" > "$OLREV/o/heartbeat"
+OLREV_S_RC=0; OLREV_S_OUT="$(inst l5 --status 2>&1)" || OLREV_S_RC=$?
+[ "$OLREV_S_RC" -eq 0 ] \
+  && ok 'status: rc 0 for the installer’s OWN unit whose keys.env repoints $O (the rendered O= is an owner too)' \
+  || bad "status: exited $OLREV_S_RC on THIS cell's own unit — the rendered O= was ignored, and bringup dies on this verb: $OLREV_S_OUT"
+case "$OLREV_S_OUT" in
+  *"other_unit="*) bad "status: reported the installer's OWN unit as another state dir's: $OLREV_S_OUT" ;;
+  *) ok 'status: does not call the installer’s own unit foreign' ;;
+esac
+OLREV_U_RC=0; OLREV_U_OUT="$(inst l5 --uninstall 2>&1)" || OLREV_U_RC=$?
+[ "$OLREV_U_RC" -eq 0 ] && [ ! -f "$OLREV/units/eldato-orchestrator.service" ] \
+  && ok 'uninstall: REMOVES the installer’s own unit when keys.env repoints $O (an enabled unit left behind keeps supervising)' \
+  || bad "uninstall: reported nothing to do over an ENABLED unit that is still armed: $OLREV_U_OUT"
+
+# — §L-v: a ROOT invocation must not EXECUTE the operator's keys.env (review P2 round 9) ————————————
+# The resolution is obtained by SOURCING the unit's `Environment=ENV_FILE=`. `keys.env` is the operator's
+# file and `--status` is documented as `sudo bash … --status`, so sourcing it as root lets any account that
+# can write that file run code with root's authority — from a verb that only READS. As root the file must be
+# evaluated only through a privilege-correct runner (`runuser -u <the file's owner>`), and NOT AT ALL when
+# that runner is unavailable or fails; the fallback is the RENDERED owner, which the unit carries in
+# cleartext and which the union above makes lossless for OWNERSHIP. These two arms pin both halves: the
+# §L-iii shape (rendered ≠ $O, resolves to $O) is the only one where the two reads disagree, so it is the
+# only fixture that can tell "evaluated" from "fell back".
+say_case "as root, the operator's keys.env is never executed without a privilege-correct runner"
+OLROOT="$(arm_root l6)"; mk_systemctl "$OLROOT/bin" "$OLROOT/state" "$OLROOT/sc.log"
+printf '#!/bin/bash\n[ "${1:-}" = "-u" ] && { printf "0\\n"; exit 0; }\nexec /usr/bin/id "$@"\n' > "$OLROOT/bin/id"
+printf '#!/bin/bash\nexit 127\n' > "$OLROOT/bin/runuser"
+chmod +x "$OLROOT/bin/id" "$OLROOT/bin/runuser"
+printf 'O=%s/o\n: > %s/SOURCED-BY-ROOT\n' "$OLROOT" "$OLROOT" > "$OLROOT/home/keys.env"
+cat > "$OLROOT/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLROOT/home
+Environment=ENV_FILE=$OLROOT/home/keys.env
+Environment=O=$OLROOT/installer-orchestrator
+Restart=always
+SH
+OLROOT_S_RC=0; OLROOT_S_OUT="$(EXTRA_ENV="PATH=$OLROOT/bin:/usr/bin:/bin" inst l6 --status 2>&1)" || OLROOT_S_RC=$?
+[ ! -f "$OLROOT/SOURCED-BY-ROOT" ] \
+  && ok 'root: the env file was NOT sourced when no privileged runner could evaluate it' \
+  || bad 'root: SOURCED the operator-writable keys.env directly — an account that can write that file runs code as root'
+[ "$OLROOT_S_RC" -ne 0 ] \
+  && ok 'root: falls back to the rendered owner (reports the copy as not provably this state dir’s, rc!=0)' \
+  || bad "root: answered rc 0 from a read it could not perform: $OLROOT_S_OUT"
+# POSITIVE CONTROL: with a privilege-correct runner present, the SAME root invocation DOES resolve — as the
+# file's OWNER, never as root — so the refusal above is about privilege, not about never reading the file.
+printf '#!/bin/bash\nprintf "%%s\\n" "$2" >> %s/runuser.log\nshift 3\nexec "$@"\n' "$OLROOT" > "$OLROOT/bin/runuser"
+chmod +x "$OLROOT/bin/runuser"
+OLROOT2_RC=0; OLROOT2_OUT="$(EXTRA_ENV="PATH=$OLROOT/bin:/usr/bin:/bin" inst l6 --status 2>&1)" || OLROOT2_RC=$?
+[ -f "$OLROOT/SOURCED-BY-ROOT" ] \
+  && ok 'root: with a privileged runner the resolution IS obtained (the runner is used, not bypassed)' \
+  || bad "root: never evaluated the env file even through the runner: $OLROOT2_OUT"
+OLROOT2_OWNER="$(stat -c %U -- "$OLROOT/home/keys.env")"
+[ -s "$OLROOT/runuser.log" ] && [ -z "$(grep -vxF "$OLROOT2_OWNER" "$OLROOT/runuser.log" 2>/dev/null)" ] \
+  && ok 'root: EVERY runner call used the FILE’S OWNER — the file never ran with root authority' \
+  || bad "root: the runner was invoked as '$(tr '\n' ' ' < "$OLROOT/runuser.log" 2>/dev/null)' instead of the file's owner ($OLROOT2_OWNER)"
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §M — the lock witness needs SHAPE *AND AGE* (review P1, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════

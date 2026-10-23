@@ -730,46 +730,82 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
 # not own, i.e. the #2402 "reads as a healthy box" false green on the one verb the docs tell an operator to
 # trust. The rendered unit CARRIES its owner, so ownership is a READ, not a guess.
 #
-# ⛔ AND THE READ IS THE RESOLUTION, NOT THE RENDERED `Environment=O=` (review P1, #2402). This copy is a
-# PINNED MIRROR of `cloud-cell-supervisor.sh::unit_owner_dir`, and it exists because the two answers
-# DIVERGED: the unit also renders `Environment=ENV_FILE=`, the controller re-sources that file and
-# `keys.env` may repoint `O` — this installer "never sources `$ENV_FILE`", so its `$O` and the
-# controller's "can legitimately differ". A bare comparison therefore called this cell's OWN unit another
-# state dir's as soon as `keys.env` carried an `O=` line: `--uninstall` reported "not installed for $O" and
-# left an ENABLED unit running (`Restart=always`, still supervising), while `--install` could not see the
-# existing copy and armed a SECOND one in the other scope — two dispatchers on one queue (#1761). A
-# trailing slash is a spelling, not a different state dir. Keep this body identical to the supervisor's:
-# §L-iii pins the divergence case here, and cloud-cell-supervisor.test.sh pins the same arm there.
-unit_owner_dir() { # <unit file> -> the state dir it supervises; nothing when it carries no O= line
+# ⛔ OWNERSHIP IS TWO READS, AND A UNIT IS OURS IF EITHER SAYS SO (review P1 round 9, #2402). The unit
+# carries its owner TWICE — the `Environment=O=` it RENDERS (what `verify_unit` pins to the installing
+# state dir) and what it RESOLVES to (`ENV_FILE` re-sourced, and `keys.env` may repoint `O`) — and the two
+# legitimately differ in BOTH directions. Reading renders only called the SUPERVISOR's own unit foreign
+# whenever `keys.env` repointed `O` (its `$O` is the resolution); reading resolutions only called THIS
+# INSTALLER's own unit foreign whenever `keys.env` repointed `O` (its `$O` is the rendered/environment
+# value, and `verify_unit` guarantees its own copies render it). Either answer is the unit's own claim
+# about itself, so ownership is the UNION — and a unit that provably matches neither is still foreign, so
+# #1761's "never arm a second supervisor" and §L's negative control both hold. `unit_owner_dir` keeps
+# answering the RESOLUTION (that is what the controller actually supervises, so it is what the reports
+# print); `unit_rendered_owner` answers the render. Keep these bodies identical to the supervisor's:
+# §L-iii/§L-iv pin both directions here, and cloud-cell-supervisor.test.sh pins them there.
+#
+# ⛔ AND ROOT MUST NEVER EXECUTE AN OPERATOR-WRITABLE FILE (review P2 round 9, #2402). The resolution above
+# is obtained by evaluating the unit's `Environment=ENV_FILE=` the way the controller does (`set -a; . file`)
+# — the only read that answers "which state dir does the controller actually use". But `keys.env` is the
+# operator's file and `--status` is documented as `sudo bash … --status`, so evaluating it AS ROOT lets any
+# account that can write that file execute with root's authority, from a verb that only READS. As root the
+# file is therefore evaluated as the account that OWNS it (the account that could have written it, and the
+# account the controller runs as), via `runuser`; when that cannot be arranged — no `runuser`, or an owner
+# that cannot be read — it is NOT evaluated at all and the caller falls back to the RENDERED owner, which
+# the unit carries in cleartext. The fallback is lossless for ownership because it is the union above.
+unit_rendered_owner() { # <unit file> -> the owner the unit RENDERS; nothing when it carries no O= line
+    local v
+    [ -f "$1" ] || return 1
+    v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
+    [ -n "${v:-}" ] || return 1
+    # A trailing slash is a spelling difference, not a different state dir.
+    printf '%s\n' "${v%/}"
+}
+env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing when not evaluated
+    local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
+    [ -n "${f:-}" ] && [ -r "$f" ] || return 1
+    if [ "$(id -u)" = "0" ]; then
+        owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+        [ -n "${owner:-}" ] || return 1
+        if [ "$owner" != "root" ]; then
+            command -v runuser >/dev/null 2>&1 || return 1
+            runner=(runuser -u "$owner" --)
+        fi
+    fi
+    out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
+        CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
+        set -a; . "$1" >/dev/null 2>&1
+        printf "%s" "${O:-}"
+    ' _ "$f" "${home:-}" "${rendered:-}" 2>/dev/null || true)"
+    [ -n "${out:-}" ] || return 1
+    printf '%s\n' "$out"
+}
+unit_owner_dir() { # <unit file> -> the state dir it RESOLVES to; nothing when nothing is readable
     local f="$1" rendered_o envf unit_home eff
     [ -f "$f" ] || return 1
-    rendered_o="$(sed -n 's/^Environment=O=//p' "$f" 2>/dev/null | head -1)"
+    rendered_o="$(unit_rendered_owner "$f")" || rendered_o=""
     envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
     unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
     eff=""
-    if [ -n "${envf:-}" ] && [ -r "$envf" ]; then
-        # The unit's own declared file, evaluated the way the controller evaluates it, in a throwaway
-        # subshell; `env -u` keeps an inherited O/CELL_HOME from shadowing the unit's own. A file with a
-        # top-level `exit` ends the subshell silently, and the empty answer falls back to the rendered
-        # value — never to "no owner".
-        eff="$(env -u O -u CELL_HOME -u ENV_FILE bash -c '
-            CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
-            set -a; . "$1" >/dev/null 2>&1
-            printf "%s" "${O:-}"
-        ' _ "$envf" "${unit_home:-}" "${rendered_o:-}" 2>/dev/null || true)"
+    if [ -n "${envf:-}" ]; then
+        # A file with a top-level `exit` ends the subshell silently, and an empty answer falls back to the
+        # rendered value — never to "no owner".
+        eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}")" || eff=""
     fi
     [ -n "${eff:-}" ] || eff="${rendered_o:-}"
     [ -n "${eff:-}" ] || return 1
     printf '%s\n' "${eff%/}"
 }
-# May this verb address <unit file>? YES for our own copy, and YES for an UNPROVABLE one (no O= line — a
-# hand-written or pre-#2402 unit), which is the fail-safe side of #1761: assume it may be ours and never
-# launch a tmux controller beside a unit that could be enabled. NO only when it provably supervises a
-# DIFFERENT state dir — and then nothing here may disable, delete, or report on it.
+# May this verb address <unit file>? YES for our own copy, and YES for an UNPROVABLE one (no O= line and no
+# readable env file — a hand-written or pre-#2402 unit), which is the fail-safe side of #1761: assume it may
+# be ours and never launch a tmux controller beside a unit that could be enabled. NO only when it provably
+# supervises a DIFFERENT state dir by BOTH reads — and then nothing here may disable, delete, or report on it.
 unit_is_ours() { # <unit file>
-    local own
-    own="$(unit_owner_dir "$1")" || return 0
-    [ "$own" = "${O%/}" ]
+    local own rendered
+    own="$(unit_owner_dir "$1")" || own=""
+    rendered="$(unit_rendered_owner "$1")" || rendered=""
+    [ -n "$own" ] || [ -n "$rendered" ] || return 0
+    [ "$own" = "${O%/}" ] && return 0
+    [ "$rendered" = "${O%/}" ]
 }
 # Every installed copy that PROVABLY belongs to another state dir — reported, never addressed.
 foreign_units() {

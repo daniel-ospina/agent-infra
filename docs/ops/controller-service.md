@@ -134,10 +134,21 @@ false red on every healthy start. The stale-heartbeat bound above is what refuse
 the residual ambiguity is one heartbeat window (900 s), stated rather than hidden.
 
 The unit name is **machine-scoped** (`eldato-orchestrator.service`), so on a box with more than one state
-dir the installer reads each copy's `Environment=O=` line: a copy that provably supervises a different
-state dir is reported as `other_unit=` and is **never** disabled, removed, or answered for. A copy with no
-`O=` line at all (hand-written, or pre-#2402) counts as ours — the fail-safe side of #1761, where the
+dir the installer reads each copy's **owner**, which that copy carries TWICE: the `Environment=O=` line it
+**renders** (which `--install` pins to the installing state dir) and what it **resolves** to, because the
+controller re-sources `Environment=ENV_FILE=` and a `keys.env` `O=` line can move its state dir. A copy is
+this state dir's when **either** read matches — the two disagree in both directions, and reading only one
+turned a healthy cell's own unit into `other_unit=` — and a copy that provably matches **neither** is
+reported as `other_unit=` and is **never** disabled, removed, or answered for. A copy with no `O=` line and
+no readable env file (hand-written, or pre-#2402) counts as ours — the fail-safe side of #1761, where the
 danger is a tmux controller launched beside a unit that may be enabled.
+
+**Those verbs never execute `keys.env` with root's authority.** Resolving the owner means *sourcing* that
+file, and the file belongs to the operator, while `sudo bash … --status` is a documented invocation — so
+when the installer runs as root it evaluates the file as the account that **owns** it (`runuser -u <owner>`),
+and when that cannot be arranged (no `runuser`, an owner it cannot read) it does not evaluate the file at
+all and falls back to the rendered `O=`, which is cleartext in the unit. The fallback costs nothing for
+ownership, because ownership is the union above.
 
 ## Tests
 

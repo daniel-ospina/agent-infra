@@ -589,46 +589,91 @@ controller_unit_copies() { # every copy on the box, system then user
   done
   return 0
 }
-# The state dir a rendered unit ACTUALLY supervises.
+# The state dir a rendered unit ACTUALLY supervises, and the one it CLAIMS.
 #
-# ⛔ THE RENDERED `Environment=O=` IS NOT THE ANSWER ON ITS OWN (review P1, #2402). The unit also renders
-# `Environment=ENV_FILE=` and `Environment=CELL_HOME=`, and the controller SOURCES that env file before it
-# derives anything from $O (`source_env_file`, above): `keys.env` may repoint `O`, and both instruments say
-# so in their own words — the installer "never sources `$ENV_FILE`", and the installer's `$O` and the
-# controller's "can legitimately differ". Comparing the rendered value against the LIVE $O therefore
-# classified this cell's OWN installed, enabled unit as ANOTHER state dir's as soon as keys.env repointed
-# `O`: `stop` fell through to the pid teardown (a kill `Restart=always` undoes within RestartSec), printed
-# "released lock" with no `systemctl stop` behind it — the "reported stopped, still running" false pass this
-# file exists to remove — while `status` printed "nothing will restart it" over a supervised cell and
-# `start` fell through to the tmux path beside an enabled unit (#1761's duplicate).
+# ⛔ OWNERSHIP IS TWO READS, AND A UNIT IS OURS IF EITHER SAYS SO (review P1 round 9, #2402). The unit
+# carries its owner TWICE — the `Environment=O=` it RENDERS (what `verify_unit` pins to the installing state
+# dir) and what it RESOLVES to (`ENV_FILE` re-sourced, and `keys.env` may repoint `O`) — and the two
+# legitimately differ in BOTH directions. Reading renders only classified this cell's OWN installed, enabled
+# unit as ANOTHER state dir's as soon as keys.env repointed `O`: `stop` fell through to the pid teardown (a
+# kill `Restart=always` undoes within RestartSec), printed "released lock" with no `systemctl stop` behind it
+# — the „reported stopped, still running" false pass this file exists to remove — while `status` printed
+# "nothing will restart it" over a supervised cell and `start` fell through to the tmux path beside an
+# enabled unit (#1761's duplicate). Reading RESOLUTIONS only does the mirror damage to the INSTALLER, whose
+# `$O` is the rendered value: `verify_unit` guarantees its own copies render it, so a `keys.env` `O=` line
+# made its own unit look foreign — a status that never asks the manager, and an uninstall that reports "not
+# installed" over an ENABLED unit. Either answer is the unit's own claim about itself, so ownership is the
+# UNION (see `unit_is_ours`); a unit that provably matches NEITHER is still foreign, so §L's negative
+# control and #1761's "never arm a second supervisor" both hold.
 #
-# The fix is the RESOLUTION, not a wider guess: evaluate the unit's own env file the way the controller
-# will (`set -a; . file`), with the unit's own CELL_HOME/O in scope, and print the `O` that results. Only
-# the copy's own declared file is evaluated, and only in a throwaway subshell whose output is captured —
-# the same posture and the same completion guard `source_env_file` uses (a file with a top-level `exit`
-# ends the subshell silently, and an EMPTY answer here falls back to the rendered value rather than reading
-# as "no owner"). `env -u` is load-bearing: an inherited O/CELL_HOME must not shadow the unit's own.
+# `unit_owner_dir` answers the RESOLUTION: evaluate the unit's own env file the way the controller will
+# (`set -a; . file`), with the unit's own CELL_HOME/O in scope, and print the `O` that results. Only the
+# copy's own declared file is evaluated, and only in a throwaway subshell whose output is captured — the
+# same posture and the same completion guard `source_env_file` uses (a file with a top-level `exit` ends the
+# subshell silently, and an EMPTY answer here falls back to the rendered value rather than reading as "no
+# owner"). `env -u` is load-bearing: an inherited O/CELL_HOME must not shadow the unit's own.
 # Prints nothing when the unit carries neither a resolvable `Environment=O=` nor a readable env file, which
 # is a HAND-WRITTEN unit: unprovable either way, and treated as this state dir's (the pre-#2402 behaviour —
 # the fail-safe side for #1761 is "assume it may be ours, never launch a session beside it").
+#
+# ⛔ AND ROOT MUST NEVER EXECUTE AN OPERATOR-WRITABLE FILE (review P2 round 9, #2402). `keys.env` is the
+# operator's file and `sudo bash … stop`/`--status` is a documented invocation, so evaluating it AS ROOT lets
+# any account that can write that file execute with root's authority. As root the file is therefore
+# evaluated as the account that OWNS it (the account that could have written it, and the account the
+# controller runs as), via `runuser`; when that cannot be arranged — no `runuser`, or an owner that cannot be
+# read — it is NOT evaluated at all and the caller falls back to the RENDERED owner, which the unit carries
+# in cleartext. That fallback is lossless for ownership because ownership is the union above.
+unit_rendered_owner() { # <unit file> -> the owner the unit RENDERS; nothing when it carries no O= line
+  local v
+  [ -f "$1" ] || return 1
+  v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
+  [ -n "${v:-}" ] || return 1
+  # A trailing slash is a spelling difference, not a different state dir.
+  printf '%s\n' "${v%/}"
+}
+env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing when not evaluated
+  local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
+  [ -n "${f:-}" ] && [ -r "$f" ] || return 1
+  if [ "$(id -u)" = "0" ]; then
+    owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+    [ -n "${owner:-}" ] || return 1
+    if [ "$owner" != "root" ]; then
+      command -v runuser >/dev/null 2>&1 || return 1
+      runner=(runuser -u "$owner" --)
+    fi
+  fi
+  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
+      CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
+      set -a; . "$1" >/dev/null 2>&1
+      printf "%s" "${O:-}"
+    ' _ "$f" "${home:-}" "${rendered:-}" 2>/dev/null || true)"
+  [ -n "${out:-}" ] || return 1
+  printf '%s\n' "$out"
+}
 unit_owner_dir() { # <unit file>
   local f="$1" rendered_o envf unit_home eff
   [ -f "$f" ] || return 1
-  rendered_o="$(sed -n 's/^Environment=O=//p' "$f" 2>/dev/null | head -1)"
+  rendered_o="$(unit_rendered_owner "$f")" || rendered_o=""
   envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
   unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
   eff=""
-  if [ -n "${envf:-}" ] && [ -r "$envf" ]; then
-    eff="$(env -u O -u CELL_HOME -u ENV_FILE bash -c '
-        CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
-        set -a; . "$1" >/dev/null 2>&1
-        printf "%s" "${O:-}"
-      ' _ "$envf" "${unit_home:-}" "${rendered_o:-}" 2>/dev/null || true)"
+  if [ -n "${envf:-}" ]; then
+    eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}")" || eff=""
   fi
   [ -n "${eff:-}" ] || eff="${rendered_o:-}"
   [ -n "${eff:-}" ] || return 1
-  # A trailing slash is a spelling difference, not a different state dir.
   printf '%s\n' "${eff%/}"
+}
+# May this verb address <unit file>? YES for our own copy by EITHER read, and YES for an UNPROVABLE one (no
+# O= line and no readable env file — a hand-written or pre-#2402 unit), the fail-safe side of #1761. NO only
+# when BOTH reads name a DIFFERENT state dir, and then nothing here may disable, delete, or report on it.
+unit_is_ours() { # <unit file>
+  local own rendered
+  own="$(unit_owner_dir "$1")" || own=""
+  rendered="$(unit_rendered_owner "$1")" || rendered=""
+  [ -n "$own" ] || [ -n "$rendered" ] || return 0
+  [ "$own" = "${O%/}" ] && return 0
+  [ "$rendered" = "${O%/}" ]
 }
 # The copy the VERBS address, resolved once and remembered: `_UNIT_PATH` (empty = none of ours), plus the
 # FIRST copy that is NOT this state dir's (`_UNIT_FOREIGN`, provably another state dir) and the FIRST that
@@ -636,15 +681,17 @@ unit_owner_dir() { # <unit file>
 # scope (system, user) — and the reports need them to be truthful.
 _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
 controller_unit_path() {
-  local f own="" first="" unp=""
+  local f own="" rendered="" first="" unp=""
   _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
   while IFS= read -r f; do
-    if ! own="$(unit_owner_dir "$f")"; then
+    own="$(unit_owner_dir "$f")" || own=""
+    rendered="$(unit_rendered_owner "$f")" || rendered=""
+    if [ -z "$own" ] && [ -z "$rendered" ]; then
       [ -n "$unp" ] || unp="$f"
       [ -n "$_UNIT_UNPROVABLE" ] || _UNIT_UNPROVABLE="$f"
       continue
     fi
-    if [ "$own" != "${O%/}" ]; then
+    if [ "$own" != "${O%/}" ] && [ "$rendered" != "${O%/}" ]; then
       [ -n "$_UNIT_FOREIGN" ] || _UNIT_FOREIGN="$f"
       continue
     fi
@@ -2002,10 +2049,14 @@ cmd_start() {
       # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
       # bound. No owned pid but a session that is still there is an ORPHAN, and an orphan never exits: the
       # short bound is what turns "impossible start" into a filled start limit instead of an active unit.
-      local _bound_now="$_bound"
+      local _bound_now="$_bound" _who=""
       [ -z "$_own" ] && _bound_now="$_orphan_bound"
-      [ "$_waited" -lt "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for ${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'} — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
-      [ "$_saidd" = 1 ] || say "controller already running (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
+      # ⛔ ONE PHRASE, COMPOSED ONCE (review P3 round 9, #2402): `${_own:-word}` yields `_own`'s VALUE when it
+      # is non-empty, so the two halves below concatenated — "pid 15562491556249", a pid `ps -p` cannot
+      # resolve, handed to the operator inside the FATAL that tells them what to wait for.
+      if [ -n "$_own" ]; then _who="pid $(_pids_join "$_own")"; else _who="tmux session '$SESSION'"; fi
+      [ "$_waited" -lt "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for $_who — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
+      [ "$_saidd" = 1 ] || say "controller already running ($_who) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
       sleep 5; _waited=$((_waited + 5))
       superseded && return 1

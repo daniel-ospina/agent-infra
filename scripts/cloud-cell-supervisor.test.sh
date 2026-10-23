@@ -2296,6 +2296,32 @@ case "$S3N_OUT" in
   *) bad "stop: left the foreign unit alone without naming it — $S3N_OUT" ;;
 esac
 rm -f "$S3/units/eldato-orchestrator.service"
+# ── #2402 review round 9 P1: the MIRROR direction — rendered `O` is ours, keys.env says elsewhere ────────
+# The arm above pins "rendered ≠ $O, resolves $O". The mirror is just as real and just as damaging:
+# `verify_unit` REQUIRES `Environment=O=$O`, so every copy the INSTALLER renders carries the installer's own
+# $O while the controller it starts may run in the dir `keys.env` resolves. A supervisor whose $O was pinned
+# before an operator repointed keys.env (or whose env file was edited since it started) then read its OWN
+# unit as another state dir's: `stop` skipped `systemctl stop`, killed the pid, printed "released lock", and
+# `Restart=always` re-created the controller within RestartSec — the same false pass, from the opposite read.
+# So ownership is the UNION of the two answers the unit carries about itself, and only a copy that provably
+# matches NEITHER stays foreign (the negative control above).
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/o
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3MP=$!
+printf '%s\n' "$S3MP" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3M_OUT="$(svc3_sup stop)"
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: a unit that RENDERS this state dir’s O is addressed even when keys.env repoints the controller elsewhere (the union, not the resolution alone)' \
+  || bad "stop: called a unit that renders THIS state dir's O foreign — the installer's own copies always render it, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3M_OUT"
+kill -9 "$S3MP" 2>/dev/null || true
+S3MC="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3MC" ] && kill -9 "$S3MC"; } 2>/dev/null || true
+rm -f "$S3/units/eldato-orchestrator.service"
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
