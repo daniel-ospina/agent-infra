@@ -1313,13 +1313,30 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
       case "$tok" in
         ''|*[!0-9]*)
           why="no pid in the name ('$tok') — this spelling has no liveness proof, so it is not reaped" ;;
+        # ⛔ A NUMBER IS NOT A PID (review round 2, P2). `kill -0` answers two different questions and
+        # this code read both as "dead": a token that CANNOT be a pid proves nothing about liveness.
+        # `kill -0 0` SUCCEEDS (it signals the caller's own process GROUP), so `cloud-cell-0.*` would
+        # otherwise never be reapable; a leading zero is octal to arithmetic; and a date-stamped
+        # spelling like `cloud-cell-20260101.XXXX` is above the kernel pid ceiling yet fails with
+        # "No such process" — i.e. it would be reaped on the age floor alone, which is exactly the
+        # reap-without-proof the no-pid arm above refuses.
+        0|0*) why="the token '$tok' cannot be a pid (0 is a process GROUP and a leading zero is not a decimal pid), so its liveness is UNKNOWN" ;;
         *)
-          if kerr="$(kill -0 "$tok" 2>&1)"; then
+          if [ "$tok" -gt 4194304 ]; then
+            why="the token '$tok' is above the kernel pid ceiling (4194304), so it is not a pid and its liveness is UNKNOWN"
+          elif kerr="$(kill -0 "$tok" 2>&1)"; then
             why="pid $tok from the name is ALIVE"
           else
             case "$kerr" in
               *ermitted*|*"not owner"*|*EPERM*)
                 why="pid $tok from the name cannot be probed here (not permitted), so its liveness is UNKNOWN" ;;
+              # The ONE answer that means "gone": bash says "(pid) - No such process", BSD says
+              # "pid: no such process". Anything else is an answer we could not read.
+              ''|*"No such process"*|*"no such process"*) ;;
+              *)
+                # Any OTHER complaint means `kill` could not answer the liveness question at all — and
+                # an unanswerable probe is not a dead pid.
+                why="the liveness of token '$tok' could not be probed ($(printf '%s' "$kerr" | head -1)), so it is UNKNOWN" ;;
             esac
           fi ;;
       esac
@@ -1343,10 +1360,12 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
       # the activity it claimed to have measured — while the log reported "untouched ${age}s" as PROOF.
       # An entry newer than the directory itself means a descendant was written after the directory's
       # last change: its age does not cover it, so the candidate is REPORTED, not reaped.
-      # `-maxdepth 3` bounds the walk (`-quit` is not portable, and `sed -n 1p` reads to EOF so no
-      # SIGPIPE); depth 3 suffices because a write at any depth updates the mtime of its deepest
-      # ancestor directory, which is at most 3 levels below `$d`.
-      if [ -n "$(find "$d" -maxdepth 3 -newer "$d" -print 2>/dev/null | sed -n '1p')" ]; then
+      # ⛔ NO `-maxdepth` (review round 2, P2): a CREATED entry bumps its parent directory's mtime, but
+      # an in-place APPEND (`echo >> $d/a/b/c/log`) bumps only the FILE's — so any depth bound leaves a
+      # hole a live writer can sit in while the directory's own age stays ancient. The walk is one
+      # linear pass over a candidate that already passed the cheap gates, and `sed -n 1p` reads to EOF
+      # (no SIGPIPE, unlike `head`).
+      if [ -n "$(find "$d" -newer "$d" -print 2>/dev/null | sed -n '1p')" ]; then
         why="an entry INSIDE it was written after its own mtime (a nested write), so its age does not prove it is idle"
       fi
     fi
@@ -1411,7 +1430,11 @@ hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
     # an operator learns to ignore the row (same reasoning as the 4/5/7 carve-out noted in
     # `reap_global_caches`, cloud-cell-supervisor.sh).
     case "$derr" in
-      *"Cannot connect"*|*"cannot connect"*|*"Is the docker daemon running"*|*"dial unix"*|*"permission denied"*)
+      # ⛔ The CONTEXT all three real spellings carry — not a bare "permission denied" (review round 2,
+      # P2): an unreadable `$DOCKER_CONFIG` or plugin directory is a real failure this role must
+      # report, and swallowing it would print "no daemon" and a green row about a box whose
+      # reclaimable images are exactly what is filling the disk.
+      *"docker daemon"*|*"Dial unix"*|*"dial unix"*)
         log "[hygiene] docker: no daemon ($(printf '%s' "$derr" | head -1)) — nothing to reclaim"
         HYG_FRAG='docker: no daemon'
         return 0 ;;
@@ -1459,7 +1482,15 @@ hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
 # The exclusion is passed as `--exclude-root=` (an EXCLUSION, never an inclusion list) so the roots
 # this file does not enumerate — `$HARNESS_REPO`'s, which it does not even know — keep their coverage.
 hygiene_cache_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
+  # ⛔ `excl` IS LOCAL, AND THAT IS THE WHOLE FIX FOR ONE P1 (review round 2). A global array is never
+  # reset, and `run_loop` calls this function over and over IN ONE PROCESS: `hr` restarts at 0 each
+  # pass, so a pass that held fewer roots overwrote only the low indices and left the rest behind. The
+  # exclusion set then grew monotonically to the historical maximum of held roots — after one busy
+  # period the sweep excluded roots nothing holds, printed "a LIVE process holds it" about them, and
+  # still recorded "swept N idle root(s)". Same failure as the clamp this role exists to remove, with
+  # a slower fuse. `cloud-cell-doctor.hygiene.test.sh` calls the function TWICE in one shell to pin it.
   local dry="${1:-}" names rc sup roots r lo lg held="" hr=0 idle_n=0 live_n=0 census_clone="" wl=""
+  local -a excl=()
   HYG_SUB_RC=0; HYG_FRAG=""
   names="$(harness_sessions)"
   case "$names" in
@@ -1541,7 +1572,7 @@ $(git -C "$HARNESS_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree
       # exactly what this sweep came for and must never be excluded.
       excl[$hr]="--exclude-root=$r"
       hr=$((hr + 1))
-      log "[hygiene] caches: LEFT $r — a LIVE process has a cwd inside it (proof: the cwd census)"
+      log "[hygiene] caches: LEFT $r — a LIVE process has a cwd inside it (proof: the cwd census, which is a floor on VISIBLE processes)"
     else
       idle_n=$((idle_n + 1))
     fi
@@ -1565,7 +1596,10 @@ $(git -C "$HARNESS_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree
   # case on a quiet box, so the plain form would fail the sweep exactly when it has most to do.
   run_bounded "$HYGIENE_TIMEOUT" bash "$sup" prune --caches ${excl[@]+"${excl[@]}"} >>"$O/logs/doctor.log" 2>&1
   rc=$?
-  log "[hygiene] caches: swept $idle_n idle root(s)$wl; excluded $(printf '%s' "$held" | tr '\n' ' ')"
+  # ⛔ "no VISIBLE holder" — not "idle" (review round 2, P2). The census cannot see another user's or a
+  # hardened process (live-ownership.sh states this), so the record says what was MEASURED instead of
+  # presenting a floor as proof.
+  log "[hygiene] caches: swept $idle_n root(s) with no VISIBLE holder$wl; excluded $(printf '%s' "$held" | tr '\n' ' ')"
   if [ "$rc" -eq 0 ]; then
     HYG_FRAG="worktree caches swept ($idle_n idle root(s)$wl)"
   else
@@ -2193,6 +2227,12 @@ parse_dry() {
   [ -n "$seen" ] && printf '%s\n' '--dry-run'
   return 0
 }
+
+# ⛔ SOURCING DEFINES FUNCTIONS; IT DOES NOT RUN A PASS. Without this guard a suite cannot exercise a
+# per-PASS invariant (the exclusion set is reset each pass — see `hygiene_cache_sweep`), because the
+# only way to reach that function twice in one shell is to source this file, and the dispatch below
+# would then execute a role as a side effect of the import.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 case "${1:-status}" in
   reap|doctor|merge|hygiene)

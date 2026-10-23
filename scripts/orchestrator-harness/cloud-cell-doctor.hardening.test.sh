@@ -1251,9 +1251,12 @@ grep -q 'cache prune' "$T/uv/uv-calls" 2>/dev/null && ok "hygiene: ran 'uv cache
 grep -q -- '--dry-run' "$T/wt/calls" 2>/dev/null && ok "hygiene: a healthy disk leaves the worktree reaper in DRY-RUN" \
   || bad "hygiene: worktree reaper mode wrong — $(cat "$T/wt/calls" 2>/dev/null)"
 
-# ⛔ The worktree-root sweep DELETES `.venv`/`node_modules` at every worktree root, so its live-worker
-# guard is the one place where a failed read has a destructive consequence. Both halves are asserted:
-# a live worker SKIPS the sweep, and an UNREADABLE session list skips it too. Measured pre-fix on the
+# ⛔ The worktree-root sweep DELETES `.venv`/`node_modules` at every worktree root, so its live-holder
+# guard is the one place where a failed read has a destructive consequence. Both halves are asserted: a
+# root a live process HOLDS is not swept, and an UNREADABLE session list skips the sweep too.
+# (Review round 2, P2: this arm's title used to say "a live worker session suppresses the sweep" —
+# which described the CLAMP this change removes, and stayed green with the clamp restored. It now names
+# the cause the code actually decides on: the per-root census.) Measured pre-fix on the
 # second: `$(harness_sessions | awk …)` made the read's status awk's, so rc=3 became `0` — "no worker
 # is live" — and the pass invoked `prune --caches` and recorded `last_rc=0`.
 say_case "hygiene: a destructive sweep is never armed by a read it could not take"
@@ -1263,8 +1266,10 @@ mk_lane lane-42 0
 # process inside $T/repo, so the root is HELD. (Gating on the session count instead was the defect —
 # see the per-root note in the doctor.)
 FAKE_CWD="$T/repo" doc hygiene
-[ -s "$T/sup/calls" ] && bad "hygiene: swept the worktree caches while a worker session was LIVE — $(cat "$T/sup/calls")" \
-  || ok "hygiene: a live worker session suppresses the worktree cache sweep"
+[ -s "$T/sup/calls" ] && bad "hygiene: swept a worktree root a live process HOLDS — $(cat "$T/sup/calls")" \
+  || ok "hygiene: a root a live process HOLDS is not swept"
+result_has "every root held" && ok "hygiene: …and the record names the reason (every root held)" \
+                             || bad "hygiene: the skip is attributed to no cause — $OUT"
 result_has "workers live" && ok "hygiene: says why the sweep was skipped" || bad "hygiene: no reason recorded — $OUT"
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 0 ] \
   && ok "hygiene: a live worker is a DECISION on a read that succeeded, so the pass is clean (rc=0)" \

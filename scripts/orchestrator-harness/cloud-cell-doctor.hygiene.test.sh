@@ -249,7 +249,6 @@ reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"      # no worker ses
 DEAD="$(dead_pid)"
 mk_tmpdir "cloud-cell-${DEAD}.AAAA" "$ANCIENT" >/dev/null
 doc hygiene
-grep -q . >/dev/null 2>&1 || true
 if [ ! -e "$T/tmp/cloud-cell-${DEAD}.AAAA" ]; then
   ok "temp: a dir whose embedded pid is NOT alive is reaped"
 else
@@ -445,7 +444,6 @@ if grep -q 'du ' "$T/o/logs/doctor.log" 2>/dev/null; then
 else
   bad "no du pair at all: the uv cache prune did not run (the label question cannot be answered by an absent line)"
 fi
-[ -e "$T/repo/wt-abandoned" ] && ok "…(fixture check) the abandoned checkout was already reclaimed" || true
 
 say_case "a failed docker prune is CANNOT-VERIFY, never a clean row"
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
@@ -486,6 +484,36 @@ doc hygiene
 log_has "$NEST — an entry INSIDE it was written after its own mtime" \
   && ok "temp: …and the keep NAMES the nested write (a silent keep is the defect the log exists to prevent)" \
   || bad "temp: the nested-write keep is unexplained — $(grep -F 'temp:' "$T/o/logs/doctor.log" 2>/dev/null | head -3)"
+
+say_case "a token that cannot be a pid is NOT 'the pid is dead' (0, a leading zero, a date stamp)"
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+# `kill -0 0` SUCCEEDS (0 is the caller's own process GROUP), so a name shaped like that would read as
+# "ALIVE" forever; `20260101` is above the kernel pid ceiling yet `kill` says "No such process", so the
+# old code read it as DEAD and reaped on the age floor alone — a reap with no liveness proof.
+mk_tmpdir "cloud-cell-0.GGGG"        "$ANCIENT" >/dev/null
+mk_tmpdir "cloud-cell-01718.HHHH"    "$ANCIENT" >/dev/null
+mk_tmpdir "cloud-cell-20260101.IIII" "$ANCIENT" >/dev/null
+doc hygiene
+for n in cloud-cell-0.GGGG cloud-cell-01718.HHHH cloud-cell-20260101.IIII; do
+  [ -e "$T/tmp/$n" ] && ok "temp: '$n' survives — its token proves nothing about liveness" \
+                     || bad "temp: '$n' was reaped on an age floor, with no liveness proof at all"
+done
+log_has "cannot be a pid" && ok "temp: …and the reason names WHY the token is not a pid" \
+                          || bad "temp: the non-pid keep is unexplained — $(grep -F 'temp:' "$T/o/logs/doctor.log" 2>/dev/null | head -3)"
+log_has "above the kernel pid ceiling" && ok "temp: …and an out-of-range token says so" \
+                                       || bad "temp: an out-of-range pid token is unexplained"
+
+say_case "an in-place APPEND below depth 3 is still activity (a created entry is not the only writer)"
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+DEAD5="$(dead_pid)"
+DEEP="$T/tmp/cloud-cell-${DEAD5}.JJJJ"
+mkdir -p "$DEEP/a/b/c/d"; printf 'x\n' > "$DEEP/a/b/c/d/log"
+# Every DIRECTORY looks ancient …
+touch -t "$ANCIENT" "$DEEP" "$DEEP/a" "$DEEP/a/b" "$DEEP/a/b/c" "$DEEP/a/b/c/d"
+touch "$DEEP/a/b/c/d/log"          # … but a file four levels down was appended to
+doc hygiene
+[ -e "$DEEP" ] && ok "temp: a deep in-place write still blocks the reap (no depth bound on the walk)" \
+               || bad "temp: reaped a dir whose file four levels down was written — the depth bound hid it"
 
 say_case "the census runs with NO worker session: a session is a declaration, a cwd is a fact"
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
@@ -539,6 +567,43 @@ result_has "docker: no daemon" && ok "docker: a permission-denied socket reads a
                    || bad "docker: rc=$DOC_RC — the row would be red on EVERY pass ($DOC_OUT)"
 grep -q 'prune' "$T/docker/calls" 2>/dev/null && bad "docker: a prune was attempted with no reachable daemon" \
                                               || ok "docker: no prune is attempted when the daemon cannot answer"
+
+# ════════════════ the exclusion set is PER PASS, not per process ════════════════════════════════
+say_case "the held-root exclusions do not survive into the next pass of the same loop process"
+# ⛔ WHY THIS ARM SOURCES THE DOCTOR INSTEAD OF RUNNING IT (review round 2, P1). Every other arm starts a
+# fresh `bash "$DOCTOR"`, so a *global* exclusion array looks correct: the process dies with it. But
+# `run_loop` calls the pass REPEATEDLY IN ONE PROCESS, and `hr` restarts at 0 each time — so a global
+# array kept the high indices from a busier pass, the exclusion set grew to its historical maximum,
+# and a later pass excluded roots nothing holds while recording "swept N root(s)". Only a second call
+# in the SAME shell can see that. The source guard at the bottom of the doctor makes it importable.
+PASS_SB="$T/passdb"
+rm -rf "$PASS_SB"; mkdir -p "$PASS_SB/out/logs" "$PASS_SB/state/roles"
+rm -f "$T/sup/calls"                                  # the two calls below must be THIS arm's, only
+printf 'lane-9\n' > "$T/tmux/sessions"
+printf '%s\n' "$T/repo" > "$T/pass-cwds-held"          # pass 1: the repo root is HELD
+printf '/usr/local/lib\n' > "$T/pass-cwds-free"        # pass 2: nothing holds it
+(
+  export O="$PASS_SB/out" CELL_HOME="$PASS_SB/home" REPO="$T/repo" OR=""
+  export SUPERVISOR="$T/bin/sup"                     # the function reads $SUPERVISOR directly
+  export FAKE_CWD_FILE="$T/pass-cwds-held"
+  . "$DOCTOR"                                        # functions only — no pass runs
+  begin_pass                                         # the pass-level state a direct call would miss
+  hygiene_cache_sweep ""
+  FAKE_CWD_FILE="$T/pass-cwds-free"
+  begin_pass
+  hygiene_cache_sweep ""
+)
+PASS_CALLS="$(cat "$T/sup/calls" 2>/dev/null)"
+PASS1="$(printf '%s\n' "$PASS_CALLS" | sed -n '1p')"
+PASS2="$(printf '%s\n' "$PASS_CALLS" | sed -n '2p')"
+case "$PASS1" in
+  *"--exclude-root="*) ok "two passes in one shell: the FIRST pass excludes the root it found held" ;;
+  *) bad "two passes in one shell: the held pass passed no exclusion — $(printf '%s' "$PASS1")" ;;
+esac
+case "$PASS2" in
+  *"--exclude-root="*) bad "the SECOND pass excluded a root nothing holds — the exclusion set survived the pass ($(printf '%s' "$PASS2"))" ;;
+  *) ok "the SECOND pass passes NO exclusion: the set is per-DRY-RUN, reset at the top of the sweep" ;;
+esac
 
 # ════════════════ summary ═══════════════════════════════════════════════════════════════════════
 echo
