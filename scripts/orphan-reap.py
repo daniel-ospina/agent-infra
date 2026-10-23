@@ -415,14 +415,19 @@ def fleet_liveness():
 def ps_pi_fields() -> Optional[Dict[str, dict]]:
     """One `ps` read with `stat` (zombie) and `etime` — the pool's process evidence.
 
-    ⛔ `None` IS A FAILED READ, AND IT IS NOT AN EMPTY POOL (review finding on #2334, cycle 2).
-    `subprocess.run`'s status used to be dropped, so a `ps` that failed (rc≠0, no stdout) returned
-    `{}` — byte-identical to "no process matched" — and every caller read that as a real, empty
-    reading. The two most expensive shapes: the census said `0 to reap` and exited 0 on a read it
-    never completed, and a second read that failed mid-window reported EVERY live lane as
-    `vanished-mid-read`, a positive claim about live processes from a read that did not happen.
-    `{}` now means what it says — the read SUCCEEDED and nothing matched (which a real `ps -Ao`
-    never does: it always carries at least init) — and `None` means the read itself failed.
+    ⛔ `None` IS A FAILED READ (review findings on #2334, cycles 2-3). `subprocess.run`'s status
+    used to be dropped, so a `ps` that failed (rc≠0, no stdout) returned `{}` — byte-identical to
+    "no process matched" — and every caller read that as a real, empty reading. The two most
+    expensive shapes: the census said `0 to reap` and exited 0 on a read it never completed, and a
+    second read that failed mid-window reported EVERY live lane as `vanished-mid-read`, a positive
+    claim about live processes from a read that did not happen.
+
+    So this reader is TWO-valued, and deliberately so: rows, or `None` for "the read did not
+    complete". There is no `{}` answer to document — a successful `ps -Ao` always lists at least
+    init, so "no parseable rows at all" IS a broken read, and it is folded into `None` here rather
+    than handed to callers as an empty world. Callers nonetheless guard with `if not rows` (not
+    `is None`), so a future edit that lets `{}` through cannot re-open the hole: the guard, not
+    this docstring, is what holds.
     """
     proc = subprocess.run(["ps", "-Ao", "pid=,ppid=,stat=,time=,etime=,comm=,args="],
                           capture_output=True, text=True)
@@ -839,7 +844,7 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
             "could not be imported; no census was read")
         return 2
     before = ps_pi_fields()
-    if before is None:
+    if not before:
         _census_unreadable(as_json, "ps-unreadable",
                            "orphan-reap: UNVERIFIABLE — `ps` returned nothing; no census was read")
         return 2
@@ -875,7 +880,7 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
     time.sleep(max(1.0, sample_s))
 
     after = ps_pi_fields()
-    if after is None:
+    if not after:
         # ⛔ THE SECOND READ IS A CENSUS TOO, and this one had no guard at all: an empty/failed
         # read makes `cur is None` for every pid, so EVERY row is reported `vanished-mid-read` —
         # a positive claim about live processes that the read never established — exit 0, and

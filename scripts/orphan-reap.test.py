@@ -323,11 +323,16 @@ def case_c(tmp) -> Box:
 
 
 def case_d(tmp) -> Box:
-    """A pid present in the first read and gone in the second: an incomplete read."""
+    """A pid present in the first read and gone in the second: an incomplete read.
+
+    The second snapshot keeps `init`, because a real `ps -Ao` ALWAYS lists at least init — an
+    empty table is a broken read (`ps-unreadable`), not a world in which every pid vanished, and
+    the census's own guard now says so. Only the row for pid 100 disappears.
+    """
     now = time.time()
     t = write_transcript(tmp, now - 30 * 3600)
-    before = {"100": _row(100, 1)}
-    return Box(before, {}, t, now - 5 * 3600,
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, {"1": _init()}, t, now - 5 * 3600,
                store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
 
 
@@ -781,10 +786,28 @@ def unreadable_json() -> int:
             return None
         return read
 
+    def _second_read_is_an_empty_table():
+        """A successful first read, then an EMPTY table.
+
+        The guard is `if not after:` — not `is None` — precisely so this shape cannot be read as
+        "every pid vanished". A real `ps -Ao` always carries init, so an empty table is a broken
+        read however the reader spells it; tightening the guard to `is None` re-opens cycle 2's
+        defect for any future edit that lets `{}` through, and this case goes red when it does.
+        """
+        calls = {"n": 0}
+        def read():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"1": _init(), "100": _row(100, 1)}
+            return {}
+        return read
+
     for label, patch, want in (
             ("`ps` returned nothing", {"ps_pi_fields": lambda: None}, "ps-unreadable"),
             ("the CPU-window `ps` read failed",
              {"ps_pi_fields": _second_read_fails()}, "ps-unreadable"),
+            ("the CPU-window `ps` read came back EMPTY",
+             {"ps_pi_fields": _second_read_is_an_empty_table()}, "ps-unreadable"),
             ("the verdict module is unimportable",
              {"fleet_liveness": lambda: None}, "liveness-unimportable"),
     ):
