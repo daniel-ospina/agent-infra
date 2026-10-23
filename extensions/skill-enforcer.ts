@@ -45,9 +45,14 @@
 // linked worktree. It does NOT stop an agent that INTENDS to evade it:
 // variable indirection (`g=commit; git $g …`), an alias/function invocation, an
 // `eval` of a variable, quote/escape splicing inside the verb, and arbitrary
-// nesting all bypass every rule. (The LITERAL text of a git command IS matched
-// wherever it appears — `eval 'git commit'` and `echo 'git commit'` are caught —
-// so every remaining evasion needs indirection.) The
+// nesting all bypass every rule when they are spelled as they are listed here.
+// ⛔ SPLICING NEEDS NO INDIRECTION, AND THIS COMMENT USED TO SAY IT DID (#1329
+// review cycle 2, P3): `git com"mit" -m x` is measured ALLOWED with no variable,
+// no alias and no `eval` — the text gate sees `com"mit"`, and re-joining it is
+// the bounded lexing pass the manifest header now calls a TRADE rather than an
+// impossibility. What IS true, and is the reason most evasions still need
+// indirection: the LITERAL text of a git command is matched wherever it appears
+// (`eval 'git commit'` and `echo 'git commit'` are caught). The
 // adopter-facing statement of that boundary — what is closed, what is not, and
 // the sanctioned bypasses — lives in the manifest header
 // (`enforcement/dangerous-ops.txt`), where the rules are read.

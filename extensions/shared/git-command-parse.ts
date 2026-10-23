@@ -284,9 +284,19 @@ function gitGhGlobalOptionRuns(command: string): Array<[number, number]> {
   const words = commandWords(command);
   const runs: Array<[number, number]> = [];
   for (let i = 0; i < words.length; i++) {
+    // ⛔ THE COMMAND WORD IS COMPARED CASE-INSENSITIVELY, BECAUSE THE RULE IT SERVES IS (#1329
+    // review cycle 2, P2). `skill-enforcer` compiles every rule with the `i` flag and the header
+    // says so ("a case-insensitive regex"), but this comparison was an exact lowercase match --
+    // so `GIT commit` was blocked by the raw rule while `GIT -C /x commit` was ALLOWED: the exact
+    // "one spelling" asymmetry #1329 removes, surviving in the case dimension. On a
+    // case-INSENSITIVE filesystem (macOS APFS -- a fleet platform) `GIT` resolves to
+    // /usr/bin/git, so that was a LIVE ungated `git commit`, not merely a false declaration.
+    // Lowercasing the WORD (not the command) keeps every offset intact: only the comparison
+    // changes, and the spans this function returns still index the original text.
+    const word = words[i].text.toLowerCase();
     const valueFlags =
-      words[i].text === "git" ? GIT_GLOBAL_VALUE_FLAGS :
-      words[i].text === "gh" ? GH_GLOBAL_VALUE_FLAGS : null;
+      word === "git" ? GIT_GLOBAL_VALUE_FLAGS :
+      word === "gh" ? GH_GLOBAL_VALUE_FLAGS : null;
     if (valueFlags === null) continue;
     let j = i + 1;
     let end = words[i].end;
@@ -338,9 +348,13 @@ export function collapseUnquotedWhitespace(command: string): string {
 }
 
 /**
- * Every spelling of `command` a text gate should try: the command itself, and
+ * Every spelling of `command` a text gate should try: the command itself;
  * — when a git/gh invocation carries GLOBAL options — the same command with
- * those option runs removed, so `git -C <dir> commit` reads like `git commit`.
+ * those option runs removed, so `git -C <dir> commit` reads like `git commit`;
+ * and — whenever the separator between tokens is wider or different from one
+ * space (a tab, a run of spaces) — that same text with every UNQUOTED whitespace
+ * run collapsed to one space. The third spelling is emitted with or without an
+ * option run, because a tab is not a different command.
  *
  * Two load-bearing properties:
  *   1. NOTHING IS FABRICATED. Every returned string is the input with spans
@@ -353,8 +367,12 @@ export function collapseUnquotedWhitespace(command: string): string {
  *      for all of them.
  *   2. MATCHING CAN ONLY ADD. The raw command is always returned FIRST, so a
  *      caller that ORs across the spellings can never lose a hit it had before.
- *      The only new hits are commands that really do run `git <verb>` with
- *      options in front of the verb.
+ *      The new hits are text a shell would read as `git <verb>` with the options
+ *      stripped or the separator widened. That can include text which is not an
+ *      invocation at all — `ls git<TAB>commit` normalises to `ls git commit` and
+ *      is blocked (measured). The over-block is fail-closed and the same family as
+ *      the already-declared `echo 'git commit'` hit, and it is stated here rather
+ *      than left for a reader to discover.
  *
  * This is NOT a shell interpreter and does not pretend to be one: variable
  * indirection, alias/function invocation, `eval`, quote/escape splicing inside

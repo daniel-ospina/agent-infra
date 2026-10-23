@@ -835,6 +835,18 @@ async function main() {
     ["git\tcommit -m x", "commit-workflow"],
     ["git  commit -m x", "commit-workflow"],
     ["git -C /x  \t stash pop", "commit-workflow"],
+    // ⛔ AND THE CASE DIMENSION (#1329 review cycle 2, P2). The rule is compiled with the `i`
+    // flag and the header says "case-insensitive regex", but the derivation's command-word
+    // comparison was an exact lowercase match — so `GIT commit` was blocked by the raw rule while
+    // `GIT -C /x commit` was ALLOWED: the same "one spelling" asymmetry, surviving in the case
+    // dimension. On a case-insensitive filesystem (macOS APFS, a fleet platform) `GIT` resolves
+    // to /usr/bin/git, i.e. a LIVE ungated commit; on Linux it is at least a false declaration.
+    ["GIT -C /x commit -m x", "commit-workflow"],
+    ["Git -C /x commit -m x", "commit-workflow"],
+    ["gIT --no-pager commit -m x", "commit-workflow"],
+    ["GIT -C /x stash pop", "commit-workflow"],
+    ["GH -R owner/name pr create --fill", "commit-workflow"],
+    ["GIT -C /x worktree add /tmp/w", "using-git-worktrees"],
   ];
 
   await test("#1329 — git/gh GLOBAL options between the command word and the verb are CLOSED", async () => {
