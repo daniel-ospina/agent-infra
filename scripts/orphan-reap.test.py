@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """orphan-reap.test.py — the gate suite for the `pi` pool (scripts/orphan-reap.py).
 
-TEN tests, each with its own fixture, and THREE MUTATIONS that must go RED when a gate is
+TWELVE tests, each with its own fixture, and THREE MUTATIONS that must go RED when a gate is
 dropped. No live process is touched and nothing here can signal a pid: `ps`, the session index,
 `stat`, the clock and the cmux hook store are all injected, and the only thing read back is the
-census's own `--json` output (so the CLI path is exercised, not a copy of it).
+census's own `--json` output (the census runs IN-PROCESS with `as_json=True`, so its JSON contract
+is exercised; the ARGUMENT PARSER — `--pool`, `--pool all`, `--json` on the orphan pool — is not,
+which is a named follow-up rather than a claim).
 On top of those: EIGHT apply-path assertions (the only code here that signals), a
 four-states-reachable pin, the name-stamp-is-UTC pin (four timezones), an empty-pool JSON
 contract check, an UNREADABLE-`ps`-still-speaks-JSON check, and the fence-default pin against
@@ -37,6 +39,14 @@ which is why the CI step depends on it.
     the transcript. `<sessions>/--<encoded-cwd>--/<stamp>_<sid>.jsonl` cannot be found by a FLAT
     search of the sessions root, and "a live writer with no store record" is the population the
     HOLDER append exists for — the reason assertion is the pin (without it: `jsonl-age-unknown`).
+(i) a same-fence file with no readable `cwd` is NOT bound          => the cwd-less file is
+    DROPPED and the row is decided by the matching one (`host-decision-hostless`); with the
+    tolerant filter restored the pair is ambiguous and the row reads `ambiguous-binding`
+(j) NO bindable session file, the lane PARKED                      => UNVERIFIABLE
+    (`no-progress-channel:no-session-file`) — the documented blind spot's safe half
+(k) NO bindable session file, the lane BUSY                        => LIVE (`cpu-advancing`)
+    ─ (j)+(k) together are the doc's claim: the transcript gate abstains only on the PARKED row,
+    because gate 1 is evaluated first. One row alone could be reordered without contradiction.
 plus: every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
 UNREACHABLE under the shipped default (the host decision), and the name-stamp parser is UTC.
 """
@@ -415,6 +425,38 @@ def case_foreign_cwd(tmp) -> Box:
                sessions_index=[(t, start), (foreign, start)])
 
 
+def case_unbound(tmp) -> Box:
+    """NO bindable session file and a ZERO CPU delta — the documented blind spot, PARKED half.
+
+    `docs/ops/fleet-liveness.md` now guarantees this row abstains as
+    `no-progress-channel:<binding>` and never as "nothing to reap", and until this case that
+    guarantee had no pin (an empty session index is the shape a print-mode / `task` child leaves).
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False),
+               sessions_dir=tmp, sessions_index=[])
+
+
+def case_unbound_busy(tmp) -> Box:
+    """NO bindable session file, but the CPU is ADVANCING — the blind spot's BUSY half.
+
+    This is the half the doc used to get WRONG (it claimed such a row could never read `LIVE`):
+    gate 1 is evaluated before the transcript gate, so a busy unbound lane is `LIVE` / 
+    `cpu-advancing`. Pinned so a future reordering of the gates cannot silently contradict the
+    doc a second time — the pairing (j)+(k) is the statement, not either row alone.
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1, time_="00:01:00")}
+    after = {"1": _init(), "100": _row(100, 1, time_="00:03:00")}
+    return Box(before, after, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False),
+               sessions_dir=tmp, sessions_index=[])
+
+
 TESTS = [
     ("(a) resolved chain, no host app: measured-and-NOT-AUTHORISED",
      case_a, "UNVERIFIABLE", "host-decision-hostless", None),
@@ -436,6 +478,10 @@ TESTS = [
      case_nested, "UNVERIFIABLE", "host-decision-hostless", None),
     ("(i) a same-fence file with no readable `cwd` is NOT bound",
      case_foreign_cwd, "UNVERIFIABLE", "host-decision-hostless", None),
+    ("(j) no bindable session file, PARKED (the documented blind spot)",
+     case_unbound, "UNVERIFIABLE", "no-progress-channel:no-session-file", None),
+    ("(k) no bindable session file, BUSY — gate 1 still reads LIVE",
+     case_unbound_busy, "LIVE", "cpu-advancing", None),
 ]
 
 
@@ -711,16 +757,34 @@ def empty_pool_json() -> int:
 
 
 def unreadable_json() -> int:
-    """The two `no census was read` returns must ALSO speak JSON in `--json` mode (rc 2).
+    """The `no census was read` returns must ALSO speak JSON in `--json` mode (rc 2).
 
-    The fixed empty-pool path was only one of three; the two FAILED reads still printed a prose
+    The fixed empty-pool path was only one of three; the FAILED reads still printed a prose
     sentence on stdout, so a consumer got a non-JSON document exactly when the read failed. Both
     are pinned here, with their own `error` code, and `counts: null` so a failed read is never
     mistakable for a real census of zero.
+
+    The THIRD case is the CPU-window read, which had NO guard at all (review finding on #2334,
+    cycle 2): `after = ps_pi_fields()` was read straight into `after.get(pid)`, so a failed second
+    read reported every live lane as `vanished-mid-read` and exited 0 — and `--apply` would then
+    announce that the reapable set was EMPTY. It is pinned separately because it is the SECOND
+    call, and a stub that fails only there is the only way to reach that arm.
     """
     fails = 0
+    def _second_read_fails():
+        """A successful first read (init + a `pi`), then a FAILED one."""
+        calls = {"n": 0}
+        def read():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"1": _init(), "100": _row(100, 1)}
+            return None
+        return read
+
     for label, patch, want in (
-            ("`ps` returned nothing", {"ps_pi_fields": lambda: {}}, "ps-unreadable"),
+            ("`ps` returned nothing", {"ps_pi_fields": lambda: None}, "ps-unreadable"),
+            ("the CPU-window `ps` read failed",
+             {"ps_pi_fields": _second_read_fails()}, "ps-unreadable"),
             ("the verdict module is unimportable",
              {"fleet_liveness": lambda: None}, "liveness-unimportable"),
     ):
