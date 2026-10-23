@@ -44,7 +44,9 @@
 # capacity, not on number of lanes" (argued at `capacity.sh`'s ceiling section and at orch-loop.sh's
 # MAX_LANES block), and re-stating that as a fixed lane ceiling here would reopen a settled
 # decision through a side door. So the gate counts THE OTHER SIDE'S CAPACITY: how many runs are
-# waiting, how many are executing, how many runners can execute them. A box that adds work when the
+# QUEUED — the GitHub enum value `status=queued`, EXACTLY and only that one (residual (i) below:
+# `waiting`/`requested`/`pending` are deliberately NOT counted, and the direction is stated) — how
+# many are executing (`status=in_progress`), how many runners can execute them. A box that adds work when the
 # queue is under the ceiling is allowed exactly as before; nothing here caps lanes.
 #
 # ── THE CEILING: DERIVED FROM THE RUNNERS AND THE JOB, NOT A MAGIC CONSTANT ────────────────────
@@ -96,6 +98,23 @@
 #     measured floor (`max(1, in_progress)` — a runner is running, so a runner exists). The record
 #     says `runners=<n>(busy)` when the endpoint answered with an online count, `runners=~<n>` when
 #     it did not.
+#   * TWO DECLARED RESIDUALS ON THE MEASUREMENT ITSELF — both stated, neither closed by reading
+#     harder:
+#     (i) ONLY `status=queued` IS COUNTED (#2333 review, P2). A run parked behind an environment
+#         approval or a concurrency group is `waiting` (`requested` and `pending` are the adjacent
+#         pre-execution states), and none of the three is in the count — so a queue whose work is
+#         PARKED reads SHALLOW, i.e. the fail-open direction. Counting them costs one `gh` request
+#         per state, and a mandatory read that can fail is a new path to `unknown(...)`: three more
+#         ways for a GitHub blip to defer EVERY CI-spending act on the box, which is the fleet-wide
+#         stop this header forbids. The ceiling models a queue DRAINING through `R` runners, and a
+#         parked run has no drain time to model — so the exclusion is deliberate, and its direction
+#         is stated rather than fixed. Home: agent-infra #2497.
+#     (ii) THE WINDOW IS THE READ, NOT THE PUSH (#2333 review, P3). `fix-one.sh` reads ONCE when the
+#         LANE STARTS, and its agent pushes up to `FIX_TIMEOUT` (default 2400 s) later, so a lane can
+#         be allowed on a shallow queue and push into a deep one — a window 2.7x `CIQ_STALE_MAX`,
+#         which no cache bound describes. A re-read at the push site would close it; it is disclosed
+#         instead because the push runs in the AGENT's own shell and a second reading there has to
+#         answer what a refusal would do to work that is already done.
 
 # `is_num` — the shared shape predicate (no leading zeros, exactly like spawn-gate.sh: a value that
 # reaches `$(( ))` must not be an invalid octal, and a non-number in a threshold makes `[ -gt ]`

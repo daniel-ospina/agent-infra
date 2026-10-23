@@ -477,8 +477,19 @@ fi
 printf '\n── (e) WIRING: the shipped callers call it (a module nobody calls is not a gate) ──\n'
 grep -q 'ci-queue.sh' "$LOOP" && grep -q 'ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed' "$LOOP"
 ck "(e1) orch-loop.sh sources ci-queue.sh and guards it on the interface" "$?"
-grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC=\$?' "$LOOP"
-ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per PASS — at most two live reads a cycle, the sweep's and the dispatch block's" "$?"
+# ⛔ THE TWO READS ARE PINNED BY SHAPE *AND* BY COUNT (#2333 review, P1). This arm used to be two
+# naked `grep -q`s, and BOTH literals also occur in the sweep predicate well above the dispatch
+# block (`ciq_read "${OR:-}" >/dev/null 2>&1 || true` and the same eval pair), so the greps stayed
+# satisfied with the DISPATCH block's own read DELETED. `CIQ_RC` is set to 1 just before that read,
+# so the deletion leaves it 1 (= allowed) for ever: the issue-path arm
+# (`[ "${CIQ_RC:-1}" != "1" ]`) can never fire, the fleet opens new PRs into a 92-deep queue, and
+# ci-queue.test.sh plus product-floor.test.sh both read CLEAN — measured on a copy (116/0 and
+# 213/0). The count is the pin: exactly TWO reads, exactly ONE of them the sweep's soft (`|| true`)
+# form — which is what makes the SECOND one the dispatch block's — and the eval pair exactly twice.
+ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per PASS — at most two live reads a cycle, the sweep's and the dispatch block's (2 reads, 1 soft/sweep, 2 eval pairs)" \
+   "$( { [ "$(grep -cF 'ciq_read "${OR:-}"' "$LOOP")" -eq 2 ] \
+        && [ "$(grep -cF 'ciq_read "${OR:-}" >/dev/null 2>&1 || true' "$LOOP")" -eq 1 ] \
+        && [ "$(grep -cF 'CIQ_VER="$(ciq_eval)"; CIQ_RC=$?' "$LOOP")" -eq 2 ]; } ; echo $? )"
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"

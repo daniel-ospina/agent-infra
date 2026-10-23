@@ -92,6 +92,12 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 # ⛔ AND THE DEFERRAL IS NOT STICKY: it writes the SAME bail marker the cross-box refusal writes,
 # which orch-loop.sh refunds, so the PR loses no attempt and is re-decided from a FRESH read on the
 # next dispatch. Nothing is dropped; nothing remembers that the queue was deep.
+# ⛔ THE ALLOW IS NOT RE-READ BEFORE THIS LANE'S OWN PUSH (#2333 review, P3). The reading above happens
+# once, at LANE START; the agent runs for up to `FIX_TIMEOUT` (default 2400 s) and pushes in its own
+# shell at the end of that window, so a lane can be allowed on a shallow queue and push into a deep
+# one - a window 2.7x `CIQ_STALE_MAX`, which no cache bound in the module describes. Disclosed rather
+# than closed here (residual (ii) in ci-queue.sh's header): a second reading at the push site has to
+# answer what a refusal would do to work that is already done.
 if [ -f "$SELF/ci-queue.sh" ]; then
   # shellcheck source=/dev/null
   . "$SELF/ci-queue.sh"
