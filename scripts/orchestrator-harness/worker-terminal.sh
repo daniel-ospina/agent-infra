@@ -101,7 +101,10 @@ wt_bounded() { # <secs> <cmd...>
   # `timeout 0` both mean "no alarm" — measured, `wt_bounded 0 sleep 2` returned after the full 2s. A
   # `WT_PROBE_TIMEOUT=0` written as "turn it off" (the module's own `WT_TABLE_TTL=0` disable seam invites
   # that reading) would silently disarm the probe that exists to stop the controller freezing.
-  case "$s" in ''|0|*[!0-9]*) s=10 ;; esac
+  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  # …and the zero test is NUMERIC, not lexical (P2 review finding, 2026-10-23, MEASURED): `00`/`000` pass
+  # a `case` match on `0` and `alarm 00` is still "no alarm" (`wt_bounded 00 sleep 2` ran the full 2s).
+  [ "$s" -gt 0 ] 2>/dev/null || s=10
   if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$s" "$@"; return $?; fi
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
   "$@"
@@ -308,9 +311,16 @@ wt_tmux_has_server() { # 0 = a server answers · 1 = no server answers · 3 = no
   # credit; "no answer" is UNKNOWN and refuses (`wt_launcher_env`).
   case "$rc" in
     0) return 0 ;;
-    124|142) return 3 ;;
+    1) return 1 ;;
   esac
-  return 1
+  # ⛔ ALLOW-LIST, NOT A DENY-LIST (P2 review finding, 2026-10-23): the default branch used to be `return
+  # 1` = "no server answers", which is the CREDIT arm — so an unnamed rc (a probe SIGKILLed by the OOM
+  # killer is 137, a SIGTERMed one 143) was read as a positive absence and credited a caller token for a
+  # server that keeps its own environment. Every MEASURED absence shape (no socket dir, no socket file,
+  # empty or stale socket) answers rc 1, so only 1 may fall through to the credit; anything else is
+  # "no answer" (UNKNOWN, refuses) — the same allow-list polarity the merge rail uses, for the same
+  # reason: a value GitHub has not documented yet must never fall through a gap.
+  return 3
 }
 
 # `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
@@ -686,9 +696,11 @@ wt_tmux_names() {
   # this while the pane's process keeps running. Matching it as a positive EMPTY read made the census
   # print `lane-N dead`, `wt_count` = 0 and `wt_alive` = DEAD for a worker that was running — so the
   # caps stopped binding and `wt_close` proceeded to delete a live worker's record (which then runs
-  # untracked forever). A box that has NEVER started a server does not answer this at all: it answers
-  # `no server running on <socket>`, which the arm above already matches. So every `error connecting`
-  # shape stays rc 3 — unreadable is never evidence of a fresh start.
+  # untracked forever). MEASURED MODEL, and it is why the WORDING cannot carry polarity: an absent
+  # socket dir or file answers `error connecting … (No such file or directory)` rc 1, AND a live server
+  # whose socket file was unlinked answers the same; `no server running` is what a stale/empty socket
+  # answers. So every `error connecting` shape stays rc 3 — unreadable is never evidence of a fresh
+  # start — and `no server running` (no server can be reached, so no tmux session can exist) is EMPTY.
   case "$out" in
     *'no server running'*|*'no sessions'*|*'no current session'*) return 0 ;;
   esac

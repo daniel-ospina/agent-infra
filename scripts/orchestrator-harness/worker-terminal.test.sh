@@ -174,8 +174,19 @@ case "${1:-}" in
                     fi ;;
   # The LOG keeps the target VERBATIM (the `=` prefix is the assertion); the STATE file needs the
   # bare name so membership still matches.
-  kill-session) printf '%s\n' "${3:-}" >> "${TMUX_KILLED:-/dev/null}"; t="${3#=}"
-                [ -n "$st" ] && [ -f "$st" ] && { grep -vx -- "$t" "$st" > "$st.n"; mv "$st.n" "$st"; } ;;
+  # ⛔ REAL tmux SEMANTICS, BOTH HALVES (review finding, 2026-10-23, MEASURED): `-t NAME` is a PREFIX
+  # match (a real `tmux kill-session -t fix-8` really kills `fix-82`), `-t =NAME` is EXACT. The stub
+  # used to remove by exact membership for BOTH shapes, so a pin asserting "a peer session whose name
+  # extends ours survives" could not fail — the stub had no prefix behaviour to get wrong, and the
+  # assertion passed for the wrong reason.
+  kill-session) printf '%s\n' "${3:-}" >> "${TMUX_KILLED:-/dev/null}"
+                tgt="${3:-}"
+                [ -n "$st" ] && [ -f "$st" ] || exit 0
+                case "$tgt" in
+                  =*) grep -vx -- "${tgt#=}" "$st" > "$st.n" ;;
+                  *)  awk -v p="$tgt" 'index($0, p) != 1' "$st" > "$st.n" ;;
+                esac
+                mv "$st.n" "$st" ;;
 esac
 exit 0
 SH
