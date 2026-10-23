@@ -199,8 +199,12 @@ abstention on the PARKED row, not a promise that an unbound row can never read `
 declared blind spot is the SWITCHED session (`/new`, `/fork`, `/clone`): pi writes a fresh stamped
 file and leaves the abandoned one behind, so the fence binds the dead transcript and the row can
 read `PARKED-REAPABLE` for a lane that was writing seconds ago — masked to `UNVERIFIABLE` under the
-shipped host decision, and a wrong kill only where that decision is reopened (#2475). On a box
-where the hook store is unreadable every
+shipped host decision, and a wrong kill only where that decision is reopened (#2475). A **third** is
+the HOST ALLOWLIST: an interactive host that is not listed in `HUMAN` is invisible to gate 2
+(WezTerm/Ghostty/Zed are covered; a VS Code `Code Helper` cannot be matched at all, because
+`ps -Ao comm=` is space-split, so such a session is caught only through a shell/terminal ancestor,
+or not at all). That list is an allowlist of owners, so a NEW host is a real gap rather than a bug.
+On a box where the hook store is unreadable every
 row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
 the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
 gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;

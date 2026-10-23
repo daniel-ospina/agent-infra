@@ -1178,9 +1178,20 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None, *, liv=None,
                 f"cannot be walked is never a licence to signal (#1207)")
             continue
         if not AUTHORISE_HOSTLESS_CHAINS:
+            # the SAME allow-list the census applies (mirror of `pi_verdict`'s final block): with
+            # the seam shut, `hostless` is not an authorising kind, and a re-check that asks a
+            # WEAKER question than the census asked is not a re-check (#1696).
             log(f"  {pid} REFUSED: host decision — no recognised host app ({detail}) is `unknown` "
                 f"under the recorded rule (#1207 option A): report-only until that decision is "
                 f"reopened")
+            continue
+        if kind not in ("authorised", "hostless"):
+            # ⛔ THE CENSUS ABSTAINS ON A KIND IT DOES NOT RECOGNISE (allow-list); the signal
+            # re-check must abstain on exactly the same kinds, or a class that is report-only at
+            # census time becomes a licence to signal at signal time — the one place it matters.
+            log(f"  {pid} REFUSED: host decision `{kind}` is not an AUTHORISING kind ({detail}) "
+                f"at signal time — a class this reaper does not recognise is report-only, never "
+                f"a licence to signal")
             continue
         ok, why = _authorisation_holds(row, liv, store_path, sessions_dir)
         if not ok:
