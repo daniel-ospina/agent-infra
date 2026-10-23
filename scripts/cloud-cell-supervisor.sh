@@ -661,7 +661,7 @@ unit_owner_dir() { # <unit file>
 # scope (system, user) — and the reports need them to be truthful.
 _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
 controller_unit_path() {
-  local f own="" first="" unp=""
+  local f own="" first="" unp="" act="" en=""
   _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
   while IFS= read -r f; do
     if ! own="$(unit_owner_dir "$f")"; then
@@ -679,11 +679,20 @@ controller_unit_path() {
     # addressing the first made every read answer "disabled", so `stop` took the pid-teardown shortcut,
     # printed success, and the enabled unit's Restart=always re-created the controller within RestartSec.
     _UNIT_PATH="$f"
-    if controller_unit_active_state >/dev/null 2>&1 || controller_unit_state >/dev/null 2>&1; then
-      printf '%s\n' "$f"; return 0
-    fi
+    # ⛔ AND `ACTIVE` OUTRANKS MERELY `ENABLED` (review P1, #2402). Returning on the first copy that is
+    # EITHER active OR enabled let an ENABLED-but-`failed` system copy (an image-baked unit that hit its
+    # StartLimit, or one whose supervisor already died — the measured #2402 shape) win over the LIVE user
+    # copy, because the copies are walked system-first. The verb then stopped the dead manager and left the
+    # running controller alone, and its "stopped" was only caught by a pid watch whose window is shorter
+    # than the surviving unit's own restart path. The copy that is RUNNING NOW is the one a stop must
+    # address; an enabled copy is only the fallback (it is what will come back when nothing is up).
+    if [ -z "$act" ] && controller_unit_active_state >/dev/null 2>&1; then act="$f"; continue; fi
+    if [ -z "$en" ] && controller_unit_state >/dev/null 2>&1; then en="$f"; fi
   done < <(controller_unit_copies)
-  if [ -n "$first" ]; then _UNIT_PATH="$first"; printf '%s\n' "$first"; return 0; fi
+  # ACTIVE, else ENABLED, else the first of ours (a unit that is neither is still the one installed here).
+  local chosen=""
+  if [ -n "$act" ]; then chosen="$act"; elif [ -n "$en" ]; then chosen="$en"; elif [ -n "$first" ]; then chosen="$first"; fi
+  if [ -n "$chosen" ]; then _UNIT_PATH="$chosen"; printf '%s\n' "$chosen"; return 0; fi
   # ⛔ AN UNPROVABLE COPY IS ADDRESSED, NOT IGNORED (review P1, #2402). A hand-written unit with no
   # `Environment=O=` line proves nothing either way, and the fail-safe side for #1761 is "assume it may be
   # ours": treating it as foreign would launch a tmux controller beside the very unit that may be
@@ -2376,7 +2385,13 @@ cmd_start() {
     # call a service-managed cell dispatches but never reaps, lands, repairs or prunes — the "dispatches
     # but cannot land" shape `start` refuses to report as started everywhere else. The fence is re-checked
     # after it, for the same reason every other launch in this function re-checks it.
-    start_doctor_loop
+    # ⛔ AND ITS FAILURE IS REFUSED HERE TOO (review P2, #2402). `exec` replaces this process, so a doctor
+    # that could not start is invisible a character later: the unit reads `active`, `--status` reports the
+    # cell supervised, and nothing reaps, lands, repairs or merges — the "dispatches but cannot land" state
+    # `start` refuses to report as started on every other launch path in this function (the tmux path two
+    # dozen lines below captures `drc` for exactly this reason). Returning non-zero also lets StartLimit
+    # converge to `failed` instead of hiding the fault behind a running-looking unit.
+    start_doctor_loop || return 1
     superseded && return 1
     say "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
     exec bash "$HARNESS/orch-loop.sh"

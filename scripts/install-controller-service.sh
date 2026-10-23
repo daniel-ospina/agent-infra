@@ -469,6 +469,26 @@ do_install() {
         return 1
     fi
 
+    # ⛔ A FOREIGN COPY AT *THIS* PATH IS NOT OURS TO REPLACE (review P2, #2402). `installed_units` lists only
+    # copies that are OURS, so a unit that provably supervises ANOTHER state dir is invisible there and the
+    # write below silently replaced it: it repointed that cell's supervisor at this state dir and disarmed
+    # its `Restart=always`, with nothing in the output naming it — one cell's verb breaking another's, the
+    # class this installer exists to remove. The bring-up runs `--install` on every `--check`, so this is a
+    # routine collision, not an exotic one. `do_status`/`do_uninstall` already refuse a foreign copy; the
+    # write path is the one that can destroy it, so it refuses too.
+    if [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
+        local fown
+        if ! fown="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME")"; then
+            : # no O= line: unprovable, and #1761's fail-safe side says assume it may be ours
+        elif [ "$fown" != "$O" ]; then
+            err "REFUSING: $UNIT_DIR/$UNIT_NAME is installed and supervises a DIFFERENT state dir:"
+            err "    owner: $fown"
+            err "  Overwriting it would repoint that cell's supervisor here and disarm its Restart=always."
+            err "  Remove it deliberately first (from THAT state dir): bash $0 --uninstall"
+            return 1
+        fi
+    fi
+
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/controller-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$tpl" "$tmpd/$UNIT_NAME" || { rm -rf "$tmpd"; return 1; }
 
@@ -516,7 +536,13 @@ do_install() {
     # heartbeat certified a unit whose `start` produced nothing. `pre_active` is read BEFORE `start`
     # because an idempotent re-install of a healthy unit must keep passing on that unit's older
     # heartbeat — `start` is a no-op there, and the lock leg proves the controller anyway.
-    unit_active_state >/dev/null 2>&1 && pre_active=1
+    # ⛔ `activating`/`reloading` IS NOT "PRE-ACTIVE" (review P2, #2402). `unit_active_state` returns 0 for
+    # them, and `activating` is exactly the `Restart=always` window (RestartSec) — the normal state of a unit
+    # whose controller just exited, i.e. the measured #2402 shape. Scoring it as pre-active CLEARS the
+    # `since` binding below, so a landing inside that window accepted the DEAD incarnation's heartbeat (the
+    # ≤2·CYC bound still passes) and exited 0 over a start that produced no controller — the precise false
+    # PASS the binding exists to close. Only the literal word `active` skips the binding.
+    [ "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" = active ] && pre_active=1
     started_at="$(date +%s)"
     # ⛔ CLEAR A HIT START LIMIT FIRST (review P1, #2402). Converging to `failed` is this unit's DESIGNED
     # outcome for a configuration fault (3 attempts in 300 s), and systemd then REFUSES to start the unit

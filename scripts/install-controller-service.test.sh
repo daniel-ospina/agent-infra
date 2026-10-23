@@ -82,14 +82,19 @@ bash -n "$SUP"  || { printf 'syntax error in %s\n' "$SUP"; exit 1; }
 # unset it resolves to `dirname($BASH_SOURCE)/..` — the REAL checkout — and HARNESS_FETCH defaults to 1:
 # measured, one suite run did `git fetch origin main` in the developer's checkout (moving its
 # origin/main) and registered two prunable worktrees in its git dir, while this file's own header claims
-# "no network". A LOCAL clone (--local: hardlinked objects, no fetch, no remote access) gives the pin the
-# same real harness tree it had before, but every record it creates lands in THIS temp dir.
+# "no network". A local clone gives the pin the same real harness tree it had before, but every record it
+# creates lands in THIS temp dir.
+# ⛔ PIN THE SOURCE'S HEAD SHA, NOT `origin/main`: a CI checkout (actions/checkout, fetch-depth 1) carries
+# no `refs/remotes/origin/main` at all, so a ref-by-NAME requirement failed this suite in CI on its first
+# run — a false red caused by the fixture, not by the code under test. The sha is always present.
 HARNESS_SRC="$T/harness-src"
-if git clone -q --local --no-checkout "$HERE/.." "$HARNESS_SRC" 2>/dev/null \
-   && [ -n "$(git -C "$HARNESS_SRC" rev-parse --verify --quiet origin/main 2>/dev/null)" ]; then
+HARNESS_REF_SHA="$(git -C "$HERE/.." rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$HARNESS_REF_SHA" ] \
+   && git clone -q --local --no-checkout "$HERE/.." "$HARNESS_SRC" 2>/dev/null \
+   && git -C "$HARNESS_SRC" cat-file -e "$HARNESS_REF_SHA^{commit}" 2>/dev/null; then
   :
 else
-  printf '❌ could not create the throwaway harness clone from %s — a suite run must never pin from the real checkout\n' "$HERE/.."
+  printf '❌ could not create the throwaway harness clone from %s (ref %s) — a suite run must never pin from the real checkout\n' "$HERE/.." "${HARNESS_REF_SHA:-<none>}"
   printf '\n────────────────────────────────────────────\npassed=%s failed=%s\n' "$PASS" "1"
   exit 1
 fi
@@ -135,7 +140,8 @@ case "\${1:-}" in
     exit 0 ;;
   # ⛔ THE STATE WORD IS THE ANSWER, not the exit status: the supervisor distinguishes "disabled" from
   # "could not read", so a stub that answered with silence would be modelling the unreadable case.
-  is-active)  if has active; then printf 'active\n'; exit 0; else printf 'inactive\n'; exit 3; fi ;;
+  is-active)  if [ -f "\$S/isactive_word" ]; then cat "\$S/isactive_word"; exit 0; fi
+              if has active; then printf 'active\n'; exit 0; else printf 'inactive\n'; exit 3; fi ;;
   is-enabled) if has enabled; then printf 'enabled\n'; exit 0; else printf 'disabled\n'; exit 1; fi ;;
   enable)     : > "\$S/enabled"; exit 0 ;;
   disable)    rm -f "\$S/enabled" "\$S/active" "\$S/mainpid"; exit 0 ;;
@@ -204,7 +210,7 @@ sup() {
   bnd env -u OR SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
       CONTROLLER_USER_UNIT_DIR="$r/nouser" PATH="$r/bin:$PATH" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" REPO="$r/repo" SCOPE=own HARNESS="$r/harness" \
-      HARNESS_REPO="$HARNESS_SRC" HARNESS_FETCH=0 \
+      HARNESS_REPO="$HARNESS_SRC" HARNESS_FETCH=0 HARNESS_REF="$HARNESS_REF_SHA" \
       SESSION="ctlunit-$$-${1:-x}" CYC=240 CONTROLLER_START_TIMEOUT=20 \
       ${SUP_EXTRA_ENV:-} bash "$SUP" "$@"
 }
@@ -1117,6 +1123,20 @@ grep -qxF 'stop eldato-orchestrator.service' "$SU2/sc.log" 2>/dev/null \
 grep -q 'controller stopped (systemd eldato-orchestrator.service)' "$T/h1.out" \
   && ok 'stop: reports the stop it performed' \
   || bad "stop: did not report the unit stop — rc=$H1_RC $(cat "$T/h1.out")"
+# (1b) ACTIVE OUTRANKS MERELY ENABLED (review P1, #2402). The copies are walked system-first, so a system
+# copy that is ENABLED but `failed` (an image-baked unit that hit its StartLimit, or whose supervisor died
+# — the measured #2402 shape) used to win over the LIVE user copy: `stop` then stopped the dead manager,
+# printed "stopped", and left the running controller alone. The copy that is RUNNING is the one to address.
+: > "$SU2/state-system/enabled"; rm -f "$SU2/state-system/active"
+rm -f "$SU2/state-user/enabled"; : > "$SU2/state-user/active"
+: > "$SU2/sc.log"
+SUP_EXTRA_ENV="CONTROLLER_USER_UNIT_DIR=$SU2/userunits" sup h1 stop > "$T/h1b.out" 2>&1
+grep -qE '^--user stop eldato-orchestrator\.service$' "$SU2/sc.log" 2>/dev/null \
+  && ok 'stop: an ENABLED-but-failed system copy does not outrank the ACTIVE user copy (the running one wins)' \
+  || bad "stop: addressed the enabled-but-dead copy while the live one kept running: $(cat "$SU2/sc.log" 2>/dev/null)"
+grep -qxF 'stop eldato-orchestrator.service' "$SU2/sc.log" 2>/dev/null \
+  && bad 'stop: ALSO stopped the dead system copy' \
+  || ok 'stop: and it did not stop the copy it was not addressing'
 # (2) a unit for ANOTHER state dir: never stopped on our behalf.
 SF="$(arm_root h2)"; mk_systemctl "$SF/bin" "$SF/state" "$SF/sc.log"; mk_tmux "$SF/bin" "$SF/tmux.log"
 : > "$SF/state/enabled"; : > "$SF/state/active"
@@ -1444,6 +1464,56 @@ if [ -f "$NPL" ]; then
 else
   bad "$NPL is missing next to the installer — the mirror cannot be checked"
 fi
+
+# ── a unit the manager is RESTARTING is not "pre-active" (review P2, #2402) ─────────────────────────
+# `is-active` answers `activating` for the whole RestartSec window — the normal state of a unit whose
+# controller just exited, i.e. the measured #2402 shape. Scoring that as pre-active CLEARED the
+# `since` binding, so an `--install` landing in the window certified itself from the DEAD incarnation's
+# heartbeat (the ≤2·CYC bound still passes) and exited 0 over a start that produced no controller.
+say_case "activating/reloading is NOT pre-active — a dead incarnation's heartbeat must not certify a start"
+for _sw in activating reloading; do
+  PA="$(arm_root pa-$_sw)"; mk_systemctl "$PA/bin" "$PA/state" "$PA/sc.log"
+  printf '%s\n' "$_sw" > "$PA/state/isactive_word"
+  PA_RC=0; SC_PROOF=stale CONTROLLER_PROOF_TIMEOUT=4 inst "pa-$_sw" --install > "$T/pa-$_sw.out" 2>&1 || PA_RC=$?
+  [ "$PA_RC" -ne 0 ] && ok "install: is-active=$_sw does NOT skip the binding (a pre-start heartbeat is refused)" \
+                     || bad "install: is-active=$_sw scored as pre-active — a dead controller's heartbeat certified the start: $(cat "$T/pa-$_sw.out")"
+done
+# …and the positive control: a unit that is literally `active` keeps passing on its older heartbeat,
+# because `start` is a no-op on a healthy unit and its heartbeat predates this run by design.
+PC="$(arm_root pc)"; mk_systemctl "$PC/bin" "$PC/state" "$PC/sc.log"
+printf 'active\n' > "$PC/state/isactive_word"; : > "$PC/state/active"; printf '4242\n' > "$PC/state/mainpid"
+printf '%s\n' "$(( $(date +%s) - 30 ))" > "$PC/o/heartbeat"
+# ⛔ `SC_PROOF=none`: the stub's `start` writes a FRESH heartbeat, which would certify the run no matter
+# what `pre_active` did — a green check that cannot fail. With `none` the ONLY heartbeat is the seeded
+# pre-start one, so the pass depends on pre_active clearing the `since` binding (and it is the bound side
+# that a regression would break: hb < started_at is then refused).
+PC_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst pc --install > "$T/pc.out" 2>&1 || PC_RC=$?
+[ "$PC_RC" -eq 0 ] && ok 'install: an ACTIVE unit still re-installs idempotently on its older heartbeat (the binding is not a treadmill)' \
+                   || bad "install: refused a healthy ACTIVE unit's idempotent re-install — the pre_active arm is too strict: $(cat "$T/pc.out")"
+
+# ── a copy that supervises ANOTHER state dir is not ours to replace (review P2, #2402) ──────────────
+# `installed_units` lists only OURS, so a foreign unit at the target path was invisible to the write
+# guard and the render silently replaced it: that cell's supervisor was repointed here and its
+# `Restart=always` disarmed, with nothing in the output naming it. The bring-up runs `--install` on
+# every `--check`, so one cell's verb broke another's.
+say_case 'install refuses to overwrite a unit that provably supervises another state dir'
+FX="$(arm_root fx)"; mk_systemctl "$FX/bin" "$FX/state" "$FX/sc.log"
+printf 'Environment=O=%s\n' "$FX/other-cell" > "$FX/units/eldato-orchestrator.service"
+BEFORE_FX="$(sha256sum "$FX/units/eldato-orchestrator.service" | cut -d' ' -f1)"
+FX_RC=0; inst fx --install > "$T/fx.out" 2>&1 || FX_RC=$?
+AFTER_FX="$(sha256sum "$FX/units/eldato-orchestrator.service" | cut -d' ' -f1)"
+[ "$FX_RC" -ne 0 ] && ok "install: REFUSES when the target path holds another state dir's unit" \
+                   || bad "install: overwrote a unit that supervises another state dir — one cell disarmed another's supervisor: $(cat "$T/fx.out")"
+grep -q "$FX/other-cell" "$T/fx.out" \
+  && ok 'install: the refusal NAMES the state dir that owns it (the operator can act on it)' \
+  || bad "install: refused without naming the owner — $(cat "$T/fx.out")"
+[ "$BEFORE_FX" = "$AFTER_FX" ] && ok 'install: the foreign unit file is BYTE-IDENTICAL after the refusal' \
+                                 || bad 'install: the refusal still rewrote the foreign unit'
+# …and OUR OWN copy at that path stays idempotent (the refusal keys on OWNERSHIP, not on existence).
+printf 'Environment=O=%s\n' "$FX/o" > "$FX/units/eldato-orchestrator.service"
+OW_RC=0; inst fx --install > "$T/ow.out" 2>&1 || OW_RC=$?
+[ "$OW_RC" -eq 0 ] && ok 'install: our OWN copy at the same path is still re-installed (ownership, not existence)' \
+                   || bad "install: refused our own unit — the guard keys on existence instead of ownership: $(cat "$T/ow.out")"
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
