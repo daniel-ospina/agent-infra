@@ -351,10 +351,25 @@ DIFF_FULL="$DIFF"
 DIFF_CAP=60000
 DIFF_NOTE=""
 DIFF_TRUNCATED=0
+# ⛔ THE TAIL HANDSHAKE'S EXPECTED VALUE (P1, fourth fresh review of #2288). See the check after the
+# reviewer exits: when the inline diff is truncated, the record still binds the FULL diff hash, so
+# "the reviewer fetched the remainder" must be PROVABLE rather than asserted — disclosure in the
+# artifact is not verification. The last non-empty line's final DIFF_TAIL_LEN characters are the
+# token: a reviewer that did not read the tail cannot produce it, and a reviewer that did gets it
+# compared exactly. `-40` is by CHARACTER under a UTF-8 locale, so a multi-byte diff cannot split a
+# character the way `tail -c` would.
+DIFF_TAIL_LEN=40
+DIFF_TAIL=""
+compute_diff_tail() {
+  local lastline
+  lastline="$(printf '%s\n' "$DIFF_FULL" | awk 'NF { last = $0 } END { print last }' | tr -d '\r')"
+  DIFF_TAIL="${lastline: -$DIFF_TAIL_LEN}"
+}
 if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
   DIFF="${DIFF:0:$DIFF_CAP}"
   DIFF_TRUNCATED=1
+  compute_diff_tail
 fi
 # The identity of what the reviewer is about to read (the same bytes we inline; the full read
 # for the truncate case is compared by the re-read below using the same truncation).
@@ -416,8 +431,8 @@ trap cleanup EXIT
 # ONE template, TWO call sites (inline diff / no diff). A second copy of this text
 # would be a second definition of the OUTPUT CONTRACT the parser depends on — the
 # exact drift the no-diff fallback would introduce under time pressure.
-compose_prompt() { # <diff> <diff-note>
-  local d="$1" n="$2"
+compose_prompt() { # <diff> <diff-note> <tail-proof-required>
+  local d="$1" n="$2" t="${3:-}"
   cat <<EOF
 You are a FRESH-CONTEXT code reviewer. You wrote none of this code, you have no
 session history, and you owe the author nothing. Report only — do not fix.
@@ -490,9 +505,20 @@ notes are welcome under CLEAN and are listed above the verdict line.
 
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
+$(if [ -n "$t" ]; then cat <<TAIL
+
+## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
+The diff inlined above is NOT the whole change. Fetch the remainder yourself (gh pr diff),
+then print ONE line immediately BEFORE your verdict line, and nothing else on it:
+  diff-tail: $t
+That value is the last $DIFF_TAIL_LEN characters of the FULL diff's final line. The caller compares it
+exactly: a missing or different value means this review never covered the rest of the change, so it
+is DISCARDED — no comment, no record — rather than recorded against a diff nobody read.
+TAIL
+fi)
 EOF
 }
-compose_prompt "$DIFF" "$DIFF_NOTE" > "$PROMPT"
+compose_prompt "$DIFF" "$DIFF_NOTE" "$DIFF_TAIL" > "$PROMPT"
 
 # Byte-budget guard (see DIFF_CAP): if the assembled prompt is still too large for a
 # single argv, drop the INLINE DIFF (the reviewer is told to fetch it) and re-check;
@@ -503,7 +529,10 @@ if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
   err "review-pr: prompt is $(prompt_bytes "$PROMPT") bytes — over the ${PROMPT_MAX}-byte single-argv budget; re-composing WITHOUT the inline diff (the reviewer fetches it)"
   DIFF_NOTE="(the diff was NOT inlined: this PR is too large for a single-argument prompt. Fetch it with: gh pr diff $PR --repo $REPO )"
   DIFF_TRUNCATED=2
-  compose_prompt "" "$DIFF_NOTE" > "$PROMPT"
+  # The tail proof is required on this branch too: the prompt carries NO diff at all, so without it
+  # there is even less evidence the reviewer read the change it certifies.
+  [ -n "$DIFF_TAIL" ] || compute_diff_tail
+  compose_prompt "" "$DIFF_NOTE" "$DIFF_TAIL" > "$PROMPT"
   if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
     die "$E_EVIDENCE" "the prompt for $REPO#$PR is $(prompt_bytes "$PROMPT") bytes even WITHOUT the diff — it cannot be passed as a single argument (Linux caps one at 131,071 bytes), so the reviewer would never start. Nothing was reviewed and NO record was written. Shorten the PR body (or file the review against a smaller revision)."
   fi
@@ -608,6 +637,28 @@ if [ "$AGENT_RC" -ne 0 ]; then
   err "  Last 20 transcript lines:"
   tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
   die "$E_NOVERDICT" "reviewer exited rc=$AGENT_RC — re-run (transcript: $TRANSCRIPT)"
+fi
+
+# ⛔ PROOF THE REVIEWER SAW THE TRUNCATED REMAINDER (P1, fourth fresh review of #2288). The record
+# binds the FULL diff hash, but only the first DIFF_CAP characters ride in the prompt; "I fetched the
+# rest" was an unverifiable CLAIM, so the attestation could assert more than the review covered —
+# the false-PASS class this repo treats as blocking, and disclosure in the artifact does not fix it.
+# The prompt asks for the last DIFF_TAIL_LEN characters of the full diff's final line; a reviewer
+# that did not read the tail cannot produce them, and one that did is checked EXACTLY here — before
+# any comment exists, so a refusal leaves no artifact a later lane could bind.
+if [ "${DIFF_TRUNCATED:-0}" != 0 ] && [ -n "$DIFF_TAIL" ]; then
+  GOT_TAIL="$(grep -a '^[[:space:]]*diff-tail:' "$LOG" 2>/dev/null | tail -1 \
+              | sed 's/^[[:space:]]*diff-tail:[[:space:]]*//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+  if [ -z "$GOT_TAIL" ]; then
+    err "$PROG: the inline diff was TRUNCATED and the reviewer printed no 'diff-tail:' line — there is no evidence it read the rest of the change it was asked to certify."
+    err "  The verdict is DISCARDED: nothing was posted and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_EVIDENCE" "the reviewer never proved it fetched the truncated remainder — re-run (transcript: $TRANSCRIPT)"
+  fi
+  if [ "$GOT_TAIL" != "$DIFF_TAIL" ]; then
+    err "$PROG: the reviewer's 'diff-tail:' proof does NOT match this diff's tail — the review covered a different change (or guessed), so it cannot certify this head."
+    err "  Expected the last $DIFF_TAIL_LEN characters of the full diff's final line; got something else. Nothing was posted and NO record was written."
+    die "$E_EVIDENCE" "the truncated-diff tail proof did not match — re-run (transcript: $TRANSCRIPT)"
+  fi
 fi
 
 # ⛔ THE VERDICT LINE: TWO ACCEPTED SHAPES, AND NO THIRD (P1, eighth fresh review). The
@@ -765,7 +816,12 @@ function counts_only(r,   guard, seen) {
   # always read.
   while (guard++ < 60) {
     gsub(/^[^[:alnum:]]+/, "", r)
-    if (seen && match(r, /^(and|or)[[:space:]]+/)) { r = substr(r, RLENGTH + 1); continue }
+    # ⛔ THE CONJUNCTION IS SKIPPED WHETHER OR NOT A COUNT WAS ALREADY READ (P1, fourth fresh review
+    # of #2288): gating this on `seen` meant a label LIST terminated by one zero count —
+    # `P0, P1 or P2 findings: none` — never reached the count, so the sentence read as a blocking
+    # finding. `and|or` opens a NEW segment whose count the loop then READS; nothing is exempted
+    # without reading it, so `P0: none, P1: 1` still blocks.
+    if (match(r, /^(and|or)[[:space:]]+/)) { r = substr(r, RLENGTH + 1); continue }
     if (r == "") return seen
     if (seen && r ~ /^p3([^[:alnum:]]|$)/) return 1
     if (r ~ /^p[0-3]([^[:alnum:]]|$)/) { r = substr(r, 3); continue }
@@ -797,31 +853,51 @@ function label(s,   a, b, pre, post) {
     a = RSTART; b = RSTART + RLENGTH - 1
     if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
   }
-  # (b) a BARE token — only when a label NOUN introduces it (with a separator on one side), or in
-  # a TABLE row. `Severity: P1` and `Severity P1:` are both introduced; `severity P2 would be…`
-  # (no separator) is prose ABOUT severity and is not.
-  if (DEC == 0 && match(s, /[Pp][0-2]/)) {
-    a = RSTART; b = RSTART + RLENGTH - 1
-    pre = tolower(substr(s, 1, a - 1)); post = substr(s, b + 1)
-    if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1 }
-    else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1 }
-    else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
-    # (b2) A bare token with a SLOT SEPARATOR right after it, whatever precedes it (`Found a P1: …`,
-    # `One P1 — …`). This is the THIRD fresh review P1, measured end-to-end: without the noun the
-    # arm above requires, these recorded `clean` over a reported blocker. The remainder is still put
-    # through counts_only()/nittag(), so a zero count or a nit tag stays clean.
-    else if (sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
-    else if (s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1 }
-    # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
-    # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
-    # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
-    # of #2288): the first arm listed the bridges it expected (`in|at|on` after a dash/bracket), so
-    # every other bridge recorded `clean` over a reported blocker ONE FORM OVER — the ratchet the
-    # `loc` arm above warns about. The remainder is a location iff it carries a
-    # `:<digits>` run whose token contains a PATH character (a letter, `_` or `/`), which also
-    # keeps a clock time or a ratio (`P1 at 10:30`, `3:1`) out of the label class. The pinned clean
-    # twin keeps its only location BEFORE the token, so nothing location-bearing follows it.
-    else if (post ~ /[[:alnum:]_.\/-]*[[:alpha:]_\/][[:alnum:]_.\/-]*:[0-9]+/) { LS = a; LE = b; NOUN_CUE = 1 }
+  # (b)/(b2)/(c) a BARE token — introduced by a label NOUN, carrying a slot separator, a
+  # `path:line` after it, or sitting in a TABLE row.
+  # ⛔ EVERY BARE TOKEN ON THE LINE IS EXAMINED, NOT JUST THE FIRST (P1, fourth fresh review of
+  # #2288). The single `match()` here meant `No P2 problems found; P1: the guard returns 0 on a
+  # failed read` only ever offered its P2 to the arms, so the P1 was invisible, the CLEAN stood and a
+  # head-bound clean record was written over a blocker the reviewer had just stated. The loop stops at
+  # the FIRST token that qualifies, so a later label wins over an earlier mention.
+  # ⛔ AND A ZERO/NEGATION CUE IMMEDIATELY BEFORE THE TOKEN MAKES IT A MENTION, NOT A USE (P1, fourth
+  # fresh review — the OVER-BLOCK direction the (b2) arm introduced): `No P0, P1 or P2 findings.` and
+  # `I found no P0, P1 or P2 issues in the changed files.` are the most natural clean summaries in the
+  # language, and their comma was being read as evidence of a finding, so a genuinely clean review was
+  # refused (a paid re-run into the same refusal — the loop this tool exists to remove). Only the
+  # IMMEDIATELY preceding word is consulted, so `No P2 problems found; P1: …` still blocks on its P1.
+  if (DEC == 0) {
+    rs = 1
+    while (rs <= length(s) && match(substr(s, rs), /[Pp][0-2]/)) {
+      a = rs + RSTART - 1; b = a + 1
+      pre = tolower(substr(s, 1, a - 1)); post = substr(s, b + 1)
+      negpre = (pre ~ /(^|[^[:alnum:]])(no|not|none|nil|zero|without)[[:space:]*_`]*$/)
+      if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      if (!negpre && pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      if (!negpre && pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # (b2) A bare token with a SLOT SEPARATOR right after it, whatever precedes it (`Found a P1: …`,
+      # `One P1 — …`). Third fresh review P1, measured end-to-end: without the noun the arm above
+      # requires, these recorded `clean` over a reported blocker. The remainder still goes through
+      # counts_only()/nittag(), so a zero count or a nit tag stays clean.
+      # ⚠️ ACCEPTED WALL (over-block direction, same family as agent-infra#2337): a parenthetical zero
+      # gloss right after the token — `Checked P2 (clean); nothing else.` — still blocks, because the
+      # bracket rule in counts_only() fires only AFTER a count is read. Left declared: exempting a
+      # leading bracket unconditionally would also exempt `P1 (actually 2 blockers)`, which is the
+      # fail-open direction. A wall costs a re-run; a miss records clean over a real defect.
+      if (!negpre && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      if (!negpre && s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
+      # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
+      # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
+      # of #2288): the first arm listed the bridges it expected (`in|at|on` after a dash/bracket), so
+      # every other bridge recorded `clean` over a reported blocker ONE FORM OVER — the ratchet the
+      # `loc` arm above warns about. The remainder is a location iff it carries a
+      # `:<digits>` run whose token contains a PATH character (a letter, `_` or `/`), which also
+      # keeps a clock time or a ratio (`P1 at 10:30`, `3:1`) out of the label class. The pinned clean
+      # twin keeps its only location BEFORE the token, so nothing location-bearing follows it.
+      if (!negpre && post ~ /[[:alnum:]_.\/-]*[[:alpha:]_\/][[:alnum:]_.\/-]*:[0-9]+/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      rs = b + 1
+    }
   }
   return (LS > 0)
 }
