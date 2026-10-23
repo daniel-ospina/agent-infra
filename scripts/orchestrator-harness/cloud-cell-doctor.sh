@@ -1799,7 +1799,7 @@ run_loop() {
     || { printf 'FATAL: cannot write %s\n' "$ROLES_DIR/loop.started" >&2; exit 3; }
   # HUP too: a tmux server restart / `kill-session` delivers HUP, and without it the identity record
   # would outlive the loop (the fence above would then see a recycled pid as a different incarnation
-  # and correctly say NO LOOP — this is the cheap half of the same repair).
+  # and correctly say DEAD — this is the cheap half of the same repair).
   trap 'rm -f "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"; exit 0' TERM INT HUP
   log "loop started pid=$$ doctor=${DOCTOR_INTERVAL}s merge=${MERGE_INTERVAL}s hygiene=${HYGIENE_INTERVAL}s"
   while :; do

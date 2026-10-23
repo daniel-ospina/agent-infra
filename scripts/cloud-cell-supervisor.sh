@@ -2370,8 +2370,9 @@ doctor_path() {
   # ⛔ THE PINNED HARNESS IS WHERE "SHIPPED" LIVES (#2306). The seeded `$O` copy and the two
   # beside-`$SUP_SELF` copies are the fast paths; when all three are missing (a cell whose `$O`
   # seed is incomplete, a supervisor copied out of the harness) the doctor is still ON the box, in
-  # `$HARNESS/scripts/orchestrator-harness/` — and looking only at the other three made a PRESENT
-  # doctor read as "not shipped".
+  # `$HARNESS/` — which IS the harness dir (`HARNESS="$dir/scripts/orchestrator-harness"`, :1264;
+  # `seed_and_stamp` copies `"$HARNESS"/*.sh` FLAT) — and looking only at the other three made a
+  # PRESENT doctor read as "not shipped".
   # ⛔ AND THE HARNESS ENTRY ONLY WHEN HARNESS IS SET (#2306 review P2): `HARNESS` is optional
   # (`HARNESS="${HARNESS:-}"`, :140), so an unset one expanded to the ABSOLUTE
   # `/scripts/orchestrator-harness/cloud-cell-doctor.sh` — a root-level path this cell would then
@@ -2381,7 +2382,13 @@ doctor_path() {
            "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
-  for c in ${HARNESS:+"$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh"}; do
+  # ⛔ `$HARNESS` IS ALREADY THE HARNESS DIR (P1, fresh review): `HARNESS="$dir/scripts/orchestrator-harness"`
+  # (:1264, asserted by `[ -f "$HARNESS/orch-loop.sh" ]`), and `seed_and_stamp` copies `"$HARNESS"/*.sh`
+  # FLAT into `$O`. Appending `scripts/orchestrator-harness/` again resolved to
+  # `…/orchestrator-harness/scripts/orchestrator-harness/…`, which exists in no layout — so the leg
+  # could never match and the very population it was added for (a present doctor on a cell whose `$O`
+  # seed is incomplete) was still declared ABSENT, with rc 0. That is the #2306 class verbatim.
+  for c in ${HARNESS:+"$HARNESS/cloud-cell-doctor.sh"}; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2400,7 +2407,7 @@ doctor_paths_searched() {
     printf '%s\n' "$O/cloud-cell-doctor.sh" \
       "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
       "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"
-    [ -n "${HARNESS:-}" ] && printf '%s\n' "$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+    [ -n "${HARNESS:-}" ] && printf '%s\n' "$HARNESS/cloud-cell-doctor.sh"
   } | tr '\n' ' '
 }
 

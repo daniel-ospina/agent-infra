@@ -3360,11 +3360,16 @@ case "$DS2_OUT" in
   *) bad "start: no "apply" remedy — $DS2_OUT" ;; esac
 
 # …and the LOOKUP finds a doctor that is only in the PINNED HARNESS (the measured cell layout: the
-# seeded `$O` copy was missing while `$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh` was
-# present). Without this the launch path took the "absent" branch for a shipped doctor.
-mkdir -p "$DS/harness/scripts/orchestrator-harness"
-printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 60\nexit 0\n' > "$DS/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh"
-chmod +x "$DS/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+# seeded `$O` copy was missing while the harness held the doctor). Without this the launch path took
+# the "absent" branch for a shipped doctor.
+# ⛔ `$HARNESS` IS THE HARNESS DIR, NOT THE REPO ROOT (P1, fresh review): `HARNESS` is set to
+# `$dir/scripts/orchestrator-harness` (:1264) and `seed_and_stamp` copies `"$HARNESS"/*.sh` FLAT, so
+# the doctor lives at `$HARNESS/cloud-cell-doctor.sh`. The fixture used to pin
+# `$DS/harness/scripts/orchestrator-harness/…` — the same invented double-nested layout the code
+# had — so the suite COULD NOT FAIL on the real case (it green-lit a lookup that never matched).
+mkdir -p "$DS/harness"
+printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 60\nexit 0\n' > "$DS/harness/cloud-cell-doctor.sh"
+chmod +x "$DS/harness/cloud-cell-doctor.sh"
 # A tmux that DOES create the session, so a found doctor is observed as started.
 cat > "$DS/bin/tmux" <<'SH'
 #!/bin/bash
