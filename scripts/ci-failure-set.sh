@@ -55,13 +55,18 @@
 #   ⚠️ WHAT [N] MEANS IN THE TWO WIDENED MAIN MODES (#9689) — `--main-union-rates`
 #   and `--main-union-signatures`, and NOT `--main-union` (see the next note). N is
 #   a STARTING WIDTH, not the size of the window: the listing is widened (doubling,
-#   bounded at 200 runs) until the window holds AT LEAST N runs that actually
-#   FINISHED A MEASUREMENT — so the window, and the `tested` an operator reads in
-#   `--runs-report`, can EXCEED N; it is never smaller. Without the widening, a
-#   `completed/cancelled` run that never expanded a job spends one of the N, a push
-#   burst can spend all of them, and `tested=0` makes admin-merge.sh report "the
-#   lane never TESTED main" about a main that simply had not been READ deep enough.
-#   The widening says so on stderr.
+#   bounded at 200 runs) until the window holds N runs that FINISHED A MEASUREMENT
+#   — and it can stop EARLY, holding FEWER than N, when the history is exhausted
+#   (`--limit 2 → 4 → 8` on a 3-run main stops at 8) or the 200-run bound is
+#   reached. Without the widening, a `completed/cancelled` run that never expanded
+#   a job spends one of the N, a push burst can spend all of them, and `tested=0`
+#   makes admin-merge.sh report "the lane never TESTED main" about a main that
+#   simply had not been READ deep enough. The widening says so on stderr.
+#   `tested` in `--runs-report` is the COLLECTORS' count over that window, not the
+#   criterion's: normally the two agree, but a `completed/failure|timed_out` whose
+#   job list turns out EMPTY is counted by the criterion and DEBITED by `tested`
+#   (#1482) — so `tested` can fall below N, and a window that measured nothing
+#   still blocks. That asymmetry is stated in full at `list_main_baseline`.
 #   --main-union-rates [N]    (#3756) per-id failure COUNTS over a window holding at
 #                             least N MEASURED runs (see "WHAT [N] MEANS" above):
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
@@ -78,10 +83,9 @@
 #                             other half of the same measurement.
 #   ⚠️ `--main-union` is NOT widened, deliberately: it is the POST-merge detector's
 #   window, which must read the width the merge was certified over rather than a
-#   wider one. Its own dilution residual is therefore unchanged and stated at
-#   `list_main_baseline` — a window spent on cancelled runs leaves main's failing
-#   set EMPTY, the detector reads every failure of the merged commit as UNIQUE, and
-#   the cost is an OVER-alarm, never a false clean.
+#   wider one. Its dilution residual is therefore unchanged, and it is stated (with
+#   its direction) in the `list_main_baseline` block: over-alarm only, never a
+#   false clean.
 #   --per-run <file>          (--commit-rows) write one line per FAILING run with
 #                             that run's failing ids, whitespace-separated — the
 #                             per-run id sets `decide()` consumes for REQUIRED
@@ -494,6 +498,15 @@ list_lane_runs() {
 # attribute to), so it is a design question and NOT part of this window fix. The
 # symptom this change does cure in that mode is the `completed=0, tested=0`
 # reading, where the width is spent on runs that never expanded at all.
+#
+# ⚠️ STATED RESIDUAL, `--main-union` (NOT widened, deliberately): that mode feeds
+# the POST-merge detector, whose window must be the width the merge was certified
+# over — a wider one would move what the detector considers pre-existing. So it
+# keeps the raw-width read (only its exclusion helper is shared), and its dilution
+# residual is unchanged: a window spent on `completed/cancelled` runs leaves main's
+# failing set EMPTY, so EVERY failure of the merged commit reads as UNIQUE. The
+# direction is an OVER-alarm — a redundant alert, never a false clean — which is
+# why it is left stated rather than fixed here.
 
 # measured_run_count <lane-file> → how many listed runs FINISHED A MEASUREMENT
 # (completed with conclusion success|failure|timed_out). A widening criterion
