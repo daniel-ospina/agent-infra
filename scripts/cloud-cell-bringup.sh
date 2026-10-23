@@ -717,10 +717,17 @@ check_disk_reaper() {
 check_controller_service() {
   local installer="" cand out rc
   # macOS is REFUSED by the installer ON PURPOSE: the launchd agent already has `KeepAlive`, so a second
-  # supervisor there would be a second dispatcher on one queue. Running the check would only produce a
-  # false red against a healthy Mac.
+  # supervisor there would be a second dispatcher on one queue. Running the installer would only produce
+  # a false red against a healthy Mac.
+  # ⛔ BUT "REFUSED THE INSTALLER" IS NOT "VERIFIED SUPERVISED" (review P2, #2402). This arm used to
+  # print `ok "controller supervised by the launchd agent"` without reading anything at all — an
+  # assertion, not a check, which is the same "a claim nobody measured" shape #2402 exists to remove.
+  # It is NOT made a hard refusal: launching a `launchctl print gui/$UID/com.eldato.orchestrator-loop`
+  # read here would refuse a healthy Mac on any context where that read is unavailable, and this PR's
+  # scope deliberately excludes the macOS path. So the claim is withdrawn and the gap is NAMED instead
+  # of hidden — the bring-up certifies the cell, and it says exactly what it did not look at.
   if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-    ok "controller supervised by the launchd agent (macOS) — the service installer is Linux-only by design"
+    ok "controller supervision on macOS is NOT VERIFIED by this check — the launchd agent (com.eldato.orchestrator-loop) is out of scope here and nothing in this run read launchctl; verify with: launchctl print gui/\$UID/com.eldato.orchestrator-loop"
     return 0
   fi
   for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \

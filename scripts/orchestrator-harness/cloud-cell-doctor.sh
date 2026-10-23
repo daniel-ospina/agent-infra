@@ -1431,18 +1431,52 @@ controller_heartbeat_verdict() { # <who>
 # must be able to say no; the controller's own lock owner is the only one that can.
 # ⛔ AND THE MATCH IS THE SHAPE `lock_controller_pid` USES (`<shell> <…/orch-loop.sh>`), NOT AN `$O/`
 # PREFIX: HARNESS_PIN_DIR is normally $CELL_HOME/harness, so the prefix form missed a live controller.
+# ⛔ AND THE SHAPE ALONE IS NOT OWNERSHIP EITHER — THE AGE IS (review P2, #2402). `lock_controller_pid`
+# (scripts/cloud-cell-supervisor.sh) carries the shape AND the age, and states why both are load-bearing:
+# the lock is data on disk and outlives a `kill -9`, so the OS can RECYCLE that pid onto a peer repo's
+# controller — which on this box is the same basename from the same shared harness path, so the shape
+# matches. That is the exact vector for which `lock_controller_pid` refuses a false positive, and this
+# function copied only half of it: with a recycled pid the ABSENT→restart arm became UNREACHABLE on a
+# service-managed cell and the doctor logged `controller RUNNING` over a dead controller — the same
+# "witness that cannot say no" this file fixed at P0 by another route (the loop.pid tautology).
+# A controller writes $O/.orch.lock AFTER it starts, so a process that BEGAN after the lock was written
+# cannot be its owner. Unprovable age returns 1 (NOT ours): a false negative falls through to the
+# ABSENT→restart arm, and that arm's `supervisor start` refuses over a controller that is really alive —
+# so the failing direction here is the safe one, unlike the supervisor's `stop`, which must not signal.
 service_controller_present() {
-  local pid c
+  local pid c lt se r d h m s started
   [ -f "$O/.orch.lock" ] || return 1
   pid="$(tr -dc '0-9' < "$O/.orch.lock" 2>/dev/null || true)"
   num_ok "${pid:-}" || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  c="$(ps -o command= -p "$pid" 2>/dev/null)" || return 1
+  c="$("$PS_BIN" -p "$pid" -o command= 2>/dev/null)" || return 1
   # shellcheck disable=SC2086
   set -- $c
   [ "$#" -ge 2 ] || return 1
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "${2##*/}" in orch-loop.sh) return 0 ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) ;; *) return 1 ;; esac
+  # ── the age rule (pinned to `_proc_began_after`, scripts/cloud-cell-supervisor.sh) ──────────
+  # ⛔ NOT `num_ok`: an epoch is TEN digits and num_ok rejects >=10, so routing `lt` through it would
+  # make every lock "unprovable" and turn this witness into a permanent false negative.
+  lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null)" || return 1
+  case "${lt:-}" in ''|*[!0-9]*) return 1 ;; esac
+  se="$("$PS_BIN" -p "$pid" -o etime= 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$se" ] || return 1
+  d=0
+  case "$se" in *-*) d="${se%%-*}"; r="${se#*-}" ;; *) r="$se" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  # `10#` because etime ZERO-PADS and bash reads a leading zero as OCTAL (`08` is an error) — the
+  # same trap `_proc_start_epoch` documents after it was reproduced with an `08:31` stub.
+  d=$((10#${d:-0})); h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0}))
+  started=$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))
+  [ "$started" -le "$(( lt + 5 ))" ] || return 1
+  return 0
 }
 
 run_doctor() {

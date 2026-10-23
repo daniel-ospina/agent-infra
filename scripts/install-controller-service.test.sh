@@ -164,9 +164,18 @@ STUB
 # ── the two entry points under test ─────────────────────────────────────────────────────────────
 # inst <arm> <args…> — the installer, pointed at the arm's fixture. HOME/CELL_HOME/O are pinned so the
 # rendered unit is the fixture's, never this box's.
+# ⛔ BOTH UNIT-DIR SEAMS ARE PINNED, NOT JUST THE WRITE ONE (review P2, #2402). `SYSTEMD_UNIT_DIR` is
+# the installer's WRITE override; `find_installed_unit`/`installed_units` also consult
+# `CONTROLLER_SYSTEM_UNIT_DIR` — the supervisor's READ seam, defaulting to the REAL `/etc/systemd/system`.
+# Pinning only the write side left every read-back arm reading this box: on any cell where the
+# production unit is installed — which is exactly the box shape this PR's bring-up creates — the
+# suite went red on its own deployment target, and the `--uninstall` arm resolved the MACHINE-SCOPE
+# copy and issued `disable --now` plus `rm -f` against it. A fixture that can reach the host is not a
+# hermetic suite, and this one would have been red on every cell it is meant to protect.
 inst() {
   local r="$T/$1"; shift
   bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
+      CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" PATH="$r/bin:$PATH" ELDATO_PLATFORM="${PLATFORM:-Linux}" \
       ${EXTRA_ENV:-} bash "$INST" "$@"
@@ -197,7 +206,12 @@ if [ -f "$UNIT" ]; then
     && ok 'Restart=always — an ORDERLY exit 0 is restarted (the measured case)' \
     || bad "not Restart=always — on-failure reproduces the defect byte for byte: $UNIT"
   u 'RestartSec=15' && ok 'RestartSec is STATED (15s default)' || bad 'RestartSec is not stated'
-  u 'After=network-online.target' && ok 'After=network-online.target (the first cycle reads GitHub)' \
+  # ⛔ `process`, NOT `mixed`. With no tmux server running the doctor session forks the SERVER inside
+  # this unit's cgroup, so `mixed` would SIGKILL every session on that per-user server on any
+  # stop/restart (review P1, #2402). Pinned here so a future edit cannot quietly widen the kill.
+  u 'KillMode=process' && ok 'KillMode=process — a stop signals the controller, never the shared tmux server' \
+    || bad "KillMode is not 'process' — 'mixed' SIGKILLs the unit's whole cgroup, which contains the tmux server the doctor session forked ($UNIT)"
+  u 'KillMode=mixed' && bad 'the installed unit carries BOTH KillMode lines — systemd takes the last, so the safe one may not win' || true  u 'After=network-online.target' && ok 'After=network-online.target (the first cycle reads GitHub)' \
     || bad 'network-online ordering missing'
   u 'Environment=ORCH_FOREGROUND=1' \
     && ok 'the unit asks for FOREGROUND mode (the controller is the main process)' \

@@ -198,7 +198,7 @@ sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 verify_unit() {
     local f="$1" k
     for k in "Restart=always" "RestartSec=$RESTART_SEC" "After=network-online.target" \
-             "StartLimitIntervalSec=300" "StartLimitBurst=3" \
+             "StartLimitIntervalSec=300" "StartLimitBurst=3" "KillMode=process" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
@@ -556,12 +556,20 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
 # gained passwordless sudo would resolve to the SYSTEM scope, print `not installed: /etc/systemd/system/…`
 # and exit 0 while the user unit stayed installed, enabled and running. The installed file is the evidence.
 find_installed_unit() {
-    local d
+    local d seen=" "
     # ⛔ `CONTROLLER_SYSTEM_UNIT_DIR` is the READ side of the system scope (the supervisor's own seam name);
     # `SYSTEMD_UNIT_DIR` stays the WRITE override. Conflating them is how a write-path override decided
     # which installed copy a read-back reported on.
+    # ⛔ AND A DIRECTORY IS COUNTED ONCE (review P2, #2402). The two seams are independent, so a caller
+    # may point both at one directory — the hermetic suite does exactly that to keep its read-backs off
+    # the host. Without this dedupe that configuration reported the SAME file twice, and `installed_units`'
+    # "two copies installed" arm then fired on a single unit: install re-runs exited 1 with `changed=1`
+    # (`install: re-run rc differs (0 then 1)`, reproduced).
     for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
-        [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
     done
     return 1
 }
@@ -569,9 +577,12 @@ find_installed_unit() {
 # installed both, and the second is why `--uninstall` must not report "no longer supervised" over a copy
 # it did not remove.
 installed_units() {
-    local d
+    local d seen=" "
     for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
-        [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && printf '%s\n' "$d/$UNIT_NAME"
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] && printf '%s\n' "$d/$UNIT_NAME"
     done
     return 0
 }
