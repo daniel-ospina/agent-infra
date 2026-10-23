@@ -435,21 +435,30 @@ mk_origin t17
 write_sync_stub
 printf '#!/bin/sh\necho hi\n' >"$T/seed-t17/tool.sh"
 printf 'spaced\n' >"$T/seed-t17/has space.txt"
+printf 'second\n' >"$T/seed-t17/C.txt"
+printf 'third\n' >"$T/seed-t17/D.txt"
 chmod 755 "$T/seed-t17/tool.sh"
-git -C "$T/seed-t17" add tool.sh "has space.txt" >/dev/null 2>&1
+git -C "$T/seed-t17" add tool.sh "has space.txt" C.txt D.txt >/dev/null 2>&1
 git -C "$T/seed-t17" -c user.email=t@example.test -c user.name=t commit -q -m "tool and a spaced name" >/dev/null 2>&1
 git -C "$T/seed-t17" push -q origin main >/dev/null 2>&1
 mk_clone t17
 REPO_P="$CLONE"; MODE_P=sync
 WANT17="$(advance_origin t17 A.txt "upstream for the dirty-set case")"
+# THREE renames on purpose: the destination set used to be read through a command substitution, which
+# drops NULs and joins them into one word — so with two or more renames NOTHING matched and the
+# destinations stayed untracked while the pass recorded `advanced`. One rename passes; three do not.
 git -C "$CLONE" mv A.txt RENAMED.txt >/dev/null 2>&1
+git -C "$CLONE" mv B.txt RENAMED-B.txt >/dev/null 2>&1
+git -C "$CLONE" mv C.txt RENAMED-C.txt >/dev/null 2>&1
 printf 'changed\n' >>"$CLONE/tool.sh"
 printf 'edited\n' >>"$CLONE/has space.txt"
 OUT="$(run_pass "$T/t17" 2>&1)"; RC=$?
-assert_eq "$RC" "10" "T17 the pass advances with a rename, an exec-bit edit and a spaced name dirty"
+assert_eq "$RC" "10" "T17 the pass advances with THREE renames, an exec-bit edit and a spaced name dirty"
 assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT17" "T17 and the checkout fast-forwarded"
-assert_eq "$(git -C "$CLONE" ls-files | grep -c '^A.txt$' | tr -d ' ')" "1" \
-    "T17 HEAD's side of the rename is back in the index (the rename was not read as one path)"
+for side in A.txt B.txt C.txt; do
+    assert_eq "$(git -C "$CLONE" ls-files | grep -c "^$side\$" | tr -d ' ')" "1" \
+        "T17 HEAD's side of the rename ($side) is back in the index (renames are not read as one path)"
+done
 case "$(ls -l "$CLONE/tool.sh" 2>/dev/null)" in
     -rwx*) ok "T17 the executable bit was restored with the content (not a staged MODE change)" ;;
     *) bad "T17 the executable bit was LOST — the restored file is not 0755" ;;
