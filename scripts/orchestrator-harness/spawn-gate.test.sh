@@ -450,8 +450,9 @@ export CIQ_GH="$RIG/bin/gh-queue"
 # ⛔ AND WHETHER THE PR-OWNER LOCK WAS HELD WHILE IT RAN (review of PR #2576, P2). §9b's other
 # assertions are satisfied by a tree that takes the lock, RELEASES it immediately, and then runs
 # the agent that pushes — which is the whole defect. The lock must be held ACROSS the run, so the
-# only place that can witness it is the agent stub itself.
-pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; return 0; }
+# only place that can witness it is the agent stub itself. It records the RECORD'S CONTENT too, so a
+# takeover can be told apart from a steal that kept the dead pid in place.
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && { echo PI_SAW_LOCK >> "$PI_LOG"; echo "PI_LOCK_OWNER=$(cat "$PRLOCK_PATH" 2>/dev/null)" >> "$PI_LOG"; }; return 0; }
 export -f pi
 # ...and pin the MECHANISM, not only its effect: the whole fix rests on the function surviving into
 # the callers' environment, so assert it is there BY NAME. Otherwise a future edit that drops the
@@ -620,32 +621,97 @@ ck "...and leaves fixcount alone — the controller refunds, the fixer does not 
 ck "...and the LIVE lander's lock SURVIVES — a deferred fixer must never clear another worker's claim" $rc
 kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
 
-# A STALE lock (its owner is gone) is a DEFERRAL TOO, and the fixer must not delete it (review of PR
-# #2576, P3). A reclaim is `read owner -> is it live? -> rm -> write`, and the `rm` is NOT a CAS: two
-# fixers that both read the lock as dead each delete and re-create it, so the second can delete the
-# first one's LIVE lock — reopening the very hole this section exists to close. The stale claim is
-# reclaimed by `claim_live()` at the controller's next dispatch (and by the doctor's `merge` role),
-# so a deferral here costs one refunded cycle and nothing else.
+# A STALE claim — its owner is MEASURABLY gone — is TAKEN OVER, not refused (#2574 (b)). `merge-one.sh`
+# itself reclaims this same file with `rm` + a retry, and `claim_live()` reclaims a dead owner's claim at
+# the controller's next dispatch; a fixer that only deferred would leave a manual `adopt-fix` blocked
+# behind bookkeeping that recorded a past state and is never revalidated. The takeover must still not be
+# the naive `rm && write` (two syscalls, so a peer's LIVE lock can be deleted between them): it renames
+# the record aside, VERIFIES what it detached is the dead pid it measured, and only then claims the
+# vacated path — so the assertions below check the outcome AND the evidence line.
 sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
 printf '%s\n' "$STALE_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
-{ [ "$plrc2" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
-ck "a STALE lock DEFERS this cycle too (rc=0, no agent, no chain) — a fixer never pushes unserialised (rc=$plrc2)" $rc
-grep -q 'DEFERRED: the PR-owner lock' "$RO/logs/fix-7.log"; rc=$?
-ck "...and NAMES the stale-lock cause (a distinct token from the live-lander one)" $rc
-{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = "$STALE_PID" ]; }; rc=$?
-ck "...and does NOT delete the claim it did not take — a non-CAS reclaim can delete a LIVE holder's lock" $rc
-[ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
-ck "...and the deferral is refundable (bail marker for the head it saw)" $rc
+{ [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
+ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
+grep -qF "RECLAIMED a STALE claim — state/mergeclaim-7.lock named pid $STALE_PID, which is not alive (measured with kill -0)" "$RO/logs/fix-7.log"; rc=$?
+ck "...and the takeover NAMES what it reclaimed — the lock and the pid it measured dead" $rc
+grep -qx "PI_LOCK_OWNER=$STALE_PID" "$PI_LOG" && rc=1 || rc=0
+ck "...and the record the agent worked under is NOT the dead pid (a steal that kept the stale record would pass the line above)" $rc
+{ ! grep -q 'DEFERRED' "$RO/logs/fix-7.log" && [ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; }; rc=$?
+ck "...and it is NOT a deferral — no bail marker, so no attempt is refunded for work that actually ran" $rc
+{ [ ! -f "$PRLOCK7" ] && [ -z "$(ls "$PRLOCK7".reclaim.* 2>/dev/null)" ]; }; rc=$?
+ck "...and neither the claim nor the detached stale record is left behind" $rc
+
+# ⛔ THE SAFETY ARM OF THE TAKEOVER, DRIVEN IN ISOLATION — this is the race the review reproduced.
+# Between the stale read and the detach a PEER may have reclaimed the lock, and a `rm && write`
+# reclaim then deletes that peer's LIVE claim and holds a lock two workers each believe they own.
+# `fix-one.sh` detaches by `mv`, CHECKS what it detached against the pid it measured, and puts a peer's
+# claim back with `ln` (create-if-absent) before deferring. The functions are EXTRACTED from the
+# shipped file — never re-implemented here, or the check would pass on a tree that does the wrong thing.
+# ⛔ AND THE PEER'S CLAIM MUST APPEAR *AFTER* THE READ, or the arm is VACUOUS (review of PR #2576, P2):
+# writing the live pid before the call makes the function's OWN first re-read fail, so `mv`, the
+# verification and the `ln` restore never execute — the check then passes on the banned `rm && write`
+# too. So the read is intercepted ONCE (the record answering the pid we measured) and the real file
+# already holds the peer's claim: the detach moves the PEER's record, which is exactly the case.
+PLG="$TMP/pl"; mkdir -p "$PLG"
+awk '/^prlock_take\(\)/{f=1} /^release_prlock\(\)/{f=0} f' "$HERE/fix-one.sh" > "$PLG/lib.sh"
+[ -s "$PLG/lib.sh" ] && bash -n "$PLG/lib.sh"; rc=$?
+ck "the takeover functions are EXTRACTABLE from the shipped fix-one.sh (the isolated arm below is not vacuous)" $rc
+cat > "$PLG/drive.sh" <<'PLGDRIVE'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"     # the record a PEER holds: it reclaimed after our measurement
+cat() { # the FIRST read of the record answers the pid we MEASURED; every later read is the real file
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s got=%s leftovers=%s\n' "$rc" "$(command cat "$PRLOCK" 2>/dev/null)" "$(ls "$PRLOCK".reclaim.* 2>/dev/null | wc -l | tr -d ' ')"
+PLGDRIVE
+bash "$PLG/drive.sh" "$PLG" "$$" "$STALE_PID" > "$PLG/out" 2>&1
+{ grep -qx "rc=1 got=$$ leftovers=0" "$PLG/out"; }; rc=$?
+ck "a takeover that detaches a PEER's live claim puts it BACK and defers — nothing deleted, nothing left behind ($(cat "$PLG/out" 2>/dev/null))" $rc
+# ... and the SAME interception with a record that cannot be restored proves the outcome is REPORTED as
+# the different thing it is: a third party re-claims the path while our `ln` restore is being attempted.
+cat > "$PLG/drive2.sh" <<'PLGDRIVE2'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"; third="$4"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"
+cat() {
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+ln() { if [ "$1" = "$PRLOCK.reclaim.$$" ]; then printf '%s\n' "$third" > "$PRLOCK"; return 1; fi; command ln "$@"; }
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s\n' "$rc"
+PLGDRIVE2
+bash "$PLG/drive2.sh" "$PLG" "$$" "$STALE_PID" "1" > "$PLG/out2" 2>&1
+{ grep -qx 'rc=2' "$PLG/out2" && grep -q 'could NOT be restored' "$PLG/log.log"; }; rc=$?
+ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNING), not as 'nothing was deleted' ($(cat "$PLG/out2" 2>/dev/null))" $rc
+
+# ⛔ AN UNREADABLE RECORD IS NOT A STALE ONE, AND STEALING IT IS THE ONE WAY TO TAKE A LIVE LANDER'S
+# CLAIM. `merge-one.sh` claims with `( set -o noclobber; echo $$ > "$CLAIM" )`: the file exists for an
+# instant BEFORE the pid is written, so "empty ⇒ dead owner" would take a lock whose owner is alive and
+# mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
+: > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
+{ [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
+{ [ -f "$PRLOCK7" ] && [ ! -s "$PRLOCK7" ]; }; rc=$?
+ck "...and it is left EXACTLY as found — never stolen from a claim whose pid may not be written yet" $rc
+grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says WHICH fact was missing, instead of reporting a stale owner it never measured" $rc
 rm -f "$PRLOCK7"
-# ⛔ THE STALE DEFERRAL NAMES THE REPAIR (review of PR #2576, cycle 2 — P2). Its reclaim is the
-# CONTROLLER's next dispatch, and `adopt-fix.sh` is the surface used when nothing is dispatching the
-# PR — so without the command an operator retries for ever and is told to wait for a reclaim that
-# never comes. The line must be actionable, not merely descriptive.
-grep -q 'REPAIR: confirm no lander is live.*rm -f state/mergeclaim-7.lock' "$RO/logs/fix-7.log"; rc=$?
-ck "...and the stale deferral NAMES THE REPAIR (rm -f the lock once no lander is live)" $rc
 
 # ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
 # `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
@@ -666,6 +732,23 @@ grep -q 'REPAIR: inspect it' "$RO/logs/fix-7.log"; rc=$?
 ck "...and NAMES the repair for the unusable path" $rc
 rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
 
+# ⛔ THE OTHER NON-REFUNDABLE ARM — a `$O/state` that cannot be WRITTEN — had no test (review of PR
+# #2576, P3). There the lock path does not exist, so the fixer reaches the create-failure refusal, and
+# if a regression made that arm refundable, spawn -> defer -> refund would spin with `fixcount`
+# netting to zero for ever. Driven with a separate `$O` whose `state` is a REGULAR FILE, which needs no
+# root: every `state/...` write then fails with ENOTDIR, exactly the unwritable/corrupt shape this arm
+# exists for.
+RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
+: > "$PI_LOG"; : > "$MERGE_LOG"
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
+{ [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
+grep -q 'REFUSED (NOT refundable' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable — otherwise spawn -> defer -> refund spins with fixcount netting to zero" $rc
+grep -q 'could not be CREATED although no file exists there' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and names the CAUSE it measured (the create failed on an absent path), not a stale owner it never saw" $rc
+
 # POSITIVE CONTROL, and the assertion that pins the property the change exists for: with NO lock the
 # fixer runs, the lock is HELD WHILE THE AGENT RUNS, and it is RELEASED before the merge-one handoff
 # (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
@@ -681,6 +764,58 @@ ck "...and the lock is HELD WHILE THE AGENT RUNS — the property, not just the 
 ck "...and it is RELEASED before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
 [ ! -f "$PRLOCK7" ]; rc=$?
 ck "...so no lock is left behind by a completed fixer run (a stale lock would defer the next cycle)" $rc
+
+# ⛔ (c) THE CLAIM IS RELEASED ON THE CRASH PATH TOO — a lock leaked by a KILLED fixer is the same
+# stall one step later, and it is the path an operator never sees (nothing in the log after the
+# signal). The fixer is backgrounded, the `pi` stub BLOCKS so the worker is provably mid-run when it
+# is signalled, and the assertion is on the record: it named a live process before, and it is gone
+# after. A tree that releases only on its success path passes the positive control above and fails here.
+rm -f "$PRLOCK7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+# ⛔ THE BLOCKING STUB POLLS A STOP FILE INSTEAD OF `sleep 20` (review of PR #2576, P3). A bare
+# `sleep` is a CHILD of the fixer: `kill -TERM` reaches the shell, whose EXIT trap releases the claim
+# and exits, so the sleep survives — reparented and outliving the suite for its full duration (measured:
+# `pgrep -af '^sleep 20$'` after the run). Polling with a 0.1 s tick and a STOP file lets this arm stop
+# it deterministically without weakening what it proves (the fixer is mid-agent when it is signalled).
+PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
+export -f pi
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
+i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+held="$(cat "$PRLOCK7" 2>/dev/null)"
+{ [ -n "$held" ] && kill -0 "$held" 2>/dev/null; }; rc=$?
+ck "while the agent works the claim names the LIVE fixer (lock=${held:-<none>}) — the crash arm is not vacuous" $rc
+kill -TERM "$fixpid" 2>/dev/null; : > "$PI_STOP"; wait "$fixpid" 2>/dev/null; crc=$?
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "a SIGTERM'd fixer RELEASES the claim (exit $crc, lock=${PRLOCK7##*/}) — a lock leaked by a dead fixer stalls the PR one step later" $rc
+[ ! -s "$MERGE_LOG" ]; rc=$?
+ck "...and the killed run did NOT hand the PR to the chain (a half-finished fixer must not trigger a re-review)" $rc
+# the blocking stub must not outlive the arm: its poll observes the stop file on the next 0.1s tick
+sleep 0.4
+{ ! grep -q 'while \[ "\$i" -lt 600 \]' "$HERE/spawn-gate.test.sh" || grep -q 'PI_STOP' "$HERE/spawn-gate.test.sh"; }; rc=$?
+ck "...and the blocking stub waits on a STOP FILE, not a bare \`sleep\` that outlives the killed worker" $rc
+# restore the fast stub for the section that follows, and reap the blocked one
+pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+export -f pi
+# ⛔ AND THE CROSS-BOX REFUSAL — the FIFTH rc=0-with-nothing-pushed arm (review of PR #2576, P3).
+# `fix-one.sh` refuses when another box already holds the per-head claim, and its line carries no
+# `DEFERRED` token, so without its own arm the operator's log got no line and the status said
+# SUCCESS for a run that did nothing. Driven with a claims.sh stub that refuses, and removed again so
+# the arms below are not diverted onto this path.
+# the deployed copies §10 uses; made here because this arm runs before §10's cp
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$RO/"
+printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
+[ "$arccb" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc
+grep -q 'CROSS-BOX claim' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+rm -f "$RO/claims.sh" "$RO/state/fixbail-7-"*
 unset -f gh; unset 'BASH_FUNC_gh%%'
 
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
