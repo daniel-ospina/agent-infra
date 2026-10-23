@@ -3107,11 +3107,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
             # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
             # read decides again — that is what makes the deferral non-sticky.
-            # ⛔ `unmeasured`, NEVER `deep`: on this path the cycle's own read has not run yet (it is
-            # taken once, in the dispatch block), so `CIQ_VER` is genuinely unset here. A `${…:-deep}`
-            # default would print a verdict this arm never measured — the exact shape this repo
-            # removed from every other instrument. The exact verdict is not lost: the `[ci-queue]
-            # DEFERRED …` line above carries it verbatim, depth and ceiling included.
+            # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
+            # reads on the COLD path (`orch-loop.sh`'s predicate), and the defer arms below are only
+            # reached *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The
+            # old comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
+            # documented the cycle-6 P0 it was written to fix; an editor trusting it would "restore"
+            # a cold-path-less predicate and refuse every fixer for ever. The `unmeasured` default is
+            # kept as a defensive floor for the arm that cannot reach the read — precisely because the
+            # exact verdict also rides the `[ci-queue] DEFERRED …` line above, verbatim.
             ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then

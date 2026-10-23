@@ -56,6 +56,15 @@ release_issue_claim_unspawned() { # <issue>
   return 0
 }
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THIS IS NOW A `gh` CONSUMER, SO IT RE-ASSERTS THE SHIMS (#2333 review P2). The `export PATH`
+# above puts the real `/opt/homebrew/bin/gh` FIRST, ahead of the controller's exported shim dirs, and
+# the CI-queue read below is this script's FIRST `gh` call — so without this it would run outside the
+# cell's rate-limit serialiser and the Mac REST adapter, while `README` §7.2g says every read goes
+# through them. `fix-one.sh` carries the identical pair for the same reason; adapter last so
+# `$O/gh-rest` (which itself calls the same helper) wins where it exists. `-d`-guarded, so a box
+# shipping neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # ── the worker launcher (worker-terminal.sh) ─────────────────────────────────────────────────────
 # Lanes and chains are WORKERS, so they are started by the same module orch-loop.sh uses — a durable
 # terminal on a cmux surface, tmux only on the launchd surface. A tmux lane on a cloud cell dies at

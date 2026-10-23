@@ -2518,15 +2518,23 @@ fi
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
-# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# Each is asserted to carry can_spawn, which is the property under test.
-fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
+# read `… && can_spawn && ! ciq_push_ok; then`, so counting `can_spawn` alone counted the two NEW
+# defer arms as spawn sites and reddened this suite on a correct change. Pinning each population
+# keeps the stated power in both directions: a spawn site that loses (or gains, ungated) its load
+# gate reddens the first line, and a defer arm that stops deferring reddens the second.
+# Each spawn site is asserted to carry can_spawn, which is the property under test.
+fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF 'can_spawn; then')
+fixer_defer_sites=$(grep -cF 'can_spawn && ! ciq_push_ok; then' "$LOOP")
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
+[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
+ck "both CI-queue defer arms sit AFTER the load gate (they are not spawn sites)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1

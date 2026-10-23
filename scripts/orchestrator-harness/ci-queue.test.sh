@@ -96,7 +96,10 @@ feed() { # <queued> <running> <runners> [busy]
 }
 
 # has <haystack> <literal-needle> -> 0 when the needle is present
-has() { printf '%s' "${1:-}" | grep -F -q -- "${2:-}"; }
+# ⛔ NO PIPE INTO A QUIET GREP (#841/#864): under `pipefail` a builtin writer piped into `grep -q`
+# SIGPIPEs the writer, and `sigpipe-grep` refuses the idiom. The payload is one line, so a here-string
+# is behaviour-identical.
+has() { grep -F -q -- "${2:-}" <<<"${1:-}"; }
 
 REC="$T/state/ci-queue-daniel-ospina_agent-infra"
 
@@ -141,6 +144,30 @@ ck "(b3) AT the ceiling is still allowed (the threshold is > ceiling, not >=)" "
 feed 11 5 5
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b4) one run OVER the ceiling is deferred" "$( [ "$d0" -eq 1 ]; echo $? )"
+
+printf '\n── (b5) HOSTED CI: no self-hosted runners must not collapse the ceiling ────\n'
+# ⛔ agent-infra's MEASURED shape is `{"total_count":0,"runners":[]}` while runs execute — its jobs
+# run on GitHub-HOSTED runners, which never appear in the repo endpoint. Inferring the runner count
+# from `in_progress` there made the ceiling smallest exactly when the box was idle: queued=4
+# running=1 => ceiling 2 => DEFERRED, i.e. "a rule that defers on 4 would be a fleet-wide stop" —
+# the failure the module header names as unacceptable. The pre-incident baseline and the incident
+# are the two arms that must BOTH hold.
+feed 4 1 0
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b5) hosted CI, zero repo runners: the PRE-INCIDENT baseline (4) is ALLOWED" "$( [ "$d0" -eq 0 ]; echo $? )"
+feed 4 1 -
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b6) hosted CI, runners endpoint REFUSING: the baseline (4) is still ALLOWED" "$( [ "$d0" -eq 0 ]; echo $? )"
+feed 97 7 0
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
+feed 4 1 0
+ciq_read "$OR" >/dev/null 2>&1
+ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" \
+   "$( case "${CIQ_RUNNERS:-}" in '~'*) echo 0 ;; *) echo 1 ;; esac )"
+v="$(ciq_eval)"
+ck "(b9) the ceiling comes from the allowance, not from `running` (ceiling=40, got: ${v})" \
+   "$( case "$v" in *'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5

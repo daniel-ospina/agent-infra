@@ -98,6 +98,11 @@ ciq_job_p90_min() { # MEASURED typical job duration, minutes (see the header's m
   ciq_is_num "$v" && [ "$v" -ge 1 ] && [ "$v" -le 600 ] || v=10
   printf '%s' "$v"
 }
+ciq_hosted_concurrency() { # GitHub-HOSTED CI's concurrent-job allowance, jobs (20 on the Free plan)
+  local v="${CIQ_HOSTED_CONCURRENCY:-20}"
+  ciq_is_num "$v" && [ "$v" -ge 1 ] && [ "$v" -le 10000 ] || v=20
+  printf '%s' "$v"
+}
 
 # ciq_ceiling <runners> -> the queued-run ceiling this runner count implies (see the derivation).
 # Prints nothing and returns 1 on an unusable runner count, so a caller can distinguish "no ceiling
@@ -192,7 +197,11 @@ ciq_read() {
   running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || running=""
   busy=""; runners=""
-  if _rn="$(ciq_gh "repos/$repo/actions/runners")"; then
+  # ⛔ `--paginate`: the endpoint returns ONE page by default (30 objects), so a fleet with more
+  # self-hosted runners than that had its count TRUNCATED — an under-derived ceiling that defers a
+  # queue which would have drained inside the horizon (#2333 review P2). Concatenated pages still
+  # count correctly: the objects are counted, never `total_count` (which would double-count).
+  if _rn="$(ciq_gh --paginate "repos/$repo/actions/runners")"; then
     # Count the online/busy runner objects. The endpoint returns `{"total_count":N,"runners":[…]}`;
     # a repo with no runners of its own (agent-infra, measured) yields 0 and is NOT an error — it
     # simply does not answer the question, so the inference below takes over.
@@ -240,9 +249,24 @@ ciq_read() {
     return 2
   fi
   if [ -z "${runners:-}" ]; then
-    # A measured lower bound: every executing run has a runner, so `running` is the parallelism that
-    # demonstrably exists. Floor of 1 keeps the ceiling derivable on an idle repo (0 executing).
-    runners="${running:-0}"; [ "$runners" -ge 1 ] || runners=1
+    # ⛔ AN UNANSWERED RUNNER ENDPOINT IS NOT A `<in_progress>`-RUNNER FLEET (#2333 review P1).
+    #
+    # The repo endpoint answering `{"total_count":0,"runners":[]}` is the HOSTED-CI shape, and it is
+    # agent-infra's MEASURED shape (empty while 7 runs executed: its jobs run on GitHub-hosted
+    # runners, which never appear in this list). Deriving the runner count from `in_progress` there
+    # was wrong in the fail-CLOSED direction: `in_progress` is a lower bound on CONCURRENCY at one
+    # instant, not on the fleet, so the ceiling came out SMALLEST exactly when the box was idle.
+    # Measured against the shipped bytes: queued=4 running=1 => ceiling 2 => DEFERRED — the
+    # "a rule that defers on 4 would be a fleet-wide stop" failure this module's header names as
+    # unacceptable, on the very repo the gate was built for.
+    #
+    # An unmeasurable self-hosted count means the throughput is the account's CONCURRENT-JOB
+    # ALLOWANCE, so derive from that (declared and overridable here, like every other tuning value).
+    # `max(allowance, running)` keeps the one property `in_progress` really does carry: at least that
+    # many jobs demonstrably execute at once, so a busy hosted fleet is never under-derived either.
+    runners="$(ciq_hosted_concurrency)"
+    if ciq_is_num "${running:-}" && [ "${running:-0}" -gt "$runners" ]; then runners="$running"; fi
+    [ "$runners" -ge 1 ] || runners=1
     runners="~$runners"
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
