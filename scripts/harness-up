@@ -486,6 +486,10 @@ else
   # The candidates, in order: the environment, this machine's config file, then the launcher's OWN
   # checkout — the operative cell path, because a cell's `keys.env` carries `REPO`/`OR` but NOT
   # `HARNESS_REPO` (docs/ops/fleet-harness-baseline.md), so the fallback is what resolves it there.
+  # ⛔ `--harness` IS NOT A SOURCE FOR THIS — and never was. It names the DIR the controller reads (on a
+  # cell, a pin worktree under PIN_ROOT), not the repo whose object DB the pin is resolved in, and
+  # `origin/main` did not accept it either (its candidates were HARNESS_REPO, the config file, the own
+  # checkout). Adding it here would silently change which repo answers the pin question on every cell.
   # ⛔ THE CONFIG KEY IS `HARNESS_REPO`, NEVER `REPO`: `REPO` is the WORK repo (read below), and taking
   # it here is precisely the conflation this block removes — the flat-copy layout (a deployed copy
   # outside any checkout) still has a way to name its harness, under a key that means one thing.
@@ -847,9 +851,16 @@ hu_row_claims() {
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
   else
-    hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed, and there is no record at $f)"; return 2; }
+    hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY}, and there is no record at $f)"; return 2; }
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
+  fi
+  # ⛔ A RECORD ABOUT ANOTHER REPO IS NOT AN ANSWER ABOUT THIS ONE (the split makes "which repo did this
+  # probe" a question with more than one answer). A record carrying a `repo=` that differs is UNKNOWN,
+  # never OK — otherwise a repurposed box reports a healthy claim registry for a repo it does not drain.
+  rec_repo="$(sed -n 's/.* repo=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  if [ -n "$rec_repo" ] && [ -n "$REPO" ] && [ "$rec_repo" != "$REPO" ]; then
+    hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, not the work repo $REPO)"; return 2
   fi
   if [ -n "$age" ] && [ "$age" -gt "$HU_CLAIMS_STALE" ]; then
     hu_row claims - "$(hu_age_txt "$age")" "LATE (last probe ${verdict:-none}, older than ${HU_CLAIMS_STALE}s)"; return 1
@@ -1017,8 +1028,15 @@ hu_row_exec() {
   # running controller was deliberately left alone — #2216/#2278), while anything else is a tree the
   # reference does not describe at all. Each is named, because "they disagree" without both shas is not
   # actionable.
-  if git -C "$HREPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+  # ⛔ AND THE ANCESTRY QUESTION IS A HARNESS QUESTION — `git -C ""` is the CWD's repo (git 2.43), so an
+  # unresolved harness would answer "is this an ancestor" about whatever checkout the operator stands in,
+  # flipping the REMEDY per CWD. No harness, no lineage claim.
+  if [ -n "$HREPO" ] && git -C "$HREPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
     hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is BEHIND the reference ${ref:0:12} from $name — the pin moved and this process was never restarted onto it)"
+    return 1
+  fi
+  if [ -z "$HREPO" ]; then
+    hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12} vs the reference ${ref:0:12} from $name — and no harness repo is resolved, so whether one is an ancestor of the other is NOT established)"
     return 1
   fi
   hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is NOT on the reference's line (${ref:0:12} from $name) — the running code is not the referenced code)"
@@ -1353,11 +1371,12 @@ hu_start_refresh() {
 # `status` can answer without paying a network round trip per row.
 hu_start_claims() {
   local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
+  HU_CLAIMS_WHY=""
   command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
   # ⛔ THE SAME EMPTY-VALUE TRAP, ONE NAMESPACE OVER: `git -C "" ls-remote origin` reads the CWD's repo —
   # a NETWORK probe against an unnamed repo — and then this function PERSISTS `claims=reachable` for it,
   # which every later `status` reads as an answer without probing. No work repo, no probe.
-  [ -n "$REPO" ] || { warn "claims: no work repo resolved (see the harness-up warning above) — the registry cannot be probed"; return 1; }
+  [ -n "$REPO" ] || { HU_CLAIMS_WHY="no work repo resolved"; warn "claims: no work repo resolved (see the harness-up warning above) — the registry cannot be probed"; return 1; }
   # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
   # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
   # registry on every box, whatever it holds. Measured in review; the fixture now carries a claim ref.
@@ -1370,7 +1389,12 @@ hu_start_claims() {
   verdict=absent
   grep -q 'refs/claims/' "$log" 2>/dev/null && verdict=reachable
   mkdir -p "$O/state" 2>/dev/null || { warn "claims: cannot create $O/state — the probe cannot be recorded"; return 1; }
-  printf 'claims=%s at=%s\n' "$verdict" "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null \
+  # ⛔ THE RECORD NAMES THE REPO IT PROBED. `refs/claims` is a fact about ONE repo's origin, so a record
+  # written when the box drained a different repo is not an answer about this one — and a box repurposed,
+  # or a pre-split run (where `REPO` could be the harness checkout), leaves exactly such a record behind
+  # for up to HU_CLAIMS_STALE. Records from before this field existed keep working (empty `repo=` means
+  # "unattributed"), so nothing reds on an old box, but every NEW record is attributable.
+  printf 'claims=%s repo=%s at=%s\n' "$verdict" "$REPO" "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null \
     || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
   say "claims: ok (refs/claims $verdict)"
   return 0
