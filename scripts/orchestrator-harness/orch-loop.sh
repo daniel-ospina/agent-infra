@@ -1772,7 +1772,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
 # revalidated" failure, applied to the fix that reports it.
 GH_LIMIT_STALE_S=900
 gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
-  local f rec kv at="" bucket="" reset="" rec_at="" now age
+  local f rec kv at="" bucket="" reset="" until="" rec_at="" now age
   f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
   [ -f "$f" ] || return 0
   rec="$(cat "$f" 2>/dev/null)" || return 0
@@ -1783,11 +1783,13 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
       at=*)        at="${kv#at=}" ;;
       bucket=*)    bucket="${kv#bucket=}" ;;
       reset=*)     reset="${kv#reset=}" ;;
+      until=*)     until="${kv#until=}" ;;
       recovered=*) rec_at="${kv#recovered=}" ;;
     esac
   done
   is_num "${at:-}" || return 0
   is_num "${reset:-}" || reset=""
+  is_num "${until:-}" || until=""
   [ "${reset:-0}" = 0 ] && reset="?"
   now="$(date +%s)"; age=$(( now - at ))
   { [ "$age" -ge 0 ] && [ "$age" -le "$GH_LIMIT_STALE_S" ]; } || return 0
@@ -1799,7 +1801,12 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
     printf 'gh=recovered(bucket=%s %ss)' "${bucket:-?}" "$age"
     return 0
   fi
-  printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
+  # ⛔ THE WINDOW IS `until=`, NOT `reset=`. A secondary/unclassified refusal retries in ~60 s while the
+  # bucket reset is ~43 min out; printing only `reset=` made the ONE line a human reads name a
+  # 43-minute block for a limit the layer clears in a minute — the misreading #2137 removes everywhere
+  # else. `until=` is the window this box actually honours, and it is printed BESIDE the reset (never
+  # instead of it) so every existing reader of the token keeps working.
+  printf 'gh=rate_limited(bucket=%s reset=%s until=%s %ss)' "${bucket:-?}" "$reset" "${until:-$reset}" "$age"
 }
 # "Is a worker with this name live?" — delegated to the ONE launcher (worker-terminal.sh), because the
 # answer now has to cover a DURABLE TERMINAL as well as a tmux session, and two implementations of
