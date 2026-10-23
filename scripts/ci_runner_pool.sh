@@ -615,8 +615,9 @@ cmd_restart() {
   fi
   # ⛔ AN UNREADABLE INSTANCE IS cannot-measure, NOT "no registration": `-f .runner` is FALSE for a
   # registration we cannot reach, and the message would send the operator to `add` a runner that is
-  # already registered (the same false verdict `status` must never print). Traversal is `x`; `restart`
-  # never lists the instance, so `r` is not required here either.
+  # already registered (the same false verdict `status` must never print). This guard DEREFERENCES a
+  # KNOWN name, so traversal (`x`) is what it needs; `probe_listener` below independently requires
+  # `r`+`x` before liveness is judged, so do not "restore symmetry" by relaxing that one too.
   if [ ! -x "$dir" ]; then
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2

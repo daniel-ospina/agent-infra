@@ -1001,16 +1001,29 @@ else
 fi
 
 # ⛔ A RUNNER_ROOT THAT EXISTS BUT IS NOT A DIRECTORY is a misconfiguration, not an empty pool — the
-#   same false empty reading in a shape no permission bit produces.
-echo "── a RUNNER_ROOT that is a FILE ──"
+#   same false empty reading in a shape no permission bit produces. TWO shapes reach that branch and
+#   each is pinned SEPARATELY, because a mode-644 file root is also caught by the traversal arm — a
+#   `rc_of` on it would stay green with the whole not-a-directory branch deleted (measured).
+echo "── a RUNNER_ROOT that is a FILE / a DANGLING SYMLINK ──"
 fresh_pool notadir; reset_logs
 rmdir "$RUNNER_ROOT"
 printf 'not a pool\n' >"$RUNNER_ROOT"
+chmod 755 "$RUNNER_ROOT"          # executable, so ONLY the not-a-directory arm can answer
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_eq "$?" "2" "a RUNNER_ROOT that is a regular file is cannot-measure, not an empty pool"
 assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it says which misconfiguration"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-x)"
+assert_eq "$?" "2" "restart names the not-a-directory root instead of 'no registration'"
+assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it says which misconfiguration"
+rm -f "$RUNNER_ROOT"
+# A DANGLING SYMLINK is the third shape: `[ -e ]` is false for it, so without the `-L` arm the root
+# reads as ABSENT — a healthy empty pool (status rc 0, slots=0) over a path that exists.
+ln -s "$T/no-such-target" "$RUNNER_ROOT"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "2" "a dangling-symlink RUNNER_ROOT is cannot-measure, not an empty pool"
+assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it names the shape"
 assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-x)" "2" \
-  "restart names the not-a-directory root too, instead of 'no registration'"
+  "restart refuses a dangling-symlink root too, rather than 'no registration'"
 rm -f "$RUNNER_ROOT"
 
 # ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED, which is what catches a competing pass that
