@@ -120,6 +120,18 @@ SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
 printf '%s | %s\n' "$PWD" "$*" >>"${CONFIG_LOG:?}"
+# ⛔ --url IS REQUIRED IF UNATTENDED (GitHub's own usage text: "Repository to add the runner to.
+#   Required if unattended"), and the runner THROWS rather than defaulting it to the token's repo —
+#   so this stub refuses exactly as config.sh does. A stub that ignored argv let the shipped `add`
+#   omit --url and stay GREEN: this file modelled the cwd contract and the listener argv, but not
+#   the ONE argument that decides whether a registration happens at all.
+case " $* " in
+  *" --unattended "*)
+    case " $* " in
+      *" --url https://github.com/"*) : ;;
+      *) echo "config.sh: Invalid configuration provided for --url. Terminating unattended configuration." >&2; exit 1 ;;
+    esac ;;
+esac
 case " $* " in *" --name ${FIXTURE_CONFIG_FAIL_NAME:-__none__} "*) echo "config.sh: a runner with this name already exists" >&2; exit 1 ;; esac
 if [ -n "${FIXTURE_CONFIG_TAKEN:-}" ]; then
   nm=""; prev=""
@@ -178,6 +190,9 @@ assert_contains "$(cat "$CONFIG_LOG")" "$RUNNER_ROOT/pi-runner-a | " \
   "config.sh ran with ITS OWN directory as cwd (GitHub's contract, not the caller's)"
 assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64" "config.sh was given the pool marker"
 assert_contains "$(cat "$CONFIG_LOG")" "--token tok-fixture" "config.sh was given a registration token"
+# ⛔ The URL is the argument whose absence made every real `add` fail while the suite stayed green.
+assert_contains "$(cat "$CONFIG_LOG")" "--url https://github.com/daniel-ospina/tortoise" \
+  "config.sh was given the REPO URL — unattended config refuses to run without one"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-a")" "1" "a listener is running for the instance dir"
 
 # ── (1) a symlinked template must still produce a COPY ─────────────────────────────────────
@@ -453,6 +468,25 @@ assert_contains "$out" "live name=pi-runner-width" "restart reads the listener L
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-width")" "1" \
   "no SECOND listener was started for one registration"
 
+# ── a process that merely NAMES the path is not a listener ────────────────────────────────
+# ⛔ The mirror image of the width pin above. Matching the binary path as a SUBSTRING accepts any
+#   process whose arguments quote it — `tail -f <dir>/bin/Runner.Listener`, an editor, a shell holding
+#   the path as an argument — so a DEAD registration reads LIVE forever: `status` exits 0, and
+#   `restart`/`reconcile` skip the registration for good while the slot stays idle and advertised to
+#   GitHub. The measured argv of a real listener is `<dir>/bin/Runner.Listener run …`, so liveness is
+#   the INVOCATION (` run` must follow the binary), not a mention of the file.
+echo "── liveness: a process that merely QUOTES the path is not a listener ──"
+fresh_pool quoted; reset_logs
+register pi-runner-quoted
+( exec -a "tail -f $RUNNER_ROOT/pi-runner-quoted/bin/Runner.Listener" sleep 60 ) &
+quoted_pid=$!
+sleep 0.3
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "3" "a DEAD registration stays DEAD when another process merely names the binary"
+assert_contains "$out" "pi-runner-quoted" "the quoting process was not read as the listener"
+assert_contains "$out" "summary live=0 dead=1 slots=1" "and it is counted dead, not live"
+kill "$quoted_pid" 2>/dev/null || true
+
 # ══ 7. RECONCILE: restart the dead, add to the ceiling, be IDEMPOTENT, and report cannot-act ══
 echo "── reconcile ──"
 fresh_pool reconcile; reset_logs
@@ -613,6 +647,11 @@ register pi-runner-settle2
 assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_START_SETTLE_S=0 rc_of restart --name pi-runner-settle2)" "2" \
   "restart refuses an unreadable settle window instead of starting a listener"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-settle2")" "0" "and it started nothing"
+# ⛔ The box whose ENV IS WRONG is the one that needs the contract, so `--help` may not sit behind
+#   operand validation — otherwise the usage block is unreachable exactly when it is needed.
+out="$(RUNNER_START_SETTLE_S=5s bash "$POOL" --help 2>&1)"
+assert_eq "$?" "0" "--help exits 0 even when RUNNER_START_SETTLE_S is unreadable"
+assert_contains "$out" "USAGE" "and it prints the usage block (not a cannot-measure verdict)"
 
 # ── (4) the preview must not announce adds it has no token source for ───────────────────────
 fresh_pool previewtoken

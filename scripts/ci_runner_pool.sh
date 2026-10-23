@@ -285,8 +285,15 @@ listener_pid() {
     [ -n "${pid:-}" ] || continue
     case "$args" in
       *Runner.Listener*)
+        # ⛔ ANCHOR ON THE INVOCATION, NOT ON THE PATH. A live runner's measured argv is
+        # `<dir>/bin/Runner.Listener run --startuptype service`, so requiring the ` run` that must
+        # follow the binary is what separates a LISTENER from any process that merely NAMES the file
+        # (`tail -f <dir>/bin/Runner.Listener`, an editor, a shell holding the path as an argument).
+        # A bare path-substring match is this file's own named defect in disguise: a DEAD
+        # registration then reads LIVE forever, so `restart`/`reconcile` skip it and the slot stays
+        # idle while the report says healthy.
         case "$args" in
-          *"$phys/bin/Runner.Listener"*|*"$d/bin/Runner.Listener"*) printf '%s\n' "$pid"; return 0 ;;
+          *"$phys/bin/Runner.Listener run"*|*"$d/bin/Runner.Listener run"*) printf '%s\n' "$pid"; return 0 ;;
         esac ;;
     esac
   done <<<"$out"
@@ -454,7 +461,15 @@ cmd_add() {
   # token already used/expired, disk full). A `see=` path pointing into a directory we just deleted
   # is worse than no pointer at all.
   local cfglog="$RUNNER_ROOT/.config-$name.log"
-  local -a args=(--unattended --name "$name" --work "$dir/_work" --labels "$label" --token "$token")
+  # ⛔ `--url` IS REQUIRED, NOT OPTIONAL. GitHub's own `config.sh --help` says "Repository to add the
+  # runner to. Required if unattended", `CommandSettings.GetUrl()` passes an EMPTY default, and
+  # PromptManager's unattended arm THROWS on an empty non-optional value ("Invalid configuration
+  # provided for --url. Terminating unattended configuration.") instead of falling back to the
+  # token's repo. Without it every real add failed at config and reported it as a NAME problem
+  # (rc 5, "a token it consumed may have registered the name") — and the suite stayed green because
+  # its config stub ignored argv. Derived from POOL_REPO in ONE place so the two cannot drift.
+  local -r pool_url="https://github.com/$POOL_REPO"
+  local -a args=(--unattended --url "$pool_url" --name "$name" --work "$dir/_work" --labels "$label" --token "$token")
   if ! "$dir/config.sh" "${args[@]}" >"$cfglog" 2>&1; then
     # Nothing valid exists yet, and a full runner install left behind is invisible to `slots`, never
     # bounded by the ceiling, and would make the next pass mint another name — so it goes.
@@ -654,13 +669,18 @@ main() {
     case "$h" in ''|*[!A-Za-z0-9._-]*) h="box" ;; esac
     POOL_PREFIX="pi-runner-$h"
   fi
+  # ⛔ HELP BEFORE VALIDATION: `--help` reads no operand, and the box whose env is WRONG is exactly
+  # the one that cannot read the contract otherwise — `RUNNER_START_SETTLE_S=5s … --help` used to
+  # report `cannot-measure` and exit 2 with the usage block unreachable.
+  case "$verb" in
+    ''|-h|--help|help) usage 0 ;;
+  esac
   validate_operands || return 2
   case "$verb" in
     status)    cmd_status "$@" ;;
     add)       cmd_add "$@" ;;
     restart)   cmd_restart "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
-    ''|-h|--help|help) usage 0 ;;
     *) err "ci_runner_pool: unknown command '$verb' (try: status|add|restart|reconcile)"; return 1 ;;
   esac
 }
