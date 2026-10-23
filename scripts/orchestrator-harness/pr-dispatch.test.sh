@@ -736,7 +736,10 @@ echo
 echo "=== T7d: the PROBE row is never read as a worker or a reason ==="
 # The record's line 1 is the controller's write probe, so the reader must subtract it AND skip it when
 # choosing the reason. A 13-byte probe could not detect a nearly-full volume either (review, cycle 3).
-printf '#\t%s\n' "$(printf '%*s' 240 '' | tr ' ' x)" > "$TMP/probe.tsv"
+# ⛔ THE MARKER IS LOAD-BEARING (review, cycle 4): the assertion below greps the operator line for
+# `cycle probe`, so a fixture padded with x's alone made that assertion VACUOUS — it could not fail
+# whatever the shipped filter did. The filler carries the marker, at a real row's width.
+printf '#\tcycle probe %s\n' "$(printf '%*s' 240 '' | tr ' ' x)" > "$TMP/probe.tsv"
 printf 'merge-4242\tcmux layout apply failed: database or disk is full\n' >> "$TMP/probe.tsv"
 SPAWNREF_BASE=1 summarise "$(printf '11\tabc\tGREEN\tact\tmerged (gate authority)\n')" 1 open-rows 3 0 "$TMP/probe.tsv"
 grep -q '1 spawn(s) REFUSED' "$TMP/s.log" && grep -q 'layout apply failed' "$TMP/s.log" \
@@ -789,6 +792,16 @@ if [ -s "$TMP/ref.sh" ] && grep -q 'wt_refused_file' "$TMP/ref.sh"; then
       ok "with the launcher module: the record resolves through WT_DIR and the probe row was written" ;;
     *) bad "the resolver ignored the launcher's own wt_dir: $(printf '%s' "$_r" | tr '\n' ' ')" ;;
   esac
+  # ⛔ THE PROBE'S WIDTH, NOT JUST ITS PRESENCE (review, cycle 4). The shipped probe is padded to the
+  # row bound because a SHORT probe passes on a volume with a few free bytes and then every refusal
+  # row (up to ~250 B) is dropped: OK=1, N=0, no suffix — a MEASURED zero, the exact false PASS the
+  # probe exists to prevent. The case above proves a probe is WRITTEN; only a measurement of the row
+  # the SHIPPED code wrote pins its size, so shortening that `printf` could not go green.
+  _pw="$(awk -F"$(printf '\t')" 'NR==1{print length($2); exit}' "$TMP/R/alt-state/spawn-refused.tsv" 2>/dev/null)"
+  case "${_pw:-}" in ''|*[!0-9]*) _pw=0 ;; esac
+  [ "$_pw" -ge 240 ] \
+    && ok "the shipped probe row is a real row's width (${_pw} B) — a short probe cannot detect a full volume" \
+    || bad "the shipped probe row is only ${_pw} B: a nearly-full volume passes the probe and every refusal is then dropped silently"
   _r="$(resolve 0)"   # no worker-terminal.sh at all = a stale deploy
   case "$_r" in
     *"OK=0"*"predates wt_refused_file"*)
