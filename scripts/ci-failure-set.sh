@@ -52,27 +52,36 @@
 #                             --main-union-signatures) drop runs whose headSha is
 #                             <sha> (full or short; matched against the run's headSha)
 #
-#   ⚠️ WHAT [N] MEANS ON MAIN (#9689). N is a STARTING WIDTH, not the size of the
-#   window: the listing is widened (doubling, bounded at 200 runs) until the
-#   window holds N runs that actually FINISHED A MEASUREMENT, because a
-#   `completed/cancelled` run that never expanded a job would otherwise spend
-#   one of the N and a push burst can spend all of them — leaving `tested=0` and
-#   making admin-merge.sh report "the lane never TESTED main" about a main that
-#   simply had not been READ deep enough. A `--runs-report` therefore shows
-#   `completed`/`tested` over a wider listing than N, and says so on stderr.
-#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N MEASURED
-#                             runs (see "WHAT [N] MEANS" above):
+#   ⚠️ WHAT [N] MEANS IN THE TWO WIDENED MAIN MODES (#9689) — `--main-union-rates`
+#   and `--main-union-signatures`, and NOT `--main-union` (see the next note). N is
+#   a STARTING WIDTH, not the size of the window: the listing is widened (doubling,
+#   bounded at 200 runs) until the window holds AT LEAST N runs that actually
+#   FINISHED A MEASUREMENT — so the window, and the `tested` an operator reads in
+#   `--runs-report`, can EXCEED N; it is never smaller. Without the widening, a
+#   `completed/cancelled` run that never expanded a job spends one of the N, a push
+#   burst can spend all of them, and `tested=0` makes admin-merge.sh report "the
+#   lane never TESTED main" about a main that simply had not been READ deep enough.
+#   The widening says so on stderr.
+#   --main-union-rates [N]    (#3756) per-id failure COUNTS over a window holding at
+#                             least N MEASURED runs (see "WHAT [N] MEANS" above):
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
 #                             subtraction excused an eight-fold regression. Emits
 #                             NOTHING when no run exercised the suite (fail-closed).
 #   --main-union-signatures [N]
-#                             (#3756) main's per-id stable SIGNATURE over the last
-#                             N MEASURED runs: `<nodeid>\t<signature>`. The rate table
-#                             alone leaves `main_signatures` empty, so the decision's
-#                             subset rule fails CLOSED and nothing is ever exempt;
-#                             this is the other half of the same measurement.
+#                             (#3756) main's per-id stable SIGNATURE over a window
+#                             holding at least N MEASURED runs:
+#                             `<nodeid>\t<signature>`. The rate table alone leaves
+#                             `main_signatures` empty, so the decision's subset rule
+#                             fails CLOSED and nothing is ever exempt; this is the
+#                             other half of the same measurement.
+#   ⚠️ `--main-union` is NOT widened, deliberately: it is the POST-merge detector's
+#   window, which must read the width the merge was certified over rather than a
+#   wider one. Its own dilution residual is therefore unchanged and stated at
+#   `list_main_baseline` — a window spent on cancelled runs leaves main's failing
+#   set EMPTY, the detector reads every failure of the merged commit as UNIQUE, and
+#   the cost is an OVER-alarm, never a false clean.
 #   --per-run <file>          (--commit-rows) write one line per FAILING run with
 #                             that run's failing ids, whitespace-separated — the
 #                             per-run id sets `decide()` consumes for REQUIRED
@@ -445,18 +454,36 @@ list_lane_runs() {
 # read 20 runs wide found a measured run at position 14.
 #
 # So the listing WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until the
-# exclusion-filtered window holds the requested number of MEASURED runs, or the
-# history is exhausted, or the bound is reached. This is the rule the rail's
+# exclusion-filtered window holds AT LEAST the requested number of MEASURED runs,
+# or the history is exhausted, or the bound is reached. This is the rule the rail's
 # lane-coverage gate already follows for its own reference window (#4844,
 # #7734: "N is a STARTING WIDTH, not a stopping rule"); the baseline pass was
 # the one place still reading N as a stopping rule.
 #
 # ⛔ THE WIDENING CRITERION IS NOT THE GATE. `measured_run_count` reads only the
-# listing's status/conclusion, so it cannot see a zero-job `success` — but it
-# decides only whether to read MORE, never that a baseline exists. The gate
-# stays `collect_union_rates`/`collect_union_signatures`'s own `tested` counter,
-# which takes the credit back for a zero-job run (#1482). A wrong widening
-# answer therefore costs one extra listing read, never a false PASS.
+# listing's status/conclusion, so it cannot see a run's JOBS — but it decides only
+# whether to read MORE, never that a baseline exists. The gate stays
+# `collect_union_rates`/`collect_union_signatures`'s own `tested` counter (#1482).
+#
+# WHERE THE TWO AGREE, and where they do NOT (this asymmetry is the whole risk, so
+# it is stated precisely rather than waved at):
+#   · on a `completed/success` run they AGREE. The collectors credit `tested` for a
+#     success WITHOUT probing its jobs, so a zero-job success is credited by both.
+#   · on a `completed/failure|timed_out` run with an EMPTY job list they CAN
+#     DISAGREE: the collectors credit it, then take the credit BACK once the log
+#     fetch reports zero jobs, while the criterion has already counted it. In that
+#     shape the loop can stop one width EARLY, so the consequence is the SAME
+#     over-block this change exists to remove, reappearing one widening short — and
+#     never a false PASS: a window of zero-job failures still blocks, because the
+#     gate is what blocks. A false PASS would need the criterion to be the gate,
+#     and it is not.
+#
+# Why that residual is stated rather than fixed: making the criterion agree would
+# mean paying a job read for EVERY failing run in EVERY window (or widening until a
+# success appears, i.e. reading to the bound on any main that is currently red) —
+# on every merge, for a shape whose frequency is unmeasured. Over-blocking one
+# widening short is the cheap side of that trade, and it is visible: the block
+# message carries `tested` and the announced widening widths.
 #
 # ⚠️ STATED RESIDUAL, `--any-workflow` (#9689 follow-up): the criterion counts a
 # completed run of ANY workflow, exactly as the gate's `tested` credit does. So in
@@ -531,9 +558,10 @@ list_main_baseline() {
     # comparing `listed` to `width`, because `drop_superseded_runs` may legitimately
     # return fewer lines than the window asked for while the history goes on —
     # stopping there would under-widen and re-create the very false block this
-    # fixes. The price is one extra listing read on a short history, and that is
-    # the correct side of the trade: an extra read costs time, a premature stop
-    # costs a blocked merge.
+    # fixes. The price is ONE LISTING READ PER DOUBLING STEP — two on a 3-run
+    # history, up to the bound on a long one, not the single extra read an earlier
+    # draft of this comment claimed — and that is the correct side of the trade: an
+    # extra listing read costs time, a premature stop costs a blocked merge.
     { [ "$read_once" -gt 0 ] && [ "$listed" -le "$prev" ]; } && break
     read_once=1; prev="$listed"
     width=$((width * 2))

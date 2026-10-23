@@ -12915,7 +12915,11 @@ grep -qx 'tested=0' "$TMP/dn-report.txt" \
 # (d) THE HISTORY IS THE CEILING, NOT THE POLICY BOUND. With one measured run in
 # existence the widening STOPS at the end of the history and reports what it
 # measured — it does not read to 200, and it does not call the shortfall a
-# baseline of the requested width.
+# baseline of the requested width. The STOP is pinned below by the widths actually
+# asked for (which the fake records), not only by `tested=1`: the two stop rules
+# this loop owns — an empty/exhausted history and the policy bound — are otherwise
+# unobservable, and deleting the exhaustion break would leave every assertion here
+# green.
 new_scen dilutedoneshort
 {
   lane_line completed cancelled dwo1 8831
@@ -12933,6 +12937,39 @@ if [ "$rc" -eq 0 ] && grep -qx 'tested=1' "$TMP/do-report.txt"; then
 else
   fail "expected tested=1 from the exhausted history, got: $(tr '\n' ' ' < "$TMP/do-report.txt")"
 fi
+# …and the STOP itself: 2 → 4 → 8 is this history read to exhaustion. At 8 the
+# listing returns the same three runs as at 4, so a wider window cannot add a
+# measurement and the EXHAUSTION rule stops the loop (the 200-run bound is not
+# reached). Widening forever would satisfy `tested=1` just as well, which is why
+# the widths are asserted and not inferred.
+LIMITS="$(grep -o -- '--limit [0-9]*' "$SCEN/calls" | tr '\n' ' ')"
+if [ "$LIMITS" = "--limit 2 --limit 4 --limit 8 " ]; then
+  pass "and the widening STOPS once the history is exhausted: run-list widths 2 → 4 → 8, never further"
+else
+  fail "expected run-list widths '--limit 2 --limit 4 --limit 8 ', got: '$LIMITS'"
+fi
+
+# (f) A LISTING READ THAT FAILS MID-WIDENING IS A LISTING FAILURE, not a thinner
+# baseline: fail-closed, non-zero, and NO report file. `list_main_baseline` reads
+# the widened listing INSIDE the loop, so a read that dies on the second (wider)
+# pass must be refused exactly like a failing first read — an unreadable run list
+# can never be read as "nothing ran".
+new_scen dilutedlistfail
+{
+  lane_line completed cancelled dwf1 8841
+  lane_line completed cancelled dwf2 8842
+  lane_fail dwf3 8843
+} > "$SCEN/runs-main"
+printf '2' > "$SCEN/fail-run-list-nth"   # the SECOND `run list` — the widened one
+cfs_run --main-union-rates 2 --runs-report "$TMP/df-report.txt"
+rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'could not list main runs' "$TMP/cfs-err"; then
+  pass "a main listing that fails on the SECOND (widened) read exits non-zero and names the failure"
+else
+  fail "expected a listing-failure exit, got $rc: $(head -2 "$TMP/cfs-err")"
+fi
+[ -s "$TMP/df-report.txt" ] && fail "a failed widened listing still wrote a runs-report — a partial window could be read as a baseline" \
+                             || pass "and it wrote no runs-report, so nothing downstream can read a baseline from it"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
