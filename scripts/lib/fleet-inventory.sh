@@ -1091,11 +1091,15 @@ fleet_start_component() { # <name>
       # exactly the abort this fence exists to prevent). `10#` pins the base, so every digit string
       # means what the operator wrote. The result is CAPPED: a typo (or an intmax value that wraps)
       # must not turn `start` into an unbounded wait.
+      # ⛔ THE CAP IS IN POLLS, NOT SECONDS. A poll is `sleep 0.2` PLUS one `fleet_pids_for` (a `ps`
+      # read under load), so 300 polls is on the order of minutes, not the "60 s" an earlier comment
+      # claimed — and the cap is only reachable when the operator asks for a window beyond it AND the
+      # record stays wrong. Stated so the number is not read as a wall-clock bound.
       case "$FLEET_START_SETTLE_S" in
         ''|*[!0-9]*) settle_polls=15 ;;
         *) settle_polls=$(( 10#$FLEET_START_SETTLE_S * 5 ))
            if [ "$settle_polls" -lt 0 ]; then settle_polls=15
-           elif [ "$settle_polls" -gt 300 ]; then settle_polls=300    # 60 s ceiling
+           elif [ "$settle_polls" -gt 300 ]; then settle_polls=300    # ~300 polls (see below)
            fi ;;
       esac
       if [ "$name" = "heartbeat-loop" ]; then
