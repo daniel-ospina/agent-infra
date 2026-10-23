@@ -2378,6 +2378,18 @@ def test_the_wedged_re_run_brief_states_the_measured_state():
     assert "WEDGED" not in never, never
     assert "150m" not in never, never
 
+    # ...AND "NOTHING IS IN FLIGHT" IS READ, NOT ASSUMED (#1926 review cycle 2, P2). The same
+    # `why=None` branch is reached when the only past-the-bound check is the DIFF-BOUND gate --
+    # `classify_one` drops that name from the order, but the gate IS in flight at the head. The
+    # branch used to say "nothing is in flight" there: a false statement in the text a lane
+    # executes, introduced by that filter. It must now name the real reason (diff-bound, clears
+    # by RECORDING) instead of claiming an empty flight.
+    in_flight_never = pr.brief(ready, "rerun-checks", None,
+                               _cr(absent=["python-ci-gate"], flight=["ai-review-gate"]))
+    assert "Nothing is in flight" not in in_flight_never, in_flight_never
+    assert "RECORDING" in in_flight_never, in_flight_never
+    assert "never ran" in in_flight_never, in_flight_never
+
 
 # ── 5. an unreadable queue is NOT an empty one: the exit codes differ ────────────────────
 
