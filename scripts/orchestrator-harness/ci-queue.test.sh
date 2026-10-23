@@ -381,16 +381,26 @@ grep -q 'fixbail-\$PR-\$HEAD' "$FIX"
 ck "(e8) fix-one.sh's deferral writes the bail marker, so no attempt is consumed" "$?"
 grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note_here "the whole batch' "$DISPATCH"
 ck "(e9) dispatch-merge.sh (the batch stampede) reads the same module and defers the batch" "$?"
-# ⛔ THE OWNER RULING IS PINNED BEHAVIOURALLY, NOT BY VOCABULARY (#2333 review, P1). The arm this
+# ⛔ THE MODULE'S VERDICT IS PINNED BEHAVIOURALLY, NOT BY VOCABULARY (#2333 review, P1). The arm this
 # replaces grepped the module for two literal substrings (`LANES…-ge`, `MAX_LANES=`). Measured in both
-# directions and both were wrong: a lane cap under ANY other identifier — or in one of the three WIRING
-# files, which is where `wt_count fix-` actually lives — stayed GREEN, while DOCUMENTING the ruling in
-# the module header (a comment naming `MAX_LANES`) turned it RED, so the cheapest way to clear a red was
-# to delete the explanation of the decision. The owner ruled 2026-10-17 that dispatch is gated on
-# CAPACITY, not on the number of lanes; that is a property of the VERDICT, so it is DRIVEN here — an
-# implausible lane fleet must not move the verdict in either direction. The stubs are shell FUNCTIONS
-# because the harness counts lanes with `wt_count` (a sourced function, invisible to a PATH stub) as
-# well as `tmux ls`.
+# directions and both were wrong: a lane cap under ANY other identifier stayed GREEN, while DOCUMENTING
+# the ruling in the module header (a comment naming `MAX_LANES`) turned it RED, so the cheapest way to
+# clear a red was to delete the explanation of the decision.
+#
+# ⛔ WHAT THESE ARMS ASSERT, EXACTLY — AND WHAT THEY DO NOT (#2333 review cycle 3, P2). They pin that
+# THIS MODULE's verdict cannot be moved by a lane count, and that the module contains no lane-cap
+# comparison in executable lines. They do NOT census the three WIRING files: a lane cap added to
+# `orch-loop.sh`/`fix-one.sh`/`dispatch-merge.sh` stays green here, and so does a cap in this module that
+# reads lanes through a name these stubs do not shim (`command tmux ls`, a lane-count FILE). Measured, not
+# assumed: each of those three mutants is 79/79 CLEAN against these arms. Do NOT restate the coverage as
+# "no lane cap can be reintroduced" — a lexical census of the wiring files cannot be written at all, since
+# they legitimately contain `wt_count fix-` and `LANES…-ge` for the pre-existing `MAX_LANES` cap that the
+# owner ruling of 2026-10-17 governs (orch-loop.sh: "MAX_LANES IS REPAIRED TO ITS OWN DERIVED DEFAULT").
+# A behavioural pin on the DISPATCH DECISION itself (extract that block and drive it, the way (h0)/(h0b)
+# drive `ciq_push_ok`) is the successor, and it is named as a residual rather than claimed here.
+#
+# The stubs are shell FUNCTIONS because the harness counts lanes with `wt_count` (a sourced function,
+# invisible to a PATH stub) as well as `tmux ls`; they are unset immediately so no later arm can see them.
 _lanestub() {
   wt_count() { echo 99; }
   tmux() { echo "fix-a"; echo "fix-b"; echo "merge-c"; }
@@ -399,7 +409,7 @@ feed 4 5 5
 _lanestub
 ciq_ci_allowed "$OR"; d0=$?
 unset -f wt_count tmux
-ck "(e10) an implausible LANE fleet does not defer a SHALLOW queue — the verdict is the queue's, per the owner ruling" "$( [ "$d0" -eq 0 ]; echo $? )"
+ck "(e10) an implausible LANE fleet does not defer a SHALLOW queue — THIS MODULE's verdict is the queue's" "$( [ "$d0" -eq 0 ]; echo $? )"
 feed 97 5 5
 _lanestub
 ciq_ci_allowed "$OR"; d0=$?

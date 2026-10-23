@@ -233,7 +233,7 @@ _lord="$(grep -n '^[[:space:]]*done < "\$ORDER_FILE"' "$LOOP" | head -1 | cut -d
 _lrep="$(grep -n 'AN UNMET FLOOR LOGS AND DEGRADES' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_lord$_lrep" in ''|*[!0-9]*) P6L=1 ;; *) P6L=0 ;; esac
 ck "P6 (setup) the order read and the reporting block are locatable (order=$_lord report=$_lrep)" $P6L
-_between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
+_between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit([[:space:];]|$)/) {print NR": "$0}' "$LOOP")"
 [ -z "$_between" ]
 ck "P6 [RED→GREEN] nothing between the order read and the report can truncate the batch, reset K, exit, or make dispatch depend on PB (got '${_between:-'<none>'}')" $?
 # ⛔ AND THE BATCH IS DISPATCHED ON `.batch` ALONE (review cycle 8, P1). The window above stops at the
@@ -274,17 +274,23 @@ ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is n
 # terms), the post-call half keeps the floor terms AND `exit` (measured, #2333 review: dropping `exit`
 # here was a real loosening — an `exit 0` inserted between the call and the body's closing `fi` (e.g.
 # right after the call, before `heartbeat` and the cycle record) left this suite 213/0 GREEN where the
-# pre-split window red'd it; the four `exit` occurrences in that region today are all in comments, so
+# pre-split window red'd it; the three `exit` tokens in that region today are all in comments, so
 # re-adding the term costs nothing and re-arms the arm), and it gains a STRICTER rule: a reset there is
 # admissible only inside the exit-code contract's arm, which is asserted to EXIST (deleting the arm
 # leaves `dispatch-merge.sh`'s exit 3 unhandled, and that now reds instead of passing silently).
 _dcall="$(grep -n '^[[:space:]]*bash "\$O/dispatch-merge.sh"' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_dcall" in ''|*[!0-9]*) P6C=1 ;; *) P6C=0 ;; esac
 ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
-_body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+_body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit([[:space:];]|$)/ || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
 ck "P6 [RED→GREEN] from the end of the report to the DISPATCH CALL nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
-_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
+# ⛔ `exit` IS MATCHED IN EVERY SPELLING — `exit 0`, `exit "$rc"`, a BARE `exit` and `exit;` (#2333
+# review, P2). The restored term first read `/^[[:space:]]*exit /`, one space required, so a bare `exit`
+# — which bash accepts and which exits with the LAST status, i.e. "stop the controller right after
+# dispatching" — still read 213/0 GREEN while this arm's own label said it was caught. Both halves use
+# the widened form. The three `exit` TOKENS in this window today are all inside comments, and the
+# anchored form cannot match a `#` line, so the widening costs no false red.
+_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/ || /^[[:space:]]*exit([[:space:];]|$)/) {print NR": "$0}' "$LOOP")"
 [ -z "$_post" ]
 ck "P6 [RED→GREEN] …and AFTER the call nothing refreshes the product batch, reads the floor, or EXITS (got '${_post:-'<none>'}')" $?
 _guard="$(grep -nF 'if [ "$_dmrc" = "3" ]; then' "$LOOP" | head -1 | cut -d: -f1)"
