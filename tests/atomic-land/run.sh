@@ -612,18 +612,21 @@ echo "── 2b-ii. #2369 — a stale record the carry CAN re-bind still updates
 new_scen stalerecordcarry
 printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
   > "$SCEN_RECORD_FILE"
-# ⚠️ NO PR-BODY MARKER HERE, deliberately (review, cycle 5). Cycle 4 added one bound to HEAD_STALE
-# to model the population this scenario protects — "a lane that updated and then died at verify",
-# record AND marker at the reviewed/before head — and claimed it reddens a tightening that required
+# ⚠️ WHAT THIS SCENARIO DOES *NOT* MODEL, stated precisely (review, cycle 5, then 6). Cycle 4 added a
+# PR-body marker bound to HEAD_STALE — "record AND marker at the reviewed/before head", the state a
+# lane that updated and then died at verify leaves — and claimed it reddens a tightening that required
 # the artifact to be IDENTIFIED AT THE CURRENT HEAD. It does not, and it could not: with
 # RECORD_HEAD=HEAD_STALE != HEAD=HEAD_OLD, B5's
 # `[ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence` short-circuits, so the rail never reads
-# the PR body here, and the producer double reads `$SCEN/head`/`$SCEN_RECORD_FILE`, never
-# `$SCEN/pr-body` (measured). A fixture nothing reads is not coverage and a comment claiming it is
-# is worse than none — this repo's own rule, one repo down. The state this scenario really models is
-# stated by its inputs: a STALE record plus a producer whose carry SUCCEEDS, which is what the
-# precondition must not block. If a future guard makes the rail read the body at the precondition,
-# the marker belongs back here — WITH the mutant that reads it.
+# the PR body in this state, and the producer double reads `$SCEN/head`/`$SCEN_RECORD_FILE`, never
+# `$SCEN/pr-body` (measured). That marker is therefore removed. What REMAINS is `new_scen`'s own
+# default marker (tests/atomic-land/run.sh:458), bound to HEAD_OLD — the LIVE head, i.e. the
+# "evidence already posted at the head being updated" population — and it is equally UNREAD here.
+# Nothing in this scenario turns on the body: a fixture nothing reads is not coverage, and a comment
+# claiming it is would be worse than none. The state this scenario really models is stated by its
+# inputs — a STALE record plus a producer whose carry SUCCEEDS, which is the precondition's job not
+# to block. If a future guard makes the rail read the body at the precondition, a marker bound to the
+# REVIEWED head belongs back here — WITH the mutant that reads it.
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
@@ -746,6 +749,35 @@ called "pr update-branch" && fail "dry-run updated the branch" || pass "no updat
 grep -q "the record is STALE" "$SCEN/out" \
   && pass "the dry-run reports the stale-record precondition" \
   || fail "the dry-run did not report the stale-record precondition"
+
+# ═══ 2b-viii. a producer FAILURE at the preflight must not claim a LANDING ═
+# The message split at do_record's `rc -ne 0` arm is a DIAGNOSIS contract: that arm is
+# reachable from step [1/4], where no head has moved and no landing was ever in
+# question, so "refusing to land without a record" there sends the operator after a
+# decision nobody made — the #1362 D1 mislabel class the `label`/`headword` plumbing
+# exists to remove, one message further out. It was UNPINNED (review, cycle 6): every
+# scenario drove the producer with rc 0 or 3, so either message could be restored
+# unnoticed. The sibling message at the [3/4] call site is pre-existing and unchanged
+# by #2369, so it is deliberately not pinned here.
+echo "── 2b-viii. a producer failure at the preflight does not claim a landing was refused"
+new_scen stalerecordfail
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+# Any exit the two refusal branches above do not own (a usage error, the clean-micro
+# tier refusal) — the fake writes its record and then exits with this code.
+SCEN_RECORD_RC=2
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "record-review" && pass "the precondition asked the producer" || fail "the precondition did not run"
+called "pr update-branch" && fail "the head was MOVED after a producer failure" || pass "no head move after a producer failure"
+called "admin-merge" && fail "landed with no record for the head" || pass "the land step did NOT run"
+grep -q "refusing to move the head without a record" "$SCEN/err" \
+  && pass "the refusal names the HEAD MOVE, which is what it withheld" \
+  || fail "the preflight producer failure did not name the head-move refusal ($(tail -2 "$SCEN/err"))"
+grep -q "refusing to land without a record" "$SCEN/err" \
+  && fail "a preflight failure claimed a LANDING was refused — no landing was in question" \
+  || pass "and it does NOT claim a landing was refused"
 
 # ═══ 3. no record → refuse before any mutation ═══════════════════════════
 echo "── 3. no review record: refuse before ANY mutation"
