@@ -69,14 +69,24 @@ RestartSec={{RESTART_SEC}}
 # rather than selectively, and the helpers that are genuine children are short-lived `gh`/`git` clients.
 KillMode=process
 TimeoutStopSec=30
-# ⛔ AN EXPLICIT START TIMEOUT, SMALLER THAN StartLimitIntervalSec (review P2, #2402). ExecStart runs the
-# WHOLE of `start`, and service mode WAITS for a controller that is already running before it takes over
-# (CONTROLLER_HANDOVER_TIMEOUT, 3600 s). Without a stated value the bound on a parks-forever start is
-# systemd's own default (90 s) — true today, but a property of the host rather than of this artifact, and
-# NOT what the handover code's comment claims. Stating it keeps the bound where an operator can read it and
-# keeps it below the start-limit window (300 s), so a start that can never succeed converges to `failed`
-# instead of looking supervised.
+# ⛔ THE START BOUND IS THE PROCESS'S, NOT THIS DIRECTIVE (review P1, #2402). `ExecStart` runs the WHOLE of
+# `start`, and in service mode `start` WAITS for a controller that is already running before it takes over.
+# For `Type=simple` the start job is finished the moment the main process is forked (systemd.service(5)), so
+# `TimeoutStartSec=` CANNOT bound that wait. An earlier revision of this file, the installer, the supervisor
+# and the doc all claimed it did — and the claim was INERT: the real bound was the supervisor's own 3600 s
+# default, so a handover that could never complete parked `ExecStart` for an hour, with the unit reading
+# `active (running)` and `--status` reading supervised. The wait is bounded by the SUPERVISOR, and BOTH of
+# its bounds are rendered into its environment here, where an operator can read them:
+#   CONTROLLER_HANDOVER_TIMEOUT  a controller this state dir OWNS is still running. That is the migration
+#                                path and it is LANDING WORK, so the wait is legitimately long.
+#   CONTROLLER_ORPHAN_TIMEOUT    the session outlived its loop. An orphan never exits, so this start can
+#                                NEVER succeed: the bound is short and below StartLimitIntervalSec, which
+#                                is what makes the burst fill and the unit converge to `failed`.
+# `TimeoutStartSec=` is kept as the systemd-side counterpart of the orphan bound — it keeps the pair true if
+# this unit ever changes `Type=` — but it is not what enforces either bound today.
 TimeoutStartSec={{START_TIMEOUT_SEC}}
+Environment=CONTROLLER_HANDOVER_TIMEOUT={{HANDOVER_TIMEOUT_SEC}}
+Environment=CONTROLLER_ORPHAN_TIMEOUT={{START_TIMEOUT_SEC}}
 StandardOutput=journal
 StandardError=journal
 

@@ -1944,14 +1944,20 @@ cmd_start() {
   # "already running" branches below and returned 0. Under `Restart=always` that is three orderly exits
   # and a `failed` unit, i.e. the P1 this wait exists to remove, in the state the migration itself
   # produces. The branch-level returns are therefore not reachable in service mode (they hand over).
-  # ⛔ THE WAIT'S BOUND IS THE UNIT'S, NOT THIS DEFAULT (review P2, #2402). The bound below (3600 s) is for
-  # a MANUAL foreground run; under the unit from install-controller-service.sh the start is bounded by the
-  # rendered `TimeoutStartSec` (120 s, required to be below `StartLimitIntervalSec=300`), so a handover that
-  # never completes is killed by its supervisor and the start limit converges the unit to `failed` — it does
-  # NOT park ExecStart for an hour. One bound would be the better design, and that is what the unit now
-  # states; do not read this default as the supervised box's bound.
+  # ⛔ TWO BOUNDS, BECAUSE THE TWO WAITS ARE NOT THE SAME WAIT (review P1, #2402). An earlier revision of
+  # this comment said the unit's `TimeoutStartSec` bounded this loop. It does not: for `Type=simple` the
+  # start job completes when the main process is forked (systemd.service(5)), so `ExecStart` was bounded
+  # only by the default below — a parks-forever start read `active (running)` for an hour. The bounds are
+  # the process's own now, and install-controller-service.sh renders BOTH into the unit's environment:
+  #   CONTROLLER_HANDOVER_TIMEOUT — an owned controller is still running. That is the MIGRATION path and it
+  #     is landing work, so the bound is long by default; the loop exists so the upgrade does not shoot it.
+  #   CONTROLLER_ORPHAN_TIMEOUT — nothing owns the loop, but the session outlived it. An orphan never exits,
+  #     so that start can NEVER succeed: the ceiling is short, and the installer refuses a value whose
+  #     attempts cannot fill StartLimitIntervalSec=300, so the unit converges to `failed` instead of
+  #     looking supervised forever.
   foreground_handover() {
     local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}"
+    local _orphan_bound="${CONTROLLER_ORPHAN_TIMEOUT:-60}"
     while :; do
       _own="$(owned_controller_pids 2>/dev/null)" \
         || die "cannot read the process table (ps) — refusing to start on an unreadable read"
@@ -1969,10 +1975,12 @@ cmd_start() {
           die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
         fi
       fi
-      # ⛔ AND THE WAIT IS BOUNDED (review P2). An orphaned session (the pane's `bash … | tee` outliving the
-      # loop — the shape cmd_stop documents) never ends, and an unbounded wait is an inert supervisor.
-      # At the bound, refuse and name what was still there, so systemd's StartLimit makes it operator-visible.
-      [ "$_waited" -lt "$_bound" ] || die "still waiting for the controller that was running ${_waited}s ago (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — refusing to become a second dispatcher; raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge"
+      # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
+      # bound. No owned pid but a session that is still there is an ORPHAN, and an orphan never exits: the
+      # short bound is what turns "impossible start" into a filled start limit instead of an active unit.
+      local _bound_now="$_bound"
+      [ -z "$_own" ] && _bound_now="$_orphan_bound"
+      [ "$_waited" -lt "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for ${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'} — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
       [ "$_saidd" = 1 ] || say "controller already running (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
       sleep 5; _waited=$((_waited + 5))
@@ -2092,6 +2100,12 @@ cmd_start() {
     # rc 1 is a real DISABLED answer: the operator said this box's controller is not service-managed, so
     # fall through to the tmux path below.
     if [ "$ust" -eq 0 ]; then
+      # ⛔ A UNIT THAT HIT ITS START LIMIT IS FAILED BY DESIGN, AND `start` REFUSES IT (review P1, #2402).
+      # StartLimitBurst=3 is what turns a configuration fault into an operator-visible `failed`; systemd then
+      # refuses every later start until `reset-failed`. An operator who fixes the key/repo/pin and runs
+      # `start` is asking for exactly one more attempt, so the counter is cleared first — a no-op on a
+      # healthy unit, and the start plus the controller proof below still decide.
+      sup_systemctl reset-failed "$CONTROLLER_UNIT" >/dev/null 2>&1 || true
       sup_systemctl start "$CONTROLLER_UNIT" \
         || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
       # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.

@@ -41,8 +41,12 @@
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
-#   ORCH_START_TIMEOUT_SEC the rendered TimeoutStartSec (default 120; a whole number, below the 300s
-#                          StartLimitIntervalSec so a start that can never succeed converges to `failed`)
+#   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 120; a whole number, below the 300s
+#                          StartLimitIntervalSec so a start that can never succeed converges to `failed`).
+#                          Rendered as CONTROLLER_ORPHAN_TIMEOUT, and as TimeoutStartSec — its systemd-side
+#                          counterpart (this unit is Type=simple, where that directive does not bound start)
+#   ORCH_HANDOVER_TIMEOUT_SEC the handover ceiling for a controller this state dir still OWNS (default 3600;
+#                          a whole number >= 1). Long on purpose: that controller is landing work
 #   CELL_HOME              the cell's home whose keys.env/state the controller reads (default $HOME)
 #   ENV_FILE               the controller's env file (default $CELL_HOME/keys.env)
 #   O                      the controller's state dir, used only to READ BACK the heartbeat
@@ -79,10 +83,17 @@ fi
 TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
 RESTART_SEC="${ORCH_RESTART_SEC:-15}"
-# The bound on ONE start. Stated in the ARTIFACT and required to be BELOW StartLimitIntervalSec, so a start
-# that can never succeed (a handover that waits for a controller that never goes) is killed by its
-# supervisor and converges to `failed` through the start limit, instead of looking active forever.
+# ⛔ TWO BOUNDS, AND ONLY ONE OF THEM CAN DESCRIBE AN IMPOSSIBLE START (review P1, #2402). A `Type=simple`
+# start job completes at fork (systemd.service(5)), so `TimeoutStartSec` does NOT bound `ExecStart`; the
+# earlier claim that it did was inert, and the wait fell back to the supervisor's 3600 s default. Both
+# bounds are now rendered into the unit's ENVIRONMENT, where the supervisor actually reads them:
+#   CONTROLLER_ORPHAN_TIMEOUT (START_TIMEOUT_SEC) — a session outlived its loop. An orphan never exits, so
+#     that start can never succeed: this value must sit BELOW StartLimitIntervalSec so the burst fills and
+#     the unit converges to `failed` instead of reading active forever.
+#   CONTROLLER_HANDOVER_TIMEOUT (HANDOVER_TIMEOUT_SEC) — an owned controller is still running, which is the
+#     migration path and is landing work. A long bound is correct here; a short one would fail the upgrade.
 START_TIMEOUT_SEC="${ORCH_START_TIMEOUT_SEC:-120}"
+HANDOVER_TIMEOUT_SEC="${ORCH_HANDOVER_TIMEOUT_SEC:-3600}"
 CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
@@ -189,6 +200,7 @@ render() {
         -e "s|{{SUPERVISOR}}|$(sed_esc "$SUPERVISOR")|g" \
         -e "s|{{RESTART_SEC}}|$RESTART_SEC|g" \
         -e "s|{{START_TIMEOUT_SEC}}|$START_TIMEOUT_SEC|g" \
+        -e "s|{{HANDOVER_TIMEOUT_SEC}}|$HANDOVER_TIMEOUT_SEC|g" \
         -e "s|{{O}}|$(sed_esc "$O")|g" \
         -e "s|{{WANTED_BY}}|$WANTED_BY|g" \
         "$tpl" >"$dest" || return 1
@@ -207,6 +219,8 @@ verify_unit() {
     for k in "Restart=always" "RestartSec=$RESTART_SEC" "After=network-online.target" \
              "StartLimitIntervalSec=300" "StartLimitBurst=3" "KillMode=process" \
              "TimeoutStartSec=$START_TIMEOUT_SEC" \
+             "Environment=CONTROLLER_ORPHAN_TIMEOUT=$START_TIMEOUT_SEC" \
+             "Environment=CONTROLLER_HANDOVER_TIMEOUT=$HANDOVER_TIMEOUT_SEC" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
@@ -348,7 +362,12 @@ do_install() {
     [ "$START_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be >= 1 (got '$START_TIMEOUT_SEC')"; return 1; }
     [ "$START_TIMEOUT_SEC" -lt 300 ] \
-        || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC is not below StartLimitIntervalSec=300 — a start that can never succeed would never fill the burst, so the unit would look supervised forever"; return 1; }
+        || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC is not below StartLimitIntervalSec=300 — an orphaned session never exits, so this start can never succeed and the burst would never fill, leaving the unit to look supervised forever"; return 1; }
+    case "${HANDOVER_TIMEOUT_SEC:-}" in
+        ''|*[!0-9]*) err "REFUSING: ORCH_HANDOVER_TIMEOUT_SEC must be a whole number of seconds (got '$HANDOVER_TIMEOUT_SEC')"; return 1 ;;
+    esac
+    [ "$HANDOVER_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
+        || { err "REFUSING: ORCH_HANDOVER_TIMEOUT_SEC must be >= 1 (got '$HANDOVER_TIMEOUT_SEC') — a handover that is given no time at all fails every upgrade"; return 1; }
     resolve_supervisor || return 1
     tpl="$TEMPLATES_DIR/$UNIT_NAME"
     [ -f "$tpl" ] || { err "template missing: $tpl (set TEMPLATES_DIR)"; return 1; }
@@ -414,6 +433,15 @@ do_install() {
     # heartbeat — `start` is a no-op there, and the lock leg proves the controller anyway.
     unit_active_state >/dev/null 2>&1 && pre_active=1
     started_at="$(date +%s)"
+    # ⛔ CLEAR A HIT START LIMIT FIRST (review P1, #2402). Converging to `failed` is this unit's DESIGNED
+    # outcome for a configuration fault (3 attempts in 300 s), and systemd then REFUSES to start the unit
+    # again until `reset-failed` (`man systemctl`: "if a unit's start limit ... is hit and the unit refuses to
+    # be started again, use this command to make it startable again"). Without this, the documented remedy —
+    # fix the key/repo/pin and re-run the installer — could never bring the cell back: `start` was discarded
+    # (`|| true`), nothing reset the counter, and the verb reported "the unit is NOT active after install"
+    # forever, with a journal naming a cause the operator had already fixed. `reset-failed` is a no-op on a
+    # healthy unit, and it cannot mask a fault: the following `start` and the controller proof still decide.
+    sc_run reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
     sc_run start "$UNIT_NAME" >/dev/null 2>&1 || true
     proof_since=0
     [ "$pre_active" = 1 ] || proof_since="$started_at"
