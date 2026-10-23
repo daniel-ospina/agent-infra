@@ -13737,7 +13737,7 @@ grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
   && pass "(g3) …and the collector labels it parse:9831" \
   || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
 
-# ── 77. THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
+# ── 78. THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
 # MEASURED DEFECT: the window was 3900s while one green STEP of this repo's own
 # `ci.yml` lane is 3960-4380s — so a healthy run could not clear it, and #2412
 # refused with "no classification attempted" four minutes before the PR merged.
@@ -13756,7 +13756,9 @@ grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
 #       runtime by a step longer than the derived period
 #   (g) an INTERMITTENTLY unreadable surface is not a silent one: unreadable time
 #       feeds the `missing` budget, never the stall clock
-echo "== 77. the FIRST-CHECKS wait distinguishes SLOW from STUCK (#2481) =="
+#   (h) a SHORT digest (a partially-read surface) is not "every run terminal": the
+#       wait must not CLEAR on it, and must not blame a stall
+echo "== 78. the FIRST-CHECKS wait distinguishes SLOW from STUCK (#2481) =="
 
 # (a) SLOW BUT PROGRESSING. Three polls show the job advancing one step at a time
 # (1/8 → 2/8 → 3/8); the fourth shows the run itself completed. The legacy window
@@ -14025,6 +14027,53 @@ grep -q 'unreadable for [0-9]*s of the 60s fallback window in total, [0-9]*s con
 grep -q 'pr merge 42 --admin' "$SCEN/calls" \
   && pass "(g) …and the PR landed on its real classification" \
   || fail "(g) no merge after the surface recovered"
+
+# (h) A SHORT DIGEST IS NOT "EVERY RUN TERMINAL". Both Jobs reads SUCCEED, but the
+# digest parser dies on the second document — an unparseable step number raises
+# OverflowError, and the inner handlers catch only TypeError/ValueError — so
+# `first_checks_digest` prints PARTIAL stdout for the FIRST run and nothing for
+# the second, while its `2>/dev/null || true` hides the traceback. Two pending
+# runs, ONE digest line. Counting that against `pending` reads "all runs
+# terminal" and CLEARS the wait; §1b then refuses with a false diagnosis ("the
+# wait CLEARED (the lane was terminal), but a NEW run appeared") — the pre-#2481
+# "gave up before classifying" shape, caused by a broken instrument rather than a
+# slow one. A line-count mismatch must be handled EXACTLY like a failed read:
+# every run stays pending, the signal is marked missing, and the legacy window
+# bounds it. RED on the pre-fix rail: `pending` stayed 0 on this path, so the
+# CLEARED wording appeared in place of the missing-signal one.
+new_scen fc-shortdigest
+HEAD_WSH="f7fe000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSH" > "$SCEN/head"
+{
+  first_checks_line in_progress "" "$HEAD_WSH" 9831 2026-10-23T10:00:00Z
+  first_checks_line in_progress "" "$HEAD_WSH" 9832 2026-10-23T10:00:00Z
+} > "$SCEN/first-checks-gen-1"
+cp "$SCEN/first-checks-gen-1" "$SCEN/runs-$HEAD_WSH"
+first_checks_jobs_gen 9831 1 1 8
+# The SECOND document is the one the parser cannot finish: `1e400` is valid JSON
+# and Python reads it as `inf`, so `int(s.get("number"))` raises OverflowError —
+# an exception the inner try/except deliberately does not name.
+printf '%s\n' '{"jobs":[{"name":"bash-suites","status":"in_progress","steps":[{"number":1e400,"name":"Bash shards — step 1 running","status":"in_progress"}]}]}' \
+  > "$SCEN/jobs-gen-9832-1.json"
+lane_fail mainsh 9833 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9833"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL=30 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a short Jobs digest does not clear the wait — the rail BLOCKS (exit $rc)" \
+  || fail "(h) a partial digest was read as 'all runs terminal' and the lane was certified"
+grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
+  && pass "(h) …the short digest is named as a MISSING SIGNAL, not as a terminal lane" \
+  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" | head -10; }
+grep -q 'wait CLEARED' "$SCEN/out" "$SCEN/err" \
+  && fail "(h) the wait reported CLEARING on an incomplete digest" \
+  || pass "(h) …and it never claimed the lane was terminal"
+grep -q 'STALLED' "$SCEN/out" "$SCEN/err" \
+  && fail "(h) a broken instrument produced a STALL verdict" \
+  || pass "(h) …and no STALL verdict was manufactured from a partial read"
+grep -q 'pr merge 42' "$SCEN/calls" \
+  && fail "(h) a merge was attempted on a lane the rail could not classify" \
+  || pass "(h) …and no merge was attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

@@ -3852,6 +3852,22 @@ wait_for_first_checks() {
               [ -n "$summary" ] && summary="$summary | "
               summary="${summary}run ${id}: ${summary_run}"
             done
+          else
+            # ⛔ A SHORT (or empty) DIGEST IS NOT "NO PENDING RUNS" EITHER. The
+            # guarantee two lines up — an unreadable surface can never fall
+            # through to `pending == 0` and CLEAR the wait — has to hold for the
+            # digest as well as for the fetch, because `first_checks_digest` is
+            # `… 2>/dev/null || true`: a parser that dies mid-list (an
+            # unparseable step number the inner handlers do not catch, an
+            # interpreter that cannot run) leaves PARTIAL stdout and no error
+            # anyone sees. Counting that against `pending` read it as "every run
+            # terminal", cleared the wait, and §1b then refused with a false
+            # diagnosis ("the wait CLEARED (the lane was terminal), but a NEW run
+            # appeared") — the pre-#2481 "gave up before classifying" shape.
+            # Same remedy as the failed-read arm: every run stays pending and the
+            # signal is marked missing.
+            pending="${#pending_ids[@]}"
+            signal_ok=0
           fi
         fi
       elif [ "${#pending_ids[@]}" -gt "$FIRST_CHECKS_JOBS_MAX" ]; then
