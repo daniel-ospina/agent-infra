@@ -42,6 +42,11 @@
 #       (never 6), uv's 4 and 7 are deferrals (pass 6, ok=0), venv's 4 is a red removal failure, 5 is
 #       red in apply and informative in dry-run, 2 is red, 3 outranks 4 across repos in both orders,
 #       and `detail=` names the DELEGATE's own code in every class (#2156, #2036).
+#   T55 the worktree class fails closed PER REPO: an unverifiable repo is skipped BY NAME
+#       (`skipped=<repo> reason=<why>`, recorded in `skipped_worktree=`) while the repo that CAN be
+#       verified is still reclaimed in the same pass — and the class verdict stays RED (#2443).
+#   T56 the installer NAMES the worktree class's gh prerequisite (auth is per-HOME), instead of
+#       letting the class be inert for an hour and then blamed on the wrong cause (#2443).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -1790,6 +1795,151 @@ assert_eq "$RC" "0" "T54 --help exits 0"
 assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T54 --help documents the stale threshold"
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T54 --help documents the watchdog pin"
 assert_contains "$OUT" "a delegate DEFERRED" "T54 --help carries the DEFERRED exit code, not a sentence cut mid-way"
+
+# ── T55: the worktree class fails closed PER REPO, and keeps reclaiming the others (#2443) ───────
+# MEASURED DEFECT (2026-10-23, a cell at 95% used): `gh` was present and working, but not
+# authenticated under the pass's HOME, so its PR query exited 4 ("requires authentication" per
+# `gh help exit-codes`). BOTH repos aborted, the pass reported `freed_df=0MB`, and the class line
+# said only `verdict=fail-closed` — no subject, no reason — while the abort blamed "gh unavailable or
+# the origin-remote probe failed". The GATE is right and is not touched here: a checkout whose PR
+# state is unknown is never removed. The defect is that one unverifiable repo could not be told apart
+# from the class having failed, so the disk could not self-heal and the message pointed elsewhere.
+# The pair below is the whole property: the bad repo is SKIPPED BY NAME and keeps its checkouts, the
+# good repo in the SAME PASS is still reclaimed, and the verdict stays fail-closed (skipping is not
+# a pass).
+ENVNAME=t55
+mkdir -p "$T/t55/bin"
+cat >"$T/t55/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+# Selective stub: the unverifiable repo answers with the AUTH exit code (4); every other repo answers
+# normally with no open PRs. This is the cell failure in one line — an installed, working tool whose
+# credentials are absent for THIS pass's HOME.
+case "$*" in
+    *t55-bad*) exit 4 ;;
+    *) : ;;
+esac
+exit 0
+SHIM
+chmod +x "$T/t55/bin/gh"
+REPO_GOOD="$(mk_repo t55-good)"
+WT_GOOD="$(mk_wt "$REPO_GOOD" merged feat/t55-good-merged)"
+commit_in "$WT_GOOD" "$RECENT_DATE" good
+"$REAL_GIT" -C "$REPO_GOOD" merge -q --no-edit feat/t55-good-merged
+"$REAL_GIT" -C "$REPO_GOOD" remote add origin https://github.com/daniel-ospina/t55-good.git
+REPO_BAD="$(mk_repo t55-bad)"
+WT_BAD="$(mk_wt "$REPO_BAD" merged feat/t55-bad-merged)"
+commit_in "$WT_BAD" "$RECENT_DATE" bad
+"$REAL_GIT" -C "$REPO_BAD" merge -q --no-edit feat/t55-bad-merged
+"$REAL_GIT" -C "$REPO_BAD" remote add origin https://github.com/daniel-ospina/t55-bad.git
+# Control: the fixture's worktree really is a candidate, so the assertions below are about the skip
+# and not about an empty pass.
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --dry-run --repo "$REPO_GOOD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T55 control: the same fixture IS reclaimable when gh answers (dry-run finds work)"
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_GOOD" --repo "$REPO_BAD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55 one unverifiable repo keeps the class RED (skipping is not a pass)"
+assert_nodir "$WT_GOOD" "T55 the repo that COULD be verified was still reclaimed (a bad repo must not disable the good ones)"
+assert_dir "$WT_BAD" "T55 the unverifiable repo's checkout was NOT touched (fail closed, per repo)"
+assert_contains "$OUT" "skipped=$REPO_BAD reason=gh-not-authenticated(rc=4)" \
+    "T55 the skip is reported as skipped=<repo> reason=<why> — the subject the verdict never had"
+assert_contains "$OUT" "UNTOUCHED" "T55 and says the skipped repo's checkouts were left alone"
+ST_T55="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST_T55" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
+    "T55 the pass record carries the skipped repo AND its reason"
+assert_contains "$ST_T55" "verdict_worktree=fail-closed" "T55 the class verdict is still fail-closed"
+assert_contains "$ST_T55" "open-PR gate unverifiable" "T55 and names the cause in detail="
+# ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST: `--print-status` is the surface
+# `cloud-cell-supervisor.sh` reads, so the skipped repo must be reachable from it and not only from a
+# hand-`cat` of the record (the same defect `classes=`/`repos=` had).
+OUT="$(run_reaper --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55 --print-status still answers 3 for a fail-closed pass"
+assert_contains "$OUT" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
+    "T55 --print-status carries the skipped repo and its reason"
+assert_absent "$ST_T55" "cannot run: " \
+    "T55 the class RAN, so it is never reported as `cannot run` (that field means could-not-be-set-up)"
+# and the reason survives a repo path that CONTAINS A SPACE: the skip line carries the path, so a
+# parser anchored on `skipped=<first token>` would silently anonymise exactly the repos most likely to
+# live under a hand-made directory — turning a named skip back into the class-wide verdict.
+ENVNAME=t55c
+REPO_SP="$(mk_repo 't55c')"          # mk_repo returns "$T/t55c"; give the repo a SPACED path
+mkdir -p "$T/t55c with space"
+cp -R "$REPO_SP/." "$T/t55c with space/"
+REPO_SP="$T/t55c with space"
+"$REAL_GIT" -C "$REPO_SP" remote add origin https://github.com/daniel-ospina/t55-bad.git
+WT_SP="$(mk_wt "$REPO_SP" merged feat/t55c-merged)"
+commit_in "$WT_SP" "$RECENT_DATE" sp
+"$REAL_GIT" -C "$REPO_SP" merge -q --no-edit feat/t55c-merged
+# and a single genuinely unverifiable repo still REFUSES to delete — the gate is never optional
+ENVNAME=t55b
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_BAD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55b a single unverifiable repo => exit 3"
+assert_dir "$WT_BAD" "T55b and it removes NOTHING from that repo"
+assert_contains "$OUT" "skipped=$REPO_BAD reason=gh-not-authenticated(rc=4)" "T55b and names it"
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_SP" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55c a repo under a path with a SPACE is still a named skip"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" \
+    "skipped_worktree=$REPO_SP[gh-not-authenticated(rc=4)]" \
+    "T55c the recorded skip keeps BOTH the spaced path and the reason"
+assert_dir "$WT_SP" "T55c and its checkout was still left alone"
+# The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
+# (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
+# repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
+OUT="$(GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
+assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
+    "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"
+
+
+# ── T56: the installer NAMES the worktree class's gh prerequisite (#2443) ───────────────────────
+# The unit pins the delegates, the bounded library and GH_TIMEOUT — but gh's credentials are PER-HOME
+# and the rendered `Environment=HOME={{HOME}}` decides whether the open-PR gate can ever run. On the
+# measured cell that HOME held no `~/.config/gh`, so the class skipped every repo every hour while the
+# unit went red for a reason nobody could read. The installer is the only component that knows the HOME
+# it is rendering, so it must say so BEFORE the hour is wasted — and must NOT refuse (a box with no
+# working gh still wants its uv and venv classes).
+ENVNAME=t56
+REPO="$(mk_repo t56)"
+mkdir -p "$T/t56/bin-ok" "$T/t56/bin-bad" "$T/t56/home"
+cat >"$T/t56/bin-ok/gh" <<'SHIM'
+#!/usr/bin/env bash
+[ "$1 $2" = "auth status" ] && exit 0
+exit 0
+SHIM
+cat >"$T/t56/bin-bad/gh" <<'SHIM'
+#!/usr/bin/env bash
+# The measured failure's shape: installed, runs, and REFUSES on credentials.
+[ "$1 $2" = "auth status" ] && exit 1
+exit 0
+SHIM
+chmod +x "$T/t56/bin-ok/gh" "$T/t56/bin-bad/gh"
+cp "$REAPER" "$T/t56/reaper.sh"
+# A REALISTIC install tree: the installer pins the three delegates and the bounded library beside
+# the reaper and REFUSES an install missing any of them (T26) — a fixture without them would fail
+# on a guard this case is not about.
+cp "$HERE/pi-cache-reap.sh" "$HERE/reap-lane-venvs.sh" "$HERE/pi-reap-worktrees.sh" "$T/t56/"
+mkdir -p "$T/t56/lib"; cp "$HERE/lib/bounded.sh" "$T/t56/lib/bounded.sh"
+inst56() { # inst56 <bindir> — a full self-contained systemd install into a scratch unit dir
+    PATH="$1:$PATH" HOME="$T/t56/home" DISK_REAPER="$T/t56/reaper.sh" DISK_REAPER_REPOS="$REPO" \
+    SYSTEMD_UNIT_DIR="$T/t56/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t56/calls.log" \
+    bash "$INST" --install
+}
+OUT="$(inst56 "$T/t56/bin-bad" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 an installed-but-unauthenticated gh does NOT refuse the install (the other classes still run)"
+assert_contains "$OUT" "WILL SKIP EVERY REPO" "T56 ... it WARNS that the worktree class will skip every repo"
+assert_contains "$OUT" "NOT AUTHENTICATED" "T56 ... and names AUTHENTICATION, the thing that is actually wrong"
+assert_contains "$OUT" "gh auth login" "T56 ... and prints the remedy"
+assert_contains "$OUT" "gh:     unauthenticated" "T56 the install summary carries the gh verdict"
+OUT="$(inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a healthy gh still installs"
+assert_absent "$OUT" "WILL SKIP EVERY REPO" "T56 and no warning is emitted when the credentials are there (no false alarm)"
+assert_contains "$OUT" "gh:     authenticated" "T56 the summary states the positive verdict too"
+# and with NO gh at all the same prerequisite is named rather than silently assumed. GH_BIN is the
+# seam BOTH sides share (the delegate already honours it), so this arm is a real assertion about the
+# installer instead of a claim about whether this host happens to ship gh in /usr/bin.
+OUT="$(GH_BIN=/nonexistent/gh inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a box with no gh still installs (its uv/venv classes are unaffected)"
+assert_contains "$OUT" "WILL SKIP EVERY REPO" "T56 ... and is warned that the worktree class will skip every repo"
+assert_contains "$OUT" "gh is not installed" "T56 ... naming the MISSING cause, not an auth one"
+assert_contains "$OUT" "gh:     missing" "T56 the summary distinguishes missing from unauthenticated"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
