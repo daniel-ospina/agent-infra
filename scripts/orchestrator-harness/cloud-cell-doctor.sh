@@ -1486,30 +1486,94 @@ run_doctor() {
   return "$rrc"
 }
 
-# Is the RECORDED loop an ALIVE, SAME-INCARNATION process? A bare `kill -0` says a pid exists, not
-# that it is OUR loop: after a tmux server restart, an OOM kill or a crash the pid survives in the
-# file and the OS may recycle it, so a dead loop would read as RUNNING (the fleet's one identity
-# rule, #1178 — applied to the loop's own record, not only to the lanes it reaps).
-loop_alive() {
-  local pid ls rec
-  pid="$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
-  num_ok "${pid:-}" || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+# The RECORDED loop's liveness — THREE-VALUED, with the reason it decided named:
+#
+#     alive | dead:<reason> | unknown:<reason> | absent:<reason>
+#
+# ⛔ WHY THREE-VALUED (agent-infra#2306). `loop_alive` answered yes/no, so `return 1` folded TWO
+# different facts into one no: "the recorded incarnation is GONE" and "I could not read the record".
+# `role_row` then read neither — it derived `WAITING` from the loop's start record alone — and printed
+# `loop: NOT RUNNING` beside four `WAITING ... 274s ago` rows on pi-cell-4. The reader concludes "the
+# first pass is slow"; the truth is that the scheduler was killed with the invoking session and no
+# pass would ever complete. Rows are what a reader and a supervisor act on, so the rows were the lie
+# (the same family as #2249/#2221).
+#
+# The states are `docs/ops/fleet-liveness.md`'s doctrine applied to this surface, not a second
+# vocabulary: IDENTITY is decided first and is the ONLY source of `dead`; an unreadable read is a
+# NAMED abstention (`unknown`), never a death witness (a `kill -0` that fails proves absence, but an
+# unparseable pid proves nothing). `absent` is kept apart from both: with no loop record at all there
+# is no incarnation to witness the death of — but nothing was unreadable either, so calling it
+# `unknown` would abstain over a fact that IS known ("no loop was ever recorded here").
+#
+# A bare `kill -0` says a pid exists, not that it is OUR loop: after a tmux server restart, an OOM
+# kill or a crash the pid survives in the file and the OS may recycle it, so a dead loop would read as
+# RUNNING (the fleet's one identity rule, #1178 — applied to the loop's own record, not only to the
+# lanes it reaps).
+loop_state() {
+  local f="$ROLES_DIR/loop.pid" pid ls rec
+  [ -f "$f" ] || { printf 'absent:no-loop-record\n'; return 0; }
+  pid="$(cat "$f" 2>/dev/null)" || { printf 'unknown:loop-record-unreadable\n'; return 0; }
+  num_ok "${pid:-}" || { printf 'unknown:pid-unparseable\n'; return 0; }
+  kill -0 "$pid" 2>/dev/null || { printf 'dead:pid-gone\n'; return 0; }
   ls="$(pid_ident "$pid")"
+  [ -n "$ls" ] || { printf 'unknown:identity-unreadable\n'; return 0; }
   rec="$(cat "$ROLES_DIR/loop.ident" 2>/dev/null)"
-  [ -n "$ls" ] && [ "$rec" = "$pid|$ls" ] || return 1
-  return 0
+  [ -n "$rec" ] || { printf 'unknown:no-identity-record\n'; return 0; }
+  [ "$rec" = "$pid|$ls" ] || { printf 'dead:identity-mismatch\n'; return 0; }
+  printf 'alive\n'
+}
+
+# `alive` in one test, for every caller that only needs "is it up" (role locking, stop, the loop's
+# own quiesce). An ABSTENTION is NOT liveness evidence, so it answers no here — but the rows, which
+# have to distinguish "dead" from "could not tell", read `loop_state` itself.
+loop_alive() { [ "$(loop_state)" = alive ]; }
+
+# Is the loop's TRANSCRIPT advancing inside the worst-case pass window? A live pid is a process, not
+# a scheduler: a hung or SIGSTOPped loop keeps its pid and writes nothing, and `WAITING ... 274s ago`
+# is exactly what that looks like. Every pass ends with a summary line in $O/logs/doctor.log (`reap
+# seen=…`, `merge candidates=…`, `hygiene …`, `doctor …`), and `start` tees the loop's stdout into
+# $O/logs/cell-doctor.log, so either file's mtime answers "did the scheduler move".
+loop_progress_age() { # → seconds since the newest transcript write; empty when there is none
+  local newest=0 m f
+  for f in "$WORKER_LOG_DIR/doctor.log" "$WORKER_LOG_DIR/cell-doctor.log"; do
+    [ -f "$f" ] || continue
+    m="$(mtime_epoch "$f")"
+    case "${m:-}" in ''|*[!0-9]*) continue ;; esac
+    [ "$m" -gt "$newest" ] && newest="$m"
+  done
+  [ "$newest" -gt 0 ] || return 0
+  printf '%s' "$(( $(date +%s) - newest ))"
 }
 
 # ── STATUS (configured vs actually ran) ─────────────────────────────────────────────────────────
 # The supervisor's `status` delegates here. "RUNNING" is a LIVE LOOP PID plus a PASS RECENT ENOUGH;
 # the two are separate facts and both are reported, because a live loop that has stopped passing and
 # a dead loop are different repairs. A role that never ran is named as NEVER RAN — never as idle.
+#
+# ⛔ NOTHING HERE MAY PRINT `WAITING`/`RUNNING` WITHOUT A PROVEN-ALIVE LOOP (#2306). `WAITING` is a
+# PROMISE that something is in progress; it used to be derived from `loop.started` (and from a stale
+# `.running` marker a SIGKILL left behind) with no liveness check at all. Rows per loop state:
+#
+#   alive          → WAITING (no record yet, inside the grace + a moving transcript) / RUNNING
+#   dead:<reason>  → DEAD      the loop is not running (<reason>) — and the verb fails
+#   unknown:<rsn>  → UNKNOWN   cannot be verified (<reason>) — and the verb fails (rc=3)
+#   absent:…       → NEVER RAN for a role with no record (a fact about the role, not the loop)
 role_row() { # <role> <stale-bound-seconds>
-  local role="$1" bound="$2" f rc ep age
+  local role="$1" bound="$2" f rc ep age st paged
   f="$ROLES_DIR/$role.state"
+  st="${LOOP_STATE:-$(loop_state)}"
   if [ ! -f "$f" ]; then
-    # ⛔ A first pass can legitimately outlast the flat grace: the loop's first tick runs doctor,
+    case "$st" in
+      dead:*)
+        printf '%-8s DEAD      the loop is not running (%s); no pass recorded, and none will come\n' \
+          "$role" "${st#dead:}"
+        return 1 ;;
+      unknown:*)
+        printf '%-8s UNKNOWN   the loop has no verifiable liveness (%s); no pass recorded\n' \
+          "$role" "${st#*:}"
+        return 3 ;;
+    esac
+    # A first pass can legitimately outlast the flat grace: the loop's first tick runs doctor,
     # merge and hygiene IN SEQUENCE, and a first merge pass may take MERGE_BUDGET_S + a rail call.
     # `run_role_pass` records an in-progress marker, so a pass that is STILL RUNNING reads WAITING —
     # bounded by ALL_PASSES_S, so a marker left by a killed loop cannot hide a NEVER RAN for ever.
@@ -1522,8 +1586,17 @@ role_row() { # <role> <stale-bound-seconds>
       fi
     fi
     if [ "${NEVER_OK:-0}" = 1 ]; then
-      printf '%-8s WAITING   loop started %ss ago; no pass recorded yet\n' "$role" "${LOOP_UP_S:-0}"
-      return 0
+      # ⛔ A LIVE PID AND A FRESH START RECORD ARE NOT PROGRESS. The loop must also have WRITTEN
+      # something inside its own worst-case pass window, or "it is working on it" is a guess.
+      paged="$(loop_progress_age)"
+      if [ -n "${paged:-}" ] && [ "$paged" -le "$ALL_PASSES_S" ]; then
+        printf '%-8s WAITING   loop started %ss ago; no pass recorded yet (transcript %ss ago)\n' \
+          "$role" "${LOOP_UP_S:-0}" "$paged"
+        return 0
+      fi
+      printf '%-8s UNKNOWN   the loop is alive but has written nothing for %ss (bound %ss); no pass recorded\n' \
+        "$role" "${paged:-?}" "$ALL_PASSES_S"
+      return 3
     fi
     printf '%-8s NEVER RAN (no pass recorded)%s\n' "$role" ""
     return 1
@@ -1531,11 +1604,22 @@ role_row() { # <role> <stale-bound-seconds>
   rc="$(state_get "$role" last_rc)"; ep="$(state_get "$role" last_pass_epoch)"
   case "${ep:-}" in ''|*[!0-9]*) ep=0 ;; esac
   age=$(( $(date +%s) - ep ))
-  if loop_alive; then
-    printf '%-8s RUNNING   last pass %ss ago rc=%s — %s\n' "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
-  else
-    printf '%-8s NO LOOP   last pass %ss ago rc=%s — %s\n' "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
-  fi
+  case "$st" in
+    dead:*)
+      # The LAST PASS is still reported — it is the only record of what the role did — but the row's
+      # verdict is the loop's: a dead scheduler means no further pass, whatever the last one said.
+      printf '%-8s DEAD      the loop is not running (%s); last pass %ss ago rc=%s — %s\n' \
+        "$role" "${st#dead:}" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
+      return 1 ;;
+    unknown:*)
+      printf '%-8s UNKNOWN   the loop has no verifiable liveness (%s); last pass %ss ago rc=%s — %s\n' \
+        "$role" "${st#*:}" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
+      return 3 ;;
+    alive)
+      printf '%-8s RUNNING   last pass %ss ago rc=%s — %s\n' "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)" ;;
+    *)
+      printf '%-8s NO LOOP   last pass %ss ago rc=%s — %s\n' "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)" ;;
+  esac
   # ⛔ A pass that did NOT complete is not healthy, however recent it is: "the controller is down and
   # the restart failed" (doctor rc=1) or "I could not read the lanes" (reap rc=3) used to print here
   # and still exit 0, which is the false green this verb exists to remove. The next CLEAN pass clears
@@ -1558,41 +1642,75 @@ role_row() { # <role> <stale-bound-seconds>
   return 0
 }
 
+# Keep the STRONGEST non-zero verdict across the four rows: a DEAD loop (1) outranks an ABSTENTION
+# (3) — a proven absence is a stronger answer than "could not tell" — and neither is masked by a clean
+# row printed after it.
+ROW_RC=0
+row_rc_merge() { # <the rc role_row returned>
+  case "${1:-0}" in
+    0) ;;
+    3) [ "${ROW_RC:-0}" -eq 1 ] || ROW_RC=3 ;;
+    *) ROW_RC=1 ;;
+  esac
+}
+
 run_status() {
-  local rc=0 desired=0 started
+  local rc=0 desired=0 started r
+  ROW_RC=0
   [ -f "$DESIRED" ] && desired=1
   # The grace window is derived from the LOOP's own start record, never from a role's, so it cannot
   # be refreshed by a pass and cannot outlive the loop that wrote it.
   # NOT `_AGE`-named on purpose: the name is an age-SHAPED identifier, and the declared-surface scan
   # rightly treats any `*_AGE` assignment as a candidate liveness bound. This is a display age for a
   # status row, not a bound — it is compared against DOCTOR_GRACE_S below, and against nothing else.
-  # (The stale bounds derived from ALL_PASSES_S are applied to a ROLE's last-pass age in `role_row`.)
+  # (The stale bounds derived from ALL_PASSES_S are applied to a ROLE's last-pass age in `role_row`, and
+  # the transcript freshness that gates `WAITING` is read by `loop_progress_age`.)
   NEVER_OK=0; LOOP_UP_S=""
+  # ⛔ THE LOOP'S LIVENESS IS DECIDED ONCE, HERE, and every row below is derived from it (#2306).
+  # Deciding it per row was where the false `WAITING` came from. `LOOP_STATE` is exported into the
+  # rows' scope (they read it, they do not re-derive it) so one read produces one verdict.
+  LOOP_STATE="$(loop_state)"
   started="$(cat "$ROLES_DIR/loop.started" 2>/dev/null)"
   case "${started:-}" in
     ''|*[!0-9]*) : ;;   # no/unknown age -> no grace (fail-closed)
     *) LOOP_UP_S=$(( $(date +%s) - started ))
        [ "$LOOP_UP_S" -ge 0 ] && [ "$LOOP_UP_S" -le "$DOCTOR_GRACE_S" ] && NEVER_OK=1 ;;
   esac
-  if loop_alive; then
-    printf 'loop:    RUNNING (pid %s)\n' "$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
-  elif [ "$desired" = 1 ]; then
-    printf 'loop:    NOT RUNNING (cell is started — the doctor loop is expected)\n'
-    rc=1
-  else
-    printf 'loop:    STOPPED (cell not started; roles are not expected to pass)\n'
-  fi
+  case "$LOOP_STATE" in
+    alive)
+      printf 'loop:    RUNNING (pid %s)\n' "$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)" ;;
+    dead:*)
+      printf 'loop:    NOT RUNNING (dead:%s — cell is started, the doctor loop is expected)\n' "${LOOP_STATE#dead:}"
+      rc=1 ;;
+    absent:*)
+      if [ "$desired" = 1 ]; then
+        printf 'loop:    NOT RUNNING (absent:%s — cell is started, the doctor loop is expected)\n' "${LOOP_STATE#absent:}"
+        rc=1
+      else
+        printf 'loop:    STOPPED (cell not started; roles are not expected to pass)\n'
+      fi ;;
+    *)
+      # A read that could not be made is not a verdict: name it, and never print the optimistic rows
+      # under it. Exit 3 is the abstention code every other surface here uses.
+      printf 'loop:    UNKNOWN — its liveness cannot be verified (%s)\n' "${LOOP_STATE#*:}"
+      rc=3 ;;
+  esac
   # reap runs INSIDE the doctor pass, so it inherits the same worst-case gap.
-  role_row reap "$DOCTOR_STALE_S" || rc=1
-  role_row doctor "$DOCTOR_STALE_S" || rc=1
+  for r in reap doctor; do
+    role_row "$r" "$DOCTOR_STALE_S"; row_rc_merge $?
+  done
   # A merge pass may last MERGE_BUDGET_S plus one overrunning rail call, and everything else in the
   # tick may run before the NEXT one starts (see ALL_PASSES_S).
-  role_row merge $((ALL_PASSES_S + MERGE_INTERVAL)) || rc=1
+  role_row merge $((ALL_PASSES_S + MERGE_INTERVAL)); row_rc_merge $?
   # …and a hygiene pass waits behind doctor+merge, plus its own bounded run.
-  role_row hygiene $((ALL_PASSES_S + HYGIENE_INTERVAL)) || rc=1
+  role_row hygiene $((ALL_PASSES_S + HYGIENE_INTERVAL)); row_rc_merge $?
+  case "${ROW_RC:-0}" in
+    1) rc=1 ;;
+    3) [ "$rc" -eq 1 ] || rc=3 ;;
+  esac
   if [ "$desired" = 1 ]; then
     # A started cell whose loop is gone is not healthy even if every role's last pass is recent.
-    loop_alive || rc=1
+    [ "$rc" -ne 0 ] || loop_alive || rc=1
   else
     # Not started: report, never fail. `stop` must stay a successful verb.
     rc=0

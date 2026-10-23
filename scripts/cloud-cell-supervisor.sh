@@ -1791,7 +1791,7 @@ cmd_start() {
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
       # answering "already running" about a cell that cannot reap or land.
-      start_doctor_loop
+      start_doctor_loop || return 1
       # ⛔ ...and that heal is fenced like every other path in this function: a `stop` that lands while
       # `start_doctor_loop` runs must not be undone by the `.desired` marker / doctor session it just
       # created.
@@ -1803,7 +1803,7 @@ cmd_start() {
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
-      start_doctor_loop
+      start_doctor_loop || return 1
       superseded && return 1
       return 0
     fi
@@ -1823,7 +1823,7 @@ cmd_start() {
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
     # doctor still cannot reap, land or prune. Fenced like every other path in this function.
-    start_doctor_loop
+    start_doctor_loop || return 1
     superseded && return 1
     return 0
   fi
@@ -1993,7 +1993,7 @@ cmd_start() {
   # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
   # dispatches but cannot land is the measured #1989 state, and a start that reported success over
   # it would be the same false green this file refuses everywhere else.
-  start_doctor_loop
+  start_doctor_loop || return 1
   superseded && return 1
   return 0
 }
@@ -2367,8 +2367,14 @@ cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at 
 # usable on a cell that has not been started yet.
 doctor_path() {
   local c
+  # ⛔ THE PINNED HARNESS IS CONSULTED TOO (#2306). $O is the seed and stays first — it is what the
+  # provenance record describes — but a cell whose $O seed is incomplete while the harness it is
+  # actually running still ships the doctor must not be told the doctor "does not exist": the file was
+  # measured present in the pinned harness dir while this lookup answered not-found.
   for c in "$O/cloud-cell-doctor.sh" "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
-           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
+           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh" \
+           "${HARNESS:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh" \
+           "${HARNESS_PIN_DIR:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh"; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2399,10 +2405,16 @@ run_role() {
 # marker is what tells the doctor that the cell is SUPPOSED to be up — without it a `stop` would be
 # undone by the next pass, and an operator's stop would never stick.
 start_doctor_loop() {
-  local d
+  local d _lrc=0 _launch_err _why _i
   mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
   : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
-  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
+  # ⛔ AN ABSENT DOCTOR IS #2211's POPULATION AND KEEPS ITS RULING: a retired/absent doctor must not
+  # take the CONTROLLER down with it, so this is a NAMED warning and rc 0. A PRESENT doctor that fails
+  # to LAUNCH is a different fact entirely and must never be reported this way (#2306).
+  if ! d="$(doctor_path)"; then
+    say "warning: the doctor is not shipped (cloud-cell-doctor.sh absent — #2160 retired the forks, and no copy was found in $O, beside $SUP_SELF, or in the pinned harness) — the controller runs, but reaping/hygiene/merge is NOT automatic; read $O/logs/cell-doctor.log"
+    return 0
+  fi
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     # ⛔ A DOCTOR SESSION NAME IS MACHINE-SCOPED (`cell-doctor` is the default for EVERY cell on a
     # box), so "a session with this name exists" is not evidence that it is OURS — the same hazard the
@@ -2444,18 +2456,39 @@ start_doctor_loop() {
   # controller's command string. `safe_argv` covers every value EXCEPT two, which are safe by other
   # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
   # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
+  _launch_err="$O/logs/.cell-doctor-launch.$$"
+  : > "$_launch_err" 2>/dev/null || _launch_err=/dev/null
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
-  sleep 2
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'" \
+    2>"$_launch_err" || _lrc=$?
+  # ⛔ A FLAT `sleep 2` WAS A GUESS AT HOW LONG TMUX NEEDS, AND IT DISCARDED THE EVIDENCE (#2306):
+  # `new-session`'s rc and stderr were dropped, so the only signal left was "a session appeared", and
+  # its absence was blamed on a retired artifact. Poll the same wall time instead, and keep the file.
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && break
+    sleep 0.1
+    _i=$((_i + 1))
+  done
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
-    say "doctor loop started (tmux '$DOCTOR_SESSION')"
+    say "doctor loop started (tmux '$DOCTOR_SESSION', doctor $d)"
+    rm -f "$_launch_err"
   else
-    # NOT fatal: cloud-cell-doctor.sh was retired (#2160) and is no longer shipped, so a
-    # missing doctor must not take the CONTROLLER down with it. Measured 2026-10-20: `start`
-    # reported FATAL one second after the controller began dispatching correctly, on every
-    # cell that used the shipped start path.
-    say "warning: the doctor loop is unavailable (cloud-cell-doctor.sh not shipped) — the controller runs, but reaping/hygiene is NOT automatic; read $O/logs/cell-doctor.log"
-    return 0
+    # ⛔ THE MESSAGE IS DECIDED BY THE FILE, NOT BY THE SESSION (#2306). This branch used to print
+    # "cloud-cell-doctor.sh not shipped" — comment and all — for ANY failed launch, including one
+    # where `doctor_path` had succeeded two lines above (it would have warned otherwise). Measured on
+    # pi-cell-4: the file was at $O/cloud-cell-doctor.sh the whole time, `tmux new-session` had printed
+    # "server exited unexpectedly" into a discarded stderr, and `start` returned 0 — so the operator
+    # was told a false cause for a real failure. A present doctor that will not launch is FATAL for
+    # this verb: the controller is up, but reap/merge/hygiene will never run.
+    _why="$(head -3 "$_launch_err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
+    rm -f "$_launch_err"
+    say "FATAL: the doctor loop did NOT start (tmux new-session rc=${_lrc:-0}${_why:+: ${_why% }})" >&2
+    say "       the doctor IS present at $d — this is a LAUNCH failure, NOT a retired artifact (#2160" >&2
+    say "       retired the forks; the doctor survived). The controller is up but reap/merge/hygiene" >&2
+    say "       are NOT automatic until a doctor loop runs. Read $O/logs/cell-doctor.log, then retry:" >&2
+    say "       $0 start   (replacing a stale session: tmux kill-session -t '=$DOCTOR_SESSION')" >&2
+    return 1
   fi
 }
 
