@@ -1436,7 +1436,7 @@ plus its tmux server (agent-infra#2159).
 `[cap]` now carries the census, measured by `lane-reap.sh count`:
 
 ```text
-lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unknown>
+lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|terminals|unknown>
 ```
 
 * **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
@@ -1451,8 +1451,13 @@ lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unkno
   same fail-closed rule as `no-log-evidence`, and the reason the census never claims to be total.
 * **zombie** — the box's `Z`-state processes. A box full of corpses otherwise reads as busy.
 * **`lanes_src=`** — where the number came from: `census` (this instrument), `unknown` (it ran but
-  could not answer), `tmux` (the OLD session count, used only while a `$O` predates `lane-reap.sh`;
-  named once in the controller log and labelled here, never printed as if it were a census).
+  could not answer), `terminals` (the LAUNCH SURFACE's own worker census — `wt_count lane-` from
+  `worker-terminal.sh`, launcher-agnostic: durable cmux terminals AND launchd tmux sessions, used only
+  while a `$O` predates `lane-reap.sh`; named once in the controller log and labelled here, never
+  printed as if it were a census). ⛔ The transition value is NOT `tmux ls | grep -c '^lane-'`: on a
+  Linux cell tmux is never the launcher (`wt_launcher` selects the cmux `terminal` surface and refuses
+  `none` rather than tmux — "a tmux window is the measured 21-line death"), so that expression reads
+  **0 on a busy cell** and the `MAX_LANES` gate stops binding, which is the #2159 OOM direction.
 * **`lanes=?/?`** — the census cannot be verified: unreadable (`ps`/`lsof` failed), ambiguous (two
   distinct lane logs), or an unidentifiable pipe identity (the reads succeeded but the platform
   prints no per-pipe name, so a `tee` cannot be shown to be the lane's own writer). `?` is not `0`: "ps is broken" and "nothing is
@@ -1461,15 +1466,23 @@ lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unkno
   FALSE and **dispatches more**, so it is a fail-OPEN on capacity. An unreadable census therefore
   sets `LANES_UNKNOWN=1` and the gate REFUSES to add work with that reason (`lanes_unknown (the lane
   census could not be read -> do not add work)`), on the same doctrine as an unreadable memory
-  probe. `[cap]` and both `[dispatch]` lines print `?` for that read (`LANES_DISPLAY`); the internal
-  `LANES` keeps a tmux lower bound ONLY so the numeric consumers stay numeric, and it is never
-  displayed or used as a licence to dispatch. A `?` NUMERATOR with readable totals
-  (`lanes=?/11 zombie=0`) is the same abstention one lane at a time — a liveness age that could not
-  be read — and `count` exits 3 for it.
+  probe — on BOTH add-work paths: the issue batch's dispatch gate AND the PR path's
+  `merge-`/`fix-`/review spawns, whose `can_spawn()` carries the same abstention beside the load gate
+  and names it in the per-PR refusal line. `[cap]` and both `[dispatch]` lines print `?` for that read
+  (`LANES_DISPLAY`); the internal `LANES` keeps the launcher census as a lower bound ONLY so the
+  numeric consumers stay numeric, and it is never displayed or used as a licence to dispatch. A `?`
+  NUMERATOR with readable totals (`lanes=?/11 zombie=0`) is the same abstention one lane at a time —
+  a liveness age that could not be read — and `count` exits 3 for it.
 
 The `reap` pass in `cloud-cell-doctor.sh` runs the same tool in process mode (dry under `--dry-run`,
 armed otherwise) and puts `lanes=… zombie=…` in its own pass line, so a cell's `status` answers
-"what is this box actually carrying" without reading a process table by hand.
+"what is this box actually carrying" without reading a process table by hand. ⛔ The reaper's
+**policy-inert** pass (it COMPLETED and judged nothing because gate 2 refuses this surface's lanes —
+the Linux-cell steady state, `docs/ops/fleet-liveness.md` §11.4) is recorded as **`rc=4`** and the
+`status` row says **`INERT`**: named, and **not** a failed pass. Recording it as `cannot-verify`
+(`rc=3`) made the operator's health verb exit 1 for ever on a healthy cell, and collapsed a genuine
+controller-restart failure (`rc=1`) into the same number — so `doctor` keeps the supervision verdict
+in its own rc and a failed restart stays `rc=1`.
 
 ### 6.5.2 The instrument that decides must itself be bounded
 

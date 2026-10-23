@@ -42,7 +42,11 @@
 #   bash cloud-cell-doctor.sh loop
 #
 # Exit codes: 0 = pass completed (including "nothing to do"); 2 = usage; 3 = the read a pass needs
-# could not be taken (cannot-verify is never a pass).
+# could not be taken (cannot-verify is never a pass); 4 = POLICY-INERT — the pass COMPLETED and judged
+# nothing because the reaper's ancestry policy refuses this surface's lanes (the Linux-cell steady
+# state, docs/ops/fleet-liveness.md §11.4). 4 is a named verdict, NOT a failure: `status` prints it and
+# stays green, and the `doctor` role never lets it mask a controller that is down (rc=1) or a real
+# cannot-verify (rc=3).
 
 set -uo pipefail
 
@@ -284,14 +288,26 @@ state_write() {
 # `dry-run (a rehearsal, no action taken)`. No record ⇒ nothing to overwrite ⇒ the rehearsal's own rc
 # stands. A record that EXISTS but holds no readable rc ⇒ fail-closed at 3.
 state_write_rehearsal() { # <role> <own_rc> <result...>
-  local role="$1" own="$2" prev; shift 2
+  local role="$1" own="$2" prev _sr_prev_fail _sr_own_fail; shift 2
   if [ -f "$ROLES_DIR/$role.state" ]; then
     prev="$(state_get "$role" last_rc)"
     case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
   else
     prev="$own"
   fi
-  num_ok "${own:-}" && [ "$own" -gt "$prev" ] && prev="$own"
+  num_ok "${own:-}" || own=3
+  # ⛔ rc=4 IS A POLICY VERDICT, NOT A SEVERITY (#2163 review r8, P1). "Keep whichever rc is larger"
+  # ranked a policy-inert pass (4) ABOVE a stored cannot-verify (3) and a failed restart (1), so a
+  # rehearsal recorded INERT over a failure that was still true — the same defect this function exists
+  # to prevent, one arm over. Only a FAILING rc (1/2/3) supersedes; 4 is carried only when neither
+  # side is failing, and a clean 0 still never clears a failure.
+  case "${prev:-}" in 1|2|3) _sr_prev_fail=1 ;; *) _sr_prev_fail=0 ;; esac
+  case "$own" in 1|2|3) _sr_own_fail=1 ;; *) _sr_own_fail=0 ;; esac
+  if [ "$_sr_own_fail" = 1 ]; then
+    prev="$own"
+  elif [ "$_sr_prev_fail" = 0 ] && [ "$own" -gt "$prev" ]; then
+    prev="$own"
+  fi
   state_write "$role" "$prev" "dry-run (a rehearsal, no action taken): $*"
 }
 
@@ -673,6 +689,10 @@ run_reap() {
   begin_pass
   local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
   local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 failed=0 result=""
+  # ⛔ A POLICY-INERT PROCESS PASS IS A THIRD VERDICT, TRACKED APART (#2163 review r8, P1). It was a
+  # `pass_rc=3`, which on a Linux cell is the STEADY STATE — so the cell's health verb was red for
+  # ever and a REAL cannot-verify could not be told from a policy decision nobody can act on.
+  local inert_pass=0
   note() { log "[reap] $*"; result="${result}${result:+; }$*"; }
   started="$(date +%s)"
   local names; names="$(harness_sessions)"
@@ -952,7 +972,14 @@ run_reap() {
       # same `total == 0` the reaper tests), never the field alone.
       *inert=[!0]*)
         case "$proc_result" in
-          *"trees=0/0"*|*'"trees":"0/0"'*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+          # ⛔ A POLICY VERDICT, NOT A FAILED READ (rc=4, #2163 review r8, P1). `3` means cannot-verify
+          # — a read that FAILED, which a consumer must escalate — and this shape is the recorded cell
+          # steady state (§11.4): the policy refused every lane because gate 2 requires positive fleet
+          # evidence and a cell's ancestry carries none. Recording 3 here made the doctor role red for
+          # ever (`role_row` → `status` rc=1) AND collapsed a genuine restart failure into the same
+          # number. It is recorded as its own verdict below (`pass_rc=4`), so it is still never a clean
+          # `reaped=0` while it says exactly what it is.
+          *"trees=0/0"*|*'"trees":"0/0"'*) inert_pass=1 ;;
         esac ;;
       *abstained=0*) ;;
       *) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
@@ -964,6 +991,10 @@ run_reap() {
   fi
   local proc_note=""
   [ -n "$proc_result" ] && proc_note="; proc: $proc_result"
+  # ⛔ A POLICY-INERT PROCESS PASS IS ITS OWN VERDICT (rc=4), NEVER A FAILED ONE (#2163 review r8, P1).
+  # It is promoted ONLY where nothing failed: a real abstention (3) still dominates, so this can never
+  # hide a read that could not be taken — it only stops a WORKING policy from reading as a fault.
+  [ "$inert_pass" = "1" ] && [ "$pass_rc" -eq 0 ] && pass_rc=4
   # The FIRST refusal travels with the state line too: the summary says how many, never why, and an
   # operator reading `state_write` is the operator who needs the why.
   [ -n "$proc_refusal" ] && proc_note="$proc_note; first: ${proc_refusal#  }"
@@ -1506,8 +1537,14 @@ run_doctor() {
   # and could both decide the same session is wedged (two kills, one corpse — the double-act the
   # lock exists to prevent). A lock held elsewhere makes this a logged SKIP, and the reap state is
   # then the sibling pass's record, which is the truth either way.
-  local rrc=0
+  local rrc=0 src_rc=0
   run_role_pass reap "$dry" >/dev/null || rrc=$?
+  # ⛔ A POLICY VERDICT FROM THE NESTED REAP IS NOT A FAILURE OF THIS PASS (#2163 review r8, P1).
+  # `rrc=4` says the reaper judged nothing because its ancestry policy refuses every lane on this
+  # surface (§11.4) — that fact is recorded in the REAP row, and this pass's own work (supervision)
+  # is unaffected. Carrying 4 into the doctor's record would make the row read `INERT` for a doctor
+  # that restarted the controller correctly. It collapses to 0 HERE, not into a failure.
+  [ "$rrc" -eq 4 ] && rrc=0
   result="reap: $(state_get reap last_result | cut -c1-160)"
   if [ ! -f "$DESIRED" ]; then
     log "[doctor] cell is not started (no $DESIRED) — supervising nothing; reap still ran"
@@ -1583,13 +1620,26 @@ run_doctor() {
         result="$result; controller restart FAILED rc=$rc"
         # ⛔ The supervision OUTCOME is part of the pass's rc. A started cell whose dispatcher is
         # absent and could not be restarted is not a clean pass, however well the reap half went.
-        [ "$rrc" -eq 0 ] && rrc=1
+        # ⛔ AND IT HAS ITS OWN SLOT (`src_rc`) SO IT STAYS EXPRESSIBLE (#2163 review r8, P1):
+        # `[ "$rrc" -eq 0 ] && rrc=1` only ever RAISED a zero, so when the nested reap recorded
+        # cannot-verify (3) a controller that was DOWN and could not be restarted recorded 3 as well —
+        # "controller is down" was no longer sayable in the rc at all.
+        src_rc=1
       fi
     else
       log "[doctor] CANNOT-VERIFY: controller absent and DOCTOR_SUPERVISOR is not a file — cannot restart"
       result="$result; controller restart cannot-verify (no supervisor)"
-      [ "$rrc" -eq 0 ] && rrc=3
+      src_rc=3
     fi
+  fi
+  # ── ONE place where the two halves' verdicts combine. The supervision FAILURE is dominant (a cell
+  # with a dead controller is the more urgent fact and must survive in the rc, whatever the reap
+  # recorded); a supervision that could not be VERIFIED raises a clean/ policy-inert pass to
+  # cannot-verify — it never lowers a 3 it found already there.
+  if [ "$src_rc" -eq 1 ]; then
+    rrc=1
+  elif [ "$src_rc" -eq 3 ] && [ "$rrc" -eq 0 ]; then
+    rrc=3
   fi
   # A nested reap that could not be taken makes THIS pass partial too: the supervision half ran, but
   # the pass as a whole must not be recorded as a clean one (cannot-verify is never a pass).
@@ -1667,6 +1717,13 @@ role_row() { # <role> <stale-bound-seconds>
   esac
   case "${rc:-0}" in
     0) ;;
+    # ⛔ rc=4 IS A POLICY VERDICT, NOT A FAILURE (#2163 review r8, P1). The reaper COMPLETED and judged
+    # nothing because its ancestry policy refuses every lane this surface has (§11.4) — the Linux-cell
+    # steady state, not an incident. Printing FAILED here made the operator's health verb permanently
+    # red on a healthy cell (and an alarm that can never clear is trained-to-be-ignored). It is NAMED
+    # (never a silent green), and the staleness bound below still applies: a reaper that stopped
+    # passing reads STALE.
+    4) printf '%-8s INERT     last pass rc=4 — judged no tree and refused every lane it found BY POLICY (this surface has no fleet ancestry marker; §11.4) — reported, not failed\n' "$role" ;;
     *) printf '%-8s FAILED    last pass rc=%s (the pass did not complete)\n' "$role" "${rc:-?}"; return 1 ;;
   esac
   if [ "$age" -gt "$bound" ]; then

@@ -927,7 +927,11 @@ is a WORKER and is counted by `workers=`, not by `lanes=`. `count` and `reap` sh
 predicate and the same evidence set; `reap` alone adds the ancestry gate. `lanes=?/?` means the
 census could not be read and is never rendered as `0/0`; a `?` live numerator with readable totals is
 the same abstention one lane at a time. An unreadable census makes the controller REFUSE to add work
-(`lanes_unknown`) — the gate is capacity, so an under-count must not dispatch more. `--apply` is the
+(`lanes_unknown`) — the gate is capacity, so an under-count must not dispatch more — on **both**
+add-work paths: the issue batch's dispatch gate AND the PR path's `merge-`/`fix-`/review spawns,
+whose `can_spawn()` carries the same abstention beside the load gate. (It used to close only the
+ISSUE batch, so a box whose census was `?/?` was still handed workers on the PR side; a merge lane is
+a `pi` like any other, so abstaining on one path is abstaining on neither.) `--apply` is the
 operator's decision, like every other deletion tool in this tree.
 
 **⛔ A CENSUS WITH NO EYES SAYS `?`, NOT `0/0`.** The POPULATION comes from the process table; every
@@ -960,17 +964,19 @@ pipe's file) nor refused (that drops a real lane's own writer). It is an **abste
 NOT `abstained=`**: it shares rc 2 with a blind read no longer, because a readable tree reported as
 "the descriptors could not be read" sends the operator after an lsof/permissions fault that does not
 exist, and the two causes need different fixes. A pass with any abstention **exits 3**,
-and so does **a pass that judged no tree while refusing lanes by policy** — an instrument that is
-inert (a cell, by design; §11.4) must not record itself as healthy. Those are the reaper's TWO
-broken shapes, and `inert=` alone is neither of them: a pass that judged lanes and refused a
-human-owned one beside them is CLEAN (exit 0), because the refusal is a policy decision and not a
-failure to look. `cloud-cell-doctor.sh` therefore escalates the **inert-pass SHAPE** — `inert`
-non-zero **together with `trees=0/0`**, the same `total == 0` the reaper tests — and not the field on
-its own; it counts an abstention the same way — including `unidentifiable=`, which it escalates on its
-own field and whose logged cause line names identity, not a blind read — and logs the **first**
-per-tree refusal beside the summary, so `[reap]` names a cause. (Escalating every non-zero `inert=` wrote `reap FAILED rc=3`
+and **a pass that judged no tree while refusing lanes by policy exits 4** — an instrument that is
+inert (a cell, by design; §11.4) must not record itself as healthy, but neither is its refusal a
+READ FAILURE. Those are the reaper's TWO broken shapes, and `inert=` alone is neither of them: a pass
+that judged lanes and refused a human-owned one beside them is CLEAN (exit 0), because the refusal is
+a policy decision and not a failure to look. `cloud-cell-doctor.sh` therefore records the **inert-pass
+SHAPE** — `inert` non-zero **together with `trees=0/0`**, the same `total == 0` the reaper tests — as
+its own verdict (`rc=4`, printed as `INERT`), and not the field on its own; it counts an abstention
+the same way — including `unidentifiable=`, which it escalates on its own field and whose logged cause
+line names identity, not a blind read — and logs the **first** per-tree refusal beside the summary, so
+`[reap]` names a cause. (Escalating every non-zero `inert=` wrote `reap FAILED`
 every pass over a pass the reaper calls clean, on any box with one human-owned or
-`ancestry-unknown` lane.)
+`ancestry-unknown` lane; escalating the inert PASS to `3` did the same for the cell's health verb —
+see §11.4.)
 
 ### 11.4 Boundaries, stated
 
@@ -984,8 +990,22 @@ every pass over a pass the reaper calls clean, on any box with one human-owned o
   into `/proc/<pid>/environ` at spawn — which is a design change with a cell-side component. It is
   recorded here as a DECISION FOR THE PR AUTHOR, deliberately not inferred, because the alternative
   (accepting `unknown`) is the fail-open that TERMed live trees. Because such a pass judges NOTHING
-  while refusing every lane, it now **exits 3** and carries `inert=<n>` — the inertness is visible to
-  the doctor, not recorded as a healthy reaper.
+  while refusing every lane, it carries `inert=<n>` and **exits 4 — a POLICY verdict, not `3`
+  (cannot-verify)**: the pass COMPLETED and judged nothing, which on a cell is the steady state, not
+  a read that failed. The distinction is load-bearing in both directions:
+  * `cloud-cell-doctor.sh` records it as `rc=4`, and the `status` verb prints the role as
+    **`INERT`** — NAMED, never a silent green — while the verb stays **green** (the staleness bound
+    still applies, so a reaper that stopped passing reads `STALE`). Recording it as `3` made
+    `cloud-cell-supervisor.sh status`, the operator's health verb, exit 1 on every healthy cell
+    carrying a lane, and an alarm that can never clear is trained-to-be-ignored.
+  * a supervision FAILURE keeps its own rc: "the controller is away and the restart FAILED" is
+    `doctor` **rc=1** whatever the nested reap recorded. It used to be `rrc=3` beside a
+    cannot-verify reap, which made "controller is down" inexpressible.
+  The inertness is therefore visible to the doctor and named on the cell's own health line, not
+  recorded as a healthy reaper and not reported as a fault nobody can act on.
+  **Residual, stated:** on a cell the armed reaper still judges nothing, so a wedged cell lane is
+  ended by the operator or by the session pass, not by this gate, until the evidence source above
+  exists.
 - **`tmux`/`screen` are NOT human markers — a product decision, stated.** They are the fleet's own
   launch surface: `worker-terminal.sh` selects tmux as THE launcher on macOS whenever
   `cmux tree --json` cannot answer (the launchd controller, measured in

@@ -32,8 +32,10 @@
 #   COUNT-NO-EVIDENCE  a census that cannot read ANY descriptor is `?/?` (never a confident 0/0 that
 #              licenses more dispatch), while a readable tree holding no fleet log is a real 0
 #   ABSTAINED  a pass that could judge nothing COUNTS it (`abstained=`) and exits 3
-#   INERT      a pass that judged NO tree while refusing lanes by POLICY exits 3 and carries
-#              `inert=` — the cell shape, where an inert reaper used to record itself as healthy
+#   INERT      a pass that judged NO tree while refusing lanes by POLICY exits 4 (a POLICY verdict,
+#              kept apart from rc 3 = cannot-verify) and carries `inert=` — the cell shape, where an
+#              inert reaper used to record itself as healthy and then, once escalated, reddened the
+#              cell's health verb for ever
 #   UNREADABLE an unreadable process table is `lanes=?/?` / exit 3 — never "empty fleet"
 #   EXEC       lane-exec.sh EXECs pi: the launcher's pid IS the agent's pid (no wrapper survives)
 #
@@ -324,8 +326,22 @@ eq "$rc" "0" "CAP: the [cap] line carries lanes=<live>/<total> and zombie=<n>"
 grep -qF 'lanes_unknown (the lane census could not be read' "$LOOP" && rc=0 || rc=1
 eq "$rc" "0" "CAP: the dispatch gate CONSUMES LANES_UNKNOWN (a tripwire: the arm is inline in the loop)"
 grep -qF 'lanes_src=' "$LOOP" && grep -qF 'lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL' "$LOOP" && rc=0 || rc=1
-eq "$rc" "0" "CAP: [cap] names the census SOURCE, so a tmux fallback is never printed as a census"
+eq "$rc" "0" "CAP: [cap] names the census SOURCE, so a LAUNCHER count is never printed as a census"
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ THE LAUNCH SURFACE'S OWN CENSUS IS A STUB, AND IT IS DISCRIMINATING (#2163 review r8, P1). The
+# loop's fallback must be `wt_count lane-` (worker-terminal.sh: durable terminals AND tmux sessions,
+# every launcher) and NOT `tmux ls | grep -c '^lane-'`: on a Linux cell tmux is never the launcher, so
+# the tmux expression reads **0 on a busy cell** and the capacity gate stops binding. The stub answers
+# only for the `lane-` prefix, so a call with another argument (or none) reads 0 and fails the leg.
+WT_COUNT_CALLS="$T/wt-count.calls"
+: > "$WT_COUNT_CALLS"
+# ⛔ THE ARGUMENT IS RECORDED IN A FILE, not a shell variable: `LANES="$(wt_count lane-)"` runs the
+# stub in a command substitution, so an in-shell assignment would be lost and the leg would pass on an
+# empty reading (the same defect class as the `=$( )` memo in worker-terminal.sh).
+wt_count() {
+  printf '%s\n' "${1:-<none>}" >> "$WT_COUNT_CALLS"
+  case "${1:-}" in lane-) printf '5\n' ;; *) printf '0\n' ;; esac
+}
 O="$T"; _HERE_RS=/nonexistent; LOG="$T/state/orch.log"
 printf '#!/bin/bash\necho "lanes=3/11 zombie=7"\n' > "$T/lane-reap.sh"
 chmod +x "$T/lane-reap.sh"
@@ -345,28 +361,35 @@ eq "$LANES_UNKNOWN" "1" "CAP: an unreadable numerator REFUSES work (no silent fa
 eq "$LANES_TOTAL/$ZOMBIES" "11/7" "CAP: readable totals are still reported"
 eq "$LANES_SOURCE" "unknown" "CAP: an abstaining census is labelled unknown"
 eq "$LANES_DISPLAY" "?" "CAP: and its DISPLAYED numerator is ?, never a fabricated 0"
+eq "$LANES" "5" "CAP: the internal lower bound is the LAUNCHER census (wt_count), not a tmux session count"
 printf '#!/bin/bash\necho "lanes=?/? zombie=?"; exit 3\n' > "$T/lane-reap.sh"
 measure_lanes
 eq "$LANES_UNKNOWN" "1" "CAP: a wholly unreadable census refuses work"
 eq "$LANES_TOTAL/$ZOMBIES" "?/?" "CAP: unknown totals stay unknown, never 0"
-# The transition arm: no lane-reap.sh at all -> the OLD tmux count, LABELLED. Re-source the block so
-# the missing-script resolution runs again (it happens at definition time). The tmux double makes the
-# value DISCRIMINATING: comparing LANES_DISPLAY with LANES inside the same assignment could never fail
-# (#2163 review, P2), so the expected number is fixed by the fixture instead.
+# The transition arm: no lane-reap.sh at all -> the LAUNCHER's own worker census, LABELLED. Re-source
+# the block so the missing-script resolution runs again (it happens at definition time).
+# ⛔ THE FIXTURE IS THE CELL SHAPE, and it is the whole point of the leg (#2163 review r8, P1):
+# `tmux ls` reports NO lane sessions (on a cell tmux is never the launcher — worker-terminal.sh
+# refuses it), while the launcher census reports 5 live lanes. The tmux double therefore prints NOTHING
+# and the expected value comes from `wt_count`, so an implementation that fell back to `tmux ls` reads
+# 0 and this leg goes RED — the direction that dispatches onto a full box.
 cat > "$T/bin/tmux" <<'SH'
 #!/bin/bash
-[ "${1:-}" = "ls" ] && printf 'lane-1\nlane-2\n'
+# A CELL: the tmux server has no lane sessions at all (it is not the launcher here).
 exit 0
 SH
 chmod +x "$T/bin/tmux"
 rm -f "$T/lane-reap.sh"
+: > "$WT_COUNT_CALLS"
 LANE_REAP_SH=""
 sed -n '/^LANE_REAP_SH=""/,/^}$/p' "$LOOP" > "$T/measure2.sh"
 . "$T/measure2.sh"
 PATH="$T/bin:$PATH" measure_lanes
-eq "$LANES_SOURCE" "tmux" "CAP: a missing tool falls back to tmux AND says so"
-eq "$LANES_DISPLAY" "2" "CAP: the tmux transition shows the (fixtured) session count"
-eq "$LANES_UNKNOWN" "0" "CAP: the tmux fallback is not an abstention (it is a named transition)"
+eq "$LANES_SOURCE" "terminals" "CAP: a missing tool falls back to the LAUNCHER census AND says so"
+eq "$LANES_DISPLAY" "5" "CAP: the transition reports the launcher census, not a tmux session count"
+eq "$LANES_UNKNOWN" "0" "CAP: the launcher fallback is not an abstention (it is a named transition)"
+eq "$(tr '\n' ' ' < "$WT_COUNT_CALLS" | sed 's/ $//')" "lane-" "CAP: the fallback asks the launcher for the LANE population"
+case "$LANES" in 0) bad "CAP: a busy cell read 0 lanes — the tmux fallback returned (fail-OPEN on capacity)" ;; *) ok "CAP: a busy cell is never read as 0 lanes (the #2159 OOM direction)" ;; esac
 
 # ── SURVIVOR: a SIGTERM-immune victim is escalated, but only while its incarnation holds ────────
 echo "== SURVIVOR (TERM followed by KILL, still fenced on the same incarnation)"
@@ -714,7 +737,12 @@ eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "DELETED-HOLDER-AGE:
 # abstained=0 mode=apply` with rc 0; `cloud-cell-doctor.sh` records `state_write reap 0` — a healthy
 # reaper, every pass, from an instrument that is inert there BY DESIGN. A policy refusal is a
 # decision, so it is counted (`inert=`) and a pass that judged nothing says so in its exit code.
-echo "== INERT (a refusal that judged zero trees is exit 3, and inert= names the count)"
+# ⛔ IT IS `4`, NOT `3` (#2163 review r8, P1): `3` is CANNOT-VERIFY (a read that failed) and a consumer
+# must escalate it; on a LINUX CELL this shape is the STEADY STATE, so escalating it there made
+# `cloud-cell-supervisor.sh status` red for ever and collapsed a real cannot-verify — and a failed
+# controller restart — into the same number. `4` is its own POLICY verdict: still never a clean `0`,
+# and now distinguishable from a failure.
+echo "== INERT (a refusal that judged zero trees is exit 4, and inert= names the count)"
 : > "$T/t-inert"; psinit >> "$T/t-inert"
 psrow 400 1 Ss 00:00:00 10:00:00 "/usr/sbin/cron -f" >> "$T/t-inert"
 psrow 1200 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-inert"
@@ -723,7 +751,7 @@ fdlink 1201 1 "$DEAD_LOG"
 out="$(run_reap "$T/t-inert" "" -- --apply)"; rc=$?
 has "$out" "refused=1 inert=1 unidentifiable=0 abstained=0" "INERT: the refusal is counted as inert, not as an abstention"
 has "$out" "trees=0/0" "INERT: no tree was judged"
-eq "$rc" "3" "INERT: …and that is exit 3, never a clean 0"
+eq "$rc" "4" "INERT: …and that is exit 4 (a POLICY verdict), never a clean 0 and never cannot-verify"
 out="$(run_reap "$T/t-inert" "" -- --json)"
 has "$out" '"inert":1' "INERT: --json carries the counter too"
 # …and inert>0 on a pass that DID judge trees is normal, not an error: a human-owned lane beside a
@@ -917,10 +945,11 @@ has "$out" "ancestry-unknown" "HUMAN-UNKNOWN: refused as ancestry-unknown"
 hasnt "$out" "REAP   root=910" "HUMAN-UNKNOWN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-UNKNOWN: --apply signals NOTHING"
 # ⛔ A PASS THAT JUDGED NOTHING IS NOT A CLEAN PASS (#2163 review r3, P2): the only tree here is a
-# real lane (it has a resolved lane log) refused by POLICY, so `inert=1` and exit 3.
+# real lane (it has a resolved lane log) refused by POLICY, so `inert=1` and a non-zero exit. It is
+# rc 4 (a POLICY verdict), NOT rc 3 — see the INERT leg above (#2163 review r8, P1).
 has "$out" "inert=1" "HUMAN-UNKNOWN: the policy refusal is COUNTED (inert=)"
 has "$out" "trees=0/0" "HUMAN-UNKNOWN: no tree was judged"
-eq "$rc" "3" "HUMAN-UNKNOWN: a pass that judged zero trees while refusing a lane exits 3"
+eq "$rc" "4" "HUMAN-UNKNOWN: a pass that judged zero trees while refusing a lane exits 4 (policy), never 0"
 
 # ── ANCESTRY-INCOMPLETE: a truncated process table is not "no human above" ───────────────────────
 # ⛔ The walk broke out on a ppid row that was missing and `host_verdict` read the resulting empty
