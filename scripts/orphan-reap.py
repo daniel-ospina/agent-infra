@@ -98,6 +98,15 @@ DECLARED BLIND SPOTS (a report must say what it CANNOT see — `lane-status.py`'
 "it cannot see a lane that leaves none"). This reaper cannot see:
   * a `pi` whose session file it cannot bind (`no-session-file`) — a `task`/print-mode child runs
     with sessions disabled, and a resumed session keeps its original stamp;
+  * a `pi` that SWITCHED session inside its own lifetime (`/new`, `/fork`, `/clone`) — pi writes a
+    FRESH stamped file for the new session and leaves the old one on disk, so the fence binds the
+    ABANDONED file (it matches the start stamp exactly and is usually the only match) and gate 3
+    ages the dead transcript. The row can then read `PARKED-REAPABLE` for a lane that was writing
+    seconds ago. Nothing is signalled under the shipped default — a hostless chain is masked by
+    the host decision — but the CENSUS's evidence is wrong for that row, and the reopening seam is
+    exactly where it would become a wrong kill. Named here rather than left to be discovered; the
+    fix needs an identity source this fence does not have (the argv sid, or the file the process
+    holds open), i.e. a canon question: #2475;
   * a `pi` started inside another's fence in the same cwd (`ambiguous-binding`);
   * any process of another uid — but NOT by abstaining: `_cwd_of_pid` returns None on a refused
     read and `bind_session` then SKIPS the cwd filter, so such a pid can still bind a
@@ -268,6 +277,26 @@ def etime_seconds(t: str) -> float:
         days = float(d)
     parts = [float(x) for x in t.split(":")]
     return days * 86400 + sum(v * (60 ** i) for i, v in enumerate(reversed(parts)))
+
+
+def etime_or_none(t: object) -> Optional[float]:
+    """`etime_seconds` without the crash: a value the read did not establish is `None`.
+
+    ⛔ A BAD VALUE IS NOT A CRASH, and it is not a ZERO either (the rule `_fence_from_env`
+    states for the environment). The `pi` census has a per-row abstention for exactly this
+    datum — `bind_session` -> `("start-unreadable", "ps etime unparseable")` — and that arm was
+    STRUCTURALLY UNREACHABLE while the census's own sort key called `etime_seconds` unguarded:
+    one unparseable `etime` anywhere in the table raised out of `pi_census` before a single row
+    was scored, so `--json` emitted NO document, the four-state census was lost, and the run
+    exited 1 — the code this file reserves for "an applied target survived".
+
+    Neither direction may collapse here: `None` means "unreadable" and is scored as an
+    abstention; `0.0` would be a claim that the process started at the epoch.
+    """
+    try:
+        return etime_seconds(str(t))
+    except (TypeError, ValueError):
+        return None
 
 
 def registered_launchd_pids() -> set[str]:
@@ -820,6 +849,21 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
                             f"`unknown` under the recorded rule (#1207 option A) ⇒ report only, "
                             f"never reap"],
                 "host-decision-hostless")
+    # ⛔ AN ALLOW-LIST, NOT A DENY-LIST. `host_kind` starts as the literal `"authorised"` and is
+    # only overwritten when gate 2 runs, so the fall-through to PARKED-REAPABLE authorised every
+    # kind this file does not name — including the `cmux` report-only class the header says must
+    # "stay report-only if it is ever added". A verdict exception that is not recognised must
+    # ABSTAIN, never authorise: a new `gate2_host_decision` kind would otherwise become reapable
+    # the day it lands, with nothing here to say so.
+    if host_kind != "authorised":
+        # `hostless` is the ONE kind the reopen seam may authorise; every other kind — a future
+        # `cmux`-style report-only class included — abstains by default.
+        if not (host_kind == "hostless" and AUTHORISE_HOSTLESS_CHAINS):
+            return ("UNVERIFIABLE",
+                    readings + [f"gate 2 host decision `{host_kind}` is not an AUTHORISING kind "
+                                f"({host_detail}) — a class this reaper does not recognise is "
+                                f"report-only, never a licence to signal"],
+                    f"host-decision-unrecognised:{host_kind}")
     return "PARKED-REAPABLE", readings, "parked-and-retired"
 
 
@@ -933,7 +977,12 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
     counts = {s: 0 for s in POOL_STATES}
     idle_floor_s = liv.IDLE_MS / 1000.0      # the canon's retirement proof, never a literal here
 
-    for pid in sorted(pi_pids, key=lambda p: etime_seconds(before[p]["etime"]), reverse=True):
+    def _longest_lived_first(p: str) -> float:
+        # an UNREADABLE start sorts last rather than aborting the loop over the whole table
+        v = etime_or_none(before[p]["etime"])
+        return -1.0 if v is None else v
+
+    for pid in sorted(pi_pids, key=_longest_lived_first, reverse=True):
         r = before[pid]
         cur = after.get(pid)
         path, binding, detail = bind_session(pid, r, t0, index, taken)
@@ -947,9 +996,11 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
             gap, n = own_expected_gap_s(path)
             tr = Transcript(path=path, age_s=(now_s - st[0]) if st else None, grew=grew,
                             own_gap_s=gap, n_entries=n)
+        ev_etime = etime_or_none(r["etime"])
+        cur_etime = etime_or_none(cur["etime"]) if cur else None
         ev = PiEvidence(
             pid=pid, comm=r["comm"], args=r["args"],
-            etime_s=etime_seconds(r["etime"]),
+            etime_s=(-1.0 if ev_etime is None else ev_etime),
             cpu_before=cpu_prev.get(pid, -1.0),
             # `cur is None` is a VANISHED pid; a row whose `time=` is unparseable is a failed
             # READ. Collapsing them reported "vanished-mid-read" for a fact the read never
@@ -960,10 +1011,11 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
             # ⛔ THE MEASURED INCARNATION IS THE SAMPLE'S **BEFORE** READ (`r["etime"]`), and the
             # binding was fenced on it. A recycle inside the window makes `etime` move BACKWARDS;
             # `_same_incarnation` only ever saw the after-read, so it could not detect this.
-            recycled_mid_read=bool(cur and etime_seconds(cur["etime"]) >= 0
-                                   and etime_seconds(r["etime"]) >= 0
-                                   and etime_seconds(cur["etime"]) + FENCE_S
-                                   < etime_seconds(r["etime"])),
+            # an unparseable `etime` on either side is `None`, not a comparison: a recycle is
+            # only ever claimed about two readings the read actually established.
+            recycled_mid_read=bool(cur is not None and cur_etime is not None
+                                   and ev_etime is not None
+                                   and cur_etime + FENCE_S < ev_etime),
             ancestry=ancestry(pid, before),
             self_ancestor=pid in selfc,
             binding=binding, binding_detail=detail, transcript=tr,
@@ -1022,11 +1074,17 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
         elif row["state"] == "UNVERIFIABLE":
             print(f"  abstain {row['pid']}: {row['reason']} — {row['binding_detail']}")
     print("declared blind spots: a `pi` whose session file cannot be bound (print-mode/task "
-          "child, or a resumed session keeping its original name-stamp), a same-fence start "
+          "child, or a resumed session keeping its original name-stamp), a `pi` that SWITCHED "
+          "session (`/new`, `/fork`, `/clone` — the abandoned file keeps the start stamp, so the "
+          "fence binds the DEAD transcript and the row can read PARKED-REAPABLE for a lane still "
+          "writing; #2475), a same-fence start "
           "in the same cwd, another uid's processes, a box where the cmux store is unreadable "
           "(every row that REACHES the canon abstains as `store-unreadable`; a row under a "
           "terminal/login-shell ancestor is `KEEP-HUMAN` from gate 2 before the canon VERDICT is "
           "consulted (the canon is still read; gate 2 supersedes its answer)), "
+          "an interactive host missing from the HUMAN allowlist (a VS Code `Code Helper` cannot "
+          "be matched at all — `ps -Ao comm=` is space-split — so such a session is caught only "
+          "through a shell/terminal ancestor, or not at all), "
           "memory/fd pressure. A row the census cannot decide is UNVERIFIABLE above; a blind "
           "spot is NOT uniformly an abstention — a skipped cwd filter can still bind, speak and "
           "score LIVE, and a store-unreadable row under a terminal ancestor is KEEP-HUMAN.")

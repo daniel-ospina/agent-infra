@@ -195,7 +195,11 @@ off gate 1 (the CPU delta). That asymmetry is deliberate, not a gap: `PARKED-REA
 reachable by a row that HAS a transcript (the abstention on a missing one sits on the same path),
 so nothing is reaped either way, and collapsing a busy unbound lane into an abstention would
 destroy the census's one diagnostic job — telling progress from parked. The guarantee is the
-abstention on the PARKED row, not a promise that an unbound row can never read `LIVE`. On a box
+abstention on the PARKED row, not a promise that an unbound row can never read `LIVE`. A **second**
+declared blind spot is the SWITCHED session (`/new`, `/fork`, `/clone`): pi writes a fresh stamped
+file and leaves the abandoned one behind, so the fence binds the dead transcript and the row can
+read `PARKED-REAPABLE` for a lane that was writing seconds ago — masked to `UNVERIFIABLE` under the
+shipped host decision, and a wrong kill only where that decision is reopened (#2475). On a box
 where the hook store is unreadable every
 row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
 the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
@@ -450,7 +454,12 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 24 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
+python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
+
+The last suite is also the only place the fence default is pinned against
+`scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
+it leaves that divergence unpinned.
 
 ---
 
