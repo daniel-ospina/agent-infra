@@ -89,6 +89,11 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP   # the EXIT trap then runs cleanup exactly once
+# ⛔ THE WIRING IS PINNED, NOT JUST THE PATTERN (#2381 review cycle 2, P2): the cleanup case below calls
+# `kill_fixture_listeners` DIRECTLY, so deleting `trap cleanup EXIT` left the suite green while every
+# run leaked its tree — the same "invisible regression" the case itself was added to end.
+assert_contains "$(trap -p EXIT)" "cleanup" "the EXIT trap is wired to cleanup (not merely defined)"
+assert_contains "$(trap -p TERM)" "exit 143" "a TERM unwinds through the EXIT trap instead of leaking"
 
 BIN="$T/bin"; mkdir -p "$BIN"
 export GH_LOG="$T/gh.log" CONFIG_LOG="$T/config.log"
@@ -148,7 +153,7 @@ out="$(/bin/ps "$@")" || { printf '%s\n' "$out" >&2; exit 1; }
 # listener at the symlink's PHYSICAL target.
 printf '%s\n' "$out" | while IFS= read -r line; do
   case "$line" in
-    *"${RUNNER_ROOT:?}/"*) printf '%s\n' "$line" ;;
+    *"${RUNNER_ROOT:-/tmp/actions-runner}/"*) printf '%s\n' "$line" ;;
     *"${FIXTURE_T:?}/real/"*) printf '%s\n' "$line" ;;
   esac
 done
@@ -1237,6 +1242,43 @@ assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "with no incomplete
 # the per-root process-table filter cannot make a LATER case read it as an outside listener
 pkill -f -- "$T/real/pi-runner-sym/bin/Runner.Listener" 2>/dev/null || true
 sleep 0.3
+# ⛔ AND A SYMLINK IS ONLY IN-POOL IF THE LISTING COUNTS IT (#2381 review cycle 2, P2): the slot
+#   predicate is a `.runner` marker (file OR symlink). Without it, a symlink to a live install OUTSIDE
+#   the root was reported in-pool while `slots` counted 0 — an uncounted listener reported as counted,
+#   so `add` proceeded on a box whose pool it had not measured.
+fresh_pool symmark
+mkdir -p "$T/real2/gh-runner-nomark"; cp -a "$TEMPLATE/." "$T/real2/gh-runner-nomark/"
+ln -s "$T/real2/gh-runner-nomark" "$RUNNER_ROOT/gh-runner-nomark"
+NOMARK_EXTRA="424246 $T/real2/gh-runner-nomark/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$NOMARK_EXTRA" run status --all)"
+assert_eq "$?" "2" "a symlinked target WITHOUT a .runner is not a counted slot, so the pool is incomplete (rc 2)"
+assert_contains "$out" "outside=$T/real2/gh-runner-nomark" "and it is reported outside rather than silently counted"
+: >"$RUNNER_ROOT/gh-runner-nomark/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$NOMARK_EXTRA" run status --all)"
+assert_eq "$?" "0" "with the marker present it IS the counted slot (rc 0, the other direction)"
+pkill -f -- "$T/real2/gh-runner-nomark/bin/Runner.Listener" 2>/dev/null || true
+
+# ⛔ A PATH THAT TRAVERSES THROUGH THE ROOT IS STILL OUTSIDE IT (#2381 review cycle 2, P1): matching
+#   `<root>/../out/gh-runner-1` as a STRING against `"$root"/*` swallowed a listener that `cd -P` puts
+#   physically outside — the uncounted listener this arm exists to report, which `listener_pid` also
+#   could not match, so `restart` double-started it.
+fresh_pool dotdot
+DOTOUT="$T/outdot/gh-runner-dot"
+mkdir -p "$DOTOUT/bin"; cp -a "$TEMPLATE/bin/Runner.Listener" "$DOTOUT/bin/"; : >"$DOTOUT/.runner"
+DOT_EXTRA="424249 $RUNNER_ROOT/../outdot/gh-runner-dot/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$DOT_EXTRA" run status --all)"
+assert_eq "$?" "2" "a listener whose argv traverses THROUGH the root is outside it (rc 2, not a clean pool)"
+assert_contains "$out" "outside=$DOTOUT" "and the PHYSICAL dir is what it names"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$DOT_EXTRA" rc_of add --name pi-runner-dot)" "2" \
+  "so add refuses instead of registering onto an uncounted listener"
+pkill -f -- "$DOTOUT/bin/Runner.Listener" 2>/dev/null || true
+
+# ⛔ A ROOT OF `/` IS NOT A POOL ROOT (#2381 review cycle 2, P2): every listener is "inside" it while
+#   the listing can only count `/*/.runner`, so the completeness gate went vacuous — `slots=0` and
+#   `add` never refused. It refuses with its own reason instead.
+out="$(RUNNER_ROOT=/ FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "2" "RUNNER_ROOT=/ is cannot-measure (rc 2), never a vacuous 'complete pool'"
+assert_contains "$out" "cannot-measure why=pool-root-is-filesystem-root" "and it names why the root cannot be a pool"
 
 # ⛔ A POOL THAT EXISTS BUT CANNOT BE LISTED IS NOT AN EMPTY POOL, and this is the direction that
 #   SPENDS capacity: the ceiling is COUNTED FROM this listing, so a listing failure read as 0 lets
@@ -1457,6 +1499,24 @@ kill_fixture_listeners
 sleep 0.3
 assert_eq "$(pgrep -f -- "$T/.*bin/Runner\.Listener" 2>/dev/null | wc -l | tr -d ' ')" "0" \
   "cleanup's pattern kills every fixture listener shape (the leak fix is LIVE, not decorative)"
+# ⛔ AND THE TREE IS REMOVED BY THE TRAP ITSELF, IN A CHILD THAT EXITS (#2381 review cycle 2, P2): the
+# case above calls the kill function directly, so a deleted `trap cleanup EXIT` still passed while every
+# run leaked `/tmp/ci-runner-pool-test.*` — no reaper covers that prefix. `trap -p` pins the wiring at
+# the top; this pins the EFFECT.
+CHILD_T="$T/trap-child"; mkdir -p "$CHILD_T/x"
+bash -c 'T=$1; cleanup() { rm -rf "$T"; }; trap cleanup EXIT; exit 0' _ "$CHILD_T" >/dev/null 2>&1
+assert_absent "$CHILD_T" "the EXIT trap removes the temp dir on a normal exit (no leaked tree)"
+
+# ⛔ TWO OUTSIDE DIRS ARE ONE COMMA-SEPARATED FIELD (#2381 review cycle 2, P2): the `outside=` field is
+# machine-readable, and the old `tr '\n' ' '` left two dirs an unquoted space-separated list. Every
+# other assertion uses ONE dir, so reverting `join_lines` stayed green.
+fresh_pool twoout
+D1="$T/elsewhere-a/pi-runner-oa"; D2="$T/elsewhere-b/pi-runner-ob"
+mkdir -p "$D1/bin" "$D2/bin"; cp -a "$TEMPLATE/bin/Runner.Listener" "$D1/bin/"; cp -a "$TEMPLATE/bin/Runner.Listener" "$D2/bin/"
+TWO_EXTRA="424247 $D1/bin/Runner.Listener run"$'\n'"424248 $D2/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$TWO_EXTRA" run status --all)"
+assert_eq "$?" "2" "two outside listeners make the pool incomplete (rc 2)"
+assert_contains "$out" "outside=$D1,$D2 — " "the field is ONE comma-separated list, not a space-separated pair"
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then

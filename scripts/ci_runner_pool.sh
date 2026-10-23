@@ -381,6 +381,13 @@ outside_listener_dirs() {
   root="$(cd "$RUNNER_ROOT" 2>/dev/null && pwd -P)" || root="$RUNNER_ROOT"
   root="${root%/}"; [ -n "$root" ] || root="/"
   lroot="${RUNNER_ROOT%/}"; [ -n "$lroot" ] || lroot="/"
+  # ⛔ `/` IS NOT A POOL ROOT, AND TREATING IT AS ONE MADE THIS GATE VACUOUS (#2381 review cycle 2,
+  # P2): every listener on the box is "inside" it, while the listing can only count `/*/.runner` — a
+  # runner at `/opt/gh-runner-1` is depth 2, so `slots` read 0 and `add` never refused. The arm that
+  # refuses everything is the safe direction and it names why.
+  if [ "$root" = "/" ] && [ "$lroot" = "/" ]; then
+    err "cannot-measure why=pool-root-is-filesystem-root (RUNNER_ROOT=/ contains every listener while the listing can only count /*/.runner) — set it to the directory that CONTAINS the instance dirs"; return 2
+  fi
   while read -r pid args; do
     [ -n "${pid:-}" ] || continue
     # Same invocation anchor as `listener_pid`: the ` run` after the binary is what separates a
@@ -397,36 +404,66 @@ outside_listener_dirs() {
     # `bash <dir>/bin/…` all carry a wrapper in front. ⚠️ One token at a time, because an INSTANCE DIR
     # MAY CONTAIN A SPACE (measured: the suite's own `bad name` fixture) — splitting on the last space
     # tore `…/bad name` into `name` and dropped a LIVE listener out of the pool.
-    while [ -n "$dir" ] && [ "${dir#/}" = "$dir" ] && [ "$dir" != "${dir#* }" ]; do dir="${dir#* }"; done
+    # ⚠️ AND AN ABSOLUTE WRAPPER IS STILL A WRAPPER (#2381 review cycle 2, P2): stopping at the first
+    # token that starts with `/` made `/usr/bin/env FOO=1 <dir>/…` report `outside=/usr/bin/env FOO=1
+    # <dir>` — a value that is not a path, so the documented remedy could never clear it. Strip while
+    # the remainder is not an existing DIRECTORY; a LIVE listener's instance dir exists by definition.
+    while [ -n "$dir" ] && [ ! -d "$dir" ] && [ "$dir" != "${dir#* }" ]; do dir="${dir#* }"; done
     case "$dir" in
-      # ⛔ A RELATIVE INSTANCE DIR IS cannot-measure, NEVER "not an instance": GitHub's own `run.sh`
-      # starts `./bin/Runner.Listener`, and a relative dir cannot be judged inside or outside without
-      # the process's cwd — so dropping it is how an outside listener gets past the arm that exists to
-      # catch exactly that.
+      # ⛔ A RELATIVE OR UNNAMEABLE INSTANCE DIR IS cannot-measure, NEVER "not an instance": GitHub's own
+      # `run.sh` starts `./bin/Runner.Listener`, and a relative dir cannot be judged inside or outside
+      # without the process's cwd — so dropping it is how an outside listener gets past the arm that
+      # exists to catch exactly that.
       /*) ;;
-      *) err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir is not an absolute path, so it cannot be judged against RUNNER_ROOT)"; return 2 ;;
+      *) err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir could not be resolved to an absolute path, so it cannot be judged against RUNNER_ROOT)"; return 2 ;;
     esac
+    # ⛔ A DIR THAT NO LONGER EXISTS IS JUDGED BY ITS PATH, NOT REFUSED OUTRIGHT: the suite — and a real
+    # box — carries LIVE listeners whose instance dir was deleted underneath them (that is the leak this
+    # file's cleanup exists for). If the path is under the root it is still this pool's listener and
+    # nothing is incomplete; if it is NOT, the value may be a wrapper prefix rather than a path, and it
+    # is then cannot-measure (`instance-dir-unnameable`) instead of a fake `outside=` value an operator
+    # could never act on (#2381 review cycle 2, P2).
+    if [ ! -d "$dir" ]; then
+      case "$dir" in
+        "$root"/*|"$lroot"/*|"$root"|"$lroot") continue ;;
+      esac
+      err "cannot-measure why=instance-dir-unnameable argv=$args (the instance dir no longer exists and no wrapper-free prefix of that argv is a directory, so it cannot be named)"; return 2
+    fi
     dir="${dir%/}"
-    # INSIDE = under the LITERAL or the PHYSICAL root (`/` contains every absolute path).
+    # ⛔ DECIDE ON THE PHYSICAL FORM, NOT ON A STRING PREFIX (#2381 review cycle 2, P1). The literal
+    # test used to run FIRST, so `<root>/../out/gh-runner-1` matched `"$root"/*` as a STRING and was
+    # swallowed as in-pool while it is physically outside — the exact uncounted listener this arm
+    # exists to report, and `listener_pid` could not match it either, so `restart` double-started it.
+    # `cd … && pwd -P` is what answers "where does this actually live"; the literal comparison is the
+    # fallback ONLY when the dir cannot be resolved at all.
+    pdir="$(cd "$dir" 2>/dev/null && pwd -P)" || pdir=""
     for cand in "$root" "$lroot"; do
       [ -n "$cand" ] || continue
-      [ "$cand" = "/" ] && continue 2
-      case "$dir" in "$cand"/*) continue 2 ;; esac
+      if [ -n "$pdir" ]; then
+        case "$pdir" in "$cand"/*) continue 2 ;; esac
+      else
+        case "$dir" in "$cand"/*) continue 2 ;; esac
+      fi
     done
-    pdir="$(cd "$dir" 2>/dev/null && pwd -P)" || pdir="$dir"
     for cand in "$root" "$lroot"; do
       [ -n "$cand" ] || continue
-      [ "$cand" = "/" ] && continue 2
-      case "$pdir" in "$cand"/*) continue 2 ;; esac
       # ⛔ A SYMLINKED INSTANCE INSIDE THE ROOT IS IN THE POOL (#2381 review round 6, P1): `run.sh`
       # resolves its own dir with `cd -P`, so argv carries the TARGET and the dir is not literally
       # under the root — while `registered_dirs` counts `$RUNNER_ROOT/$(basename)` as a slot and
       # `listener_pid` reads it LIVE. Reporting it outside refused `add` and `reconcile` on a box whose
-      # only defect was a hand-made symlink, and printed a report that contradicted its own rows.
+      # only defect was a hand-made symlink.
+      # ⚠️ AND IT IS ONLY IN THE POOL IF THE LISTING COUNTS IT (#2381 review cycle 2, P2): the arm is
+      # admitted on the SAME predicate `registered_dirs` uses (a `.runner` marker, file or symlink).
+      # Without it a symlink to a live install outside the root was reported in-pool while `slots`
+      # counted 0 — an uncounted listener reported as counted, so `add` proceeded.
       one="$cand/$(basename "$dir")"
-      if [ -d "$one" ] && [ "$(cd "$one" 2>/dev/null && pwd -P)" = "$pdir" ]; then continue 2; fi
+      if [ -n "$pdir" ] && [ -d "$one" ] \
+         && { [ -e "$one/.runner" ] || [ -L "$one/.runner" ]; } \
+         && [ "$(cd "$one" 2>/dev/null && pwd -P)" = "$pdir" ]; then continue 2; fi
     done
-    printf '%s\n' "$dir"
+    # Name the PHYSICAL dir when it resolves, so `outside=` is a path an operator can cd into (a literal
+    # `<root>/../out/x` names the same install the long way round).
+    printf '%s\n' "${pdir:-$dir}"
   done <<<"$out"
   return 0
 }
@@ -820,7 +857,7 @@ cmd_reconcile() {
     # The REASON was already named by `registered_dirs` (runner-root-unreadable /
     # runner-root-not-a-directory), so this line does not invent one — and the pass still publishes its
     # machine-readable summary, as every other cannot-measure exit of this verb does.
-    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=unmeasured ceiling=%s mem_available=unmeasured floor=%s MB dry_run=%s\n' \
+    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=unmeasured ceiling=%s mem_available=unmeasured floor=%s MB dry_run=%s pool_read=process-table-live-only\n' \
       "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${CEILING:-unmeasured}" "${MEM_FLOOR_MB:-unset}" "$DRY"
     err "cannot-act (the restart arm could not enumerate the pool; the reason is the line above the summary)"
     return 2
@@ -888,7 +925,7 @@ cmd_reconcile() {
   if ! readings; then
     cannot=$((cannot + 1))
     slots >/dev/null 2>&1 || SLOTS="unmeasured"
-    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=unmeasured mem_available=unmeasured floor=%s MB dry_run=%s\n' \
+    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=unmeasured mem_available=unmeasured floor=%s MB dry_run=%s pool_read=process-table-live-only\n' \
       "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "${MEM_FLOOR_MB:-unset}" "$DRY"
     err "cannot-measure why=capacity-readings-unavailable (the restart arm already ran; nothing was ADDED) — fix the reading, then re-run"
     return 2
@@ -974,7 +1011,7 @@ cmd_reconcile() {
   if ! slots; then
     cannot=$((cannot + 1))
   fi
-  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
+  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s pool_read=process-table-live-only\n' \
     "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
   # ⛔ A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS. Exit 5 is per-NAME (that is the whole point:
   # one taken name must not end the pass), so on its own it cannot report a box that could not register

@@ -223,13 +223,14 @@ above) and the same box reports its real slots and can restart its real registra
   names that limitation instead of asserting the registration does not exist. That is the one class
   this read cannot close, and it is why the parents should be **consolidated under one directory**:
   pointing the root at `/opt` on a box that also keeps an install under `/tmp` strands the other one,
-  and the refusal names the dirs it found rather than guessing which parent was meant. A listener
-  started through a wrapper (`nohup`, `env K=V`, `bash`, a service shim) is still read as a listener,
-  and a **symlinked** instance inside the root is still in-pool: `run.sh` resolves its own dir with
-  `cd -P`, so argv carries the target, while the listing counts the name. ⚠️ **The reading is the process table, so it only holds LIVE
-listeners**: a registration under another parent whose listener is DEAD is not enumerable at all —
-which is why `status` prints `pool_read=process-table-live-only` beside its count and `restart` names
-that limitation instead of asserting absence. Consolidating the parents is the real fix.
+  and the refusal names the dirs it found rather than guessing which parent was meant.
+  Two shapes are still in-pool: a listener started through a **wrapper** (`nohup`, `env K=V`, `bash`, a
+  service shim — the instance dir is the argv token that carries the binary), and a **symlinked**
+  instance whose target lives elsewhere, but only when the listing itself counts that slot (a `.runner`
+  marker) and `$RUNNER_ROOT/$(basename)` resolves to the same physical dir — `run.sh` resolves its own
+  dir with `cd -P`, so argv carries the target. A root of `/` is refused
+  (`pool-root-is-filesystem-root`): it contains every listener while the listing can only count
+  `/*/.runner`, so the completeness gate would be vacuous.
 - **Liveness is the process table, not a pid file.** A pid file records a past state and is never
   revalidated; a recycled pid reads "live" forever, and on a box without `/proc` it cannot be
   revalidated at all. The runner's argv (`<dir>/bin/Runner.Listener run`) cannot go stale, and it is
