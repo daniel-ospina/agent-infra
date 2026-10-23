@@ -175,7 +175,17 @@ elif mode == "checks":
     deduped = []
     for _k, items in groups.items():
         if len(items) > 1 and all(x.get("startedAt") for x in items):
-            deduped.append(max(items, key=lambda x: x["startedAt"]))
+            newest = max(items, key=lambda x: x["startedAt"])
+            # ⛔ SAME SECOND IS NOT A RULING. `startedAt` has one-second resolution, and `max()` returns
+            # the FIRST maximal element — so a red and a green attempt started in the same second
+            # resolved by list order (measured: [success,failure] merged, [failure,success] did not).
+            # On a tie, PREFER THE NON-GREEN ROW: the safe direction is "still red".
+            tied = [x for x in items if x["startedAt"] == newest["startedAt"]]
+            if len(tied) > 1:
+                bad = [x for x in tied if (x.get("state") or "").strip().lower() not in green_ok | pending]
+                deduped.append(bad[0] if bad else newest)
+            else:
+                deduped.append(newest)
         else:
             deduped.extend(items)
     for c in deduped:
@@ -358,8 +368,8 @@ def ts(s):
 try:
     base_dt = ts(base_iso)
 except Exception:
-    print("FATAL\tbase tip committer date is unreadable — NOTHING is selected (a step with no\n"
-          "\tclock cannot decide what is stale, and guessing 'everything' would re-run the fleet)")
+    print("FATAL\tbase tip committer date is unreadable — NOTHING is selected (a step with no "
+          "clock cannot decide what is stale, and guessing everything would re-run the fleet)")
     raise SystemExit(0)
 
 # The board the LANDER read is the only set this step may act on. A PR the lander did not see is
@@ -563,7 +573,10 @@ lander_stale_rerun() { # <board-numbers-file>  (one PR number per line, from the
   #      waiting for an EOF that never comes (measured: the step hung and the run had to be killed).
   # An explicit file is bounded in both directions, and its absence is a named refusal.
   local tmp boardf="${1:-}"
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/lander-stale.XXXXXX")" || return 0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/lander-stale.XXXXXX")" || {
+    say "stale-rerun: no scratch directory (mktemp failed under ${TMPDIR:-/tmp}) — 0 re-runs this run"
+    return 0
+  }
   if [ -z "$boardf" ] || [ ! -r "$boardf" ]; then
     say "stale-rerun: no readable board file was passed — 0 re-runs this run (nothing may be acted on that this run did not see)"
     rm -rf "$tmp"; return 0
@@ -578,7 +591,12 @@ lander_stale_rerun() { # <board-numbers-file>  (one PR number per line, from the
   # comparison error out and left `n` at the budget-derived value — the guard was inert for the one
   # case it exists for (measured: n=880 survived `[ 880 -gt 10O ]`). Out-of-range values are CLAMPED
   # to the documented bounds, never honoured and never silently ignored.
+  # ⛔ LENGTH IS CHECKED BEFORE THE COMPARISON: bash arithmetic ERRORS on an overflowed integer, and
+  # without `set -e` the `&&` merely short-circuits, so `STALE_RERUN_CAP=9999…` (a plausible fat-finger)
+  # left the cap astronomic and N came straight from the bucket — 900 POSTs against the ONE shared
+  # 5000/hr pool. A 4+-digit cap is not a value this step has any use for, so it is clamped, not run.
   case "${STALE_RERUN_CAP:-}" in ''|*[!0-9]*) STALE_RERUN_CAP=8 ;; esac
+  [ "${#STALE_RERUN_CAP}" -gt 2 ] && STALE_RERUN_CAP=50
   [ "$STALE_RERUN_CAP" -gt 50 ] && STALE_RERUN_CAP=50
   case "${STALE_RERUN_RESERVE:-}" in ''|*[!0-9]*) STALE_RERUN_RESERVE=500 ;; esac
   case "${STALE_RERUN_WINDOW:-}" in ''|*[!0-9]*) STALE_RERUN_WINDOW=10800 ;; esac
@@ -653,8 +671,14 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
   # `stale-by-base=0` — a silent zero, which hard rule 4 forbids (measured by the reviewer: one
   # unparseable `startedAt` produced `stale-by-base=0 … outcomes read=1`).
   if ! grep -q "^INFO$(printf '\037')" "$tmp/plan.us" 2>/dev/null; then
-    local why="the planner printed nothing explanatory"
-    [ -s "$tmp/plan.err" ] && why="$(tr '\n' ' ' <"$tmp/plan.err" | cut -c1-300)"
+    # ⛔ THE REASON IS ON STDOUT (`plan.txt`), NOT `plan.err`: every planner refusal is a FATAL line.
+    # Reading plan.err here reported "printed nothing explanatory" for EVERY refusal and made the
+    # FATAL dispatch arm below dead code, so an operator saw a truncated-surface guard fire and was
+    # told nothing (measured by the reviewer against three different refused reads).
+    local why
+    why="$(grep -m1 "^FATAL$(printf '\037')" "$tmp/plan.us" 2>/dev/null | cut -d"$(printf '\037')" -f2-)"
+    [ -n "$why" ] || why="$(tr '\n' ' ' <"$tmp/plan.err" 2>/dev/null | cut -c1-300)"
+    [ -n "$why" ] || why="the planner printed nothing explanatory"
     say "stale-rerun: the plan did not complete (no INFO line) — 0 re-runs this run: $why"
     rm -rf "$tmp"; return 0
   fi
@@ -689,21 +713,21 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     # inherits the deferral instead of pretending it was re-run.
     case "$okruns" in
       *" $b "*)
-        if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$g" "$h" >> "$STALE_RERUN_STATE"; then
+        if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$f" "$g" >> "$STALE_RERUN_STATE"; then
           say "stale-rerun: #$a $c is re-run by the SAME run $b already POSTed in this pass (check $d) — recorded so its outcome is read, not POSTed twice"
         else
           say "stale-rerun: #$a $c shares run $b (already POSTed) but the STATE FILE COULD NOT BE WRITTEN — its outcome will not be read"
         fi
         continue ;;
     esac
-    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$g" "$h" >> "$STALE_RERUN_STATE"; continue ;; esac
+    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE"; continue ;; esac
     if [ "$DRY" = 1 ]; then
       say "stale-rerun: #$a $c WOULD RE-RUN (check id $d started $e — before the base tip $base_iso; run $b)"
       continue
     fi
     if GH_LIMIT_NO_WAIT=1 gh api -X POST "repos/$OR/actions/runs/$b/rerun-failed-jobs" >/dev/null 2>"$tmp/post.err"; then
       re_ran=$((re_ran+1)); okruns="$okruns$b "
-      if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$g" "$h" >> "$STALE_RERUN_STATE"; then
+      if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$f" "$g" >> "$STALE_RERUN_STATE"; then
         say "stale-rerun: #$a $c RE-RUN (run $b, check $d started $e < base tip $base_iso) — the result is read next pass, as success or still-red"
       else
         say "stale-rerun: #$a $c was RE-RUN (run $b) but the STATE FILE COULD NOT BE WRITTEN ($STALE_RERUN_STATE) — its outcome will not be read, and the same run may be re-run again next pass"
@@ -715,7 +739,7 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
       # the next pass does not pay another POST to learn the same thing; it is never resolved into
       # an outcome, because nothing ran.
       badruns="$badruns$b "
-      printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$g" "$h" >> "$STALE_RERUN_STATE"
+      printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$f" "$g" >> "$STALE_RERUN_STATE"
       say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
     fi
   done <"$tmp/plan.us"

@@ -150,6 +150,10 @@ PY
 }
 
 rerun_calls() { cat "$STUB_CALLS.rerun" 2>/dev/null | awk 'NF{print}' | tr '\n' ' '; }
+# ⛔ COUNT THE FILE, NEVER THE JOINED STRING. `rerun_calls` collapses newlines to spaces, so
+# `grep -c` on IT always returns 1 and the two "exactly ONE POST" arms could not fail (measured by a
+# reviewer: the per-run dedupe removed, two POSTs in the log, the arm still said 1).
+post_count() { grep -c 'rerun-failed-jobs' "$STUB_CALLS.rerun" 2>/dev/null || true; }
 state_file() { printf '%s/state/stale-rerun-stub-repo.tsv' "$O"; }
 
 # seed <n> <mergeable> <mstate> <draft> <head> — one PR in the candidate list
@@ -371,7 +375,7 @@ has "$OUT" "#111 sigpipe-grep RE-RUN (run 5001, check 1001 started 2026-10-23T01
 grep -q "^R" "$(state_file)" 2>/dev/null \
   && ok "STALE: the re-run was recorded in the state file (so its outcome is read on a later pass)" \
   || bad "STALE: nothing was recorded in $(state_file)"
-n_posts="$(printf '%s\n' "$(rerun_calls)" | grep -c 'rerun-failed-jobs')"
+n_posts="$(post_count)"
 [ "$n_posts" = "1" ] && ok "STALE: exactly ONE POST for the run — the green sibling was not re-run by name" \
                      || bad "STALE: expected exactly 1 POST, got $n_posts ('$(rerun_calls)')"
 
@@ -557,7 +561,7 @@ checks 123 sigpipe-grep:failure bash-suites:failure
 surface 123 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|6010|1110" \
             "bash-suites|FAILURE|2026-10-23T01:00:01Z|6010|1111"
 run_lander
-n_posts="$(printf '%s\n' "$(rerun_calls)" | grep -c 'rerun-failed-jobs')"
+n_posts="$(post_count)"
 [ "$n_posts" = "1" ] && ok "RUN-SCOPE: two stale checks sharing run 6010 produced exactly ONE POST" \
                      || bad "RUN-SCOPE: expected 1 POST for run 6010, got $n_posts ('$(rerun_calls)')"
 has "$OUT" "#123 bash-suites is re-run by the SAME run 6010 already POSTed in this pass (check 1111)" \
@@ -565,6 +569,35 @@ has "$OUT" "#123 bash-suites is re-run by the SAME run 6010 already POSTed in th
   || bad "RUN-SCOPE: the second stale check vanished from the report ($(printf '%s\n' "$OUT" | grep 'stale-rerun: #123'))"
 [ "$(grep -c '^R' "$(state_file)")" = "2" ] && ok "RUN-SCOPE: both checks got their own R record, so BOTH outcomes are read later" \
                                            || bad "RUN-SCOPE: expected 2 R records (one per check), got $(grep -c '^R' "$(state_file)")"
+say_case "case 23 — TWO PASSES: the R record a pass WRITES is the one the next pass READS (writer->reader)"
+# ⛔ THIS IS THE ARM THAT WAS MISSING. Every other arm seeds the state by hand, so an off-by-one field
+# mapping in the WRITER (app and workflow in the wrong slots) made the reader miss its key and NO
+# outcome was ever produced — while the whole suite stayed green. Pass 1 runs for real; pass 2 must
+# read pass 1's own record and report the new attempt.
+new_case
+base_tip "$BASE_ISO"
+seed 124 MERGEABLE CLEAN false aaaa9999000011112222333344445555666677778
+checks 124 sigpipe-grep:failure
+surface 124 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|6020|3001"
+run_lander
+has "$(rerun_calls)" "actions/runs/6020/rerun-failed-jobs" \
+  && ok "2-PASS: pass 1 issued the POST" || bad "2-PASS: pass 1 did not POST ('$(rerun_calls)')"
+grep -q '^R' "$(state_file)" 2>/dev/null && ok "2-PASS: pass 1 wrote an R record" \
+                                        || bad "2-PASS: pass 1 wrote no R record"
+# The re-run produces a NEW attempt with a NEW check-run id and a NEWER startedAt; the old one stays.
+surface 124 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|6020|3001" \
+            "sigpipe-grep|SUCCESS|2026-10-23T14:30:00Z|6020|4001"
+: >"$STUB_CALLS.rerun"
+run_lander
+has "$OUT" "#124 sigpipe-grep is now SUCCESS (check 4001, replacing 3001)" \
+  && ok "2-PASS: pass 2 READ pass 1's record and reported the outcome against the new attempt" \
+  || bad "2-PASS: pass 2 produced no outcome from pass 1's record — the writer and the reader disagree ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -3))"
+grep -q '^O.*success' "$(state_file)" 2>/dev/null && ok "2-PASS: the resolved record was folded into an O row" \
+                                                || bad "2-PASS: no O row ($(cat "$(state_file)" 2>/dev/null | tr '\n' ' '))"
+grep -q '^R' "$(state_file)" 2>/dev/null && bad "2-PASS: the resolved R row was not consumed (it will be re-reported forever)" \
+                                        || ok "2-PASS: the resolved R row was consumed"
+[ "$(post_count)" = "0" ] && ok "2-PASS: pass 2 issued no POST (the new attempt measures the tree)" \
+                          || bad "2-PASS: pass 2 re-ran a run it had already re-run ('$(rerun_calls)')"
 # ══ summary ═════════════════════════════════════════════════════════════════════════════════
 printf '\n%s of %s assertions passed, %s failed\n' "$PASS" "$((PASS+FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
