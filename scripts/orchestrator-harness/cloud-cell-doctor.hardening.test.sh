@@ -966,6 +966,15 @@ result_has "NEVER RAN" && ok "status: names the roles that never ran" || bad "st
 # writes only `loop.pid` is not "a live loop" to the shipped code: it is a dead one. This writes both
 # halves in the shipped format: `pid|<identity>`, where the identity is `/proc` start time where the
 # kernel offers one and `lstart` otherwise.
+# ⛔ THE FIXTURE WRITES THE TRANSCRIPT THE REAL LOOP WRITES (P1, fresh review of #2335). The sibling
+# suite got this fix; this one did not, so its "freshly started loop" arm wrote `loop.started = now`
+# while `$T/o/logs/doctor.log` still carried the PREVIOUS arm's mtime — and whenever that write fell
+# in an earlier second, `loop_transcript_fresh` vetoed (`m < st`) and the arm went UNKNOWN. Measured:
+# 1 natural hit in 6 runs, 100% with a 2 s gap. Call it AFTER writing loop.started.
+loop_transcript() { # <pid>
+  mkdir -p "$T/o/logs"
+  printf '%s  loop started pid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$T/o/logs/doctor.log"
+}
 write_loop_alive() { # <pid>
   printf '%s\n' "$1" > "$T/o/state/roles/loop.pid"
   local ident
@@ -979,6 +988,7 @@ write_loop_alive() { # <pid>
 
 write_loop_alive "$GRACE_PID"
 printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+loop_transcript "$GRACE_PID"
 doc status
 kill "$GRACE_PID" 2>/dev/null || true
 [ "$RC" -eq 0 ] && result_has "WAITING" \

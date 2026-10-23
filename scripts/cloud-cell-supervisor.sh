@@ -2372,9 +2372,16 @@ doctor_path() {
   # seed is incomplete, a supervisor copied out of the harness) the doctor is still ON the box, in
   # `$HARNESS/scripts/orchestrator-harness/` — and looking only at the other three made a PRESENT
   # doctor read as "not shipped".
+  # ⛔ AND THE HARNESS ENTRY ONLY WHEN HARNESS IS SET (#2306 review P2): `HARNESS` is optional
+  # (`HARNESS="${HARNESS:-}"`, :140), so an unset one expanded to the ABSOLUTE
+  # `/scripts/orchestrator-harness/cloud-cell-doctor.sh` — a root-level path this cell would then
+  # EXECUTE as its doctor (`run_role` -> `bash "$d"`), and which the "looked in" message advertised
+  # as a legitimate location.
   for c in "$O/cloud-cell-doctor.sh" "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
-           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh" \
-           "${HARNESS:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh"; do
+           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  for c in ${HARNESS:+"$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh"}; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2386,11 +2393,15 @@ doctor_paths_searched() {
   # ⛔ THE SAME EXPRESSION the lookup evaluates, so the printed path is one the lookup actually tried
   # (a message that renders `"<HARNESS unset>/…"` while the probe used `/scripts/…` names a location
   # nobody consulted).
-  printf '%s\n' "$O/cloud-cell-doctor.sh" \
-    "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
-    "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh" \
-    "${HARNESS:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh" | tr '\n' ' '
-  [ -n "${HARNESS:-}" ] || printf '(! HARNESS is UNSET, so the last entry was /scripts/orchestrator-harness/cloud-cell-doctor.sh) '
+  # ⛔ THE HARNESS ENTRY IS OMITTED WHEN HARNESS IS UNSET, matching doctor_path exactly (P2, fresh
+  # review): printing a location the lookup never consulted — or an absolute `/scripts/…` that an
+  # unset HARNESS would produce — is a message that lies about what was searched.
+  {
+    printf '%s\n' "$O/cloud-cell-doctor.sh" \
+      "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
+      "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"
+    [ -n "${HARNESS:-}" ] && printf '%s\n' "$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+  } | tr '\n' ' '
 }
 
 # One role pass, in this cell's own environment. `doctor` and `merge` resolve the queue target first

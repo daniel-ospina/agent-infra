@@ -586,8 +586,43 @@ doc status
 [ "$RC" -eq 0 ] && ok "status: a stopped cell does not fail (stop must stay successful)" \
   || bad "status: rc=$RC on a not-started cell — $OUT"
 result_has "STOPPED" && ok "status: names the not-started state" || bad "status: STOPPED not printed — $OUT"
+# ⛔ THE ROWS, not just the headline (P2, fresh review): `result_has "STOPPED"` was satisfied by
+# `loop: STOPPED …`, so DELETING the per-role branch left this arm green — the row shape was
+# unasserted. Pin the row itself.
+printf '%s\n' "$OUT" | grep -qE '^(reap|doctor|merge|hygiene) +STOPPED' \
+  && ok "status: every ROLE row reads STOPPED for a not-started cell" \
+  || bad "status: the role rows are not STOPPED — $OUT"
 case "$OUT" in *WAITING*) bad "status: a not-started cell prints WAITING — $OUT" ;; *) : ;; esac
 rm -f "$T/o/state/roles/loop.started" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+
+# ⛔ DEAD **WITH PASS RECORDS** — issue #2306 ask 4(a)'s exact population (P2, fresh review of
+# #2335). Every other arm uses `reset_state` (no role.state), so a regression that printed RUNNING
+# for a dead loop would have shipped undetected: mutating the DEAD arm to print RUNNING left BOTH
+# suites green. A cell with recent clean passes whose loop is GONE must read DEAD, fail, and never
+# report WAITING/RUNNING from those stale-but-recent records.
+say_case "status: a DEAD loop with RECENT clean passes still reads DEAD (#2306 ask 4a)"
+reset_state; : > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 60 & DEAD_PID=$!
+loop_up "$DEAD_PID"
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+mkdir -p "$T/o/logs"; : > "$T/o/logs/doctor.log"
+kill "$DEAD_PID" 2>/dev/null || true
+wait "$DEAD_PID" 2>/dev/null || true
+NOW="$(date +%s)"
+for r in reap doctor merge hygiene; do
+  printf 'role=%s\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=0\nlast_result=ok\n' "$r" "$NOW" \
+    > "$T/o/state/roles/$r.state"
+done
+doc status
+[ "$RC" -ne 0 ] && ok "status: a dead loop with clean records FAILS (rc=$RC)" \
+  || bad "status: rc=0 for a dead loop whose role records are recent — $OUT"
+printf '%s\n' "$OUT" | grep -qE '^(reap|doctor|merge|hygiene) +DEAD' \
+  && ok "status: every role row reads DEAD, not RUNNING/WAITING, once the loop is gone" \
+  || bad "status: a role row is not DEAD — $OUT"
+# (the headline legitimately says "NOT RUNNING" — assert the ROLE rows, not the substring)
+printf '%s\n' "$OUT" | grep -qE '^(reap|doctor|merge|hygiene) +(RUNNING|WAITING)' \
+  && bad "status: stale-but-recent records dressed a dead loop as healthy — $OUT" \
+  || ok "status: no role row reports RUNNING/WAITING for a dead loop"
 
 # A live loop pid + one recent pass per role = healthy.
 "$REAL_SLEEP" 60 & LOOP_PID=$!
