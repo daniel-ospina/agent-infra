@@ -99,20 +99,35 @@ DECLARED BLIND SPOTS (a report must say what it CANNOT see — `lane-status.py`'
   * a `pi` whose session file it cannot bind (`no-session-file`) — a `task`/print-mode child runs
     with sessions disabled, and a resumed session keeps its original stamp;
   * a `pi` started inside another's fence in the same cwd (`ambiguous-binding`);
-  * any process of another uid (refused reads abstain, never vote);
-  * a box where the cmux hook store is unreadable — then EVERY row abstains as
-    `store-unreadable`, which is the canon's own rule, not this file's choice;
+  * any process of another uid — but NOT by abstaining: `_cwd_of_pid` returns None on a refused
+    read and `bind_session` then SKIPS the cwd filter, so such a pid can still bind a
+    same-fence session file and vote on it. The skipped filter is recorded NOWHERE —
+    `binding_detail` reports only the fence/ambiguity outcome — so the row does not even show that
+    its cwd was never checked;
+  * a box where the cmux hook store is unreadable — every row that reaches the canon abstains as
+    `store-unreadable` (the canon's own rule), but a row under a terminal/login-shell ancestor is
+    decided `KEEP-HUMAN` by gate 2 BEFORE the canon VERDICT is consulted (the canon is still
+    read; gate 2 supersedes its answer) and so does not abstain. The
+    safe property (nothing reaped) holds; the count is not "every row";
   * memory pressure, fd pressure, or a live child of a parked parent it does not enumerate;
   * an interactive host missing from `HUMAN` (WezTerm/Ghostty/Zed/VS Code's `Code Helper` are
     covered, but the list is an allowlist of owners and a new host is a real gap).
-A blind spot is reported as UNVERIFIABLE with its reason; it is never silently a LIVE row.
+⛔ A blind spot is NOT uniformly an abstention. Where the census cannot decide, it is reported as
+UNVERIFIABLE with its reason. But two bullets above do not abstain: an unreadable cwd means
+`bind_session` SKIPS the filter, so the row can bind, speak, and be scored LIVE on the fence
+evidence alone (and nothing in the row shows the cwd went unchecked); and a store-unreadable row
+under a terminal ancestor is `KEEP-HUMAN` from gate 2 before the canon's verdict is consulted.
 
 USAGE
     orphan-reap.py                 # dry run (default): report every candidate + gate reading
     orphan-reap.py --pool pi       # the `pi` session pool (four states); dry run by default
     orphan-reap.py --pool all
-    orphan-reap.py --apply         # SIGTERM the ones that pass all five, then verify gone
-    orphan-reap.py --pool pi --apply   # SIGTERM only PARKED-REAPABLE, gate 2 re-checked live
+    orphan-reap.py --apply         # the ORPHAN pool: SIGTERM, then SIGKILL 3 s later, then verify
+    orphan-reap.py --pool pi --apply   # SIGTERM only PARKED-REAPABLE, gate 2 + the authorisation
+                                   # re-checked live; this pool NEVER escalates to SIGKILL, and
+                                   # exits 1 when a signalled target survives. The scoping matters:
+                                   # the unqualified `--apply` on the line above DOES SIGKILL, and
+                                   # its orphan path predates the pi pool's re-verification (#2410).
     orphan-reap.py --sample 20     # CPU sample window in seconds (default 15)
     orphan-reap.py --json          # machine-readable census
 
@@ -472,7 +487,8 @@ _CWD_CACHE: Dict[str, Optional[str]] = {}
 
 
 def _cwd_of_pid(pid: str) -> Optional[str]:
-    """One lsof read per pid, cached. A refused read is None (abstain, never a vote)."""
+    """One lsof read per pid, cached. A refused read is None — and None makes `bind_session`
+    SKIP the cwd filter, so the pid still binds by fence and still votes: not an abstention."""
     if pid in _CWD_CACHE:
         return _CWD_CACHE[pid]
     val: Optional[str] = None
@@ -780,6 +796,7 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
         cur = after.get(pid)
         path, binding, detail = bind_session(pid, r, t0, index, taken)
         tr = None
+        st = None
         if path:
             taken.add(path)
             st = _stat(path)
@@ -808,6 +825,11 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
         state, readings, reason = pi_verdict(ev, g)
         counts[state] += 1
         rows_out.append({"pid": pid, "state": state, "reason": reason, "readings": readings,
+                         # carried so APPLY can re-read the evidence that AUTHORISED this row at
+                         # signal time — identity alone is not the authorisation (review cycle 1)
+                         "transcript": path,
+                         "transcript_stat": (None if st is None else [st[0], st[1]]),
+                         "n_entries": (None if tr is None else tr.n_entries),
                          "args": r["args"][:120], "binding": binding,
                          "binding_detail": detail,
                          "ancestry": ev.ancestry[:8],
@@ -827,7 +849,9 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
                           "gates": g}, indent=2))
         # the JSON document owns stdout; the apply log goes to stderr so `--json --apply` stays
         # parseable (a documented machine-readable mode may not be destroyed by its own action)
-        return 0 if apply is False else _apply_parked(rows_out, apply, stream=sys.stderr)
+        return 0 if apply is False else _apply_parked(
+            rows_out, apply, stream=sys.stderr,
+            liv=liv, store_path=store_path, sessions_dir=sessions_dir)
 
     print(f"pool: pi · processes: {len(pi_pids)} · CPU sample window: {sample_s:.0f}s "
           f"· PARKED = delta < {TOLERANCE_S:.2f}s · fence ±{FENCE_S:g}s "
@@ -851,8 +875,12 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
     print("declared blind spots: a `pi` whose session file cannot be bound (print-mode/task "
           "child, or a resumed session keeping its original name-stamp), a same-fence start "
           "in the same cwd, another uid's processes, a box where the cmux store is unreadable "
-          "(then EVERY row abstains as `store-unreadable`), memory/fd pressure. Those rows are "
-          "UNVERIFIABLE above, never LIVE.")
+          "(every row that REACHES the canon abstains as `store-unreadable`; a row under a "
+          "terminal/login-shell ancestor is `KEEP-HUMAN` from gate 2 before the canon VERDICT is "
+          "consulted (the canon is still read; gate 2 supersedes its answer)), "
+          "memory/fd pressure. A row the census cannot decide is UNVERIFIABLE above; a blind "
+          "spot is NOT uniformly an abstention — a skipped cwd filter can still bind, speak and "
+          "score LIVE, and a store-unreadable row under a terminal ancestor is KEEP-HUMAN.")
     if not apply:
         print("dry run — nothing was signalled (--apply is a separate, reviewed step).")
         if not AUTHORISE_HOSTLESS_CHAINS:
@@ -860,7 +888,8 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
                   "reaching no recognised host app abstains, so the reapable set is EMPTY BY "
                   "DECISION. The census is the deliverable; arming it is a reopen, not a flag.")
         return 0
-    return _apply_parked(rows_out, apply)
+    return _apply_parked(rows_out, apply, liv=liv, store_path=store_path,
+                         sessions_dir=sessions_dir)
 
 
 def _stat(path: str):
@@ -871,13 +900,23 @@ def _stat(path: str):
         return None
 
 
-def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
-    """SIGTERM PARKED-REAPABLE only, re-verifying the INCARNATION and gate 2 at signal time.
+def _apply_parked(rows_out: List[dict], apply: bool, stream=None, *, liv=None,
+                  store_path: str = "", sessions_dir: str = "") -> int:
+    """SIGTERM PARKED-REAPABLE only, re-verifying the AUTHORISATION at signal time.
 
     The census's readings are stale by construction; `lane-watchdog.py`'s #1696 lesson is that a
     pid recycled inside the measurement->signal window receives a signal meant for a corpse. So
     the pid must still be the SAME `pi` (comm) and still be the SAME incarnation (its `etime`
     within the canon fence of the one the census measured) before anything is sent.
+
+    ⛔ IDENTITY IS NOT THE AUTHORISATION (review cycle 1). The census called this row
+    PARKED-REAPABLE because its transcript was STOPPED and the store record did not veto it
+    (#947). Those two readings authorise the signal and are just as stale as the identity, so
+    `_authorisation_holds` re-takes BOTH immediately before each `os.kill` — the same discipline
+    `lane-watchdog.py` applies by forking its CLI at signal time. Without it, a lane that
+    received a prompt during the census loop's forks keeps its identity and would still be
+    signalled: the in-flight turn destroyed, which is the exact outcome this pool exists to
+    avoid.
     """
     out = stream or sys.stdout
 
@@ -905,6 +944,7 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
             "against an absent reading is not a check)")
         return 2
     log(f"apply: {len(target)} PARKED-REAPABLE")
+    sent = set()          # pids actually signalled — the ONLY rows a `survived` claim may cover
     for row in target:
         pid = row["pid"]
         cur = live.get(pid)
@@ -935,8 +975,13 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
                 f"under the recorded rule (#1207 option A): report-only until that decision is "
                 f"reopened")
             continue
+        ok, why = _authorisation_holds(row, liv, store_path, sessions_dir)
+        if not ok:
+            log(f"  {pid} REFUSED: {why} — nothing done")
+            continue
         try:
             os.kill(int(pid), 15)
+            sent.add(pid)
             log(f"  SIGTERM -> {pid}")
         except ProcessLookupError:
             log(f"  {pid} already gone")
@@ -956,16 +1001,65 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
     stuck = 0
     for row in target:
         pid = row["pid"]
-        if pid in still:
+        if pid not in sent:
+            # ⛔ NOTHING WAS SIGNALLED FOR THIS ROW, so it is not a survivor. Counting its
+            # presence as `STILL ALIVE` asserted that a SIGTERM was sent and survived when the
+            # row was refused or had already vanished — a false report, and one that turned
+            # the documented "exit non-zero when a target survives" contract into an exit 1 for
+            # a target that never existed (review cycle 1).
+            log(f"  not signalled: {pid}")
+            continue
+        alive = still.get(pid)
+        if alive is not None and is_pi(alive):
             stuck += 1
             log(f"  STILL ALIVE (no SIGKILL for this pool — reporting): {pid}")
         else:
             log(f"  verified gone: {pid}")
     if stuck:
         # a caller must be able to tell "reaped the set" from "asked and nothing died"
-        log(f"apply: {stuck} of {len(target)} target(s) survived SIGTERM — reporting, not retrying")
+        log(f"apply: {stuck} of {len(sent)} signalled target(s) survived SIGTERM — "
+            f"reporting, not retrying")
         return 1
     return 0
+
+
+def _authorisation_holds(row: dict, liv, store_path: str, sessions_dir: str):
+    """Re-read AT SIGNAL TIME the two readings that made this row PARKED-REAPABLE.
+
+    Returns (True, "") or (False, <reason>). Every refusal is fail-closed: an unreadable
+    transcript, a changed transcript, a missing reader or a canon verdict that is no longer
+    `idle` all decline to signal. Refusing is the safe direction — it leaves a parked process
+    parked, which the next census re-measures; signalling on a stale reading destroys a lane.
+    """
+    path = row.get("transcript")
+    if not path:
+        return False, ("no transcript was bound at census time, so the stopped-reading that "
+                       "authorised this row cannot be re-taken")
+    now_st = _stat(path)
+    if now_st is None:
+        return False, ("the transcript re-read FAILED at signal time — an absent reading is not "
+                       "evidence that the lane is still parked")
+    was = row.get("transcript_stat")
+    if was and (now_st[0] != was[0] or now_st[1] != was[1]):
+        return False, ("the transcript CHANGED since the census — the lane consumed input in "
+                       "the measurement->signal window")
+    if liv is None:
+        return False, "no liveness reader at signal time, so the store record cannot be re-read"
+    now_ms = int(time.time() * 1000)
+    # `grew=False` is NOT an assumption that the lane is quiet: growth is detected by the stat
+    # comparison ABOVE, which returns before this line. Passing `grew=True` "to be conservative"
+    # made every row derive `running-quiet:jsonl-grew` and refuse — a guard that can never
+    # authorise is not a guard, it is an off switch (review cycle 1 caught exactly that).
+    tr = Transcript(path=path, age_s=time.time() - now_st[0], grew=False,
+                    own_gap_s=row.get("own_gap_s"), n_entries=row.get("n_entries") or 0)
+    canon = canon_verdict(liv, row["pid"], tr, now_ms, store_path=store_path,
+                          sessions_dir=sessions_dir)
+    if canon is None:
+        return False, "the canon verdict could not be re-derived at signal time"
+    state, reason = canon
+    if state != "idle":
+        return False, f"the canon verdict is no longer `idle` ({state}:{reason})"
+    return True, ""
 
 
 def _same_incarnation(row: dict, cur: dict) -> bool:

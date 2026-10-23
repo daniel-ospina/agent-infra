@@ -222,6 +222,30 @@ def case_a2(tmp) -> Box:
                store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
 
 
+def case_grew(tmp) -> Box:
+    """The SAME authorised row, but its transcript GREW between the census and the signal.
+
+    That is the lane consuming input inside the measurement->signal window: the stopped-reading
+    that made the row PARKED-REAPABLE no longer holds, so the signal must be REFUSED. The census
+    stats the transcript TWICE (pre-window ground truth, then the measurement) and both see it
+    stopped; the third read — the signal-time re-read — sees it larger.
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    box = Box(before, before, t, now - 5 * 3600,
+              store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+    mtime = os.stat(t).st_mtime
+    calls = {"n": 0}
+
+    def stat_grows_at_signal(path):
+        calls["n"] += 1
+        return (mtime, 4096 if calls["n"] <= 2 else 4608)
+
+    box.stat = stat_grows_at_signal
+    return box
+
+
 def case_b(tmp) -> Box:
     """The SAME child, but the walk reaches a login shell: a human owns it."""
     now = time.time()
@@ -354,7 +378,7 @@ def _apply_run(box, live=None, post=None):
 
 
 def apply_path() -> int:
-    """FOUR assertions on the only code in this file that can send a signal.
+    """FIVE assertions on the only code in this file that can send a signal.
 
     Every other case runs `apply=False`, so the kill path — its incarnation/recycle refusals,
     and the two guards that keep an UNREADABLE `ps` read from reading as success — had no test
@@ -392,6 +416,16 @@ def apply_path() -> int:
         check("(g4) the PRE-signal read returned nothing", rc, out, kills, 2, [],
               must=("UNVERIFIABLE — the pre-signal",),
               must_not=("verified gone: 100", "SIGTERM ->"))
+
+        # (g5) the TRANSCRIPT GREW in the measurement->signal window: the reading that authorised
+        # the row is stale, so nothing is signalled — and a refused row is NOT a survivor. This
+        # pins BOTH review-cycle-1 defects: identity-only re-verification (the kill would have
+        # been sent) and the survivor accounting (a refused pid used to print STILL ALIVE and
+        # exit 1 although no SIGTERM was ever sent to it).
+        rc, out, kills = _apply_run(case_grew(tmp))
+        check("(g5) the transcript grew before the signal", rc, out, kills, 0, [],
+              must=("REFUSED: the transcript CHANGED", "not signalled: 100"),
+              must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return fails

@@ -597,8 +597,13 @@ GH_PROBE_ERR=""
 gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
 gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
   local _s="$1"; shift
-  GH_PROBE_ERR="${TMPDIR:-/tmp}/.refresh-gh-probe.$$"
-  : > "$GH_PROBE_ERR" 2>/dev/null || GH_PROBE_ERR=/dev/null
+  # ⛔ AN UNPREDICTABLE NAME WITH O_EXCL, never `$$` in a world-writable dir. A pid-derived name is
+  # guessable by any other local user, and `: >` follows a symlink — so a peer on a shared cell
+  # could pre-create that path as a symlink and have this harness truncate an arbitrary file. The
+  # stderr this captures holds `gh`'s output (never logged, per the note above), so it must not be
+  # readable either: mktemp gives an unpredictable name and mode 0600.
+  GH_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/.refresh-gh-probe.XXXXXX" 2>/dev/null)" || GH_PROBE_ERR=/dev/null
+  [ -n "$GH_PROBE_ERR" ] || GH_PROBE_ERR=/dev/null
   if command -v perl >/dev/null 2>&1; then
     perl -e 'my $t=shift; my $pid=fork(); if(!defined $pid){ exit 125 }
              if($pid==0){ setpgrp(0,0); exec @ARGV; exit 127 }
