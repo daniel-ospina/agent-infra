@@ -178,6 +178,22 @@ scenario cmux; scenario absent; scenario darwin; scenario host
 # the scenario dir ALONE (no `:$PATH`), or the real /usr/bin/tmux a developer box carries would be
 # found and the case could never be driven.
 scenario bare; rm -f "$TMP/bin-bare/tmux"
+# A box whose `gh` cannot answer (absent, or a broken install): `scenario` copies the cmux/tmux/uname
+# stubs so only `gh` differs. The credential-contract pins below need it — a hosts.yml credit is only
+# usable if the worker's OWN `gh` can read the store, and that is the arm a session-start cannot see.
+scenario nogh
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin-nogh/gh"; chmod +x "$TMP/bin-nogh/gh"
+# …and the positive control: a `gh` that ANSWERS a token (offline — this suite makes no network call),
+# so the refusal below is a real probe of the environment, not a blanket ban on a store credit.
+scenario ghtok
+printf '#!/usr/bin/env bash\nprintf %%s\\n gho_stubtoken\n' > "$TMP/bin-ghtok/gh"; chmod +x "$TMP/bin-ghtok/gh"
+# A box with NO `gh` AT ALL — the grader is driven with `PATH` set to this dir ALONE, because a
+# `:$PATH` suffix would find the real /usr/bin/gh and the arm could never be reached. Only the
+# utilities the prefix itself calls are linked in, so "no gh" means no gh.
+scenario storenogh
+for _u in bash env grep mkdir date rm sed cat; do
+  _p="$(command -v "$_u" 2>/dev/null)" && ln -sf "$_p" "$TMP/bin-storenogh/$_u"
+done
 
 # lib <scenario> <O> — a shell with the SHIPPED library sourced and nothing else set up.
 librun() { # librun <dir-name> <script-text...>
@@ -460,10 +476,54 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
 [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
 ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
-# ⚠ The pin above is about the WORKER's shell, not about `wt_spawn`: `tmux new-session -d` returns 0 as
-# soon as the session object exists, so a worker that exits 98 in its first millisecond is still recorded
-# as started. That is pre-existing and wider than this PR (any fast-dying worker), so it is filed, not
-# smuggled in here: agent-infra#2447.
+# ⛔ THAT GUARD IS NOW ENFORCED BEFORE ANY SESSION EXISTS (P1 review finding, 2026-10-23, MEASURED).
+# This note used to say only that `tmux new-session -d` returns 0 as soon as the session object exists,
+# so a worker that exits 98 in its first millisecond is still recorded as started — true, and filed as
+# agent-infra#2447, but it left the guard above DECORATIVE: measured on the pre-fix head, (i) a
+# token-bearing hosts.yml on a box with no `gh` and (ii) a keys.env line the static credit sees but the
+# source never executes each produced `wt_spawn` rc=0 AND a `kind=tmux` record for a pane that had
+# already exited 98. `wt_spawn` now executes the prefix once caller-side and refuses on non-zero, so the
+# CREDENTIAL-CONTRACT arm cannot be blessed; #2447 keeps the wider residual (any worker COMMAND that
+# dies at once, after the contract passed).
+rm -rf "$TMP/O4nogh"; gh_hosts_fixture "$TMP/home-store-nogh"
+cat > "$TMP/c10.sh" <<'SH'
+set -u
+O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"
+mkdir -p "$WT_DIR"          # still the caller's PATH here — narrowed to the box below
+PATH="$2"                  # NO gh anywhere: a `:$PATH` suffix would find the real /usr/bin/gh
+export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5"; : > "$TMUX_LOG"
+unset GH_TOKEN GITHUB_TOKEN
+. "$1"
+wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
+SH
+out="$(bash "$TMP/c10.sh" "$LIB" "$TMP/bin-storenogh" "$TMP/O4nogh" "$TMP/tmux4nogh.log" "$TMP/home-store-nogh" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "(i) a hosts.yml credit on a box with NO gh is REFUSED, not started" $rc
+grep -q 'new-session' "$TMP/tmux4nogh.log" && rc=1 || rc=0
+ck "…and no session is created for it (the refusal lands BEFORE new-session)" $rc
+[ -f "$TMP/O4nogh/state/worker-lane-8" ] && rc=1 || rc=0
+ck "…and NO worker record is written, so nothing reports a dead lane as started" $rc
+grep -q 'FAILS when it is executed' "$TMP/O4nogh/test.log" && rc=0 || { rc=1; cat "$TMP/O4nogh/test.log" 2>/dev/null; }
+ck "…naming the executed contract as the reason, so an operator can see where the credit broke" $rc
+# ⛔ AND A STATIC GREP MATCH IS NOT A CREDIT (case ii): the file PARSES and the line matches, but the
+# source never executes it — the shape the grep-alone credit blessed and the pane then exited 98 on.
+rm -rf "$TMP/O4static"; mkdir -p "$TMP/home-static"
+printf 'if [ -n "${NEVER_SET:-}" ]; then\nexport GH_TOKEN=ghp_never_runs\nfi\n' > "$TMP/home-static/keys.env"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4static" "$TMP/tmux4static.log" "$TMP/home-static" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "(ii) a keys.env line the static credit sees but the source never runs is REFUSED" $rc
+grep -q 'new-session' "$TMP/tmux4static.log" && rc=1 || rc=0
+ck "…and no session is created (the credit is VERIFIED by execution, not by the grep)" $rc
+[ -f "$TMP/O4static/state/worker-lane-8" ] && rc=1 || rc=0
+ck "…and no worker record is written" $rc
+# POSITIVE CONTROL: the SAME token-bearing hosts.yml on a box whose gh DOES answer spawns — the
+# pre-flight is a probe of the environment, not a blanket ban on the store arm.
+rm -rf "$TMP/O4ghok"; gh_hosts_fixture "$TMP/home-store-ghok"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-ghtok" "$TMP/O4ghok" "$TMP/tmux4ghok.log" "$TMP/home-store-ghok" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "control: the same store credit spawns when the worker's gh can read it (the pre-flight is a probe)" $rc
+grep -q '^kind=tmux' "$TMP/O4ghok/state/worker-lane-8" && rc=0 || rc=1
+ck "…and the worker record is written, as before" $rc
 # ⛔ BUT A BENIGN NON-ZERO LAST STATEMENT IS NOT A BROKEN FILE (review finding, 2026-10-23, measured).
 # The guard used to be `… && . FILE || exit 98`, which reads the status of the LAST COMMAND IN THE FILE —
 # so an ordinary operator line like `[ -d /x ] && export Y`, false and last, killed the worker AFTER it
@@ -1241,14 +1301,24 @@ else
   # Offline (no docker, or no image) is still reported as blind, never as a pass.
   b32=0
   if command -v docker >/dev/null 2>&1; then
-    if timeout 300 docker run --rm -v "$HERE:/h:ro" bash:3.2 bash -n /h/worker-terminal.sh >/dev/null 2>&1; then b32=0
-    else b32=$?; fi
-    if [ "$b32" = "0" ]; then
-      ck "parse: a real bash 3.2 (docker bash:3.2) accepts worker-terminal.sh — the macOS parse class" 0
-    elif [ "$b32" = "124" ] || [ "$b32" = "125" ]; then
-      ck "parse DECLARED BLIND: docker could not provide a 3.2 parser here (rc=$b32) — this leg checked nothing" 0
+    # ⛔ PROBE THE RUNTIME, NOT THE CLI (P2 review finding, 2026-10-23). A docker CLI with no usable
+    # daemon or permission exits non-zero for a reason that has nothing to do with bash's parser, and
+    # the old code read EVERY rc except 124/125 as "a real bash 3.2 REJECTS worker-terminal.sh" — an
+    # environment artifact presented as a parse verdict, which reds bash-suites on a correct change
+    # (measured shape: `docker run` rc=1, `Cannot connect to the Docker daemon`). Probe first; a probe
+    # failure is DECLARED BLIND, exactly like the no-docker branch.
+    if ! timeout 300 docker run --rm bash:3.2 true >/dev/null 2>&1; then
+      ck "parse DECLARED BLIND: the docker CLI cannot run bash:3.2 here (no daemon, permission or image) — this leg checked nothing" 0
     else
-      ck "parse: a real bash 3.2 (docker bash:3.2) REJECTS worker-terminal.sh (rc=$b32)" 1
+      if timeout 300 docker run --rm -v "$HERE:/h:ro" bash:3.2 bash -n /h/worker-terminal.sh >/dev/null 2>&1; then b32=0
+      else b32=$?; fi
+      if [ "$b32" = "0" ]; then
+        ck "parse: a real bash 3.2 (docker bash:3.2) accepts worker-terminal.sh — the macOS parse class" 0
+      elif [ "$b32" = "124" ] || [ "$b32" = "125" ]; then
+        ck "parse DECLARED BLIND: docker could not provide a 3.2 parser here (rc=$b32) — this leg checked nothing" 0
+      else
+        ck "parse: a real bash 3.2 (docker bash:3.2) REJECTS worker-terminal.sh (rc=$b32)" 1
+      fi
     fi
   else
     ck "parse DECLARED BLIND: no 3.x /bin/bash and no docker — the legs cannot see the macOS 3.2 parse class" 0
