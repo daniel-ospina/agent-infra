@@ -163,8 +163,13 @@ wt_gh_hosts_token() {
   local home="${1:-}"
   [ -n "$home" ] || return 1
   if command -v gh >/dev/null 2>&1; then
-    env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token >/dev/null 2>&1
-    return $?
+    # ⛔ gh's own OUTPUT is held to the same rule as every other arm (review finding, 2026-10-23,
+    # measured): `oauth_token: "   "` made `gh auth token` print three spaces and exit 0, so the gh arm
+    # credited a file its own file-arm refuses, and the worker's gh rejected the value at the first call.
+    local tok
+    tok="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token 2>/dev/null)" || return 1
+    case "$tok" in *[![:space:]]*) return 0 ;; esac
+    return 1
   fi
   wt_gh_hosts_value "$(wt_gh_hosts "$home")"
 }
@@ -235,11 +240,11 @@ wt_tmux_has_server() {
 # counts only when it carries a VALUE; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
 # (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
-  local home="${1:-}" keys have=0 keys_credit=0 caller_val=0
+  local home="${1:-}" keys have=0 keys_credit=0 caller_val=0 store_credit=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
   case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) caller_val=1 ;; esac
-  wt_gh_hosts_token "$home" && have=1
+  wt_gh_hosts_token "$home" && { have=1; store_credit=1; }
   # ⛔ A VALUE IS NOT A QUOTED EMPTY (review finding, measured 2026-10-23). `=[^[:space:]]` counted
   # `GH_TOKEN=""` as provision — the character after `=` is a quote — so the file exported an EMPTY
   # token, `gh` fell back to the hosts.yml this HOME does not have, and the worker died at its first
@@ -269,6 +274,27 @@ wt_launcher_env() {
     wt_tmux_server_token || return 1
   fi
   printf 'export HOME=%s' "$(wt_q "$home")"
+  # ⛔ AN INHERITED `GH_TOKEN` OVERRIDES THE STORE THE GATE JUST CHECKED (P1 review finding, 2026-10-23,
+  # measured). gh prefers `GH_TOKEN`/`GITHUB_TOKEN` over ANY store, and a tmux pane inherits the SERVER's
+  # environment — which this very module can have stamped (the caller-token arm creates the server with
+  # the caller's env, and `wt_tmux_server_token` exists because such servers carry tokens). So when the
+  # credit came from the STORE or the FILE, the launch line clears those two names before the file is
+  # read: the worker then resolves the credential the probe resolved. Driven end-to-end before this: a
+  # server carrying `GH_TOKEN=ghp_from_SERVER` plus a validated `hosts.yml` gave a worker whose
+  # `gh auth token` printed the SERVER's token, on a spawn that reported provisioned. The caller-token
+  # and server-token arms are deliberately EXEMPT — there the inherited value IS the credential.
+  # ⛔ A BLANK `GH_TOKEN`/`GITHUB_TOKEN` IS CLEARED ON EVERY ARM: gh prefers it over a valid
+  # `GITHUB_TOKEN` and over the store, so `GH_TOKEN='   '` beside a real token is a dead lane, not a
+  # provisioned one.
+  # ⛔ AND THE BLANK-VALUE CLEAR RUNS AFTER `keys.env` IS SOURCED, not here (P1 review finding,
+  # 2026-10-23, MEASURED). Emitted before the source, it could not see what the file wrote: on a STORE
+  # credit the old post-source check never ran (it was gated on the FILE credit or a non-zero source
+  # status), so a file carrying `GH_TOKEN='   '` beside a validated `hosts.yml` produced a worker whose
+  # gh printed `The token in GH_TOKEN is invalid`, on a spawn that reported provisioned. Only the
+  # STORE-override unset belongs here, before the file is read.
+  if [ "$store_credit" = "1" ] || [ "$keys_credit" = "1" ]; then
+    printf '; unset GH_TOKEN GITHUB_TOKEN'
+  fi
   # ⛔ keys.env IS SOURCED UNDER `set -a`, exactly as cloud-cell-supervisor.sh sources it. An operator
   # file that ASSIGNS without `export` is legal there (`set -a; . "$ENV_FILE"; set +a`), and a worker
   # that sourced it plainly would hold those values in the launch shell only and hand the lane it
@@ -280,8 +306,8 @@ wt_launcher_env() {
     # own launch line is bash-shaped — so a `sh -n` check is an over-block on a perfectly good cell, which
     # is the #2210 refusal loop in a new disguise. bash is what the harness runs and what the cell's own
     # supervisor sources this file with, so bash decides when it exists; `sh -n` is the last resort.
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; wsrc=$?; set +a; kcredit=%s' \
-      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$keys_credit"
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; set +a' \
+      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
   fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
   # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
@@ -289,9 +315,8 @@ wt_launcher_env() {
   # it had exported the token, on a spawn that returned 0 and wrote its record. A parse check alone fixes
   # that but re-opens the other side: a file containing `return 1` PARSES, then aborts the source before
   # the token assignment, and the worker runs credential-less. So the guard asks two questions: does it
-  # parse (before anything is applied), and — only if the source reported non-zero — does the environment
-  # nevertheless HOLD a credential now? The second check runs AFTER the config-dir pinning below, so it
-  # sees the same store the worker will (`wsrc` is captured, not re-derived).
+  # parse (before anything is applied), and does the environment HOLD a usable credential after it ran?
+  # The second check runs AFTER the config-dir pinning below, so it sees the same store the worker will.
   # ⛔ HOME IS RE-ASSERTED AFTER THE SOURCE, and that is not belt-and-braces (review finding,
   # 2026-10-22). A `HOME=` line inside keys.env is exported by the `set -a` source above and would
   # OVERWRITE the HOME this gate just validated — measured: a file carrying `HOME=/home/cmux` left the
@@ -323,20 +348,24 @@ wt_launcher_env() {
     printf '; unset GH_CONFIG_DIR XDG_CONFIG_HOME'
   fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
-  # The second half of the `keys.env` guard (see its comment above): a source that reported non-zero is
-  # fatal ONLY if it also left no credential behind. ⛔ A BLANK VALUE IS NOT A CREDENTIAL (review finding,
-  # 2026-10-23, measured): `[ -z "$GH_TOKEN$GITHUB_TOKEN" ]` counted `GH_TOKEN='   '` as provision — the
-  # same defect this file refuses statically for the keys.env arm (`[^[:space:]]`), so the two halves of
-  # ONE gate disagreed; `gh` rejects whitespace at the first call. The `case` asks the same question the
-  # static arm asks: does the value contain a non-space character? `gh auth token` answers for the
-  # worker's own HOME + pinned config dir; with no `gh` at all the fallthrough exits, the fail-closed
-  # direction for a worker that has just proved it could not be provisioned cleanly.
+  # ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE CLEAR MUST SEE WHAT THE SOURCE WROTE (P1 review
+  # finding, 2026-10-23, MEASURED): the pre-source clear could not, so a `keys.env` re-introducing
+  # `GH_TOKEN='   '` survived on every arm whose post-source check did not fire. Both names, because gh
+  # prefers `GH_TOKEN` then `GITHUB_TOKEN` over any store — a blank one in either hides a valid one.
+  printf '; case "${GH_TOKEN:-}" in *[![:space:]]*) : ;; *) unset GH_TOKEN ;; esac; case "${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) unset GITHUB_TOKEN ;; esac'
+  # The credential guard: after the source and the blank-clear, either a name holds a VALUE or the
+  # store the probe read must answer. ⛔ IT RUNS ON EVERY ARM (P1 review finding, 2026-10-23, measured):
+  # gating it on the FILE credit or a non-zero source status skipped exactly the arm where a `keys.env`
+  # had just overwritten an inherited token, leaving a credential-less worker on a spawn that reported
+  # provisioned. It costs a `gh auth token` only when no name carries a value — and `gh auth token`
+  # answers for the worker's own HOME + pinned config dir, so with no gh at all the fallthrough exits
+  # 98 (fail-closed).
   # ⛔ AND THE gh CALL MUST NOT RE-READ THE VALUE THAT WAS JUST JUDGED BLANK (review finding, 2026-10-23,
   # measured): with `GH_TOKEN='   '` exported, `gh auth token` prints it and exits 0, so the guard would
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
   # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
   # the STORE — and never the question it just answered NO to.
-  [ -f "$keys" ] && printf '; if [ "${kcredit:-0}" = 1 ] || [ "${wsrc:-0}" -ne 0 ]; then case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac; fi'
+  printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac'
   return 0
 }
 
@@ -704,7 +733,14 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value), this caller's own GH_TOKEN/GITHUB_TOKEN (only when this spawn creates the server) and the tmux server's GH_TOKEN/GITHUB_TOKEN; found none in any of them. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
         return 1
       }
-      if tmux new-session -d -s "$name" "$envpfx; cd $(wt_q "$cwd") && $cmd" 2>/dev/null; then
+      # ⛔ THE SHELL-COMMAND MUST BE ONE ARGUMENT (P0 review finding, 2026-10-23, MEASURED). tmux runs
+      # a SINGLE shell-command argument through the shell, but a MULTI-argument command is exec'd
+      # DIRECTLY — so the three-word form `bash -c "'<line>'"` handed bash a literally single-quoted
+      # word as its command string, bash looked for a command by that name, and every pane died with
+      # status 127 while `new-session -d` still returned 0 (spawn rc=0, record written, nothing running:
+      # the dead-lane-reported-provisioned this PR exists to remove). `bash -c $(wt_q LINE)` is ONE argv,
+      # so tmux's shell unquotes it exactly once and bash parses the line the pre-check validated.
+      if tmux new-session -d -s "$name" "bash -c $(wt_q "$envpfx; cd $(wt_q "$cwd") && $cmd")" 2>/dev/null; then
         mkdir -p "$dir" 2>/dev/null || true
         printf 'kind=tmux\nhome=%s\ncwd=%s\ncreated=%s\n' "$home" "$cwd" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null || true
         wt_forget
