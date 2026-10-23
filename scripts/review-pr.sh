@@ -77,6 +77,8 @@
 # is the record/artifact arm, and it covers FOUR cases that need DIFFERENT remedies (a table
 # that described it as "the one that can leave a record behind" pointed two of them at a
 # remedy that cannot work — P3, fresh review of #2288):
+#   * the recorder RAN and FAILED (non-zero) — nothing was recorded, and re-running the recorder is
+#     the remedy (the review comment already exists and is nameable);
 #   * the recorder SUCCEEDED but the artifact check (c) reads is not right (no record bound to
 #     the head, no body marker, or a marker posted unsigned) — the remedy IS to re-run the
 #     recorder, not to re-review, and a record may already exist;
@@ -85,9 +87,13 @@
 #   * the notes or the verdict COMMENT could not be posted — no comment id exists to name as
 #     `--evidence`, so re-running the recorder cannot help either; the review exists only in
 #     the transcript.
-# A review COMMENT may already be posted when 7/8/9 exit — that comment IS the artifact
+# A review COMMENT may already be posted when 7 or 9 exit — that comment IS the artifact
 # (it says what the reviewer found, and `Outcome: not-clean` when it was not clean); it is
-# not a verdict, and it is never composed when the verdict contradicts its own findings:
+# not a verdict, and it is never composed when the verdict contradicts its own findings.
+# ⛔ EXIT 8 IS NOT ONE OF THEM (P3, fresh review of #2288): the head/diff re-read runs BEFORE any
+# comment is composed and the arm itself says so, so an exit-8 run has posted NOTHING — telling an
+# operator an artifact may exist sends them hunting a comment that cannot exist (or, worse, to
+# hand-bind one to a head nobody read).
 #   0  reviewed clean, record written and verified at the reviewed head
 #   2  usage / argument error
 #   3  evidence failure: no gh, no auth, unresolvable PR/repo/head, url/repo conflict
@@ -1480,10 +1486,17 @@ if [ "$VERDICT" = clean ]; then
       # is not the defect here; UNDERSTATING an enforced one is the same "two contradictory
       # claims about one control" class this file refuses elsewhere. It now says what happened:
       # the fetch was proven, and what the reviewer read beyond that proof is not auditable.
+      # ⛔ WHAT THIS SAYS ABOUT THE FETCH (P3, fresh review of #2288; CORRECTED again at P2, the
+      # next round): it first said the remainder fetch was "NOT verifiable from here", which
+      # contradicted an enforced check, and the correction then said the verdict covers the whole
+      # diff — which OVERSTATED that check. The `diff-tail:` digest proves a fetch was EXECUTED
+      # (the prompt hands the reviewer the exact one-line producer, which prints 64 hex and nothing
+      # else); it cannot prove the remainder was READ. The artifact now states exactly that, because
+      # this is the text `record-review.sh` accepts as review evidence.
       if [ "${DIFF_TRUNCATED}" = 2 ]; then
-        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself — and PROVED it: its `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. Treat the verdict as covering the whole diff; what it read beyond that proof is not auditable from here, while the RECORD binds the full diff hash.\n\n' "'"
+        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself and PROVED the fetch happened: the `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. That check establishes that a fetch was executed; it cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "'"
       else
-        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself — and PROVED it: its `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. Treat the verdict as covering the whole diff; what it read beyond that proof is not auditable from here, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
+        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself and PROVED the fetch happened: the `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. That check establishes that a fetch was executed; it cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
       fi
     fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
