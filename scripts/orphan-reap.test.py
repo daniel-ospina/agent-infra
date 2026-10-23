@@ -246,6 +246,29 @@ def case_grew(tmp) -> Box:
     return box
 
 
+def case_store_fresh_at_signal(tmp) -> Box:
+    """The SAME authorised row, but the HOOK STORE turns fresh between the census and the signal.
+
+    This is the #947 leg on its own: a prompt was queued behind a tool, so the transcript has not
+    been appended yet and a stat-only re-check sees nothing — only re-running the canon catches
+    it. Pins the canon leg of `_authorisation_holds`; without this case deleting that leg leaves
+    the whole suite green (a false PASS of the gate, not of the code).
+    """
+    now = time.time()
+    start = now - 5 * 3600
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    box = Box(before, before, t, start,
+              store=write_store(tmp, pid=100, start_s=start, cwd=tmp, fresh=False))
+
+    def on_ps(n):
+        if n == 3:          # the PRE-signal read: the store becomes fresh here
+            write_store(tmp, pid=100, start_s=start, cwd=tmp, fresh=True)
+
+    box.on_ps = on_ps
+    return box
+
+
 def case_b(tmp) -> Box:
     """The SAME child, but the walk reaches a login shell: a human owns it."""
     now = time.time()
@@ -349,8 +372,12 @@ def _apply_run(box, live=None, post=None):
     calls = {"n": 0}
 
     def ps():
-        snap = snaps[min(calls["n"], len(snaps) - 1)]
+        n = calls["n"]
         calls["n"] += 1
+        hook = getattr(box, "on_ps", None)
+        if hook is not None:
+            hook(n + 1)
+        snap = snaps[min(n, len(snaps) - 1)]
         return {pid: dict(r) for pid, r in snap.items()}
 
     kills = []
@@ -378,7 +405,7 @@ def _apply_run(box, live=None, post=None):
 
 
 def apply_path() -> int:
-    """FIVE assertions on the only code in this file that can send a signal.
+    """SIX assertions on the only code in this file that can send a signal.
 
     Every other case runs `apply=False`, so the kill path — its incarnation/recycle refusals,
     and the two guards that keep an UNREADABLE `ps` read from reading as success — had no test
@@ -410,6 +437,14 @@ def apply_path() -> int:
         rc, out, kills = _apply_run(case_a(tmp), post={})
         check("(g3) the POST-signal read returned nothing", rc, out, kills, 2, [(100, 15)],
               must=("UNVERIFIABLE — the post-signal",), must_not=("verified gone: 100",))
+
+        # (g6) the HOOK STORE turns fresh before the signal, while the transcript is untouched: only
+        # the canon leg can see it. Pins `_authorisation_holds`'s store re-read — without this case,
+        # deleting that leg leaves g1-g5 green and restores the #947 fail-open silently.
+        rc, out, kills = _apply_run(case_store_fresh_at_signal(tmp))
+        check("(g6) the store turned fresh before the signal", rc, out, kills, 0, [],
+              must=("REFUSED: the canon verdict is no longer `idle`", "not signalled: 100"),
+              must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
 
         # (g4) an UNREADABLE pre-signal read cannot re-verify identity: nothing is signalled
         rc, out, kills = _apply_run(case_a(tmp), live={})

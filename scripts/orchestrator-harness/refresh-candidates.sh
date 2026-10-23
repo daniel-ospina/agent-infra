@@ -597,6 +597,12 @@ GH_PROBE_ERR=""
 gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
 gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
   local _s="$1"; shift
+  # ⛔ RELEASE THIS FUNCTION'S OWN PREVIOUS PROBE FILE FIRST. Every call mints a NEW `mktemp` path and
+  # reassigns GH_PROBE_ERR, so without this the prior call's file is orphaned — and the harness makes
+  # TWO calls (the credential probe, then the rate-limit probe), so the common path leaked one 0-byte
+  # file per refresh pass. The cleanup helper is the single guarded `rm` site, so calling it here adds
+  # no second `rm -f "$GH_PROBE_ERR"` and the funnel's "exactly ONE code-level rm" assertion holds.
+  gh_probe_err_cleanup
   # ⛔ AN UNPREDICTABLE NAME WITH O_EXCL, never `$$` in a world-writable dir. A pid-derived name is
   # guessable by any other local user, and `: >` follows a symlink — so a peer on a shared cell
   # could pre-create that path as a symlink and have this harness truncate an arbitrary file. The

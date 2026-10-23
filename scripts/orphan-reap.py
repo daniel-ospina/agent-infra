@@ -1010,7 +1010,14 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None, *, liv=None,
             log(f"  not signalled: {pid}")
             continue
         alive = still.get(pid)
-        if alive is not None and is_pi(alive):
+        # A ZOMBIE HAS ALREADY EXITED: it keeps its comm and its `etimes`, and `os.kill` on a `Z`
+        # returns 0 — so presence + `is_pi` alone would report a process that is dead as a survivor.
+        # And a pid recycled into ANOTHER `pi` inside the 3 s window is not the row we signalled, so
+        # the incarnation is re-checked here too (`pi_verdict` already treats a zombie as a
+        # non-answer; this loop uses the same vocabulary rather than a weaker one).
+        if (alive is not None and is_pi(alive)
+                and not alive["stat"].startswith("Z")
+                and _same_incarnation(row, alive)):
             stuck += 1
             log(f"  STILL ALIVE (no SIGKILL for this pool — reporting): {pid}")
         else:
