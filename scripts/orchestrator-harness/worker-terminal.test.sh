@@ -255,6 +255,23 @@ grep -qF "export HOME='$TMP/home-c'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$T
 ck "…whose launch line exports the HOME that holds the gh credential (the credential is HOME-bound)" $rc
 grep -qF ". '$TMP/home-c/keys.env'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
 ck "…and sources that HOME's keys.env, exactly like the cell's working manual dispatch" $rc
+# ⛔ SOURCED UNDER `set -a` — the supervisor's own idiom (`set -a; . "$ENV_FILE"; set +a`). A keys.env
+# that ASSIGNS without `export` is legal there, and a worker that sourced it plainly would keep those
+# values in its own launch shell and hand the lane it starts nothing: the credential-less worker this
+# gate removes, one layer lower. Driven for real — the prefix is EXECUTED and `env` is read back.
+mkdir -p "$TMP/home-plain/.config/gh"; printf 'github.com:\n' > "$TMP/home-plain/.config/gh/hosts.yml"
+printf 'CELLPLAIN=plainvalue\n' > "$TMP/home-plain/keys.env"
+cat > "$TMP/c5.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+. "$1"
+printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
+SH
+out="$(bash "$TMP/c5.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4k" "$TMP/home-plain" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+seen="$(env -i PATH=/usr/bin:/bin O="$TMP/O4k" /bin/bash -c "$pfx; env" 2>/dev/null | grep -c '^CELLPLAIN=plainvalue$')"
+[ "$seen" = "1" ] && rc=0 || { rc=1; echo "      prefix=$pfx"; }
+ck "a keys.env that assigns WITHOUT export still reaches the worker (sourced under set -a)" $rc
 grep -q '^kind=tmux' "$TMP/O4/state/worker-lane-8" && grep -q '^home=' "$TMP/O4/state/worker-lane-8" && rc=0 || rc=1
 ck "…and records the worker AND the HOME it was given, so an operator can audit it" $rc
 # ⛔ THE LOUD HALF: a tmux spawn whose worker would have NO credential is refused, not started.

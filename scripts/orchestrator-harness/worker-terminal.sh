@@ -165,7 +165,12 @@ wt_launcher_env() {
     tmux show-environment -g GH_TOKEN >/dev/null 2>&1 || return 1
   fi
   printf 'export HOME=%s' "$(wt_q "$home")"
-  [ -f "$keys" ] && printf '; . %s' "$(wt_q "$keys")"
+  # ⛔ keys.env IS SOURCED UNDER `set -a`, exactly as cloud-cell-supervisor.sh sources it. An operator
+  # file that ASSIGNS without `export` is legal there (`set -a; . "$ENV_FILE"; set +a`), and a worker
+  # that sourced it plainly would hold those values in the launch shell only and hand the lane it
+  # starts NOTHING — the credential-less worker this gate exists to refuse, one layer down. `set +a`
+  # follows immediately so the worker's own shell options are the caller's, unchanged.
+  [ -f "$keys" ] && printf '; set -a; . %s; set +a' "$(wt_q "$keys")"
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
   return 0
 }
