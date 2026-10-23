@@ -4,8 +4,9 @@
 #   O=/path/to/orchestrator REPO=/path/to/tortoise ./report.sh 6
 #
 # Reads ONLY durable artifacts — state/walltime.tsv, state/merged-*.done, state/parked-*,
-# state/fixcount-*, $O/logs/orch-loop.log, the recorded harness stamp, and `origin`. It is
-# READ-ONLY (no `gh` write, no tmux, no lock), so it is safe to run while the loop is working.
+# state/fixcount-*, state/needsreview-* (the open-PR stale-evidence queue, #2132),
+# $O/logs/orch-loop.log, the recorded harness stamp, and `origin`. It is READ-ONLY (no `gh` write, no
+# tmux, no lock), so it is safe to run while the loop is working.
 # Dependency-free beyond bash + git + gh + python3 (the last two only for the sections that need
 # them; a missing one makes its section say so, never abort the report).
 #
@@ -219,13 +220,80 @@ echo "  → live: ${claims:-0}  (a claim with a live lease = a reviewer in fligh
 echo
 
 echo "── queue health ────────────────────────────────────────────"
-if [ -d "$REPO" ] && command -v gh >/dev/null 2>&1; then
-  open=$(cd "$REPO" && gh pr list --state open --limit 300 --json number --jq length 2>/dev/null)
-  echo "  open PRs: ${open:-<could not read>}"
-else
-  echo "  open PRs: <needs a repo checkout and gh>"
+# ⛔ TRI-STATE, NOT AN EXIT-CODE GUESS (review round 2, P1). The first form only set the failure flag
+# INSIDE the "repo AND gh present" branch, so when either was missing the flag stayed 0 and BOTH
+# lines printed a confident `0` — a blind read presented as a clean queue, on the very lines whose
+# job is to detect a stall (and the `<needs a repo checkout and gh>` message became unreachable).
+# ⛔ THE LISTING CARRIES THE LIVE HEAD (review round 7, P2). Asking it for numbers alone forced the
+# parked/stale attribution below to INFER whether a park is current from the marker set — an inference
+# that misfires both ways: a park with no marker at all was reported as "needs a human" even after a
+# push re-armed it, and a park AT the live head whose only marker named an older head was reported as
+# re-armed and dropped from BOTH queues. `number:headRefOid` is the same one `gh` read, and the park
+# test is then exactly the controller's own (`parked-<PR>` == live head).
+OPEN_STATE=unreadable; OPENNUMS=""
+if [ ! -d "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
+  OPEN_STATE=norepo
+elif OPENNUMS="$(cd "$REPO" && gh pr list --state open --limit 300 --json number,headRefOid --jq '.[]|"\(.number):\(.headRefOid)"' 2>/dev/null)"; then
+  OPEN_STATE=ok
 fi
-echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+case "$OPEN_STATE" in
+  norepo) echo "  open PRs: <needs a repo checkout and gh>" ;;
+  ok)     echo "  open PRs: $(printf '%s' "$OPENNUMS" | grep -c ':')" ;;
+  *)      echo "  open PRs: <could not read>" ;;
+esac
+# ⛔ SUPERSEDED PARKS ARE NOT "NEEDS A HUMAN" (review round 6, P3), AND THE LINE IS PRINTED EXACTLY
+# ONCE (review round 6, P2 — the first form left the raw echo above AND the adjusted echo below, so an
+# operator read two contradictory numbers for one quantity). A park whose recorded head is not the
+# PR's LIVE head has been RE-ARMED by a push (the controller honours a park only when its content
+# matches the live head), so that PR is being worked and belongs in neither queue.
+# ⛔ BOTH LINES NOW WALK THE OPEN LISTING, NOT THE MARKER FILES (review round 7, P2): each open PR is
+# classified exactly once from facts the listing supplies — its live head and its park file — so a PR
+# with no marker and a re-armed park is no longer reported as a human's work, and a PR parked at its
+# live head is no longer dropped from both queues. Marker files only decide whether an unparked PR has
+# a verdict-less run recorded.
+# ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
+# a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR needs to be
+# re-reviewed. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence stays
+# at 0", and before this line nothing in the harness could answer it at all.
+# ⛔ ON THE DEGRADED PATHS THE PARKED COUNT IS LABELLED RAW (landing-review note, P3). Attribution needs
+# the OPEN LISTING — it is the only source of each PR's live head — so on a box with no checkout, or
+# with an unreadable listing, a superseded park cannot be told apart from a current one. The readable
+# path attributes both numbers; these two paths print the raw `parked-*` file count and MUST say so,
+# because an unlabelled raw count presents an INFLATED human queue as a measured one. The direction is
+# fail-closed either way (it over-reports attention, never under-reports), so the number is kept —
+# only its provenance is named.
+case "$OPEN_STATE" in
+  norepo)
+    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')  (raw marker count — a superseded head cannot be told apart without a repo checkout and gh)"
+    echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
+  ok)
+    stale=0; superseded=0; parked_cur=0
+    while IFS= read -r _row; do
+      [ -n "$_row" ] || continue
+      _pr="${_row%%:*}"; _lh="${_row#*:}"
+      case "$_pr" in ''|*[!0-9]*) continue ;; esac
+      _ph="$(cat "$O/state/parked-$_pr" 2>/dev/null)"
+      if [ -n "$_ph" ]; then
+        if [ "$_ph" = "$_lh" ]; then parked_cur=$(( parked_cur + 1 )); else superseded=$(( superseded + 1 )); fi
+        continue
+      fi
+      # Not parked: is there a recorded verdict-less run at all? (An old-head marker still means no
+      # head-bound clean evidence exists now — merge-one has not looked at the newer head yet.)
+      _has=0
+      for _g in "$O"/state/needsreview-"$_pr"-*; do [ -e "$_g" ] && { _has=1; break; }; done
+      [ "$_has" = "1" ] && stale=$(( stale + 1 ))
+    done <<EOF
+$OPENNUMS
+EOF
+    if [ "$superseded" -gt 0 ]; then
+      echo "  parked (needs a human): $parked_cur ($superseded at a superseded head — the loop has re-armed them)"
+    else
+      echo "  parked (needs a human): $parked_cur"
+    fi
+    echo "  stale evidence (needs re-review): $stale" ;;
+  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')  (raw marker count — a superseded head cannot be told apart from an unreadable listing)"
+     echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
+esac
 cap=3
 [ -n "${MAX_FIX_TRIES:-}" ] && case "$MAX_FIX_TRIES" in ''|*[!0-9]*) ;; *) cap="$MAX_FIX_TRIES" ;; esac
 atcap=0

@@ -101,12 +101,23 @@ ISNUM="$T/is_num.sh"
 grep -m1 '^is_num() {' "$LOOP" > "$ISNUM"
 if [ -s "$ISNUM" ]; then ok "caller: is_num() extracted from the shipped loop"
 else bad "caller: could not extract is_num() — the driven block would not run"; fi
+# ── the SHIPPED record-contract helpers (agent-infra#2308) ─────────────────────
+# They live ABOVE the single-instance lock (so `--check-refresh` can answer on a RUNNING box), which is
+# outside the origination block — so they are extracted on their own and sourced FIRST. A missing block
+# is fatal for section 10 below: driven with no resolver, every SEED-SKEW case would trivially "pass".
+HELPFNS="$T/refresh-record-fns.sh"
+awk '/# \[refresh-record:begin\]/{f=1} f{print} f&&/# \[refresh-record:end\]/{exit}' "$LOOP" > "$HELPFNS"
+if [ -s "$HELPFNS" ] && grep -q '^resolve_refresh_sh()' "$HELPFNS"; then
+  ok "caller: the record-contract helpers are extractable from the shipped orch-loop.sh"
+else
+  bad "caller: could not extract resolve_refresh_sh() — the seed-skew verdict is ungraded"
+fi
 
 # drive_gate <O> <gate_why> — source the shipped block and print the line it would log.
 OUT_DRIVE=""
 drive_gate() {
   local o="$1" why="$2"
-  OUT_DRIVE="$(O="$o" LOG=/dev/null bash -c '. "$1"; . "$2"; dispatch_gate_line "$3" 0 0 "stub PR path"' _ "$ISNUM" "$FNS" "$why" 2>&1)"
+  OUT_DRIVE="$(O="$o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
 }
 
 # run_env <dir> [KEY=VAL …] — ONE hermetic environment for every invocation (review P2: `--check` used
@@ -131,6 +142,10 @@ mk_case() {
   git init -q "$D/repo"
   git -C "$D/repo" remote add origin "$D/origin.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
+  # A REAL BOX HAS A REFRESH SCRIPT. "No refresh script at all" is its OWN state (rc=1, tested in
+  # section 10); a fixture without one would be a box that cannot originate, and the gate would
+  # (correctly, since #2308) refuse to read its record instead of grading the branch under test.
+  printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$D/o/refresh-candidates.sh"
   mk_gh_rest "$D" "$@"
 }
 # mk_gh_rest <dir> [<issue> …] — the `gh` the shipped script talks to. REST only: the listings are
@@ -149,7 +164,7 @@ mk_gh_rest() {
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 case "\$1 \$2" in
-  "auth token") exit 0 ;;
+  "auth token") [ -n "\${GH_AUTH_TOKEN_SIG:-}" ] && kill -"\${GH_AUTH_TOKEN_SIG}" \$\$; [ -n "\${GH_AUTH_TOKEN_HANG:-}" ] && sleep 300; exit 0 ;;
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
@@ -162,7 +177,10 @@ SH
   chmod +x "$d/bin/gh.body"
   cat > "$d/bin/gh" <<'SH'
 #!/bin/bash
+# GHCALLS: every argv the shipped pass handed to gh, so a check can assert WHICH question was asked
+# (the presence short-circuit is "gh auth token was never invoked", which no output line can prove).
 d="$(cd "$(dirname "$0")" && pwd)"
+[ -n "${GHCALLS:-}" ] && printf '%s\n' "$*" >> "$GHCALLS"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
   out="$("$d/gh.body" api "$@" 2>/dev/null)"; rc=$?
@@ -472,6 +490,8 @@ esac
 # `handed=42`; a line that infers "queued 0" from the empty queue sends an operator after origination
 # that worked (review P1, two reviewers).
 D2="$T/drained"; mkdir -p "$D2/state"
+# a box that HAS a refresh script (the no-script state is section 10's)
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$D2/refresh-candidates.sh"
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=3\nhanded=42\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D2/state/refresh-last"
 : > "$D2/candidates.txt"
 drive_gate "$D2" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
@@ -588,6 +608,11 @@ case "$OUT_DRIVE" in
 esac
 
 # ── 5c) THE TOMBSTONE AND THE OTHER NON-'skipped' STATES ───────────────────────
+# (For the same reason as `mk_case`: these fixtures model a box that HAS a refresh script. The
+# no-script-at-all state is section 10's.)
+for _d in "$T/running" "$T/weird" "$T/mask-o" "$T/mask-q" "$T/mask-none" "$T/drained"; do
+  mkdir -p "$_d"; printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$_d/refresh-candidates.sh"
+done
 # `result=running` is what a pass that died mid-flight leaves behind. With a queued candidate the
 # deferral is real (so `deferred`), and with an empty queue there is no evidence at all (so BLOCKED).
 mkdir -p "$T/running/state"
@@ -704,7 +729,10 @@ case "$OUT_DRIVE" in
   *) bad "unreadable: not BLOCKED-with-cause — $OUT_DRIVE" ;;
 esac
 # No record at all + no queue: no evidence either way.
+# (A capable refresh script is present: a box with NONE is its own verdict — section 10 — and this
+# block grades the no-record branches, not that one.)
 rm -rf "$T/mask-none"; mkdir -p "$T/mask-none"; : > "$T/mask-none/candidates.txt"
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$T/mask-none/refresh-candidates.sh"
 drive_gate "$T/mask-none" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   "[dispatch] BLOCKED: no refresh pass has completed"*) ok "mask: no record + empty queue is BLOCKED" ;;
@@ -928,11 +956,17 @@ esac
 # exit code and the untouched state dir are both asserted.
 mk_case check-readonly
 mk_tool_clean "$D"          # a provisionable tool: --check must SUCCEED, not refuse
+# ⛔ MEASURED AS A BEFORE/AFTER LIST, not against a hardcoded whitelist (review P2): the whitelist had
+# to name every fixture file `mk_case` seeds, so adding one read as "--check wrote into $O" when it had
+# written nothing. The comparison is of the SAME directory either side of the one invocation, which is
+# what the contract actually says.
+O_BEFORE="$(ls -A "$D/o" 2>/dev/null | sort)"
 OUT="$(run_env "$D" bash "$REFRESH" --check 2>&1)"; RC=$?
+O_AFTER="$(ls -A "$D/o" 2>/dev/null | sort)"
 [ "$RC" -eq 0 ] && ok "--check: exits 0" || bad "--check: rc=$RC (want 0) — $OUT"
-[ -z "$(ls -A "$D/o" 2>/dev/null | grep -v '^claims.sh$' || true)" ] \
+[ "$O_BEFORE" = "$O_AFTER" ] \
   && ok "--check: writes NOTHING into the state dir (the read-only contract held)" \
-  || bad "--check: wrote into \$O: $(ls -A "$D/o" 2>/dev/null | tr '\n' ' ')"
+  || bad "--check: changed \$O: before [$O_BEFORE] after [$O_AFTER]"
 # ⛔ AND NOTHING OUTSIDE IT EITHER (review P2). `cloud-cell-supervisor.sh` gates a cell's START on this
 # being read-only, and the realistic regression is a `git worktree add`/`fetch`/`checkout` under
 # `--check` — a write into the CHECKOUT, which the state-dir assertion above reads as a PASS. The
@@ -971,6 +1005,476 @@ if [ -n "$BEG" ] && [ -n "$END" ] && [ "$BEG" -lt "$END" ]; then
   fi
 else
   bad "wiring: could not resolve the [origination:begin]/[origination:end] range"
+fi
+
+# ── 10) THE PRESENCE PROBE IS BOUNDED — AND AN ENV TOKEN COSTS NO gh CALL (TOKEN_HANG_FIX) ────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe captured it UNBOUNDED, so this pass stalled
+# forever at stage=provision: every pass recorded `STALE(800m)` and ORIGINATION NEVER RAN all session.
+# Both halves are pinned here, because fixing only one of them leaves the outage:
+#   (a) a token in the ENVIRONMENT is presence, answered WITHOUT invoking gh — so the hanging probe is
+#       never reached and the pass COMPLETES (the negative assertion is the gh-call ledger, not prose:
+#       no output line can distinguish "asked and got an answer" from "never asked");
+#   (b) with no env token the probe is BOUNDED and a probe that cannot answer is PRESENCE UNKNOWN +
+#       TRANSIENT — never the permanent marker, and never a stall. The bound is asserted by WALL CLOCK
+#       (the defect is an unbounded wait, so a line-matching check would have passed on the broken copy
+#       in 5 minutes instead of failing), and the positive half (`auth token` WAS attempted) is asserted
+#       so a pass that skipped the probe entirely cannot read green.
+mk_case token-env 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_TOKEN=fake-token GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) bad "token-env: the pass reported PRESENCE UNKNOWN although GH_TOKEN is in the environment — the env token is being ignored, so a hanging gh is still consulted" ;;
+  *"FAILED stage=provision"*) bad "token-env: the pass refused at stage=provision with an env token present — $OUT" ;;
+  *) ok "token-env: an ENV token is accepted as presence (no refusal, no PRESENCE UNKNOWN)" ;;
+esac
+if [ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" = "0" ]; then
+  ok "token-env: 'gh auth token' was NEVER invoked (the presence question cost no gh call at all)"
+else
+  bad "token-env: 'gh auth token' was invoked $(grep -c 'auth token' "$GHCALLS") time(s) despite GH_TOKEN — that is the call that hangs on these images"
+fi
+[ "$ELAPSED" -lt 25 ] && ok "token-env: the pass completed in ${ELAPSED}s (the hanging probe cannot reach the clock)" \
+  || bad "token-env: the pass took ${ELAPSED}s with a hanging gh stub — the env short-circuit did not short-circuit"
+[ "$RC" -eq 0 ] && ok "token-env: the pass exits 0 (a provisionable box is not refused)" \
+  || bad "token-env: rc=$RC (want 0) — $OUT"
+
+mk_case token-hang 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=3 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+# THE POSITIVE HALF FIRST: the probe WAS attempted (a pass that never probed cannot prove a bound).
+[ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" -ge 1 ] \
+  && ok "token-hang: the presence probe was ATTEMPTED (the bound is exercised, not skipped)" \
+  || bad "token-hang: 'gh auth token' was never invoked — this case proves nothing about a bound"
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) ok "token-hang: a probe that did not answer is reported as PRESENCE UNKNOWN, not as 'no credential'" ;;
+  *) bad "token-hang: no 'PRESENCE UNKNOWN' line — a hang is being read as an absent credential: $OUT" ;;
+esac
+[ "$ELAPSED" -lt 25 ] && ok "token-hang: the pass was BOUNDED at ${ELAPSED}s (GH_PROBE_TIMEOUT=3)" \
+  || bad "token-hang: the pass took ${ELAPSED}s against a 3s bound — the probe is unbounded, which is the outage"
+[ "$RC" -eq 1 ] && ok "token-hang: exits the TRANSIENT code (1), so the next cycle retries" \
+  || bad "token-hang: rc=$RC (want 1 TRANSIENT) — $OUT"
+[ "$(rec "$D" stage)" = "provision" ] && ok "token-hang: the record names stage=provision (the pass records an outcome instead of stalling)" \
+  || bad "token-hang: record stage='$(rec "$D" stage)' (want provision)"
+[ -e "$D/o/.refresh-blocked" ] \
+  && bad "token-hang: the PERMANENT marker .refresh-blocked was written for a probe that merely could not answer — a human-only-clear latch on a transient fault" \
+  || ok "token-hang: the permanent marker is NOT written (presence-unknown is transient by construction)"
+
+
+# ── A PROBE KILLED BY A SIGNAL IS NOT A SUCCESS (review findings on this PR, mutation-proved below) ──
+# Two defects, one class ("a non-answer read as a verdict"):
+#   * the bound forks and reaps, and perl puts a SIGNAL DEATH in the LOW byte of `$?`, so a bare
+#     `exit($? >> 8)` reported 0 for a killed child — an OOM-killed `gh` read as "credential present and
+#     the API answered";
+#   * re-spelling it as 128+N only helps if the CONSUMER treats the whole class as a non-answer; a list
+#     of {142,124,137} sent SIGTERM/SEGV/ABRT to the "no credential STORED" arm and latched the
+#     human-only-clear MERGE-ONLY marker.
+# So two signals are driven: SIGKILL (the OOM shape) and SIGTERM (the service-manager shape).
+for _sig in KILL TERM; do
+  mk_case "token-sig$_sig" 42
+  mk_tool_clean "$D"
+  OUT="$(run_env "$D" GH_AUTH_TOKEN_SIG="$_sig" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+  case "$OUT" in
+    *"PRESENCE UNKNOWN"*) ok "token-sig$_sig: a probe KILLED BY SIG$_sig reads as PRESENCE UNKNOWN, not as success" ;;
+    *"NOT PROVISIONABLE"*) bad "token-sig$_sig: a kill by SIG$_sig was read as 'no credential STORED' — a kill is a non-answer, not an absence: $OUT" ;;
+    *) bad "token-sig$_sig: a signal-killed probe was read as a SUCCESS (the exit-status-shift defect): $OUT" ;;
+  esac
+  [ "$RC" -ne 0 ] && ok "token-sig$_sig: the pass does not report success off a killed probe (rc=$RC)" \
+                  || bad "token-sig$_sig: rc=0 — a probe killed by SIG$_sig blessed the box"
+done
+
+# ── THE PROBE'S ERROR FILE CLEANUP CANNOT DELETE A DEVICE (review finding, cycle 3) ──────────────────
+# When ${TMPDIR} is unwritable the error path falls back to `/dev/null`, so an unguarded
+# `rm -f "$GH_PROBE_ERR"` on an exit path deletes the DEVICE NODE (refused for an unprivileged user,
+# destructive for root). ONE guarded cleanup point, and no other `rm -f` of that variable anywhere.
+# comment lines are excluded (the block above QUOTES the pattern it warns about)
+_n_rm="$(grep -v '^[[:space:]]*#' "$REFRESH" | grep -c 'rm -f "\$GH_PROBE_ERR"' || true)"
+[ "${_n_rm:-0}" = "1" ] && ok "probe-error cleanup: exactly ONE code-level rm of \$GH_PROBE_ERR (a single guarded point)" \
+                       || bad "probe-error cleanup: ${_n_rm:-0} code-level rm sites for \$GH_PROBE_ERR — each must remember the /dev/null guard"
+if grep -q 'gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in .*|/dev/null)' "$REFRESH"; then
+  ok "probe-error cleanup: the sentinel /dev/null is GUARDED, so the device node is never removed"
+else
+  bad "probe-error cleanup: nothing guards the /dev/null fallback — a root run could delete /dev/null"
+fi
+# …and the fallback really happens: an unwritable TMPDIR must not fail the pass or remove the device.
+mk_case token-badtmp 42
+mk_tool_clean "$D"
+OUT="$(run_env "$D" GH_TOKEN=fake-token TMPDIR=/nonexistent-refresh-$$ GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+# ⛔ OBSERVED THROUGH A STUB `rm`, NOT THROUGH `[ -c /dev/null ]` (review P3 on this PR): an unprivileged
+# runner's `rm -f /dev/null` is silently REFUSED, so the device-exists assertion cannot go red on the
+# broken code in the environment this suite actually runs in — a vacuous check. A stub `rm` that only
+# RECORDS is privilege-independent, and it is paired with its positive half so neither direction is
+# vacuous: /dev/null must invoke `rm` ZERO times, a real temp path must invoke it ONCE.
+_stub="$D/bin-norm"; mkdir -p "$_stub"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "${RMLOG:-/dev/null}"\n' > "$_stub/rm"
+chmod +x "$_stub/rm"
+eval "$(sed -n 's/^\(gh_probe_err_cleanup() {.*\)$/\1/p' "$REFRESH")"
+if command -v gh_probe_err_cleanup >/dev/null 2>&1; then
+  RMLOG="$D/rm.log"; : > "$RMLOG"
+  GH_PROBE_ERR=/dev/null RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && bad "probe-error cleanup: the cleanup invoked \`rm\` for the /dev/null SENTINEL ($(cat "$RMLOG")) — the guard is gone" \
+    || ok "probe-error cleanup: /dev/null is never handed to rm (observed through a recording stub, not through the device)"
+  printf 'stderr\n' > "$D/probe.err"
+  GH_PROBE_ERR="$D/probe.err" RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && ok "probe-error cleanup: a REAL probe file IS removed (the cleanup is not disabled)" \
+    || bad "probe-error cleanup: a real probe file was not removed — the cleanup does nothing at all"
+else
+  bad "probe-error cleanup: could not extract gh_probe_err_cleanup from the shipped script — the guard is unproven"
+fi
+case "$OUT" in
+  *"FAILED stage=provision"*) bad "probe-error cleanup: an unwritable TMPDIR refused the pass at stage=provision (the probe path must not depend on it)" ;;
+  *) ok "probe-error cleanup: an unwritable TMPDIR does not turn a provisionable box into a refusal" ;;
+esac
+
+# ── 11) THE RECORD'S WRITER AND ITS READER MUST BE THE SAME GENERATION (agent-infra#2308) ──
+# The measured defect this section exists for: a live cell's beat printed `BLOCKED: … so the pass
+# DIED` on every cycle for 16 hours. The pass had not died — the controller executes
+# `$O/refresh-candidates.sh` (the SEEDED copy) and THAT copy predated the pass record, so it could not
+# write `state/refresh-last` at all. The record's age then froze, and the only reader turned a frozen
+# age into a cause. "Nothing here can write this file" and "the writer died" are different states.
+SKEW="$T/skew"
+mkdir -p "$SKEW/o/state" "$SKEW/self" "$SKEW/ok/o"
+# $O's copy: the DEPLOYED generation — it can queue, it cannot record. Its comment MENTIONS the
+# writer on purpose: a substring probe would read this script as capable (a false PASS on the probe).
+printf '%s\n' '#!/usr/bin/env bash' \
+  '# a deployed copy from before agent-infra#2229: it never writes state/refresh-last' \
+  '# (the name refresh_record_write appears here only as prose)' \
+  'echo "refresh: queued nothing"' > "$SKEW/o/refresh-candidates.sh"
+# The copy the CONTROLLER itself runs (beside the loop) — this one can record.
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$SKEW/self/refresh-candidates.sh"
+# An intact box: the seeded copy itself can record.
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$SKEW/ok/o/refresh-candidates.sh"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+  "$(( $(date +%s) - 3 * 3600 ))" > "$SKEW/o/state/refresh-last"
+printf '7\n' > "$SKEW/o/candidates.txt"
+
+# drive_gate_self <O> <why> <self-dir> — the same shipped block, with the copy beside the loop named.
+drive_gate_self() {
+  local o="$1" why="$2" self="$3"
+  OUT_DRIVE="$(O="$o" LOG=/dev/null REFRESH_SELF_DIR="$self" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
+}
+
+# (a) THE PROBE ITSELF: a definition is capability, a mention in prose is not.
+PROBE_OUT="$(O="$SKEW/o" bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/o/refresh-candidates.sh" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "1" ] && ok "probe: a script that only MENTIONS refresh_record_write in prose is NOT capable" \
+  || bad "probe: a prose mention was read as the capability (rc=$PROBE_RC) — a stale copy would look healthy"
+PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/self/refresh-candidates.sh" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "0" ] && ok "probe: a script that DEFINES refresh_record_write is capable" \
+  || bad "probe: a real writer was not recognised (rc=$PROBE_RC) — the resolver would pass over a good copy"
+# ⛔ AND THE SHIPPED COPY MUST SATISFY THE PROBE THAT JUDGES IT (review P2). Every assertion above — and
+# every one below — grades a SYNTHETIC fixture, so the probe's answer on the REAL file it is pointed at
+# in production was ungraded: `refresh_can_record` is a TEXT match whose correctness depends on the
+# FORMATTING of a definition in a DIFFERENT, unchanged file (`refresh-candidates.sh`'s
+# `refresh_record_write() {` line). A reformat bash accepts (`function refresh_record_write {`, or the
+# brace on the next line) would make the probe read EVERY real copy on EVERY box as incapable: the beat
+# would print `BLOCKED (SEED-SKEW)` permanently — suppressing the genuine-death reading this whole
+# section exists to keep — and `--check-refresh` would exit 2, while this suite stayed green. Grading
+# the shipped file is what makes that reformat RED here; a fixture cannot, because the fixture is ours.
+PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$REFRESH" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "0" ] && ok "probe: the SHIPPED refresh-candidates.sh satisfies refresh_can_record (its definition's formatting is graded, not assumed)" \
+  || bad "probe: the probe reads the SHIPPED refresh-candidates.sh as INCAPABLE (rc=$PROBE_RC) — every real box would report SEED-SKEW and --check-refresh would exit 2; the probe and the shipped definition disagree"
+# ⛔ AND THE MENTION A COMMENT-ONLY EXCLUSION CANNOT SEE (review P3): a heredoc BODY is not a comment,
+# so any non-comment line merely STARTING with the name satisfied a signature-only match. Captured text
+# that quotes the definition is not the capability — the seed would be read as a recorder and this
+# whole verdict would never fire on the box it exists for.
+printf '%s\n' '#!/usr/bin/env bash' 'why="$(cat <<EOF' 'refresh_record_write() writes the record before this note' 'EOF' ')"' 'echo "$why"' > "$SKEW/prose-heredoc.sh"
+PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/prose-heredoc.sh" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "1" ] && ok "probe: a heredoc body that only QUOTES the name is NOT capable" \
+  || bad "probe: a heredoc body was read as the capability (rc=$PROBE_RC) — a stale copy would look healthy"
+
+# (b) THE MEASURED CELL: $O cannot record, a capable copy sits beside the loop. The controller runs the
+# capable one, so a stale record IS evidence of a dead pass — the DIED bound must NOT be relaxed just
+# because the seed is stale (that would replace one wrong reading with another).
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/self"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: a refresh pass wrote its start marker"*"stale bound"*) ok "skew+recorder-beside-loop: the death reading is preserved (a capable writer is on the box)" ;;
+  *) bad "skew+recorder-beside-loop: the gate no longer reports a dead pass on a box that can record — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"SEED-SKEW"*) bad "skew+recorder-beside-loop: printed SEED-SKEW although a capable copy exists — $OUT_DRIVE" ;;
+  *) ok "skew+recorder-beside-loop: and it does not claim a seed skew it does not have" ;;
+esac
+
+# (c) NOTHING ON THE BOX CAN RECORD: the record's age proves nothing, so the reading must be its own
+# verdict — never "the pass DIED", which sends an operator to look for a crash that did not happen.
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED (SEED-SKEW):"*) ok "unwritable: with no recorder anywhere the gate says SEED-SKEW" ;;
+  *) bad "unwritable: not SEED-SKEW — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"the pass DIED"*) bad "unwritable: the gate claimed the pass DIED for a record nothing can write — the measured 16h false reading is back" ;;
+  *) ok "unwritable: and never 'the pass DIED' — the cause it cannot know is not asserted" ;;
+esac
+case "$OUT_DRIVE" in
+  *"$SKEW/o/refresh-candidates.sh"*) ok "unwritable: the verdict NAMES the copy it tried (an operator is not sent hunting)" ;;
+  *) bad "unwritable: the verdict did not name the path it tried — $OUT_DRIVE" ;;
+esac
+# ⛔ AND WHAT IT SAYS ABOUT THAT PATH MUST AGREE WITH THE RESOLVER (review P2). With rc=2 `$REFRESH_SH`
+# is BY DEFINITION the copy the probe just proved CANNOT record, so the old clause — “a copy that can
+# record would run as <it>” — asserted the capability of the one file it had just disproved, and an
+# operator reading it would take the stale seed for healthy. Both halves are asserted: the wrong claim
+# absent AND the right one present (an absence check alone passes on an empty reading).
+case "$OUT_DRIVE" in
+  *"a copy that can record would run as"*) bad "unwritable: the verdict claims the copy it just proved INCAPABLE can record — $OUT_DRIVE" ;;
+  *) ok "unwritable: the verdict does not claim the incapable copy can record" ;;
+esac
+case "$OUT_DRIVE" in
+  *"the copy this box WOULD run is $SKEW/o/refresh-candidates.sh — it cannot record"*) ok "unwritable: it says of the named path that it CANNOT record (rc-aware clause)" ;;
+  *) bad "unwritable: the rc=2 clause does not match the resolver's own answer — $OUT_DRIVE" ;;
+esac
+# The frozen record's own content is not thrown away: a real past failure is still readable there.
+case "$OUT_DRIVE" in
+  *"frozen at result=running"*) ok "unwritable: the frozen record's own result is quoted, not discarded" ;;
+  *) bad "unwritable: the frozen record's content was dropped — $OUT_DRIVE" ;;
+esac
+# ⛔ AND A YOUNG RECORD IS STILL IN FLIGHT, not SEED-SKEW: a reader that fired on that would invent a
+# second wrong cause for the ordinary in-flight state.
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(date +%s)" > "$SKEW/o/state/refresh-last"
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  *"SEED-SKEW"*) bad "unwritable+young: a fresh start marker was read as a seed skew — $OUT_DRIVE" ;;
+  *) ok "unwritable+young: a record inside the stale bound is still in flight, not SEED-SKEW" ;;
+esac
+# ⛔ AND THE POSITIVE HALF (the absence assertion above would pass on an EMPTY reading — the vacuity
+# this suite guards against in section 9): the young record must land on its NORMAL branch.
+# ⛔ `start marker` IS NOT AN ACCEPTABLE WORD HERE (review P2): it appears in BOTH the in-flight
+# reading and the death line, so accepting it made this case pass on the very regression it exists to
+# catch. Only the two branches a young record can legitimately take are accepted, and the death
+# sentence is refused explicitly.
+case "$OUT_DRIVE" in
+  "[dispatch] deferred ("*|*"nothing to defer ("*) ok "unwritable+young: and it takes the ordinary in-flight branch (a real reading, not an empty one)" ;;
+  *) bad "unwritable+young: no readable gate line at all — the absence assertion above passed vacuously: $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"DIED"*) bad "unwritable+young: a FRESH start marker was reported as a death — $OUT_DRIVE" ;;
+  *) ok "unwritable+young: and a fresh marker is never called a death" ;;
+esac
+# ⛔ AN UN-AGEABLE STAMP IS NOT A DEATH ON AN UNWRITABLE BOX EITHER (review P2): a future or
+# non-numeric `at=` used to fall into "cannot be told apart from a pass that DIED" — the very sentence
+# this verdict exists to stop, on a box where nothing can write the record.
+for bad_at in "$(( $(date +%s) + 7200 ))" "notanumber"; do
+  printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$bad_at" > "$SKEW/o/state/refresh-last"
+  drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+  case "$OUT_DRIVE" in
+    *"DIED"*) bad "unwritable+unageable(at=$bad_at): the gate fell through to the death reading — $OUT_DRIVE" ;;
+    *"SEED-SKEW"*) ok "unwritable+unageable(at=$bad_at): an unageable stamp on an unwritable box is SEED-SKEW, not a death" ;;
+    *) bad "unwritable+unageable(at=$bad_at): no verdict — $OUT_DRIVE" ;;
+  esac
+done
+# (d2) THE CHECK MUST ANSWER ON A RUNNING BOX: `orch-loop.sh` refuses a second instance early and exits
+# 0, so a check placed BELOW that guard reports "healthy" on every live cell without ever looking —
+# measured in review against the first version of this change.
+CHK_LINE="$(grep -n '# \[refresh-check:begin\]' "$LOOP" | head -1 | cut -d: -f1)"
+LOCK_LINE="$(grep -n '^LOCKF="\$O/\.orch\.lock"' "$LOOP" | head -1 | cut -d: -f1)"
+if [ -n "$CHK_LINE" ] && [ -n "$LOCK_LINE" ] && [ "$CHK_LINE" -lt "$LOCK_LINE" ]; then
+  ok "check: the --check-refresh block is ABOVE the single-instance lock (it can answer on a running box)"
+else
+  bad "check: --check-refresh sits below the lock guard (line ${CHK_LINE:-?} vs ${LOCK_LINE:-?}) — on a live box it would exit 0 with 'already running' and never look"
+fi
+# (d3) ... and it is a PER-CYCLE resolution, not a per-process cache: a re-seed must re-enable spawning
+# without a restart, or the remedy this change prints is a remedy that does nothing.
+if grep -Eq '^[[:space:]]*REFRESH_RESOLVED=0;' "$LOOPCODE"; then
+  ok "check: the resolution is reset per cycle (a re-seed takes effect without a restart)"
+else
+  bad "check: no per-cycle reset of REFRESH_RESOLVED — a cached verdict outlives the remedy"
+fi
+
+# ⛔ AND A STALE `ok` IS NOT EVIDENCE EITHER (review P1). The mirror of the defect: a box whose writer
+# was seeded away still has the last pass's `result=ok` on disk, and an exemption for `ok` at ANY age
+# printed `skipped (… refresh ok, 3h ago)` — a false green claiming origination works, which is the
+# claim this whole verdict exists to refuse. Only FRESHNESS may exempt it.
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nhanded=7\n' \
+  "$(( $(date +%s) - 3 * 3600 ))" > "$SKEW/o/state/refresh-last"
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  *"SEED-SKEW"*) ok "unwritable+stale-ok: a 3h-old ok on a box with no writer is SEED-SKEW, not a green" ;;
+  *) bad "unwritable+stale-ok: a stale ok printed '$(printf '%s' "$OUT_DRIVE" | cut -c1-60)…' — a false 'origination works'" ;;
+esac
+case "$OUT_DRIVE" in
+  "[dispatch] skipped ("*) bad "unwritable+stale-ok: printed 'skipped (… refresh ok)' for a record nothing could have written — $OUT_DRIVE" ;;
+  *) ok "unwritable+stale-ok: and never 'skipped (… refresh ok)'" ;;
+esac
+# ...while a FRESH ok is still evidence and takes the normal branch (the exemption is freshness only).
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nhanded=7\n' "$(date +%s)" > "$SKEW/o/state/refresh-last"
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  "[dispatch] skipped ("*) ok "unwritable+fresh-ok: a FRESH ok still reads as 'skipped' (freshness is the only exemption)" ;;
+  *) bad "unwritable+fresh-ok: a fresh ok did not take the normal branch — $OUT_DRIVE" ;;
+esac
+# ⛔ AND THE SIBLING STATE: NO REFRESH SCRIPT AT ALL (rc=1). The spawn site refuses to start a pass it
+# cannot run, so nothing will EVER write the record — which makes the death sentence self-refuting
+# ('nothing will replace that marker but a pass that finishes').
+# ⛔ THE RECORD GOES IN THE DIR THAT IS DRIVEN (review P2): writing it into `$SKEW/o` and then driving
+# `$SKEW/no-script` exercised the *absent* record arm (`[ -z "$at" ]`), never the stale numeric one —
+# the state this comment claims to test.
+mkdir -p "$SKEW/no-script/state"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+  "$(( $(date +%s) - 16 * 3600 ))" > "$SKEW/no-script/state/refresh-last"
+printf '7\n' > "$SKEW/no-script/candidates.txt"
+drive_gate_self "$SKEW/no-script" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/no-script2"
+case "$OUT_DRIVE" in
+  *"DIED"*) bad "no-script: the gate claimed the pass DIED although no pass can start here — $OUT_DRIVE" ;;
+  *"SEED-SKEW"*) ok "no-script: a box with NO refresh script reports SEED-SKEW, never a death" ;;
+  *) bad "no-script: no verdict at all — $OUT_DRIVE" ;;
+esac
+# ...and the record's own frozen content is still quoted, so a real past failure is not lost.
+case "$OUT_DRIVE" in
+  *"frozen at result=running"*) ok "no-script: and the frozen record's result is still quoted" ;;
+  *) bad "no-script: the frozen record was dropped — $OUT_DRIVE" ;;
+esac
+
+# (d) `--check-refresh` — the answer in EXIT CODES, which is what a monitor or CI can read.
+CHECKBLOCK="$T/refresh-check.sh"
+awk '/# \[refresh-check:begin\]/{f=1} f{print} f&&/# \[refresh-check:end\]/{exit}' "$LOOP" > "$CHECKBLOCK"
+if [ -s "$CHECKBLOCK" ] && grep -q -- '--check-refresh' "$CHECKBLOCK"; then
+  ok "check: the --check-refresh block is extractable from the shipped orch-loop.sh"
+else
+  bad "check: could not extract the --check-refresh block — the exit-code contract is ungraded"
+fi
+check_run() {  # <O> <self-dir> -> prints the record line; exit code in $?
+  cat "$HELPFNS" "$CHECKBLOCK" > "$T/check-drive.sh"
+  O="$1" REFRESH_SELF_DIR="$2" bash "$T/check-drive.sh" --check-refresh 2>&1
+}
+OUT_C="$(check_run "$SKEW/ok/o" "")"; RC_C=$?
+[ "$RC_C" = "0" ] && ok "check: an intact seed exits 0" || bad "check: an intact seed exited $RC_C, not 0 — $OUT_C"
+case "$OUT_C" in *"relation=ok"*) ok "check: and records relation=ok" ;; *) bad "check: no relation=ok — $OUT_C" ;; esac
+OUT_C="$(check_run "$SKEW/o" "$SKEW/self")"; RC_C=$?
+[ "$RC_C" = "1" ] && ok "check: a stale seed with a capable copy beside the loop exits 1 (DIVERGENCE)" \
+  || bad "check: a skewed seed exited $RC_C, not 1 — a monitor would read it as healthy: $OUT_C"
+case "$OUT_C" in *"relation=skew"*) ok "check: and names the skew" ;; *) bad "check: no relation=skew — $OUT_C" ;; esac
+OUT_C="$(check_run "$SKEW/o" "$SKEW/none")"; RC_C=$?
+[ "$RC_C" = "2" ] && ok "check: no recorder anywhere exits 2 (cannot be verified, never a pass)" \
+  || bad "check: an unprovable box exited $RC_C, not 2 — $OUT_C"
+case "$OUT_C" in *"relation=unwritable"*) ok "check: and says the record is unwritable" ;; *) bad "check: no relation=unwritable — $OUT_C" ;; esac
+
+# ⛔ AND THE SHIPPED ENTRYPOINT, NOT ONLY AN EXCERPT (#2308 review, P2). `check_run` above RE-CREATES
+# the block in `$T/check-drive.sh`, so it grades the block and not the path a monitor or a CI job runs:
+# a `$1` consumed earlier, a changed default for `O`/`REFRESH_SELF_DIR`, or any guard added above the
+# case leaves every assertion above green while `orch-loop.sh --check-refresh` answers something else —
+# the false-green interface this change exists to give monitors. Each arm below runs the SHIPPED script.
+mkdir -p "$T/repo"
+ship_run() {  # <O> <self-dir> <repo> -> prints the output; exit code in $?
+  REPO="$3" O="$1" REFRESH_SELF_DIR="$2" bash "$LOOP" --check-refresh 2>&1
+}
+OUT_S="$(ship_run "$SKEW/ok/o" "" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "0" ] && ok "ship: the SHIPPED entrypoint exits 0 on an intact seed" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 0 — a monitor reads a healthy box as broken: $OUT_S"
+case "$OUT_S" in *"relation=ok"*) ok "ship: and the shipped entrypoint records relation=ok" ;; *) bad "ship: no relation=ok from the shipped entrypoint — $OUT_S" ;; esac
+OUT_S="$(ship_run "$SKEW/o" "$SKEW/self" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "1" ] && ok "ship: the SHIPPED entrypoint exits 1 on a skewed seed" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 1 — the divergence is invisible to a monitor: $OUT_S"
+OUT_S="$(ship_run "$SKEW/o" "$SKEW/none" "$T/repo")"; RC_S=$?
+[ "$RC_S" = "2" ] && ok "ship: the SHIPPED entrypoint exits 2 when nothing on the box can record" \
+  || bad "ship: the shipped --check-refresh exited $RC_S, not 2 — $OUT_S"
+OUT_S="$(ship_run "$SKEW/ok/o" "" "")"; RC_S=$?
+[ "$RC_S" = "78" ] && ok "ship: the SHIPPED entrypoint exits 78 when the controller cannot start (REPO unset)" \
+  || bad "ship: the shipped --check-refresh exited $RC_S with REPO unset, not 78 — a startup failure would read as a verdict: $OUT_S"
+
+# (e) THE WIRING: the spawn must use the RESOLVED script, or the fix is inert on the box it was
+# written for (the shipped loop used to hardcode `$O/refresh-candidates.sh`).
+if grep -Eq '^[^#]*bash "\$O/refresh-candidates\.sh"' "$LOOPCODE"; then
+  bad "wiring: orch-loop.sh still spawns \$O/refresh-candidates.sh directly — a stale seed is executed unprobed"
+else
+  ok "wiring: no code line spawns the unprobed \$O/refresh-candidates.sh"
+fi
+if grep -Eq '^[^#]*bash "\$REFRESH_SH"' "$LOOPCODE"; then
+  ok "wiring: the spawn runs the RESOLVED script (\$REFRESH_SH)"
+else
+  bad "wiring: no code line spawns \$REFRESH_SH — the resolution would be decorative"
+fi
+
+# (f) THE SPAWN MUST SAY WHEN IT RUNS A DIFFERENT COPY THAN THE OPERATOR SEEDED (review P2). The
+# `rc=0`-with-skew case is the MEASURED cell's own remedy — a stale `$O` seed passed over in favour of
+# a recorder beside the loop — and it was the one arm that logged only `spawning`: the box silently
+# ran something other than the seed, so the seed could stay stale forever with no operator-visible
+# signal. The shipped block is extracted VERBATIM (the same extractor refresh-scout.test.sh §7 uses)
+# and DRIVEN, because an arm that exists in the text but never fires grades nothing.
+SPAWNBLOCK="$T/refresh-spawn-block.sh"
+{
+  grep -m1 '^is_num()' "$LOOP"
+  awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  cat "$HELPFNS"
+  awk '/^refresh_record_snapshot\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_record_field\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_cause_brief\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
+} > "$SPAWNBLOCK"
+printf '\nwait\n' >> "$SPAWNBLOCK"
+if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep -q '^resolve_refresh_sh()' "$SPAWNBLOCK"; then
+  SP="$T/spawn"; mkdir -p "$SP/o/state" "$SP/self"
+  # The SEEDED copy cannot record; a RECORDER sits beside the loop. Resolvable rc = 0 WITH a skew —
+  # the exact shape whose remedy this PR is.
+  printf '%s\n' '#!/usr/bin/env bash' '# a deployed copy from before #2229: refresh_record_write is only prose here' \
+    'echo "refresh: queued nothing"' > "$SP/o/refresh-candidates.sh"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP/self-invoked'" 'refresh_record_write() { :; }' > "$SP/self/refresh-candidates.sh"
+  : > "$SP/o/candidates.txt"
+  O="$SP/o" LOG="$SP/log" REFRESH_SELF_DIR="$SP/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP/self-invoked" ] && ok "spawn+skew: the RESOLVER's copy is the one that runs (non-vacuity: the arm is reached)" \
+    || bad "spawn+skew: the recording copy was never executed — the driven block did not reach the spawn"
+  if grep -q 'SEED-SKEW' "$SP/log" 2>/dev/null && grep -q "$SP/o/refresh-candidates.sh" "$SP/log" 2>/dev/null; then
+    ok "spawn+skew: the swap is DISCLOSED, naming the passed-over seed"
+  else
+    bad "spawn+skew: the seeded copy was passed over silently (log: $(cat "$SP/log" 2>/dev/null | tr '\n' '|'))"
+  fi
+  grep -q 'cannot record' "$SP/log" 2>/dev/null && ok "spawn+skew: and says WHY the seed was passed over (it cannot record)" \
+    || bad "spawn+skew: the disclosure does not state the seed's defect — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
+  # ⛔ THE REMEDY MUST BE THE VERIFYING SEEDER, NOT A BARE `cp *.sh` (#2308 review, P3). `deploy-harness.sh`
+  # is the seeder that reports a per-file verdict; a bare copy is the source of a silently PARTIAL
+  # deployment (agent-infra#2041), so a SEED-SKEW message that prescribes it can leave the operator with
+  # a mixed seed and the same skew firing — with nothing explaining why.
+  if grep -qF 'deploy-harness.sh' "$SP/log" 2>/dev/null && ! grep -qF 'cp scripts/orchestrator-harness/*.sh' "$SP/log" 2>/dev/null; then
+    ok "spawn+skew: and carries the VERIFYING remedy (deploy-harness.sh), never the bare cp"
+  else
+    bad "spawn+skew: the disclosure names no usable remedy — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
+  fi
+  # ⛔ AND THE SHAPE THE SKEW FLAG CANNOT SEE (review P2): `$O` was NEVER seeded (or its seed was
+  # deleted), so the resolver finds only the copy beside the loop and answers rc=0 with NO skew
+  # recorded — `REFRESH_SH_SKEW` names only a copy that EXISTS but cannot record. An arm keyed on that
+  # flag left this case in no branch at all: the beat logged only `spawning` while a script the operator
+  # never seeded there ran, and the box looked fully healthy. Driven, not grepped: an arm in the text
+  # that never fires grades nothing (the same reason this whole block is driven).
+  SP2="$T/spawn-noseed"; mkdir -p "$SP2/o/state" "$SP2/self"
+  # ONLY the beside-the-loop copy exists; the seeded path does not, at any generation.
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP2/self-invoked'" 'refresh_record_write() { :; }' > "$SP2/self/refresh-candidates.sh"
+  printf '7\n' > "$SP2/o/candidates.txt"
+  O="$SP2/o" LOG="$SP2/log" REFRESH_SELF_DIR="$SP2/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP2/self-invoked" ] && ok "spawn+no-seed: the beside-the-loop copy runs (non-vacuity: the arm is reached)" \
+    || bad "spawn+no-seed: no refresh ran at all — the driven block did not reach the spawn"
+  if grep -q 'SEED-SKEW' "$SP2/log" 2>/dev/null && grep -qF "$SP2/self/refresh-candidates.sh" "$SP2/log" 2>/dev/null; then
+    ok "spawn+no-seed: running a copy the operator never seeded is DISCLOSED, naming the copy it ran"
+  else
+    bad "spawn+no-seed: an unseeded \$O silently ran a different script than the operator seeded (log: $(cat "$SP2/log" 2>/dev/null | tr '\n' '|'))"
+  fi
+  grep -qF "$SP2/o/refresh-candidates.sh" "$SP2/log" 2>/dev/null && ok "spawn+no-seed: and names the seeded path that is missing (so the remedy is visible)" \
+    || bad "spawn+no-seed: the disclosure does not name the missing seeded path — $(cat "$SP2/log" 2>/dev/null | tr '\n' '|')"
+  if grep -qF 'deploy-harness.sh' "$SP2/log" 2>/dev/null && ! grep -qF 'cp scripts/orchestrator-harness/*.sh' "$SP2/log" 2>/dev/null; then
+    ok "spawn+no-seed: and carries the VERIFYING remedy (deploy-harness.sh), never the bare cp"
+  else
+    bad "spawn+no-seed: the disclosure names no usable remedy — $(cat "$SP2/log" 2>/dev/null | tr '\n' '|')"
+  fi
+  # ...AND THE INTACT BOX STAYS SILENT (the positive paired with the absences above): a disclosure arm
+  # that fired on the seeded copy would train an operator to ignore it.
+  SP3="$T/spawn-intact"; mkdir -p "$SP3/o/state" "$SP3/self"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP3/seed-invoked'" 'refresh_record_write() { :; }' > "$SP3/o/refresh-candidates.sh"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP3/self-invoked'" 'refresh_record_write() { :; }' > "$SP3/self/refresh-candidates.sh"
+  printf '7\n' > "$SP3/o/candidates.txt"
+  O="$SP3/o" LOG="$SP3/log" REFRESH_SELF_DIR="$SP3/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP3/seed-invoked" ] && [ ! -s "$SP3/self-invoked" ] \
+    && ok "spawn+seeded: the SEEDED copy is the one that runs (the operator's seed still wins)" \
+    || bad "spawn+seeded: the seeded copy was not the one executed — the resolver no longer prefers \$O"
+  grep -q 'SEED-SKEW' "$SP3/log" 2>/dev/null \
+    && bad "spawn+seeded: an INTACT seed still disclosed a skew — the line would become noise nobody reads (log: $(cat "$SP3/log" 2>/dev/null | tr '\n' '|'))" \
+    || ok "spawn+seeded: an intact seed says nothing about a skew"
+else
+  bad "spawn+skew: could not extract the refresh spawn block — the disclosure is ungraded"
 fi
 
 echo

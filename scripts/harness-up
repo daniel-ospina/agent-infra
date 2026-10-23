@@ -8,8 +8,14 @@
 #   ./scripts/harness-up down        # stop the stack (delegated; nothing invented here)
 #   ./scripts/harness-up status      # one line per component (pid + age) + ONE verdict
 #
-#   Flags: --harness <dir> --repo <path> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
+#   Flags: --harness <dir> --repo <agent-infra checkout> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
 #          --no-fetch --skip-selftest --timeout <secs> --plain
+#          ⛔ `--repo` is THE HARNESS CHECKOUT (the repo the pin commit and `--ref` are commits OF), NOT the
+#          repo the controller drains: that one is `REPO=<work repo>` in the environment, and it is left
+#          alone. On a cell the two differ (harness=agent-infra, work=tortoise) — see the TWO repos block.
+#          Without `--repo` the harness resolves from `HARNESS_REPO` (env, then this machine's `ENV_FILE`)
+#          and then the launcher's OWN checkout; a candidate that is not a checkout ROOT is skipped.
+#          An unusable `--repo` REFUSES, naming the value; an unusable inherited candidate is skipped.
 #   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to
 #   capacity.sh's CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units), HU_DISK_PER_LANE_MB
 #   (1100), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a
@@ -84,7 +90,7 @@ SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }
-die()  { printf 'harness-up: %s\n' "$*" >&2; exit "${2:-3}"; }
+die()  { local m="$1" rc="${2:-3}"; printf 'harness-up: %s\n' "$m" >&2; exit "$rc"; }
 
 usage() { # <exit-code>
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
@@ -92,7 +98,7 @@ usage() { # <exit-code>
 }
 
 VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1
-A_HARNESS=""; A_REPO=""; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
+A_HARNESS=""; A_REPO=""; A_REPO_SEEN=0; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
 BOUND="${HARNESS_UP_TIMEOUT:-900}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -106,7 +112,7 @@ while [ $# -gt 0 ]; do
         fi
         VERB="$1"; shift ;;
     --harness)             [ $# -ge 2 ] || die "--harness needs a path"; A_HARNESS="$2"; shift 2 ;;
-    --repo)                [ $# -ge 2 ] || die "--repo needs a path"; A_REPO="$2"; shift 2 ;;
+    --repo)                [ $# -ge 2 ] || die "--repo needs a path"; A_REPO="$2"; A_REPO_SEEN=1; shift 2 ;;
     --ref)                 [ $# -ge 2 ] || die "--ref needs a git ref"; A_REF="$2"; shift 2 ;;
     --pin)                 [ $# -ge 2 ] || die "--pin needs a file"; A_PIN="$2"; shift 2 ;;
     --pin-dir)             [ $# -ge 2 ] || die "--pin-dir needs a path"; A_PINDIR="$2"; shift 2 ;;
@@ -444,15 +450,117 @@ cfg_value() { # <key> <file>
   bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' _ "$f" "$k" 2>/dev/null || true
 }
 
-REPO="${A_REPO:-${REPO:-}}"
-if [ -z "$REPO" ]; then
-  for cand in "${HARNESS_REPO:-}" "$(cfg_value REPO "$ENV_FILE")" \
-              "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
-    [ -n "$cand" ] && [ -d "$cand" ] && { REPO="$cand"; break; }
-  done
+# ── TWO repos, because they are two different things ─────────────────────────────────────────────
+# HREPO is THE HARNESS CHECKOUT: the repo the pin commit and $REF are commits OF, and the repo whose
+# per-commit worktrees are materialised under PIN_ROOT. REPO is THE WORK REPO: the checkout the
+# controller reads its backlog from and whose origin `orch-loop.sh` derives `$OR` from. They are the
+# same path on a laptop and DIFFERENT on a cell, where the fleet exports REPO=<the work repo>
+# (tortoise) while the harness lives in agent-infra.
+# ⛔ CONFLATING THEM BROKE BOTH DIRECTIONS AT ONCE (measured 2026-10-22, cell): the pin commit was
+# resolved in the WORK repo, which does not contain it, so `pin: UNRESOLVABLE` REFUSED a pin whose
+# record and tree agreed perfectly; and the repair a reader reaches for — `--repo <agent-infra>` —
+# then wrote `REPO=<agent-infra>` into the child's environment, silently RETARGETING the controller
+# at the harness repo's backlog. One variable can never mean both: the pin is a harness-repo commit,
+# and REPO is what the lanes work on.
+# ⛔ NAME THE VALUE, AND SEPARATE THE TWO WAYS IT CAN BE WRONG. `--repo` is an operator's assertion
+# about THIS run, so a mistyped one is REFUSED and NAMED — never silently replaced by a different
+# checkout, which is how the pre-split launcher lost the harness/ work distinction in the first place.
+# An INHERITED candidate (`HARNESS_REPO`, the config file, the launcher's own checkout) is not an
+# assertion about this run: the supervisor PRUNES pin worktrees, so a candidate that has since moved is
+# ordinary wear, and the pre-split launcher skipped such a candidate. Refusing EVERY verb on it —
+# `down` included — would leave a live controller with no sanctioned way to stop it, which is a worse
+# answer than resolving the harness from the next candidate. So: explicit → refuse; inherited → skip,
+# SAY SO on stderr, and continue.
+HREPO=""
+HREPO_BAD=""
+# ⛔ `--repo ""` IS AN OPERATOR ASSERTION THAT NAMES NOTHING, so it is REFUSED like any other unusable
+# assertion — never read as "no flag". `[ -n "$A_REPO" ]` treated an empty value as absent and then
+# resolved the harness from HARNESS_REPO / the launcher's own checkout, i.e. the run answered about a
+# checkout the operator never named — the silent-substitution class this block exists to remove. It is
+# reachable in the ordinary way (`--repo "$SOME_UNSET_VAR"`). (#2351 review)
+if [ "${A_REPO_SEEN:-0}" = 1 ] && [ -z "${A_REPO:-}" ]; then
+  die "--repo '' is empty — it must name the HARNESS checkout (the repo the pin commit and --ref are commits OF); an empty value is refused, never read as 'no flag'" 2
 fi
-[ -n "$REPO" ] && [ -d "$REPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set REPO, or run from a checkout" 2
-git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git checkout" 2
+if [ -n "${A_REPO:-}" ]; then
+  HREPO="$A_REPO"
+  [ -d "$HREPO" ] || die "--repo $HREPO is not a directory — --repo names the HARNESS checkout, the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
+  git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "--repo $HREPO is not a git checkout — the pin commit and --ref must be commits OF it" 2
+  # ⛔ THE ROOT RULE APPLIES TO THE FLAG TOO: `git -C` WALKS UP, so `--repo <a subdir of a checkout>`
+  # would satisfy both guards above and then resolve the pin in the ENCLOSING object DB — the same
+  # wrong-repo resolution the inherited candidates are refused for, on the path an operator asserts.
+  [ "$(git -C "$HREPO" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$HREPO" && pwd -P)" ] \
+    || die "--repo $HREPO is inside another checkout, not the checkout root — the pin commit and --ref are commits OF the harness repo ROOT" 2
+else
+  # The candidates, in order: the environment, this machine's config file, then the launcher's OWN
+  # checkout — the operative cell path, because a cell's `keys.env` carries `REPO`/`OR` but NOT
+  # `HARNESS_REPO` (docs/ops/fleet-harness-baseline.md), so the fallback is what resolves it there.
+  # ⛔ `--harness` IS NOT A SOURCE FOR THIS — and never was. It names the DIR the controller reads (on a
+  # cell, a pin worktree under PIN_ROOT), not the repo whose object DB the pin is resolved in, and
+  # `origin/main` did not accept it either (its candidates were HARNESS_REPO, the config file, the own
+  # checkout). Adding it here would silently change which repo answers the pin question on every cell.
+  # ⛔ THE CONFIG KEY IS `HARNESS_REPO`, NEVER `REPO`: `REPO` is the WORK repo (read below), and taking
+  # it here is precisely the conflation this block removes — the flat-copy layout (a deployed copy
+  # outside any checkout) still has a way to name its harness, under a key that means one thing.
+  for cand in "${HARNESS_REPO:-}" "$(cfg_value HARNESS_REPO "$ENV_FILE")" \
+              "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
+    [ -n "$cand" ] || continue
+    [ -d "$cand" ] || { warn "harness: ignoring '$cand' (not a directory) — trying the next candidate"; continue; }
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 \
+      || { warn "harness: ignoring '$cand' (not a git checkout) — trying the next candidate"; continue; }
+    # ⛔ `rev-parse --git-dir` WALKS UP, so it answers "is this inside some repo", not "is this the repo".
+    # A pruned or mistyped path that now sits INSIDE another checkout (the ordinary way a stale path comes
+    # to exist) would be accepted and the pin resolved in that foreign object DB — the #2356 symptom, one
+    # inherited candidate further in. Require the candidate to BE a toplevel.
+    if [ "$(git -C "$cand" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$cand" && pwd -P)" ]; then
+      warn "harness: ignoring '$cand' (inside another checkout, not a checkout root) — trying the next candidate"
+      continue
+    fi
+    HREPO="$cand"; break
+  done
+  # ⛔ UNRESOLVABLE IS A HELD VERDICT TOO, NOT A UNIVERSAL REFUSAL (review P1): `down` reads no harness at
+  # all — it delegates to the authority's own `stop` — so a box that names its work repo but not a harness
+  # (the flat-copy layout, or a cell whose agent-infra main worktree was pruned) must still be stoppable.
+  # on `origin/main` that invocation REACHED cmd_down; dying here would have removed it one verb at a time.
+  [ -n "$HREPO" ] || HREPO_BAD="no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout"
+fi
+# The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
+# only then the harness checkout — the pre-split behaviour for a box that configures neither.
+# ⛔ NAME WHERE THE REFUSED VALUE CAME FROM. `--repo` sets the HARNESS and can no longer change REPO, and
+# when the value came from the config file `unset REPO` is not even a change — the next run re-reads the
+# same value. Both remedies in the old text were INERT for the value it refused (measured: `--repo
+# <harness>` on a REPO from `ENV_FILE` gives the identical rc 2), which is the same "a refusal that steers
+# the reader somewhere unhelpful" class this block exists to remove.
+REPO_SRC=""
+if [ -n "${REPO:-}" ]; then
+  REPO_SRC="the environment"
+else
+  REPO="$(cfg_value REPO "$ENV_FILE")"
+  if [ -n "$REPO" ]; then REPO_SRC="the config file $ENV_FILE"; fi
+fi
+# ⛔ UNSET AND SET-BUT-WRONG ARE NOT THE SAME STATE. Unset legitimately falls back to the harness checkout
+# (a box that configures neither — the pre-split behaviour). A REPO that is SET and is not a directory is a
+# CONFIGURATION ERROR and is refused, because substituting the harness here would export
+# `REPO=<agent-infra>` to the controller and `orch-loop.sh` would derive `$OR` from agent-infra's origin —
+# the silent wrong-backlog retarget this whole block exists to prevent, one case further down.
+REPO_BAD=""
+if [ -z "$REPO" ]; then REPO="$HREPO"
+elif [ ! -d "$REPO" ]; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a directory — REPO names the WORK repo the controller drains, not the harness; --repo sets the HARNESS checkout and cannot change REPO — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness"
+# ⛔ A DIRECTORY IS NOT A CHECKOUT. The controller derives its owner/repo from `$REPO`'s ORIGIN
+# (`orch-loop.sh` `derive_or`); handed a directory that is not a repo it WARNS and falls back to a
+# hardcoded literal — a controller grading a repo nobody named, while this launcher reports it started.
+# The pre-split code validated this (it was the only repo it had); the split must not lose it.
+elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness"
+fi
+# ⛔ THE VERDICT IS HELD HERE AND APPLIED BY THE VERB — a refusal is not a universal verb policy.
+# `up` STARTS a controller that would drain a repo nobody named, so it REFUSES (nothing is started).
+# Every OTHER verb must stay answerable: `down`/`status` are what an operator reaches for on a machine
+# that is wrong, and that is the authority's own stated rule (`orchestrator-bringup.sh` `cmd_stop`:
+# "REPORT, never die: `stop` is the verb an operator reaches for on a machine that is wrong, and it must
+# stay answerable"). It also closes an escape this split would otherwise remove: `--repo` no longer sets
+# REPO, so a launcher that died for every verb would leave a box with a stale REPO unstoppable until the
+# operator edited their shell.
+# ⛔ AND THE BAD VALUE IS NOT SUBSTITUTED for the non-`up` verbs: exporting the harness as REPO is the
+# silent wrong-backlog retarget this whole block exists to prevent, so it is passed through and NAMED.
 
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.
 PIN_ROOT="${A_PINDIR:-${HARNESS_PIN_DIR:-}}"
@@ -494,7 +602,7 @@ hu_env_add() { HU_ENV+=("$1=$2"); }
 hu_env_add CELL_HOME "$CELL_HOME"
 hu_env_add O "$O"
 hu_env_add REPO "$REPO"
-hu_env_add HARNESS_REPO "$REPO"
+hu_env_add HARNESS_REPO "$HREPO"
 hu_env_add HARNESS_REF "$REF"
 hu_env_add ENV_FILE "$ENV_FILE"
 # ⛔ HARNESS IS UNCONDITIONAL. It used to be added only on a box with pin machinery, so on a PIN-LESS
@@ -582,6 +690,50 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
 # anything else = MISMATCH.
 HU_PIN_PENDING=0
 hu_real() { ( cd "${1:-/nonexistent}" 2>/dev/null && pwd -P ); }
+# ⛔ TWO PATHS ARE THE SAME REPO ONLY WHEN BOTH RESOLVE AND THE RESULTS MATCH. `hu_real` prints NOTHING
+# for a path that does not exist, so a bare `[ "$(hu_real a)" = "$(hu_real b)" ]` declares two MISSING
+# paths EQUAL — and in the claims row that means a record about a repo this box does not drain is reused
+# as an answer (`OK (refs/claims reachable)`) with no probe run, which is the exact false PASS that row
+# exists to prevent. An EMPTY resolution is the ABSENCE of an identity, never an identity shared by two
+# paths (#2351 review, reproduced: both-missing read OK and the record was left untouched).
+hu_same_repo() { # <a> <b> — resolved equality; an empty resolution on either side is NOT equality
+  local ra rb
+  ra="$(hu_real "${1:-}")"; rb="$(hu_real "${2:-}")"
+  [ -n "$ra" ] && [ -n "$rb" ] && [ "$ra" = "$rb" ]
+}
+# ⛔ THE PATH IS NOT THE FACT. `refs/claims` reachability is a property of the checkout's ORIGIN, so a
+# checkout re-cloned or repurposed AT THE SAME PATH keeps the previous repo's answer: `$O/state` lives
+# OUTSIDE the checkout, so it survives the re-clone, and a path-only record then reads `OK (refs/claims
+# reachable)` for a repo nobody probed — for up to HU_CLAIMS_STALE. The record therefore carries the
+# origin it probed, and reuse requires that origin to still be this checkout's. An ABSENT `origin=`
+# (records written before this field existed, or a checkout with no readable remote) keeps the old
+# path-only behaviour, so nothing reds on an old box.
+hu_origin() { git -C "${1:-/nonexistent}" remote get-url origin 2>/dev/null || true; }
+hu_same_origin() { # <recorded> <live> — empty RECORDED ⇒ legacy path-only ⇒ same
+  local a="${1:-}" b="${2:-}"
+  [ -z "$a" ] && return 0
+  a="${a%/}"; a="${a%.git}"; b="${b%/}"; b="${b%.git}"
+  [ -n "$b" ] && [ "$a" = "$b" ]
+}
+# The record is `claims=<v> repo=<path> [origin=<url>] at=<ts>`; the repo path may contain spaces, so the
+# parse is anchored on `at=` and the OPTIONAL field is split from the END of the repo field.
+hu_rec_parse() { # <file> — sets HU_REC_REPO / HU_REC_ORIGIN (empty when absent)
+  local line rest
+  HU_REC_REPO=""; HU_REC_ORIGIN=""
+  line="$(sed -n 's/^claims=[^ ]* //p' "$1" 2>/dev/null | head -1)"
+  # ⛔ THE REMAINDER MUST *BE* THE REPO FIELD. Without this, the oldest record shape —
+  # `claims=reachable at=1`, which a box started by an older launcher still holds — parsed as
+  # repo="at=1": a NON-EMPTY, foreign repo, so the row re-probed and a deliberately AGED record read as a
+  # fresh OK instead of LATE (caught by harness-cohesion's aged-record arm). No `repo=` ⇒ unattributed.
+  case "$line" in repo=*) ;; *) return 1 ;; esac
+  rest="${line% at=*}"
+  rest="${rest#repo=}"
+  case "$rest" in
+    *' origin='*) HU_REC_REPO="${rest% origin=*}"; HU_REC_ORIGIN="${rest##* origin=}" ;;
+    *)            HU_REC_REPO="$rest" ;;
+  esac
+  return 0
+}
 hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (used after a start)
   local strict="${1:-0}" sha want got real_want real_got got_head got_root
   HU_PIN_PENDING=0
@@ -589,6 +741,11 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     say "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
     return 4
   fi
+  # ⛔ AN EMPTY HARNESS IS NOT A BYPASS. `git -C ""` addresses the PROCESS CWD's repo (verified on git
+  # 2.43), so a box with no resolvable harness would otherwise answer this row from whatever checkout the
+  # operator happens to stand in — `pin: OK` for a repo the launcher never identified, feeding the single
+  # verdict. The row is UNRESOLVED (cannot-verify), never a pass.
+  [ -n "$HREPO" ] || { say "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
   # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE. `head` on a mode-000 file, or on a path behind an
   # unsearchable ancestor, prints nothing — exactly like a record that was never written — so the pin
   # "resolved" from $REF, the read dir was never compared to the pin's tree, and the controller start
@@ -611,17 +768,17 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     # is what creates the record (harness-refresh's mend, exit 11). Refusing here would make the
     # mender unreachable behind the gate that needs it — a permanent self-inflicted block.
     local tipsha
-    tipsha="$(git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
+    tipsha="$(git -C "$HREPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
     if [ -z "$tipsha" ]; then
-      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $REPO"
+      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
       return 2
     fi
     say "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
     return 0
   fi
-  sha="$(git -C "$REPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
+  sha="$(git -C "$HREPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
   if [ -z "$sha" ]; then
-    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in $REPO"
+    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
     return 2
   fi
   want="$PIN_ROOT/${sha:0:12}/scripts/orchestrator-harness"
@@ -662,7 +819,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   got_head=""; [ -n "$got_root" ] && got_head="$(git -C "$got_root" rev-parse --verify --quiet HEAD 2>/dev/null)"
   got_root="$(hu_real "$got_root")"
   if [ -n "$got_head" ] && [ -n "$got_root" ] && [ "$got_root" != "$(hu_real "$PIN_ROOT")" ] \
-     && git -C "$REPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
+     && git -C "$HREPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
     HU_PIN_PENDING=1
     if [ "$strict" = 1 ]; then
       say "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
@@ -741,12 +898,56 @@ hu_row_refresh() {
 # and an AGED record is LATE rather than OK: a stale "reachable" speaks about a probe nobody repeated.
 HU_CLAIMS_STALE="${HARNESS_UP_CLAIMS_STALE:-1800}"
 hu_row_claims() {
-  local f="$O/state/harness-claims" age verdict=""
+  local f="$O/state/harness-claims" age verdict="" rec_repo="" rec_origin="" why=""
   if [ -f "$f" ]; then
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    # ⛔ THE FIELD IS THE REST OF THE LINE, anchored on both sides: a path containing a space is the
+    # ordinary macOS shape (`/Users/First Last`), and `[^ ]*` would truncate the launcher's OWN record into
+    # a "different repo", turning a healthy box BROKEN for no configuration error.
+    hu_rec_parse "$f" || true
+    rec_repo="$HU_REC_REPO"; rec_origin="$HU_REC_ORIGIN"
     age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
-  else
-    hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed, and there is no record at $f)"; return 2; }
+  fi
+  # ⛔ A RECORD ABOUT ANOTHER REPO IS NOT AN ANSWER ABOUT THIS ONE, AND IT IS NOT A PERMANENT VERDICT
+  # EITHER: the split makes "which repo did this probe" a question with more than one answer, but a
+  # mismatch must RE-PROBE (one bounded read, the round trip the record would have saved) rather than stick
+  # on UNKNOWN. `hu_start_claims` is the only writer and `status` only reached it when the file was
+  # ABSENT, so a box repurposed to a different work repo — or one whose `keys.env` changed under a
+  # launchd/cloud-cell-supervisor restart that never runs `harness-up` — would have read BROKEN forever.
+  # ⛔ AND THE COMPARISON IS RESOLVED (hu_real, as every other path compare in this file is): `/var/…` and
+  # `/private/var/…`, a trailing slash, or a symlink are the SAME repo, not a repurposed box.
+  if [ -n "$rec_repo" ]; then
+    if [ -z "$REPO" ]; then
+      hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, and no work repo is resolved to attribute it)"; return 2
+    fi
+    if ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$(hu_origin "$REPO")"; then
+      # ⛔ NAME THE SIDE THAT FAILED (review P2). The sentence used to say "not the work repo $REPO" for
+      # EVERY mismatch, so a work repo that simply does not resolve printed
+      # `the record probed /tmp/gone, not the work repo /tmp/gone` — two identical strings, i.e. the row
+      # told an operator its own path was a different repo, which is a diagnostic that steers the reader
+      # away from the actual fault. Path-identity, origin-identity and unresolvable-work-repo are three
+      # different faults and are three different sentences.
+      local live_origin
+      live_origin="$(hu_origin "$REPO")"
+      if [ -z "$(hu_real "$REPO")" ]; then
+        why="the work repo $REPO does not resolve to a directory, so the record ($rec_repo${rec_origin:+ at origin $rec_origin}) cannot be attributed to it"
+      elif ! hu_same_repo "$rec_repo" "$REPO"; then
+        why="the record probed $rec_repo${rec_origin:+ ($rec_origin)}, not the work repo $REPO"
+      else
+        why="the record probed $rec_repo at origin ${rec_origin}, but $REPO's origin is ${live_origin:-<unreadable>}"
+      fi
+      # Re-probe and re-read; the row is the FRESH answer, or UNKNOWN with the probe's reason.
+      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN ($why, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
+      verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+      age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
+      hu_rec_parse "$f" || true
+      rec_repo="$HU_REC_REPO"; rec_origin="$HU_REC_ORIGIN"
+      if [ -n "$rec_repo" ] && { ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$live_origin"; }; then
+        hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the re-probe left a record for $rec_repo${rec_origin:+ at origin $rec_origin}, not for $REPO${live_origin:+ at origin $live_origin})"; return 2
+      fi
+    fi
+  elif [ ! -f "$f" ]; then
+    hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY}, and there is no record at $f)"; return 2; }
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
   fi
@@ -868,11 +1069,14 @@ hu_row_exec() {
       fi
       pinraw="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
       if [ -n "$pinraw" ]; then
-        ref="$(git -C "$REPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
+        # ⛔ SAME FAIL-CLOSED RULE AS hu_verify_pin: `git -C ""` is the CWD's repo, so an empty harness
+        # would compare the running tree against the operator's own checkout and could print OK.
+        [ -n "$HREPO" ] || { hu_row exec "$pid" - "UNRESOLVED (no harness repo resolved, so the pin record ${pinraw:0:12} cannot be compared with $path)"; return 2; }
+        ref="$(git -C "$HREPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
         # ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN", AND NOT A LICENCE TO FALL THROUGH: falling
         # through printed `OK` about the harness dir while the pin named a commit nothing could read
         # (measured in review). Naming it is the only honest answer.
-        [ -n "$ref" ] || { hu_row exec "$pid" - "UNRESOLVABLE (the pin record $PIN_SHA_FILE names ${pinraw:0:12}, which is not a commit in $REPO, so $path cannot be compared with it)"; return 2; }
+        [ -n "$ref" ] || { hu_row exec "$pid" - "UNRESOLVABLE (the pin record $PIN_SHA_FILE names ${pinraw:0:12}, which is not a commit in the harness repo $HREPO, so $path cannot be compared with it)"; return 2; }
         name="the pin ($PIN_SHA_FILE)"
       fi ;;
   esac
@@ -913,8 +1117,15 @@ hu_row_exec() {
   # running controller was deliberately left alone — #2216/#2278), while anything else is a tree the
   # reference does not describe at all. Each is named, because "they disagree" without both shas is not
   # actionable.
-  if git -C "$REPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+  # ⛔ AND THE ANCESTRY QUESTION IS A HARNESS QUESTION — `git -C ""` is the CWD's repo (git 2.43), so an
+  # unresolved harness would answer "is this an ancestor" about whatever checkout the operator stands in,
+  # flipping the REMEDY per CWD. No harness, no lineage claim.
+  if [ -n "$HREPO" ] && git -C "$HREPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
     hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is BEHIND the reference ${ref:0:12} from $name — the pin moved and this process was never restarted onto it)"
+    return 1
+  fi
+  if [ -z "$HREPO" ]; then
+    hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12} vs the reference ${ref:0:12} from $name — and no harness repo is resolved, so whether one is an ancestor of the other is NOT established)"
     return 1
   fi
   hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is NOT on the reference's line (${ref:0:12} from $name) — the running code is not the referenced code)"
@@ -1218,7 +1429,7 @@ hu_start_refresh() {
   # that has none makes it record one where nothing will ever materialise it, and (before the split in
   # hu_verify_pin) the next `up` then refused for the life of the box. With no flag the refresh's own
   # default governs, which is the same file but is the refresh's decision, not ours.
-  args=(--repo "$REPO" --ref "$REF")
+  args=(--repo "$HREPO" --ref "$REF")
   [ "$PIN_PRESENT" -eq 1 ] && args+=(--pin "$PIN_SHA_FILE")
   [ "$FETCH" -eq 1 ] || args+=(--no-fetch)
   hu_run "$BOUND" bash "$HARNESS/harness-refresh.sh" "${args[@]}" >"$log" 2>&1
@@ -1249,7 +1460,12 @@ hu_start_refresh() {
 # `status` can answer without paying a network round trip per row.
 hu_start_claims() {
   local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
+  HU_CLAIMS_WHY=""
   command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
+  # ⛔ THE SAME EMPTY-VALUE TRAP, ONE NAMESPACE OVER: `git -C "" ls-remote origin` reads the CWD's repo —
+  # a NETWORK probe against an unnamed repo — and then this function PERSISTS `claims=reachable` for it,
+  # which every later `status` reads as an answer without probing. No work repo, no probe.
+  [ -n "$REPO" ] || { HU_CLAIMS_WHY="no work repo resolved"; warn "claims: no work repo resolved (see the harness-up warning above) — the registry cannot be probed"; return 1; }
   # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
   # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
   # registry on every box, whatever it holds. Measured in review; the fixture now carries a claim ref.
@@ -1262,7 +1478,15 @@ hu_start_claims() {
   verdict=absent
   grep -q 'refs/claims/' "$log" 2>/dev/null && verdict=reachable
   mkdir -p "$O/state" 2>/dev/null || { warn "claims: cannot create $O/state — the probe cannot be recorded"; return 1; }
-  printf 'claims=%s at=%s\n' "$verdict" "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null \
+  # ⛔ THE RECORD NAMES THE REPO IT PROBED, AND THE ORIGIN THAT MAKES IT TRUE. `refs/claims` is a fact
+  # about ONE repo's origin, so neither a record written when the box drained a different repo, nor one
+  # left behind at a path that was re-cloned from a DIFFERENT origin (the cell-recycling shape — `$O/state`
+  # outlives the checkout), is an answer about this one. A box repurposed, or a pre-split run (where `REPO`
+  # could be the harness checkout), leaves exactly such a record behind for up to HU_CLAIMS_STALE. Records
+  # from before these fields existed keep working (empty `repo=`/`origin=` means "unattributed"), so
+  # nothing reds on an old box, but every NEW record is attributable down to the origin it probed.
+  printf 'claims=%s repo=%s origin=%s at=%s\n' "$verdict" "$REPO" "$(hu_origin "$REPO")" "$(date +%s)" \
+    > "$O/state/harness-claims" 2>/dev/null \
     || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
   say "claims: ok (refs/claims $verdict)"
   return 0
@@ -1372,7 +1596,15 @@ hu_start_component() { # <name>
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────────
 cmd_up() {
   local c rc pin_rc=0 bad=0 cap="" cap_rc=0 cap_lanes="" cap_fixed="none"
-  say "==> harness-up ($PLATFORM) — repo $REPO, ref $REF"
+  # ⛔ THE ONE VERB THAT REFUSES ON A BAD `REPO`: it would START a controller that drains a repo nobody
+  # named. Nothing is started, so the refusal is safe here and nowhere else (see the REPO_BAD block).
+  [ -z "$REPO_BAD" ] || die "$REPO_BAD — and 'up' STARTS a controller that would drain it. Nothing was started." 2
+  [ -z "$HREPO_BAD" ] || die "$HREPO_BAD — and 'up' needs the harness repo to resolve the pin. Nothing was started." 2
+  # ⛔ NAME WHERE `REPO` CAME FROM. `--repo` can no longer set it, so the only ways to have a wrong
+  # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
+  # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
+  # screen instead of implied by a path the reader must recognise.
+  say "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
   say "    state dir : $O"
   say "    harness   : $HARNESS (from $HARNESS_SRC)"
 
@@ -1490,6 +1722,12 @@ cmd_status() {
 HU_TMP="$(hp_mktemp_d)" || die "cannot create a temp dir (TMPDIR unset, full or read-only) — nothing is verifiable here" 2
 trap 'rm -rf "$HU_TMP"' EXIT
 
+if [ -n "$REPO_BAD" ] && [ "$VERB" != up ]; then
+  warn "$REPO_BAD — continuing, because '$VERB' starts nothing (a box with a stale REPO must still be stoppable)"
+fi
+if [ -n "$HREPO_BAD" ] && [ "$VERB" != up ]; then
+  warn "$HREPO_BAD — continuing, because '$VERB' reads no harness (a box with an unresolvable harness must still be stoppable)"
+fi
 case "$VERB" in
   up)     cmd_up ;;
   down)   cmd_down ;;
