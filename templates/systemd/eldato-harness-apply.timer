@@ -15,7 +15,7 @@
 # ⛔ AND THE PASS IS A NO-OP WHEN IT IS ALREADY CURRENT (exit 0, `action=none`), so the cadence costs
 # one `git fetch` per tick on a converged box — that is what makes a 10-minute interval honest rather
 # than a deploy every 10 minutes.
-Description=eldato harness apply every 10 minutes
+Description=eldato harness apply every {{INTERVAL_MIN}} minutes
 
 [Timer]
 OnBootSec=2min

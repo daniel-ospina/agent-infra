@@ -180,10 +180,24 @@ launchctl bootout "gui/$(id -u)/com.eldato.harness-apply"
 `--dry-run` is a PREVIEW (renders and prints the artifact, writes nothing, enables
 nothing) and is **not** a disarm.
 
-`--status` is the readiness gate and it fails on all three legs: not installed, installed
-but **inactive** (an enabled-but-inactive timer is not a schedule), and a pass record that
-is refusing or stale. A fresh install whose first tick has not happened yet reports
-`note=no pass has completed yet` rather than failing.
+`--status` is the readiness gate, and every leg below is a distinct way a scheduled pass
+can be dead while looking alive:
+
+- **not installed** — including the macOS case where the job is LOADED but its plist is
+  gone (launchd keeps it loaded; the plist is what returns at the next login);
+- **not enabled** — active now, absent after the next reboot;
+- **inactive** — an enabled-but-inactive timer is not a schedule;
+- **user scope without lingering** — fires while you are logged in and never again;
+- **the service's own last exit** — the only witness for a pass that refuses before it
+  can write a record (its previous `ok=1` record would otherwise stay fresh for an hour);
+- **the pass record** — refusing, stale, dated in the future, `behind>0`, or written from
+  a comparison that was not fresh;
+- **a comparison that could not be made** — a failed `git fetch` is `cannot-verify`
+  (exit 23), never `current` against a stale ref.
+
+A fresh install whose first tick is still running reports `note=…` rather than failing —
+the trigger exists immediately (a timer whose `OnBootSec` has elapsed fires at once), so a
+pass that has **never completed** is the honest discriminator, not the trigger's presence.
 
 ## Install targets
 
@@ -225,7 +239,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 144 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 158 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -251,6 +265,8 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename** — each of the three used to leave the tree dirty while the pass reported `advanced` |
 | T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
 | T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
+| T20 | an **unpreservable** dirty tree is REFUSED (20) and nothing moves — the other half of the DIRTY pair, which had no fixture |
+| T8a | an installed-but-**disabled** timer fails readiness (it will not survive a reboot) |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`
