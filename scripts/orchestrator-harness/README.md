@@ -499,6 +499,50 @@ That one asymmetry stopped both halves of the harness, and neither log line name
 | `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
 | `pr comment --body` | `POST …/issues/{n}/comments` |
 
+### The creation gate — `pr create` is measured, not assumed (#2535)
+
+`run_agent` in `spawn-gate.sh` gates a **worker spawn** on the repo's land:open ratio (#2460) and it
+answers correctly — measured 16:15Z on 2026-10-23 it said `LAND-BACKLOG 69 open / 1.8 landings per
+hour … hold new creation` (rc=1). Six PRs had been created in the half hour before that reading.
+
+It does not see those creations, because it asks *"may a worker of this KIND start?"* and never *"may
+this PR be created?"*. `fixer`/`reviewer`/`prfix` are exempt by design — nothing stopped an exempt
+worker opening a **new** PR (7 of the last 10 are follow-ups to a PR under review) — and a `task`
+sub-agent, an interactive session or a `cmux send` into a live pane never call `run_agent` at all.
+
+So the same threshold is asked at the boundary every creation must cross: **`gh pr create`**, in
+`gh-rest/gh` — the one `gh` every harness process resolves first (`install.sh` seeds `$O/gh-rest`
+and puts it first, Macs and cells alike). `creation-gate.sh` holds the window and the floor in ONE
+place:
+
+| constant | value | meaning |
+|---|---|---|
+| `CG_WINDOW_MIN` | 60 | observation window |
+| `CG_MAX_LEAD_H` | 24 | the lead time we accept for one open PR |
+| `CG_DRAIN_PCT10` | `ceil(1000/24)` = **4.2%** | floor: the open queue must drain inside 24 h |
+| `CG_CACHE_MAX_AGE_S` | 600 | a read older than this is UNKNOWN, never zero |
+
+One cached GraphQL read (`open totalCount` + the merged nodes' `mergedAt`) serves every creation in
+the window — three creations cost **one** `gh` call.
+
+| measurement | `create` | `land` / `fix` / `measure` |
+|---|---|---|
+| at/above the floor | allowed | allowed |
+| below the floor | **refused**, quoting *"69 open, 1 landed in 60 min (ratio 1.4% < 4.2% floor …)"* | **allowed** |
+| unreadable / stale / absent | **refused** (fail closed) | **allowed** (fail open) |
+
+⛔ **The drain is never throttled, and that is a requirement rather than a loophole.** In M/M/1,
+`W = 1/(μ−λ)` and `L = λ/(μ−λ)`: capping the service rate μ *raises* both the queue and the wait,
+so a gate that also held a landing lane during a landing backlog would grow the backlog it exists to
+shrink — and at the limit, deadlock (nothing admitted, nothing landed). The asymmetry in the last row
+is the same argument: refusing to land because GitHub was unreachable would freeze the fleet in
+exactly the moment it must keep moving, while a false hold costs one re-dispatch.
+
+⛔ **No unsafe default.** `--kind` is required; a caller that omits it gets rc 2 and a message saying
+why. A missing `$O/creation-gate.sh` is not "fine" either: `gh-rest/gh` holds `pr create` and names
+the path and the remedy (`install.sh` seeds the gate *before* the adapter precisely so this state
+cannot come from install order).
+
 ### The layer underneath: `gh-limit` (#1988)
 
 Four boxes act as **one GitHub account**, so they share one REST bucket and one GraphQL bucket.

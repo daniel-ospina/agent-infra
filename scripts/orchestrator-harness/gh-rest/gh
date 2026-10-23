@@ -332,6 +332,42 @@ print(json.dumps(out[0] if (single and out) else out))
 
 case "$SUB" in
 
+"pr create")
+  # ── THE CREATION GATE, AT THE ACT (#2535) ─────────────────────────────────────────────────────
+  # #2460 put a CORRECT creation gate at the WORKER SPAWN (`run_agent`, keyed on `KIND`), and at
+  # 16:15Z it answered `LAND-BACKLOG 69 open / 1.8 landings per hour` (rc=1) — while six PRs
+  # (#2524 #2525 #2527 #2529 #2530 #2534) had been created in the half hour before that reading. The
+  # gate asks "may a worker of this KIND start?"; it never asks "may this PR be created?". Every
+  # exempt KIND (`fixer`, `reviewer`, `prfix`) and every path that never calls `run_agent` (a `task`
+  # sub-agent, an interactive session, a `cmux send` into a live pane) can still open a NEW PR.
+  #
+  # ⛔ THIS LAYER IS THE ONE THAT SEES THE ACT. `gh pr create` is the single instruction every
+  # creation path must issue, whatever dispatched it, and this adapter is the one `gh` every harness
+  # process resolves first on PATH — `install.sh` seeds `$O/gh-rest` and puts it first on Macs and
+  # cells alike (250-ish call sites cannot forget a layer they never have to call).
+  #
+  # ⛔ AND IT IS A THIRD INTERPOSER ONLY IN NAME: the gate is a SIBLING SCRIPT, not another `gh` on
+  # PATH. A third wrapper is the recursion this file's own header documents (two shims resolving to
+  # each other, measured at 1,700 processes in 6 s, `fork: Resource temporarily unavailable`), so the
+  # gate is invoked here and cannot re-enter the resolution walk at all.
+  #
+  # ⛔ IT GATES ARRIVALS ONLY. `prepare`/`--help`/`--version` are not creations, and NOTHING on the
+  # service side (merge, ready, comment, view, checks, list, fix) passes through this arm — capping μ
+  # raises both L and W in M/M/1 (W = 1/(μ−λ)), so a gate that helped throttle the drain would grow
+  # the very backlog it exists to shrink.
+  for _a in "$@"; do
+    case "$_a" in --help|-h|--version) delegate ;; esac
+  done
+  CG="$SELF_DIR/../creation-gate.sh"
+  # ⛔ A MISSING GATE IS "UNKNOWN", NOT "FINE" — the inert-enforcer class. The refusal below is the
+  # same fail-closed answer the gate itself gives for a failed or stale measurement, and it names
+  # the path, so the remedy (re-run install.sh) is one line instead of an investigation.
+  [ -f "$CG" ] || die "REFUSED pr create — the creation gate is missing at $CG, so the landing ratio cannot be measured and creation is HELD (fail closed: a false hold costs one re-dispatch, a false allow adds PRs that nothing lands). Remedy: re-run scripts/orchestrator-harness/install.sh (or 'cloud-cell-supervisor.sh apply') to seed \$O."
+  _cg=( --kind=create )
+  [ -n "$REPO" ] && _cg+=( --repo "$REPO" )
+  bash "$CG" "${_cg[@]}" || exit $?
+  delegate ;;
+
 "pr view"|"issue view")
   # Plain-text rendering is NOT modelled — without --json the caller wants gh's formatting.
   # `comments` is an ARRAY of comment objects in gh, but an integer count in the REST object, so it

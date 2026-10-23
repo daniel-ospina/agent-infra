@@ -51,6 +51,12 @@ case "$*" in *"--jq .head.sha"*)
 case "$*" in *"--auto"*) printf 'STUB: delegated auto-merge'; exit 0 ;; esac
 # POST /comments (pr comment) and GET /comments (pr view --json comments) share a path — split on method.
 case "$*" in *"-X POST"*"/comments"*) printf '{"id":7,"html_url":"https://github.com/o/r/pull/8833#issuecomment-7"}'; exit 0 ;; esac
+# `pr create` is DELEGATED by the adapter once the creation gate allows it (#2535), so the stub must
+# answer it BEFORE the path-dispatch below (a creation carries no `repos/` path): otherwise the stub's
+# own refusal reads as "the gate blocked it" when the real cause is the missing fixture.
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "create" ]; then
+  printf '%s' 'https://github.com/o/r/pull/9999'; exit 0
+fi
 path="$(printf '%s\n' "$@" | grep -m1 -E '^repos/')"
 case "$path" in
   *"/pulls/9001/merge"*)  printf '{"merged":false,"message":"Pull Request is not mergeable"}'; exit 0 ;;
@@ -291,6 +297,59 @@ ck "a refused COMMENTS read names the bucket (not a bare jq parse error)" \
 _o="$(GH_LIMIT_NO_WAIT=1 STUB_STS_FAIL=1 run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-x")"; _r=$?
 ck "a refused legacy commit-status read FAILS the call (rc!=0) and says the set is incomplete" \
    "$([ "$_r" -ne 0 ] && has 'INCOMPLETE' "$(cat "$TMP/err-x")" && [ -z "$_o" ] && echo 0 || echo 1)"
+
+
+# ── Y. `pr create` IS GATED AT THE ACT (#2535) ─────────────────────────────────────────────────────
+# #2460's gate sits at the WORKER SPAWN and asks about the KIND; it never asks about the CREATION, so
+# every exempt kind (fixer/reviewer/prfix) and every path that never calls `run_agent` (a task
+# sub-agent, an interactive session) can still open a new PR. This arm is the act.
+#
+# The measurement is pre-seeded as a FRESH cache row, so these arms are offline AND deterministic:
+# with a fresh stamp the gate makes no `gh` call at all (it resolves `gh` on PATH, which is not this
+# adapter's stub), and the only evidence of delegation is the stub log.
+_cg_run() {  # <ok|failed> <open> <lands> <args...> — writes a FRESH cache row, then runs the adapter
+  local _st="$1" _op="$2" _ln="$3"; shift 3
+  local _od; _od="$(mktemp -d)"
+  mkdir -p "$_od/state"
+  { printf '# fresh\n'; printf '%s\t%s\t%s\t%s\t60\n' "$(date +%s)" "$_st" "$_op" "$_ln"
+  } >"$_od/state/creation-ratio-o-r.tsv"
+  O="$_od" run "$@"
+}
+
+_o="$(_cg_run ok 69 1 pr create --repo o/r --title x --body y 2>"$TMP/err-cg1")"; _r=$?
+ck "pr create OVER the drain floor is REFUSED (rc!=0) — 69 open / 1 landed (1.4% < 4.2%)" \
+   "$([ "$_r" -ne 0 ] && has 'REFUSED kind=create' "$(cat "$TMP/err-cg1")" && echo 0 || echo 1)"
+ck "  the refusal quotes the numbers it compared (69 open, 1 landed, 4.2% floor)" \
+   "$(has '69 open, 1 landed in 60 min' "$(cat "$TMP/err-cg1")" && has '4.2% floor' "$(cat "$TMP/err-cg1")" && echo 0 || echo 1)"
+# ⛔ THE POINT OF THE ARM: nothing reached GitHub. A refusal that still delegates would create the PR
+# and then report a failure — the worst of both.
+_before="$(stublog)"
+_o="$(_cg_run ok 69 1 pr create --repo o/r --title x --body y 2>/dev/null)"; _r=$?
+ck "  and NO pr create reached the real gh (the stub log is unchanged)" \
+   "$([ "$_before" = "$(stublog)" ] && echo 0 || echo 1)"
+
+_o="$(_cg_run ok 69 9 pr create --repo o/r --title x --body y 2>/dev/null)"; _r=$?
+ck "pr create UNDER the floor is ALLOWED (rc=0) and delegates to the real gh" \
+   "$([ "$_r" -eq 0 ] && has 'pr create' "$(stublog)" && echo 0 || echo 1)"
+
+_o="$(_cg_run failed -1 -1 pr create --repo o/r --title x 2>"$TMP/err-cg2")"; _r=$?
+ck "an UNREADABLE measurement REFUSES pr create (fail closed)" \
+   "$([ "$_r" -ne 0 ] && has 'UNREADABLE' "$(cat "$TMP/err-cg2")" && echo 0 || echo 1)"
+
+# ⛔ THE SERVICE SIDE IS NOT IN THIS ARM AT ALL. If the gate had been wired as a PATH wrapper around
+# `gh`, a landing lane would pay for — or be blocked by — the measurement. Assert the boundary: the
+# arm is keyed on the SUBCOMMAND, so a merge never enters it.
+ck "the gate arm is keyed on 'pr create' only, not on every gh call" \
+   "$(grep -q '^"pr create")' "$SHIM" && ! grep -q '"pr merge".*creation-gate' "$SHIM" && echo 0 || echo 1)"
+
+# A MISSING GATE IS UNKNOWN, NOT FINE. Copy the adapter where no sibling gate exists: creation must
+# be HELD (the inert-enforcer class), and the message must name the path and the remedy.
+mkdir -p "$TMP/nogate/gh-rest"
+cp "$SHIM" "$TMP/nogate/gh-rest/gh"
+_err="$(STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" GH_LIMIT_DIR="$TMP/limit" \
+        bash "$TMP/nogate/gh-rest/gh" pr create --repo o/r --title x 2>&1)"; _r=$?
+ck "a MISSING gate refuses pr create and names the path + remedy" \
+   "$([ "$_r" -ne 0 ] && has 'creation gate is missing' "$_err" && has 'install.sh' "$_err" && echo 0 || echo 1)"
 
 echo
 printf 'gh-rest: %d passed, %d failed\n' "$pass" "$fail"

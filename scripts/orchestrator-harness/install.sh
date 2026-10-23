@@ -559,6 +559,24 @@ mkdir -p "$O/logs" "$O/state" "$O/wip"
 touch "$O/candidates.txt" "$O/dispatched.txt" "$O/checked.txt"
 ok "state dir $O"
 
+# ── the creation gate (#2535) ───────────────────────────────────────────────────
+# SEEDED HERE, TOGETHER WITH — and BEFORE — the adapter that calls it. `gh-rest/gh` refuses `pr create`
+# when its sibling gate is missing (a measurement that cannot be read is never an OK, so creation is
+# HELD), and the adapter is replaced a few lines below in this same run. Seeding the CALLER and not
+# the CALLEE would leave a box where every creation is refused for a reason that is pure install
+# order, which is the "gate that fails closed because the deployment drifted" failure this whole
+# change exists to remove. The pair is therefore staged together — gate FIRST — and a failed gate copy
+# dies before the adapter is touched, so `$O` is never left holding a newer caller than callee.
+if [ -f "$HERE/creation-gate.sh" ]; then
+  _gtmp="$O/.seed-creation-gate.$$"
+  cp "$HERE/creation-gate.sh" "$_gtmp" || { rm -f "$_gtmp"; die "cannot stage creation-gate.sh into $O"; }
+  chmod +x "$_gtmp"                   || { rm -f "$_gtmp"; die "cannot chmod creation-gate.sh"; }
+  mv -f "$_gtmp" "$O/creation-gate.sh" || { rm -f "$_gtmp"; die "cannot install $O/creation-gate.sh"; }
+  ok "creation gate -> $O/creation-gate.sh (a 'pr create' is measured against the repo's own landing ratio)"
+else
+  warn "the shipped tree has no creation-gate.sh — \$O/gh-rest/gh will HOLD every 'pr create' (fail closed) until one is seeded: cp '$HERE/creation-gate.sh' \$O/"
+fi
+
 # ── gh REST adapter (#1959) ─────────────────────────────────────────────────────
 # Installed FIRST on the daemon PATH so every gh call the harness makes can be served over REST when
 # GraphQL is refused. Measured 2026-10-17: a GraphQL refusal stopped BOTH halves of the harness —
@@ -847,7 +865,7 @@ DRIFTED=""
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh gh-rest/gh gh-limit.py creation-gate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
