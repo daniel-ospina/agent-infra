@@ -247,7 +247,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 186 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 188 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -270,7 +270,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
-| T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename**, and the checkout is **clean** afterwards; a later upstream commit to the renamed path still merges (a leftover untracked copy would block it for ever) |
+| T17 | the dirty set survives an **executable bit**, a **path with a space**, and **three renames** (one rename passes even when the destination set is read through a command substitution, which drops NULs and joins the names into one word), and the checkout is **clean** afterwards; a later upstream commit to the renamed path still merges (a leftover untracked copy would block it for ever) |
 | T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
 | T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
 | T20 | an **unpreservable** dirty tree is REFUSED (20) and nothing moves — the other half of the DIRTY pair, which had no fixture |

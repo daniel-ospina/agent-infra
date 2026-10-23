@@ -622,7 +622,14 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # HEAD has as 100755 is a MODE CHANGE staged by any `git add` — the tree stays dirty, a later
     # upstream commit to that path makes the fast-forward refuse for ever, and this repo tracks 207
     # executable files (one of them is the very file the measured Mac defect was about).
-    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest
+    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest d dests=""
+    # ⛔ THE RENAME-DESTINATION SET IS BUILT NUL-SAFELY, ONCE, BEFORE THE LOOP. `$(list_rename_dests)`
+    # DROPS every NUL (bash warns "ignored null byte in input") and concatenates the destinations into
+    # ONE WORD, so with two or more renames nothing matched: the destinations stayed untracked (the tree
+    # never converged, and the next upstream commit to one of them was refused for ever) while the pass
+    # recorded `advanced`/rc=10 — GREEN — over it. Measured in review; a single-rename fixture passes,
+    # which is why the suite did not see it.
+    while IFS= read -r -d '' d; do dests="${dests}${d}"$'\n'; done < <(list_rename_dests)
     while IFS= read -r -d '' p; do
         [ -n "$p" ] || continue
         case "$p" in /*) n_skipped=$((n_skipped + 1)); continue ;; esac
@@ -643,7 +650,9 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
             # `changes.patch` and it is copied into `untracked/` first, so nothing is lost.
             # A plain staged ADDITION is different: the file may be the only copy a lane has, so it stays
             # in the worktree (its bytes are in the patch, and it is reported as dirty in the record).
-            if printf '%s\0' "$(list_rename_dests)" | tr '\0' '\n' | grep -qxF -- "$p"; then
+            # bash 3.2-safe membership test (macOS ships 3.2): no array expansion under `set -u`, no grep.
+            case $'\n'"$dests" in *$'\n'"$p"$'\n'*) _is_rename_dest=1 ;; *) _is_rename_dest=0 ;; esac
+            if [ "$_is_rename_dest" = 1 ]; then
                 mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || true
                 cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || true
                 rm -f "$REPO/$p" 2>/dev/null || true
@@ -695,7 +704,10 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
     if [ "$DRY_RUN" = 1 ]; then
         say "dry-run: would preserve $DIRTY_N dirty path(s) by name and then fast-forward"
     else
-        PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)"
+        # ⛔ PER-SECOND IS NOT PER-PASS. Two passes in the same second shared one directory, and the
+        # SECOND truncated the first's `changes.patch` and `MANIFEST` — which for restored tracked paths
+        # is their only remaining copy. The pid makes the name unique in the only way a shell can.
+        PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)-$$"
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
