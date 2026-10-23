@@ -1415,6 +1415,56 @@ def test_evidence_name_strips_to_a_fixpoint_and_truncates_inside():
     assert objective.evidence_name("**") == "\u00ab?\u00bb"
 
 
+def test_the_wedge_reason_is_BOUNDED_and_says_how_many_it_hid():
+    """⛔ THE REASON LANDS ON A LINE READ WITH A FIXED CUT (#1948 review cycle 5, P2).
+
+    `cadence-nudge.sh:311` reads `objective.last` line 2 with `cut -c1-900`, and the
+    dispatcher-liveness field and the CI indicators sit BEHIND the class segment. Measured on a
+    realistic starved-queue head: 19 named checks -> `why` 487 chars, so one such PR pushes those
+    fields out of every lane's nudge -- and a fleet-wide starvation is exactly when the reason is
+    longest. The NUMBER of names is author-influenced (a head publishes as many check-runs as it
+    likes), which is what made an unbounded join a defect rather than a long line.
+    """
+    rows = [(f"ctx-{i:02d}", "queued", 100 + i) for i in range(19)]
+    why = objective.wedge_reason(rows)
+    assert why is not None
+    assert len(why) <= objective.WEDGE_REASON_MAX_CHARS + len(",+15 more"), why
+    # the OLDEST are the ones kept: they are the checks a lane should start first
+    assert "ctx-18" in why, why
+    assert "ctx-00" not in why, why
+    # and the bound never reads as "that was all of it"
+    assert why.endswith(",+15 more"), why
+    assert why.count(" queued ") == objective.WEDGE_REASON_MAX_NAMES, why
+    # the same rows WITHOUT the cap exceed the budget this bound exists to protect
+    uncapped = ",".join(f"{objective.evidence_name(n)} {st} {a:.0f}m" for n, st, a in rows)
+    assert len(uncapped) > 3 * objective.WEDGE_REASON_MAX_CHARS, len(uncapped)
+    # FOUR OR FEWER: nothing is hidden, so nothing is claimed
+    four = objective.wedge_reason(rows[:4])
+    assert "+0 more" not in four and "more" not in four, four
+    # EMPTY is None, never an empty order
+    assert objective.wedge_reason([]) is None
+    # ORDER IS DETERMINISTIC: age descending, then name
+    tie = [("b", "queued", 100), ("a", "queued", 100), ("c", "queued", 200)]
+    assert objective.wedge_reason(tie, max_names=3) == \
+        "«c» queued 200m,«a» queued 100m,«b» queued 100m"
+
+
+def test_the_objective_line_stays_within_the_cut_for_a_starved_head(monkeypatch):
+    """END TO END at the sink: the token the fleet parses stays inside the `cut -c1-900` window
+    even when a head publishes many wedged contexts (#1948 review cycle 5, P2)."""
+    cr = _absent_gate_cr() + [_run(f"ctx-{i:02d}", "queued", run=9200 + i) for i in range(18)]
+    runs = {9200 + i: _Result(0, json.dumps(
+        {"run_started_at": _iso(NOW - (WEDGED_MIN + i) * 60)})) for i in range(18)}
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])), runs=runs)
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 1, classes
+    token = objective._class_token("rerun-checks", 1, by_class["rerun-checks"])
+    assert len(token) < 200, (len(token), token)
+    assert "more" in token, token
+
+
 def test_the_beat_names_a_stalled_duplicate_name_once_with_its_worst_age(monkeypatch):
     """END TO END for the reason a lane reads: BOTH attempts of `script-validate` stalled is a
     re-trigger, and the beat prints ONE line per name, aged by the OLDER attempt (`stalled_flight`'s
@@ -1436,7 +1486,7 @@ def test_the_beat_names_a_stalled_duplicate_name_once_with_its_worst_age(monkeyp
 
 def test_the_beat_names_the_wedged_check_and_its_age(monkeypatch):
     """END TO END through the classifier the beat actually prints: `rerun-checks=1:
-    #8822(python-ci-gate queued 150m)` -- WHICH check, in which state, for how long. A bare
+    #8822(«python-ci-gate» queued 150m)` -- WHICH check, in which state, for how long. A bare
     `rerun-checks=1: #8822` would make a wedged run and a head whose checks never got created
     look identical, and they need different repairs."""
     cr = _wedged_cr(age_min=None)
@@ -1510,7 +1560,7 @@ def test_an_absent_gate_beside_children_that_cannot_complete_is_a_re_trigger():
 
 
 def test_the_beat_names_the_wedged_child_and_its_age(monkeypatch):
-    """END TO END for the absent-gate shape: `rerun-checks=1: #8822(test (a) queued 150m)`.
+    """END TO END for the absent-gate shape: `rerun-checks=1: #8822(«test (a)» queued 150m)`.
 
     The reason is the difference between the two repairs, so it must reach the beat (and from
     there `pr-doctor`'s brief) for THIS shape too -- not only for a wedged REQUIRED check.

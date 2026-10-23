@@ -1164,6 +1164,51 @@ def evidence_name(name, limit=60):
     return "\u00ab" + (out[:limit] or "?") + "\u00bb"
 
 
+# ⛔ THE REASON IS BOUNDED, BECAUSE IT LANDS ON A LINE THAT IS READ WITH A FIXED CUT (#1948
+# review cycle 5, P2). The objective line is `sed -n '2p' ... | cut -c1-900`
+# (`cadence-nudge.sh:311`), and the fields AFTER the class segment -- the dispatcher-liveness field
+# and the CI indicators -- sit behind it. Measured on a realistic starved-queue head (this
+# project's own matrix, `python-ci-gate` absent, every other context queued past the bound): 19
+# named checks -> `why` 487 chars -> token 510, so ONE such PR pushes those fields out of every
+# lane's nudge -- and a fleet-wide starvation is exactly when the reason is longest. The count is
+# bounded only by how many check-runs the head publishes, i.e. it is author-influenced too: each
+# NAME is capped by `evidence_name`, the NUMBER of names was not.
+# The other consumer of the same string already caps it (`pr-doctor.brief` renders `why` with
+# `_untrusted(why, limit=120)`), which is the asymmetry that gives the budget away.
+# The cap keeps the WORST (oldest) names -- the ones the lane should start first -- and states how
+# many it hid, so the bound never reads as "that was all of it".
+WEDGE_REASON_MAX_NAMES = 4
+WEDGE_REASON_MAX_CHARS = 120
+
+
+def wedge_reason(rows, max_names=WEDGE_REASON_MAX_NAMES, max_chars=WEDGE_REASON_MAX_CHARS):
+    """`why` for a wedged head: the oldest few names, then `,+K more` when any are hidden.
+
+    Rows are `(name, status, age_min)` as `wedge_evidence` returns them; ordering is by AGE
+    DESCENDING, then name, so the cap is deterministic and always keeps the longest-stuck check.
+    """
+    ordered = sorted(rows, key=lambda r: (-r[2], r[0]))
+    kept, used = [], 0
+    for idx, (name, st, age) in enumerate(ordered):
+        piece = f"{evidence_name(name)} {st} {age:.0f}m"
+        cost = len(piece) + (1 if kept else 0)
+        hidden = len(ordered) - idx          # what would remain hidden if we stop here
+        tail = len(f",+{hidden} more") if hidden else 0
+        if kept and (used + cost + tail > max_chars or len(kept) >= max_names):
+            break
+        kept.append(piece)
+        used += cost
+        if len(kept) >= max_names:
+            break
+    if not kept:
+        return None
+    out = ",".join(kept)
+    hidden = len(ordered) - len(kept)
+    if hidden:
+        out += f",+{hidden} more"
+    return out
+
+
 def wedge_evidence(stalled, gated_absent, flight_attempts, flight_stalled):
     """[(name, status, age_min)] -- WHY a `rerun-checks` verdict is a re-trigger, or [].
 
@@ -1493,10 +1538,13 @@ def classify_one(p):
         # still an author-published check-run name, and this string becomes an executed order AND
         # a machine-parsed token downstream. `st` is a conclusion this file chose from a fixed
         # vocabulary; `n` is whatever the head published.
-        why = ",".join(f"{evidence_name(n)} {st} {a:.0f}m" for n, st, a in
-                       wedge_evidence(stalled, gated_absent,
-                                      inflight_attempts(cr), flight_stalled)
-                       if n not in DIFF_BOUND_CHECKS) or None
+        # ⛔ BOUNDED, not merely joined (#1948 review cycle 5, P2): this string is cut at 900
+        # chars downstream, and an unbounded list of author-published names can push the fields
+        # behind it off the line. `wedge_reason` keeps the oldest few and says how many it hid.
+        why = wedge_reason([row for row in
+                            wedge_evidence(stalled, gated_absent,
+                                           inflight_attempts(cr), flight_stalled)
+                            if row[0] not in DIFF_BOUND_CHECKS])
     elif cr and k == "blocked-by-rail":
         why = rail_block_reason(red, flight, _seen)
     elif cr and k == "fix-ci":
