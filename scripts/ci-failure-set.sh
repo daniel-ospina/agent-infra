@@ -67,16 +67,18 @@
 #   job list turns out EMPTY is counted by the criterion and DEBITED by `tested`
 #   (#1482) — so `tested` can fall below N, and a window that measured nothing
 #   still blocks. That asymmetry is stated in full at `list_main_baseline`.
-#   --main-union-rates [N]    (#3756) per-id failure COUNTS over a window holding at
-#                             least N MEASURED runs (see "WHAT [N] MEANS" above):
+#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the main window
+#                             widened TOWARD N MEASURED runs — fewer when the history
+#                             ends (or the 200-run bound is reached) first, so read
+#                             "WHAT [N] MEANS" above for what `[N]` is and is not:
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
 #                             subtraction excused an eight-fold regression. Emits
 #                             NOTHING when no run exercised the suite (fail-closed).
 #   --main-union-signatures [N]
-#                             (#3756) main's per-id stable SIGNATURE over a window
-#                             holding at least N MEASURED runs:
+#                             (#3756) main's per-id stable SIGNATURE over the SAME
+#                             widened window (≤ N MEASURED runs, same early stops):
 #                             `<nodeid>\t<signature>`. The rate table alone leaves
 #                             `main_signatures` empty, so the decision's subset rule
 #                             fails CLOSED and nothing is ever exempt; this is the
