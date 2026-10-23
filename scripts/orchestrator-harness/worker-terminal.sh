@@ -169,18 +169,32 @@ wt_gh_hosts_token() {
   wt_gh_hosts_value "$(wt_gh_hosts "$home")"
 }
 
+# `wt_keys_credit <keys.env>` — 0 iff the file ASSIGNS a token-looking value to GH_TOKEN/GITHUB_TOKEN.
+# ONE predicate for its two consumers (`wt_launcher_home`'s SELECTION and `wt_launcher_env`'s credit),
+# so the HOME that is chosen and the HOME that is accepted cannot disagree (review finding, 2026-10-23):
+# selection used the gh-store probe only, so a HOME provisioned by its own keys.env — the shape this
+# file's header measures as the working manual dispatch — was never a candidate and the spawn was
+# refused on a box that had a credential. A static match is a CLAIM only; the launch line re-verifies
+# the credit dynamically after the source (see `wt_launcher_env`).
+wt_keys_credit() {
+  local keys="${1:-}"
+  [ -n "$keys" ] && [ -f "$keys" ] || return 1
+  grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=["'\'']?[^[:space:]"'\'']' "$keys" 2>/dev/null
+}
+
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
 # operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
-# Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential
-# (a `gh` hosts.yml that carries a token; see `wt_gh_hosts_token`). If none does (a box
-# authenticating from `GH_TOKEN` in the environment), the caller's HOME is used anyway and
-# `wt_launcher_env` decides. Returns 1 only when there is no HOME at all to export, which is a spawn
-# this file cannot make safely.
+# Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential,
+# either a `gh` store that answers (`wt_gh_hosts_token`) OR its own `keys.env` carrying a token value
+# (`wt_keys_credit`). If none does (a box authenticating from `GH_TOKEN` in the environment), the
+# caller's HOME is used anyway and `wt_launcher_env` decides. Returns 1 only when there is no HOME at
+# all to export, which is a spawn this file cannot make safely.
 wt_launcher_home() {
   local c
   [ -n "${WT_WORKER_HOME:-}" ] && { printf '%s\n' "$WT_WORKER_HOME"; return 0; }
   for c in "${HOME:-}" /tmp/cell-home; do
-    [ -n "$c" ] && wt_gh_hosts_token "$c" && { printf '%s\n' "$c"; return 0; }
+    [ -n "$c" ] || continue
+    { wt_gh_hosts_token "$c" || wt_keys_credit "$c/keys.env"; } && { printf '%s\n' "$c"; return 0; }
   done
   [ -n "${HOME:-}" ] && { printf '%s\n' "$HOME"; return 0; }
   return 1
@@ -235,7 +249,7 @@ wt_tmux_has_server() {
 # counts only when it carries a VALUE; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
 # (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
-  local home="${1:-}" keys have=0 keys_credit=0 caller_val=0
+  local home="${1:-}" keys have=0 caller_val=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
   case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) caller_val=1 ;; esac
@@ -250,12 +264,11 @@ wt_launcher_env() {
   # ⛔ A STATIC GREP IS NOT PROOF THE SOURCE EXPORTS IT (review finding, 2026-10-23, measured). A line the
   # file never executes — `if [ -n "$X" ]; then export GH_TOKEN=…; fi`, or an assignment in a function
   # nobody calls — matches this grep, so the gate reports provisioned while the worker gets nothing. The
-  # credit is therefore remembered (`keys_credit`) and VERIFIED in the launch line after the source: a
+  # file's credit is therefore VERIFIED in the launch line after the source, unconditionally: a
   # file-only credit must leave a non-blank token in the environment, or the worker is refused. That is
   # the same dynamic check the broken-file guard uses, applied where the credit came from the file.
-  if [ "$have" = "0" ] && [ -f "$keys" ] \
-     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=["'\'']?[^[:space:]"'\'']' "$keys" 2>/dev/null; then
-    have=1; keys_credit=1
+  if [ "$have" = "0" ] && wt_keys_credit "$keys"; then
+    have=1
   fi
   if [ "$have" = "0" ] && [ "$caller_val" = "1" ]; then
     # ... but only if this spawn will CREATE the server (see above), and that is decided by a
@@ -280,8 +293,16 @@ wt_launcher_env() {
     # own launch line is bash-shaped — so a `sh -n` check is an over-block on a perfectly good cell, which
     # is the #2210 refusal loop in a new disguise. bash is what the harness runs and what the cell's own
     # supervisor sources this file with, so bash decides when it exists; `sh -n` is the last resort.
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; wsrc=$?; set +a; kcredit=%s' \
-      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$keys_credit"
+    # ⛔ AND THE FILE MUST ACTUALLY FINISH SOURCING (review finding, 2026-10-23, measured — agent-infra
+    # #1713's class). `bash -n` accepts `GH_TOKEN=ghp_x` + `exit 0`, and `. FILE` then ends the WORKER'S
+    # shell before the HOME re-assert, the config-dir pin and the credential re-check ever run: the
+    # spawn returns 0, the `home=` record is written, and the lane never starts. The file is therefore
+    # evaluated in a throwaway subshell whose LAST action is a sentinel — the sentinel's ABSENCE (not a
+    # non-zero status: `exit 0` IS success) is the signal — and only then sourced for real. The file is
+    # evaluated more than once; like the cell supervisor's own `source_env_file`, it must be a plain
+    # assignment file.
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _p="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai1713_env_sourced__ )"; case "$_p" in *__ai1713_env_sourced__) unset _p ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
+      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
   fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
   # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
@@ -289,9 +310,13 @@ wt_launcher_env() {
   # it had exported the token, on a spawn that returned 0 and wrote its record. A parse check alone fixes
   # that but re-opens the other side: a file containing `return 1` PARSES, then aborts the source before
   # the token assignment, and the worker runs credential-less. So the guard asks two questions: does it
-  # parse (before anything is applied), and — only if the source reported non-zero — does the environment
-  # nevertheless HOLD a credential now? The second check runs AFTER the config-dir pinning below, so it
-  # sees the same store the worker will (`wsrc` is captured, not re-derived).
+  # parse AND finish (the sentinel above), and does the environment HOLD a credential now? The second
+  # check is UNCONDITIONAL (review finding, 2026-10-23, measured): it used to fire only when the file
+  # had credited the token, so a `keys.env` that SOURCES CLEANLY but carries `GH_TOKEN=` (the
+  # placeholder an operator leaves when moving to store auth) exported an EMPTY value over a caller or
+  # store credit and nothing re-read it — a credential-less worker on an rc=0 spawn, which is the
+  # #2210 death this gate exists to refuse. It runs AFTER the config-dir pinning below, so it sees the
+  # same store the worker will.
   # ⛔ HOME IS RE-ASSERTED AFTER THE SOURCE, and that is not belt-and-braces (review finding,
   # 2026-10-22). A `HOME=` line inside keys.env is exported by the `set -a` source above and would
   # OVERWRITE the HOME this gate just validated — measured: a file carrying `HOME=/home/cmux` left the
@@ -336,7 +361,7 @@ wt_launcher_env() {
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
   # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
   # the STORE — and never the question it just answered NO to.
-  [ -f "$keys" ] && printf '; if [ "${kcredit:-0}" = 1 ] || [ "${wsrc:-0}" -ne 0 ]; then case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac; fi'
+  [ -f "$keys" ] && printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac'
   return 0
 }
 
