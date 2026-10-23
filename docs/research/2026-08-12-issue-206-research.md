@@ -258,3 +258,7 @@ pattern needed — the repo precedent is authoritative and richer.
    `~/.pi/agent/skills` is a real-dir mirror refreshed by `sync.sh` /
    auto-sync — repo edits land there on the next sync. The drift-guard must
    assert repo-relative paths so it never depends on runtime copy state.
+
+<!-- Control-experiment marker (agent-infra#2409): this line exists only to make an
+     inert, zero-build-surface diff so the PR lane's checks can be read on an
+     UNTOUCHED tree. It changes nothing the suites exercise. -->
