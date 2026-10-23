@@ -64,11 +64,24 @@ reset_env() {  # fresh state dir, clock, counters — one scenario per box
 # inferred from a counter the stub is trusted to keep.
 cat >"$TMP/stub-gh" <<'STUB'
 #!/usr/bin/env bash
-n="$(cat "$GH_LIMIT_TEST_COUNT" 2>/dev/null || echo 0)"
-n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 # ⛔ EVERY invocation is logged, INCLUDING the exempt `/rate_limit` probe and the arms that exit
 # early — a test that counts requests must see all of them (the probe used to be invisible here).
 printf 'call|%s\n' "$*" >>"$GH_LIMIT_TEST_STUBLOG"
+# ⛔ THE EXEMPT METER IS NOT WORKLOAD (#2342). `gh-limit.py` spends ONE `/rate_limit` probe per box per
+# TTL when it has no snapshot, so the floor guard can act at all. It is answered HERE, before the
+# per-scenario counter below is incremented: that counter models "how many LOADS did this read take",
+# and a lane that shifted every scenario's counter by one would make fixtures like `n<=1 => fail` mean
+# something other than what they say. The call is still logged above, so `meter_calls()` can pin it.
+case "$*" in
+  *"api rate_limit"*)
+    # It is a real invocation, so it emits the same start/end markers the in-flight assertions count.
+    printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
+    printf '{"resources":{"core":{"remaining":4999,"reset":1700003600},"graphql":{"remaining":4999,"reset":1700003600}}}'
+    printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
+    exit 0 ;;
+esac
+n="$(cat "$GH_LIMIT_TEST_COUNT" 2>/dev/null || echo 0)"
+n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 case "$GH_LIMIT_SCENARIO" in
   converge|limited|coalesce|leaderfail|slow)
     printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
@@ -82,12 +95,6 @@ case "$GH_LIMIT_SCENARIO" in
         while [ "$_pi" -lt 100 ] && [ ! -e "$GH_LIMIT_TEST_RELEASE" ]; do sleep 0.1; _pi=$(( _pi + 1 )); done ;;
     esac
     printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
-esac
-case "$*" in
-  *"api rate_limit"*)
-    # The exempt endpoint, measured to report healthy headroom while another bucket is empty.
-    printf '{"resources":{"core":{"remaining":4999,"reset":1700003600},"graphql":{"remaining":4999,"reset":1700003600}}}'
-    exit 0 ;;
 esac
 case "$GH_LIMIT_SCENARIO" in
   coalesce)
@@ -223,7 +230,13 @@ export GH_LIMIT_TEST_RELEASE="$TMP/release"
 
 # ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 run_helper() { python3 "$HELPER" --real-gh "$TMP/stub-gh" -- "$@"; }
-calls() { grep -c '^call|' "$STUB_LOG" 2>/dev/null || true; }
+# ⛔ THE EXEMPT METER IS NOT A "LOAD" (#2342). `gh-limit.py` spends ONE `/rate_limit` probe per box
+# per `GH_LIMIT_BUDGET_TTL` when it has no snapshot to read, so the floor guard can act at all — it is
+# exempt from the primary limit and it is SHARED by every lane. Counting it as an underlying call would
+# make every coalescing assertion below measure the meter instead of the read. `meter_calls()` pins it
+# separately, so the exclusion cannot hide an unbounded probe.
+calls() { grep '^call|' "$STUB_LOG" 2>/dev/null | grep -vc 'api rate_limit' || true; }
+meter_calls() { grep '^call|' "$STUB_LOG" 2>/dev/null | grep -c 'api rate_limit' || true; }
 calls_for() { grep -c -- "^call|$1" "$STUB_LOG" 2>/dev/null || true; }
 sleeps() { tr '\n' ' ' < "$SLEEPS" | sed 's/ *$//'; }
 # A wait must be AT LEAST its documented floor (and below the floor + its jitter ceiling): asserting
@@ -262,10 +275,18 @@ ck "retry-after: the streams stay clean on a call that eventually succeeded" \
    "$([ ! -s "$TMP/err-A" ] && echo 0 || echo 1)"
 
 # ── B. A secondary limit with NO headers: >=60s, doubling, bounded, then FAIL LOUDLY ──────────
+# ⛔ THE VEHICLE IS A GRAPHQL READ, NOT A MUTATION, because a MUTATION is now recorded against `core`
+# (a write has no second pool, and the REST adapter translates the GraphQL-shaped writes into REST
+# ones — see `bucket_for`). The assertion is unchanged: the failure must name the bucket that was
+# actually refused, never whichever counter happens to look healthy.
 reset_env secondary
-out="$(run_helper pr comment 5 --repo o/r --body hi 2>"$TMP/err-B")"; rc=$?
+out="$(run_helper pr view 5 --repo o/r 2>"$TMP/err-B")"; rc=$?
 ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a loud failure" \
-   "$([ "$(calls_for 'pr comment')" -eq 4 ] && echo 0 || echo 1)"
+   "$([ "$(calls_for 'pr view')" -eq 4 ] && echo 0 || echo 1)"
+# and the rule that made this vehicle necessary is itself pinned: a WRITE is bucketed `core`.
+ck "secondary: a MUTATION is bucketed core (a write has no second pool)" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['pr','merge','7'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' and m.bucket_for(['pr','view','7'])=='graphql' else 1)" && echo 0 || echo 1)"
+
 ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
    "$(has 'bucket=graphql' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"
@@ -486,6 +507,12 @@ ck "(b) 5 concurrent DIFFERENT reads make 5 calls (no over-collapsing) [$(calls)
    "$([ "$(calls)" -eq 5 ] && echo 0 || echo 1)"
 ck "(b) … and they are still SERIALISED, never 2 in flight (#2005 stands) [peak $(max_inflight)]" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ THE EXCLUSION MUST NOT HIDE AN UNBOUNDED PROBE (#2342 review P2). `calls()` above stops counting
+# the exempt `/rate_limit` meter so the coalescing assertions measure the READ; this is the assertion
+# that keeps the meter honest — five different reads on a box with no snapshot cost AT MOST one probe
+# (the TTL stamp), never one per call.
+ck "(b) … and the box spent AT MOST ONE exempt meter probe for them [meter=$(meter_calls)]" \
+   "$([ "$(meter_calls)" -le 1 ] && echo 0 || echo 1)"
 
 # (c) a FAILING leader: every follower learns the failure, with the leader's error, and none reports
 # the success a later call would have produced.
