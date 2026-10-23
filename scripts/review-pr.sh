@@ -792,11 +792,23 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                       for (i = 1; i <= NR; i++)
                         if (ln[i] ~ /^[[:space:]]*(```|~~~)/) { n++; mk[n] = i }
                       # ⛔ AN UNMATCHED MARKER OPENS NOTHING (the same rule the finding scan uses,
-                      # and the reason a bare toggle is wrong here): with an ODD marker count the
-                      # last one is closed by nothing, so it must not swallow the tail. A toggle
+                      # and the reason a bare toggle is wrong here): with an ODD marker count ONE
+                      # marker is closed by nothing, so it must not swallow the tail. A toggle
                       # dropped the real verdict in `… quoted hunk …` + (no closing fence) + `CLEAN`
                       # and turned a decidable transcript into exit 6.
-                      if (n % 2 == 1) n--
+                      # ⛔ AND IT IS THE **FIRST** MARKER THAT IS DROPPED, NOT THE LAST (P1, fresh
+                      # review of #2288). Dropping the LAST one re-pairs every marker AFTER the
+                      # unmatched one: `(unclosed ```diff)` … `(``` opening a quoted artifact)`
+                      # `CLEAN` `(``` closing it)` has markers [3,9,11], so n-- paired (3,9) and
+                      # left the QUOTED `CLEAN` on line 10 inside no pair at all — rc 0, artifact
+                      # posted, signed clean record. Dropping the FIRST instead pairs (9,11) and
+                      # skips the quotation, which is the fail-closed direction: the worst case
+                      # becomes a wasted paid run (exit 6), never a clean attestation over a
+                      # revision the reviewer said it did not review.
+                      if (n % 2 == 1) {
+                        for (k = 1; k < n; k++) mk[k] = mk[k + 1]
+                        n--
+                      }
                       for (i = 1; i <= NR; i++) {
                         skip = 0
                         for (k = 1; k <= n; k += 2)
@@ -1149,6 +1161,19 @@ if [ "$BLOCK_SORT_RC" -ne 0 ]; then
   err "$PROG: the blocking-finding SORT failed (sort rc=$BLOCK_SORT_RC) — the findings could not be counted, so a clean verdict cannot be certified."
   err "  This is a tool failure, NOT a clean review: no comment was posted and NO record was written."
   die "$E_SCAN" "the P0/P1/P2 sort did not run (transcript: $TRANSCRIPT)"
+fi
+# ⛔ THE READ OF THE FINDINGS LIST IS MEASURED LIKE THE THREE STAGES THAT BUILT IT (P2, fresh
+# review of #2288). Every awk/grep/sort stage above refuses on a non-zero rc — "a failed scan is
+# not an empty one" — but this FINAL read was unchecked, and the script does not run under `set
+# -e`: a run directory that vanished or became unreadable between `sort` and here (the mid-run
+# directory loss this file already MEASURED, defended at the recorder redirect but not here, or
+# any TMPDIR cleaner) yielded "" and the contradiction gate read that as "no blocking findings".
+# A clean artifact and a signed record over a transcript that carried `[P1]` is the whole fail-open
+# class this section exists to prevent, so the invariant is applied one stage further.
+if [ ! -r "$RUN_DIR/blocking-findings.txt" ]; then
+  err "$PROG: the blocking-findings list could not be READ ($RUN_DIR/blocking-findings.txt) — the findings are unknown, so a clean verdict cannot be certified."
+  err "  This is a tool failure, NOT a clean review: no comment was posted and NO record was written."
+  die "$E_SCAN" "the findings list was unreadable (transcript: $TRANSCRIPT)"
 fi
 BLOCKING_FINDINGS="$(cat "$RUN_DIR/blocking-findings.txt")"
 # ⛔ THE COUNT IS THE NUMBER AFTER `ISSUES` (P3, tenth fresh review): scraping every digit

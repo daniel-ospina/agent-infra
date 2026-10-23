@@ -431,6 +431,17 @@ run "$SRC" 2284
 [ "$(rc_of)" = "6" ]; ck $? "a TAB-indented quotation is not a verdict either (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
 no_comment; ck $? "  …and nothing posted"
+# ⛔ AN UNMATCHED MARKER MUST NOT RE-PAIR THE MARKERS AFTER IT (P1, fresh review of #2288). The
+# first version of this rule dropped the LAST marker of an odd count, which re-pairs every marker
+# after the unmatched one: `(unclosed ```diff)` … `(``` opening a quoted artifact)` `CLEAN`
+# `(``` closing it)` has markers [2,6,8], so pairing (2,6) left the QUOTED `CLEAN` in no pair at all
+# — rc 0, artifact posted, signed clean record, over a transcript whose author said it was not the
+# verdict. Dropping the FIRST marker pairs (6,8) instead, the fail-closed direction.
+reset; printf '# Quoting the diff I was shown:\n```diff\n- old line\n- another line\n# ...and the earlier artifact:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\nThis is not my verdict.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "an UNMATCHED marker before a CLOSED quote does not expose the quote (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded — the quotation stayed a quotation"
+no_comment; ck $? "  …and nothing posted"
 # ⛔ THE COUNT GRAMMAR MUST ALSO BE A FINDING GRAMMAR (P2, fresh review of #2288): the count
 # extractor reads `2 × P1` as the verdict's own count (§AM), while the severity cross-check had no
 # cue for it at all — so `Blocking: 2 × P1` followed by `CLEAN` recorded clean. The one check
