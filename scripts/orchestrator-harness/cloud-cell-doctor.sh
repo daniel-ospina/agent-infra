@@ -1283,7 +1283,7 @@ hyg_df_delta() { # <before> <after>
 # ANYTHING UNCLEAR IS REPORTED: no pid in the name, a pid we may not probe (EPERM), an unreadable
 # mtime. A live pid is never touched.
 hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
-  local dry="${1:-}" root d name tok mt age now kerr why
+  local dry="${1:-}" root d name tok mt age now kerr why walk=""
   local reaped=0 kept=0 failed=0 would=0 df_before df_after
   root="${HYGIENE_TMP_DIR:-${TMPDIR:-/tmp}}"
   HYG_SUB_RC=0
@@ -1365,7 +1365,13 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
       # hole a live writer can sit in while the directory's own age stays ancient. The walk is one
       # linear pass over a candidate that already passed the cheap gates, and `sed -n 1p` reads to EOF
       # (no SIGPIPE, unlike `head`).
-      if [ -n "$(find "$d" -newer "$d" -print 2>/dev/null | sed -n '1p')" ]; then
+      # ⛔ THE WALK'S EXIT STATUS IS PART OF THE PROOF (review round 3, P2). `[ -n "$(find …)" ]` cannot
+      # tell "nothing newer" from "the walk did not complete": a find that fails (EACCES below the root,
+      # a resource limit) prints nothing and exits non-zero, and the candidate would then be reaped on
+      # evidence the pass never obtained — with the log asserting "untouched Ns".
+      if ! walk="$(find "$d" -newer "$d" -print 2>/dev/null)"; then
+        why="the nested-write walk over it could not be completed, so its idleness cannot be proven"
+      elif [ -n "$walk" ]; then
         why="an entry INSIDE it was written after its own mtime (a nested write), so its age does not prove it is idle"
       fi
     fi
@@ -1430,11 +1436,18 @@ hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
     # an operator learns to ignore the row (same reasoning as the 4/5/7 carve-out noted in
     # `reap_global_caches`, cloud-cell-supervisor.sh).
     case "$derr" in
-      # ⛔ The CONTEXT all three real spellings carry — not a bare "permission denied" (review round 2,
-      # P2): an unreadable `$DOCKER_CONFIG` or plugin directory is a real failure this role must
-      # report, and swallowing it would print "no daemon" and a green row about a box whose
-      # reclaimable images are exactly what is filling the disk.
-      *"docker daemon"*|*"Dial unix"*|*"dial unix"*)
+      # ⛔ A DENIED SOCKET IS NOT AN ABSENT DAEMON (review round 3, P2 — and round 2 had narrowed this
+      # the wrong way). "Cannot connect … Is the docker daemon running?" means the box holds NOTHING for
+      # us to reclaim: a true, clean "nothing to do". A daemon that EXISTS and refuses this user means
+      # the opposite — the reclaimable images and volumes are there and this pass cannot touch them.
+      # Reporting that as "no daemon" put a green row and a false cause on the exact shape the issue
+      # measured (24.9 GB of idle images on cell-3).
+      *"permission denied"*|*"not permitted"*|*"operation not permitted"*)
+        log "[hygiene] CANNOT-VERIFY: the docker daemon is unreachable from this user — $(printf '%s' "$derr" | head -1)"
+        HYG_FRAG='CANNOT-VERIFY: docker daemon unreachable (permission) — reclaimable images/volumes exist but this pass cannot prune them'
+        HYG_SUB_RC=3
+        return 0 ;;
+      *"docker daemon"*|*"Dial unix"*|*"dial unix"*|*"Is the docker daemon running"*)
         log "[hygiene] docker: no daemon ($(printf '%s' "$derr" | head -1)) — nothing to reclaim"
         HYG_FRAG='docker: no daemon'
         return 0 ;;
@@ -1451,6 +1464,12 @@ hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
     return 0
   fi
   if cell_stopped_midpass; then HYG_FRAG='STOP arrived mid-pass — docker prune skipped'; return 0; fi
+  # ⛔ THE REDIRECT IS WHERE THE PRUNE IS DECIDED. Without the directory the SHELL fails before `docker`
+  # runs at all, and both prunes then report rc=1 — recorded as "docker prune FAILED", a cannot-verify
+  # naming the wrong cause while the reclaim silently did not happen (measured: a manual `hygiene` verb
+  # on an $O whose logs/ the loop had not created yet — and the same on a full disk, which is exactly
+  # the case this role exists for).
+  mkdir -p "$O/logs" 2>/dev/null || true
   root="$("$DOCKER_BIN" info --format '{{.DockerRootDir}}' 2>/dev/null | head -1)"
   [ -n "$root" ] && [ -d "$root" ] || root="$CELL_HOME"
   df_before="$(hyg_df_mb "$root")"

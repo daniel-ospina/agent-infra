@@ -555,18 +555,48 @@ case "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" in
   *) bad "cache sweep: an unenumerable root set recorded a CLEAN pass" ;;
 esac
 
-say_case "docker: an unreachable daemon is a CLASS — 'permission denied' must not redden every pass"
+say_case "docker: an ABSENT daemon is 'nothing to reclaim'; a DENIED one is cannot-verify"
+# ⛔ The two are not the same fact (review round 3). "Cannot connect … Is the docker daemon running?"
+# means the box holds nothing for us; a daemon that exists and refuses this user means the reclaimable
+# images/volumes are there and this pass cannot reach them — a green row there would hide exactly the
+# incident the issue measured (24.9 GB of idle images on a cell whose loop could not prune them).
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
 printf '1\n' > "$T/docker/info_rc"
-printf 'permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get http://x/v1.24/info: dial unix /var/run/docker.sock: connect: permission denied\n' > "$T/docker/info_err"
+printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' > "$T/docker/info_err"
+doc hygiene
+result_has "docker: no daemon" && ok "docker: an ABSENT daemon reads as 'no daemon' (a true nothing-to-reclaim)" \
+                              || bad "docker: the absent-daemon class was not recognised — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")"
+[ "$DOC_RC" -eq 0 ] && ok "docker: …and that box is not reddened" || bad "docker: rc=$DOC_RC — $(printf '%s' "$DOC_OUT" | tail -2)"
+printf 'permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: dial unix /var/run/docker.sock: connect: permission denied\n' > "$T/docker/info_err"
+reset_state; reset_out; reset_calls
 doc hygiene
 rm -f "$T/docker/info_rc" "$T/docker/info_err"
-result_has "docker: no daemon" && ok "docker: a permission-denied socket reads as 'no daemon' (nothing to reclaim)" \
-                              || bad "docker: the unreachable-daemon class was not recognised — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")"
-[ "$DOC_RC" -eq 0 ] && ok "docker: …so a healthy box with an unreachable daemon is not permanently red" \
-                   || bad "docker: rc=$DOC_RC — the row would be red on EVERY pass ($DOC_OUT)"
+result_has "docker daemon unreachable" && ok "docker: a DENIED socket is cannot-verify (the data is there, this pass cannot prune it)" \
+                                      || bad "docker: a denied socket was reported as $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")"
+[ "$DOC_RC" -eq 3 ] && ok "docker: …and the pass is rc=3, not a green row over 25 GB of idle images" \
+                   || bad "docker: rc=$DOC_RC (want 3) — $(printf '%s' "$DOC_OUT" | tail -2)"
 grep -q 'prune' "$T/docker/calls" 2>/dev/null && bad "docker: a prune was attempted with no reachable daemon" \
                                               || ok "docker: no prune is attempted when the daemon cannot answer"
+
+say_case "temp: a walk that could not COMPLETE is not 'nothing newer inside' (fail-open)"
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+DEAD6="$(dead_pid)"
+WALK="$T/tmp/cloud-cell-${DEAD6}.KKKK"
+mk_tmpdir "cloud-cell-${DEAD6}.KKKK" "$ANCIENT" >/dev/null
+# A `find` that fails ONLY for the nested-write walk (everything else passes through to the real one), so
+# this arm is about the exit status of that read and nothing else.
+cat > "$T/bin/find" <<SH
+#!/bin/bash
+case " \$* " in *" -newer "*) exit 1 ;; esac
+exec /usr/bin/find "\$@"
+SH
+chmod +x "$T/bin/find"
+doc hygiene
+rm -f "$T/bin/find"
+[ -e "$WALK" ] && ok "temp: a FAILED nested-write walk leaves the candidate alone (an unreadable read is not a proof)" \
+               || bad "temp: reaped a dir on a walk that never completed — the exit status was discarded"
+log_has "nested-write walk over it could not be completed" \
+  && ok "temp: …and the reason says the walk failed" || bad "temp: the failed walk is unexplained — $(grep -F 'temp:' "$T/o/logs/doctor.log" 2>/dev/null | head -2)"
 
 # ════════════════ the exclusion set is PER PASS, not per process ════════════════════════════════
 say_case "the held-root exclusions do not survive into the next pass of the same loop process"
@@ -602,7 +632,10 @@ case "$PASS1" in
 esac
 case "$PASS2" in
   *"--exclude-root="*) bad "the SECOND pass excluded a root nothing holds — the exclusion set survived the pass ($(printf '%s' "$PASS2"))" ;;
-  *) ok "the SECOND pass passes NO exclusion: the set is per-DRY-RUN, reset at the top of the sweep" ;;
+  # ⛔ AN EMPTY CALL LINE IS NOT "NO EXCLUSION" (review round 3): if the second pass never invoked the
+  # sweep at all, the old `*)` arm reported the reset as proven from a call that does not exist.
+  *"prune --caches"*) ok "the SECOND pass passes NO exclusion: the set is per-PASS, reset at the top of the sweep" ;;
+  *) bad "the SECOND pass never invoked the sweep, so this arm proved nothing — calls=[$(printf '%s' "$PASS_CALLS" | tr '\n' '|')]" ;;
 esac
 
 # ════════════════ summary ═══════════════════════════════════════════════════════════════════════
