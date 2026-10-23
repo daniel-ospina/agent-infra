@@ -13080,6 +13080,15 @@ grep -q "unreadable" "$SCEN/err" \
 grep -q "main is GREEN here" "$SCEN/out" \
   && pass "(a) …and the GREEN claim is made where it is earned (examined=0)" \
   || fail "(a) a measured-green window does not state its green claim: $(grep 'EMPTY BY' -A2 "$SCEN/out" | head -4)"
+# ⛔ AND THE SAME SENTENCE IN THE ARTIFACT (#2569 review, cycle 5). The green reason is
+# one variable feeding stdout AND the evidence body; the CLIPPED arm is pinned by (f)/(f2)
+# but the GREEN arm was pinned by nothing, so emptying it left stdout saying GREEN while
+# the evidence declared the table's completeness UNKNOWN — the stdout-vs-artifact
+# disagreement `main_side_reason` exists to close. `--dry-run` prints the body it would
+# post, so it is assertable here without a second run.
+grep -q "main side: 0 failing run(s).*EMPTY because the lane is GREEN" "$SCEN/out" \
+  && pass "(a) …and the EVIDENCE body carries the same green reason (not the UNKNOWN default)" \
+  || fail "(a) the evidence body disagrees with stdout about the green window: $(grep 'main side:' "$SCEN/out" | head -1)"
 
 # (b) THE REFUSING DIRECTION — NON-VACUITY. The SAME fixture with ONE failing main
 # run whose failed-step log cannot be fetched (a `gh` error with jobs present, the
@@ -13120,9 +13129,18 @@ grep -q "FAILED READ, not an empty baseline" "$SCEN/err" \
 grep -q "was read but" "$SCEN/err" \
   && pass "(b) …naming the COMPOSITE reason (read, but no identity) rather than a bare fetch" \
   || fail "(b) the parse arm's wording is missing: $(grep 'FAILED READ' -A4 "$SCEN/err" | head -6)"
-grep -q "could not be fetched (a gh transport error)" "$SCEN/err" \
-  && fail "(b) the rate path claimed a failed FETCH — its remedy cannot clear a parse failure" \
-  || pass "(b) …and does not claim the fetch-only remedy on the rate path"
+# ⛔ THE NEGATIVE MUST TARGET THE CLAIM SHAPE, NOT THE WORD "fetched" (#2569 review,
+# cycle 5). The parse wording deliberately mentions a fetch as one POSSIBLE cause ("its
+# log could not be fetched, or the id parser could not read it"), so a grep for that
+# word can never discriminate — and an earlier version of this assertion grepped for a
+# phrase that exists nowhere in the producer, i.e. it could not fire at all. The CLAIM
+# is "the failed-step log of run <id> could not be fetched", which is the removed
+# rate-path arm's shape (and still the signature block's). That is what must not appear
+# here: re-running cannot clear a parser fault, so naming only a fetch sends the
+# operator at the wrong system.
+grep -q "failed-step log of run" "$SCEN/err" \
+  && fail "(b) the rate path CLAIMED a failed-step log fetch — its remedy cannot clear a parse failure" \
+  || pass "(b) …and does not claim a failed-step log fetch on the rate path"
 grep -q "run 9215" "$SCEN/err" \
   && pass "(b) …NAMING the run whose log could not be read" \
   || fail "(b) the unreadable run is not named: $(grep 'FAILED READ' -A3 "$SCEN/err" | head -5)"
