@@ -234,6 +234,30 @@ class Record:
         if not isinstance(d, dict):
             self.problem = "not a JSON object"
             return
+        # ⛔ THE CLOCK IS READ BEFORE THE ABSENCE RETURNS BELOW (review P2). A target the gate reads as
+        # ABSENT can still carry a usable `reviewed_at` — a bad `repo` charset does not stop the stamp
+        # from parsing — and `decide()` MUST see it. With the parse below this point, every unreadable
+        # target looked dateless, so the repair arm replaced a NEWER record with an older one (the
+        # inversion rule 3 forbids) and, unlike every other arm, preserved nothing.
+        ra = d.get("reviewed_at")
+        if isinstance(ra, str):
+            self.reviewed_at = ra
+            try:
+                parsed = datetime.fromisoformat(ra.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+            # ⛔ NOT a `problem`. The gate never parses `reviewed_at` (it only echoes it into audit
+            # events), so a record with a non-ISO stamp IS valid evidence and must still cross boxes;
+            # it simply cannot be ORDERED. Made into an `invalid` record it made the tool overwrite a
+            # gate-valid NEWER record with an older one, and made a gate-valid record un-syncable.
+            if parsed is None:
+                self.stamp_note = f"reviewed_at {ra!r} is not ISO-8601 — cannot be ordered"
+            elif parsed.tzinfo is None:
+                # ⛔ A NAIVE stamp (no offset — `2026-10-22 01:00:00`, a date-only `2026-10-22`, a
+                # plain dotted format) is AMBIGUOUS: `datetime.timestamp()` reads it in THIS BOX'S
+                # local zone, so the same pair orders one way in New York and the other way in Madrid,
+                # and both runs exit 0. Never guess a zone (review P1): no offset = no usable clock.
+                self.stamp_note = f"reviewed_at {ra!r} carries no UTC offset — cannot be ordered"
         if not isinstance(d.get("head_sha"), str) or not isinstance(d.get("verdict"), str):
             self.problem = "missing string head_sha/verdict (the gate would read it as absent)"
             return
@@ -261,25 +285,6 @@ class Record:
                 self.problem = f"repo field {repo!r} fails the gate's charset (gate reads it as absent)"
                 return
             self.repo = repo
-        ra = d.get("reviewed_at")
-        if isinstance(ra, str):
-            self.reviewed_at = ra
-            try:
-                parsed = datetime.fromisoformat(ra.replace("Z", "+00:00"))
-            except ValueError:
-                parsed = None
-            # ⛔ NOT a `problem`. The gate never parses `reviewed_at` (it only echoes it into audit
-            # events), so a record with a non-ISO stamp IS valid evidence and must still cross boxes;
-            # it simply cannot be ORDERED. Made into an `invalid` record it made the tool overwrite a
-            # gate-valid NEWER record with an older one, and made a gate-valid record un-syncable.
-            if parsed is None:
-                self.stamp_note = f"reviewed_at {ra!r} is not ISO-8601 — cannot be ordered"
-            elif parsed.tzinfo is None:
-                # ⛔ A NAIVE stamp (no offset — `2026-10-22 01:00:00`, a date-only `2026-10-22`, a
-                # plain dotted format) is AMBIGUOUS: `datetime.timestamp()` reads it in THIS BOX'S
-                # local zone, so the same pair orders one way in New York and the other way in Madrid,
-                # and both runs exit 0. Never guess a zone (review P1): no offset = no usable clock.
-                self.stamp_note = f"reviewed_at {ra!r} carries no UTC offset — cannot be ordered"
         # Optional ordering tiebreak for equal `reviewed_at` (see decide()): `record-review.sh`'s CARRY
         # arm preserves `reviewed_at` while changing head_sha and adding `mint: carried` / `carried_at`
         # / `carried_from` (record-review.sh:2263-2276), so the carried record IS the later one even
@@ -343,6 +348,15 @@ def decide(src: Record, dst: Record) -> tuple[str, str]:
     if dst.problem:
         # The target is one the GATE would read as absent, and the source is valid for the same key:
         # adopting is a repair, not a loss (nothing is deleted) — but say so, it is not silent.
+        # ⛔ A REPAIR IS NOT A LICENCE TO TRAVEL BACKWARDS (review P2). An unreadable target can still
+        # carry a usable `reviewed_at` (`Record` now reads the clock before its absence returns), and
+        # replacing a NEWER record with an older one is the inversion rule 3 exists to forbid — a
+        # corrupt record must not be laundered, and it must not become a way to lose the newest
+        # evidence either. The caller PRESERVES the displaced bytes on every repair (see transfer()).
+        if src.stamp is not None and dst.stamp is not None and dst.stamp >= src.stamp:
+            return "conflict", (f"target is unreadable to the gate ({dst.problem}) but is not older "
+                                f"({dst.reviewed_at} vs source {src.reviewed_at}) — cannot order, so "
+                                "nothing is replaced")
         return "replace", f"target is unreadable to the gate ({dst.problem}); adopting the valid source"
     if src.raw == dst.raw:
         return "keep", "identical"
@@ -506,6 +520,12 @@ def transfer(src_dir: Path, dst_dir: Path, label: str, dry_run: bool, union_dir:
         if dry_run:
             stats[action] += 1              # a dry run reports what it WOULD do; nothing was written
             continue
+        # ⛔ A REPAIR REPLACES A TARGET THAT MAY STILL BE SOMEONE'S ONLY COPY (review P2). Every other
+        # arm that displaces a record preserves it under <union>/conflicts/; the repair arm silently
+        # dropped it. `preserve` never writes into the gate's directory and never overwrites, so this
+        # cannot resurrect a record the gate would read — it only keeps the bytes recoverable.
+        if action == "replace" and dst is not None and dst.problem:
+            preserve_safely(union_dir, dst, f"{label}-displaced", stats, lines, tty)
         try:
             ok = atomic_write(dst_dir / key, src.raw, dst.raw if dst is not None else None)
         except OSError as e:
@@ -523,6 +543,8 @@ def transfer(src_dir: Path, dst_dir: Path, label: str, dry_run: bool, union_dir:
         except OSError:
             now = None
         again, why2 = ("add", "raced; target now absent") if now is None else decide(src, now)
+        if again == "replace" and now is not None and now.problem:
+            preserve_safely(union_dir, now, f"{label}-displaced", stats, lines, tty)
         if again in ("add", "replace"):
             try:
                 landed = atomic_write(cur, src.raw, now.raw if now else None)

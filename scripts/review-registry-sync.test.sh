@@ -502,6 +502,32 @@ rc=$(run push --registry "$TMP/reg42" --union "$TMP/uni42")
 check "exit 1, not adopted" "[ $rc -eq 1 ] && [ ! -f '$TMP/reg42/1.json' ]"
 check "the message names the real cause (not 'charset')" "grep -q 'is not a string' '$TMP/out'"
 
+echo "== §43 a REPAIR never travels backwards, and the displaced target's bytes are kept (review P2)"
+# A target the gate reads as ABSENT (here: a `repo` charset failure) can still carry a usable
+# `reviewed_at`. Before the fix, the repair arm replaced it unconditionally — so a NEWER record was
+# overwritten by an older one (the inversion rule 3 forbids) and, alone among the arms, nothing was
+# preserved: the only copy was gone.
+mkdir -p "$TMP/reg43" "$TMP/uni43"
+python3 -c "import json;open('$TMP/reg43/7.json','w').write(json.dumps({'head_sha':'$H40','verdict':'blocked','repo':'daniel-ospina/tortoise ','reviewed_at':'2027-01-01T00:00:00Z'}))"
+mkrec "$TMP/uni43/7.json" 7 "$H40" clean daniel-ospina/tortoise 2026-01-01T00:00:00Z
+before_43="$(sha256sum "$TMP/reg43/7.json" | cut -d' ' -f1)"
+rc=$(run push --registry "$TMP/reg43" --union "$TMP/uni43")
+check "exit 1 — a NEWER unreadable target is NOT replaced" "[ $rc -eq 1 ]"
+check "target bytes untouched" "[ \"\$(sha256sum '$TMP/reg43/7.json' | cut -d' ' -f1)\" = '$before_43' ]"
+check "the source is preserved, not dropped" "[ -n \"\$(ls '$TMP/uni43/conflicts/'*7* 2>/dev/null)\" ]"
+check "the reason names the clock, not just the corruption" "grep -q 'is not older' '$TMP/out'"
+
+# The other half: an OLDER unreadable target IS repaired — and its bytes are preserved, because they
+# may be the only copy of a record a peer minted.
+mkdir -p "$TMP/reg43b" "$TMP/uni43b"
+python3 -c "import json;open('$TMP/reg43b/8.json','w').write(json.dumps({'head_sha':'$H40','verdict':'blocked','repo':'daniel-ospina/tortoise ','reviewed_at':'2025-01-01T00:00:00Z'}))"
+mkrec "$TMP/uni43b/8.json" 8 "$H40" clean daniel-ospina/tortoise 2026-01-01T00:00:00Z
+rc=$(run push --registry "$TMP/reg43b" --union "$TMP/uni43b")
+check "exit 0 — an OLDER unreadable target is repaired" "[ $rc -eq 0 ]"
+check "repaired to the valid record" \
+  "python3 -c \"import json;assert json.load(open('$TMP/reg43b/8.json'))['verdict']=='clean'\""
+check "the displaced target's bytes ARE preserved" "grep -rq 'blocked' '$TMP/uni43b/conflicts'"
+
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
