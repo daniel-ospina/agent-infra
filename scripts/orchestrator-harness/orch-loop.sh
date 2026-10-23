@@ -36,6 +36,14 @@ if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2;
 # prevent (review round 3).
 O="${O:-$HOME/orchestrator}"
 _HERE_RS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# The directory of the RUNNING script, named once: `resolve_refresh_sh` looks beside the loop for a
+# refresh that can write the pass record this loop reads (agent-infra#2308), and the SEED-SKEW line
+# names it as the copy the controller itself runs. `_HERE_RS` already resolved it for repo-slug.sh.
+# ⛔ THE ENV FORM IS HONOURED ON PURPOSE, and it was NOT (review P2): the unconditional assignment made
+# the knob inert on the shipped entrypoint, so the only way to exercise "a capable copy BESIDE the
+# loop" was the suite's sourced excerpt. It is a LOOK-HERE hint only — `$O` is still tried first and
+# the capability probe still decides, so an ambient value cannot make an incapable copy executable.
+REFRESH_SELF_DIR="${REFRESH_SELF_DIR:-$_HERE_RS}"
 if [ -n "${O:-}" ] && [ -f "$O/repo-slug.sh" ]; then . "$O/repo-slug.sh"
 elif [ -f "$_HERE_RS/repo-slug.sh" ]; then . "$_HERE_RS/repo-slug.sh"
 else
@@ -79,10 +87,12 @@ if [ "$OR_RC" != "0" ]; then
   [ -d "$O" ] && echo "$(date) [startup] $_or_warn" >> "$O/logs/orch-loop.log" 2>/dev/null
 fi
 # ⛔ EXPORTED, AND THAT IS LOAD-BEARING (#2040 review). `refresh-candidates.sh` reads its LISTINGS
-# from $OR, and it runs as a CHILD (`bash "$O/refresh-candidates.sh" 6`). A DERIVED value never
-# reached this script through the environment, so without this export the child re-derives its own
-# default — the pool would come from one repo while the controller graded another. (Before this
-# change the same held true, consistently: both sides used the same literal.)
+# from $OR, and it runs as a CHILD — `bash "$REFRESH_SH" 6`, where `$REFRESH_SH` is the copy
+# `resolve_refresh_sh` RESOLVED for this cycle (the seed in $O when it can record, a recording copy
+# beside the loop when the seed cannot — #2308; the spawn site names no hardcoded path any more).
+# A DERIVED value never reached this script through the environment, so without this export the child
+# re-derives its own default — the pool would come from one repo while the controller graded another.
+# (Before this change the same held true, consistently: both sides used the same literal.)
 export OR
 # ⛔ NO `export REPO` HERE, DELIBERATELY. It would be a no-op for every supported invocation: a
 # value that reached this script through the environment is ALREADY exported to the refresh and
@@ -926,6 +936,129 @@ harness_refresh_cycle() {
 # END harness-refresh
 
 # single-instance lock (atomic: noclobber create fails if the file exists)
+# [refresh-record:begin]
+# ── THE REFRESH THAT WRITES THE RECORD MUST BE THE REFRESH THAT RUNS (agent-infra#2308) ─────────
+# ⛔ MEASURED 2026-10-22 ON A LIVE LINUX CELL. The beat printed `BLOCKED: a refresh pass wrote its
+# start marker 16h ago … so the pass DIED` on EVERY cycle for 16 hours, while `candidates.txt` held
+# 17 real issues and the refresh was in fact running (its funnel record was 22 minutes old). The pass
+# had not died: this loop executes `$O/refresh-candidates.sh` — the SEEDED copy — and that copy was
+# one generation behind the build the controller itself ran, so it could not write
+# `state/refresh-last` at all (`refresh_record_write` appears 0 times in it). The record therefore
+# could never advance, and its frozen age — the only evidence this reader has — was printed as a
+# death. "Nothing on this box can write the file" and "the writer died" are DIFFERENT states and
+# must never print as one sentence: the first is a deployment defect with a one-line remedy, the
+# second is a crash. The two helpers this loop already capability-probes — worker-terminal.sh
+# (`command -v` for `wt_spawn`) and rail-refusal.sh (`declare -f`) — refuse a stale copy; the refresh
+# is the one helper whose OUTPUT RECORD this loop parses, and it was the one helper with no probe at
+# all. (harness-refresh.sh is existence-tested, not probed: its contract is a record line, not a
+# named function — so it is deliberately not in that list.)#
+# NOT A SECOND READER, AND NOT A CONVENIENCE FALLBACK: `$O` stays FIRST (an operator's seeded copy
+# wins, #2278). A copy is only passed over when it cannot satisfy the contract this loop depends on,
+# and when NO copy can, the gate says SEED-SKEW and names every path it tried — it never claims a
+# cause it cannot know (#2229's own rule, applied to #2229's own record).
+refresh_can_record() {   # <refresh-script> — 0 when it can WRITE the pass record this loop READS
+  [ -f "$1" ] || return 1
+  # ⛔ THE DEFINITION, NOT A MENTION: this very file's prose contains the word, and a completed
+  # pass's output can quote it — so a substring match would report the capability for a script that
+  # has none (a false PASS on the probe itself). Same shape as spawn-gate.sh's `run_agent` probe and
+  # worker-terminal.sh's `wt_spawn` probe: the controller asks for the function it calls.
+  # ⛔ AND THE BODY OPENER, NOT JUST THE SIGNATURE (review P3): excluding `#`-comments answers prose
+  # that is COMMENTED, but any non-comment line that merely STARTS with the name satisfies a
+  # signature-only match — a heredoc body does exactly that
+  # (`why="$(cat <<EOF` / `refresh_record_write() writes the record…` / `EOF` / `)"`), so a box whose
+  # seed only QUOTES the name in captured text would be read as a recorder and the SEED-SKEW verdict
+  # never fires. Requiring the `{` keeps the match on a definition; the shipped definition puts the
+  # brace on the signature line (`refresh_record_write() {      # …`), so this refuses no real copy.
+  grep -qE '^[[:space:]]*refresh_record_write[[:space:]]*\(\)[[:space:]]*\{' "$1" 2>/dev/null
+}
+REFRESH_RESOLVED=0        # 1 once resolution has run THIS cycle (reset per cycle, like _HR_DONE — a
+                          # cached answer would keep reporting the skew the remedy just fixed, and a
+                          # cached "absent" would keep a re-seeded box from ever spawning again)
+REFRESH_RC=0              # the resolution's own answer (0 recorder · 2 found-but-incapable · 1 absent)
+REFRESH_SH=""            # the script this loop executes (empty only when NO refresh exists at all)
+REFRESH_SH_SKEW=""       # the first copy passed over because it cannot record
+REFRESH_TRIED=""         # every path tried, in order — the SEED-SKEW verdict names them
+# 0 = a RECORDER was found (possibly beside the loop) · 2 = a script was found but NONE can record
+# (the box still runs one — origination keeps queueing, the BEAT just refuses to read its silence as
+# a cause) · 1 = no refresh script anywhere. The three answers are kept apart because their remedies
+# differ and two of them used to print as the third's symptom.
+resolve_refresh_sh() {
+  [ "${REFRESH_RESOLVED:-0}" = "1" ] && return "${REFRESH_RC:-1}"
+  local _self c _found=""
+  _self="${REFRESH_SELF_DIR:-}"
+  if [ -z "$_self" ]; then
+    # The directory of the RUNNING script (the pinned build on a cell). Never `$PWD`, which is
+    # whatever the operator's shell happened to be in.
+    _self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _self=""
+  fi
+  for c in "$O/refresh-candidates.sh" ${_self:+"$_self/refresh-candidates.sh"}; do
+    [ -n "$c" ] || continue
+    case " $REFRESH_TRIED " in *" $c "*) continue ;; esac
+    REFRESH_TRIED="$REFRESH_TRIED${REFRESH_TRIED:+ }$c"
+    [ -f "$c" ] || continue
+    if refresh_can_record "$c"; then REFRESH_SH="$c"; REFRESH_RESOLVED=1; REFRESH_RC=0; return 0; fi
+    [ -n "$REFRESH_SH_SKEW" ] || REFRESH_SH_SKEW="$c"
+    [ -n "$_found" ] || _found="$c"
+  done
+  REFRESH_RESOLVED=1
+  # An INCAPABLE script still runs: refusing to spawn would take a box that can still fill its pool
+  # down to merging only, which is a worse outcome than a queue it cannot account for. What must not
+  # happen is the reader TURNING ITS SILENCE INTO A CAUSE — that is the flag this sets.
+  if [ -n "$_found" ]; then REFRESH_SH="$_found"; REFRESH_RC=2; return 2; fi
+  REFRESH_RC=1
+  return 1
+}
+# 0 when the record on disk cannot be ADVANCED by anything this box would execute AND its age would
+# otherwise be read as a cause. A YOUNG, AGEABLE record is left alone — it is a pass in flight, and
+# calling that SEED-SKEW would be inventing a second wrong cause; that includes a YOUNG `result=ok`,
+# which is real evidence and must keep taking the `skipped`/`nothing to defer` branches.
+# ⛔ BOTH UNWRITABLE STATES COUNT (review P1): `2` (a script exists that cannot record) AND `1` (no
+# refresh script at all — the spawn site refuses to start a pass it cannot run, so nothing will EVER
+# write the record). Scoping this to `2` left the measured sentence — "so the pass DIED … nothing will
+# replace that marker but a pass that finishes" — printing on a box where the loop has made that event
+# impossible; that is the same fabricated cause, for the sibling state.
+# ⛔ AND A STALE `result=ok` IS NOT EXEMPT (review P1): the previous guard exempted `ok` at ANY age, so
+# a box whose writer was seeded away printed `skipped (… refresh ok, 3h ago)` — a false green that
+# claims origination works, the mirror of the defect this verdict exists for. Only FRESHNESS decides,
+# and it is decided here, in one place.
+refresh_contract_gap() {   # <result> <at> <d>
+  local at="${2:-}" d="${3:-}"
+  resolve_refresh_sh; case "$?" in 1|2) ;; *) return 1 ;; esac
+  [ -z "$at" ] && return 0
+  is_num "$at" || return 0            # present but unageable: no evidence of a pass being alive
+  is_num "$d" && [ "$d" -lt "$RUNNING_STALE_MIN" ] && return 1   # young => in flight
+  return 0
+}
+# [refresh-record:end]
+# [refresh-check:begin]
+case "${1:-}" in
+  --check-refresh)
+    resolve_refresh_sh; _rc=$?
+    if [ "$_rc" = "0" ]; then
+      if [ "$REFRESH_SH" = "$O/refresh-candidates.sh" ]; then
+        printf 'refresh-contract relation=ok executed=%s tried=%s\n' "$REFRESH_SH" "$REFRESH_TRIED"
+        exit 0
+      fi
+      printf 'refresh-contract relation=skew executed=%s passed_over=%s tried=%s\n' \
+        "$REFRESH_SH" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
+      # ⛔ "MISSING OR CANNOT RECORD", NOT "CANNOT RECORD" (review P2): the skew arm is reachable when
+      # `$O` has NO copy at all (the resolver then finds the one beside the loop), and calling that a
+      # copy that "cannot record" is a false statement about a file that is not there. `passed_over=none`
+      # says which it is; the prose names both states.
+      printf '  DIVERGENCE: the seeded copy is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      exit 1
+    fi
+    if [ "$_rc" = "2" ]; then
+      printf 'refresh-contract relation=unwritable executed=%s tried=%s\n' "${REFRESH_SH:-none}" "${REFRESH_TRIED:-none}"
+      printf '  BROKEN: no refresh-candidates.sh on this box defines refresh_record_write, so state/refresh-last cannot advance and its age proves nothing. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      exit 2
+    fi
+    printf 'refresh-contract relation=absent tried=%s\n' "${REFRESH_TRIED:-none}"
+    printf '  UNKNOWN: no refresh-candidates.sh was found at all, so origination cannot run. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+    exit 2 ;;
+esac
+# [refresh-check:end]
+
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
 if ! acq; then
@@ -1358,6 +1491,31 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   if [ -n "$unrec" ]; then
     printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+  elif refresh_contract_gap "${result:-}" "${at:-}" "${d:-}"; then
+    # ⛔ TWO STATES, TWO SENTENCES (agent-infra#2308). The record below may say `running` (a pass that
+    # started and never finished), `fail`, a STALE `ok`, or nothing at all — but when NOTHING on this box
+    # can write the record, its age is not evidence about any pass, and this branch must not lend it the
+    # authority of a cause. Only FRESHNESS exempts a record (see `refresh_contract_gap`), so a fresh `ok`
+    # never reaches this line and a stale one does — which is the point: the frozen content is quoted (so
+    # a real past failure, or a real past success, is not lost) and the verdict names the deployment
+    # defect plus the paths it tried.
+    # ⛔ THE CLAUSE MUST AGREE WITH THE RESOLVER'S OWN ANSWER (review P2). With rc=2 the path in
+    # `$REFRESH_SH` is BY DEFINITION a copy that CANNOT record — `resolve_refresh_sh` only falls back
+    # to an incapable copy when no recorder was found anywhere — so the old wording ("a copy that can
+    # record would run as %s") asserted the capability of the one file it had just proved incapable,
+    # and an operator reading it would take the stale seed for healthy. rc=1 names no copy at all.
+    local _skew_run
+    if [ "${REFRESH_RC:-1}" = "2" ] && [ -n "$REFRESH_SH" ]; then
+      _skew_run="the copy this box WOULD run is $REFRESH_SH — it cannot record"
+    elif [ -n "$REFRESH_SH" ]; then
+      _skew_run="a copy that can record would run as $REFRESH_SH"
+    else
+      _skew_run="no refresh copy exists on this box to run"
+    fi
+    printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died — whether one is ALSO dying here is UNKNOWABLE from this record (check state/refresh-funnel and the log); what is proved is only that nothing on this box can advance it, which is a deployment defect with a one-line remedy. Tried: %s. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — %s, and the loop looked beside itself in %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
+      "$age" "${result:-<no result= recorded>}" "$(refresh_cause_brief "$rec")" \
+      "${REFRESH_TRIED:-none}" "$_skew_run" "${REFRESH_SELF_DIR:-?}" \
+      "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
     if [ "$backlog" -gt 0 ]; then
       printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (refresh ok, %s) | PR path: %s\n' \
@@ -2159,6 +2317,24 @@ unowned_scan() { # <open_prs>
   printf '%s\n' "$u"
 }
 
+# ── `--check-refresh`: IS THIS BOX ABLE TO PROVE ITS OWN ORIGINATION? (agent-infra#2308) ────────
+# The loop's answer to a broken refresh is a log line, and a log line is not a signal a monitor, a
+# CI job or `harness-status` can read. This mode is read-only and answers the ONE question the record
+# contract depends on, with the same exit vocabulary as check-single-source.sh:
+#   0  the executed refresh can record a pass outcome, and it is the seeded `$O` copy (no skew)
+#   1  DIVERGENCE — `$O`'s copy cannot record; the controller would execute a different copy
+#   2  UNKNOWN/BROKEN — no copy on this box can record, so origination cannot be proven at all
+# It never exits 0 on "could not look", which is the shape that let a 16-hour false DIED run.
+# ⛔ WHAT "READ-ONLY" DOES AND DOES NOT MEAN (review P2, measured): this block writes no record,
+# spawns no pass and takes no lock (`LOCKF`/`acq`/the EXIT trap are all BELOW it). An invocation still
+# does what EVERY invocation does above it, and that is not nothing: `mkdir -p "$O/logs" "$O/state"`,
+# the `[startup] worker launcher=…` append to `$O/logs/orch-loop.log`, `touch` of `candidates.txt` /
+# `checked.txt` / `dispatched.txt`, and `chmod +x "$O"/*.sh`. So a monitor pointed at ANOTHER box's
+# `$O` creates those files and appends to that log — said plainly rather than claimed away.
+# ⛔ AND 78 IS REACHABLE, OUTSIDE THE 0/1/2 BELOW: the startup guards (a missing repo-authority.sh /
+# worker-terminal.sh, an unusable REPO) exit 78 before this case runs. That is deliberate — a box that
+# cannot run at all has a bigger problem than its record, and answering 0/1/2 would grade a controller
+# that would never start. A caller must read 78 as "cannot run", never as "healthy".
 while true; do
   # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
   # `CYCLE_T0` is the START of this cycle, not the end: a record stamped at the end reports the
@@ -2197,6 +2373,11 @@ while true; do
   # `state/harness-refresh` stops being rewritten. That is the exact failure this block exists to end,
   # so the reset belongs at the call site — the guard still catches a SECOND call in the same cycle.
   _HR_DONE=0
+  # ⛔ THE REFRESH RESOLUTION IS A PER-CYCLE FACT (agent-infra#2308), reset with the rest of the cycle
+  # state. Cached per PROCESS it was a stale flag: a re-seed would not re-enable spawning (a cached
+  # "absent" keeps logging "no refresh-candidates.sh found at all"), and a cached skew keeps printing
+  # SEED-SKEW after the remedy — so the next GENUINE death would be misattributed to the seed.
+  REFRESH_RESOLVED=0; REFRESH_RC=0; REFRESH_SH=""; REFRESH_SH_SKEW=""; REFRESH_TRIED=""
   harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
@@ -4376,7 +4557,47 @@ PY
       # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
       # The mark is a LINE index, and the `echo` above has just terminated any partial tail.
       log_mark="$(awk 'END{print NR}' "$LOG" 2>/dev/null)"; [ -n "$log_mark" ] || log_mark=0
-      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
+      # ⛔ THE REFRESH IS RESOLVED, NOT HARDCODED (agent-infra#2308) — see `resolve_refresh_sh`. A pass
+      # whose outcome nothing can record is spawned ONLY if that is disclosed and not repeated for
+      # nothing: with no recorder anywhere, spawning buys a full pool read whose result this loop is
+      # then forbidden to trust. The skew line names the passed-over copy, so a stale seed cannot sit
+      # invisible behind a healthy-looking pass — and EVERY arm that picks a copy OTHER than the
+      # seeded one speaks.
+      # ⛔ KEYED ON THE PATH CHOSEN, NOT ON THE SKEW FLAG (review P2). `REFRESH_SH_SKEW` is set only for
+      # a copy that EXISTS but cannot record, so a key of `-n "$REFRESH_SH_SKEW"` left the
+      # `rc=0`-with-NO-SEED case in no arm at all: `$O` was never seeded (or its seed was deleted), the
+      # resolver found the copy beside the loop and answered rc=0 with no skew recorded, and the beat
+      # logged only `spawning` while a script the operator never seeded there ran — a healthy-looking
+      # cell whose skew was invisible except to `--check-refresh`, which nobody runs per cycle. The arm
+      # below asks the only question the contract is about: is the copy being executed the SEEDED one?
+      resolve_refresh_sh; _rrc=$?
+      _seeded_refresh="$O/refresh-candidates.sh"
+      if [ "$_rrc" = "2" ]; then
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+      elif [ "$_rrc" = "1" ]; then
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        rm -rf "$O/.refresh.lock"
+      elif [ -n "$REFRESH_SH" ] && [ "$REFRESH_SH" != "$_seeded_refresh" ]; then
+        # ⛔ A COPY OTHER THAN THE SEEDED ONE IS DISCLOSED, NOT SILENT (review P2). Two shapes reach this
+        # arm and they are named apart, because their remedies read differently: a seed that EXISTS but
+        # cannot record (the MEASURED cell — a stale `$O` seed, a recording copy beside the loop), and a
+        # seed that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal
+        # here — a pass IS being spawned; only the CHOICE OF COPY is being announced.
+        if [ -n "$REFRESH_SH_SKEW" ]; then
+          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        else
+          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        fi
+      elif [ -z "$REFRESH_SH" ]; then
+        # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
+        # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall
+        # past `if [ -n "$REFRESH_SH" ]` with no `else`: the log had already said `spawning`, nothing ran,
+        # and `.refresh.lock` stayed on disk — a silent no-op wearing a spawn line.
+        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        rm -rf "$O/.refresh.lock"
+      fi
+      if [ -n "$REFRESH_SH" ]; then
+        ( bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
@@ -4410,6 +4631,7 @@ PY
           # agree on the cause. A missing record is named, not glossed.
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
         fi ) &
+      fi
     else
       # stale lock guard (default 20 min; REFRESH_STALE_LOCK_MIN). The SAME constant bounds the
       # origination block's "in flight vs died" reading, so the beat and the controller cannot
