@@ -295,7 +295,7 @@ It is deliberately thin. It carries **no agent invocation of its own** — it ba
 equality: a direct spawn here would be a fourth, ungated launch path.
 
 ```bash
-bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [bg|prfix]
 bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed rc=N | lost
 ```
 
@@ -2508,19 +2508,22 @@ already holding):
 
 | part | where | what it does |
 |---|---|---|
-| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
-| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk\|land>` (`land` = the creation back-pressure refusal, §7.2g) | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk / 74 land-backlog) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
 | the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
 
 **Decisions worth not re-litigating.**
 
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
-  (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
-  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
-  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
-  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
-  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
-  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+  (`load` or `disk` — opposite remedies — and, since #2409, `land`: the creation gate's refusal, whose
+  remedy is on neither this box nor any peer's), and the transfer is driven by the refusal event. Load
+  is a symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is
+  also why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **load, disk or land** (`spawn-gate.sh`), so those are the three
+  values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
+  refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
+  predates #2409 and knows only two values must treat `land` as `load` (it is non-numeric for its
+  purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal".
 - **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
   never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
   for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
@@ -2536,8 +2539,8 @@ already holding):
   corrupt byte. Past that, each consumes the fields it needs and no others:
   - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
     this chain's start minus the ordering slack, and not older than the record's own yield window).
-    It reports **field 3** as the exit code (75 load / 77 disk) and maps an unrecognised value to
-    `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
+    It reports **field 3** as the exit code (75 load / 77 disk / 74 land) and maps an unrecognised value
+    to `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
     one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
     yield window must not make a proven refusal unreadable.
   - `orch-loop.sh`'s `capacity_yield_live()` uses **fields 1 and 2 together**, and only a COHERENT pair
@@ -2828,6 +2831,66 @@ cannot guess:
 assertion is paired with a POSITIVE one (`BLOCKED: refresh failed — stage=<that stage>`) so a driven
 block that silently does nothing reads RED rather than vacuously green.
 
+
+### 7.2g Creation back-pressure — the fleet opens PRs faster than it lands them — **FIXED in agent-infra#2409**
+
+Every capacity gate this harness had measures **the box**: `MAX_LOAD`, `MIN_MEM_FREE_MB`,
+`MIN_SWAP_FREE`, `DISK_MIN_FREE_MB`, the pi spawn point. A box with 20 free lane slots in front of an
+81-PR queue therefore reads perfectly healthy — and opens the 82nd PR. Measured 2026-10-23T11:50Z over
+a trailing 48h, both repos, from REST:
+
+| repo | opened | merged | ratio | open |
+|---|---|---|---|---|
+| `daniel-ospina/agent-infra` | 73 (**1.52/h**) | 25 (**0.52/h**) | **2.9 : 1** | **81** |
+| `daniel-ospina/tortoise` | 131 (2.73/h) | 115 (2.40/h) | 1.1 : 1 | 19 |
+
+So the same harness is roughly balanced on one repo and accumulating ~24 PRs a day on the other. The
+difference is throughput, not capacity — which is why a COUNT is the wrong threshold: 19 open is a
+healthy queue on tortoise and would be a catastrophe on a repo landing 0.1/h. **The sizing rule is
+Little's law, L = λW**: the ceiling is the repo's OWN measured landing rate times the lead time we accept
+(`λ` from the better of the two trailing 24h windows, floor 5, so a suppressed day cannot shrink the
+ceiling and a repo that has landed nothing cannot collapse to zero).
+
+Where it acts: `run_agent` (spawn-gate.sh), **after** the disk and load gates and **for every KIND
+except `fixer`, `reviewer` and `prfix`** — a deny-list, so `lane.sh` (KIND=lane) *and*
+`nonblocking-dispatch.sh` (KIND=bg) are both measured, and a KIND nobody has written yet is gated by
+default rather than silently exempt. It acts at the moment a CREATION worker is spawned, before any work
+exists.
+
+⛔ **`KIND` IS NOT A CREATION/REPAIR DISCRIMINATOR, WHICH IS WHY THE EXEMPT SET HAS `prfix`.**
+`pr-doctor` dispatches every PR repair through `nonblocking-dispatch.sh`, so a hardcoded `KIND=bg` put
+those repairs under the gate in exactly the state that triggers it (review cycle 2, P1: the gate held
+the work that drains it). The dispatcher now takes the kind as an **argument** —
+`nonblocking-dispatch.sh <name> <wt> <brief> <timeout> [bg|prfix]`, default `bg` — and refuses any other
+value, so a caller DECLARES what it spawns and an undeclared caller still gets the refusing default.
+The exempt set is therefore: `fixer` (fix-one.sh: pushes to an open PR), `reviewer` (merge-one.sh: the
+verdict that lets one land), `prfix` (pr-doctor: rebases/fixes an already-open PR). No merge path calls
+`run_agent`, so a deep backlog can never stop the work that drains it (`capacity-transfer.test.sh`
+asserts the shell paths AND the non-shell ones — the pr-doctor declaration, its argv, and the
+dispatcher's closed vocabulary).
+
+The verdict is a **named state, never a silent pass** — exactly one line, first word the state:
+
+| state | when | what happens |
+|---|---|---|
+| `LAND-BACKLOG <n> open / <r> landings per hour (ceiling …)` | `open > ceiling` | **held**: no agent starts, exit **74**, the issue stays in the pool, `state/capacity-refused-<N>` records `land` so `chain-merge.sh` stops waiting and releases the claim |
+| `OK <n> open / <r> landings per hour (ceiling …)` | `open <= ceiling` | the lane starts |
+| `UNREADABLE <reason>` | any read failed, or the worktree's origin is not a GitHub slug | **held** (exit 74). A measurement that cannot be read is never the default that reads as OK; the safe direction is the cheap one (a false hold costs one re-dispatch, a false OK costs 1.5 PRs/hour that nothing lands) |
+
+Two **evidence** exemptions, both read from GitHub so a lane cannot mint one: an issue labelled
+`P0-blocker`, and a `base-red`/`main-red` repair detected in the issue title. Both REDUCE the backlog,
+so holding them would be backwards. They are evaluated **before** the verdict, so a readable call never
+holds a P0. A TOTAL `gh` outage fails the exemption read too — an exemption that cannot be read cannot
+be proven — and then a P0 lane IS held; the refusal line says `EXEMPTION-UNREADABLE` so the operator
+fixes the gh chain instead of concluding the issue was judged non-urgent. There is deliberately **no
+env bypass** (`LB_SKIP`, `LB_GH` or similar): an ambient switch that opens a gate is not a gate, and a
+`gh` seam was measured opening this one on an 82-PR repo before it was removed.
+
+The refusal is a *different* refusal from a capacity one, and the vocabulary says so: exit **74**
+(`AGENT_LAND_BACKLOG`), the record's field 3 is `land`, `chain-merge.sh` maps it to 74 and states in its
+own words that it is **not** a capacity transfer (the backlog is repo-wide, so handing the issue to a
+peer box cannot clear it — the remedy is to LAND). Full contract and the four cases: 
+`capacity-transfer.test.sh` §LB.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 

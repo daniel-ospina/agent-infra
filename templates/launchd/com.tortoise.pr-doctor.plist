@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pr-doctor (#2303): drive every open PR toward `merged`, automatically.
+         The doctor itself is agent-infra/scripts/pr-doctor.py, farmed to
+         $HOME/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts farm.
+
+         ⛔ WHY THIS TEMPLATE EXISTS AT ALL. The code had been shipped and farmed
+         for days while NO job definition existed for it: on 2026-10-21
+         `bash scripts/install-launchd.sh` with its status verb listed every other job as
+         `installed=loaded` and this one as `NOT INSTALLED`, `orchestrator-bringup.sh
+         status` printed `pr-doctor … no job definition … MISSING`, and the farmed
+         script never ran. A missing job is invisible in exactly the way that costs
+         most: nothing fails, so nothing is filed. The label is the one the live box
+         was hand-armed under (`com.tortoise.pr-doctor`), so installing this template
+         REPLACES that hand-made agent with the tracked one — same label, same
+         script, now reproducible from source. That replacement is the point.
+
+         THE TARGET IS THE FARMED COPY, like every other always-installable job in
+         this directory (pi-reap-orphans, pi-cache-reap, lane-liveness): setup.sh's
+         fleet-scripts farm copies pr-doctor.py to that path BEFORE the launchd
+         convergence step, which is what makes the `<string>` resolve on a fresh box.
+         install-launchd.sh hard-fails a job whose target does not resolve, and that
+         check is deliberately NOT defeated here: a bare `install-launchd.sh` on a box
+         that never ran the farm FAILs this job instead of installing a dead one, which
+         is the correct verdict and the same one every farmed job gets.
+         The interpreter is `/usr/bin/env python3` — the shape the LIVE job was armed
+         with — and not the installer's PYTHON_BIN placeholder: on a non-swarm box that
+         placeholder is deliberately pointed at a venv that does not exist, so using it
+         would hard-fail this install for a reason that has nothing to do with the
+         doctor.
+
+         WHY 30 MINUTES. One pass is a real read of every open non-draft PR plus up
+         to MAX_FIX/MAX_REVIEW load-gated worker spawns, with each gh call bounded at
+         180s — it is a DISPATCH pass, not a poll. 1800s matches the interval the
+         live box was hand-armed at, and it is the cadence the pass's own cooldown
+         and per-PR idempotency were built for: a tighter timer would mostly re-read
+         state it just wrote, and a looser one would let a red PR wait an hour for its
+         fixer. There is no RunAtLoad on purpose — the same shape as the reapers
+         above: `launchctl kickstart` (or the next sync) starts it immediately when an
+         operator wants a pass now.
+
+         WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
+         $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
+         .../pr-doctor.status.json; the launchd capture below is the third surface and
+         the one its own code names — a pass that dies before it can write either
+         still leaves its crash text here (a launchd job's stderr is the only place
+         an interpreter-level death lands), which is what makes an import error
+         distinguishable from an honest RED verdict.
+
+         GH: PATH carries the fleet's gh-wrapper dir first (rendered by
+         install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
+         HOME stays the real home so the doctor's state dir is the fleet's, not
+         launchd's. -->
+    <key>Label</key>
+    <string>com.tortoise.pr-doctor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>{{HOME}}/.pi/agent/scripts/pr-doctor.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>GH_REPO</key>
+        <string>daniel-ospina/tortoise</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <!-- ⛔ /tmp, like every other template in this directory: launchd opens these files BEFORE exec,
+         and nothing in install-launchd.sh creates $HOME/.pi/agent/state. A capture path whose parent
+         may not exist fails at bootstrap, and the job that loses its only crash surface is this one. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/pr-doctor.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pr-doctor.launchd.err</string>
+</dict>
+</plist>

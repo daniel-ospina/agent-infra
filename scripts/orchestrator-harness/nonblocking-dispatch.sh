@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+# nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [kind]
 # nonblocking-dispatch.sh --status <name>
+#
+# `kind` declares WHAT is being spawned, because `KIND` is not a creation/repair discriminator: the
+# creation back-pressure gate (spawn-gate.sh, agent-infra#2409) holds every KIND except the ones whose
+# product IS the drain, and pr-doctor dispatches its PR-REPAIR workers through this script. A
+# hardcoded `KIND=bg` therefore put those repairs under the gate in exactly the state that triggers
+# it (review cycle 2, P1). The caller now says `prfix` for an already-open PR's repair; the DEFAULT
+# stays `bg`, i.e. the refusing direction, so an undeclared caller is measured rather than trusted.
 #
 # Launches a headless worker in the BACKGROUND and RETURNS IMMEDIATELY, so an orchestrator can keep
 # working instead of blocking on it. (The built-in `task`/`subagent` tools block the caller — that is
@@ -37,12 +44,20 @@ if [ "$NAME" = "--status" ]; then
   fi
   exit 0
 fi
-WT="${2:-}"; PROMPT="${3:-}"; T="${4:-3000}"
+WT="${2:-}"; PROMPT="${3:-}"; T="${4:-3000}"; WK="${5:-bg}"
 if [ -z "$NAME" ] || [ -z "$WT" ] || [ -z "$PROMPT" ]; then
-  echo "usage: nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]" >&2
+  echo "usage: nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [bg|prfix]" >&2
   echo "       nonblocking-dispatch.sh --status <name>" >&2
   exit 2
 fi
+# ⛔ A CLOSED VOCABULARY, NOT FREE TEXT. `KIND` is what spawn-gate.sh switches on, so an unvalidated
+# argument would let a caller invent `KIND=whatever-i-like` and the gate's deny-list would hold it by
+# accident, not by design (`prfix` and `bg` are the only two this dispatcher may start; the exempt
+# `fixer`/`reviewer` kinds belong to fix-one.sh/merge-one.sh, which have their own entry points).
+case "$WK" in
+  bg|prfix) ;;
+  *) echo "nonblocking-dispatch.sh: kind '$WK' is not bg or prfix" >&2; exit 2 ;;
+esac
 case "${T:-}" in ''|*[!0-9]*) echo "nonblocking-dispatch.sh: timeout '$T' is not a positive integer" >&2; exit 2 ;; esac
 
 O="${O:-$HOME/orchestrator}"; D="$O/bg"; mkdir -p "$D" "$O/state"
@@ -80,12 +95,14 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELD
 export PI_MCP_SERVERS=none
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 \
        SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
-KIND=bg; TAG="$NAME"; export KIND TAG
+KIND="$WK"; TAG="$NAME"; export KIND TAG
+# The kind is part of the durable stamp: a later reader asking "was this worker held by the creation
+# gate?" is answering a question about the KIND, and reconstructing it from a prompt file is prose.
 
 rm -f "$RC"
 : > "$LOG"
-printf 'name=%s\nworktree=%s\nbranch=%s\nprompt=%s\nstarted=%s\ncap=%ss\n' \
-  "$NAME" "$WT" "$(git -C "$WT" branch --show-current 2>/dev/null)" "$PROMPT" \
+printf 'name=%s\nworktree=%s\nbranch=%s\nkind=%s\nprompt=%s\nstarted=%s\ncap=%ss\n' \
+  "$NAME" "$WT" "$(git -C "$WT" branch --show-current 2>/dev/null)" "$WK" "$PROMPT" \
   "$(date '+%Y-%m-%d %H:%M:%S')" "$T" > "$STAMP"
 
 cd "$WT" || exit 2

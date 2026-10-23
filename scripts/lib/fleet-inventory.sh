@@ -499,12 +499,32 @@ fleet_row_controller() {
 }
 
 # ── component: the watchdog that puts a REMOVED controller back ───────────────────────────────
-# Two mechanisms exist on a Mac and they MUTATE the same job (`watchdog.sh` loads/reloads the
-# controller's launchd job): the launchd job `com.eldato.orchestrator-watchdog` and the plain
-# `$O/watchdog-loop.sh`. Both running is the "duplicate of a mutating action" case — each reload
-# races the other. Exactly one is expected.
+# Two mechanisms exist on a Mac and they MUTATE the same job: a launchd job, and the plain
+# `$O/watchdog-loop.sh`. Both running is the "duplicate of a mutating action" case — each restart
+# races the other. Exactly one is expected (the PAIR is deliberate redundancy — see the branch below).
+#
+# ⛔ THE LABEL MOVED (#2303), AND READING ONLY THE OLD ONE MADE THE MUTATING COMPONENT INVISIBLE.
+#   com.eldato.orchestrator-watchdog  the Mac's HAND-PROVISIONED job (`StartInterval` 20 →
+#                                     `~/orchestrator/watchdog.sh`, absolute home hardcoded). Listed
+#                                     in templates/launchd/RETIRED, so install-launchd.sh unloads +
+#                                     removes it.
+#   com.eldato.controller-watchdog    the TRACKED job (templates/launchd/), `StartInterval` 300 →
+#                                     scripts/orchestrator-harness/watchdog-loop.sh
+# This row used to hard-wire the RETIRED label, so on a box that had been through the installer —
+# i.e. exactly the box this row exists for — nothing matched, and the ONE component that takes a
+# destructive action (`launchctl kickstart -k`) fell outside the table built to catch "silently off,
+# missing, or running twice". One resolver, so the row, `start`, `stop` and the per-row readers
+# cannot disagree about which job this component IS.
+_fleet_watchdog_label() {
+  local l
+  for l in com.eldato.controller-watchdog com.eldato.orchestrator-watchdog; do
+    [ -f "$(fleet_plist "$l")" ] && { printf '%s\n' "$l"; return 0; }
+  done
+  printf 'com.eldato.controller-watchdog\n'
+}
 fleet_row_watchdog() {
-  local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" label="com.eldato.orchestrator-watchdog"
+  local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" label
+  label="$(_fleet_watchdog_label)"
   local installed=0 mechanisms="" n=0 loop_pids loaded
   [ -f "$(fleet_plist "$label")" ] && installed=1
   [ -f "$o/watchdog-loop.sh" ] && installed=1
@@ -550,11 +570,18 @@ fleet_row_watchdog() {
       fleet_row controller-watchdog "1 watchdog" "$n instances ($mechanisms)" DUPLICATE \
         "$loop_n copies of $o/watchdog-loop.sh are running — the same mechanism twice, so every action runs twice"; return 0
     fi
-    # ⛔ NOT DUPLICATE, and this is a deliberate departure from the plain reading. Both mechanisms run
-    # the SAME idempotent watchdog.sh (check -> load -> log -> exit); they cannot disagree about the
-    # desired state, so the overlap costs one redundant no-op pass, not divergent work. The pair is
-    # intentional redundancy against launchctl being defeated (see watchdog-loop.sh's header; the
-    # loop is the stopgap for #1976). Calling that a fault reddens this row on a HEALTHY box forever
+    # ⛔ NOT DUPLICATE, AND THE REASON CHANGED IN #2303 — read this before "tidying" the row. Before
+    # #2303 both mechanisms ran the SAME idempotent `watchdog.sh` (check -> load -> log -> exit), so
+    # they could not disagree about the desired state. The TRACKED launchd job now runs
+    # `watchdog-loop.sh`, which takes a NON-idempotent `launchctl kickstart -k`. What keeps the pair
+    # safe is now the RESTART BUDGET, not idempotence: the cap is ONE count on disk
+    # ($HOME/.pi/agent/state/controller-watchdog.streak), so both runners spend the same budget and
+    # the restarts per episode stay bounded by MAX_CONSEC — never a tight loop.
+    # The job that WOULD make them disagree — the hand-provisioned `com.eldato.orchestrator-watchdog`,
+    # a DIFFERENT script ($o/watchdog.sh) on its own 20s timer — is listed in
+    # templates/launchd/RETIRED, so the installer removes it rather than leaving two mutating watchdogs
+    # on one controller. A pair here is therefore deliberate redundancy for #1976 (the plain loop
+    # survives a bootout), not a fault, and calling it one reddens this row on a HEALTHY box forever
     # and turns `status` into a permanently non-zero command — a false block, which must not be red.
     if [ -n "$ex" ] && [ "$ex" != "0" ]; then
       fleet_row controller-watchdog "1 watchdog" "1 launchd (exit $ex) + watchdog-loop.sh" FAILING \
@@ -562,7 +589,7 @@ fleet_row_watchdog() {
       return 0
     fi
     fleet_row controller-watchdog "1 watchdog" "1 launchd + watchdog-loop.sh (redundant by design)" OK \
-      "both mechanisms invoke $o/watchdog.sh; the overlap is deliberate redundancy for #1976 (the plain loop survives a bootout), so it is not reported as a duplicate — only a second copy of the SAME mechanism is"
+      "deliberate redundancy: the launchd job ($label) and the plain $o/watchdog-loop.sh share ONE restart budget on disk ($HOME/.pi/agent/state/controller-watchdog.streak), so however often each wakes they cannot restart in a tight loop (#1976 — the plain loop survives a bootout); only a second copy of the SAME mechanism is a duplicate"
     return 0
   fi
   if [ -n "$ex" ] && [ "$ex" != "0" ]; then
@@ -1033,7 +1060,7 @@ fleet_render_table() {
 # per-row readers cannot disagree about which job a row means.
 _fleet_label_for() { # <name>
   case "${1:-}" in
-    controller-watchdog)       printf 'com.eldato.orchestrator-watchdog\n' ;;
+    controller-watchdog)       _fleet_watchdog_label ;;
     pr-doctor)                 printf 'com.tortoise.pr-doctor\n' ;;
     reaper.worktree-reaper)    printf 'com.tortoise.worktree-reaper\n' ;;
     reaper.branch-reaper)      printf 'com.tortoise.branch-reaper\n' ;;
@@ -1070,7 +1097,7 @@ fleet_component_has_stop() { # <name>
       # ⛔ EITHER mechanism. `fleet_component_has_start` needs the launchd job, but on a box that runs
       # only the plain loop (no plist) the loop IS stoppable — asking has_start there answered "no
       # stop mechanism" and `stop` left a watchdog running that it could have signalled.
-      [ -f "$(fleet_plist com.eldato.orchestrator-watchdog)" ] || [ -f "$FLEET_O/watchdog-loop.sh" ]; return ;;
+      [ -f "$(fleet_plist "$(_fleet_watchdog_label)")" ] || [ -f "$FLEET_O/watchdog-loop.sh" ]; return ;;
   esac
   fleet_component_has_start "$1"
 }
