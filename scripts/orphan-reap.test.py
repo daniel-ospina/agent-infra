@@ -515,13 +515,12 @@ def run_one(fn, gates=None):
 def _apply_run(box, live=None, post=None):
     """Exercise `_apply_parked` with `os.kill` REPLACED, so no real pid can be signalled.
 
-    Three reads are controllable, because each has its own guard: the census's `before`, the
-    pre-signal re-verification (`live`), and the post-signal verification (`post`). `{}` means
-    an UNREADABLE read — the shape that used to print `verified gone` for every target.
+    FOUR reads are controllable, in this order, because each has its own guard: the census's
+    `before`, the CPU-window `after`, the pre-signal re-verification (`live`), and the post-signal
+    verification (`post`). An empty mapping means an UNREADABLE read — the shape that used to
+    print `verified gone` for every target — and the census guards all four with `if not <read>`,
+    never `is None`, so the reading cannot be re-admitted by a change to `ps_pi_fields`.
     """
-    # FOUR reads, in this order: the census's `before` and CPU-window `after`, then the
-    # pre-signal re-verification (`live`) and the post-signal verification (`post`). `{}` means
-    # an UNREADABLE read — the shape that used to print `verified gone` for every target.
     snaps = [box.rows[0], box.rows[1],
              box.rows[1] if live is None else live,
              box.rows[1] if post is None else post]
