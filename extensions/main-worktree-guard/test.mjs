@@ -1080,6 +1080,19 @@ expectBool("#1144: plain `pull --ff-only` → verifiable",
   seff("git pull --ff-only origin main")?.unverifiable === false, true);
 expectBool("#1144: attached short value `-Xours` consumes no next token",
   seff("git merge --ff-only -Xours origin/main")?.ffOnly === true, true);
+// ── #2277: the SOURCE ref list (positionals) — the foreign-checkout arm needs
+// the no-positional form, so a `pull --ff-only origin main` must expose its
+// refs rather than look like the bare form.
+expectBool("#2277: bare `pull --ff-only` has NO positional (targets the configured upstream)",
+  JSON.stringify(seff("git pull --ff-only")?.positionals) === "[]", true);
+expectBool("#2277: `pull --ff-only origin main` exposes both positionals",
+  JSON.stringify(seff("git pull --ff-only origin main")?.positionals) === '["origin","main"]', true);
+expectBool("#2277: an option VALUE is not a positional (`merge -m msg --ff-only`)",
+  JSON.stringify(seff("git merge -m msg --ff-only")?.positionals) === "[]", true);
+expectBool("#2277: a value attached inside a cluster is not a positional (`merge -qm msg`)",
+  JSON.stringify(seff("git merge -qm msg --ff-only origin/main")?.positionals) === '["origin/main"]', true);
+expectBool("#2277: a dashless branch name is a positional (`pull --ff-only main`)",
+  JSON.stringify(seff("git pull --ff-only main")?.positionals) === '["main"]', true);
 // ── cycle-2 reviewer: git's left-to-right short scan + fail-closed option shapes ──
 expectBool("#1144: `merge -Xours --ff-only` → ffOnly true (attached value, real flag follows)",
   seff("git merge -Xours --ff-only origin/main")?.ffOnly === true, true);
