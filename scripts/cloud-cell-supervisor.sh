@@ -1791,11 +1791,17 @@ cmd_start() {
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
       # answering "already running" about a cell that cannot reap or land.
-      start_doctor_loop || return 1
+      start_doctor_loop; local drc=$?
       # ⛔ ...and that heal is fenced like every other path in this function: a `stop` that lands while
       # `start_doctor_loop` runs must not be undone by the `.desired` marker / doctor session it just
       # created.
+      # ⛔ THE FENCE RUNS WHETHER THE HEAL SUCCEEDED OR NOT (#2306 review): `start_doctor_loop || return 1`
+      # ran BEFORE it, so a launch failure — and a `stop` that killed the last tmux session is exactly
+      # what makes `new-session` fail — returned with the `.desired` marker the failed heal had just
+      # written still on disk, i.e. it left the cell reading as STARTED after the operator's stop. The
+      # rc is carried past the fence, never used instead of it.
       superseded && return 1
+      [ "$drc" -eq 0 ] || return 1
       return 0
     fi
     # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
@@ -1803,8 +1809,9 @@ cmd_start() {
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
-      start_doctor_loop || return 1
+      start_doctor_loop; local drc=$?
       superseded && return 1
+      [ "$drc" -eq 0 ] || return 1
       return 0
     fi
     die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
@@ -1823,8 +1830,9 @@ cmd_start() {
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
     # doctor still cannot reap, land or prune. Fenced like every other path in this function.
-    start_doctor_loop || return 1
+    start_doctor_loop; local drc=$?
     superseded && return 1
+    [ "$drc" -eq 0 ] || return 1
     return 0
   fi
   if [ -n "$live" ]; then
@@ -1993,8 +2001,9 @@ cmd_start() {
   # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
   # dispatches but cannot land is the measured #1989 state, and a start that reported success over
   # it would be the same false green this file refuses everywhere else.
-  start_doctor_loop || return 1
+  start_doctor_loop; local drc=$?
   superseded && return 1
+  [ "$drc" -eq 0 ] || return 1
   return 0
 }
 
@@ -2470,9 +2479,20 @@ start_doctor_loop() {
     sleep 0.1
     _i=$((_i + 1))
   done
+  # ⛔ ONE OBSERVATION IS NOT "STARTED" (#2306 review): the old flat `sleep 2` gave a doctor that died
+  # on its first line time to disappear before the check, and the poll above breaks on the FIRST
+  # sighting — so an unrunnable seed would be reported started. Require the session to still be there
+  # after the launch settles: strictly stronger than before, and the same total wall time.
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+    sleep 0.5
+    if ! tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+      say "FATAL: the doctor session came up and then EXITED (tmux '$DOCTOR_SESSION', doctor $d) —" >&2
+      say "       no role is scheduling. Read $O/logs/cell-doctor.log${_why:+ (tmux said: ${_why% })}" >&2
+      [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
+      return 1
+    fi
     say "doctor loop started (tmux '$DOCTOR_SESSION', doctor $d)"
-    rm -f "$_launch_err"
+    [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
   else
     # ⛔ THE MESSAGE IS DECIDED BY THE FILE, NOT BY THE SESSION (#2306). This branch used to print
     # "cloud-cell-doctor.sh not shipped" — comment and all — for ANY failed launch, including one
@@ -2482,8 +2502,15 @@ start_doctor_loop() {
     # was told a false cause for a real failure. A present doctor that will not launch is FATAL for
     # this verb: the controller is up, but reap/merge/hygiene will never run.
     _why="$(head -3 "$_launch_err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
-    rm -f "$_launch_err"
+    [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
     say "FATAL: the doctor loop did NOT start (tmux new-session rc=${_lrc:-0}${_why:+: ${_why% }})" >&2
+    if [ ! -s "$d" ]; then
+      # A file that exists but is EMPTY is neither absent nor a launch failure (#2306 review): it is a
+      # seed killed mid-write or a full disk, and the remedy is a re-seed, not a retry.
+      say "       $d is present but EMPTY — a copy killed mid-write or a full disk, which is worse than" >&2
+      say "       absent. Re-seed it: $0 apply" >&2
+      return 1
+    fi
     say "       the doctor IS present at $d — this is a LAUNCH failure, NOT a retired artifact (#2160" >&2
     say "       retired the forks; the doctor survived). The controller is up but reap/merge/hygiene" >&2
     say "       are NOT automatic until a doctor loop runs. Read $O/logs/cell-doctor.log, then retry:" >&2
