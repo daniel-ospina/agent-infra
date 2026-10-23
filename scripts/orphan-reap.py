@@ -849,6 +849,21 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
                             f"`unknown` under the recorded rule (#1207 option A) ⇒ report only, "
                             f"never reap"],
                 "host-decision-hostless")
+    # ⛔ AN ALLOW-LIST, NOT A DENY-LIST. `host_kind` starts as the literal `"authorised"` and is
+    # only overwritten when gate 2 runs, so the fall-through to PARKED-REAPABLE authorised every
+    # kind this file does not name — including the `cmux` report-only class the header says must
+    # "stay report-only if it is ever added". A verdict exception that is not recognised must
+    # ABSTAIN, never authorise: a new `gate2_host_decision` kind would otherwise become reapable
+    # the day it lands, with nothing here to say so.
+    if host_kind != "authorised":
+        # `hostless` is the ONE kind the reopen seam may authorise; every other kind — a future
+        # `cmux`-style report-only class included — abstains by default.
+        if not (host_kind == "hostless" and AUTHORISE_HOSTLESS_CHAINS):
+            return ("UNVERIFIABLE",
+                    readings + [f"gate 2 host decision `{host_kind}` is not an AUTHORISING kind "
+                                f"({host_detail}) — a class this reaper does not recognise is "
+                                f"report-only, never a licence to signal"],
+                    f"host-decision-unrecognised:{host_kind}")
     return "PARKED-REAPABLE", readings, "parked-and-retired"
 
 
@@ -1059,11 +1074,17 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
         elif row["state"] == "UNVERIFIABLE":
             print(f"  abstain {row['pid']}: {row['reason']} — {row['binding_detail']}")
     print("declared blind spots: a `pi` whose session file cannot be bound (print-mode/task "
-          "child, or a resumed session keeping its original name-stamp), a same-fence start "
+          "child, or a resumed session keeping its original name-stamp), a `pi` that SWITCHED "
+          "session (`/new`, `/fork`, `/clone` — the abandoned file keeps the start stamp, so the "
+          "fence binds the DEAD transcript and the row can read PARKED-REAPABLE for a lane still "
+          "writing; #2475), a same-fence start "
           "in the same cwd, another uid's processes, a box where the cmux store is unreadable "
           "(every row that REACHES the canon abstains as `store-unreadable`; a row under a "
           "terminal/login-shell ancestor is `KEEP-HUMAN` from gate 2 before the canon VERDICT is "
           "consulted (the canon is still read; gate 2 supersedes its answer)), "
+          "an interactive host missing from the HUMAN allowlist (a VS Code `Code Helper` cannot "
+          "be matched at all — `ps -Ao comm=` is space-split — so such a session is caught only "
+          "through a shell/terminal ancestor, or not at all), "
           "memory/fd pressure. A row the census cannot decide is UNVERIFIABLE above; a blind "
           "spot is NOT uniformly an abstention — a skipped cwd filter can still bind, speak and "
           "score LIVE, and a store-unreadable row under a terminal ancestor is KEEP-HUMAN.")

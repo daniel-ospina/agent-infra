@@ -54,6 +54,11 @@ which is why the CI step depends on it.
         => UNVERIFIABLE: recycled-mid-read
 (n) a 25 h-frozen transcript whose OWN median gap is 1000 s => LIVE: progress-within-own-expected
     (its own bound, 27.8 h, is what keeps it LIVE; the canon's 24 h floor alone would say parked)
+(n2) a tail too short to establish a distribution                => UNVERIFIABLE: abstain
+    (an unestablished distribution is never read as `0 s`, which would collapse the bound to the
+    floor and authorise a short, long-idle session on a distribution nobody measured)
+(n3) an unparseable BEFORE-sample CPU time                        => UNVERIFIABLE: cpu-unreadable
+    (`-1.0` for a bad read must not become a phantom POSITIVE delta that reads LIVE)
 plus: one UNPARSEABLE `etime` ROW abstains without killing the census (the JSON still speaks),
 and every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
 UNREACHABLE under the shipped default (the host decision), and the name-stamp parser is UTC.
@@ -304,18 +309,50 @@ def case_bad_etime(tmp) -> Box:
 
 
 def case_gate3_own_gap(tmp) -> Box:
-    """Gate 3's OWN-DISTRIBUTION arm, made load-bearing on its own.
+    """Gate 3's OWN-DISTRIBUTION COMPARISON, made load-bearing on its own.
 
     This session's entries are 1000 s apart, so its own bound is `100 x that` = 27.8 h and a
     25 h-old transcript is still WITHIN its own expected interval — the canon's 24 h idle floor
     would call the same transcript parked. The row reads LIVE *only* because gate 3's comparison
-    runs, which is what makes the comparison itself pinnable: making `age < bound` inert (or
-    replacing the unestablished-distribution abstention with `100 * (own_gap or 0.0)`) flips this
-    case, while before it the GROWTH arm alone carried gate 3's mutation.
+    runs, so making `age < bound` inert (or `if False and …`) flips this case, while before it the
+    GROWTH arm alone carried gate 3's mutation. The OTHER arm — the abstention for a tail too
+    short to establish a distribution — is a different case (n2); one fixture cannot pin both.
     """
     now = time.time()
     t = write_transcript(tmp, now - 25 * 3600, n=9, gap=1000.0)
     before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+
+
+def case_own_dist_unestablished(tmp) -> Box:
+    """A tail too SHORT to establish an own distribution abstains — it does not use the floor.
+
+    Four stamps are three inter-entry gaps, under `MIN_TAIL_ENTRIES`. The fail-open this pins is
+    `bound = max(idle_floor, 100 * (own_gap or 0.0))`: reading an unestablished distribution as
+    0 s collapses the bound to the canon's 24 h floor, so a 30 h-old short session is authorised
+    on a distribution nobody measured. Nothing in the suite produced `own_gap_s is None` before
+    this case, so that substitution was invisible (review finding, cycle 3).
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600, n=4, gap=2.0)
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+
+
+def case_cpu_before_unreadable(tmp) -> Box:
+    """An unparseable FIRST `time=` abstains — it must not become a phantom positive delta.
+
+    `cpu_seconds` returns −1.0 for a value it cannot parse, so `after − before` with a broken
+    before-read is a large POSITIVE number: without the `cpu_before < 0` guard the row is
+    promoted to `LIVE / cpu-advancing` — gate 1's one diagnostic job inverted, and a parked lane
+    made invisible in the census. The guard existed and had no fixture, so it could be deleted
+    with the suite fully green (review finding, cycle 3).
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1, time_="garbage")}
     return Box(before, before, t, now - 5 * 3600,
                store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
 
@@ -608,6 +645,11 @@ TESTS = [
      case_recycled_mid_read, "UNVERIFIABLE", "recycled-mid-read", None),
     ("(n) 25 h frozen, but its OWN 1000 s median gap makes the bound 27.8 h",
      case_gate3_own_gap, "LIVE", "progress-within-own-expected", {"3": False}),
+    ("(n2) four stamps = THREE gaps, too few to establish an own distribution",
+     case_own_dist_unestablished, "UNVERIFIABLE", "own-distribution-unestablished",
+     {"3": False}),
+    ("(n3) the BEFORE sample's `time=` did not parse — no phantom positive delta",
+     case_cpu_before_unreadable, "UNVERIFIABLE", "cpu-unreadable", None),
 ]
 
 
@@ -1027,6 +1069,36 @@ def bad_etime_row() -> int:
     return 0 if ok else 1
 
 
+def unrecognised_host_kind() -> int:
+    """A host-decision kind this reaper does not know must ABSTAIN — never authorise.
+
+    `host_kind` starts as the literal `"authorised"`, so the old fall-through to
+    `PARKED-REAPABLE` authorised every kind the file did not name — including the `cmux`
+    report-only class its own header says must "stay report-only if it is ever added". The
+    authorisation is an ALLOW-LIST now; this pins the polarity, because a future kind is exactly
+    the change that will not think to look here. Runs through the reopen seam: under the shipped
+    default every row is masked, so the seam is the only configuration where the difference shows.
+    """
+    tmp = tempfile.mkdtemp(prefix="orphan-reap-hostkind-")
+    real = mod.gate2_host_decision
+    try:
+        box = case_a(tmp)
+        mod.gate2_host_decision = lambda chain: ("cmux-report-only", "a cmux lane")
+        try:
+            with _reopen_seam(True):
+                out = box.census()
+        finally:
+            mod.gate2_host_decision = real
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    row = row_of(out)
+    ok = (row["state"] == "UNVERIFIABLE"
+          and row["reason"].startswith("host-decision-unrecognised"))
+    print(f"{'PASS' if ok else 'FAIL'} an UNRECOGNISED host-decision kind abstains, never "
+          f"authorises ({row['state']}/{row['reason']})")
+    return 0 if ok else 1
+
+
 def fence_matches_canon() -> int:
     """The fence default is the CANON's, and the two are pinned together.
 
@@ -1049,14 +1121,25 @@ def fence_matches_canon() -> int:
     ok = want == mod.FENCE_DEFAULT_S
     print(f"{'PASS' if ok else 'FAIL'} the fence default mirrors the canon "
           f"(pid-identity.sh {want:g} s vs this file {mod.FENCE_DEFAULT_S:g} s)")
-    return 0 if ok else 1
+    # ⛔ THE SECOND COPIED NUMBER, PINNED THE SAME WAY. `PI_TAIL_BYTES` is the canon's
+    # `TURN_TAIL_BYTES` restated as a literal with no pin, so a canon that widened its window would
+    # leave gate 3's own-gap measured over a DIFFERENT slice of the same transcript than the canon
+    # reads — two answers about one file, with nothing going red. A number copied out of the canon
+    # is a second contract until a test says otherwise.
+    liv = mod.fleet_liveness()
+    tail_ok = getattr(liv, "TURN_TAIL_BYTES", None) == mod.PI_TAIL_BYTES
+    print(f"{'PASS' if tail_ok else 'FAIL'} the transcript tail bound mirrors the canon "
+          f"(liveness.TURN_TAIL_BYTES {getattr(liv, 'TURN_TAIL_BYTES', None)} vs this file "
+          f"{mod.PI_TAIL_BYTES})")
+    return 0 if (ok and tail_ok) else 1
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
     fails = (suite(None) + four_states_reachable() + utc_stamp() + apply_path()
-             + empty_pool_json() + unreadable_json() + bad_etime_row() + fence_matches_canon())
+             + empty_pool_json() + unreadable_json() + bad_etime_row()
+             + unrecognised_host_kind() + fence_matches_canon())
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1
@@ -1071,7 +1154,12 @@ def main(argv=None) -> int:
     for name, fn, expect, _reason, mutation in TESTS:
         if not mutation:
             continue
-        out = run_one(fn, mutation)
+        # ⛔ THROUGH THE REOPEN SEAM, like `suite(mutate)` above and for the same reason: under
+        # the shipped default `PARKED-REAPABLE` is masked for every row, so a mutation that
+        # correctly authorises a row would read `UNVERIFIABLE` either way and the control would
+        # silently stop proving anything about the gate that was dropped.
+        with _reopen_seam(True):
+            out = run_one(fn, mutation)
         got = row_of(out)["state"]
         order = [s for s, v in mutation.items() if not v]
         red = (got != expect)
