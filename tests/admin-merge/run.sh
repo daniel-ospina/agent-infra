@@ -13113,6 +13113,16 @@ grep -q "Refusing to certify a comparison computed over an unreadable baseline" 
 grep -q "FAILED READ, not an empty baseline" "$SCEN/err" \
   && pass "(b) …and it now SAYS it is a failed read rather than an empty baseline" \
   || fail "(b) the refusal does not distinguish itself from a green main: $(grep 'BLOCK' -A5 "$SCEN/err" | head -8)"
+# The rate path extracts through the COMPOSITE extractor, so the label is `parse:` and
+# the wording must NOT claim a failed FETCH (whose remedy — re-run — cannot clear a
+# parser failure). Both halves asserted: the parse wording is present, the fetch
+# wording is not.
+grep -q "was read but" "$SCEN/err" \
+  && pass "(b) …naming the COMPOSITE reason (read, but no identity) rather than a bare fetch" \
+  || fail "(b) the parse arm's wording is missing: $(grep 'FAILED READ' -A4 "$SCEN/err" | head -6)"
+grep -q "could not be fetched (a gh transport error)" "$SCEN/err" \
+  && fail "(b) the rate path claimed a failed FETCH — its remedy cannot clear a parse failure" \
+  || pass "(b) …and does not claim the fetch-only remedy on the rate path"
 grep -q "run 9215" "$SCEN/err" \
   && pass "(b) …NAMING the run whose log could not be read" \
   || fail "(b) the unreadable run is not named: $(grep 'FAILED READ' -A3 "$SCEN/err" | head -5)"
@@ -13249,12 +13259,35 @@ grep -q "main is GREEN here" "$SCEN/out" \
   && fail "(f) main was certified GREEN over a window that held an unmeasured FAILING run" \
   || pass "(f) no green claim is made over an unmeasured failing run"
 
+# (f2) …AND THE POSTED EVIDENCE MUST AGREE WITH STDOUT. `main side:` in the evidence
+# comment is the DURABLE artifact — a human and `verify-admin-merge-evidence.sh` read
+# it, and the verifier's own comment names that line as reading the zero as "EMPTY
+# because the lane is GREEN". Leaving it unconditional ships a certificate asserting
+# the opposite of the same run's stdout, which is the false-certificate direction this
+# rail exists to prevent (#2569 review, cycle 3).
+run_admin_here 42 --main-runs 10 >/dev/null 2>&1
+if [ -f "$SCEN/comment" ]; then
+  pass "(f2) the clipped run posts evidence (the artifact exists to assert on)"
+  grep -q "main side: 1 failing run(s)" "$SCEN/comment" \
+    && pass "(f2) …whose main-side line carries the real counts (1 failing run)" \
+    || fail "(f2) the main-side counts are missing: $(grep 'main side:' "$SCEN/comment" | head -1)"
+  grep -q "EMPTY because the lane is GREEN" "$SCEN/comment" \
+    && fail "(f2) the posted EVIDENCE certifies main GREEN over a window with an unmeasured failing run" \
+    || pass "(f2) …and it does NOT claim the lane was green"
+  grep -q "CLIPPED, not green" "$SCEN/comment" \
+    && pass "(f2) …instead saying CLIPPED, matching what stdout printed" \
+    || fail "(f2) the evidence does not say CLIPPED: $(grep 'main side:' "$SCEN/comment" | head -1)"
+else
+  fail "(f2) no evidence comment was posted for the clipped baseline run"
+fi
+
 # (d) THE SIGNATURE PASS GETS THE SAME DISCLOSURE, from its OWN report. It used to
 # be invoked with no `--runs-report` at all, so its counters and its reason were
 # discarded on every run — a second capture whose failure could only be described
 # by the rate pass's evidence. The wrapper below models a signature capture that
-# read its window and died on ONE failing run's log, which is the shape the rate
-# side's (b) covers one level up.
+# read its window and died on ONE failing run's log. NOTE the rate arm (b) labels
+# `parse:` — its extractor is composite — so the `log:` label is driven HERE, by the
+# one capture that calls `fetch_failed_log` directly.
 new_scen sigunreadable
 HEAD_SU="9c9c000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SU" > "$SCEN/head"
@@ -13300,6 +13333,82 @@ grep -q "A FAILED READ over a window that WAS listed" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" \
   && fail "(d) a merge was attempted over an unreadable signature baseline" \
   || pass "(d) no merge attempted"
+
+# (d2) THE SIGNATURE BLOCK'S OTHER TWO ARMS. (d) drives `log:` only; collapsing the
+# three-way case to a single `*)` arm then keeps the whole suite green, and the rail
+# would tell an operator that a window WAS listed — naming an empty run id — for a
+# capture that listed nothing. Both remaining arms are driven here.
+new_scen sigunreadnowindow
+HEAD_SW="9f9f000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SW" > "$SCEN/head"
+lane_pass "$HEAD_SW" 9701 > "$SCEN/runs-$HEAD_SW"
+lane_jobset 9701 success 'test (a)'
+{ main_red_n mainsw01 9711 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9711 failure 'test (a)'
+lane_jobset 9712 failure 'test (a)'
+# No report written: the capture never got a read window.
+SIG_NOWINDOW="$TMP/cfs-sig-nowindow.sh"
+cat > "$SIG_NOWINDOW" <<'DIFFEOF5'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "--main-union-signatures" ] && { echo "simulated signature listing failure" >&2; exit 1; }
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF5
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$SIG_NOWINDOW" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d2) a signature capture with NO read window still BLOCKS (exit $rc)" \
+  || fail "(d2) expected a non-zero exit, got 0"
+grep -q "No signature pass ran over a read window" "$SCEN/err" \
+  && pass "(d2) …and says no signature pass ran over a read window" \
+  || fail "(d2) the no-window arm is not distinguished: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
+grep -q "window that WAS listed" "$SCEN/err" \
+  && fail "(d2) a capture that listed NOTHING was reported as a window that WAS listed" \
+  || pass "(d2) …and does NOT claim a window that was listed"
+
+# (d3) …and the `parse:` arm names its own run id (the mutation `parse:*` → `*)`
+# otherwise stays green while dropping the identity the operator needs).
+new_scen sigparse
+HEAD_SP="a1a1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SP" > "$SCEN/head"
+lane_pass "$HEAD_SP" 9751 > "$SCEN/runs-$HEAD_SP"
+lane_jobset 9751 success 'test (a)'
+{ main_red_n mainsp01 9761 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9761 failure 'test (a)'
+lane_jobset 9762 failure 'test (a)'
+SIG_PARSE_FAILING="$TMP/cfs-sig-parse.sh"
+cat > "$SIG_PARSE_FAILING" <<'DIFFEOF6'
+#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+  if [ "$a" = "--main-union-signatures" ]; then
+    for b in "$@"; do
+      case "$prev" in --runs-report) printf 'tested=9\nunreadable=parse:7788\n' > "$b" ;; esac
+      prev="$b"
+    done
+    echo "simulated signature parse failure" >&2
+    exit 1
+  fi
+  prev="$a"
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF6
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$SIG_PARSE_FAILING" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d3) a signature capture with a parse failure still BLOCKS (exit $rc)" \
+  || fail "(d3) expected a non-zero exit, got 0"
+grep -q "and run 7788" "$SCEN/err" \
+  && pass "(d3) …and names the run whose identity could not be parsed" \
+  || fail "(d3) the parse arm does not name its run: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
+grep -q "A FAILED READ over a window that WAS listed" "$SCEN/err" \
+  && pass "(d3) …under the "window WAS listed" disclosure (this one is measured)" \
+  || fail "(d3) the parse arm lost the measured-window disclosure"
 
 
 if [ "$failures" -gt 0 ]; then

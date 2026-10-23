@@ -6231,24 +6231,24 @@ main() {
     # the fleet's own refusals 2026-10-23). The REFUSAL is unchanged; what changes is
     # that it now SAYS which case it is in and names the window it measured.
     #
-    # `unreadable=` names WHICH read died, so the remedy named is one that can work:
-    # `log:<id>` is a failed-step LOG FETCH (re-fetch by re-running), `parse:<id>` is
-    # a log that was read but yielded no ids (a parser/format problem, which no
-    # re-fetch clears). An ABSENT report on this mode means the LISTING failed — the
-    # one way to reach this block without a read window behind it.
+    # `unreadable=` names WHICH read died, so the remedy named is one that can work.
+    # On THIS mode the label is `parse:<id>` (see the arm below); an ABSENT report
+    # means no read window reached the collector at all — the LISTING failed, or the
+    # capture was killed/refused before publishing, or the report could not be
+    # written (which `write_runs_report` now says out loud).
     local main_unreadable main_tested_bad main_completed_bad
     main_unreadable="$(report_value "$TMP/main-report.txt" unreadable)"
     main_tested_bad="$(report_value "$TMP/main-report.txt" tested)"
     main_completed_bad="$(report_value "$TMP/main-report.txt" completed)"
     say_err "admin-merge: ✗ BLOCK — could not extract main's rate table (parser exit $main_status)."
+    # ⛔ `log:` IS NOT A RATE-PATH LABEL (review, cycle 3). This capture extracts
+    # through the COMPOSITE `extract_failed_tests` (fetch → ids → job-level fallback
+    # for a pruned log), so its reason is `parse:<id>`: naming a FETCH here would
+    # claim a precision the collector does not have — and a dead `log:` arm in a
+    # gate is worse than no arm, because a test that drives it proves nothing. The
+    # signature block below DOES establish the fetch (it calls `fetch_failed_log`
+    # directly), so `log:` lives there and only there.
     case "$main_unreadable" in
-      log:*)
-        say_err "   This is a FAILED READ, not an empty baseline: the window WAS listed and"
-        say_err "   partially measured — main: completed=${main_completed_bad:-0} run(s), of which"
-        say_err "   tested=${main_tested_bad:-0} — and the failed-step log of run ${main_unreadable#log:}"
-        say_err "   could not be fetched (a gh transport error). Re-running the rail re-fetches it."
-        say_err "   One unreadable failing run withholds the WHOLE table, because a run whose"
-        say_err "   log cannot be read may be hiding a failure." ;;
       parse:*)
         say_err "   This is a FAILED READ, not an empty baseline: the window WAS listed and"
         say_err "   partially measured — main: completed=${main_completed_bad:-0} run(s), of which"
@@ -6328,6 +6328,10 @@ main() {
   # lane — this one does) have no single --workflow spanning both sides, which is
   # what --any-workflow is for (#1003).
   local main_tested main_completed
+  # The EMPTY-baseline reason, computed ONCE at step 2b-bis and reused verbatim in the
+  # posted evidence's `main side:` line, so stdout and the durable artifact cannot
+  # disagree about whether the zero means "green" or "clipped" (#2569 review).
+  local main_side_reason=""
   main_tested="$(report_value "$TMP/main-report.txt" tested)"
   main_completed="$(report_value "$TMP/main-report.txt" completed)"
   if ! counter_is_positive "$main_tested"; then
@@ -6363,12 +6367,21 @@ main() {
     main_examined="$(report_value "$TMP/main-report.txt" examined)"
     main_extracted="$(report_value "$TMP/main-report.txt" extracted)"
     info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $lane)."
+    # ONE predicate, and the reason it produces is used BOTH here and in the POSTED
+    # EVIDENCE below (`main side:`), because the evidence body is the durable artifact
+    # a human and the verifier read: `verify-admin-merge-evidence.sh` names that very
+    # line as reading the zero as "EMPTY because the lane is GREEN", and a CLIPPED
+    # baseline producing that zero would make the certificate contradict the run
+    # (#2569 review, cycle 3). `main_side_reason` is that shared sentence.
     if counter_is_zero "$main_examined"; then
+      main_side_reason="EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b)."
       info "admin-merge:    examined=0, so no run in that window failed: this is a READ that measured no failure, i.e. main is GREEN here — not a failed read."
     elif counter_is_number "$main_examined" && counter_is_number "$main_extracted"; then
+      main_side_reason="EMPTY of ATTRIBUTABLE ids, but CLIPPED, not green: ${main_examined} failing run(s) yielded only ${main_extracted} identity(ies), so a main-side failure with NO failure identity is invisible to this comparison."
       info "admin-merge:    BUT examined=${main_examined} with only ${main_extracted} yielding an identity: the baseline is CLIPPED, not green —"
       info "admin-merge:    a main-side failure with NO failure identity is invisible to this comparison (it can only make a residual look larger)."
     else
+      main_side_reason="EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN."
       info "admin-merge:    The window's examined/extracted counters were not published, so this table's completeness is UNKNOWN."
     fi
   fi
@@ -7281,7 +7294,7 @@ $attribution_line"
    measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
    lane parity: $parity_evidence
    PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
-   main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
+   main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). ${main_side_reason:-EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN.}
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
    Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
