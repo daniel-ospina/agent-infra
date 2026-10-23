@@ -1063,6 +1063,67 @@ else
   ck "(m5) MUTANT — without the predicate a deep queue reruns anyway ((m5: $r) = rerun=yes), so (m2) is not always-green" \
      "$( { has "$r" 'rerun=yes'; } ; echo $? )"
 fi
+# ⛔ (n) AN UNREADABLE QUEUE SAYS *WHY* AND *FOR HOW LONG* (#2333 review round 5, P2). The token
+# was anonymous and unbounded: a transient 500 on cycle 3 and a permanently unanswerable endpoint on
+# cycle 900 printed the identical line, so "is this a blip or is this stuck?" — the question an
+# operator actually has — had no answer, and the header's "UNKNOWN costs a cycle" only ever justified
+# the blip. The cause is the endpoint's own words (stderr, previously discarded by ciq_gh) and the
+# streak is PERSISTED, so it counts rather than being a constant.
+printf '\n── (n) an UNKNOWN names its cause and its streak ─────────────────────────────\n'
+BAD="$T/gh404"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "gh: Not Found (HTTP 404)\\n" >&2\n'
+  printf 'exit 1\n'
+} > "$BAD"
+chmod +x "$BAD"
+drive_unknown() { # <module> <state-dir> <gh> -> "rc=<rc> state=<state> tok=<token>"
+  (
+    unset -f ciq_is_num ciq_is_count ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency ciq_ceiling ciq_slug \
+             ciq_state_dir ciq_gh ciq_now ciq_read ciq_eval ciq_record_usable ciq_verdict \
+             ciq_defer_note ciq_defer_note_here ciq_ci_allowed ciq_defer_line 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
+    CIQ_GH="$3"; CIQ_TTL=0; CIQ_STALE_MAX=0; CIQ_STATE_DIR="$2"
+    export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+    ciq_read "o/r" >/dev/null 2>&1; local rc=$?
+    local tok; tok="$(ciq_eval)"
+    printf 'rc=%s state=%s tok=%s' "$rc" "${CIQ_STATE:-}" "$tok"
+  ) 2>/dev/null
+}
+mkdir -p "$T/unkstate"
+r1="$(drive_unknown "$MOD" "$T/unkstate" "$BAD")"
+ck "(n1) the FIRST unreadable read names the cause ((n1: $r1) — expects streak=1 cause=HTTP 404)" \
+   "$( { has "$r1" 'rc=2' && has "$r1" 'streak=1' && has "$r1" 'cause=HTTP 404'; } ; echo $? )"
+r2="$(drive_unknown "$MOD" "$T/unkstate" "$BAD")"
+ck "(n2) a SECOND consecutive failure COUNTS ((n2: $r2) — expects streak=2, so it is persisted, not a constant)" \
+   "$( { has "$r2" 'rc=2' && has "$r2" 'streak=2'; } ; echo $? )"
+# A successful read must CLEAR the streak, or "how long has this been failing" would be a lifetime
+# total rather than a current state — the same "a stale fact re-read as a live one" class this repo
+# removes everywhere else.
+r3="$(drive_unknown "$MOD" "$T/unkstate" "$STUB")"
+ck "(n3) …and a SUCCESSFUL read clears the record of failure ((n3: ${r3%% tok=*}))" \
+   "$( { has "$r3" 'rc=0'; } ; echo $? )"
+# The success wrote a record; drop it so the next read MUST go live (the staleness arm serves a
+# 0-second-old record at CIQ_STALE_MAX=0, which is a cache answer, not the failure this arm is about).
+rm -f "$T/unkstate/ci-queue-o_r"
+r4="$(drive_unknown "$MOD" "$T/unkstate" "$BAD")"
+ck "(n4) …so the next failure starts again at 1 ((n4: $r4)) — the streak is a CURRENT state, not a lifetime total" \
+   "$( { has "$r4" 'streak=1' && ! has "$r4" 'streak=3'; } ; echo $? )"
+# …and (n2) is not always-green: without the persisted write the streak cannot advance.
+grep -v 'printf .%s. "$CIQ_STREAK" > "$_sf"' "$MOD" > "$T/nostreak.sh"
+if cmp -s "$MOD" "$T/nostreak.sh"; then
+  bad "(n5) the streak-persistence mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/nostreak.sh" 2>/dev/null; then
+  bad "(n5) the streak mutant does not parse — a broken mutant proves nothing about the streak"
+else
+  mkdir -p "$T/unkmut"
+  m1="$(drive_unknown "$T/nostreak.sh" "$T/unkmut" "$BAD")"
+  m2="$(drive_unknown "$T/nostreak.sh" "$T/unkmut" "$BAD")"
+  ck "(n5) MUTANT — an unpersisted streak stays at 1 ($m2), so (n2) is not always-green" \
+     "$( { has "$m1" 'streak=1' && has "$m2" 'streak=1'; } ; echo $? )"
+fi
+
 
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'

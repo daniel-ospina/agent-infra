@@ -165,9 +165,14 @@ ciq_state_dir() {
 # ciq_gh -> the reader. DELIBERATELY a function with an override: the suite stubs it, so the tests
 # exercise the SHIPPED parsing and arithmetic against a canned feed instead of asserting on prose.
 ciq_gh() { # <args...> -> JSON on stdout, non-zero when the read failed
+  # ⛔ STDERR IS NO LONGER DISCARDED (#2333 review round 5, P2). The caller redirects it into a
+  # per-state-dir scratch file so the failure's CAUSE can be named: with `2>/dev/null` a transient
+  # 500, a rate limit and a definitive 403/404 all reached the operator as the same anonymous
+  # `unknown(...)`, and a gate that cannot say why it is stuck reads the same on cycle 3 and cycle
+  # 900. The exit status and the stdout contract are unchanged.
   local ghbin="${CIQ_GH:-gh}"
   command -v "$ghbin" >/dev/null 2>&1 || return 127
-  "$ghbin" api "$@" 2>/dev/null
+  "$ghbin" api "$@"
 }
 
 # ciq_now -> epoch seconds (one seam, so the TTL is drivable in the suite).
@@ -206,6 +211,7 @@ ciq_record_usable() {
 ciq_read() {
   local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
+  CIQ_STREAK=""; CIQ_CAUSE=""
   [ -n "$repo" ] || return 2
   dir="${dir:-$(ciq_state_dir)}"
   f="$dir/ci-queue-$(ciq_slug "$repo")"
@@ -245,9 +251,14 @@ ciq_read() {
 
   # A live read: three cheap counts. `per_page=1` because only `total_count` is wanted — the array is
   # not read at all, so a capped page can never truncate the number that matters.
-  queued="$(ciq_gh "repos/$repo/actions/runs?status=queued&per_page=1" \
+  # ⛔ THE FAILURE'S CAUSE IS CAPTURED, NOT DISCARDED (#2333 review round 5, P2): stderr is collected
+  # into one scratch file in the state dir, so the `unknown(...)` token can carry the HTTP status the
+  # endpoint actually returned together with the length of the streak.
+  mkdir -p "$dir" 2>/dev/null || true
+  _errf="$dir/ciq-err"; : > "$_errf" 2>/dev/null || true
+  queued="$(ciq_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>>"$_errf" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
-  running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" \
+  running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" 2>>"$_errf" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || running=""
   busy=""; runners=""; declared=""; rn_answered=""
   # ⛔ `--paginate` LAST, AFTER THE ENDPOINT (#2333 review P1). The endpoint returns ONE page by
@@ -258,7 +269,7 @@ ciq_read() {
   # flag shifts the URL into `$3`, every stub takes its `*) exit 1` arm, and the count would silently
   # go unmeasured — with the suite red for a reason that hides the parse it exists to cover.
   # Concatenated pages still count correctly: the OBJECTS are counted, never `total_count`.
-  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate)"; then
+  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate 2>>"$_errf")"; then
     # ANSWERED. `rn_answered` is what separates a measured hosted zero from an unreadable endpoint
     # (see the three-branch decision below); without it both collapse into the permissive arm.
     rn_answered=1
@@ -311,6 +322,20 @@ ciq_read() {
     # path a reader is least likely to check.
     CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_AGE=""
     CIQ_STATE=unknown
+    # ⛔ AND THE WHY, AND FOR HOW LONG (#2333 review round 5, P2). `unknown(...)` used to be
+    # anonymous and unbounded: an outage on cycle 3 and a permanently unanswerable endpoint on cycle
+    # 900 printed the identical line, so the one question an operator has ("is this a blip or is
+    # this stuck?") had no answer, and the header's "UNKNOWN costs a cycle" only ever justified the
+    # blip. The streak is COUNTED here and CARRIED in the token; the cause is the endpoint's own
+    # words (first HTTP status, else the first stderr line), truncated so a token stays one line.
+    CIQ_CAUSE=""
+    CIQ_CAUSE="$(grep -o 'HTTP [0-9][0-9][0-9]' "$_errf" 2>/dev/null | head -1)"
+    [ -n "$CIQ_CAUSE" ] || CIQ_CAUSE="$(sed -n '1s/[[:space:]]*//p' "$_errf" 2>/dev/null | cut -c1-60)"
+    _sf="$dir/ciq-unknown-$(ciq_slug "$repo")"
+    CIQ_STREAK="$(cat "$_sf" 2>/dev/null || printf '0')"
+    ciq_is_num "${CIQ_STREAK:-}" || CIQ_STREAK=0
+    CIQ_STREAK=$(( CIQ_STREAK + 1 ))
+    printf '%s' "$CIQ_STREAK" > "$_sf" 2>/dev/null || true
     return 2
   fi
   if [ -z "${runners:-}" ]; then
@@ -372,6 +397,8 @@ ciq_read() {
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
   CIQ_STATE=fresh; CIQ_AGE=0
+  CIQ_STREAK=0; CIQ_CAUSE=""
+  rm -f "$dir/ciq-unknown-$(ciq_slug "$repo")" 2>/dev/null || true
   CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
   mkdir -p "$dir" 2>/dev/null || true
   { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nat=%s\n' \
@@ -389,17 +416,26 @@ ciq_read() {
 # harness has already fixed twice).
 ciq_eval() {
   local q r n c sm
+  # ⛔ THE UNKNOWN TOKEN CARRIES ITS AGE AND ITS CAUSE (#2333 review round 5, P2). `unknown(…)` was
+  # anonymous, so "cycle 3 of a blip" and "cycle 900 of an endpoint that will never answer" printed
+  # the same line — the one question an operator has had no answer. `streak=` is how many CONSECUTIVE
+  # reads failed (a successful read clears it), and `cause=` is the endpoint's own words. Both are
+  # appended only when known, so a caller's `unknown(`/`state=unknown` matching is unaffected.
+  ciq_unknown_suffix() {
+    [ -n "${CIQ_STREAK:-}" ] && [ "${CIQ_STREAK}" != 0 ] && printf ' streak=%s' "$CIQ_STREAK"
+    [ -n "${CIQ_CAUSE:-}" ] && printf ' cause=%s' "$CIQ_CAUSE"
+  }
   if [ "${CIQ_STATE:-unknown}" = unknown ]; then
     # …and the number PRINTED is the one that DECIDED (#2333 review cycle 2, P2): `ciq_read`
     # normalises a garbage `CIQ_STALE_MAX` to 900, so echoing the raw variable claimed a window the
     # module never used.
     sm="${CIQ_STALE_MAX:-900}"; ciq_is_num "$sm" || sm=900
-    printf 'unknown(queue unreadable: no fresh read and no record inside %ss — CI capacity is UNKNOWN, which defers CI-spending work rather than opening the gate)' "$sm"
+    printf 'unknown(queue unreadable: no fresh read and no record inside %ss — CI capacity is UNKNOWN, which defers CI-spending work rather than opening the gate%s)' "$sm" "$(ciq_unknown_suffix)"
     return 2
   fi
   q="$CIQ_QUEUED"; r="$CIQ_RUNNING"; n="${CIQ_RUNNERS#\~}"; c="${CIQ_CEILING:-}"
   if [ -z "${c:-}" ]; then
-    printf 'unknown(no ceiling derivable from runners=%s)' "${CIQ_RUNNERS:-?}"
+    printf 'unknown(no ceiling derivable from runners=%s%s)' "${CIQ_RUNNERS:-?}" "$(ciq_unknown_suffix)"
     return 2
   fi
   # ⛔ A NUMBER THAT DOES NOT FIT IS NOT A READING (#2333 review P2). Above intmax `[ … -gt … ]`
@@ -407,8 +443,8 @@ ciq_eval() {
   # OPENING on the one value it could not compare. Out of range is therefore UNKNOWN, the same
   # verdict as unreadable: the fail-CLOSED direction, which is the only direction this gate has.
   if ! ciq_is_count "${q:-}" || ! ciq_is_count "${r:-}" || ! ciq_is_count "${n:-}" || ! ciq_is_count "${c:-}"; then
-    printf 'unknown(not a comparable reading: queued=%s running=%s runners=%s ceiling=%s)' \
-      "${q:-?}" "${r:-?}" "${CIQ_RUNNERS:-?}" "${c:-?}"
+    printf 'unknown(not a comparable reading: queued=%s running=%s runners=%s ceiling=%s%s)' \
+      "${q:-?}" "${r:-?}" "${CIQ_RUNNERS:-?}" "${c:-?}" "$(ciq_unknown_suffix)"
     return 2
   fi
   if [ "$q" -gt "$c" ]; then
