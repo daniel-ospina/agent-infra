@@ -294,7 +294,10 @@ ck "(c4c) a FUTURE-stamped record is NOT served (rc=$rc state=${CIQ_STATE:-?}) �
 # documented operator knob) inert with it. The stale record is driven, and the mutant below proves the
 # arm can go red.
 old=$(( $(ciq_now) - 1000 ))
-printf 'queued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$old" > "$REC"
+# ⛔ THE RECORD CARRIES ITS REPO (#2333 review round 3, P2). Without `repo=` the wrong-surface guard
+# refuses this record BEFORE the age is compared, so (c4d) was a FALSE PASS: deleting the TTL bound
+# from the module left it green, because the arm was red-proof only for the guard it did not name.
+printf 'repo=%s\nqueued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$OR" "$old" > "$REC"
 qenv /nonexistent-gh 90 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c4d) a record OLDER than the TTL is NOT served (rc=$rc state=${CIQ_STATE:-?}) — the cache cannot outlive its bound" \
@@ -308,7 +311,7 @@ drive_read() { # <module> <state-dir> -> "<rc>|<state>" for a 1000s-old record w
     mkdir -p "$2"
     CIQ_GH=/nonexistent-ciq-gh; CIQ_TTL=90; CIQ_STALE_MAX=900; CIQ_STATE_DIR="$2"
     export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
-    printf 'queued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$(( $(date +%s) - 1000 ))" \
+    printf 'repo=daniel-ospina/agent-infra\nqueued=1\nrunning=0\nrunners=5\nbusy=5\nat=%s\n' "$(( $(date +%s) - 1000 ))" \
       > "$2/ci-queue-daniel-ospina_agent-infra"
     # shellcheck source=/dev/null
     . "$1" >/dev/null 2>&1 || { printf 'NO-LOAD|'; return; }
@@ -844,9 +847,9 @@ printf '\n── (k) a RECORD names its repo (the wrong-surface guard, DRIVEN) �
 # lossy — `ciq_slug` maps `/` to `_`, so `a/b_c` and `a_b/c` share ONE `ci-queue-*` file — meaning
 # a collision is not hypothetical arithmetic, it is the identifier scheme. The guard is now real
 # (the record carries `repo=`, ciq_record_usable refuses a mismatch) and these arms drive it.
-drive_read() { # <module> <repo> <state-dir> -> "state=<CIQ_STATE> queued=<CIQ_QUEUED>"
+drive_rec() { # <module> <repo> <state-dir> -> "rc=<rc> state=<CIQ_STATE> queued=<CIQ_QUEUED>"
   (
-    unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency ciq_ceiling ciq_slug \
+    unset -f ciq_is_num ciq_is_count ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency ciq_ceiling ciq_slug \
              ciq_state_dir ciq_gh ciq_now ciq_read ciq_eval ciq_record_usable ciq_verdict \
              ciq_defer_note ciq_defer_note_here ciq_ci_allowed ciq_defer_line 2>/dev/null
     # shellcheck source=/dev/null
@@ -857,39 +860,81 @@ drive_read() { # <module> <repo> <state-dir> -> "state=<CIQ_STATE> queued=<CIQ_Q
     CIQ_TEST_QUEUED=7; CIQ_TEST_RUNNING=1; CIQ_TEST_RUNNERS=2; CIQ_TEST_BUSY=true
     CIQ_TEST_OFFLINE=0; CIQ_TEST_NOTOTAL=0
     export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY CIQ_TEST_OFFLINE CIQ_TEST_NOTOTAL
-    ciq_read "$2" >/dev/null 2>&1
-    printf 'state=%s queued=%s' "${CIQ_STATE:-}" "${CIQ_QUEUED:-}"
+    ciq_read "$2" >/dev/null 2>&1; local rc=$?
+    printf 'rc=%s state=%s queued=%s' "$rc" "${CIQ_STATE:-}" "${CIQ_QUEUED:-}"
   ) 2>/dev/null
 }
 mkdir -p "$T/recstate"
 REC_A="$T/recstate/ci-queue-a_b_c"      # the SLUG for BOTH a/b_c and a_b/c
-r="$(drive_read "$MOD" "a/b_c" "$T/recstate")"
+r="$(drive_rec "$MOD" "a/b_c" "$T/recstate")"
 ck "(k1) a real read WRITES the repo into its record (the writer, not a hand-made file)" \
    "$( grep -q '^repo=a/b_c$' "$REC_A"; echo $? )"
 # Make the record's NUMBER distinguishable from the stub's (7), so "used the record" is visible.
 sed 's/^queued=.*/queued=99/' "$REC_A" > "$REC_A.tmp" && mv "$REC_A.tmp" "$REC_A"
-r="$(drive_read "$MOD" "a/b_c" "$T/recstate")"
+r="$(drive_rec "$MOD" "a/b_c" "$T/recstate")"
 ck "(k2) the SAME repo is answered from its record ((k2: $r) = state=cache queued=99)" \
    "$( { has "$r" 'state=cache' && has "$r" 'queued=99'; } ; echo $? )"
-r="$(drive_read "$MOD" "a_b/c" "$T/recstate")"
-ck "(k3) a repo that COLLIDES on the slug is NOT answered from the other's record ((k3: $r) — it reads LIVE)" \
+r="$(drive_rec "$MOD" "a_b/c" "$T/recstate")"
+ck "(k3) a repo that COLLIDES on the slug is NOT answered from the other's record ((k3: $r) - it reads LIVE)" \
    "$( { has "$r" 'state=fresh' && has "$r" 'queued=7' && ! has "$r" 'queued=99'; } ; echo $? )"
-# A record written by an OLDER module has no `repo=` — "cannot verify" must read as "not usable",
+# A record written by an OLDER module has no `repo=` - "cannot verify" must read as "not usable",
 # never as "matches": the direction of the refusal is a live read, and a failing read is UNKNOWN.
 printf 'queued=99\nrunning=1\nrunners=2\nbusy=true\nat=%s\n' "$(ciq_now)" > "$REC_A"
-r="$(drive_read "$MOD" "a_b/c" "$T/recstate")"
+r="$(drive_rec "$MOD" "a_b/c" "$T/recstate")"
 ck "(k4) an UNVERIFIABLE record (no repo= line) reads LIVE, never as a match ((k4: $r))" \
    "$( { has "$r" 'state=fresh' && has "$r" 'queued=7'; } ; echo $? )"
-# …and (k3)/(k4) are not always-green: without the guard the collided record WINS.
+# ...and (k3)/(k4) are not always-green: without the guard the collided record WINS.
 sed 's/&& ciq_record_usable "\$cached" "\$repo"//' "$MOD" > "$T/noguard.sh"
 printf 'repo=a/b_c\nqueued=99\nrunning=1\nrunners=2\nbusy=true\nat=%s\n' "$(ciq_now)" > "$REC_A"
 if cmp -s "$MOD" "$T/noguard.sh"; then
-  bad "(k5) the guard mutation did not apply — this arm would prove nothing"
+  bad "(k5) the guard mutation did not apply - this arm would prove nothing"
 elif ! bash -n "$T/noguard.sh" 2>/dev/null; then
-  bad "(k5) the guard mutant does not parse — a broken mutant proves nothing about the guard"
+  bad "(k5) the guard mutant does not parse - a broken mutant proves nothing about the guard"
 else
-  r="$(drive_read "$T/noguard.sh" "a_b/c" "$T/recstate")"
-  ck "(k5) MUTANT — without ciq_record_usable the collided record WINS ((k5: $r) = state=cache queued=99), so (k3) is not always-green" \
+  r="$(drive_rec "$T/noguard.sh" "a_b/c" "$T/recstate")"
+  ck "(k5) MUTANT - without ciq_record_usable the collided record WINS ((k5: $r) = state=cache queued=99), so (k3) is not always-green" \
+     "$( { has "$r" 'state=cache' && has "$r" 'queued=99'; } ; echo $? )"
+fi
+# (k6)/(k7) THE STALENESS ARM'S GUARD, PINNED SEPARATELY (#2333 review round 3, P2). (k3) covers the
+# TTL arm; REMOVING the staleness arm's `&& ciq_record_usable` left this suite 114/0 CLEAN, so the
+# arm that must not answer for another repo was pinned by nothing - and it is the WORSE of the two,
+# because the staleness fallback runs while the feed is FAILING: there is no live measurement to
+# contradict a borrowed number. Driven with TTL=0 (so the TTL arm cannot answer) and a DEAD feed,
+# reading a repo that collides with the record's owner on the slug.
+drive_stale() { # <module> <repo> <state-dir> -> "rc=<rc> state=<state> queued=<queued>"
+  (
+    unset -f ciq_is_num ciq_is_count ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency ciq_ceiling ciq_slug \
+             ciq_state_dir ciq_gh ciq_now ciq_read ciq_eval ciq_record_usable ciq_verdict \
+             ciq_defer_note ciq_defer_note_here ciq_ci_allowed ciq_defer_line 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
+    declare -f ciq_read ciq_record_usable >/dev/null 2>&1 || { echo 'INTERFACE-MISSING'; exit 0; }
+    CIQ_GH=/nonexistent-ciq-gh; CIQ_TTL=0; CIQ_STALE_MAX=900; CIQ_STATE_DIR="$3"
+    export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+    ciq_read "$2" >/dev/null 2>&1; local rc=$?
+    printf 'rc=%s state=%s queued=%s' "$rc" "${CIQ_STATE:-}" "${CIQ_QUEUED:-}"
+  ) 2>/dev/null
+}
+mkdir -p "$T/recstale"
+printf 'repo=a/b_c\nqueued=99\nrunning=1\nrunners=9\nbusy=true\nat=%s\n' "$(ciq_now)" \
+  > "$T/recstale/ci-queue-a_b_c"
+r="$(drive_stale "$MOD" "a_b/c" "$T/recstale")"
+ck "(k6) the STALENESS fallback refuses another repo's record ((k6: $r) = rc=2 state=unknown) - no borrowed numbers while the feed is down" \
+   "$( { has "$r" 'rc=2' && has "$r" 'state=unknown' && ! has "$r" 'queued=99'; } ; echo $? )"
+# ...and (k6) is not always-green: disarming ONLY the staleness call site must make the borrow visible.
+awk '
+  /ciq_record_usable "\$cached"/ { n++; if (n == 2) sub(/ciq_record_usable/, "true") }
+  { print }
+' "$MOD" > "$T/noguard-stale.sh"
+printf 'repo=a/b_c\nqueued=99\nrunning=1\nrunners=9\nbusy=true\nat=%s\n' "$(ciq_now)" \
+  > "$T/recstale/ci-queue-a_b_c"
+if cmp -s "$MOD" "$T/noguard-stale.sh"; then
+  bad "(k7) the staleness-guard mutation did not apply - this arm would prove nothing"
+elif ! bash -n "$T/noguard-stale.sh" 2>/dev/null; then
+  bad "(k7) the staleness-guard mutant does not parse - a broken mutant proves nothing about the guard"
+else
+  r="$(drive_stale "$T/noguard-stale.sh" "a_b/c" "$T/recstale")"
+  ck "(k7) MUTANT - without the staleness arm's guard the collided record is SERVED ((k7: $r)), so (k6) is not always-green" \
      "$( { has "$r" 'state=cache' && has "$r" 'queued=99'; } ; echo $? )"
 fi
 
