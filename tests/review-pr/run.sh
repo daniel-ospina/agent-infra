@@ -70,6 +70,12 @@
 #      resolved by running it (`sha256sum`, falling back to `shasum -a 256`)
 #   §AM an UNCOUNTED `ISSUES` verdict over findings the severity scan cannot label FAILS CLOSED
 #      (`ISSUES` is never read as `ISSUES 0`), and a printed dash-count (`ISSUES — 2`) survives
+#   §AO the prompt's own `diff-tail:` PRODUCER is extracted from the RENDERED prompt and RUN (a
+#      MUTATION un-escapes `$0` and the producer stops yielding the digest); a verdict quoted inside
+#      an HTML block (`<pre>`/`<code>`) is a quotation, never the verdict, including over an earlier
+#      `ISSUES` (MUTATION: the arm made unfindable records the false clean); a verdict line that says
+#      CLEAN **and** carries a non-zero ISSUES count is refused while a ZERO count still records; and
+#      a reviewer whose output ends with no trailing newline still has its verdict read
 #   §AN a numeral `0` immediately before a severity token is a ZERO CUE, not a reported finding (so
 #      `CLEAN — 0 P1, 0 P2 findings.` records instead of refusing itself), while a later non-zero
 #      count in the same line still blocks; and the `CLEAN — <prose>` separator is matched by a
@@ -1644,8 +1650,98 @@ no_record; ck $? "  …nothing recorded"
 
 # ── end §AN ────────────────────────────────────────────────────────────────
 
-echo
-# Section-loss tripwire (see header): the count is a floor, not a coverage claim.
+echo; echo "§AO the prompt's own producer runs, an HTML-quoted verdict is a quotation, a CLEAN with a count, and a verdict with no trailing newline"
+# ⛔ FOUR MEASURED DEFECTS, from two fresh reviews of #2288 at two different heads. The first was
+# reported at `3a7956fe` and is re-pinned HERE as a RUN, not as a grep: the prompt is composed by an
+# UNQUOTED heredoc, so awk's `$0` was expanded at composition time into this script's own path and a
+# reviewer that obeyed the instruction verbatim got `awk: unexpected character '.'` plus the SHA-256 of
+# EMPTY input — every diff over DIFF_CAP was paid for and then discarded. The other three were
+# measured at the head this section was added at: a quoted verdict inside `<pre>`/`<code>` became the
+# verdict, a line that said CLEAN and carried an ISSUES count recorded clean, and a verdict with no
+# trailing newline was destroyed by the harness's own status line.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "the truncated-diff arm records with a correct proof (rc=$(rc_of))"
+# the PRODUCER line, extracted from the RENDERED prompt and EXECUTED — a grep for 'shasum' cannot see
+# this class, and neither could any earlier assertion: they synthesised the digest with the fixture's
+# helper and never ran what the prompt tells the reviewer to run.
+PRODUCER="$(sed -n 's/^  \(gh pr diff .*cut -d.*\)$/\1/p' "$TMP/pi-prompt.txt" 2>/dev/null | head -1)"
+[ -n "$PRODUCER" ]; ck $? "the prompt carries a producer command (found: ${PRODUCER:0:60}…)"
+NONCE_P="$(sed -n 's/^[[:space:]]*run-nonce:[[:space:]]*//p' "$TMP/pi-prompt.txt" 2>/dev/null | tail -1 | tr -d ' \r')"
+EXPECT_P="$(printf '%s%s' "$NONCE_P" '+[ "$FAIL" -eq 0 ]' | fixture_sha256)"
+PRODUCED="$(PATH="$TMP/bin:$PATH" bash -c "$PRODUCER" 2>/dev/null)"
+[ "$PRODUCED" = "$EXPECT_P" ]; ck $? "…and running it VERBATIM yields this diff's digest (got: ${PRODUCED:0:16}… want: ${EXPECT_P:0:16}…)"
+# ⛔ MUTATION: unescape the `$0` the heredoc must NOT expand => the rendered producer stops working.
+# This is the pin's own control: if the assertion above could pass with a broken producer, it is a
+# grep with extra steps.
+MD="$TMP/mutant-dollar.sh"
+cp "$SRC" "$MD"; chmod +x "$MD"
+sed 's/\\\$0} END{printf/$0} END{printf/' "$SRC" > "$MD"
+if cmp -s "$SRC" "$MD"; then
+  fail "the \$0 mutation did not apply — the anchored producer line changed shape, so this control proves NOTHING"
+else
+  reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+  printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$MD" 2284
+  PRODUCER_M="$(sed -n 's/^  \(gh pr diff .*cut -d.*\)$/\1/p' "$TMP/pi-prompt.txt" 2>/dev/null | head -1)"
+  PRODUCED_M="$(PATH="$TMP/bin:$PATH" bash -c "$PRODUCER_M" 2>/dev/null)"
+  [ "$PRODUCED_M" != "$EXPECT_P" ]; ck $? "the MUTANT's rendered producer does NOT yield the digest (so the assertion above is the fix's doing)"
+  case "$PRODUCER_M" in *"$PWD"*) rc=1 ;; *) rc=0 ;; esac
+  ck $rc "  …because the unescaped \$0 WAS the script path in the prompt text"
+fi
+# ⛔ A VERDICT QUOTED INSIDE AN HTML BLOCK IS A QUOTATION (P1, measured at this head): only fences and
+# the 4-column indent were regions, so `**Verdict:** ISSUES — 2` … `<pre>` + CLEAN + `</pre>` exited 0
+# and minted a signed clean record — the promotion the fence arms exist to prevent, one markup form
+# over. The RAW_LAST/LAST_LINE comparison cannot catch it: the quoted line is also the last SURVIVOR,
+# so the two agree and it simply BECOMES the verdict.
+reset; printf '**Verdict:** ISSUES — 2\n\n<pre>\n**Verdict:** CLEAN — no blocking findings.\n</pre>\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a CLEAN quoted inside <pre> is a QUOTATION, not a verdict (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded (an earlier ISSUES cannot be promoted)"
+no_comment; ck $? "  …and nothing posted"
+reset; printf 'The PR already carries this from an earlier head:\n<pre>\n**Verdict:** CLEAN — no blocking findings.\n</pre>\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…and a quoted verdict as the ONLY verdict is no verdict either (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded there either"
+reset; printf '**Verdict:** ISSUES — 2\n<code>\n**Verdict:** CLEAN — no blocking findings.\n</code>\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…the same for <code> (rc=$(rc_of))"
+# ⛔ MUTATION: the HTML arm made unfindable => the <pre> scenario RECORDS. What makes the three
+# refusals above the ARM's doing rather than an accident of the transcript.
+MH="$TMP/mutant-html.sh"
+cp "$SRC" "$MH"; chmod +x "$MH"
+sed 's/^\( *\)hpos = index(lo, "<" tg)$/\1hpos = 0/' "$SRC" > "$MH"
+if cmp -s "$SRC" "$MH"; then
+  fail "the HTML-arm mutation did not apply — the anchored line changed shape, so this control proves NOTHING"
+else
+  reset; printf '**Verdict:** ISSUES — 2\n\n<pre>\n**Verdict:** CLEAN — no blocking findings.\n</pre>\n' > "$TMP/reviewer-out"
+  run "$MH" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT exits 0 on a quoted CLEAN over an earlier ISSUES — so the arm is what refuses it"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "  …and the MUTANT records the false clean, exactly the fail-open §AO exists to catch"
+fi
+# ⛔ A CLEAN THAT CARRIES A NON-ZERO COUNT IS A VERDICT OF CONVENIENCE (fail-open class, measured):
+# the count reader parsed `ISSUE_N=2` out of the accepted line and the clean arm discarded it.
+reset; printf '**Verdict:** CLEAN — actually ISSUES 2: the guard returns 0 on a failed read.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a CLEAN line that ALSO carries an ISSUES count is refused, not recorded (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+no_comment; ck $? "  …and nothing posted"
+reset; printf '**Verdict:** CLEAN — issues: 0 remaining, nothing blocking.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …while a CLEAN carrying a ZERO count still records (the counter-direction) (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …recorded"
+# ⛔ A VERDICT WITH NO TRAILING NEWLINE MUST SURVIVE THE HARNESS'S OWN STATUS LINE (over-block,
+# measured): the appended `[review-pr] reviewer pid=…` was FUSED onto the final `CLEAN`, which matches
+# no verdict shape — exit 6, a paid review discarded, nothing posted.
+reset; printf 'notes about the diff\n\nthe guard looks right\nCLEAN' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a reviewer whose output ends WITHOUT a trailing newline is still read (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the review is recorded rather than discarded"
+if [ -n "$(grep -aE 'CLEAN\[review-pr\]' "$TMP"/tmp/*.log 2>/dev/null)" ]; then rc=1; else rc=0; fi
+ck $rc "  …because the harness terminated the child's last line before appending its own"
+
+
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
 # whenever sections are added — this is 431, measured after the seventh review's fixes (§A2 drives the
@@ -1675,11 +1771,12 @@ echo
 # "a whole section was deleted and the suite still said ALL PASSED" failure the pin exists for. Re-set
 # from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim. It was
 # re-set to 447 when §ROUND 9 added 17 assertions and again to 478 when §ROUND 10 and the
-# nonce-bound tail proof added 32, for the same reason: a pin with slack lets that section be deleted
-# silently.
+# nonce-bound tail proof added 32, and again to 499 when §AO added 21 (the executed producer, the
+# HTML-quotation arm, the CLEAN-with-a-count refusal and the trailing-newline fix), for the same
+# reason: a pin with slack lets that section be deleted silently.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 478 ]; ck $? "assertion-count pin: >= 478 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 499 ]; ck $? "assertion-count pin: >= 499 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

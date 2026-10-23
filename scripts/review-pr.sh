@@ -584,7 +584,7 @@ line immediately BEFORE your verdict line, and nothing else on it:
 This run has a fresh random nonce, different on every run:
   run-nonce: $DIFF_NONCE
 Mix it in EXACTLY as the command below does (nonce FIRST, no separator):
-  gh pr diff $PR --repo $REPO | tr -d '\r' | awk -v n='$DIFF_NONCE' 'NF{last=$0} END{printf "%s%s", n, last}' | $SHA_CMD | cut -d' ' -f1
+  gh pr diff $PR --repo $REPO | tr -d '\r' | awk -v n='$DIFF_NONCE' 'NF{last=\$0} END{printf "%s%s", n, last}' | $SHA_CMD | cut -d' ' -f1
 The caller holds the expected value and compares it exactly: a missing or different value means this
 review never covered the rest of the change, so it is DISCARDED — no comment, no record — rather than
 recorded against a diff nobody read. (The expected DIGEST is NOT given to you anywhere in this prompt:
@@ -681,6 +681,13 @@ run_reviewer() { # <secs> <log> <prompt-file>
   fi
   wait "$pid" 2>/dev/null; local rc=$?
   elapsed=$(( $(date +%s) - start ))
+  # ⛔ TERMINATE THE CHILD'S LAST LINE BEFORE APPENDING OUR OWN (P3 label, measured — fresh review of
+  # #2288). A reviewer whose output ends WITHOUT a trailing newline had this status line FUSED onto its
+  # final verdict (`CLEAN[review-pr] reviewer pid=…`), which no longer matches the verdict shape: exit
+  # 6 "no verdict", a PAID review discarded and nothing posted — an over-block wall. `tail -c1` of a
+  # file that ends in a newline yields an empty substitution, so this only fires when the boundary is
+  # genuinely missing.
+  if [ -n "$(tail -c1 "$log" 2>/dev/null)" ]; then printf '\n' >> "$log"; fi
   printf '%s\n' "[review-pr] reviewer pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc capped=${alive_after_cap}" >> "$log"
   return "$rc"
 }
@@ -828,9 +835,12 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 # non-review and an attestation. Fence state is therefore tracked here, and a markdown INDENTED
 # code block (4+ leading spaces, the other way to quote) is dropped the same way; the blockquote
 # form (`> **Verdict:** …`) never matched, because every pattern anchors after optional WHITESPACE.
-# ⚠️ DECLARED RESIDUAL, so that no later reviewer reads the fence/indent fix as full coverage: a
-# verdict-shaped line on a PLAIN, unfenced, unindented line, quoted and then followed by NO later
-# verdict, is still read as the verdict. That is not shape-distinguishable from a real conclusion
+# ⚠️ DECLARED RESIDUAL, so that no later reviewer reads the fence/indent/HTML fix as full coverage: a
+# verdict-shaped line on a PLAIN, unfenced, unindented, non-HTML line, quoted and then followed by NO
+# later verdict, is still read as the verdict. (HTML block/inline code — <pre>…</pre>, <code>…</code>
+# — is handled in arm (3) of the map below; it was a measured fail-open until the review that filed
+# it, because a quoted CLEAN inside <pre> became the verdict over an earlier ISSUES.) That is not
+# shape-distinguishable from a real conclusion
 # under this file's deliberate decision that the LAST verdict-shaped line wins and trailing prose
 # is allowed (§AB) — closing it would mean requiring the verdict to be the final non-empty line,
 # which changes that decision rather than fixing a bug. Quote it inside a fence or indent it and
@@ -938,6 +948,44 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                         if (mch[a] == mch[ostart] && mlen[a] >= mlen[ostart]) inopen = 0
                       }
                       if (inopen) for (t = mline[ostart]; t <= NR; t++) sk[t] = 1
+                      # ── (3) HTML CODE SPANS: <pre>…</pre> and <code>…</code> ─────────────────
+                      # ⛔ A QUOTED VERDICT IN AN HTML BLOCK IS A QUOTATION TOO (P1, fresh review of
+                      # #2288 — this was a measured FAIL-OPEN). Only backtick/tilde fences and the
+                      # 4-column indent were treated as regions, so `**Verdict:** ISSUES — 2` …
+                      # then `<pre>` + `**Verdict:** CLEAN — no blocking findings.` + `</pre>`
+                      # exited 0, posted the CLEAN artifact and minted a signed head-bound clean
+                      # record — the exact promotion the fence arms exist to prevent, ONE MARKUP
+                      # FORM OVER. The RAW_LAST comparison below cannot catch it: the quoted line is
+                      # also the last line the map SURVIVES, so the two agree and it simply BECOMES
+                      # the verdict. Pair each tag with its own next closer; an opener with no closer
+                      # runs to end-of-file (the same rule the fence arm uses), and the only direction
+                      # this can err is over-skipping — a paid re-run, exit 6, never a clean
+                      # attestation.
+                      for (i = 1; i <= NR; i++) {
+                        lo = tolower(ln[i])
+                        for (k = 1; k <= 2; k++) {
+                          tg = (k == 1) ? "pre" : "code"
+                          hpos = index(lo, "<" tg)
+                          if (!hpos) continue
+                          # ⛔ A REAL TAG, NOT A MENTION (`<codespan`, `<prev`): the character after
+                          # the tag name must END it. A mention cannot open a region.
+                          hnext = substr(lo, hpos + length(tg) + 1, 1)
+                          if (hnext != ">" && hnext != " " && hnext != "\t") continue
+                          # a tag opened AND closed on this line is one line of quotation
+                          if (index(lo, "</" tg)) { sk[i] = 1; continue }
+                          hclose = 0
+                          for (j = i + 1; j <= NR; j++)
+                            if (index(tolower(ln[j]), "</" tg)) { hclose = j; break }
+                          # ⚠️ DECLARED RESIDUAL (same direction as the fence arm): an OPENER WITH NO
+                          # CLOSER runs to end-of-file, so a transcript that merely MENTIONS a bare
+                          # `<code>`/`<pre>` and then concludes costs a paid re-run (exit 6, nothing
+                          # recorded). That is the fail-closed direction on purpose: the alternative
+                          # reads a quoted verdict as the verdict, which is the fail-open this arm
+                          # exists to close.
+                          if (!hclose) hclose = NR
+                          for (t = i; t <= hclose; t++) sk[t] = 1
+                        }
+                      }
                       for (i = 1; i <= NR; i++) {
                         if (sk[i]) continue
                         # ⛔ A TAB IS THE INDENTATION IT IS (P2, fresh review of #2288): a markdown
@@ -952,6 +1000,27 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                     }' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
+# ⛔ THE VERDICT MUST BE THE LAST VERDICT-SHAPED LINE IN THE TRANSCRIPT (P1, fresh review of
+# #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
+# silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
+# `**Verdict:** ISSUES — 2` inside it ⇒ rc=0 and a signed clean record over a reviewer that said
+# ISSUES 2, while the same transcript without the stray marker exits 7. The file claimed the only
+# direction this could err was over-skipping; it could err into a clean attestation, which is the one
+# thing the contradiction guard exists to make impossible. So the last verdict-shaped line in the
+# STREAM is compared with the one the map kept: when they differ, the run refuses — a quotation is
+# not a verdict, and neither is a verdict of convenience. (TEXT, not position: a promoted line can
+# only be a defect when it says something DIFFERENT from the one the reviewer wrote last, and a text
+# comparison needs no second copy of the verdict grammar inside awk.)
+# ⛔ THE RAW READ NEEDS NO FILTERING: blank and `[review-pr]` lines never match a verdict pattern, so
+# the last verdict-shaped line in the LOG is the one a text comparison needs — and a filtered
+# intermediate FILE was the wrong shape twice over (a `|` chain under `pipefail` with a non-matching
+# first grep truncated it to empty, so every ordinary CLEAN read as "no verdict").
+RAW_LAST="$(grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+# ⛔ THE REFUSAL IS DEFERRED, THE FACT IS RECORDED HERE (P1, fresh review of #2288): the decision is
+# made NOW, but it must not preempt the SCANNER-failure arm — a box whose `awk` is broken has no
+# verdict at all and must refuse with exit 10 ("the scan did not run"), not 6 ("a quotation").
+VERDICT_QUOTED=0
+[ -n "${RAW_LAST:-}" ] && [ "$LAST_LINE" != "$RAW_LAST" ] && VERDICT_QUOTED=1
 LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
 # A finding line LEADS with its severity; mid-line mentions are prose, not findings. See the
@@ -1384,9 +1453,35 @@ esac
 # ⛔ THE VERDICT WORD IS THE **FIRST** ONE ON THE LINE (P1, ninth fresh review). Matching
 # `*clean*` anywhere meant `**Verdict: ISSUES — … the code is not clean**` recorded CLEAN:
 # the worst possible reading of a line, from the widest possible pattern.
+# ⛔ A QUOTATION IS NOT A VERDICT, AND NEITHER IS A VERDICT OF CONVENIENCE (P1, fresh review of
+# #2288 — this was a FAIL-OPEN). Fires after the scanner arms above, so a broken `awk` still refuses
+# with 10 rather than 6.
+if [ "${VERDICT_QUOTED:-0}" = 1 ]; then
+  err "$PROG: the LAST verdict-shaped line in the transcript is inside a quoted/fenced/indented/HTML region, and the last verdict this map accepts differs from it — a quotation is not a verdict, and promoting an earlier one would attest a verdict the reviewer did not give last."
+  err "  quoted/fenced last line: $RAW_LAST"
+  err "  accepted (surviving)  : ${LAST_LINE:-<none>}"
+  err "  Last 20 transcript lines:"
+  tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
+  die "$E_NOVERDICT" "the final verdict-shaped line is a quotation — re-run, or ask the reviewer to print its verdict LAST and unquoted (transcript: $TRANSCRIPT)"
+fi
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
 case "$VWORD" in
-  clean)  VERDICT=clean ;;   # a CLEAN line carries no count
+  clean)
+    # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
+    # FAIL-OPEN class — fresh review of #2288). The count reader above already parsed the
+    # contradiction out of the accepted line, and this arm then THREW IT AWAY, so
+    # `**Verdict:** CLEAN — actually ISSUES 2: …` recorded `clean` with `ISSUE_N=2` in hand — and no
+    # P-token on the line meant the severity contradiction gate could not see it either. The
+    # first-word rule (the verdict WORD) is deliberate and unchanged; this is the other channel that
+    # was already measured and discarded. A reviewer that means clean reports no count, so the
+    # refusal only ever fires on a line that contradicts itself.
+    if [ -n "${ISSUE_N:-}" ] && [ "${ISSUE_N:-0}" -gt 0 ]; then
+      err "$PROG: the verdict line says CLEAN and also carries an ISSUES count of ${ISSUE_N} — a line cannot be both, so this is a verdict of convenience, not a clean review."
+      err "  accepted verdict line: $LAST"
+      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
+    fi
+    VERDICT=clean ;;   # a CLEAN line carries no count of its own
   issues)
     VERDICT=issues
     if [ -z "${ISSUE_N:-}" ]; then
