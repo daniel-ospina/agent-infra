@@ -123,9 +123,19 @@ srv() {
   esac
   [ -n "$st" ] && [ -s "$st" ]
 }
-noserver() { echo "error connecting to /tmp/tmux-501/default (No such file or directory)"; }
+# ⛔ FAITHFUL TO tmux 3.4 (review finding, 2026-10-23, MEASURED): a box that has NEVER started a
+# server answers `no server running on <socket>` (rc 1). The `error connecting to … (No such file or
+# directory)` wording is a DIFFERENT state — the socket file having been unlinked out from under a
+# server that is still running — and modelling absence with it made the census's most dangerous state
+# look like its most ordinary one (see section K).
+noserver() { echo "no server running on /tmp/tmux-501/default"; }
 case "${1:-}" in
-  ls) if [ "${TMUX_LS_FAIL:-0}" = "1" ]; then
+  ls) if [ "${TMUX_LS_UNLINKED:-0}" = "1" ]; then
+        # The socket FILE was removed under a LIVE server: tmux 3.4 answers exactly this, rc 1, while
+        # the session's processes keep running (measured on a real server, 2026-10-23).
+        echo "error connecting to /tmp/tmux-501/default (No such file or directory)"; exit 1
+      fi
+      if [ "${TMUX_LS_FAIL:-0}" = "1" ]; then
         # tmux's own UNREADABLE-socket answer, and deliberately NOT the "No such file" wording above:
         # a broken socket must stay distinguishable from a box that never started a server, because
         # the code treats them differently (unreadable = UNKNOWN/fail-closed, absent = EMPTY/positive).
@@ -1094,6 +1104,33 @@ SH
 out="$(FAKE_UNAME=Darwin bash "$TMP/j2.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O12" 2>&1)"
 case "$out" in *"alive=no"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…while 'no server running' (the real absent answer) is still a positive EMPTY read" $rc
+echo
+echo "── K) an unlinked socket under a LIVE server is UNKNOWN — never 'no sessions' ──"
+# ⛔ MEASURED (tmux 3.4, 2026-10-23): remove the socket FILE of a running server and `tmux ls` answers
+# `error connecting to <socket> (No such file or directory)`, rc 1, WHILE ITS PANES KEEP RUNNING. An arm
+# added by this change matched that as a positive EMPTY read, so the census printed every tmux worker
+# DEAD: `wt_count` stopped binding the caps and `wt_close` went on to delete a live worker's record —
+# the polarity rule at the top of the module inverted, on the surface a cell now uses for every worker.
+cat > "$TMP/k1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_STATE="$O/tmux-sessions" TMUX_LOG="$O/tmux.log" TMUX_KILLED="$O/killed.log" TMUX_PANE_PID=4194305
+export TMUX_LS_UNLINKED=1
+printf 'lane-31\n' > "$TMUX_STATE"
+printf 'kind=tmux\ncwd=/tmp\n' > "$WT_DIR/worker-lane-31"
+. "$1"
+echo "alive=$(wt_alive lane-31 && echo yes || echo no)"
+echo "count=$(wt_count lane-)"
+wt_close lane-31; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-lane-31" ] && echo kept || echo gone)"
+SH
+out="$(FAKE_UNAME=Darwin bash "$TMP/k1.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O13b" 2>&1)"
+case "$out" in *"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an unlinked socket leaves its worker ALIVE (unknown is alive)" $rc
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1;; esac
+ck "…so the caps keep binding while the socket is unreachable" $rc
+case "$out" in *"record=kept"*) rc=0 ;; *) rc=1;; esac
+ck "…and a live worker's record is NOT deleted for a census that could not read it" $rc
 # ⛔ A RECORD-LESS `chain-*` SESSION IS COUNTED TOO (review finding on this diff). dispatch-merge.sh
 # spawns and counts `chain-<N>` workers, so a chain the census cannot see is a cap that reads low — and
 # on a cell tmux is the only surface, so this covers the whole worker population there.

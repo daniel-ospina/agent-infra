@@ -79,6 +79,30 @@ wt_warn() {
   return 0
 }
 
+# `wt_bounded <secs> <cmd...>` — run a probe under a bound, because EVERY probe here can HANG.
+# ⛔ WHY THIS EXISTS (P1 review finding, 2026-10-23, MEASURED). Two facts, both measured:
+#   * `gh auth token` can block until the caller is killed (rc=142) on these images — the hazard
+#     `scripts/harness-up` records in its own header (`NEVER gh auth token` … "`hu_bounded` is what
+#     stops it hanging") and `scripts/harness-cohesion.test.sh` pins for itself;
+#   * a tmux server that is REACHABLE BUT WEDGED makes `show-environment`/`ls`/`new-session` block
+#     indefinitely (measured on tmux 3.4: socket listening, never answering, still blocked after
+#     8s, rc=124 under `timeout`).
+# This change puts both on the controller's SYNCHRONOUS spawn path — the cycle's critical path — so an
+# unbounded probe there is a controller that silently stops cycling, which is #2210's own symptom in a
+# new form. A bound that FIRES is a normal non-zero answer: every caller treats it as "no answer"
+# (refuse the spawn, or UNKNOWN — which is ALIVE in the census), never as a pass.
+# perl's `alarm` survives `exec`, which is why it is the bound and not `timeout` (absent on macOS — see
+# scripts/orchestrator-harness/README.md's platform rules); `timeout` is the second choice, and the
+# last resort is a plain run (declared residual: a box with neither cannot be bounded, and refusing
+# every spawn there would be the refusal loop this change exists to remove).
+wt_bounded() { # <secs> <cmd...>
+  local s="${1:-10}"; shift || true
+  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$s" "$@"; return $?; fi
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+  "$@"
+}
+
 # ── which launcher this surface gets ──────────────────────────────────────────────────────────
 # `terminal` — a cmux surface where the DAEMON answers (a Mac process started inside cmux, or a cell
 #              whose guest CLI can run). PREFERRED everywhere it answers.
@@ -167,7 +191,7 @@ wt_gh_hosts_token() {
     # measured): `oauth_token: "   "` made `gh auth token` print three spaces and exit 0, so the gh arm
     # credited a file its own file-arm refuses, and the worker's gh rejected the value at the first call.
     local tok
-    tok="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token 2>/dev/null)" || return 1
+    tok="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token 2>/dev/null)" || return 1
     case "$tok" in *[![:space:]]*) return 0 ;; esac
     return 1
   fi
@@ -223,7 +247,7 @@ wt_tmux_server_token_value() {
   local n v
   command -v tmux >/dev/null 2>&1 || return 1
   for n in GH_TOKEN GITHUB_TOKEN; do
-    v="$(tmux show-environment -g "$n" 2>/dev/null)" || continue
+    v="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g "$n" 2>/dev/null)" || continue
     case "$v" in
       "$n="*) case "${v#"$n="}" in *[![:space:]]*) printf '%s\n' "${v#"$n="}"; return 0 ;; esac ;;
     esac
@@ -240,7 +264,7 @@ wt_tmux_server_token_value() {
 # a socket that has none (rc 1) — the distinction the listing cannot make.
 wt_tmux_has_server() {
   command -v tmux >/dev/null 2>&1 || return 1
-  tmux show-environment -g >/dev/null 2>&1
+  wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g >/dev/null 2>&1
 }
 
 # `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
@@ -359,6 +383,17 @@ wt_launcher_env() {
   # cell home; post-source so the file cannot repoint it). `O` is emitted after the source for the
   # same reason.
   printf '; export HOME=%s' "$(wt_q "$home")"
+  # ⛔ THE WORKER'S PATH IS PART OF THE CONTRACT, because the tmux SERVER's PATH is not the caller's
+  # (P1 review finding, 2026-10-23, MEASURED): `tmux show-environment -g PATH` answers
+  # `unknown variable: PATH` on a server created by `env -i`, and the pane then runs with bash's
+  # DEFAULT path — so on a Mac (gh only in /opt/homebrew/bin) the caller-side pre-check resolved `gh`
+  # and the PANE did not: the guard exited 98 in the pane's first millisecond, `new-session -d` had
+  # already returned 0, and `wt_spawn` reported a provisioned lane that was dead on arrival — the exact
+  # class this file exists to refuse. Pinning it also makes the pre-check faithful (it now measures the
+  # resolution the worker will have) and gives the tmux arm what the durable-terminal arm already gets
+  # from its env snapshot. Emitted AFTER the source, like HOME, so a `keys.env` cannot repoint where
+  # `gh`, `uv` or `pi` resolve to.
+  printf '; export PATH=%s' "$(wt_q "$PATH")"
   # ⛔ THE WORKER MUST RESOLVE `gh`'s CONFIG THE WAY THE PROBE DID — IN BOTH DIRECTIONS.
   # `wt_gh_hosts` accepts `GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, but a tmux session does NOT inherit this
   # shell's environment — so probing a repointed config dir and then starting a worker without it would
@@ -551,7 +586,11 @@ WT_WS_PY="$(_wt_ws_py_body)"
 wt_tmux_names() {
   local out
   command -v tmux >/dev/null 2>&1 || return 0     # no binary ⇒ no tmux session can exist
-  if out="$(tmux ls -F '#{session_name}' 2>&1)"; then printf '%s\n' "$out"; return 0; fi
+  if out="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux ls -F '#{session_name}' 2>&1)"; then
+    printf '%s\n' "$out"; return 0
+  fi
+  # A bound that fired is an UNREADABLE read, not an empty one: fall through to `return 3` (UNKNOWN),
+  # which the census reads as ALIVE — the fail-closed direction.
   # ⛔ A SOCKET THAT WAS NEVER CREATED IS "NO SERVER", and tmux 3.4 says so in its own words: it
   # reports "error connecting to <socket> (No such file or directory)", rc=1. Not matching that made
   # a FRESH box (no server ever started) answer 3 — "unreadable, not evidence of a fresh start" — so
@@ -570,9 +609,18 @@ wt_tmux_names() {
   # It did NOT reduce to a standalone fixture (the same text in a fresh file parses), so the durable
   # rule is not "avoid these characters" — it is that this file is parse-checked in the controller's
   # own shell, which worker-terminal.test.sh now does (and which is blind where /bin/bash is bash 5).
+  # ⛔ `error connecting to … (No such file or directory)` IS NOT "NO SESSIONS" (P1 review finding,
+  # 2026-10-23, MEASURED — this arm was WRONG and it inverted the polarity rule at the top of this
+  # file). tmux 3.4 prints exactly that, rc 1, for the socket FILE HAVING BEEN UNLINKED under a server
+  # that is still running: measured end-to-end, `rm` the socket of a live session and `tmux ls` answers
+  # this while the pane's process keeps running. Matching it as a positive EMPTY read made the census
+  # print `lane-N dead`, `wt_count` = 0 and `wt_alive` = DEAD for a worker that was running — so the
+  # caps stopped binding and `wt_close` proceeded to delete a live worker's record (which then runs
+  # untracked forever). A box that has NEVER started a server does not answer this at all: it answers
+  # `no server running on <socket>`, which the arm above already matches. So every `error connecting`
+  # shape stays rc 3 — unreadable is never evidence of a fresh start.
   case "$out" in
     *'no server running'*|*'no sessions'*|*'no current session'*) return 0 ;;
-    *'error connecting to'*'No such file or directory'*) return 0 ;;
   esac
   return 3
 }
@@ -756,7 +804,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val pre_rc preout
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx srv_val pre_rc preout premsg spout spmsg
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   case "$name" in
@@ -801,14 +849,22 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # server-token arm the credential comes from the tmux SERVER's global environment (the prefix
       # neither exports it nor reads a file for it), so the server's value is injected here; on every
       # other arm the prefix pins or clears the names itself, which makes the injection inert.
-      # Declared residual: PATH. The caller's PATH decides where `gh` is found, so a pane inheriting a
-      # DIFFERENT PATH from a pre-existing server is over-refused (fail-closed) rather than blessed.
+      # ⛔ PATH IS PINNED IN THE CONTRACT (P1 review finding, 2026-10-23, MEASURED — this comment used to
+      # claim the opposite, and it was wrong): the pre-check below runs in the CALLER's environment while
+      # the pane runs in the SERVER's, so an unpinned PATH validated a different `gh` resolution than the
+      # one the worker would use. Measured on tmux 3.4, a server created by `env -i`: the caller-side
+      # prefix exits 0 (its PATH carries an answering `gh`) while the same prefix in the pane exits 98
+      # (the server's PATH has no `gh`) — a spawn reported provisioned for a lane dead in its first
+      # millisecond. `wt_launcher_env` now emits `export PATH=…`, so the two measure the same thing.
       srv_val="$(wt_tmux_server_token_value 2>/dev/null)" || srv_val=""
       pre_rc=0
+      # ⛔ BOUNDED, because the prefix's own guard calls `gh` (see `wt_bounded`): an unbounded probe
+      # here hangs the controller's spawn path instead of refusing it. rc 142/124 is a REFUSAL — no
+      # session is created — which is the fail-closed direction.
       if [ -n "$srv_val" ]; then
-        preout="$(GH_TOKEN="$srv_val" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+        preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" env GH_TOKEN="$srv_val" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
       else
-        preout="$(bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
+        preout="$(wt_bounded "${WT_PRE_TIMEOUT:-20}" bash -c "$envpfx; :" 2>&1 </dev/null)" || pre_rc=$?
       fi
       if [ "$pre_rc" -ne 0 ]; then
         premsg="${preout//$'\n'/ }"
@@ -822,13 +878,26 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # status 127 while `new-session -d` still returned 0 (spawn rc=0, record written, nothing running:
       # the dead-lane-reported-provisioned this PR exists to remove). `bash -c $(wt_q LINE)` is ONE argv,
       # so tmux's shell unquotes it exactly once and bash parses the line the pre-check validated.
-      if tmux new-session -d -s "$name" "bash -c $(wt_q "$envpfx; cd $(wt_q "$cwd") && $cmd")" 2>/dev/null; then
+      if spout="$(wt_bounded "${WT_SPAWN_TIMEOUT:-30}" tmux new-session -d -s "$name" "bash -c $(wt_q "$envpfx; cd $(wt_q "$cwd") && $cmd")" 2>&1)"; then
         mkdir -p "$dir" 2>/dev/null || true
-        printf 'kind=tmux\nhome=%s\ncwd=%s\ncreated=%s\n' "$home" "$cwd" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null || true
-        wt_forget
-        return 0
+        # ⛔ THE RECORD IS CHECKED, like the durable-terminal arm's (P2 review finding, 2026-10-23): a
+        # spawn that returns 0 without a record is an UNTRACKABLE worker — no census, no cap, no reap —
+        # and `home=` is the field this change added for the operator's audit. A session we cannot
+        # record is closed again rather than leaked.
+        if printf 'kind=tmux\nhome=%s\ncwd=%s\ncreated=%s\n' "$home" "$cwd" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null; then
+          wt_forget
+          return 0
+        fi
+        wt_bounded "${WT_SPAWN_TIMEOUT:-30}" tmux kill-session -t "$name" >/dev/null 2>&1 || true
+        wt_warn "REFUSED $name: the tmux session started but its record in $dir could not be written, so the worker would be untrackable (no census, no cap, no reap) — the session was closed again"
+        return 1
       fi
-      wt_warn "tmux could not start $name"
+      # ⛔ tmux's OWN ANSWER IS CARRIED (P2 review finding, 2026-10-23): every other refusal in this file
+      # names what it read. On a cell tmux is the only surface, so "tmux could not start X" with the
+      # reason discarded (a permission-broken socket dir answers `directory … has unsafe permissions`)
+      # is the one diagnostic that matters most where it was missing.
+      spmsg="${spout//$'\n'/ }"
+      wt_warn "tmux could not start $name: ${spmsg:0:300}"
       return 1 ;;
     terminal) : ;;
     *) wt_warn "REFUSED $name: unreadable launcher '$kind'"; return 1 ;;
