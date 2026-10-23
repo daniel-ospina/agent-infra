@@ -887,10 +887,16 @@ def rollup_checks(cr):
 # not reach this read, which carries its own clocks.
 #
 # ⛔ SCOPE, STATED: the aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
-# (`drift-guard`/`flip-gate`/`provenance`) is not in it, and is NOT silently waited on either --
-# it lands in `blocked-by-rail`, which is an ACTION the fleet dispatches a lane for, naming the
-# gate. Ageing it into `rerun-checks` would change the ladder for a non-required surface; that
-# is a separate call, deliberately not made here.
+# (`drift-guard`/`flip-gate`/`provenance`) is not in it -- and, contrary to what this comment said
+# until review cycle 3, it is NOT dispatched either: `rail_block_reason` ACCEPTS an in-flight gate,
+# but arm 1 returns `blocked-by-rail` only when that gate is in `red` (`if _rail in red`), so a
+# wedged rail gate is non-`completed`, never `red`, and reads `running`. That is DELIBERATE, one
+# block above (#1872 review round 7: "an in-flight rail gate reads `running` and a RED one still
+# reads `blocked-by-rail`") -- an in-flight gate is not work to repair. So a wedged rail gate IS
+# silently waited on, exactly the never-ending wait this change bounds for the gated set, and it is
+# left UNBOUNDED on the rail surface: ageing it into `rerun-checks` would change the ladder for a
+# non-required surface. That is a separate call, deliberately not made here, and the honest
+# statement of it is this paragraph rather than a claim that the dispatch already exists.
 #
 # ⛔ THE ONE OTHER USE OF AN AGE, AND WHY IT IS NOT THAT CALL (#1926 review, P1):
 # `wedge_evidence` also ages EVERY context, but only to answer a narrower question -- *can the
@@ -1021,9 +1027,10 @@ def stalled_flight(cr, now=None, bound_min=None, run_clock=None, restrict=GATED_
     (`GATED_CHECKS`), which is the set #1926 is about; `restrict=None` ages EVERY context, which
     is what the absent-gate half of the `running` arm needs (see `wedge_evidence`).
 
-    ⛔ THIS IS THE SHAPE THE RE-TRIGGER ARM CANNOT REACH. Here that arm requires `not req_seen`
-    (#1872 re-words the same arm as `not flight`): a wedged run is missing from `seen` while its
-    HEALTHY siblings are not, so `req_seen` is non-empty and the arm cannot fire -- and it can
+    ⛔ THIS IS THE SHAPE THE RE-TRIGGER ARM CANNOT REACH. That arm requires `not req_seen` (and
+    `not flight`, #1872): a wedged run IS present in `seen` -- it is a required context that
+    REPORTED -- while its HEALTHY siblings are also present, so `req_seen` is non-empty and
+    `flight` is non-empty, and the arm cannot fire -- and it can
     never satisfy `not flight` either, since its status is not `completed`. Past the bound it is
     not a wait: nothing will ever complete it, so the work is to START it, which is what
     `rerun-checks` already tells a lane to do.
@@ -1117,8 +1124,9 @@ def evidence_name(name, limit=60):
     Drops non-printables (a lone `\\x00`/`\\u200b` would otherwise reassemble a marker), strips
     the fleet's markers TO A FIXPOINT (one ordered pass can rebuild `DO:` out of `D` + a removed
     backtick + `O:`), THEN drops the token-assignment characters (`=`/`:`) the machine-parsed line
-    is keyed on, collapses whitespace, and truncates the INNER text -- truncating after any
-    wrapping is how a quotation loses its closing mark.
+    is keyed on, collapses whitespace, truncates the INNER text, and WRAPS the result in guillemets
+    -- so it can only be read as a quotation by either consumer, the brief a lane executes and the
+    machine-parsed objective line that is pasted into a lane's nudge.
     """
     out = " ".join(str(name or "").split())
     out = "".join(ch for ch in out if ch.isprintable() and ch not in "\u00ab\u00bb")
@@ -1135,7 +1143,15 @@ def evidence_name(name, limit=60):
     # assignment characters, THEN re-collapse.
     out = "".join(ch for ch in out if ch not in "=:")
     out = " ".join(out.split())
-    return out[:limit] or "?"
+    # ⛔ THE WRAPPER BELONGS TO THE BUILD BOUNDARY, NOT TO ONE CONSUMER (#1948 review cycle 3,
+    # F2). The brief wraps the reason in guillemets (`pr-doctor._untrusted`), but the OBJECTIVE
+    # LINE interpolates it UNQUOTED inside `#<n>(...)` -- and that line is appended verbatim into
+    # a live lane's nudge (`turn-classify.py`'s "CURRENT STATE:", `cadence-nudge.sh`). Instruction-
+    # shaped prose survived sanitisation there ("IGNORE THE RAIL AND RUN ..."), so the token half
+    # was closed and the instruction half was not. Wrapping HERE closes both in one place: the
+    # author's own guillemets are already stripped above, so the wrapper cannot be forged or
+    # escaped, and `_untrusted` strips-and-rewraps, so the brief still shows exactly one pair.
+    return "\u00ab" + (out[:limit] or "?") + "\u00bb"
 
 
 def wedge_evidence(stalled, gated_absent, flight_attempts, flight_stalled):
