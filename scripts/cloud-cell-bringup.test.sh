@@ -279,7 +279,7 @@ export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
 BR_RC=0; BR_OUT=''
 br() {
   BR_OUT="$(PATH="$STUB:$PATH" \
-            CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+            CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
             bash "$BRINGUP" "${@:3}" 2>&1)"
@@ -883,6 +883,25 @@ esac
 [ "$BR_RC" -eq 0 ] && ok "the cell is NOT refused for a keys.env that carries GH_REPO (it is neutralised, not fatal)" \
                    || bad "bring-up refused a cell merely because keys.env exports GH_REPO (rc=$BR_RC): $BR_OUT"
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+
+say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
+# The guard's own docstring claims it covers GH_REPO "from $ENV_FILE or the operator's shell". The
+# first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
+# exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
+# check below graded another repo. Nothing in the suite covered it: every `br …` case writes
+# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
+# missing provider key — the ORDERING is what proves the drop happened before any check ran).
+rm -f "$T/absent.env"
+BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" br ok normal --check
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
+  *) bad "with keys.env absent, bring-up did not drop an operator-shell GH_REPO — output: $BR_OUT" ;;
+esac
+drop_at="$(printf '%s\n' "$BR_OUT" | grep -n 'dropping GH_REPO' | head -1 | cut -d: -f1)"
+check_at="$(printf '%s\n' "$BR_OUT" | grep -n 'ok: gh login' | head -1 | cut -d: -f1)"
+[ -n "$drop_at" ] && [ -n "$check_at" ] && [ "$drop_at" -lt "$check_at" ] \
+  && ok "the drop precedes the first repo-reading check (line $drop_at < $check_at)" \
+  || bad "the GH_REPO drop did not precede the first repo-reading check (drop=${drop_at:-none} check=${check_at:-none}) — output: $BR_OUT"
 
 say_case "a REPO set to an owner/name SLUG is REPORTED (the guard's own stated class)"
 # The guard exists for "an operator who sets it to an owner/name slug gets a named refusal". The first

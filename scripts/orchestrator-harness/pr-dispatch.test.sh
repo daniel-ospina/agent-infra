@@ -46,6 +46,15 @@ grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/isnum.sh"
 sed -n '/^spawn_gate_tok() {/,/^}/p' "$ORCH" > "$TMP/spawntok.sh"
 [ -s "$TMP/shq.sh" ] || { echo "FATAL: shq() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num() not found in orch-loop.sh"; exit 1; }
+# ⛔ THE REVIEW-GATE ARM'S OWN CLASSIFIER, EXTRACTED AND NOT STUBBED (#2333 review, P2). Since
+# agent-infra#2132 the arm decides NEEDS-FIX vs NEEDS-REVIEW through `review_gate_state()`, which
+# reads the findings marker. A driver that stubbed it would grade its own copy and could never reach
+# the arm's DEFER branch (the deferral is only for a head WITH findings); an UNDEFINED command here
+# would return empty -> NEEDS-REVIEW -> the re-record path, i.e. the drive would silently prove
+# nothing about the defer arm it exists for. So the shipped polarity is sourced.
+sed -n '/^review_gate_state() {/,/^}/p' "$ORCH" > "$TMP/rgs.sh"
+[ -s "$TMP/rgs.sh" ] && grep -q 'NEEDS-FIX' "$TMP/rgs.sh" \
+  || { echo "FATAL: review_gate_state() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/spawntok.sh" ] || { echo "FATAL: spawn_gate_tok() not found in orch-loop.sh"; exit 1; }
 
 # ⛔ NO SYNTAX CHECK OF A TEMP FILE HERE, AND NO REMOVAL OF ONE (#709). Both forms are read by the
@@ -106,6 +115,8 @@ drive() {
     . "$TMP/shq.sh"
     # shellcheck disable=SC1090
     . "$TMP/disp.sh"
+    # shellcheck disable=SC1090
+    . "$TMP/rgs.sh"
     # The worker census the arm compares against `$MF`/`$MR` comes from the LAUNCHER now, so the
     # stub is the SURFACE: `cmux tree --json` renders `$TMP/lanes` (written per drive, so the same
     # stub serves an idle box and a saturated one) as `wt-<worker>` workspaces with a live terminal.
@@ -170,6 +181,14 @@ PY
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
     park_ctrl() { return 0; }
+    # ⛔ THE CI-QUEUE PREDICATE IS STUBBED LIKE EVERY OTHER NEIGHBOUR (#2333 review cycle 2, P1).
+    # It is not decoration: `orch-loop.sh` now calls `ciq_push_ok` in both fixer arms, and an
+    # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
+    # and the driver could never reach a spawn it is supposed to prove. That is the same `! 127`
+    # polarity trap the loop's own top-level definition carries a ⛔ comment about, reproduced one
+    # layer down. `CIQ_PUSH_RC=1` is how an arm asks for the deferred world.
+    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs so the
     # driven line carries a reading instead of an empty field (see the extraction above).
     . "$TMP/spawntok.sh"
@@ -236,6 +255,11 @@ PY
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo CONFLICTING ;; esac; return 0; }
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
+    # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
+    # calls `ciq_push_ok`, and an undefined command is `! 127` = TRUE = DEFER, which would make this
+    # rig unable to prove the conflict path ever dispatches.
+    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     . "$TMP/shq.sh"
     . "$TMP/spawntok.sh"
     . "$TMP/isnum.sh"        # the blocks' `is_num "$NFC" || NFC=0` guards (see drive() for why)
@@ -316,6 +340,30 @@ drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
   && ok "CONFLICTING: a FAILED conflict-fixer spawn is a wait + a printed line (never a phantom act)" \
   || bad "CONFLICTING: a failed spawn recorded acts=$(acts) — the record claims work that did not happen"
+# ⛔ THE DEFERRAL ITSELF IS DRIVEN, NOT MERELY STUBBED (#2333 review cycle 2, P1). Without this arm
+# the new gate is exercised only by its own module suite, and the wiring's failure mode — a deferral
+# that spawns anyway, or one that is recorded as an ACT — would be invisible here.
+CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
+[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CONFLICTING on a deep/unknown CI queue: NO spawn, ONE wait row, and the deferral is NAMED" \
+  || bad "CONFLICTING on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
+# ⛔ THE OTHER TWO PUSHERS' DEFER ARMS ARE DRIVEN TOO, NOT MERELY GREPPED (#2333 review, P2). The
+# review-gate fixer and the CI-red fixer each carry a defer arm of their own, and before these arms
+# they were pinned ONLY by text greps on the call site (`ci-queue.test.sh` e4b/e4c/e6) — so a defer
+# branch that ALSO SPAWNED (moving the `printf … > argv-$PR` / `wt_spawn` into the defer body) kept
+# every arm green while the gate silently stopped deferring on two of the four CI-spending surfaces.
+# That is exactly the class the CONFLICTED drive above was added for, one arm short.
+CIQ_PUSH_RC=1; drive 'FAILED:pipeline-compliance' rail 0 1; unset CIQ_PUSH_RC
+[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CI-red fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
+  || bad "CI-red fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
+# The review-gate arm only reaches ITS defer branch for a PR with FINDINGS at this head (a head with
+# none is a re-record, which spends no CI), so the needsfix marker is supplied — otherwise this drive
+# would exercise the re-record path and prove nothing about the defer arm.
+NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFIX CIQ_PUSH_RC
+[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "review-gate fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
+  || bad "review-gate fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
 drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
