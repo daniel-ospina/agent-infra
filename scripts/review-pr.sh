@@ -788,38 +788,54 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | awk '{ ln[NR] = $0 }
                     END {
-                      n = 0
-                      for (i = 1; i <= NR; i++)
-                        if (ln[i] ~ /^[[:space:]]*(```|~~~)/) { n++; mk[n] = i }
-                      # ⛔ AN UNMATCHED MARKER OPENS NOTHING (the same rule the finding scan uses,
-                      # and the reason a bare toggle is wrong here): with an ODD marker count ONE
-                      # marker is closed by nothing, so it must not swallow the tail. A toggle
-                      # dropped the real verdict in `… quoted hunk …` + (no closing fence) + `CLEAN`
-                      # and turned a decidable transcript into exit 6.
-                      # ⛔ AND IT IS THE **FIRST** MARKER THAT IS DROPPED, NOT THE LAST (P1, fresh
-                      # review of #2288). Dropping the LAST one re-pairs every marker AFTER the
-                      # unmatched one: `(unclosed ```diff)` … `(``` opening a quoted artifact)`
-                      # `CLEAN` `(``` closing it)` has markers [3,9,11], so n-- paired (3,9) and
-                      # left the QUOTED `CLEAN` on line 10 inside no pair at all — rc 0, artifact
-                      # posted, signed clean record. Dropping the FIRST instead pairs (9,11) and
-                      # skips the quotation, which is the fail-closed direction: the worst case
-                      # becomes a wasted paid run (exit 6), never a clean attestation over a
-                      # revision the reviewer said it did not review.
-                      if (n % 2 == 1) {
-                        for (k = 1; k < n; k++) mk[k] = mk[k + 1]
-                        n--
+                      # ── FENCED REGIONS, BY FENCE SIGNATURE, FAIL-CLOSED ──────────────────
+                      # ⛔ DO NOT PAIR MARKERS BY POSITION (P1, TWO fresh reviews of #2288: the
+                      # first version used a bare toggle, the second an odd-count parity fix, and
+                      # each was defeated by a DIFFERENT input). Positional pairing is wrong in two
+                      # ways, and both mint a signed clean record over a revision the reviewer said
+                      # it did not review:
+                      #   * NESTING: ```` `````` ```` wrapping a ```` ``` ```` block (the standard way
+                      #     to quote a markdown artifact that itself contains fences) puts four
+                      #     markers on the page; adjacent pairing pairs across the nesting and
+                      #     exposes the INNER block content as if it were prose.
+                      #   * AN UNMATCHED MARKER: with an odd count, dropping the LAST marker exposes
+                      #     what the FIRST pair covered, and dropping the FIRST exposes what the LAST
+                      #     pair covered — whichever one is dropped, the other direction is a hole.
+                      # So: group markers by SIGNATURE (fence character + run length, which is what
+                      # CommonMark uses to decide whether a line can close a fence), pair adjacently
+                      # WITHIN each signature, and when a signature has an odd count take the UNION
+                      # of the two pairings. A union can only SKIP MORE lines, so the worst case
+                      # is a wasted paid run (exit 6, no record), never a clean attestation. An
+                      # unmatched marker on its own therefore marks nothing (it cannot swallow the
+                      # tail), which is the rule the pinned unclosed-fence case needs.
+                      ng = 0
+                      for (i = 1; i <= NR; i++) {
+                        # ⛔ THE RUN IS MEASURED, NOT BOUNDED BY AN INTERVAL (mawk 1.3.4 treats
+                        # `{3,}` as exactly three, so `/`{3,}/` matched only the first three
+                        # backticks of a four-backtick fence and put every fence in one signature
+                        # group — which made the nesting case pair adjacently again).
+                        if (!match(ln[i], /^[[:space:]]*(`+|~+)/)) continue
+                        run = substr(ln[i], RSTART, RLENGTH); gsub(/[[:space:]]/, "", run)
+                        if (length(run) < 3) continue
+                        sig = substr(run, 1, 1) length(run)
+                        if (!(sig in gidx)) { ng++; gidx[sig] = ng; gsig[ng] = sig; gn[ng] = 0 }
+                        x = gidx[sig]; gn[x]++; gv[x, gn[x]] = i
+                      }
+                      for (x = 1; x <= ng; x++) {
+                        k = gn[x]
+                        for (j = 1; j + 1 <= k; j += 2)
+                          for (t = gv[x, j]; t <= gv[x, j + 1]; t++) sk[t] = 1
+                        if (k % 2 == 1)
+                          for (j = 2; j + 1 <= k; j += 2)
+                            for (t = gv[x, j]; t <= gv[x, j + 1]; t++) sk[t] = 1
                       }
                       for (i = 1; i <= NR; i++) {
-                        skip = 0
-                        for (k = 1; k <= n; k += 2)
-                          if (i >= mk[k] && i <= mk[k+1]) { skip = 1; break }
-                        if (skip) continue
-                        # ⛔ A TAB IS THE INDENTATION IT IS (P2, fresh review of #2288): a
-                        # markdown indented code block is FOUR COLUMNS, and a tab reaches the
-                        # second stop, so `\t**Verdict:** CLEAN …` quoted a previous head
-                        # successfully — rc 0, artifact posted, signed clean record — while the
-                        # same line with four spaces correctly exited 6. Expand tabs on a COPY
-                        # (the printed line keeps the text as the reviewer wrote it).
+                        if (sk[i]) continue
+                        # ⛔ A TAB IS THE INDENTATION IT IS (P2, fresh review of #2288): a markdown
+                        # indented code block is FOUR COLUMNS, and a tab reaches the second stop, so
+                        # a tab-indented quotation minted a clean record while the same line with
+                        # four spaces correctly exited 6. Expand tabs on a COPY (the printed line
+                        # keeps the text as the reviewer wrote it).
                         t = ln[i]; gsub(/\t/, "    ", t)
                         if (t ~ /^    /) continue
                         print ln[i]

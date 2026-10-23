@@ -442,6 +442,29 @@ run "$SRC" 2284
 [ "$(rc_of)" = "6" ]; ck $? "an UNMATCHED marker before a CLOSED quote does not expose the quote (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded — the quotation stayed a quotation"
 no_comment; ck $? "  …and nothing posted"
+# ⛔ POSITIONAL PAIRING IS WRONG IN TWO DIRECTIONS; BOTH ARE PINNED (P1, fresh review of #2288).
+# (a) an unmatched marker LAST: dropping the first marker exposes what the first pair covered;
+# (b) NESTING: a 4-backtick fence wrapping a 3-backtick block is the standard way to quote a
+# markdown artifact that itself contains fences — adjacent pairing pairs across the nesting and
+# treats the INNER block as prose. Both minted a signed clean record. The rule is now: group markers
+# by fence SIGNATURE (character + run length) and take the UNION of both odd pairings, which can
+# only skip MORE lines, so the worst case is exit 6 — never an attestation.
+reset; printf 'Earlier head artifact:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\nI could not complete the deep pass. Opening notes:\n```\nunfinished tail\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "(a) an unmatched marker LAST does not expose the earlier CLOSED quote (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'Quoting the hunk with a nested block:\n````md\n```\n**Verdict:** CLEAN — no blocking findings.\n```\n````\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "(b) a NESTED fence does not expose the inner block as the verdict (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# CONTROL for (b): the identical transcript without the 4-backtick wrapper IS a verdict — so the
+# refusal above is the nesting rule and not the fixture refusing everything.
+reset; printf 'Quoting the hunk:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\nNothing else to add.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "  …while the same block WITHOUT the wrapper is still a quotation (rc=$(rc_of))"
+reset; printf 'The hunk, then my verdict.\n```\n**Verdict:** CLEAN — no blocking findings.\n```\n**Verdict:** CLEAN — no blocking findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …and a REAL verdict after a closed quote still records (rc=$(rc_of))"
 # ⛔ THE COUNT GRAMMAR MUST ALSO BE A FINDING GRAMMAR (P2, fresh review of #2288): the count
 # extractor reads `2 × P1` as the verdict's own count (§AM), while the severity cross-check had no
 # cue for it at all — so `Blocking: 2 × P1` followed by `CLEAN` recorded clean. The one check
