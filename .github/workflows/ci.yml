@@ -121,52 +121,23 @@ jobs:
       - name: search-cost harness (corpus contract, both directions)
         run: bash tests/search-cost/run.sh
 
-  admin-merge:
-    # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
-    # nothing makes it *safe*: it cannot tell a check already red on main from a
-    # NEW failure the PR introduces (tortoise #3420 merged carrying a test that
-    # was not in main's failing set, and main ratcheted redder). This job is the
-    # per-PR half: scripts/ci-failure-set.sh is the ONE parser, and
-    # scripts/admin-merge.sh is the chokepoint (union baseline + flake re-run +
-    # head-bound evidence). The refusal half (a raw `gh pr merge --admin`
-    # without evidence) is pinned by extensions/review-enforcer/index.test.ts.
-    # Hermetic: a fake `gh` serves every call — no network, no provider keys.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
-        run: bash tests/admin-merge/run.sh
-      - name: Atomic land unit suite (#1367)
-        # update → verify → record → land as ONE unit. The land step DELEGATES to
-        # admin-merge.sh (the suite above) and the record step to record-review.sh;
-        # this suite pins only the sequencing and the fail-closed preconditions.
-        run: bash tests/atomic-land/run.sh
-      - name: Review-evidence diff normalizer (#1362 D1)
-        # The ONE implementation of the diff normalization the review-evidence
-        # digest is computed over, plus the three byte-level D1 properties
-        # (base-move invariant, content change, whitespace change). This is a
-        # dedicated per-PR step AND the suite is registered in the one shard
-        # list (scripts/run-bash-shards.sh) that both lanes run — same
-        # deliberate double-run as the admin-merge suites above. The producer's
-        # integration pins live in scripts/record-review.test.sh §12, which is
-        # likewise in the shard list, so it runs in BOTH lanes.
-        run: bash scripts/diff-normalize.test.sh
-      - name: Argv-level admin-merge guard suite (#984)
-        # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
-        # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
-        # suite drives the real shim through a real shell with the splices that
-        # defeated the string scanner, and asserts refusal.
-        run: bash tests/gh-shim/run.sh
-      - name: Certificate contract suite (#1388)
-        # The ONE contract, pinned against a REAL captured evidence comment rather
-        # than a hand-written fixture. bcbb7df (#3756) renamed the producer's
-        # residual clause and BOTH gates kept requiring the old name; every admin
-        # merge was refused fleet-wide for six days with every suite green, because
-        # a hand-written fixture cannot notice that the producer moved. This suite
-        # extracts the required literals FROM the gate, asserts each exists in real
-        # evidence, mutates the producer's clause one word and requires refusal, and
-        # pins clause 6 — that the TS gate owns no copy of the clause set.
-        run: bash tests/admin-merge-evidence-contract/run.sh
+  # ⛔ NO `admin-merge` JOB (agent-infra#2439). Its five suites are SHARDS now
+  # (`scripts/run-bash-shards.sh`: `tests/admin-merge/run.sh`,
+  # `tests/atomic-land/run.sh`, `scripts/diff-normalize.test.sh`,
+  # `tests/gh-shim/run.sh` and `tests/admin-merge-evidence-contract/run.sh`), which
+  # is a strictly better home: the shard list is the ONE list BOTH lanes run
+  # (#1369), so the same guarantee is kept and the post-merge lane gains the
+  # evidence-contract suite for free, while the PR lane stops paying for it TWICE.
+  #
+  # The double-run was measured, not assumed: on PR #2385's head this job spent
+  # 3,009 s of runner time re-running four suites the `bash-suites` job had
+  # already run on the SAME commit (`bash-suites` alone is 5,600 s of that PR's
+  # 9,079 s runner-seconds; this job was a further 3,009 s, i.e. 33%). At 14
+  # runners and ~20 concurrent PR pushes that duplicate is what a landing waits
+  # behind. The rail's own rationale (#930: `scripts/ci-failure-set.sh` is the
+  # ONE parser, `scripts/admin-merge.sh` the chokepoint) is unchanged — it is the
+  # RUN SITE that moved, not the coverage. The refusal half stays in
+  # `extensions/review-enforcer/index.test.ts`.
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
@@ -900,20 +871,11 @@ jobs:
       - name: Shared-predicate parity pin (#1330)
         run: npx tsx extensions/verification-gate/tool-call-event-parity.test.ts
 
-  setup-suite:
-    # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
-    # that catches the #447 ship-list drift class at PR time (previously the
-    # parity suite ran nowhere in CI — the drift shipped silently and was found
-    # by manual invocation only). Real setup.sh under a temp HOME, hermetic
-    # (npm stubbed, launchctl shim, Darwin-gated assertions); ~2min.
-    # Covers: no-nesting (#93), active-file refresh, farm-link preservation,
-    # extensions/ content parity (single source of truth #95), launchd
-    # isolation (#446).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: pi-bootstrap setup regression suite
-        run: bash pi-bootstrap/tests/test-setup-no-nesting.sh
+  # ⛔ NO `setup-suite` JOB (agent-infra#2439). Its one step was
+  # `pi-bootstrap/tests/test-setup-no-nesting.sh`, which is ALREADY a shard of
+  # `scripts/run-bash-shards.sh` — so this job re-ran it on every PR push (17 s of
+  # the 23 s job was the suite itself). The #449 rationale stands and is cited on
+  # that shard line; only the second run site is gone.
 
   bash-suites:
     # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check

@@ -198,6 +198,37 @@ chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: th
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
 
+# ── swap provisioning (agent-infra#2390) ─────────────────────────────────────────────────────────
+# The bring-up now CREATES SWAP, which needs root. This suite must never create swap on (or edit
+# /etc of) the host that runs it, so every path the step touches is redirected into $T and the
+# kernel-side commands are shims whose effects land in a FIXTURE that stands in for /proc/swaps.
+# The seam is the same one the script documents (`SWAP_SUDO`), emptied here so nothing escalates.
+# ⛔ The fixture is not proof of the kernel — the real read-back is `swapon --show` on a cell. What
+# these cases pin is the SHIPPED logic: what it creates, what it skips on a re-run, and what it says
+# when it cannot act.
+export SWAPFILE="$T/swapfile"
+export SWAP_MB="4096"          # pinned so the cases do not depend on the RAM of the host running them
+export SWAP_PROC="$T/proc-swaps"
+export SWAP_FSTAB="$T/fstab"
+export SWAP_SYSCTL_CONF="$T/sysctl.d/99-cell-swap.conf"
+export SWAP_SYSCTL_FILE="$T/swappiness"
+export SWAP_SUDO=""           # no escalation in a test; a case overrides it with `false`
+export SWAP_AVAIL_KB=104857600  # 100 GiB free: the refusal is exercised deliberately only
+mkdir -p "$T/sysctl.d"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"   # header only: no swap, the measured shape
+: > "$T/fstab"
+printf '60\n' > "$T/swappiness"                                     # the image default, so the pin is a CHANGE
+SWAP_LOG="$T/swap-calls.log"
+# `fallocate` allocates SPARSELY for the fixture (dd seek), so a 4 GiB request costs no disk here.
+printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "mkswap $*" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/mkswap"
+# `swapon <file>` appends a REAL /proc/swaps row (path, type, size_kb, used_kb, prio) to the fixture,
+# so the script's own reading of the swap record is what the case asserts on. `--show` is only there
+# for a hand-run on the fixture; the script itself deliberately reads the record instead.
+printf '#!/bin/sh\n[ "$1" = "--show" ] && { cat "$SWAP_PROC"; exit 0; }\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapon $*" >> "$SWAP_STUB_LOG"\nkb=$(( $(wc -c < "$1") / 1024 ))\ngrep -qF "$1" "$SWAP_PROC" 2>/dev/null || printf "%%s file %%s 0 -2\\n" "$1" "$kb" >> "$SWAP_PROC"\nexit 0\n' > "$STUB/swapon"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapoff $*" >> "$SWAP_STUB_LOG"\ngrep -vF "$1" "$SWAP_PROC" > "$SWAP_PROC.tmp" 2>/dev/null && mv "$SWAP_PROC.tmp" "$SWAP_PROC"\nexit 0\n' > "$STUB/swapoff"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "sysctl $*" >> "$SWAP_STUB_LOG"\nfor a in "$@"; do case "$a" in vm.swappiness=*) printf "%%s\\n" "${a#vm.swappiness=}" > "$SWAP_SYSCTL_FILE" ;; esac; done\nexit 0\n' > "$STUB/sysctl"
+chmod +x "$STUB"/*
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
 mkdir -p "$T/home" "$T/cell/.git" "$T/tok"
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
@@ -770,6 +801,239 @@ else
                     || bad "the first registered secret SURVIVED the dead-stdout cleanup (rc=$DEAD_RC)"
   [ ! -e "$SEC_B" ] && ok "the SECOND registered secret was removed (the loop reached the end)" \
                     || bad "the second registered secret SURVIVED — a dead stdout truncated the cleanup (rc=$DEAD_RC)"
+fi
+
+echo
+# ── 11) swap: a cell with NO swap must get one — the measured shape (agent-infra#2390) ───────────
+# cell-3 at 345M available with 17 lanes and two pytest runs has nowhere to put a spike: the next
+# allocation is an OOM kill. The bring-up is the one step that can escalate, so it must provision
+# swap, ACTIVATE it, and read it back from the kernel record rather than trust `swapon`'s status.
+say_case "swap absent -> provisioned, activated, persisted, swappiness pinned"
+# RESET to the measured shape: no swap row, no file, no fstab line (case 2 already ran this path).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+: > "$T/fstab"
+printf '60\n' > "$T/swappiness"
+rm -f "$T/swapfile" "$T/sysctl.d/99-cell-swap.conf"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up exits 0 with swap provisioned (rc=$BR_RC)" \
+  || bad "bring-up FAILED provisioning swap (rc=$BR_RC): $BR_OUT"
+[ -f "$T/swapfile" ] && ok "the swapfile was created at \$SWAPFILE" \
+  || bad "no swapfile was created"
+[ "$(grep -c '^fallocate ' "$SWAP_LOG" 2>/dev/null)" = 1 ] \
+  && ok "the file was ALLOCATED once (fallocate, not a sparse region of zeros)" \
+  || bad "expected exactly 1 fallocate call, got: $(cat "$SWAP_LOG" 2>/dev/null)"
+# The MODE, not just the file: a world-readable swapfile leaks the pages of every process on the box,
+# and nothing else here would notice `chmod 600` being dropped (the fixture stays private either way).
+[ "$(ls -l "$T/swapfile" 2>/dev/null | cut -c1-10)" = "-rw-------" ] \
+  && ok "the swapfile is mode 600 (not world-readable)" \
+  || bad "the swapfile mode is '$(ls -l "$T/swapfile" 2>/dev/null | cut -c1-10)', expected -rw-------"
+# ORDER, not presence: an implementation that swapped on before formatting would still log both.
+MK_LINE="$(grep -n '^mkswap ' "$SWAP_LOG" 2>/dev/null | cut -d: -f1)"
+SW_LINE="$(grep -n '^swapon ' "$SWAP_LOG" 2>/dev/null | cut -d: -f1)"
+[ -n "$MK_LINE" ] && [ -n "$SW_LINE" ] && [ "$MK_LINE" -lt "$SW_LINE" ] \
+  && ok "mkswap ran BEFORE swapon (an unformatted file is never activated)" \
+  || bad "mkswap/swapon order is wrong or a call is missing: $(cat "$SWAP_LOG" 2>/dev/null)"
+grep -qF "$T/swapfile file " "$T/proc-swaps" 2>/dev/null \
+  && ok "the kernel swap record carries the new area (the read-back, not swapon's exit status)" \
+  || bad "the swap record has no row for the file: $(cat "$T/proc-swaps" 2>/dev/null)"
+# 4096 MB = 4194304 KB, the SWAP_MB value pinned above.
+grep -qF "$T/swapfile file 4194304 " "$T/proc-swaps" 2>/dev/null \
+  && ok "the active area matches the requested size (4096M)" \
+  || bad "the active area is not the requested size: $(cat "$T/proc-swaps" 2>/dev/null)"
+case "$BR_OUT" in
+  *"swap: 4096M active"*) ok "the report states the measured swap total and target" ;;
+  *) bad "the swap line does not report the reading: $BR_OUT" ;;
+esac
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "an fstab entry was added, once (the swap survives a reboot)" \
+  || bad "expected exactly one fstab entry, got: $(cat "$T/fstab" 2>/dev/null)"
+[ "$(cat "$T/swappiness" 2>/dev/null)" = "30" ] \
+  && ok "vm.swappiness was pinned to 30 (not left at the image default of 60)" \
+  || bad "vm.swappiness is '$(cat "$T/swappiness" 2>/dev/null)', expected 30"
+grep -qxF 'vm.swappiness=30' "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null \
+  && ok "the boot-time pin is written to \$SWAP_SYSCTL_CONF" \
+  || bad "no boot-time swappiness pin: $(cat "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null)"
+
+# ── 12) IDEMPOTENCY: a second run must not touch a provisioned cell ────────────────────────────
+# Rewriting a LIVE swap area is an outage for every page in it, and re-appending the fstab line is
+# how a re-run slowly corrupts the boot path. So: no second fallocate/mkswap/swapon, no duplicate
+# fstab row, and the report says so.
+say_case "swap already provisioned -> nothing is re-created (idempotent)"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a re-run exits 0 (rc=$BR_RC)" || bad "a re-run FAILED (rc=$BR_RC): $BR_OUT"
+[ ! -s "$SWAP_LOG" ] && ok "a re-run issued NO fallocate/mkswap/swapon/swapoff (the area was left alone)" \
+  || bad "a re-run touched the live area: $(cat "$SWAP_LOG" 2>/dev/null)"
+case "$BR_OUT" in
+  *"already provisioned"*) ok "the report says the cell was already provisioned" ;;
+  *) bad "the re-run does not report the existing swap: $BR_OUT" ;;
+esac
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "the fstab entry was not duplicated" \
+  || bad "the fstab entry was duplicated: $(cat "$T/fstab" 2>/dev/null)"
+
+# ── 12b) ACTIVE but NOT PERSISTED: the fstab line is re-established on the "already provisioned"
+# path too. An area a hand `swapon` (or a first run whose append failed) left out of fstab is
+# otherwise certified for ever, and the cell comes back from a reboot with NO swap — the measured
+# defect, one power cycle later. The check must ADD the entry and still not touch the live area.
+say_case "active swap with NO fstab entry -> the entry is added, the area is not touched"
+: > "$T/fstab"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "the missing fstab entry was ADDED on the already-provisioned path" \
+  || bad "an active swap area was left unpersisted: $(cat "$T/fstab" 2>/dev/null)"
+[ ! -s "$SWAP_LOG" ] && ok "the live area was not swapped off or re-created to persist it" \
+  || bad "the live area was touched: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 12c) a `noauto` ENTRY IS NOT A BOOT MOUNT. It names the file in field 1 but explicitly does not
+# mount at boot, so a first-field-only match reports "survives a reboot" for the one entry that
+# guarantees it does not.
+say_case "an fstab entry with noauto does NOT count as persisted"
+printf '%s none swap noauto 0 0\n' "$T/swapfile" > "$T/fstab"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+[ "$(grep -cF "$T/swapfile none swap sw 0 0" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "a real boot entry was added beside the noauto one" \
+  || bad "the noauto entry was accepted as a boot mount: $(cat "$T/fstab" 2>/dev/null)"
+printf '%s none swap sw 0 0\n' "$T/swapfile" > "$T/fstab"   # restore the persisted shape
+
+# ── 12d) A LIVE AREA BELOW TARGET IS NOT RESIZED. `swapoff` faults every swapped page back into RAM,
+# and this step runs on a box already short of it — the one action that could OOM-kill the lanes the
+# swap exists to protect. It must be REPORTED, not performed: a failed re-allocation after a removal
+# is how a cell that had some swap ends up with NONE.
+say_case "a live area below target is reported, never swapped off"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 1048576 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"   # 1024M live, target 4096M
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"NOT resizing a live area"*) ok "the shortfall is REPORTED as a decision not to resize" ;;
+  *) bad "the below-target live area was not reported: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"READING: MemTotal="*) ok "the report carries the reading" ;;
+  *) bad "the report does not carry the reading: $BR_OUT" ;;
+esac
+[ ! -s "$SWAP_LOG" ] && ok "nothing was swapped off, re-allocated or re-formatted" \
+  || bad "a live area was destroyed by a --check: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 12e) THE BOOT-TIME PIN IS VERIFIED ON ITS OWN. When the runtime value already reads 30, a
+# pin_swappiness that only writes the drop-in inside the "runtime differs" branch reports "pinned at
+# boot" while the file does not exist — and the cell reverts to the image default at the next reboot,
+# with the one line an operator greps reading as success.
+say_case "runtime already 30 -> the boot-time pin is still written and verified"
+printf '30\n' > "$T/swappiness"
+rm -f "$T/sysctl.d/99-cell-swap.conf"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+grep -qxF 'vm.swappiness=30' "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null \
+  && ok "the drop-in was written although the runtime value already matched" \
+  || bad "the boot-time pin was reported on the strength of the runtime value: $(cat "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null)"
+case "$BR_OUT" in
+  *"runtime and pinned at boot"*) ok "the report distinguishes the runtime value from the boot pin" ;;
+  *) bad "the swappiness line does not name both halves: $BR_OUT" ;;
+esac
+
+# ── 12f) NOT ENOUGH FREE DISK: a swapfile is not reclaimable by the disk reaper, so allocating one
+# on a cell near the threshold trades an OOM kill for a dead cell (worktree/uv fail at ~97%).
+say_case "not enough free disk -> refused with the reading, no CELL READY"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '60\n' > "$T/swappiness"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal \
+          SWAP_AVAIL_KB=1024 \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) when the swapfile would not fit" \
+  || bad "bring-up returned 0 and allocated a swapfile on a full disk"
+case "$BR_OUT" in
+  *"not enough free disk"*"free 1024K"*) ok "the refusal names the free-space reading it acted on" ;;
+  *) bad "the refusal does not print the disk reading: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness after refusing to allocate" ;;
+  *) ok "never claims CELL READY after the refusal" ;;
+esac
+# restore the provisioned shape for the cases that follow
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 4194300 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"
+printf '30\n' > "$T/swappiness"
+
+# ── 13) REFUSAL: a cell that cannot get swap must not be certified ────────────────────────────
+# The failure this removes is a box that looks healthy at 345M available and then silently loses
+# lanes. The refusal must name the READING (MemTotal, SwapTotal, target) so an operator can act on
+# it, and must not print CELL READY over a cell with no swap.
+say_case "cannot escalate -> refused WITH the reading, no CELL READY"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+rm -f "$T/swapfile"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal \
+          SWAP_SUDO=false \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) when it cannot create swap" \
+  || bad "bring-up returned 0 with NO swap on the cell"
+case "$BR_OUT" in
+  *"cannot escalate to root"*) ok "the refusal names escalation as the reason" ;;
+  *) bad "the refusal does not name why it could not act: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"READING: MemTotal="*"SwapTotal="*"target="*) ok "the refusal PRINTS THE READING (MemTotal/SwapTotal/target)" ;;
+  *) bad "the refusal does not print the reading: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no swap on the cell (fail-open)" ;;
+  *) ok "never claims CELL READY without swap" ;;
+esac
+
+# ── 14) the KERNEL'S ROUNDING is not a shortfall (found on a live cell) ──────────────────────
+# A 4096M swapfile reports 4194300K = 4095M in /proc/swaps: the kernel rounds the area down to whole
+# pages and drops the swap header. Without slack that reads as "below target", so every bring-up
+# would WARN on a healthy cell and — worse — swapoff/re-create a LIVE area. Measured on this cell
+# (`/swapfile file 4194300 0 -2` for a `-l 4096M` file), pinned here so the rounding cannot come back
+# as a re-creation loop.
+say_case "a kernel-rounded area (4095M for a 4096M request) is NOT re-created"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 4194300 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a re-run on the rounded area exits 0 (rc=$BR_RC)" \
+  || bad "a rounded area FAILED the run (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"already provisioned"*) ok "4095M counts as provisioned against a 4096M target" ;;
+  *) bad "the rounded area is not recognised as provisioned: $BR_OUT" ;;
+esac
+[ ! -s "$SWAP_LOG" ] && ok "nothing was swapped off or re-created (a live area was left alone)" \
+  || bad "the rounded area was re-created: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 15) the SIZING PREDICATE, driven from the shipped function ─────────────────────────────────
+# Extracted and driven, not re-derived here: a copy of `max(4 GiB, MemTotal/4)` written into this
+# suite would pass against a build whose predicate had been changed to a flat number.
+say_case "sizing predicate: max(4 GiB, RAM/4), capped at 16 GiB"
+sed -n '/^swap_target_mb() {/,/^}/p' "$BRINGUP" > "$T/target.sh"
+if [ -s "$T/target.sh" ]; then
+  ( unset SWAP_MB
+    . "$T/target.sh"
+    t4096=$(swap_target_mb 8011)    # the measured 8 GiB cell: 25% is 2 GiB, below the floor
+    tfloor=$(swap_target_mb 2048)   # even a 2 GiB box gets 4 GiB
+    t32=$(swap_target_mb 32768)
+    t64=$(swap_target_mb 65536)     # capped
+    SWAP_MB=512; tover=$(swap_target_mb 32768)
+    printf '%s %s %s %s %s' "$t4096" "$tfloor" "$t32" "$t64" "$tover" ) > "$T/target.out"
+  got="$(cat "$T/target.out")"
+  [ "$got" = "4096 4096 8192 16384 512" ] \
+    && ok "8011M->4096M, 2048M->4096M (floor), 32768M->8192M, 65536M->16384M (cap), SWAP_MB=512->512M" \
+    || bad "predicate drift: got '$got', expected '4096 4096 8192 16384 512'"
+else
+  bad "swap_target_mb() is no longer extractable from the shipped script"
 fi
 
 echo

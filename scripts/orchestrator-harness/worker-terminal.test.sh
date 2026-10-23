@@ -583,5 +583,110 @@ got="$(bash -c "sysctl() { echo 'total = 2048.00M  used = 1.00M  free = 2047.00M
 ck "swap_usage_mb(): the macOS path yields <free> <total> MB — '${got:-<empty>}'" $rc
 
 echo
+echo "── P) the module INITIALISES under bash 3.2 — no heredoc inside a command substitution (#2248) ──"
+# ⛔ WHY THIS TEST IS TEXTUAL, AND WHY A LINUX-ONLY CI NEEDS IT.
+# Apple ships bash 3.2.57 (GPLv2). Under it, a heredoc NESTED INSIDE A COMMAND SUBSTITUTION is
+# mis-parsed, in two measured ways (both reproduced on 3.2.57 before this gate was written):
+#   1. the quoted delimiter is NOT honoured, so a single quote anywhere in the body opens an
+#      unterminated string — `line N: unexpected EOF while looking for matching `''` — and the rest
+#      of the file is swallowed by the parse;
+#   2. the WORDS OF THE HEREDOC BODY are executed as commands.
+# The shipped `WT_TREE_PY="$(cat <<'PY' … PY)"` did both: it executed a COMMENT as a command (the
+# body contains `worker's`), then died on `WT_TREE_PY: unbound variable`, and every verb below it was
+# never defined — the controller died AT SOURCE TIME on macOS while `launchctl` and `harness verify`
+# both said GREEN (measured: `controller … alive but the heartbeat is 3652s old` for an hour).
+# `bash -n` PASSES on the broken form: it is a runtime mis-parse, not a syntax error. And GitHub's
+# runners are Linux with bash 5.x, which parses the construct CORRECTLY — so the box that breaks
+# cannot run this file, and the box that runs this file cannot observe the break. The parse is simply
+# unavailable to CI at ANY depth of testing, which leaves one honest way to pin it: assert the
+# CONSTRUCT is absent, and separately drive the OBSERVABLE it destroyed (the two Python programs are
+# non-empty after a source). Everything below is non-vacuous — three synthetic broken fixtures are
+# fed through the same predicate, and the startup GUARD is EXECUTED, not grepped for.
+#
+# The predicate is per-file (never a word-split list), always quotes its operands, forces the
+# filename prefix with -H, and answers SCANNER-ERROR instead of silence when it cannot scan — so it
+# fails CLOSED on a path with a space, an empty file list, and a single-file directory alike.
+_hh_hits() { # argv: files → one "file:line:text" per hit; never reads stdin, never silently empty
+  local f
+  [ "$#" -gt 0 ] || { printf 'SCANNER-ERROR: no files to scan\n'; return 0; }
+  for f in "$@"; do
+    [ -f "$f" ] || { printf 'SCANNER-ERROR: cannot scan %s\n' "$f"; continue; }
+    # the single-line shapes, whitespace-tolerant (`$(cat <<`, `$( cat<<`, …), minus whole-line comments
+    grep -Hn -E '\$\([[:space:]]*cat[[:space:]]*<<' -- "$f" | grep -vE ':[0-9]+:[[:space:]]*#'
+    # the wrapped shape: `$(` ending a line, `cat <<` opening the next
+    awk 'p ~ /\$\([[:space:]]*$/ && $0 ~ /^[[:space:]]*cat[[:space:]]*<</ { printf "%s:%d:%s\n", FILENAME, NR, $0 } { p = $0 }' "$f"
+  done
+}
+harness_sh=()
+for _f in "$HERE"/*.sh; do
+  case "$_f" in *.test.sh) continue ;; esac   # a suite carries the shape as TEXT on purpose; no controller sources one
+  harness_sh+=("$_f")
+done
+hits="$(_hh_hits "${harness_sh[@]}")"
+[ -z "$hits" ] && rc=0 || { rc=1; printf '      %s\n' "$hits"; }
+ck "no shipped harness module puts a heredoc inside a command substitution (the shape bash 3.2 executes)" $rc
+
+# The observable that regressed: source the module and read the two variables the census feeds to
+# `python3 -c`. An empty program is not a loud failure — `python3 -c ''` exits 0 and prints nothing,
+# which in this module reads EXACTLY like "no workers": the caps stop binding and a busy box reports
+# an idle controller. So assert non-empty, and name the program in the failure.
+src_out="$(set -u; . "$LIB" 2>&1; echo "tree=${#WT_TREE_PY} ws=${#WT_WS_PY}")"
+case "$src_out" in
+  *"tree=0 "*) rc=1 ;;
+  *"ws=0"*) rc=1 ;;
+  *"tree="*"ws="*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "sourcing the module leaves WT_TREE_PY and WT_WS_PY NON-EMPTY — '$(printf '%s' "$src_out" | tr '\n' ' ')'" $rc
+# …and it must not have leaked the parser's damage into the log: a bash 3.2 mis-parse prints
+# `command not found` / `unexpected EOF` / `unbound variable` lines that a caller redirecting to a
+# log would swallow.
+case "$src_out" in
+  *"command not found"*|*"unbound variable"*|*"syntax error"*|*"unexpected EOF"*)
+    rc=1; printf '      %s\n' "$src_out" ;;
+  *) rc=0 ;;
+esac
+ck "…and sourcing emits no command-not-found / unbound-variable / syntax-error / unexpected-EOF" $rc
+
+# ⛔ THE STARTUP GUARD IS EXECUTED, NOT GREPPED FOR. Asserting the NAME appears in orch-loop.sh was a
+# vacuous gate: the file's own prose explains the guard and mentions both variables, so DELETING the
+# guard loop left that assertion green (measured), and dropping `WT_TREE_PY` from the loop while
+# keeping `WT_WS_PY` left BOTH green — i.e. the check could not see the one variable whose emptiness
+# produced the outage. So: extract the guard verbatim and RUN it, once per variable. It must exit 78
+# AND name the empty variable.
+awk '/^for _wt_py in WT_TREE_PY WT_WS_PY; do$/,/^done$/' "$LOOP" > "$TMP/wt-guard.sh"
+[ -s "$TMP/wt-guard.sh" ] && rc=0 || { rc=1; echo "      orch-loop.sh no longer carries the WT_TREE_PY/WT_WS_PY startup guard"; }
+ck "orch-loop.sh still carries the WT_TREE_PY/WT_WS_PY startup guard block" $rc
+_guard() { # _guard <WT_TREE_PY> <WT_WS_PY> → "rc=<n>|<output>"
+  bash -c 'O=/x; WT_MOD=/x/worker-terminal.sh; WT_TREE_PY="$2"; WT_WS_PY="$3"
+           . "$1"; echo "rc=0|UNREACHABLE"' _ "$TMP/wt-guard.sh" "$1" "$2" 2>&1
+}
+g="$(_guard abc def)"
+case "$g" in *UNREACHABLE*) rc=0 ;; *) rc=1; printf '      %s\n' "$g" ;; esac
+ck "the guard PASSES when both programs are populated (it is not a blanket refusal)" $rc
+for _gv in WT_TREE_PY WT_WS_PY; do
+  if [ "$_gv" = WT_TREE_PY ]; then g="$(_guard "" def)"; else g="$(_guard abc "")"; fi
+  case "$g" in
+    *UNREACHABLE*) rc=1; echo "      an empty $_gv did NOT stop the controller" ;;
+    *"$_gv is EMPTY"*) rc=0 ;;
+    *) rc=1; printf '      %s\n' "$g" ;;
+  esac
+  ck "an EMPTY $_gv stops the controller at startup, naming $_gv" $rc
+done
+
+# NON-VACUITY of the scanner: three synthetic fixtures carrying the three shapes that break 3.2 —
+# including the apostrophe, which is what makes the delimiter-quoting failure real rather than
+# hypothetical (a fixture WITHOUT one sources fine on 3.2 and proves nothing; measured).
+{ printf '%s\n' 'WT_X="$(cat <<'"'"'PY'"'"'' "# it's an apostrophe" 'PY' ')"'
+  printf '%s\n' 'WT_Y="$(cat<<'"'"'PY'"'"'' "# no space before the <<" 'PY' ')"'
+  printf '%s\n' 'WT_Z="$(' 'cat <<'"'"'PY'"'"'' "# the wrapped shape" 'PY' ')"'
+} > "$TMP/broken-shapes.sh"
+misses="$(_hh_hits "$TMP/broken-shapes.sh" | grep -c ':')"
+[ "$misses" -ge 3 ] && rc=0 || { rc=1; echo "      the scanner found $misses of 3 known-broken shapes"; }
+ck "the \$(cat << scan detects ALL THREE broken shapes (non-vacuous: spaced, unspaced, wrapped)" $rc
+# …and it fails CLOSED when it cannot scan at all, rather than reporting a clean tree it never read.
+case "$(_hh_hits "$TMP"/no-such-dir/*.sh)" in *SCANNER-ERROR*) rc=0 ;; *) rc=1 ;; esac
+ck "the scanner reports SCANNER-ERROR when it cannot read its inputs (never a silent pass)" $rc
+
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

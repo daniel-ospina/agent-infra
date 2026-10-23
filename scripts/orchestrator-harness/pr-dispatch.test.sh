@@ -37,8 +37,16 @@ grep -E '^shq\(\) \{' "$ORCH" > "$TMP/shq.sh"
 # `is_num` is the shipped digit validator (it refuses a leading zero, which `[ -gt ]` reads as decimal):
 # the summariser's tallies pass through it, so the fixture must use the SHIPPED one, not a stub.
 grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/isnum.sh"
+# ⛔ THE REFUSAL LINES' EVIDENCE TOKEN IS EXTRACTED TOO (agent-infra#1732 review). Four of the five
+# held-back-spawn lines print `$(spawn_gate_tok)`, which is DEFINED OUTSIDE both extracted blocks, so
+# without this a drive renders `… NO merge slot (merge lanes=9/9, )` — an empty field where the gate's
+# reading belongs — and, because the drives discard stderr, it does so SILENTLY while the T5 assertion
+# ("a capacity refusal NAMES itself") stays green on the prefix alone. Same defect the red-fixer drive
+# had, in the suite that drives the other four lines.
+sed -n '/^spawn_gate_tok() {/,/^}/p' "$ORCH" > "$TMP/spawntok.sh"
 [ -s "$TMP/shq.sh" ] || { echo "FATAL: shq() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num() not found in orch-loop.sh"; exit 1; }
+[ -s "$TMP/spawntok.sh" ] || { echo "FATAL: spawn_gate_tok() not found in orch-loop.sh"; exit 1; }
 
 # ⛔ NO SYNTAX CHECK OF A TEMP FILE HERE, AND NO REMOVAL OF ONE (#709). Both forms are read by the
 # main-worktree-guard as an unverifiable script operand or discard target, and it then refuses to run
@@ -161,6 +169,16 @@ PY
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
     park_ctrl() { return 0; }
+    # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs so the
+    # driven line carries a reading instead of an empty field (see the extraction above).
+    . "$TMP/spawntok.sh"
+    L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
+    # ⛔ AND `is_num`, WHICH THE BLOCKS CALL TOO (review of #1732; pre-existing, latent, same class).
+    # `arm.sh`'s cap guards do `is_num "$NF" || NF=0`: with the predicate UNDEFINED that is
+    # `command not found` (discarded with stderr), so a drive that seeds `fixcount-<PR>` reads 0 and
+    # silently grades the UNCAPPED path — the cap assertions would pass against a cap that never
+    # bound. No drive seeds one today, which is why this was invisible rather than red.
+    . "$TMP/isnum.sh"
     # shellcheck disable=SC1090
     . "$TMP/arm.sh"
   ) >/dev/null 2>&1
@@ -218,6 +236,9 @@ PY
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     . "$TMP/shq.sh"
+    . "$TMP/spawntok.sh"
+    . "$TMP/isnum.sh"        # the blocks' `is_num "$NFC" || NFC=0` guards (see drive() for why)
+    L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     for _once in 1; do
       . "$TMP/conflict.sh"
@@ -287,7 +308,8 @@ drive_conflict 0
   || bad "CONFLICTING with a free slot: spawns=$(spawns) acts=$(acts) — the conflicted-first path did not dispatch"
 drive_conflict 9
 [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -qi 'NO fixer slot' "$TMP/d.log" \
-  && ok "CONFLICTING at the fix-lane ceiling: refused, named in the log, recorded as a wait" \
+  && grep -q 'mem-gate=9000M/512' "$TMP/d.log" \
+  && ok "CONFLICTING at the fix-lane ceiling: refused, named in the log WITH its gate evidence, recorded as a wait" \
   || bad "CONFLICTING at the ceiling: acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
 drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
