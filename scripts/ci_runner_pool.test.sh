@@ -192,6 +192,28 @@ assert_file "$RUNNER_ROOT/pi-runner-sym/.runner" "the copy has its own .runner"
 assert_absent "$TEMPLATE/.runner" "the pristine release was NOT mutated by the add"
 assert_eq "$(slots)" "1" "one add is one slot (the template is never counted)"
 
+# ── (2) the template is never a slot, in the SHIPPED nesting ───────────────────────────────
+# The default is `RUNNER_TEMPLATE=$RUNNER_ROOT/_template` — INSIDE the glob that lists registrations.
+# A `.runner` there must not become a slot, a `status` row, or something the pass starts a listener in
+# (a listener inside the pristine release would then be COPIED into every later instance).
+echo "── the nested template is never a runner ──"
+fresh_pool nesting; reset_logs
+mkdir -p "$RUNNER_ROOT/_template"; cp -a "$TEMPLATE/." "$RUNNER_ROOT/_template/"; : >"$RUNNER_ROOT/_template/.runner"
+register pi-runner-real
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/_template" run status --all)"
+assert_contains "$out" "summary live=0 dead=1 slots=1" "the nested template is NOT a slot"
+if grep -qF "_template" <<<"$out"; then
+  bad "status does not list the template as a runner"
+else
+  ok "status does not list the template as a runner"
+fi
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/_template" run reconcile --dry-run)"
+if grep -qF "for name=_template" <<<"$out"; then
+  bad "the pass does not start a listener inside the pristine release"
+else
+  ok "the pass does not start a listener inside the pristine release"
+fi
+
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"
 fresh_pool floor; reset_logs
@@ -286,6 +308,29 @@ out="$(run restart --name pi-runner-absent)"
 assert_eq "$?" "3" "restart of an unregistered name exits 3 (REFUSED)"
 assert_contains "$out" "no registration at" "the refusal says what it looked for"
 
+# ── (3) a shared PREFIX is not an identity: `-1` and `-10` are different runners ───────────
+# The measured pool's names run -1..-12, so a bare directory-prefix match would let a live `-10`
+# listener make a DEAD `-1` read live — a false row AND a listener that is never restarted.
+echo "── names that share a prefix ──"
+fresh_pool prefixmatch; reset_logs
+register pi-runner-x-1
+register pi-runner-x-10
+bash "$POOL" restart --name pi-runner-x-10 >/dev/null 2>&1
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-x-10")" "1" "the -10 listener is up"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-x-1")" "0" "the -1 registration has no listener"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_contains "$out" "summary live=1 dead=1" "a live -10 does NOT make -1 read live"
+if grep -qE '^pi-runner-x-1 +- +DEAD' <<<"$out"; then
+  ok "the -1 row is DEAD"
+else
+  bad "the -1 row is DEAD"
+fi
+ten_pid="$(listener_pids_for "$RUNNER_ROOT/pi-runner-x-10")"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-x-1)"
+assert_eq "$?" "0" "restart of -1 starts ITS OWN listener"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-x-1")" "1" "the -1 listener is now up"
+assert_eq "$(listener_pids_for "$RUNNER_ROOT/pi-runner-x-10")" "$ten_pid" "the -10 listener was not touched"
+
 # ══ 6. STATUS: rows, and a DEAD listener is an exiting fact ═════════════════════════════════
 echo "── status ──"
 fresh_pool status; reset_logs
@@ -363,14 +408,42 @@ assert_contains "$out" "ceiling reached slots=3 ceiling=3" "and it still stopped
 # an operator is previewing. Own pool: 0 slots, ceiling 3.
 fresh_pool preview
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
-assert_contains "$out" "dry-run: would add pi-runner-fixturebox-1" "the preview names the first add"
-assert_contains "$out" "dry-run: would add pi-runner-fixturebox-3" "and the LAST one the pass would make"
+assert_contains "$out" "register name=pi-runner-fixturebox-1" "the preview names the first add"
+assert_contains "$out" "register name=pi-runner-fixturebox-3" "and the LAST one the pass would make"
 assert_contains "$out" "dry-run: ceiling would be reached slots=0+3 ceiling=3" \
   "the preview says where it would stop"
 assert_eq "$(slots)" "0" "the preview added nothing"
 fresh_pool previewcmp
 assert_contains "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)" "added=3" \
   "the real pass on the same fixture makes the three adds the preview announced"
+
+# ⛔ A preview that RESTATED "would add" instead of ASKING announced capacity the owner's floor
+# refuses — the mirror of under-reporting it. These fixtures are the ones where it lied.
+fresh_pool previewfloor
+out="$(FIXTURE_MEM_MB=1000 FIXTURE_NCPU=8 run reconcile --dry-run)"
+assert_eq "$?" "0" "a preview below the floor exits 0 (the floor is a verdict, not a failure)"
+assert_contains "$out" "REFUSED add name=pi-runner-fixturebox-1" \
+  "the preview HONOURS the floor instead of announcing capacity the pass refuses"
+if grep -qF 'register name=' <<<"$out"; then
+  bad "the preview announced no add below the floor"
+else
+  ok "the preview announced no add below the floor"
+fi
+assert_contains "$out" "refused=1" "the preview counts the refusal"
+
+fresh_pool previewtpl
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/nope" run reconcile --dry-run)"
+assert_eq "$?" "2" "a preview with no template exits 2, like the pass it previews"
+assert_contains "$out" "cannot-act why=runner-template-absent" "the preview names the same cannot-act"
+
+# …and a preview of a RESTART is faithful too: it names the listener it would start, and refuses
+# when the listener cannot be measured.
+fresh_pool previewrestart
+register pi-runner-restartme
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
+assert_contains "$out" "dry-run: would start the listener for name=pi-runner-restartme" \
+  "a preview of a restart names the listener it would start"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-restartme")" "0" "the preview started nothing"
 
 # ══ 8. NAME VALIDATION: a name is a path component, and an escaped one sits outside the ceiling ══
 echo "── name validation ──"

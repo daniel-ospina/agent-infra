@@ -441,7 +441,19 @@ cmd_reconcile() {
       2) cannot=$((cannot + 1)); continue ;;   # cannot measure: start nothing
     esac
     dead=$((dead + 1))
-    if [ "$DRY" = 1 ]; then say "dry-run: would restart $(basename "$d")"; continue; fi
+    if [ "$DRY" = 1 ]; then
+      # ⛔ THE PREVIEW ASKS, IT DOES NOT RESTATE. `restart --dry-run` re-runs the same liveness probe
+      # and the same cannot-measure arm, so a preview can never announce a start the real pass would
+      # refuse (an unreadable process table, a missing `run.sh`).
+      rc=0
+      "$0" restart --name "$(basename "$d")" --dry-run || rc=$?
+      case "$rc" in
+        0) restarted=$((restarted + 1)) ;;
+        3) refused=$((refused + 1)) ;;
+        *) cannot=$((cannot + 1)) ;;
+      esac
+      continue
+    fi
     rc=0
     "$0" restart --name "$(basename "$d")" || rc=$?
     case "$rc" in
@@ -459,7 +471,14 @@ cmd_reconcile() {
   #        the box the capacity it is entitled to.
   while [ "$budget" -gt 0 ]; do
     budget=$((budget - 1))
-    [ "$(slots)" -lt "$CEILING" ] || { say "ceiling reached slots=$(slots) ceiling=$CEILING ncpu=$NCPU"; break; }
+    # Nothing is added in a dry run, so `slots` never moves: the ceiling is counted against
+    # slots + what the preview has already announced.
+    if [ "$DRY" = 1 ]; then
+      [ $(( $(slots) + dry_adds )) -lt "$CEILING" ] || {
+        say "dry-run: ceiling would be reached slots=$(slots)+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
+    else
+      [ "$(slots)" -lt "$CEILING" ] || { say "ceiling reached slots=$(slots) ceiling=$CEILING ncpu=$NCPU"; break; }
+    fi
     scan=0
     while [ -e "$RUNNER_ROOT/$POOL_PREFIX-$n" ]; do
       n=$((n + 1)); scan=$((scan + 1))
@@ -468,19 +487,18 @@ cmd_reconcile() {
         cannot=$((cannot + 1)); break 2
       fi
     done
-    if [ "$DRY" = 1 ]; then
-      # ⛔ A preview must not under-report: nothing is added, so `slots` never moves and a `break`
-      # here would announce ONE add where the real pass makes several. Count them instead.
-      say "dry-run: would add $POOL_PREFIX-$n"
-      dry_adds=$((dry_adds + 1))
-      if [ $(( $(slots) + dry_adds )) -lt "$CEILING" ]; then n=$((n + 1)); continue; fi
-      say "dry-run: ceiling would be reached slots=$(slots)+$dry_adds ceiling=$CEILING ncpu=$NCPU"
-      break
-    fi
+    # ⛔ THE PREVIEW ASKS, IT DOES NOT RESTATE: `add --dry-run` runs the SAME floor, ceiling, label,
+    # name-availability and template checks, in the same order, and returns the same codes. A preview
+    # that published "would add" unconditionally announced capacity the owner's memory floor refuses
+    # (the mirror of under-reporting it).
     rc=0
-    "$0" add --name "$POOL_PREFIX-$n" || rc=$?
+    if [ "$DRY" = 1 ]; then
+      "$0" add --name "$POOL_PREFIX-$n" --dry-run || rc=$?
+    else
+      "$0" add --name "$POOL_PREFIX-$n" || rc=$?
+    fi
     case "$rc" in
-      0) added=$((added + 1)); n=$((n + 1)) ;;
+      0) if [ "$DRY" = 1 ]; then dry_adds=$((dry_adds + 1)); else added=$((added + 1)); fi; n=$((n + 1)) ;;
       4) skipped=$((skipped + 1)); n=$((n + 1)) ;;
       3) refused=$((refused + 1)); break ;;
       *) cannot=$((cannot + 1)); break ;;
