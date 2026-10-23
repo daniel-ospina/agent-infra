@@ -90,7 +90,8 @@
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED by
 #       a gate (a floor/ceiling verdict), nothing changed · 4 name not available (that name is taken;
-#       nothing changed, try another name)
+#       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
+#       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
 #
 # `status` exits 3 when it produced a report in which at least one listener is DEAD — a report is
 # still a report, but a dead listener is a fact a caller must be able to branch on without parsing
@@ -99,6 +100,11 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAPACITY_LIB="${CAPACITY_LIB:-$SELF_DIR/orchestrator-harness/capacity.sh}"
+# ⛔ RE-INVOKE THROUGH AN ABSOLUTE PATH, NEVER `$0`: `bash ci_runner_pool.sh reconcile` run from the
+# script's own directory leaves `$0` as a bare filename that is not on PATH, so every child dispatch
+# fails `command not found` — reconcile then reports a false `cannot-act` on a healthy box and no dead
+# listener is ever restarted.
+SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 RUNNER_ROOT="${RUNNER_ROOT:-/tmp/actions-runner}"
 RUNNER_TEMPLATE="${RUNNER_TEMPLATE:-$RUNNER_ROOT/_template}"
@@ -369,19 +375,23 @@ cmd_add() {
     # Nothing valid exists yet, and a full runner install left behind is invisible to `slots`, never
     # bounded by the ceiling, and would make the next pass mint another name — so it goes.
     rm -rf "$dir"
-    err "cannot-act why=config-failed see=$cfglog (the installation was removed; GitHub-side state is unknown — a token it consumed may have registered the name)"; return 2
+    # ⛔ rc 5, NOT rc 2: a config failure is about THIS NAME (GitHub already holds it, the token was
+    # spent, this dir's permissions), while the gates an rc 2 reports are about the BOX. Ending the
+    # pass here is how a box that rebooted `/tmp` — every local `.runner` gone, every name still taken
+    # on GitHub — could never re-provision the pool this pass exists to recover.
+    err "name-failed why=config-failed see=$cfglog (the installation was removed; GitHub-side state is unknown — a token it consumed may have registered the name); trying the next name"; return 5
   fi
   # config.sh's own `.runner` marker is the proof the registration happened — never the exit code
   # alone (a config that "succeeded" without writing `.runner` has registered nothing).
   if [ ! -f "$dir/.runner" ]; then
     rm -rf "$dir"
-    err "cannot-act why=no-registration-marker dir=$dir see=$cfglog (the installation was removed)"; return 2
+    err "name-failed why=no-registration-marker dir=$dir see=$cfglog (the installation was removed); trying the next name"; return 5
   fi
   rm -f "$cfglog"   # the marker proves the registration; a successful log is no longer news
   if ! start_listener "$dir"; then
     # The registration EXISTS now. Saying "nothing changed" here would be false, and the retry is
     # refused by the `.runner` check above — so name the state and the way back.
-    err "registered=1 listener=dead name=$name dir=$dir — the registration is in place; run: $0 restart --name $name"
+    err "registered=1 listener=dead name=$name dir=$dir — the registration is in place; run: $SELF restart --name $name"
     return 2
   fi
   say "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
@@ -416,6 +426,10 @@ cmd_restart() {
     0) say "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
+  # ⛔ THE START'S OWN PRECONDITION IS CHECKED BEFORE THE DRY RETURN, so a preview cannot announce a
+  # start the real pass refuses. `start_listener` re-checks it (defence in depth), but a check that
+  # only lives downstream of the `--dry-run` return is a preview that lies.
+  [ -x "$dir/run.sh" ] || { err "cannot-act why=runner-not-installed path=$dir/run.sh"; return 2; }
   if [ "$DRY" = 1 ]; then say "dry-run: would start the listener for name=$name"; return 0; fi
   start_listener "$dir" || return 2
   say "restarted name=$name pid=$(listener_pid "$dir")"
@@ -423,7 +437,7 @@ cmd_restart() {
 }
 
 cmd_reconcile() {
-  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 n=1 rc budget scan=0 dry_adds=0
+  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
@@ -446,7 +460,7 @@ cmd_reconcile() {
       # and the same cannot-measure arm, so a preview can never announce a start the real pass would
       # refuse (an unreadable process table, a missing `run.sh`).
       rc=0
-      "$0" restart --name "$(basename "$d")" --dry-run || rc=$?
+      "$SELF" restart --name "$(basename "$d")" --dry-run || rc=$?
       case "$rc" in
         0) restarted=$((restarted + 1)) ;;
         3) refused=$((refused + 1)) ;;
@@ -455,7 +469,7 @@ cmd_reconcile() {
       continue
     fi
     rc=0
-    "$0" restart --name "$(basename "$d")" || rc=$?
+    "$SELF" restart --name "$(basename "$d")" || rc=$?
     case "$rc" in
       0) restarted=$((restarted + 1)) ;;
       3) refused=$((refused + 1)) ;;
@@ -493,20 +507,27 @@ cmd_reconcile() {
     # (the mirror of under-reporting it).
     rc=0
     if [ "$DRY" = 1 ]; then
-      "$0" add --name "$POOL_PREFIX-$n" --dry-run || rc=$?
+      "$SELF" add --name "$POOL_PREFIX-$n" --dry-run || rc=$?
     else
-      "$0" add --name "$POOL_PREFIX-$n" || rc=$?
+      "$SELF" add --name "$POOL_PREFIX-$n" || rc=$?
     fi
     case "$rc" in
       0) if [ "$DRY" = 1 ]; then dry_adds=$((dry_adds + 1)); else added=$((added + 1)); fi; n=$((n + 1)) ;;
       4) skipped=$((skipped + 1)); n=$((n + 1)) ;;
+      # A name that could not be REGISTERED is a per-name accident too: try the next one, because the
+      # box's capacity does not depend on GitHub happening to hold this name.
+      5) failed=$((failed + 1)); n=$((n + 1)) ;;
       3) refused=$((refused + 1)); break ;;
       *) cannot=$((cannot + 1)); break ;;
     esac
   done
 
-  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
-    "$dead" "$restarted" "$added" "$skipped" "$refused" "$cannot" "$(slots)" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
+  # ⛔ In a dry run the counts are the PREVIEW's, for every field — `restarted` already counted what
+  # it would start, so `added` must count what it would add, or the machine-readable summary
+  # under-reports the very change the preview announced.
+  [ "$DRY" = 1 ] && added=$((added + dry_adds))
+  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
+    "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$(slots)" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
   [ "$cannot" -eq 0 ] || return 2
   return 0
 }

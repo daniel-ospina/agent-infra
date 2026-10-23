@@ -219,7 +219,11 @@ local evidence for is not in the table — that is why an add whose listener fai
 and says so.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
-message names) · 3 REFUSED by a gate · 4 name not available (that name is taken; try another)`. `status`
+message names) · 3 REFUSED by a gate · 4 name not available (that name is taken; try another) · 5 this
+name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
+tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
+local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
+always taken). `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it
 could not measure, which includes an unreadable **process table**: that is the one unreadable input
 whose absence would produce an action (a second listener) instead of a refusal, so it fails closed too.

@@ -120,6 +120,7 @@ SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
 printf '%s | %s\n' "$PWD" "$*" >>"${CONFIG_LOG:?}"
+case " $* " in *" --name ${FIXTURE_CONFIG_FAIL_NAME:-__none__} "*) echo "config.sh: a runner with this name already exists" >&2; exit 1 ;; esac
 [ "${FIXTURE_CONFIG_FAIL:-0}" = 1 ] && { echo "config.sh: the registration token is invalid" >&2; exit 1; }
 [ "${FIXTURE_CONFIG_NOMARKER:-0}" = 1 ] && exit 0
 : >.runner
@@ -358,12 +359,12 @@ assert_contains "$out" "restarted name=pi-runner-dead" "reconcile started the de
 assert_contains "$out" "added name=pi-runner-fixturebox-1" "reconcile added a runner above the floor"
 assert_contains "$out" "ceiling reached slots=3 ceiling=3 ncpu=8" \
   "reconcile stopped at the core-aware ceiling"
-assert_contains "$out" "reconcile: dead=1 restarted=1 added=1 skipped=0 refused=0 cannot=0 slots=3" \
+assert_contains "$out" "reconcile: dead=1 restarted=1 added=1 skipped=0 failed=0 refused=0 cannot=0 slots=3" \
   "reconcile summarises the pass with its readings"
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
 assert_eq "$?" "0" "a second reconcile exits 0"
-assert_contains "$out" "reconcile: dead=0 restarted=0 added=0 skipped=0 refused=0 cannot=0 slots=3" \
+assert_contains "$out" "reconcile: dead=0 restarted=0 added=0 skipped=0 failed=0 refused=0 cannot=0 slots=3" \
   "RECONCILE IS IDEMPOTENT: a second pass changes nothing"
 
 # A gate verdict ENDS the pass: the box is below the floor, so the first add refuses and the summary
@@ -412,6 +413,7 @@ assert_contains "$out" "register name=pi-runner-fixturebox-1" "the preview names
 assert_contains "$out" "register name=pi-runner-fixturebox-3" "and the LAST one the pass would make"
 assert_contains "$out" "dry-run: ceiling would be reached slots=0+3 ceiling=3" \
   "the preview says where it would stop"
+assert_contains "$out" "added=3" "the summary counts the adds the preview ANNOUNCED (it used to say added=0)"
 assert_eq "$(slots)" "0" "the preview added nothing"
 fresh_pool previewcmp
 assert_contains "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)" "added=3" \
@@ -444,6 +446,20 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
 assert_contains "$out" "dry-run: would start the listener for name=pi-runner-restartme" \
   "a preview of a restart names the listener it would start"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-restartme")" "0" "the preview started nothing"
+
+# …and a registration whose install is broken must be REFUSED by the preview too, not announced.
+fresh_pool previewbroken
+register pi-runner-broken
+mv "$RUNNER_ROOT/pi-runner-broken/run.sh" "$T/run.sh.bak2"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-broken --dry-run)"
+assert_eq "$?" "2" "a preview refuses a start the real pass would refuse (no run.sh)"
+assert_contains "$out" "cannot-act why=runner-not-installed" "the preview names the same cannot-act"
+if grep -qF 'would start the listener' <<<"$out"; then
+  bad "the preview did not announce a start it cannot perform"
+else
+  ok "the preview did not announce a start it cannot perform"
+fi
+mv "$T/run.sh.bak2" "$RUNNER_ROOT/pi-runner-broken/run.sh"
 
 # ══ 8. NAME VALIDATION: a name is a path component, and an escaped one sits outside the ceiling ══
 echo "── name validation ──"
@@ -495,8 +511,9 @@ assert_contains "$out" "cannot-act why=runner-template-absent" "it names the mis
 assert_absent "$RUNNER_ROOT/pi-runner-t" "it created nothing"
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_FAIL=1 run add --name pi-runner-f)"
-assert_eq "$?" "2" "a failing config.sh is cannot-act (rc 2)"
-assert_contains "$out" "cannot-act why=config-failed" "it names the step that failed"
+assert_eq "$?" "5" "a failing config.sh is a NAME failure (rc 5), not a box verdict"
+assert_contains "$out" "name-failed why=config-failed" "it names the step that failed"
+assert_contains "$out" "trying the next name" "and it says the pass may carry on"
 cfg_path="${out#*see=}"; cfg_path="${cfg_path%% *}"
 assert_file "$cfg_path" "the config log SURVIVES the removed install (the only diagnostic for a taken name or a spent token)"
 assert_contains "$(cat "$cfg_path" 2>/dev/null)" "the registration token is invalid" \
@@ -511,8 +528,21 @@ assert_contains "$out" "cannot-act why=template-copy-failed" "it names the copy 
 assert_absent "$T/nonexistent-parent" "no partial install was left behind"
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_NOMARKER=1 run add --name pi-runner-n)"
-assert_eq "$?" "2" "a config.sh that exits 0 WITHOUT writing .runner is cannot-act (rc 2)"
-assert_contains "$out" "cannot-act why=no-registration-marker" "the marker, not the exit code, is the proof"
+assert_eq "$?" "5" "a config.sh that exits 0 WITHOUT writing .runner is a NAME failure (rc 5)"
+assert_contains "$out" "name-failed why=no-registration-marker" "the marker, not the exit code, is the proof"
+assert_absent "$RUNNER_ROOT/pi-runner-n" "the unproven install was removed"
+
+# ⛔ A NAME GITHUB ALREADY HOLDS MUST NOT END THE PASS. `RUNNER_ROOT` defaults to /tmp/actions-runner,
+# so a reboot erases every local `.runner` while GitHub keeps every registration: without this, the
+# first name minted after a reboot is always taken and the box can never re-provision its pool.
+fresh_pool takenname
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_FAIL_NAME=pi-runner-fixturebox-1 run reconcile)"
+assert_eq "$?" "0" "a GitHub-taken name does not end the pass"
+assert_contains "$out" "name-failed why=config-failed" "the taken name is reported"
+assert_contains "$out" "added name=pi-runner-fixturebox-2" "the pass moved on to the NEXT name and registered it"
+assert_contains "$out" "failed=1" "the summary counts the name failure separately"
+assert_absent "$RUNNER_ROOT/pi-runner-fixturebox-1" "the taken name registered nothing"
+assert_eq "$(slots)" "3" "the pass filled to the ceiling with the FREE names"
 
 # A registration whose listener never comes up must not be reported as a clean add, and the message
 # must say the registration exists (a bare "nothing changed" would be false, and the retry is refused).
@@ -560,6 +590,17 @@ assert_contains "$mut_out" "added name=pi-runner-mut" "the mutant proceeds to ad
 assert_eq "$(FIXTURE_MEM_MB=2263 FIXTURE_NCPU=8 rc_of add --name pi-runner-shipped)" "3" \
   "the SHIPPED script still refuses the fixture the mutant accepted"
 assert_absent "$RUNNER_ROOT/pi-runner-shipped" "the shipped refusal created nothing"
+
+# ── (4) the child dispatch must not depend on `$0` being a path ────────────────────────────
+# `bash ci_runner_pool.sh reconcile` from the script's own directory leaves `$0` as a bare filename
+# that is not on PATH: with `$0`-based dispatch every child is `command not found`, so no dead
+# listener is ever restarted and the pass reports a false cannot-act on a healthy box.
+fresh_pool barename; reset_logs
+register pi-runner-bare
+out="$(cd "$SCRIPT_DIR" && FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash ci_runner_pool.sh reconcile 2>&1)"
+assert_eq "$?" "0" "reconcile invoked by a bare relative filename exits 0"
+assert_contains "$out" "restarted name=pi-runner-bare" "and its child dispatch actually ran"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-bare")" "1" "the dead listener was restarted"
 
 # ══ 11. usage ═══════════════════════════════════════════════════════════════════════════════
 out="$(bash "$POOL" --help 2>&1)"
