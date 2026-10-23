@@ -128,11 +128,27 @@ cat >"$BIN/ls" <<'STUB'
 # The pool listing is `ls -A "$RUNNER_ROOT"`. FIXTURE_LS_FAIL makes THAT readdir fail while the mode
 # bits still allow it (an ACL/SELinux denial, a transient error on a mounted root) — the one shape the
 # permission checks cannot reach, so it is the arm that genuinely proves the listing is checked.
-if [ "${FIXTURE_LS_FAIL:-0}" = 1 ]; then
-  for a in "$@"; do
-    [ "$a" = "${RUNNER_ROOT:-}" ] && { echo "ls: cannot open directory '$a': Permission denied" >&2; exit 2; }
-  done
-fi
+# FIXTURE_LS_FAIL_AFTER=<n> lets the FIRST n root listings through and fails the next one: that is the
+# only way to reach a guard on a LATER listing (a pass that listed the pool once already), which is
+# where `reconcile`'s add loop re-reads it.
+ls_root_listed() { # counts this root-listing call and says whether it may proceed
+  local f c
+  f="${RUNNER_ROOT:?}/.ls-count"
+  c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
+  case "$c" in ''|*[!0-9]*) c=0 ;; esac
+  c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+  [ "$c" -le "$1" ]
+}
+for a in "$@"; do
+  if [ "$a" = "${RUNNER_ROOT:-}" ]; then
+    if [ "${FIXTURE_LS_FAIL:-0}" = 1 ]; then
+      echo "ls: cannot open directory '$a': Permission denied" >&2; exit 2
+    fi
+    if [ -n "${FIXTURE_LS_FAIL_AFTER:-}" ] && ! ls_root_listed "$FIXTURE_LS_FAIL_AFTER"; then
+      echo "ls: cannot open directory '$a': Permission denied" >&2; exit 2
+    fi
+  fi
+done
 if [ -x /bin/ls ]; then exec /bin/ls "$@"; fi
 exec /usr/bin/ls "$@"
 STUB
@@ -348,6 +364,25 @@ assert_contains "$out" "cannot-measure why=runner-root-unreadable" "it names the
 assert_eq "$(FIXTURE_LS_FAIL=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-r2)" "2" \
   "and an add refuses rather than adding above an unreadable ceiling"
 assert_eq "$(count_lines "$CONFIG_LOG")" "0" "nothing was registered"
+
+# ⛔ A LISTING THAT FAILS **LATER** IN THE PASS IS ITS OWN GUARD: `reconcile` re-reads the pool before
+#   every add, and losing that re-read flipped a fail-closed pass into rc 0 / `cannot=0` with an
+#   INVENTED reason (`ceiling reached slots= ceiling=3`) — the monitored rc + cannot= pair read a
+#   healthy box over a pool it never listed. The counter lets the restart arm's listing through and
+#   fails the add loop's, which is the only way to reach a guard on a second listing.
+echo "── reconcile: a listing that fails inside the add loop ──"
+fresh_pool latefail; reset_logs
+register pi-runner-lf1
+out="$(FIXTURE_LS_FAIL_AFTER=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "2" "a listing failure inside the add loop stops the pass (rc 2, not a clean 0)"
+assert_contains "$out" "cannot=1" "the summary counts it"
+assert_contains "$out" "the pass stopped; nothing was added" "and the measured reason is published"
+if grep -qF "ceiling reached" <<<"$out"; then
+  bad "the pass invents 'ceiling reached' when it never listed the pool"
+else
+  ok "the pass invents no ceiling verdict it did not measure"
+fi
+rm -f "$RUNNER_ROOT/.ls-count"
 
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"
