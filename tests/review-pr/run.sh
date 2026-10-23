@@ -105,6 +105,14 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
        FIXTURE_SIGN_KEY
+# ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
+# `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
+# the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
+# tell "the parent held the key" (the precondition §U's ABSENT assertion rests on) from ambient
+# luck, and deleting `AI_REVIEW_GATE_KEY=` from `run()` left all 423 assertions green. Every
+# invocation of `run()` exports the fixture's key; this line makes that the ONLY source, so the
+# recorder's signature proves what the fixture passed rather than what the box happened to have.
+unset AI_REVIEW_GATE_KEY
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -146,7 +154,12 @@ case "$cmd" in
       view)
         case "$json" in
           "url,headRefOid,title,state,baseRefName")
-            printf '%s\t%s\t%s\t%s\t%s\n' "${FIXTURE_URL:-}" "$(cat "$TMP/head")" \
+            # ⛔ THE PRODUCTION SEPARATOR, NOT TAB (P2, fresh review of #2288): the SUT reads
+            # the `--jq '… join("\u001f")'` shape, i.e. unit-separated fields. A tab fixture
+            # drove a `*)` fallback arm that shipped code no longer has (and whose empty-field
+            # collapse made the empty-url guard unreachable), so all 420 assertions covered a
+            # path production never takes. This fixture is now byte-shaped like the real read.
+            printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "${FIXTURE_URL:-}" "$(cat "$TMP/head")" \
               "${FIXTURE_TITLE:-fixture title}" "${FIXTURE_STATE:-OPEN}" "${FIXTURE_BASE:-main}" ;;
           body) [ "${FIXTURE_READ_FAIL:-}" = "body" ] && { echo "HTTP 503" >&2; exit 1; }
                 cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}"
@@ -185,9 +198,15 @@ case "$cmd" in
         n=$(( $(cat "$TMP/comment-n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/comment-n"
         cp "$body_file" "$TMP/comment-$n.md" 2>/dev/null
         cp "$body_file" "$TMP/comment.md" 2>/dev/null
+        # ⛔ A DISTINCT ID PER COMMENT (P2, fresh review of #2288): one constant id made the
+        # evidence id INDISTINGUISHABLE from the notes comment id, so a mutant that recorded
+        # the non-blocking notes as `--evidence` passed all 420 assertions — and
+        # `record-review.sh`'s veto would accept that body (it states no `Outcome:` field and
+        # matches no blocking marker). The notes body posting is the FIRST comment and the
+        # verdict the SECOND, so their ids differ and §A can assert WHICH one was recorded.
         [ "${FIXTURE_NO_URL:-0}" = "1" ] && exit 0
         printf 'https://github.com/%s/pull/%s#issuecomment-%s\n' \
-          "${FIXTURE_REPO:-$REPO_FIXTURE}" "$prnum" "${FIXTURE_CID:-9001}" ;;
+          "${FIXTURE_REPO:-$REPO_FIXTURE}" "$prnum" "$(( ${FIXTURE_CID:-9001} + n - 1 ))" ;;
       *) echo "fake-gh: unhandled pr sub '$sub'" >&2; exit 1 ;;
     esac ;;
   *) echo "fake-gh: unhandled cmd '$cmd'" >&2; exit 1 ;;
@@ -246,14 +265,16 @@ if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
   # the key being present would sign even the scenario that needs NO signature and the seam's
   # unsigned-marker refusal could never be driven.
   printf '\n%s\n' "$marker" >> "$TMP/body.md"
-elif [ -n "${FIXTURE_SIGN_KEY:-}" ]; then
-  # A REAL HMAC, exactly as record-review.sh computes it. ⛔ THIS EXERCISES THE FIXTURE'S SIGNING, NOT
-  # THE SEAM'S VERIFICATION (P3, freshest review of #2288): review-pr.sh performs NO HMAC verification
+elif [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
+  # A REAL HMAC, exactly as record-review.sh computes it — signed with the SAME env var the real
+  # recorder uses (`AI_REVIEW_GATE_KEY`), not with the fixture's own variable (P3, fresh review of
+  # #2288: keying this on FIXTURE_SIGN_KEY meant the fixture could sign even when the seam passed
+  # the recorder NO key, so deleting `AI_REVIEW_GATE_KEY=` from `run()` left the suite green while
+  # §U still claimed "the PARENT held the key"). ⛔ THIS EXERCISES THE FIXTURE'S SIGNING, NOT THE
+  # SEAM'S VERIFICATION (P3, freshest review of #2288): review-pr.sh performs NO HMAC verification
   # at all (declared residual, scripts/review-pr.sh:1160-1170) — it pins the marker's SHAPE, i.e. a
-  # 64-hex `sig=` field — so §A/§AD cannot tell a real signature from any 64 hex characters. The old
-  # claim here said the opposite, and the branch was DEAD anyway: FIXTURE_SIGN_KEY was never exported,
-  # so every scenario fell through to the shape-valid zero signature below.
-  sig="$(printf '%s' "$marker" | openssl dgst -sha256 -hmac "$FIXTURE_SIGN_KEY" | awk '{print $NF}')"
+  # 64-hex `sig=` field — so §A/§AD cannot tell a real signature from any 64 hex characters.
+  sig="$(printf '%s' "$marker" | openssl dgst -sha256 -hmac "$AI_REVIEW_GATE_KEY" | awk '{print $NF}')"
   # (the FIXTURE_BAD_SIG branch went with the dead key resolution it served: review-pr.sh no longer
   # reads the signing key at all — record-review.sh owns it — so a forged signature is not a case
   # this tool can see. Its fixture var was reset but never set by any scenario (P3, dogfood review).)
@@ -319,8 +340,17 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "exit 0 on a CLEAN verdict (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "record-review.sh WAS called"
 want="$REPO_FIXTURE"; [ "$(cat "$TMP/record-argv.txt" 2>/dev/null | head -1)" = \
-  "2284 $HEAD_FIXTURE clean $want --evidence comment:9001" ]
+  "2284 $HEAD_FIXTURE clean $want --evidence comment:9002" ]
 ck $? "…with <PR> <reviewed-head> clean <repo-from-url> --evidence comment:<id> (got: $(cat "$TMP/record-argv.txt" 2>/dev/null))"
+# ⛔ WHICH comment it names is asserted, not just that it names one (P2, fresh review of
+# #2288): the notes comment is posted first (id 9001) and the verdict second (id 9002), and
+# the seam must record the VERDICT — a mutant recording the notes passed every other
+# assertion while naming an artifact that explicitly says it is not the verdict.
+case "$(cat "$TMP/record-argv.txt" 2>/dev/null)" in
+  *"--evidence comment:9001"*) rc=1 ;;
+  *"--evidence comment:9002"*) rc=0 ;;
+esac
+ck $rc "…and it names the VERDICT comment (9002), never the non-blocking notes comment (9001)"
 rec="$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json"
 grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$rec" 2>/dev/null
 ck $? "…and the record file is bound to the head that was REVIEWED"
@@ -369,6 +399,12 @@ no_record; ck $? "NO record was written"
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_URL=""
 run "$SRC" 2284
 [ "$(rc_of)" = "3" ]; ck $? "an EMPTY url is also refused (exit 3), never defaulted to a repo"
+# ⛔ THE GUARD, NAMED (P2, fresh review of #2288): the fixture used to emit TAB, so an empty
+# url collapsed into URL=<head sha> and this scenario died on the url-SHAPE check instead —
+# rc=3 for the wrong reason, and the empty-field guard was never executed by any assertion.
+# With the production separator the empty field survives the split, so the refusal the operator
+# reads is the one this guard emits.
+err_has "gh returned an empty url"; ck $? "…refused BY THE EMPTY-URL GUARD (not by an accidental url-shape failure)"
 no_record; ck $? "…and writes no record"
 
 # ── §D no auth ───────────────────────────────────────────────────────────────
@@ -850,7 +886,14 @@ grep -qx "GHREPO=$REPO_FIXTURE" "$TMP/pi-env.txt" 2>/dev/null; ck $? "the review
 # `run()` exports AI_REVIEW_GATE_KEY and the fake recorder has to mint a signature, so a green
 # record is the proof the key was present in the parent — which is what makes "absent" below
 # the CHILD's doing rather than a fixture that never set it.
-[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record was signed, so the PARENT held the key"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the recorder ran"
+# ⛔ SIGNED MEANS NON-ZERO (P3, fresh review of #2288): this line used to assert only that the
+# argv file existed, which is equally true when the fake recorder took its no-key arm and wrote
+# an all-zero `sig=`. The HMAC is what proves the PARENT held the key — which is the only thing
+# that makes §U's "the child saw it ABSENT" a result rather than a fixture that never set it.
+_record_sig="$(grep -o 'sig=[0-9a-f]\{64\}' "$TMP/body.md" 2>/dev/null | tail -1 | cut -d= -f2)"
+[ -n "$_record_sig" ] && [ "$_record_sig" != "$(printf '%064d' 0)" ]
+ck $? "  …and the record was SIGNED with a non-zero HMAC, so the PARENT held the key"
 grep -qx 'GATEKEY=absent' "$TMP/pi-env.txt" 2>/dev/null; ck $? "  …while the reviewer child saw AI_REVIEW_GATE_KEY ABSENT (its stdout is pasted into a public comment)"
 
 # ── §V an `ISSUES n` over ONLY P3 lines is clean — reconciled, never assumed ─

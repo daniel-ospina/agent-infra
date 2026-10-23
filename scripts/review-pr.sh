@@ -74,9 +74,17 @@
 #      marker — agent-infra#1224).
 #
 # EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8 and 10. Exit 9
-# is the one that can leave a record behind: it fires when the recorder SUCCEEDED but the
-# artifact check (c) reads is not right (no record bound to the head, no body marker, or an
-# unsigned marker) — the remedy there is to re-run the recorder, not to re-review.
+# is the record/artifact arm, and it covers FOUR cases that need DIFFERENT remedies (a table
+# that described it as "the one that can leave a record behind" pointed two of them at a
+# remedy that cannot work — P3, fresh review of #2288):
+#   * the recorder SUCCEEDED but the artifact check (c) reads is not right (no record bound to
+#     the head, no body marker, or a marker posted unsigned) — the remedy IS to re-run the
+#     recorder, not to re-review, and a record may already exist;
+#   * the recorder was never REACHED (not found / not a regular executable, before any review
+#     was paid for) — nothing was consumed and there is nothing to re-run against;
+#   * the notes or the verdict COMMENT could not be posted — no comment id exists to name as
+#     `--evidence`, so re-running the recorder cannot help either; the review exists only in
+#     the transcript.
 # A review COMMENT may already be posted when 7/8/9 exit — that comment IS the artifact
 # (it says what the reviewer found, and `Outcome: not-clean` when it was not clean); it is
 # not a verdict, and it is never composed when the verdict contradicts its own findings:
@@ -89,8 +97,9 @@
 #   7  the reviewer found issues (P0/P1/P2), OR its `CLEAN` contradicts its own
 #      severity lines — NOT recorded, findings printed
 #   8  the head moved during the review — NOT recorded
-#   9  recording failed, OR rc=0 arrived WITHOUT the artifact check (c) reads: no
-#      record bound to this head, no marker in the PR body, or a marker posted
+#   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
+#      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
+#      reads: no record bound to this head, no marker in the PR body, or a marker posted
 #      UNSIGNED (no AI_REVIEW_GATE_KEY — the signed marker is what the gate verifies,
 #      so "recorded" without it is a green report over a red check)
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
@@ -227,10 +236,15 @@ read_meta() {
   # became URL=<next field> and the "gh returned an empty url" guard could never fire
   # (P3, eleventh fresh review; record-review.sh documents the same trap). The delimiter is
   # a non-whitespace unit separator, and the fields are split explicitly.
-  case "$out" in
-    *$'\x1f'*) IFS=$'\x1f' read -r URL HEAD TITLE STATE BASE <<<"$out" ;;
-    *)          IFS=$'\t'  read -r URL HEAD TITLE STATE BASE <<<"$out" ;;   # test fixtures emit TSV
-  esac
+  # ⛔ AND THERE IS NO TAB FALLBACK (P2, fresh review of #2288). A `*)` arm here read TSV so
+  # the FIXTURES could drive this function — which meant the one arm production takes (`\u001f`,
+  # the `--jq … join` shape above) had ZERO coverage, while the tab arm still carried the
+  # empty-field collapse this split exists to remove: an empty url became URL=<head sha>, so the
+  # suite's "an EMPTY url is also refused" assertion passed on the url-SHAPE guard the shipped
+  # code never reaches. The fixtures now emit the production separator, so a single definition
+  # of the read exists and the tested arm IS the shipped arm; a gh that stopped honouring `--jq`
+  # trips the url guard loudly instead of being papered over by a second parser.
+  IFS=$'\x1f' read -r URL HEAD TITLE STATE BASE <<<"$out"
   [ -n "${URL:-}" ] || { META_ERR="gh returned an empty url"; return 1; }
   return 0
 }
@@ -1414,8 +1428,17 @@ if [ "$VERDICT" = clean ] && [ -n "$FINDINGS" ]; then
   # record-review.sh's veto scans, and its arm-(1) markers are unconditional.
   {
     printf '## Reviewer notes (non-blocking) — %s#%s @ `%s`\n\n' "$REPO" "$PR" "${HEAD:0:12}"
-    printf 'Disposition: `follow_up` — P3 notes only; they do not block this revision and are\n'
-    printf 'not the verdict. The verdict comment is the `--evidence` artifact, not this one.\n\n'
+    # ⛔ NOT "P3 NOTES ONLY" (P3, fresh review of #2288): `FINDINGS` is the SEV_RE grep over
+    # P0-P3 minus summary rows, so a note can legitimately quote a P1/P2 label (a fenced quote,
+    # or the reviewer quoting the prompt) while the blocking decision is the artifact awk scan.
+    # The old header claimed "P3 notes only" over a body that could print `[P1] …`, i.e. the
+    # comment contradicted the line it quoted. The header now states what the comment is: the
+    # reviewer's own verbatim notes, non-blocking, with the blocking decision made elsewhere.
+    printf 'Disposition: `follow_up` — non-blocking notes; they do not block this revision and\n'
+    printf 'are not the verdict. The verdict comment is the `--evidence` artifact, not this one.\n'
+    printf 'A note is quoted verbatim, so it may repeat a severity label the reviewer quoted from\n'
+    printf 'code or from the prompt; the contradiction guard reads the verdict artifact, never this\n'
+    printf 'comment.\n\n'
     printf '%s\n' "$FINDINGS"
   } > "$RUN_DIR/notes.md"
   if post_comment "$RUN_DIR/notes.md"; then
@@ -1425,7 +1448,7 @@ if [ "$VERDICT" = clean ] && [ -n "$FINDINGS" ]; then
     err "  The verdict artifact was NOT posted either and NO record was written; the notes are in $TRANSCRIPT."
     die "$E_RECORD" "notes comment post FAILED — refusing to post the verdict artifact without the notes it cites"
   fi
-  err "review-pr: reviewer notes posted: comment:$NOTES_CID (non-blocking, P3)"
+  err "review-pr: reviewer notes posted: comment:$NOTES_CID (non-blocking)"
 fi
 
 if [ "$VERDICT" = clean ]; then
@@ -1450,10 +1473,17 @@ if [ "$VERDICT" = clean ]; then
     # reader of this comment could not tell a whole-diff review from a head-of-diff one.
     # Disclosed here, in the artifact, so the claim is measurable instead of implied.
     if [ "${DIFF_TRUNCATED:-0}" != 0 ]; then
+      # ⛔ WHAT THIS SAYS ABOUT THE FETCH (P3, fresh review of #2288): it used to say the
+      # remainder fetch was "NOT verifiable from here", which contradicts an ENFORCED check —
+      # the `diff-tail:` digest of the full diff's final line is verified above, before any
+      # comment exists (exit 3 when it is missing or wrong). Overstating an unverifiable fetch
+      # is not the defect here; UNDERSTATING an enforced one is the same "two contradictory
+      # claims about one control" class this file refuses elsewhere. It now says what happened:
+      # the fetch was proven, and what the reviewer read beyond that proof is not auditable.
       if [ "${DIFF_TRUNCATED}" = 2 ]; then
-        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer was told to fetch it itself. That fetch is NOT verifiable from here: treat the verdict as covering the code the reviewer could read, while the RECORD binds the full diff hash.\n\n' "'"
+        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself — and PROVED it: its `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. Treat the verdict as covering the whole diff; what it read beyond that proof is not auditable from here, while the RECORD binds the full diff hash.\n\n' "'"
       else
-        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself. That fetch is NOT verifiable from here: treat the verdict as covering the code the reviewer could read, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
+        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself — and PROVED it: its `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. Treat the verdict as covering the whole diff; what it read beyond that proof is not auditable from here, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
       fi
     fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
@@ -1465,7 +1495,7 @@ if [ "$VERDICT" = clean ]; then
     # refuse a genuinely clean verdict (exit 9, after the review was paid for). The notes
     # are posted as their own comment instead; the artifact names that comment.
     if [ -n "$NOTES_CID" ]; then
-      printf 'The reviewer also left %s non-blocking (P3) note(s), quoted verbatim in comment %s on this PR — the `follow_up` disposition, not a verdict input.\n' \
+      printf 'The reviewer also left %s non-blocking note(s), quoted verbatim in comment %s on this PR — the `follow_up` disposition, not a verdict input (a note may repeat a severity label the reviewer quoted; it never blocks).\n' \
         "$(printf '%s\n' "$FINDINGS" | grep -c . )" "$NOTES_CID"
     fi
   } > "$COMMENT_FILE"
