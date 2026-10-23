@@ -467,6 +467,51 @@ RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX")" || die "$E_RECORD"
 LOG="$RUN_DIR/reviewer.log"
 PROMPT="$RUN_DIR/prompt.txt"
 COMMENT_FILE="$RUN_DIR/comment.md"
+# ⛔ NOTHING REVIEWER-CONTROLLED IS PUBLISHED UNREDACTED (P2, fresh review of #2288 — measured
+# EXFILTRATION channel, not a style nit). The reviewer child inherits this process's environment
+# (the spawn strips `AI_REVIEW_GATE_KEY` and nothing else), its prompt hands it ATTACKER-WRITTEN PR
+# body/diff/issue text with bash available, and its own output is published VERBATIM into a PUBLIC
+# PR comment on BOTH paths (`$FINDINGS`, and the not-clean `tail -80` of the transcript). A
+# prompt-injected `[P1] x.sh:1 — GH_TOKEN=<value>` line is `SEV_RE`-matched and lands in that
+# comment with no redaction: one stripped variable closed the marker-minting key and left every
+# other credential in place. The channel is therefore closed at the PUBLISHING CHOKEPOINT
+# (`post_comment`), not by enumerating what a child may keep: values of secret-shaped variables are
+# scrubbed by VALUE (whatever they are), and GitHub token FORMATS by SHAPE (recognisable without
+# knowing the value). Values under 8 characters are skipped so a short variable cannot redact the
+# prose it appears in; the token shapes carry their own minimum length.
+SECRET_VALUES=()
+for _sv in $(compgen -e 2>/dev/null || true); do
+  case "$_sv" in
+    *TOKEN*|*_KEY|*KEY_*|*SECRET*|*PASSWORD*|*PASSWD*|*_PAT|*CREDENTIAL*)
+      _svv="${!_sv:-}"
+      [ "${#_svv}" -ge 8 ] || continue
+      case "$_svv" in *[[:space:]]*) continue ;; esac
+      SECRET_VALUES+=("$_svv")
+      [ "${#SECRET_VALUES[@]}" -ge 64 ] && break ;;
+  esac
+done
+unset _sv _svv
+# redact_file <src> <dst> — write <src> to <dst> with credential values/shapes replaced. The caller
+# must post <dst> (not <src>), so the body-equality fallback in `post_comment` still compares the
+# bytes that were actually published.
+redact_file() { # <src> <dst> -> 0, or 1 when the body could not be built
+  local src="$1" dst="$2" blob v n
+  [ -r "$src" ] || return 1
+  blob="$(cat "$src" 2>/dev/null)" || return 1
+  blob="$(printf '%s' "$blob" | sed -E \
+    -e 's/gh[pousr]_[A-Za-z0-9]{20,}/[REDACTED:github-token]/g' \
+    -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED:github-pat]/g' 2>/dev/null)" || return 1
+  for v in ${SECRET_VALUES[@]+"${SECRET_VALUES[@]}"}; do
+    [ "${#v}" -ge 8 ] || continue
+    n=0
+    while [ "${blob#*"$v"}" != "$blob" ] && [ "$n" -lt 500 ]; do
+      blob="${blob%%"$v"*}[REDACTED:secret]${blob#*"$v"}"
+      n=$((n + 1))
+    done
+  done
+  printf '%s\n' "$blob" > "$dst" 2>/dev/null || return 1
+  return 0
+}
 # The transcript is the AUDIT TRAIL of a refusal ("the reviewer said ISSUES 2" is
 # checkable only if its output survives). It is copied OUT of the scratch dir on
 # exit — a message that names a path the trap then deletes names nothing.
@@ -661,6 +706,14 @@ run_reviewer() { # <secs> <log> <prompt-file>
   # GH_TOKEN/GH_REPO, which is all the verification it does.
   ( cd "$RUN_DIR" && exec env -u AI_REVIEW_GATE_KEY "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
   pid=$!
+  # ⛔ A KILLED SEAM MUST NOT LEAK A PAID REVIEWER (P3, fresh review of #2288 — measured): only an
+  # EXIT trap was installed, so SIGTERM to this script left the `pi -p` child ALIVE (child ppid =
+  # this script before, `kill -0` true 2 s after the parent died) — a full provider call running to
+  # completion with its output read by nobody, on the load-gated cells `spawn-gate.sh` exists to
+  # protect. The handler kills the CHILD (TERM, then KILL after a short grace, mirroring the
+  # watchdog) and then exits 143 so the EXIT trap still removes the scratch dir. The trap is reset
+  # after the wait, so a later signal in this process cannot target a recycled pid.
+  trap 'kill -TERM "${pid:-}" 2>/dev/null; sleep 1; kill -KILL "${pid:-}" 2>/dev/null; exit 143' INT TERM HUP
   while kill -0 "$pid" 2>/dev/null; do
     elapsed=$(( $(date +%s) - start ))
     if [ "$elapsed" -ge "$t" ]; then
@@ -680,6 +733,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
   fi
   wait "$pid" 2>/dev/null; local rc=$?
+  trap - INT TERM HUP
   elapsed=$(( $(date +%s) - start ))
   # ⛔ TERMINATE THE CHILD'S LAST LINE BEFORE APPENDING OUR OWN (P3 label, measured — fresh review of
   # #2288). A reviewer whose output ends WITHOUT a trailing newline had this status line FUSED onto its
@@ -803,7 +857,14 @@ fi
 # (`—` as one character in UTF-8, three bytes in C), so the separator no longer depends on a
 # locale being present. The hyphen rule is preserved: `CLEAN-UP` still fails, because the class
 # is followed by `[[:space:]]+` and `-UP` has no space after it.
-VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[^[:alnum:][:space:]]+[[:space:]]+)'
+# ⛔ A MARKDOWN HEADING IS A VERDICT SPELLING TOO (P3, fresh review of #2288 — measured): `VD_LABEL`
+# accepts `#{1,6}` before `Verdict:` (§AG added it because a model closes with a heading) but the
+# BARE shape did not, so a reviewer closing `### CLEAN` was exit 6 "NO VERDICT" — a paid review
+# discarded and a re-run into the same refusal — while `### Verdict: CLEAN` recorded. Same
+# two-readers-drift class the `ISSUES — 2` fix closed, one shape over. The heading prefix is
+# harmless for the terminator rules below (`## CLEAN UP` still fails: `UP` is alphanumeric and the
+# `[^[:alnum:][:space:]]+` arm requires a decoration, not a word).
+VD_CLEAN='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[^[:alnum:][:space:]]+[[:space:]]+)'
 # ⛔ THE SHAPE MUST ACCEPT WHAT THE COUNT READER DOCUMENTS (P2, fresh review of #2288). The
 # count reader (`${LAST_LC#*issues}` + the separator class) and the comments in the count block
 # both name `ISSUES — 2` / `ISSUES — 0 × P1` as the realistic report closer, but THIS shape
@@ -812,7 +873,7 @@ VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[
 # discarded as NO VERDICT and was told to re-run into the same refusal. That is the same
 # two-readers-drift class this file already filed for the colon form, one shape over. The digits
 # stay MANDATORY, so `ISSUES —` with no count is still not a verdict (pin in §AM).
-VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*[][(:,—–,-]*[[:space:]]*[0-9]+'
+VD_ISSUES='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*[][(:,—–,-]*[[:space:]]*[0-9]+'
 # The CLOSING decoration is part of the shape, exactly as in VD_CLEAN above: `**Verdict: CLEAN**`
 # is what a model actually emits, and without this group the line failed to parse as a verdict at
 # all (exit 6 = NO VERDICT) while a hyphenated `**Verdict: CLEAN-UP …**` still refuses, because the
@@ -1481,6 +1542,38 @@ case "$VWORD" in
       err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
       die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
     fi
+    # ⛔ A CLEAN THAT COUNTS ITS OWN BLOCKING FINDINGS IS A VERDICT OF CONVENIENCE (P2, fresh review
+    # of #2288 — FAIL-OPEN class, measured). The count reader above reads ONLY the `ISSUES` token
+    # channel, so `**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff`
+    # recorded `clean` (rc 0, comment posted, signed head-bound record written) with a reported
+    # blocking finding in hand and no P-token on the line for the severity scan to see. It is the
+    # SAME contradiction as `ISSUES 2`, spelled in words, and the head commit fixed exactly this
+    # class one grammar over — so it is refused in every shape rather than grown into a grammar.
+    # ⛔ THE OVER-BLOCK IS DELIBERATE (category B direction, chosen over a false PASS): a CLEAN that
+    # means "and I repaired one" must say so with a resolved participle (fixed/addressed/resolved/
+    # closed/removed), which is the ONE exemption; a bare non-zero count refuses. `0 blocking
+    # findings` / `no blocking findings` are not counts of anything and stay clean.
+    # ⛔ THE COUNT MUST START A WORD (P2 guard against my own fix, caught by §AN): `CLEAN — 0 P1, 0 P2
+    # findings.` is a ZERO report, but a bare `[0-9]+` class read the `2 findings` INSIDE `0 P2
+    # findings` as a count of two and refused a clean review. The leading `(^|[^[:alnum:]])` group
+    # makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
+    # never a count.
+    CLEAN_COUNT_WORDS=""
+    while IFS= read -r _cm; do
+      [ -n "$_cm" ] || continue
+      _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
+      [ "${_cn:-0}" -gt 0 ] || continue
+      CLEAN_COUNT_WORDS="$_cm"; break
+    done <<<"$(printf '%s' "$LAST" \
+      | grep -oiE '(^|[^[:alnum:]])[0-9]+[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+      | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+    if [ -n "$CLEAN_COUNT_WORDS" ]; then
+      err "$PROG: the verdict line says CLEAN and ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
+      err "  accepted verdict line: $LAST"
+      err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
+      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
+    fi
     VERDICT=clean ;;   # a CLEAN line carries no count of its own
   issues)
     VERDICT=issues
@@ -1578,9 +1671,17 @@ fi
 # the caller would print an empty cause — the same class of silent-cause bug this command
 # exists to remove.
 post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
-  local out rc cid
+  local out rc cid body
   POST_CID=""; POST_ERR=""
-  out="$(env -u GH_REPO gh pr comment "$PR" --repo "$REPO" --body-file "$1" 2>&1)"; rc=$?
+  # ⛔ PUBLISH THE REDACTED BODY, NEVER THE FILE HANDED IN (P2, fresh review of #2288). Every
+  # reviewer-controlled byte that reaches a PR comment passes through here, so the credential
+  # scrubbing lives at THIS chokepoint rather than at the four call sites that compose bodies.
+  body="$RUN_DIR/comment-post.md"
+  if ! redact_file "$1" "$body"; then
+    POST_ERR="could not build the redacted comment body from $1"
+    return 1
+  fi
+  out="$(env -u GH_REPO gh pr comment "$PR" --repo "$REPO" --body-file "$body" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then POST_ERR="$out"; return 1; fi
   cid="$(printf '%s' "$out" | grep -oE '#issuecomment-[0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
   if [ -z "$cid" ]; then
@@ -1604,7 +1705,7 @@ post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
       return 1
     fi
     printf '%s' "$b64" | base64 -d > "$lastbody" 2>/dev/null || true
-    if ! cmp -s "$lastbody" "$1"; then
+    if ! cmp -s "$lastbody" "$body"; then
       POST_ERR="gh printed no comment URL and the NEWEST comment is not the body just posted (id=$cid is someone else's) — refusing to name a foreign artifact as the review evidence"
       return 1
     fi

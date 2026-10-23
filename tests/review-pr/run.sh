@@ -81,6 +81,13 @@
 #      count in the same line still blocks; and the `CLEAN — <prose>` separator is matched by a
 #      NON-ALNUM class rather than a multibyte bracket expression, so the arm still fires under
 #      `LC_ALL=C` (a bracket expression is a BYTE there) while `CLEAN-UP` stays prose in both locales
+#   §AP a CLEAN that reports its own findings in WORDS (`1 blocking finding remains`) is a verdict of
+#      convenience and is refused, while the zero report, the severity-labelled zero report
+#      (`0 P1, 0 P2 findings`) and a REPAIRED one (`1 finding fixed`) still record; a `### CLEAN`
+#      heading is a verdict spelling while `## CLEAN UP …` is not; a credential the reviewer printed
+#      (a `GH_TOKEN` VALUE and a raw `ghp_…` SHAPE) never reaches the published comment, while the
+#      finding around it survives; and SIGTERM to the seam takes the paid reviewer child with it
+#      (no orphan, nothing recorded, nothing posted). Three of the four carry a MUTATION control.
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -1772,11 +1779,130 @@ ck $rc "  …because the harness terminated the child's last line before appendi
 # from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim. It was
 # re-set to 447 when §ROUND 9 added 17 assertions and again to 478 when §ROUND 10 and the
 # nonce-bound tail proof added 32, and again to 499 when §AO added 21 (the executed producer, the
-# HTML-quotation arm, the CLEAN-with-a-count refusal and the trailing-newline fix), for the same
-# reason: a pin with slack lets that section be deleted silently.
+# HTML-quotation arm, the CLEAN-with-a-count refusal and the trailing-newline fix), and again to 526
+# when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
+# and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
+# silently.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 499 ]; ck $? "assertion-count pin: >= 499 assertions executed (section loss tripwire)"
+# ══ §AP a CLEAN that COUNTS ITS OWN FINDINGS in words, a heading-form CLEAN, no credential in a
+# published comment, and no orphaned reviewer on a signal (fresh review of #2288) ══
+echo; echo "§AP count-in-words CLEAN, heading CLEAN, credential redaction, no orphan on SIGTERM"
+# ⛔ THE COUNT CHANNEL IS NOT THE ONLY ONE (P2, FAIL-OPEN, measured — fresh review of #2288): the
+# clean arm read a count ONLY out of the `ISSUES` token, so a CLEAN that reported a blocking finding
+# in WORDS recorded clean with nothing for the severity scan to see.
+reset; printf '**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a CLEAN that reports '1 blocking finding remains' is refused, not recorded (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+no_comment; ck $? "  ...and nothing posted"
+reset; printf '**Verdict:** CLEAN — 3 blockers, all pre-existing.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  ...the same for a bare '3 blockers' (rc=$(rc_of))"
+no_record; ck $? "    ...nothing recorded"
+# COUNTER-DIRECTIONS: over-blocking every CLEAN that mentions a number would be category B, so the
+# zero report, the SEVERITY-labelled zero report and the repaired-one report must all still record.
+reset; printf '**Verdict:** CLEAN — 0 blocking findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...while '0 blocking findings' still records (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+reset; printf '**Verdict:** CLEAN — 0 P1, 0 P2 findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and a severity-labelled ZERO report is not a count of two (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+reset; printf '**Verdict:** CLEAN — 1 finding fixed and re-reviewed.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and a REPAIRED one (resolved participle) is still clean (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+# ⛔ MUTATION: the count arm made unfindable => the scenario above RECORDS. Without it, "1 blocking
+# finding remains" could pass because the line happened to fail some other check.
+MC="$TMP/mutant-count.sh"
+cp "$SRC" "$MC"; chmod +x "$MC"
+sed 's/^      CLEAN_COUNT_WORDS="\$_cm"; break$/      : "$_cm"/' "$SRC" > "$MC"
+if cmp -s "$SRC" "$MC"; then
+  fail "the count-arm mutation did not apply - this control proves NOTHING"
+else
+  reset; printf '**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff.\n' > "$TMP/reviewer-out"
+  run "$MC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT records the count-in-words CLEAN - so the arm is what refuses it"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "  ...and writes the false clean, the fail-open §AP catches"
+fi
+# ⛔ A HEADING IS A VERDICT SPELLING (P3, measured): `### CLEAN` was exit 6 while `### Verdict: CLEAN`
+# recorded, so a model that closes with a heading lost a paid review.
+reset; printf 'notes\n\n### CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a '### CLEAN' heading is read as the verdict (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  ...and recorded"
+reset; printf 'notes\n\n## CLEAN UP the guard next pass\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "  ...while '## CLEAN UP ...' is still NOT a verdict (rc=$(rc_of))"
+no_record; ck $? "    ...nothing recorded"
+# ⛔ A CREDENTIAL MUST NOT BE PUBLISHED (P2, EXFILTRATION, measured): the child keeps GH_TOKEN, the
+# prompt carries attacker-written PR text, and its output is posted verbatim to a PUBLIC comment.
+SECRET_FIX="s3cr3t-value-DO-NOT-PUBLISH-0123456789"
+GH_TOKEN="$SECRET_FIX"
+GH_TOKEN_SHAPE="ghp_$(printf 'A%.0s' $(seq 1 36))"
+export GH_TOKEN
+reset; printf '[P1] scripts/x.sh:7 - the guard reads env: GH_TOKEN=%s\nand a raw token %s\n**Verdict:** ISSUES 1\n' \
+  "$SECRET_FIX" "$GH_TOKEN_SHAPE" > "$TMP/reviewer-out"
+run "$SRC" 2284
+unset GH_TOKEN
+[ "$(rc_of)" = "7" ]; ck $? "a reviewer that prints a credential still yields the not-clean verdict (rc=$(rc_of))"
+if [ -f "$TMP/comment.md" ]; then
+  grep -qF "$SECRET_FIX" "$TMP/comment.md" && bad=1 || bad=0
+  [ "$bad" = "0" ]; ck $? "  ...and the PUBLISHED comment does NOT contain the GH_TOKEN value"
+  grep -qF "$GH_TOKEN_SHAPE" "$TMP/comment.md" && bad=1 || bad=0
+  [ "$bad" = "0" ]; ck $? "  ...nor the raw gh token SHAPE it printed"
+  grep -qF '[REDACTED:' "$TMP/comment.md"; ck $? "  ...the scrubbed line carries a [REDACTED:...] marker instead"
+  grep -qF 'the guard reads env' "$TMP/comment.md"; ck $? "  ...while the REVIEWER'S actual finding survives (redaction is not deletion)"
+else
+  fail "the not-clean comment was not posted at all (rc=$(rc_of)) - the redaction assertions above proved nothing"
+fi
+# ⛔ MUTATION: publishing the file handed in (no redaction) => the secret IS published.
+MR="$TMP/mutant-redact.sh"
+cp "$SRC" "$MR"; chmod +x "$MR"
+sed 's/^  if ! redact_file "\$1" "\$body"; then$/  if ! cp "$1" "$body"; then/' "$SRC" > "$MR"
+if cmp -s "$SRC" "$MR"; then
+  fail "the redaction mutation did not apply - this control proves NOTHING"
+else
+  GH_TOKEN="$SECRET_FIX"; export GH_TOKEN
+  reset; printf '[P1] scripts/x.sh:7 - the guard reads env: GH_TOKEN=%s\n**Verdict:** ISSUES 1\n' "$SECRET_FIX" > "$TMP/reviewer-out"
+  run "$MR" 2284
+  unset GH_TOKEN
+  if [ -f "$TMP/comment.md" ]; then
+    grep -qF "$SECRET_FIX" "$TMP/comment.md"; ck $? "the MUTANT publishes the secret - so the redaction is what removes it"
+  else
+    fail "the MUTANT posted no comment at all - the control proves NOTHING"
+  fi
+fi
+# ⛔ A SIGNALLED SEAM MUST NOT LEAK ITS PAID CHILD (P3, measured): only an EXIT trap existed, so
+# SIGTERM left `pi -p` running to completion with its output read by nobody.
+reset
+cat > "$TMP/bin/fake-pi-slow" <<'SLOWPI'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$FIXTURE_SLOW_PIDFILE"
+sleep 30
+SLOWPI
+chmod +x "$TMP/bin/fake-pi-slow"
+FIXTURE_SLOW_PIDFILE="$TMP/slow-child.pid"; export FIXTURE_SLOW_PIDFILE
+rm -f "$TMP/slow-child.pid"
+HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi-slow" \
+  REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" AI_REVIEW_GATE_KEY="$FIXTURE_SIGN_KEY" \
+  bash "$SRC" 2284 > "$TMP/out.txt" 2> "$TMP/err.txt" &
+SUT_PID=$!
+for _i in $(seq 1 200); do [ -s "$TMP/slow-child.pid" ] && break; sleep 0.05; done
+SLOW_CHILD="$(cat "$TMP/slow-child.pid" 2>/dev/null || true)"
+[ -n "$SLOW_CHILD" ] && kill -0 "$SLOW_CHILD" 2>/dev/null; ck $? "the slow reviewer child really started (pid=${SLOW_CHILD:-<none>})"
+kill -TERM "$SUT_PID" 2>/dev/null
+for _i in $(seq 1 200); do kill -0 "$SUT_PID" 2>/dev/null || break; sleep 0.05; done
+sleep 2
+[ -n "$SLOW_CHILD" ] && kill -0 "$SLOW_CHILD" 2>/dev/null && alive=1 || alive=0
+[ "$alive" = "0" ]; ck $? "  ...and SIGTERM to the seam takes the CHILD with it (alive=$alive)"
+no_record; ck $? "  ...nothing recorded from a killed run"
+no_comment; ck $? "  ...and nothing posted"
+# ══ end §AP ══
+
+[ "$PASS" -ge 526 ]; ck $? "assertion-count pin: >= 526 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
