@@ -318,6 +318,7 @@ const badSamples = [
   '/* block ' + OPEN + ' x }} */',                        // block comment
   'const u = "s/' + OPEN + ' x }}";',                     // string literal
   'const t = `t ' + OPEN + ' x }}`;',                     // template literal
+  'const r = /x' + OPEN + '2}}/;',                        // regex literal
 ];
 const badProblems = inspect(badSamples.map((script) =>
   ({ file: '<control>', job: '<control>', step: 0, script })));
