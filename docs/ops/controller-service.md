@@ -89,6 +89,19 @@ A service-managed controller must not fight its own verbs:
 An installed but **disabled** unit falls through to the tmux path: "disabled" is an operator saying this
 box is not service-managed.
 
+**Who may re-arm a stopped or failed unit is part of the contract.** A deliberate
+`systemctl stop eldato-orchestrator.service` (or `--uninstall`'s `disable --now`) does not remove
+`.desired`, so the cell's doctor loop still reaches its "controller absent → restart" arm on its next pass.
+That restart is an **automated** one (`ORCH_AUTOMATED_RESTART=1`), and it does **not** re-arm a unit the
+service manager reports not active: doing so would (a) undo the operator's stop, leaving the manager
+reporting `inactive` over a live dispatcher — the "reported stopped, still running" shape this whole file
+removes — and (b) clear the start-limit counter that is supposed to converge a configuration fault to
+`failed`, so a keyless cell would retry forever with every surface reading supervised. A human
+`cloud-cell-supervisor.sh start` **is** asking for exactly one more attempt: it clears the counter and
+starts the unit. Only another unit name can be installed beside another state dir's copy — `--install`
+**refuses** to overwrite a unit that provably supervises a different state dir, naming that dir and the
+override (`CONTROLLER_UNIT=…`) to use instead.
+
 **A unit belongs to ONE state dir, and the verbs read that rather than assume it.** The unit name is
 machine-scoped, so "the first unit file on the box" can be another cell's. Every unit this installer
 renders carries `Environment=O=<state dir>`, and `start` / `stop` / `status` resolve the copy that declares

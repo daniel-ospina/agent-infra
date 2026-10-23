@@ -40,6 +40,13 @@ Environment=PATH={{PATH}}
 # would leave the installer's own read-backs (`--status`, the heartbeat) watching one directory while the
 # controller used another.
 Environment=O={{O}}
+# ⛔ THE UNIT NAME THE VERBS ADDRESS IS CARRIED TOO (review P1, #2402). `install-controller-service.sh`
+# honours a `CONTROLLER_UNIT` override for the FILE name, and the supervisor's `start`/`stop`/`status`
+# default it to `eldato-orchestrator.service`: an install under any other name was invisible to every
+# cooperating verb — `stop` killed pids and printed "stopped" over a unit `Restart=always` revived within
+# RestartSec, `status` printed `supervision: NONE`, and `start` could take the tmux path beside an enabled
+# unit (#1761's two dispatchers). Rendering it makes the name ONE fact, read by whoever runs the verb.
+Environment=CONTROLLER_UNIT={{UNIT_NAME}}
 # ⛔ THE CONTROLLER IS THIS UNIT'S MAIN PROCESS, NOT A CHILD IN A SESSION. `start` sees this variable and
 # `exec`s the loop instead of creating a tmux session, so the unit's cgroup owns the controller's
 # lifetime. Every other verb cooperates with that: `stop` stops the UNIT (a pid kill is undone by

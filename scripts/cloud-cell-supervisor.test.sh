@@ -3607,6 +3607,39 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# keys.env cannot override a bound the INSTALLER validated (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# The unit renders `CONTROLLER_ORPHAN_TIMEOUT` / `CONTROLLER_HANDOVER_TIMEOUT` into its ENVIRONMENT so the
+# supervisor reads the values the installer proved fit StartLimitBurst inside StartLimitIntervalSec. But
+# `source_env_file` runs with `set -a`, so a `CONTROLLER_ORPHAN_TIMEOUT=3600` line in keys.env replaced the
+# validated 60 — and at 3600 the burst can never fill (3 x (3600+15) >> 300 s), so the unit restarted
+# forever while the template, the installer, the doc and `--status` all printed 60: exactly the pre-fix
+# state the arithmetic exists to remove. The re-assert is the same caller-describes-the-caller shape
+# ORCH_FOREGROUND already had; it is pinned structurally because a behavioural arm would have to park on
+# the very wait it bounds.
+say_case "keys.env cannot override the validated controller bounds (the caller's values survive the source)"
+_src_block="$(awk '/^ORCH_FOREGROUND_IN=/,/^export HOME=/' "$SUP" 2>/dev/null)"
+printf '%s' "$_src_block" | grep -q '^source_env_file' \
+  && ok 'env-file override: the snapshot/restore block straddles the source (non-vacuous)' \
+  || bad 'env-file override: the re-assert block does not surround source_env_file'
+for _v in ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT; do
+  printf '%s' "$_src_block" | grep -q "^${_v}_IN=" \
+    && ok "env-file override: $_v is SNAPSHOTTED before the source" \
+    || bad "env-file override: $_v is not snapshotted — a keys.env line would silently replace the value the installer validated"
+  printf '%s' "$_src_block" | grep -q "${_v}=\"\$${_v}_IN\"" \
+    && ok "env-file override: $_v is re-asserted AFTER the source" \
+    || bad "env-file override: $_v is not restored after source_env_file — keys.env can still win"
+done
+# ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
+# sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
+# it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.
+# Both halves are behavioural arms in install-controller-service.test.sh §C and cloud-cell-doctor.test.sh;
+# this pin fails if either end of the contract is deleted here.
+grep -q 'ORCH_AUTOMATED_RESTART' "$SUP" && grep -q '          return 4' "$SUP" \
+  && ok 'automated restart: the supervisor carries the fence and its rc=4 outcome' \
+  || bad 'automated restart: the ORCH_AUTOMATED_RESTART fence (or its rc=4 outcome) is gone from the supervisor'
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

@@ -203,6 +203,7 @@ render() {
         -e "s|{{START_TIMEOUT_SEC}}|$START_TIMEOUT_SEC|g" \
         -e "s|{{HANDOVER_TIMEOUT_SEC}}|$HANDOVER_TIMEOUT_SEC|g" \
         -e "s|{{O}}|$(sed_esc "$O")|g" \
+        -e "s|{{UNIT_NAME}}|$(sed_esc "$UNIT_NAME")|g" \
         -e "s|{{WANTED_BY}}|$WANTED_BY|g" \
         "$tpl" >"$dest" || return 1
     if grep -q '{{' "$dest"; then
@@ -223,6 +224,7 @@ verify_unit() {
              "Environment=CONTROLLER_ORPHAN_TIMEOUT=$START_TIMEOUT_SEC" \
              "Environment=CONTROLLER_HANDOVER_TIMEOUT=$HANDOVER_TIMEOUT_SEC" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
+             "Environment=CONTROLLER_UNIT=$UNIT_NAME" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
         grep -qxF -- "$k" "$f" || { err "REFUSING: the rendered unit does not carry '$k'"; return 1; }
@@ -447,6 +449,23 @@ do_install() {
         err "REFUSING: a unit is already installed at $other, and this run targets $UNIT_DIR/$UNIT_NAME."
         err "  Two ENABLED units are two supervisors for one queue (#1761). Remove the other one first:"
         err "    bash $0 --uninstall   # resolves the INSTALLED copy, then re-run --install"
+        return 1
+    fi
+    # ⛔ NEVER OVERWRITE A COPY THAT PROVABLY SUPERVISES ANOTHER STATE DIR (review P1, #2402). The guard
+    # above filters to OUR copies (`installed_units` skips foreign ones), so a unit file at the WRITE target
+    # that belongs to another state dir was not a competitor — it was something to `install -m 0644` over,
+    # and that is the #2402 defect caused by another cell's install: the overwrite strips that cell's
+    # `Restart=always`, its enabled unit then `ExecStart`s THIS cell's `O=`, and the damage lands BEFORE the
+    # controller proof, so this verb may still exit non-zero (or 0 on the heartbeat leg) with that cell's
+    # supervision already gone. `--status` and `--uninstall` refuse this exact case; `--install` is the one
+    # verb that writes, so it is the one that must refuse first. `cloud-cell-bringup.sh --check` re-runs
+    # `--install` every time, so this is the next bring-up, not an exotic state.
+    if [ -f "$UNIT_DIR/$UNIT_NAME" ] && ! unit_is_ours "$UNIT_DIR/$UNIT_NAME"; then
+        err "REFUSING: $UNIT_DIR/$UNIT_NAME already exists and supervises state dir '$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null)', NOT this one ($O)."
+        err "  Overwriting it would replace that cell's supervisor with this one — its controller would then run on"
+        err "  this state dir's queue (two dispatchers on one queue, #1761) or on none, with its Restart=always gone."
+        err "  Leave it alone and install this cell's unit under its own name: CONTROLLER_UNIT=eldato-orchestrator-$(basename "$O").service bash $0 --install"
+        err "  (or remove it from the cell that owns it: bash $0 --uninstall, run by that state dir)."
         return 1
     fi
 

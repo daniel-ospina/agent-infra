@@ -1976,6 +1976,7 @@ run_doctor() {
       # baseline on entry, so a stop landing between this launch and that snapshot (bash startup, the
       # whole source) would otherwise be invisible and the restart would complete after the stop.
       STOP_GENERATION_AT_LAUNCH="$PASS_STOP_GEN" \
+      ORCH_AUTOMATED_RESTART=1 \
       run_bounded "$CONTROLLER_START_TIMEOUT" bash "$SUPERVISOR" start >>"$O/logs/doctor.log" 2>&1 &
       local rpid=$!
       tmp="$ROLES_DIR/.restart.ident.tmp.$$"
@@ -1986,6 +1987,15 @@ run_doctor() {
       if [ "$rc" -eq 0 ]; then
         log "[doctor] controller restarted (supervisor start rc=0)"
         result="$result; controller RESTARTED"
+      elif [ "$rc" -eq 4 ]; then
+        # ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). `start` answers rc 4
+        # when an AUTOMATED restart would have to re-arm a unit the manager reports not active — a
+        # deliberate `systemctl stop` (`.desired` survives it, so this pass would otherwise undo the
+        # operator's stop within one pass) or a start limit that converged to `failed` (clearing it here
+        # is what made a keyless cell retry forever with every surface reading supervised). Honouring it is
+        # NOT a failed pass: the stop is the decision, and a failed unit is already what `--status` prints.
+        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop, or a start limit that converged to failed); a human 'cloud-cell-supervisor.sh start' re-arms it"
+        result="$result; controller restart not launched (service-managed, unit not active)"
       else
         log "[doctor] controller restart FAILED (supervisor start rc=$rc) — see $O/logs/doctor.log"
         result="$result; controller restart FAILED rc=$rc"

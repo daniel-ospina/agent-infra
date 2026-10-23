@@ -391,8 +391,27 @@ source_env_file() {
 # cgroup (#2402's defect, one indirection out). Snapshotted BEFORE the source, put back AFTER it — the
 # same shape as the HOME re-assert below.
 ORCH_FOREGROUND_IN="${ORCH_FOREGROUND:-0}"
+# ⛔ AN AUTOMATED RESTART IS NOT AN OPERATOR'S START (review P1, #2402), and keys.env must not be able to
+# say otherwise — the same caller-describes-the-caller rule as ORCH_FOREGROUND above. The doctor's restart
+# arm sets it; `cmd_start` refuses to re-arm a unit the service manager reports NOT ACTIVE under it (see
+# the service branch), so a `keys.env` line carrying it would make every operator `start` inert over a
+# stopped or failed unit.
+ORCH_AUTOMATED_RESTART_IN="${ORCH_AUTOMATED_RESTART:-0}"
+# ⛔ THE BOUNDS THE INSTALLER VALIDATED MUST BE THE BOUNDS IN FORCE (review P1, #2402). The unit renders
+# `CONTROLLER_*_TIMEOUT` into the ENVIRONMENT precisely so the supervisor reads the values the installer
+# proved fit StartLimitBurst inside StartLimitIntervalSec. But `source_env_file` runs with `set -a`, so a
+# `CONTROLLER_ORPHAN_TIMEOUT=3600` line in keys.env silently replaced the validated 60 — and at 3600 the
+# burst can never fill (3 x (3600+15) >> 300 s), so the unit restarted forever and every surface read
+# supervised: exactly the pre-fix state the arithmetic exists to remove, with the artifact the operator
+# reads still printing 60. Only a value the CALLER/unit actually provided is re-asserted; an unset one
+# legitimately comes from the env file (tmux mode has no unit to provide it).
+CONTROLLER_ORPHAN_TIMEOUT_IN="${CONTROLLER_ORPHAN_TIMEOUT:-}"
+CONTROLLER_HANDOVER_TIMEOUT_IN="${CONTROLLER_HANDOVER_TIMEOUT:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
+ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
+[ -z "$CONTROLLER_ORPHAN_TIMEOUT_IN" ]   || CONTROLLER_ORPHAN_TIMEOUT="$CONTROLLER_ORPHAN_TIMEOUT_IN"
+[ -z "$CONTROLLER_HANDOVER_TIMEOUT_IN" ] || CONTROLLER_HANDOVER_TIMEOUT="$CONTROLLER_HANDOVER_TIMEOUT_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -2135,6 +2154,23 @@ cmd_start() {
       # refuses every later start until `reset-failed`. An operator who fixes the key/repo/pin and runs
       # `start` is asking for exactly one more attempt, so the counter is cleared first — a no-op on a
       # healthy unit, and the start plus the controller proof below still decide.
+      # ⛔ AN AUTOMATED RESTART MUST NOT RE-ARM WHAT THE SERVICE MANAGER HAS STOPPED OR FAILED (review P1,
+      # #2402). Every branch above establishes that no controller of this cell is RUNNING, which is NOT the
+      # same fact as "the cell should be running": after a deliberate `systemctl stop` (the stop the unit's
+      # own doc tells an operator to use) the marker `.desired` survives, so the doctor's next pass 120 s
+      # later reaches this line — and `reset-failed` + `start` both (a) undoes the operator's stop, so the
+      # manager reports `inactive` over a live dispatcher (the "reported stopped, still running" shape this
+      # PR removes), and (b) CLEARS the start-limit counter that is supposed to converge a configuration
+      # fault to `failed` — measured against a keyless cell, which retried forever with every surface
+      # reading supervised. A HUMAN running `$0 start` is asking for exactly one more attempt, so the fence
+      # is scoped to the automated caller and reported as its own outcome (rc 4), never as a failure.
+      if [ "${ORCH_AUTOMATED_RESTART:-0}" = 1 ]; then
+        local ast=0; controller_unit_active_state || ast=$?
+        if [ "$ast" -ne 0 ]; then
+          say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop, or a start limit that converged to failed, is the operator's decision. Run '$0 start' to re-arm it."
+          return 4
+        fi
+      fi
       sup_systemctl reset-failed "$CONTROLLER_UNIT" >/dev/null 2>&1 || true
       sup_systemctl start "$CONTROLLER_UNIT" \
         || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"

@@ -238,6 +238,14 @@ if [ -f "$UNIT" ]; then
   u 'Environment=ORCH_FOREGROUND=1' \
     && ok 'the unit asks for FOREGROUND mode (the controller is the main process)' \
     || bad 'the unit does not request FOREGROUND mode — Restart= would supervise a launcher that exits'
+  # ⛔ THE NAME THE VERBS ADDRESS IS IN THE ARTIFACT (review round 8, #2402). `CONTROLLER_UNIT` was an
+  # advertised override the installer honoured for the FILE name only: an install as `other.service` was
+  # invisible to `cloud-cell-supervisor.sh {start,stop,status}`, which default the name — so `stop` printed
+  # "stopped" over a unit `Restart=always` revived within RestartSec, `status` printed `supervision: NONE`,
+  # and `start` could take the tmux path beside an enabled unit (#1761's two dispatchers).
+  u 'Environment=CONTROLLER_UNIT=eldato-orchestrator.service' \
+    && ok 'the unit CARRIES its own name — the supervisor reads it, so every verb addresses THIS unit' \
+    || bad 'the unit does not render CONTROLLER_UNIT — the verbs address a default name instead ($UNIT)'
   u "ExecStart=/bin/bash $SUP start" && ok "ExecStart runs the shipped supervisor's start" \
     || bad "ExecStart does not name the shipped supervisor ($SUP)"
   u "User=$(id -un)" && ok 'the service runs as the invoking user, not root' \
@@ -492,6 +500,67 @@ esac
 grep -q 'harness:' "$T/c2.out" \
   && ok 'start: a DISABLED unit falls through to the tmux path (the cell still starts)' \
   || bad "start: a DISABLED unit did not fall through to the tmux path — rc=$C2_RC $(cat "$T/c2.out")"
+
+# ── an AUTOMATED restart must not re-arm what the manager has stopped or failed ────────────────
+# ⛔ MEASURED FAILURE this arm exists for (review P1, #2402): `systemctl stop eldato-orchestrator.service`
+# (the stop the unit's own doc tells an operator to use) leaves `.desired` in place, so the doctor's next
+# pass — 120 s later — took the ABSENT→restart arm, called `start`, and that path did `reset-failed` +
+# `systemctl start` unconditionally. The manager then reported `inactive` over a live dispatcher (the
+# "reported stopped, still running" shape this PR removes) AND the start-limit counter was cleared on every
+# pass, so a keyless cell retried forever while the template, the installer and the doc all promised
+# convergence to `failed`. A HUMAN `start` is asking for exactly one more attempt; the fence is scoped to
+# the automated caller and answers rc 4 (its own outcome), never a failure.
+say_case 'an AUTOMATED restart does not re-arm a unit the service manager reports not active'
+C3="$(arm_root c3)"; mk_systemctl "$C3/bin" "$C3/state" "$C3/sc.log"; mk_tmux "$C3/bin" "$C3/tmux.log"
+: > "$C3/units/eldato-orchestrator.service"   # PRESENT  = service-managed
+: > "$C3/state/enabled"                      # ENABLED  = the manager owns its lifetime
+# NO `state/active`: the manager reports the unit not active — a deliberate stop, or a converged failure.
+: > "$C3/sc.log"
+SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup c3 start > "$T/c3.out" 2>&1; C3_RC=$?
+[ "$C3_RC" -eq 4 ] \
+  && ok 'start: an automated restart answers rc=4 (service-managed, not active) — its own outcome, not a failure' \
+  || bad "start: an automated restart did not report the service-managed refusal — rc=$C3_RC $(tail -3 "$T/c3.out")"
+grep -q 'reset-failed' "$C3/sc.log" 2>/dev/null \
+  && bad 'start: an automated restart CLEARED the start limit — a configuration fault then retries forever instead of converging to failed' \
+  || ok 'start: the start limit is left alone (a converged `failed` stays visible to the operator)'
+! grep -qxF 'start eldato-orchestrator.service' "$C3/sc.log" 2>/dev/null \
+  && ok 'start: the unit is NOT re-started behind a deliberate systemctl stop' \
+  || bad 'start: an automated restart re-started a stopped unit — the manager would report inactive over a live dispatcher'
+case "$(cat "$T/c3.out")" in
+  *'NOT re-arming'*) ok 'start: says WHY it did not re-arm, and how a human re-arms it' ;;
+  *) bad "start: refused silently — an operator sees a stopped cell with no reason: $(cat "$T/c3.out")" ;;
+esac
+# CONTROL: the SAME fixture, WITHOUT the marker — a human `start` still resets the counter and starts the
+# unit (the fence is the caller, not the state). CONTROLLER_START_TIMEOUT is short because this arm's stub
+# start produces no controller process, so `start` ends in its own proof failure (rc 1) after the calls the
+# arm asserts — the point is WHICH calls were made.
+: > "$C3/sc.log"
+SUP_EXTRA_ENV="CONTROLLER_START_TIMEOUT=2" sup c3 start > "$T/c3b.out" 2>&1 || true
+grep -q 'reset-failed' "$C3/sc.log" 2>/dev/null \
+  && ok 'start: a HUMAN start still clears the start limit (the fence discriminates on the caller)' \
+  || bad 'start: a human start no longer clears the start limit — an operator could not re-arm a failed unit'
+grep -qxF 'start eldato-orchestrator.service' "$C3/sc.log" 2>/dev/null \
+  && ok 'start: a HUMAN start still starts the unit' \
+  || bad 'start: a human start no longer starts a service-managed unit'
+
+# ── an install under a DIFFERENT unit name carries that name to the verbs ──────────────────
+# ⛔ `CONTROLLER_UNIT` IS AN ADVERTISED SEAM (header) AND THE VERBS DEFAULT THE NAME (review P1, #2402).
+# Rendered, the unit tells `cloud-cell-supervisor.sh` which unit it is; unrendered, an install under any
+# other name was invisible to `start`/`stop`/`status` — `stop` killed pids and printed "stopped" over a
+# unit `Restart=always` revived within RestartSec, `status` printed `supervision: NONE`, and `start` could
+# take the tmux path beside an enabled unit (#1761's two dispatchers). The template is resolved BY NAME,
+# so the fixture supplies a template under the overridden name — which is what makes the seam usable at
+# all, and is the state this arm pins.
+say_case 'an install under a DIFFERENT unit name carries that name to the verbs that address it'
+U1="$(arm_root u1)"; mk_systemctl "$U1/bin" "$U1/state" "$U1/sc.log"; mk_tmux "$U1/bin" "$U1/tmux.log"
+mkdir -p "$U1/tpl"; cp "$TPL" "$U1/tpl/eldato-orchestrator-alt.service"
+U1_RC=0; U1_OUT="$(TPL_DIR="$U1/tpl" EXTRA_ENV="CONTROLLER_UNIT=eldato-orchestrator-alt.service" inst u1 --install 2>&1)" || U1_RC=$?
+[ "$U1_RC" -eq 0 ] && [ -f "$U1/units/eldato-orchestrator-alt.service" ] \
+  && ok 'install: the override names the FILE it writes' \
+  || bad "install: CONTROLLER_UNIT was ignored — rc=$U1_RC $U1_OUT"
+grep -qxF 'Environment=CONTROLLER_UNIT=eldato-orchestrator-alt.service' "$U1/units/eldato-orchestrator-alt.service" 2>/dev/null \
+  && ok 'install: the unit carries ITS OWN name, so start/stop/status address the installed copy' \
+  || bad 'install: the unit does not render CONTROLLER_UNIT — every verb would address the default name instead'
 
 # ── an UNREADABLE is-enabled must REFUSE, not read as "not service-managed" ────────────────────────
 # ⛔ THE FAIL-OPEN THIS ARM EXISTS FOR (review P1): `systemctl is-enabled --quiet` answers "no" for both
@@ -1235,6 +1304,31 @@ OLA_U_RC=0; OLA_U_OUT="$(inst l1 --uninstall 2>&1)" || OLA_U_RC=$?
 [ "$OLA_U_RC" -eq 0 ] && [ ! -f "$OLA/units/eldato-orchestrator.service" ] \
   && ok 'uninstall: the OWNING state dir still uninstalls its own unit (the ownership read discriminates)' \
   || bad "uninstall: refused to remove the caller's OWN unit — the ownership read over-blocks: $OLA_U_OUT"
+# ⛔ THE VERB THAT *WRITES* WAS THE ONE WITH NO OWNERSHIP READ (review P1, #2402). `--status` and
+# `--uninstall` refused a foreign copy, but `do_install`'s duplicate-supervisor guard filters to OUR copies
+# (`installed_units`), so a unit at the WRITE target belonging to another state dir was not a competitor —
+# it was something to `install -m 0644` OVER. That overwrite is the #2402 defect caused by another cell's
+# install: the other cell's `Restart=always` is stripped, its enabled unit re-`ExecStart`s THIS cell's `O=`,
+# and the damage lands BEFORE the controller proof — so this verb can still exit non-zero (or 0 on the
+# heartbeat leg) with that cell's supervision already gone. `cloud-cell-bringup.sh --check` re-runs
+# `--install` every time, so this is the next bring-up, not an exotic state.
+say_case 'install REFUSES to overwrite a unit that provably supervises another state dir'
+OLA_R2=0; OLA_R2_OUT="$(inst l1 --install 2>&1)" || OLA_R2=$?
+[ "$OLA_R2" -eq 0 ] && [ -f "$OLA/units/eldato-orchestrator.service" ] \
+  && ok 'fixture: A installed its unit again (the overwrite arms need a foreign copy to protect)' \
+  || bad "fixture: A could not re-install, so the overwrite arms cannot run: $OLA_R2_OUT"
+cp "$OLA/units/eldato-orchestrator.service" "$OLA/unit.before" 2>/dev/null
+OLB_I_RC=0; OLB_I_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$OLA/units" inst l2 --install 2>&1)" || OLB_I_RC=$?
+[ "$OLB_I_RC" -ne 0 ] \
+  && ok 'install: REFUSED to write over another state dir’s unit' \
+  || bad "install: exited 0 after installing over ANOTHER state dir’s unit — that cell’s supervision is gone and nothing said so: $OLB_I_OUT"
+cmp -s "$OLA/unit.before" "$OLA/units/eldato-orchestrator.service" \
+  && ok "install: A's unit BYTES are unchanged (nothing was overwritten)" \
+  || bad "install: REPLACED another state dir’s unit file — its controller now runs on this cell's state dir, or on none"
+case "$OLB_I_OUT" in
+  *'supervises state dir'*) ok 'install: NAMES the state dir the existing unit supervises (not a bare refusal)' ;;
+  *) bad "install: refused without telling the operator whose unit it found: $OLB_I_OUT" ;;
+esac
 
 # — §L-iii: ownership is the RESOLUTION, not the rendered value (review P1, #2402) ———————————————————
 # The installer renders ITS `$O`; the controller re-sources `$ENV_FILE`, and this installer never sources it

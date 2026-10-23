@@ -447,6 +447,30 @@ doc doctor
 grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a started cell with no controller session restarts it" \
   || bad "doctor: did NOT restart the missing controller — $OUT"
 
+# ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). A deliberate
+# `systemctl stop` leaves `.desired` in place, so this pass still reaches the ABSENT→restart arm; the
+# supervisor answers rc 4 instead of re-arming the unit. Folding that into the FAILED arm would redden the
+# pass over the operator's own decision (and log "restart FAILED" every 120 s on a cell that is correctly
+# stopped), while folding it into the success arm would claim a restart that never happened.
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '4\n' > "$T/sup/rc"
+doc doctor; RC4=$?
+rm -f "$T/sup/rc"
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok 'doctor: the restart was attempted through the supervisor' \
+  || bad "doctor: never called the supervisor — the rc=4 arm cannot be reached: $OUT"
+case "$OUT" in
+  *'controller restart not launched'*) ok 'doctor: rc=4 is recorded as NOT LAUNCHED (service-managed), not as a failure' ;;
+  *) bad "doctor: rc=4 was not reported as a service-managed non-restart: $OUT" ;;
+esac
+case "$OUT" in
+  *'restart FAILED'*) bad 'doctor: reported a FAILED restart for a unit the manager deliberately stopped' ;;
+  *) ok 'doctor: a deliberate unit stop is not counted against the pass' ;;
+esac
+[ "$RC4" -eq 0 ] \
+  && ok 'doctor: the pass stays clean when the manager owns a stopped controller (rrc unchanged)' \
+  || bad "doctor: a service-managed non-restart reddened the pass (rc=$RC4) — the operator's stop would read as a doctor failure"
+
 # ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
 # `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a
 # tautology in `loop` mode (the only mode a cell runs), so a cell whose controller had DIED read
