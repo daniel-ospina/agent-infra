@@ -361,8 +361,8 @@ the pre-fix arm `tmux new-session -d -s X 'cd CWD && CMD'` produced **7 lines an
 (`You are not logged into any GitHub hosts`), while the same session with `export HOME=/tmp/cell-home;
 . $HOME/keys.env` produced **50 lines and rc=0**. Every lane alive on that box carried the prefix by
 hand, which is why the death reproduced for the controller and never for an operator. So the tmux arm
-now refuses **loudly** a spawn it cannot give a credential to (`wt_launcher_env` names the three
-places it looked) instead of starting a worker that will stop at its first `gh` call.
+now refuses **loudly** a spawn it cannot give a credential to (`wt_spawn` refuses and names every
+place it looked) instead of starting a worker that will stop at its first `gh` call.
 
 Two ordering rules in that contract are load-bearing, both measured (2026-10-22):
 
@@ -397,7 +397,8 @@ Around the spawn, three properties hold:
     `state/env-<worker>.sh` (0600, the exported names) — it is a login shell and inherits nothing;
   - a **tmux** worker gets `state/worker-<worker>` carrying `kind=tmux`, **`home=`** (the HOME it was
     given, i.e. where its credential came from), `cwd=` and `created=`, and its launch line is the
-    session's own command — `tmux list-panes -p -t '=merge-42' -F '#{pane_start_command}'`;
+    session's own command — `tmux list-panes -t '=merge-42' -F '#{pane_start_command}'` (no `-p`: tmux
+    3.4 answers `unknown flag -p` and exits 1);
   so the audit artifact exists on every surface, and the one that carries the environment contract
   says which HOME it carried;
 - **a worker's environment travels explicitly (on a cmux surface)** — a durable terminal does NOT
@@ -1300,15 +1301,18 @@ record that they existed. Today this is recovered by reading `git worktree list`
 ### Detecting a hung worker (do this first if the queue stops moving)
 
 `pi -p` has no internal timeout, so a reviewer or fixer can hang indefinitely — and because the
-concurrency caps count **live workers** (from the launcher's census: durable terminals on a cell, tmux
-sessions on macOS — §2.1), one hang permanently occupies a slot. Observed
+concurrency caps count **live workers** (from the launcher's census: `wt-*` workspaces where the cmux
+daemon answers, tmux sessions where it does not — on a Mac or a cell, §2.1), one hang permanently
+occupies a slot. Observed
 2026-10-12: three merge workers hung for 6–9 hours (one had spawned a `find /` that ran for 8
 hours), so half the merge capacity was dead weight overnight while the queue looked busy.
 
 ```bash
-# a worker whose log has not grown in 40+ minutes is hung. ⛔ READ THE CENSUS, NOT `tmux ls`: on a
-# cloud cell the workers are cmux durable terminals, so `tmux ls` answers EMPTY while every lane runs
-# (§2.1). `wt_table` prints `<worker>` TAB `<alive|dead|unknown>`; `unknown` means the census could not
+# a worker whose log has not grown in 40+ minutes is hung. ⛔ READ THE CENSUS, NOT `tmux ls`: where
+# the cmux daemon answers the workers are `wt-*` workspaces, so `tmux ls` answers EMPTY while every
+# lane runs; where the launcher is tmux (a Mac, or a cell whose guest cmux cannot answer — #2210) that
+# listing DOES name them, and an empty one then means no workers at all (§2.1). `wt_table` prints
+# `<worker>` TAB `<alive|dead|unknown>`; `unknown` means the census could not
 # be read and counts as ALIVE (fail-closed), which is the safe reading for a human too.
 bash -c '. "$HOME/orchestrator/worker-terminal.sh"; wt_table' | while IFS="$(printf '\t')" read -r s st; do
   [ "$st" = "dead" ] && continue
@@ -1331,8 +1335,8 @@ before exiting 1, so a BSD-first ladder is the bug itself. See §4's "capacity p
 `orch-loop.sh` now reaps these itself (`STALE_MIN`, default 40): the session is killed and the PR
 is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's claim.
 
-⛔ **That is ONE signal over ONE population** — the controller's own workers (durable terminals on a
-cell, tmux sessions on macOS), judged on log mtime, and only while the controller itself is alive. It
+⛔ **That is ONE signal over ONE population** — the controller's own workers (`wt-*` workspaces where
+cmux answers, tmux sessions where it does not), judged on log mtime, and only while the controller itself is alive. It
 also decides on a **single** mtime sample, with no CPU tolerance and no second observation. A lane on a
 box with no controller, or a process that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
 satisfying it.
@@ -1433,8 +1437,8 @@ it), and the controller's own `reap_stale_workers()` — which runs only while t
 `fix` alike. The doctor's bound is per-run and requires the lane's subtree to show no CPU delta, so
 the two in-tree reapers disagree; the doctor is the one this MUST is being met by.**
 `reap_stale_workers()` reaps only the controller's OWN
-`lane|merge|fix` workers — through the launcher's census, so on a cell they are durable terminals and
-not tmux sessions (§2.1) — on log-mtime staleness past `STALE_MIN` (default 40) —
+`lane|merge|fix` workers — through the launcher's census, so they are `wt-*` workspaces where the cmux
+daemon answers and tmux sessions where it does not (§2.1) — on log-mtime staleness past `STALE_MIN` (default 40) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
 launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
 `com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).

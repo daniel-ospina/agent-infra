@@ -37,8 +37,10 @@
 # cmux-tui SERVER (ppid = the daemon, not the caller), `cmux terminal wait-exit` says `pending`
 # while it runs and `exited code=N` once the command returns, and `cmux terminal close` ends it.
 # When the installed CLI DOES advertise the `surface` scope (the Mac host CLI), the exact primitive
-# named above is used instead. Both branches create a durable terminal; NEITHER falls back to tmux
-# on a cell — see `wt_launcher` for the one surface where tmux is still correct.
+# named above is used instead. Both branches create a durable terminal. Where NEITHER can run — the
+# cmux daemon does not answer — `wt_launcher` selects tmux: on a launchd Mac AND on a cell (#2210).
+# That arm, and only that arm, carries the `wt_launcher_env` contract below, because it is the one
+# surface whose worker inherits a FOREIGN environment (the tmux server's).
 #
 # ⛔ WHY THE ENVIRONMENT IS CARRIED EXPLICITLY. A tmux worker inherited the SERVER's environment, so
 # an exported O / PATH / API key reached it for free. A durable terminal's shell is a LOGIN shell
@@ -241,7 +243,13 @@ wt_launcher_env() {
   # that sourced it plainly would hold those values in the launch shell only and hand the lane it
   # starts NOTHING — the credential-less worker this gate exists to refuse, one layer down. `set +a`
   # follows immediately so the worker's own shell options are the caller's, unchanged.
-  [ -f "$keys" ] && printf '; set -a; . %s; set +a' "$(wt_q "$keys")"
+  [ -f "$keys" ] && printf '; set -a; . %s || exit 98; set +a' "$(wt_q "$keys")"
+  # ⛔ THE `|| exit 98` IS THE POINT (review finding, 2026-10-23). Without it a `keys.env` that fails
+  # to source — a syntax error, an unreadable file at pane time — left the environment PARTIALLY
+  # applied and ran the worker's command anyway; if the failed line was the token assignment that is
+  # again a credential-less lane on a spawn that returned 0 and wrote its record. `wt_runfile` below
+  # already dies on the same failure; the two surfaces must agree on whether a broken `keys.env` is
+  # fatal, and on a cell tmux is the only surface there is.
   # ⛔ HOME IS RE-ASSERTED AFTER THE SOURCE, and that is not belt-and-braces (review finding,
   # 2026-10-22). A `HOME=` line inside keys.env is exported by the `set -a` source above and would
   # OVERWRITE the HOME this gate just validated — measured: a file carrying `HOME=/home/cmux` left the
@@ -251,15 +259,26 @@ wt_launcher_env() {
   # cell home; post-source so the file cannot repoint it). `O` is emitted after the source for the
   # same reason.
   printf '; export HOME=%s' "$(wt_q "$home")"
-  # ⛔ THE WORKER MUST RESOLVE `gh`'s CONFIG THE WAY THE PROBE DID. `wt_gh_hosts` accepts
-  # `GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, but a tmux session does NOT inherit this shell's
-  # environment — so probing a repointed config dir and then starting a worker without it would be
-  # the same false provision this gate exists to refuse, one layer down (found reviewing this
-  # diff's own fix). Emitted only when it actually drove the probe.
+  # ⛔ THE WORKER MUST RESOLVE `gh`'s CONFIG THE WAY THE PROBE DID — IN BOTH DIRECTIONS.
+  # `wt_gh_hosts` accepts `GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, but a tmux session does NOT inherit this
+  # shell's environment — so probing a repointed config dir and then starting a worker without it would
+  # be the same false provision this gate exists to refuse, one layer down. The INVERSE is the same bug
+  # (review finding, 2026-10-23): when the probe used the DEFAULT (`$home/.config/gh`, neither variable
+  # set here), a worker that still inherits `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` — from the tmux SERVER's
+  # environment, or exported by the `keys.env` sourced under `set -a` just above — reads a DIFFERENT
+  # file than the one that was probed. Measured on 9b30d611 with a token-bearing caller HOME and
+  # `XDG_CONFIG_HOME` in the session env: `wt_launcher_env` returned 0, and the worker's `gh` would have
+  # read `<XDG>/gh/hosts.yml`, which in the fixture carries no token — a dead lane, reported provisioned.
+  # So the default case UNSETS both: the launch line, not the spawn caller's environment, decides where
+  # the worker's gh looks.
   if [ -n "${GH_CONFIG_DIR:-}" ]; then
     printf '; export GH_CONFIG_DIR=%s' "$(wt_q "$GH_CONFIG_DIR")"
+    printf '; unset XDG_CONFIG_HOME'
   elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
     printf '; export XDG_CONFIG_HOME=%s' "$(wt_q "$XDG_CONFIG_HOME")"
+    printf '; unset GH_CONFIG_DIR'
+  else
+    printf '; unset GH_CONFIG_DIR XDG_CONFIG_HOME'
   fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
   return 0
@@ -615,7 +634,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         # hardcode `$home/.config/gh/hosts.yml` while the probe goes through `wt_gh_hosts` (GH_CONFIG_DIR,
         # then XDG_CONFIG_HOME, then `$HOME/.config/gh`) — so on a repointed box the operator was sent to
         # a path that does not exist. A refusal must name the places it looked, not a guess at them.
-        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value) and the tmux server's GH_TOKEN, found none. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
+        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value), this caller's own GH_TOKEN/GITHUB_TOKEN (only when this spawn creates the server) and the tmux server's GH_TOKEN/GITHUB_TOKEN; found none in any of them. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
         return 1
       }
       if tmux new-session -d -s "$name" "$envpfx; cd $(wt_q "$cwd") && $cmd" 2>/dev/null; then

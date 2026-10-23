@@ -2346,8 +2346,11 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
-  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: where the cmux daemon answers a cell's lanes are durable
+  # terminals, so that answered 0 for a busy box. (The `grep -c` form is SIGPIPE-safe — it consumes all
+  # input — but it is still the wrong SOURCE: where the launcher is tmux (#2210) it lists only that
+  # surface, and the census is the one read that is right on both.) An unreadable census prints
+  # UNKNOWN, never 0.
   say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and

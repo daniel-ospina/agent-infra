@@ -1243,7 +1243,9 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
 # ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
-# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cell is in. The
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cmux-ANSWERING
+# cell is in (a cell whose guest cmux cannot answer runs tmux sessions instead, #2210, which the two
+# PROV_TMUX_ arms above cover). The
 # pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
 # lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
 rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"

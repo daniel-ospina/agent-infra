@@ -423,6 +423,44 @@ ck "…while a box whose credential lives in GH_CONFIG_DIR spawns (gh's own reso
 # WORKER cannot see — a false provision one layer down (found reviewing this diff's own fix).
 grep -q "export GH_CONFIG_DIR=" "$TMP/tmux4r.log" && rc=0 || { rc=1; cat "$TMP/tmux4r.log" 2>/dev/null; }
 ck "…and the launch line carries GH_CONFIG_DIR, so the worker's gh resolves the same file the probe read" $rc
+# ⛔ AND THE INVERSE, WHICH IS THE SAME BUG (review finding, 2026-10-23): when the probe used the
+# DEFAULT (`$home/.config/gh`, neither variable set in the caller), a worker that still inherits
+# `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` — from the tmux SERVER's environment, or exported by the `keys.env`
+# sourced under `set -a` — reads a DIFFERENT file than the one that was probed. Measured at 9b30d611:
+# the probe read `$home/.config/gh/hosts.yml` (token present) while the worker's gh would have read
+# `$XDG_CONFIG_HOME/gh/hosts.yml` (no token) — a dead lane on a spawn that returned 0. Driven for real:
+# the prefix is EXECUTED under `env -i` carrying both variables, and both are read back.
+cat > "$TMP/c8.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+unset GH_CONFIG_DIR XDG_CONFIG_HOME   # the CALLER probes the default; the worker must inherit nothing
+. "$1"
+printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
+SH
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4s" "$TMP/home-plain" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP/elsewhere" GH_CONFIG_DIR="$TMP/ghcd" /bin/bash -c "$pfx; printf 'XDG=[%s] GHCD=[%s]\n' \"\${XDG_CONFIG_HOME:-unset}\" \"\${GH_CONFIG_DIR:-unset}\"" 2>&1)"
+case "$envout" in *"XDG=[unset] GHCD=[unset]"*) rc=0 ;; *) rc=1; echo "      $envout";; esac
+ck "…and a DEFAULT-config probe UNSETS both, so an inherited config dir cannot repoint the worker's gh" $rc
+# ⛔ A `keys.env` THAT FAILS TO SOURCE IS FATAL (review finding): `wt_runfile` already dies (`|| exit
+# 98`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
+# and runs a credential-less lane on a spawn that returned 0 and wrote its record.
+rm -rf "$TMP/home-badkeys" "$TMP/O4t"; gh_hosts_fixture "$TMP/home-badkeys"
+printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
+ck "a keys.env that fails to source EXITS 98 (the worker never runs half-provisioned)" $rc
+# ⛔ A `hosts.yml` THAT IS A DIRECTORY IS NOT A CREDENTIAL (review finding): `-s` was true for any
+# object of non-zero size, and a directory has one. What refuses it here is the TOKEN READ — grep on a
+# directory fails, so the value test cannot pass (`[ -f ]` alone does not decide it, measured: with the
+# `-f` arm relaxed but the grep kept, this pin still passes). The pin covers the pre-fix predicate as a
+# whole, which was presence without a value.
+rm -rf "$TMP/home-dirgh" "$TMP/O4u"; mkdir -p "$TMP/home-dirgh/.config/gh/hosts.yml"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4u" "$TMP/tmux4u.log" "$TMP/home-dirgh" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a hosts.yml that is a DIRECTORY is not provision (refused, never spawned)" $rc
 # ... while the SAME pre-existing server is fine when IT carries the token (the positive control), so
 # the refusal is a probe of where the credential actually is, not a blanket ban.
 rm -rf "$TMP/O4i"
