@@ -2283,13 +2283,29 @@ cmd_stop() {
       # straight back, and the pid reads below can conclude before the new controller writes its lock —
       # so this verb would print "controller stopped (systemd …)" over a live dispatcher. Verify the
       # EFFECT, like every other read in this function: nothing of this state dir alive after the stop.
-      local _sw=0
-      while [ "$_sw" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
-        if [ -z "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
-        sleep 1; _sw=$((_sw + 1))
-      done
-      if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then
-        say "warn: $CONTROLLER_UNIT was stopped but a controller of this state dir (pid $(_pids_join "$(owned_controller_pids)")) is STILL running after ${_sw}s — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"; rc=1
+      # ⛔ BUT ONLY WHEN THE UNIT IS THE ADDRESSED SUPERVISOR (review P1, #2402). This check used to run
+      # unconditionally, i.e. also in the state the migration doc calls normal — a unit file that is
+      # installed but DISABLED, where `stop` is a deliberate no-op and the controller is a tmux session.
+      # There it slept the whole CONTROLLER_STOP_TIMEOUT over a controller this function had not killed
+      # yet, warned "not reporting a stop", set rc=1, and THEN killed it and printed success — and
+      # `harness-down` turns that contradiction into a refusal over a box that is in fact quiet. A
+      # definite "not enabled AND not active" (rc 1 from both reads) means the unit is not what runs the
+      # controller; the pid teardown below owns the claim then. An UNREADABLE answer (rc 3) stays
+      # conservative and waits.
+      local _en=3 _act=3
+      controller_unit_state; _en=$?
+      controller_unit_active_state; _act=$?
+      if [ "$_en" -eq 1 ] && [ "$_act" -eq 1 ]; then
+        : # installed-but-DISABLED → the tmux/pid teardown below is the mechanism that stops it
+      else
+        local _sw=0
+        while [ "$_sw" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
+          if [ -z "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
+          sleep 1; _sw=$((_sw + 1))
+        done
+        if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then
+          say "warn: $CONTROLLER_UNIT was stopped but a controller of this state dir (pid $(_pids_join "$(owned_controller_pids)")) is STILL running after ${_sw}s — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"; rc=1
+        fi
       fi
     else
       say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
@@ -2706,8 +2722,14 @@ start_doctor_loop() {
   # controller's command string. `safe_argv` covers every value EXCEPT two, which are safe by other
   # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
   # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
+  # ⛔ AND ORCH_FOREGROUND MUST NOT REACH THE DOCTOR (review P1, #2402). A tmux session is served from
+  # the SERVER's environment (this file documents that twice above), and on a service-managed cell the
+  # SERVER is first started by the unit's own `start`, which carries ORCH_FOREGROUND=1. Inherited here,
+  # the doctor's restart (`run_doctor` → `$SUPERVISOR start`) would take the FOREGROUND branch and `exec`
+  # the loop inside the doctor's tmux session — outside the unit's cgroup, with the start fence killing
+  # it at CONTROLLER_START_TIMEOUT. Pin it to 0 for the loop and everything it launches.
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; ORCH_FOREGROUND=0 HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
   sleep 2
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"

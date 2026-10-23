@@ -405,6 +405,20 @@ doc doctor
 grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a started cell with no controller session restarts it" \
   || bad "doctor: did NOT restart the missing controller — $OUT"
 
+# ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
+# `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a
+# tautology in `loop` mode (the only mode a cell runs), so a cell whose controller had DIED read
+# `controller RUNNING (no heartbeat recorded yet)`, the ABSENT→restart arm below was unreachable, and the
+# doctor never restarted it. This arm fakes exactly that state: a live, identity-matched loop record and
+# NO controller (no session, no lock owner, no heartbeat). The restart MUST still be launched.
+reset_tmux; reset_ps; reset_state
+rm -f "$T/sup/calls"; : > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+loop_up "$$"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: the doctor's own loop record does not witness a controller — a missing one is still restarted" \
+  || bad "doctor: reported a controller RUNNING from its OWN loop pid and did NOT restart it — $OUT"
+rm -f "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+
 # Present but stale: report, do not start (a live-but-slow controller is a P0 kill decision).
 printf 'orch\n' >> "$T/tmux/sessions"
 printf '1111\n' > "$T/tmux/panes/orch"

@@ -267,27 +267,35 @@ heartbeat_age() {    local hb="$O/heartbeat" t now age
 # the loop's pid; identity is checked as well as liveness, because a recycled pid is not our loop (#1178).
 # A plausible heartbeat is the second witness (the loop's own first cycle), so a cell whose lock the loop
 # has not taken YET — harness_apply + cmd_check run first — is not refused for the seconds it needs.
-controller_proof() {
-    local pid hb now
-    pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
+controller_proof() { # [<not_before_epoch>] — a heartbeat older than this start proves nothing
+    local pid hb now since="${1:-0}"
+    pid=""
+    [ ! -f "$O/.orch.lock" ] || pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
        && ps -o args= -p "$pid" 2>/dev/null | grep -qF "$O/orch-loop.sh"; then
         return 0
     fi
-    hb="$(tr -dc '0-9' <"$O/heartbeat" 2>/dev/null || true)"
+    hb=""
+    [ ! -f "$O/heartbeat" ] || hb="$(tr -dc '0-9' <"$O/heartbeat" 2>/dev/null || true)"
     case "${hb:-}" in ''|*[!0-9]*) return 1 ;; esac
     [ "${#hb}" -le 12 ] || return 1
     hb=$(( 10#$hb ))
     [ "$hb" -ge 1000000000 ] 2>/dev/null || return 1
     now="$(date +%s)"
     [ "$hb" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
+    # ⛔ A HEARTBEAT FROM BEFORE THIS START IS NOT A CONTROLLER THIS START PRODUCED (review P1, #2402).
+    # `start` is a NO-OP when the unit is already running, so a DEAD controller's leftover heartbeat —
+    # up to 2·CYC old, the bound below — certified a unit whose start produced nothing, and the verdict
+    # printed a pid for a controller that did not exist. The binding is skipped ONLY for an idempotent
+    # re-install, where the unit was already active and its heartbeat legitimately predates us.
+    [ "$hb" -ge "$since" ] || return 1
     # a heartbeat older than two cycles is not proof of a controller NOW (the same bound --status uses)
     [ "$(( now - hb ))" -le "$(( ${CYC:-240} * 2 ))" ]
 }
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
 do_install() {
-    local tpl tmpd changed=0 linger=0 pid rc
+    local tpl tmpd changed=0 linger=0 pid rc pre_active=0 started_at="" proof_since=0
     # ⛔ REFUSE AN ELEVATED INSTALL (review P2, #2402). `sudo bash install-controller-service.sh` renders
     # User=root / HOME=/root / O=/root/orchestrator, and verify_unit *requires* that — so the unit is green,
     # runs as root with root's keys.env and gh auth, and, because it is ENABLED, a later `start` delegates
@@ -364,7 +372,15 @@ do_install() {
     # ⛔ `start`, NOT `restart`: on an idempotent re-install of a HEALTHY unit, a restart would kill a
     # working controller (mid-merge, mid-dispatch) for no reason. `start` is a no-op when it is already
     # running, which is what "running the installer twice changes nothing" has to mean.
+    # ⛔ A HEARTBEAT MUST BE BOUND TO *THIS* START (review P1, #2402): a dead controller's leftover
+    # heartbeat certified a unit whose `start` produced nothing. `pre_active` is read BEFORE `start`
+    # because an idempotent re-install of a healthy unit must keep passing on that unit's older
+    # heartbeat — `start` is a no-op there, and the lock leg proves the controller anyway.
+    unit_active_state >/dev/null 2>&1 && pre_active=1
+    started_at="$(date +%s)"
     sc_run start "$UNIT_NAME" >/dev/null 2>&1 || true
+    proof_since=0
+    [ "$pre_active" = 1 ] || proof_since="$started_at"
 
     # ⛔ THE VERDICT IS THE UNIT *AND* A CONTROLLER. `is-active` alone is the false green: the unit is
     # active for the seconds before `start` dies on a missing key, a wrong repo or a foreign controller,
@@ -388,12 +404,12 @@ do_install() {
     [ "${pid:-0}" != "0" ] || { err "$UNIT_NAME is active with MainPID 0 — no controller process; read: journalctl -u $UNIT_NAME -n 40"; return 1; }
     local waited=0
     while [ "$waited" -lt "${CONTROLLER_PROOF_TIMEOUT:-240}" ]; do
-        controller_proof && break
+        controller_proof "$proof_since" && break
         # a unit that has already converged to `failed` will not produce a controller — stop waiting
         case "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" in failed) break ;; esac
         sleep 2; waited=$((waited + 2))
     done
-    controller_proof || {
+    controller_proof "$proof_since" || {
         err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s:"
         err "  expected the harness's lock ($O/.orch.lock) held by a live orch-loop.sh, or a heartbeat at $O/heartbeat."
         err "  An active unit whose start is about to die (no key, a foreign controller, a bad pin) converges to"
@@ -469,7 +485,15 @@ do_status() {
     esac
     say "enabled=$enabled"
     say "active=$active"
-    if pid="$(unit_main_pid 2>/dev/null)"; then say "main_pid=$pid"; else say "main_pid=UNREADABLE"; rc=1; fi
+    if pid="$(unit_main_pid 2>/dev/null)"; then
+        say "main_pid=$pid"
+        # ⛔ MainPID 0 IS NOT A CONTROLLER (review P1, #2402; do_install already refuses it). `is-active`
+        # reports `activating` during a RestartSec wait and this installer maps that to "active", so a
+        # readable-but-old heartbeat let `--status` return 0 for a unit with no controller process — while
+        # the doc promises it requires BOTH an active/enabled unit AND a controller MainPID. A heartbeat is
+        # evidence the loop TICKED once; it is not evidence one is running now.
+        [ "${pid:-0}" != "0" ] || { err "the unit is active with MainPID 0 — no controller process (the RestartSec/activating state, or a start that died): journalctl -u $UNIT_NAME -n 40"; rc=1; }
+    else say "main_pid=UNREADABLE"; rc=1; fi
     # NRestarts is the direct evidence for the issue's bullet 3/5 ("it comes back on its own"): a unit
     # that has restarted had a controller that died and was brought back without a human.
     local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) say "restarts=${nr#NRestarts=}" ;; *) say "restarts=unreadable" ;; esac

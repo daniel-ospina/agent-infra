@@ -1386,9 +1386,23 @@ run_hygiene() {
 # running") while `CONTROLLER STALE` became unreachable on exactly the box shape #2402 creates. `$who`
 # names what is up so the log stays true in both modes. Sets the caller's `result` (bash dynamic scope).
 controller_heartbeat_verdict() { # <who>
-  local who="$1" hb age
-  hb="$(cat "$O/heartbeat" 2>/dev/null)"
-  case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
+  local who="$1" hb t now age
+  hb=0
+  t="$(cat "$O/heartbeat" 2>/dev/null)"
+  # ⛔ A DIGIT RUN IS NOT NECESSARILY AN INSTANT (review P2, #2402) — the four guards
+  # install-controller-service.sh:253-264 documents, carried here because this helper is now the ONLY
+  # staleness signal on the service-managed path: `$(( ))` parses a LEADING-ZERO run as OCTAL while
+  # `[ ]` parses it as DECIMAL (a fabricated multi-year age), a FUTURE heartbeat makes the age NEGATIVE
+  # and `[ -N -le bound ]` is true for every negative (a DEAD controller reads FRESH forever), and a
+  # long run overflows. Anything unparseable is 0 — reported as "no heartbeat recorded yet", never fresh.
+  case "${t:-}" in
+    ''|*[!0-9]*) : ;;
+    *) if [ "${#t}" -le 12 ]; then
+         hb=$(( 10#$t ))
+         now="$(date +%s)"
+         if [ "$hb" -lt 1000000000 ] || [ "$hb" -gt "$(( now + 60 ))" ]; then hb=0; fi
+       fi ;;
+  esac
   if [ "$hb" -gt 0 ]; then
     age=$(( $(date +%s) - hb ))
     [ "$age" -ge 0 ] || age=0
@@ -1404,17 +1418,31 @@ controller_heartbeat_verdict() { # <who>
 }
 
 # Is a controller OF THIS STATE DIR running with no session? The harness's own single-instance lock
-# ($O/.orch.lock, taken by orch-loop.sh) is the authority; identity is checked as well as liveness, and
-# the loop's own record is the second witness. FALSE is safe here: a false negative falls through to the
-# pre-existing ABSENT→restart arm, which is what the doctor did before services existed.
+# ($O/.orch.lock, taken by orch-loop.sh) is the ONLY authority: liveness plus the #1178 identity rule.
+# FALSE is safe here: a false negative falls through to the pre-existing ABSENT→restart arm, which is
+# what the doctor did before services existed.
+# ⛔ FALSE IS SAFE; A FALLBACK WITNESS THAT CANNOT BE FALSE IS A FALSE PASS (review P0, #2402). This used
+# to end in `loop_alive`, which reads $ROLES_DIR/loop.pid — and run_loop() writes that file with its OWN
+# pid. Inside `doctor loop` (the only mode a cell runs: start_doctor_loop launches `doctor loop`) the
+# fallback was therefore a TAUTOLOGY: service_controller_present returned 0 for a cell whose controller had
+# died, the ABSENT→restart arm below became UNREACHABLE, and the doctor logged `controller RUNNING (no
+# heartbeat recorded yet)` over exactly the "dispatches nothing, reads as idle" defect #2402 exists to
+# remove — and over a start-limited `failed` unit that StartLimitBurst is designed to produce. A witness
+# must be able to say no; the controller's own lock owner is the only one that can.
+# ⛔ AND THE MATCH IS THE SHAPE `lock_controller_pid` USES (`<shell> <…/orch-loop.sh>`), NOT AN `$O/`
+# PREFIX: HARNESS_PIN_DIR is normally $CELL_HOME/harness, so the prefix form missed a live controller.
 service_controller_present() {
-  local pid
+  local pid c
+  [ -f "$O/.orch.lock" ] || return 1
   pid="$(tr -dc '0-9' < "$O/.orch.lock" 2>/dev/null || true)"
-  if num_ok "${pid:-}" && kill -0 "$pid" 2>/dev/null \
-     && ps -o args= -p "$pid" 2>/dev/null | grep -qF "$O/orch-loop.sh"; then
-    return 0
-  fi
-  loop_alive
+  num_ok "${pid:-}" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  c="$(ps -o command= -p "$pid" 2>/dev/null)" || return 1
+  # shellcheck disable=SC2086
+  set -- $c
+  [ "$#" -ge 2 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) return 0 ;; *) return 1 ;; esac
 }
 
 run_doctor() {
