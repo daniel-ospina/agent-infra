@@ -563,7 +563,32 @@ do_install() {
     # `since` binding below, so a landing inside that window accepted the DEAD incarnation's heartbeat (the
     # ≤2·CYC bound still passes) and exited 0 over a start that produced no controller — the precise false
     # PASS the binding exists to close. Only the literal word `active` skips the binding.
-    [ "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" = active ] && pre_active=1
+    # ⛔ ...AND `active` ALONE STILL CERTIFIES A DEAD INCARNATION (review P1, #2402). The literal word closes
+    # the `activating` window, but an ACTIVE unit also covers a FRESH LAUNCHER after the previous controller
+    # died: systemd has restarted the unit and `ExecStart` is still inside harness_apply/cmd_check (budgeted
+    # 600 s), so the heartbeat in $O is the DEAD incarnation's and its age still fits the <=2xCYC leg. Asking
+    # the process table settles it: a launcher that BEGAN AFTER the heartbeat cannot be its author. Same
+    # shape+age rule the lock leg uses, so an unprovable age fails CLOSED (and says so) rather than
+    # certifying - a false red here is an install that refuses, a false green is the #2402 defect.
+    if [ "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" = active ]; then
+        local _pre_pid _pre_hb _pre_rc
+        _pre_pid="$(unit_main_pid 2>/dev/null || true)"
+        _pre_hb=""
+        if [ -f "$O/heartbeat" ]; then _pre_hb="$(tr -dc '0-9' < "$O/heartbeat" 2>/dev/null || true)"; fi
+        if [ -z "${_pre_hb:-}" ]; then
+            # No heartbeat to bind: nothing can be certified from it, and the lock leg still decides.
+            pre_active=1
+        elif [ "${_pre_pid:-0}" = "0" ]; then
+            : # an active unit with no MainPID proves nothing about a heartbeat
+        else
+            _proc_began_after "$_pre_pid" "$_pre_hb"; _pre_rc=$?
+            case "$_pre_rc" in
+                1) pre_active=1 ;;
+                2) say "warning: cannot date MainPID $_pre_pid - NOT treating $UNIT_NAME as pre-active; a heartbeat predating this start will not certify it" ;;
+                *) : ;;
+            esac
+        fi
+    fi
     started_at="$(date +%s)"
     # ⛔ CLEAR A HIT START LIMIT FIRST (review P1, #2402). Converging to `failed` is this unit's DESIGNED
     # outcome for a configuration fault (3 attempts in 300 s), and systemd then REFUSES to start the unit

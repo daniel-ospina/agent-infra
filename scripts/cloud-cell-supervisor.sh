@@ -750,7 +750,12 @@ controller_unit_path() {
     # running controller alone, and its "stopped" was only caught by a pid watch whose window is shorter
     # than the surviving unit's own restart path. The copy that is RUNNING NOW is the one a stop must
     # address; an enabled copy is only the fallback (it is what will come back when nothing is up).
-    if [ -z "$act" ] && controller_unit_active_state >/dev/null 2>&1; then act="$f"; continue; fi
+    # ⛔ THE ACTIVE TIER IS THE LITERAL WORD (review P2, #2402). `controller_unit_active_state` maps
+    # `activating` to 0, and `activating` is the auto-restart window of a unit whose controller just exited —
+    # so ranking on it let an auto-restarting copy outrank the copy that is actually RUNNING, which is the
+    # exact mis-resolution the tiering was added to fix, one state wider. `reloading`/`activating` fall to the
+    # ENABLED tier; `--status` keeps the three-word mapping, which it needs for its own verdict.
+    if [ -z "$act" ] && [ "$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null)" = active ]; then act="$f"; continue; fi
     if [ -z "$en" ] && controller_unit_state >/dev/null 2>&1; then en="$f"; fi
   done < <(controller_unit_copies)
   # ACTIVE, else ENABLED, else the first of ours (a unit that is neither is still the one installed here).
@@ -2267,7 +2272,13 @@ cmd_start() {
           return 4
         fi
       fi
-      sup_systemctl reset-failed "$CONTROLLER_UNIT" >/dev/null 2>&1 || true
+      # ⛔ AND AN AUTOMATED RESTART NEVER CLEARS THE COUNTER (review P2, #2402). The fence above only exits
+      # for `inactive`/`failed`, while an auto-restarting unit is `activating`/`active` for almost all of its
+      # life — so `reset-failed` ran on exactly the state whose burst is still filling, and a slow-failing
+      # configuration fault (each attempt costing CONTROLLER_ORPHAN_TIMEOUT) restarted forever with `--status`
+      # reading `supervised`: the pre-fix state the StartLimit block, the doc and the installer's arithmetic
+      # all assert is gone. A HUMAN running `$0 start` is asking for one more attempt and keeps the reset.
+      [ "${ORCH_AUTOMATED_RESTART:-0}" = 1 ] || sup_systemctl reset-failed "$CONTROLLER_UNIT" >/dev/null 2>&1 || true
       sup_systemctl start "$CONTROLLER_UNIT" \
         || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
       # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.

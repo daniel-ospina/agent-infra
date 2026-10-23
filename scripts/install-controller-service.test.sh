@@ -580,6 +580,21 @@ grep -qxF 'start eldato-orchestrator.service' "$C3/sc.log" 2>/dev/null \
   && ok 'start: a HUMAN start still starts the unit' \
   || bad 'start: a human start no longer starts a service-managed unit'
 
+# …and an ACTIVE unit under the same automated caller must not have its counter cleared either. The fence
+# above only returns for `inactive`/`failed`; an auto-restarting unit is `activating`/`active` for almost
+# all of its life, so `reset-failed` ran on exactly the state whose burst is still filling — a slow-failing
+# configuration fault then restarted forever, re-running the network reads on every attempt, while
+# `--status` read `supervised` (review P2, #2402).
+: > "$C3/state/active"; printf 'active\n' > "$C3/state/isactive_word"; : > "$C3/sc.log"
+SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1 CONTROLLER_START_TIMEOUT=2" sup c3 start > "$T/c3c.out" 2>&1 || true
+grep -q 'reset-failed' "$C3/sc.log" 2>/dev/null \
+  && bad 'start: an automated restart cleared the start limit on an ACTIVE unit — the burst can never fill, so a config fault restarts forever' \
+  || ok 'start: an automated restart leaves the start limit ALONE even on an ACTIVE unit'
+grep -qxF 'start eldato-orchestrator.service' "$C3/sc.log" 2>/dev/null \
+  && ok 'start: …and it still starts the unit (the reset is what is skipped, not the start)' \
+  || bad "start: an automated restart no longer starts an ACTIVE unit at all: $(cat "$C3/sc.log")"
+rm -f "$C3/state/isactive_word"
+
 # ── an install under a DIFFERENT unit name carries that name to the verbs ──────────────────
 # ⛔ `CONTROLLER_UNIT` IS AN ADVERTISED SEAM (header) AND THE VERBS DEFAULT THE NAME (review P1, #2402).
 # Rendered, the unit tells `cloud-cell-supervisor.sh` which unit it is; unrendered, an install under any
@@ -1135,7 +1150,8 @@ sc=""; [ "\${1:-}" = "--user" ] && { sc=user; shift; }
 if [ "\$sc" = user ]; then S="$SU2/state-user"; else S="$SU2/state-system"; fi
 case "\${1:-}" in
   is-enabled) if [ -f "\$S/enabled" ]; then printf 'enabled\n'; exit 0; else printf 'disabled\n'; exit 1; fi ;;
-  is-active)  if [ -f "\$S/active"  ]; then printf 'active\n';  exit 0; else printf 'inactive\n'; exit 3; fi ;;
+  is-active)  if [ -f "\$S/isactive_word" ]; then cat "\$S/isactive_word"; exit 0; fi
+              if [ -f "\$S/active"  ]; then printf 'active\n';  exit 0; else printf 'inactive\n'; exit 3; fi ;;
   stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
   *)          exit 0 ;;
 esac
@@ -1168,6 +1184,20 @@ grep -qE '^--user stop eldato-orchestrator\.service$' "$SU2/sc.log" 2>/dev/null 
 grep -qxF 'stop eldato-orchestrator.service' "$SU2/sc.log" 2>/dev/null \
   && bad 'stop: ALSO stopped the dead system copy' \
   || ok 'stop: and it did not stop the copy it was not addressing'
+# (1c) `activating` IS NOT THE ACTIVE TIER (review P2, #2402). The tiers rank on the LITERAL word: a copy in
+# its auto-restart window is not the copy that is RUNNING, and the three-word `controller_unit_active_state`
+# mapping (which counts `activating`) put the restarting system copy first — the same mis-resolution one
+# state wider, and it costs a live controller a kill+revive and leaves the lock behind.
+rm -f "$SU2/state-system/enabled" "$SU2/state-system/active"
+printf 'activating\n' > "$SU2/state-system/isactive_word"
+rm -f "$SU2/state-user/isactive_word" "$SU2/state-user/enabled"; : > "$SU2/state-user/active"
+: > "$SU2/sc.log"
+SUP_EXTRA_ENV="CONTROLLER_USER_UNIT_DIR=$SU2/userunits" sup h1 stop > "$T/h1c.out" 2>&1
+grep -qE '^--user stop eldato-orchestrator\.service$' "$SU2/sc.log" 2>/dev/null \
+  && ok 'stop: an ACTIVATING system copy does not outrank the ACTIVE user copy (the running one wins)' \
+  || bad "stop: ranked the auto-restarting copy as ACTIVE and addressed the wrong manager: $(cat "$SU2/sc.log" 2>/dev/null)"
+rm -f "$SU2/state-system/isactive_word"
+
 # (2) a unit for ANOTHER state dir: never stopped on our behalf.
 SF="$(arm_root h2)"; mk_systemctl "$SF/bin" "$SF/state" "$SF/sc.log"; mk_tmux "$SF/bin" "$SF/tmux.log"
 : > "$SF/state/enabled"; : > "$SF/state/active"
@@ -1690,7 +1720,11 @@ done
 # …and the positive control: a unit that is literally `active` keeps passing on its older heartbeat,
 # because `start` is a no-op on a healthy unit and its heartbeat predates this run by design.
 PC="$(arm_root pc)"; mk_systemctl "$PC/bin" "$PC/state" "$PC/sc.log"
-printf 'active\n' > "$PC/state/isactive_word"; : > "$PC/state/active"; printf '4242\n' > "$PC/state/mainpid"
+printf 'active\n' > "$PC/state/isactive_word"; : > "$PC/state/active"
+# ⛔ A REAL MainPID THAT PREDATES THE HEARTBEAT: a nonexistent pid is UNPROVABLE, and unprovable now
+# fails CLOSED (the installer refuses), so the arm must seed one the process table can date. This suite
+# started before the seeded heartbeat, so its own pid is exactly that process.
+printf '%s\n' "$$" > "$PC/state/mainpid"
 printf '%s\n' "$(( $(date +%s) - 30 ))" > "$PC/o/heartbeat"
 # ⛔ `SC_PROOF=none`: the stub's `start` writes a FRESH heartbeat, which would certify the run no matter
 # what `pre_active` did — a green check that cannot fail. With `none` the ONLY heartbeat is the seeded
@@ -1699,6 +1733,53 @@ printf '%s\n' "$(( $(date +%s) - 30 ))" > "$PC/o/heartbeat"
 PC_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst pc --install > "$T/pc.out" 2>&1 || PC_RC=$?
 [ "$PC_RC" -eq 0 ] && ok 'install: an ACTIVE unit still re-installs idempotently on its older heartbeat (the binding is not a treadmill)' \
                    || bad "install: refused a healthy ACTIVE unit's idempotent re-install — the pre_active arm is too strict: $(cat "$T/pc.out")"
+
+# ── the installer's $O is RESOLVED, so it recognises the unit it installed (review P1, #2402) ──────
+# The controller SOURCES $ENV_FILE after the unit's own `Environment=O=`, so a `keys.env` carrying `O=` wins.
+# `unit_owner_dir` reports that RESOLVED dir; if the installer compares it against its own RAW $O, the cell's
+# own installed unit reads as another state dir's — `--uninstall` then prints "not installed ... nothing to
+# do" and exits 0 over an enabled `Restart=always` unit it never disabled (the false PASS on the one removal
+# verb), and `--install` refuses the unit it just rendered, which kills the bring-up's `--check`.
+say_case "keys.env repointing \$O does not make the cell's OWN unit foreign"
+KY="$(arm_root ky)"; mk_systemctl "$KY/bin" "$KY/state" "$KY/sc.log"
+printf 'O=%s\n' "$KY/o2" > "$KY/home/keys.env"
+mkdir -p "$KY/o2"
+{
+  printf 'Environment=O=%s\n' "$KY/o"
+  printf 'Environment=ENV_FILE=%s\n' "$KY/home/keys.env"
+  printf 'Environment=CELL_HOME=%s\n' "$KY/home"
+} > "$KY/units/eldato-orchestrator.service"
+: > "$KY/sc.log"
+KY_RC=0; inst ky --uninstall > "$T/ky.out" 2>&1 || KY_RC=$?
+grep -q '^disable' "$KY/sc.log" 2>/dev/null \
+  && ok 'uninstall: a unit whose keys.env repoints the state dir is still OURS (it is disabled, not ignored)' \
+  || bad "uninstall: skipped the cell's own unit as foreign — its Restart=always stayed armed: $(cat "$T/ky.out")"
+grep -qi 'not installed' "$T/ky.out" \
+  && bad "uninstall: reported 'not installed' over an armed unit — the false pass #2402 removes: $(cat "$T/ky.out")" \
+  || ok 'uninstall: and it does not claim "not installed" over a unit that is present'
+
+# ── `active` is not enough: the heartbeat must belong to the RUNNING process (review P1, #2402) ──
+# A unit is `active` for the whole window in which its FRESH LAUNCHER is still inside harness_apply /
+# cmd_check (budgeted 600 s) after the previous controller died — the heartbeat in $O is then the DEAD
+# incarnation's, and its age still fits the <=2xCYC leg. So `pre_active` must also require that the unit's
+# MainPID began at/before the heartbeat. A launcher that began AFTER it cannot be its author.
+say_case "an ACTIVE unit whose MainPID began AFTER the heartbeat does not certify the install"
+DL="$(arm_root dl)"; mk_systemctl "$DL/bin" "$DL/state" "$DL/sc.log"
+printf 'active\n' > "$DL/state/isactive_word"; : > "$DL/state/active"
+printf '%s\n' "$(( $(date +%s) - 100 ))" > "$DL/o/heartbeat"
+sleep 60 & DL_LATE=$!
+printf '%s\n' "$DL_LATE" > "$DL/state/mainpid"
+DL_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst dl --install > "$T/dl.out" 2>&1 || DL_RC=$?
+kill "$DL_LATE" 2>/dev/null || true
+[ "$DL_RC" -ne 0 ] && ok 'install: a launcher that began AFTER the heartbeat does NOT certify it (the dead incarnation wins nothing)' \
+                   || bad "install: certified an ACTIVE unit from a heartbeat older than its own MainPID — this is the #2402 false pass: $(cat "$T/dl.out")"
+# …and the same shape with the heartbeat ABSENT still installs: there is nothing to bind, and the lock leg decides.
+DN="$(arm_root dn)"; mk_systemctl "$DN/bin" "$DN/state" "$DN/sc.log"
+printf 'active\n' > "$DN/state/isactive_word"; : > "$DN/state/active"; printf '4242\n' > "$DN/state/mainpid"
+rm -f "$DN/o/heartbeat"
+DN_RC=0; CONTROLLER_PROOF_TIMEOUT=4 inst dn --install > "$T/dn.out" 2>&1 || DN_RC=$?
+[ "$DN_RC" -eq 0 ] && ok 'install: an ACTIVE unit with NO heartbeat is not refused (the binding has nothing to bind)' \
+                   || bad "install: refused an active unit with no heartbeat — the MainPID gate over-reaches: $(cat "$T/dn.out")"
 
 # ── a copy that supervises ANOTHER state dir is not ours to replace (review P2, #2402) ──────────────
 # `installed_units` lists only OURS, so a foreign unit at the target path was invisible to the write
