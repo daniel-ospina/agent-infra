@@ -611,8 +611,12 @@ do_status() {
         # ⛔ ENABLED IS GATED, NOT JUST PRINTED. A timer that is active now but NOT enabled does not
         # come back at the next reboot, so the box stops being advanced at the first restart — and the
         # install path checks this while the STATUS path did not (measured in review).
+        # ⛔ ONLY `enabled`. `static` means the unit has no `[Install]` section, so nothing links it into
+        # `timers.target` and it is gone at the next boot — the exact inert-after-reboot state this gate
+        # exists for. (The shipped template has `[Install]`; this is reachable only on a hand-edited or
+        # foreign unit, which is precisely when a gate earns its keep.)
         case "${ENABLED:-no}" in
-            enabled|static) ;;
+            enabled) ;;
             *) err "the timer is '${ENABLED:-no}', not enabled — it will not survive a reboot, so the harness stops being applied"; return 1 ;;
         esac
         ACTIVE="$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo no)"
