@@ -294,11 +294,16 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # keys on 75 alone will mis-read a disk refusal, and a caller that keys on the exit status alone will
 # mis-read a `pi` that exited 75 for its own reason. That is why the early contract here named only the load gate, and
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
-# a review that reached a verdict records a `needsfix-<PR>-<head>` marker only when it found ISSUES;
-# a run that never produced a verdict writes NONE (agent-infra#8602's `verdict_kind`, ported into
-# merge-one.sh), so it cannot authorise a fixer, burn a MAX_FIX_TRIES attempt or park the PR (the
-# #1716/#1720 class). Stated precisely here because this comment used to say the verdict-less case
-# DID write the marker — true before #8602, false after, and this file is what a caller reads.
+# merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings (and, since
+# agent-infra#2132, a `needsreview-<PR>-<head>` one for a run that produced NO USABLE VERDICT — which
+# is wider than "unparseable": a bare or zero-count `ISSUES` line and an empty final message both
+# land there. What the marker means is "no evidence exists at this head", never "the reviewer found
+# nothing"). ⛔ Note the DIFFERENT case one arm over: a CLEAN verdict with no comment URL is not
+# evidence either, but it PARKS at once (merge-one.sh's CLEAN arm) rather than writing `needsreview`
+# — a different marker and a different remedy, and the `ISSUES 0` class never reaches it, because the
+# classifier never reads a URL. Recording a
+# FINDINGS marker for a load refusal would authorise a fixer for a review that never happened, burn a
+# MAX_FIX_TRIES attempt and eventually park the PR (the same failure class as agent-infra#1716).
 AGENT_LOAD_REFUSED=75
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
@@ -390,11 +395,11 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ A REFUSAL AT THE SPAWN POINT IS THIS GATE'S OWN REFUSAL (agent-infra#1884). Without this arm
   # the installed `pi`'s 76 is read by every caller as "the agent ran and failed" — and the two
   # consequences are both real: fix-one.sh re-runs the merge chain for a fixer that never ran, and
-  # the refusal is mistaken for a review that RAN AND FAILED, which (#1716/#1720) is what burns a
-  # MAX_FIX_TRIES attempt and eventually parks the PR. Since #8602 a verdict-less run writes no
-  # `needsfix` marker at all, so the marker half is closed in merge-one.sh; this arm keeps the exit
-  # code distinct so a caller never has to infer "no agent ran" from a bare 76. The load is read
-  # twice on purpose (here, and again in the shim) — the band
+  # merge-one.sh's verdict arm would treat the refusal as a reviewer run that produced no verdict —
+  # which since agent-infra#2132 spends one of `MAX_REVIEW_TRIES` (and, before it, authorised a
+  # FIXER) for a REVIEW that never happened, burning a fix-loop attempt and eventually parking the
+  # PR (#1716/#1720 class). The arm below therefore writes NO marker at all. The load is read twice
+  # on purpose (here, and again in the shim) — the band
   # between them is milliseconds, and closing it by trusting an env marker from the caller would
   # hand the bypass back. So the SECOND refusal is translated into the FIRST: no agent ran
   # (AGENT_STARTED=0), the caller sees AGENT_LOAD_REFUSED, and no walltime row is written.
