@@ -28,16 +28,18 @@
 #
 # Hermetic: fixture repos, throwaway HOME/CELL_HOME, stubbed tools, no network, no real process read.
 set -u
-# ⛔ THE AMBIENT `REPO` IS NOT THIS SUITE'S INPUT — start from a known-empty one. `harness-up` now
-# PREFERS the caller's `REPO` (the WORK repo) over `--repo` (the HARNESS checkout), which is the whole
-# point of #2356, so a fixture that passes only `--repo` inherits whatever the shell exports. A fleet
-# shell exports `REPO=<its work repo>` and a cell's is a different checkout, so without this the suite
-# grades the ambient value: measured with `REPO=<a dir that is not a checkout>` **52 of 91 assertions
-# fail** for a reason that is not this code, while the same run with `REPO` unset is 0. That is a false
-# RED the next reader would attribute to the launcher — and it would also let an arm pass for the wrong
-# reason. Fixtures that need a work repo set it explicitly (`REPO="$WORK"` in (e)); (a)-(d) pass
-# `--repo` and want the launcher's own fallback answer.
-unset REPO HARNESS_REPO
+# ⛔ THE AMBIENT ENVIRONMENT IS NOT THIS SUITE'S INPUT — start from known-empty inputs. `harness-up`
+# now PREFERS the caller's `REPO` (the WORK repo) over `--repo` (the HARNESS checkout), which is the
+# whole point of #2356, so a fixture that passes only `--repo` inherits whatever the shell exports. A
+# fleet shell exports `REPO=<its work repo>`, and a shell that sourced a cell's `keys.env` (a documented
+# knob, harness-up's ENV_FILE) brings `REPO` in through the config seam instead. Without this the suite
+# grades the ambient value: measured on this tree, `REPO=<a dir that is not a checkout>` -> **52 of 91
+# assertions fail**, `ENV_FILE=<a file naming that dir>` -> **52 fail**, `HARNESS_PIN=<a bogus path>` ->
+# **12**, `O=<a bogus dir>` -> **8** — every one of them for a reason that is not this code, against a
+# header that claims hermeticity. That is a false RED the next reader attributes to the launcher, and
+# it also lets an arm pass for the wrong reason. Fixtures that need a work repo set it explicitly
+# (`REPO="$WORK"` in (e)); (a)-(d) pass `--repo` and want the launcher's own fallback answer.
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0
@@ -644,15 +646,32 @@ mkdir -p "$WORK"
   && git remote add origin "$WORK" ) >/dev/null 2>&1
 ck "(e) the work-repo fixture does NOT contain the pin commit (a foreign object DB)" \
    "$([ -n "$WORK" ] && ! git -C "$WORK" rev-parse --verify --quiet "$SHA_B^{commit}" >/dev/null 2>&1 && echo 0 || echo 1)"
-# The launcher, run with NO --repo, must resolve the harness from the harness tree it IS, and read the
-# pin there — not from the foreign work repo exported by the caller.
+# CANDIDATE 2 (`HARNESS_REPO`, which the fleet may export): the pin is read in the HARNESS repo, never in
+# the foreign work repo the caller exported as `REPO`. This arm supplies `HARNESS_REPO` ON PURPOSE —
+# candidate 3 (the launcher's own checkout) is the NEXT arm's subject. Conflating the two is how a suite
+# proves one candidate while its comment claims another.
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPAU=4 HU_NCPU=4 \
         HARNESS_UP_OS= bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
-ck "(e) a foreign REPO does not poison the pin read: pin is OK, not UNRESOLVABLE" \
+ck "(e) a foreign REPO does not poison the pin read: the pin resolves in HARNESS_REPO (pin: OK)" \
    "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …and it does NOT claim the pin is unresolvable" \
+   "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ CANDIDATE 3 (`git worktree list`, the launcher's OWN checkout) IS THE OPERATIVE CELL PATH, and it is
+# the one a `HARNESS_REPO`-carrying arm cannot cover: a cell's `keys.env` carries `OR` and `REPO` but NOT
+# `HARNESS_REPO` (docs/ops/fleet-harness-baseline.md), so the fallback is what resolves the harness there.
+# Run with NEITHER `--repo` NOR `HARNESS_REPO`, from a copy of the launcher living INSIDE the harness
+# fixture's worktree — `git worktree list` names the MAIN worktree first, so its own checkout IS the
+# harness repo — and the pin must resolve there. Without this arm, making the fallback revert to the work
+# repo (the exact conflation #2356 removes) left the suite at 0 failed.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --harness "$FH" --no-fetch 2>&1 )"
+ck "(e) with no --repo and no HARNESS_REPO the harness resolves from the launcher's OWN checkout (pin: OK)" \
+   "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and that fallback reads the pin in the harness repo, not the foreign work repo" \
    "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
 # The child env: REPO stays the WORK repo, HARNESS_REPO is the harness checkout. This is the half that
 # a `--repo <harness>` repair breaks, so it is asserted rather than assumed — WITH `--repo` PASSED.
