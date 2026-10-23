@@ -1855,7 +1855,7 @@ assert_eq "$RC" "3" "T55 --print-status still answers 3 for a fail-closed pass"
 assert_contains "$OUT" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
     "T55 --print-status carries the skipped repo and its reason"
 assert_absent "$ST_T55" "cannot run: " \
-    "T55 the class RAN, so it is never reported as `cannot run` (that field means could-not-be-set-up)"
+    "T55 the class RAN, so it is never reported as cannot-run (that field means could-never-be-set-up)"
 # and the reason survives a repo path that CONTAINS A SPACE: the skip line carries the path, so a
 # parser anchored on `skipped=<first token>` would silently anonymise exactly the repos most likely to
 # live under a hand-made directory — turning a named skip back into the class-wide verdict.

@@ -345,7 +345,12 @@ EOF
 refuse_systemd_unsafe_values() {
     local v
     [ "${TARGET:-}" = "launchd" ] && return 0
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER"; do
+    # ⛔ EVERY VALUE THE UNIT RENDERS AS A BARE `Environment=` BELONGS IN THIS LIST, including the ones
+    # added later: GH_BIN was rendered without being added here, so `GH_BIN="/opt/gh bin/gh"` passed the
+    # preflight (a path the shell can run) and rendered `Environment=GH_BIN=/opt/gh bin/gh`, which
+    # systemd splits into two assignments — the hourly delegate would then answer
+    # gh-missing(rc=127) for every repo for ever, which is the false PASS this whole change removes.
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER" "GH_BIN=${GH_BIN:-}"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
         esac
@@ -514,15 +519,30 @@ gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated 
     command -v "$ghbin" >/dev/null 2>&1 || { printf 'missing'; return 0; }
     # Run it with the SAME HOME the unit will carry, and with any inherited token removed, so the
     # answer is about the UNIT's environment rather than this shell's.
-    # ⛔ BOUNDED. `gh auth status` validates the token against the API, and a plain gh auth probe can
-    # hang for the life of the shell (rc=142 measured, recorded in orchestrator-harness/README.md).
-    # An installer that blocks before writing the unit gives the operator neither the warning nor an
-    # install — and the reaper it was replacing has already been stopped. 10s is a probe, not a
-    # pass: no timeout(1) means the probe runs unbounded, which is stated rather than hidden.
-    if command -v timeout >/dev/null 2>&1; then
-        HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN timeout 10 "$ghbin" auth status >/dev/null 2>&1
+    # ⛔ BOUNDED, ON EVERY PLATFORM. `gh auth status` validates the token against the API, and a plain
+    # gh auth probe can hang for the life of the shell (rc=142 measured, recorded in
+    # orchestrator-harness/README.md). An installer that blocks before writing the unit gives the
+    # operator neither the warning nor an install — and the reaper it was replacing has already been
+    # stopped.
+    # ⛔ NOT `command -v timeout` AND A FALLBACK TO UNBOUNDED: stock macOS ships neither `timeout` nor
+    # `gtimeout`, which is the very platform the launchd arm exists for, so that shape would be
+    # unbounded exactly where the hang was measured. The repo already owns this problem once
+    # (scripts/lib/bounded.sh: timeout -> gtimeout -> internal watchdog, #2046) and the installer
+    # already REQUIRES that file beside the reaper (T26), so the probe goes through it instead of
+    # growing a second resolver. The script never exits and sets no shell options, by its own contract.
+    local lib="${REAPER%/*}/lib/bounded.sh"
+    if [ -f "$lib" ] && [ "${TB_SOURCED_BY_INSTALLER:-0}" != 1 ]; then
+        # shellcheck disable=SC1090
+        . "$lib"
+        TB_SOURCED_BY_INSTALLER=1
+    fi
+    if [ "${TB_SOURCED_BY_INSTALLER:-0}" = 1 ] && command -v tb_timeout >/dev/null 2>&1; then
+        HOME="$home" tb_timeout 10 env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
     else
+        # No helper anywhere (a farmed installer without ../lib, which the install arm refuses anyway).
+        # Say so rather than implying a bound that is not there.
+        INSTALL_GH_PROBE_UNBOUNDED=1
         HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
     fi
@@ -551,8 +571,12 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
             err "  remedy: sudo -u $user -H gh auth login   (or install with the HOME the lanes actually use), then re-run this installer" ;;
     esac
     err "  the uv and venv classes are unaffected; each pass reports skipped=<repo> reason=<why> (#2443)"
+    [ "${INSTALL_GH_PROBE_UNBOUNDED:-0}" = 1 ] && \
+        err "  note: no bounded-execution helper was found beside the reaper, so this probe ran UNBOUNDED"
     return 0
 }
+
+# A probe that could not be run at all (no helper) is still a probe; the flag only describes it.
 
 
 # ── actions ────────────────────────────────────────────────────────────────────────────────────

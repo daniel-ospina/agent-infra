@@ -1071,7 +1071,20 @@ reap_worktree() {
         # match nothing — silently turning a named skip back into an anonymous fail-closed class.
         # `tr -d '[:space:]'` keeps a malformed/split token from becoming half a reason; the delegate
         # emits space-free tokens, so this only ever removes trailing whitespace in practice (#2443 P1).
-        _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
+        # ⛔ ONLY A FAILING DELEGATE CAN HAVE SKIPPED A REPO. The delegate echoes worktree paths verbatim
+        # on stdout, so a checkout whose directory name contains a newline followed by a
+        # `SKIPPED-REPO: …` line could otherwise forge a skip on a pass that skipped nothing — the same
+        # forge class the newline-in-a-label defect was. An rc=0 pass has no skip by construction, and
+        # the token must still have the shape this delegate emits (`name` or `name(rc=N)`).
+        _skip=""
+        if [ "$rc" != 0 ]; then
+            _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
+            case "$_skip" in
+                # The token alphabet only: name, optional `(rc=N)`. Anything else is echoed path
+                # text, not a verdict this delegate emits.
+                ''|*[!A-Za-z0-9._:\(\)=-]*) _skip="" ;;
+            esac
+        fi
         if [ -n "$_skip" ]; then
             SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
             SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
