@@ -1129,6 +1129,36 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" R
 gonerow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
 ck "(e) two MISSING paths are not the same repo — the row never reuses the record as OK [$gonerow]" \
    "$(case "$gonerow" in *'OK ('*) echo 1 ;; *'UNKNOWN'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE REFUSAL NAMES WHICH SIDE FAILED (review P2 ×2): an unresolvable work repo, a record about
+# another PATH, and a record about another ORIGIN are three different faults, and the row used to print
+# ONE sentence that named the work repo twice whenever the two strings matched — an operator was told its
+# own path was a different repo. Asserted per branch, so collapsing them back reds here.
+ck "(e) …and the unresolvable-work-repo case says so, instead of 'not the work repo <its own path>'" \
+   "$(case "$gonerow" in *'does not resolve to a directory'*) case "$gonerow" in *"not the work repo $GONENEW"*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+# A checkout with NO origin remote: the re-probe cannot answer, so the row's own REASON is what a reader
+# gets — the only way to observe the path/origin sentence without the probe rewriting the record first.
+NOORIGIN="$TMP/work-no-origin"
+mkdir -p "$NOORIGIN"
+( cd "$NOORIGIN" && git init -q -b main . && printf 'x\n' > README && git add README \
+  && git -c user.email=t@example.com -c user.name=t commit -qm noorigin ) >/dev/null 2>&1
+printf 'claims=reachable repo=%s at=%s\n' "$WORK" "$(date +%s)" \
+  > "$FRESHCELL/orchestrator/state/harness-claims"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$NOORIGIN" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+pathrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) a record about a DIFFERENT path names that path, and the failed re-probe is surfaced [$pathrow]" \
+   "$(case "$pathrow" in *"the record probed $WORK"*"not the work repo $NOORIGIN"*) echo 0 ;; *) echo 1 ;; esac)"
+printf 'claims=reachable repo=%s origin=%s at=%s\n' "$NOORIGIN" "$TMP/some-other-origin" "$(date +%s)" \
+  > "$FRESHCELL/orchestrator/state/harness-claims"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$NOORIGIN" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+origrow2="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) the same PATH with another ORIGIN names the ORIGIN side, not the path [$origrow2]" \
+   "$(case "$origrow2" in *"at origin $TMP/some-other-origin"*"origin is"*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ AND THE PATH IS NOT THE FACT (review P1): `refs/claims` reachability is a property of the checkout's
 # ORIGIN, and `$O/state` lives OUTSIDE the checkout — so a box re-cloned or repurposed AT THE SAME PATH
 # keeps the previous repo's answer for up to HU_CLAIMS_STALE. A record naming this path with a DIFFERENT
