@@ -1553,19 +1553,45 @@ for shape in unparseable-pid no-identity-record; do
 done
 reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
 
-# ── 19) THE LOOP SURVIVES ITS FIRST TICK, AND AN ABSENT MODE IS A LIVE PASS (agent-infra#2424) ────
-# ⛔ THE BUG THIS CASE EXISTS FOR: `run_loop` dispatches `run_role_pass doctor` with NO mode
-# argument, so `"$@"` expanded to nothing and every role's `local dry="$1"` read an UNBOUND `$1`
-# under `set -u` — the loop DIED on its first tick, every tick, on every cell, and nothing recorded
-# it (`doctor` is first in the tick, so it crashed; `reap`/`merge`/`hygiene` carried the same latent
-# bug). The `.desired`-absent fixture above could NOT see it: that loop exits BEFORE its first
-# dispatch, which is exactly why the crash survived three recorded instances on cell-4.
-# ⛔ A SUBCOMMAND-DRIVING test is VACUOUS here: the CLI always binds `$1` (to ""), so only driving
-# `loop` exercises the ABSENT-argument shape. And "it did not crash" is not the criterion either —
-# a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE pass.
-say_case "loop: the first tick dispatches, and an absent mode is a LIVE pass (#2424)"
+say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick and every role's BARE entry (#2135/#2424)"
+# ⛔ THE BUG THESE CASES EXIST FOR. `run_loop` dispatches `run_role_pass doctor|merge|hygiene` with NO
+# mode argument; `run_role_pass` forwards `"$@"`, so each role's `local dry="$1"` read an UNBOUND `$1`
+# under `set -u` and the loop DIED on its first tick — every tick, on every cell
+# (`cloud-cell-doctor.sh: line 1385: $1: unbound variable`). Doctor is first, so it crashed; reap,
+# merge and hygiene carried the identical latent crash. The suite above never saw it because its loop
+# fixture has no `.desired` and quenches BEFORE the first dispatch, and because every CLI verb binds
+# `$1` (to "") — so only the BARE call shape the scheduler uses is fatal.
+#
+# ⛔ THE ROLE SET IS DERIVED FROM THE DISPATCHER, NEVER SPELLED HERE. A hardcoded list covers the four
+# roles that exist today and silently ignores the fifth: a new role added to `run_role_pass` with a
+# bare `"$1"` (or with a non-empty default such as `"${1:---dry-run}"`) would crash — or, worse,
+# rehearse while the fleet believes the work was attempted — with this suite still green.
+ROLES="$(awk '/^run_role_pass\(\) \{/,/^\}/' "$DOCTOR" \
+         | sed -nE 's/^[[:space:]]*([a-z][a-z_]*)\)[[:space:]]+run_([a-z_]+).*/\1 \2/p')"
+ROLE_N="$(printf '%s\n' "$ROLES" | grep -c . || true)"
+if [ "${ROLE_N:-0}" -ge 4 ]; then
+  ok "roles: derived $ROLE_N dispatched role(s) from run_role_pass: $(printf '%s' "$ROLES" | awk '{printf "%s ", $1}')"
+else
+  bad "roles: found ${ROLE_N:-0} role arm(s) in run_role_pass — the derivation is broken, so every arm below is vacuous"
+fi
+# The derived name must BE the function the dispatcher calls, or the arms below would exercise a
+# function that is not wired to the role at all.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  if grep -qE "^run_${_f}\(\) \{" "$DOCTOR"; then
+    ok "roles: '${_r}' dispatches run_${_f}, which the script defines"
+  else
+    bad "roles: '${_r}' dispatches run_${_f}, which the script does NOT define — the derivation is wrong"
+  fi
+done <<<"$ROLES"
+
+# Arm A — the loop on a STARTED cell: no abort, and EVERY derived role records a pass.
+# ⛔ It owns its fixture. Measured false red without this: a `rail/sleep` left by an earlier case
+# (case 5 sets one to 2s) truncates the tick inside the 6s bound and this arm then reports the two
+# #2424 strings — "role 'merge' recorded NO pass" — for a doctor that is completely correct.
 reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
-: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not exit
+rm -f "$T"/gh/* "$T"/rail/* "$T"/sup/* "$T"/uv/* "$T"/wt/* 2>/dev/null || true
+: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not quench
 : > "$T/tmux/sessions"
 OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
        timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
@@ -1573,20 +1599,157 @@ case "$OUT" in
   *"unbound variable"*) bad "loop: DIED on its first tick (the #2424 abort) — $OUT" ;;
   *)                    ok "loop: the first tick dispatches with no unbound-variable abort" ;;
 esac
-for r in reap doctor merge hygiene; do
-  st="$T/o/state/roles/$r.state"
-  if [ ! -f "$st" ]; then bad "loop: role '$r' recorded NO pass (its state file is missing)"; continue; fi
+result_has "loop started" && ok "loop: it recorded the tick ('loop started')" \
+  || bad "loop: no 'loop started' line — $OUT"
+# "The loop survived" is NOT the acceptance: a loop that schedules nothing has fixed nothing.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  st="$T/o/state/roles/${_r}.state"
+  if [ ! -f "$st" ]; then bad "loop: role '${_r}' recorded NO pass (its state file is missing)"; continue; fi
   p="$(sed -n 's/^passes=//p' "$st")"
-  res="$(sed -n 's/^last_result=//p' "$st")"
-  { [ -n "$p" ] && [ "$p" -ge 1 ]; } \
-    && ok "loop: role '$r' recorded a pass (passes=$p)" \
-    || bad "loop: role '$r' recorded passes='${p}' — it never completed a pass"
-  case "$res" in
-    *"a rehearsal"*) bad "loop: role '$r' ran as a REHEARSAL (dry-run branch) with no flag — $res" ;;
-    *)               ok "loop: role '$r' ran LIVE (absent mode ≠ --dry-run)" ;;
+  { [ -n "$p" ] && [ "$p" -ge 1 ]; } && ok "loop: role '${_r}' recorded a pass (passes=$p)" \
+    || bad "loop: role '${_r}' recorded passes='${p}' — it never completed a pass"
+  # What this READS is exactly what it says: the record is not MARKED as a rehearsal. It is not the
+  # only guard — a rehearsal that exits on cannot-verify writes an UNMARKED record, so "empty means
+  # live" is pinned by the VALUE rule in arm C and proven behaviourally in arm D, not by this string.
+  case "$(sed -n 's/^last_result=//p' "$st")" in
+    *"a rehearsal"*) bad "loop: role '${_r}' recorded a REHEARSAL with no flag — empty must mean LIVE" ;;
+    *)               ok "loop: role '${_r}' did not record a rehearsal (the record is not marked as one)" ;;
   esac
-done
-reset_state; rm -f "$T/o/state/roles/.desired"
+done <<<"$ROLES"
+
+# Arm B — every role entry point called with NO ARGUMENT AT ALL, sourced from the script's own
+# define-only prelude so `set -u` is the FILE's, not the suite's. Arm A can only reach the roles the
+# tick dispatches, and every CLI verb binds `$1`; only this arm exercises the absent shape directly.
+PRELUDE="$T/doctor-funcs.sh"
+CASELINE="$(grep -n '^case "${1:-status}" in$' "$DOCTOR" | head -1 | cut -d: -f1)"
+if [ -n "$CASELINE" ] && [ "$CASELINE" -gt 100 ]; then
+  head -n "$((CASELINE - 1))" "$DOCTOR" > "$PRELUDE"
+  ok "bare-entry: the define-only prelude was extracted ($CASELINE lines of the doctor)"
+else
+  bad "bare-entry: could not find the CLI dispatch line — this arm cannot run (head=-n '${CASELINE}')"
+fi
+# ⛔ NON-VACUITY: an empty or truncated prelude would make every call below "command not found" (rc
+# 127) and read as a pass. Prove each function exists before trusting any result.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  if [ -s "$PRELUDE" ] && bash -c "source '$PRELUDE'; declare -F run_${_f} >/dev/null" 2>/dev/null; then
+    ok "bare-entry: run_${_f} is defined by the extracted prelude"
+  else
+    bad "bare-entry: run_${_f} is NOT defined by the prelude — the arm below would be vacuous"
+  fi
+done <<<"$ROLES"
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+  # No `.desired`: the doctor arm then takes its "cell is not started" path instead of starting a
+  # controller. The abort being pinned happens on the FIRST line of each role, before any of that.
+  OUT="$(bash -u -c "source '$PRELUDE'; run_${_f}" 2>&1)"; RC=$?
+  case "$OUT" in
+    *"unbound variable"*) bad "bare-entry: run_${_f} with NO argument DIED on an unbound variable — $OUT" ;;
+    *) ok "bare-entry: run_${_f} with NO argument returns (rc=$RC) instead of dying on \${1}" ;;
+  esac
+done <<<"$ROLES"
+
+# Arm C — the CLASS, not the four lines. Every `local` assignment that READS a positional must be
+# classified, and the classification is by VALUE:
+#   * `"${N:-}"`      → DEFAULTED to the empty string: absent means the caller's empty value;
+#   * `"${N:-<any>}"` → REJECTED: a default here would invent a mode (a rehearsal would arm itself);
+#   * bare `$N`       → permitted only when the bound name is one of the REQUIRED reads the audit
+#                       block documents (an empty role/pid/head is never a safe value).
+# ⛔ The classifier is a FUNCTION so the scanner itself can be tested: a shape-whitelist that cannot
+# see `local dry="${1}"` (or `local x="$1/derived"`) reports "clean" over the exact crash, which is
+# the fail-open shape this case exists to prevent. Both were measured blind in an earlier revision.
+audit_line() { # <text> -> "<verdict> <name> <read>" per positional read
+  local body="$1" assign var val rd
+  while read -r assign; do
+    [ -n "$assign" ] || continue
+    var="${assign%%=*}"; val="${assign#*=}"
+    case "$val" in *'$'[1-9]*|*'${'[1-9]*) ;; *) continue ;; esac
+    while read -r rd; do
+      [ -n "$rd" ] || continue
+      # A value that is ONLY the positional is a BINDING of it — the shape that must declare how it
+      # treats an absent argument. A value that merely USES the positional (`"$1/x"`) is derived: it
+      # cannot carry a default and inherits its function's contract, so it is REPORTED, not graded.
+      case "$val" in
+        "$rd"|"\"$rd\"") ;;
+        *) printf 'derived %s %s\n' "$var" "$rd"; continue ;;
+      esac
+      case "$rd" in
+        '${1:-}'|'${2:-}'|'${3:-}') printf 'defaulted %s %s\n' "$var" "$rd" ;;
+        '${'*':-'*)                 printf 'invented %s %s\n' "$var" "$rd" ;;
+        *)                          printf 'bare %s %s\n' "$var" "$rd" ;;
+      esac
+    done < <(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"$val")
+  done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
+}
+# The scanner's own contract on the shapes that matter, INCLUDING the two the whitelist missed.
+while IFS='|' read -r want text; do
+  [ -n "${want:-}" ] || continue
+  got="$(audit_line "$text" | cut -d' ' -f1 | head -1)"
+  [ "$got" = "$want" ] && ok "audit[self-test]: '$text' is classified '$want'" \
+    || bad "audit[self-test]: '$text' classified '${got:-<nothing>}' (want '$want') — the scanner is blind to a shape that crashes the scheduler"
+done <<'EOF'
+defaulted|local dry="${1:-}" s log
+invented|local dry="${1:---dry-run}" s log
+invented|local dry="${1:-0}" s log
+bare|local dry="${1}" s log
+bare|local dry="$1" s log
+bare|local x=$1
+derived|local d="$ROLES_DIR/.$1.lock"
+derived|local tmp="$1/.own.tmp.$$"
+bare|local d="$1" tmp="$1/.own.tmp.$$"
+EOF
+# …then the real file.
+REQUIRED_LOCALS=" role rc own d s pid pr head bound "
+AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0
+while IFS= read -r line; do
+  ln="${line%%:*}"; body="${line#*:}"
+  while read -r verdict var rd; do
+    [ -n "${verdict:-}" ] || continue
+    case "$verdict" in
+      defaulted) AUDIT_DEF=$((AUDIT_DEF + 1))
+                 ok "audit: $var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
+      invented)  bad "audit: $var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
+      derived)   AUDIT_DER=$((AUDIT_DER + 1))
+                 ok "audit: $var (line $ln) DERIVES from $rd — reported, not graded: a derived value cannot carry a default" ;;
+      *)         AUDIT_BARE=$((AUDIT_BARE + 1))
+                 case "$REQUIRED_LOCALS" in
+                   *" $var "*) ok "audit: $var (line $ln) REQUIRED — reads $rd bare; a caller bug is the right outcome" ;;
+                   *)          bad "audit: $var (line $ln) reads $rd BARE and is not on the REQUIRED list — decide it, do not imitate its neighbour" ;;
+                 esac ;;
+    esac
+  done < <(audit_line "$body")
+done < <(grep -nE '^[[:space:]]*local ' "$DOCTOR")
+[ "$((AUDIT_DEF + AUDIT_BARE + AUDIT_DER))" -ge 15 ] && [ "$AUDIT_DEF" -ge 4 ] \
+  && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_BARE required, $AUDIT_DER derived)" \
+  || bad "audit: classified only $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) reads ($AUDIT_DEF defaulted) — the scan is broken, so this arm proves nothing"
+# …and each dispatched role's mode read must BE the empty-defaulted one (the derived list again).
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  # ⛔ NO PIPE INTO `grep -q` (#841): under the suite's `pipefail` a quiet grep exits at its first
+  # match, awk takes SIGPIPE, and the pipeline status makes this `if` take the ELSE branch — the
+  # measured flake was one role failing while the other three passed on the SAME file.
+  if grep -q 'local dry="\${1:-}"' < <(awk "/^run_${_f}\\(\\) \\{/,/^\\}/" "$DOCTOR"); then
+    ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (the bare-dispatch shape the loop uses)"
+  else
+    bad "audit: run_${_f} does NOT read its mode as \"\${1:-}\" — a bare dispatch would kill or rehearse the scheduler"
+  fi
+done <<<"$ROLES"
+
+# Arm D — THE DIRECTION THAT MATTERS, behaviourally: with no flag a destructive verb ACTS, with
+# `--dry-run` it does not. Arm C pins the source value; this pins what the value DOES, so "empty
+# means live" cannot be satisfied by a comment.
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+mk_lane lane-42 4242
+doc reap --dry-run
+killed lane-42 && bad "rehearsal: 'reap --dry-run' KILLED the lane (a rehearsal took the destructive path)" \
+  || ok "rehearsal: 'reap --dry-run' killed nothing (the opt-in rehearsal still rehearses)"
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+mk_lane lane-42 4242
+OUT="$(bash -u -c "source '${PRELUDE:-/dev/null}'; run_reap" 2>&1)"; RC=$?
+killed lane-42 && ok "live: run_reap with NO argument REAPED the lane (empty mode = a live pass, rc=$RC)" \
+  || bad "live: run_reap with NO argument did NOT reap — an absent mode took the rehearsal path, rc=$RC — $OUT"
 
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo
