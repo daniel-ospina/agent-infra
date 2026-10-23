@@ -1783,16 +1783,22 @@ cat > "$T30/bin/gh" <<'EOF'
 for x in "$@"; do
   case "$x" in
     *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
-    *"/compare/"*)  printf 'mb\t%s\n' "${FIX_MB}"; printf '%s\n' "${FIX_ROWS}"; exit 0 ;;
+    *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then exit "$FIX_COMPARE_RC"; fi
+                     printf 'mb\t%s\n' "${FIX_MB}"; printf '%s\n' "${FIX_ROWS}"; exit 0 ;;
   esac
 done
 exit 1
 EOF
 chmod +x "$T30/bin/gh"
 HEX40="0123456789abcdef0123456789abcdef01234567"
+# HOME is ISOLATED here too: this seam writes nothing TODAY, and the assertion
+# below pins that. Without it a regression would mint owner-repo-42.json into the
+# LIVE ~/.pi/agent/reviews registry that the merge gate consumes — the same
+# defect class (30ix) exists to prevent, with a much worse blast radius.
+T30H="$T30/home"; rm -rf "$T30H"; mkdir -p "$T30H"
 tier_for() { # <changed_files_count> <rows...> → "<status>\t<tier>"
   local count="$1"; shift
-  PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
     FIX_COUNT="$count" FIX_ROWS="$(printf '%s\n' "$@")" \
     bash "$SRC" --print-tier 42 owner/repo 2>/dev/null
 }
@@ -1866,6 +1872,47 @@ T30_EMPTY="$(tier_for 0)"
 [ "$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')" = "$(printf 'ok\tfull')" ] \
   && pass "(30xiv) a rename OUT of scripts/admin-merge.sh is FULL — both ends are classified even though only one is counted" \
   || fail "(30xiv) a rename out of the rail was not full (got '$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')')"
+
+# The diff-identity producer and the CI/pre-commit gate bodies (cycle-2 F1): the
+# recorder's own argument ("leaving it out would be a one-line bypass") applies
+# verbatim to the ONE implementation of the diff digest.
+for f in scripts/lib/diff-normalize.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit; do
+  [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
+    && pass "(30xvi) $f is ALWAYS-FULL" \
+    || fail "(30xvi) $f did NOT select full — a gate body is outside the class"
+done
+
+# A compare that fails while the pulls read SUCCEEDS is positive evidence (the
+# API is reachable and refuses THIS revision — a fork head over 404), not
+# transport. Classifying it as transport let a fork PR editing a rail record
+# clean-micro with one stderr line (cycle-2 P1).
+T30_CMP_RC="$(FIX_COMPARE_RC=1 PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_CMP_RC" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xvii) a compare non-2xx (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — positive evidence, no tier" \
+  || fail "(30xvii) a compare non-2xx was read as transport (got '$T30_CMP_RC')"
+
+# ...and on the RECORD path the same response must refuse, like its clean-low
+# sibling does 60 lines later.
+rm -rf "$T30H/.pi/agent/reviews"
+FIX_COMPARE_RC=1 HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
+T30_CMP_GUARD_RC=$?
+[ "$T30_CMP_GUARD_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xviii) a compare non-2xx REFUSES the clean-micro record (exit 4, no record) — a fork PR cannot skip review on a rail" \
+  || fail "(30xviii) a compare non-2xx still minted a record (rc=$T30_CMP_GUARD_RC)"
+
+# THE SEAM IS READ-ONLY (cycle-2 F3): drive the selector with an isolated HOME
+# and no record on disk, then assert nothing appeared. Order-independent — the
+# directory is cleared first, so a record left by the RECORD-path runs above can
+# never be mistaken for one the selector minted.
+rm -rf "$T30H/.pi/agent/reviews"
+tier_for 1 "$(printf 'modified\tdocs/ops/x.md\t')" >/dev/null
+[ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xix) --print-tier wrote NOTHING: the seam is read-only (no record minted into the isolated HOME)" \
+  || fail "(30xix) --print-tier MINTED a record — the read-only seam is not read-only"
 
 # MUTATION: delete the rail from the always-full arm and (ii) must go RED — the
 # arm is load-bearing, not decoration.
@@ -1955,7 +2002,7 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\td
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=159
+MIN_ASSERTIONS=165
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

@@ -426,7 +426,18 @@ clean_low_shape_ok() {
 #   * the merge/land/repair rails — their correctness IS the product's gates, so
 #     a defect here is a false PASS at the last gate before main;
 #   * `record-review.sh` itself — the producer of the attestation this cap
-#     protects; leaving it out would be a one-line bypass;
+#     protects; leaving it out would be a one-line bypass — and
+#     `scripts/lib/diff-normalize.py`, the SINGLE implementation of the diff
+#     digest (`--print-diff-hash`'s contract). The same argument applies to it
+#     verbatim: the file's own #1362 note records that a normalizer which prints
+#     nothing yields `DIFF_HASH = sha256("")`, a constant that collides for
+#     every diff and lets the carry arm mint head-bound evidence for an
+#     unreviewed revision — a FALSE ACCEPT, which is what this class is for;
+#   * `scripts/check-*`, `.husky/**` — CI and pre-commit gate bodies: the same
+#     "correctness IS a gate" argument as the rails above. NOTE the BOUNDARY
+#     here, stated so the list does not grow without one: the class is the
+#     surfaces whose own correctness is a gate, NOT every script. `scripts/`
+#     outside those names is reviewed at its risk class like any other code;
 #   * CI workflow + action definitions — the `[skip ci]` / job-wiring surface;
 #   * `extensions/**` — every local enforcement gate (review-enforcer,
 #     verification-gate, sequence-enforcer);
@@ -460,8 +471,8 @@ review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = un
     *"//"*|*"/./"*|*"/../"*) return 2 ;;
   esac
   case "$p" in
-    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh) return 0 ;;
-    .github/workflows/*|.github/actions/*|extensions/*|skills/*|enforcement/*|templates/*) return 0 ;;
+    scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py) return 0 ;;
+    scripts/check-*|.github/workflows/*|.github/actions/*|.husky/*|extensions/*|skills/*|enforcement/*|templates/*) return 0 ;;
   esac
   return 1
 }
@@ -510,14 +521,16 @@ review_tier_cap() {
 # compare/<base>...<sha>, prefixed by one "mb\t<merge-base>\t<expected-count>"
 # line.
 #   rc 0 = rows printed (header + at least one row)
-#   rc 1 = TRANSPORT failure — gh absent, a non-2xx, an unreadable body. Absent
-#          evidence; the callers warn loudly and proceed.
+#   rc 1 = TRANSPORT failure with nothing read — gh absent, or the `pulls` read
+#          itself failed. Absent evidence; the callers warn loudly and proceed.
 #   rc 2 = the API answered: the PR has NO changed files.
-#   rc 3 = the API ANSWERED but the payload is unusable (no merge base, no rows,
-#          a malformed row). That is POSITIVE evidence of a diff this classifier
-#          cannot certify, so the callers REFUSE — it must never be confused
-#          with rc 1, which was exactly how one `copied` row turned the cap into
-#          a no-op and let a rail edit record `clean-micro`.
+#   rc 3 = the API ANSWERED but the payload is unusable (a `pulls` body with no
+#          base/count, a compare non-2xx — a fork head over HTTP 404, say — no
+#          merge base, no rows, a malformed row). That is POSITIVE evidence of a
+#          diff this classifier cannot certify, so the callers REFUSE. It must
+#          never be confused with rc 1: that confusion was how one `copied` row,
+#          and separately a fork-head 404, turned the cap into a no-op and let a
+#          rail edit record `clean-micro`.
 #
 # An EXPLICIT <sha>, not pulls/<n>/files, for the reason the clean-low guard
 # gives above: pulls/<n>/files always describes the CURRENT head, so a push
@@ -540,7 +553,15 @@ review_surface_rows() {
     [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 3
     sha="$head"
   fi
-  cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)" || return 1
+  # A non-2xx here is NOT transport. The pulls read SUCCEEDED, so the API is
+  # reachable and answered our first question; it REFUSED the second, which means
+  # this revision cannot be compared (the fork-head / unreachable-sha 404 this
+  # codebase documents as predictable, or a rewritten sha). That is POSITIVE
+  # evidence, so rc 3 — refusing — not rc 1. Classifying it as transport made the
+  # cap silently no-op on exactly the case the sibling clean-low guard hard-fails
+  # 60 lines later, leaving a fork PR that edits a rail free to record
+  # clean-micro (measured: rc 0, record written, one stderr line).
+  cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)" || return 3
   # Split the header line in BASH, never `printf … | head -1 | cut`. This script
   # runs `set -o pipefail`, and a `head` that exits after its one line sends
   # SIGPIPE to the writer — the substitution then fails and, under `set -e`, the
@@ -2174,15 +2195,6 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       # (E) (#1575) — the veto. Refuse BEFORE printing either arm's success line and
       # before re-binding SHA, so a red target never produces a signed `clean`.
       if target_head_red "$CURRENT_HEAD"; then
-        # ⛔ CONSUMER CONTRACT — the literal `(#1575 clause E)` in this message is READ
-        # by scripts/atomic-land.sh, which greps for it to tell a HEAD-HEALTH refusal
-        # from a CONTENT refusal (the #2369 update precondition PROCEEDS on the first —
-        # refreshing is the only remedy the rail has for a drift-caused red — and STOPS
-        # on the second). Both causes share exit 3, so this string is the only
-        # discriminator: reword it and the rail silently reads a red head as a changed
-        # artifact, making the drift-red population unlandable with no other signal.
-        # The pin is executable — `tests/atomic-land/run.sh` scenario 2b-vi asserts this
-        # literal is still here AND that the rail still greps it. Keep both ends in sync.
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD IS MEASURABLY RED." >&2
         echo "   A base-only move is still a change to the tree the verdict describes, so re-binding '$VERDICT' to it would put a SIGNED 'clean' on a head whose own checks are failing — an attestation that records a red tree as reviewed-green, and one the merge gate cannot see once the record outlives the run (#4823, #5395, #5292)." >&2
         echo "   The LANE's artifact IS unchanged — that is what the carry proved. Only the head's health is unknown or bad. Re-review at ${CURRENT_HEAD:0:12}…, or re-run the failing checks and re-record." >&2
