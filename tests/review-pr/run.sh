@@ -93,7 +93,8 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
+       FIXTURE_SIGN_KEY
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -224,15 +225,24 @@ fi
 # for the seam's post-record verification to be exercised at all.
 if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ] || [ "${FIXTURE_NO_RECORD_FILE:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
 marker="review recorded: reviews/$pr.json verdict=$verdict @ $sha ($repo)"
-if [ -n "${FIXTURE_SIGN_KEY:-}" ]; then
-  # A REAL HMAC, exactly as record-review.sh computes it — so the seam's verification is exercised.
+if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
+  # ⛔ THE UNSIGNED-MARKER ARM IS CHECKED FIRST (P3, freshest review of #2288): FIXTURE_SIGN_KEY is now
+  # EXPORTED (it was not, which is why the real-HMAC branch below was dead), so keying this branch on
+  # the key being present would sign even the scenario that needs NO signature and the seam's
+  # unsigned-marker refusal could never be driven.
+  printf '\n%s\n' "$marker" >> "$TMP/body.md"
+elif [ -n "${FIXTURE_SIGN_KEY:-}" ]; then
+  # A REAL HMAC, exactly as record-review.sh computes it. ⛔ THIS EXERCISES THE FIXTURE'S SIGNING, NOT
+  # THE SEAM'S VERIFICATION (P3, freshest review of #2288): review-pr.sh performs NO HMAC verification
+  # at all (declared residual, scripts/review-pr.sh:1160-1170) — it pins the marker's SHAPE, i.e. a
+  # 64-hex `sig=` field — so §A/§AD cannot tell a real signature from any 64 hex characters. The old
+  # claim here said the opposite, and the branch was DEAD anyway: FIXTURE_SIGN_KEY was never exported,
+  # so every scenario fell through to the shape-valid zero signature below.
   sig="$(printf '%s' "$marker" | openssl dgst -sha256 -hmac "$FIXTURE_SIGN_KEY" | awk '{print $NF}')"
   # (the FIXTURE_BAD_SIG branch went with the dead key resolution it served: review-pr.sh no longer
   # reads the signing key at all — record-review.sh owns it — so a forged signature is not a case
   # this tool can see. Its fixture var was reset but never set by any scenario (P3, dogfood review).)
   printf '\n%s sig=%s\n' "$marker" "$sig" >> "$TMP/body.md"
-elif [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
-  printf '\n%s\n' "$marker" >> "$TMP/body.md"
 else
   # shape-valid, UNVERIFIABLE here (no key on the box): the seam must say so, not claim "signed"
   printf '\n%s sig=%064d\n' "$marker" 0 >> "$TMP/body.md"
@@ -252,8 +262,10 @@ reset() {
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
   FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0
-  # Every scenario signs with a FIXTURE key by default: the seam verifies the HMAC locally, and
-  # with no key it REFUSES (fail-closed) — so a hermetic default has to have one.
+  # Every scenario signs with a FIXTURE key by default so the fake recorder writes a REAL HMAC (a
+  # shape-valid 64-hex sig the seam can pin). ⛔ The seam does NOT verify the HMAC (declared residual,
+  # scripts/review-pr.sh:1160) — it checks the marker is PRESENT and carries a `sig=` field of the
+  # right shape. FIXTURE_NO_KEY=1 is the unsigned-marker arm, which the seam must refuse.
   FIXTURE_SIGN_KEY="fixture-signing-key"
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
@@ -1016,6 +1028,21 @@ run "$SRC" 2284
 reset; printf 'No findings at scripts/x.sh:12; severity P2 would be over-calling.\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "…and the pinned clean twin still records (rc=$(rc_of))"
+# ⛔ THE THIRD FRESH REVIEW'S P1 — A SLOT SEPARATOR RIGHT AFTER THE BARE TOKEN (P1, measured). Each
+# shape below exited 0 and wrote a signed `clean` record over a reviewer that had just stated a
+# blocker, because every arm needed a label NOUN before the token or a `path:line` after it and these
+# have neither. A separator is a USE cue on its own now; §Q pins that the zero-count forms stay clean.
+for sepshape in 'Found a P1: the guard returns 0 on a failed read.' 'Found a P1 — the guard returns 0 on a failed read.' 'One P1: the early return skips validation.'; do
+  reset; printf '%s\nCLEAN\n' "$sepshape" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "…and '$sepshape' under CLEAN is REFUSED (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+# …while a ZERO count after the same separator keeps its exemption — the counter-direction this arm
+# must not break (the arm widens LABEL detection, and counts_only()/nittag() still run after it).
+reset; printf 'P1: 0 — nothing blocking.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and 'P1: 0 — nothing blocking.' still records (rc=$(rc_of))"
 
 # ── §AI a FOREIGN repo's legacy record at the same PR number+head is not evidence ──
 echo; echo "§AI the existing-record check reads the record's OWN repo field"
@@ -1062,7 +1089,7 @@ run "$SRC" 2284
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
 cp "$SRC" "$MUT"; chmod +x "$MUT"
-sed 's/^if \[ "\$KIND" != "clean" \]; then$/if false; then/' "$SRC" > "$MUT"
+sed 's/^if \[ "\$VERDICT" != "clean" \]; then$/if false; then/' "$SRC" > "$MUT"
 if cmp -s "$SRC" "$MUT"; then
   fail "the mutation did not apply — the anchored guard line changed shape, so this control proves NOTHING"
 else
@@ -1079,7 +1106,9 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 315, measured on the run that added §AH (a bare label with a
+# whenever sections are added — this is 323, measured on the run that added the §AH separator shapes
+# (a bare `Found a P1: …` / `Found a P1 — …` / `One P1: …` under CLEAN, each plus its no-record arm,
+# and the `P1: 0 — nothing blocking.` counter-direction the added arm must not break), on top of
 # `path:line` AFTER it, in every bridge form — dash, colon, comma, parenthetical — plus the clock-time
 # counter-direction), §AI (the record's own `repo` field) and §AJ (a quoted gate refusal
 # is not a refusal), plus §Q's label-SHAPE
@@ -1093,6 +1122,6 @@ echo
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 315 ]; ck $? "assertion-count pin: >= 315 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 322 ]; ck $? "assertion-count pin: >= 322 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

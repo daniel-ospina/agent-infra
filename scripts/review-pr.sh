@@ -517,6 +517,11 @@ export PI_MCP_SERVERS=none   # headless reviewer needs no MCP servers (merge-one
 # The spawn-point gate's ledger (spawn-gate.sh) records the caller's KIND/TAG; unset, a
 # refusal lands as `untagged` and the operator cannot tell which seam was refused
 # (P2, fresh review of PR #2288). merge-one.sh exports the same pair for its reviewer.
+# ⛔ AND THE GATE TAG IS NOT THE VERDICT (P3, freshest review of PR #2288). This variable was ALSO
+# reused as the verdict below, so after the verdict parse a child spawned later inherited
+# `KIND=clean`/`KIND=issues` and spawn-gate.sh's ledger tagged it with a VERDICT where it expects a
+# caller kind — the exact mistagging the export exists to prevent. `KIND` now means only the gate
+# tag; the verdict lives in `VERDICT`.
 KIND=reviewer; TAG="$PR"; export KIND TAG
 # ⛔ AND PIN THE REPO FOR THE CHILD (P3, fourth fresh review). The `env -u GH_REPO` rule
 # protects THIS script's lookups; the reviewer is a separate process that inherits whatever
@@ -546,7 +551,12 @@ run_reviewer() { # <secs> <log> <prompt-file>
       alive_after_cap=1
       break
     fi
-    sleep 5
+    # ⛔ THE POLL INTERVAL IS PURE LATENCY (P2, freshest review of #2288). The bound is the
+    # `elapsed >= t` test above, so a 5 s tick made EVERY invocation cost >= 5 s even for a reviewer
+    # that exits in 50 ms — measured 5007 ms for a 50 ms child, and ~11m40s wall for ~14 s of CPU
+    # across the suite's 94 SUT invocations, on a shard both CI lanes run per PR. 0.2 s costs one
+    # `kill -0` per tick and changes nothing else: the wall-clock cap is still enforced.
+    sleep 0.2
   done
   if [ "$alive_after_cap" = 1 ]; then
     kill -TERM "$pid" 2>/dev/null
@@ -713,8 +723,20 @@ SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 # ⚠️ AND THE EXEMPTION LIST IS DELIBERATELY NARROW — it is a closed grammar too, and widening it
 # is where a fail-open lives: an earlier shape returned "summary" on a separator WITHOUT re-reading
 # the count that follows, so `P0: none, P1: 1` and `| P0 | 0 | P1 | 2 |` were exempted whole.
-# STATED RESIDUAL — stated at its TRUE width (P3 dogfood + TWO fresh reviews of #2288, which measured
-# the claim below asserting coverage the code did not have, twice): a label that carries NO label noun
+# ⛔ THIRD FRESH REVIEW'S P1 — THE BARE TOKEN WITH A SLOT SEPARATOR RIGHT AFTER IT. Measured
+# end-to-end against this file: `Found a P1: the guard returns 0 on a failed read` + `CLEAN` exited 0,
+# wrote `{"verdict":"clean"}` bound to the head and posted a "no blocking findings" artifact — over
+# a reporter that had just stated the blocker. Every other arm needed a label NOUN before the token
+# or a `path:line` after it, so a separator-bearing sentence with neither was prose to this scanner,
+# while the residual text below claimed that shape was caught. A slot separator is a USE cue on its
+# own (`Found a P1: …`, `One P1 — …`, `=> P1,`), so it is now one, whatever precedes the token.
+# counts_only()/nittag() still run on the remainder, which is what keeps the zero-count and note
+# forms clean (`P1: 0 — nothing blocking.`, `| P1 | 0 |`, `P2 — none, all clean`) — §Q/§AH pin both
+# directions. This scan is the ONLY chokepoint between a reported blocker and a `clean` record, so a
+# miss costs a shipped defect and an over-block costs one re-run.
+# STATED RESIDUAL — stated at its TRUE width (P3 dogfood + THREE fresh reviews of #2288, which
+# measured the claim below asserting coverage the code did not have, three times): a label that
+# carries NO label noun in front of it, NO slot separator right after it, and NO location AFTER it
 # in front of it, NO slot separator right after it, and NO location AFTER it is prose to this scanner
 # — `Found one — P1 the guard returns 0`, `There is a **P1** in the guard.` and `no cwd isolation — [P1]`
 # all pass. What the prompt CONTRACTS to is a label carrying a `path:line` location
@@ -784,6 +806,11 @@ function label(s,   a, b, pre, post) {
     if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
+    # (b2) A bare token with a SLOT SEPARATOR right after it, whatever precedes it (`Found a P1: …`,
+    # `One P1 — …`). This is the THIRD fresh review P1, measured end-to-end: without the noun the
+    # arm above requires, these recorded `clean` over a reported blocker. The remainder is still put
+    # through counts_only()/nittag(), so a zero count or a nit tag stays clean.
+    else if (sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1 }
     else if (s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1 }
     # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
     # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
@@ -897,9 +924,9 @@ ISSUE_N="$(printf '%s' "$LAST_LC" | grep -oiE 'issues[[:space:]]*[([ ]?[[:space:
 # the worst possible reading of a line, from the widest possible pattern.
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
 case "$VWORD" in
-  clean)  KIND=clean ;;   # a CLEAN line carries no count
+  clean)  VERDICT=clean ;;   # a CLEAN line carries no count
   issues)
-    KIND=issues
+    VERDICT=issues
     if [ -z "${ISSUE_N:-}" ]; then
       # No count right after ISSUES (`**Verdict: ISSUES — 3 × P1**`): use the `N ×` form, then
       # the number of blocking lines, and only then 1 — never under-report (P3, eleventh review).
@@ -923,9 +950,9 @@ esac
 # findings" by the prompt's own definition of n, so it is clean; anything else is blocking,
 # and a reviewer that prints `ISSUES 2` over two P3 notes has broken the output contract
 # (the prompt says P3 notes ride under CLEAN) — that is named loudly rather than guessed at.
-if [ "$KIND" = issues ] && [ "${ISSUE_N:-1}" = "0" ]; then
+if [ "$VERDICT" = issues ] && [ "${ISSUE_N:-1}" = "0" ]; then
   err "review-pr: the reviewer printed 'ISSUES 0' — zero blocking findings by its own count. Treating it as clean."
-  KIND=clean
+  VERDICT=clean
 fi
 
 # ⛔ A `CLEAN` THAT CONTRADICTS ITS OWN OUTPUT IS REFUSED **BEFORE** ANYTHING IS POSTED
@@ -935,7 +962,7 @@ fi
 # hand-recordable, head-bound FALSE CLEAN artifact for a revision its own reviewer had
 # flagged blocking. A fail-closed check placed after the side effect fails open: the
 # guard must run while the only thing it can still prevent is the artifact itself.
-if [ "$KIND" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
+if [ "$VERDICT" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
   err "$PROG: the reviewer's verdict said CLEAN but its own output carries BLOCKING finding(s) — refusing to post or record a self-contradicting verdict:"
   printf '%s\n' "$BLOCKING_FINDINGS" | sed 's/^/    /' >&2
   err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
@@ -950,7 +977,7 @@ fi
 # for the old head stands as its own artifact") could mint a clean record for a revision
 # nobody reviewed. A fail-closed refusal must run while the thing it prevents does not yet
 # exist. Nothing is posted on this path, and the message says so.
-if [ "$KIND" = clean ]; then
+if [ "$VERDICT" = clean ]; then
   HEAD_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
   [ -n "$HEAD_AFTER" ] || die "$E_EVIDENCE" "could not re-read the head of $REPO#$PR before posting/recording — refusing to certify a head I cannot verify"
   # ⛔ THE REVIEWED *DIFF* IS RE-VERIFIED, NOT JUST THE HEAD (P2, thirteenth fresh review). An
@@ -1019,7 +1046,7 @@ post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
 }
 
 NOTES_CID=""
-if [ "$KIND" = clean ] && [ -n "$FINDINGS" ]; then
+if [ "$VERDICT" = clean ] && [ -n "$FINDINGS" ]; then
   # The reviewer's P3 notes go in their OWN comment: the evidence body is what
   # record-review.sh's veto scans, and its arm-(1) markers are unconditional.
   {
@@ -1038,7 +1065,7 @@ if [ "$KIND" = clean ] && [ -n "$FINDINGS" ]; then
   err "review-pr: reviewer notes posted: comment:$NOTES_CID (non-blocking, P3)"
 fi
 
-if [ "$KIND" = clean ]; then
+if [ "$VERDICT" = clean ]; then
   # ⛔ The clean body must not trip record-review.sh's evidence veto: no "issues
   # remain", no "NOT CLEAN", no "requires human attention", no "auto-fix …".
   # `Outcome: clean` is stated EXPLICITLY so the loose `not…clean` prose arm (which
@@ -1101,7 +1128,7 @@ if post_comment "$COMMENT_FILE"; then
 else
   err "$PROG: could not post the review comment on $REPO#$PR: $POST_ERR"
   err "  Without a comment there is no artifact to name, so NO record was written."
-  [ "$KIND" = issues ] && [ -n "$FINDINGS" ] && printf '%s\n' "$FINDINGS"
+  [ "$VERDICT" = issues ] && [ -n "$FINDINGS" ] && printf '%s\n' "$FINDINGS"
   die "$E_RECORD" "review comment post FAILED — the review exists only in $TRANSCRIPT"
 fi
 err "review-pr: review comment posted: comment:$CID"
@@ -1109,7 +1136,7 @@ err "review-pr: review comment posted: comment:$CID"
 # ── 7) findings => NO record, exit non-zero, print them ──────────────────────
 # THE GUARD. Everything above this line is observation; this is the only place a
 # verdict can become a record, and only `clean` gets past it.
-if [ "$KIND" != "clean" ]; then
+if [ "$VERDICT" != "clean" ]; then
   err "$PROG: the reviewer found ${ISSUE_N:-some} blocking issue(s) at ${HEAD:0:12}… — NOT recording a verdict. Fix them, push, and re-run this command at the new head."
   if [ -z "${BLOCKING_FINDINGS//[[:space:]]/}" ]; then
     err "  NOTE: the verdict said ISSUES but NO P0/P1/P2 line was printed — the findings all parse as non-blocking (P3). That is a reviewer-protocol slip, not a code defect: per the code-review skill clean = zero blocking findings, so a re-run of this command usually returns CLEAN. Nothing was recorded either way."
