@@ -37,9 +37,13 @@ set -u
 # assertions fail**, `ENV_FILE=<a file naming that dir>` -> **52 fail**, `HARNESS_PIN=<a bogus path>` ->
 # **12**, `O=<a bogus dir>` -> **8** — every one of them for a reason that is not this code, against a
 # header that claims hermeticity. That is a false RED the next reader attributes to the launcher, and
-# it also lets an arm pass for the wrong reason. Fixtures that need a work repo set it explicitly
-# (`REPO="$WORK"` in (e)); (a)-(d) pass `--repo` and want the launcher's own fallback answer.
-unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O
+# it also lets an arm pass for the wrong reason. The capacity and selftest/OS knobs are ambient too —
+# `HARNESS_UP_SELFTESTS=<bogus>` -> **12 fail**, `HARNESS_UP_OS=Darwin` -> **6**, `HU_LOAD_PER_CPU=1` or
+# `HU_LOAD_PER_LANE=1` -> **3** each — and every fixture depends on their DEFAULTS, so they are cleared
+# as well; arms that exercise them set them per-command (`HARNESS_UP_OS=Darwin` in (d)).
+# Fixtures that need a work repo set it explicitly (`REPO="$WORK"` in (e)); (a)-(d) pass `--repo` and
+# want the launcher's own fallback answer.
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0

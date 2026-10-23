@@ -463,7 +463,12 @@ HREPO="${A_REPO:-${HARNESS_REPO:-}}"
 if [ -z "$HREPO" ]; then
   HREPO="$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
 fi
-[ -n "$HREPO" ] && [ -d "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
+[ -n "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
+# ⛔ NAME THE VALUE. The empty case and the wrong-value case are DIFFERENT answers, and prescribing
+# "pass --repo" to an operator who just passed a mistyped `--repo` is the failure this launcher is
+# already being fixed for: a refusal that steers the reader somewhere unhelpful. (`$HREPO is not a git
+# checkout` below already names its value; this one now does too.)
+[ -d "$HREPO" ] || die "$HREPO is not a directory — the HARNESS checkout is the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
 git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "$HREPO is not a git checkout" 2
 # The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
 # only then the harness checkout — the pre-split behaviour for a box that configures neither.
