@@ -209,7 +209,8 @@ slot count **and** the memory reading.
   above the floor and below the ceiling, and a gate verdict ENDS the pass (the verdict is a
   measurement of the box, not a per-name accident) — while a taken **name** is skipped, because one
   stale directory must not cost the box the capacity it is entitled to. It is idempotent; a `cannot-act` makes the pass
-  exit 2, so a scheduler never reads "could not act" as success. ⛔ **Nothing schedules it yet** —
+  exit 2 — and so does a pass that ends short of the ceiling having registered nothing, because a
+  per-name code must never be able to report a box that could register nothing as success. ⛔ **Nothing schedules it yet** —
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
 

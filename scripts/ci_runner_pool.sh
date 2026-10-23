@@ -144,6 +144,18 @@ is_uint() {
   return 0
 }
 
+# validate_operands — the env operands that are not READINGS but still gate an action.
+# ⛔ `RUNNER_START_SETTLE_S` was the one operand that reached arithmetic unvalidated: `5s` made
+# `$((SETTLE_S * 2))` a bash ERROR (rc 1, "value too great for base") on a start that had already
+# succeeded, and `0` skipped the settle loop entirely and reported `listener-never-appeared` for a
+# listener that was running. Both are a one-character typo producing a wrong verdict.
+validate_operands() {
+  if ! is_uint "$SETTLE_S"; then
+    err "cannot-measure why=settle-unreadable value=${SETTLE_S:-<empty>} (RUNNER_START_SETTLE_S must be a positive integer of seconds)"; return 2
+  fi
+  return 0
+}
+
 # ── readings ─────────────────────────────────────────────────────────────────────────────────
 # Both gates read HERE, once, so the number a decision was taken on is the number it printed.
 readings() {
@@ -341,7 +353,16 @@ cmd_add() {
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
     err "cannot-act why=runner-template-absent path=$RUNNER_TEMPLATE/config.sh (one complete runner install to copy)"; return 2
   }
-  if [ "$DRY" = 1 ]; then say "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0; fi
+  if [ "$DRY" = 1 ]; then
+    # The registration token is the add's last precondition and is minted AFTER this return (a dry run
+    # must not POST). So the preview requires a token SOURCE — and says so — rather than announcing an
+    # add the pass cannot make. A `gh` that is present but unauthenticated is the one residual a
+    # side-effect-free probe cannot see; it is named here rather than papered over.
+    if [ -z "${RUNNER_TOKEN:-}" ] && ! command -v "$GH_CMD" >/dev/null 2>&1; then
+      err "cannot-act why=no-registration-token repo=$POOL_REPO (set RUNNER_TOKEN, or put $GH_CMD on PATH) — a preview cannot mint one"; return 2
+    fi
+    say "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0
+  fi
 
   token="${RUNNER_TOKEN:-}"
   if [ -z "$token" ]; then
@@ -442,7 +463,12 @@ cmd_reconcile() {
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
   readings || return 2
-  budget=$((CEILING * 2 + 4))   # belt: the ceiling bounds the adds; this bounds a bug in it
+  # ⛔ THIS BOUNDS ATTEMPTS, NOT ADDS. Every iteration advances `n` (or breaks), so this is what makes
+  # the loop terminate — but a name GitHub already holds costs an attempt AND adds nothing, so a budget
+  # sized to the ceiling lands the pass short of capacity, and at 2*CEILING+4 held names it can never
+  # add at all. Held names are normal after a `/tmp` wipe (every local `.runner` gone, every
+  # registration still on GitHub), so the slack is sized for that, not for a hypothetical bug.
+  budget=$((CEILING * 4 + 20))
 
   # (a) every EXISTING registration must have a live listener. This is the half the fleet had no
   #     automation for at all: a dead listener on a live registration reads OFFLINE to GitHub while
@@ -528,6 +554,14 @@ cmd_reconcile() {
   [ "$DRY" = 1 ] && added=$((added + dry_adds))
   printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
     "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$(slots)" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
+  # ⛔ A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS. Exit 5 is per-NAME (that is the whole point:
+  # one taken name must not end the pass), so on its own it cannot report a box that could not register
+  # ANYTHING — a GitHub 5xx, an expired runner scope, a full disk all arrive as the same code. When the
+  # pass ended short of the ceiling with every attempt failing, that IS cannot-act.
+  if [ "$added" -eq 0 ] && [ "$failed" -gt 0 ] && [ "$(slots)" -lt "$CEILING" ]; then
+    err "cannot-act why=no-runner-registered failed=$failed slots=$(slots) ceiling=$CEILING — the box gained no capacity this pass"
+    return 2
+  fi
   [ "$cannot" -eq 0 ] || return 2
   return 0
 }
@@ -542,6 +576,7 @@ main() {
     case "$h" in ''|*[!A-Za-z0-9._-]*) h="box" ;; esac
     POOL_PREFIX="pi-runner-$h"
   fi
+  validate_operands || return 2
   case "$verb" in
     status)    cmd_status "$@" ;;
     add)       cmd_add "$@" ;;

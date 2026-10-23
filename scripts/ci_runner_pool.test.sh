@@ -121,6 +121,11 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
 printf '%s | %s\n' "$PWD" "$*" >>"${CONFIG_LOG:?}"
 case " $* " in *" --name ${FIXTURE_CONFIG_FAIL_NAME:-__none__} "*) echo "config.sh: a runner with this name already exists" >&2; exit 1 ;; esac
+if [ -n "${FIXTURE_CONFIG_TAKEN:-}" ]; then
+  nm=""; prev=""
+  for a in "$@"; do [ "$prev" = "--name" ] && nm="$a"; prev="$a"; done
+  case " ${FIXTURE_CONFIG_TAKEN} " in *" ${nm##*-} "*) echo "config.sh: a runner with this name already exists" >&2; exit 1 ;; esac
+fi
 [ "${FIXTURE_CONFIG_FAIL:-0}" = 1 ] && { echo "config.sh: the registration token is invalid" >&2; exit 1; }
 [ "${FIXTURE_CONFIG_NOMARKER:-0}" = 1 ] && exit 0
 : >.runner
@@ -243,6 +248,18 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CORES_PER_SLOT=0 run add --nam
 assert_eq "$?" "2" "a zero cores-per-slot is cannot-measure (rc 2)"
 assert_contains "$out" "cannot-measure why=cores-per-slot-unreadable" "it names the operand"
 assert_absent "$RUNNER_ROOT/pi-runner-op2" "it added nothing"
+
+# ── (5) a directory that is not ours is refused, never adopted and deleted ──────────────────
+# The unregistered-directory arm is the guard that stops `add` from `cp`-ing INTO a foreign dir (which
+# then makes its config.sh non-executable, and the failure path `rm -rf`s it).
+echo "── add: a directory that is not ours ──"
+fresh_pool foreign; reset_logs
+mkdir -p "$RUNNER_ROOT/pi-runner-foreign"; echo "someone else's work" >"$RUNNER_ROOT/pi-runner-foreign/keep.txt"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-foreign)"
+assert_eq "$?" "4" "a directory without a .runner is name-unavailable (rc 4), not adoptable"
+assert_contains "$out" "exists without a .runner registration" "the refusal names what it found"
+assert_file "$RUNNER_ROOT/pi-runner-foreign/keep.txt" "the foreign directory was NOT deleted"
+assert_eq "$(count_lines "$CONFIG_LOG")" "0" "no config.sh ran inside it"
 
 # ══ 4. ADD above the CORE-AWARE ceiling ═════════════════════════════════════════════════════
 echo "── add: above the core-aware ceiling ──"
@@ -460,6 +477,50 @@ else
   ok "the preview did not announce a start it cannot perform"
 fi
 mv "$T/run.sh.bak2" "$RUNNER_ROOT/pi-runner-broken/run.sh"
+
+# ── (1) a pass that provisioned nothing is cannot-act, not success ─────────────────────────
+# Exit 5 is per-name by design; on its own it cannot report a box that could register NOTHING (a
+# GitHub 5xx, an expired runner scope, a full disk all arrive as the same code).
+fresh_pool nothingadds
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_FAIL=1 run reconcile)"
+assert_eq "$?" "2" "a pass that registered NOTHING exits 2, never 0"
+assert_contains "$out" "cannot-act why=no-runner-registered" "it says the box gained no capacity"
+assert_contains "$out" "added=0" "and the summary says so"
+assert_eq "$(slots)" "0" "nothing is registered"
+
+# ── (2) GitHub-held names must not land the pass SHORT of the ceiling ──────────────────────
+# After a `/tmp` wipe every local `.runner` is gone and every registration is still on GitHub, so a
+# budget charged per failed name would stop the pass below capacity — and at enough held names,
+# forever at added=0.
+fresh_pool takenmany
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_TAKEN="1 2 3 4 5 6 7 8" run reconcile)"
+assert_eq "$?" "0" "the pass still succeeds with eight held names"
+assert_contains "$out" "added=3" "it reached the ceiling despite eight taken names"
+assert_contains "$out" "ceiling reached slots=3 ceiling=3" "and it stopped there"
+
+# ── (3) RUNNER_START_SETTLE_S is an operand, and an unreadable one changes nothing ──────────
+fresh_pool settle; reset_logs
+for bad in 5s 0 -1; do
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_START_SETTLE_S="$bad" run add --name pi-runner-settle)"
+  assert_eq "$?" "2" "RUNNER_START_SETTLE_S=$bad is cannot-measure (rc 2), never rc 1 mid-action"
+  assert_contains "$out" "cannot-measure why=settle-unreadable" "it names the operand"
+  assert_absent "$RUNNER_ROOT/pi-runner-settle" "nothing was created"
+done
+register pi-runner-settle2
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_START_SETTLE_S=0 rc_of restart --name pi-runner-settle2)" "2" \
+  "restart refuses an unreadable settle window instead of starting a listener"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-settle2")" "0" "and it started nothing"
+
+# ── (4) the preview must not announce adds it has no token source for ───────────────────────
+fresh_pool previewtoken
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_POOL_GH=/nonexistent-gh run reconcile --dry-run)"
+assert_eq "$?" "2" "a preview with no token source exits 2, like the pass it previews"
+assert_contains "$out" "cannot-act why=no-registration-token" "it names the precondition"
+if grep -qF 'would copy' <<<"$out"; then
+  bad "the preview announced an add it cannot make"
+else
+  ok "the preview announced an add it cannot make"
+fi
 
 # ══ 8. NAME VALIDATION: a name is a path component, and an escaped one sits outside the ceiling ══
 echo "── name validation ──"
