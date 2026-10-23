@@ -491,9 +491,18 @@ script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
+script:harness-apply-pass.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
+# its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
+# producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
+# which is what makes the timer able to run on a cell at all — so this is a re-pin of the derived
+# population, not an exemption. Verified against the CODE, not the diff (#1899): the exec site is
+# `templates/systemd/eldato-harness-apply.service` + `templates/launchd/harness-apply/*.plist`, both
+# naming `$HOME/.pi/agent/scripts/harness-apply-pass.sh`.
+#
 # `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
 # reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
 # so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
