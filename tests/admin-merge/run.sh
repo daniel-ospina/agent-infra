@@ -1528,6 +1528,14 @@ cfs_run() {
   return $?
 }
 
+# The same, with the #1574 retry DISABLED. Pins that the refusal message stops
+# promising a retry the operator turned off (review cycle 1, P2-1).
+cfs_run_no_retry() {
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" CI_FAILURE_SET_LOG_BACKOFF_S=0 \
+    CI_FAILURE_SET_LOG_ATTEMPTS=1 bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  return $?
+}
+
 # Same reason as cfs_diff, one indirection further out: the #1484 classifier fails
 # closed on a `$(bash <path> …)` substitution, because that is also the shape of the
 # closed script backdoor. Calling the guard through a function whose body is the plain
@@ -3085,6 +3093,32 @@ n=$(grep -c '^run view 7796 ' "$SCEN/calls")
 grep -q 'has NO LOG (GitHub pruned it)' "$TMP/cfs-err" \
   && pass "the pruned cause is still named" \
   || fail "expected the pruned-log note on stderr"
+
+# ── 5q. #1574: the refusal's REMEDY must be true when the retry is off ──────
+# With CI_FAILURE_SET_LOG_ATTEMPTS=1 nothing is retried, so a message promising
+# "a TRANSIENT error is retried" sends the operator after a remedy that does not
+# exist. A misleading remediation is the specific class the #1482/#7131 wording
+# work exists to remove, so it is pinned rather than left to prose.
+echo "== 5q. with the retry DISABLED the refusal says so (no phantom remedy) =="
+new_scen norety
+{ main_red_n main7797 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7797 7797
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-7797"          # a persistent transport error
+printf '3\n' > "$SCEN/jobs-count-7797"
+cfs_run_no_retry --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -ne 0 ] && pass "with the retry disabled a transport error still refuses (exit $rc)" \
+  || fail "expected a non-zero exit with attempts=1, got 0"
+n=$(grep -c '^run view 7797 ' "$SCEN/calls")
+[ "$n" -eq 1 ] && pass "the attempts knob is honoured: exactly 1 attempt" \
+  || fail "expected 1 attempt with CI_FAILURE_SET_LOG_ATTEMPTS=1, got $n"
+grep -q 'the retry is DISABLED' "$TMP/cfs-err" \
+  && pass "the refusal STATES the retry is disabled" \
+  || fail "the refusal does not say the retry was disabled"
+grep -q 'a TRANSIENT error is retried' "$TMP/cfs-err" \
+  && fail "the refusal claims a retry that is DISABLED — a phantom remedy" \
+  || pass "it does not claim a retry that is off"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="

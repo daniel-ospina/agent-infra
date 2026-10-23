@@ -822,7 +822,7 @@ run_failed_job_ids() {
 # auth/network for a run whose logs GitHub had simply pruned — so the natural
 # responses (re-auth, retry, wait out a rate limit) could not possibly work.
 fetch_failed_log() {
-  local run_id="$1" out="$2" err jobs attempt=1
+  local run_id="$1" out="$2" err jobs attempt=1 retry_note
   while :; do
     # shellcheck disable=SC2086
     if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
@@ -862,7 +862,17 @@ fetch_failed_log() {
       say_err "ci-failure-set: · run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — falling back to the JOB-LEVEL failure set (#7131): the test-level identity does not exist on any surface, so the run is attributed by failed JOB NAME and, carrying no signature, cannot be exempted"
       return 3 ;;
     *)
-      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error; ${attempt} attempt(s) made of ${LOG_FETCH_ATTEMPTS} — a transient error is retried, see #1574); its job count $jobs_note — refusing to read this as an empty failing set" ;;
+      # ⛔ THE REMEDY MUST BE TRUE. `CI_FAILURE_SET_LOG_ATTEMPTS=1` disables the
+      # retry, and a message that still says "a transient error is retried" then
+      # points the operator at a remedy that does not exist — the same misleading-
+      # remediation class this function's #1482/#7131 messaging exists to prevent
+      # (review cycle 1, P2). State which one applies.
+      if [ "$LOG_FETCH_ATTEMPTS" -gt 1 ]; then
+        retry_note="${attempt} attempt(s) made of ${LOG_FETCH_ATTEMPTS} — a TRANSIENT error is retried (#1574)"
+      else
+        retry_note="1 attempt made — the retry is DISABLED (CI_FAILURE_SET_LOG_ATTEMPTS=1), so no transient was outlasted"
+      fi
+      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error; ${retry_note}); its job count $jobs_note — refusing to read this as an empty failing set" ;;
   esac
   return 1
 }
