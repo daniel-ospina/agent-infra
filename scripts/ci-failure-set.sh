@@ -55,22 +55,24 @@
 #   ⚠️ WHAT [N] MEANS IN THE TWO WIDENED MAIN MODES (#9689) — `--main-union-rates`
 #   and `--main-union-signatures`, and NOT `--main-union` (see the next note). N is
 #   a STARTING WIDTH, not the size of the window: the listing is widened (doubling,
-#   bounded at 200 runs) until the window holds N runs that FINISHED A MEASUREMENT
-#   — and it can stop EARLY, holding FEWER than N, when the history is exhausted
-#   (`--limit 2 → 4 → 8` on a 3-run main stops at 8) or the 200-run bound is
-#   reached. Without the widening, a `completed/cancelled` run that never expanded
-#   a job spends one of the N, a push burst can spend all of them, and `tested=0`
-#   makes admin-merge.sh report "the lane never TESTED main" about a main that
-#   simply had not been READ deep enough. The widening says so on stderr.
+#   bounded at 200 runs) until the window holds AT LEAST N runs that FINISHED A
+#   MEASUREMENT — so the doubling can OVERSHOOT N — and it can also stop EARLY,
+#   holding FEWER than N, when the history is exhausted (`--limit 2 → 4 → 8` on a
+#   3-run main stops at 8) or the 200-run bound is reached. The window is therefore
+#   never pinned to N: ≥ N when the sufficiency rule fires, < N on an early stop.
+#   Without the widening, a `completed/cancelled` run that never expanded a job
+#   spends one of the N, a push burst can spend all of them, and `tested=0` makes
+#   admin-merge.sh report "the lane never TESTED main" about a main that simply had
+#   not been READ deep enough. The widening says so on stderr.
 #   `tested` in `--runs-report` is the COLLECTORS' count over that window, not the
 #   criterion's: normally the two agree, but a `completed/failure|timed_out` whose
 #   job list turns out EMPTY is counted by the criterion and DEBITED by `tested`
-#   (#1482) — so `tested` can fall below N, and a window that measured nothing
-#   still blocks. That asymmetry is stated in full at `list_main_baseline`.
+#   (#1482) — so `tested` can fall below N even when the window reached it, and a
+#   window that measured nothing still blocks. That asymmetry is stated in full at
+#   `list_main_baseline`.
 #   --main-union-rates [N]    (#3756) per-id failure COUNTS over the main window
-#                             widened TOWARD N MEASURED runs — fewer when the history
-#                             ends (or the 200-run bound is reached) first, so read
-#                             "WHAT [N] MEANS" above for what `[N]` is and is not:
+#                             widened TOWARD N MEASURED runs — it can OVERSHOOT N, and
+#                             it can stop short of it; read "WHAT [N] MEANS" above:
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
@@ -78,7 +80,8 @@
 #                             NOTHING when no run exercised the suite (fail-closed).
 #   --main-union-signatures [N]
 #                             (#3756) main's per-id stable SIGNATURE over the SAME
-#                             widened window (≤ N MEASURED runs, same early stops):
+#                             widened window as --main-union-rates (identical early
+#                             stops, so it can hold FEWER than N measured runs):
 #                             `<nodeid>\t<signature>`. The rate table alone leaves
 #                             `main_signatures` empty, so the decision's subset rule
 #                             fails CLOSED and nothing is ever exempt; this is the
@@ -460,11 +463,12 @@ list_lane_runs() {
 # read 20 runs wide found a measured run at position 14.
 #
 # So the listing WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until the
-# exclusion-filtered window holds AT LEAST the requested number of MEASURED runs,
-# or the history is exhausted, or the bound is reached. This is the rule the rail's
-# lane-coverage gate already follows for its own reference window (#4844,
-# #7734: "N is a STARTING WIDTH, not a stopping rule"); the baseline pass was
-# the one place still reading N as a stopping rule.
+# exclusion-filtered window holds AT LEAST the requested number of MEASURED runs
+# (a doubling step may OVERSHOOT it), or the history is exhausted, or the bound is
+# reached — an early stop can leave the window holding FEWER than requested. This
+# is the rule the rail's lane-coverage gate already follows for its own reference
+# window (#4844, #7734: "N is a STARTING WIDTH, not a stopping rule"); the baseline
+# pass was the one place still reading N as a stopping rule.
 #
 # ⛔ THE WIDENING CRITERION IS NOT THE GATE. `measured_run_count` reads only the
 # listing's status/conclusion, so it cannot see a run's JOBS — but it decides only
@@ -548,8 +552,10 @@ exclude_runs() {
 #
 # Lists main's lane runs at <requested-width> and WIDENS it (doubling, bounded
 # by $MAIN_RUNS_MAX) until the exclusion-filtered listing holds at least the
-# requested number of MEASURED runs. The ORDINARY case — a requested window that
-# already holds that many — reads exactly ONE listing, byte-identical to before.
+# requested number of MEASURED runs — overshooting it by up to a doubling step — or
+# stops early (empty listing, exhausted history, the bound), holding FEWER. The
+# ORDINARY case — a requested window that already holds that many — reads exactly
+# ONE listing, byte-identical to before.
 # Returns 1 when a listing read fails (fail-closed: an unreadable run list must
 # never read as "nothing ran").
 list_main_baseline() {
