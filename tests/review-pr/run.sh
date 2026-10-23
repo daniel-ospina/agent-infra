@@ -131,7 +131,7 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
-       FIXTURE_SIGN_KEY
+       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -260,6 +260,17 @@ printf '%s\n' "$*" > "$TMP/pi-argv.txt"
 for a in "$@"; do prompt="$a"; done
 printf '%s' "$prompt" > "$TMP/pi-prompt.txt"
 printf 'ran\n' >> "$TMP/pi-runs.txt"
+# ⛔ A SLEEPING REVIEWER IS AN OBSERVABLE (P2, fresh review of PR #2288). The wall-clock cap, its
+# SIGTERM/SIGKILL escalation and the `--timeout` floor had NO assertion behind them: the fixture
+# could only set an EXIT CODE, nothing could make it hang, and `grep -c -- '--timeout'` in this
+# file returned 0 — so deleting the cap left every assertion green while the command the lane
+# brief tells landers to type could hold a cell forever. A cap that is never driven is not a guard.
+if [ -n "${FIXTURE_PI_SLEEP:-}" ]; then
+  # The probe line is written BEFORE the sleep: a run that is KILLED at the cap still leaves it,
+  # so a scenario can tell "the cap fired" from "the fixture never started".
+  printf 'sleeping %s\n' "$FIXTURE_PI_SLEEP" >> "$TMP/pi-slept.txt"
+  sleep "$FIXTURE_PI_SLEEP"
+fi
 # ⛔ THE REVIEWER'S CWD IS AN OBSERVABLE (P1, dogfood review of this very file): it used to inherit
 # the caller's checkout while the prompt asserted there was none, so the record could certify a head
 # whose context reads came from a different tree.
@@ -344,7 +355,7 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" "$TMP/pi-cwd.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body" "$TMP/pr-repo.log" "$TMP/served-diff.txt" "$TMP/reviewer-out.expanded"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body" "$TMP/pr-repo.log" "$TMP/served-diff.txt" "$TMP/reviewer-out.expanded" "$TMP/pi-slept.txt"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
@@ -366,7 +377,8 @@ reset() {
   FIXTURE_ISSUE_BODY="the linked issue body"
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
   FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
-  unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL
+  FIXTURE_PI_SLEEP=""
+  unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
 }
 
 # run <script> [args...] — drives the REAL script under the fakes.
@@ -379,6 +391,8 @@ run() {
   HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" \
     REVIEW_PR_RECORD_SH="${RECORDER_OVERRIDE:-$TMP/bin/fake-record}" \
     AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
+    REVIEW_PR_MIN_TIMEOUT="${REVIEW_PR_MIN_TIMEOUT-}" \
+    REVIEW_PR_KILL_GRACE="${REVIEW_PR_KILL_GRACE-}" \
     LC_ALL="${RUN_LC_ALL-}" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
@@ -690,6 +704,17 @@ echo; echo "§J the tool never edits a PR body (a body edit wipes a recorded mar
 CODE="$(grep -v '^[[:space:]]*#' "$SRC" | grep -v '^[[:space:]]*$')"
 case "$CODE" in *"gh pr edit"*) rc=1;; *) rc=0;; esac; ck $rc "no 'gh pr edit' in the executable lines"
 case "$CODE" in *"-X PATCH"*) rc=1;; *) rc=0;; esac; ck $rc "no '-X PATCH' (the marker-destroying body write) in the executable lines"
+# ⛔ A SOURCE GREP IS NOT THE INVARIANT (P3, fresh review of PR #2288): the fake `gh` already logs
+# every argv to `$TMP/gh-calls.log`, so assert on what the tool ACTUALLY SENT. A body write spelled
+# `gh api --method PATCH … -f body=@f` (or `-X "$M"`) sails past both `case` arms above while this
+# section kept reporting clean.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a full clean run completes (rc=$(rc_of))"
+if [ -f "$TMP/gh-calls.log" ] && grep -qE 'ARGV=pr[[:space:]]+edit' "$TMP/gh-calls.log"; then rc=1; else rc=0; fi
+ck $rc "…and no 'gh pr edit' was ever SENT to gh"
+if [ -f "$TMP/gh-calls.log" ] && grep -qE 'ARGV=api[[:space:]]+[^[:space:]]*repos/[^[:space:]]*/pulls/[0-9]+[[:space:]].*(--method[[:space:]=]+PATCH|-X[[:space:]]*PATCH)' "$TMP/gh-calls.log"; then rc=1; else rc=0; fi
+ck $rc "…and the PR OBJECT was never PATCHed (the write that wipes a recorded marker)"
 
 # ── §L a CLEAN verdict that contradicts its own blocking finding ─────────────
 echo; echo "§L CLEAN that carries a blocking finding => refused (the verdict must agree with its lines)"
@@ -968,7 +993,14 @@ run "$SRC" 2284
 # change introduced and then fixed had no tripwire until here. The suite already puts `$TMP/bin`
 # first on PATH, so a failing `awk` stub is all it takes; every other tool the script needs is real.
 if [ -d "$TMP/bin" ]; then
-  printf '#!/bin/sh\nexit 2\n' > "$TMP/bin/awk"; chmod +x "$TMP/bin/awk"
+  # ⛔ THE STUB MUST STILL COMPILE (P1, fresh review of PR #2288). The seam now PARSE-CHECKS the awk
+  # program against /dev/null before it trusts a scan, so a blanket `exit 2` stub is refused at the
+  # PARSE arm (§AP) and this arm — a scanner that PARSES but fails on the transcript — would become
+  # unreachable. The stub therefore delegates the /dev/null compile to the real awk and fails only
+  # the real scan, which is exactly the shape it claims to drive.
+  REAL_AWK="$(command -v awk)"
+  printf '#!/bin/sh\ncase "$*" in *dev/null*) exec "%s" "$@";; *) echo "stub awk: refusing the transcript" >&2; exit 2;; esac\n' "$REAL_AWK" > "$TMP/bin/awk"
+  chmod +x "$TMP/bin/awk"
   reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
   run "$SRC" 2284
   [ "$(rc_of)" = "10" ]; ck $? "a FAILING scanner refuses with exit 10, never a silent clean (rc=$(rc_of))"
@@ -1769,6 +1801,72 @@ ck $rc "  …because the harness terminated the child's last line before appendi
 # assertions (any label form: ordinal-in-span, continuation-line slot, code-styled token), the
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
+# ── §AS a scanner PROGRAM that cannot be parsed is a tool failure, not an empty scan ──
+echo; echo "§AS a scanner program the awk REFUSES => exit 10, nothing posted, nothing recorded"
+# ⛔ THIS WALL SHIPPED ONCE (P1, fresh review of PR #2288): the program carried a bracket expression
+# `[—–-,(\[]` whose `-` formed a RANGE from `–` down to `-`. mawk accepted it. gawk refuses the
+# WHOLE PROGRAM at compile time ("Invalid range end"), so on every gawk box — this repo's Linux
+# cells, where /usr/bin/awk IS gawk — EVERY run died at exit 10 (269 of the assertions in this
+# file), each one after paying for a review and discarding its transcript. The fix is an
+# alternation; this arm is the tripwire on the PARSE refusal, §AT the tripwire on the dialect.
+printf '#!/bin/sh\nexit 2\n' > "$TMP/bin/awk"; chmod +x "$TMP/bin/awk"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "10" ]; ck $? "a program the awk cannot compile refuses with exit 10 (rc=$(rc_of))"
+err_has "does not PARSE"; ck $? "  …naming a PARSE failure rather than a scan rc"
+err_has "NOT a clean review"; ck $? "  …and stating it is not a clean review"
+no_comment; ck $? "  …nothing posted as the evidence artifact"
+no_record; ck $? "  …nothing recorded"
+rm -f "$TMP/bin/awk"
+
+# ── §AT the scanner program compiles under the awk THIS box runs ─────────────
+echo; echo "§AT the scanner awk program compiles under $(command -v awk) and still catches the separator forms"
+# ⛔ THE DIALECT IS THE ROOT, NOT THE ONE CLASS (P1, fresh review of PR #2288). One awk dialect must
+# not be able to hide a parse failure: this arm extracts the program from the SUT and compiles it
+# with whatever awk is on PATH. On the box that shipped the P1 (gawk 5.2.1) the pre-fix program
+# fails here; on a mawk-only box it passes — which is why the suite has to run on both, and why
+# scripts/run-bash-shards.sh registering it is part of the fix rather than a nicety.
+SCANNER="$(sed -n "/^BLOCK_SPAN_AWK='/,/^'\$/p" "$SRC" | sed '1d;$d')"
+[ -n "$SCANNER" ]; ck $? "the scanner program was extracted from the SUT"
+printf '%s\n' "$SCANNER" > "$TMP/scanner.awk"
+awk -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
+[ "$sp" = "0" ]; ck $? "…and COMPILES under $(command -v awk) (rc=$sp)"
+# A COMPILE WARNING is not a failure, but it is the signature of the class that produced the P1, so
+# show it when there is one instead of swallowing it into pass output.
+[ "$sp" = "0" ] && [ -s "$TMP/scanner.err" ] && echo "     · scanner warnings: $(head -2 "$TMP/scanner.err" | tr '\n' ' ')"
+# …and it is EXERCISED, not merely compiled: the separator class this P1 broke must still catch a
+# label in every bridge form it names, and must still exempt the pinned clean twin.
+{ printf '%s\n' 'scripts/x.sh:12 — P1 the guard returns 0' \
+                 'scripts/x.sh:12, P1 the guard returns 0' \
+                 'blocked at scripts/x.sh:12 (P1) in the guard' \
+                 'No findings at scripts/x.sh:12; severity P2 would be over-calling'; } > "$TMP/probe.txt"
+LC_ALL=C awk -f "$TMP/scanner.awk" "$TMP/probe.txt" > "$TMP/probe.out" 2>/dev/null
+[ "$(wc -l < "$TMP/probe.out")" = "3" ]; ck $? "…all 3 LOCATION-separator forms still CATCH, and the pinned clean twin still does not ($(wc -l < "$TMP/probe.out") caught)"
+
+# ── §AU the WALL-CLOCK cap on the paid spawn is DRIVEN, not assumed ───────────
+echo; echo "§AU a reviewer that never returns is CAPPED, killed, and nothing is recorded"
+# ⛔ A CAP THAT IS NEVER DRIVEN IS NOT A GUARD (P2, fresh review of PR #2288): nothing could make the
+# fixture hang, so deleting the `elapsed >= t` test, the SIGTERM/SIGKILL escalation, or the `--timeout`
+# floor left the whole suite green while the command the lane brief tells landers to type could hold a
+# cell forever. REVIEW_PR_MIN_TIMEOUT / REVIEW_PR_KILL_GRACE are test seams (declared in the SUT
+# header); production never sets them.
+reset; run "$SRC" 2284 --timeout 30
+[ "$(rc_of)" = "2" ]; ck $? "--timeout below the 60 s floor is a usage error (rc=$(rc_of))"
+err_has ">= 60"; ck $? "  …and the refusal names the floor"
+no_reviewer; ck $? "  …before any review is paid for"
+
+reset
+T0=$(date +%s)
+REVIEW_PR_MIN_TIMEOUT=1 REVIEW_PR_KILL_GRACE=1 FIXTURE_PI_SLEEP=30 \
+  run "$SRC" 2284 --timeout 1
+T1=$(date +%s); DT=$(( T1 - T0 ))
+[ "$(rc_of)" = "6" ]; ck $? "a reviewer still running at the cap is killed and reads as NO VERDICT (rc=$(rc_of))"
+[ -f "$TMP/pi-slept.txt" ]; ck $? "  …the reviewer really did start (so this drove the cap, not a preflight)"
+[ "$DT" -le 20 ]; ck $? "  …and it was killed at the cap (${DT}s wall for a fixture that sleeps 30s)"
+no_comment; ck $? "  …nothing posted as the evidence artifact"
+no_record; ck $? "  …nothing recorded"
+reset
+
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
 # `ck` runs AFTER this comparison, so on a fully green run PASS is 478 here and the RESULT line then
 # prints 479. A floor equal to the printed total could never pass — a permanently red tripwire is
@@ -1783,6 +1881,8 @@ ck $rc "  …because the harness terminated the child's last line before appendi
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
+# Re-set to 545 when §AS/§AT/§AU added 20 (the gawk-dialect P1, the wall-clock cap and the
+# sent-argv body-write arm).
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
@@ -1903,6 +2003,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 526 ]; ck $? "assertion-count pin: >= 526 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 545 ]; ck $? "assertion-count pin: >= 545 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

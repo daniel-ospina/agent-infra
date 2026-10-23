@@ -96,13 +96,17 @@
 # hand-bind one to a head nobody read).
 #   0  reviewed clean, record written and verified at the reviewed head
 #   2  usage / argument error
-#   3  evidence failure: no gh, no auth, unresolvable PR/repo/head, url/repo conflict
+#   3  evidence failure: no gh, no auth, unresolvable PR/repo/head, url/repo conflict, a
+#      failed RE-READ of the head/diff after the review, or no writable temp directory.
+#      Nothing was recorded on this path
 #   4  `pi` unavailable (before any review is paid for)
 #   5  a `clean` record already exists at this head — refusing to re-record
 #   6  the reviewer ran but produced NO verdict (crash/timeout/garbage transcript)
 #   7  the reviewer found issues (P0/P1/P2), OR its `CLEAN` contradicts its own
 #      severity lines — NOT recorded, findings printed
-#   8  the head moved during the review — NOT recorded
+#   8  the reviewed REVISION changed during the review — the head moved, OR a BASE retarget
+#      moved the three-dot diff while the head stayed put (the record binds the DIFF, so a
+#      retarget is the same refusal) — NOT recorded
 #   9  the record/artifact arm — four cases, see above: recording failed, the recorder was
 #      never reached, a comment post failed, OR rc=0 arrived WITHOUT the artifact check (c)
 #      reads: no record bound to this head, no marker in the PR body, or a marker posted
@@ -120,6 +124,11 @@
 #   REVIEW_PR_PI        the `pi` binary to spawn          (default: pi)
 #   REVIEW_PR_RECORD_SH the recorder to call              (default: sibling
 #                       record-review.sh, else $HOME/.pi/agent/scripts/record-review.sh)
+#   REVIEW_PR_MIN_TIMEOUT the `--timeout` floor in seconds (default: 60). A seam because the
+#                       wall-clock cap and its kill escalation cannot otherwise be driven
+#                       without a 75 s test; production never sets it, and the floor is what
+#                       stops a caller asking for a cap shorter than a review takes.
+#   REVIEW_PR_KILL_GRACE  seconds between SIGTERM and SIGKILL at the cap (default: 15)
 # The record STORE is not a seam: it is `$HOME/.pi/agent/reviews` because that is
 # where record-review.sh writes, so fixtures set HOME instead of introducing a
 # second env var for a path another tool owns.
@@ -161,7 +170,9 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$PR" ] || { usage >&2; exit "$E_USAGE"; }
 [[ "$PR" =~ ^[0-9]+$ ]] || die "$E_USAGE" "PR must be numeric (got '$PR')"
-[[ "$TIMEOUT" =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -ge 60 ] || die "$E_USAGE" "--timeout must be a number of seconds >= 60 (got '$TIMEOUT')"
+TIMEOUT_FLOOR="${REVIEW_PR_MIN_TIMEOUT:-60}"
+[[ "$TIMEOUT_FLOOR" =~ ^[0-9]+$ ]] && [ "$TIMEOUT_FLOOR" -ge 1 ] || die "$E_USAGE" "REVIEW_PR_MIN_TIMEOUT must be a positive integer (got '$TIMEOUT_FLOOR')"
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -ge "$TIMEOUT_FLOOR" ] || die "$E_USAGE" "--timeout must be a number of seconds >= $TIMEOUT_FLOOR (got '$TIMEOUT')"
 if [ -n "$REPO_IN" ]; then
   [[ "$REPO_IN" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
     || die "$E_USAGE" "--repo must be owner/name (got '$REPO_IN')"
@@ -463,7 +474,7 @@ while IFS= read -r iurl; do
 done <<<"$ISSUE_URLS"
 [ -n "$ISSUE_TEXT" ] || ISSUE_TEXT="(the PR body names no issue this PR closes — treat the PR description as the claim)"
 
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX")" || die "$E_RECORD" "mktemp failed"
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX")" || die "$E_EVIDENCE" "mktemp failed — no writable temp directory, so no review was paid for and nothing was written (set TMPDIR)"
 LOG="$RUN_DIR/reviewer.log"
 PROMPT="$RUN_DIR/prompt.txt"
 COMMENT_FILE="$RUN_DIR/comment.md"
@@ -526,7 +537,7 @@ redact_file() { # <src> <dst> -> 0, or 1 when the body could not be built
 # A mktemp FAILURE IS FATAL (P3, thirteenth fresh review): the `|| fallback` re-introduced the
 # predictable shared-$TMPDIR path this comment says `mktemp` removed.
 TRANSCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX" 2>/dev/null)" \
-  || die "$E_RECORD" "mktemp failed for the transcript directory — refusing to write an audit trail to a predictable path in a shared $TMPDIR"
+  || die "$E_EVIDENCE" "mktemp failed for the transcript directory — no review was paid for and nothing was written; refusing to fall back to a predictable path in a shared $TMPDIR (set TMPDIR)"
 TRANSCRIPT="$TRANSCRIPT_DIR/reviewer.log"
 cleanup() {
   # ⛔ ONLY THE MAIN SHELL CLEANS UP (real defect, found by looping a scenario: the
@@ -729,7 +740,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   done
   if [ "$alive_after_cap" = 1 ]; then
     kill -TERM "$pid" 2>/dev/null
-    sleep 15
+    sleep "${REVIEW_PR_KILL_GRACE:-15}"
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
   fi
   wait "$pid" 2>/dev/null; local rc=$?
@@ -1330,7 +1341,16 @@ function label(s,   a, b, pre, post, sl) {
       # leading bracket unconditionally would also exempt `P1 (actually 2 blockers)`, which is the
       # fail-open direction. A wall costs a re-run; a miss records clean over a real defect.
       if (!negpre && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
-      if (!negpre && s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /[—–-,(\[][[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # ⛔ A RANGE INSIDE A BRACKET EXPRESSION IS A COMPILE ERROR, NOT A SET (P1, fresh review of
+      # PR #2288). This separator class was written `[—–-,(\[]` — read as a RANGE from `–` to `-`,
+      # whose end sorts BELOW its start, so gawk ([[:alpha:]]awk) refuses the WHOLE PROGRAM at parse
+      # time ("Invalid range end"), `awk` exits 2, the scan cannot run and EVERY review dies at
+      # E_SCAN=10 — after the reviewer was paid for, with its transcript discarded. Measured on a
+      # box whose /usr/bin/awk is gawk 5.2.1: 269 of the assertions in the suite this PR adds
+      # failed. A class is not a list of literals: an ALTERNATION says what was meant with nothing
+      # left positional, and it is the same regex under mawk and gawk (`tests/review-pr/run.sh` §AO
+      # parses this program with the awk on PATH, so one dialect cannot hide it again).
+      if (!negpre && s ~ /[[:alnum:]_\/.-]+:[0-9]+/ && pre ~ /(—|–|-|,|\(|\[)[[:space:]]*[`*_]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (b3) A NUMERIC MULTIPLIER DIRECTLY ON THE TOKEN — `2 × P1`, `3x P2` (P2, fresh review of
       # #2288). The COUNT extractor already reads this form as the own count of the verdict
       # (`grep -oE '[0-9]+[[:space:]]*[×x]'`, pinned by §AM (`ISSUES — 2`)), while the severity
@@ -1424,6 +1444,22 @@ END {
   }
 }
 '
+# ⛔ THE SCANNER IS PARSED, NOT ASSUMED PARSEABLE (P1, fresh review of PR #2288). A program a
+# dialect REFUSES is not an empty scan, and the refusal is dialect-dependent — gawk rejects a
+# bracket expression whose `-` forms a range with a multibyte member while mawk accepts it — so a
+# scanner that cannot run is invisible on the box that wrote it and TOTAL on the box that lands it
+# (measured: gawk 5.2.1, 269 failing assertions in the suite this PR adds, every run paying for a
+# review and then discarding it at E_SCAN). Compiling the program against /dev/null costs
+# milliseconds and names the cause instead of reporting `awk rc=2` from a scan that never ran.
+# The DURABLE guard is the suite arm (`tests/review-pr/run.sh` §AO), which parses this program
+# with the awk on PATH: this check only makes the failure legible at runtime, where the review is
+# already paid for.
+if ! awk "$BLOCK_SPAN_AWK" /dev/null 2>"$RUN_DIR/scanner-parse.err"; then
+  err "$PROG: the blocking-finding SCANNER PROGRAM does not PARSE under $(command -v awk) — this is a tool/dialect failure, NOT a clean review."
+  err "  Program error: $(head -3 "$RUN_DIR/scanner-parse.err" 2>/dev/null | tr '\n' ' ')"
+  err "  No comment was posted and NO record was written. Fix the program for this awk dialect; do not read this as a verdict."
+  die "$E_SCAN" "the P0/P1/P2 scanner could not even be compiled (see above) — refusing to certify anything (transcript: $TRANSCRIPT)"
+fi
 # ⛔ A SEVERITY SUMMARY ROW IS NOT A FINDING (P2, ninth fresh review). Reviewers close a
 # report with a table of counts (`| P0 | 0 |`, `| P1 | 0 |`); each row LEADS with a
 # severity token, so the positional rule read them as findings — a clean report refused
@@ -1784,7 +1820,7 @@ if [ "$VERDICT" = clean ]; then
       # producer prints 64 hex, not the diff). The artifact states exactly that, because this is the
       # text `record-review.sh` accepts as review evidence.
       if [ "${DIFF_TRUNCATED}" = 2 ]; then
-        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "'"
+        printf '⚠️ **Scope of this review:** this PR’s diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n'
       else
         printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
       fi
