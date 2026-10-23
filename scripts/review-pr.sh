@@ -1661,6 +1661,23 @@ fi
 # findings` as a count of two and refused a clean review. The leading `(^|[^[:alnum:]])` group
 # makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
 # never a count.
+# ⛔ THE QUANTIFIER REACHES THE NOUN ACROSS A QUALIFIER RUN (P1, fresh re-review at c838ed8 — the
+# SAME fail-OPEN class as the P0 ABOVE, one grammar over, MEASURED). The old shape allowed exactly
+# ONE intervening word and only the literal `blocking`, so `ISSUES 0 — a single blocking finding
+# remains.` / `a lone …` / `an outstanding …` / `one outstanding blocking finding` / the `path:line`
+# variant and their `**Verdict:** CLEAN — …` twins all exited 0 and wrote a signed clean record over a
+# reported blocker — the severity scan cannot see them either (no P-token, and the `path:line`
+# variant has no P-token to bridge). A hyphen is now a word boundary too, so
+# `one-blocking-finding remains` is not invisible. `0`/`no`/`none`/`zero` stay clean because the count
+# filter below skips a ZERO and `no` is not in the quantifier alternation; `0 P1, 0 P2 findings`
+# stays clean because a SEVERITY label (`P1`, digit) is not an `[[:alpha:]]` qualifier word.
+# ⛔ THE RESOLVED-PARTICIPLE EXEMPTION ACCEPTS A COPULA (P3, same re-review — an over-block this very
+# fix INTRODUCED, MEASURED). Adding the call below the case made the `ISSUES 0` path pass this guard
+# for the first time, and the participle had to sit IMMEDIATELY after the noun, so the line this
+# guard's own remedy tells a reviewer to write — `ISSUES 0 — one blocking finding was fixed.` — was
+# refused (rc 7, no record) where the pre-fix head recorded it. `was|is|are|were` is now allowed
+# before the participle. The direction stays fail-closed: a count with NO resolved participle still
+# refuses.
 refuse_counted_clean() {
   local _vl _vw _hit _one _dig
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
@@ -1684,9 +1701,13 @@ refuse_counted_clean() {
       die "$E_ISSUES" "a self-contradicting transcript (an ISSUES verdict line, then CLEAN) is never recorded — re-run the review"
     fi
     # (a) a non-zero count of findings on ANY verdict-shaped line.
+    # ⛔ THE QUANTIFIER REACHES THE NOUN, AND A COPULA IS A PARTICIPLE (kept from the concurrent fix
+    # this commit is rebased onto): the bridge between the numeral and `finding(s)` is any run of up
+    # to three words, and a resolved participle may carry `was|is|are|were`. Vocabulary also carries
+    # the word numerals this lane added (single/sole/lone/half a dozen/thirteen…twenty).
     _hit="$(printf '%s' "$_vl" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|half([[:space:]]+a)?[[:space:]]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
-      | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|issues?|blockers?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+      | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
     [ -n "$_hit" ] || continue
     # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
     # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
