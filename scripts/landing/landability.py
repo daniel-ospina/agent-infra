@@ -174,9 +174,24 @@ def parse_ndjson(text):
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            parsed = json.loads(line)
         except ValueError:
-            continue
+            # ⛔ A LINE WE CANNOT READ IS NOT AN ABSENT CHECK (P2, fresh review). This used
+            # to `continue`, so a truncated/partial surface silently lost that run — and if
+            # the dropped line was the only red, `failed` came back empty and the verdict
+            # fell through to `AT`: a false "checks clear", the exact class the module's
+            # own note guards against ("a truncated page reads as absent checks"). An
+            # unreadable surface must be BLOCKED, never clear.
+            raise Failure(
+                f"unparseable check-run line: {line[:120]!r} "
+                "(a partial read is not an absent check)"
+            )
+        if not isinstance(parsed, dict):
+            raise Failure(
+                f"check-run line is not an object: {line[:120]!r} "
+                "(a partial read is not an absent check)"
+            )
+        out.append(parsed)
     return out
 
 
@@ -239,22 +254,59 @@ def record_binding(record, head, live_diff):
     if head_matches(record.get("head_sha"), head):
         return "AT"
     diff = record.get("diff_sha256") or ""
-    if diff and live_diff and diff == live_diff:
-        return "CARRY"
     if not diff:
         return "NEEDS-REVIEW(no-diff-identity)"
+    if not live_diff:
+        # ⛔ NOT MEASURED IS NOT CHANGED (P2, fresh review). For a not-open/draft PR this
+        # function used to return `NEEDS-REVIEW(diff-changed)` from a comparison that never
+        # happened (the report prints `live diff: none` two lines above) — telling a lane a
+        # byte-identical draft had changed and must be re-reviewed. Same rule the module
+        # already applies to check-runs: an unmeasured read is a NAMED abstention.
+        return "NEEDS-REVIEW(diff-unmeasured)"
+    if diff == live_diff:
+        return "CARRY"
     return "NEEDS-REVIEW(diff-changed)"
 
 
 def merge_base_of(repo, base, head, repo_dir):
     """The merge base of base...head — the commit that identifies the certified
     content. INVARIANT under a base that merely ADVANCES; it moves exactly when
-    the base is repointed or rewritten. Mirrors atomic-land.sh's `merge_base_of`."""
-    rc, out, _err = gh_text(
+    the base is repointed or rewritten. Mirrors atomic-land.sh's `merge_base_of`.
+
+    ⛔ AN UNREADABLE READ IS AN ANSWER WE DO NOT HAVE, NEVER A REPOINT (P1, fresh
+    review). This used to return "" on any non-zero `gh` exit (rate limit, 5xx,
+    network) and the caller turned the empty string into `base_repointed = True`,
+    printing `BLOCKED(base-repointed)` — "the record's merge base is not this PR's
+    merge base" — from a comparison that never happened. That invites the
+    re-review-and-re-record remedy this module exists to prevent, and it breaks
+    the module's own contract ("2 = the question could not be answered … never a
+    guess"). The rail names the empty read instead of claiming a repoint
+    (atomic-land.sh:1321-1342); so does this."""
+    rc, out, err = gh_text(
         ["api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha"],
         repo_dir,
     )
-    return out.strip() if rc == 0 else ""
+    sha = out.strip()
+    if rc != 0 or not sha:
+        raise Failure(
+            f"could not read the merge base of {base}...{head[:12]}: "
+            f"{err.strip()[:200] or 'no stderr'}"
+        )
+    return sha
+
+
+def run_name(run):
+    """The run's name, or a stable placeholder for an UNNAMED run.
+
+    ⛔ NEVER `None` IN A NAME SET (P2, fresh review). `newest_per_app_and_name`
+    deliberately supports unnamed runs (`name or "\x00unnamed:<id>"`, mirroring the
+    rail's #1353 fix), so a check surface that mixes one unnamed run with a named
+    one made `sorted()` raise `TypeError: '<' not supported between 'str' and
+    'NoneType'` — a crash in the one tool a merge-duty lane runs to decide whether
+    it may land, and `bulk.py` catches only `Failure`, so it aborted a whole batch.
+    """
+    name = run.get("name")
+    return name or f"<unnamed:{run.get('id')}>"
 
 
 def newest_per_app_and_name(runs):
@@ -290,10 +342,10 @@ def newest_per_app_and_name(runs):
 
 def check_state(runs):
     groups = newest_per_app_and_name(runs)
-    in_flight = sorted({r.get("name") for r in groups if r.get("status") != "completed"})
+    in_flight = sorted({run_name(r) for r in groups if r.get("status") != "completed"})
     failed = sorted(
         {
-            r.get("name")
+            run_name(r)
             for r in groups
             if r.get("status") == "completed"
             and r.get("conclusion") not in GREEN + UNTESTED
@@ -301,7 +353,7 @@ def check_state(runs):
     )
     untested = sorted(
         {
-            r.get("name")
+            run_name(r)
             for r in groups
             if r.get("status") == "completed" and r.get("conclusion") in UNTESTED
         }
@@ -313,7 +365,10 @@ def check_state(runs):
     # rail's per-lane vacuity guard is what actually decides "was THIS lane tested".
     not_tested = sorted(
         {
-            r.get("name")
+            # ⛔ run_name(), not the raw field — this is the FOURTH name set and the one a partial
+            # fix misses (VGATE, #1550): an unnamed completed `skipped` run beside a named one
+            # raised the same TypeError here, in the same function the docstring above claims fixed.
+            run_name(r)
             for r in groups
             if r.get("status") == "completed" and r.get("conclusion") in NOT_TESTED
         }
@@ -385,8 +440,10 @@ def check(pr, repo, repo_dir, normalizer):
         # for it — the same declared residual the rail documents.
         rec_mb = (record or {}).get("merge_base_sha")
         if rec_mb and head_matches((record or {}).get("head_sha"), head):
+            # merge_base_of() raises when the read cannot be taken, so `live_mb` is a
+            # MEASURED sha here and only a real difference is a repoint.
             live_mb = merge_base_of(repo, base, head, repo_dir)
-            base_repointed = not live_mb or live_mb != rec_mb
+            base_repointed = live_mb != rec_mb
 
     binding = record_binding(record, head, live_diff)
     if state != "OPEN":

@@ -75,7 +75,7 @@ python3.12 scripts/landing/landability.py <pr> [--repo owner/name] [--repo-dir P
 # real run, from an agent-infra worktree, against a tortoise PR:
 python3.12 scripts/landing/landability.py 6872 \
   --repo daniel-ospina/tortoise \
-  --repo-dir /Users/danielospina/Documents/GitHub/tortoise/.worktrees/1509-E1
+  --repo-dir <tortoise-checkout>   # e.g. a tortoise worktree, not a path from one machine
 ```
 
 - `--repo` defaults to `gh repo view --json nameWithOwner` resolved **in `--repo-dir`**.
@@ -166,7 +166,7 @@ scripts/landing/rail-bg.sh poll  [--max s] <pr> [pr...]  # wait for several, the
 
 ```bash
 # real run: a tortoise PR with no review record — the rail stops, and the report says so
-LAND_DIR=/Users/danielospina/Documents/GitHub/tortoise/.worktrees/1509-E1 \
+LAND_DIR=<tortoise-checkout> \
 LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
   scripts/landing/rail-bg.sh start 6872
 LAND_DIR=... LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \

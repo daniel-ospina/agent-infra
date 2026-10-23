@@ -131,6 +131,14 @@ cmd_wait() {
   is_numeric "$max" || die_usage "max_s must be numeric (got '$max')"
   local log start
   log="$(log_file "$pr")"
+  # ⛔ A RAIL THAT WAS NEVER STARTED HAS NOT "FINISHED" (P2, fresh review). `pid_alive` is false
+  # for a PR nobody started, so the loop below fell straight through to "finished after 0s" and a
+  # REFUSED recommendation — a fabricated rail event, on the surface a merge-duty lane reads to
+  # decide what happened. The `merged=` read is genuine (so it is not a false PASS), but a lane
+  # would record a refusal for a rail that never ran. Require the start's own artifacts.
+  if [ ! -f "$(pid_file "$pr")" ] && [ ! -f "$log" ]; then
+    die "no rail started for $pr — run 'rail-bg.sh start $pr' first"
+  fi
   start=$SECONDS
   while pid_alive "$pr"; do
     if [ $(( SECONDS - start )) -ge "$max" ]; then
@@ -158,6 +166,12 @@ cmd_poll() {
   [ "${#prs[@]}" -gt 0 ] || die_usage "poll needs at least one PR number"
   for a in "${prs[@]}"; do is_numeric "$a" || die_usage "PR must be numeric (got '$a')"; done
   local start alive pr
+  # Same rule as `wait`: a PR with no start artifacts is not "done", it was never started (P2).
+  for pr in "${prs[@]}"; do
+    if [ ! -f "$(pid_file "$pr")" ] && [ ! -f "$(log_file "$pr")" ]; then
+      die "no rail started for $pr — run 'rail-bg.sh start $pr' first"
+    fi
+  done
   start=$SECONDS
   while :; do
     alive=""
