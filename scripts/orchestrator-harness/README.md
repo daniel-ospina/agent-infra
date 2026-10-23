@@ -100,9 +100,11 @@ doc_status: draft
 > | `orch-loop.sh` moves the sweep's PR **listing** to a conditional REST call (`gh api --paginate -i` + `If-None-Match`, ETag in `state/sweep-etag`, age floor `SWEEP_MAX_AGE`) and takes its rate-limit signal from the **response headers** (`x-ratelimit-remaining`/`-reset`/`Retry-After`) rather than `/rate_limit`; the `# BEGIN sweep-quota` helper block (`sweep_fail_kind`/`sweep_defer_until`) and the new `sweep-quota.test.sh` are agent-infra-only (and the ported `selftest.sh` gains the section that runs it, with its coercion-count pin) | a `304` is not charged to the primary rate limit, so the listing is free, and the `/rate_limit` counter was measured reporting `graphql 4933/5000` while **every** GraphQL call failed — a cell that cannot list PRs cannot merge and read as idle-but-fine (agent-infra#1762). tortoise still carries the polling sweep, so a faithful port must not delete this block as "unported work": port it or keep it |
 >
 > The upstream-logic defects found in the same review are **not** diverged here; they are tracked
-> instead — `fix-one.sh`'s spaced-check-name word-splitting (agent-infra#1703), `can_spawn()`'s
-> load-only gate (agent-infra#1732) and the classifier's inert `(app, name)` grouping
-> (agent-infra#1733) are all still present, matching tortoise.
+> The upstream-logic defects found in the same review are **not** diverged here; they are tracked
+> instead — `fix-one.sh`'s spaced-check-name word-splitting (agent-infra#1703) and the classifier's
+> inert `(app, name)` grouping (agent-infra#1733) are still present, matching tortoise.
+> `can_spawn()`'s load-only gate (agent-infra#1732) is the one that is now DIVERGED: the memory arm
+> is agent-infra's, and tortoise still carries the load-only form until it is ported.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -966,11 +968,12 @@ argument, so the controller revisits every cycle with no delay and hammers the G
 `install.sh` refuses `CYC<5` at render time and `orch-loop.sh` floors a zero/bad value to its 240s
 default, so the two ends cannot disagree. `CYC=5` (a deliberately fast cycle) is still accepted.
 
-**The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
+**The CONTROLLER's spawn decisions are load- AND memory-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
 lane gate already respected `MAX_LOAD`; the merge sweep did not, so a fresh boot got six reviewers
-piled onto the spike. `can_spawn()` now guards the five spawn sites in `orch-loop.sh` — conflict
-fixer, rail merge worker (GREEN), re-record fixer, re-record merge worker, CI-red fixer — while the
+piled onto the spike. `can_spawn()` now guards the six spawn sites in `orch-loop.sh` — conflict
+fixer, rail merge worker (GREEN), re-record fixer, re-record merge worker, CI-red fixer, red-fixer —
+while the
 cheap actions (`gh pr ready`, `gh run rerun`, and `gh pr merge` in *gate* mode) stay ungated, so
 **gate-mode** merges keep flowing during a spike and nothing is
 starved. ⚠️ **On a rail-mode repo the merge is itself a gated worker, so it does NOT keep flowing.**
@@ -982,11 +985,36 @@ spawn a `pi` agent with no `MAX_LOAD` read of their own — `chain-<N>` → `mer
 first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `adopt-fix.sh` →
 `fix-one.sh`; tracked as agent-infra#1720.
 
-⚠️ **`can_spawn()` tests load only.** The available-memory gate applies to *lane dispatch*, not to
-these five spawn sites — the two cover different populations. Raising `MAX_LOAD` therefore narrows
-the band in which the spawn sites hold back (`16`–`99` is now permitted, where `16` used to hold).
-Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
-self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
+**The controller's spawn gate has TWO dimensions — load AND available memory (agent-infra#1732).**
+The six spawn sites above used to be load-gated only, while lane dispatch was bounded by load + lanes
++ swap + available memory: two gates over two different populations, with the resource that actually
+kills this box consulted on only one of them. `can_spawn()` now ANDs `mem_spawn_ok()`, which refuses at
+`mem_avail <= MIN_MEM_FREE_MB` — the dispatch gate's own boundary, so the two can never disagree about
+one reading — and refuses when the probe is UNKNOWN: **fail-CLOSED, unlike the load reading's fail-open**
+(§8). A probe we could not take is not evidence of capacity. The reading is taken in the cycle
+prologue (`measure_mem`), BEFORE the first spawn site; the `[cap]` block re-measures because a dispatch
+decision must see the present. `MEM_UNKNOWN`/`MEMAVAIL_MB` are set in ONE place (`measure_mem`), so
+neither reading can be derived differently from the other, and `selftest.sh` pins the ORDER — a gate
+that consults the pair only where the `[cap]` block reads it decides on the PREVIOUS cycle's figure,
+and on cycle 1 on nothing. Each slot refusal now prints `mem-gate=<reading>M/<floor>M` beside
+`load-gate=`, so a spawn held back by memory no longer reads as a load refusal.
+
+⛔ **WHAT THIS DOES NOT BUY: a floor is a floor, not a headroom policy.** Measured 2026-10-22 on
+cell-3, `MemAvailable` reached **653 MB** with 14 lanes and the box OOM-killed its own runners (the
+pool oscillated 12→8 three times in one night). At 653 MB **the new gate is still TRUE** — 653 > 512
+— so that exact reading remains permitted by both gates. What the change removes is the structural
+gap: the spawn sites previously read *no* memory figure at all, so no floor — not even a raised
+`MIN_MEM_FREE_MB` — could bind them, while the dispatch gate 1,300 lines below was already honouring
+one. An operator who wants 653 MB to refuse now sets `MIN_MEM_FREE_MB` above it and BOTH populations
+obey; raising the default floor is a separate decision (it is a capacity policy, not a wiring bug)
+and is deliberately not made here.
+
+⚠️ **The SPAWN POINT is still memory-blind** (agent-infra#2387): `spawn-gate.sh`'s `run_agent()` gates
+on load and the disk floor and consults no memory probe, so a worker started by `lane.sh`/`fix-one.sh`
+— or by an installed `pi` — is bounded by memory only through the controller's decision to start it.
+A different population from these six sites, and it needs its own polarity decision: that file's disk
+gate fails OPEN on purpose (a live dispatch path must not stop every lane on the box for ever), while
+this memory arm fails CLOSED.
 
 ⚠️ **The account's CONCURRENCY cap is a shared FLEET resource — the ceiling on parallelism is
 neither CPU, RAM nor disk.** Every limit in the table above bounds *this box*: load, lanes, swap,
@@ -1053,7 +1081,12 @@ unchanged — only its Linux measurability is.
 
 A load reading that is *unreadable* stays the documented **fail-open** (`can_spawn()` defaults it to
 `0`): both supported platforms are measurable now, and failing closed on an unreadable probe would
-turn "no load back-pressure" into a permanent controller outage. `install.sh` still refuses to run
+turn "no load back-pressure" into a permanent controller outage. ⛔ **That licence covers LOAD ONLY.**
+The memory half of the same gate is fail-**CLOSED** (§4): a memory probe that cannot answer refuses
+the spawn, because the cost of a wrong "ample" is the box OOM-killing its own runners. Do not read
+`can_spawn()`'s load default as covering the memory arm, and do not "fix" a refusing memory gate by
+making `MEMAVAIL_MB` default to a large number — `measure_mem()` zeroes it on a failed probe for
+exactly that reason. `install.sh` still refuses to run
 off macOS (it renders a launchd plist) — the portability that matters is `orch-loop.sh`, the file
 `cloud-cell-supervisor.sh` starts.
 
@@ -2816,10 +2849,13 @@ were deleted.
 > agent-infra#1705 (the fail-open reaper) and agent-infra#1712 (this directory's provenance pin) —
 > both closed.
 
-- **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
-  sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
-  sites are bounded by load alone, so raising `MAX_LOAD` widens the band in which they proceed while
-  memory is already the binding gate. §4 states the gap; this is its tracker item.
+- ~~**`can_spawn()` gates on load only, so the memory ceiling does not cover the controller spawn
+  sites**~~ (agent-infra#1732 — **FIXED**, this branch). The six spawn sites now AND a memory arm
+  (`mem_spawn_ok()`, measured once per cycle by `measure_mem` before the first site) with the load
+  arm, refusing at `mem_avail <= MIN_MEM_FREE_MB` and on an UNKNOWN probe. It is recorded here rather
+  than deleted because the failure mode is the point: two gates over two populations, the resource
+  that actually kills the box consulted on one of them. ⚠️ The **spawn point** (`spawn-gate.sh`'s
+  `run_agent`) is still memory-blind — a different population, tracked as agent-infra#2387.
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
   at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
   no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a
