@@ -220,6 +220,32 @@ else
   ok "the pass does not start a listener inside the pristine release"
 fi
 
+# ── the template exclusion must NOT depend on the template RESOLVING ─────────────────────
+# `tpl` was the only bound: an unresolvable RUNNER_TEMPLATE left it empty, the `[ -z "$tpl" ] || …`
+# guard then evaluated TRUE, and the pristine release was emitted as a runner — so `reconcile`
+# started a listener INSIDE it (which every later `add` copies into the instance, `.runner` and
+# all) and `slots` counted it against the ceiling. Here the release is still unpacking (the env var
+# points somewhere that does not exist yet) while `$RUNNER_ROOT/_template` carries a stray marker.
+echo "── the template is excluded even when RUNNER_TEMPLATE does not resolve ──"
+fresh_pool nestunres; reset_logs
+mkdir -p "$RUNNER_ROOT/_template"; cp -a "$TEMPLATE/." "$RUNNER_ROOT/_template/"; : >"$RUNNER_ROOT/_template/.runner"
+register pi-runner-real
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/nothing-unpacked-yet" run status)"
+assert_contains "$out" "summary live=0 dead=1 slots=1" \
+  "an unresolvable template does not turn the pristine release into a slot"
+if grep -qF "_template" <<<"$out"; then
+  bad "an unresolvable template does not list the pristine release as a runner"
+else
+  ok "an unresolvable template does not list the pristine release as a runner"
+fi
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/nothing-unpacked-yet" run reconcile)"
+if grep -qF "name=_template" <<<"$out"; then
+  bad "an unresolvable template does not make the pass start a listener inside the release"
+else
+  ok "an unresolvable template does not make the pass start a listener inside the release"
+fi
+assert_eq "$(listeners_for "$RUNNER_ROOT/_template")" "0" "no listener was started inside the pristine release"
+
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"
 fresh_pool floor; reset_logs
@@ -257,9 +283,24 @@ fresh_pool foreign; reset_logs
 mkdir -p "$RUNNER_ROOT/pi-runner-foreign"; echo "someone else's work" >"$RUNNER_ROOT/pi-runner-foreign/keep.txt"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-foreign)"
 assert_eq "$?" "4" "a directory without a .runner is name-unavailable (rc 4), not adoptable"
-assert_contains "$out" "exists without a .runner registration" "the refusal names what it found"
+assert_contains "$out" "path=$RUNNER_ROOT/pi-runner-foreign already exists" "the refusal names what it found"
 assert_file "$RUNNER_ROOT/pi-runner-foreign/keep.txt" "the foreign directory was NOT deleted"
 assert_eq "$(count_lines "$CONFIG_LOG")" "0" "no config.sh ran inside it"
+
+# ── a REGULAR FILE at the target path is refused, and SURVIVES ──────────────────────────
+# `[ -d "$dir" ]` let a file through to `cp -aL`; the copy then failed and the cleanup path ran
+# `rm -rf "$dir"` — deleting an operator's file to tidy up after the tool's own failure. Data loss
+# reached from a typo in a runner name, so the guard is `-e` (anything already there) and the file
+# must still be byte-identical after the refusal.
+echo "── add: a regular FILE at the target path ──"
+fresh_pool foreignfile; reset_logs
+printf 'operator notes — not a runner\n' >"$RUNNER_ROOT/pi-runner-file"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
+assert_eq "$?" "4" "a regular file at the target path is name-unavailable (rc 4)"
+assert_contains "$out" "already exists" "the refusal says the path exists"
+assert_eq "$(cat "$RUNNER_ROOT/pi-runner-file" 2>/dev/null)" "operator notes — not a runner" \
+  "the operator's FILE was not deleted by add's failure cleanup"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-file")" "0" "no listener was started for a file"
 
 # ══ 4. ADD above the CORE-AWARE ceiling ═════════════════════════════════════════════════════
 echo "── add: above the core-aware ceiling ──"
@@ -273,6 +314,19 @@ assert_contains "$out" "MemAvailable=11.72 GB floor=3.50 GB" \
 assert_absent "$RUNNER_ROOT/pi-runner-c" "a ceiling refusal creates no instance dir"
 assert_contains "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-c)" "ncpu=8 ceiling=3" \
   "the same slot count is ACCEPTED on an 8-core box"
+
+# ── a TAKEN NAME reports 4 even when the box is ALSO at a gate ─────────────────────────────
+# The name checks used to sit AFTER the floor/ceiling gates, so a taken name on a full box returned
+# 3 — a caller branching on the documented "4 = that name is taken, try another" could never see the
+# name condition it asked about (this is the reconcile retry branch). rc 4 is the answer about the
+# NAME, and it is a fact about the request rather than about the box.
+echo "── add: a taken name outranks a gate verdict ──"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=4 rc_of add --name pi-runner-1)" "4" \
+  "a taken name reports 4, not the ceiling's 3, on a box at its ceiling"
+assert_eq "$(FIXTURE_MEM_MB=100 FIXTURE_NCPU=8 rc_of add --name pi-runner-1)" "4" \
+  "a taken name reports 4, not the floor's 3, on a box below its floor"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=4 rc_of add --name pi-runner-free)" "3" \
+  "a FREE name still gets the ceiling verdict (the reorder did not swallow the gate)"
 
 # ══ 5. RESTART: a dead listener comes back, a live one is NOT touched ═══════════════════════
 echo "── restart: dead vs live ──"
@@ -365,6 +419,40 @@ bash "$POOL" restart --name pi-runner-dead >/dev/null 2>&1
 assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of status --all)" "0" \
   "status exits 0 once every listener is live"
 
+# ── a DOT-named registration is visible ─────────────────────────────────────────────────
+# `"$RUNNER_ROOT"/*/` never matches a name starting with `.`, so a hand-provisioned `.foo`
+# registration was invisible to `status` and to `slots` (never bounded by the ceiling) while
+# `restart` started it — one registration read two ways by two verbs.
+# (Own pool, placed AFTER the shared-pool assertions so it cannot reset the root under them.)
+echo "── status: a dot-named registration ──"
+fresh_pool dotdir; reset_logs
+register .hidden-runner
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "summary live=0 dead=1 slots=1" "a dot-named registration IS a slot"
+assert_contains "$out" ".hidden-runner" "a dot-named registration is listed"
+
+# ── the process table must be read at FULL WIDTH ──────────────────────────────────────────
+# `ps -eo pid=,args=` TRUNCATES `args` to $COLUMNS (measured on procps-ng 4.0.4: with COLUMNS=80
+# every line came back exactly 80 chars with the argv cut mid-`Runner.Li`, and `ps -ww` returned the
+# full line under the same COLUMNS), and BSD/macOS `ps` truncates unless `-w` is given. A truncated
+# argv misses the suffix match, so a LIVE listener reads DEAD — and that is not a cosmetic
+# mis-report: `restart`/`reconcile` start a SECOND listener for one registration (the double-start
+# the process-table design exists to prevent) and `status` exits 3 on a healthy box. COLUMNS=40 is
+# below every fixture path, so the truncated spelling cannot pass this case.
+echo "── liveness: the process table is read at FULL WIDTH ──"
+fresh_pool narrow; reset_logs
+register pi-runner-width
+bash "$POOL" restart --name pi-runner-width >/dev/null 2>&1
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-width")" "1" "one listener runs before the narrow read"
+out="$(COLUMNS=40 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "0" "a narrow COLUMNS does not make a LIVE listener read DEAD (status exits 0)"
+assert_contains "$out" "pi-runner-width" "the live runner is still listed"
+out="$(COLUMNS=40 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-width)"
+assert_eq "$?" "0" "restart under a narrow COLUMNS exits 0"
+assert_contains "$out" "live name=pi-runner-width" "restart reads the listener LIVE, not DEAD"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-width")" "1" \
+  "no SECOND listener was started for one registration"
+
 # ══ 7. RECONCILE: restart the dead, add to the ceiling, be IDEMPOTENT, and report cannot-act ══
 echo "── reconcile ──"
 fresh_pool reconcile; reset_logs
@@ -404,6 +492,21 @@ assert_eq "$?" "2" "a pass that could not start a listener exits 2 (never 0)"
 assert_contains "$out" "cannot-act why=runner-not-installed" "the failure names the missing install"
 assert_contains "$out" "cannot=1" "the summary counts it as cannot-act, not as a refusal"
 mv "$T/run.sh.bak" "$RUNNER_ROOT/pi-runner-dead/run.sh"
+
+# ── an UNREADABLE capacity reading must not stop the RESTART arm ────────────────────────
+# `readings` used to gate the WHOLE pass, so a broken memory/core read returned 2 BEFORE any dead
+# listener was restarted — refusing the one action this tool exists for (bring a dead listener
+# back) on exactly the box that needs it. The restart arm consumes no reading; only ADDING does,
+# and the summary must say the add arm did not run.
+echo "── reconcile: an unreadable reading still restarts the dead ──"
+fresh_pool nocapacity; reset_logs
+register pi-runner-deadlistener
+out="$(FIXTURE_MEM_MB=not-a-number FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "2" "an unreadable reading still exits 2 (the ADD arm could not be measured)"
+assert_contains "$out" "restarted name=pi-runner-deadlistener" "the dead listener was restarted anyway"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-deadlistener")" "1" \
+  "exactly one listener now runs for it"
+assert_contains "$out" "ceiling=unmeasured" "the summary discloses that the add arm did not run"
 
 # A prefix that would mint an invalid name must not spin the add loop. Own pool: at the ceiling no
 # add is attempted at all, so the pass would exit 0 for the wrong reason.

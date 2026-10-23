@@ -73,9 +73,11 @@
 #
 # USAGE
 #   ci_runner_pool.sh status  [--all]              # per-runner rows + this box's readings
-#                                                 (--all = every runner on THIS box; the cross-box
-#                                                  view is capacity.sh / the fleet inventory, which
-#                                                  this script does not duplicate)
+#                                                 (--all is the SAME view: the default already lists
+#                                                  every runner on THIS box, so the flag widens
+#                                                  nothing. The cross-box view is capacity.sh / the
+#                                                  fleet inventory, which this script does not
+#                                                  duplicate.)
 #   ci_runner_pool.sh add      --name <name> [--dry-run]
 #   ci_runner_pool.sh restart  --name <name> [--dry-run]
 #   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, add to ceiling
@@ -92,6 +94,8 @@
 #       a gate (a floor/ceiling verdict), nothing changed · 4 name not available (that name is taken;
 #       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
+#       ⛔ 4 IS CHECKED BEFORE 3: a name that is already taken reports 4 even on a box that is also
+#       at/below a gate, because the name condition is a fact about the request, not the box.
 #
 # `status` exits 3 when it produced a report in which at least one listener is DEAD — a report is
 # still a report, but a dead listener is a fact a caller must be able to branch on without parsing
@@ -200,15 +204,36 @@ pool_label_for_host() {
 # listing is the FILESYSTEM, not a `gh` call: a box that cannot reach GitHub must still be able to
 # say what it has registered (and GitHub's view is the thing that lies when a listener has died).
 registered_dirs() {
-  local d tpl
+  local d tpl tpl_lit
   [ -d "$RUNNER_ROOT" ] || return 0
+  # ⛔ THE TEMPLATE EXCLUSION MUST NOT DEPEND ON THE TEMPLATE RESOLVING. `$tpl` used to be the only
+  # bound, so an unresolvable RUNNER_TEMPLATE left it EMPTY and the `[ -z "$tpl" ] || …` guard
+  # evaluated TRUE — the pristine release was then emitted as a runner, `reconcile` started a
+  # listener INSIDE it (which every later `add` copies into its instance, `.runner` and all, voiding
+  # the proof-of-registration check), and `slots` counted it against the ceiling. So BOTH the
+  # resolved and the literal path are excluded, plus the documented default `$RUNNER_ROOT/_template`
+  # by name — the layout the shipped default uses while a release is still unpacking.
   tpl="$(cd "$RUNNER_TEMPLATE" 2>/dev/null && pwd -P)" || tpl=""
-  for d in "$RUNNER_ROOT"/*/; do
+  tpl_lit="${RUNNER_TEMPLATE%/}"
+  # ⛔ DOT DIRECTORIES ARE ENUMERATED: `"$RUNNER_ROOT"/*/` never matches a name starting with `.`,
+  # so a hand-provisioned `.foo` registration was invisible to `status` and to `slots` (never
+  # bounded by the ceiling) while `restart` happily started it — the same registration read two
+  # different ways by two verbs.
+  for d in "$RUNNER_ROOT"/*/ "$RUNNER_ROOT"/.[!.]*/; do
     [ -d "$d" ] || continue
-    [ -f "${d%/}/.runner" ] || continue
+    d="${d%/}"
+    # ⛔ A DIR WE CANNOT INSPECT IS COUNTED, NOT SKIPPED. `-f .runner` is FALSE for a registration
+    # we cannot read, so a `chmod 000` instance vanished from `slots`: the box looked EMPTIER than
+    # it is and the core-aware ceiling (the owner's sizing bound) under-counted — the OVER-add
+    # direction. Counting it keeps the ceiling conservative, and the probe downstream then reports
+    # cannot-measure instead of inventing a number.
+    if [ ! -r "$d" ]; then printf '%s\n' "$d"; continue; fi
+    [ -e "$d/.runner" ] || [ -L "$d/.runner" ] || continue
     # The pristine template is never a runner, even if something wrote a `.runner` into it.
+    [ "$d" != "${RUNNER_ROOT%/}/_template" ] || continue
+    [ -z "$tpl_lit" ] || [ "$d" != "$tpl_lit" ] || continue
     [ -z "$tpl" ] || [ "$(cd "$d" && pwd -P)" != "$tpl" ] || continue
-    printf '%s\n' "${d%/}"
+    printf '%s\n' "$d"
   done
 }
 # slots — how many runners this box carries. `wc -l` (never `grep -c .`) so an empty pool is 0 with
@@ -244,8 +269,16 @@ take_name_value() {
 listener_pid() {
   local d="$1" phys out pid args
   phys="$(cd "$d" 2>/dev/null && pwd -P)" || phys="$d"
-  if ! out="$(ps -eo pid=,args= 2>/dev/null)"; then
-    err "cannot-measure why=process-table-unreadable (ps -eo pid=,args= failed)"; return 2
+  # ⛔ `-ww`, NOT A BARE `ps -eo`: procps TRUNCATES `args` to `$COLUMNS` (measured: with
+  # `COLUMNS=80` every line came back exactly 80 chars, the argv cut mid-`Runner.Li`, while
+  # `ps -ww` returned the full line under the same COLUMNS), and BSD/macOS `ps` truncates `args`
+  # unless `-w` is given — and this file explicitly claims to work on a box with no /proc.
+  # A truncated argv makes the suffix match below MISS a LIVE listener, which is not a cosmetic
+  # reporting bug: `restart`/`reconcile` then start a SECOND listener for one registration (the
+  # double-start the process-table design exists to prevent) and `status` exits 3 (DEAD) on a
+  # healthy box. Double `-w` means unlimited width on both GNU and BSD.
+  if ! out="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
+    err "cannot-measure why=process-table-unreadable (ps -ww -eo pid=,args= failed)"; return 2
   fi
   [ -n "$out" ] || { err "cannot-measure why=process-table-empty (ps listed no processes)"; return 2; }
   while read -r pid args; do
@@ -294,6 +327,10 @@ start_listener() {
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
   local dead=0 live=0 d rc
+  # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
+  # default view already IS every runner on this box, so there is no narrower form for the flag to
+  # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
+  # than it does — and rather than dropped, because the issue's clause names it.
   while [ $# -gt 0 ]; do
     case "$1" in --all) shift ;; *) err "usage: status [--all]"; return 1 ;; esac
   done
@@ -331,6 +368,23 @@ cmd_add() {
   if ! valid_name "$name"; then
     err "usage: add --name <runner-name> — a name is [A-Za-z0-9._-], must not start with '.', and must not contain '/'"; return 1
   fi
+  # ⛔ THE NAME'S OWN VERDICT COMES BEFORE THE BOX'S. A name availability check placed AFTER the
+  # floor/ceiling gates returned rc 3 on a box at its ceiling even when the name was already
+  # registered — so a caller branching on the documented "4 = that name is taken, try another"
+  # could never see the name condition it was asking about. These checks read no capacity, so
+  # running them first costs nothing and costs the caller nothing.
+  dir="$RUNNER_ROOT/$name"
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    if [ -e "$dir/.runner" ] || [ -L "$dir/.runner" ]; then
+      err "name-unavailable name=$name already registered at $dir — use restart"; return 4
+    fi
+    # ⛔ `-e`, NOT `-d`. A caller-supplied path may be a FILE (an operator's notes, a symlink to a
+    # shared install), and a `-d` test let it through to `cp -aL`; the copy then fails and the
+    # cleanup below does `rm -rf "$dir"` — DELETING the operator's file to tidy up after our own
+    # failure. Anything already at the target path is refused, and its message does not claim it
+    # is a directory.
+    err "name-unavailable name=$name path=$dir already exists (a file, a symlink, or a directory without a .runner registration) — clear it or pick another name"; return 4
+  fi
   readings || return 2
 
   # ⛔ MEMORY FIRST: the owner's binding constraint is memory, not cores (#2344 comment 6347825624).
@@ -359,15 +413,6 @@ cmd_add() {
   esac
   say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$(slots) labels=$label"
 
-  dir="$RUNNER_ROOT/$name"
-  if [ -f "$dir/.runner" ]; then
-    err "name-unavailable name=$name already registered at $dir — use restart"; return 4
-  fi
-  # A directory with no `.runner` is a FAILED earlier config (ours are removed on failure) or another
-  # tool's. It is not a free slot and it is not ours to delete.
-  if [ -d "$dir" ]; then
-    err "name-unavailable name=$name dir=$dir exists without a .runner registration — clear it or pick another name"; return 4
-  fi
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
     err "cannot-act why=runner-template-absent path=$RUNNER_TEMPLATE/config.sh (one complete runner install to copy)"; return 2
   }
@@ -480,13 +525,6 @@ cmd_reconcile() {
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
-  readings || return 2
-  # ⛔ THIS BOUNDS ATTEMPTS, NOT ADDS. Every iteration advances `n` (or breaks), so this is what makes
-  # the loop terminate — but a name GitHub already holds costs an attempt AND adds nothing, so a budget
-  # sized to the ceiling lands the pass short of capacity, and at 2*CEILING+4 held names it can never
-  # add at all. Held names are normal after a `/tmp` wipe (every local `.runner` gone, every
-  # registration still on GitHub), so the slack is sized for that, not for a hypothetical bug.
-  budget=$((CEILING * 4 + 20))
 
   # (a) every EXISTING registration must have a live listener. This is the half the fleet had no
   #     automation for at all: a dead listener on a live registration reads OFFLINE to GitHub while
@@ -522,6 +560,28 @@ cmd_reconcile() {
       *) cannot=$((cannot + 1)) ;;
     esac
   done <<<"$(registered_dirs)"
+
+  # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no
+  # capacity reading at all — no floor, no ceiling (see cmd_restart) — so gating the WHOLE pass on
+  # `readings` refused the one action this tool exists for, on exactly the box that needs it: dead
+  # listeners on a host whose memory read is broken. Measured shape: an unreadable
+  # cap_mem_free_mb returned 2 before the restart arm ran, so every dead listener stayed dead and
+  # nothing in the output said the restart arm had never been reached. The restart arm therefore runs
+  # FIRST; only the ADD arm requires the readings, and an unreadable reading still makes the pass exit
+  # 2 — after the restarts, with the summary disclosing that the add arm did not run.
+  if ! readings; then
+    cannot=$((cannot + 1))
+    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=unmeasured mem_available=unmeasured floor=%s MB dry_run=%s\n' \
+      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$(slots)" "${MEM_FLOOR_MB:-unset}" "$DRY"
+    err "cannot-measure why=capacity-readings-unavailable (the restart arm already ran; nothing was ADDED) — fix the reading, then re-run"
+    return 2
+  fi
+  # ⛔ THIS BOUNDS ATTEMPTS, NOT ADDS. Every iteration advances `n` (or breaks), so this is what makes
+  # the loop terminate — but a name GitHub already holds costs an attempt AND adds nothing, so a budget
+  # sized to the ceiling lands the pass short of capacity, and at 2*CEILING+4 held names it can never
+  # add at all. Held names are normal after a `/tmp` wipe (every local `.runner` gone, every
+  # registration still on GitHub), so the slack is sized for that, not for a hypothetical bug.
+  budget=$((CEILING * 4 + 20))
 
   # (b)+(c) add only ABOVE the floor and BELOW the ceiling. A gate verdict (rc 3) ENDS the pass — it
   #        is a measurement of this box, not a per-name accident — while an UNAVAILABLE name (rc 4)

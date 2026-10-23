@@ -172,7 +172,8 @@ GitHub showed OFFLINE were not missing but had **dead listeners** (their `_diag`
 `Deleting Runner Session`), and nothing in the repo could re-register one.
 
 ```bash
-bash scripts/ci_runner_pool.sh status  --all        # rows + readings (--all = every runner on THIS box)
+bash scripts/ci_runner_pool.sh status  --all        # rows + readings (--all is the same view: the
+                                                   # default already lists every runner on THIS box)
 bash scripts/ci_runner_pool.sh add     --name <n>   # floor- and ceiling-gated
 bash scripts/ci_runner_pool.sh restart --name <n>   # bring a dead listener back
 bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT yet scheduled)
@@ -199,7 +200,11 @@ slot count **and** the memory reading.
   revalidated; a recycled pid reads "live" forever, and on a box without `/proc` it cannot be
   revalidated at all. The runner's argv (`<dir>/bin/Runner.Listener run`) cannot go stale, and it is
   the only way the runners the old hand scripts started are visible — they wrote no pid file, and
-  reading them as DEAD would double-start a listener on every pass.
+  reading them as DEAD would double-start a listener on every pass. ⛔ **The table is read at full
+  width** (`ps -ww`): procps truncates `args` to `$COLUMNS` (measured: every line exactly 80 chars
+  under `COLUMNS=80`, the argv cut mid-`Runner.Li`) and BSD/macOS truncates unless `-w` is given, so
+  a truncated read would report a LIVE listener as DEAD — and `restart`/`reconcile` would answer that
+  by starting a SECOND one for the same registration.
 - **The label describes the runner.** `ci_runner_gate.sh` selects the pool by `self-hosted-x64` /
   `self-hosted-arm64`. A runner registered without that marker is invisible to the gate forever —
   registered, advertised, idle. The marker is derived from the host's arch by default; an arch we
@@ -210,21 +215,28 @@ slot count **and** the memory reading.
   measurement of the box, not a per-name accident) — while a taken **name** is skipped, because one
   stale directory must not cost the box the capacity it is entitled to. It is idempotent; a `cannot-act` makes the pass
   exit 2 — and so does a pass that ends short of the ceiling having registered nothing, because a
-  per-name code must never be able to report a box that could register nothing as success. ⛔ **Nothing schedules it yet** —
+  per-name code must never be able to report a box that could register nothing as success. ⛔ An
+  **unreadable capacity reading does not stop the restart arm**: bringing a dead listener back needs
+  no memory or core reading, so the pass restarts first and only the ADD arm is gated — otherwise a
+  box whose reading is broken (the box most likely to have dead listeners) would have every one of
+  them left dead, with nothing in the output saying the restart arm was never reached. ⛔ **Nothing schedules it yet** —
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
 
 `status --all` is scoped to **this box**: there is no cross-box read here (the fleet's cross-box view
 is `capacity.sh`'s probe and the fleet inventory), so a runner this box registered and then lost the
 local evidence for is not in the table — that is why an add whose listener fails keeps its `.runner`
-and says so.
+and says so. `--all` widens nothing: the default view already lists every runner on this box, and the
+flag exists because #2373's clause names it.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED by a gate · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
 local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
-always taken). `status`
+always taken). ⛔ **4 is checked before 3**: a name that is already taken reports 4 even on a box that
+is also at a gate, because the name condition is a fact about the request, not about the box — a
+caller that branches on 4 to try another name must be able to see it. `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it
 could not measure, which includes an unreadable **process table**: that is the one unreadable input
 whose absence would produce an action (a second listener) instead of a refusal, so it fails closed too.
