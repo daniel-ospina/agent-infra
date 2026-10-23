@@ -60,10 +60,16 @@
 # both arms must pass: a rule that defers on 4 would be a fleet-wide stop, and one that allows 92 is
 # not a gate at all.
 #
-# ⛔ EVERY TUNING VALUE LIVES IN THIS FILE, IN THE TWO FUNCTIONS BELOW (`ciq_horizon_min`,
-# `ciq_job_p90_min`) — one place to change the arithmetic, overridable by the matching env name,
-# with the shipped default being the MEASURED one. Nothing about this gate is rendered into the
-# launchd plist, so there is no second copy to drift (install.sh does not source this file).
+# ⛔ EVERY TUNING VALUE LIVES IN THIS FILE — FIVE OF THEM, NOT TWO (#2333 review, P2). The three
+# functions below (`ciq_horizon_min`, `ciq_job_p90_min`, `ciq_hosted_concurrency`) plus the two
+# cache bounds read inline in `ciq_read` (`CIQ_TTL`, `CIQ_STALE_MAX`) — each overridable by the
+# matching env name, with the shipped default being the MEASURED one. `ciq_hosted_concurrency` is
+# NAMED here because it is not cosmetic: on the GitHub-HOSTED shape (a repo whose `actions/runners`
+# answers `total_count: 0`) it SUPPLIES the runner count, so it sets the ceiling through the same
+# arithmetic — `ceil(20 * 20 / 10) = 40` at the defaults. An earlier version of this header said
+# "THE TWO FUNCTIONS"; an operator retuning a hosted repo by it would have changed nothing, which
+# is the class of claim this repository asks a review to catch. Nothing about this gate is rendered
+# into the launchd plist, so there is no second copy to drift (install.sh does not source this file).
 #
 # ── FAIL-CLOSED, AND THE ONE PLACE THAT IS DELIBERATELY NOT ─────────────────────────────────────
 #   * An UNREADABLE queue is **UNKNOWN**, and UNKNOWN defers CI-spending work. The alternative — an

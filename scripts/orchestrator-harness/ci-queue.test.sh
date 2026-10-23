@@ -516,6 +516,45 @@ ck "(h0b) the per-cycle reset was EXTRACTED from orch-loop.sh (record AND memo),
    "$( { [ -s "$RST" ] && grep -q 'CIQ_ARM_RC=""' "$RST" && grep -q 'CIQ_VER=""' "$RST"; } ; echo $? )"
 ck "(h0c) …and it sits INSIDE the cycle body (while@${_whileln:-?} < reset@${_resetln:-?}) — a hoisted reset re-pins cycle 1's verdict for ever" \
    "$( { [ -n "${_whileln:-}" ] && [ -n "${_resetln:-}" ] && [ "$_resetln" -gt "$_whileln" ]; } ; echo $? )"
+# ⛔ THE MODULE-ABSENT FALLBACK IS DRIVEN TOO (#2333 review, P2 — a FALSE PASS closed here). The
+# body's third load-bearing property is "a missing module never becomes a permanent stop", and it
+# was pinned by NOTHING: every arm above drives the CIQ=1 predicate, and (e13)/(e14) grep the
+# INCOMPLETE message. Measured before this arm existed: flipping the shipped `else` arm from
+# `return 0` to `return 1` — the exact P0 the body says was fixed, a box with no `$O/ci-queue.sh`
+# deferring every fixer for ever while the [ci-queue] line calls the arm inert — left ci-queue 83/0,
+# pr-dispatch 36/0, selftest 464/0 and test-gates 395/0 ALL GREEN. The bytes that decide it are
+# EXTRACTED from orch-loop.sh (not restated), so this arm fails when the shipped polarity changes.
+FB="$T/fallback.sh"
+awk '/^  ciq_push_ok\(\) \{ return 0; \}$/{print; exit}' "$LOOP" > "$FB"
+ck "(h0d) the module-absent fallback was EXTRACTED from orch-loop.sh (not a restatement)" \
+   "$( { [ -s "$FB" ] && grep -q 'return 0' "$FB" && ! grep -q 'CIQ_ARM_RC' "$FB"; } ; echo $? )"
+fb_rc() { # drive a fallback file in a NAMESPACE WITH NO MODULE: nothing from this suite may leak in
+  ( unset -f ciq_push_ok 2>/dev/null; . "$1"; ciq_push_ok; printf '%s' "$?" )
+}
+fbrc="$(fb_rc "$FB")"
+ck "(h0e) a box with NO module ALLOWS (rc=$fbrc) — the fallback is 'arm inert', never 'defer for ever'" \
+   "$( [ "$fbrc" = 0 ]; echo $? )"
+# …and the arm is not always-green: the OPPOSITE polarity must fail it.
+sed 's/return 0/return 1/' "$FB" > "$T/fallback-mutant.sh"
+if cmp -s "$FB" "$T/fallback-mutant.sh"; then
+  bad "(h0f) the fallback mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/fallback-mutant.sh" 2>/dev/null; then
+  bad "(h0f) the fallback mutant does not parse — a broken mutant proves nothing about polarity"
+else
+  mrc="$(fb_rc "$T/fallback-mutant.sh")"
+  ck "(h0g) MUTANT — the inverted fallback returns $mrc, so (h0e) goes red instead of passing a permanent stop" \
+     "$( [ "$mrc" != 0 ]; echo $? )"
+fi
+# …and the INERT disclosure an operator reads must sit INSIDE the CIQ=0 arm (the else of the guard),
+# not anywhere in the file: a line about an unsourced module printed on the CIQ=1 path would be a
+# false statement about the box's own state, which is the defect cycle 12 fixed for the other arm.
+_ciq0ln="$(grep -n '^  CIQ=0$' "$LOOP" | head -1 | cut -d: -f1)"
+_inertln="$(grep -n 'the CI-queue arm is INERT this cycle' "$LOOP" | head -1 | cut -d: -f1)"
+_grdln="$(grep -n '^if \[ "\${CIQ:-0}" = "1" \]; then$' "$LOOP" | head -1 | cut -d: -f1)"
+n_inert="$(grep -c 'the CI-queue arm is INERT this cycle' "$LOOP")"
+ck "(h0h) the INERT disclosure sits INSIDE the CIQ=0 arm (CIQ=0@${_ciq0ln:-?} < INERT@${_inertln:-?} < guard@${_grdln:-?}, n=$n_inert)" \
+   "$( { [ -n "${_ciq0ln:-}" ] && [ -n "${_inertln:-}" ] && [ -n "${_grdln:-}" ] \
+        && [ "$_inertln" -gt "$_ciq0ln" ] && [ "$_inertln" -lt "$_grdln" ] && [ "$n_inert" -eq 1 ]; } ; echo $? )"
 # shellcheck source=/dev/null
 reset_cycle() { . "$RST"; }
 feed 1 0 3; reset_cycle      # SHALLOW: 1 queued, 3 runners => ceiling 6 => allowed
@@ -607,6 +646,67 @@ else
   i2="$(drive_note "$T/mutant-note/ci-queue.sh")"
   ck "(i2) MUTANT — a SILENCED in-shell note keeps the same decision (allowed=1) and LOSES the line, so (i1) is not always-green" \
      "$( { has "$i2" 'allowed=1' && has "$i2" 'note=[ci-queue] DEFERRED'; [ $? -ne 0 ]; } ; echo $? )"
+fi
+
+# ⛔ (j) THE DEFERRAL'S EFFECT, DRIVEN — NOT THE PRESENCE OF ITS LINES (#2333 review, P2).
+# `(e7)`/`(e8)` grep for `ciq_ci_allowed "$OR"` and `fixbail-$PR-$HEAD`, which is how a deferral
+# whose `exit 0` was replaced by `:` stayed green: the block PRINTS "DEFERRED … nothing pushed" and
+# then FALLS THROUGH to the cross-box claim, runs the fixer and pushes — the log asserting the exact
+# opposite of what the process did, and the bail marker making the controller refund an attempt that
+# did work. The one suite that executes fix-one.sh (`test-crossbox.sh`) is excluded from
+# run-bash-shards.sh by design (spawn-gate.test.sh pins the excluded set), so NO CI LANE ran it.
+# Measured before this arm: the `exit 0` → `:` mutant left this file 83 passed, 0 failed, CLEAN.
+# The shipped block is EXTRACTED (not restated) and driven under a stub module in both polarities.
+printf '\n── (j) the fix-one.sh deferral EXITS, driven with a stub module ───────────────\n'
+FBLK="$T/fixgate.sh"
+awk '/^if \[ -f "\$SELF\/ci-queue.sh" \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$FIX" > "$FBLK"
+ck "(j1) fix-one.sh's gate block was EXTRACTED (not a restatement)" \
+   "$( { [ -s "$FBLK" ] && grep -q 'ciq_ci_allowed "\$OR"' "$FBLK" && grep -q '^      exit 0$' "$FBLK"; } ; echo $? )"
+mkstub() { # $1 = dir, $2 = ciq_ci_allowed's rc (1 = DEEP, 0 = SHALLOW)
+  mkdir -p "$1"
+  {
+    printf '%s\n' 'ciq_read() { return 0; }' \
+      'ciq_eval() { return 1; }' \
+      'ciq_defer_note_here() { printf "note=[ci-queue] DEFERRED %s\n" "$1"; }' \
+      "ciq_ci_allowed() { return $2; }" \
+      'ciq_verdict() { printf "%s" "stub"; }' \
+      'ciq_is_count() { return 0; }' \
+      'ciq_ceiling() { printf "4"; }' \
+      'ciq_defer_line() { printf "stub-line"; }' \
+      'ciq_horizon_min() { printf "20"; }' \
+      'ciq_job_p90_min() { printf "10"; }'
+  } > "$1/ci-queue.sh"
+  printf '%s\n' 'CIQ_QUEUED=99; CIQ_RUNNING=1; CIQ_RUNNERS=2; CIQ_CEILING=4; CIQ_STATE=deep; CIQ_AGE=0' >> "$1/ci-queue.sh"
+}
+mkstub "$T/fixself-deep" 1
+mkstub "$T/fixself-shallow" 0
+drive_fixgate() { # $1 = block file, $2 = stub dir → writes $T/sentinel iff the block FELL THROUGH
+  : > "$T/fixlog.log"
+  rm -f "$T/sentinel"
+  ( SELF="$2"; OR="o/r"; PR="7"; BR="fix/b"; HEAD="$(printf 'deadbeef%.0s' 1 2 3 4 5)"; CTRL=1
+    O="$T/fixstate"; mkdir -p "$O/state"; L="$T/fixlog"
+    # shellcheck source=/dev/null
+    . "$1"
+    printf 'FELL-THROUGH\n' >> "$T/sentinel" ) >/dev/null 2>&1
+  printf '%s' "$?"
+}
+rc="$(drive_fixgate "$FBLK" "$T/fixself-deep")"
+ck "(j2) a DEEP queue EXITS the fixer before it runs (rc=$rc, no fall-through, bail marker written) — the lane that PUSHES does not" \
+   "$( { [ "$rc" = 0 ] && [ ! -e "$T/sentinel" ] \
+        && grep -q 'DEFERRED' "$T/fixlog.log" && [ -e "$T/fixstate/state/fixbail-7-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ]; } ; echo $? )"
+rc="$(drive_fixgate "$FBLK" "$T/fixself-shallow")"
+ck "(j3) …and a SHALLOW queue FALLS THROUGH (rc=$rc, sentinel present) — so (j2) is a decision, not a constant exit" \
+   "$( { [ "$rc" = 0 ] && [ -e "$T/sentinel" ] && ! grep -q 'DEFERRED' "$T/fixlog.log"; } ; echo $? )"
+# …and the effect is not decoration: without the `exit 0` the block FALLS THROUGH on a DEEP queue.
+sed 's/^      exit 0$/      :/' "$FBLK" > "$T/fixgate-mutant.sh"
+if cmp -s "$FBLK" "$T/fixgate-mutant.sh"; then
+  bad "(j4) the deferral mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/fixgate-mutant.sh" 2>/dev/null; then
+  bad "(j4) the deferral mutant does not parse — a broken mutant proves nothing about the exit"
+else
+  rc="$(drive_fixgate "$T/fixgate-mutant.sh" "$T/fixself-deep")"
+  ck "(j5) MUTANT — a deferral without its \`exit 0\` reaches the push (rc=$rc, sentinel=$([ -e "$T/sentinel" ] && echo yes || echo no)), so (j2) is not always-green" \
+     "$( { [ "$rc" = 0 ] && [ -e "$T/sentinel" ]; } ; echo $? )"
 fi
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
