@@ -128,6 +128,16 @@ fi
 # purpose, so the vacuity arms ALWAYS execute — a slice must never be able to leave "can a failing
 # shard fail this run?" untested. Positions are dealt round-robin (pos % n), so slow shards spread
 # across slices instead of clustering in one (contiguous chunks would stack the expensive suites).
+#
+# ⛔ THE EXECUTED PATHS ARE RECORDED, not only counted (#2482 review, 2026-10-23). A COUNT cannot
+# distinguish "ran my 10" from "ran MY NEIGHBOUR's 10": with the modulus broken so every slice runs
+# the first slice's set, N=78 is caught only because 78 % 8 ≠ 0 — at N=80 all eight slices execute a
+# correct COUNT (10 each) and print ✅ while 10 of the 80 shards never run at all. The list grows, so
+# that decay is scheduled rather than hypothetical. The set is compared at the end.
+shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
+: > "$shard_ran_log" 2>/dev/null || true
+trap 'rm -f "$shard_ran_log"' EXIT
+
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
@@ -158,7 +168,7 @@ shard_note() {
 # anonymously) can be measured at all: until now no lane printed how long a shard took, so "which
 # shard is slow, which one hangs" was answerable only by watching a job's clock. It prints ONLY for
 # list lines (`shard_is_listed`), so the sentinels cannot print a bogus row.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -295,6 +305,7 @@ run_shard scripts/harness-surface.test.sh                                  # #22
 run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail — ⛔ FOLDED HERE by agent-infra#2439: it used to ALSO be a step of ci.yml's `admin-merge` job, which re-ran this suite on the SAME commit (993 s of that job's 3,009 s, measured on PR #2385's head at 39879010341). One run site, and it is the one BOTH lanes execute (#1369)
 run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit — ⛔ FOLDED HERE by agent-infra#2439 (same duplicate job; this suite was 1,920 s of it, 32 min). The land step DELEGATES to admin-merge.sh and the record step to record-review.sh; the suite pins only the sequencing and the fail-closed preconditions
 run_shard tests/record-review/run.sh                                       # the lane-dimension carry (#6072/#6213/#4823): a base-only head move must CARRY, lane work must REFUSE, and a lying local base ref must REFUSE
+run_shard tests/review-pr/run.sh                                           # the REVIEW SEAM a lander runs (scripts/review-pr.sh): a fresh-context reviewer's CLEAN verdict is RECORDED bound to the reviewed head, findings are NOT recorded (exit 7, printed), an unresolvable repo / no auth / missing `pi` / no verdict / a head that moved mid-review all refuse with no record, an unchanged head is never re-recorded, an ambient GH_REPO cannot choose the repo, and a MUTANT that removes the clean-only guard records a false `clean` (hermetic: stub gh, fake pi, fake recorder)
 run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim — ⛔ FOLDED HERE by agent-infra#2439 (same duplicate job, 86 s): the shim inspects its OWN argv, where bash has already resolved `-${V:--}admin=true` into `--admin`, and the suite drives it through a real shell with the splices that defeated the string scanner
 run_shard tests/admin-merge-evidence-contract/run.sh                       # #1388 the ONE certificate contract, pinned against a REAL captured evidence comment rather than a hand-written fixture (bcbb7df renamed the producer's residual clause and BOTH gates kept requiring the old name — six days of fleet-wide refusals with every suite green). ⛔ MOVED HERE from ci.yml's `admin-merge` job by agent-infra#2439: the suite was the ONLY step there that was not already a shard, so folding it is what let that job go — and, unlike the job, this list runs in BOTH lanes, so the post-merge lane now runs it too (it previously ran at PR time only)
 run_shard tests/pipeline-compliance-fetch-stderr/run.sh                    # #1876 in the FETCH path: a warning on a SUCCESSFUL gh call is SURFACED, never parsed (stderr merged into the --jq stream turned it into "invalid character ... looking for beginning of value") and a FAILED call reports BLOCKED-BY-TOOLING, never a policy failure. Mutation included: the stderr-merged variant must fail
@@ -325,6 +336,19 @@ fi
 # wrong subset (off-by-one in the modulus, an unreadable env var, a stray `continue`) fails here,
 # and so does an unsharded run that skipped anything.
 if [ "$slice_count" -gt 0 ]; then
+  # ⛔ IDENTITY, not a count. The expected set is DERIVED from the same list and the same round-robin
+  # the skips use (`pos % n == i`), and compared as a SORTED SET, so a slice that runs the right
+  # number of the WRONG shards fails here — the hole a count assertion reports as green.
+  exp_log="$shard_ran_log.expected"
+  sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" \
+    | awk -v i="$slice_index" -v n="$slice_count" '(NR - 1) % n == i' | sort > "$exp_log"
+  sort "$shard_ran_log" > "$exp_log.ran"
+  if ! cmp -s "$exp_log" "$exp_log.ran"; then
+    echo "❌ slice $((slice_index + 1))/$slice_count executed a DIFFERENT SET of shards than its index derives (expected $(wc -l <"$exp_log" | tr -d ' '), ran $(wc -l <"$exp_log.ran" | tr -d ' ')); first difference: $(diff "$exp_log" "$exp_log.ran" | head -4 | tr '\n' ' ')"
+    rm -f "$exp_log" "$exp_log.ran"
+    exit 1
+  fi
+  rm -f "$exp_log" "$exp_log.ran"
   expected=$(( (listed - 1 - slice_index) / slice_count + 1 ))
   if [ "$shard_ran" -ne "$expected" ]; then
     echo "❌ slice $((slice_index + 1))/$slice_count executed $shard_ran shard(s), expected $expected — the slice does not cover its share of the list"

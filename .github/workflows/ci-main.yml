@@ -380,7 +380,9 @@ jobs:
     # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
     # self-test. Bound from CI's own measurement of that body of work on PR #2412 (job
     # 120365087427 on ubuntu-latest): shard step 73m37s + parity self-test 38m41s + the syntax
-    # sweeps ≈ 115 min. 180 min is ~1.6x that.
+    # sweeps ≈ 112.4 min. The bound shipped below is 230 min ≈ 2.0x that — ONE number and ONE
+    # measurement, stated once (see the arithmetic note below, which also gives the sum of the step
+    # bounds).
     #
     # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
     # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
