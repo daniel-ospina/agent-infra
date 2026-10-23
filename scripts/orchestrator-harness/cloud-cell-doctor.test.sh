@@ -1085,6 +1085,78 @@ rm -f "$T/tmux/ls_rc" "$T/tmux/ls_msg"
   && ok "hygiene: an unreadable session list is rc=3 (the sweep was never evaluated)" \
   || bad "hygiene: an unreadable session list produced rc=$RC (a clean pass over an unrun sweep)"
 
+# ── 18) A DEAD LOOP IS NEVER 'WAITING' (agent-infra#2306) ────────────────────────────────────────
+# The measured pi-cell-4 output, in full: `loop: NOT RUNNING` printed BESIDE four `WAITING … 274s
+# ago` rows that quoted the dead loop's start time as if it were progressing. The only row that knew
+# the truth did not suppress or downgrade the others, so a reader concluded "the first pass is slow"
+# while nothing would ever complete — and reap/merge/hygiene never ran at all (a cell that produces
+# PRs and can never land them).
+say_case "status: a DEAD loop reports DEAD in every row, never WAITING (#2306)"
+reset_state; reset_tmux; reset_ps; : > "$T/o/state/roles/.desired"
+: > "$T/o/logs/doctor.log"
+# A pid that is provably gone: start one and reap it, so `kill -0` fails for the right reason.
+"$REAL_SLEEP" 0.05 & GONE_PID=$!; wait "$GONE_PID" 2>/dev/null || true
+printf '%s\n' "$GONE_PID" > "$T/o/state/roles/loop.pid"
+printf '%s|proc:12345\n' "$GONE_PID" > "$T/o/state/roles/loop.ident"
+printf '%s\n' "$(( $(date +%s) - 274 ))" > "$T/o/state/roles/loop.started"
+# …and the SIGKILL's leftovers: the in-progress marker a killed loop cannot remove.
+: > "$T/o/state/roles/.doctor.running"
+# ⛔ THE EXACT MEASURED SHAPE FIRST: no role record yet (so the old code took the grace branch) plus
+# the marker a SIGKILL left behind. That is the combination that printed `WAITING … 274s ago` beside
+# `loop: NOT RUNNING`, and it is the one a role-record-only fixture cannot reach.
+doc status
+case "$OUT" in *WAITING*) bad "status: printed WAITING for a role with no pass under a DEAD loop — $OUT" ;;
+              *) ok "status: the measured shape (no pass + stale .running marker) is not WAITING" ;; esac
+case "$OUT" in *"still running"*) bad "status: read the killed loop's .running marker as a live pass — $OUT" ;;
+              *) ok "status: a killed loop's in-progress marker is not read as a live pass" ;; esac
+NOW="$(date +%s)"
+for r in reap doctor merge hygiene; do
+  printf 'role=%s\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=0\nlast_result=ok\n' "$r" "$NOW" \
+    > "$T/o/state/roles/$r.state"
+done
+doc status
+case "$OUT" in *WAITING*) bad "status: printed WAITING under a DEAD loop (the #2306 lie) — $OUT" ;;
+              *) ok "status: no row promises WAITING when the loop is gone" ;; esac
+case "$OUT" in *"DEAD"*) ok "status: names the rows DEAD" ;; *) bad "status: no DEAD row — $OUT" ;; esac
+result_has "pid-gone" && ok "status: names the evidence (pid-gone), not just the verdict" || bad "status: the reason is not named — $OUT"
+result_has "last pass" && ok "status: still reports the last pass each role recorded" || bad "status: the last-pass record was lost — $OUT"
+[ "$RC" -ne 0 ] && ok "status: a dead loop under a started cell fails the verb (rc=$RC)" || bad "status: rc=0 beside a dead loop"
+# ⛔ THE SAME FIXTURE WITH A LIVE LOOP MUST NOT READ DEAD — otherwise the arm above is satisfied by
+# "rows are always red" rather than by the liveness check it claims to test.
+"$REAL_SLEEP" 30 & LIVE_PID=$!
+loop_up "$LIVE_PID"
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+doc status
+kill "$LIVE_PID" 2>/dev/null || true
+case "$OUT" in *"DEAD"*) bad "status: called a LIVE loop's roles DEAD (the control arm) — $OUT" ;;
+              *) ok "status: a live loop's rows are not DEAD (non-vacuity of the arm above)" ;; esac
+[ "$RC" -eq 0 ] && ok "status: the live-loop control is clean, so the dead arm is decided by liveness" \
+                 || bad "status: the live-loop control failed (rc=$RC) — $OUT"
+
+# ⛔ AN UNREADABLE READ IS NOT A DEATH WITNESS. Each shape below cannot distinguish "gone" from "could
+# not tell", so it must abstain: UNKNOWN + rc 3, never WAITING (a promise) and never DEAD (a claim).
+say_case "status: unverifiable loop records abstain with a named reason (#2306)"
+for shape in unparseable-pid no-identity-record; do
+  reset_state; : > "$T/o/state/roles/.desired"; : > "$T/o/logs/doctor.log"
+  "$REAL_SLEEP" 30 & LIVE_PID=$!
+  case "$shape" in
+    unparseable-pid)      printf 'not-a-pid\n' > "$T/o/state/roles/loop.pid" ;;
+    no-identity-record)   printf '%s\n' "$LIVE_PID" > "$T/o/state/roles/loop.pid"
+                          rm -f "$T/o/state/roles/loop.ident" ;;
+  esac
+  printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+  doc status
+  kill "$LIVE_PID" 2>/dev/null || true
+  case "$OUT" in *WAITING*) bad "status[$shape]: abstained as WAITING (a promise it cannot make) — $OUT" ;;
+                *) ok "status[$shape]: no WAITING row" ;; esac
+  case "$OUT" in *DEAD*) bad "status[$shape]: manufactured a death witness from an unreadable read — $OUT" ;;
+                *) ok "status[$shape]: does not claim DEAD from an unreadable read" ;; esac
+  [ "$RC" -eq 3 ] && ok "status[$shape]: rc=3 (the abstention code, not a pass)" \
+                  || bad "status[$shape]: rc=$RC (want 3) — $OUT"
+  result_has "UNKNOWN" && ok "status[$shape]: named UNKNOWN" || bad "status[$shape]: no UNKNOWN row — $OUT"
+done
+reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
+
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

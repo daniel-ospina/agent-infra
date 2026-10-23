@@ -493,6 +493,20 @@ cap=[];cap_wip=[];cap_busy=[];cap_dead=[];cap_occ=[]
 # pass -- the probe is a courtesy read, the pass is the product.
 PANE_PROBE_CAP=2
 _pane_probes=0
+# ⛔ PROTECTED COMES FROM ONE LIST (owner report, twice). This payload kept its OWN hardcoded
+# copy of the names while lane-actions.py already unions the DECLARED file with them -- so a
+# workspace the owner created or renamed stayed dispatchable HERE (the beat publishes it as
+# free= / wip= capacity) after the roster had learned about it (review, P1). Read the same file
+# with the same rules: strip, skip blanks, skip `#` comments, and a malformed or missing file
+# degrades to the historical tuple rather than raising. `utf-8-sig` so a BOM does not turn the
+# first name into an unmatchable string. NO APOSTROPHE IN THIS PAYLOAD -- see the note above.
+_OWS_FILE=os.path.expanduser("~/.pi/agent/state/owner-workspaces.txt")
+try:
+    with open(_OWS_FILE, encoding="utf-8-sig", errors="replace") as _f:
+        _OWS=tuple(x.strip() for x in _f if x.strip() and not x.lstrip().startswith("#"))
+except (OSError, ValueError):
+    _OWS=()
+_PROTECTED=("DMeer", "DMer", "HANG")+_OWS
 for r in rows:
     if r["verdict"] not in ("DONE-IDLE","WIP-IDLE"): continue
     if (r.get("child") or {}): continue          # a child in flight is work, not idle
@@ -556,7 +570,9 @@ for r in rows:
     # Named here too, at the point the list is built. Matched as a SUBSTRING because the
     # workspace title carries a suffix and a prefix (`DMeer - linkedin outreach`).
     # NO APOSTROPHE IN THIS PAYLOAD -- see the note above.
-    if any(p in r["lane"] for p in ("DMeer", "DMer", "HANG")):
+    # The list is the DECLARED one united with the historical tuple (see _PROTECTED above), not a
+    # second hardcoded copy: that copy is how the owner workspace stayed dispatchable here.
+    if any(p and p in r["lane"] for p in _PROTECTED):
         continue
     (cap_wip if r["verdict"] == "WIP-IDLE" else cap).append(
         "%s(%dm%s)[%s]" % (r["lane"], a, _busy, _h))

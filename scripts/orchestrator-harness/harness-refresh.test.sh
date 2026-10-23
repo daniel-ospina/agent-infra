@@ -1079,9 +1079,13 @@ chmod +x "$D/O/harness-refresh.sh"
 # No pipe: `grep … | grep -q` is the SIGPIPE false-negative idiom the repo's own guard rejects (a quiet
 # consumer exiting early can make the producer die with SIGPIPE under `pipefail`, and the assertion then
 # reads as a plain "no match"). awk reads the file once and exits on the first hit.
-_hr_call_ctx="$(awk '{ w[NR%4]=$0 }
-  /^  harness_refresh_cycle/ {
-    if (w[(NR-1)%4] ~ /_HR_DONE=0/ || w[(NR-2)%4] ~ /_HR_DONE=0/ || w[(NR-3)%4] ~ /_HR_DONE=0/) print "yes"
+# The reset is its own STATEMENT, not a one-liner: comments (and later per-cycle resets, e.g. the
+# #2308 refresh-resolution reset) legitimately sit between `_HR_DONE=0` and the call, so the look-back
+# must span the intervening block rather than a fixed 3 lines — a narrow window reported a FALSE RED
+# on a correct call site the moment a comment was added between the two statements.
+_hr_call_ctx="$(awk '{ w[NR%32]=$0 }
+  /^[[:space:]]*harness_refresh_cycle[[:space:]]*($|#)/ {
+    for (i=1; i<=24; i++) if (w[(NR-i)%32] ~ /_HR_DONE=0/) { print "yes"; exit }
     exit
   }' "$LOOP")"
 [ "$_hr_call_ctx" = yes ] \
