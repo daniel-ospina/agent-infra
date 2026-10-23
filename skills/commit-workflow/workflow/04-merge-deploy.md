@@ -66,8 +66,10 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    `scripts/check-pipeline-compliance.sh`, the recorder `scripts/record-review.sh`,
    `.github/workflows/**`, `.github/actions/**`, `.husky/**`, `extensions/**`,
    `skills/**`, `templates/**`, `enforcement/**`, `scripts/check-*`,
-   `scripts/lib/diff-normalize.py` — the last five because they are
-   agent-executable instructions or gate bodies), `record-review.sh` REFUSES
+   `scripts/lib/diff-normalize.py`, and the rail-exec'd decision modules
+   (`scripts/ci_exemption.py`, `scripts/ci-workflow-pr-evaluable.sh`,
+   `scripts/checkout_guard.sh`, `scripts/ci_runner_gate.sh`) — the last five
+   because they are agent-executable instructions or gate bodies), `record-review.sh` REFUSES
    (exit 4) a `clean-micro` record whose readable diff touches one; a TRANSPORT
    failure only warns, and a payload the API answered with but the classifier
    cannot certify refuses. A `complexity:micro` label does not make a merge-rail

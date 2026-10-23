@@ -1783,7 +1783,16 @@ cat > "$T30/bin/gh" <<'EOF'
 for x in "$@"; do
   case "$x" in
     *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
-    *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then exit "$FIX_COMPARE_RC"; fi
+    *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then
+                       # The real `gh` prints its own diagnosis on STDERR, and the
+                       # recorder now classifies a compare failure by the HTTP
+                       # status on it (404/422 = the API refused THIS revision;
+                       # 403/5xx/network = nothing was read). A fixture that sets
+                       # only an exit code cannot model that — it was how the
+                       # earlier version pinned "every failure is a refusal".
+                       printf '%s\n' "${FIX_COMPARE_ERR:-}" >&2
+                       exit "$FIX_COMPARE_RC"
+                     fi
                      printf 'mb\t%s\n' "${FIX_MB}"; printf '%s\n' "${FIX_ROWS}"; exit 0 ;;
   esac
 done
@@ -1876,7 +1885,7 @@ T30_EMPTY="$(tier_for 0)"
 # The diff-identity producer and the CI/pre-commit gate bodies (cycle-2 F1): the
 # recorder's own argument ("leaving it out would be a one-line bypass") applies
 # verbatim to the ONE implementation of the diff digest.
-for f in scripts/lib/diff-normalize.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit; do
+for f in scripts/lib/diff-normalize.py scripts/check-no-sigpipe-grep.sh .husky/pre-commit scripts/ci_exemption.py scripts/ci-workflow-pr-evaluable.sh; do
   [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
     && pass "(30xvi) $f is ALWAYS-FULL" \
     || fail "(30xvi) $f did NOT select full — a gate body is outside the class"
@@ -1886,28 +1895,47 @@ done
 # API is reachable and refuses THIS revision — a fork head over 404), not
 # transport. Classifying it as transport let a fork PR editing a rail record
 # clean-micro with one stderr line (cycle-2 P1).
-T30_CMP_RC="$(FIX_COMPARE_RC=1 PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+T30_CMP_RC="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
   FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
   HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
 [ "$T30_CMP_RC" = "$(printf 'unclassified\t')" ] \
-  && pass "(30xvii) a compare non-2xx (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — positive evidence, no tier" \
-  || fail "(30xvii) a compare non-2xx was read as transport (got '$T30_CMP_RC')"
+  && pass "(30xvii) a compare HTTP 404 (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — the API REFUSED this revision" \
+  || fail "(30xvii) a compare HTTP 404 was read as transport (got '$T30_CMP_RC')"
 
 # ...and on the RECORD path the same response must refuse, like its clean-low
 # sibling does 60 lines later.
 rm -rf "$T30H/.pi/agent/reviews"
-FIX_COMPARE_RC=1 HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
   FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
   bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
 T30_CMP_GUARD_RC=$?
 [ "$T30_CMP_GUARD_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
-  && pass "(30xviii) a compare non-2xx REFUSES the clean-micro record (exit 4, no record) — a fork PR cannot skip review on a rail" \
-  || fail "(30xviii) a compare non-2xx still minted a record (rc=$T30_CMP_GUARD_RC)"
+  && pass "(30xviii) a compare HTTP 404 REFUSES the clean-micro record (exit 4, no record) — a fork PR cannot skip review on a rail" \
+  || fail "(30xviii) a compare HTTP 404 still minted a record (rc=$T30_CMP_GUARD_RC)"
 
-# THE SEAM IS READ-ONLY (cycle-2 F3): drive the selector with an isolated HOME
-# and no record on disk, then assert nothing appeared. Order-independent — the
-# directory is cleared first, so a record left by the RECORD-path runs above can
-# never be mistaken for one the selector minted.
+# THE OTHER DIRECTION, which the earlier version got WRONG: a 403 rate-limit,
+# a 5xx and a dead socket are NOT refusals of this revision. Treating them as
+# positive evidence stranded a legitimate micro lane on a transient failure and
+# told it to pay for a full review.
+for _cerr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Get "https://api.github.com/x": connection refused'; do
+  T30_TRANS="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR="$_cerr" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+    HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$T30_TRANS" = "$(printf 'unavailable\t')" ] \
+    && pass "(30xvii-b) a non-refusal compare failure ('${_cerr:0:38}…') is TRANSPORT (unavailable), not a refusal" \
+    || fail "(30xvii-b) a non-refusal compare failure was classified as a refusal (got '$T30_TRANS')"
+done
+
+# THE SEAM IS READ-ONLY: drive the selector with an isolated HOME and no record
+# on disk, then assert nothing appeared. Order-independent — the directory is
+# cleared first, so a record left by the RECORD-path runs above can never be
+# mistaken for one the selector minted.
+#
+# COVERAGE LIMIT, stated rather than implied: this pins the OUTCOME, not the
+# mechanism. A mutant that deletes the seam's `exit 0` still leaves no record,
+# because the empty-`SHA` stale guard refuses before any write — measured. So
+# this assertion catches a regression where BOTH change, and cannot isolate the
+# seam's own exit; it is not load-bearing for the read-only claim on its own.
 rm -rf "$T30H/.pi/agent/reviews"
 tier_for 1 "$(printf 'modified\tdocs/ops/x.md\t')" >/dev/null
 [ ! -d "$T30H/.pi/agent/reviews" ] \
@@ -2002,7 +2030,7 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\td
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=165
+MIN_ASSERTIONS=170
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

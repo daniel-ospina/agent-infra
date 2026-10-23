@@ -472,6 +472,13 @@ review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = un
   esac
   case "$p" in
     scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh|scripts/lib/diff-normalize.py) return 0 ;;
+    # Rail-exec'd decision modules: `admin-merge.sh` execs BOTH of these to decide
+    # whether a red check blocks — `ci_exemption.py` makes the exemption call and
+    # `ci-workflow-pr-evaluable.sh` decides that such a red must stay BLOCKING.
+    # Matched by EXACT name, not by the `check-` shape: a defect here makes a
+    # genuinely failing check read as exempt, which is the false PASS this class
+    # exists to prevent.
+    scripts/ci_exemption.py|scripts/ci-workflow-pr-evaluable.sh|scripts/checkout_guard.sh|scripts/ci_runner_gate.sh) return 0 ;;
     scripts/check-*|.github/workflows/*|.github/actions/*|.husky/*|extensions/*|skills/*|enforcement/*|templates/*) return 0 ;;
   esac
   return 1
@@ -521,15 +528,18 @@ review_tier_cap() {
 # compare/<base>...<sha>, prefixed by one "mb\t<merge-base>\t<expected-count>"
 # line.
 #   rc 0 = rows printed (header + at least one row)
-#   rc 1 = TRANSPORT failure with nothing read — gh absent, or the `pulls` read
-#          itself failed. Absent evidence; the callers warn loudly and proceed.
+#   rc 1 = TRANSPORT failure with nothing read — gh absent, the `pulls` read
+#          failed, or the compare failed for a reason that is NOT a refusal of
+#          this revision (403 rate-limit, 5xx, no route to host). Absent
+#          evidence; the callers warn loudly and proceed.
 #   rc 2 = the API answered: the PR has NO changed files.
-#   rc 3 = the API ANSWERED but the payload is unusable (a `pulls` body with no
-#          base/count, a compare non-2xx — a fork head over HTTP 404, say — no
-#          merge base, no rows, a malformed row). That is POSITIVE evidence of a
-#          diff this classifier cannot certify, so the callers REFUSE. It must
-#          never be confused with rc 1: that confusion was how one `copied` row,
-#          and separately a fork-head 404, turned the cap into a no-op and let a
+#   rc 3 = the API ANSWERED and REFUSED, or answered with a payload this
+#          classifier cannot certify: a `pulls` body with no base/count, a
+#          compare HTTP 404/422 (a fork head, a rewritten sha), a compare that
+#          exited 0 with no readable body, no merge base, no rows, a malformed
+#          row. POSITIVE evidence, so the callers REFUSE. It must never be
+#          confused with rc 1: that confusion was how one `copied` row, and
+#          separately a fork-head 404, turned the cap into a no-op and let a
 #          rail edit record `clean-micro`.
 #
 # An EXPLICIT <sha>, not pulls/<n>/files, for the reason the clean-low guard
@@ -561,7 +571,32 @@ review_surface_rows() {
   # cap silently no-op on exactly the case the sibling clean-low guard hard-fails
   # 60 lines later, leaving a fork PR that edits a rail free to record
   # clean-micro (measured: rc 0, record written, one stderr line).
-  cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)" || return 3
+  # A compare failure is only POSITIVE evidence when the API REFUSED this
+  # revision. `gh` exits 1 for a 404, a 403 rate-limit, a 502 and a dead socket
+  # alike, so the exit code alone cannot carry that distinction — and getting it
+  # wrong in either direction is a real cost:
+  #   * treating a refusal as transport let a fork-head 404 (documented here as
+  #     predictable) record clean-micro on a rail diff;
+  #   * treating transport as a refusal would strand a legitimate micro PR on a
+  #     rate-limit window or a blip, and tell it to go pay for a full review.
+  # So classify on the STATUS gh reported: an HTTP refusal of THIS revision
+  # (404 Not Found / 422 Unprocessable) is rc 3; everything else — 403, 5xx, no
+  # route to host, empty stderr — is rc 1 (nothing read, warn and proceed), the
+  # same posture the `pulls` read above already takes.
+  CMP_ERR="$(mktemp 2>/dev/null)" || CMP_ERR=""
+  if [ -n "$CMP_ERR" ]; then
+    cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>"$CMP_ERR")"
+  else
+    cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)"
+  fi
+  if ! [[ "$cmp" =~ ^mb ]]; then
+    CMP_REFUSED=0
+    if [ -n "$CMP_ERR" ] && command grep -qE 'HTTP (404|422)\b' "$CMP_ERR" 2>/dev/null; then CMP_REFUSED=1; fi
+    [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
+    [ "$CMP_REFUSED" -eq 1 ] || return 1
+    return 3
+  fi
+  [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
   # Split the header line in BASH, never `printf … | head -1 | cut`. This script
   # runs `set -o pipefail`, and a `head` that exits after its one line sends
   # SIGPIPE to the writer — the substitution then fails and, under `set -e`, the
@@ -2323,7 +2358,11 @@ if [ "$VERDICT" = "clean-micro" ]; then
       exit 4
     fi
     if [ "$MICRO_RC" -eq 3 ]; then
-      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… answered with a changed-path payload this classifier cannot certify (a malformed row, no merge base, or no rows) — an uncertifiable diff cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record)." >&2
+      # The cause list names EVERY rc-3 arm, including the one this cap was
+      # written for: the compare 404 of an unreachable fork head. A message that
+      # omits it makes the next lane re-diagnose the same 404 from scratch — the
+      # exact failure the sibling clean-low guard's wording exists to prevent.
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… — the changed-path payload cannot be certified. Causes: the compare endpoint REFUSED this revision (HTTP 404/422 — an unreachable fork head or a rewritten sha), answered with no readable body, returned no merge base, returned no rows, or returned a malformed row. A diff whose surface cannot be read cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record). A TRANSPORT failure (403 rate-limit / 5xx / network) does NOT take this arm — it warns and proceeds — so a retry after the window is worth one attempt before paying for a full review." >&2
       echo "   → Run the code-review skill on the current head, then record clean with --evidence <artifact>." >&2
       exit 4
     fi
