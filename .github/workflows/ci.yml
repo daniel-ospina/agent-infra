@@ -141,11 +141,14 @@ jobs:
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-    # every extensions/ top-level entry except *.test.ts must be farm-wired
+    # every TRACKED extensions/ top-level entry except *.test.ts must be farm-wired
     # into pi-bootstrap/pi-config/extensions (single source of truth — a new
     # extension that isn't wired ships on NO machine) AND listed in manifest.json
     # files.extensions.entries (the consumer ship-list — a tree entry with no
-    # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
+    # manifest row ships on NO consumer, #498 staleness class). #2425: "tracked"
+    # means git lists it under extensions/ (the index is read); an untracked,
+    # git-ignored directory such as extensions/<x>/node_modules is not an
+    # extension and cannot false-block. Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
     # checks 1–5 (materialized copy / mistargeted link / unwired entry /
     # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
