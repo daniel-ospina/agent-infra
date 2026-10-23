@@ -300,6 +300,17 @@ done
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
   command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
+# ⛔ DEFINING THE VERBS IS NOT HAVING INITIALISED THE MODULE (#2248). The verbs above are FUNCTIONS;
+# the two embedded Python programs are VARIABLES assigned by a command substitution at source time,
+# and a substitution can come out empty while every function still parses. That is exactly what a
+# bash 3.2 mis-parse produced on macOS: `WT_TREE_PY` never got a value, the census fed `python3 -c ''`
+# and returned nothing — which reads identically to "no workers" — so the caps silently stopped
+# binding and the box logged a `controller … alive but the heartbeat is 3652s old` for an hour while
+# `launchctl` and `harness verify` both said GREEN. Check the DATA, and NAME the variable that is
+# empty, so the next occurrence costs one log line instead of an hour of false green.
+for _wt_py in WT_TREE_PY WT_WS_PY; do
+  [ -n "${!_wt_py:-}" ] || { echo "orch-loop: FATAL worker-terminal.sh did not initialise at ${WT_MOD:-$O} — $_wt_py is EMPTY (its embedded Python program was not assigned; on bash 3.2 this is the heredoc-in-command-substitution mis-parse, see agent-infra#2248) — refusing to run a controller whose census would read 0 workers and never trip its caps; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
+done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
 # workers cd to their own repo/worktree themselves, so this only has to be a sane, existing place.
@@ -467,6 +478,31 @@ mem_avail_mb() { # [<meminfo-file>]
   is_num "$mb" || return 1
   printf '%s\n' "$mb"
 }
+# measure_mem — the ONE place MEMAVAIL_MB / MEM_UNKNOWN are SET (agent-infra#1732).
+#
+# ⛔ ONE SEAM, TWO DECISION POINTS, NO SECOND DERIVATION. It read this pair INLINE in the [cap] block
+# only — measured on the pre-fix tree: ~620 lines BELOW the FIRST of the six spawn sites, ~225 below
+# the last, and ~2,000 below `can_spawn()`'s own definition — so a gate that "consults" these values is
+# reading the PREVIOUS cycle's figure, or (cycle 1) nothing at all. Both are a stale record
+# presented as current, the exact class this file keeps removing. The function is called at the cycle
+# prologue (before the FIRST spawn site) and again at the [cap] block (dispatch decides on a fresh
+# reading); the coercion lives HERE so the two cannot disagree about what a failed probe means.
+# Polarity is UNCHANGED and deliberate: a probe failure is UNKNOWN, not ample — we cannot see capacity,
+# so we do not add work. `MEMAVAIL_MB=0` is set with it so any consumer that compares only the number
+# still refuses; MEM_UNKNOWN is kept for consumers that must name WHY.
+measure_mem() {
+  if MEMAVAIL_MB="$(mem_avail_mb)"; then
+    MEM_UNKNOWN=0
+  else
+    MEMAVAIL_MB=0; MEM_UNKNOWN=1
+  fi
+  # ⛔ COERCE like L / SWFREE / SWTOTAL (#1985 review, P2). Those three are is_num-guarded; MEMAVAIL_MB
+  # was not, so an empty value reached `[ "$MEMAVAIL_MB" -le … ]` as `[: : integer expression expected`
+  # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
+  # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
+  if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
+}
+
 # $O is operator config, not attacker input, but a quote or metacharacter here would break every
 # spawn (the tmux command string is executed via sh -c). Fail loudly instead of failing mysteriously.
 case "$O" in
@@ -1686,7 +1722,44 @@ sess() { wt_alive "${1:-}"; }
 # (gh pr merge / ready / run rerun) stay ungated, so merges keep flowing while the spike passes.
 # Nothing is starved: a held-back spawn retries next cycle, because the marker that authorises it
 # (needsfix-<PR>-<head>, fixcount-<PR>) is only written on a SUCCESSFUL spawn.
-can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
+#
+# ⛔ MEMORY IS PART OF THE SPAWN GATE (agent-infra#1732), AND IT IS THE BINDING ONE WHEN IT BINDS.
+# The load gate alone covered these sites while the DISPATCH gate was bounded by load + lanes + swap +
+# available memory — two gates over two different populations, with the resource that actually kills
+# this box (measured 2026-10-22: MemAvailable 653MB with 14 lanes, and the box OOM-killed its OWN
+# runners; the pool oscillated 12→8 three times) consulted on only one of them. Raising MAX_LOAD
+# widens the band in which the spawn sites proceed while memory is already the constraint, so the
+# spawn path must read it too.
+#
+# The polarity is the DISPATCH gate's, not the disk gate's: `mem_avail <= MIN_MEM_FREE_MB` refuses
+# (the same boundary for THAT arm, so the two gates cannot disagree about the `mem_avail` reading
+# itself), and UNKNOWN is NOT ample — a
+# probe we could not take is not evidence of capacity. That is deliberately FAIL-CLOSED while the
+# load reading stays fail-open (an unreadable load file must not stop every merge on a host without
+# procfs); the two are different probes with different failure costs, and `MEMAVAIL_MB` is only ever
+# set by measure_mem(), which zeroes it on failure so this holds even if MEM_UNKNOWN is ever unset.
+#
+# It reads the CYCLE-LEVEL reading measured in the prologue — the same posture as `L`, which the
+# spawn sites have always read from the cycle's own `load1`. The [cap] gate re-measures, because it
+# decides a dispatch and must see the present.
+# ⚠️ NOT COVERED HERE, BY DESIGN: the dispatch gate's OTHER arms (`lanes=`, `swap_free=`, and the
+# swap-joint `mem_avail <= 2*MIN_MEM_FREE_MB` arm that only arms when swap is also tight). A spawn
+# refused by those is a different population's decision and is not this gate's to make — so the
+# shared boundary is the plain `<= MIN_MEM_FREE_MB` arm, and nothing more.
+mem_spawn_ok() { [ "${MEM_UNKNOWN:-0}" != "1" ] && [ "${MEMAVAIL_MB:-0}" -gt "$MIN_MEM_FREE_MB" ]; }
+can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok; }
+# spawn_gate_tok — the EVIDENCE a held-back spawn records, in the ONE shape all five slot refusals
+# print (agent-infra#1732). Before the memory arm these lines printed `load-gate=<L>/<MAX_LOAD>` only,
+# and that was complete: load was the whole gate. It is not any more — a memory-only refusal would now
+# print two healthy-looking numbers and name no cause, which is the silent-refusal class this file
+# removes elsewhere (#2126 T5). The token reports the reading AND the floor for both arms, so the line
+# answers "which gate bound" without a second lookup; UNKNOWN is spelled out rather than printed as a
+# number, because `0M/512M` is a refused-probe reading that reads like a real measurement.
+spawn_gate_tok() {
+  local mem="UNKNOWN"
+  [ "${MEM_UNKNOWN:-0}" = "1" ] || mem="${MEMAVAIL_MB:-?}M"
+  printf 'load-gate=%s/%s mem-gate=%s/%s' "${L:-0}" "${MAX_LOAD:-?}" "$mem" "${MIN_MEM_FREE_MB:-?}"
+}
 # head_reds <pr> -> GREEN | RED | UNKNOWN
 #
 # ⛔ THE RAIL'S QUESTION, NOT THE REPO'S REQUIRED SET. `admin-merge.sh` refuses on a red tree measured
@@ -2284,6 +2357,12 @@ while true; do
   REFRESH_RESOLVED=0; REFRESH_RC=0; REFRESH_SH=""; REFRESH_SH_SKEW=""; REFRESH_TRIED=""
   harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
+  # ⛔ MEASURE MEMORY HERE, ONCE, BEFORE THE FIRST SPAWN SITE — not only at the [cap] block below
+  # (agent-infra#1732). The six `can_spawn` sites run in section 1-3 of the cycle and the [cap] block
+  # runs in section 4, so a gate that read MEMAVAIL_MB there would decide on the PREVIOUS cycle's
+  # reading (and on cycle 1, on nothing). Same rule LAND_EPOCH/UPN follow above: a value must be read
+  # BEFORE the line that prints it, and before every gate that acts on it.
+  measure_mem
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
   echo "=== $(date) load=$L lanes=$(wt_count lane-) backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL}${HARNESS_TOKEN:+ harness=$HARNESS_TOKEN} ===" >> "$LOG"
@@ -3151,7 +3230,7 @@ while true; do
             # (3) THE BOX CAP. Nothing is consumed: the refusal stays, the next cycle retries when a
             # slot frees, and the reason names the ceiling AND the load gate (the silent-capacity-refusal
             # shape #2126 T5 removed from the other five sites).
-            echo "#$PR RED TREE but NO red-fixer slot (fix lanes=$(wt_count fix-)/${MAX_RED_FIX:-4}, load-gate=L/${MAX_LOAD:-?}) — attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed, no fix-$PR. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            echo "#$PR RED TREE but NO red-fixer slot (fix lanes=$(wt_count fix-)/${MAX_RED_FIX:-4}, $(spawn_gate_tok)) — attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed, no fix-$PR. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "capacity: red-fixer ceiling ${MAX_RED_FIX:-4} reached or the spawn gate refused"
           fi
         fi
@@ -3289,7 +3368,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
             # `elif` with no `else`, so a saturated box logged NOTHING and `lanes=0` was unexplained.
-            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
           continue
@@ -3348,7 +3427,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               disp "$PR" "${HEAD_N:-}" GREEN wait "rail worker spawn FAILED"
             fi
           else
-            echo "#$PR GREEN but NO merge slot (merge lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR GREEN but NO merge slot (merge lanes=$(wt_count merge-)/$MR, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" GREEN wait "capacity: merge-lane ceiling $MR reached or the spawn gate refused"
           fi
         elif [ "$MERGE_AUTHORITY" = "gate" ]; then
@@ -3497,7 +3576,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
               fi
             else
-              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, $(spawn_gate_tok))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
@@ -3544,7 +3623,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi
           else
-            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
         else
@@ -3758,17 +3837,11 @@ PY
   # on a cell; `free`+`inactive` vm_stat pages on macOS. It fails CLOSED (rc != 0 -> UNKNOWN -> do
   # not add work) -- before #1702 the probe was vm_stat-only and therefore failed closed on EVERY
   # Linux cell, which is the false green (cycles complete, nothing ever dispatches) this PR removes.
-  if MEMAVAIL_MB="$(mem_avail_mb)"; then
-    MEM_UNKNOWN=0
-  else
-    # The probe itself failed. UNKNOWN, not ample: we cannot see capacity, so we do not add work.
-    MEMAVAIL_MB=0; MEM_UNKNOWN=1
-  fi
-  # ⛔ COERCE like L / SWFREE / SWTOTAL (#1985 review, P2). Those three are is_num-guarded; MEMAVAIL_MB
-  # was not, so an empty value reached `[ "$MEMAVAIL_MB" -le … ]` as `[: : integer expression expected`
-  # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
-  # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
-  if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
+  # ⛔ RE-MEASURED HERE ON PURPOSE (agent-infra#1732): the prologue already measured it for the spawn
+  # gate, but THIS read decides a dispatch, and a dispatch must see the present — memory can fall a
+  # long way during a cycle's sweep. One seam (`measure_mem`) sets the pair, so the two readings can
+  # never be derived differently; see measure_mem for the UNKNOWN-not-ample polarity.
+  measure_mem
   # ⛔ THE MERGE-PRIORITY GATE IS HANDED ITS EVIDENCE, NOT ITS CONCLUSION (see mp_reason): the unowned
   # COUNT, the epoch of the last recorded land, and the cap it is measured against. All of them are
   # read HERE, once, and BEFORE the [cap] line that prints them — read after it, that line printed `?`

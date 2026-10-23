@@ -153,6 +153,12 @@ FLEET_LANDER_DRAIN_LATE_S="${FLEET_LANDER_DRAIN_LATE_S:-1800}"
 # Set by `fleet_start_component` to WHAT IT DID, so a caller cannot print "started" for a no-op (cycle-3
 # review: the verb said "already running, left alone" and the caller then printed "started heartbeat-loop").
 FLEET_START_ACTION=""
+# Bound on `start`'s SETTLE wait (#2221): how long the post-launch read-back keeps RE-reading after a
+# process is up, waiting for the record the row reads to name the process that actually runs it. A
+# pidfile loop re-execs itself detached, so the pid the FIRST read sees is the transient LAUNCHER; one
+# snapshot inside that handover printed `pid ... pidfile says ... FAILING` for a loop that was healthy
+# one second later. `status` never had this defect because it reads once, later.
+FLEET_START_SETTLE_S="${FLEET_START_SETTLE_S:-3}"
 # Tolerated scheduling slack for launchd periodic jobs, added on top of 2×StartInterval.
 FLEET_JOB_SLACK_S="${FLEET_JOB_SLACK_S:-300}"
 
@@ -493,12 +499,32 @@ fleet_row_controller() {
 }
 
 # ── component: the watchdog that puts a REMOVED controller back ───────────────────────────────
-# Two mechanisms exist on a Mac and they MUTATE the same job (`watchdog.sh` loads/reloads the
-# controller's launchd job): the launchd job `com.eldato.orchestrator-watchdog` and the plain
-# `$O/watchdog-loop.sh`. Both running is the "duplicate of a mutating action" case — each reload
-# races the other. Exactly one is expected.
+# Two mechanisms exist on a Mac and they MUTATE the same job: a launchd job, and the plain
+# `$O/watchdog-loop.sh`. Both running is the "duplicate of a mutating action" case — each restart
+# races the other. Exactly one is expected (the PAIR is deliberate redundancy — see the branch below).
+#
+# ⛔ THE LABEL MOVED (#2303), AND READING ONLY THE OLD ONE MADE THE MUTATING COMPONENT INVISIBLE.
+#   com.eldato.orchestrator-watchdog  the Mac's HAND-PROVISIONED job (`StartInterval` 20 →
+#                                     `~/orchestrator/watchdog.sh`, absolute home hardcoded). Listed
+#                                     in templates/launchd/RETIRED, so install-launchd.sh unloads +
+#                                     removes it.
+#   com.eldato.controller-watchdog    the TRACKED job (templates/launchd/), `StartInterval` 300 →
+#                                     scripts/orchestrator-harness/watchdog-loop.sh
+# This row used to hard-wire the RETIRED label, so on a box that had been through the installer —
+# i.e. exactly the box this row exists for — nothing matched, and the ONE component that takes a
+# destructive action (`launchctl kickstart -k`) fell outside the table built to catch "silently off,
+# missing, or running twice". One resolver, so the row, `start`, `stop` and the per-row readers
+# cannot disagree about which job this component IS.
+_fleet_watchdog_label() {
+  local l
+  for l in com.eldato.controller-watchdog com.eldato.orchestrator-watchdog; do
+    [ -f "$(fleet_plist "$l")" ] && { printf '%s\n' "$l"; return 0; }
+  done
+  printf 'com.eldato.controller-watchdog\n'
+}
 fleet_row_watchdog() {
-  local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" label="com.eldato.orchestrator-watchdog"
+  local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" label
+  label="$(_fleet_watchdog_label)"
   local installed=0 mechanisms="" n=0 loop_pids loaded
   [ -f "$(fleet_plist "$label")" ] && installed=1
   [ -f "$o/watchdog-loop.sh" ] && installed=1
@@ -544,11 +570,18 @@ fleet_row_watchdog() {
       fleet_row controller-watchdog "1 watchdog" "$n instances ($mechanisms)" DUPLICATE \
         "$loop_n copies of $o/watchdog-loop.sh are running — the same mechanism twice, so every action runs twice"; return 0
     fi
-    # ⛔ NOT DUPLICATE, and this is a deliberate departure from the plain reading. Both mechanisms run
-    # the SAME idempotent watchdog.sh (check -> load -> log -> exit); they cannot disagree about the
-    # desired state, so the overlap costs one redundant no-op pass, not divergent work. The pair is
-    # intentional redundancy against launchctl being defeated (see watchdog-loop.sh's header; the
-    # loop is the stopgap for #1976). Calling that a fault reddens this row on a HEALTHY box forever
+    # ⛔ NOT DUPLICATE, AND THE REASON CHANGED IN #2303 — read this before "tidying" the row. Before
+    # #2303 both mechanisms ran the SAME idempotent `watchdog.sh` (check -> load -> log -> exit), so
+    # they could not disagree about the desired state. The TRACKED launchd job now runs
+    # `watchdog-loop.sh`, which takes a NON-idempotent `launchctl kickstart -k`. What keeps the pair
+    # safe is now the RESTART BUDGET, not idempotence: the cap is ONE count on disk
+    # ($HOME/.pi/agent/state/controller-watchdog.streak), so both runners spend the same budget and
+    # the restarts per episode stay bounded by MAX_CONSEC — never a tight loop.
+    # The job that WOULD make them disagree — the hand-provisioned `com.eldato.orchestrator-watchdog`,
+    # a DIFFERENT script ($o/watchdog.sh) on its own 20s timer — is listed in
+    # templates/launchd/RETIRED, so the installer removes it rather than leaving two mutating watchdogs
+    # on one controller. A pair here is therefore deliberate redundancy for #1976 (the plain loop
+    # survives a bootout), not a fault, and calling it one reddens this row on a HEALTHY box forever
     # and turns `status` into a permanently non-zero command — a false block, which must not be red.
     if [ -n "$ex" ] && [ "$ex" != "0" ]; then
       fleet_row controller-watchdog "1 watchdog" "1 launchd (exit $ex) + watchdog-loop.sh" FAILING \
@@ -556,7 +589,7 @@ fleet_row_watchdog() {
       return 0
     fi
     fleet_row controller-watchdog "1 watchdog" "1 launchd + watchdog-loop.sh (redundant by design)" OK \
-      "both mechanisms invoke $o/watchdog.sh; the overlap is deliberate redundancy for #1976 (the plain loop survives a bootout), so it is not reported as a duplicate — only a second copy of the SAME mechanism is"
+      "deliberate redundancy: the launchd job ($label) and the plain $o/watchdog-loop.sh share ONE restart budget on disk ($HOME/.pi/agent/state/controller-watchdog.streak), so however often each wakes they cannot restart in a tight loop (#1976 — the plain loop survives a bootout); only a second copy of the SAME mechanism is a duplicate"
     return 0
   fi
   if [ -n "$ex" ] && [ "$ex" != "0" ]; then
@@ -1027,7 +1060,7 @@ fleet_render_table() {
 # per-row readers cannot disagree about which job a row means.
 _fleet_label_for() { # <name>
   case "${1:-}" in
-    controller-watchdog)       printf 'com.eldato.orchestrator-watchdog\n' ;;
+    controller-watchdog)       _fleet_watchdog_label ;;
     pr-doctor)                 printf 'com.tortoise.pr-doctor\n' ;;
     reaper.worktree-reaper)    printf 'com.tortoise.worktree-reaper\n' ;;
     reaper.branch-reaper)      printf 'com.tortoise.branch-reaper\n' ;;
@@ -1064,7 +1097,7 @@ fleet_component_has_stop() { # <name>
       # ⛔ EITHER mechanism. `fleet_component_has_start` needs the launchd job, but on a box that runs
       # only the plain loop (no plist) the loop IS stoppable — asking has_start there answered "no
       # stop mechanism" and `stop` left a watchdog running that it could have signalled.
-      [ -f "$(fleet_plist com.eldato.orchestrator-watchdog)" ] || [ -f "$FLEET_O/watchdog-loop.sh" ]; return ;;
+      [ -f "$(fleet_plist "$(_fleet_watchdog_label)")" ] || [ -f "$FLEET_O/watchdog-loop.sh" ]; return ;;
   esac
   fleet_component_has_start "$1"
 }
@@ -1075,7 +1108,27 @@ fleet_start_component() { # <name>
   case "$name" in
     controller) return 0 ;;   # the platform verb owns it, with its redundancy guard
     heartbeat-loop|cadence-timer)
-      local script i pids
+      local script i pids pf_now p hit nopf alive settle_polls
+      # ⛔ THE BOUND IS VALIDATED, not trusted (#9v's lesson: an env value of `1.5` makes bash
+      # arithmetic a SYNTAX ERROR, which turns a fence into an abort). A bad value falls back to the
+      # shipped window instead of skipping the wait.
+      # ⛔ AND "ALL DIGITS" IS NOT A VALID ARITHMETIC TOKEN: `08`, `09` and `010` are OCTAL, and
+      # `$(( 08 * 5 ))` is a FATAL "value too great for base" that kills the whole bringup shell
+      # (measured: with FLEET_START_SETTLE_S=08 the verb never printed its table and exited 1 —
+      # exactly the abort this fence exists to prevent). `10#` pins the base, so every digit string
+      # means what the operator wrote. The result is CAPPED: a typo (or an intmax value that wraps)
+      # must not turn `start` into an unbounded wait.
+      # ⛔ THE CAP IS IN POLLS, NOT SECONDS. A poll is `sleep 0.2` PLUS one `fleet_pids_for` (a `ps`
+      # read under load), so 300 polls is on the order of minutes, not the "60 s" an earlier comment
+      # claimed — and the cap is only reachable when the operator asks for a window beyond it AND the
+      # record stays wrong. Stated so the number is not read as a wall-clock bound.
+      case "$FLEET_START_SETTLE_S" in
+        ''|*[!0-9]*) settle_polls=15 ;;
+        *) settle_polls=$(( 10#$FLEET_START_SETTLE_S * 5 ))
+           if [ "$settle_polls" -lt 0 ]; then settle_polls=15
+           elif [ "$settle_polls" -gt 300 ]; then settle_polls=300    # ~300 polls (see below)
+           fi ;;
+      esac
       if [ "$name" = "heartbeat-loop" ]; then
         script="$FLEET_AGENT_SCRIPTS/heartbeat-loop.sh"
       else
@@ -1128,9 +1181,53 @@ fleet_start_component() { # <name>
       i=0
       while [ "$i" -lt 25 ]; do
         pids="$(fleet_pids_for "$script")" || return 1
-        [ -n "$(printf '%s' "$pids" | tr -d '[:space:]')" ] && return 0
+        [ -n "$(printf '%s' "$pids" | tr -d '[:space:]')" ] && break
         sleep 0.2; i=$(( i + 1 ))
       done
+      [ "$i" -lt 25 ] || return 1
+      # ⛔ SETTLE, THEN JUDGE (#2221). A process being up is NOT the same as the read being about the
+      # process that runs this component: `heartbeat-loop.sh` re-execs itself DETACHED, so the pid the
+      # read-back above returns on is the LAUNCHER, and `fleet_pids_for` cannot even see the daemon
+      # while it is the launcher's child (a descendant of a match is not a second instance — out of
+      # `_fleet_ps_awk`, correctly). MEASURED on the owner's Mac: `start` printed
+      # `pid 67710, pidfile says 67715 FAILING` and `status` said OK a second later, with ONE loop
+      # alive the whole time — the row's verdict was about the handover, not about the loop.
+      #
+      # So this verb does not print a verdict about a process it has just created and not yet seen
+      # settle. It re-reads until the component's OWN record names a pid the row will also count
+      # (the row's OK predicate, i.e. exactly what the table `start` prints is about to read), or
+      # until the wait is spent — and then it still returns 0, because a process IS alive: if the
+      # record is genuinely wrong after that, that is the row's FAILING to report, not a start to
+      # negate (a start that negates it would also hide the record defect the row names).
+      # ⛔ A CACHED TABLE HERE WOULD NEVER SETTLE: `fleet_ps_snapshot` answers `FLEET_PS_CACHE` when it
+      # is set, so every poll must clear it or the loop re-reads the launcher forever.
+      i=0; nopf=0; alive=1     # alive=1: a process WAS seen (the read-back above broke out on it)
+      while [ "$i" -lt "$settle_polls" ]; do
+        sleep 0.2; i=$(( i + 1 ))
+        FLEET_PS_CACHE=""
+        pids="$(fleet_pids_for "$script")" || return 1
+        if [ -z "$(printf '%s' "$pids" | tr -d '[:space:]')" ]; then
+          alive=0; nopf=0; continue      # it came up and then went: keep watching, end on the last read
+        fi
+        alive=1
+        pf_now=""
+        [ -f "$pf" ] && pf_now="$(tr -dc '0-9' 2>/dev/null < "$pf")"
+        if [ -n "$pf_now" ]; then
+          hit=0
+          for p in $pids; do [ "$p" = "$pf_now" ] && { hit=1; break; }; done
+          [ "$hit" -eq 1 ] && return 0  # settled: the record names the live loop, so the row reads OK
+          nopf=0
+        else
+          # NO RECORD AT ALL, for a whole second of polls: nothing here can hand over or go stale, and
+          # this row cannot read FAILING on an ABSENT pidfile (it reports LATE/MISSING instead), so
+          # there is nothing about this component for the window to fix.
+          nopf=$(( nopf + 1 ))
+          [ "$nopf" -ge 5 ] && return 0
+        fi
+      done
+      # ⛔ RETURN, do not fall through: a `case` branch that only EVALUATES its last test runs on into
+      # the launchd path below, which has no plist for these two components and answers a bare 1.
+      [ "$alive" -eq 1 ] && return 0
       return 1 ;;
   esac
   label="$(_fleet_label_for "$name")"

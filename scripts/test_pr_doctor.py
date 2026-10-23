@@ -226,6 +226,24 @@ def test_spawn_argv_is_the_background_dispatcher_not_cmux(monkeypatch):
     assert "cmux_dispatch" not in " ".join(argv)
 
 
+def test_spawn_argv_DECLARES_the_repair_kind(monkeypatch):
+    """The last argument must be `prfix`, or the creation gate holds the work that drains it.
+
+    agent-infra#2409 gates every worker KIND except the ones whose product is the drain, and
+    `nonblocking-dispatch.sh` DEFAULTed to `KIND=bg` -- a creation label. Every worker this script
+    spawns repairs an ALREADY OPEN PR, so inheriting that label put pr-doctor's own repairs under
+    the gate in exactly the state that triggers it (review cycle 2, P1). The kind is an ARGUMENT
+    here, so the declaration is visible in the one command this module builds.
+    """
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    argv = pr.spawn_argv("prd-7", "/repo/.worktrees/prd-7", "/state/brief.txt")
+    assert argv[-1] == "prfix", (
+        "the spawn does not declare the repair kind: the dispatcher would default to `bg` and the "
+        "creation back-pressure gate would refuse a PR-repair worker")
+    # The timeout keeps its own position: inserting a flag here would shift it silently.
+    assert argv[-2] == str(pr.SPAWN_TIMEOUT_S)
+
+
 def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
@@ -1563,6 +1581,35 @@ def test_a_row_is_kept_when_the_rc_came_from_pi_not_the_gate(tmp_path, monkeypat
     st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
                 "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     assert pr.void_refused_rows(st) == []
+
+
+def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
+    """Exit 74 is a gate refusal, not a launch (agent-infra#2409).
+
+    The creation back-pressure gate refuses BEFORE any agent starts and writes `[land-backlog]
+    REFUSED` into the worker log. If 74 is absent from GATE_REFUSALS, `_confirm` reads the `.rc` as
+    "launched", `dispatch` records the row, and that PR burns a 45-min cooldown and a 90-min budget
+    slot for work that never ran -- the precise accounting failure the 75/77 discrimination exists
+    to prevent. Both halves are asserted, because either alone re-opens it: the code must be
+    recognised AND the marker must be the gate's own line (a `pi` that exits 74 for its own reason
+    is not a refusal).
+    """
+    assert 74 in pr.GATE_REFUSALS
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-9.rc").write_text("74\n")
+    (d / "bg" / "prd-9.log").write_text(
+        "[land-backlog] REFUSED bg prd-9: LAND-BACKLOG 81 open / 0.6 landings per hour "
+        "(ceiling 15) -- hold new creation, land the open queue first\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-9", 74) is True
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == ["9"]
+    # The cooldown-KEEPING direction: an agent that exits 74 itself is not a gate refusal.
+    (d / "bg" / "prd-9.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=74\n")
+    assert pr.gate_refused("prd-9", 74) is False
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():

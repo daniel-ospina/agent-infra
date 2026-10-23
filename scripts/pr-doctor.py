@@ -290,13 +290,16 @@ CONFIRM_WINDOW_S = 1.0
 # `7` is not a refusal code, so dispatch() recorded as launched a spawn the gate had REFUSED.
 # Require the trailing newline, so a partial write is never a verdict.
 _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
-GATE_REFUSALS = (75, 77)
+GATE_REFUSALS = (75, 77, 74)
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
 # gate refused, nothing consumed" from "a `pi` exited 75 for its own reason" -- the ambiguity
 # spawn-gate.sh itself warns about. A test pins these literals against that file, so a reworded
 # marker reddens the suite instead of silently making every refusal look like a dispatch.
-REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED")
+# `[land-backlog]` is the creation back-pressure gate (agent-infra#2409, exit 74). Without it a
+# refusal read as "launched", so the row burned a 45-min cooldown and a 90-min budget slot for a
+# worker that never started -- the exact accounting failure the 75/77 discrimination exists for.
+REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
@@ -2056,8 +2059,15 @@ def void_refused_rows(st: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
-    """The ONE spawn command. A test asserts this is the background dispatcher, not cmux."""
-    return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S)]
+    """The ONE spawn command. A test asserts this is the background dispatcher, not cmux.
+
+    ⛔ THE LAST ARGUMENT IS THE WORK KIND (agent-infra#2409), AND IT IS `prfix`, NOT THE DEFAULT.
+    Every worker this script spawns repairs an ALREADY OPEN PR (fetch -> rebase -> fix -> push), so
+    it is the drain, not creation. The dispatcher's default is `bg` -- measured as creation by the
+    back-pressure gate -- because an UNdeclared caller is safer held than trusted; declaring it here
+    is what keeps `pr-doctor` running when the backlog is over its ceiling.
+    """
+    return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
 
 
 def _confirm(name: str) -> tuple[str, str]:
@@ -2110,8 +2120,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     `record` says whether the ATTEMPT belongs in the state file even though nothing was launched.
     Two of the three refusal classes differ in exactly that:
 
-      * a GATE refusal (load 75 / disk 77) consumed nothing and CLEARS BY ITSELF -> not recorded;
-        a row would burn a 45-min cooldown and a 90-min budget slot for work that never ran;
+      * a GATE refusal (load 75 / disk 77 / land-backlog 74) consumed nothing and CLEARS BY ITSELF
+        -> not recorded; a row would burn a 45-min cooldown and a 90-min budget slot for work that
+        never ran;
       * a WORKTREE refusal that is a verdict about the tree (uncommitted work, commits the PR
         head does not have, a file the next checkout would overwrite, a path we may not delete)
         does NOT clear by waiting -> recorded, so the PR reaches a cooldown instead of logging the
