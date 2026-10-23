@@ -62,6 +62,10 @@
 #   §AJ a COMPLETED review that quotes `[pi-gate] REFUSED` is not the gate's refusal (rc is the signal)
 #   §AK the ISSUES COUNT accepts every separator the verdict SHAPE accepts (`ISSUES: 0` is clean),
 #      and a count the reviewer PRINTED is never raised — the clamp defaults only an UNPARSED one
+#   §AL a TRUNCATED inline diff must PROVE the reviewer read the rest: a missing or wrong `diff-tail:`
+#      digest is refused (rc=3, nothing posted, nothing recorded) — including when the diff's final
+#      line is SHORTER than the token (the case that silently disabled the handshake) — while an
+#      untruncated diff needs no proof at all
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -472,7 +476,7 @@ no_comment; ck $? "no comment posted"
 
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(head -c 40 /dev/zero | tr '\0' 'x')" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
+reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(head -c 200000 /dev/zero | tr '\0' 'x')" | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "still reviews (rc=$(rc_of)) — a huge diff is not fatal"
 # The PROPERTY is what matters, not which branch delivered it: the oversized payload
@@ -498,7 +502,7 @@ done
 if [ -z "$UTF8_OK" ]; then
   fail "PROMPT_MAX re-compose arm SKIPPED: this box has no UTF-8 locale, so a multi-byte diff cannot be built (the branch is untested here)"
 else
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(awk 'BEGIN { for (i = 0; i < 40; i++) printf "\342\206\222" }')" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
+reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(awk 'BEGIN { for (i = 0; i < 60000; i++) printf "\342\206\222" }')" | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
 LC_ALL="$UTF8_OK" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
 case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
@@ -1084,7 +1088,7 @@ run "$SRC" 2284
 # ⛔ THE FOURTH FRESH REVIEW'S P1 — ONLY THE FIRST BARE TOKEN USED TO BE EXAMINED. `label()` ran a
 # single `match()`, so a blocking label LATER on the line was invisible to every arm and a CLEAN over
 # it was recorded. The loop examines every token; a later label wins over an earlier mention.
-for latelabel in 'No P2 problems found; P1: the guard returns 0 on a failed read.' 'The fixture is fine (P2 clean); P1: the guard returns 0 on a failed read.'; do
+for latelabel in 'No P2 problems found; P1: the guard returns 0 on a failed read.' 'The fixture is fine (P2 clean); P1: the guard returns 0 on a failed read.' 'Two [P1] blockers. P1: the guard returns 0 on a failed read.' 'The **[P1]** convention applies here; P1 — the guard returns 0 on a failed read.'; do
   reset; printf '%s\nCLEAN\n' "$latelabel" > "$TMP/reviewer-out"
   run "$SRC" 2284
   [ "$(rc_of)" = "7" ]; ck $? "…and a LATER blocking label refuses: '${latelabel:0:40}…' (rc=$(rc_of))"
@@ -1132,8 +1136,8 @@ run "$SRC" 2284
 [ -f "$TMP/record-argv.txt" ]; ck $? "  …the record is written"
 # …and the REAL refusal signal (rc=76) is still §O's arm.
 
-# ── §AK a TRUNCATED inline diff needs PROOF the reviewer read the rest ─────
-echo; echo "§AK a truncated-diff review must prove it fetched the tail"
+# ── §AL a TRUNCATED inline diff needs PROOF the reviewer read the rest ─────
+echo; echo "§AL a truncated-diff review must prove it fetched the tail"
 # The record binds the FULL diff hash while the prompt inlines only DIFF_CAP characters, so the
 # reviewer's "I fetched the remainder" was an unverifiable claim and the attestation could assert
 # more than the review covered (P1, fourth fresh review of #2288). The prompt demands the last 40
@@ -1144,10 +1148,24 @@ run "$SRC" 2284
 [ "$(rc_of)" = "3" ]; ck $? "a truncated diff with NO 'diff-tail:' proof is REFUSED (rc=$(rc_of))"
 no_comment; ck $? "  …nothing posted (no artifact a lane could bind)"
 no_record; ck $? "  …and nothing recorded"
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(head -c 40 /dev/zero | tr '\0' 'y')" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
+reset; printf 'diff-tail: %064d\nCLEAN\n' 0 > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
 run "$SRC" 2284
 [ "$(rc_of)" = "3" ]; ck $? "…and a WRONG tail proof is REFUSED (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
+# ⛔ THE PROOF MUST NOT DEPEND ON THE TAIL LINE'S LENGTH (P1, fifth fresh review). bash returns the
+# EMPTY string from `${s: -40}` when the line is shorter than 40, so a diff ending on a short line —
+# this PR's own diff ends on an 18-character one — silently skipped the whole handshake while the
+# code still looked like it enforced it. The token is a SHA-256 now: no length precondition, no
+# whitespace to lose. Both directions are pinned with a SHORT final line.
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "a truncated diff ending on a SHORT line still DEMANDS the proof (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
+printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | sha256sum | cut -d' ' -f1)" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and the correct SHORT-line digest records (rc=$(rc_of))"
 # …while a diff that FITS needs no proof at all: the requirement is scoped to truncation, not to
 # every review (a spurious demand would wall every small PR).
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
@@ -1175,8 +1193,11 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
-# whenever sections are added — this is 336, measured on the run that added §AK (the truncated-diff
-# tail proof: missing proof, wrong proof, and the untruncated control), the §AH later-label cases and
+# whenever sections are added — this is 354, measured after the rebase onto the branch's own §AK
+# (the ISSUES-count separator fix, which took that section number): §AL carries the truncated-diff
+# arms (a truncated diff ending on an 18-character line must still DEMAND the proof, and accept the
+# correct digest), the `Two [P1] …; P1: …` decorated-plus-bare cases, the §AL tail proof (missing
+# proof, wrong proof, and the untruncated control), the §AH later-label cases and
 # the `No P0, P1 or P2 findings.` / `I found no P0, P1 or P2 issues …` clean summaries, on top of the
 # §AH separator shapes (a bare `Found a P1: …` / `Found a P1 — …` / `One P1: …` under CLEAN, each
 # plus its no-record arm, and the `P1: 0 — nothing blocking.` counter-direction), which were added
@@ -1188,12 +1209,12 @@ echo
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 315 here and the RESULT line then
-# prints 316. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 353 here and the RESULT line then
+# prints 354. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 335 ]; ck $? "assertion-count pin: >= 335 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 353 ]; ck $? "assertion-count pin: >= 353 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

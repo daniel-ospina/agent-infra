@@ -354,16 +354,23 @@ DIFF_TRUNCATED=0
 # ⛔ THE TAIL HANDSHAKE'S EXPECTED VALUE (P1, fourth fresh review of #2288). See the check after the
 # reviewer exits: when the inline diff is truncated, the record still binds the FULL diff hash, so
 # "the reviewer fetched the remainder" must be PROVABLE rather than asserted — disclosure in the
-# artifact is not verification. The last non-empty line's final DIFF_TAIL_LEN characters are the
-# token: a reviewer that did not read the tail cannot produce it, and a reviewer that did gets it
-# compared exactly. `-40` is by CHARACTER under a UTF-8 locale, so a multi-byte diff cannot split a
-# character the way `tail -c` would.
-DIFF_TAIL_LEN=40
+# artifact is not verification. The token is a SHA-256 of the full diff's LAST NON-EMPTY LINE (with
+# its newline), because that value is transport-safe: a raw character window can BEGIN or END with
+# whitespace (a diff context line, an indented `}`), which no prompt/terminal round trip survives
+# intact, and a fixed-length window silently degenerates (P1, fifth fresh review: bash returns the
+# EMPTY string from `${s: -40}` when the line is shorter than 40 — this PR's own diff ends on an
+# 18-character line, so the proof was skipped for the very change that added it). A digest has no
+# length precondition and no whitespace to trim, and it cannot be guessed without the line.
 DIFF_TAIL=""
+DIFF_LASTLINE=""
 compute_diff_tail() {
-  local lastline
-  lastline="$(printf '%s\n' "$DIFF_FULL" | awk 'NF { last = $0 } END { print last }' | tr -d '\r')"
-  DIFF_TAIL="${lastline: -$DIFF_TAIL_LEN}"
+  # ⛔ SAME PIPELINE AS THE PROMPT'S COMMAND, byte for byte: `printf '%s\n'` re-adds the newline that
+  # the command substitution stripped from the fetch, and `tr -d '\r'` is stated in the prompt too.
+  DIFF_LASTLINE="$(printf '%s\n' "$DIFF_FULL" | tr -d '\r' | awk 'NF { last = $0 } END { print last }')"
+  DIFF_TAIL=""
+  if [ -n "$DIFF_LASTLINE" ]; then
+    DIFF_TAIL="$(printf '%s\n' "$DIFF_LASTLINE" | sha256sum | cut -d' ' -f1)"
+  fi
 }
 if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
@@ -508,12 +515,14 @@ comment on GitHub: the caller posts your findings.
 $(if [ -n "$t" ]; then cat <<TAIL
 
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
-The diff inlined above is NOT the whole change. Fetch the remainder yourself (gh pr diff),
-then print ONE line immediately BEFORE your verdict line, and nothing else on it:
+The diff inlined above is NOT the whole change. Fetch the remainder yourself, then print ONE
+line immediately BEFORE your verdict line, and nothing else on it:
   diff-tail: $t
-That value is the last $DIFF_TAIL_LEN characters of the FULL diff's final line. The caller compares it
-exactly: a missing or different value means this review never covered the rest of the change, so it
-is DISCARDED — no comment, no record — rather than recorded against a diff nobody read.
+That is the SHA-256 of the FULL diff's final NON-EMPTY line. Reproduce it EXACTLY with:
+  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=$0} END{print last}' | sha256sum | cut -d' ' -f1
+The caller compares it exactly: a missing or different value means this review never covered the
+rest of the change, so it is DISCARDED — no comment, no record — rather than recorded against a
+diff nobody read.
 TAIL
 fi)
 EOF
@@ -655,17 +664,25 @@ fi
 # The prompt asks for the last DIFF_TAIL_LEN characters of the full diff's final line; a reviewer
 # that did not read the tail cannot produce them, and one that did is checked EXACTLY here — before
 # any comment exists, so a refusal leaves no artifact a later lane could bind.
-if [ "${DIFF_TRUNCATED:-0}" != 0 ] && [ -n "$DIFF_TAIL" ]; then
+if [ "${DIFF_TRUNCATED:-0}" != 0 ]; then
+  if [ -z "$DIFF_TAIL" ]; then
+    err "$PROG: the inline diff was TRUNCATED and this diff has NO computable tail (no non-empty line), so the reviewer could not be asked to prove it read the rest — refusing to certify a diff nobody can show was read."
+    die "$E_EVIDENCE" "the truncated diff has no tail token to verify against — refusing (transcript: $TRANSCRIPT)"
+  fi
   GOT_TAIL="$(grep -a '^[[:space:]]*diff-tail:' "$LOG" 2>/dev/null | tail -1 \
-              | sed 's/^[[:space:]]*diff-tail:[[:space:]]*//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+              | sed 's/^.*diff-tail:[[:space:]]*//' | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+  EXPECT_TAIL="$(printf '%s' "$DIFF_TAIL" | tr 'A-Z' 'a-z')"
   if [ -z "$GOT_TAIL" ]; then
     err "$PROG: the inline diff was TRUNCATED and the reviewer printed no 'diff-tail:' line — there is no evidence it read the rest of the change it was asked to certify."
     err "  The verdict is DISCARDED: nothing was posted and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_EVIDENCE" "the reviewer never proved it fetched the truncated remainder — re-run (transcript: $TRANSCRIPT)"
   fi
-  if [ "$GOT_TAIL" != "$DIFF_TAIL" ]; then
-    err "$PROG: the reviewer's 'diff-tail:' proof does NOT match this diff's tail — the review covered a different change (or guessed), so it cannot certify this head."
-    err "  Expected the last $DIFF_TAIL_LEN characters of the full diff's final line; got something else. Nothing was posted and NO record was written."
+  # ⛔ WHITESPACE IS STRIPPED ON THE EXTRACTED DIGEST ONLY (P2, fifth fresh review): a hex digest has
+  # none, so trimming cannot corrupt a correct answer — while a raw character-window token that began
+  # or ended with whitespace could never match after a prompt round trip.
+  if [ "$GOT_TAIL" != "$EXPECT_TAIL" ]; then
+    err "$PROG: the reviewer's 'diff-tail:' proof does NOT match this diff's tail (expected the SHA-256 of the full diff's final non-empty line) — the review covered a different change (or guessed), so it cannot certify this head."
+    err "  Nothing was posted and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_EVIDENCE" "the truncated-diff tail proof did not match — re-run (transcript: $TRANSCRIPT)"
   fi
 fi
@@ -875,10 +892,21 @@ function label(s,   a, b, pre, post) {
   # language, and their comma was being read as evidence of a finding, so a genuinely clean review was
   # refused (a paid re-run into the same refusal — the loop this tool exists to remove). Only the
   # IMMEDIATELY preceding word is consulted, so `No P2 problems found; P1: …` still blocks on its P1.
-  if (DEC == 0) {
+  # ⛔ THE BARE SCAN RUNS EVEN WHEN THE LINE ALSO CARRIES A DECORATED TOKEN (P1, fifth fresh review of
+  # #2288). The old `DEC == 0` gate skipped it entirely, so `Two [P1] blockers. P1: the guard returns 0`
+  # never offered its BARE P1 to any arm: the decorated mention was enough to stop the scan, the CLEAN
+  # stood, and a head-bound clean record was written over a blocker the reviewer had just stated —
+  # while the comment here claimed every bare token is examined. A candidate INSIDE a decorated span is
+  # skipped (it belongs to the decorated match); every other one is offered, and the first that
+  # qualifies wins.
+  {
     rs = 1
     while (rs <= length(s) && match(substr(s, rs), /[Pp][0-2]/)) {
       a = rs + RSTART - 1; b = a + 1
+      deco = 0
+      if (a > 1 && substr(s, a - 1, 1) ~ /[\[(]/ && substr(s, b + 1, 1) ~ /[\])]/) deco = 1
+      if (a > 2 && substr(s, a - 2, 2) ~ /(\*\*|__)/ && substr(s, b + 1, 2) ~ /(\*\*|__)/) deco = 1
+      if (deco) { rs = b + 1; continue }
       pre = tolower(substr(s, 1, a - 1)); post = substr(s, b + 1)
       negpre = (pre ~ /(^|[^[:alnum:]])(no|not|none|nil|zero|without)[[:space:]*_`]*$/)
       if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
