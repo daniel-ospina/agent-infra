@@ -2238,6 +2238,64 @@ case "$OUT" in
   *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
   *) bad "status: still reports a controller after stop — $OUT" ;;
 esac
+
+# ── #2402 cycle-2: a unit stop's EFFECT is read AFTER the teardown ─────────────────────────────────
+# The effect check used to run AT the `systemctl stop` call, where the two states are indistinguishable:
+#   (a) unit installed but DISABLED (the migration state) — the unit stop is a deliberate NO-OP and the
+#       pid teardown stops the controller. Reading early failed a stop that then succeeded, and
+#       `harness-down` turned that into a refusal over a quiet box;
+#   (b) the OTHER scope's unit under `Restart=always` — the stop lands on the wrong manager and a
+#       controller comes back AFTER the teardown. Only a post-teardown observation can see it, and
+#       skipping the check whenever the addressed unit is disabled hides exactly this case.
+say_case "stop on a service-managed box: the unit's effect is read AFTER the teardown"
+S2="$T/svc2"; rm -rf "$S2"; mkdir -p "$S2/units" "$S2/o" "$S2/home" "$S2/repo" "$S2/bin"
+: > "$S2/units/eldato-orchestrator.service"
+cat > "$S2/bin/systemctl" <<'SH'
+#!/bin/bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  stop)       [ -n "${SVC_HOOK:-}" ] && [ -x "${SVC_HOOK:-}" ] && "$SVC_HOOK"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S2/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S2/o/orch-loop.sh"
+svc_sup() { # <verb>
+  PATH="$S2/bin:$PATH" SYSTEMCTL="$S2/bin/systemctl" SVC_HOOK="${SVC_HOOK:-}" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S2/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S2/home" ENV_FILE="$S2/keys.env" SESSION="svc2402-$$" O="$S2/o" REPO="$S2/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+# (a) BENIGN migration state: the teardown stops it, and the verdict must be a clean stop.
+rm -f "$S2/o/.orch.lock"; bash "$S2/o/orch-loop.sh" & S2P=$!
+printf '%s\n' "$S2P" > "$S2/o/.orch.lock"; sleep 0.3
+unset SVC_HOOK
+S2_OUT="$(svc_sup stop)"; S2_RC=$?
+[ "$S2_RC" -eq 0 ] && ok "stop: installed-but-DISABLED → rc=0 (the teardown's stop is not a false failure)" \
+                   || bad "stop: rc=$S2_RC over a stop that succeeded — $S2_OUT"
+case "$S2_OUT" in
+  *'not reporting a stop'*) bad "stop: warned 'not reporting a stop' over a quiet box — $S2_OUT" ;;
+  *) ok "stop: no false 'not reporting a stop' in the migration state" ;;
+esac
+kill -0 "$S2P" 2>/dev/null && kill -9 "$S2P" 2>/dev/null
+# (b) a controller comes BACK after the teardown (the other scope's Restart=always): the verb must FAIL.
+cat > "$S2/hook" <<SH
+#!/bin/bash
+( sleep 1; bash "$S2/o/orch-loop.sh" >/dev/null 2>&1 & printf '%s\n' "\$!" > "$S2/o/.orch.lock" ) >/dev/null 2>&1 &
+SH
+chmod +x "$S2/hook"; rm -f "$S2/o/.orch.lock"
+SVC_HOOK="$S2/hook" S2B_OUT="$(SVC_HOOK="$S2/hook" svc_sup stop)"; S2B_RC=$?
+[ "$S2B_RC" -ne 0 ] && ok "stop: a controller that returns AFTER the teardown FAILS the verb (restart=always, wrong scope)" \
+                    || bad "stop: reported success over a controller that came back — $S2B_OUT"
+case "$S2B_OUT" in
+  *'AFTER the teardown'*) ok "stop: the warning says the controller returned after the teardown" ;;
+  *) bad "stop: failed without naming what it saw — $S2B_OUT" ;;
+esac
+[ -f "$S2/o/.orch.lock" ] && ok "stop: left the lock in place (its owner was alive — #1761's duplicate)" \
+                          || bad "stop: released a lock whose owner was alive"
+S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; } 2>/dev/null || true
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is

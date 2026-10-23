@@ -384,7 +384,15 @@ source_env_file() {
   [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which would end this script and report success (rc=0) having done nothing. Remove it; put the work in a script, not in keys.env."
   set -a; . "$ENV_FILE"; set +a
 }
+# ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, NOT THE BOX (review P2, #2402). It decides whether `start`
+# `exec`s the loop in THIS process or delegates to the unit, so keys.env must not be able to set it: the
+# doctor pins ORCH_FOREGROUND=0 in its session string, and an `ORCH_FOREGROUND=1` line in keys.env would
+# then be re-applied here and reparent the controller into the DOCTOR's tmux pane instead of the unit's
+# cgroup (#2402's defect, one indirection out). Snapshotted BEFORE the source, put back AFTER it — the
+# same shape as the HOME re-assert below.
+ORCH_FOREGROUND_IN="${ORCH_FOREGROUND:-0}"
 source_env_file
+ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -2278,6 +2286,30 @@ sup_pid_ident() {
   ps -p "$1" -o lstart= 2>/dev/null
 }
 
+# ⛔ THE EFFECT OF A UNIT STOP IS READ AFTER THE TEARDOWN, AND ON **BOTH** EXITS OF `stop` (#2402 review,
+# cycle 2). Reading it at the `systemctl stop` call cannot separate the two states that look identical
+# there: (a) the migration state — a unit installed but DISABLED, where the unit stop is a deliberate
+# no-op and the PID TEARDOWN stops the controller; and (b) the wrong-scope case — the stop landed on `
+# the other manager and the live unit's `Restart=always` brings a controller back. (a) must be a clean
+# stop (reading early failed it, and `harness-down` turned that into a refusal over a quiet box); (b) must
+# fail. Only a POST-teardown observation distinguishes them, and gating on the unit's own state cannot:
+# in (b) the ADDRESSED unit is equally disabled+inactive. The window is held OPEN for the manager —
+# breaking on the first empty read would let a controller whose RestartSec is 15 s return after this
+# function had printed success.
+# 0 = nothing of this state dir came back · 1 = a controller is alive after the teardown.
+unit_stop_effect_verdict() { # <unit>
+  [ -n "${1:-}" ] || return 0
+  local w=0 own
+  while [ "$w" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
+    [ -z "$(owned_controller_pids 2>/dev/null)" ] || break
+    sleep 1; w=$((w + 1))
+  done
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to report a stop from an unreadable read"
+  [ -n "$own" ] || return 0
+  say "warn: $1 was stopped but a controller of this state dir (pid $(_pids_join "$own")) is STILL running ${w}s AFTER the teardown — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"
+  return 1
+}
 cmd_stop() {
   local rc=0 lpid lident rpid rident i
   # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
@@ -2312,32 +2344,13 @@ cmd_stop() {
       # running": with two unit files on the box (an image-baked disabled system unit plus the live user
       # unit) the stop lands on the wrong manager, the live unit's `Restart=always` brings the controller
       # straight back, and the pid reads below can conclude before the new controller writes its lock —
-      # so this verb would print "controller stopped (systemd …)" over a live dispatcher. Verify the
-      # EFFECT, like every other read in this function: nothing of this state dir alive after the stop.
-      # ⛔ BUT ONLY WHEN THE UNIT IS THE ADDRESSED SUPERVISOR (review P1, #2402). This check used to run
-      # unconditionally, i.e. also in the state the migration doc calls normal — a unit file that is
-      # installed but DISABLED, where `stop` is a deliberate no-op and the controller is a tmux session.
-      # There it slept the whole CONTROLLER_STOP_TIMEOUT over a controller this function had not killed
-      # yet, warned "not reporting a stop", set rc=1, and THEN killed it and printed success — and
-      # `harness-down` turns that contradiction into a refusal over a box that is in fact quiet. A
-      # definite "not enabled AND not active" (rc 1 from both reads) means the unit is not what runs the
-      # controller; the pid teardown below owns the claim then. An UNREADABLE answer (rc 3) stays
-      # conservative and waits.
-      local _en=3 _act=3
-      controller_unit_state; _en=$?
-      controller_unit_active_state; _act=$?
-      if [ "$_en" -eq 1 ] && [ "$_act" -eq 1 ]; then
-        : # installed-but-DISABLED → the tmux/pid teardown below is the mechanism that stops it
-      else
-        local _sw=0
-        while [ "$_sw" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
-          if [ -z "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
-          sleep 1; _sw=$((_sw + 1))
-        done
-        if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then
-          say "warn: $CONTROLLER_UNIT was stopped but a controller of this state dir (pid $(_pids_join "$(owned_controller_pids)")) is STILL running after ${_sw}s — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"; rc=1
-        fi
-      fi
+      # so this verb would print "controller stopped (systemd …)" over a live dispatcher. The EFFECT is
+      # therefore read — but AT THE END, AFTER THE TEARDOWN (see the note at the post-kill assertion),
+      # never here. Reading it here cannot work: in the state the migration doc calls normal (a unit
+      # installed but DISABLED, controller in tmux) the stop above is a deliberate NO-OP, so this read
+      # would sleep the whole window over a controller this function has not killed yet and fail a stop
+      # that then succeeds. Gating on the unit's own state does not separate the two cases either, because
+      # in the wrong-scope case the ADDRESSED unit is equally disabled+inactive.
     else
       say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
     fi
@@ -2421,6 +2434,13 @@ cmd_stop() {
       # A stop that went through the SERVICE MANAGER says so: "not running" is true but reads as "there
       # was nothing to stop", which is the opposite of what happened and hides the unit from the operator
       # who is about to check that the box stays stopped.
+      # ⛔ AND THE UNIT'S EFFECT IS VERIFIED HERE TOO (this branch returns before the common tail): a
+      # clean "stopped (systemd …)" must not be printed over a controller that came back after the
+      # teardown — nor a failure over one that is genuinely gone.
+      if [ -n "$stop_unit" ]; then
+        unit_stop_effect_verdict "$stop_unit" || rc=1
+        [ "$rc" -eq 0 ] || return 1
+      fi
       if [ -n "$stop_unit" ]; then say "controller stopped (systemd $stop_unit)"; else say "not running"; fi
       # A doctor-loop stop failure recorded above still fails the verb: "not running" is about the
       # CONTROLLER, and this branch used to return 0 over it.
@@ -2472,6 +2492,12 @@ cmd_stop() {
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
   [ -z "$own" ] || die "controller(s) still alive after stop (pid $(_pids_join "$own")) — NOT releasing $LOCK"
+  # ⛔ The unit's effect, read AFTER the teardown (see unit_stop_effect_verdict). A controller that
+  # reappeared here makes the verb fail, and the lock below is NOT released — its owner is alive, and a
+  # lock removed while its owner lives is #1761's duplicate.
+  if [ -n "$stop_unit" ]; then
+    unit_stop_effect_verdict "$stop_unit" || return 1
+  fi
   live="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
   foreign="$(_pids_minus "$live" "$own")"
