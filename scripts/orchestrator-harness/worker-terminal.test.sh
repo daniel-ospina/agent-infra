@@ -170,9 +170,38 @@ cat > "$TMP/stub/uname" <<'SH'
 echo "${FAKE_UNAME:-Linux}"
 SH
 chmod +x "$TMP/stub/uname"
+# A plaintext-store `gh` — the shape CI's ubuntu runner has. It answers from the SAME hosts.yml the
+# shipped code reads (GH_CONFIG_DIR, then XDG, then $HOME/.config/gh) and NEVER from the machine's own
+# store, so a fixture HOME's answer is a property of the fixture on every platform.
+cat > "$TMP/stub/gh" <<'SH'
+#!/usr/bin/env bash
+h="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/gh}}"; h="${h:-$HOME/.config/gh}"
+f="$h/hosts.yml"
+case "${1:-} ${2:-}" in
+  "auth token")
+    [ -f "$f" ] || exit 1
+    while IFS= read -r l; do
+      case "$l" in *oauth_token:*) : ;; *) continue ;; esac
+      v="${l#*oauth_token:}"
+      v="${v#"${v%%[![:space:]]*}"}"
+      case "$v" in ''|'#'*) continue ;; esac
+      v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+      case "$v" in *[![:space:]]*) printf '%s\n' "$v"; exit 0 ;; esac
+    done < "$f"
+    exit 1 ;;
+  "auth status")
+    grep -q 'oauth_token:' "$f" 2>/dev/null && exit 0 || exit 1 ;;
+esac
+exit 1
+SH
+chmod +x "$TMP/stub/gh"
 # scenario <name> — a bin dir whose stubs are the ones above (first on PATH, so they shadow the real
 # cmux/uname/tmux a developer box or a cell may have).
-scenario() { mkdir -p "$TMP/bin-$1"; cp "$TMP/stub/cmux" "$TMP/stub/tmux" "$TMP/stub/uname" "$TMP/bin-$1/"; }
+# ⛔ AND A HERMETIC `gh` (review finding, 2026-10-23): without one, every REFUSED leg asks whatever gh
+# the MACHINE has, and gh's default store is the system keychain, which answers for a HOME it was never
+# pointed at — 34 pins then red on the maintainer's macOS box on an unchanged tree while CI (plaintext
+# store) was green. The stub models the plaintext store off the SAME hosts.yml the code reads.
+scenario() { mkdir -p "$TMP/bin-$1"; cp "$TMP/stub/cmux" "$TMP/stub/tmux" "$TMP/stub/uname" "$TMP/stub/gh" "$TMP/bin-$1/"; }
 scenario cmux; scenario absent; scenario darwin; scenario host
 # A box with NO surface at all: cmux cannot answer AND there is no tmux binary. `PATH` for this one is
 # the scenario dir ALONE (no `:$PATH`), or the real /usr/bin/tmux a developer box carries would be
@@ -338,6 +367,11 @@ export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5" TMUX_SERVER_GH_TOKEN="${T
 # must clear it — otherwise this driver passes on a lane box and fails on a clean one, for a reason
 # that has nothing to do with what it asserts. The caller-token case sets it back deliberately.
 [ "${KEEP_CALLER_TOKEN:-0}" = "1" ] || unset GH_TOKEN GITHUB_TOKEN
+# `CALLER_UNEXPORTED=1`: the name is a SHELL VARIABLE, not in the environment — a tmux client never
+# carries it, so crediting it would bless a dead lane (review finding, 2026-10-23, measured). The unset
+# is REQUIRED here: this suite inherits the lane's own exported GH_TOKEN, and an assignment to an
+# already-exported name keeps the export attribute, which would make the fixture look exported.
+if [ "${CALLER_UNEXPORTED:-0}" = "1" ]; then unset GH_TOKEN GITHUB_TOKEN; GH_TOKEN=ghp_shell_only; fi
 . "$1"
 wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
 SH
@@ -371,6 +405,16 @@ case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a caller whose own environment carries GH_TOKEN spawns (it will CREATE the server)" $rc
 grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux4f.log" && rc=0 || rc=1
 ck "…and it is a tmux session the worker inherits the caller's GH_TOKEN through" $rc
+# ⛔ …BUT ONLY IF IT IS **EXPORTED** (P1 review finding, 2026-10-23, measured). A tmux client hands the
+# server — and therefore the pane — only EXPORTED variables. `GH_TOKEN=ghp_x` as a plain shell variable is
+# invisible to tmux, so crediting it produced gate rc=0, a written record, and a lane with NO credential:
+# the same dead lane as the ~21-line death, reported as provisioned. Driven through the real spawn path.
+rm -rf "$TMP/O4u"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 CALLER_UNEXPORTED=1 bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4u" "$TMP/tmux4u.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a caller GH_TOKEN that is NOT exported is REFUSED (a tmux pane never inherits a shell variable)" $rc
+grep -q 'new-session -d -s lane-8' "$TMP/tmux4u.log" && rc=1 || rc=0
+ck "…and no session is started for it" $rc
 # ⛔ BUT ONLY WHEN THE SPAWN *CREATES* THE SERVER (review finding 1 on this diff, measured on tmux 3.4):
 # against an ALREADY-RUNNING server a `new-session` gets the SERVER's global env plus tmux's
 # `update-environment` list, which does not carry GH_TOKEN — a server created by `env -i HOME=/tmp/a`
@@ -607,7 +651,13 @@ ck "…and a file that blanks the ONLY credential EXITS 98 (no store to fall bac
 tok_rc() { ( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts_token "$1" >/dev/null 2>&1; printf '%s' "$?" ); }
 rm -rf "$TMP/home-wstok"; mkdir -p "$TMP/home-wstok/.config/gh"
 printf 'github.com:\n    user: fixture\n    oauth_token: "   "\n' > "$TMP/home-wstok/.config/gh/hosts.yml"
-[ "$(tok_rc "$TMP/home-wstok")" != "0" ] && rc=0 || rc=1
+# ⛔ HERMETIC (review finding, 2026-10-23): this pin asks the shipped probe directly, so without a stub
+# it asks whatever gh the MACHINE has — and a keychain store answers for a HOME it was never pointed at.
+# The stub models the exact faulty answer: rc 0 with three spaces.
+mkdir -p "$TMP/bin-wstok"
+printf '#!/usr/bin/env bash\ncase "${1:-} ${2:-}" in "auth token") printf "   \\n"; exit 0 ;; esac\nexit 1\n' > "$TMP/bin-wstok/gh"
+chmod +x "$TMP/bin-wstok/gh"
+[ "$( PATH="$TMP/bin-wstok:$PATH" tok_rc "$TMP/home-wstok" )" != "0" ] && rc=0 || rc=1
 ck "wt_gh_hosts_token: a WHITESPACE token is refused by the gh arm too (one rule, both arms)" $rc
 # ⛔ AND THE SPAWN PINS THE SOURCING SHELL: the pre-check's dialect must be the runtime's dialect.
 grep -q 'TMUX new-session -d -s lane-8 bash -c' "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
@@ -671,6 +721,33 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-bashy" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a BASH-only syntax in keys.env is not refused by the pre-check (bash decides, not dash)" $rc
+# ⛔ THE RUNTIME GUARD MUST ASK THE SAME TWO QUESTIONS THE GATE ASKED (P2 review finding, 2026-10-23,
+# measured). The gate credits through gh OR, with no gh on PATH, through the credential FILE. The guard
+# knew only `gh auth token`, so a file-credited box passed the gate, wrote its record, and the worker
+# died with exit 98 on its first statement — a silently dead lane. Pinned on the emitted prefix: the gh
+# arm names an ABSOLUTE path resolved at build time (a `PATH=` line inside keys.env cannot move it) and
+# is BOUNDED (the README's own rule: a plain `gh auth token` can hang, rc=142 measured), and the guard
+# also carries the SAME file predicate as its fallback (one definition, `WT_OAUTH_TOKEN_RX`), so a box
+# with no gh at all is not killed by its own guard.
+rm -rf "$TMP/home-guard" "$TMP/O4t9"; gh_hosts_fixture "$TMP/home-guard"
+printf 'EXTRA=1\n' > "$TMP/home-guard/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t9" "$TMP/home-guard" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+case "$pfx" in *"grep -qE"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
+ck "…a box with no gh is not killed by its own guard (the guard carries the FILE predicate too)" $rc
+if command -v perl >/dev/null 2>&1; then
+  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
+  ck "…and its gh call is BOUNDED and ABSOLUTE (a hung gh would freeze the controller's whole cycle)" $rc
+  case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
+  ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
+fi
+# ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
+# `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
+# controller's single-threaded cycle). Asserted at the SOURCE: a runtime pin would have to hang for the
+# whole alarm window to tell the difference. Every non-comment `auth token` call must carry the bound.
+n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -vc "alarm 10")"
+[ "$n_unbounded" = "0" ] && rc=0 || rc=1
+ck "every non-comment 'gh auth token' in the library is BOUNDED (no unbounded credential probe on the spawn path)" $rc
 # ⛔ A `hosts.yml` THAT IS A DIRECTORY IS NOT A CREDENTIAL (review finding): `-s` was true for any
 # object of non-zero size, and a directory has one. What refuses it here is the TOKEN READ — grep on a
 # directory fails, so the value test cannot pass (`[ -f ]` alone does not decide it, measured: with the
@@ -837,8 +914,8 @@ case "$out" in *"launcher=none"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "no cmux AND no tmux => launcher=none (a box with no surface at all is still reported, not guessed)" $rc
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the spawn is REFUSED" $rc
-grep -q 'tmux=absent' "$TMP/O4d/test.log" && grep -qE 'cmux=(present|absent)' "$TMP/O4d/test.log" && rc=0 || { rc=1; cat "$TMP/O4d/test.log" 2>/dev/null; }
-ck "…with a message that names BOTH surfaces it looked for (so it is a diagnosis, not a shrug)" $rc
+grep -q 'tmux=absent' "$TMP/O4d/test.log" && grep -q 'cmux tree rc=' "$TMP/O4d/test.log" && rc=0 || { rc=1; cat "$TMP/O4d/test.log" 2>/dev/null; }
+ck "…with a message that names BOTH surfaces AND what the cmux probe answered (rc, not binary presence)" $rc
 # ⛔ And a box that cannot produce a CONTRACT is refused, not started credential-less. Two arms:
 # the function itself refuses an empty HOME, and the knob an operator sets is the one that is used
 # (a silent fall-through to $HOME would make "the credential lives at X" a suggestion).

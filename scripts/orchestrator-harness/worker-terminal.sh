@@ -131,16 +131,20 @@ wt_gh_hosts() {
   else printf '%s\n' "$home/.config/gh/hosts.yml"; fi
 }
 
+# The `oauth_token:` VALUE pattern, ONE definition for every consumer (the no-gh fallback probe, the
+# runtime guard in the launch line, and `wt_gh_hosts_value`). Group excludes the quote characters and
+# `#`, because `oauth_token: ""` is empty and `oauth_token:   # redacted` is a YAML NULL — neither is a
+# token (measured: gh itself answers `no oauth token found for github.com` for both).
+WT_OAUTH_TOKEN_RX='^[[:space:]]*oauth_token:[[:space:]]*["'"'"']?[^[:space:]#"'"'"']'
+
 # `wt_gh_hosts_value <file>` — the FALLBACK probe, for a box with no `gh` on PATH: 0 iff that file is a
 # regular file carrying a non-empty `oauth_token:` VALUE. Kept as its own function so it is testable on
 # its own (a spawn-level test cannot reach it on a box that HAS gh — `wt_gh_hosts_token` takes the gh
-# arm first, so the regex would be unpinned there). The value group excludes the quote characters and
-# `#`, because `oauth_token: ""` is empty and `oauth_token:   # redacted` is a YAML NULL — neither is a
-# token (measured: gh itself answers `no oauth token found for github.com` for both).
+# arm first, so the regex would be unpinned there).
 wt_gh_hosts_value() {
   local f="${1:-}"
   [ -n "$f" ] && [ -f "$f" ] || return 1
-  grep -qE '^[[:space:]]*oauth_token:[[:space:]]*["'\'']?[^[:space:]#"'\'']' "$f" 2>/dev/null
+  grep -qE "$WT_OAUTH_TOKEN_RX" "$f" 2>/dev/null
 }
 
 # `wt_gh_hosts_token <home>` — 0 iff `gh` ITSELF can produce a token for that HOME.
@@ -162,16 +166,40 @@ wt_gh_hosts_value() {
 wt_gh_hosts_token() {
   local home="${1:-}"
   [ -n "$home" ] || return 1
-  if command -v gh >/dev/null 2>&1; then
-    # ⛔ gh's own OUTPUT is held to the same rule as every other arm (review finding, 2026-10-23,
-    # measured): `oauth_token: "   "` made `gh auth token` print three spaces and exit 0, so the gh arm
-    # credited a file its own file-arm refuses, and the worker's gh rejected the value at the first call.
-    local tok
-    tok="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token 2>/dev/null)" || return 1
-    case "$tok" in *[![:space:]]*) return 0 ;; esac
-    return 1
-  fi
+  wt_gh_token "$home" >/dev/null && return 0
+  # ⛔ NO gh (or no BOUNDED gh — see `wt_gh_token`): ask the FILE the worker's gh would read. The two
+  # predicates must agree with the runtime guard in the launch line, or a credit this probe granted is
+  # revoked one layer down (see the guard's own note).
   wt_gh_hosts_value "$(wt_gh_hosts "$home")"
+}
+
+# `wt_gh_token <home>` — gh's OWN answer for that HOME, printed on stdout; 0 iff it carries a non-space
+# value. ⛔ BOUNDED (recorded rule, README §"Two platform rules are enforced by the suite"): a plain
+# `gh auth token` can hang for the life of the shell (rc=142 measured), and `wt_spawn` runs on the
+# controller's SINGLE-THREADED cycle — a hung probe freezes the cycle (no heartbeat, no census, no
+# dispatch), a worse failure than the credential-less lane this gate refuses. `timeout`/`gtimeout` are
+# absent on macOS, so the bound is perl's alarm, the README's own bound. With no perl there is no bound
+# to give, so this returns 1 and the FILE predicate answers instead — never an unbounded call on the hot
+# path. Residual: a box with no perl AND keyring-only auth falls back to the file test; macOS ships perl
+# and `gh`, so that shape is a container edge, and it is a REFUSAL, not a silent dead lane.
+# ⛔ gh's own OUTPUT is held to the same rule as every other arm (review finding, 2026-10-23, measured):
+# `oauth_token: "   "` made `gh auth token` print three spaces and exit 0, so the gh arm credited a file
+# its own file-arm refuses, and the worker's gh rejected the value at the first call.
+wt_gh_token() {
+  local home="${1:-}" tok
+  [ -n "$home" ] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  command -v perl >/dev/null 2>&1 || return 1
+  tok="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" perl -e 'alarm 10; exec @ARGV' gh auth token 2>/dev/null)" || return 1
+  case "$tok" in *[![:space:]]*) printf '%s' "$tok"; return 0 ;; esac
+  return 1
+}
+
+# `_wt_exported <name>` — 0 iff that shell variable carries the EXPORT attribute. Only exported names
+# cross into a tmux client's environment, so only those may be credited as "the caller's credential".
+_wt_exported() {
+  case "$(export -p 2>/dev/null)" in *" $1="*) return 0 ;; esac
+  return 1
 }
 
 # `wt_keys_credit <keys.env>` — 0 iff the file ASSIGNS a token-looking value to GH_TOKEN/GITHUB_TOKEN.
@@ -257,7 +285,13 @@ wt_launcher_env() {
   local home="${1:-}" keys have=0 keys_credit=0 caller_val=0 store_credit=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
-  case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) caller_val=1 ;; esac
+  # ⛔ THE CALLER'S CREDIT MUST BE **EXPORTED** (P1 review finding, 2026-10-23, measured). A tmux client
+  # hands the server — and therefore the pane — only EXPORTED variables, so a `GH_TOKEN=x` that is a plain
+  # shell variable satisfies `"${GH_TOKEN:-}"` here while never reaching the worker: gate rc=0, record
+  # written, lane dead at its first `gh` call. `export -p` is the portable way to ask (bash prints
+  # `declare -x GH_TOKEN=…`, POSIX sh prints `export GH_TOKEN=…`; both carry ` GH_TOKEN=`).
+  if [ "${caller_val:-0}" = "0" ]; then case "${GH_TOKEN:-}" in *[![:space:]]*) _wt_exported GH_TOKEN && caller_val=1 ;; esac; fi
+  if [ "${caller_val:-0}" = "0" ]; then case "${GITHUB_TOKEN:-}" in *[![:space:]]*) _wt_exported GITHUB_TOKEN && caller_val=1 ;; esac; fi
   wt_gh_hosts_token "$home" && { have=1; store_credit=1; }
   # ⛔ A VALUE IS NOT A QUOTED EMPTY (review finding, measured 2026-10-23). `=[^[:space:]]` counted
   # `GH_TOKEN=""` as provision — the character after `=` is a quote — so the file exported an EMPTY
@@ -391,7 +425,23 @@ wt_launcher_env() {
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
   # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
   # the STORE — and never the question it just answered NO to.
-  [ -f "$keys" ] && printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac'
+  # ⛔ AND IT MUST ASK THE **SAME TWO QUESTIONS THE GATE ASKED** (P2 review finding, 2026-10-23,
+  # measured): the guard used to know only `gh auth token`, while the gate can also credit through the
+  # FILE predicate (no gh on PATH — the fallback one function up). A box credited that way returned to
+  # `wt_launcher_env` rc=0, wrote its record, and the worker then died with `exit 98` on its first
+  # statement — a silently dead lane, which is exactly the class this gate exists to remove. So the
+  # guard takes gh's answer from an ABSOLUTE path resolved at BUILD time (a `PATH=` line inside
+  # `keys.env` cannot move it) and falls back to the same credential-file predicate the probe uses;
+  # `gh` itself stays bounded (see `wt_gh_token`).
+  if [ -f "$keys" ]; then
+    _hosts_f="$(wt_gh_hosts "$home")"
+    _guard="grep -qE $(wt_q "$WT_OAUTH_TOKEN_RX") $(wt_q "$_hosts_f") 2>/dev/null"
+    _ghbin="$(command -v gh 2>/dev/null || true)"
+    if [ -n "$_ghbin" ] && command -v perl >/dev/null 2>&1; then
+      _guard="env -u GH_TOKEN -u GITHUB_TOKEN perl -e 'alarm 10; exec @ARGV' $(wt_q "$_ghbin") auth token >/dev/null 2>&1 || $_guard"
+    fi
+    printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
+  fi
   return 0
 }
 
@@ -738,7 +788,15 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
   kind="$(wt_launcher)"
   case "$kind" in
     none)
-      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer AND there is no tmux binary, so there is nothing to start a worker in (checked: cmux=$(command -v cmux >/dev/null 2>&1 && echo present || echo absent), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
+      # ⛔ THE MESSAGE CARRIES WHAT THE PROBE ACTUALLY ANSWERED, not whether a binary exists (review
+      # finding, 2026-10-23; issue #2210's own reopen asks for "`cmux tree` rc, `tmux` presence,
+      # `uname`"). `command -v cmux` is TRUE on every cloud cell — #2368's condition is precisely "the
+      # binary exits, the daemon does not answer" — so a presence test sent the operator to the wrong
+      # fault. The rc is re-measured here (the refusal is the rare path, and `wt_launcher` runs in a
+      # command substitution, so it cannot hand a variable back).
+      _cmrc=127
+      if command -v cmux >/dev/null 2>&1; then _cmrc=0; cmux tree --json >/dev/null 2>&1 || _cmrc=$?; fi
+      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
       return 1 ;;
     tmux)
       # The launchd Mac surface and the Linux cell (see wt_launcher) — WITH the environment contract.
