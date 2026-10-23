@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# harness-apply-pass.sh — ONE pass that puts this box's harness on origin/main, on a clock (#2416).
+#
+#   ./harness-apply-pass.sh                 # apply (or advance the pin), recording one pass record
+#   ./harness-apply-pass.sh --dry-run       # read + decide + print, change NOTHING
+#   ./harness-apply-pass.sh --print-status  # answer "did the last pass succeed" from the record
+#   ./harness-apply-pass.sh --help
+#
+# ⛔ IT OWNS NO ACTIVATION. The capability already exists and is used AS IS:
+#     · a CELL advances its harness with `scripts/cloud-cell-supervisor.sh apply` (agent-infra#1745),
+#       which fetches agent-infra main and pins a detached per-commit worktree; that is the whole of
+#       "apply the proper harness" and this file does not re-implement one line of it.
+#     · a MAC syncs its checkout with `./sync.sh` (auto-sync, #1661/#265) — fetch + `pull --ff-only`
+#       + pi config refresh + launchd. Also not re-implemented.
+#   What was missing is the CLOCK: nothing scheduled either verb, so a box ran whatever code it had
+#   when it was last started and `main` moved away underneath it. A harness fix that merged but is
+#   not live on a cell has fixed nothing. `scripts/install-harness-apply-timer.sh` installs this pass
+#   on the box's scheduler; this file is what the scheduler runs.
+#
+# ── WHY A WRAPPER AND NOT THE VERB STRAIGHT INTO THE UNIT ────────────────────────────────────────
+# Because the verb alone would run on a box that must NOT be moved, and the measured fleet has such
+# boxes. The predicates below are the difference between "advance the harness" and "destroy the only
+# copy of a lane's work", and they have to run BEFORE the verb, every time:
+#
+#   AHEAD      The checkout's HEAD carries commits that are NOT on the ref's line. Advancing would
+#              drop them. MEASURED: c4 lost three unlanded commits on 2026-10-22, recovered only by
+#              `git cherry`. REFUSED, with the ahead count, and nothing is touched.
+#   DIVERGED   Neither ancestor nor descendant. Same class, same refusal — the two are NAMED
+#              separately because the remedy differs (cherry-pick vs rebase).
+#   DIRTY      The tree this pass is about to MOVE (the checkout, on the sync path) has uncommitted
+#              changes — the measured Mac defect: ONE modified tracked file
+#              (`scripts/orchestrator-harness/install.sh`) made `sync.sh` abort, and NOTHING
+#              surfaced it, so the orchestrator aged 91 commits behind main with every signal
+#              reading "auto". The files are PRESERVED BY NAME first (a patch plus every untracked
+#              file, under `<state>/harness-apply-preserved/<UTC>/`), each path is printed, and only
+#              then is the tree restored and fast-forwarded. A box that cannot preserve them is
+#              REFUSED (exit 20), never quietly cleaned.
+#   LANES      A running lane is NEVER signalled. This pass has no kill, no stop, no restart: the
+#              cell advance is PIN-PER-COMMIT (`apply --force --pin-only`), so a lane keeps the tree it
+#              started with and the restart is deferred to the next launch — the recorded design in
+#              harness-refresh.sh's header, honoured rather than re-decided. BOTH flags: `--pin-only`
+#              keeps the scheduler out of $O (seeding is `start`'s job), and `--force` is what `apply`
+#              requires before it will touch a cell whose controller is live — without it the advance
+#              is REFUSED on every running cell (measured in review). Neither relaxes anything else.
+#              `scripts/harness-apply-timer.test.sh` pins both, statically and at runtime.
+#
+# ── THE PIN MUST NOT LIE ────────────────────────────────────────────────────────────────────────
+# A pin is TWO records: the SHA file (`HARNESS-PIN`) and the PATH file (`.harness-path` → the tree the
+# controller execs). MEASURED 2026-10-23: c1's SHA said 54bbb0c6 while the tree it names was at
+# ce987bb2 — a pin that disagrees with the checkout is a false record of what is deployed, and every
+# reader (cloud-cell-supervisor.sh status, harness-up, harness-refresh) then reports a commit nobody
+# runs. After the move this pass re-reads BOTH and, when they disagree, REPAIRS the SHA record to the
+# tree's actual HEAD, saying old → new. `--pin-only` deliberately does not do this for a pin that is
+# already at the ref, which is exactly the state c1 was in.
+#
+# ── THE READINGS ARE PRINTED, EVERY PASS ────────────────────────────────────────────────────────
+# `harness: head=… ref=… behind=N ahead=0 dirty=0 pin=… pin_tree=… mode=…`, then the action. A verdict
+# without the numbers behind it is not auditable, and "behind" is the number that was invisible for
+# 91 commits.
+#
+# ── EXIT VOCABULARY — ONE VOCABULARY, THE ONE THIS REPO ALREADY USES ────────────────────────────
+# `scripts/orchestrator-harness/harness-refresh.sh` already speaks exactly this, because it answers
+# the same question in-loop. A second set of codes for the same facts would be the two-vocabularies
+# defect this repo keeps deleting, so this file adopts it verbatim:
+#    0  current       the pin already names the ref tip; NOTHING was changed (the no-op cadence)
+#   10  advanced      the materialiser ran and the pin moved to the ref tip (or the pin record was
+#                     repaired to the tree's head, or preserved dirt was restored as part of it)
+#   11  mended        the pin was missing/empty/not-a-commit; what this box actually runs was recorded
+#   20  REFUSED dirty the tree to move carries uncommitted work AND it could not be preserved
+#   21  REFUSED ahead local commits are not on the ref's line — nothing was touched
+#   22  REFUSED diverged the running commit is neither ancestor nor descendant — nothing was touched
+#   23  REFUSED unknown the ref/repo/running commit cannot be resolved (cannot-verify is not a pass),
+#                     the materialiser failed, or the pin record could not be written
+#   25  behind        on the ref's line but older, and this box has no materialiser to advance it
+#   2   usage
+# The systemd unit treats 0/10/11 as success and everything else as RED: a refusal means a HUMAN must
+# resolve something (an ahead box, a tree that cannot be preserved), and reddening the unit is the
+# only surface that is not a log nobody reads.
+#
+# ⛔ WHAT IT DELIBERATELY DOES NOT DO
+#   · No branch switch and no whole-tree discard anywhere: both are refused inside a cell's main
+#     checkout by the same guard the laptop runs, and both can lose work. On the sync path the tracked
+#     paths are brought back to HEAD one named path at a time, then re-staged with `git add -u` (which
+#     never touches an untracked file), and ONLY after every dirty path has been preserved and named.
+#   · No probing of `main` more than once per pass, and NO COMMIT COUNTS AS A RELATION: hash equality
+#     or `merge-base --is-ancestor`, exactly as the supervisor's provenance block requires (a count
+#     reads a tree that is not on main's line at all as "1 behind", and the count MOVES as main
+#     advances). The COUNT is printed as a measurement of "how stale", never used to decide.
+#   · No spawning, signalling or restarting of the controller or a lane. The only `--now` in this
+#     feature is on the TIMER, and it lives in the installer, not here.
+#
+# Env seams (a cell sets none of these; the suite sets all of them):
+#   HARNESS_REPO          the agent-infra checkout that carries the ref (default: this file's repo)
+#   HARNESS_REF           the ref to converge on (default origin/main)
+#   HARNESS_FETCH         1|0 — fetch origin before comparing (default 1; 0 for a hermetic test)
+#   HARNESS_PIN           the SHA record file (default ${CELL_HOME:-$HOME}/.pi/agent/state/HARNESS-PIN)
+#   HARNESS_PIN_FILE      the PATH record (default $CELL_HOME/.harness-path)
+#   HARNESS_PIN_DIR       the pin root (default $CELL_HOME/harness)
+#   CELL_HOME             the cell's home (default $HOME)
+#   O                     the orchestrator state dir (default $CELL_HOME/orchestrator)
+#   HARNESS_MATERIALISER  the script that materialises a pin (default <repo>/scripts/cloud-cell-supervisor.sh)
+#   HARNESS_APPLY_MODE    pin|sync — force one path (default: pin when a pin record exists, else sync
+#                         when the checkout carries ./sync.sh, else pin)
+#   HARNESS_APPLY_STATE_DIR  the pass record dir (default $HOME/.pi/agent/state)
+#   HARNESS_APPLY_STALE_SECONDS  a record older than this is STALE (default 3600 = 6 cadences)
+#   HARNESS_APPLY_SYNC_CMD   the sync verb to run on the sync path (default <repo>/sync.sh; the suite
+#                            points it at a stub so the fixture never runs pi-bootstrap)
+#
+# Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
+#
+# ⛔ ONE DECLARED LIMIT, AND IT IS THE GUARD WORKING AS DESIGNED. The dirty-preserving restore below
+# brings tracked paths back to HEAD from git content, which is what `main-worktree-guard` (#709)
+# classifies as a REVERT — so an AGENT executing this file from a checkout that carries uncommitted
+# changes is refused before bash runs a line (measured: `--print-status` and even `bash -n`). That is
+# the guard doing its job on a shared checkout, not a defect in the pass: under the scheduler
+# (systemd/launchd) there is no such guard, and an operator with a dirty checkout can run it with the
+# documented hatch. The INSTALLER calls the pass through its own resolved path, so
+# `install-harness-apply-timer.sh --status` — the verb this feature documents — is unaffected. The
+# same interaction is recorded for `scripts/pi-cache-reap.test.sh` in docs/ops/disk-reaper.md.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
+
+say()  { printf '%s\n' "$*"; }
+err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
+
+help_text() {
+    local n
+    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
+    # NO CONSTANT FALLBACK (the same rule install-disk-reaper-timer.sh records): a magic range
+    # silently truncates the header the moment a line is added, and a piped start cannot derive it.
+    if [ -z "$n" ]; then
+        err "cannot derive the help range (invoke this FILE, not a pipe: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help')"
+        return 2
+    fi
+    # ⛔ ONE PROCESS, NO PIPELINE. The obvious `sed -n "2,Np" "$0" | sed …` reads the FILE through
+    # `$0`, and a static discard guard cannot resolve that producer — it fails closed on the payload
+    # and refuses the whole invocation, which would make this script unrunnable by the very lanes it
+    # must never disturb (measured). `awk` answers the same question in one process: print the header
+    # lines up to the `set -uo pipefail` sentinel, dropping the leading `# `.
+    awk 'NR == 1 { next } /^set -uo pipefail/ { exit } { sub(/^# ?/, ""); print }' "$0"
+}
+usage() { help_text; exit 2; }
+
+MODE=run
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)      DRY_RUN=1 ;;
+        --print-status) MODE=status ;;
+        --help|-h)      help_text; exit $? ;;
+        *)              err "unknown argument: $1 (try --help)"; usage ;;
+    esac
+    shift
+done
+
+CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
+O="${O:-$CELL_HOME/orchestrator}"
+REF="${HARNESS_REF:-origin/main}"
+FETCH="${HARNESS_FETCH:-1}"
+PIN_SHA_FILE="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
+PIN_PATH_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+PIN_ROOT="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${HOME}/.pi/agent/state}"
+STALE_SECONDS="${HARNESS_APPLY_STALE_SECONDS:-3600}"
+RECORD="$STATE_DIR/harness-apply.status"
+LOG="$STATE_DIR/harness-apply.log"
+
+# ── the checkout that carries the ref ──────────────────────────────────────────────────────────
+# ⛔ THE MAIN WORKTREE, never `--show-toplevel` of this file: on a cell this script may itself be
+# running from a PINNED worktree (a linked worktree of the checkout), and deriving the repo from it
+# would make the pin its own repo — `apply` would then operate on the tree it is running from. Same
+# expression cloud-cell-supervisor.sh and harness-refresh.sh use.
+main_worktree() {
+    git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'
+}
+REPO="${HARNESS_REPO:-}"
+if [ -z "$REPO" ]; then
+    for cand in "${AGENT_INFRA_PATH:-}" "$(dirname "$HERE")" "$HERE"; do
+        [ -n "$cand" ] && [ -d "$cand" ] || continue
+        cand="$(main_worktree "$cand")"
+        [ -n "$cand" ] && { REPO="$cand"; break; }
+    done
+fi
+
+# ⛔ A NUMERIC SEAM IS VALIDATED BEFORE IT IS USED. `[ "$age" -gt "abc" ]` prints "integer expression
+# expected" and takes the ELSE arm, so an unvalidated bound would make every record read fresh.
+case "$STALE_SECONDS" in
+    ''|*[!0-9]*) err "HARNESS_APPLY_STALE_SECONDS must be a whole number of seconds (got '$STALE_SECONDS')"; exit 23 ;;
+esac
+[ "$STALE_SECONDS" -gt 0 ] || { err "HARNESS_APPLY_STALE_SECONDS must be positive (got '$STALE_SECONDS')"; exit 23; }
+
+# ── the pass record ────────────────────────────────────────────────────────────────────────────
+# One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
+# from "no pass has run", and that is the false-PASS shape this feature exists to remove.
+REC_HEAD=""; REC_REF=""; REC_BEHIND="unknown"; REC_AHEAD="unknown"; REC_DIRTY="unknown"
+REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+write_record() { # <ok> <rc>
+    local tmp ok="$1" rc="$2"
+    mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR"; return 1; }
+    tmp="$RECORD.tmp-$$"
+    # ⛔ ONE `key=value` PER LINE, which is the house shape for a pass record: `disk-reaper.status`
+    # writes it that way and `tools/fleet/fleet-health.py` reads it that way (a single line of
+    # space-separated pairs parses to ONE key there — measured, and it silently reported every pass as
+    # "no readable epoch"). A record nobody can read is the same false PASS as no record.
+    # `detail` is last and newline-sanitised: it is prose, and a newline in it would forge a field.
+    # `preserved=` is a FIELD, not prose inside `detail=`: the preservation directory is where an
+    # operator goes to recover work, so it must not be at the mercy of a prose truncation.
+    {
+        printf 'mode=%s\n' "$PASS_MODE"
+        printf 'ok=%s\n' "$ok"
+        printf 'rc=%s\n' "$rc"
+        printf 'epoch=%s\n' "$(date +%s)"
+        printf 'at=%s\n' "$(date -u +%FT%TZ)"
+        printf 'head=%s\n' "${REC_HEAD:-unknown}"
+        printf 'deployed=%s\n' "$REC_DEPLOYED"
+        printf 'ref=%s\n' "${REC_REF:-unknown}"
+        printf 'behind=%s\n' "$REC_BEHIND"
+        printf 'ahead=%s\n' "$REC_AHEAD"
+        printf 'dirty=%s\n' "$REC_DIRTY"
+        printf 'pin=%s\n' "$REC_PIN"
+        printf 'pin_tree=%s\n' "$REC_PIN_TREE"
+        printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
+        printf 'action=%s\n' "$REC_ACTION"
+        printf 'lanes=none-signalled\n'
+        printf 'detail=%s\n' "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ' | cut -c1-240)"
+    } >"$tmp" 2>/dev/null \
+        || { rm -f "$tmp"; err "cannot stage the pass record in $STATE_DIR"; return 1; }
+    mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; err "cannot write the pass record at $RECORD"; return 1; }
+    { printf '%s ' "$(date -u +%FT%TZ)"; tr '\n' ' ' <"$RECORD"; printf '\n'; } >>"$LOG" 2>/dev/null || true
+    return 0
+}
+
+short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
+
+# ── --print-status: the record answers "did it succeed", and STALENESS is an alarm ─────────────
+# ⛔ AN ENABLED TIMER THAT STOPPED FIRING MUST NOT READ AS A HEALTHY NO-OP. A pass whose pin already
+# equals the ref exits 0 and writes rc=0 every ten minutes; if the timer dies those records simply
+# stop, and only the AGE can say so. Same rule (and the same reason) as disk-reaper.sh's
+# `--print-status`.
+print_status() {
+    [ -f "$RECORD" ] || { say "status=never pin=none — no pass has ever completed on this box ($RECORD)"; return 3; }
+    local body epoch rc age
+    body="$(cat "$RECORD" 2>/dev/null)"
+    epoch="$(printf '%s\n' "$body" | sed -n 's/^epoch=\([0-9]*\)$/\1/p' | head -1)"
+    rc="$(printf '%s\n' "$body" | sed -n 's/^rc=\([0-9]*\)$/\1/p' | head -1)"
+    case "${epoch:-}" in
+        ''|*[!0-9]*)
+            say "status=unreadable rc=${rc:-?} — the record carries no usable epoch, so its age cannot be judged (cannot-verify is not fresh)"
+            return 3 ;;
+    esac
+    age=$(( $(date +%s) - epoch ))
+    # ⛔ A FUTURE-DATED RECORD IS STALE, NOT `age=0`. Clamping it made the clamp itself the bug: the
+    # comment said "stale-by-definition" while the code printed `status=ok age=0s`, so a record dated
+    # an hour ahead read fresh for ever — and `fleet-health.py` alarmed on the SAME file, two readers
+    # disagreeing about one record with the READINESS GATE being the lenient one (measured in review).
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$STALE_SECONDS" ]; then
+        if [ "$age" -lt 0 ]; then
+            say "status=stale rc=${rc:-?} age=${age}s — the record is dated in the FUTURE, so its age proves nothing"
+        else
+            say "status=stale rc=${rc:-?} age=${age}s — the timer is not firing (bound ${STALE_SECONDS}s)"
+        fi
+        printf '%s\n' "$body" | sed 's/^/  /'
+        return 3
+    fi
+    case "${rc:-}" in
+        0|10|11) say "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
+        *)       say "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+    esac
+}
+
+if [ "$MODE" = "status" ]; then print_status; exit $?; fi
+
+# ── readings ───────────────────────────────────────────────────────────────────────────────────
+PIN_MODE=0
+if [ -f "$PIN_PATH_FILE" ] || [ -f "$PIN_SHA_FILE" ]; then PIN_MODE=1; fi
+PASS_MODE="${HARNESS_APPLY_MODE:-}"
+if [ -z "$PASS_MODE" ]; then
+    if [ "$PIN_MODE" = 1 ]; then PASS_MODE=pin
+    elif [ -x "$REPO/sync.sh" ] || [ -n "${HARNESS_APPLY_SYNC_CMD:-}" ]; then PASS_MODE=sync
+    else PASS_MODE=pin
+    fi
+fi
+case "$PASS_MODE" in pin|sync) ;; *) err "HARNESS_APPLY_MODE must be pin|sync (got '$PASS_MODE')"; exit 2 ;; esac
+
+# ⛔ `--verify --quiet` IS LOAD-BEARING: a bare `git rev-parse <junk>` ECHOES its argument while
+# exiting non-zero, so a plain capture reads an unresolvable ref as a resolved one.
+resolve() { git -C "$REPO" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null; }
+
+[ -n "$REPO" ] && [ -d "$REPO" ] || { REC_DETAIL="no checkout resolved (set HARNESS_REPO)"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { REC_DETAIL="$REPO is not a git checkout"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
+
+FETCH_STATE="notfetched"
+if [ "$FETCH" = 1 ]; then
+    if git -C "$REPO" fetch --quiet origin main >/dev/null 2>&1; then FETCH_STATE=ok; else FETCH_STATE=failed; fi
+fi
+REF_SHA="$(resolve "$REF")"
+[ -n "$REF_SHA" ] || {
+    REC_REF="unresolved"; REC_DETAIL="cannot resolve $REF in $REPO (fetch=$FETCH_STATE) — cannot-verify is not a pass"
+    write_record 0 23; err "$REC_DETAIL"; exit 23; }
+HEAD_SHA="$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+[ -n "$HEAD_SHA" ] || {
+    REC_REF="$(short "$REF_SHA")"; REC_DETAIL="cannot resolve HEAD in $REPO — cannot-verify is not a pass"
+    write_record 0 23; err "$REC_DETAIL"; exit 23; }
+
+# The relation, by ANCESTRY — never by a count (see the header). The counts are printed, and the
+# `behind` count is the one number the fleet instrument alarms on, so it is computed for the commit
+# this box RUNS (`deployed`), not merely for the checkout: on a pin-per-commit cell the advance never
+# moves the checkout, so a `behind` measured there would be permanently non-zero and the alarm would
+# be wallpaper (measured in review: a cell would have been red for ever while its pin was current).
+#   R_REL / R_BEHIND / R_AHEAD are the outputs.
+relation_of() { # <sha>
+    local s="$1"
+    R_REL=unknown; R_BEHIND=unknown; R_AHEAD=unknown
+    [ -n "$s" ] || return 0
+    if [ "$s" = "$REF_SHA" ]; then R_REL=current; R_BEHIND=0; R_AHEAD=0; return 0; fi
+    if git -C "$REPO" merge-base --is-ancestor "$s" "$REF_SHA" 2>/dev/null; then
+        R_REL=behind
+        R_BEHIND="$(git -C "$REPO" rev-list --count "$s..$REF_SHA" 2>/dev/null)"; R_BEHIND="${R_BEHIND:-unknown}"
+        R_AHEAD=0
+        return 0
+    fi
+    if git -C "$REPO" merge-base --is-ancestor "$REF_SHA" "$s" 2>/dev/null; then
+        R_REL=ahead
+        R_AHEAD="$(git -C "$REPO" rev-list --count "$REF_SHA..$s" 2>/dev/null)"; R_AHEAD="${R_AHEAD:-unknown}"
+        R_BEHIND=0
+        return 0
+    fi
+    R_REL=diverged
+}
+relation_of "$HEAD_SHA"
+RELATION="$R_REL"; BEHIND="$R_BEHIND"; AHEAD="$R_AHEAD"
+
+# The dirty count, read from the tree this pass will actually MOVE. On the pin path a dirty checkout
+# is harmless BY CONSTRUCTION (the advance creates a NEW per-commit worktree, and `apply` re-pins
+# rather than reusing a dirty tree) — so it is printed and not acted on. On the sync path it is the
+# thing that must be preserved.
+DIRTY_LIST="$(git -C "$REPO" status --porcelain 2>/dev/null)"
+DIRTY_RC=$?
+case "$DIRTY_RC" in
+    0) DIRTY_N="$(printf '%s\n' "$DIRTY_LIST" | awk 'NF' | wc -l | tr -d ' ')" ;;
+    *) DIRTY_N="unknown" ;;    # cannot-verify is never "clean"
+esac
+case "${DIRTY_N:-unknown}" in ''|*[!0-9]*) DIRTY_N=unknown ;; esac
+
+REC_HEAD="$(short "$HEAD_SHA")"; REC_REF="$(short "$REF_SHA")"
+REC_BEHIND="$BEHIND"; REC_AHEAD="$AHEAD"; REC_DIRTY="$DIRTY_N"
+PIN_SHA=""; PIN_TREE_SHA=""
+read_pin() {
+    local pv pd
+    pv="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
+    # A pin that is not a commit is NOT a pin — `resolve` is the test, for the reason above.
+    if [ -n "$pv" ] && [ -z "$(resolve "$pv")" ]; then pv=""; fi
+    PIN_SHA="$pv"
+    REC_PIN="$(short "${pv:-}")"; [ -n "$REC_PIN" ] || REC_PIN=none
+    PIN_TREE_SHA=""
+    pd="$(head -1 "$PIN_PATH_FILE" 2>/dev/null)"
+    if [ -n "$pd" ] && [ -d "$pd" ]; then
+        pd="$(git -C "$pd" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+        if [ -n "$pd" ]; then PIN_TREE_SHA="$pd"; REC_PIN_TREE="$(short "$pd")"; return 0; fi
+    fi
+    REC_PIN_TREE=none
+    return 0
+}
+[ "$PASS_MODE" = pin ] && read_pin
+
+# The commit this box RUNS, and the readings the fleet instrument alarms on. On the pin path that is
+# the tree the path record names (what the controller execs); on the sync path it is the checkout's
+# own HEAD. `head=` stays the checkout reading; `deployed=` is the one the verdict is about.
+DEPLOYED_SHA=""
+recompute_deployed() {
+    [ "$PASS_MODE" = pin ] && read_pin
+    if [ "$PASS_MODE" = pin ] && [ -n "$PIN_TREE_SHA" ]; then
+        DEPLOYED_SHA="$PIN_TREE_SHA"
+    else
+        DEPLOYED_SHA="$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+    fi
+    REC_HEAD="$(short "$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)")"
+    REC_DEPLOYED="$(short "${DEPLOYED_SHA:-}")"; [ -n "$REC_DEPLOYED" ] || REC_DEPLOYED=unknown
+    relation_of "$DEPLOYED_SHA"
+    REC_BEHIND="$R_BEHIND"; REC_AHEAD="$R_AHEAD"
+    REC_DIRTY="$(git -C "$REPO" status --porcelain 2>/dev/null | awk 'NF' | wc -l | tr -d ' ')"
+    case "${REC_DIRTY:-}" in ''|*[!0-9]*) REC_DIRTY=unknown ;; esac
+}
+
+say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") ref_sha=$(short "$REF_SHA") relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
+[ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
+    say "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
+[ "$FETCH_STATE" = failed ] && err "WARNING: git fetch failed — the comparison is against the ref as of the last successful fetch, not against origin now"
+
+# finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
+# (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
+# identical from a log, and an operator who reads `current` has to be able to see it WAS current.
+finish() { # <ok> <rc> <detail>
+    REC_DETAIL="$3"
+    # ⛔ THE RECORD IS RE-READ FROM THE FINAL STATE, never written from the readings taken before the
+    # move. A record carrying `head=<old> behind=1` next to `action=advanced` told the fleet instrument
+    # the box was STILL behind — the exact false alarm that makes an alarm wallpaper (measured in
+    # review: a cell would have been red for ever, and a Mac green pass would have alarmed).
+    # `deployed=` is the commit the box RUNS: the pin tree on the pin path (where the checkout is never
+    # moved by design), the checkout on the sync path. `behind=` is about that commit.
+    recompute_deployed
+    write_record "$1" "$2" || exit 23
+    if [ "$1" = 1 ]; then say "$3"; else err "${3:-pass failed}"; fi
+    exit "$2"
+}
+
+# ── PREDICATE 1: AHEAD / DIVERGED — refuse before anything is touched ──────────────────────────
+# ⛔ THIS IS THE c4 DEFECT. Its local commits existed in no other place; an advance would have
+# dropped them and NOTHING in the fleet would have said so. The count is in the message because
+# "ahead" alone does not tell an operator whether it is one commit worth keeping or twenty.
+if [ "$RELATION" = ahead ]; then
+    REC_ACTION=refused-ahead
+    finish 0 21 "REFUSED ahead: $REPO carries $AHEAD commit(s) that are not on $REF — advancing would drop them. Recover or land them first (git log $REF..HEAD), then re-run. Nothing was touched."
+fi
+if [ "$RELATION" = diverged ]; then
+    REC_ACTION=refused-diverged
+    finish 0 22 "REFUSED diverged: HEAD is neither an ancestor nor a descendant of $REF — a rebase or cherry-pick is an operator decision, not a scheduled one. Nothing was touched."
+fi
+
+# ── PREDICATE 2: DIRTY — preserve BY NAME, then move (sync path only) ──────────────────────────
+# MEASURED (the Mac, 2026-10-23): ONE modified tracked file made `sync.sh` abort for 91 commits and
+# nothing reported it. `sync.sh` aborting is CORRECT — it must not discard work. What was missing is a
+# path that SAVES the work and then completes the advance, and a record that says so.
+preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save everything
+    local dest="$1" p n=0 paths
+    mkdir -p "$dest" || { err "cannot create the preservation dir $dest"; return 1; }
+    # The byte-exact record of every tracked change (staged and unstaged), then one line per path.
+    if ! git -C "$REPO" diff --binary HEAD >"$dest/changes.patch" 2>/dev/null; then
+        err "cannot write $dest/changes.patch — refusing to touch a tree whose changes are not saved"
+        return 1
+    fi
+    : >"$dest/MANIFEST" || return 1
+    # ⛔ THE PATH LIST IS READ ONCE. Reading `git status` again after the restore would describe a
+    # tree that no longer has the changes, and a second read is a second answer to one question.
+    paths="$(git -C "$REPO" status --porcelain 2>/dev/null | cut -c4-)"
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        printf '%s\n' "$p" >>"$dest/MANIFEST" || return 1
+        say "preserved: $p -> $dest/changes.patch"
+        n=$((n + 1))
+    done <<EOF
+$paths
+EOF
+    # ⛔ UNTRACKED FILES ARE COPIED, not just named: a patch cannot carry them, and they are the
+    # likeliest thing on a box to exist in no other place. A path that cannot be copied is a refusal.
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in /*) continue ;; esac
+        mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || return 1
+        cp -p "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || { err "cannot preserve untracked $p — refusing to touch the tree"; return 1; }
+        say "preserved: $p -> $dest/untracked/$p"
+    done <<EOF
+$(git -C "$REPO" ls-files --others --exclude-standard 2>/dev/null)
+EOF
+    # ── bring the tracked paths back to HEAD so a fast-forward is possible ──────────────────────
+    # ⛔ THE TWO OBVIOUS WAYS ARE BOTH WRONG HERE, for different reasons. A branch switch is what this
+    # repo blocks inside a cell's main checkout (cloud-cell-supervisor.sh's header records why). A
+    # whole-tree discard verb is refused by main-worktree-guard (#709) wherever its target is not
+    # statically resolvable — which it never is here, because the checkout is a seam — and that refusal
+    # would land on the scheduled PASS as well as on the suite. The guard exists to stop an agent
+    # discarding a SHARED checkout's work; this runs on the box's own deployment checkout under a
+    # scheduler, and every affected byte is already at `$dest` under the names printed above.
+    # So the effect is produced one bounded step at a time, on the paths this pass already listed:
+    #   1. each tracked path is rewritten from the blob HEAD holds, so a path the merge is about to
+    #      modify matches HEAD and cannot block the fast-forward, then
+    #   2. `git add -u` re-stages ONLY tracked paths (never an untracked one), which makes the index
+    #      agree with HEAD for exactly those paths — no staged residue is left to block the merge.
+    # Nothing is lost that was not first saved, and no untracked file is touched at all.
+    #
+    # ⛔ THE BLOB GOES TO A TEMP FILE IN THE SAME DIRECTORY AND IS RENAMED OVER THE PATH — never
+    # redirected straight at it. `> "$REPO/$p"` FOLLOWS A SYMLINK and writes through it, so restoring a
+    # dirty symlink would corrupt the CLEAN file it points at, destroy bytes that were (correctly) never
+    # preserved, leave `$p` itself still wrong, and then print "tracked paths match HEAD". This repo
+    # tracks 34 symlinks (`pi-bootstrap/pi-config/extensions/*`), so that is a live shape, not a
+    # hypothetical. A rename REPLACES the directory entry, so a symlink is restored as a symlink.
+    local n_restored=0 n_skipped=0 tmp mode blob
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in /*) n_skipped=$((n_skipped + 1)); continue ;; esac
+        # A path that is not in HEAD is UNTRACKED (or newly staged) — the untracked copy above owns it.
+        if ! git -C "$REPO" cat-file -e "HEAD:$p" 2>/dev/null; then n_skipped=$((n_skipped + 1)); continue; fi
+        mode="$(git -C "$REPO" ls-tree HEAD -- "$p" 2>/dev/null | awk 'NR==1 {print $1}')"
+        case "$mode" in
+            120000)
+                # ⛔ A SYMLINK IS RESTORED AS A SYMLINK. Writing its blob (which IS the target string) to
+                # the path would replace the link with a regular FILE holding that text — a type change
+                # `git status` reports as still dirty, and the merge then refuses to proceed.
+                blob="$(git -C "$REPO" cat-file blob "HEAD:$p" 2>/dev/null)" \
+                    || { err "cannot bring tracked path $p back to HEAD"; return 1; }
+                mkdir -p "$(dirname "$REPO/$p")" 2>/dev/null || { err "cannot bring tracked path $p back to HEAD"; return 1; }
+                ln -sfn "$blob" "$REPO/$p" 2>/dev/null || { err "cannot bring tracked path $p back to HEAD"; return 1; } ;;
+            160000)
+                # A GITLINK (submodule) is not materialised here; it is left alone and counted as
+                # skipped, so the success line cannot claim it.
+                n_skipped=$((n_skipped + 1)); continue ;;
+            *)
+                mkdir -p "$(dirname "$REPO/$p")" 2>/dev/null || { err "cannot bring tracked path $p back to HEAD"; return 1; }
+                tmp="$(dirname "$REPO/$p")/.harness-apply-restore.$$"
+                # ⛔ REDIRECT THE BLOB, NEVER `printf '%s' "$blob"`. Command substitution strips every
+                # trailing newline, so the printf form silently rewrites any text file that ends with one
+                # — i.e. almost all of them — to a version that differs from HEAD.
+                git -C "$REPO" cat-file blob "HEAD:$p" >"$tmp" 2>/dev/null \
+                    || { rm -f "$tmp"; err "cannot bring tracked path $p back to HEAD"; return 1; }
+                mv -f "$tmp" "$REPO/$p" 2>/dev/null || { rm -f "$tmp"; err "cannot bring tracked path $p back to HEAD"; return 1; } ;;
+        esac
+        n_restored=$((n_restored + 1))
+    done <<EOF
+$paths
+EOF
+    git -C "$REPO" add -u >/dev/null 2>&1 || { err "cannot re-stage the tracked paths after preserving the changes"; return 1; }
+    # ⛔ THE CLAIM IS COUNTED, NOT ASSUMED. The unconditional "tracked paths match HEAD" was printed
+    # even when a path had been skipped (`cat-file` could not resolve it, or it was never in HEAD) —
+    # a success line that outran the work it describes.
+    say "restored: $n_restored tracked path(s) brought back to HEAD${n_skipped:+ ($n_skipped skipped: untracked or not in HEAD)}; the hand edits above exist only in the preserved copies"
+    say "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
+    return 0
+}
+
+if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unknown" ] && [ "$DIRTY_N" -gt 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        say "dry-run: would preserve $DIRTY_N dirty path(s) by name and then fast-forward"
+    else
+        PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)"
+        preserve_dirty "$PRESERVED_DIR" || {
+            REC_ACTION=refused-dirty
+            finish 0 20 "REFUSED dirty: $DIRTY_N path(s) in $REPO carry uncommitted work that could not be preserved — nothing was touched. Preserve them by hand, then re-run."
+        }
+    fi
+fi
+
+# ── the move ──────────────────────────────────────────────────────────────────────────────────
+# ⛔ A NO-OP WHEN THE PIN ALREADY NAMES THE REF TIP — that is the cadence requirement, and it is the
+# common case: every ten minutes on a box that is already current must change NOTHING and say so.
+ACT_RC=0
+if [ "$DRY_RUN" = 1 ]; then
+    # ⛔ A PREVIEW WRITES NO RECORD. `--dry-run` is documented as "change NOTHING", and rewriting the
+    # pass record to `action=dry-run epoch=now` reset the staleness clock: a box whose timer had died
+    # then read `status=ok age=0s` in `--print-status`, in the installer's `--status` and in
+    # fleet-health — the false PASS this whole feature exists to delete, produced by its preview verb.
+    [ "$PASS_MODE" = pin ] && read_pin
+    say "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
+    exit 0
+fi
+
+if [ "$PASS_MODE" = pin ]; then
+    MATERIALISER="${HARNESS_MATERIALISER:-$REPO/scripts/cloud-cell-supervisor.sh}"
+    if [ ! -f "$MATERIALISER" ]; then
+        REC_ACTION=unmaterialisable
+        finish 0 25 "behind=$BEHIND but no materialiser at $MATERIALISER — this box has no way to advance its own pin (set HARNESS_MATERIALISER)"
+    fi
+    if [ "$RELATION" = current ] && [ -n "$REF_SHA" ]; then
+        # Nothing to advance. The pin is still re-read and repaired below — c1's state was exactly
+        # this: the pin at the ref tip while the sha RECORD named an older commit.
+        REC_ACTION=none
+    else
+        # ⛔ `--force --pin-only`, ALWAYS — BOTH FLAGS, AND FOR DIFFERENT REASONS.
+        #   `--pin-only` because a SCHEDULER MUST NOT SEED $O. A plain `apply` runs `seed_and_stamp`,
+        #      which swaps the helpers a RUNNING loop is executing under it — the version skew
+        #      cloud-cell-supervisor.sh's own header refuses. Seeding belongs to `start`; a pin does
+        #      not disturb a lane (it keeps the tree it started with) and the restart is deferred to
+        #      the next launch, exactly as harness-refresh.sh's recorded design says.
+        #   `--force` because `apply` REFUSES to touch a cell whose controller is live WITHOUT it —
+        #      `--pin-only` does not relax that guard. Measured in review: `apply --pin-only` on a
+        #      live cell exits 1 with "a controller is RUNNING … re-run with --force", so the pass
+        #      recorded rc=23 and the unit went RED every ten minutes on a healthy box while the pin
+        #      never moved. harness-refresh.sh passes both flags for the same reason.
+        #   The guard `--force` relaxes here is "do not replace the harness tree under a live
+        #      controller", and a pin-only advance cannot: it creates a NEW per-commit worktree and
+        #      leaves the running one untouched. Nothing else about `apply` changes.
+        OUT="$(bash "$MATERIALISER" apply --force --pin-only 2>&1)"; ACT_RC=$?
+        printf '%s\n' "$OUT" | sed 's/^/  /'
+        [ "$ACT_RC" -eq 0 ] || {
+            REC_ACTION=materialiser-failed
+            finish 0 23 "the materialiser exited $ACT_RC — the pin was NOT advanced (nothing was seeded either)"
+        }
+        REC_ACTION=advanced
+    fi
+else
+    # sync path — the checkout's OWN verb (fetch + ff-only + config refresh + launchd), never a
+    # second implementation of it.
+    SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$REPO/sync.sh}"
+    [ -x "$SYNC_CMD" ] || [ -f "$SYNC_CMD" ] || {
+        REC_ACTION=no-sync-verb
+        finish 0 25 "behind=$BEHIND but there is no sync verb at $SYNC_CMD — this box has no way to advance its checkout"
+    }
+    if [ "$RELATION" = current ]; then
+        REC_ACTION=none
+    else
+        # The checkout is handed to the verb as $1: `./sync.sh` ignores arguments (it cds to its own
+        # dir), and a configured verb that needs to know which tree it is syncing gets the answer
+        # rather than having to guess it from its cwd. One seam, both shapes.
+        OUT="$(bash "$SYNC_CMD" "$REPO" 2>&1)"; ACT_RC=$?
+        printf '%s\n' "$OUT" | sed 's/^/  /'
+        # ⛔ THE SYNC'S EXIT IS NOT THE ONLY FACT. `sync.sh` exits 0 when the checkout is not on main
+        # (the branch-ownership guard, #265), which is a SKIP, not an advance — so the HEAD is re-read
+        # and the outcome judged from the tree, never from the verb's own claim.
+        NEW_HEAD="$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+        if [ "$ACT_RC" -eq 0 ] && [ "$NEW_HEAD" = "$REF_SHA" ]; then
+            REC_ACTION=advanced; HEAD_SHA="$NEW_HEAD"
+        elif [ "$ACT_RC" -eq 0 ]; then
+            REC_ACTION=sync-skipped; REC_HEAD="$(short "$NEW_HEAD")"
+            finish 0 25 "the sync verb exited 0 but HEAD is $(short "$NEW_HEAD"), not $REF — the checkout was not moved (not on main? a skipped guard?). behind=$BEHIND"
+        else
+            REC_ACTION=sync-failed
+            finish 0 23 "the sync verb exited $ACT_RC and HEAD is $(short "$NEW_HEAD") — the checkout was not moved"
+        fi
+    fi
+fi
+
+# ── PREDICATE 3: THE PIN MUST NAME THE TREE'S ACTUAL HEAD ─────────────────────────────────────
+# Read AFTER the move: on the pin path `apply` has just written both records, so any disagreement
+# that survives is a REAL one. MEASURED (c1, 2026-10-23): HARNESS-PIN 54bbb0c6 while the tree the
+# path record names was at ce987bb2 — every reader then reported a commit nobody was running.
+if [ "$PASS_MODE" = pin ]; then
+    read_pin
+    if [ "$REC_PIN_TREE" != "none" ]; then
+        TREE_SHA="$(head -1 "$PIN_PATH_FILE" 2>/dev/null)"
+        TREE_SHA="$(git -C "$TREE_SHA" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+        if [ -z "$REC_PIN" ] || [ "$REC_PIN" = "none" ]; then
+            # MEND: an absent/empty pin is the measured 2026-10-20 fleet state, and recording what
+            # this box actually runs is strictly better than leaving the record empty.
+            printf '%s\n' "$TREE_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
+                && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null \
+                || { REC_ACTION=pin-unwritable; finish 0 23 "cannot record the pin at $PIN_SHA_FILE (the tree runs $(short "$TREE_SHA"))"; }
+            say "pin: MENDED (was absent) -> $(short "$TREE_SHA")"
+            REC_ACTION=mended
+        elif [ "$(short "$TREE_SHA")" != "$REC_PIN" ]; then
+            OLD_PIN="$REC_PIN"
+            printf '%s\n' "$TREE_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
+                && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null \
+                || { REC_ACTION=pin-unwritable; finish 0 23 "the pin ($OLD_PIN) disagrees with the tree ($(short "$TREE_SHA")) and $PIN_SHA_FILE could not be rewritten — the pin still lies"; }
+            say "pin: REPAIRED $OLD_PIN -> $(short "$TREE_SHA") (the pin now names the tree this box actually runs)"
+            REC_ACTION=pin-repaired
+        fi
+    else
+        # A pin record that names a tree which is not there, or a box with no PATH record at all:
+        # reported, never invented. The sha record may legitimately be the only one on a box whose
+        # controller was never started from a pin.
+        say "pin: no tree at $PIN_PATH_FILE — the sha record ${REC_PIN} cannot be checked against a checkout"
+    fi
+fi
+
+# ── the verdict ──────────────────────────────────────────────────────────────────────────────
+read_pin_done=0
+[ "$PASS_MODE" = pin ] && read_pin_done=1
+[ "$read_pin_done" = 1 ] && read_pin
+REC_ACTION="${REC_ACTION:-none}"
+case "$REC_ACTION" in
+    mended)
+        # 11, the code `harness-refresh.sh` uses for the same event and the one this file's header and
+        # the unit's SuccessExitStatus advertise. Folding it into 10 made the vocabulary a lie: a box
+        # whose pin had been EMPTY was recorded as "advanced", and anything keyed on 11 was dead code.
+        finish 1 11 "mended: the pin was missing and now names $(short "${PIN_TREE_SHA:-}") (the tree this box runs); head=$(short "$HEAD_SHA") ref=$(short "$REF_SHA")" ;;
+    advanced|pin-repaired)
+        finish 1 10 "$REC_ACTION: head=$(short "$HEAD_SHA") deployed=$REC_DEPLOYED ref=$(short "$REF_SHA") behind=$REC_BEHIND pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}" ;;
+    none)
+        # ⛔ CURRENT IS NOT ENOUGH ON ITS OWN. A pin that names the ref tip while the PATH record
+        # points at an older tree is `restart-pending` at best and a lie at worst; say which.
+        if [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && [ "$REC_PIN_TREE" != "$REC_PIN" ]; then
+            finish 0 25 "current for the checkout, but the pin ($REC_PIN) and the tree this box reads ($REC_PIN_TREE) disagree — harness-up reports this as restart-pending; nothing here restarts a live controller"
+        fi
+        finish 1 0 "current: pin already names $REF ($(short "$REF_SHA")) — nothing changed (behind=0 ahead=0 dirty=$DIRTY_N)" ;;
+    *)
+        finish 1 0 "$REC_ACTION: behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N" ;;
+esac
