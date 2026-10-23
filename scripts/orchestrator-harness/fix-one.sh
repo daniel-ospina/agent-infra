@@ -130,7 +130,13 @@ if [ -f "$SELF/ci-queue.sh" ]; then
   fi
 else
   # …and so is an ABSENT one: the stale-`$O` shape `install.sh`/`check-single-source.sh` now detect.
-  echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --o <dir>)" >> "$L.log"
+  # ⛔ THE REMEDY MUST BE A COMMAND THAT CAN SUCCEED (#2333 review, P2). It said
+  # `deploy-harness.sh --o <dir>`, but that script REFUSES any invocation without `--src`/`--repo`
+  # (`--src <harness dir> (or --repo <checkout>) is required`, exit 78) — so the one line printed
+  # exactly when the module is missing told the operator to run a bad invocation and get "nothing was
+  # copied" instead of a re-seed. Every sibling message (`dispatch-merge.sh`, `install.sh`,
+  # `report.sh`) passes `--repo <checkout>`; this one now does too.
+  echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>)" >> "$L.log"
 fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path

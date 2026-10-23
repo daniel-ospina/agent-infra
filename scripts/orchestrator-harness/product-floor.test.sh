@@ -295,15 +295,25 @@ _post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidate
 ck "P6 [RED→GREEN] …and AFTER the call nothing refreshes the product batch, reads the floor, or EXITS (got '${_post:-'<none>'}')" $?
 _guard="$(grep -nF 'if [ "$_dmrc" = "3" ]; then' "$LOOP" | head -1 | cut -d: -f1)"
 _resets="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/) {print NR}' "$LOOP")"
+# ⛔ MEMBERSHIP IN THE ARM, NOT ORDER AFTER ITS OPENING LINE (#2333 review, P2). Requiring only
+# `_rl > _guard` let an UNCONDITIONAL `K=0; : > "$O/.batch"` inserted just PAST the arm's `fi` pass
+# this check — it truncates every batch (and reports dispatched=0 for batches that really dispatched)
+# while the label below claims the reset "sits ONLY inside the rc=3 deferral arm". The arm ENDS at the
+# next line whose indentation equals the guard's and which is exactly `fi`; a reset must fall inside
+# that window.
+_pad="$(sed -n "${_guard:-0}p" "$LOOP" | sed -e 's/[^ ].*//')"
+_armend="$(awk -v g="${_guard:-0}" -v pad="$_pad" 'NR>g && $0 == pad "fi" {print NR; exit}' "$LOOP")"
 _unguarded=""
 for _rl in ${_resets:-}; do
   case "${_guard:-}" in ''|*[!0-9]*) _unguarded="$_unguarded $_rl(no-guard)"; continue ;; esac
-  [ "$_rl" -gt "$_guard" ] || _unguarded="$_unguarded $_rl(before-guard@$_guard)"
+  case "${_armend:-}" in ''|*[!0-9]*) _unguarded="$_unguarded $_rl(no-arm-end)"; continue ;; esac
+  { [ "$_rl" -gt "$_guard" ] && [ "$_rl" -lt "$_armend" ]; } \
+    || _unguarded="$_unguarded $_rl(outside-arm@$_guard..$_armend)"
 done
 # A post-call reset is admissible, but the arm that carries it is not optional: `dispatch-merge.sh`
 # exits 3 on a deferral, and an unhandled 3 is a batch the controller counts as dispatched.
-[ -n "${_guard:-}" ] && [ -n "${_resets:-}" ] && [ -z "$_unguarded" ]
-ck "P6 [RED→GREEN] the post-call batch reset exists and sits ONLY inside the rc=3 deferral arm (guard=${_guard:-?} resets=[${_resets:-none}] unguarded=[${_unguarded:-none}])" $?
+[ -n "${_guard:-}" ] && [ -n "${_armend:-}" ] && [ -n "${_resets:-}" ] && [ -z "$_unguarded" ]
+ck "P6 [RED→GREEN] the post-call batch reset exists and sits ONLY inside the rc=3 deferral arm (guard=${_guard:-?} arm-end=${_armend:-?} resets=[${_resets:-none}] unguarded=[${_unguarded:-none}])" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
