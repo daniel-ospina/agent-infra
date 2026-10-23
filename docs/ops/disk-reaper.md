@@ -112,11 +112,12 @@ and turn a named skip back into an anonymous class-wide verdict.
 `install-disk-reaper-timer.sh` names this prerequisite **at install time** (a warning, not a refusal:
 a box without working `gh` still wants its `uv` and `venv` classes). A unit installed with a `HOME`
 that cannot authenticate `gh` otherwise goes red every hour while nothing is reclaimed, and the red
-names a cause nobody can act on. The installer reports one of four verdicts, each with its own remedy:
+names a cause nobody can act on. The installer reports one of five verdicts, each with its own remedy:
 `missing` (gh is absent, or present but unrunnable — a broken interpreter or wrapper is not an
 authentication problem), `unauthenticated` (installed and runnable, no credentials for that `HOME`),
-`probe-timeout` and `probe-error` (**UNKNOWN** — the probe could not answer, so the installer says so
-rather than guessing a skip). The probe is bounded on every platform through `scripts/lib/bounded.sh`,
+and `probe-timeout` / `probe-error` / `probe-pin` (**UNKNOWN** — the probe could not answer, because it
+timed out, gh failed unexpectedly, or the bounded-execution pin `TB_TIMEOUT_BIN` cannot be executed; the
+installer says so rather than guessing a skip). The probe is bounded on every platform through `scripts/lib/bounded.sh`,
 because `gh auth status` reaches the API and a plain gh auth probe can hang for the life of the shell.
 
 The worktree owner additionally requires the checkout to be

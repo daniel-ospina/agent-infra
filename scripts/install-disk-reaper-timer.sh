@@ -505,7 +505,7 @@ GH_PREFLIGHT=""
 gh_preflight_summary() {
     case "${GH_PREFLIGHT:-}" in
         '')            printf 'authenticated via HOME=%s — the open-PR gate can run' "$HOME" ;;
-        probe-timeout|probe-error) printf 'UNKNOWN — the auth probe could not answer (%s); the worktree class may skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
+        probe-timeout|probe-error|probe-pin) printf 'UNKNOWN — the auth probe could not answer (%s); the worktree class may skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
         *)             printf '%s — the worktree class will skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
     esac
 }
@@ -536,6 +536,16 @@ gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated 
         . "$lib"
         TB_SOURCED_BY_INSTALLER=1
     fi
+    # ⛔ AN UNUSABLE timeout PIN IS NOT A gh PROBLEM, and this check has to come AFTER the helper is
+    # sourced because THAT is when the pin is resolved (TB_TIMEOUT_KIND). With TB_TIMEOUT_BIN pointing
+    # at something that cannot run, bounded.sh keeps the pin and reports kind=invalid, so tb_timeout
+    # execs the bad pin and answers 127 WITHOUT ever running gh — which would be read as "gh is
+    # missing" on a box whose gh is fine, with a remedy that can never clear it. The worktree delegate
+    # REFUSES on an unusable pin rather than blaming gh; here it is a verdict, since the install must
+    # not be blocked by an optional probe.
+    # ⛔ THE VERDICT CARRIES THE CAUSE, because this function runs inside `$( )`: a variable set here
+    # would not survive into the caller's warning, and the warning is where the operator reads WHY.
+    if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then printf 'probe-pin'; return 0; fi
     if [ "${TB_SOURCED_BY_INSTALLER:-0}" = 1 ] && command -v tb_timeout >/dev/null 2>&1; then
         HOME="$home" tb_timeout 10 env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
         rc=$?
@@ -572,8 +582,13 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
         probe-timeout)
             err "WARNING: gh did not answer 'auth status' within 10s, so this installer CANNOT say whether the worktree class will run on this box"
             err "  install anyway and check later: bash $REAPER --print-status, or  gh auth status  by hand" ;;
+        probe-pin)
+            err "WARNING: the gh auth probe could not be run, so this installer CANNOT say whether the worktree class will run on this box"
+            err "  cause: TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}' cannot be executed, so the bounded probe never reached gh — fix or unset that pin"
+            err "  check by hand: HOME=$home gh auth status" ;;
         probe-error)
-            err "WARNING: gh answered 'auth status' with an unexpected status, so this installer CANNOT say whether the worktree class will run on this box"
+            err "WARNING: the gh auth probe could not be run, so this installer CANNOT say whether the worktree class will run on this box"
+            err "  cause: gh answered 'auth status' with an unexpected status"
             err "  check by hand: HOME=$home gh auth status" ;;
         *)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
@@ -600,6 +615,20 @@ do_install() {
     case "${AGED_DAYS:-}" in
         ''|*[!0-9]*) err "REFUSING: DISK_REAPER_WT_AGED_DAYS must be a whole number of days (got '$AGED_DAYS')"; return 1 ;;
     esac
+    # ⛔ GH_BIN IS OPTIONAL AND EMPTY BY DEFAULT, so it must not be able to FAIL the install: before this
+    # PR it was not rendered at all, and a box whose gh works through PATH installed fine with a
+    # GH_BIN that a unit cannot carry. systemd splits an unquoted Environment= value on whitespace, so
+    # such a value is dropped HERE — before the preflight and before the render — with a warning and a
+    # working fallback (the delegate resolves `gh` from PATH). Refusing would be a false block; rendering
+    # it would install a unit that answers gh-missing(rc=127) for ever. A plist value is its own
+    # <string>, so macOS keeps it.
+    if [ "$PLATFORM" != "Darwin" ]; then
+        case "${GH_BIN:-}" in
+            *[[:space:]]*)
+                err "WARNING: GH_BIN='${GH_BIN}' contains whitespace, which systemd splits in the rendered unit — it is DROPPED and the unit will resolve gh from PATH (the install is not refused)"
+                GH_BIN="" ;;
+        esac
+    fi
     # The worktree class's ONE unpinnable dependency, named before the unit is written (#2443).
     warn_gh_prerequisite "$HOME" "$(id -un)"
     if [ "$PLATFORM" = "Darwin" ]; then do_install_launchd; else do_install_systemd; fi

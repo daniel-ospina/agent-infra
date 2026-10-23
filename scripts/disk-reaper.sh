@@ -1035,7 +1035,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" _repo_sv="" SKIP_NOTE=""
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" _skip_raw="" _repo_sv="" SKIP_NOTE=""
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1084,10 +1084,18 @@ reap_worktree() {
         # `gh auth` instead of the removal failure). The delegate strips newlines from its own line; the
         # entry point must not trust the rest of the stream either.
         if [ "$rc" = 3 ]; then
-            _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
-            # The token alphabet only (name, optional `(rc=N)`). `tr -d` rather than a `case` bracket:
-            # bash's case parser rejects `(` inside `[...]`, and escaping it silently ADMITS a backslash.
-            if [ -n "$(printf '%s' "$_skip" | tr -d 'A-Za-z0-9._:()=-')" ]; then _skip=""; fi
+            # ⛔ A TOKEN CONTAINING WHITESPACE IS NOT A TOKEN — rejected, NOT joined. `tr -d '[:space:]'`
+            # here turned `reason=not a token with spaces` into `notatokenwithspaces`, a cause no
+            # component ever emitted, and wrote it into the record the supervisor reads. The delegate
+            # emits space-free tokens by contract, so whitespace means the line was split or forged.
+            _skip_raw="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)"
+            _skip=""
+            case "$_skip_raw" in
+                ''|*[[:space:]]*) : ;;
+                # The token alphabet only: name, optional `(rc=N)`. `tr -d` rather than a `case` bracket,
+                # because bash's case parser rejects `(` inside `[...]` and escaping it admits `\`.
+                *) if [ -z "$(printf '%s' "$_skip_raw" | tr -d 'A-Za-z0-9._:()=-')" ]; then _skip="$_skip_raw"; fi ;;
+            esac
         fi
         if [ -n "$_skip" ]; then
             SKIPPED_WT_N=$((SKIPPED_WT_N + 1))

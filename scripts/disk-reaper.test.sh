@@ -1982,10 +1982,25 @@ printf '#!/nonexistent/interp\nexit 0\n' >"$T/t56/bin-broken/gh"
 chmod +x "$T/t56/bin-broken/gh"
 # ⛔ BY ABSOLUTE PATH, NOT BY PATH ORDER: execvp SKIPS a candidate whose interpreter is missing (ENOENT
 # continues the search), so a PATH-based fixture silently runs the box's real gh and asserts nothing.
+# ⛔ AN UNRENDERABLE GH_BIN IS NORMALISED, NOT FATAL: systemd splits `Environment=` on whitespace, and
+# refusing a whole install over an OPTIONAL, empty-by-default pin would be a false block on a box whose
+# gh works through PATH — while rendering it would install a unit answering gh-missing(rc=127) for ever.
+OUT="$(GH_BIN="$T/t56/with space/gh" inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a GH_BIN containing whitespace does NOT refuse the install (an optional pin must not be a false block)"
+assert_contains "$OUT" "is DROPPED and the unit will resolve gh from PATH" "T56 ... it is dropped with a warning"
+assert_eq "$(sed -n 's/^Environment=GH_BIN=//p' "$T/t56/units/eldato-disk-reaper.service")" "" \
+    "T56 ... and the rendered unit carries an EMPTY pin (the delegate's PATH fallback), never a split value"
+assert_contains "$OUT" "gh:     authenticated" "T56 the verdict then describes what the unit will actually run"
 OUT="$(GH_BIN="$T/t56/bin-broken/gh" inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T56 a gh that cannot execute still installs"
 assert_contains "$OUT" "gh:     missing" "T56 an unrunnable gh is reported as MISSING (127 is not an auth answer)"
 assert_absent "$OUT" "NOT AUTHENTICATED" "T56 ... and never as an authentication failure"
+# and an unusable bounded-execution PIN is not a gh problem either: the probe never reached gh
+OUT="$(TB_TIMEOUT_BIN=/nonexistent/timeout inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 an unusable TB_TIMEOUT_BIN pin does not refuse the install"
+assert_contains "$OUT" "cause: TB_TIMEOUT_BIN=" "T56 ... and the warning names the PIN as the cause"
+assert_absent "$OUT" "gh is not installed" "T56 ... never blaming gh for a broken timeout pin"
+assert_contains "$OUT" "gh:     UNKNOWN" "T56 the summary says UNKNOWN rather than a verdict it cannot make"
 
 
 # ── T57: a SKIPPED-REPO line is only believed from a FAIL-CLOSED (3) delegate (#2443) ────────────
@@ -2025,8 +2040,10 @@ SHIM
 chmod +x "$T/t57/bin/wt-badtoken.sh"
 OUT="$(WORKTREE_REAPER="$T/t57/bin/wt-badtoken.sh" run_reaper --dry-run --repo "$REPO" --only worktree 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T57c an unshaped token still leaves the class fail-closed"
-assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "skipped_worktree=
-" \
+# ⛔ EXACT FIELD COMPARISON. A `grep -qF` pattern containing a newline is TWO patterns (the second
+# empty), and an empty pattern matches every line — so `assert_contains ... "skipped_worktree=\n"`
+# asserted nothing and passed on the very record it was meant to reject.
+assert_eq "$(sed -n 's/^skipped_worktree=//p' "$T/$ENVNAME/state/disk-reaper.status")" "" \
     "T57c ... but an unshaped token is never recorded as a named skip (the field stays empty)"
 
 echo
