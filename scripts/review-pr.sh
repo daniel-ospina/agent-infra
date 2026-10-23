@@ -1591,6 +1591,57 @@ if [ "${VERDICT_QUOTED:-0}" = 1 ]; then
   tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
   die "$E_NOVERDICT" "the final verdict-shaped line is a quotation — re-run, or ask the reviewer to print its verdict LAST and unquoted (transcript: $TRANSCRIPT)"
 fi
+# ⛔ A CLEAN THAT COUNTS ITS OWN BLOCKING FINDINGS IS A VERDICT OF CONVENIENCE (P2, then P0 — FAIL-OPEN
+# class, measured twice). The count reader above reads ONLY the `ISSUES` token channel, so
+# `**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff` recorded `clean`
+# (rc 0, comment posted, signed head-bound record written) with a reported blocking finding in hand
+# and no P-token on the line for the severity scan to see. It is the SAME contradiction as
+# `ISSUES 2`, spelled in words, and the head commit fixed exactly this class one grammar over — so
+# it is refused in every shape rather than grown into a grammar.
+# ⛔ A COUNT IS NOT ONLY A NUMERAL (P1). The DIGIT alternation alone left the WORD channel wide open:
+# `**Verdict:** CLEAN — one blocking finding remains, in a file outside this diff.` recorded clean
+# while the artifact the recorder accepted as evidence said `CLEAN — no blocking findings.` A word
+# numeral maps to a NON-ZERO count; `no` / `none` / `zero` are absent from the alternation, so the
+# zero report stays clean.
+# ⛔ THIS IS A FUNCTION, AND IT IS CALLED ON THE **FINAL** VERDICT (P0, fresh review of #2288 at
+# a8656b9 — FAIL-OPEN class, MEASURED). It used to live INLINE inside the `clean)` arm of the case
+# below, so the `ISSUES 0 ⇒ clean` conversion BELOW that case bypassed it: measured at that head,
+# `ISSUES 0 — note that one blocking finding is pre-existing and out of scope.` exited 0 and wrote a
+# signed head-bound `clean` record, while the identical sentence spelled `**Verdict:** CLEAN — note
+# that one blocking finding …` exited 7 and recorded nothing. The severity scan cannot see it either
+# (no P-token, no `path:line`, no slot separator), so this was the ONLY guard that could fire — and
+# the arm that skipped it was the one converting a count into a clean verdict. The guard is keyed on
+# the FINAL verdict, never on which spelling produced it.
+# ⛔ THE OVER-BLOCK IS DELIBERATE (category B direction, chosen over a false PASS): a CLEAN that
+# means "and I repaired one" must say so with a resolved participle (fixed/addressed/resolved/
+# closed/removed), which is the ONE exemption; a bare non-zero count refuses. `0 blocking
+# findings` / `no blocking findings` are not counts of anything and stay clean.
+# ⛔ THE COUNT MUST START A WORD (P2 guard against my own fix, caught by §AN): `CLEAN — 0 P1, 0 P2
+# findings.` is a ZERO report, but a bare `[0-9]+` class read the `2 findings` INSIDE `0 P2
+# findings` as a count of two and refused a clean review. The leading `(^|[^[:alnum:]])` group
+# makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
+# never a count.
+refuse_counted_clean() {
+  local _cm _cn
+  CLEAN_COUNT_WORDS=""
+  while IFS= read -r _cm; do
+    [ -n "$_cm" ] || continue
+    _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
+    [ -n "$_cn" ] || _cn=1      # a WORD numeral is a non-zero count by definition
+    [ "${_cn:-0}" -gt 0 ] || continue
+    CLEAN_COUNT_WORDS="$_cm"; break
+  done <<<"$(printf '%s' "$LAST" \
+    | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+    | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+  if [ -n "$CLEAN_COUNT_WORDS" ]; then
+    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and the same line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
+    err "  accepted verdict line: $LAST"
+    err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
+    err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
+  fi
+}
+
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
 case "$VWORD" in
   clean)
@@ -1608,47 +1659,10 @@ case "$VWORD" in
       err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
       die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + ISSUES ${ISSUE_N}) is never recorded — re-run the review"
     fi
-    # ⛔ A CLEAN THAT COUNTS ITS OWN BLOCKING FINDINGS IS A VERDICT OF CONVENIENCE (P2, fresh review
-    # of #2288 — FAIL-OPEN class, measured). The count reader above reads ONLY the `ISSUES` token
-    # channel, so `**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff`
-    # recorded `clean` (rc 0, comment posted, signed head-bound record written) with a reported
-    # blocking finding in hand and no P-token on the line for the severity scan to see. It is the
-    # SAME contradiction as `ISSUES 2`, spelled in words, and the head commit fixed exactly this
-    # class one grammar over — so it is refused in every shape rather than grown into a grammar.
-    # ⛔ THE OVER-BLOCK IS DELIBERATE (category B direction, chosen over a false PASS): a CLEAN that
-    # means "and I repaired one" must say so with a resolved participle (fixed/addressed/resolved/
-    # closed/removed), which is the ONE exemption; a bare non-zero count refuses. `0 blocking
-    # findings` / `no blocking findings` are not counts of anything and stay clean.
-    # ⛔ THE COUNT MUST START A WORD (P2 guard against my own fix, caught by §AN): `CLEAN — 0 P1, 0 P2
-    # findings.` is a ZERO report, but a bare `[0-9]+` class read the `2 findings` INSIDE `0 P2
-    # findings` as a count of two and refused a clean review. The leading `(^|[^[:alnum:]])` group
-    # makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
-    # never a count.
-    CLEAN_COUNT_WORDS=""
-    # ⛔ A COUNT IS NOT ONLY A NUMERAL (P1, fresh review of PR #2288). The DIGIT alternation below
-    # left the WORD channel wide open: `**Verdict:** CLEAN — one blocking finding remains, in a file
-    # outside this diff.` recorded clean (rc 0, comment posted, a signed head-bound record written)
-    # while the artifact the recorder accepted as evidence said `CLEAN — no blocking findings.` The
-    # `ISSUES`-token channel needs the literal word `issues`, and no P-token is on the line, so the
-    # severity scan had nothing to see either — the same fail-open this guard exists to close, one
-    # GRAMMAR over, while the comment above claimed EVERY shape. A word numeral maps to a NON-ZERO
-    # count; `no` / `none` / `zero` are absent from the alternation, so the zero report stays clean.
-    while IFS= read -r _cm; do
-      [ -n "$_cm" ] || continue
-      _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
-      [ -n "$_cn" ] || _cn=1      # a WORD numeral is a non-zero count by definition
-      [ "${_cn:-0}" -gt 0 ] || continue
-      CLEAN_COUNT_WORDS="$_cm"; break
-    done <<<"$(printf '%s' "$LAST" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
-      | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
-    if [ -n "$CLEAN_COUNT_WORDS" ]; then
-      err "$PROG: the verdict line says CLEAN and ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
-      err "  accepted verdict line: $LAST"
-      err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
-      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
-      die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
-    fi
+    # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
+    # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
+    # (P0, fresh review at a8656b9; the full rationale lives on the function).
+    refuse_counted_clean
     VERDICT=clean ;;   # a CLEAN line carries no count of its own
   issues)
     VERDICT=issues
@@ -1691,6 +1705,18 @@ esac
 if [ "$VERDICT" = issues ] && [ "${ISSUE_N:-1}" = "0" ]; then
   err "review-pr: the reviewer printed 'ISSUES 0' — zero blocking findings by its own count. Treating it as clean."
   VERDICT=clean
+fi
+
+# ⛔ THE COUNT-WORD CONTRADICTION GUARD RUNS ON **EVERY** SPELLING THAT REACHES `clean` (P0, fresh
+# review of #2288 at a8656b9 — FAIL-OPEN class, MEASURED). It used to run only inside the `clean)`
+# arm, so this conversion — which turns a reviewed count of 0 into a clean verdict — skipped it
+# entirely and the severity scan below could not see the contradiction either (no P-token, no
+# `path:line`). Measured at that head: `ISSUES 0 — note that one blocking finding is pre-existing and
+# out of scope.` exited 0 and wrote a signed head-bound `clean` record, while the same sentence
+# spelled `**Verdict:** CLEAN — note that one blocking finding …` exited 7 and recorded nothing. A
+# guard placed on one of two paths to the same verdict is not a guard.
+if [ "$VERDICT" = clean ]; then
+  refuse_counted_clean
 fi
 
 # ⛔ A `CLEAN` THAT CONTRADICTS ITS OWN OUTPUT IS REFUSED **BEFORE** ANYTHING IS POSTED

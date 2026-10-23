@@ -1076,6 +1076,27 @@ reset; printf 'Nothing blocks.\nISSUES 0\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "ISSUES 0 records clean (zero blocking findings by its own count) (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "…and the record IS written"
+# ⛔ `ISSUES 0` IS NOT A LICENCE TO REPORT A BLOCKING FINDING IN WORDS (P0, fresh review of #2288 at
+# a8656b9 — FAIL-OPEN class, MEASURED). The count-word contradiction guard ran only inside the
+# `clean)` arm, so the `ISSUES 0 ⇒ clean` conversion below the case skipped it: this exact line
+# exited 0 and wrote a signed head-bound `clean` record, while the same sentence spelled
+# `**Verdict:** CLEAN — …` exited 7 and recorded nothing. Both spellings are pinned, so a future
+# edit cannot re-open one of them by moving the guard back into an arm.
+reset; printf 'ISSUES 0 — note that one blocking finding is pre-existing and out of scope.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "ISSUES 0 that ALSO reports 'one blocking finding' is refused, never converted to clean (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf '**Verdict:** CLEAN — note that one blocking finding is pre-existing and out of scope.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and its CLEAN spelling refuses the same way (the guard is keyed on the VERDICT, not on the arm) (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# ⛔ A CLOSED/MERGED PR IS REFUSED BEFORE ANY REVIEW IS PAID FOR (P3, fresh review at a8656b9):
+# `[ "$STATE" = OPEN ]` had no scenario behind it, so it could be deleted with the suite green.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_STATE="MERGED"
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "a MERGED PR is refused with exit 3 (rc=$(rc_of))"
+no_reviewer; ck $? "  …no reviewer was spawned (nothing was paid for)"
+no_record; ck $? "  …no record was written"
 reset; printf '[P3] scripts/x.sh:1 — nit one\n[P3] scripts/x.sh:2 — nit two\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "ISSUES 2 over two P3s is NOT converted to clean (the contract says P3s ride under CLEAN) (rc=$(rc_of))"
@@ -2023,7 +2044,7 @@ run "$SRC" 2284
 # finding remains" could pass because the line happened to fail some other check.
 MC="$TMP/mutant-count.sh"
 cp "$SRC" "$MC"; chmod +x "$MC"
-sed 's/^      CLEAN_COUNT_WORDS="\$_cm"; break$/      : "$_cm"/' "$SRC" > "$MC"
+sed 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_cm"; break$/\1: "$_cm"/' "$SRC" > "$MC"
 if cmp -s "$SRC" "$MC"; then
   fail "the count-arm mutation did not apply - this control proves NOTHING"
 else
@@ -2031,6 +2052,20 @@ else
   run "$MC" 2284
   [ "$(rc_of)" = "0" ]; ck $? "the MUTANT records the count-in-words CLEAN - so the arm is what refuses it"
   [ -f "$TMP/record-argv.txt" ]; ck $? "  ...and writes the false clean, the fail-open §AP catches"
+fi
+# ⛔ MUTATION: the POST-CONVERSION CALL made unfindable => the `ISSUES 0` + words scenario RECORDS
+# (P0, fresh review at a8656b9). This is the mutation that proves the call below the case — not the
+# `clean)` arm's own call — is what refuses the CONVERTED verdict. Only the two-space call is
+# rewritten; the arm's own call is indented four spaces and must stay live for the control above.
+MC0="$TMP/mutant-conversion-call.sh"
+sed 's/^  refuse_counted_clean$/  :/' "$SRC" > "$MC0"; chmod +x "$MC0"
+if cmp -s "$SRC" "$MC0"; then
+  fail "the post-conversion-call mutation did not apply - this control proves NOTHING"
+else
+  reset; printf 'ISSUES 0 — note that one blocking finding is pre-existing and out of scope.\n' > "$TMP/reviewer-out"
+  run "$MC0" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT records the CONVERTED count-in-words CLEAN - so the call below the case is what refuses it"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "  ...and writes the false clean, the fail-open the P0 pin catches"
 fi
 # ⛔ A HEADING IS A VERDICT SPELLING (P3, measured): `### CLEAN` was exit 6 while `### Verdict: CLEAN`
 # recorded, so a model that closes with a heading lost a paid review.
