@@ -4048,6 +4048,13 @@ PY
     ciq_read "${OR:-}" >/dev/null 2>&1
     CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
     echo "[ci-queue] repo=${OR:-?} verdict=$CIQ_VER queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} busy=${CIQ_BUSY:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s horizon=$(ciq_horizon_min)m job_p90=$(ciq_job_p90_min)m" >> "$LOG"
+  elif [ -n "${_ciq_mod:-}" ]; then
+    # TWO distinct causes of CIQ=0, and THIS line must not confuse them (#2333 review, P2). The
+    # module was FOUND and did not source the ten-name interface — the [ci-queue] INCOMPLETE line
+    # above already named the missing names, and `_ciq_mod` (a global in this same shell) carries
+    # the path. Printing "NOT available" here was a false statement about the box's own state on
+    # the next line of the same log: the exact class the INCOMPLETE disclosure was fixed for.
+    echo "[ci-queue] $_ciq_mod is present but did not source the ten-name interface (see the [ci-queue] INCOMPLETE line above) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   else
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi

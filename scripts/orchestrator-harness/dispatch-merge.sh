@@ -91,12 +91,14 @@ git fetch origin main --quiet 2>/dev/null
 # queued=92/in_progress=6 on 5 runners (tortoise) and queued=97/in_progress=7 (agent-infra) — a batch
 # dispatched into that finishes nothing and makes the backlog worse. The read is the SAME module the
 # controller and fix-one.sh read (`ci-queue.sh`), so the three surfaces cannot disagree about the
-# queue. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes
-# `refs/claims/issue-<N>` (orch-loop.sh:3860) and appends N to `.batch` AND `dispatched.txt` BEFORE it
-# hands the batch to this script, so "deferring claims nothing" was FALSE. Without the release below,
-# every issue in a deferred batch would sit on a 3 h cross-box lease held by a box that started no
-# work — refused by every peer — and be skipped by this box until the row was reaped. The release and
-# the row drop are what make "the issues stay in the pool, re-decided on the next invocation" true.
+# queue. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes the
+# claim (`claim_issue_acquire "" "$ISS"` in orch-loop.sh's dispatch block) and appends N to `.batch`
+# AND `dispatched.txt` BEFORE it hands the batch to this script, so "deferring claims nothing" was
+# FALSE. Without the release below, every issue in a deferred batch would sit on a 3 h cross-box
+# lease held by a box that started no work — refused by every peer — and be skipped by this box
+# until the row was reaped. The release and the row drop are what make "the issues stay in the pool,
+# re-decided on the next invocation" true. ⛔ SYMBOLS, NOT LINE NUMBERS (#2333 review, P2): this note
+# used to cite a line number in that block, and it drifted on the very next edit to orch-loop.sh.
 CIQ_MOD="$O/ci-queue.sh"
 [ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then

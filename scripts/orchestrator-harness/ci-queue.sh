@@ -99,9 +99,12 @@ ciq_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) retu
 
 # `is_count` — the SHAPE **and** the MAGNITUDE. `is_num` accepts any number of digits, and a value
 # above intmax makes `[ … -gt … ]` ERROR — an errored test is FALSE, and a FALSE comparison here
-# falls through to `ok(...)`, i.e. it OPENS the gate whose whole purpose is to fail closed. Nine
-# digits is three orders of magnitude above any real queue and three below intmax, so a reading that
-# does not fit is not a reading: it is UNKNOWN (the same verdict as unreadable), never "allowed".
+# falls through to `ok(...)`, i.e. it OPENS the gate whose whole purpose is to fail closed. The bound
+# is 9 digits: ~7 orders above any real queue (the measured incident peaked at 97) and 10 orders
+# below intmax's 19 digits (9.22e18), so no reading that could plausibly arrive can overflow the
+# comparison, and a reading that does not fit is not a reading: it is UNKNOWN (the same verdict as
+# unreadable), never "allowed". (#2333 review, P2: this sentence is the whole justification for the
+# bound, and it used to claim "three orders" in BOTH clauses — 10^2 vs 10^9 and 10^9 vs 10^19.)
 ciq_is_count() { ciq_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 
 # ── the two tuning values (the ONE place) ───────────────────────────────────────────────────────
