@@ -662,8 +662,14 @@ check_harness_pin() {
   fi
   [ -f "$dir/scripts/orchestrator-harness/orch-loop.sh" ] \
     || die "the harness pin at $dir carries no scripts/orchestrator-harness/orch-loop.sh — this is not a harness tree, and a controller started from it would exit at once"
-  printf '%s\n' "$dir/scripts/orchestrator-harness" > "$HARNESS_PIN_FILE" \
-    || die "cannot record the harness pin path in $HARNESS_PIN_FILE"
+  # ⛔ TEMP-THEN-RENAME, the same rule the pin record below states: an in-place write truncates
+  # the one artifact that answers "which harness is this box on?" before its replacement exists, so
+  # a concurrent `status`/`start` can `head -1` an EMPTY pin, and a write that fails after the
+  # redirect leaves a previously valid pin EMPTY instead of keeping the box on the harness it was
+  # already running (the measured `pinned=none`-with-a-pin-file state).
+  printf '%s\n' "$dir/scripts/orchestrator-harness" > "$HARNESS_PIN_FILE.tmp.$$" \
+    && mv -f "$HARNESS_PIN_FILE.tmp.$$" "$HARNESS_PIN_FILE" \
+    || { rm -f "$HARNESS_PIN_FILE.tmp.$$"; die "cannot record the harness pin path in $HARNESS_PIN_FILE"; }
   mkdir -p "$(dirname "$HARNESS_PIN_RECORD")" || die "cannot create $(dirname "$HARNESS_PIN_RECORD")"
   # ⛔ THE RECORD CARRIES THE COMMIT THE PIN IS ACTUALLY ON — never `$want` by assumption. An ACCEPTED
   # existing pin may sit on an older commit than $HARNESS_REF (the supervisor re-pins per commit and the
@@ -698,11 +704,13 @@ neutralise_gh_repo() {
     unset GH_REPO
   fi
   # reported, never unset: `REPO` is a PATH (the cell's checkout) and the controller legitimately needs
-  # it. An operator who sets it to an owner/name slug gets a named refusal instead of a cell whose
-  # every command silently resolves against a path shaped like a repo name.
+  # it. The test is ABSOLUTE PATH, not "contains a slash": an owner/name slug DOES contain a slash,
+  # so a `*/*` test accepted the one shape this guard exists for (the measured keys.env carried
+  # `GH_REPO=daniel-ospina/tortoise`, and `REPO` set the same way is the same mistake one variable
+  # over), and the warning that did fire described a bare name as a slug. Both wrong shapes warn.
   case "${REPO:-}" in
-    */*) : ;;
-    *) [ -n "${REPO:-}" ] && warn "REPO='$REPO' is not an owner/name slug and not an absolute path — the controller reads REPO as the CHECKOUT PATH, so a bare name here resolves to nothing" ;;
+    ''|/*) : ;;
+    *) warn "REPO='$REPO' is not an absolute path — the controller reads REPO as the CHECKOUT PATH, so '$REPO' resolves to nothing (an owner/name slug here is the keys.env GH_REPO mistake one variable over: the repo a command acts on is per-invocation state, never an inherited global)" ;;
   esac
   return 0
 }

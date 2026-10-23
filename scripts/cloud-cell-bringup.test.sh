@@ -853,6 +853,27 @@ esac
                    || bad "bring-up refused a cell merely because keys.env exports GH_REPO (rc=$BR_RC): $BR_OUT"
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
 
+say_case "a REPO set to an owner/name SLUG is REPORTED (the guard's own stated class)"
+# The guard exists for "an operator who sets it to an owner/name slug gets a named refusal". The first
+# cut tested `*/*` — and a slug CONTAINS a slash, so the one shape it was written for was accepted
+# SILENTLY (an inert guard), while the warning that did fire described a bare name as a slug. Both
+# halves are pinned here so neither direction can go vacuous: the slug must warn, an absolute path
+# must stay silent.
+printf 'DEEPSEEK_API_KEY=fake\nexport REPO=daniel-ospina/tortoise\n' > "$T/keys.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a `*/*` test made this arm unreachable)" ;;
+  *) bad "bring-up accepted REPO=daniel-ospina/tortoise without a word — the guard is inert for the class it names: $BR_OUT" ;;
+esac
+printf 'DEEPSEEK_API_KEY=fake\nexport REPO=/srv/cell/checkout\n' > "$T/keys.env"
+br ok normal --check
+case "$BR_OUT" in
+  *"REPO='/srv/cell/checkout' is not an absolute path"*) bad "an ABSOLUTE path REPO was warned about — the guard now fires on the shape it must accept: $BR_OUT" ;;
+  *) ok "an absolute-path REPO stays silent (a guard that fires on everything is not a guard)" ;;
+esac
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+
 say_case "a NEW box is born PINNED: a linked worktree plus the sha+timestamp record"
 rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
 printf '%s\n' "$TOK_BODY" > "$TOK"

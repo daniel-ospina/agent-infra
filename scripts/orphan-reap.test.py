@@ -5,6 +5,8 @@ SIX tests, each with its own fixture, and THREE MUTATIONS that must go RED when 
 dropped. No live process is touched and nothing here can signal a pid: `ps`, the session index,
 `stat`, the clock and the cmux hook store are all injected, and the only thing read back is the
 census's own `--json` output (so the CLI path is exercised, not a copy of it).
+On top of those: EIGHT apply-path assertions (the only code here that signals), an empty-pool JSON
+contract check, and the fence-default pin against the canon.
 ⚠️ ONE READER IS REAL, ON PURPOSE: `canon_verdict` calls the canon's `gather`, which forks the
 fleet's identity probe (`scripts/lib/pid-identity.sh`) for the store record it is given. That is
 the RULE under test, not a fixture, so a provider machine without a working probe CLI fails these
@@ -27,6 +29,12 @@ which is why the CI step depends on it.
     (this is the finding the first draft failed: asserting `store_ok=True` made the canon's
     #947 record veto structurally unreachable, so a lane whose record says it just consumed
     input was reapable as `idle`)
+(g) the candidate is an ANCESTOR of this very reaper               => KEEP-HUMAN: self-ancestor
+    (pins the arm; against every other fixture it is `always False`, so its removal was invisible)
+(h) the REAL nested layout with a store record naming no `cwd`     => the canon must still find
+    the transcript. `<sessions>/--<encoded-cwd>--/<stamp>_<sid>.jsonl` cannot be found by a FLAT
+    search of the sessions root, and "a live writer with no store record" is the population the
+    HOLDER append exists for — the reason assertion is the pin (without it: `jsonl-age-unknown`).
 plus: every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
 UNREACHABLE under the shipped default (the host decision), and the name-stamp parser is UTC.
 """
@@ -38,6 +46,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -134,7 +143,8 @@ class Clock:
 class Box:
     """An injected process table + session index + store + clock for one census."""
 
-    def __init__(self, rows_before, rows_after, transcript, start_ts, sizes=None, store=None):
+    def __init__(self, rows_before, rows_after, transcript, start_ts, sizes=None, store=None,
+                 sessions_dir=None):
         self.rows = [rows_before, rows_after]
         self.ps_calls = 0
         self.stat_calls = 0
@@ -142,6 +152,10 @@ class Box:
         self.start_ts = start_ts
         self.sizes = sizes        # optional [size_before, size_after] to fake growth
         self.store = store
+        # the SESSIONS ROOT, when it is not the transcript's own directory: pi nests a transcript
+        # in `<sessions>/--<encoded-cwd>--/`, so a fixture that only ever writes FLAT cannot see
+        # a reader that fails to descend (case_nested)
+        self.sessions_dir = sessions_dir
         self.clock = Clock(time.time())
 
     # ── the injected readers ────────────────────────────────────────────
@@ -170,7 +184,7 @@ class Box:
         mod._cwd_of_pid = lambda pid: None
         mod._stat = self.stat
         mod.time = self.clock          # sleep advances it: a post-window reference must drift
-        mod.SESSIONS_DIR = os.path.dirname(self.transcript)
+        mod.SESSIONS_DIR = self.sessions_dir or os.path.dirname(self.transcript)
         mod.STORE_PATH = self.store
         try:
             with contextlib.redirect_stdout(buf):
@@ -316,6 +330,48 @@ def case_f(tmp) -> Box:
                store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=True))
 
 
+def case_self(tmp) -> Box:
+    """A candidate that is an ANCESTOR of this very process: the reaper must never classify the
+    chain it runs under. `_self_chain` walks from `os.getpid()` through the snapshot, so the
+    fixture makes pid 100 this process's parent — the shape a controller's own shell has.
+
+    Pinned because the arm is `always False` against every other fixture (none of them carries
+    this process's pid), so deleting `if ev.self_ancestor: return KEEP-HUMAN` left the suite green.
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    me = str(os.getpid())
+    before = {me: _row(int(me), 100), "1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+
+
+def case_nested(tmp) -> Box:
+    """THE REAL LAYOUT, with a store record that names NO `cwd`: pi writes
+    `<sessions>/--<encoded-cwd>--/<stamp>_<sid>.jsonl`, and the population this pool exists for is
+    "a live writer with no store record" — the canon's `session_file_for` then searches the
+    sessions root FLAT and cannot descend, so it lost the transcript and abstained
+    `jsonl-age-unknown` while the row printed a measured age.
+
+    Every other fixture writes the transcript FLAT inside the sessions root, which is why the
+    suite could not see it. With the fix the reason is the host decision's; without it, it is
+    `canon:unknown:jsonl-age-unknown` — the reason assertion is the pin.
+    """
+    now = time.time()
+    nest = os.path.join(tmp, "--" + tmp.lstrip("/").replace("/", "-") + "--")
+    os.makedirs(nest, exist_ok=True)
+    t = write_transcript(nest, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    store = write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False)
+    with open(store, "r", encoding="utf-8") as fh:
+        recs = json.load(fh)
+    for rec in recs.values():
+        rec.pop("cwd", None)      # a record that names no checkout — the HOLDER-append population
+    with open(store, "w", encoding="utf-8") as fh:
+        json.dump(recs, fh)
+    return Box(before, before, t, now - 5 * 3600, store=store, sessions_dir=tmp)
+
+
 TESTS = [
     ("(a) resolved chain, no host app: measured-and-NOT-AUTHORISED",
      case_a, "UNVERIFIABLE", "host-decision-hostless", None),
@@ -331,6 +387,10 @@ TESTS = [
      case_e, "LIVE", "cpu-advancing", {"1": False}),
     ("(f) canonical record veto: the lane's own record is fresh",
      case_f, "UNVERIFIABLE", "canon:running-quiet:record-non-idle-fresh", None),
+    ("(g) the candidate is an ANCESTOR of this reaper",
+     case_self, "KEEP-HUMAN", "self-ancestor", None),
+    ("(h) the real nested layout, store record naming no `cwd`",
+     case_nested, "UNVERIFIABLE", "host-decision-hostless", None),
 ]
 
 
@@ -405,11 +465,16 @@ def _apply_run(box, live=None, post=None):
 
 
 def apply_path() -> int:
-    """SIX assertions on the only code in this file that can send a signal.
+    """EIGHT assertions on the only code in this file that can send a signal.
 
     Every other case runs `apply=False`, so the kill path — its incarnation/recycle refusals,
     and the two guards that keep an UNREADABLE `ps` read from reading as success — had no test
     that could go red if the guard were deleted. `os.kill` is replaced, so no pid is touched.
+
+    (g7)/(g8) exist because the docstring above was TRUE and the suite did not yet deliver it:
+    g1 posts the IDENTICAL row, so `_same_incarnation` and the `is_pi(cur)` re-check could each
+    be deleted with every assertion still passing (verified by deletion mutant). They are the two
+    arms that stop a RECYCLED pid receiving a signal meant for a corpse.
     """
     fails = 0
     tmp = tempfile.mkdtemp(prefix="orphan-reap-apply-")
@@ -461,6 +526,24 @@ def apply_path() -> int:
         check("(g5) the transcript grew before the signal", rc, out, kills, 0, [],
               must=("REFUSED: the transcript CHANGED", "not signalled: 100"),
               must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
+
+        # (g7) the pid survives but is no longer a `pi` — the recycle's other half. Pins the
+        # `is_pi(cur)` re-check: deleting it signals a recycled non-pi process.
+        rc, out, kills = _apply_run(
+            case_a(tmp),
+            live={"1": _init(), "100": _row(100, 1, comm="python3", args="python3")})
+        check("(g7) the pid is no longer a `pi` (recycled)", rc, out, kills, 0, [],
+              must=("REFUSED: the pid is no longer a `pi`",),
+              must_not=("SIGTERM ->", "STILL ALIVE"))
+
+        # (g8) the SAME pid, still a `pi`, but a NEWER process: `etime` moved BACKWARDS, which is
+        # precisely the recycle signature. Pins `_same_incarnation` — g1 posts the identical row,
+        # so without this case that guard can be deleted and every assertion still passes.
+        rc, out, kills = _apply_run(
+            case_a(tmp), live={"1": _init(), "100": _row(100, 1, etime="00:00:10")})
+        check("(g8) the pid is a NEWER incarnation (etime moved backwards)", rc, out, kills, 0, [],
+              must=("REFUSED: incarnation changed",),
+              must_not=("SIGTERM ->", "STILL ALIVE"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return fails
@@ -552,14 +635,70 @@ def utc_stamp() -> int:
     return 0 if ok else 1
 
 
+def empty_pool_json() -> int:
+    """`--pool pi --json` on a box with no `pi` must still emit JSON (and exit 0).
+
+    The empty pool is the single most common input, and it printed a PROSE sentence on stdout
+    before the `as_json` branch was reached — so a caller's `| jq` failed to parse exactly when
+    the answer was "0 pi, nothing to reap", while the exit code said success. The machine-readable
+    mode may not be destroyed by its own trivial case any more than by its own action.
+    """
+    saved = {n: getattr(mod, n) for n in ("ps_pi_fields",)}
+    buf = io.StringIO()
+    mod.ps_pi_fields = lambda: {"1": _init()}          # a real, EMPTY read: no `pi` in the table
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = mod.pi_census(1.0, apply=False, as_json=True)
+    finally:
+        for n, v in saved.items():
+            setattr(mod, n, v)
+    raw = buf.getvalue()
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        print(f"FAIL the empty pool's `--json` emitted non-JSON on stdout: {raw.strip()[:120]!r}")
+        return 1
+    ok = (rc == 0 and doc.get("rows") == []
+          and doc.get("counts") == {s: 0 for s in mod.POOL_STATES})
+    print(f"{'PASS' if ok else 'FAIL'} the empty `pi` pool emits a JSON census "
+          f"(rc={rc}, counts={doc.get('counts')}, rows={doc.get('rows')})")
+    return 0 if ok else 1
+
+
+def fence_matches_canon() -> int:
+    """The fence default is the CANON's, and the two are pinned together.
+
+    `FENCE_S` must carry a literal fallback (a Python module cannot read the bash `:-` default at
+    run time), so a test is the only thing keeping `pid-identity.sh:68` and this file from
+    drifting — and a wider fence here is a silently weaker identity rule the canon cannot see.
+    """
+    path = os.path.join(ROOT, "scripts", "lib", "pid-identity.sh")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError as exc:
+        print(f"FAIL the canon's fence default could not be read ({exc})")
+        return 1
+    m = re.search(r"FENCE_TOLERANCE_SECONDS:-([0-9.]+)", src)
+    if not m:
+        print(f"FAIL {path}: no `${{FENCE_TOLERANCE_SECONDS:-N}}` default found")
+        return 1
+    want = float(m.group(1))
+    ok = want == mod.FENCE_DEFAULT_S
+    print(f"{'PASS' if ok else 'FAIL'} the fence default mirrors the canon "
+          f"(pid-identity.sh {want:g} s vs this file {mod.FENCE_DEFAULT_S:g} s)")
+    return 0 if ok else 1
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
-    fails = suite(None) + four_states_reachable() + utc_stamp() + apply_path()
+    fails = (suite(None) + four_states_reachable() + utc_stamp() + apply_path()
+             + empty_pool_json() + fence_matches_canon())
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1
-    print("\nall 10 gate tests PASS")
+    print("\nall gate tests PASS")
 
     if "--mutations" not in argv:
         print("(run with --mutations to prove each gate is load-bearing)")

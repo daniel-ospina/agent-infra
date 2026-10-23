@@ -189,8 +189,13 @@ process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap))
 reported states are `LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`. Its declared blind
 spots are the ones §1 leaves it: a `pi` that leaves no bindable session file (a print-mode / `task`
 child, or a resumed session keeping its original name-stamp) reads `UNVERIFIABLE` with that reason,
-never `LIVE` and never "nothing to reap"; and on a box where the hook store is unreadable **every**
-row abstains, because that is what §1 requires of the verdict it consumes.
+never `LIVE` and never "nothing to reap"; and on a box where the hook store is unreadable every
+row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
+the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
+gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;
+gate 2 supersedes its answer). The safe property holds either way — nothing is reaped — but
+`counts.UNVERIFIABLE == pool size` is **not** a store-health probe, and 0 UNVERIFIABLE does not
+mean the store was readable.
 
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):

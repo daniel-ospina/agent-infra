@@ -103,7 +103,9 @@ DECLARED BLIND SPOTS (a report must say what it CANNOT see — `lane-status.py`'
     read and `bind_session` then SKIPS the cwd filter, so such a pid can still bind a
     same-fence session file and vote on it. The skipped filter is recorded NOWHERE —
     `binding_detail` reports only the fence/ambiguity outcome — so the row does not even show that
-    its cwd was never checked;
+    its cwd was never checked; the FILE side of the same filter IS fail-closed: a session file
+    whose own first lines carry no readable `cwd` is dropped from the candidates, never accepted
+    for any pid;
   * a box where the cmux hook store is unreadable — every row that reaches the canon abstains as
     `store-unreadable` (the canon's own rule), but a row under a terminal/login-shell ancestor is
     decided `KEEP-HUMAN` by gate 2 BEFORE the canon VERDICT is consulted (the canon is still
@@ -209,9 +211,10 @@ def gate2_host_decision(chain: List[str]) -> Tuple[str, str]:
     human = [h for h in HUMAN if any(h in a for a in chain)]
     if human:
         return "human", human[0]
-    missing = next((a for a in chain if a.startswith("<pid ")), "")
-    if missing:
-        return "unknown-incomplete", missing
+    # ONE predicate for "the walk broke" (`ancestry_complete`, the named rule), so a future
+    # change to what counts as an incomplete walk has one home instead of two.
+    if not ancestry_complete(chain):
+        return "unknown-incomplete", next((a for a in chain if a.startswith("<pid ")), "")
     return "hostless", " > ".join(chain[:6]) or "(empty chain)"
 
 TOLERANCE_S = 0.10          # gate 1: below this the process is PARKED
@@ -349,9 +352,38 @@ POOL_STATES = ("LIVE", "PARKED-REAPABLE", "KEEP-HUMAN", "UNVERIFIABLE")
 # ⛔ THE FENCE IS THE CANON'S, NOT THIS FILE'S. `scripts/lib/pid-identity.sh:68` owns the
 # tolerance (`FENCE_TOLERANCE_SECONDS`, default 3 s, env-overridable) and §3 of
 # `docs/ops/fleet-liveness.md` forbids a second identity probe with a different bound. Read it
-# from the same variable; do not restate the number (a wider fence here is a silently weaker
-# identity rule the canon cannot see).
-FENCE_S = float(os.environ.get("FENCE_TOLERANCE_SECONDS", "3"))
+# from the same variable, with the canon's OWN default (a wider fence here is a silently weaker
+# identity rule the canon cannot see). The default literal below is pinned to
+# `pid-identity.sh:68`'s `${FENCE_TOLERANCE_SECONDS:-3}` by `orphan-reap.test.py`, so a change to
+# the canon's tolerance goes RED here instead of silently diverging.
+FENCE_DEFAULT_S = 3.0
+
+
+def _fence_from_env(default: float = FENCE_DEFAULT_S) -> float:
+    """The canon's fence, read defensively: a malformed value must never abort the tool.
+
+    ⛔ A BAD VALUE IS NOT A CRASH. `float(os.environ[...])` evaluated at MODULE IMPORT turned one
+    malformed `FENCE_TOLERANCE_SECONDS=3s` (a cell's keys.env, an operator's shell) into a
+    traceback for EVERY invocation — `--help` and the pre-existing ORPHAN pool included — so a
+    value the bash canon degrades to "not in fence" (i.e. abstain) aborted the reaper before it
+    could abstain. Unset / unparseable / negative / non-finite falls back to the canon default and
+    SAYS SO on stderr; it never silently widens the fence.
+    """
+    raw = os.environ.get("FENCE_TOLERANCE_SECONDS")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        v = float("nan")
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        print(f"orphan-reap: FENCE_TOLERANCE_SECONDS='{raw}' is not a non-negative number — "
+              f"using the canon default {default:g} s", file=sys.stderr)
+        return default
+    return v
+
+
+FENCE_S = _fence_from_env()
 OUTLIER_FACTOR = 100       # gate 3: "two orders out" of the process's OWN expected interval
 PI_TAIL_BYTES = 262_144    # same tail bound the liveness classifier reads
 MIN_TAIL_ENTRIES = 5       # fewer stamped entries cannot establish an OWN distribution
@@ -470,7 +502,12 @@ def bind_session(pid: str, row: dict, ref_s: float, index: List[Tuple[str, float
     near = [(p, ts) for p, ts in index if abs(ts - start) <= FENCE_S]
     cwd = _cwd_of_pid(pid)
     if cwd is not None:
-        near = [(p, ts) for p, ts in near if _session_cwd(p) in (None, cwd)]
+        # ⛔ AN UNREADABLE SESSION `cwd` IS NOT A MATCH. `in (None, cwd)` accepted a file whose
+        # first lines carry no readable `cwd` for ANY pid, and `session_index` globs every
+        # project subdirectory — so a foreign checkout's transcript could supply this row's
+        # gate-3 age and own gap. The rest of this file reads a missing datum as an ABSTENTION
+        # (`_stat` -> None => UNVERIFIABLE); this was the one place that read it as consent.
+        near = [(p, ts) for p, ts in near if _session_cwd(p) == cwd]
     near = [(p, ts) for p, ts in near if p not in taken]
     if not near:
         return None, "no-session-file", (f"no session file within ±{FENCE_S:g}s of start "
@@ -592,7 +629,17 @@ def canon_verdict(liv, pid: str, tr: Transcript, now_ms: int, *, store_path: str
         return None
     try:
         ev = liv.gather(
-            session_sid(tr.path), store_path=store_path, sessions_dir=sessions_dir,
+            session_sid(tr.path), store_path=store_path,
+            # ⛔ THE CANON RE-READS THE FILE ITSELF — the caller only says WHERE it is. `gather`
+            # resolves the JSONL from the sid PLUS the store record's `cwd`; with no record it
+            # searches `sessions_dir` FLAT, which cannot see pi's real layout
+            # `<sessions>/--<encoded-cwd>--/<stamp>_<sid>.jsonl`. The population this append
+            # exists for is exactly "a live writer with NO store record", so the canon lost the
+            # transcript and abstained `jsonl-age-unknown` while the same census row printed a
+            # measured age — the row said its transcript age was both known and unknown, and
+            # those lanes could never reach `idle`. Naming the bound file's own directory hands
+            # the canon the one fact this process proved by binding it; the AGE stays the canon's.
+            sessions_dir=os.path.dirname(tr.path) or sessions_dir,
             now_ms=now_ms,
         )
         # the process we are holding, as a HOLDER candidate (positive observation, never a guess)
@@ -741,9 +788,10 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
               gates: Optional[Dict[str, bool]] = None) -> int:
     """The dry-run census + optional SIGTERM of PARKED-REAPABLE only.
 
-    Returns 0 on a completed census (dry run or applied), 2 when the census could not be read
-    at all. A census that read NOTHING is exit 2, never "0 to reap" — absence of a reading is
-    not evidence of absence (`lane-status.py`, `liveness.py` C3).
+    Returns 0 on a completed census (dry run or applied), 1 when an applied target SURVIVED the
+    signal, 2 when the census could not be read at all. A census that read NOTHING is exit 2,
+    never "0 to reap" — absence of a reading is not evidence of absence (`lane-status.py`,
+    `liveness.py` C3).
     """
     g = dict(GATES)
     if gates:
@@ -772,8 +820,20 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
     pi_pids = [pid for pid, r in before.items() if is_pi(r)]
     if not pi_pids:
         # an EMPTY pool is a real reading, and it is not the same as an unreadable one
-        print("orphan-reap: the `pi` pool is EMPTY in this read "
-              "(0 LIVE / 0 PARKED-REAPABLE / 0 KEEP-HUMAN / 0 UNVERIFIABLE)")
+        if as_json:
+            # ⛔ THE JSON DOCUMENT OWNS STDOUT ON EVERY PATH, the empty one included. A prose
+            # sentence here made `--pool pi --json | jq` fail to parse on the single most common
+            # input (a box where no `pi` is running) while exiting 0, so the caller could not
+            # tell "0 of everything" from "unparseable output" — and the human sentence is
+            # exactly what the `--json` contract says stdout is not for.
+            print(json.dumps({"pool": "pi", "sample_s": sample_s, "tolerance_s": TOLERANCE_S,
+                              "fence_s": FENCE_S, "outlier_factor": OUTLIER_FACTOR,
+                              "idle_floor_s": liv.IDLE_MS / 1000.0,
+                              "counts": {s: 0 for s in POOL_STATES}, "rows": [], "gates": g},
+                             indent=2))
+        else:
+            print("orphan-reap: the `pi` pool is EMPTY in this read "
+                  "(0 LIVE / 0 PARKED-REAPABLE / 0 KEEP-HUMAN / 0 UNVERIFIABLE)")
         return 0
     # transcript size/mtime, read once BEFORE the window and once AFTER
     pre_index = session_index(sessions_dir)
@@ -1204,8 +1264,9 @@ def main() -> int:
                 print(f"  {pid} still alive, kill failed: {e}")
         else:
             print(f"  verified gone: {pid}")
-    # `--pool all`: whichever census could not be read decides the exit code; a silent 0 here
-    # would report success for a pi census that read nothing.
+    # `--pool all`: the `pi` census's status IS this run's status (it is the only census that
+    # returns one — 0/1/2 above). A silent 0 here would report success for a pi census that read
+    # nothing; the orphan class contributes no status of its own, so this is not a max over two.
     return max(0 if rc_pi is None else rc_pi, 0)
 
 
