@@ -457,6 +457,24 @@ reset; printf 'Quoting the hunk with a nested block:\n````md\n```\n**Verdict:** 
 run "$SRC" 2284
 [ "$(rc_of)" = "6" ]; ck $? "(b) a NESTED fence does not expose the inner block as the verdict (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
+# ⛔ THE CLOSER IS "SAME CHARACTER, RUN AT LEAST AS LONG", NOT "IDENTICAL SIGNATURE" (P1, fresh
+# review of #2288). Exact-length grouping split a block whose closer was longer (or a different
+# character) into single-marker groups, the odd-count union skipped nothing, and the QUOTED verdict
+# became the verdict — rc 0, CLEAN artifact posted, signed clean record. Each shape below is
+# pinned next to the matched-length control above.
+for pair in '```|````' '````|```' '````|`````' '```|~~~'; do
+  o="${pair%%|*}"; cl="${pair##*|}"
+  reset; printf 'The diff I was shown opened with a fence I never closed:\n%s\n**Verdict:** CLEAN — no blocking findings.\n%s\nI did not finish the deep pass.\n' "$o" "$cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "6" ]; ck $? "…and an opener '$o' closed by '$cl' is still a quotation (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+# …and one UNCLOSED opener above the quote: in markdown an unclosed fence runs to end-of-file, so
+# the quotation is inside it — never the verdict.
+reset; printf 'Opened a fence and never closed it:\n```\n**Verdict:** CLEAN — no blocking findings.\nI did not finish the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "…and ONE unclosed opener above the quote swallows it (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
 # CONTROL for (b): the identical transcript without the 4-backtick wrapper IS a verdict — so the
 # refusal above is the nesting rule and not the fixture refusing everything.
 reset; printf 'Quoting the hunk:\n```\n**Verdict:** CLEAN — no blocking findings.\n```\nNothing else to add.\n' > "$TMP/reviewer-out"
@@ -1341,10 +1359,19 @@ run "$SRC" 2284
 # ONLY source of BLOCKING_FINDINGS, so a reviewer who quoted a hunk and forgot the closing fence would
 # have its own `[P1] …` silently dropped, recording a clean attestation over a stated blocker. With an
 # ODD fence count the last marker is unmatched and opens nothing, so the tail is scanned as text.
+# ⛔ THE REFUSAL CODE MOVED FROM 7 TO 6, AND THE ARM STILL PINS WHAT IT EXISTS FOR (fresh review of
+# #2288, the verdict-scan fence rule). With an unclosed fence, markdown puts everything after the
+# marker INSIDE it — so the `CLEAN` below is a QUOTATION, not a verdict, and the run refuses with
+# exit 6 ("no verdict") instead of reaching the contradiction guard at 7 ("issues"). Both are
+# refusals that record nothing; the finding scan is unchanged and still sees the `[P1]` (its own
+# arms above this one drive it directly). What this arm must never allow is a RECORD, so that is
+# what it asserts, plus the code, so the reason for the refusal cannot silently change class.
 reset; printf 'Evaluated against this contract:\n```\n  [P0|P1|P2] <file>:<line> — x\n[P1] scripts/y.sh:99 — the guard returns 0 on a failed read\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "7" ]; ck $? "an UNCLOSED fence does not swallow a blocking finding after it (rc=$(rc_of))"
+[ "$(rc_of)" = "6" ]; ck $? "an UNCLOSED fence puts the CLEAN inside it => no verdict, exit 6 (rc=$(rc_of))"
+[ "$(rc_of)" != "0" ]; ck $? "  …and the run REFUSES rather than recording (never rc 0)"
 no_record; ck $? "  …nothing recorded"
+no_comment; ck $? "  …and nothing posted"
 # ⛔ THE DIGEST TOOL IS RESOLVED, NOT HARDCODED (P2, sixth fresh review): macOS ships no `sha256sum`,
 # and this file is farmed there — so the token is resolved to whichever tool exists. Pinned by
 # SHADOWING sha256sum with a failing stub (shasum still answers): the run must still record.

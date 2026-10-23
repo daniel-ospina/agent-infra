@@ -788,46 +788,77 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | awk '{ ln[NR] = $0 }
                     END {
-                      # ── FENCED REGIONS, BY FENCE SIGNATURE, FAIL-CLOSED ──────────────────
-                      # ⛔ DO NOT PAIR MARKERS BY POSITION (P1, TWO fresh reviews of #2288: the
-                      # first version used a bare toggle, the second an odd-count parity fix, and
-                      # each was defeated by a DIFFERENT input). Positional pairing is wrong in two
-                      # ways, and both mint a signed clean record over a revision the reviewer said
-                      # it did not review:
-                      #   * NESTING: ```` `````` ```` wrapping a ```` ``` ```` block (the standard way
-                      #     to quote a markdown artifact that itself contains fences) puts four
-                      #     markers on the page; adjacent pairing pairs across the nesting and
-                      #     exposes the INNER block content as if it were prose.
-                      #   * AN UNMATCHED MARKER: with an odd count, dropping the LAST marker exposes
-                      #     what the FIRST pair covered, and dropping the FIRST exposes what the LAST
-                      #     pair covered — whichever one is dropped, the other direction is a hole.
-                      # So: group markers by SIGNATURE (fence character + run length, which is what
-                      # CommonMark uses to decide whether a line can close a fence), pair adjacently
-                      # WITHIN each signature, and when a signature has an odd count take the UNION
-                      # of the two pairings. A union can only SKIP MORE lines, so the worst case
-                      # is a wasted paid run (exit 6, no record), never a clean attestation. An
-                      # unmatched marker on its own therefore marks nothing (it cannot swallow the
-                      # tail), which is the rule the pinned unclosed-fence case needs.
-                      ng = 0
+                      # ── FENCED REGIONS: PAIR THE WAY MARKDOWN DOES, FAIL CLOSED ─────────────
+                      # ⛔ THREE POSITIONAL/KEYED SCHEMES WERE EACH DEFEATED BY A DIFFERENT INPUT
+                      # (P1s from three separate fresh reviews of #2288), so this is the markdown
+                      # rule itself, not an arithmetic approximation of it:
+                      #   1. a bare toggle let an UNCLOSED fence swallow the tail;
+                      #   2. odd-count parity (drop last, then drop first) had a hole in whichever
+                      #      direction it did not drop, and re-paired everything after an unmatched
+                      #      marker;
+                      #   3. exact-signature grouping (char + run length) does not close a fence
+                      #      with a LONGER run of the same character, nor pair across a nesting
+                      #      wrapper, so a quoted block split into single-marker groups, the union
+                      #      skipped nothing, and the QUOTED verdict became the verdict — rc 0, the
+                      #      CLEAN artifact posted, a signed clean record minted.
+                      # The rule now: a marker OPENS a region; the next marker of the SAME
+                      # character whose run is AT LEAST as long CLOSES it; anything else is
+                      # content. An opener with no qualifying closer runs to end-of-file — in
+                      # markdown that IS how an unclosed fence behaves, and here it means the
+                      # verdict scan can only ever skip MORE lines. Skipping more costs a paid
+                      # re-run (exit 6, nothing recorded); skipping less is a false attestation.
+                      # ⛔ This is the VERDICT scan only. The P0/P1/P2 finding scan is a separate
+                      # awk over the same log, so an unclosed fence still cannot hide a blocker
+                      # there (the pinned §AL case), and its own fence rule is untouched.
+                      nm = 0
                       for (i = 1; i <= NR; i++) {
-                        # ⛔ THE RUN IS MEASURED, NOT BOUNDED BY AN INTERVAL (mawk 1.3.4 treats
-                        # `{3,}` as exactly three, so `/`{3,}/` matched only the first three
-                        # backticks of a four-backtick fence and put every fence in one signature
-                        # group — which made the nesting case pair adjacently again).
+                        # ⛔ THE RUN IS MEASURED, NOT BOUNDED BY AN INTERVAL: mawk 1.3.4 treats
+                        # `{3,}` as exactly three, so `/`{3,}/` matched three backticks of a
+                        # four-backtick fence.
                         if (!match(ln[i], /^[[:space:]]*(`+|~+)/)) continue
                         run = substr(ln[i], RSTART, RLENGTH); gsub(/[[:space:]]/, "", run)
                         if (length(run) < 3) continue
-                        sig = substr(run, 1, 1) length(run)
-                        if (!(sig in gidx)) { ng++; gidx[sig] = ng; gsig[ng] = sig; gn[ng] = 0 }
-                        x = gidx[sig]; gn[x]++; gv[x, gn[x]] = i
+                        nm++; mline[nm] = i; mch[nm] = substr(run, 1, 1); mlen[nm] = length(run)
                       }
-                      for (x = 1; x <= ng; x++) {
-                        k = gn[x]
-                        for (j = 1; j + 1 <= k; j += 2)
-                          for (t = gv[x, j]; t <= gv[x, j + 1]; t++) sk[t] = 1
-                        if (k % 2 == 1)
-                          for (j = 2; j + 1 <= k; j += 2)
-                            for (t = gv[x, j]; t <= gv[x, j + 1]; t++) sk[t] = 1
+                      # ⛔ EVERY VALID PAIRING CONTRIBUTES ITS SPAN — THE UNION, NOT ONE CHOSEN
+                      # INTERPRETATION (P1, fresh review of #2288). Choosing one pairing always
+                      # leaves a hole in the other one: with markers [open-diff, close-diff/open-
+                      # quote, close-quote] the strict reading pairs (1,2) and exposes the quoted
+                      # verdict between 2 and 3, while pairing (2,3) exposes what the first pair
+                      # covered. Both readings are legitimate, so BOTH are skipped: a line is
+                      # fenced if ANY valid pairing puts it inside a fence. A valid pairing is
+                      # markdown own rule — same character, closer run at least as long as the
+                      # opener; a shorter or different-character marker is content, which is what
+                      # makes a nested wrapper work.
+                      # ⛔ UNION OVER EVERY VALID PAIRING — NEVER ONE CHOSEN INTERPRETATION
+                      # (P1, three fresh reviews of #2288). Choosing one pairing always leaves a
+                      # hole in the other: with markers [open-diff, close-diff/open-quote,
+                      # close-quote] the strict reading pairs (1,2) and exposes the QUOTED verdict
+                      # between 2 and 3, while pairing (2,3) exposes what the first pair covered.
+                      # Both readings are legitimate, so both are skipped: a line is fenced if ANY
+                      # valid pairing puts it inside a fence. Validity is markdown own rule — same
+                      # fence character, closer run at least as long as the opener; a shorter or
+                      # different-character marker is CONTENT, which is what makes a nested
+                      # wrapper work.
+                      # The pair loop runs in BOTH directions for the same reason, and a marker
+                      # with NO relation in either direction (one fence opened and never closed,
+                      # nothing around it) runs to end-of-file — markdown semantics, and the only
+                      # direction this can err is over-skipping (a paid re-run, exit 6), never a
+                      # clean attestation over a revision nobody reviewed.
+                      for (a = 1; a <= nm; a++) {
+                        closer = 0; opener = 0
+                        for (b = 1; b <= nm; b++) {
+                          if (b == a || mch[b] != mch[a]) continue
+                          if (b > a && mlen[b] >= mlen[a]) {
+                            closer = 1
+                            for (t = mline[a]; t <= mline[b]; t++) sk[t] = 1
+                          }
+                          if (b < a && mlen[a] >= mlen[b]) {
+                            opener = 1
+                            for (t = mline[b]; t <= mline[a]; t++) sk[t] = 1
+                          }
+                        }
+                        if (!closer && !opener) for (t = mline[a]; t <= NR; t++) sk[t] = 1
                       }
                       for (i = 1; i <= NR; i++) {
                         if (sk[i]) continue
