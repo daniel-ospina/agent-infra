@@ -354,11 +354,21 @@ unset GH_LIMIT_READ_CACHE
 
 echo "── (e) MUTATION: GH_LIMIT_FAILOVER=0 must make (a) fail ──────────────────────────────────────"
 reset_env e core0
+# a DATED-EMPTY snapshot: the pool is MEASURED empty, which is what makes the pre-emptive refusal
+# (and therefore the "nothing was sent" assertion below) meaningful.
+budget core0
 export GH_LIMIT_FAILOVER=0
 run core0 api repos/o/r/pulls/7 --jq .head.sha
 ck "(e) with the failover disabled the core-exhausted read fails" $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
 ck "(e) and it says the right thing (named state, not a generic unreadable)" \
    $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
+# ⛔ (review P2) THE POINT OF THE KILL-SWITCH FIX IS THAT NOTHING IS SENT. Before it, turning the
+# failover off ALSO disabled the floor and the dated-empty write guard, so this read went into a
+# measured-empty pool — and since the stub refuses it too, "rc!=0 + named state" cannot tell the two
+# versions apart. Assert the REQUESTS, or that regression passes the whole suite.
+ck "(e) … and NOTHING was sent into the measured-empty pool" \
+   $([ "$(reqs 'pulls/7')" -eq 0 ] && echo 0 || echo 1)
+ck "(e) … and no failover was attempted" $([ "$(reqs 'api graphql')" -eq 0 ] && echo 0 || echo 1)
 unset GH_LIMIT_FAILOVER
 
 echo "── (f) the healthy path is unchanged and clears the named state ──────────────────────────────"

@@ -411,6 +411,11 @@ The conditional-GET PASS CACHE has its own three: `GH_LIMIT_PASS_CACHE` (unset/`
 other value enables it — `refresh-candidates.sh` sets it for the sweep), `GH_LIMIT_PASS_CACHE_MAX_ENTRY`
 (4 MiB — the largest single `--include` response it will keep) and `GH_LIMIT_PASS_CACHE_MAX_BYTES`
 (64 MiB — the whole cache's budget); an entry over either bound is simply not cached.
+`GH_LIMIT_PROBE_TIMEOUT` (20 s, clamped 1–120 — the bound on the exempt `/rate_limit` meter probe,
+which runs while the BOX-WIDE LOCK is held; a timeout costs one window with no snapshot, never a
+stalled box), `GH_LIMIT_BUDGET_TTL` (30 s — how long a snapshot is trusted), `GH_LIMIT_CORE_FLOOR`
+(800 — the reserve; `--stats` prints which knob supplied it) and `GH_LIMIT_ESSENTIAL=1` (this read
+cannot be deferred — set by the landing scripts, never by a poll).
 Every knob
 is range-clamped, and `nan`/`inf` fall back to the documented default rather than disabling a bound
 (an `inf` lock timeout would be a hang, a `nan` wait a traceback).
