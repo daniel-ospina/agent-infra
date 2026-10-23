@@ -237,6 +237,15 @@ if [ "${SCEN_RECORD_CLAUSE_E:-0}" = 1 ] && ! grep -qF -- 'pr update-branch' "$SC
   echo "⛔ (#1575 clause E) refusing the carry onto the current head — the TARGET HEAD IS MEASURABLY RED." >&2
   exit 3
 fi
+# …and the SAME refusal with NO position rule, so a clause-(E) veto can also be
+# modelled at step [3/4] — after the head moved. That is the path where the veto must
+# still stop the unit short of admin-merge; without it, nothing exercises the caller's
+# rejection of `do_record`'s return 4 (mutation B5g; measured: accepting 4 there left
+# the whole suite green).
+if [ "${SCEN_RECORD_CLAUSE_E_ALL:-0}" = 1 ]; then
+  echo "⛔ (#1575 clause E) refusing the carry onto the current head — the TARGET HEAD IS MEASURABLY RED." >&2
+  exit 3
+fi
 # The LIVE contract (#767): a zero exit leaves a record naming the PR's CURRENT
 # head — either it already did (sha == head), or the carry-forward arm re-bound it
 # because the reviewed diff is content-unchanged and the prior marker's signature
@@ -392,7 +401,7 @@ new_scen() {
   # reset every scenario-scoped switch (a leak between scenarios is a test bug)
   SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
   SCEN_RECORD_NO_WRITE=0
-  SCEN_RECORD_REFUSE_PREFLIGHT=0; SCEN_RECORD_CLAUSE_E=0
+  SCEN_RECORD_REFUSE_PREFLIGHT=0; SCEN_RECORD_CLAUSE_E=0; SCEN_RECORD_CLAUSE_E_ALL=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
@@ -470,6 +479,7 @@ rail_exec() { # <extra args...>
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_REFUSE_PREFLIGHT="${SCEN_RECORD_REFUSE_PREFLIGHT:-0}" \
   SCEN_RECORD_CLAUSE_E="${SCEN_RECORD_CLAUSE_E:-0}" \
+  SCEN_RECORD_CLAUSE_E_ALL="${SCEN_RECORD_CLAUSE_E_ALL:-0}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
   SCEN_RECORD_NO_WRITE="${SCEN_RECORD_NO_WRITE:-0}" \
   SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
@@ -667,6 +677,45 @@ called "pr update-branch 42" \
 grep -q "refused on the CURRENT head's HEALTH" "$SCEN/out" \
   && pass "and the log says why it proceeded" \
   || fail "the rail proceeded without naming the head-health exception"
+# ═══ 2b-vi. the two ends of the clause-(E) discriminator are pinned ═══
+# Exit 3 carries BOTH refusal causes, so `(#1575 clause E)` in the producer's stderr
+# is the ONLY thing separating "the artifact changed" from "the head is red". The
+# rail now decides CONTROL FLOW on it (proceed vs stop), so a reword upstream would
+# silently restore #2369 for every drift-red PR. Pin both ends in CI rather than
+# trusting two comments to stay in sync (a comment is not an instrument).
+echo "── 2b-vi. the clause-(E) discriminator is a pinned cross-script contract"
+# ⛔ GREP THE EMITTER LINE, not the file: a whole-file grep for the literal is
+# satisfied by the CONSUMER CONTRACT comment above the echo if the echo itself is
+# reworded — a probe proved exactly that (echo changed, comment kept, whole-file
+# grep still passed while the rail's grep would not match: #2369 silently restored,
+# suite green). The `^ *echo "` anchor is what makes this a test of the emitter.
+grep -qE '^[[:space:]]*echo "⛔ \(#1575 clause E\)' "$ROOT/scripts/record-review.sh" \
+  && pass "the producer still EMITS the literal the rail greps for" \
+  || fail "scripts/record-review.sh no longer EMITS '(#1575 clause E)' (a comment mentioning it is not the emitter) — the rail would read a red head as a changed artifact"
+grep -qF "grep -qF '(#1575 clause E)'" "$ROOT/scripts/atomic-land.sh" \
+  && pass "and the rail still greps that literal for the head-health classification" \
+  || fail "scripts/atomic-land.sh stopped grepping the clause-(E) literal — the proceed/stop split is gone"
+# ═══ 2b-vii. a clause-(E) veto at step [3/4] still blocks the landing ═════
+# The landing side of the `return 4` contract. The preflight proceeds on this code;
+# step 3 must NOT. A caller that accepted 4 there would merge a measurably red head —
+# the #1575 defect itself — so this scenario exists to redden if that regresses.
+echo "── 2b-vii. a clause-(E) refusal at step [3/4] still stops short of the landing"
+new_scen laste
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+SCEN_RECORD_CLAUSE_E_ALL=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" \
+  && pass "the update itself proceeded (the preflight accepts a head-health refusal)" \
+  || fail "the update was blocked — this scenario is supposed to reach step [3/4]"
+called "admin-merge" \
+  && fail "the land step ran on a MEASURABLY RED head — the #1575 clause-(E) veto was accepted by the caller" \
+  || pass "the land step did NOT run on a red head"
+grep -q "nothing was merged" "$SCEN/err" \
+  && pass "and the step-3 path still says nothing was merged" \
+  || fail "the step-3 refusal left the transcript silent about the merge"
 
 # ═══ 2b-iv. dry-run with a STALE record writes nothing ═══════════════════
 echo "── 2b-iv. #2369 — dry-run reports the precondition it would take and writes nothing"
@@ -2535,6 +2584,15 @@ if true; then
   # only because its base is stale can never be refreshed, so it is unlandable by the
   # rail's own hand (#1533/#7727). 2b-v must redden.
   mutate_and_expect_fail B5f  's/if \[ "\$rec_rc" -eq 4 \]; then/if false; then/'
+  # B5g (#2369/#1575): let the LANDING path ACCEPT `do_record`'s return 4. The failure
+  # it prevents: a clause-(E) refusal at step [3/4] — a head that is measurably red —
+  # would fall through to admin-merge, merging exactly what the veto exists to stop,
+  # and only when a base move made the carry reachable (the preflight's proceed arm
+  # makes 4 a NORMAL outcome, so the landing side is the half that must still refuse).
+  # VERIFIED NECESSARY: before scenario 2b-vii existed, this mutation left the suite
+  # green — every clause-(E) fixture was position-gated to the preflight. 2b-vii must
+  # redden.
+  mutate_and_expect_fail B5g  's/^  if ! do_record; then exit 1; fi$/  do_record; __r=$?; [ "\044__r" -eq 4 ] || [ "\044__r" -eq 0 ] || exit 1/m'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway

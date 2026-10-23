@@ -1081,14 +1081,17 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   # B5 above stops when the ONLY record is bound to this head and no marker could
   # restore it. The STALE case was left to the record step, and that is the defect:
   # when the record is already behind the head, `[1/4] update` moved the head
-  # ANYWAY, `[3/4] record` then refused (no signed marker carried the new live
-  # diff, and the lane carry cannot fire because intervening non-base commits are
-  # exactly what makes the record stale), and the unit had spent a full CI cycle
-  # at the new head for a PR no record could name. MEASURED (#9639): the rail
-  # refreshed d35d37a2… → d34da3c7… on BASE DRIFT and then refused at step 3 — the
-  # record was already at 11a2ac6f…, stale BEFORE the run, so the update bought
-  # nothing. (Not this defect, in the same batch: #9635/#9651/#9545 refused at
-  # step 1 on CONFLICTED, and #9658 reached step 4 on runner capacity.)
+  # ANYWAY, `[3/4] record` then refused, and the unit had spent a full CI cycle at
+  # the new head for a PR no record could name. MEASURED (#9639): the rail refreshed
+  # d35d37a2… → d34da3c7… on BASE DRIFT and then refused at step 3 — the record was
+  # already at 11a2ac6f…, stale BEFORE the run, so the update bought nothing. (Not
+  # this defect, in the same batch: #9635/#9651/#9545 refused at step 1 on
+  # CONFLICTED, and #9658 reached step 4 on runner capacity.)
+  # The stale population has TWO causes and only one is hopeless: a lane that PUSHED
+  # after recording (a new non-base commit, so no carry arm can re-bind it — the
+  # fresh review this guard demands), and a BASE-ONLY move whose record was never
+  # re-bound (the lane arm's own population, where the probe SUCCEEDS — test 2b-ii).
+  # The guard stops only the first, because it asks the producer instead of guessing.
   #
   # The precondition is DELEGATED, never re-derived. The rail still computes no
   # diff (see pr_has_carry_evidence): the probe IS `record-review.sh`, asked about
@@ -1266,16 +1269,29 @@ do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-hea
     # measurably red. Blaming a changed diff would send the operator hunting for a
     # change that does not exist — the same misdiagnosis class #1362 D1 fixes below.
     if grep -qF '(#1575 clause E)' "$log"; then
+      # ⛔ THE GREP IS A CONSUMER CONTRACT, not a convenience: exit 3 carries BOTH
+      # refusal causes, so this literal (emitted by scripts/record-review.sh at its
+      # clause (E) veto, which names this rail beside it) is the only discriminator
+      # between "the artifact changed" and "the head is red". Rewording it upstream
+      # would silently reclassify a head-health refusal as a content refusal and
+      # restore the #2369 defect for drift-red PRs. Scenario 2b-vi pins both ends.
       err "atomic-land: the carry was REFUSED by (#1575 clause E) — the target head ${HEAD:0:12}… IS MEASURABLY RED. The lane artifact WAS proven unchanged; do NOT hunt for a diff change. Re-run the failing checks (or wait for them), then re-record."
+      # The step-[3/4] path must still say nothing was merged — it is the path that
+      # runs AFTER the head was moved and the CI cycle spent, and with no further
+      # output the transcript would leave that unsaid. The preflight neither lands
+      # nor merges, so it does not claim to withhold a merge.
+      if [ "${1:-}" != "preflight" ]; then
+        err "atomic-land: the landing path does NOT accept this refusal — nothing was merged."
+      fi
       rm -f "$log"
       # A DISTINCT return, so a caller can tell a CONTENT refusal from a HEAD-HEALTH
-      # one. The #2369 preflight must PROCEED on this one: refreshing is the only
-      # remedy the rail has for a red the stale base caused, and refusing it here
-      # would leave exactly that population unlandable by the rail's own hand
-      # (#1533/#7727). Step [3/4] re-runs the veto at the new head, where the check
-      # surface is fresh — so the landing path's behaviour is unchanged (`if !
-      # do_record; then exit 1`), and a head that is red for its OWN reasons is still
-      # refused there (the accepted residual documented at the preflight).
+      # one. The #2369 preflight proceeds on this one: refreshing is the only remedy
+      # the rail has for a red the stale base caused, and refusing it here would leave
+      # exactly that population unlandable by the rail's own hand (#1533/#7727). Step
+      # [3/4] re-runs the veto at the new head, where the check surface is fresh — a
+      # head that is red for its OWN reasons is refused THERE, and it is the caller's
+      # rejection of this code that does it (mutation B5g pins that, so a caller that
+      # accepted 4 could not land on a red head unnoticed).
       return 4
     fi
     err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
