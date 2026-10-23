@@ -1274,6 +1274,39 @@ result_has "a worktree of a DIFFERENT repository" \
 git -C "$R/foreign" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
 rm -rf "$R/hub/.worktrees/registry-sync"
 
+say_case "hygiene: a STALE worktree registration (dir gone) is re-created, not a permanent deadlock"
+# ⛔ The worktree is a THROWAWAY, so `rm -rf`-ing it — what any disk cleanup does — leaves the
+# registration behind, and a plain `worktree add` then refuses FOR EVER with rc=128 ("missing but
+# already registered"). Measured: every hourly pass logged `could not provision … rc=128` and skipped,
+# so the sub-step was dead on that box while `--dry-run` still said `would sync`. The fix re-creates
+# OUR OWN registration with `-f` (not `worktree prune`, which would also drop other, possibly merely
+# unmounted, registrations that are not this role's to remove).
+reset_state
+git -C "$R/foreign" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+git -C "$R/hub" worktree add --detach --no-checkout "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 \
+  || bad "registry fixture: could not register the throwaway worktree"
+rm -rf "$R/hub/.worktrees/registry-sync"          # the registration survives; the directory does not
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry synced" \
+  && ok "registry: a stale registration is RE-CREATED and the pass converges (not a permanent skip)" \
+  || bad "registry: a stale registration deadlocked the sub-step (rc=$RC) — $OUT"
+result_has "REGISTERED as a worktree but its directory is gone" \
+  && ok "registry: the repair is LOGGED (the state is visible, not silent)" \
+  || bad "registry: the repair is silent — $OUT"
+case "$OUT" in
+  *"rc=128"*) bad "registry: the pass still hit the 'missing but already registered' refusal — $OUT" ;;
+  *) ok "registry: no rc=128 provisioning refusal" ;;
+esac
+[ -f "$REC" ] && ok "registry: the record was synced through the re-created worktree" \
+  || bad "registry: nothing was synced after the repair — $OUT"
+
 say_case "hygiene: no registry-sync.sh anywhere is a SKIP (not cannot-verify, unlike every other step)"
 reset_state
 # ⛔ A COPY, in a directory with no `registry-sync.sh` beside or above it: the shipped resolution order
