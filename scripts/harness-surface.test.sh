@@ -1077,8 +1077,8 @@ ck "(e) a claims record about ANOTHER repo is RE-PROBED, not read as an answer [
    "$(case "$claimsrow2" in *'/some/other/checkout'*) echo 1 ;; *) echo 0 ;; esac)"
 # ⛔ AND THE WRITER/READER ROUND TRIP IS THE POINT (review: only fixture-written records were ever read):
 # the re-probe must REWRITE the record with THIS box's work repo, so every later status is attributable.
-ck "(e) …and the re-probe REWRITES the record naming this box's work repo (the write path is asserted)" \
-   "$(grep -Eq "claims=[a-z-]+ repo=$WORK at=[0-9]+" "$FRESHCELL/orchestrator/state/harness-claims" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and the re-probe REWRITES the record naming this box's work repo and the ORIGIN it probed" \
+   "$(grep -Eq "claims=[a-z-]+ repo=$WORK origin=$WORK at=[0-9]+" "$FRESHCELL/orchestrator/state/harness-claims" 2>/dev/null && echo 0 || echo 1)"
 # ⛔ A PATH WITH A SPACE IS THE ORDINARY MACOS SHAPE (`/Users/First Last`), and writer/reader must agree on
 # it: an unanchored parse truncated the launcher's OWN record at the space and read it as a FOREIGN repo,
 # sending a healthy box through a re-probe (and, before the re-probe existed, into a permanent UNKNOWN).
@@ -1128,6 +1128,31 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" R
 gonerow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
 ck "(e) two MISSING paths are not the same repo — the row never reuses the record as OK [$gonerow]" \
    "$(case "$gonerow" in *'OK ('*) echo 1 ;; *'UNKNOWN'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE PATH IS NOT THE FACT (review P1): `refs/claims` reachability is a property of the checkout's
+# ORIGIN, and `$O/state` lives OUTSIDE the checkout — so a box re-cloned or repurposed AT THE SAME PATH
+# keeps the previous repo's answer for up to HU_CLAIMS_STALE. A record naming this path with a DIFFERENT
+# origin must be re-probed (and rewritten with the live origin), never read as an answer.
+printf 'claims=reachable repo=%s origin=%s at=%s\n' "$WORK" "$TMP/some-other-origin" "$(date +%s)" \
+  > "$FRESHCELL/orchestrator/state/harness-claims"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$WORK" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+originrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) a record at this PATH but for a DIFFERENT ORIGIN is re-probed, never reused [$originrow]" \
+   "$(grep -Fq "origin=$WORK at=" "$FRESHCELL/orchestrator/state/harness-claims" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ AND A LEGACY RECORD (no `origin=`) STILL WORKS: the field is new, and an old box must not go BROKEN
+# because its record predates it — an absent origin is "unattributed", which keeps the path-only answer.
+printf 'claims=reachable repo=%s at=%s\n' "$WORK" "$(date +%s)" \
+  > "$FRESHCELL/orchestrator/state/harness-claims"
+legacy_before="$(cat "$FRESHCELL/orchestrator/state/harness-claims")"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$WORK" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+legacyrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) a LEGACY record (no origin=) still reads OK and is not re-probed [$legacyrow]" \
+   "$(if [ "$(cat "$FRESHCELL/orchestrator/state/harness-claims")" = "$legacy_before" ]; then case "$legacyrow" in *'OK ('*) echo 0 ;; *) echo 1 ;; esac; else echo 1; fi)"
 # ⛔ AND AN EXPLICITLY EMPTY `--repo` IS REFUSED, never read as "no flag" (review P2): `[ -n "$A_REPO" ]`
 # read `--repo ""` as absent, then resolved the harness from HARNESS_REPO / the launcher's own checkout —
 # answering about a checkout the operator never named. Reachable in the ordinary way (`--repo "$UNSET"`).

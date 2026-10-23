@@ -701,6 +701,39 @@ hu_same_repo() { # <a> <b> — resolved equality; an empty resolution on either 
   ra="$(hu_real "${1:-}")"; rb="$(hu_real "${2:-}")"
   [ -n "$ra" ] && [ -n "$rb" ] && [ "$ra" = "$rb" ]
 }
+# ⛔ THE PATH IS NOT THE FACT. `refs/claims` reachability is a property of the checkout's ORIGIN, so a
+# checkout re-cloned or repurposed AT THE SAME PATH keeps the previous repo's answer: `$O/state` lives
+# OUTSIDE the checkout, so it survives the re-clone, and a path-only record then reads `OK (refs/claims
+# reachable)` for a repo nobody probed — for up to HU_CLAIMS_STALE. The record therefore carries the
+# origin it probed, and reuse requires that origin to still be this checkout's. An ABSENT `origin=`
+# (records written before this field existed, or a checkout with no readable remote) keeps the old
+# path-only behaviour, so nothing reds on an old box.
+hu_origin() { git -C "${1:-/nonexistent}" remote get-url origin 2>/dev/null || true; }
+hu_same_origin() { # <recorded> <live> — empty RECORDED ⇒ legacy path-only ⇒ same
+  local a="${1:-}" b="${2:-}"
+  [ -z "$a" ] && return 0
+  a="${a%/}"; a="${a%.git}"; b="${b%/}"; b="${b%.git}"
+  [ -n "$b" ] && [ "$a" = "$b" ]
+}
+# The record is `claims=<v> repo=<path> [origin=<url>] at=<ts>`; the repo path may contain spaces, so the
+# parse is anchored on `at=` and the OPTIONAL field is split from the END of the repo field.
+hu_rec_parse() { # <file> — sets HU_REC_REPO / HU_REC_ORIGIN (empty when absent)
+  local line rest
+  HU_REC_REPO=""; HU_REC_ORIGIN=""
+  line="$(sed -n 's/^claims=[^ ]* //p' "$1" 2>/dev/null | head -1)"
+  # ⛔ THE REMAINDER MUST *BE* THE REPO FIELD. Without this, the oldest record shape —
+  # `claims=reachable at=1`, which a box started by an older launcher still holds — parsed as
+  # repo="at=1": a NON-EMPTY, foreign repo, so the row re-probed and a deliberately AGED record read as a
+  # fresh OK instead of LATE (caught by harness-cohesion's aged-record arm). No `repo=` ⇒ unattributed.
+  case "$line" in repo=*) ;; *) return 1 ;; esac
+  rest="${line% at=*}"
+  rest="${rest#repo=}"
+  case "$rest" in
+    *' origin='*) HU_REC_REPO="${rest% origin=*}"; HU_REC_ORIGIN="${rest##* origin=}" ;;
+    *)            HU_REC_REPO="$rest" ;;
+  esac
+  return 0
+}
 hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (used after a start)
   local strict="${1:-0}" sha want got real_want real_got got_head got_root
   HU_PIN_PENDING=0
@@ -865,13 +898,14 @@ hu_row_refresh() {
 # and an AGED record is LATE rather than OK: a stale "reachable" speaks about a probe nobody repeated.
 HU_CLAIMS_STALE="${HARNESS_UP_CLAIMS_STALE:-1800}"
 hu_row_claims() {
-  local f="$O/state/harness-claims" age verdict="" rec_repo="" why=""
+  local f="$O/state/harness-claims" age verdict="" rec_repo="" rec_origin="" why=""
   if [ -f "$f" ]; then
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     # ⛔ THE FIELD IS THE REST OF THE LINE, anchored on both sides: a path containing a space is the
     # ordinary macOS shape (`/Users/First Last`), and `[^ ]*` would truncate the launcher's OWN record into
     # a "different repo", turning a healthy box BROKEN for no configuration error.
-    rec_repo="$(sed -n 's/^claims=[^ ]* repo=\(.*\) at=[^ ]*$/\1/p' "$f" 2>/dev/null | head -1)"
+    hu_rec_parse "$f" || true
+    rec_repo="$HU_REC_REPO"; rec_origin="$HU_REC_ORIGIN"
     age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
   fi
   # ⛔ A RECORD ABOUT ANOTHER REPO IS NOT AN ANSWER ABOUT THIS ONE, AND IT IS NOT A PERMANENT VERDICT
@@ -886,13 +920,14 @@ hu_row_claims() {
     if [ -z "$REPO" ]; then
       hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, and no work repo is resolved to attribute it)"; return 2
     fi
-    if ! hu_same_repo "$rec_repo" "$REPO"; then
+    if ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$(hu_origin "$REPO")"; then
       # Re-probe and re-read; the row is the FRESH answer, or UNKNOWN with the probe's reason.
-      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the record probed $rec_repo, not the work repo $REPO, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
+      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the record probed $rec_repo${rec_origin:+ ($rec_origin)}, not the work repo $REPO, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
       verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
       age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
-      rec_repo="$(sed -n 's/^claims=[^ ]* repo=\(.*\) at=[^ ]*$/\1/p' "$f" 2>/dev/null | head -1)"
-      if [ -n "$rec_repo" ] && ! hu_same_repo "$rec_repo" "$REPO"; then
+      hu_rec_parse "$f" || true
+      rec_repo="$HU_REC_REPO"; rec_origin="$HU_REC_ORIGIN"
+      if [ -n "$rec_repo" ] && { ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$(hu_origin "$REPO")"; }; then
         hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record still names $rec_repo, not the work repo $REPO)"; return 2
       fi
     fi
@@ -1428,12 +1463,15 @@ hu_start_claims() {
   verdict=absent
   grep -q 'refs/claims/' "$log" 2>/dev/null && verdict=reachable
   mkdir -p "$O/state" 2>/dev/null || { warn "claims: cannot create $O/state — the probe cannot be recorded"; return 1; }
-  # ⛔ THE RECORD NAMES THE REPO IT PROBED. `refs/claims` is a fact about ONE repo's origin, so a record
-  # written when the box drained a different repo is not an answer about this one — and a box repurposed,
-  # or a pre-split run (where `REPO` could be the harness checkout), leaves exactly such a record behind
-  # for up to HU_CLAIMS_STALE. Records from before this field existed keep working (empty `repo=` means
-  # "unattributed"), so nothing reds on an old box, but every NEW record is attributable.
-  printf 'claims=%s repo=%s at=%s\n' "$verdict" "$REPO" "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null \
+  # ⛔ THE RECORD NAMES THE REPO IT PROBED, AND THE ORIGIN THAT MAKES IT TRUE. `refs/claims` is a fact
+  # about ONE repo's origin, so neither a record written when the box drained a different repo, nor one
+  # left behind at a path that was re-cloned from a DIFFERENT origin (the cell-recycling shape — `$O/state`
+  # outlives the checkout), is an answer about this one. A box repurposed, or a pre-split run (where `REPO`
+  # could be the harness checkout), leaves exactly such a record behind for up to HU_CLAIMS_STALE. Records
+  # from before these fields existed keep working (empty `repo=`/`origin=` means "unattributed"), so
+  # nothing reds on an old box, but every NEW record is attributable down to the origin it probed.
+  printf 'claims=%s repo=%s origin=%s at=%s\n' "$verdict" "$REPO" "$(hu_origin "$REPO")" "$(date +%s)" \
+    > "$O/state/harness-claims" 2>/dev/null \
     || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
   say "claims: ok (refs/claims $verdict)"
   return 0
