@@ -326,14 +326,33 @@ awk '
 drive_arm() { # <module-path> -> the predicate's answer + the note (+ a marker when it never loaded)
   (
     unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_ceiling ciq_slug ciq_state_dir \
-             ciq_gh ciq_now ciq_read ciq_eval ciq_verdict ciq_defer_note ciq_ci_allowed 2>/dev/null
+             ciq_gh ciq_now ciq_read ciq_eval ciq_verdict ciq_defer_note ciq_defer_note_here \
+             ciq_ci_allowed 2>/dev/null
     # shellcheck source=/dev/null
     . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
-    declare -f ciq_read ciq_ci_allowed ciq_defer_note >/dev/null 2>&1 \
+    declare -f ciq_read ciq_ci_allowed ciq_defer_note ciq_defer_note_here >/dev/null 2>&1 \
       || { echo 'INTERFACE-MISSING'; exit 0; }
     feed 31 5 5
     ciq_ci_allowed "$OR"; printf 'allowed=%s\n' "$?"
     ciq_defer_note "CONFLICTED fixer for #1234 (a push to fix/x invalidates head abc123)"
+  ) 2>/dev/null
+}
+# ⛔ THE WIRING'S OWN NOTE, DRIVEN (#2333 merge review, P2). `drive_arm` above drives
+# `ciq_defer_note`, the STANDALONE entry point (it re-reads). Every shipping caller uses
+# `ciq_defer_note_here` instead, and until this driver existed NO arm executed it — so a mutant whose
+# body was `return 1` silenced every daemon deferral line while the suite reported CLEAN.
+drive_note() { # <module-path> -> the predicate's answer + the IN-SHELL note (empty when silenced)
+  (
+    unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_ceiling ciq_slug ciq_state_dir \
+             ciq_gh ciq_now ciq_read ciq_eval ciq_verdict ciq_defer_note ciq_defer_note_here \
+             ciq_ci_allowed ciq_defer_line 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
+    declare -f ciq_read ciq_ci_allowed ciq_defer_note_here >/dev/null 2>&1 \
+      || { echo 'INTERFACE-MISSING'; exit 0; }
+    feed 31 5 5
+    ciq_ci_allowed "$OR"; printf 'allowed=%s\n' "$?"
+    printf 'note='; ciq_defer_note_here "CONFLICTED fixer for #1234"
   ) 2>/dev/null
 }
 if cmp -s "$MOD" "$T/mutant/ci-queue.sh"; then
@@ -361,10 +380,11 @@ grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC
 ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per PASS — at most two live reads a cycle, the sweep's and the dispatch block's" "$?"
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
-n="$(grep -cF 'elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then' "$LOOP")"
+n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
 ck "(e4) BOTH fixer push arms defer (the CONFLICTED and CI-red spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
-ck "(e4-eligibility) …and each defer arm carries the SPAWN arm's own eligibility, so a deep queue is never reported as the binding reason for a PR the capacity gate refused (#2333 cycle 7, P2)" \
-   "$( { [ "$n" -eq 2 ] && [ "$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")" -eq 0 ]; } ; echo $? )"
+m="$(grep -cF -- '-lt "$MF"' "$LOOP")"
+ck "(e4-eligibility) …and the deferral NESTS inside each spawn arm's own eligibility, so a deep queue is never reported as the binding reason for a PR the capacity gate refused — with exactly ONE \$MF comparison per fixer spawn site (found $m, expected 3: the count test-gates.sh asserts so that every fixer spawn site is on the drain-aware budget, which a DUPLICATED predicate would inflate) (#2333 cycle 7, P2)" \
+   "$( { [ "$n" -eq 2 ] && [ "$m" -eq 3 ] && [ "$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")" -eq 0 ]; } ; echo $? )"
 ck "(e4b) AND SO DOES THE THIRD PUSHER — the review-gate fixer arm (its product is a new head too)" \
    "$( grep -q '_fix_eligible" = "1" ] && ciq_push_ok' "$LOOP"; echo $? )"
 ck "(e4c) …and its defer arm cannot fire for a PR that was simply not eligible (the guard is shared, not duplicated)" \
@@ -548,6 +568,33 @@ n="$(tr -d '\n' < "$T/g2.out")"
 ck "(g2) 'ceiling --runners 7' => 14 (got '$n')" "$( [ "$n" = 14 ]; echo $? )"
 bash "$MOD" status --repo >/dev/null 2>&1; rc=$?
 ck "(g3) '--repo' as the LAST word exits 64 instead of looping for ever (rc=$rc)" "$( [ "$rc" -eq 64 ]; echo $? )"
+
+printf '\n── (i) the note the WIRING calls is EXECUTED — and can go red ─────────────────\n'
+# ⛔ EXECUTED, NOT GREPPED (#2333 merge review, P2). (a)/(b)/(c) drive `ciq_defer_note`, the
+# STANDALONE entry point, which RE-READS; every shipping caller uses `ciq_defer_note_here`. Measured
+# before this arm existed: a module whose `ciq_defer_note_here` body is `return 1` — silencing EVERY
+# daemon deferral line, the single failure this module exists to prevent — reported 79 passed, 0
+# failed, CLEAN. The execution arms could not see it and the wiring arms only grepped the call sites.
+i1="$(drive_note "$MOD")"
+ck "(i1) the IN-SHELL note the wiring calls defers AND prints its one line (depth named)" \
+   "$( { has "$i1" 'allowed=1' && has "$i1" 'note=[ci-queue] DEFERRED'; } ; echo $? )"
+mkdir -p "$T/mutant-note"
+awk '
+  /^ciq_defer_note_here\(\) \{/ { print; print "  return 1"; skip=1; next }
+  skip && /^\}$/              { skip=0; print; next }
+  skip                        { next }
+  { print }
+' "$MOD" > "$T/mutant-note/ci-queue.sh"
+if cmp -s "$MOD" "$T/mutant-note/ci-queue.sh"; then
+  bad "(i0) the note mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/mutant-note/ci-queue.sh" 2>/dev/null; then
+  bad "(i0) the note mutant does not parse — a broken mutant proves nothing about a silenced note"
+else
+  ok "(i0) the note mutant applied and still parses (the in-shell note returns 1 without printing)"
+  i2="$(drive_note "$T/mutant-note/ci-queue.sh")"
+  ck "(i2) MUTANT — a SILENCED in-shell note keeps the same decision (allowed=1) and LOSES the line, so (i1) is not always-green" \
+     "$( { has "$i2" 'allowed=1' && has "$i2" 'note=[ci-queue] DEFERRED'; [ $? -ne 0 ]; } ; echo $? )"
+fi
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -2542,26 +2542,23 @@ fi
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
-# read `… && can_spawn && ! ciq_push_ok; then`, so counting `can_spawn` alone counted the two NEW
-# defer arms as spawn sites and reddened this suite on a correct change. Pinning each population
-# keeps the stated power in both directions: a spawn site that loses (or gains, ungated) its load
-# gate reddens the first line, and a defer arm that stops deferring reddens the second.
-# Each spawn site is asserted to carry can_spawn, which is the property under test.
-# ⛔ THE WIDE PREDICATE MINUS THE DEFER ARMS (#2333 review cycle 12, P2). The narrowing to
-# `can_spawn; then` matched the two defer arms away, but it ALSO stopped matching a future spawn arm
-# whose condition continues past `can_spawn` (`… && can_spawn && <cond>; then`, or a multi-line arm
-# like the review-gate site) — silently losing the power this file's own NOTE claims for the line.
-# Counting `can_spawn` wide and subtracting the defer arms keeps BOTH powers: a fourth spawn site
-# reddens `fixer_sites` whether or not it happens to end in `can_spawn; then`, and a defer arm that
-# stops deferring still reddens `fixer_defer_sites`.
-fixer_defer_sites=$(grep -cF 'can_spawn && ! ciq_push_ok; then' "$LOOP")
-fixer_sites=$(( $(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn) - fixer_defer_sites ))
+# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
+# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
+# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
+# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
+# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
+# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
+# With nesting, the two populations are disjoint by construction, so each is counted directly. The
+# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
+# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
+fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
+fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
 [ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
-ck "both CI-queue defer arms sit AFTER the load gate (they are not spawn sites)" $rc
+ck "both CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1

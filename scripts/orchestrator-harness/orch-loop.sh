@@ -3191,39 +3191,49 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
-          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then
-            # ⛔ THE DEFER ARM CARRIES THE SAME ELIGIBILITY THE SPAWN ARM BELOW DOES (#2333 cycle 7, P2).
-            # Evaluated in the OTHER order, a box with every fix lane busy AND a deep queue reported
-            # `ci-queue(deep(…))` as the binding reason and never printed its own `NO fixer slot`
-            # diagnosis — a disposition the capacity gate, not the queue, was binding. Same rule the
-            # review-gate fixer arm applies by hoisting `_fix_eligible` (see its own ⛔ below); this
-            # chain is `elif`-shaped, so the predicate rides the condition instead of a new variable.
-            # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
-            # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
-            # finish inside its own lease and (b) invalidate this PR's head-bound review record —
-            # the attestation is bound to a SHA, so the push destroys the artifact it exists to
-            # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
-            # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
-            # read decides again — that is what makes the deferral non-sticky.
-            # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
-            # reads on the COLD path (`orch-loop.sh`'s predicate), and the defer arms below are only
-            # reached *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The
-            # old comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
-            # documented the cycle-6 P0 it was written to fix; an editor trusting it would "restore"
-            # a cold-path-less predicate and refuse every fixer for ever. The `unmeasured` default is
-            # kept as a defensive floor for the arm that cannot reach the read — precisely because the
-            # exact verdict also rides the `[ci-queue] DEFERRED …` line above, verbatim.
-            ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-              echo $((NFC + 1)) > "$CF"
-              echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
+            # ⛔ ONE PREDICATE, ONE SITE: THE QUEUE GATE NESTS INSIDE THE ELIGIBILITY IT QUALIFIES
+            # (#2333 cycle 7 P2, kept through the merge with main). Evaluated as a separate `elif`
+            # the predicate would be duplicated — and a duplicated predicate is what lets the DEFER
+            # arm drift from the SPAWN arm it is supposed to mirror: evaluated in the other order, a
+            # box with every fix lane busy AND a deep queue reported `ci-queue(deep(…))` as the
+            # binding reason and never printed its own `NO fixer slot` diagnosis, a disposition the
+            # capacity gate — not the queue — was binding. Nested, the deferral is reachable ONLY
+            # through the spawn's own predicate, so a non-eligible PR can never be reported as
+            # deferred, and no second copy can drift. (The review-gate fixer arm below cannot nest —
+            # it is a two-arm `if`/`elif` chain — so it hoists `_fix_eligible` for the same reason;
+            # see its own ⛔.) It also keeps ONE comparison against the drain-aware `$MF` per spawn
+            # site, which is the count `test-gates.sh` asserts as "every fixer spawn site uses the
+            # drain-aware budget" — a second copy of the comparison is not a second spawn site.
+            if ciq_push_ok; then
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+                echo $((NFC + 1)) > "$CF"
+                echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
+              else
+                echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
+              fi
             else
-              echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
+              # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
+              # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
+              # finish inside its own lease and (b) invalidate this PR's head-bound review record —
+              # the attestation is bound to a SHA, so the push destroys the artifact it exists to
+              # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
+              # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
+              # read decides again — that is what makes the deferral non-sticky.
+              # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
+              # reads on the COLD path (`orch-loop.sh`'s predicate), and this arm is only reached
+              # *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The old
+              # comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
+              # documented the cycle-6 P0 it was written to fix; an editor trusting it would
+              # "restore" a cold-path-less predicate and refuse every fixer for ever. The
+              # `unmeasured` default is kept as a defensive floor for the arm that cannot reach the
+              # read — precisely because the exact verdict also rides the `[ci-queue] DEFERRED …`
+              # line above, verbatim.
+              ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             fi
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
@@ -3486,24 +3496,28 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
-          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then
-            # Same eligibility-carrying arm as the CONFLICTED site above (#2333 cycle 7, P2): a deep
-            # queue is the BINDING reason only for a PR that could otherwise have spawned.
-            # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
-            # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
-            # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
-            # for a cycle in which nothing was even started.
-            ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-            disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
-              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
+            # ONE PREDICATE, ONE SITE — the CONFLICTED arm above carries the full reasoning (#2333
+            # cycle 7 P2): the queue decision nests inside the eligibility it qualifies, so a deep
+            # queue is the BINDING reason only for a PR that could otherwise have spawned, and there
+            # is no second copy of the `$MF` comparison to drift from this one.
+            if ciq_push_ok; then
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+                echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+                echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
+              else
+                echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
+              fi
             else
-              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
+              # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
+              # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
+              # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
+              # for a cycle in which nothing was even started.
+              ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             fi
           else
             echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
