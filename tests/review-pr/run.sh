@@ -70,6 +70,11 @@
 #      resolved by running it (`sha256sum`, falling back to `shasum -a 256`)
 #   §AM an UNCOUNTED `ISSUES` verdict over findings the severity scan cannot label FAILS CLOSED
 #      (`ISSUES` is never read as `ISSUES 0`), and a printed dash-count (`ISSUES — 2`) survives
+#   §AN a numeral `0` immediately before a severity token is a ZERO CUE, not a reported finding (so
+#      `CLEAN — 0 P1, 0 P2 findings.` records instead of refusing itself), while a later non-zero
+#      count in the same line still blocks; and the `CLEAN — <prose>` separator is matched by a
+#      NON-ALNUM class rather than a multibyte bracket expression, so the arm still fires under
+#      `LC_ALL=C` (a bracket expression is a BYTE there) while `CLEAN-UP` stays prose in both locales
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -193,18 +198,25 @@ case "$cmd" in
         # A huge diff is GENERATED here, never carried through the environment: a
         # 200 KB exported variable is itself past the single-string exec limit on this
         # box, which would test the harness instead of the seam (§P).
-        if [ -n "${FIXTURE_DIFF_BYTES:-}" ]; then
-          printf 'diff --git a/big b/big\n'
-          if [ "${FIXTURE_DIFF_MULTIBYTE:-0}" = "1" ]; then
-            awk -v n="$FIXTURE_DIFF_BYTES" 'BEGIN { for (i = 0; i < n; i++) printf "\342\206\222" }'
+        # ⛔ AND WHAT WAS SERVED IS ALSO ON DISK (P2, tenth fresh review of #2288): the tail proof now
+        # binds a PER-RUN NONCE, so a scenario cannot hardcode the digest any more — the fake reviewer
+        # must compute it from the nonce in its own prompt and the tail of the diff it actually
+        # fetched, which is what a real reviewer does. §AL drives both directions.
+        {
+          if [ -n "${FIXTURE_DIFF_BYTES:-}" ]; then
+            printf 'diff --git a/big b/big\n'
+            if [ "${FIXTURE_DIFF_MULTIBYTE:-0}" = "1" ]; then
+              awk -v n="$FIXTURE_DIFF_BYTES" 'BEGIN { for (i = 0; i < n; i++) printf "\342\206\222" }'
+            else
+              head -c "$FIXTURE_DIFF_BYTES" /dev/zero | tr '\0' 'x'
+            fi
+            printf '\n'
           else
-            head -c "$FIXTURE_DIFF_BYTES" /dev/zero | tr '\0' 'x'
+            printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}"
           fi
-          printf '\n'
-        else
-          printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}"
-        fi
-        [ -f "$TMP/diff-body" ] && cat "$TMP/diff-body"
+          [ -f "$TMP/diff-body" ] && cat "$TMP/diff-body"
+        } > "$TMP/served-diff.txt"
+        cat "$TMP/served-diff.txt"
         exit 0 ;;
       comment)
         # Each posted comment is kept UNDER ITS OWN NAME (the seam posts a notes comment
@@ -249,7 +261,21 @@ printf 'GATEKEY=%s\n' "$(if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then printf presen
 [ "${FIXTURE_FLIP_DIFF:-0}" = "1" ] && printf 'diff --git a/x b/x\n+BASE RETARGETED\n' > "$TMP/diff-body"
 # A head move DURING the review (the caller must refuse to record it).
 [ -n "${FIXTURE_MOVE_HEAD_TO:-}" ] && printf '%s\n' "$FIXTURE_MOVE_HEAD_TO" > "$TMP/head"
-cat "$TMP/reviewer-out" 2>/dev/null
+# ⛔ THE REVIEWER COMPUTES ITS PROOF FROM WHAT IT FETCHED (P2, tenth fresh review of #2288). The
+# expected value is sha256(per-run nonce + full diff tail) and the nonce is in the prompt, so a
+# scenario can no longer hardcode a digest: it writes `diff-tail: @TAILPROOF@` and this fake — the
+# stand-in for a reviewer that DID fetch — mixes the nonce it was given with the tail the fake gh
+# served. A stub that cannot compute leaves the placeholder in place, which the seam must refuse.
+if [ -f "$TMP/reviewer-out" ] && grep -q '@TAILPROOF@' "$TMP/reviewer-out" 2>/dev/null; then
+  nonce="$(sed -n 's/^[[:space:]]*run-nonce:[[:space:]]*//p' "$TMP/pi-prompt.txt" 2>/dev/null | tail -1 | tr -d ' \r')"
+  tail_line="$(tr -d '\r' < "$TMP/served-diff.txt" 2>/dev/null | awk 'NF{last=$0} END{print last}')"
+  proof="$(printf '%s%s' "$nonce" "$tail_line" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$proof" ] || proof="$(printf '%s%s' "$nonce" "$tail_line" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
+  sed "s/@TAILPROOF@/$proof/g" "$TMP/reviewer-out" > "$TMP/reviewer-out.expanded" 2>/dev/null \
+    && cat "$TMP/reviewer-out.expanded"
+else
+  cat "$TMP/reviewer-out" 2>/dev/null
+fi
 exit "${FIXTURE_PI_RC:-0}"
 EOF
 
@@ -305,7 +331,7 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" "$TMP/pi-cwd.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body" "$TMP/pr-repo.log"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt" "$TMP/diff-body" "$TMP/pr-repo.log" "$TMP/served-diff.txt" "$TMP/reviewer-out.expanded"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
@@ -327,7 +353,7 @@ reset() {
   FIXTURE_ISSUE_BODY="the linked issue body"
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
   FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
-  unset RECORDER_OVERRIDE GH_REPO
+  unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL
 }
 
 # run <script> [args...] — drives the REAL script under the fakes.
@@ -340,6 +366,7 @@ run() {
   HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" \
     REVIEW_PR_RECORD_SH="${RECORDER_OVERRIDE:-$TMP/bin/fake-record}" \
     AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
+    LC_ALL="${RUN_LC_ALL-}" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
 }
@@ -688,7 +715,7 @@ no_comment; ck $? "no comment posted"
 
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(head -c 200000 /dev/zero | tr '\0' 'x')" | fixture_sha256)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
+reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "still reviews (rc=$(rc_of)) — a huge diff is not fatal"
 # The PROPERTY is what matters, not which branch delivered it: the oversized payload
@@ -714,7 +741,7 @@ done
 if [ -z "$UTF8_OK" ]; then
   fail "PROMPT_MAX re-compose arm SKIPPED: this box has no UTF-8 locale, so a multi-byte diff cannot be built (the branch is untested here)"
 else
-reset; printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' "$(awk 'BEGIN { for (i = 0; i < 60000; i++) printf "\342\206\222" }')" | fixture_sha256)" > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
+reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
 LC_ALL="$UTF8_OK" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
 case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
@@ -871,6 +898,24 @@ for prose in 'P0: 0 — none.' 'P1: 0 (verified against the full diff).' 'P1: 0 
   reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
   run "$SRC" 2284
   [ "$(rc_of)" = "0" ]; ck $? "  a gloss/note tail with NO blocking pair does NOT block: '${prose:0:30}…' (rc=$(rc_of))"
+done
+# ⛔ ROUND 10 — THE SEVERITY VOCABULARY (P2, tenth fresh review of #2288). The prompt and this repo
+# own code-review skill name severity in WORDS, and the scanner only ever looked for `P<n>`: a
+# findings report in the skill own vocabulary that closed `CLEAN` was certified clean — measured at
+# the reviewed head for all four decorated forms below (rc 0, signed record, CLEAN artifact).
+# The counter-direction is the reason the word is not matched bare: `Only HIGH-confidence issues` and
+# `**High** confidence …` are clean summaries that USE the word without labelling a finding, and
+# refusing them is the paid loop this tool exists to remove.
+for form in '- [High] scripts/x.sh:12 — the guard returns 0 on a failed read' '- [Medium] tests/y.sh:7 — the fixture is vacuous' '- [Blocker] scripts/x.sh:12 — the guard returns 0' '- **[Critical]** scripts/x.sh:12 — the guard returns 0' '**High** — the guard returns 0 on a failed read' 'Severity: high — this ships a red gate that reports green' 'Priority: critical — the recorder is bypassed'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  a SEVERITY-WORD finding blocks CLEAN (rc=$(rc_of)): '${form:0:34}…'"
+  no_record; ck $? "  …nothing recorded"
+done
+for prose in 'Only HIGH-confidence, real issues were considered.' '**High** confidence that the flagged guard is sound.' 'Per the contract, severities are high, medium and low.' 'No [High] findings — I checked the changed files.' 'No significant findings; the high-risk path is covered.'; do
+  reset; printf '%s\nCLEAN\n' "$prose" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "  a clean summary that only USES a severity word does NOT block: '${prose:0:30}…' (rc=$(rc_of))"
 done
 # ⛔ ROUND 7 — the CUE. A label ALONE is not evidence: `No [P1] findings; …` (clean) and
 # `- Finding: [P1] …` (blocking) are structurally identical — decorated token, mid-line, no
@@ -1449,7 +1494,7 @@ run "$SRC" 2284
 [ "$(rc_of)" = "3" ]; ck $? "a truncated diff ending on a SHORT line still DEMANDS the proof (rc=$(rc_of))"
 no_record; ck $? "  …nothing recorded"
 reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-printf 'diff-tail: %s\nCLEAN\n' "$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | fixture_sha256)" > "$TMP/reviewer-out"
+printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "…and the correct SHORT-line digest records (rc=$(rc_of))"
 # …while a diff that FITS needs no proof at all: the requirement is scoped to truncation, not to
@@ -1462,18 +1507,31 @@ run "$SRC" 2284
 # pass the proof and mint a clean record — the exact false PASS the handshake exists to prevent. The
 # prompt now states what to COMPUTE; the expected value is asserted absent from the prompt bytes.
 reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-EXPECT_DIGEST="$(printf '%s\n' '+[ "$FAIL" -eq 0 ]' | fixture_sha256)"
-printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "the computed digest is accepted (rc=$(rc_of))"
+# ⛔ THE NONCE IS DISCLOSED AND THE ANSWER IS NOT (P2, tenth fresh review of #2288). The digest binds a
+# per-run nonce, so the prompt may (and must) carry the nonce while the digest stays absent — which is
+# what makes an echoed instruction line, or a digest planted in the PR body, unable to satisfy it.
+NONCE_IN_PROMPT="$(sed -n 's/^[[:space:]]*run-nonce:[[:space:]]*//p' "$TMP/pi-prompt.txt" 2>/dev/null | tail -1 | tr -d ' \r')"
+[ -n "$NONCE_IN_PROMPT" ]; ck $? "…and the prompt discloses a per-run nonce (got: '${NONCE_IN_PROMPT:0:12}…')"
+EXPECT_DIGEST="$(printf '%s%s' "$NONCE_IN_PROMPT" '+[ "$FAIL" -eq 0 ]' | fixture_sha256)"
 if grep -qF "$EXPECT_DIGEST" "$TMP/pi-prompt.txt"; then rc=1; else rc=0; fi
-ck $rc "…and the expected digest appears NOWHERE in the reviewer prompt (it cannot be echoed)"
+ck $rc "…and the expected DIGEST appears NOWHERE in the reviewer prompt (it cannot be echoed)"
+# …and the nonce is FRESH: a constant one is a public value again, so the token would be reusable
+# across runs (and a body written against a prior run would satisfy the next one).
+NONCE_A="$NONCE_IN_PROMPT"
+rm -rf "$TMP/home/.pi/agent/reviews"   # a second run at an already-recorded head exits 5 before composing
+printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+NONCE_B="$(sed -n 's/^[[:space:]]*run-nonce:[[:space:]]*//p' "$TMP/pi-prompt.txt" 2>/dev/null | tail -1 | tr -d ' \r')"
+[ -n "$NONCE_B" ] && [ "$NONCE_A" != "$NONCE_B" ]; ck $? "…and the nonce differs on every run (it is not a constant)" 
 if grep -qF 'diff-tail:' "$TMP/pi-prompt.txt"; then rc=0; else rc=1; fi
 ck $rc "…while the PROOF LINE ITSELF is still requested by name"
 # …and a correct digest WRAPPED IN MARKUP is still correct: the extracted value is normalised to hex
 # (P3, sixth fresh review), so a backticked digest is not misdiagnosed as 'a different change'.
 reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-printf 'diff-tail: `%s`\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+printf 'diff-tail: `@TAILPROOF@`\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a backticked correct digest is accepted (rc=$(rc_of))"
 # ⛔ A FENCED QUOTE IS NOT A FINDING (P2, sixth fresh review): a clean review that quotes this tool own
@@ -1512,7 +1570,7 @@ if command -v shasum >/dev/null 2>&1; then
   mkdir -p "$TMP/nosha"
   printf '#!/bin/sh\nexit 1\n' > "$TMP/nosha/sha256sum"; chmod +x "$TMP/nosha/sha256sum"
   reset; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""; printf '+[ "$FAIL" -eq 0 ]\n' > "$TMP/diff-body"
-  printf 'diff-tail: %s\nCLEAN\n' "$EXPECT_DIGEST" > "$TMP/reviewer-out"
+  printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"
   PATH="$TMP/nosha:$PATH" run "$SRC" 2284
   [ "$(rc_of)" = "0" ]; ck $? "a box without sha256sum still computes the proof via shasum (rc=$(rc_of))"
   if grep -qF 'shasum -a 256' "$TMP/pi-prompt.txt"; then rc=0; else rc=1; fi
@@ -1539,6 +1597,54 @@ else
 fi
 
 echo
+# ── §AN a numeral ZERO is a zero cue, and the verdict separator is LOCALE-independent ──
+echo; echo "§AN a numeral 0 is a clean closer, in any locale"
+# Two P2s from a fresh review of #2288. Both are the OVER-BLOCK direction, and both cost a paying
+# lane a whole re-run into the same refusal because the prompt is rebuilt identically: a genuine
+# CLEAN is read as a self-contradiction, or as no verdict at all.
+#
+# (1) `negpre` — the zero/negation vocabulary — was WORD-ONLY (`no|not|none|nil|zero|without`), so
+# the most compact clean closer, `CLEAN — 0 P1, 0 P2 findings.`, was read as a USE of P1/P2 and
+# refused (exit 7, nothing posted, nothing recorded). `0` is not a word, and it is the form a
+# reviewer actually prints.
+reset; printf 'Nothing blocks.\nCLEAN — 0 P1, 0 P2 findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "'CLEAN — 0 P1, 0 P2 findings.' is CLEAN, not a self-contradiction (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record IS written (a paid review is not discarded)"
+# The counter-direction, because the fix must exempt only the token the zero PRECEDES: a later
+# non-zero count is still a reported blocker.
+reset; printf 'Two blockers.\nCLEAN — 0 P1, 2 P2 findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  …but 'CLEAN — 0 P1, 2 P2' still blocks on the P2 (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# (b4) the MIRROR grammar, a non-zero count BEFORE the token. This one was already broken and had
+# no failing case: every count arm read what FOLLOWED a token, so `CLEAN — 2 P2 findings.` recorded
+# clean. It only became visible here because the `0` cue lets a two-token line reach its second
+# token — the comma arm used to fire on the first one and block the line for the wrong reason.
+reset; printf 'Two blockers.\nCLEAN — 2 P2 findings.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  …and a count BEFORE the token ('CLEAN — 2 P2 findings.') blocks (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+#
+# (2) `VD_CLEAN`'s separator arm was a multibyte bracket expression (`[—–-]`). A bracket expression
+# matches ONE CHARACTER and a POSIX C-locale character is a BYTE, so on a box with no UTF-8 locale
+# (a service, a cron, an unattended runner — LANG/LC_* simply unset) the class consumed a single
+# byte of the em dash and the following `[[:space:]]+` could never match: measured, `CLEAN — no
+# blocking findings.` parses under C.UTF-8 and exits 6 "NO VERDICT" under LC_ALL=C. That is the one
+# decorated form the arm exists for, dead exactly where an unattended lane runs.
+reset; printf 'Nothing blocks.\n**CLEAN — no blocking findings.**\n' > "$TMP/reviewer-out"
+RUN_LC_ALL=C; run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "under LC_ALL=C a decorated 'CLEAN — …' is still a verdict (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and it records (no paid review lost to a missing locale)"
+# …and the hyphen rule the arm must NOT weaken, in the same locale: `CLEAN-UP` is prose.
+reset; printf 'Cleaning up.\nCLEAN-UP: see below\n' > "$TMP/reviewer-out"
+RUN_LC_ALL=C; run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "  …while a hyphenated 'CLEAN-UP' is still NOT a verdict under C (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+
+# ── end §AN ────────────────────────────────────────────────────────────────
+
+echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. Re-set from a MEASURED total
@@ -1561,18 +1667,19 @@ echo
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 447 here and the RESULT line then
-# prints 448. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 478 here and the RESULT line then
+# prints 479. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ THE MARGIN WAS 49 ASSERTIONS AND IS NOW 1 (P3, fresh review of #2288): at 374 against 423, deleting
 # §AH + §AL (48 assertions) still left 375 >= 374 and the suite reported green — the exact
 # "a whole section was deleted and the suite still said ALL PASSED" failure the pin exists for. Re-set
 # from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim. It was
-# re-set to 447 when §ROUND 9 added 17 assertions, for the same reason: a pin with slack lets that
-# section be deleted silently.
+# re-set to 447 when §ROUND 9 added 17 assertions and again to 478 when §ROUND 10 and the
+# nonce-bound tail proof added 32, for the same reason: a pin with slack lets that section be deleted
+# silently.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 447 ]; ck $? "assertion-count pin: >= 447 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 478 ]; ck $? "assertion-count pin: >= 478 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

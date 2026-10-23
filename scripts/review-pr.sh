@@ -385,6 +385,12 @@ DIFF_TRUNCATED=0
 # the check: a reviewer that fetched nothing recorded a clean attestation with rc=0, which is the
 # precise false PASS this handshake exists to prevent. The prompt now states what to COMPUTE and how;
 # only the caller holds the value.
+# ⛔ AND IT BINDS A PER-RUN NONCE (P2, tenth fresh review of #2288). `sha256(tail)` alone is a function
+# of PUBLIC data: the PR body is inlined verbatim into the prompt and the author can put the tail digest
+# in it, so a transcript that echoed the body satisfied the proof without any fetch — while the artifact
+# called it "PROVED the fetch happened". The expected value is now `sha256(nonce + tail)` with a
+# nonce minted per run AFTER the body was read, so no text supplied by the PR can carry the answer and
+# it cannot be computed from the prompt (which holds the nonce but never the tail).
 # ⛔ PORTABLE DIGEST TOOL (P2, sixth fresh review): this file is farmed to macOS boxes (see the
 # `mktemp` and `timeout` notes below), where `sha256sum` does not exist — a hardcoded one yields an
 # empty token for every oversized diff and the run dies AFTER the review was paid for. Resolved once.
@@ -399,6 +405,7 @@ elif printf 'probe\n' | shasum -a 256 >/dev/null 2>&1; then
 fi
 DIFF_TAIL=""
 DIFF_LASTLINE=""
+DIFF_NONCE=""
 DIFF_TAIL_CAUSE=""
 # TAIL_REQUIRED is the PROMPT-side flag: set only by the truncation branches, and it never carries the
 # expected value (the prompt must not disclose what it is checking).
@@ -417,8 +424,14 @@ compute_diff_tail() {
     DIFF_TAIL_CAUSE="neither 'sha256sum' nor 'shasum -a 256' is installed on this box, so the truncation proof cannot be computed"
     return
   fi
+  # The per-run nonce. `od` is POSIX; the RANDOM/date fallback keeps a minimal box able to compute a
+  # token rather than dying after the review was paid for (an empty nonce would make the proof a
+  # function of public data again, so it is never left empty).
+  DIFF_NONCE="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ -n "$DIFF_NONCE" ] || DIFF_NONCE="$(printf '%04x%04x%04x%04x' "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}" "${RANDOM:-0}")"
+  [ -n "$DIFF_NONCE" ] || DIFF_NONCE="$(date +%s%N 2>/dev/null | tr -cd '0-9')"
   # shellcheck disable=SC2086  # SHA_CMD is a resolved command line, not a single word.
-  DIFF_TAIL="$(printf '%s\n' "$DIFF_LASTLINE" | $SHA_CMD | cut -d' ' -f1)"
+  DIFF_TAIL="$(printf '%s%s' "$DIFF_NONCE" "$DIFF_LASTLINE" | $SHA_CMD | cut -d' ' -f1)"
 }
 if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
@@ -567,13 +580,15 @@ $(if [ -n "$t" ]; then cat <<TAIL
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
 The diff inlined above is NOT the whole change. Fetch the remainder yourself, then print ONE
 line immediately BEFORE your verdict line, and nothing else on it:
-  diff-tail: <the SHA-256 of the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>
-Compute the value YOURSELF with:
-  gh pr diff $PR --repo $REPO | tr -d '\r' | awk 'NF{last=$0} END{print last}' | $SHA_CMD | cut -d' ' -f1
+  diff-tail: <the SHA-256 of THIS RUN'S NONCE followed immediately by the FULL diff's final NON-EMPTY line — COMPUTE it, do not copy this>
+This run has a fresh random nonce, different on every run:
+  run-nonce: $DIFF_NONCE
+Mix it in EXACTLY as the command below does (nonce FIRST, no separator):
+  gh pr diff $PR --repo $REPO | tr -d '\r' | awk -v n='$DIFF_NONCE' 'NF{last=$0} END{printf "%s%s", n, last}' | $SHA_CMD | cut -d' ' -f1
 The caller holds the expected value and compares it exactly: a missing or different value means this
 review never covered the rest of the change, so it is DISCARDED — no comment, no record — rather than
-recorded against a diff nobody read. (The value is NOT given to you anywhere in this prompt, so
-echoing these instructions cannot satisfy it.)
+recorded against a diff nobody read. (The expected DIGEST is NOT given to you anywhere in this prompt:
+the nonce above is useless without the full diff's final line, which is only in the fetched remainder.)
 TAIL
 fi)
 EOF
@@ -767,7 +782,21 @@ fi
 #     `CLEAN:` and `CLEAN — <prose>` qualify; a HYPHENATED continuation (`CLEAN-UP`) does not,
 #     because the `-` must be followed by a space. The token is UPPERCASE — that is the contract
 #     the prompt states and what separates a verdict from prose.
-VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[—–-][[:space:]]+)'
+# ⛔ THE SEPARATOR CLASS MUST NOT BE A MULTIBYTE LITERAL (P2, fresh review of #2288). This
+# arm was written as `[—–-][[:space:]]+`, which is a POSIX bracket expression: a bracket
+# expression matches ONE CHARACTER, and in the C/POSIX locale a character is a BYTE. So on a
+# box with no UTF-8 locale (`LANG`/`LC_*` unset — a service, a cron, a minimal container, the
+# normal state for an unattended runner) the class matched a single 0xE2/0x80/0x94 byte, the
+# following `[[:space:]]+` then required whitespace that was not there, and the arm could NEVER
+# fire — measured: `CLEAN — no blocking findings.` parsed under C.UTF-8 and exited 6 "NO
+# VERDICT" under LC_ALL=C. The one decorated form this arm exists for (a ninth review added it
+# because `CLEAN — …` was rejected) was therefore inert exactly where an unattended lane runs,
+# and the operator was told the reviewer produced no verdict when it had. A NEGATED class of
+# one-or-more non-alphanumeric non-space characters matches a whole decoration in EITHER locale
+# (`—` as one character in UTF-8, three bytes in C), so the separator no longer depends on a
+# locale being present. The hyphen rule is preserved: `CLEAN-UP` still fails, because the class
+# is followed by `[[:space:]]+` and `-UP` has no space after it.
+VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[^[:alnum:][:space:]]+[[:space:]]+)'
 # ⛔ THE SHAPE MUST ACCEPT WHAT THE COUNT READER DOCUMENTS (P2, fresh review of #2288). The
 # count reader (`${LAST_LC#*issues}` + the separator class) and the comments in the count block
 # both name `ISSUES — 2` / `ISSUES — 0 × P1` as the realistic report closer, but THIS shape
@@ -1089,11 +1118,32 @@ function counts_only(r,   guard, seen) {
 function noun() { return "(findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major)" }
 function nittag(s) { return (s ~ /^[[:space:]]*[*_`]*(\()?\[(nit|note|optional|informational|suggestion)[)\]][[:space:]]*:/ || s ~ /^[[:space:]]*[*_`]*\((nit|note|optional|informational|suggestion)\)/) }
 function sepafter(s) { return (s ~ /^[[:space:]*_`]*[][):.,;—–-]/) }
-function label(s,   a, b, pre, post) {
+function label(s,   a, b, pre, post, sl) {
   LS = 0; LE = 0; DEC = 0; NOUN_CUE = 0
   # (a) DECORATED shapes — bracketed, parenthesised, bolded/italicised
   if (match(s, /[\[(][Pp][0-2][\])]/)) { LS = RSTART; LE = RSTART + RLENGTH - 1; DEC = 1 }
   if (match(s, /(\*\*|__)[[:space:]]*[Pp][0-2][[:space:]]*(\*\*|__)/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
+  }
+  # ⛔ A SEVERITY WORD IS A LABEL VOCABULARY TOO (P2, tenth fresh review of #2288). The prompt and
+  # the repo code-review skill name severity in WORDS (`- [High] …`, `**Blocker** — …`,
+  # `Severity: high — …`), and the scanner only ever looked for `P<n>` — so a findings report written
+  # in the skill vocabulary that closed `CLEAN` was certified clean (measured: `- [High]
+  # scripts/x.sh:12 — the guard returns 0 on a failed read`, rc 0, signed record, CLEAN artifact).
+  # The WORD is a label only in a DECORATED span or after a `severity:`/`priority:` slot AND with a
+  # separator or a `path:line` after it, so a clean summary that merely uses the word
+  # (`**High** confidence in the clean result`, `Only HIGH-confidence issues`) stays a mention.
+  sl = tolower(s)
+  if (match(sl, /[\[(][[:space:]]*(critical|high|major|blocker|medium)[[:space:]]*[\])]/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    if ((substr(sl, b + 1) ~ /^[[:space:]]*[]):.,;—–-]/ || substr(sl, b + 1) ~ /[[:alnum:]_\/.-]+:[0-9]+/) && (LS == 0 || a < LS)) { LS = a; LE = b; DEC = 1 }
+  }
+  if (match(sl, /(\*\*|__)[[:space:]]*(critical|high|major|blocker|medium)[[:space:]]*(\*\*|__)/)) {
+    a = RSTART; b = RSTART + RLENGTH - 1
+    if ((substr(sl, b + 1) ~ /^[[:space:]]*[]):.,;—–-]/ || substr(sl, b + 1) ~ /[[:alnum:]_\/.-]+:[0-9]+/) && (LS == 0 || a < LS)) { LS = a; LE = b; DEC = 1 }
+  }
+  if (match(sl, /(severity|priority)[[:space:]]*[:=][[:space:]]*[`*_]*(critical|high|major|blocker|medium)([^[:alnum:]]|$)/)) {
     a = RSTART; b = RSTART + RLENGTH - 1
     if (LS == 0 || a < LS) { LS = a; LE = b; DEC = 1 }
   }
@@ -1126,7 +1176,17 @@ function label(s,   a, b, pre, post) {
       if (a > 2 && substr(s, a - 2, 2) ~ /(\*\*|__)/ && substr(s, b + 1, 2) ~ /(\*\*|__)/) deco = 1
       if (deco) { rs = b + 1; continue }
       pre = tolower(substr(s, 1, a - 1)); post = substr(s, b + 1)
-      negpre = (pre ~ /(^|[^[:alnum:]])(no|not|none|nil|zero|without)[[:space:]*_`]*$/)
+      # ⛔ THE NUMERAL `0` IS A ZERO CUE TOO (P2, fresh review of #2288). The vocabulary was
+      # word-only (`no|not|none|nil|zero|without`), so the most compact clean closer —
+      # `CLEAN — 0 P1, 0 P2 findings.` — was read as a USE of P1/P2 rather than a zero mention,
+      # measured: the scanner printed that line as a blocking finding, the contradiction gate
+      # then refused the CLEAN (exit 7, nothing posted, nothing recorded), and because the prompt
+      # is rebuilt identically a re-run reproduced the same refusal — a paid review into the same
+      # wall, the exact loop this tool exists to remove. `0` cannot over-exempt: the `(^|[^[:alnum:]])`
+      # guard means the `0` in `10`, `20` or `P10` is preceded by an alphanumeric and never
+      # matches, and only the IMMEDIATELY preceding token is consulted, so `0 P1, 1 P2` still
+      # blocks on the P2.
+      negpre = (pre ~ /(^|[^[:alnum:]])(no|not|none|nil|zero|without|0)[[:space:]*_`]*$/)
       if (s ~ /^[[:space:]]*\|/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       if (!negpre && pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[:=—–][[:space:]]*[`*_]*[[:space:]]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       if (!negpre && pre ~ (noun() "([[:space:]]*[0-9]+)?[[:space:]]*[(\[*_`]*$") && sepafter(post)) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
@@ -1155,6 +1215,15 @@ function label(s,   a, b, pre, post) {
       # preceding boundary matters just as much: without it the `1` of `P0/P1/P2` read as a
       # multiplier and a pinned CLEAN (`Per the contract: P0/P1/P2 block.`) started to block.
       if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*([^[:alnum:][:space:]]+|[xX])[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # (b4) A NON-ZERO COUNT IMMEDIATELY BEFORE THE TOKEN — `2 P2 findings`, `Found 2 P1 issues`,
+      # `CLEAN — 2 P2 findings.` (P2, this review). Every count arm above reads what FOLLOWS a token,
+      # so the mirror grammar recorded clean over a stated contradiction in the reviewer output: measured,
+      # `CLEAN — 2 P2 findings.` and `CLEAN — 2 P1 findings.` produced NO blocking line and a `clean`
+      # record, while the same sentence with the count after the noun (`P2: 2 findings`) blocked. It
+      # was invisible until the numeral-zero cue below made the sibling form (`0 P1, 2 P2`) reach this
+      # token at all: the comma arm used to fire on the FIRST token and block the line for the wrong
+      # reason, so the missing arm had no failing case. Non-zero only — `0` is the cue, not a count.
+      if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
@@ -1512,14 +1581,16 @@ if [ "$VERDICT" = clean ]; then
       # ⛔ WHAT THIS SAYS ABOUT THE FETCH (P3, fresh review of #2288; CORRECTED again at P2, the
       # next round): it first said the remainder fetch was "NOT verifiable from here", which
       # contradicted an enforced check, and the correction then said the verdict covers the whole
-      # diff — which OVERSTATED that check. The `diff-tail:` digest proves a fetch was EXECUTED
-      # (the prompt hands the reviewer the exact one-line producer, which prints 64 hex and nothing
-      # else); it cannot prove the remainder was READ. The artifact now states exactly that, because
-      # this is the text `record-review.sh` accepts as review evidence.
+      # diff — which OVERSTATED that check. The `diff-tail:` digest proves the reviewer HELD the
+      # fetched tail line: it is sha256(per-run nonce + tail), so it cannot be precomputed from the
+      # prompt or from PR-supplied text (P2, tenth fresh review: `sha256(tail)` alone could be
+      # supplied by the inlined PR body and echoed). It cannot prove the remainder was READ (the
+      # producer prints 64 hex, not the diff). The artifact states exactly that, because this is the
+      # text `record-review.sh` accepts as review evidence.
       if [ "${DIFF_TRUNCATED}" = 2 ]; then
-        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself and PROVED the fetch happened: the `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. That check establishes that a fetch was executed; it cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "'"
+        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer fetched it itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "'"
       else
-        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself and PROVED the fetch happened: the `diff-tail:` digest of the full diff final line was verified against this diff before this comment existed. That check establishes that a fetch was executed; it cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
+        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
       fi
     fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
