@@ -76,6 +76,9 @@ mk_origin() {
 }
 mk_clone() { # <name> -> CLONE
     CLONE="$T/c-$1"
+    # Replace, never reuse: a second call for the same name would fail silently ("already exists") and
+    # leave $CLONE pointing at the OLD clone — a fixture that looks built and is not.
+    rm -rf "$CLONE"
     git clone -q "$T/o-$1" "$CLONE" >/dev/null 2>&1
     git -C "$CLONE" config user.email t@example.test
     git -C "$CLONE" config user.name t
@@ -311,6 +314,67 @@ assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT15" "T15 and the checkout fa
 assert_eq "$(git -C "$CLONE" status --porcelain | grep -c 'link' | tr -d ' ')" "0" \
     "T15 the symlink is no longer reported dirty (it really was replaced)"
 
+# ── T16: the unit's OWN environment is enough to run the pass (the #2416 P0) ──────────────────
+# MEASURED IN REVIEW: the rendered unit exports `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` while the
+# pass read only `HARNESS_REPO` / `HARNESS_REF`. Under systemd/launchd there is no AGENT_INFRA_PATH and
+# the farmed copy has no checkout beside it, so EVERY tick exited 23: the timer looked scheduled, the
+# pin never moved, and the box the feature exists for converged nothing. This runs the pass with `env
+# -i` and exactly the keys the artifact renders, and asserts the ARTIFACT (the record's ref/head), not
+# the output text.
+say_case "T16 the pass runs from the unit's own environment"
+mk_origin t16; mk_clone t16; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t16/state" "$T/t16/home"
+OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" \
+    HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=sync \
+    HARNESS_APPLY_STATE_DIR="$T/t16/state" HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+    bash "$PASS_SH" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T16 the pass resolves the checkout from HARNESS_APPLY_REPO alone"
+REC16="$(cat "$T/t16/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$REC16" "ref=$(printf '%s' "$(git -C "$T/o-t16" rev-parse main)" | cut -c1-12)" \
+    "T16 and the record names the ref the unit rendered (an artifact read, not a log line)"
+assert_absent "$OUT" "no checkout resolved" "T16 the P0 refusal text is absent"
+# ... and the same environment still HONOURS the direct-run names, so an operator's own invocation and
+# a unit-rendered one cannot resolve two different repos.
+OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main \
+    HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t16/state" \
+    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" bash "$PASS_SH" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T16 the direct-run names (HARNESS_REPO/HARNESS_REF) still work"
+
+# ── T17: what a dirty set actually contains — mode, spaces, and a rename ─────────────────────
+# Three shapes that each broke the restore while the pass reported success (all measured in review):
+# a 755 file came back 0644 (a staged MODE change, 207 such paths in this repo); a path with a space
+# was C-quoted by `--porcelain` so it was never restored; and a rename's `old -> new` sentence was read
+# as a path, leaving HEAD's side deleted and the destination staged for ever.
+say_case "T17 the dirty set survives mode, spaces and a rename"
+mk_origin t17
+write_sync_stub
+printf '#!/bin/sh\necho hi\n' >"$T/seed-t17/tool.sh"
+printf 'spaced\n' >"$T/seed-t17/has space.txt"
+chmod 755 "$T/seed-t17/tool.sh"
+git -C "$T/seed-t17" add tool.sh "has space.txt" >/dev/null 2>&1
+git -C "$T/seed-t17" -c user.email=t@example.test -c user.name=t commit -q -m "tool and a spaced name" >/dev/null 2>&1
+git -C "$T/seed-t17" push -q origin main >/dev/null 2>&1
+mk_clone t17
+REPO_P="$CLONE"; MODE_P=sync
+WANT17="$(advance_origin t17 A.txt "upstream for the dirty-set case")"
+git -C "$CLONE" mv A.txt RENAMED.txt >/dev/null 2>&1
+printf 'changed\n' >>"$CLONE/tool.sh"
+printf 'edited\n' >>"$CLONE/has space.txt"
+OUT="$(run_pass "$T/t17" 2>&1)"; RC=$?
+assert_eq "$RC" "10" "T17 the pass advances with a rename, an exec-bit edit and a spaced name dirty"
+assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT17" "T17 and the checkout fast-forwarded"
+assert_eq "$(git -C "$CLONE" ls-files | grep -c '^A.txt$' | tr -d ' ')" "1" \
+    "T17 HEAD's side of the rename is back in the index (the rename was not read as one path)"
+case "$(ls -l "$CLONE/tool.sh" 2>/dev/null)" in
+    -rwx*) ok "T17 the executable bit was restored with the content (not a staged MODE change)" ;;
+    *) bad "T17 the executable bit was LOST — the restored file is not 0755" ;;
+esac
+assert_eq "$(git -C "$CLONE" status --porcelain | grep -c '^ M tool.sh' | tr -d ' ')" "0" \
+    "T17 the executable is no longer reported dirty"
+assert_eq "$(cat "$CLONE/has space.txt")" "spaced" \
+    "T17 the path with a space was restored from HEAD (not skipped as an unresolvable pathspec)"
+
 # ── T3 + T5 + T8-T13: the INSTALLER ───────────────────────────────────────────────────────────
 # A shim that records every call, so "enabled" and "bootstrapped" are asserted on what the installer
 # DID, not on what it printed.
@@ -323,6 +387,8 @@ case "$*" in
   *is-active*)  echo "${SYSTEMCTL_ACTIVE:-active}" ;;
   *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 2min left Mon 2026-10-19 00:20:00 UTC 8min ago eldato-harness-apply.timer eldato-harness-apply.service" ;;
   *show-environment*) [ "${SYSTEMD_USER_OK:-1}" = 1 ] && exit 0 || exit 1 ;;
+  # `systemctl show -p LastTriggerUSec --value` — empty means "never fired" (a fresh install).
+  *show*LastTriggerUSec*) [ -n "${SYSTEMCTL_LAST_TRIGGER:-}" ] && echo "$SYSTEMCTL_LAST_TRIGGER" ; exit 0 ;;
   # `status` reads installation from the unit FILE, so the shim must too — a shim that answers 0 for
   # everything would make T10's post-uninstall check pass without the removal having happened.
   cat*) f="${*: -1}"; [ -f "${SYSTEMD_UNIT_DIR:-/nonexistent}/$f" ] && exit 0 || exit 1 ;;
@@ -401,6 +467,28 @@ mkdir -p "$T/t3/home/.pi/agent/state"
 OUT="$(inst3 --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8 --status fails when the last pass recorded a refusal"
 assert_contains "$OUT" "action=refused-ahead" "T8 and it shows the pass record it judged from"
+
+say_case "T8b a timer that HAS fired with no record is a failure, not a fresh install"
+# ⛔ THE OTHER HALF OF "status=never". A fresh install has no record because the first tick is pending —
+# a note. A timer whose OWN last trigger exists and which still has no record has a pass refusing before
+# it can write anything, and certifying that is the inert-enforcer false PASS. The scheduler's own
+# `LastTriggerUSec` is the only witness that distinguishes them (before this, the systemd arm could not,
+# while fleet-health.py alarmed on exactly that state).
+FRESH2="$T/t8b-units"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b the install itself succeeds on a box whose first tick has not happened"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b --status passes when the timer has never fired and no record exists"
+OUT="$(SYSTEMCTL_LAST_TRIGGER="Thu 2026-10-23 05:00:00 UTC" HOME="$T/t3/home" \
+    HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8b --status FAILS when the timer fired and left no record"
+assert_contains "$OUT" "HAS fired" "T8b and it says the timer fired with no record"
 
 say_case "T14 a STALE pass record is an alarm, not a healthy silence"
 mk_origin t14; mk_clone t14; write_sync_stub

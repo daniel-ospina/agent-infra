@@ -224,8 +224,8 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 99 assertions, run by the `harness-apply-timer`
-shard of `run-bash-shards.sh`:
+`scripts/harness-apply-timer.test.sh` — 126 assertions, run by the
+`harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
 |---|---|
@@ -245,6 +245,9 @@ shard of `run-bash-shards.sh`:
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
+
+| T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
+| T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename** — each of the three used to leave the tree dirty while the pass reported `advanced` |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`
