@@ -166,6 +166,15 @@ fi
 # from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
 # entirely. Nothing here is sticky — the marker describes one cycle, not a state.
 #
+# ⛔ THIS LANE NEVER RECLAIMS A LOCK, NOT EVEN A STALE ONE (review of PR #2576, P3). A reclaim is
+# `read owner -> is it live? -> rm -> write`, and the `rm` is NOT a CAS: two fixers that both read a
+# stale lock as dead each delete and re-create it, so the second may delete the FIRST one's LIVE
+# lock — after which the lander is excluded by nothing and the hole this block exists to close is
+# open again. A fixer's refusal is free (the attempt is refunded), so it needs no reclaim at all:
+# `claim_live()` removes a dead owner's claim at the next dispatch and the doctor's `merge` role
+# does the same when it retakes, so a stale lock costs this lane ONE re-decided cycle. Never a
+# deletion it cannot prove, for a cycle that costs nothing.
+#
 # ⛔ THE LOOSE-LIVENESS READ IS THE FLEET'S EXISTING CONVENTION, NOT A NEW ONE. "Any live pid holds"
 # is `claim_live`'s documented spawn-guard direction (a recycled pid means "do not spawn", one lost
 # cycle, nothing deleted) and the doctor's `merge` role reads the same file the same way. The
@@ -191,6 +200,10 @@ release_prlock() { # never removes a lock we do not own: a lander that outlived 
 # The refusal has the SAME three arms as the other two gates: the controller refunds by consuming
 # `fixbail-<PR>-<HEAD>`, and an empty HEAD (the cross-box marker's own documented hole) or a manual
 # run must not pretend to have booked one.
+# ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
+# surface onto this script — has to name the cause in the log the operator reads, exactly as it does
+# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
+# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
 prlock_defer() { # prlock_defer <why>
   echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
@@ -206,17 +219,14 @@ prlock_defer() { # prlock_defer <why>
 if PL_OWNER="$(prlock_live_owner)"; then
   prlock_defer "the LANDER owns this PR (state/mergeclaim-$PR.lock held by live pid $PL_OWNER) — a push now would move the head out from under the attestation it is landing"
 fi
-# A lock whose owner is NOT live is stale, not a refusal: take it over exactly as the lander does.
-# The LOCK IS NOT DELETED before the take, so the take is still a CAS rather than a clear-then-write
-# race; a lost race re-reads and defers if the winner is live.
+# ONE CAS, NO RECLAIM. A failed take means an owner exists (live, or dead-but-not-yet-reclaimed by
+# `claim_live`/the doctor). Either way this lane defers: see the block comment above for why a
+# reclaim is unsafe and why a deferred fixer costs nothing.
 if ! prlock_take; then
   if PL_OWNER="$(prlock_live_owner)"; then
     prlock_defer "the LANDER claimed this PR while this lane was starting (state/mergeclaim-$PR.lock held by live pid $PL_OWNER)"
   fi
-  rm -f "$PRLOCK" 2>/dev/null      # stale: an owner that is not live cannot be worked for
-  if ! prlock_take; then
-    prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) could not be taken and its holder is not live — refusing to push unserialised against a lander"
-  fi
+  prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) exists and its owner is not live — a stale claim is reclaimed by the controller's next dispatch (claim_live) or by the doctor's merge role, never deleted from here, because the delete is not a CAS and could take a live holder's lock"
 fi
 echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (no lander is in flight on this PR)" >> "$L.log"
 CROSS_OWN=""; CROSS_RC=0

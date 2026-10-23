@@ -447,7 +447,11 @@ export CIQ_GH="$RIG/bin/gh-queue"
 # PATH edit; the stub is therefore defined as an exported function as well as a file. The file stub
 # is KEPT because it is what the pre-export `drive` checks above resolve — and because dropping the
 # `export -f` below costs a RED control (fail-closed), never another silently-real agent.
-pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+# ⛔ AND WHETHER THE PR-OWNER LOCK WAS HELD WHILE IT RAN (review of PR #2576, P2). §9b's other
+# assertions are satisfied by a tree that takes the lock, RELEASES it immediately, and then runs
+# the agent that pushes — which is the whole defect. The lock must be held ACROSS the run, so the
+# only place that can witness it is the agent stub itself.
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; return 0; }
 export -f pi
 # ...and pin the MECHANISM, not only its effect: the whole fix rests on the function surviving into
 # the callers' environment, so assert it is there BY NAME. Otherwise a future edit that drops the
@@ -616,20 +620,40 @@ ck "...and leaves fixcount alone — the controller refunds, the fixer does not 
 ck "...and the LIVE lander's lock SURVIVES — a deferred fixer must never clear another worker's claim" $rc
 kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
 
-# A STALE lock (its owner is gone) is NOT a refusal: the fixer takes it over, runs, and hands the PR
-# to the chain ONLY after releasing it — otherwise merge-one.sh, which takes the same lock first,
-# exits "already owns this PR" and the fixer's own re-review never happens (#2132's strand).
+# A STALE lock (its owner is gone) is a DEFERRAL TOO, and the fixer must not delete it (review of PR
+# #2576, P3). A reclaim is `read owner -> is it live? -> rm -> write`, and the `rm` is NOT a CAS: two
+# fixers that both read the lock as dead each delete and re-create it, so the second can delete the
+# first one's LIVE lock — reopening the very hole this section exists to close. The stale claim is
+# reclaimed by `claim_live()` at the controller's next dispatch (and by the doctor's `merge` role),
+# so a deferral here costs one refunded cycle and nothing else.
 sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
 printf '%s\n' "$STALE_PID" > "$PRLOCK7"
-fix_argv; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
-{ [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
-ck "POSITIVE CONTROL: a STALE lock (owner not live) does not over-block — the fixer runs and the chain is re-run (rc=$plrc2)" $rc
-grep -q 'PR-owner lock: acquired' "$RO/logs/fix-7.log"; rc=$?
-ck "...and it says it TOOK the PR-owner lock over, so a takeover is not silent" $rc
+{ [ "$plrc2" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a STALE lock DEFERS this cycle too (rc=0, no agent, no chain) — a fixer never pushes unserialised (rc=$plrc2)" $rc
+grep -q 'DEFERRED: the PR-owner lock' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the stale-lock cause (a distinct token from the live-lander one)" $rc
+{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = "$STALE_PID" ]; }; rc=$?
+ck "...and does NOT delete the claim it did not take — a non-CAS reclaim can delete a LIVE holder's lock" $rc
+[ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and the deferral is refundable (bail marker for the head it saw)" $rc
+rm -f "$PRLOCK7"
+
+# POSITIVE CONTROL, and the assertion that pins the property the change exists for: with NO lock the
+# fixer runs, the lock is HELD WHILE THE AGENT RUNS, and it is RELEASED before the merge-one handoff
+# (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
+# fixer's own re-review — #2132's strand).
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
+{ [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
+grep -q PI_SAW_LOCK "$PI_LOG"; rc=$?
+ck "...and the lock is HELD WHILE THE AGENT RUNS — the property, not just the acquisition line" $rc
 { grep -q MERGE_ONE_RAN "$MERGE_LOG" && ! grep -q MERGE_ONE_SAW_LOCK "$MERGE_LOG"; }; rc=$?
-ck "...and it RELEASES the lock before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
+ck "...and it is RELEASED before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
 [ ! -f "$PRLOCK7" ]; rc=$?
 ck "...so no lock is left behind by a completed fixer run (a stale lock would defer the next cycle)" $rc
 unset -f gh; unset 'BASH_FUNC_gh%%'
@@ -673,6 +697,24 @@ ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
+# ⛔ ... AND A DEFERRAL IS NOT SUCCESS EITHER (#2576, review of PR #2576 P2). `fix-one.sh` now defers
+# (rc=0, nothing pushed) when a LANDER holds `mergeclaim-<PR>.lock`. `adopt-fix.sh` maps ITS OWN
+# deferrals to exit 79 precisely so an operator's `adopt-fix … && next` stops; a deferral it does not
+# recognise returns 0 and writes no line into `adopt-<PR>.log` — the log this wrapper exists to fill
+# (#1720) — so the operator sees SUCCESS for a fixer that did nothing and a chain that ran nothing.
+sleep 300 & ADOPT_LANDER=$!
+printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
+[ "$arc79" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
+grep -q 'PR-OWNER lock' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+kill "$ADOPT_LANDER" 2>/dev/null; wait "$ADOPT_LANDER" 2>/dev/null
+rm -f "$RO/state/mergeclaim-7.lock"
 # The DISK arm of the same wrapper: 77 must PROPAGATE too, and be named. A 75-only mapping would
 # report a full filesystem as "wait for the load to fall" — a remedy that cannot ever work.
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"

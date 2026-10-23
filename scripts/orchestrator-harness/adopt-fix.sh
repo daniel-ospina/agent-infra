@@ -40,6 +40,21 @@ elif [ "$rc" = "77" ]; then
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED by the CI-queue gate' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (CI-QUEUE gate) — the CI queue is deeper than the runners can drain, so nothing was pushed and no attempt was consumed; the depth is in $O/logs/fix-$PR.log. Re-run when it drains." >> "$O/logs/adopt-$PR.log"
   exit 79
+# ⛔ AND THE PR-OWNER LOCK IS THE FOURTH, NAMED FOR THE SAME REASON (review of PR #2576, P2).
+# `fix-one.sh` now defers — also rc=0, also nothing pushed — when a LANDER holds
+# `mergeclaim-<PR>.lock`, because a push there would move the head out from under the attestation the
+# lander is landing. Without this arm an operator reading `adopt-$PR.log` (the log THIS script exists
+# to fill, #1720) saw no line at all and got SUCCESS for a run that did nothing, and a `… && next`
+# chain took the wrong branch. It is 79 like the CI-queue deferral: a deferral stops the chain, and a
+# deferral that will clear by itself is exactly what 79 says.
+# The token is `DEFERRED: the LANDER` — `fix-one.sh`'s deferred line is `[fix <PR>] DEFERRED: <why>`, so
+# this matches the CAUSE, never a substring shared with the CI-queue wording above.
+elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the LANDER' "$O/logs/fix-$PR.log" 2>/dev/null; then
+  echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock) — a lander owns this PR right now (review/record/merge in flight), so nothing was pushed and no attempt was consumed; the holder and the reason are in $O/logs/fix-$PR.log. Re-run once the lander finishes (it lands the PR, or refuses and releases)." >> "$O/logs/adopt-$PR.log"
+  exit 79
+elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.log" 2>/dev/null; then
+  echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, STALE) — the lock exists and its owner is not live; this fixer does not reclaim it (a reclaim is not a CAS and could delete a live holder's lock), so nothing was pushed and no attempt was consumed. The controller's next dispatch reclaims a dead owner's claim; re-run then." >> "$O/logs/adopt-$PR.log"
+  exit 79
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with
