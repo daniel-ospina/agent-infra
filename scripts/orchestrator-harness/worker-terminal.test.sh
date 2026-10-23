@@ -451,7 +451,68 @@ out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
 [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
-ck "a keys.env that fails to source EXITS 98 (the worker never runs half-provisioned)" $rc
+ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
+# ⚠ The pin above is about the WORKER's shell, not about `wt_spawn`: `tmux new-session -d` returns 0 as
+# soon as the session object exists, so a worker that exits 98 in its first millisecond is still recorded
+# as started. That is pre-existing and wider than this PR (any fast-dying worker), so it is filed, not
+# smuggled in here: agent-infra#2447.
+# ⛔ BUT A BENIGN NON-ZERO LAST STATEMENT IS NOT A BROKEN FILE (review finding, 2026-10-23, measured).
+# The guard used to be `… && . FILE || exit 98`, which reads the status of the LAST COMMAND IN THE FILE —
+# so an ordinary operator line like `[ -d /x ] && export Y`, false and last, killed the worker AFTER it
+# had exported the token, on a spawn that returned 0 and wrote its record. The guard is now a PARSE
+# check in the sourcing dialect (`bash -n`, `sh -n` only when bash is absent) BEFORE the source, plus a
+# post-source credential re-check that fires only on a non-zero status — so this shape runs.
+rm -rf "$TMP/home-lastfalse" "$TMP/O4t2"; gh_hosts_fixture "$TMP/home-lastfalse"
+printf 'GH_TOKEN=ghp_ok\n[ -d /tmp/definitely-not-a-dir-2396 ] && export EXTRA=1\n' > "$TMP/home-lastfalse/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t2" "$TMP/home-lastfalse" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a keys.env whose LAST statement is false still runs the worker (a non-zero status is not fatal while a credential was exported)" $rc
+# ⛔ …AND A FILE THAT PARSES BUT ABORTS **BEFORE** THE TOKEN IS STILL FATAL (the other half, measured):
+# `return 1` is legal in a sourced file and `sh -n` accepts it, so a syntax pre-check alone would let the
+# source stop before the token assignment and run the worker credential-less on an rc=0 spawn. The guard
+# therefore re-checks the ENVIRONMENT after the source: non-zero status AND no credential ⇒ exit 98.
+# ⚠ NO hosts.yml on this HOME: with one, the environment would legitimately hold a credential through it
+# and running the worker would be correct — the case under test is the one where NOTHING does.
+rm -rf "$TMP/home-return" "$TMP/O4t3"; mkdir -p "$TMP/home-return"
+printf 'FOO=1\nreturn 1\nGH_TOKEN=ghp_ok\n' > "$TMP/home-return/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t3" "$TMP/home-return" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a keys.env that aborts BEFORE the token exits 98 (a parse check alone would have run it)" $rc
+# …and the same abort AFTER the token has been exported is NOT fatal — the environment holds the
+# credential the worker needs, which is the question the guard is asking.
+rm -rf "$TMP/home-return2" "$TMP/O4t4"; mkdir -p "$TMP/home-return2"
+printf 'GH_TOKEN=ghp_ok\nreturn 1\n' > "$TMP/home-return2/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t4" "$TMP/home-return2" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return2" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a keys.env that aborts AFTER exporting the token still runs the worker (a credential is present)" $rc
+# ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE TWO HALVES OF THIS GATE MUST AGREE ON THAT (review
+# finding, 2026-10-23, measured). `[ -z "$GH_TOKEN$GITHUB_TOKEN" ]` counted `GH_TOKEN='   '` as provision,
+# while the STATIC keys.env arm refuses whitespace (`[^[:space:]]`) — and gh rejects it at the first call.
+# The `$( )` spelling is what the static arm's documented residual lets through, so it is the shape that
+# reaches the dynamic guard at all.
+rm -rf "$TMP/home-ws" "$TMP/O4t5"; mkdir -p "$TMP/home-ws"
+printf 'GH_TOKEN="$(printf '\''   '\'')"\nfalse\n' > "$TMP/home-ws/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t5" "$TMP/home-ws" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-ws" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a WHITESPACE-only GH_TOKEN plus a non-zero source status exits 98 (blank is not a credential)" $rc
+# ⛔ THE PARSE CHECK MUST USE THE DIALECT THE FILE IS WRITTEN IN (review finding, 2026-10-23, measured):
+# `sh -n` on a dash box refuses a BASH-valid keys.env, and a refused spawn is forever (no session starts,
+# so nothing changes the answer) — the #2210 loop in a new disguise. bash decides when it exists.
+rm -rf "$TMP/home-bashy" "$TMP/O4t6"; mkdir -p "$TMP/home-bashy"
+printf 'GH_TOKEN=ghp_ok\nARR=(1 2)\n' > "$TMP/home-bashy/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t6" "$TMP/home-bashy" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-bashy" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a BASH-only syntax in keys.env is not refused by the pre-check (bash decides, not dash)" $rc
 # ⛔ A `hosts.yml` THAT IS A DIRECTORY IS NOT A CREDENTIAL (review finding): `-s` was true for any
 # object of non-zero size, and a directory has one. What refuses it here is the TOKEN READ — grep on a
 # directory fails, so the value test cannot pass (`[ -f ]` alone does not decide it, measured: with the
@@ -517,13 +578,19 @@ done
 # `home=…`, so the lane was recorded as started while it could never reach `gh`. That is the exact
 # silent dead lane #2210 records, reported as provisioned. Only a VALUE counts, the same rule the
 # keys.env arm already applies.
-rm -rf "$TMP/home-hostonly" "$TMP/home-braces" "$TMP/home-unreadable"
-mkdir -p "$TMP/home-hostonly/.config/gh" "$TMP/home-braces/.config/gh"
+rm -rf "$TMP/home-hostonly" "$TMP/home-braces" "$TMP/home-unreadable" "$TMP/home-emptyval" "$TMP/home-hashval"
+mkdir -p "$TMP/home-hostonly/.config/gh" "$TMP/home-braces/.config/gh" "$TMP/home-emptyval/.config/gh" "$TMP/home-hashval/.config/gh"
 printf 'github.com:\n    user: fixture\n    git_protocol: https\n' > "$TMP/home-hostonly/.config/gh/hosts.yml"
 printf '{}\n' > "$TMP/home-braces/.config/gh/hosts.yml"
+# ⛔ A VALUE IS NOT A QUOTED EMPTY, AND A COMMENT IS NOT A VALUE (review finding, 2026-10-23, measured):
+# the value regex accepted `#` as a character, so `oauth_token:   # redacted` — a YAML NULL, i.e. a file
+# that carries no token at all — read as provision. Driven against the shipped probe: `emptyval` and
+# `hashval` both come back `no oauth token found for github.com`.
+printf 'github.com:\n    user: fixture\n    oauth_token: ""\n' > "$TMP/home-emptyval/.config/gh/hosts.yml"
+printf 'github.com:\n    user: fixture\n    oauth_token:   # redacted\n' > "$TMP/home-hashval/.config/gh/hosts.yml"
 # An UNREADABLE hosts.yml is a refusal too (mode 000). Skipped as root, where 000 is readable and the
 # assertion would test the runtime user rather than the probe.
-unreadable_cases=(hostonly braces)
+unreadable_cases=(hostonly braces emptyval hashval)
 if [ "$(id -u)" != "0" ]; then
   gh_hosts_fixture "$TMP/home-unreadable"; chmod 000 "$TMP/home-unreadable/.config/gh/hosts.yml"
   unreadable_cases+=(unreadable)
@@ -538,12 +605,49 @@ for h in "${unreadable_cases[@]}"; do
   [ -f "$TMP/O-$h/state/worker-lane-8" ] && rc=1 || rc=0
   ck "…$h: and no worker record is left behind" $rc
 done
+# ⛔ THE FILE PROBE ITSELF, PINNED DIRECTLY (review finding, 2026-10-23). The loop above runs through
+# `wt_spawn`, which takes the `gh` arm whenever gh is on PATH — so on any developer box or runner the
+# FILE fallback is never executed, and a mutation that gutted its value regex (or replaced the whole
+# predicate with `grep -qE '^'`) left every pin above green. `wt_gh_hosts_value` is the fallback as a
+# function precisely so it can be pinned on its own: one file shape in, one rc out, gh irrelevant.
+val_rc() { ( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts_value "$1" >/dev/null 2>&1; printf '%s' "$?" ); }
+printf 'github.com:\n    user: fixture\n    oauth_token: gho_value0token\n    git_protocol: https\n' > "$TMP/hosts-real.yml"
+[ "$(val_rc "$TMP/hosts-real.yml")" = "0" ] && rc=0 || rc=1
+ck "wt_gh_hosts_value: a real oauth_token VALUE is a credential (rc 0)" $rc
+for h in hostonly braces emptyval hashval; do
+  [ "$(val_rc "$TMP/home-$h/.config/gh/hosts.yml")" = "1" ] && rc=0 || rc=1
+  ck "wt_gh_hosts_value: $h is NOT a credential (no token value: absent, empty, or a YAML comment)" $rc
+done
+printf 'github.com:\n    oauth_token: "gho_quoted"\n' > "$TMP/hosts-quoted.yml"
+[ "$(val_rc "$TMP/hosts-quoted.yml")" = "0" ] && rc=0 || rc=1
+ck "wt_gh_hosts_value: a QUOTED token still counts (the quote group is optional, not a ban)" $rc
 # POSITIVE CONTROL for the same predicate: the SAME host entry PLUS a token spawns, so the refusals
 # above are a probe of the token and not a ban on `hosts.yml`.
 rm -rf "$TMP/O-hostok" "$TMP/home-hostok"; gh_hosts_fixture "$TMP/home-hostok"
 out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O-hostok" "$TMP/tmux-hostok.log" "$TMP/home-hostok" 2>&1)"
 case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      hostok: $out";; esac
 ck "…while the same hosts.yml WITH an oauth_token spawns (the probe reads the token, not the file)" $rc
+# ⛔ AND THE PROBE MUST ASK `gh`, NOT THE FILE (P1 review finding, 2026-10-23, measured). gh's DEFAULT
+# store is the system credential store, and in that mode gh REMOVES the plaintext `oauth_token:` from
+# `hosts.yml`. A file grep therefore refuses a FULLY PROVISIONED box on every spawn, forever — and a
+# refusal starts no session, so nothing can ever change the answer. That is #2210's own loop, one
+# predicate over, and it would newly apply to the macOS launchd arm this PR gates. Driven with a `gh`
+# that reports a token and a hosts.yml that is the keyring SHAPE (no oauth_token line).
+mkdir -p "$TMP/bin-keyring"; cp "$TMP/stub/cmux" "$TMP/stub/tmux" "$TMP/stub/uname" "$TMP/bin-keyring/"
+cat > "$TMP/bin-keyring/gh" <<'SH'
+#!/usr/bin/env bash
+# stands in for `gh auth token` on a box whose credential lives in the OS keyring
+echo gho_from_keyring
+exit 0
+SH
+chmod +x "$TMP/bin-keyring/gh"
+rm -rf "$TMP/O-keyring" "$TMP/home-keyring"; mkdir -p "$TMP/home-keyring/.config/gh"
+printf 'github.com:\n    user: fixture\n    git_protocol: https\n' > "$TMP/home-keyring/.config/gh/hosts.yml"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-keyring" "$TMP/O-keyring" "$TMP/tmux-keyring.log" "$TMP/home-keyring" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      keyring: $out";; esac
+ck "a KEYRING-only hosts.yml spawns when gh reports a token (the probe asks gh, not the file)" $rc
+grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux-keyring.log" 2>/dev/null && rc=0 || { rc=1; cat "$TMP/tmux-keyring.log" 2>/dev/null; }
+ck "…and that box really gets a worker (the P1 is a refusal loop, not a cosmetic flag)" $rc
 rm -rf "$TMP/O4d"
 # ⛔ The `none` refusal is PROTECTIVE and stays: a box with no cmux answer AND no tmux binary has no
 # surface at all and must not pretend otherwise.

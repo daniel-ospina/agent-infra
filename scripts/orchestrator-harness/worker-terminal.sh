@@ -131,22 +131,42 @@ wt_gh_hosts() {
   else printf '%s\n' "$home/.config/gh/hosts.yml"; fi
 }
 
-# `wt_gh_hosts_token <home>` — 0 iff the resolved `gh` hosts file is READABLE and carries a NON-EMPTY
-# token value. ⛔ NOT `-s` (review finding on this diff, measured 2026-10-23): `-s` is "exists and is
-# non-empty", so a `hosts.yml` of `{}`, or one whose host entry lost its `oauth_token:` line (a
-# half-written or hand-redacted file — the same leftover class as a `gh auth logout`), read as
-# PROVISIONED and started exactly the credential-less worker this gate exists to refuse, while the
-# worker record said `home=…` and the spawn returned 0. The keys.env arm below already demands a
-# VALUE for the same reason; this is that rule for the other file, so the two cannot disagree about
-# what "has a credential" means. Residual: an EXPIRED token is still a token — expiry cannot be read
-# offline and is not this probe's question.
-wt_gh_hosts_token() {
-  local f
-  f="$(wt_gh_hosts "${1:-}")"
+# `wt_gh_hosts_value <file>` — the FALLBACK probe, for a box with no `gh` on PATH: 0 iff that file is a
+# regular file carrying a non-empty `oauth_token:` VALUE. Kept as its own function so it is testable on
+# its own (a spawn-level test cannot reach it on a box that HAS gh — `wt_gh_hosts_token` takes the gh
+# arm first, so the regex would be unpinned there). The value group excludes the quote characters and
+# `#`, because `oauth_token: ""` is empty and `oauth_token:   # redacted` is a YAML NULL — neither is a
+# token (measured: gh itself answers `no oauth token found for github.com` for both).
+wt_gh_hosts_value() {
+  local f="${1:-}"
   [ -n "$f" ] && [ -f "$f" ] || return 1
-  # A missing/unreadable file makes grep fail, so absence and unreadability are both refusals — never
-  # a provision. The quote group rejects `oauth_token: ""` / `''` for the same reason keys.env does.
-  grep -qE '^[[:space:]]*oauth_token:[[:space:]]*["'\'']?[^[:space:]"'\'']' "$f" 2>/dev/null
+  grep -qE '^[[:space:]]*oauth_token:[[:space:]]*["'\'']?[^[:space:]#"'\'']' "$f" 2>/dev/null
+}
+
+# `wt_gh_hosts_token <home>` — 0 iff `gh` ITSELF can produce a token for that HOME.
+# ⛔ ASK gh, DO NOT GREP THE FILE (P1 review finding, 2026-10-23, measured). gh's DEFAULT store is the
+# system credential store (keychain / secret service), and in that mode gh **removes the plaintext
+# `oauth_token:` from `hosts.yml`** — so a file grep refuses a FULLY PROVISIONED box on every spawn,
+# forever: `wt_launcher_env` returns 1, and because a refusal starts no session nothing can ever change
+# the answer. That is #2210's own loop, re-created one predicate over, and it would have applied to the
+# macOS launchd arm that this PR newly gates. `gh auth token` is an OFFLINE lookup over whichever store
+# gh resolves (hosts.yml or the keyring), which is the same store the WORKER's gh will read — the shape
+# `refresh-candidates.sh` already uses for exactly this question. GH_TOKEN/GITHUB_TOKEN are cleared so
+# this probe answers "what does THIS HOME hold?": the caller's own environment token is credited
+# separately below, and crediting it here would bless a worker that never inherits it (a session
+# against an already-running server).
+# Residual (filed, #2435): the probe is host-agnostic — a GHES-only `hosts.yml` answers for a lane that
+# will talk to github.com. Deliberate polarity: a wrong refusal here stops the whole cell, so this probe
+# over-credits rather than over-blocks. Residual: an EXPIRED token is still a token — expiry cannot be
+# read offline and is not this probe's question.
+wt_gh_hosts_token() {
+  local home="${1:-}"
+  [ -n "$home" ] || return 1
+  if command -v gh >/dev/null 2>&1; then
+    env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" gh auth token >/dev/null 2>&1
+    return $?
+  fi
+  wt_gh_hosts_value "$(wt_gh_hosts "$home")"
 }
 
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
@@ -243,13 +263,24 @@ wt_launcher_env() {
   # that sourced it plainly would hold those values in the launch shell only and hand the lane it
   # starts NOTHING — the credential-less worker this gate exists to refuse, one layer down. `set +a`
   # follows immediately so the worker's own shell options are the caller's, unchanged.
-  [ -f "$keys" ] && printf '; set -a; . %s || exit 98; set +a' "$(wt_q "$keys")"
-  # ⛔ THE `|| exit 98` IS THE POINT (review finding, 2026-10-23). Without it a `keys.env` that fails
-  # to source — a syntax error, an unreadable file at pane time — left the environment PARTIALLY
-  # applied and ran the worker's command anyway; if the failed line was the token assignment that is
-  # again a credential-less lane on a spawn that returned 0 and wrote its record. `wt_runfile` below
-  # already dies on the same failure; the two surfaces must agree on whether a broken `keys.env` is
-  # fatal, and on a cell tmux is the only surface there is.
+  if [ -f "$keys" ]; then
+    # ⛔ THE PRE-CHECK USES THE DIALECT THE FILE WILL BE SOURCED IN (review finding, 2026-10-23, measured):
+    # `sh -n` on a dash box refuses a BASH-valid `keys.env` (e.g. one carrying an array), and this file's
+    # own launch line is bash-shaped — so a `sh -n` check is an over-block on a perfectly good cell, which
+    # is the #2210 refusal loop in a new disguise. bash is what the harness runs and what the cell's own
+    # supervisor sources this file with, so bash decides when it exists; `sh -n` is the last resort.
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; set -a; . %s; wsrc=$?; set +a' \
+      "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")" "$(wt_q "$keys")"
+  fi
+  # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
+  # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
+  # COMMAND IN THE FILE, so `[ -d /x ] && export Y` — false, last — killed a perfectly good worker AFTER
+  # it had exported the token, on a spawn that returned 0 and wrote its record. A parse check alone fixes
+  # that but re-opens the other side: a file containing `return 1` PARSES, then aborts the source before
+  # the token assignment, and the worker runs credential-less. So the guard asks two questions: does it
+  # parse (before anything is applied), and — only if the source reported non-zero — does the environment
+  # nevertheless HOLD a credential now? The second check runs AFTER the config-dir pinning below, so it
+  # sees the same store the worker will (`wsrc` is captured, not re-derived).
   # ⛔ HOME IS RE-ASSERTED AFTER THE SOURCE, and that is not belt-and-braces (review finding,
   # 2026-10-22). A `HOME=` line inside keys.env is exported by the `set -a` source above and would
   # OVERWRITE the HOME this gate just validated — measured: a file carrying `HOME=/home/cmux` left the
@@ -281,6 +312,20 @@ wt_launcher_env() {
     printf '; unset GH_CONFIG_DIR XDG_CONFIG_HOME'
   fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
+  # The second half of the `keys.env` guard (see its comment above): a source that reported non-zero is
+  # fatal ONLY if it also left no credential behind. ⛔ A BLANK VALUE IS NOT A CREDENTIAL (review finding,
+  # 2026-10-23, measured): `[ -z "$GH_TOKEN$GITHUB_TOKEN" ]` counted `GH_TOKEN='   '` as provision — the
+  # same defect this file refuses statically for the keys.env arm (`[^[:space:]]`), so the two halves of
+  # ONE gate disagreed; `gh` rejects whitespace at the first call. The `case` asks the same question the
+  # static arm asks: does the value contain a non-space character? `gh auth token` answers for the
+  # worker's own HOME + pinned config dir; with no `gh` at all the fallthrough exits, the fail-closed
+  # direction for a worker that has just proved it could not be provisioned cleanly.
+  # ⛔ AND THE gh CALL MUST NOT RE-READ THE VALUE THAT WAS JUST JUDGED BLANK (review finding, 2026-10-23,
+  # measured): with `GH_TOKEN='   '` exported, `gh auth token` prints it and exits 0, so the guard would
+  # bless the very token the `case` above rejected. The environment names are cleared for this one call
+  # (as the static probe clears them), so it answers the question the `case` asked — is there a token in
+  # the STORE — and never the question it just answered NO to.
+  [ -f "$keys" ] && printf '; if [ "${wsrc:-0}" -ne 0 ]; then case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) env -u GH_TOKEN -u GITHUB_TOKEN gh auth token >/dev/null 2>&1 || exit 98 ;; esac; fi'
   return 0
 }
 
