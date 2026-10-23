@@ -76,6 +76,15 @@ trap 'ai1711_cleanup; tmux kill-session -t "=${DOCTOR_SESSION:-cell-doctor}" 2>/
 # exercised deliberately, not by accident).
 export DOCTOR_SESSION="cell-doctor-test-$$"
 tmux kill-session -t "=cell-doctor" 2>/dev/null || true
+# ⛔ THE SERVICE SEAM IS PINNED AWAY FROM THIS BOX (#2402). `cloud-cell-supervisor.sh` now asks whether a
+# controller SERVICE is installed and enabled, and delegates `start`/`stop` to the service manager when it
+# is. That answer is MACHINE state (`/etc/systemd/system`, `$HOME/.config/systemd/user`), so on a cell
+# where the controller is service-managed — the state #2402 exists to create — this suite would drive the
+# REAL unit: `start` would start the production dispatcher and `stop` would stop it, from a test.
+# Every invocation below inherits these exports (no `env -i` wraps the supervisor), so one pin covers all
+# of them; the arms that exercise service mode live in `install-controller-service.test.sh`, which points
+# both dirs at its own fixtures.
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/no-system-units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units"
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }

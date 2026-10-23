@@ -1,0 +1,59 @@
+[Unit]
+# eldato orchestrator controller — the cell's dispatcher, owned by a service manager (agent-infra#2402).
+#
+# WHY THIS UNIT EXISTS. `cloud-cell-supervisor.sh start` handed the controller to a tmux session, and a
+# tmux session has NOTHING above it: when the box empties and the last session closes, the server exits
+# and no surface restarts the controller. The cell then sits idle with no dispatcher and reads as a
+# healthy idle box. MEASURED 2026-10-23 on cell-1: at 02:20Z `tmux ls` printed "no server running on
+# /tmp/tmux-1000/default" and `pgrep -fc "[o]rch-loop.sh"` printed 0, while landings on that box had
+# completed normally at 01:56/02:10/02:16 — the lanes finished and exited. Nothing crashed, which is
+# exactly why nothing reported it. This unit is the supervisor that was missing.
+#
+# Rendered by scripts/install-controller-service.sh (the same installer pattern the disk reaper's timer
+# uses): one verb that renders, installs and converges, and fails loudly rather than skipping.
+Description=eldato orchestrator controller — the cell's dispatcher (agent-infra#2402)
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/controller-service.md
+# The controller's first cycle reads GitHub and the candidate board. Started before the network is up it
+# records "no work" and then sleeps a whole CYC, so the ordering is load-bearing, not cosmetic.
+After=network-online.target
+Wants=network-online.target
+# ⛔ THE START LIMIT IS NAMED EXPLICITLY, because systemd's DEFAULT CANNOT FIRE HERE — leaving it
+# implicit made the intent below false. systemd's default window is 10 s (`DefaultStartLimitIntervalSec`),
+# and at most one start per RestartSec (15 s) can ever occur, so the default 5-in-10 s burst is
+# unreachable: a box that cannot start a controller for a CONFIGURATION reason (no key, a foreign
+# controller, a bad pin) would restart every 15 s forever, re-running cmd_check's network reads on every
+# attempt with the failure living only in a journal. 3 failures inside 5 minutes is not a transient — it
+# is a configuration fault — and it must converge to `failed`, which is what `--status` prints and what an
+# operator can act on. (A deliberate `systemctl stop` never counts: systemd does not restart on a stop.)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=CELL_HOME={{CELL_HOME}}
+Environment=ENV_FILE={{ENV_FILE}}
+Environment=PATH={{PATH}}
+# ⛔ THE CONTROLLER IS THIS UNIT'S MAIN PROCESS, NOT A CHILD IN A SESSION. `start` sees this variable and
+# `exec`s the loop instead of creating a tmux session, so the unit's cgroup owns the controller's
+# lifetime. Every other verb cooperates with that: `stop` stops the UNIT (a pid kill is undone by
+# Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
+# beside an enabled unit is two dispatchers on one queue, #1761).
+Environment=ORCH_FOREGROUND=1
+ExecStart=/bin/bash {{SUPERVISOR}} start
+# ⛔ `always`, NOT `on-failure`. The measured case is an ORDERLY exit: the lanes finish, the controller
+# returns 0, and nothing came back — `on-failure` reproduces that defect byte for byte. `Restart=always`
+# restarts on a crash, a kill AND a clean exit, which is the whole requirement.
+Restart=always
+RestartSec={{RESTART_SEC}}
+# orch-loop.sh traps TERM and exits in ~0.1s (agent-infra#1715). `mixed` signals the controller first and
+# only then the group, so a stop does not leave a half-spawned worker behind — a `stop` that orphans a
+# lane is a lane that keeps landing PRs.
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
