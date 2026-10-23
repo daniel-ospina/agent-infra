@@ -152,7 +152,10 @@ if [ -f "$CIQ_MOD" ]; then
       exit 3
     fi
   else
-    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count); the CI-queue gate is INERT for this batch" >&2
+    # Keep the name list byte-identical to the `declare -f` guard above (#2333 review cycle 12, P2):
+    # a stale `$O` copy is the case this message reports, so the list is LITERAL — it cannot be
+    # rendered from a variable the module would define.
+    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min); the CI-queue gate is INERT for this batch" >&2
   fi
 else
   # ⛔ AN ABSENT MODULE IS ANNOUNCED TOO (#2333 cycle 3, P2). This is the stale-`$O` shape that

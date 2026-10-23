@@ -566,7 +566,16 @@ done
 [ -n "$_ciq_mod" ] && . "$_ciq_mod"
 if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then CIQ=1; else
   CIQ=0
-  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
+# ⛔ THE DISCLOSURE NAMES EVERY FUNCTION THE GUARD ABOVE REQUIRES (#2333 review cycle 12, P2).
+  # Cycle 10 widened the guard to TEN names and left these messages naming six, so a `$O` copy
+  # missing only `ciq_ceiling` — the exact stale-copy shape that guard exists for — announced
+  # "needs ciq_read/…/ciq_is_count", i.e. named six functions that were all PRESENT and none of the
+  # one that was MISSING: a false statement about the box's own state, in the one line an operator
+  # reads to decide whether to re-seed. The names are LITERAL, not rendered from a variable defined
+  # in the module — an old module would not define it, which is exactly the case being reported.
+  # Keep this list byte-identical to the `declare -f` list on the line above; (e8) in
+  # ci-queue.test.sh asserts it.
+  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
 # degrade is named on the [ci-queue] line every cycle (the same stance `capacity.sh`'s absence takes).
@@ -706,7 +715,11 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
 # fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
-# already owns this head). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# already owns this head) — OR when the CI-queue gate DEFERS the push before any work (fix-one.sh's
+# `ciq_ci_allowed` arm, #2296). Both are "no agent work was done", which is the only property this
+# marker asserts; the LOG LINE below names both causes, because a deferral logged as a cross-box
+# refusal sends an operator hunting for a lease that never existed (the #1720 "the log names the
+# wrong cause" class). The controller books the attempt at SPAWN (fixcount+1) and, on the
 # reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
 # used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
 # refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
@@ -725,9 +738,9 @@ refund_bailed_fixer() {
   echo "$n" > "$f"
   if [ "$restore" = "1" ]; then
     touch "$O/state/needsfix-$pr-$head"
-    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, findings marker restored" >>"$LOG"
   else
-    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -2828,7 +2841,7 @@ while true; do
             refund_bailed_fixer "$PR" "$HEAD_N" 0
             RF_N=$(( RF_N - 1 ))
             printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
-            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim, or the CI-queue gate deferred the push) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
           fi
           # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
           # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so

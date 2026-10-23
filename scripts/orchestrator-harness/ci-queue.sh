@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # ci-queue.sh — CI BACK-PRESSURE: how deep is the repo's CI queue, and may this box send it more
-# work yet? Sourced by `orch-loop.sh` (one read per cycle, before dispatch), by `fix-one.sh` (the
+# work yet? Sourced by `orch-loop.sh` (the cycle's read, before dispatch), by `fix-one.sh` (the
 # lane whose whole job is to PUSH a new head), and by `dispatch-merge.sh` (the batch dispatcher),
 # and runnable STANDALONE (`bash ci-queue.sh status --repo owner/name`), because the same bytes must
 # answer the question on whichever surface asks it. It never calls `set` — a sourced library must
 # not mutate its caller's shell options.
 #
 # ── COVERAGE, AND THE ONE DELIBERATE EXCLUSION (#2296 review cycle 4) ───────────────────────────
-# Gated: ONE read per controller cycle before dispatch, every fixer spawn arm (the CONFLICTED, the
-# CI-red and the review-gate ones — each product is a new head), every pre-push check in `fix-one.sh`,
+# Gated: the controller's read before dispatch, the THREE fixer spawn arms whose product is a pushed
+# head (the CONFLICTED, the CI-red and the review-gate ones), every pre-push check in `fix-one.sh`,
 # the batch dispatcher, and the CI RERUN.
+# ⛔ AND ONE FIXER ARM IS NOT GATED YET, DISCLOSED RATHER THAN IMPLIED: the RED-TREE fixer
+# (`orch-loop.sh`'s `MAX_RED_FIX` spawn) books its attempt and spawns BEFORE any `ciq_push_ok` call,
+# so on a deep queue that lane still starts, is deferred by `fix-one.sh` on its first push, and hands
+# the attempt back through `fixbail` on a later cycle — churn and a false "another box holds the
+# claim" log line, not added CI. It is the fourth pusher and the only ungated one; home agent-infra
+# #2408.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
@@ -294,7 +300,15 @@ ciq_read() {
        && [ "${running:-0}" -le "$(ciq_hosted_concurrency)" ]; then
       floor="$running"
     fi
-    if [ "${rn_answered:-0}" = 1 ] && { [ -z "${declared:-}" ] || [ "${declared:-0}" -eq 0 ]; }; then
+    # ⛔ THE ALLOWANCE DEMANDS POSITIVE EVIDENCE: A **PARSED** `total_count == 0` (#2333 review
+    # cycle 12, P1). Until this cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and
+    # `declared` is EMPTY exactly when the answered page carried no parseable `total_count` — i.e.
+    # branch (c), unparseable — so an ANSWERED-but-unusable body took the hosted ALLOWANCE, and the
+    # shape the (c) comment above records as measured-dangerous came back through the front door:
+    # `queued=31` on a repo with nothing online became `~20`/ceiling 40 => ALLOWED, the gate
+    # reporting a measurement it never made. Only a parsed zero selects the allowance; anything else
+    # unmeasured fails CLOSED to the floor, which is what (b) and (c) both say.
+    if [ "${rn_answered:-0}" = 1 ] && [ "${declared:-x}" = "0" ]; then
       runners="$(ciq_hosted_concurrency)"
     else
       runners="$floor"

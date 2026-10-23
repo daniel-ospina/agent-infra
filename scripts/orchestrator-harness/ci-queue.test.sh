@@ -62,6 +62,12 @@ case "$2" in
     # (3x too permissive on the measured box, i.e. exactly the over-dispatch this module exists to
     # stop). The feed below is the shape the reader actually meets.
     [ "${CIQ_TEST_RUNNERS:-0}" = "-" ] && exit 1
+    # ⛔ CIQ_TEST_NOTOTAL=1 answers 200 with a body that carries NO parseable `total_count` — the
+    # ANSWERED-but-UNPARSEABLE shape (#2333 review cycle 12, P1). It is branch (c) and must fail
+    # CLOSED to the measured floor; until cycle 12 the empty `declared` selected the hosted ALLOWANCE
+    # here, i.e. a 200 with an unusable body quadrupled the ceiling (40 vs 10) on a repo with no
+    # self-hosted runner online, and ALLOWED the incident's own 31-deep queue.
+    [ "${CIQ_TEST_NOTOTAL:-0}" = "1" ] && { printf '{\n  "runners": []\n}\n'; exit 0; }
     n="${CIQ_TEST_RUNNERS:-0}"; i=0
     # CIQ_TEST_OFFLINE=1 emits a DECLARED-but-offline fleet (`total_count > 0`, nothing online) — the
     # shape that must NOT be confused with the hosted zero (ci-queue.sh, "two different zeroes").
@@ -88,13 +94,14 @@ qenv() { # <gh> <ttl> <stale_max>
   export CIQ_GH CIQ_TTL CIQ_STALE_MAX
 }
 
-feed() { # <queued> <running> <runners> [busy] [offline]
+feed() { # <queued> <running> <runners> [busy] [offline] [no-total-count]
   state
   qenv "$STUB" 0 900
   CIQ_STATE_DIR="$T/state"; export CIQ_STATE_DIR
   CIQ_TEST_QUEUED="${1:-0}"; CIQ_TEST_RUNNING="${2:-0}"
   CIQ_TEST_RUNNERS="${3:-0}"; CIQ_TEST_BUSY="${4:-true}"; CIQ_TEST_OFFLINE="${5:-0}"
-  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY CIQ_TEST_OFFLINE
+  CIQ_TEST_NOTOTAL="${6:-0}"
+  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY CIQ_TEST_OFFLINE CIQ_TEST_NOTOTAL
   OR="daniel-ospina/agent-infra"; export OR
 }
 
@@ -214,6 +221,19 @@ feed 4 7 5 true 1
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b12) declared-but-offline still honours `running` (4 queued, 7 running => ceiling 14 => ALLOWED)" \
    "$( [ "$d0" -eq 0 ]; echo $? )"
+# ⛔ AN ANSWERED PAGE WITH NO PARSEABLE `total_count` IS BRANCH (c), NOT THE HOSTED ZERO (#2333 review
+# cycle 12, P1). `declared` is EMPTY exactly when the answered body carried no readable count — the
+# unparseable shape (c) says must fail CLOSED — and that emptiness used to select the ALLOWANCE, so a
+# 200 with an unusable body on a repo with nothing online gave runners=~20 / ceiling 40 and ALLOWED the
+# incident's own queue. Both arms below are red on the pre-fix tree (ceiling 40 => allowed).
+feed 31 5 0 true 0 1
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b13) an answered-but-UNPARSEABLE runners body fails CLOSED (31 queued, 5 running => ceiling 10 => DEFERRED)" \
+   "$( [ "$d0" -eq 1 ]; echo $? )"
+feed 31 5 0 true 0 1
+ciq_read "$OR" >/dev/null 2>&1
+ck "(b14) …and the record carries the measured floor, never the allowance (runners=${CIQ_RUNNERS:-?})" \
+   "$( [ "${CIQ_RUNNERS:-}" = '~5' ]; echo $? )"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5
@@ -338,7 +358,7 @@ printf '\n── (e) WIRING: the shipped callers call it (a module nobody calls 
 grep -q 'ci-queue.sh' "$LOOP" && grep -q 'ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed' "$LOOP"
 ck "(e1) orch-loop.sh sources ci-queue.sh and guards it on the interface" "$?"
 grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC=\$?' "$LOOP"
-ck "(e2) orch-loop.sh reads the queue ONCE per cycle, IN THIS SHELL (not a subshell)" "$?"
+ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per PASS — at most two live reads a cycle, the sweep's and the dispatch block's" "$?"
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then' "$LOOP")"
@@ -371,13 +391,32 @@ ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner rulin
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
 ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
    "$( { [ "$n" -eq 4 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
-# ⛔ ONE READ PER CYCLE — INCLUDING WHEN THE READ FAILS (#2296 cycle 5, P2). The module's cache covers
+# ⛔ ONE READ PER PASS — INCLUDING WHEN THE READ FAILS (#2296 cycle 5, P2). The module's cache covers
 # only a SUCCESSFUL read, so on the outage path every arm re-read live (measured: 15 `gh api` calls for
 # 5 arms against a failing feed, versus 3 against a working one) — the gate's own cost then grew with
 # the backlog, in the cycle where `gh-limit` is already the bottleneck. The predicate captures its
 # verdict AND memoizes it, and the memo is reset with the rest of the per-cycle state.
 ck "(e12) the gate's verdict is CAPTURED for the rows and MEMOIZED (one read per pass, even on failure)" \
    "$( { grep -q 'CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"' "$LOOP" && grep -q 'CIQ_ARM_RC=""' "$LOOP"; } ; echo $? )"
+# ⛔ THE INCOMPLETE DISCLOSURE MUST NAME EVERY FUNCTION ITS OWN GUARD REQUIRES (#2333 review cycle 12,
+# P2). Cycle 10 widened the three guards from six names to ten and left the three messages naming six,
+# so the one line an operator reads to decide whether to re-seed announced six functions that were all
+# PRESENT and none of the one that was missing. The names are literal in each message (a stale copy is
+# the case being reported, so they cannot be rendered from the module), which is exactly why they can
+# drift — this arm is the pin that catches the next widening.
+miss=""
+for _fn in ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count \
+           ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min; do
+  has "$(sed -n '/is present but INCOMPLETE/p' "$LOOP")" "$_fn" || miss="$miss $_fn"
+done
+ck "(e13) orch-loop.sh's INCOMPLETE disclosure names every function its guard requires (missing:${miss:- none})" \
+   "$( [ -z "$miss" ]; echo $? )"
+n=0
+for _f in "$FIX" "$DISPATCH"; do
+  has "$(sed -n '/is present but INCOMPLETE/p' "$_f")" ciq_ceiling && n=$(( n + 1 ))
+done
+ck "(e14) …and both other callers name ciq_ceiling too — the newest member of the guard (named in $n/2)" \
+   "$( [ "$n" -eq 2 ]; echo $? )"
 
 printf '\n── (h) THE PREDICATE ITSELF, DRIVEN (not grepped) ────────────────────────────\n'
 # ⛔ WHY THIS SECTION EXISTS (#2296 cycle 6, P0). `(e12)` was two textual greps, and no arm anywhere

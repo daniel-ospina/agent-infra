@@ -123,7 +123,10 @@ if [ -f "$SELF/ci-queue.sh" ]; then
     # arm the guard's `else` was silent on the ONE surface whose product is a pushed head, while the
     # other two callers announce the same state (dispatch-merge.sh, orch-loop.sh) — the "silence in
     # one of three callers is how a gate rots into a decoration" rule this module's own header states.
-    echo "[fix $PR] WARNING — $SELF/ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count); the CI-queue gate is INERT for this run and the push proceeds UNMEASURED" >> "$L.log"
+    # Keep the name list below byte-identical to the `declare -f` list above (#2333 review cycle 12,
+    # P2): a stale `$O` copy is exactly the case this message reports, so the list is LITERAL and
+    # cannot be rendered from a variable defined in the module being reported as incomplete.
+    echo "[fix $PR] WARNING — $SELF/ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min); the CI-queue gate is INERT for this run and the push proceeds UNMEASURED" >> "$L.log"
   fi
 else
   # …and so is an ABSENT one: the stale-`$O` shape `install.sh`/`check-single-source.sh` now detect.

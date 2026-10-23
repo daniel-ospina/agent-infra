@@ -2527,8 +2527,15 @@ fi
 # keeps the stated power in both directions: a spawn site that loses (or gains, ungated) its load
 # gate reddens the first line, and a defer arm that stops deferring reddens the second.
 # Each spawn site is asserted to carry can_spawn, which is the property under test.
-fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF 'can_spawn; then')
+# ⛔ THE WIDE PREDICATE MINUS THE DEFER ARMS (#2333 review cycle 12, P2). The narrowing to
+# `can_spawn; then` matched the two defer arms away, but it ALSO stopped matching a future spawn arm
+# whose condition continues past `can_spawn` (`… && can_spawn && <cond>; then`, or a multi-line arm
+# like the review-gate site) — silently losing the power this file's own NOTE claims for the line.
+# Counting `can_spawn` wide and subtracting the defer arms keeps BOTH powers: a fourth spawn site
+# reddens `fixer_sites` whether or not it happens to end in `can_spawn; then`, and a defer arm that
+# stops deferring still reddens `fixer_defer_sites`.
 fixer_defer_sites=$(grep -cF 'can_spawn && ! ciq_push_ok; then' "$LOOP")
+fixer_sites=$(( $(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn) - fixer_defer_sites ))
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
