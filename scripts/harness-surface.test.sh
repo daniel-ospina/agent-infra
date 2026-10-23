@@ -424,6 +424,23 @@ DISKCOST=5000 DISKFLOOR=0 PS_TABLE="$TMP/ps-none" run_status_fix
 cap_disk="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) with the disk as the BINDING leg the row reports lanes=4 (not the load bound, 7) [$cap_disk]" \
    "$(case "$cap_disk" in *"lanes=4 "*"disk_free=20000MB"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ THE DEFAULT 500MB RESERVE IS PART OF THE RULE, and it must be exercised WITHOUT the helper (which
+# always passes the knob explicitly, so the launcher's own default is otherwise unreachable): invoke the
+# launcher directly with `HU_DISK_FLOOR_MB` unset. On the fixture's 20000MB, (20000-500)/5000 = 3 lanes;
+# a dropped reserve answers 4.
+OUT="$( cd "$REPO_FIX" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_DISK_PER_LANE_MB=5000 bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"
+cap_floor="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+ck "(c) the DEFAULT 500MB reserve is applied when the knob is UNSET (lanes=3, not 4) [$cap_floor]" \
+   "$(case "$cap_floor" in *"lanes=3 "*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND A KNOB THAT IS NOT A NUMBER FALLS BACK TO THE DEFAULT, rather than turning the box BROKEN: a
+# typo'd measurement is a measurement this box does not have, and the documented default is the answer.
+DISKCOST=abc PS_TABLE="$TMP/ps-none" run_status_fix
+cap_bad="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+ck "(c) a non-numeric disk knob falls back to the default and still answers (lanes=7) [$cap_bad]" \
+   "$(case "$cap_bad" in *"lanes=7 "*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ A LEADING ZERO IS OCTAL TO `$(( ))` (review round 3): `HU_LOAD_PER_LANE=0400` divided by 256 and
 # reported 10 lanes where the reading supports 7 (a 43% over-report, in the direction that over-places
 # work), and `HU_LOAD_PER_CPU=0800` did not parse at all. The same reading must give the same answer
@@ -927,6 +944,42 @@ ck "(e) 'down' from a copy that cannot name a harness still stops the box (rc=$R
    "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "(e) …the stop was delegated, and the unresolvable harness was NAMED, not fatal" \
    "$(HU_NAMED=0; case "$OUT" in *'no agent-infra checkout resolved'*) HU_NAMED=1 ;; esac; if [ "$HU_NAMED" -eq 1 ] && grep -qx 'stop' "$FIXCELL/fix.log" 2>/dev/null; then echo 0; else echo 1; fi)"
+ck "(e) …and the harness-side continuation is SAID too (not just the REPO-side clause)" \
+   "$(case "$OUT" in *"continuing, because 'down' reads no harness"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and an EMPTY candidate is never reported as a misconfigured one" \
+   "$(case "$OUT" in *"ignoring ''"*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AND `up` MUST REFUSE ON THE SAME BOX (review P1, fail-open): with no harness the pin cannot be
+# resolved, so starting a controller is the #2356 refusal skipped entirely. Pin-less is the Mac shape; a
+# flat copy with its own authority stub is the deployed shape. Nothing was started, and that is checked
+# by the EMPTY authority log, not by the sentence alone.
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+ck "(e) 'up' REFUSES when no harness resolves (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …says NOTHING WAS STARTED, and started nothing" \
+   "$(HU_S=0; case "$OUT" in *'Nothing was started'*) HU_S=1 ;; esac; if [ "$HU_S" -eq 1 ] && [ ! -s "$FIXCELL/fix.log" ]; then echo 0; else echo 1; fi)"
+ck "(e) …and the exit code is NOT spilled into the sentence (die formats its message, not its argv)" \
+   "$(case "$OUT" in *'Nothing was started. 2'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AND THE CLAIMS PROBE MUST NOT RUN ON AN UNNAMED WORK REPO (review P1): `git -C "" ls-remote origin`
+# reads the CWD's repo, over the NETWORK, and PERSISTS `claims=reachable` for it — a record every later
+# `status` reads as an answer. No work repo, no probe. ⛔ THE CWD HERE IS A REAL CHECKOUT ON PURPOSE: from
+# a non-repo cwd the guarded and unguarded launchers behave identically (both fail), so the arm would be
+# vacuous — the guard is only observable where `git -C ""` WOULD succeed.
+FRESHCELL="$TMP/cell-flat2"
+mkdir -p "$FRESHCELL/.pi/agent/state" "$FRESHCELL/orchestrator/state"
+printf '%s\n' "$PIN_TREE" > "$FRESHCELL/.harness-path"
+printf '%s\n' "$B12" > "$FRESHCELL/.pi/agent/state/HARNESS-PIN"
+OUT="$( cd "$REPO_FIX" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+claimsrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) an unresolvable WORK repo does not probe claims (the row is UNKNOWN, not a latched OK) [$claimsrow]" \
+   "$(case "$claimsrow" in *'UNKNOWN'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and no claims record was written for an unnamed repo" \
+   "$([ ! -f "$FRESHCELL/orchestrator/state/harness-claims" ] && echo 0 || echo 1)"
 # ── THE SOURCE IS NAMED FOR A CONFIG-FILE REPO TOO: `unset REPO` is INERT for this value ──────────
 printf 'REPO=%s\n' "$TMP/plaindir" > "$TMP/badrepo.env"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ENV_FILE="$TMP/badrepo.env" \
@@ -1028,15 +1081,25 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ENV_FI
 ck "(e) a flat copy outside any checkout resolves its harness from the config file's HARNESS_REPO (rc=$RC, not a refusal)" "$([ "$RC" -ne 2 ] && echo 0 || echo 1)"
 ck "(e) …and the pin resolves there (pin: OK, never UNRESOLVABLE)" \
    "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
-# ⛔ AND WITH NO CANDIDATE AT ALL IT REFUSES: a launcher that fell through here would print a full
-# component/VERDICT table about a path derived from the copy's own location — grading a tree nobody
-# named, which is the class this block exists to refuse.
+# ⛔ AND IT RESOLVED IN THE HARNESS, NOT IN A FOREIGN REPO — a distinct detector, not a second copy of the
+# line above: the pin line must name the HARNESS fixture's commit ($B12). A work-repo read answers a
+# different sha (or nothing), so this line can fail where the one above passes.
+ck "(e) …and the resolved object is the HARNESS fixture's commit ($B12), not the work repo's tip" \
+   "$(pinline2="$(printf '%s\n' "$OUT" | grep -m1 'pin:')"; case "$pinline2" in *"$B12"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND WITH NO CANDIDATE AT ALL, `status` CONTINUES AND SAYS BROKEN — it does NOT refuse (review: the
+# earlier arm claimed a refusal that the code never implemented, so it passed for either behaviour). What
+# must be true is that the screen NAMES the unresolvable harness, reports cannot-verify, and never prints
+# an OK row about a tree nobody named.
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a flat copy with NO candidate REFUSES (rc=$RC) instead of grading a tree nobody named" \
+ck "(e) a flat copy with NO candidate reports BROKEN for status (rc=$RC), naming the unresolvable harness" \
    "$([ "$RC" -eq 2 ] && case "$OUT" in *'no agent-infra checkout resolved'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and the pin row is UNRESOLVED (cannot-verify), NOT a pass from the operator's own checkout" \
+   "$(case "$OUT" in *'pin: UNRESOLVED'*) case "$OUT" in *'pin: OK'*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+ck "(e) …and the verdict is BROKEN, never HEALTHY over a tree nobody named" \
+   "$(case "$OUT" in *'VERDICT: BROKEN'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ AN UNRESOLVABLE PIN NAMES THE REPO IT LOOKED IN — naming the WORK repo there is the refusal that
 # sends the reader to the wrong place (the class this PR removes), and it was unasserted.
 BADPIN2="$TMP/cell-badpin2"

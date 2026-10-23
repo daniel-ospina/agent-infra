@@ -90,7 +90,7 @@ SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }
-die()  { printf 'harness-up: %s\n' "$*" >&2; exit "${2:-3}"; }
+die()  { local m="$1" rc="${2:-3}"; printf 'harness-up: %s\n' "$m" >&2; exit "$rc"; }
 
 usage() { # <exit-code>
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
@@ -685,6 +685,11 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     say "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
     return 4
   fi
+  # ⛔ AN EMPTY HARNESS IS NOT A BYPASS. `git -C ""` addresses the PROCESS CWD's repo (verified on git
+  # 2.43), so a box with no resolvable harness would otherwise answer this row from whatever checkout the
+  # operator happens to stand in — `pin: OK` for a repo the launcher never identified, feeding the single
+  # verdict. The row is UNRESOLVED (cannot-verify), never a pass.
+  [ -n "$HREPO" ] || { say "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
   # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE. `head` on a mode-000 file, or on a path behind an
   # unsearchable ancestor, prints nothing — exactly like a record that was never written — so the pin
   # "resolved" from $REF, the read dir was never compared to the pin's tree, and the controller start
@@ -964,6 +969,9 @@ hu_row_exec() {
       fi
       pinraw="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
       if [ -n "$pinraw" ]; then
+        # ⛔ SAME FAIL-CLOSED RULE AS hu_verify_pin: `git -C ""` is the CWD's repo, so an empty harness
+        # would compare the running tree against the operator's own checkout and could print OK.
+        [ -n "$HREPO" ] || { hu_row exec "$pid" - "UNRESOLVED (no harness repo resolved, so the pin record ${pinraw:0:12} cannot be compared with $path)"; return 2; }
         ref="$(git -C "$HREPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
         # ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN", AND NOT A LICENCE TO FALL THROUGH: falling
         # through printed `OK` about the harness dir while the pin named a commit nothing could read
@@ -1346,6 +1354,10 @@ hu_start_refresh() {
 hu_start_claims() {
   local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
   command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
+  # ⛔ THE SAME EMPTY-VALUE TRAP, ONE NAMESPACE OVER: `git -C "" ls-remote origin` reads the CWD's repo —
+  # a NETWORK probe against an unnamed repo — and then this function PERSISTS `claims=reachable` for it,
+  # which every later `status` reads as an answer without probing. No work repo, no probe.
+  [ -n "$REPO" ] || { warn "claims: no work repo resolved (see the harness-up warning above) — the registry cannot be probed"; return 1; }
   # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
   # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
   # registry on every box, whatever it holds. Measured in review; the fixture now carries a claim ref.
