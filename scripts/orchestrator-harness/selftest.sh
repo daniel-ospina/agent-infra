@@ -2882,8 +2882,10 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # a coercion added without its pin must redden this check, not pass as "more is better".
 # 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
 # its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
-[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 18 -> 20 for agent-infra#2296 (CI_QUEUE_MAX + CI_QUEUE_LANES: the CI-queue-aware lane ceiling —
+# both are compared against a measured queue depth at a spawn decision, so both fail OPEN uncoerced).
+[ "$_ngrd_n" = "20" ] && rcn=0 || { rcn=1; echo "      expected 20 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 20 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
