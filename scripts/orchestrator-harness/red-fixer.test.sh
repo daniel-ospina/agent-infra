@@ -265,10 +265,11 @@ drive_route() {
       esac
       return 0
     }
-    # ⛔ THE SPAWN SURFACE IS THE LAUNCHER, NOT TMUX (agent-infra#2209/#2210). The controller spawns
-    # through `worker-terminal.sh`, so on a cloud cell a worker gets a daemon-OWNED durable terminal;
-    # a tmux window (or a transient exec child) dies at ~21 log lines, and a dead red-fixer is
-    # indistinguishable from one that found nothing to fix. The stubs below answer the launcher's own
+    # ⛔ THE SPAWN SURFACE IS THE LAUNCHER, NOT A HAND-WRITTEN COMMAND (agent-infra#2209/#2210). The
+    # controller spawns through `worker-terminal.sh`, so a worker gets a daemon-OWNED durable terminal
+    # where the cmux daemon answers and tmux WITH the HOME+keys.env contract where it does not — a
+    # credential-less worker dies early (the `~21 log lines` death was the environment, agent-infra#2210
+    # reopened), and a dead red-fixer is indistinguishable from one that found nothing to fix. The stubs below answer the launcher's own
     # verbs and record into the SAME spy, in the SAME `<session> -- <command>` shape the assertions
     # already read — so every arm keeps testing what it was written to test, and the `wt_count`
     # default (an EMPTY census line) is what a box with no workers really answers.

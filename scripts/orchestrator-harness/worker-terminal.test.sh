@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # worker-terminal.test.sh — the worker launcher and the controller's portability, driven.
 #
-# TWO MEASURED FACTS THIS SUITE PINS (2026-10-20, all three cloud cells):
-#   1. A lane launched as a tmux window (or a `setsid nohup` child of a transient `cmux cloud exec`
-#      session) dies at ~21 log lines — its first `bash` tool call never returns and its transcript
-#      stops after ONE toolCall. The SAME lane in a DURABLE TERMINAL survives. So: the shipped
-#      launchers may not start a worker with `tmux new-session`/`setsid`/`nohup`, the spawn must go
-#      to a daemon-owned terminal, and a Linux host with no such surface must REFUSE rather than
-#      silently fall back to the launcher that kills lanes.
+# TWO MEASURED FACTS THIS SUITE PINS:
+#   1. (2026-10-20, corrected 2026-10-22) A lane launched by the harness produced nothing and its log
+#      stopped after ~21 lines. agent-infra#2210 first concluded "never a tmux window" and made the
+#      tmux arm macOS-only — which on a Linux cell resolved to `none` and refused EVERY spawn, every
+#      cycle. The reopening measured the mechanism: `gh`'s credential is HOME-bound
+#      (`$HOME/.config/gh/hosts.yml`) and a tmux worker inherits the tmux SERVER's environment, so a
+#      worker with no explicit HOME has no credential and stops at its first `gh` call. So: a spawn
+#      must carry the HOME+keys.env contract or be REFUSED (never started credential-less), tmux is
+#      the surface where the cmux daemon does not answer — on Linux as well as macOS — and a box with
+#      NO surface at all still refuses.
 #   2. `orch-loop.sh`'s capacity probes must answer on Linux as well as macOS. agent-infra#1702's
 #      portable helpers are already shipped; what was NOT pinned is the macOS SHAPE of the stat probe
 #      (`stat -f %m` succeeding while `stat -c %Y` fails) — unreachable on a Linux CI host without a
@@ -102,12 +105,16 @@ case "${1:-}" in
   # plausible number here signalled whatever unrelated process happened to own it during a test run.
   list-panes) printf '%s\n' "${TMUX_PANE_PID:-4194305}" ;;
   new-session) [ "${TMUX_SPAWN_RC:-0}" = "0" ]; [ -n "$st" ] && printf '%s\n' "${4#=}" >> "$st" ;;
-  # `tmux show-environment -g GH_TOKEN` — the SERVER-environment credential probe `wt_launcher_env`
+  # `tmux show-environment -g <name>` — the SERVER-environment credential probe `wt_launcher_env`
   # uses when a worker's HOME carries no credential file. Faithful: tmux exits 1 with
-  # `unknown variable` when the name is not set, which is a different answer from an empty one.
-  show-environment) if [ "${3:-}" = "GH_TOKEN" ]; then
-                      [ "${TMUX_SERVER_GH_TOKEN:-0}" = "1" ] && { printf 'GH_TOKEN=ghp_test\n'; exit 0; }
-                      echo "unknown variable: GH_TOKEN"; exit 1
+  # `unknown variable` when the name is not set (a different answer from an empty value, which it
+  # prints as `NAME=`), and both names are probed because gh honours GITHUB_TOKEN too.
+  show-environment) if [ "${3:-}" = "GH_TOKEN" ] || [ "${3:-}" = "GITHUB_TOKEN" ]; then
+                      if [ "${3:-}" = "GITHUB_TOKEN" ] && [ "${TMUX_SERVER_GH_TOKEN:-0}" != "1" ]; then
+                        echo "unknown variable: GITHUB_TOKEN"; exit 1
+                      fi
+                      [ "${TMUX_SERVER_GH_TOKEN:-0}" = "1" ] && { printf 'GH_TOKEN=%s\n' "${TMUX_SERVER_TOKEN_VAL-ghp_test}"; exit 0; }
+                      echo "unknown variable: ${3:-}"; exit 1
                     fi ;;
   # The LOG keeps the target VERBATIM (the `=` prefix is the assertion); the STATE file needs the
   # bare name so membership still matches.
@@ -312,9 +319,58 @@ ck "control: a HOME with no credential file still spawns when the tmux server ca
 rm -rf "$TMP/O4f"
 out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4f" "$TMP/tmux4f.log" "$TMP/home-nocred" 2>&1)"
 case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
-ck "a caller whose own environment carries GH_TOKEN spawns (no credential file needed)" $rc
+ck "a caller whose own environment carries GH_TOKEN spawns (it will CREATE the server)" $rc
 grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux4f.log" && rc=0 || rc=1
 ck "…and it is a tmux session the worker inherits the caller's GH_TOKEN through" $rc
+# ⛔ BUT ONLY WHEN THE SPAWN *CREATES* THE SERVER (review finding 1 on this diff, measured on tmux 3.4):
+# against an ALREADY-RUNNING server a `new-session` gets the SERVER's global env plus tmux's
+# `update-environment` list, which does not carry GH_TOKEN — a server created by `env -i HOME=/tmp/a`
+# then `GH_TOKEN=ghp_caller_only tmux new-session` gave a pane with NO GH_TOKEN
+# (`tmux show-environment -g GH_TOKEN` → `unknown variable`). Crediting the caller there is the same
+# silent credential-less worker this gate exists to refuse, so it must be refused.
+rm -rf "$TMP/O4h"; printf 'lane-99\n' > "$TMP/srv-sessions"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env TMUX_STATE="$TMP/srv-sessions" bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4h" "$TMP/tmux4h.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a caller token against an EXISTING server is REFUSED (that session does not inherit it)" $rc
+grep -q 'new-session -d -s lane-8' "$TMP/tmux4h.log" && rc=1 || rc=0
+ck "…and no session is started for it" $rc
+# ... while the SAME pre-existing server is fine when IT carries the token (the positive control), so
+# the refusal is a probe of where the credential actually is, not a blanket ban.
+rm -rf "$TMP/O4i"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env TMUX_STATE="$TMP/srv-sessions" TMUX_SERVER_GH_TOKEN=1 bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4i" "$TMP/tmux4i.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…but the same server WITH the token spawns (the worker inherits the server's env)" $rc
+# ⛔ AN EMPTY VALUE IS NOT PROVISION, in either place (review finding 3): `GH_TOKEN=` in keys.env and a
+# server variable set to the empty string both read as "provisioned" to a presence test.
+rm -rf "$TMP/O4j"; mkdir -p "$TMP/home-emptytok/.config/gh"
+printf 'github.com:\n' > "$TMP/home-emptytok/.config/gh/hosts.yml"
+printf 'export GH_TOKEN=\n' > "$TMP/home-emptytok/keys.env"
+: > "$TMP/home-emptytok/.config/gh/hosts.yml"   # no credential file either: the keys.env is all there is
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4j" "$TMP/tmux4j.log" "$TMP/home-emptytok" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an empty \`GH_TOKEN=\` in keys.env is REFUSED (an assignment with no value is not a credential)" $rc
+rm -rf "$TMP/O4l"
+out="$(FAKE_UNAME=Linux TMUX_STATE="$TMP/srv-sessions" TMUX_SERVER_GH_TOKEN=1 TMUX_SERVER_TOKEN_VAL='' bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4l" "$TMP/tmux4l.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an empty server variable is REFUSED too (presence is not provision on the server side)" $rc
+# ⛔ A `HOME=` LINE INSIDE keys.env MUST NOT REPOINT THE VALIDATED HOME (review finding 2, measured:
+# the worker ended with `worker_HOME=/home/cmux`, where no hosts.yml exists — the exact credential-less
+# worker this gate exists to refuse, reported as provisioned). Driven: the prefix is EXECUTED and $HOME
+# is read back, so this pins the ORDER of the launch line, not its text.
+rm -rf "$TMP/O4m"; mkdir -p "$TMP/home-repoint/.config/gh"
+printf 'github.com:\n' > "$TMP/home-repoint/.config/gh/hosts.yml"
+printf 'HOME=/home/cmux\nexport DEEPSEEK_API_KEY=sk-x\n' > "$TMP/home-repoint/keys.env"
+cat > "$TMP/c6.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+. "$1"
+printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
+SH
+out="$(bash "$TMP/c6.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4m" "$TMP/home-repoint" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+worker_home="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent O="$TMP/O4m" /bin/bash -c "$pfx; printf '%s' \"\$HOME\"" 2>/dev/null)"
+[ "$worker_home" = "$TMP/home-repoint" ] && rc=0 || { rc=1; echo "      worker_HOME=$worker_home  prefix=$pfx"; }
+ck "a HOME= line inside keys.env does NOT repoint the validated HOME (re-asserted after the source)" $rc
 # ⛔ PRESENCE IS NOT PROVISION (same review): an EMPTY hosts.yml (a `gh auth logout` leftover) or a
 # keys.env that names no token reads as provisioned and starts exactly the credential-less worker the
 # gate exists to stop.
@@ -533,6 +589,23 @@ SH
 out="$(FAKE_UNAME=Darwin bash "$TMP/j2.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O12" 2>&1)"
 case "$out" in *"alive=no"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…while 'no server running' (the real absent answer) is still a positive EMPTY read" $rc
+# ⛔ A RECORD-LESS `chain-*` SESSION IS COUNTED TOO (review finding on this diff). dispatch-merge.sh
+# spawns and counts `chain-<N>` workers, so a chain the census cannot see is a cap that reads low — and
+# on a cell tmux is the only surface, so this covers the whole worker population there.
+cat > "$TMP/j3.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_STATE="$O/tmux-sessions" TMUX_LOG="$O/tmux.log"
+printf 'chain-7\n' > "$TMUX_STATE"      # no state/worker-chain-7: the session name is the only record
+. "$1"
+echo "alive=$(wt_alive chain-7 && echo yes || echo no)"
+echo "count=$(wt_count chain-)"
+SH
+out="$(FAKE_UNAME=Darwin bash "$TMP/j3.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O12b" 2>&1)"
+case "$out" in *"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a record-less chain-* session is ALIVE (the name is the contract, not the ledger)" $rc
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1;; esac
+ck "…and it is COUNTED, so the chain cap reads the real population" $rc
 
 echo
 echo "── K) the census memo is a FILE, so a cycle's questions are ONE daemon read ──"

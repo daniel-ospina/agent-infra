@@ -134,35 +134,57 @@ wt_launcher_home() {
   return 1
 }
 
+# `wt_tmux_server_token` — 0 when the tmux SERVER's global environment carries a NON-EMPTY token
+# variable. This is the only credential a worker against an ALREADY-RUNNING server can inherit (see
+# `wt_launcher_env`), so it is probed for both names, and an empty value is not provision.
+wt_tmux_server_token() {
+  local n v
+  command -v tmux >/dev/null 2>&1 || return 1
+  for n in GH_TOKEN GITHUB_TOKEN; do
+    v="$(tmux show-environment -g "$n" 2>/dev/null)" || continue
+    case "$v" in
+      "$n="*) [ -n "${v#"$n="}" ] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
 # credential. ⛔ THIS IS THE LOUD HALF: a credential-less worker burns a dispatch and produces nothing,
 # which is indistinguishable from the launcher killing it — so the spawn is refused, naming every
 # place a credential could have come from.
-# ⛔ THE CALLER'S OWN ENVIRONMENT IS ONE OF THOSE PLACES (review finding, 2026-10-22). `tmux new-session`
-# starts a SERVER that inherits the CALLER's environment, so a box whose gh authenticates from
-# `GH_TOKEN` in the environment is a working shape — and the pre-review probe (`tmux show-environment
-# -g GH_TOKEN` only) refused it forever, because that probe needs a server and a refusal starts none.
-# That is the same "refused every spawn, every cycle" failure this change removes, for a different
-# credential shape (the repo already treats a token-in-env cell as supported: refresh-candidates.sh).
-# ⛔ AND PRESENCE IS NOT PROVISION (same review): an EMPTY `hosts.yml` (a `gh auth logout` leftover) or a
-# `keys.env` that carries no token read as provisioned and start exactly the credential-less worker this
-# gate exists to stop. So a file counts only when it is non-empty AND (for keys.env) actually names a
-# token, and `GITHUB_TOKEN` is accepted beside `GH_TOKEN` because `gh` honours both.
+# ⛔ A CALLER'S `GH_TOKEN` IS ONLY PORTABLE WHEN THIS SPAWN CREATES THE SERVER (review finding,
+# 2026-10-22). `tmux new-session` inherits the CALLER's environment only when it starts a server;
+# against an ALREADY-RUNNING server the session gets that server's global env plus tmux's
+# `update-environment` list, which does not include `GH_TOKEN` — measured on tmux 3.4: a server
+# created by `env -i HOME=/tmp/a` then `GH_TOKEN=ghp_caller_only tmux new-session` gave a pane whose
+# environ had NO `GH_TOKEN` and `tmux show-environment -g GH_TOKEN` said `unknown variable`. So the
+# caller's token is credited only when there is positively no server; otherwise the server itself
+# must answer (below). A steady-state cell has exactly such a server, so this is the normal case.
+# ⛔ AND PRESENCE IS NOT PROVISION: an EMPTY `hosts.yml` (a `gh auth logout` leftover), a `keys.env`
+# that assigns no value, and a server variable set to the empty string are all refusals. A file or
+# variable counts only when it is non-empty; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
+# (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
-  local home="${1:-}" keys have=0
+  local home="${1:-}" keys have=0 names
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
-  [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && have=1
   [ -s "$home/.config/gh/hosts.yml" ] && have=1
   if [ "$have" = "0" ] && [ -f "$keys" ] \
-     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=' "$keys" 2>/dev/null; then
+     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=[^[:space:]]' "$keys" 2>/dev/null; then
     have=1
   fi
-  if [ "$have" = "0" ]; then
-    # nothing in the HOME or the caller: the tmux SERVER's environment may still carry one, and a
-    # worker inherits it. Probe it — but only when there IS a server to ask (see above).
+  if [ "$have" = "0" ] && [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+    # ... but only if this spawn will CREATE the server (see above). `wt_tmux_names` answers rc=0 with
+    # EMPTY output for the genuine `no server` case and 3 for an unreadable socket — an unreadable
+    # socket is not evidence of a fresh start, so the caller's token is not credited for it.
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux show-environment -g GH_TOKEN >/dev/null 2>&1 || return 1
+    if names="$(wt_tmux_names)" && [ -z "$names" ]; then have=1; fi
+  fi
+  if [ "$have" = "0" ]; then
+    # nothing in the HOME or a credit-bearing caller: the tmux SERVER's global env may still carry one,
+    # and a worker against that server inherits it. Probe it — non-empty, either name.
+    wt_tmux_server_token || return 1
   fi
   printf 'export HOME=%s' "$(wt_q "$home")"
   # ⛔ keys.env IS SOURCED UNDER `set -a`, exactly as cloud-cell-supervisor.sh sources it. An operator
@@ -171,6 +193,15 @@ wt_launcher_env() {
   # starts NOTHING — the credential-less worker this gate exists to refuse, one layer down. `set +a`
   # follows immediately so the worker's own shell options are the caller's, unchanged.
   [ -f "$keys" ] && printf '; set -a; . %s; set +a' "$(wt_q "$keys")"
+  # ⛔ HOME IS RE-ASSERTED AFTER THE SOURCE, and that is not belt-and-braces (review finding,
+  # 2026-10-22). A `HOME=` line inside keys.env is exported by the `set -a` source above and would
+  # OVERWRITE the HOME this gate just validated — measured: a file carrying `HOME=/home/cmux` left the
+  # worker with `worker_HOME=/home/cmux`, where no `hosts.yml` exists, i.e. the exact credential-less
+  # worker the gate exists to refuse, blessed as provisioned. Same two-step shape as
+  # `cloud-cell-supervisor.sh` (pre-source so `$HOME` expansions inside the file still resolve to the
+  # cell home; post-source so the file cannot repoint it). `O` is emitted after the source for the
+  # same reason.
+  printf '; export HOME=%s' "$(wt_q "$home")"
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
   return 0
 }
@@ -401,7 +432,12 @@ EOF
       # falls THROUGH on the empty match, so the normal "no sessions" answer (one blank line) added a
       # phantom `\talive` row to the census. Consumers filter a nameless row, so it only added noise —
       # but noise in the one table every cap, liveness answer and reap reads is not worth keeping.
-      case "$name" in lane-*|merge-*|fix-*) ;; *) continue ;; esac
+      # ⛔ `chain-*` IS IN THIS LIST (review finding on this diff): dispatch-merge.sh spawns
+      # `chain-<N>` workers and counts them (`wt_count lane- chain-`), but a chain session with no
+      # RECORD — a wiped $O/state, an older harness, a hand-start — was invisible here, so the census
+      # under-counted it and the cap it feeds was softer than it claimed. Pre-existing, and more
+      # load-bearing now that tmux is the only surface on a cell.
+      case "$name" in lane-*|merge-*|fix-*|chain-*) ;; *) continue ;; esac
       case "$name" in *[!A-Za-z0-9-]*) continue ;; esac
       # ⛔ IN-SHELL MEMBERSHIP, not `printf | awk` per line: a listing that STREAMS (the
       # cloud-cell-supervisor fixture streams 60k lines to prove no SIGPIPE fail-open) made this loop

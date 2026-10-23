@@ -160,8 +160,9 @@ without a human in the loop:
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
 It deliberately does **not** use the `task` sub-agent tool. Workers are separate `pi -p`
-processes in their own **durable terminal** (a daemon-owned surface on a cmux box; a tmux session
-only on macOS — see §2.1), so a killed worker cannot take the controller down with it.
+processes in their own **durable terminal** where the cmux daemon answers; where it does not, they run
+in a **tmux session carrying the HOME+keys.env contract** (macOS launchd and a Linux cell — see §2.1), so
+a killed worker cannot take the controller down with it.
 
 ---
 
@@ -340,7 +341,7 @@ own `pi` workers, which do not go through `task`.
 
 Every worker (`lane-*`, `chain-*`, `merge-*`, `fix-*`) is started by ONE module, `wt_spawn`, never by
 a hand-written command in a caller. It asks the box what it can actually provide and **refuses** when
-the answer is nothing — it never falls back to the launcher that does not work here:
+the answer is nothing (no cmux answer AND no `tmux` binary):
 
 | `wt_launcher` | when | what a worker is |
 |---|---|---|
@@ -358,6 +359,20 @@ the pre-fix arm `tmux new-session -d -s X 'cd CWD && CMD'` produced **7 lines an
 hand, which is why the death reproduced for the controller and never for an operator. So the tmux arm
 now refuses **loudly** a spawn it cannot give a credential to (`wt_launcher_env` names the three
 places it looked) instead of starting a worker that will stop at its first `gh` call.
+
+Two ordering rules in that contract are load-bearing, both measured (2026-10-22):
+
+- **`HOME` is re-asserted AFTER `keys.env` is sourced.** A `HOME=` line inside `keys.env` is exported
+  by the `set -a` source and would otherwise repoint the worker at a home with no credential — the
+  exact silent death the gate exists to refuse, reported as provisioned. (Same two-step shape as
+  `cloud-cell-supervisor.sh`: pre-source so `$HOME` expansions inside the file resolve to the cell
+  home, post-source so the file cannot move it.) Keys are sourced under `set -a` … `set +a` for the
+  same reason the supervisor does it: an assignment without `export` is legal there.
+- **A caller's `GH_TOKEN` counts as provision only when this spawn CREATES the tmux server.** Against
+  an already-running server a `new-session` gets the SERVER's global environment (measured on tmux
+  3.4: no `GH_TOKEN` in the pane, `unknown variable` from `show-environment`), because `GH_TOKEN` is
+  not in tmux's `update-environment` list. So with a server in place, the credential must be in the
+  worker's HOME/`keys.env` or in the server's own environment — either name, non-empty; else refused.
 
 There is **no env override** for the launcher: a gate an agent can defeat with an export is not a gate.
 (`WT_WORKER_HOME` is not a launcher override — it names the HOME that holds a worker's credentials, an
@@ -866,7 +881,7 @@ observe.
 ```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
-tmux ls                                      # macOS: lane-*, chain-*, merge-*, fix-*
+tmux ls                                      # no cmux answer (macOS launchd, or a Linux cell): lane-*, chain-*, merge-*, fix-*
 cmux workspace list                          # a cell: wt-lane-*, wt-chain-*, wt-merge-*, wt-fix-*
 ```
 
@@ -1149,8 +1164,8 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    `safe_ref` admits only `[A-Za-z0-9._/-]` **and** requires `git check-ref-format --branch`; PR ids
    must be all digits (`is_num`); worker arguments travel in a file and the daemon launches
    `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the command string the launcher
-   (`worker-terminal.sh`: a durable terminal on a cell, `tmux new-session` on macOS) executes **on any
-   live path**. (`retired/auto-loop.sh` still contains the old
+   (`worker-terminal.sh`: a durable terminal where the cmux daemon answers, otherwise `tmux new-session`
+   with the HOME+keys.env contract) executes **on any live path**. (`retired/auto-loop.sh` still contains the old
    unsafe interpolation, annotated in place — it is unreachable from the live scripts and exists
    only as history; do not reuse it.) Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
@@ -1547,7 +1562,7 @@ ships armed. ⛔ Note what is NOT that guard:
 `reap_stale_workers()` closes a worker **through the launcher's census**
 (`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
 ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
-surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
+surface (a durable terminal, or a tmux session — see §2.1), never a session NAME alone.
 
 ⛔ **The ancestry row is where arms get lost.** `ppid==1` is both this section's warning and
 `pi-reap-orphans.sh`'s candidate filter: once the kernel reparents a process, `ps` no longer holds
@@ -2555,7 +2570,8 @@ joined against `git worktree list --porcelain` by LONGEST prefix, so a worktree 
 `.worktrees/x` names its own branch rather than the repo's.
 
 ⛔ **What no longer counts as ownership, and it is the point:** a `fix-<PR>`/`merge-<PR>` **worker
-surface name** (a durable terminal on a cell, a tmux session on macOS — a reviewer reads the PR through `gh` and holds no branch; a session outlives its
+surface name** (a durable terminal where the cmux daemon answers, otherwise a tmux session with the
+HOME+keys.env contract — a reviewer reads the PR through `gh` and holds no branch; a session outlives its
 work), a **`needsfix-<PR>-<head>` marker** (it *authorises* a spawn, it does not prove one ran), and a
 **local claim ref whose holder died** (the lease outlives the process by design — `claims.sh`:
 "LEASE = DATA, NOT LIVENESS"). Each of those is a record of INTENT, and reading intent as work is what

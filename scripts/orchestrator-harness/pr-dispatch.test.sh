@@ -71,9 +71,10 @@ fi
 # drive <V> <merge-authority> [<lanes-in-use:0>] [<spawn-ok:1>] [<authority-unknown:0>] [<mergeable:CLEAN>]
 # `lanes-in-use` is how many fake WORKERS the surface reports, so the arm's own
 # `wt_count fix-` / `wt_count merge-` ceiling test is exercised for real. `MF`/`MR` stay at 9.
-# The surface is a fake `cmux` (worker-terminal.sh's durable terminal), NOT a fake `tmux`: a tmux
-# window is the measured 21-line death on a cell, so the launcher this suite drives is the one that
-# replaced it. `$TMP/lanes` names the workers; `cmux tree` renders them as the workspaces the
+# The surface is a fake `cmux` (worker-terminal.sh's durable terminal): this suite drives the launcher's
+# durable-terminal arm, the surface that answers first wherever a daemon is reachable. (The `~21 log
+# lines` death agent-infra#2210 blamed on tmux was the missing HOME+keys.env environment, not tmux —
+# the tmux arm is exercised by worker-terminal.test.sh §C/§D.) `$TMP/lanes` names the workers; `cmux tree` renders them as the workspaces the
 # shipped census reads.
 # Writes:  $TMP/d.tsv (the ledger the shipped disp() produced)   $TMP/spy (spawn argv)
 #          $TMP/gspy (gh argv)                                    $TMP/d.log (the log lines)
