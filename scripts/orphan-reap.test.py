@@ -482,6 +482,27 @@ def case_zombie(tmp) -> Box:
                sessions_dir=tmp)
 
 
+def case_recycled_mid_read(tmp) -> Box:
+    """`etime` jumped BACKWARDS between the two census reads — a recycle INSIDE the sample window.
+
+    The row's binding and its gate-3 age are measured off the BEFORE read, so in this shape they
+    describe a process that no longer exists, and the pid now belongs to a fresh `pi`. The
+    signal-time fence could not see it: it compares the after-read with the signal-time read, and
+    BOTH are the new process. So the census itself must refuse the measurement — the after-read's
+    `etime` (10 s) being lower than the before-read's (5 h) is the signature.
+
+    The REASON is the pin: while this went undetected the row read `PARKED-REAPABLE`, i.e. it was
+    a signal target; it must abstain as `recycled-mid-read`. (g10) pins the signal path.
+    """
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1, etime="05:00:00")}
+    after = {"1": _init(), "100": _row(100, 1, etime="00:00:10")}
+    return Box(before, after, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False),
+               sessions_dir=tmp)
+
+
 def case_unbound(tmp) -> Box:
     """NO bindable session file and a ZERO CPU delta — the documented blind spot, PARKED half.
 
@@ -543,6 +564,8 @@ TESTS = [
      case_unbound_busy, "LIVE", "cpu-advancing", None),
     ("(l) the after-sample row is a ZOMBIE (`stat` = Z) — abstain, never a verdict",
      case_zombie, "UNVERIFIABLE", "zombie", None),
+    ("(m) `etime` moved BACKWARDS between the two census reads — recycled inside the window",
+     case_recycled_mid_read, "UNVERIFIABLE", "recycled-mid-read", None),
 ]
 
 
@@ -705,6 +728,24 @@ def apply_path() -> int:
         check("(g9) the survivor is a ZOMBIE (already exited)", rc, out, kills, 0, [(100, 15)],
               must=("verified gone: 100",),
               must_not=("STILL ALIVE", "survived SIGTERM"))
+
+        # (g10) a pid recycled BETWEEN the two census reads must never reach a signal: the row's
+        # binding and age were measured off the dead process, so it is not a target at all.
+        rc, out, kills = _apply_run(case_recycled_mid_read(tmp))
+        check("(g10) the pid was recycled inside the sample window", rc, out, kills, 0, [],
+              must_not=("SIGTERM ->", "STILL ALIVE", "verified gone: 100"))
+
+        # (g11) `_same_incarnation` must fence against the incarnation the row was MEASURED on,
+        # not only its after-read. Here the after-read and the signal-time read agree (both 12 s)
+        # — so the after-read comparison passes — but the row was measured on a 5 h process.
+        # Pins the measured-etime floor: without it this returns True and a recycled pid is killed.
+        recycled = {"etime": "05:00:00", "etime_after": "00:00:12"}
+        cur = _row(100, 1, etime="00:00:12")
+        ok = mod._same_incarnation(recycled, cur)
+        print(f"{'PASS' if not ok else 'FAIL'} (g11) `_same_incarnation` rejects a row measured "
+              f"on an older incarnation than its after-read: {ok}")
+        if ok:
+            fails += 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return fails

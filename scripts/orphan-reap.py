@@ -118,10 +118,12 @@ DECLARED BLIND SPOTS (a report must say what it CANNOT see — `lane-status.py`'
     terminal ancestor, or not at all if that ancestor is a bare `-sh`). The list is an allowlist of
     owners, so a new host is a real gap.
 ⛔ A blind spot is NOT uniformly an abstention. Where the census cannot decide, it is reported as
-UNVERIFIABLE with its reason. But two bullets above do not abstain: an unreadable cwd means
-`bind_session` SKIPS the filter, so the row can bind, speak, and be scored LIVE on the fence
-evidence alone (and nothing in the row shows the cwd went unchecked); and a store-unreadable row
-under a terminal ancestor is `KEEP-HUMAN` from gate 2 before the canon's verdict is consulted.
+UNVERIFIABLE with its reason. But one bullet above does not abstain: an unreadable cwd means
+`bind_session` skips the pid-side filter, so the row can bind, speak, and be scored LIVE on the
+fence evidence alone — while the FILE side stays fail-closed (a `cwd`-less transcript is never a
+candidate) and `binding_detail` records that the pid-side cwd went unchecked, so the row shows it.
+The store-unreadable bullet does not abstain either: such a row under a terminal ancestor is
+`KEEP-HUMAN` from gate 2 before the canon's verdict is consulted.
 
 USAGE
     orphan-reap.py                 # dry run (default): report every candidate + gate reading
@@ -642,6 +644,7 @@ class PiEvidence:
     cpu_before: float
     cpu_after: Optional[float]     # None: the pid VANISHED between the two reads
     zombie_after: bool
+    recycled_mid_read: bool        # `etime` jumped BACKWARDS between the two census reads
     ancestry: List[str]
     self_ancestor: bool
     binding: str
@@ -714,6 +717,16 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
         return "UNVERIFIABLE", ["pid vanished between the two reads"], "vanished-mid-read"
     if ev.zombie_after:
         return "UNVERIFIABLE", ["process is a zombie: only its parent can reap it"], "zombie"
+    if ev.recycled_mid_read:
+        # ⛔ THE RECYCLE CAN HAPPEN BETWEEN THIS CENSUS'S OWN TWO READS, and that window is the
+        # one the binding was measured in. `_same_incarnation` fences the SIGNAL-time read against
+        # `etime_after`, so it cannot see this: both of ITS readings are the new process, and it
+        # would pass. The row would have bound the DEAD process's transcript (the fence keyed on
+        # the before-read `etime`) and then SIGTERMed whoever now holds the pid. An `etime` that
+        # moved backwards across the sample window is the signature, and it is a failed
+        # measurement, not a row (#1696).
+        return ("UNVERIFIABLE", ["pid was recycled between the two census reads: `etime` moved "
+                                "backwards inside the sample window"], "recycled-mid-read")
     if ev.cpu_after < 0:
         # the after-sample row EXISTS but its `time=` did not parse: a failed read, not a
         # disappeared process (which is `cpu_after is None` above).
@@ -944,6 +957,13 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
             cpu_after=(None if cur is None else
                        (cpu_seconds(cur["time"]) if cpu_seconds(cur["time"]) >= 0 else -1.0)),
             zombie_after=bool(cur and cur["stat"].startswith("Z")),
+            # ⛔ THE MEASURED INCARNATION IS THE SAMPLE'S **BEFORE** READ (`r["etime"]`), and the
+            # binding was fenced on it. A recycle inside the window makes `etime` move BACKWARDS;
+            # `_same_incarnation` only ever saw the after-read, so it could not detect this.
+            recycled_mid_read=bool(cur and etime_seconds(cur["etime"]) >= 0
+                                   and etime_seconds(r["etime"]) >= 0
+                                   and etime_seconds(cur["etime"]) + FENCE_S
+                                   < etime_seconds(r["etime"])),
             ancestry=ancestry(pid, before),
             self_ancestor=pid in selfc,
             binding=binding, binding_detail=detail, transcript=tr,
@@ -1210,9 +1230,18 @@ def _authorisation_holds(row: dict, liv, store_path: str, sessions_dir: str):
 
 
 def _same_incarnation(row: dict, cur: dict) -> bool:
-    """Same process, not a recycled pid: its elapsed time must not have jumped backwards."""
+    """Same process, not a recycled pid: its elapsed time must not have jumped backwards.
+
+    BOTH the after-read (`etime_after`, what `_apply_parked` compares against) AND the MEASURED
+    incarnation (`etime`, the before-read the binding and the verdict were fenced on) are
+    floors. The after-read alone was not enough: a pid recycled inside the census's own sample
+    window leaves after-read and signal-time read both describing the NEW process, so comparing
+    them passes — while the row was bound on the OLD one. `pi_verdict` rejects that row as
+    `recycled-mid-read`; this floor is the second, independent guard on the signal path.
+    """
     try:
         was = etime_seconds(row.get("etime_after") or row.get("etime") or "")
+        measured = etime_seconds(row.get("etime") or "")
         now = etime_seconds(cur["etime"])
     except Exception:
         return False
@@ -1222,7 +1251,12 @@ def _same_incarnation(row: dict, cur: dict) -> bool:
     # slightly HIGHER one (age grew). Requiring `now + FENCE_S >= was` therefore rejects a jump
     # BACKWARDS — the recycle — while tolerating the fence's rounding. (The earlier comment said
     # the opposite, which would invert the check if anyone "fixed" the code to match it.)
-    return now + FENCE_S >= was
+    if not now + FENCE_S >= was:
+        return False
+    # the incarnation the row was MEASURED on: an unreadable floor cannot license a signal
+    if measured < 0:
+        return False
+    return now + FENCE_S >= measured
 
 
 def main() -> int:
