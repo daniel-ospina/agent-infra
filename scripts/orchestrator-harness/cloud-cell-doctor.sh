@@ -1419,13 +1419,32 @@ registry_store() { # → the worktree to sync from (may provision one), or empty
   # and the only step here that can block on a slow/locked/shared filesystem; a hang there would hold
   # the one loop that supervises everything else — past `REGISTRY_STEP_TIMEOUT` and past `WORST_PASS_S`,
   # both of which bound the VERB and would therefore report a healthy cell while the loop is stuck.
-  local prc=0
+  local prc=0 stale=0 l regs
+  # ⛔ A STALE REGISTRATION IS A PERMANENT DEADLOCK, and it is reachable WITHOUT hand-editing: the
+  # worktree is a THROWAWAY, so `rm -rf`-ing it (what any disk cleanup does, and what its own name
+  # invites) leaves the registration in `<hub>/.git/worktrees/` with no directory — and then a plain
+  # `worktree add` refuses FOR EVER with rc=128 ("is a missing but already registered worktree; use
+  # 'add -f' to override, or 'prune'"). Measured: every hourly pass logged `could not provision … rc=128`
+  # and skipped, i.e. the sub-step was dead on that box while the rehearsal still said `would sync`.
+  # The targeted repair is `-f` on OUR OWN path: `git worktree prune` would also drop other (possibly
+  # merely-unmounted) registrations, which is not this role's to remove. Read the registration list
+  # itself — the directory's absence was already established by the caller.
+  regs="$(git -C "$hub" worktree list --porcelain 2>/dev/null)"
+  while IFS= read -r l; do
+    [ "$l" = "worktree $wt" ] && stale=1
+  done <<< "$regs"
   # The STEP bound, not the network one: this is a LOCAL gitdir write, and using the network knob here
   # let an operator who raised it for a slow store also widen an unrelated local bound.
-  run_bounded "$REGISTRY_STEP_TIMEOUT" git -C "$hub" worktree add --detach --no-checkout "$wt" \
-    >/dev/null 2>&1 || prc=$?
+  if [ "$stale" = 1 ]; then
+    log "[hygiene] registry: $wt is REGISTERED as a worktree but its directory is gone — re-creating it (a throwaway removed out of band leaves this state, which plain \`worktree add\` refuses for ever)" >&2
+    run_bounded "$REGISTRY_STEP_TIMEOUT" git -C "$hub" worktree add -f --detach --no-checkout "$wt" \
+      >/dev/null 2>&1 || prc=$?
+  else
+    run_bounded "$REGISTRY_STEP_TIMEOUT" git -C "$hub" worktree add --detach --no-checkout "$wt" \
+      >/dev/null 2>&1 || prc=$?
+  fi
   if [ "$prc" -ne 0 ]; then
-    log "[hygiene] registry: could not provision the sync worktree at $wt from $hub (rc=$prc) — skipped (the hub checkout is deliberately not used; #2520)" >&2
+    log "[hygiene] registry: could not provision the sync worktree at $wt from $hub (rc=$prc, stale_registration=$stale) — skipped (the hub checkout is deliberately not used; #2520). If a registration is stale: git -C $hub worktree prune" >&2
     return 1
   fi
   printf '%s\n' "$wt"
