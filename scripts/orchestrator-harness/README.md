@@ -310,8 +310,8 @@ never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
-Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty-one `*.sh` plus `gh-rest/gh`
-and `gh-limit.py` — twenty-three entries (`install.sh:815`, moved by this PR's own added line) —
+Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty-two `*.sh` plus `gh-rest/gh`
+and `gh-limit.py` — twenty-four entries (`install.sh:855`, moved by this PR's own added line) —
 and this file **is** on it (added when
 `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale `$O/nonblocking-dispatch.sh`
 names itself instead of silently leaving every background dispatch to fail. ⛔ A stale copy is
@@ -818,7 +818,7 @@ its deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`).
 recursive `find`, so **the rule is: every file that is not a top-level `*.sh` is outside that
 comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/gh`, `$O/gh-limit/gh`,
 `$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
-`install.sh`'s `DRIFTED` list (`install.sh:815`) carries exactly two of them — `gh-rest/gh` and
+`install.sh`'s `DRIFTED` list (`install.sh:855`) carries exactly two of them — `gh-rest/gh` and
 `gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
 `gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
 `launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is

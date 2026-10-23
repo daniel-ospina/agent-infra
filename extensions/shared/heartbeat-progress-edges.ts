@@ -1279,7 +1279,7 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
   {
     symbol: "CIQ_AGE",
     rationale:
-      "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `ciq_stale_max`/`ciq_ttl`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
+      "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `CIQ_STALE_MAX`/`CIQ_TTL`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
     owner: "#2426",
   },
   {
