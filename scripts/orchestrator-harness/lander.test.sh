@@ -371,8 +371,9 @@ has "$OUT" "#111 sigpipe-grep RE-RUN (run 5001, check 1001 started 2026-10-23T01
 grep -q "^R" "$(state_file)" 2>/dev/null \
   && ok "STALE: the re-run was recorded in the state file (so its outcome is read on a later pass)" \
   || bad "STALE: nothing was recorded in $(state_file)"
-has "$(rerun_calls)" "test" && bad "STALE: the re-run was issued per check, not per run" \
-                             || ok "STALE: one POST for the run — the green sibling was not re-run by name"
+n_posts="$(printf '%s\n' "$(rerun_calls)" | grep -c 'rerun-failed-jobs')"
+[ "$n_posts" = "1" ] && ok "STALE: exactly ONE POST for the run — the green sibling was not re-run by name" \
+                     || bad "STALE: expected exactly 1 POST, got $n_posts ('$(rerun_calls)')"
 
 say_case "case 12 — (ii) a RED check started AFTER the base tip is NOT selected (this tree is current)"
 new_case
@@ -503,6 +504,67 @@ run_lander
 has "$OUT" "#119 sigpipe-grep skipped — run 5009 was already re-run inside the" \
   && ok "REFUSED: the deferral is reported as a windowed skip, so the red is still visible" \
   || bad "REFUSED: the deferral is silent on the next pass ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -2))"
+say_case "case 20 — the BOUNDARY: started_at EQUAL to the base tip is NOT stale; one second before IS"
+# The rule is `started_at < base tip`. A `<` vs `<=` slip ships a re-run of a check that measured the
+# CURRENT tree, so both sides of the boundary are pinned here (the reviewer measured that flipping the
+# comparison to `<=` left the whole suite green — it was uncovered).
+new_case
+base_tip "$BASE_ISO"
+seed 120 MERGEABLE CLEAN false aaaa5555666677778888999900001111222233334
+checks 120 sigpipe-grep:failure
+surface 120 "sigpipe-grep|FAILURE|$BASE_ISO|6001|1101"          # EXACTLY the tip
+run_lander
+[ -z "$(rerun_calls)" ] && ok "BOUNDARY: started_at EQUAL to the base tip is NOT stale (no re-run)" \
+                         || bad "BOUNDARY: a check started AT the tip was re-run ('$(rerun_calls)')"
+has "$OUT" "stale-by-base=0" && ok "BOUNDARY: and it is counted as not-stale" \
+                              || bad "BOUNDARY: the equal case is miscounted ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+
+new_case
+base_tip "$BASE_ISO"
+seed 121 MERGEABLE CLEAN false aaaa6666777788889999000011112222333344445
+checks 121 sigpipe-grep:failure
+surface 121 "sigpipe-grep|FAILURE|2026-10-23T12:51:02Z|6002|1102"   # exactly one second BEFORE the tip
+run_lander
+has "$(rerun_calls)" "actions/runs/6002/rerun-failed-jobs" \
+  && ok "BOUNDARY: one second before the tip IS stale and is re-run" \
+  || bad "BOUNDARY: a check started 1s before the tip was not re-run ('$(rerun_calls)')"
+
+say_case "case 21 — a re-run's TWO attempts are co-resident: the drain must judge the NEWEST, not count both"
+# The re-run ADDS a check-run. A drain that counts every row reports the PR red forever after a
+# re-run came back GREEN — i.e. the value this step produces would be invisible to the only consumer
+# that decides a merge. This fixture is exactly what a successful re-run leaves on the head.
+new_case
+base_tip "$BASE_ISO"
+seed 122 MERGEABLE CLEAN false aaaa7777888899990000111122223333444455556
+python3 - "$FX/checks-122.json" <<'PY'
+import json, sys
+json.dump([
+    {"name": "sigpipe-grep", "state": "failure", "workflow": "CI", "startedAt": "2026-10-23T01:26:15Z"},
+    {"name": "sigpipe-grep", "state": "success", "workflow": "CI", "startedAt": "2026-10-23T13:58:23Z"},
+], open(sys.argv[1], "w"))
+PY
+run_lander
+has "$(merged_nums)" "122" && ok "CO-RESIDENT: the superseded failure does not block the merge — the newest attempt is the verdict" \
+                           || bad "CO-RESIDENT: a PR whose re-run went green was NOT merged (merge calls: '$(merged_nums)')"
+if grep -q 'FAILED check' <<<"$OUT"; then
+  bad "CO-RESIDENT: the superseded failure is still counted ($(printf '%s\n' "$OUT" | grep 'FAILED check'))"
+else ok "CO-RESIDENT: the superseded failure is not counted as a failure"; fi
+say_case "case 22 — TWO stale checks in ONE run get ONE POST (the cap counts runs; the POSTs must too)"
+new_case
+base_tip "$BASE_ISO"
+seed 123 MERGEABLE CLEAN false aaaa8888999900001111222233334444555566667
+checks 123 sigpipe-grep:failure bash-suites:failure
+surface 123 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|6010|1110" \
+            "bash-suites|FAILURE|2026-10-23T01:00:01Z|6010|1111"
+run_lander
+n_posts="$(printf '%s\n' "$(rerun_calls)" | grep -c 'rerun-failed-jobs')"
+[ "$n_posts" = "1" ] && ok "RUN-SCOPE: two stale checks sharing run 6010 produced exactly ONE POST" \
+                     || bad "RUN-SCOPE: expected 1 POST for run 6010, got $n_posts ('$(rerun_calls)')"
+has "$OUT" "#123 bash-suites is re-run by the SAME run 6010 already POSTed in this pass (check 1111)" \
+  && ok "RUN-SCOPE: the second check is still REPORTED and RECORDED (re-run by the run's POST, not dropped)" \
+  || bad "RUN-SCOPE: the second stale check vanished from the report ($(printf '%s\n' "$OUT" | grep 'stale-rerun: #123'))"
+[ "$(grep -c '^R' "$(state_file)")" = "2" ] && ok "RUN-SCOPE: both checks got their own R record, so BOTH outcomes are read later" \
+                                           || bad "RUN-SCOPE: expected 2 R records (one per check), got $(grep -c '^R' "$(state_file)")"
 # ══ summary ═════════════════════════════════════════════════════════════════════════════════
 printf '\n%s of %s assertions passed, %s failed\n' "$PASS" "$((PASS+FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

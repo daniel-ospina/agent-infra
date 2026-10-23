@@ -162,7 +162,23 @@ elif mode == "checks":
     # exist (and send a fixer after nothing), while calling it green would merge unverified work.
     nonred   = {"cancelled", "stale"}
     g = p = f = 0; names = []; odd = []
+    # ⛔ A RE-RUN ADDS A CHECK-RUN; IT NEVER CLEARS ONE, so the same (workflow, job) legitimately
+    # appears twice on one head — a superseded `failure` beside a newer `success`. Counting every row
+    # made a re-run worthless: the PR kept reading "1 FAILED check(s)" (measured by the reviewer with
+    # a two-row fixture, and and by this lane own live re-runs, whose two attempts are co-resident on
+    # the head). Take the NEWEST by `startedAt` per (workflow, name) and DROP the superseded ones.
+    # ⛔ The dedupe is only applied when EVERY row in a group carries `startedAt`: an undateable row
+    # cannot be ordered, and guessing would let a red fall through a gap. Fail-closed = count it.
+    groups = {}
     for c in d:
+        groups.setdefault(((c.get("workflow") or ""), (c.get("name") or "")), []).append(c)
+    deduped = []
+    for _k, items in groups.items():
+        if len(items) > 1 and all(x.get("startedAt") for x in items):
+            deduped.append(max(items, key=lambda x: x["startedAt"]))
+        else:
+            deduped.extend(items)
+    for c in deduped:
         st = (c.get("state") or "").strip().lower()
         if st in green_ok: g += 1
         elif st in pending: p += 1
@@ -359,9 +375,26 @@ if doc.get("errors"):
           + json.dumps(doc["errors"])[:200])
     raise SystemExit(0)
 try:
-    nodes = doc["data"]["repository"]["pullRequests"]["nodes"]
+    _prs = doc["data"]["repository"]["pullRequests"]
+    nodes = _prs["nodes"]
 except Exception:
     print("FATAL\tthe check-surface read has no pull request nodes — nothing selected")
+    raise SystemExit(0)
+if (_prs.get("pageInfo") or {}).get("hasNextPage"):
+    print("FATAL\tthe PR list was TRUNCATED (pageInfo.hasNextPage) — nothing selected: with more than "
+          "100 open PRs this read is a SAMPLE, and acting on a sample is how the fleet ends up with a "
+          "second, disagreeing opinion about the board")
+    raise SystemExit(0)
+_trunc = []
+for _p in nodes:
+    for _cs in (((_p.get("commits") or {}).get("nodes") or [])[:1]):
+        _ctx = ((((_cs.get("commit") or {}).get("statusCheckRollup") or {}).get("contexts")) or {})
+        if (_ctx.get("pageInfo") or {}).get("hasNextPage"):
+            _trunc.append(str(_p.get("number")))
+if _trunc:
+    print("FATAL\tthe check surface is TRUNCATED for PR(s) " + ",".join(_trunc[:10]) +
+          " (pageInfo.hasNextPage on contexts) — nothing selected: the NEWEST attempt may be outside "
+          "the first 100, and an older GREEN attempt inside it would make a stale red invisible")
     raise SystemExit(0)
 
 # ── prior state: unresolved re-runs (R) and resolved outcomes (O) ────────────────────────────
@@ -412,9 +445,17 @@ for pr in nodes:
 # is where `still-red` is produced — never assumed green, never dropped.
 keep = list(deferred)
 for f in unresolved:
-    _, epoch, pr, run, name, cid, started = (f + [""] * 7)[:7]
+    # R fields: R epoch pr run name cid started [app] [wf]   (app/wf are optional: older rows lack them)
+    _, epoch, pr, run, name, cid, started = (f + [""] * 9)[:7]
+    app, wf = ((f + [""] * 9)[7] or "", (f + [""] * 9)[8] or "")
     g = newest.get(pr) or {}
-    hit = next((v for k, v in g.items() if k[2] == name), None)
+    # ⛔ THE FULL GROUP KEY, NOT THE FIRST NAME MATCH. Two workflows can publish the same job name;
+    # a name-only match reported SUCCESS from the wrong one (measured by the reviewer: a red `CI/test`
+    # masked by a green `Stress/test`). Fall back to name-only ONLY for a legacy row with no app/wf.
+    if app or wf:
+        hit = g.get((app, wf, name))
+    else:
+        hit = next((v for k, v in g.items() if k[2] == name), None)
     if hit is None:
         keep.append(f); continue            # nothing readable for that name yet: still unknown
     new = hit["c"]
@@ -431,7 +472,12 @@ for f in unresolved:
 # ── selection: RED, dated, started BEFORE the base tip, not already in the window ─────────────
 cands, undated, nonactions = [], [], 0
 excluded = 0
-seen_runs = {(f[2], f[3]) for f in unresolved} | {(f[2], f[3]) for f in deferred}
+# ⛔ THE WINDOW IS THE BOUND, NOT THE PRUNE. `window` used to be parsed and never referenced, so the
+# real suppression was the 7-day prune — and a `403 workflow is already running` deferral (which
+# clears in minutes) blocked that run's re-measurement for a week while the report claimed the
+# ${STALE_RERUN_WINDOW}s window. Only records INSIDE the window suppress; unresolved R records older
+# than the window are still resolved for their outcome (that is a read, not a re-run).
+seen_runs = {(f[2], f[3]) for f in unresolved + deferred if now - int(f[1]) <= window}
 for pr in nodes:
     num = str(pr.get("number"))
     if num not in board:
@@ -457,23 +503,39 @@ for pr in nodes:
         if (num, str(hit["run"])) in seen_runs:
             print(f"SKIPWIN\t{num}\t{hit['run']}\t{name}")
             continue
-        cands.append((sa, num, str(hit["run"]), name, str(c.get("databaseId")), sa))
+        cands.append((sa, num, str(hit["run"]), name, str(c.get("databaseId")), sa, app, wf))
+
+# ⛔ THE EXCLUSION IS PER CHECK, BUT THE MUTATION IS PER RUN. `rerun-failed-jobs` re-runs EVERY
+# failed job in the run, so a run that also carries an excluded check must not be selected at all —
+# otherwise the excluded check is re-run by the same POST, which is exactly the folding-together this
+# step's header forbids. Today `pipeline-compliance` lives in its own workflow so it cannot share a
+# run with a `ci.yml` job; that is the LAYOUT, not an invariant, so it is enforced here too.
+excluded_runs = set()
+for pr in nodes:
+    num = str(pr.get("number"))
+    if num not in board:
+        continue
+    for (app, wf, name), hit in (newest.get(num) or {}).items():
+        if name in exclude and hit.get("run"):
+            excluded_runs.add(str(hit["run"]))
+excluded_run_checks = len(excluded_runs)
+cands = [c for c in cands if c[2] not in excluded_runs]
 
 cands.sort()                                # oldest staleness first, so a bounded pass drains fairly
 chosen, over, runs = [], 0, set()
-for sa, num, run, name, cid, started in cands:
+for sa, num, run, name, cid, started, app, wf in cands:
     if run not in runs:
         if len(runs) >= cap:
             over += 1; continue
         runs.add(run)
-    chosen.append((sa, num, run, name, cid, started))
+    chosen.append((sa, num, run, name, cid, started, app, wf))
 
-for sa, num, run, name, cid, started in chosen:
-    print(f"RERUN\t{num}\t{run}\t{name}\t{cid}\t{started}")
+for sa, num, run, name, cid, started, app, wf in chosen:
+    print(f"RERUN\t{num}\t{run}\t{name}\t{cid}\t{started}\t{app}\t{wf}")
 stale_prs = {c[1] for c in cands}
 cand_runs = len({c[2] for c in cands})
 print(f"INFO\t{base_iso}\t{len(cands)}\t{len(stale_prs)}\t{cand_runs}\t{len(chosen)}\t{len(runs)}\t{over}\t"
-      f"{len(undated)}\t{nonactions}\t{len(keep)}\t{excluded}")
+      f"{len(undated)}\t{nonactions}\t{len(keep)}\t{excluded}\t{excluded_run_checks}")
 for num, name in undated[:10]:
     print(f"UNDATED\t{num}\t{name}")
 
@@ -511,11 +573,25 @@ lander_stale_rerun() { # <board-numbers-file>  (one PR number per line, from the
   fi
   # THE BUDGET, before anything is spent. `/rate_limit` is documented as NOT counting against the
   # limit, so reading it costs nothing — and 5 points per POST is the documented cost of a mutation.
+  # ⛔ THE KNOBS ARE VALIDATED BEFORE THEY ARE USED, because each one bounds a MUTATION. This
+  # block used to sit AFTER `n` was derived, so a typo'd `STALE_RERUN_CAP=10O` made the `-gt`
+  # comparison error out and left `n` at the budget-derived value — the guard was inert for the one
+  # case it exists for (measured: n=880 survived `[ 880 -gt 10O ]`). Out-of-range values are CLAMPED
+  # to the documented bounds, never honoured and never silently ignored.
+  case "${STALE_RERUN_CAP:-}" in ''|*[!0-9]*) STALE_RERUN_CAP=8 ;; esac
+  [ "$STALE_RERUN_CAP" -gt 50 ] && STALE_RERUN_CAP=50
+  case "${STALE_RERUN_RESERVE:-}" in ''|*[!0-9]*) STALE_RERUN_RESERVE=500 ;; esac
+  case "${STALE_RERUN_WINDOW:-}" in ''|*[!0-9]*) STALE_RERUN_WINDOW=10800 ;; esac
+  # ⛔ EVERY CALL THIS STEP MAKES IS BOUNDED (`GH_LIMIT_NO_WAIT=1`). The gh layer backs off for up to
+  # MAX_WAIT=300s on a shared-bucket refusal; inside a drain loop that is not patience, it is a STALL
+  # of the whole run (measured: the step blocked and the lander had to be killed at 150s). A limited
+  # call now returns AT ONCE with the named rate-limit error, which this step reports as a refusal —
+  # and a refusal is recorded as a deferral, never read as green.
   local rem n now kind a b c d e f
   # ⛔ NOT `--jq`: this call may be served by the seeded REST adapter, and a projection that fails
   # inside the adapter yields an EMPTY string that is indistinguishable from "no budget". Parse the
   # body here, where a failure to parse is a named failure and not a silent zero.
-  rem="$(gh api rate_limit 2>/dev/null | python3 -c 'import json,sys
+  rem="$(GH_LIMIT_NO_WAIT=1 gh api rate_limit 2>/dev/null | python3 -c 'import json,sys
 for f in (sys.stdin,):
     try: d=json.load(f)
     except Exception: print(""); raise SystemExit
@@ -529,21 +605,12 @@ print(r if isinstance(r,int) else "")' 2>/dev/null)"
   n=$(( (rem - STALE_RERUN_RESERVE) / 5 ))
   [ "$n" -gt "$STALE_RERUN_CAP" ] && n="$STALE_RERUN_CAP"
   [ "$n" -lt 0 ] && n=0
-  # ⛔ THE KNOBS ARE VALIDATED, because each one bounds a MUTATION. A typo'd
-  # `STALE_RERUN_CAP=10O` would make the `-gt` comparison error out, leave `n` at the budget-derived
-  # value and spend more than the operator asked; a typo'd reserve would remove the floor that keeps
-  # the rail able to make its own reads. Out-of-range values are CLAMPED to the documented bounds,
-  # never honoured and never silently ignored.
-  case "${STALE_RERUN_CAP:-}" in ''|*[!0-9]*) STALE_RERUN_CAP=8 ;; esac
-  [ "$STALE_RERUN_CAP" -gt 50 ] && STALE_RERUN_CAP=50
-  case "${STALE_RERUN_RESERVE:-}" in ''|*[!0-9]*) STALE_RERUN_RESERVE=500 ;; esac
-  case "${STALE_RERUN_WINDOW:-}" in ''|*[!0-9]*) STALE_RERUN_WINDOW=10800 ;; esac
   now="$(date -u +%s)"
 
   # THE BASE TIP, over GRAPHQL (the REST bucket is the scarce one: `commits/<sha>` and
   # `pulls/<n>` reads that the rest of this file makes are the same 5000/hr pool). The committer
   # date is the clock this step measures against — one point, no REST.
-  gh api graphql -f query='
+  GH_LIMIT_NO_WAIT=1 gh api graphql -f query='
 query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){
   defaultBranchRef{ target{ ... on Commit { committedDate } } } } }' \
     -f owner="${OR%%/*}" -f name="${OR##*/}" >"$tmp/base.json" 2>/dev/null
@@ -559,42 +626,50 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
 
   # THE CHECK SURFACE, ONE GraphQL read for the whole board. `contexts` is the commit's check runs; the
   # per-PR `checkSuites` read is the COMPLETE surface but costs a node budget per PR that this box
-  # cannot spend 83 times, so selection uses the rollup and the OUTCOME check below is what protects
-  # against its known gap: an attempt missing here can only make this step OVER-select (re-measure a
-  # check that is already green), never under-report a red as green.
-  gh api graphql -f query='query($owner:String!,$name:String!){
+  # cannot spend 100 times.
+  # ⛔ `pageInfo{hasNextPage}` IS REQUESTED AND ENFORCED, because the earlier claim that a truncated
+  # read "can only make this step OVER-select" was FALSE in one direction: if the newest attempt falls
+  # outside the first 100 contexts and an older GREEN attempt is inside it, a stale red is neither
+  # selected nor counted (`stale-by-base=0`). The planner refuses a truncated surface instead.
+  GH_LIMIT_NO_WAIT=1 gh api graphql -f query='query($owner:String!,$name:String!){
   repository(owner:$owner,name:$name){
     pullRequests(first:100, states:OPEN, orderBy:{field:UPDATED_AT, direction:DESC}){
+      pageInfo{ hasNextPage }
       nodes{ number
         commits(last:1){ nodes{ commit{
-          statusCheckRollup{ contexts(first:100){ nodes{ __typename
-            ... on CheckRun { databaseId name status conclusion startedAt
-              checkSuite{ app{slug} workflowRun{ databaseId workflow{ name } } } }
-            ... on StatusContext { context state } } } } } } } } } } }' \
+          statusCheckRollup{ contexts(first:100){
+            pageInfo{ hasNextPage }
+            nodes{ __typename
+              ... on CheckRun { databaseId name status conclusion startedAt
+                checkSuite{ app{slug} workflowRun{ databaseId workflow{ name } } } }
+              ... on StatusContext { context state } } } } } } } } } } }' \
     -f owner="${OR%%/*}" -f name="${OR##*/}" >"$tmp/rollup.json" 2>/dev/null
 
   lander_stale_plan "$tmp/rollup.json" "$boardf" "$base_iso" "$STALE_RERUN_STATE" \
     "$n" "$STALE_RERUN_WINDOW" "$now" "$STALE_RERUN_EXCLUDE" >"$tmp/plan.txt" 2>"$tmp/plan.err"
-  if [ ! -s "$tmp/plan.txt" ] && [ -s "$tmp/plan.err" ]; then
-    say "stale-rerun: the planner failed — 0 re-runs this run: $(tr '\n' ' ' <"$tmp/plan.err" | cut -c1-200)"
+  tr '\t' '\037' <"$tmp/plan.txt" >"$tmp/plan.us"
+  # ⛔ ABSENCE OF AN `INFO` LINE IS THE FAILURE SIGNAL, not an empty file. A planner that dies after
+  # its first print leaves a NON-EMPTY plan, every counter at its 0 default and a summary that reads
+  # `stale-by-base=0` — a silent zero, which hard rule 4 forbids (measured by the reviewer: one
+  # unparseable `startedAt` produced `stale-by-base=0 … outcomes read=1`).
+  if ! grep -q "^INFO$(printf '\037')" "$tmp/plan.us" 2>/dev/null; then
+    local why="the planner printed nothing explanatory"
+    [ -s "$tmp/plan.err" ] && why="$(tr '\n' ' ' <"$tmp/plan.err" | cut -c1-300)"
+    say "stale-rerun: the plan did not complete (no INFO line) — 0 re-runs this run: $why"
     rm -rf "$tmp"; return 0
   fi
-  # ⛔ TABS FROM PYTHON, UNIT SEPARATORS FOR THE SHELL. The plan is written with `\t` because it is
-  # also human-readable in the log; `read` must not use TAB as IFS (a tab is IFS WHITESPACE, so runs
-  # of them collapse and an EMPTY field is swallowed — the same defect lander.sh's own `py view`
-  # documents). ONE translation here keeps both properties.
-  tr '\t' '\037' <"$tmp/plan.txt" >"$tmp/plan.us"
-
-  local stale_runs=0 stale_prs=0 over=0 undated=0 nonact=0 cands=0 want=0 chose_runs=0 re_ran=0 outcomes=0 successes=0 stillred=0 excluded=0
+  local stale_runs=0 stale_prs=0 over=0 undated=0 nonact=0 cands=0 want=0 chose_runs=0 re_ran=0 outcomes=0 successes=0 stillred=0 excluded=0 excluded_runs=0
   # INFO's field order: base, candidate checks, candidate PRs, candidate runs, chosen checks,
-  # chosen runs, over-budget checks, undated, non-actions, unresolved re-runs, excluded-by-name
+  # chosen runs, over-budget checks, undated, non-actions, unresolved re-runs, excluded-by-name,
+  # excluded-by-run
   local info; info="$(awk -F"$US" '$1=="INFO"{print; exit}' "$tmp/plan.us")"
   if [ -n "$info" ]; then
-    IFS="$US" read -r _ base_iso cands stale_prs stale_runs want chose_runs over undated nonact _ excluded <<<"$info"
+    IFS="$US" read -r _ base_iso cands stale_prs stale_runs want chose_runs over undated nonact _ excluded excluded_runs <<<"$info"
   fi
   while IFS="$US" read -r kind a b c d e f; do
     case "$kind" in
-      FATAL)  say "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
+      FATAL)    say "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
+      STATEERR) say "stale-rerun: THE STATE FILE COULD NOT BE WRITTEN ($a) — the outcome of every re-run this run is UNRECORDED, so it will be re-reported (and, for an unresolved re-run, re-measured) next pass. This is a degraded run, not a clean one" ;;
       UNDATED) say "stale-rerun: #$a $b is RED but carries no started_at — NOT selected (a check that cannot be dated cannot be called stale; it stays red and visible)" ;;
       SKIPWIN) say "stale-rerun: #$a $c skipped — run $b was already re-run inside the ${STALE_RERUN_WINDOW}s window (the state file is what stops a re-run loop)" ;;
     esac
@@ -602,23 +677,45 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
 
   # ACT: one POST per RUN (a run can carry several stale checks — sigpipe-grep and bash-suites live
   # in the same `CI` run), never per check.
-  while IFS="$US" read -r kind a b c d e f; do
+  # ⛔ THE PLAN EMITS ONE LINE PER CHECK, SO THE RUN IS DEDUPED HERE. Measured live before this
+  # guard existed: run 39854279334 carried two stale checks and got TWO POSTs, the second refused by
+  # a secondary limit — doubling the spend and tripping the limit for every later run in the pass.
+  # The CAP is counted in runs; the POSTS must be too, or the two disagree.
+  local okruns=" " badruns=" "
+  while IFS="$US" read -r kind a b c d e f g h; do
     [ "$kind" = "RERUN" ] || continue
+    # A second check on a run this pass ALREADY posted for is still RECORDED (its own outcome has to
+    # be read on a later pass) but is never a second POST. If the first POST was refused, the sibling
+    # inherits the deferral instead of pretending it was re-run.
+    case "$okruns" in
+      *" $b "*)
+        if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$g" "$h" >> "$STALE_RERUN_STATE"; then
+          say "stale-rerun: #$a $c is re-run by the SAME run $b already POSTed in this pass (check $d) — recorded so its outcome is read, not POSTed twice"
+        else
+          say "stale-rerun: #$a $c shares run $b (already POSTed) but the STATE FILE COULD NOT BE WRITTEN — its outcome will not be read"
+        fi
+        continue ;;
+    esac
+    case "$badruns" in *" $b "*) printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$g" "$h" >> "$STALE_RERUN_STATE"; continue ;; esac
     if [ "$DRY" = 1 ]; then
       say "stale-rerun: #$a $c WOULD RE-RUN (check id $d started $e — before the base tip $base_iso; run $b)"
       continue
     fi
-    if gh api -X POST "repos/$OR/actions/runs/$b/rerun-failed-jobs" >/dev/null 2>"$tmp/post.err"; then
-      re_ran=$((re_ran+1))
-      printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" >> "$STALE_RERUN_STATE"
-      say "stale-rerun: #$a $c RE-RUN (run $b, check $d started $e < base tip $base_iso) — the result is read next pass, as success or still-red"
+    if GH_LIMIT_NO_WAIT=1 gh api -X POST "repos/$OR/actions/runs/$b/rerun-failed-jobs" >/dev/null 2>"$tmp/post.err"; then
+      re_ran=$((re_ran+1)); okruns="$okruns$b "
+      if printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$a" "$b" "$c" "$d" "$e" "$g" "$h" >> "$STALE_RERUN_STATE"; then
+        say "stale-rerun: #$a $c RE-RUN (run $b, check $d started $e < base tip $base_iso) — the result is read next pass, as success or still-red"
+      else
+        say "stale-rerun: #$a $c was RE-RUN (run $b) but the STATE FILE COULD NOT BE WRITTEN ($STALE_RERUN_STATE) — its outcome will not be read, and the same run may be re-run again next pass"
+      fi
     else
       # ⛔ A REFUSAL IS RECORDED, NOT RETRIED. Measured live: `403 This workflow is already
       # running` for a run whose other jobs are still executing — the failed check-run is real and
       # old, but the RUN cannot be re-run yet. Recording it as a deferral (D) spends the window so
       # the next pass does not pay another POST to learn the same thing; it is never resolved into
       # an outcome, because nothing ran.
-      printf 'D\t%s\t%s\t%s\t%s\t-\t-\n' "$now" "$a" "$b" "$c" >> "$STALE_RERUN_STATE"
+      badruns="$badruns$b "
+      printf 'D\t%s\t%s\t%s\t%s\t-\t-\t%s\t%s\n' "$now" "$a" "$b" "$c" "$g" "$h" >> "$STALE_RERUN_STATE"
       say "stale-rerun: #$a $c re-run REFUSED by the API (run $b): $(tr '\n' ' ' <"$tmp/post.err" | cut -c1-200) — recorded as deferred; not retried inside the ${STALE_RERUN_WINDOW}s window, and NOT treated as green"
     fi
   done <"$tmp/plan.us"
@@ -635,8 +732,8 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
     esac
   done <"$tmp/plan.us"
 
-  say "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun)"
-  note "stale-rerun: base_tip=$base_iso cands=$cands prs=$stale_prs runs=$stale_runs N=$n want=$want ran=$re_ran over=$over outcomes=$outcomes success=$successes still_red=$stillred"
+  say "stale-rerun: stale-by-base=$cands check(s) across $stale_prs PR(s) in $stale_runs run(s); budget N=$n run(s) (REST core ${rem} left, minus ${STALE_RERUN_RESERVE} reserve, 5 points per re-run POST); selected=$want check(s) in $chose_runs run(s), re-ran=$re_ran run(s), over-budget=$over check(s) left for the next run; undated=$undated non-actions=$nonact; outcomes read=$outcomes (success=$successes still-red=$stillred); excluded-by-name=$excluded run(s)-dropped=$excluded_runs (NOT base-staleness: ${STALE_RERUN_EXCLUDE} is #2467's class, owned by the recorder rerun; a RUN carrying one is dropped entirely, because the POST re-runs every failed job in it)"
+  note "stale-rerun: base_tip=$base_iso cands=$cands prs=$stale_prs runs=$stale_runs N=$n want=$want ran=$re_ran over=$over outcomes=$outcomes success=$successes still_red=$stillred excl_run=$excluded_runs"
   if [ "${STALE_RERUN_DEBUG:-0}" = 1 ]; then say "stale-rerun: DEBUG kept $tmp (plan, rollup, base)"; else rm -rf "$tmp"; fi
   return 0
 }
@@ -706,7 +803,7 @@ lander_one() { # <pr>
   # FAILED as an UNREADABLE surface, and this component would report "waiting" for a red PR forever.
   # The payload is captured FIRST and judged ONLY by whether it is a JSON array: rc is discarded here
   # deliberately, and that is why the capture and the classification are two statements.
-  ckraw="$(gh pr checks "$pr" --repo "$OR" --json name,state 2>/dev/null)"
+  ckraw="$(gh pr checks "$pr" --repo "$OR" --json name,state,startedAt,workflow 2>/dev/null)"
   chk="$(printf '%s' "$ckraw" | py checks)"; crc=$?
   if [ "$crc" -ne 0 ] || [ -z "$chk" ]; then
     # An incomplete read is neither green nor red. Reading it as "no checks" is the defect that let
