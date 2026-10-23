@@ -77,6 +77,23 @@ done
 bash -n "$INST" || { printf 'syntax error in %s\n' "$INST"; exit 1; }
 bash -n "$SUP"  || { printf 'syntax error in %s\n' "$SUP"; exit 1; }
 
+# ── ONE THROWAWAY CHECKOUT THE SUPERVISOR MAY PIN A HARNESS FROM (review P2, #2402) ──────────────
+# ⛔ THE `start` ARMS FALL THROUGH TO THE SUPERVISOR, WHICH APPLIES (pins) A HARNESS. With HARNESS_REPO
+# unset it resolves to `dirname($BASH_SOURCE)/..` — the REAL checkout — and HARNESS_FETCH defaults to 1:
+# measured, one suite run did `git fetch origin main` in the developer's checkout (moving its
+# origin/main) and registered two prunable worktrees in its git dir, while this file's own header claims
+# "no network". A LOCAL clone (--local: hardlinked objects, no fetch, no remote access) gives the pin the
+# same real harness tree it had before, but every record it creates lands in THIS temp dir.
+HARNESS_SRC="$T/harness-src"
+if git clone -q --local --no-checkout "$HERE/.." "$HARNESS_SRC" 2>/dev/null \
+   && [ -n "$(git -C "$HARNESS_SRC" rev-parse --verify --quiet origin/main 2>/dev/null)" ]; then
+  :
+else
+  printf '❌ could not create the throwaway harness clone from %s — a suite run must never pin from the real checkout\n' "$HERE/.."
+  printf '\n────────────────────────────────────────────\npassed=%s failed=%s\n' "$PASS" "1"
+  exit 1
+fi
+
 # Every invocation is bounded. A wedged arm must surface as a RED line, never as silence.
 BOUND="${BOUND:-90}"
 bnd() { timeout "$BOUND" "$@"; }
@@ -187,6 +204,7 @@ sup() {
   bnd env -u OR SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
       CONTROLLER_USER_UNIT_DIR="$r/nouser" PATH="$r/bin:$PATH" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" REPO="$r/repo" SCOPE=own HARNESS="$r/harness" \
+      HARNESS_REPO="$HARNESS_SRC" HARNESS_FETCH=0 \
       SESSION="ctlunit-$$-${1:-x}" CYC=240 CONTROLLER_START_TIMEOUT=20 \
       ${SUP_EXTRA_ENV:-} bash "$SUP" "$@"
 }
@@ -258,8 +276,14 @@ if [ -f "$UNIT" ]; then
   else
     bad "StartLimitIntervalSec=${_si}s ≤ RestartSec=${_rs}s — the start limit can never trip"
   fi
-  [ -f "$SUP" ] && ok 'ExecStart names an existing file (a 127-every-restart unit is an inert enforcer)' \
-                || bad "the supervisor the unit names does not exist: $SUP"
+  # ⛔ RESOLVED OUT OF THE ARTIFACT, NOT OUT OF THE SUITE'S OWN VARIABLE (review P2, #2402). `[ -f "$SUP" ]`
+  # was a TAUTOLOGY — the suite already exits unless $SUP exists — so the row could never be red while it
+  # read as proof that the rendered ExecStart resolves. A unit whose ExecStart names a missing file is the
+  # inert enforcer: `enable --now` succeeds and every restart is a 127 with no controller.
+  _ex="$(sed -n 's|^ExecStart=/bin/bash ||p' "$UNIT" | head -1)"; _ex="${_ex% start}"
+  [ -n "${_ex:-}" ] && [ -f "$_ex" ] \
+    && ok "the INSTALLED ExecStart resolves to an existing file ($_ex)" \
+    || bad "the installed unit's ExecStart names a file that does not exist: '${_ex:-<no ExecStart>}'"
 else
   bad "no unit installed at $UNIT — §A cannot assert the artifact ($A_OUT)"
 fi
@@ -841,7 +865,7 @@ esac
 printf '%s\n' 1234 > "$H/state/mainpid"
 printf '%s\n' '0001234567' > "$H/o/heartbeat"
 H2_RC=0; H2_OUT="$(inst h --status 2>&1)" || H2_RC=$?
-if printf '%s\n' "$H2_OUT" | grep -qE 'heartbeat_age_s=1[0-9]{9}'; then
+if grep -qE 'heartbeat_age_s=1[0-9]{9}' <<<"$H2_OUT"; then
   bad 'status: subtracted a LEADING-ZERO heartbeat as octal and printed a fabricated epoch-sized age'
 fi
 case "$H2_OUT" in
@@ -1171,6 +1195,116 @@ KL_RC=0; KL_OUT="$(EXTRA_ENV=CONTROLLER_STALE_S=600 inst kl --status 2>&1)" || K
 [ "$KL_RC" -ne 0 ] \
   && ok 'status: a LOWERED CONTROLLER_STALE_S is honoured too (the doctor is the authority both ways)' \
   || bad "status: clamped CONTROLLER_STALE_S=600 back up to 900 — the operator tightened one instrument and got another opinion: $KL_OUT"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §L — the unit NAME is machine-scoped; OWNERSHIP IS A READ (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# MEASURED FAILURE this section exists for: on a two-state-dir box, B's `--uninstall` ran `disable --now`
+# and `rm -f` against A's unit and reported "the controller is no longer supervised" (rc 0) — stopping A's
+# controller and stripping its Restart=always, i.e. the #2402 defect caused by a DIFFERENT cell's verb —
+# while B's `--status` answered enabled+active+MainPID with rc 0 over a unit B does not own. The render
+# carries `Environment=O=`, so ownership is readable rather than guessed.
+say_case 'a unit that provably supervises ANOTHER state dir is reported and never addressed'
+OLA="$(arm_root l1)"; mk_systemctl "$OLA/bin" "$OLA/state" "$OLA/sc.log"
+OLA_RC=0; OLA_OUT="$(inst l1 --install 2>&1)" || OLA_RC=$?
+[ "$OLA_RC" -eq 0 ] && [ -f "$OLA/units/eldato-orchestrator.service" ] \
+  && ok 'fixture: state dir A installed its unit (the machine-scoped name now exists on the box)' \
+  || bad "fixture: could not install A's unit — the ownership arms cannot run: $OLA_OUT"
+OLB="$(arm_root l2)"; mk_systemctl "$OLB/bin" "$OLB/state" "$OLB/sc.log"
+OLB_S_RC=0; OLB_S_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$OLA/units" inst l2 --status 2>&1)" || OLB_S_RC=$?
+case "$OLB_S_OUT" in
+  *"other_unit=$OLA/units/eldato-orchestrator.service"*) ok 'status: NAMES the unit as another state dir’s, instead of answering for it' ;;
+  *) bad "status: did not report A's unit as foreign — it read a machine-scoped NAME as its own: $OLB_S_OUT" ;;
+esac
+[ "$OLB_S_RC" -ne 0 ] \
+  && ok 'status: rc!=0 while the only unit present belongs to another state dir (no false green)' \
+  || bad "status: exited 0 on a box whose only unit supervises a DIFFERENT state dir: $OLB_S_OUT"
+OLB_U_RC=0; OLB_U_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$OLA/units" inst l2 --uninstall 2>&1)" || OLB_U_RC=$?
+[ -f "$OLA/units/eldato-orchestrator.service" ] \
+  && ok "uninstall: ANOTHER state dir's unit file SURVIVES" \
+  || bad 'uninstall: DELETED another state dir’s unit — the #2402 defect, caused by a different cell'
+grep -qE '^disable( |$)' "$OLB/sc.log" 2>/dev/null \
+  && bad 'uninstall: issued disable for a unit it does not own (that cell’s controller would stop and lose Restart=always)' \
+  || ok 'uninstall: issued NO disable for the foreign unit'
+case "$OLB_U_OUT" in
+  *"other_unit=$OLA/units/eldato-orchestrator.service"*) ok 'uninstall: REPORTS what it left untouched (not silent)' ;;
+  *) bad "uninstall: changed nothing and said nothing about the foreign copy: $OLB_U_OUT" ;;
+esac
+# NEGATIVE CONTROL: the SAME verb on A itself still addresses A's unit (the filter is ownership, not a wall).
+OLA_U_RC=0; OLA_U_OUT="$(inst l1 --uninstall 2>&1)" || OLA_U_RC=$?
+[ "$OLA_U_RC" -eq 0 ] && [ ! -f "$OLA/units/eldato-orchestrator.service" ] \
+  && ok 'uninstall: the OWNING state dir still uninstalls its own unit (the ownership read discriminates)' \
+  || bad "uninstall: refused to remove the caller's OWN unit — the ownership read over-blocks: $OLA_U_OUT"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §M — the lock witness needs SHAPE *AND AGE* (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# A stale $O/.orch.lock outlives a kill -9/OOM/reboot, and the OS recycles pids: on this fleet the
+# recycled target is a PEER repo's controller — same basename, same shared harness path — so the shape
+# test matches perfectly. A controller always writes the lock AFTER it starts, so a process that BEGAN
+# after the lock was written cannot own it. This arm makes the lock OLD (2020) and then names a live,
+# loop-shaped process in it: the install must NOT be certified by that lock.
+say_case 'a recycled pid that merely LOOKS like the loop does not certify an install (shape AND age)'
+MR="$(arm_root m1)"; mk_systemctl "$MR/bin" "$MR/state" "$MR/sc.log"
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$MR/harness/orch-loop.sh"
+chmod +x "$MR/harness/orch-loop.sh"
+printf '0\n' > "$MR/o/.orch.lock"
+touch -d '2020-01-01 00:00:00' "$MR/o/.orch.lock" 2>/dev/null || touch -t 202001010000 "$MR/o/.orch.lock"
+bash "$MR/harness/orch-loop.sh" & MR_LP=$!; PIDS="$PIDS $MR_LP"
+sleep 1
+printf '%s\n' "$MR_LP" > "$MR/o/.orch.lock"
+touch -d '2020-01-01 00:00:00' "$MR/o/.orch.lock" 2>/dev/null || touch -t 202001010000 "$MR/o/.orch.lock"
+MR_RC=0; MR_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=3 inst m1 --install 2>&1)" || MR_RC=$?
+[ "$MR_RC" -ne 0 ] \
+  && ok 'install: a pid that BEGAN long AFTER the lock does not certify (the age half discriminates)' \
+  || bad "install: certified the unit from a lock whose named pid began five years after it was written — a recycled peer controller is accepted as ours: $MR_OUT"
+kill -9 "$MR_LP" 2>/dev/null || true
+# POSITIVE CONTROL: the same live process, with a lock written AFTER it started (the real order), certifies.
+MP="$(arm_root m2)"; mk_systemctl "$MP/bin" "$MP/state" "$MP/sc.log"
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$MP/harness/orch-loop.sh"
+chmod +x "$MP/harness/orch-loop.sh"
+bash "$MP/harness/orch-loop.sh" & MP_LP=$!; PIDS="$PIDS $MP_LP"
+sleep 1
+printf '%s\n' "$MP_LP" > "$MP/o/.orch.lock"
+MP_RC=0; MP_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=8 inst m2 --install 2>&1)" || MP_RC=$?
+[ "$MP_RC" -eq 0 ] \
+  && ok 'install: a controller that began BEFORE its lock still certifies (the age read is not a blanket refusal)' \
+  || bad "install: refused a genuine lock owner — the age read over-blocks: $MP_OUT"
+kill -9 "$MP_LP" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §N — the pid-identity mirror must not DRIFT from scripts/lib/pid-identity.sh (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# This installer is deployed STANDALONE, so it cannot source the library; it carries the functions as
+# PINNED MIRRORS. Two copies of a timing predicate with different slacks is the #1178 defect, so the
+# bodies are compared with the names normalised — the same drift pin cloud-cell-supervisor.test.sh §(p)
+# applies to the supervisor's copy.
+say_case "the installer's pid-identity mirror is identical to scripts/lib/pid-identity.sh"
+NPL="$(dirname "$INST")/lib/pid-identity.sh"
+if [ -f "$NPL" ]; then
+  extract_fn() { awk -v n="$2" 'index($0, n"() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"; }
+  norm_fn() {
+    sed -e 's/_proc_start_epoch/FN_START/g' -e 's/_proc_began_after/FN_AFTER/g' \
+        -e 's/pid_start_epoch/FN_START/g'   -e 's/pid_began_after/FN_AFTER/g' \
+        -e 's/LOCK_START_SLACK_SECONDS/SLACK/g' -e 's/PID_START_SLACK_SECONDS/SLACK/g' \
+        -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'
+  }
+  INST_BODY="$( { extract_fn "$INST" _proc_start_epoch; extract_fn "$INST" _proc_began_after; } | norm_fn )"
+  LIB_BODY="$( { extract_fn "$NPL" pid_start_epoch;    extract_fn "$NPL" pid_began_after;    } | norm_fn )"
+  if [ -n "$INST_BODY" ] && [ "$INST_BODY" = "$LIB_BODY" ]; then
+    ok 'the mirror’s CODE is identical to the library’s (names + slack normalised, comments excluded)'
+  else
+    bad "the installer's pid-identity mirror has DRIFTED from $NPL"
+    diff <(printf '%s\n' "$LIB_BODY") <(printf '%s\n' "$INST_BODY") | sed 's/^/      /' | head -20
+  fi
+  _as="$(sed -n 's/^LOCK_START_SLACK_SECONDS=\([0-9]*\).*/\1/p' "$INST" | head -1)"
+  _bs="$(grep -E '^PID_START_SLACK_SECONDS=' "$NPL" | head -1 | grep -oE '[0-9]+' | tail -1)"
+  [ -n "${_as:-}" ] && [ "$_as" = "$_bs" ] \
+    && ok "the two slack constants agree (${_as}s)" \
+    || bad "slack drifted: installer=${_as:-<absent>} library=${_bs:-<absent>}"
+else
+  bad "$NPL is missing next to the installer — the mirror cannot be checked"
+fi
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

@@ -42,8 +42,7 @@
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
 #   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
-#                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install)
-#                          StartLimitIntervalSec so a start that can never succeed converges to `failed`).
+#                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install).
 #                          Rendered as CONTROLLER_ORPHAN_TIMEOUT, and as TimeoutStartSec — its systemd-side
 #                          counterpart (this unit is Type=simple, where that directive does not bound start)
 #   ORCH_HANDOVER_TIMEOUT_SEC the handover ceiling for a controller this state dir still OWNS (default 3600;
@@ -295,8 +294,9 @@ heartbeat_age() {    local hb="$O/heartbeat" t now age
 # controller execs the harness it was started from). A `grep -qF "$O/orch-loop.sh"` therefore never
 # matched on the only platform this installer supports, so the documented second witness could not fire
 # and the install verdict rested on the heartbeat alone — while the supervisor's own `lock_controller_pid`
-# called the very same process `controller: RUNNING`. Same rule, one implementation: a shell followed by
-# an `orch-loop.sh`, which is what both the loop and its wrapper look like.
+# called the very same process `controller: RUNNING`. This is the SHAPE half of that one rule — a shell
+# followed by an orch-loop.sh, which is what both the loop and its wrapper look like. The AGE half is
+# `_proc_began_after` below, the same predicate the supervisor and the doctor apply.
 argv_is_orch_loop() { # <pid>
     local c
     c="$(ps -o command= -p "$1" 2>/dev/null)" || return 1
@@ -306,16 +306,64 @@ argv_is_orch_loop() { # <pid>
     case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
     case "${2##*/}" in orch-loop.sh) return 0 ;; *) return 1 ;; esac
 }
+# ⛔ THE AGE HALF OF THE SAME RULE, AND IT IS A PINNED MIRROR — NOT A THIRD OPINION (review P1, #2402).
+# controller_proof's lock leg checked SHAPE only, while cloud-cell-supervisor.sh::lock_controller_pid and
+# cloud-cell-doctor.sh::service_controller_present both require "the process BEGAN BEFORE the record was
+# written", because a stale $O/.orch.lock outlives a kill -9/OOM/reboot and the OS recycles pids: on this
+# fleet the recycled target is a PEER repo's controller with the same basename from the same shared
+# harness path, so shape alone matches perfectly. Without this, --install (and the bring-up's
+# check_controller_service, which runs it) certified a unit whose start produced NO controller.
+# This script is deployed STANDALONE (a farmed copy has no sibling lib), so it mirrors
+# scripts/lib/pid-identity.sh verbatim; install-controller-service.test.sh §N extracts both bodies and
+# REDDENS if they drift (the same drift pin cloud-cell-supervisor.test.sh §(p) applies).
+# Same value as LOCK_START_SLACK_SECONDS / PID_START_SLACK_SECONDS (the drift arm pins all three).
+LOCK_START_SLACK_SECONDS=5
+_proc_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  # 10#, NOT a bare arithmetic expansion: etime ZERO-PADS its fields and bash reads 08 as OCTAL, so an
+  # 08/09 in any field made this fail — and a failed age would read as "began before the fence" = owner.
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+# 0 = the process began AFTER <epoch> (so it cannot own a record written before it), 1 = provably before,
+# 2 = cannot tell. Three outcomes, because folding "cannot tell" into "began before" makes an unreadable
+# age the strongest possible evidence of ownership (the #1856 defect this predicate exists to close).
+_proc_began_after() {
+  local pe="${2:-}" ps
+  case "$pe" in ''|*[!0-9]*) return 2 ;; esac
+  ps="$(_proc_start_epoch "${1:-}")" || return 2
+  [ "$ps" -gt "$((pe + LOCK_START_SLACK_SECONDS))" ]
+}
 # Is a CONTROLLER of this state dir running? (review P1, #2402) The harness's single-instance lock names
 # the loop's pid; identity is checked as well as liveness, because a recycled pid is not our loop (#1178).
 # A plausible heartbeat is the second witness (the loop's own first cycle), so a cell whose lock the loop
 # has not taken YET — harness_apply + cmd_check run first — is not refused for the seconds it needs.
 controller_proof() { # [<not_before_epoch>] — a heartbeat older than this start proves nothing
     local pid hb now since="${1:-0}"
+    local lt rc
     pid=""
     [ ! -f "$O/.orch.lock" ] || pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && argv_is_orch_loop "$pid"; then
-        return 0
+        # ⛔ SHAPE IS NOT OWNERSHIP (review P1, #2402). Every controller on this box is a shell followed by
+        # a shared-harness orch-loop.sh, so a recycled pid — a PEER repo's controller — passes the shape
+        # test. A controller always writes $LOCK AFTER it starts, so a process that BEGAN after the lock
+        # was written cannot be its owner. Unprovable age (ps/date that cannot answer) is NOT a proof
+        # either: fall through to the heartbeat leg rather than certify.
+        lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null || true)"
+        _proc_began_after "$pid" "${lt:-}"; rc=$?
+        [ "$rc" -eq 1 ] && return 0
     fi
     hb=""
     [ ! -f "$O/heartbeat" ] || hb="$(tr -dc '0-9' <"$O/heartbeat" 2>/dev/null || true)"
@@ -534,7 +582,7 @@ do_install() {
 }
 
 do_status() {
-    local active enabled pid age rc=0 _found=""
+    local active enabled pid age rc=0 _found="" _f
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
     else
@@ -550,6 +598,23 @@ do_status() {
         fi
     fi
     say "unit=$UNIT_NAME target=$TARGET"
+    # ⛔ NAME A COPY THAT IS NOT THIS STATE DIR'S, INSTEAD OF ANSWERING FOR IT (review P1, #2402). Silence
+    # here is what made this verb's rc 0 readable as "my cell is supervised" on a box whose only unit belongs
+    # to another state dir. It is reported on its own line and never addressed: the manager answers about the
+    # unit NAME, which is machine-scoped.
+    while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        say "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; NOT read, NOT addressed)"
+    done < <(foreign_units)
+    # ⛔ AND DO NOT ASK THE MANAGER ABOUT A NAME THAT IS PROVABLY SOMEONE ELSE'S (review P1, #2402). The
+    # `is-enabled`/`is-active`/`show -p MainPID` reads below are answered by the unit NAME, so on the
+    # measured two-state-dir box they described A's unit while B held nothing: rc 0, "active", a live
+    # MainPID — B's operator reads that as their own cell being supervised. When the copy resolved for THIS
+    # scope provably supervises another state dir, there is nothing of ours here to verify.
+    if [ -f "$UNIT_DIR/$UNIT_NAME" ] && ! unit_is_ours "$UNIT_DIR/$UNIT_NAME"; then
+        err "nothing installed for $O here: the unit at $UNIT_DIR supervises $(unit_owner_dir "$UNIT_DIR/$UNIT_NAME") — UNKNOWN whether this state dir is supervised by anything (it is not by that unit)"
+        return 1
+    fi
     # ⛔ AN UNREADABLE IS NOT A "NO" (review P2, #2402): both reads below report UNKNOWN rather than a
     # definite verdict, because `--status` is the documented verification verb. `is-enabled` prints a state
     # WORD on success; an EMPTY answer is not a state (a shim, a truncated read).
@@ -576,6 +641,18 @@ do_status() {
         # evidence the loop TICKED once; it is not evidence one is running now.
         [ "${pid:-0}" != "0" ] || { err "the unit is active with MainPID 0 — no controller process (the RestartSec/activating state, or a start that died): journalctl -u $UNIT_NAME -n 40"; rc=1; }
     else say "main_pid=UNREADABLE"; rc=1; fi
+    # ⛔ MainPID IS THE UNIT'S MAIN PROCESS, NOT NECESSARILY THE CONTROLLER (review P2, #2402). Under
+    # Type=simple the main process is the launcher (`… start`), which spends harness_apply/cmd_check — and
+    # up to CONTROLLER_HANDOVER_TIMEOUT — before it `exec`s the loop, so a live MainPID alone can be a
+    # launcher. The CONTROLLER-level witness is the one --install already applies (the lock's owner, age
+    # bound; or a plausible heartbeat). Reported here, never used to decide rc: a start that is still
+    # inside its first CYC legitimately has neither witness, and turning that into a refusal would be a
+    # false red on every healthy start. The stale-heartbeat refusal above is what bounds the ambiguity.
+    if controller_proof; then
+        say "controller=proved (an owned lock holder, or a heartbeat newer than 2*CYC)"
+    else
+        say "controller=none-proved yet (no owned lock holder and no plausible heartbeat — expected during the first CYC after a start; the heartbeat bound above is what refuses a dead one)"
+    fi
     # NRestarts is the direct evidence for the issue's bullet 3/5 ("it comes back on its own"): a unit
     # that has restarted had a controller that died and was brought back without a human.
     local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) say "restarts=${nr#NRestarts=}" ;; *) say "restarts=unreadable" ;; esac
@@ -646,6 +723,41 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
                                       else SC="sudo -n systemctl"; fi ;;
     esac
 }
+# ⛔ A UNIT FILE'S PRESENCE IS NOT AN OWNERSHIP CLAIM (review P1, #2402). The unit NAME is machine-scoped
+# (eldato-orchestrator.service), so "the first copy on the box" can be ANOTHER state dir's — measured on a
+# two-state-dir box: B's `--uninstall` disabled and deleted A's unit and reported "the controller is no
+# longer supervised" (rc 0), and B's `--status` answered enabled+active+MainPID with rc 0 over a unit B does
+# not own, i.e. the #2402 "reads as a healthy box" false green on the one verb the docs tell an operator to
+# trust. The rendered unit CARRIES its owner (`Environment=O=`, which verify_unit requires), so ownership is
+# a READ, not a guess. Same rule, same fallback as cloud-cell-supervisor.sh::unit_owner_dir.
+unit_owner_dir() { # <unit file> -> the state dir it supervises; nothing when it carries no O= line
+    local v
+    [ -f "$1" ] || return 1
+    v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
+    [ -n "${v:-}" ] || return 1
+    printf '%s\n' "$v"
+}
+# May this verb address <unit file>? YES for our own copy, and YES for an UNPROVABLE one (no O= line — a
+# hand-written or pre-#2402 unit), which is the fail-safe side of #1761: assume it may be ours and never
+# launch a tmux controller beside a unit that could be enabled. NO only when it provably supervises a
+# DIFFERENT state dir — and then nothing here may disable, delete, or report on it.
+unit_is_ours() { # <unit file>
+    local own
+    own="$(unit_owner_dir "$1")" || return 0
+    [ "$own" = "$O" ]
+}
+# Every installed copy that PROVABLY belongs to another state dir — reported, never addressed.
+foreign_units() {
+    local d seen=" "
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || printf '%s\n' "$d/$UNIT_NAME"
+    done
+    return 0
+}
 # ⛔ FIND THE INSTALLED COPY, DO NOT RE-DERIVE THE SCOPE (review P2, #2402). `choose_target` answers "where
 # WOULD this go on THIS box now", which is not "where IS it": a box that installed a USER unit and later
 # gained passwordless sudo would resolve to the SYSTEM scope, print `not installed: /etc/systemd/system/…`
@@ -664,7 +776,9 @@ find_installed_unit() {
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
-        [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || continue
+        printf '%s\n' "$d/$UNIT_NAME"; return 0
     done
     return 1
 }
@@ -677,12 +791,18 @@ installed_units() {
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
-        [ -f "$d/$UNIT_NAME" ] && printf '%s\n' "$d/$UNIT_NAME"
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || continue
+        printf '%s\n' "$d/$UNIT_NAME"
     done
     return 0
 }
 do_uninstall() {
-    local p left
+    local p left _f
+    # ⛔ ANOTHER STATE DIR'S UNIT IS NOT OURS TO REMOVE, AND NOT SILENT EITHER (review P1, #2402): the
+    # `--uninstall` for state dir B used to `disable --now` and `rm -f` A's unit and report success, which
+    # stops A's controller and strips its Restart=always — the #2402 defect, caused by another cell's verb.
+    # Named once, up front, so an operator on a two-state-dir box is never blind to what was left alone.
     # ⛔ AN ELEVATED UNINSTALL CANNOT SEE THE OPERATOR'S UNIT (review P2, #2402). Running the installer
     # through `sudo` sets HOME=/root, so every reader here ($HOME/.config/systemd/user, the state dir)
     # describes root's world: find_installed_unit found nothing, the verb printed "not installed" and
@@ -697,6 +817,19 @@ do_uninstall() {
     if [ -z "$SC" ]; then choose_target >/dev/null 2>&1 || true; fi
     # the installed copy decides the scope; the resolved one is only the fallback when none is found
     p="$(find_installed_unit)" || p="${UNIT_DIR:+$UNIT_DIR/$UNIT_NAME}"
+    while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        say "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; left untouched)"
+    done < <(foreign_units)
+    # ⛔ THE FALLBACK PATH IS NOT A LICENCE TO ADDRESS SOMEONE ELSE'S UNIT (review P1, #2402). When no copy
+    # of OURS is installed, `p` falls back to the path THIS box would choose — which on a two-state-dir box
+    # is the very directory the foreign copy lives in. Without this check the verb below would `disable
+    # --now` and `rm -f` that copy: it stops another cell's controller and strips its Restart=always. There
+    # is nothing of ours to uninstall here, so report that and change nothing.
+    if [ -n "$p" ] && [ -f "$p" ] && ! unit_is_ours "$p"; then
+        say "not installed for $O: the unit at $p supervises $(unit_owner_dir "$p") — nothing to do"
+        return 0
+    fi
     if [ -z "$p" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
     UNIT_DIR="$(dirname "$p")"
     scope_for_dir "$UNIT_DIR"
