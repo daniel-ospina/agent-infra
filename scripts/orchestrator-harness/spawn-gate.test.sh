@@ -133,7 +133,12 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+# `scripts/review-pr.sh` is DECLARED here for the same reason (#2288): it spawns the fresh-context
+# reviewer that produces the merge artifact. It carries the bound run_agent() would give it (its own
+# wall-clock watchdog), the SAME posture merge-one.sh's reviewer has — the installed `pi` shim is the
+# load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
+# consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
@@ -253,6 +258,21 @@ echo "PI_RAN" >> "$PI_LOG"
 exit 0
 PI
 chmod +x "$TMP/bin/pi"
+# ⛔ THE CREATION BACK-PRESSURE GATE IS SUPPLIED A READING, NOT SWITCHED OFF (#2409). `run_agent` now
+# measures the repo's landing ratio immediately before any spawn, through `gh` — and these arms drive
+# it straight from this checkout (whose origin IS agent-infra), so the system `gh` would answer
+# `LAND-BACKLOG` and every positive control below would be refused by the WRONG gate (measured: 14
+# arms). Supplying the reading is the fix the #2333 review established for its CI-queue gate: an env
+# var that opens a gate is not a gate, so this puts a calm answer where the gate actually reads.
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
+# ⛔ AND THE REPO MUST BE SUPPLIED TOO (review cycle 2, P2). `land_backlog_repo` derives owner/name
+# from the CURRENT worktree's origin, so every driver below that ran in "whatever checkout the runner
+# started in" reddened 14 arms the moment that checkout had no GitHub origin (measured: `cd /tmp` ->
+# 82 passed / 14 failed, all "rc=74 started=0"). A fixture with a GitHub origin makes the reading
+# explicit, exactly as `capacity-transfer.test.sh` §LB does — the arms then test their SUBJECT.
+FIXREPO="$TMP/repofix"; mkdir -p "$FIXREPO"
+git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com/owner/repo.git
 
 # drive <load> <label> [<max-load>] — runs the SHIPPED run_agent under a controlled reading. `load1`
 # is re-declared AFTER sourcing, which is the seam described at the top. `pi` is a stub; every
@@ -265,12 +285,13 @@ drive() { # drive <load> <label> <max-load>
   # load-refusal assertions would otherwise come back 77 and read as a load-gate regression.
   PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
     . "$1"
+    cd "$7" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
     load1() { printf "%s" "$LOAD"; }
     run_agent 1 "$LOG" "$PROMPT" "$LABEL" >/dev/null 2>&1
     rc=$?
     printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
-  ' _ "$GATE" "$load" "$max" "$LOG" "$PROMPT" "$label"
+  ' _ "$GATE" "$load" "$max" "$LOG" "$PROMPT" "$label" "$FIXREPO"
 }
 
 rm -f "$TMP/O/state/walltime.tsv"; : > "$LOG"
@@ -333,13 +354,14 @@ ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
 got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" bash -c '
   . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   MAX_LOAD=10
   load1() { printf "2"; }                   # the controller-time reading: quiet
   can_spawn "$(load1)" || exit 9            # would have allowed the session
   load1() { printf "99"; }                  # load has since spiked
   run_agent 5 "$2" "$3" "late chain worker" >/dev/null 2>&1
   printf "rc=%s" "$?"
-' _ "$GATE" "$TMP/log2" "$PROMPT" 2>/dev/null)"
+' _ "$GATE" "$TMP/log2" "$PROMPT" "$FIXREPO" 2>/dev/null)"
 [ "$got" = "rc=75" ]; rc=$?
 ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<none>}')" $rc
 # ... and pi's 0-255 namespace cannot be mistaken for a refusal, so AGENT_STARTED (not the exit
@@ -356,11 +378,12 @@ printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
 chmod +x "$TMP/bin75/pi"
 got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
   . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "0"; }
   MAX_LOAD=10
   run_agent 1 "$2" "$3" "pi that exits 75 itself" >/dev/null 2>&1
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
-' _ "$GATE" "$TMP/log3" "$PROMPT" 2>/dev/null)"
+' _ "$GATE" "$TMP/log3" "$PROMPT" "$FIXREPO" 2>/dev/null)"
 [ "$got" = "rc=75 started=1" ]; rc=$?
 ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want rc=75 started=1, got '${got:-<none>}')" $rc
 
@@ -388,6 +411,29 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
+# `ci-queue.sh` now gates EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue defers
+# (fail-closed — an unreadable queue is not an empty one). The `gh` stub above FAILS every call by
+# design (the arms below need a failing `gh pr view`), so without a genuine reading every fixer arm
+# would be deferred before it ever reached the load/disk gate it exists to test: six "load-gate
+# regressions" that are not regressions. That is what these seven arms reported before this stub
+# existed, on a tree where nothing was wrong with the load gate.
+# ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
+# `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the
+# production precondition under which a fixer may run — and `ciq_gh`'s documented `CIQ_GH` seam is
+# how the module's own suite feeds it too. Nothing here touches `gh`, so the arms that need a failing
+# `gh` keep it, and no env var can disable the gate (a gate an env var can open is not a gate).
+cat > "$RIG/bin/gh-queue" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count":1}' ;;
+  *status=in_progress*) echo '{"total_count":0}' ;;
+  *actions/runners*)    printf '%s\n' '{"total_count":3,"runners":[{"id":1,"name":"r1","status":"online","busy":false},{"id":2,"name":"r2","status":"online","busy":false},{"id":3,"name":"r3","status":"online","busy":false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$RIG/bin/gh-queue"
+export CIQ_GH="$RIG/bin/gh-queue"
 # ⛔ THE FILE STUB ALONE IS NOT ENOUGH FOR THESE ARMS, AND WHAT IT PRODUCES IS THE WORST KIND OF
 # FAILURE (P1, found 2026-10-16 while fixing #1828, reproduced live). Every caller this section
 # drives runs `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a SYSTEM `pi` AHEAD
@@ -616,11 +662,12 @@ drive_disk() { # drive_disk <path> <floor-mb> [<warn-mb>]
   DISK_GATE_PATH="$path" DISK_MIN_FREE_MB="$floor" DISK_WARN_FREE_MB="$warn" \
   bash -c '
     . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "disk gate test" >/dev/null 2>&1
     rc=$?
     printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
-  ' _ "$GATE" "$LOG" "$PROMPT"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO"
 }
 
 # POSITIVE CONTROL, FIRST — the file's own rule. On a tree with no disk probe at all the "refused"
@@ -821,10 +868,11 @@ ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not sile
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_GATE_PATH="$TMP" \
   DISK_MIN_FREE_MB=9999999 bash -c '
     . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     disk_free_mb() { printf "%s" "9.7e+15"; }
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "non-numeric probe" >/dev/null 2>&1
-    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT")"
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
 [ "$res" = "rc=0 started=1" ]; rc=$?
 ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim that the disk is full ($res)" $rc
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?

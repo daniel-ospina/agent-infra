@@ -126,7 +126,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -213,6 +213,15 @@ LOG="$T/launchctl.log"
 LOG2="$T/launchctl-retire.log"  # isolated log for the HOME2 retirement section
 : > "$LOG"
 : > "$LOG2"
+
+# ⛔ THE CHECKOUT UNDER TEST, PINNED SUITE-WIDE. A template target that names {{AGENT_INFRA_PATH}}
+# (the controller watchdog does) is rendered from resolve_infra_main(), which prefers $AGENT_INFRA_PATH
+# and otherwise reads `git worktree list` — the developer's MAIN checkout. On a box whose ~/agent-infra
+# is an older state that path does not carry the script, so the fixture would hard-fail the install for
+# a reason that has nothing to do with the template under test, and the same suite would be green on CI
+# and red on the operator's laptop (the host-dependence §1 was fixed for). Pinning it to THIS tree makes
+# the rendered target the checkout being tested, which is what every other assertion assumes.
+export AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 run_installer() { # <home> [extra env assignments...]
     (
@@ -460,12 +469,13 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # a sibling of this tree, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
 # beside this one installs branch-reaper (#1787) + worktree-reaper (#1311) and a bare CI checkout
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
-# and a pinned 9 measured here reads 11 beside a checkout. So: 9 always-installable jobs pinned by
+# and a pinned 9 measured here reads 11 beside a checkout. So: the always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
 # fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
 # job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
 # stated: adding a gated template without bumping it here reds this suite on main, which is what
-# happened when worktree-hygiene (#1095/#1678) landed — the template arrived, the pin did not.
+# happened when worktree-hygiene (#1095/#1678) landed, and again when pr-doctor + controller-watchdog
+# (#2303) landed: the templates arrived, the pin did not. The number is 12 since #2303.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 GATED_TEMPLATES1=0
 GATED_INSTALLED1=0
@@ -496,7 +506,7 @@ else
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((10 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (10 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate + the #1862-restored pi-reap-orphans, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((12 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (12 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate + the #1862-restored pi-reap-orphans + pr-doctor (#2303) + controller-watchdog (#2303), plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 # #1949 (rebased onto #2006; re-keyed after review): name the two gated JOBS, so an ambient
 # `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
 # ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:

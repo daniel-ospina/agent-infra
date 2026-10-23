@@ -2524,29 +2524,128 @@ fi
 # ── load gate: an agent spawn must not be piled onto a post-boot indexing storm ──
 # Driven, not grep'd: a text-presence check passes against a build with the gate neutered to
 # `can_spawn() { true; }` — reproduced before this version replaced it.
+# ⛔ AND SINCE #1732 THE SPAWN GATE HAS A SECOND DIMENSION, so the extraction takes BOTH halves.
+# Against the pre-fix tree TEN checks below fail — SIX `MEMAVAIL_MB` cases (the shipped `can_spawn`
+# there reads `L` alone, so a box with 100M available and load 3 still spawns), the order assertion,
+# the evidence-token count, and the two extraction checks for `spawn_gate_tok()`/`measure_mem()` — on
+# a log where every pre-existing load case still passes (measured: 462 passed / 10 failed on
+# `origin/main`, 475 passed / 0 failed on the fixed tree). That is the reproduction: the new checks
+# bite, and nothing old was weakened.
 grep -m1 '^can_spawn() {' "$LOOP" > "$TMP/canspawn.sh"
+grep -m1 '^mem_spawn_ok() {' "$LOOP" >> "$TMP/canspawn.sh"
 if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; then
-  MAX_LOAD=16
+  MAX_LOAD=16; MIN_MEM_FREE_MB=512
+  # An AMPLE reading is the baseline for the load cases: memory must not mask a load assertion
+  # (both halves are ANDed, so a missing reading would refuse every case below and the load
+  # assertions would "pass" for the wrong reason).
+  MEMAVAIL_MB=9000; MEM_UNKNOWN=0
   . "$TMP/canspawn.sh"
   L=0;   can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): load 0 < 16 -> spawn allowed" $rc
   L=15;  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): load 15 < 16 -> spawn allowed" $rc
   L=16;  can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 16 -> spawn held back" $rc
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
+  # ── the MEMORY arm (#1732): available memory below the floor refuses at a calm load ──
+  L=3
+  MEMAVAIL_MB=513; MEM_UNKNOWN=0; can_spawn && rc=0 || rc=1
+  ck "shipped can_spawn(): mem 513M > floor 512M at load 3 -> spawn allowed" $rc
+  MEMAVAIL_MB=512; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): mem 512M == floor (the dispatch gate's own boundary) -> held back" $rc
+  MEMAVAIL_MB=100; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): mem 100M < floor 512M at load 3 -> held back" $rc
+  MEMAVAIL_MB=653; MEM_UNKNOWN=0; MIN_MEM_FREE_MB=700; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): a raised MIN_MEM_FREE_MB binds the spawn sites (653M < 700M) -> held back" $rc
+  # UNKNOWN is not ample, and it must hold even with a STALE ample number beside it: that is the
+  # shape a failed probe leaves behind in any tree where the two are not set together.
+  MIN_MEM_FREE_MB=512
+  MEMAVAIL_MB=9000; MEM_UNKNOWN=1; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): MEM_UNKNOWN=1 with a stale ample reading -> held back (unknown is not ample)" $rc
+  MEMAVAIL_MB=""; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): unset MEMAVAIL_MB -> held back (fail-CLOSED, unlike the load fail-open)" $rc
+  MEMAVAIL_MB="garbage"; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): non-numeric MEMAVAIL_MB -> held back (an errored comparison must not open the gate)" $rc
+fi
+# ⛔ THE READING MUST BE TAKEN BEFORE THE SITES THAT READ IT (#1732). This is the half a behavioural
+# test on the extracted function CANNOT see: `measure_mem` used to run only in the [cap] block, which
+# sits BELOW all six spawn sites, so a `can_spawn` that consults MEMAVAIL_MB there would decide on the
+# previous cycle's figure (and on cycle 1, on nothing at all) — while every unit case above passes.
+# Assert the ORDER in the shipped file: the prologue call precedes the first spawn site.
+_mm_line=$(grep -n '^  measure_mem$' "$LOOP" | head -1 | cut -d: -f1)
+_site_line=$(grep -nE '&& can_spawn' "$LOOP" | head -1 | cut -d: -f1)
+if [ -n "$_mm_line" ] && [ -n "$_site_line" ] && [ "$_mm_line" -lt "$_site_line" ]; then rc=0; else
+  rc=1; echo "      measure_mem at '${_mm_line:-<none>}', first can_spawn site at '${_site_line:-<none>}'"
+fi
+ck "the shipped loop MEASURES memory before the first spawn site reads it (line $_mm_line < $_site_line)" $rc
+# ⛔ A HELD-BACK SPAWN MUST NAME THE ARM THAT HELD IT (#1732). The five slot refusals printed
+# `load-gate=<L>/<MAX>` only, which was complete while load WAS the gate; with a memory arm it reads as
+# a load refusal. Assert both halves: every refusal site prints the token, and the token spells out an
+# UNKNOWN probe instead of printing a `0M` that looks like a measurement.
+_slot_n=$(grep -cE 'but NO [a-z-]+ slot \(' "$LOOP")
+_slot_t=$(grep -E 'but NO [a-z-]+ slot \(' "$LOOP" | grep -cF '$(spawn_gate_tok)')
+# ⛔ ANCHORED TO THE REFUSAL LINES, NOT A FILE-WIDE COUNT (review, #1732). A bare `grep -c` of the
+# token is satisfied by a COMMENT that mentions it — and this very function's comment block discusses
+# the token, so a decoy there would keep the check green while a real refusal line lost its evidence.
+# The comment 40 lines below names the same class; this is it.
+[ "$_slot_n" = "5" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 5 of 5)"; }
+ck "all five held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
+sed -n '/^spawn_gate_tok() {/,/^}/p' "$LOOP" > "$TMP/spawntok.sh"
+if need "$TMP/spawntok.sh" "spawn_gate_tok() is extracted from the shipped loop"; then
+  got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=100; MEM_UNKNOWN=0; spawn_gate_tok' _ "$TMP/spawntok.sh")"
+  [ "$got" = "load-gate=3/40 mem-gate=100M/512" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped spawn_gate_tok(): prints the READING and the FLOOR for both arms" $rc
+  got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=0; MEM_UNKNOWN=1; spawn_gate_tok' _ "$TMP/spawntok.sh")"
+  [ "$got" = "load-gate=3/40 mem-gate=UNKNOWN/512" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped spawn_gate_tok(): a FAILED probe prints UNKNOWN, not a 0M that reads as a measurement" $rc
+fi
+# ...and the measurement's own failure polarity, driven: a probe that cannot answer must ZERO the
+# reading and set UNKNOWN, which is what makes the fail-closed claim above independent of MEM_UNKNOWN.
+sed -n '/^measure_mem() {/,/^}/p' "$LOOP" > "$TMP/measuremem.sh"
+if need "$TMP/measuremem.sh" "measure_mem() is extracted from the shipped loop"; then
+  { grep -m1 '^is_num() {' "$LOOP"; cat "$TMP/measuremem.sh"; } > "$TMP/measuremem-full.sh"
+  got="$(bash -c '. "$1"; mem_avail_mb() { return 1; }; MEMAVAIL_MB=9000; MEM_UNKNOWN=0; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "0 1" ] && rc=0 || { rc=1; echo "      got '$got' (expected '0 1')"; }
+  ck "shipped measure_mem(): a FAILED probe zeroes the reading and sets MEM_UNKNOWN" $rc
+  got="$(bash -c '. "$1"; mem_avail_mb() { printf "garbage\\n"; }; MEMAVAIL_MB=9000; MEM_UNKNOWN=0; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "0 1" ] && rc=0 || { rc=1; echo "      got '$got' (expected '0 1')"; }
+  ck "shipped measure_mem(): a NON-NUMERIC probe zeroes the reading and sets MEM_UNKNOWN" $rc
+  got="$(bash -c '. "$1"; mem_avail_mb() { printf "4096\\n"; }; MEMAVAIL_MB=0; MEM_UNKNOWN=1; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "4096 0" ] && rc=0 || { rc=1; echo "      got '$got' (expected '4096 0')"; }
+  ck "shipped measure_mem(): a GOOD probe clears MEM_UNKNOWN and publishes the reading" $rc
 fi
 # Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
-# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# Each is asserted to carry can_spawn, which is the property under test.
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
+# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
+# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
+# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
+# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
+# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
+# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
+# With nesting, the two populations are disjoint by construction, so each is counted directly. The
+# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
+# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
+# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
+# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
+# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
+# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
+# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
+# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
+fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
+[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
+ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
+[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
+ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1

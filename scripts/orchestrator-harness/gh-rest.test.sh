@@ -58,8 +58,8 @@ case "$path" in
   *"ready_for_review"*)   printf '{}'; exit 0 ;;
   # check-runs BEFORE status: "check-runs" does not contain "/status", but order still matters.
   *"check-runs"*)         printf '%s\n%s\n' \
-      '{"check_runs":[{"name":"ai-review-gate","status":"completed","conclusion":"success","details_url":"https://x/runs/1","app":{"slug":"github-actions"}},{"name":"changes","status":"in_progress","conclusion":null,"details_url":"https://x/runs/2","app":{"slug":"github-actions"}}]}' \
-      '{"check_runs":[{"name":"python-ci-gate","status":"completed","conclusion":"failure","details_url":"https://x/runs/12345/job/9","app":{"slug":"github-actions"}}]}'
+      '{"check_runs":[{"name":"ai-review-gate","status":"completed","conclusion":"success","started_at":"2026-10-23T01:00:00Z","completed_at":"2026-10-23T01:05:00Z","details_url":"https://x/runs/1","app":{"slug":"github-actions"}},{"name":"changes","status":"in_progress","conclusion":null,"started_at":"2026-10-23T01:06:00Z","details_url":"https://x/runs/2","app":{"slug":"github-actions"}}]}' \
+      '{"check_runs":[{"name":"python-ci-gate","status":"completed","conclusion":"failure","started_at":"2026-10-23T01:10:00Z","completed_at":"2026-10-23T01:20:00Z","details_url":"https://x/runs/12345/job/9","app":{"slug":"github-actions"}}]}'
       exit 0 ;;
   *"/status")             # legacy commit status (StatusContext) — not a check run
       printf '{"statuses":[{"context":"vercel/deploy","state":"pending","target_url":"https://vercel/1","creator":{"login":"vercel"}}]}'; exit 0 ;;
@@ -127,6 +127,19 @@ ck "pr checks --json name,link surfaces details_url (fix-one.sh:150 derives the 
 out="$(run pr checks 8833 --repo o/r --json name,state 2>&1)"
 ck "pr checks includes LEGACY commit statuses (else a protection context is never green)" \
    "$(printf '%s' "$out" | json_eq 'any(x["name"]=="vercel/deploy" for x in d)')"
+
+# ⛔ ORDERING FIELDS MUST SURVIVE THE PROJECTION, not just the allow-list. `startedAt` was in
+# CHECK_FIELDS (so `gh pr checks --json ...,startedAt` passed the field check and was NOT delegated)
+# while the projection emitted no such key — a caller ordering check runs by attempt got undefined
+# on EVERY installed box, silently. MEASURED: the lander newest-attempt dedupe was inert through
+# this adapter, so a re-run that came back green still read `1 FAILED check(s)`.
+out="$(run pr checks 8833 --repo o/r --json name,state,startedAt,workflow 2>&1)"
+ck "pr checks projects startedAt (a dedupe by newest attempt cannot work without it)" \
+   "$(printf '%s' "$out" | json_eq 'all(("startedAt" in x) for x in d) and any(x.get("startedAt") for x in d)')"
+ck "pr checks projects start times that can ORDER two attempts of one job (not all null)" \
+   "$(printf '%s' "$out" | json_eq 'len({x.get("startedAt") for x in d if x.get("startedAt")}) >= 2')"
+ck "pr checks still delegates a field it does not model (startedAt must not license a partial answer)" \
+   "$(printf '%s' "$out" | json_eq 'all(("workflow" in x) for x in d)')"
 
 # ── D2. pr checks WITHOUT --json delegates (the table is not modelled) ──────────────────────────
 : >"$TMP/log"

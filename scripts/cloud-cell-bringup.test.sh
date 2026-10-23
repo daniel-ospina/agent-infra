@@ -105,7 +105,13 @@ done
 printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.json\nexit 0\n' > "$STUB/npm"
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
-printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
+# ⛔ `GIT_STUB_REAL=1` DELEGATES THE WORKTREE VERBS TO THE REAL GIT. The harness-PIN cases (§below)
+# must exercise a REAL linked worktree — `git worktree add` and the `worktree list --porcelain` read are
+# the subject — and a stub that answers `abc1234` to every command cannot prove either. Only those verbs
+# delegate: everything else keeps the fake answers the rest of this suite is written against, so no
+# other case changes behaviour. Delegating by VERB (not by case) is deliberate: a fixture that switched
+# git off wholesale would make check_repo/check_gh answer differently and redden unrelated arms.
+printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *)\n  if [ -n "${GIT_STUB_REAL:-}" ]; then\n    case "$*" in *" rev-parse --git-dir"*|*" rev-parse --git-common-dir"*|*" worktree list"*|*" worktree add"*|*" worktree remove"*|*" rev-parse --verify"*) exec /usr/bin/git "$@" ;; esac\n  fi\n  echo abc1234;; esac\n' > "$STUB/git"
 # The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
 # lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
 # probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
@@ -198,6 +204,37 @@ chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: th
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
 
+# ── swap provisioning (agent-infra#2390) ─────────────────────────────────────────────────────────
+# The bring-up now CREATES SWAP, which needs root. This suite must never create swap on (or edit
+# /etc of) the host that runs it, so every path the step touches is redirected into $T and the
+# kernel-side commands are shims whose effects land in a FIXTURE that stands in for /proc/swaps.
+# The seam is the same one the script documents (`SWAP_SUDO`), emptied here so nothing escalates.
+# ⛔ The fixture is not proof of the kernel — the real read-back is `swapon --show` on a cell. What
+# these cases pin is the SHIPPED logic: what it creates, what it skips on a re-run, and what it says
+# when it cannot act.
+export SWAPFILE="$T/swapfile"
+export SWAP_MB="4096"          # pinned so the cases do not depend on the RAM of the host running them
+export SWAP_PROC="$T/proc-swaps"
+export SWAP_FSTAB="$T/fstab"
+export SWAP_SYSCTL_CONF="$T/sysctl.d/99-cell-swap.conf"
+export SWAP_SYSCTL_FILE="$T/swappiness"
+export SWAP_SUDO=""           # no escalation in a test; a case overrides it with `false`
+export SWAP_AVAIL_KB=104857600  # 100 GiB free: the refusal is exercised deliberately only
+mkdir -p "$T/sysctl.d"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"   # header only: no swap, the measured shape
+: > "$T/fstab"
+printf '60\n' > "$T/swappiness"                                     # the image default, so the pin is a CHANGE
+SWAP_LOG="$T/swap-calls.log"
+# `fallocate` allocates SPARSELY for the fixture (dd seek), so a 4 GiB request costs no disk here.
+printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "mkswap $*" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/mkswap"
+# `swapon <file>` appends a REAL /proc/swaps row (path, type, size_kb, used_kb, prio) to the fixture,
+# so the script's own reading of the swap record is what the case asserts on. `--show` is only there
+# for a hand-run on the fixture; the script itself deliberately reads the record instead.
+printf '#!/bin/sh\n[ "$1" = "--show" ] && { cat "$SWAP_PROC"; exit 0; }\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapon $*" >> "$SWAP_STUB_LOG"\nkb=$(( $(wc -c < "$1") / 1024 ))\ngrep -qF "$1" "$SWAP_PROC" 2>/dev/null || printf "%%s file %%s 0 -2\\n" "$1" "$kb" >> "$SWAP_PROC"\nexit 0\n' > "$STUB/swapon"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapoff $*" >> "$SWAP_STUB_LOG"\ngrep -vF "$1" "$SWAP_PROC" > "$SWAP_PROC.tmp" 2>/dev/null && mv "$SWAP_PROC.tmp" "$SWAP_PROC"\nexit 0\n' > "$STUB/swapoff"
+printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "sysctl $*" >> "$SWAP_STUB_LOG"\nfor a in "$@"; do case "$a" in vm.swappiness=*) printf "%%s\\n" "${a#vm.swappiness=}" > "$SWAP_SYSCTL_FILE" ;; esac; done\nexit 0\n' > "$STUB/sysctl"
+chmod +x "$STUB"/*
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
 mkdir -p "$T/home" "$T/cell/.git" "$T/tok"
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
@@ -215,12 +252,34 @@ TOK_BODY="$(cat "$TOK")"
 # the already-exported environment).
 export HARNESS="$T/no-harness"
 
+# ── a REAL harness checkout to pin FROM (the measured trap this suite pins) ────────────────────────
+# `check_harness_pin` materialises a LINKED WORKTREE (`git worktree add --detach`) and refuses a pin
+# root that is a directory of sha-named COPIES. Both are git facts a stub cannot answer, so the fixture
+# is a throwaway bare-origin repo with a real `origin/main` and a real harness tree, and the git stub
+# delegates the worktree verbs for every case (GIT_STUB_REAL). It is also the honest shape of a new
+# box: bring-up pins from the checkout it trusts, not from a hand-copy.
+INFRA="$T/infra"; INFRA_ORIGIN="$T/infra-origin.git"
+mkdir -p "$INFRA/scripts/orchestrator-harness"
+git init -q --bare "$INFRA_ORIGIN"
+git init -q "$INFRA"
+git -C "$INFRA" config user.email test@test.local
+git -C "$INFRA" config user.name test
+git -C "$INFRA" config commit.gpgsign false
+printf '#!/bin/bash\n: controller\n' > "$INFRA/scripts/orchestrator-harness/orch-loop.sh"
+chmod +x "$INFRA/scripts/orchestrator-harness/orch-loop.sh"
+git -C "$INFRA" add -A
+git -C "$INFRA" commit -q -m "fixture harness"
+git -C "$INFRA" branch -M main
+git -C "$INFRA" remote add origin "$INFRA_ORIGIN"
+git -C "$INFRA" push -q origin main
+export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
+
 # br <gh-mode> <curl-mode> [extra args…] — run the REAL script with the stub toolchain. Capture rc
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
 BR_RC=0; BR_OUT=''
 br() {
   BR_OUT="$(PATH="$STUB:$PATH" \
-            CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+            CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
             bash "$BRINGUP" "${@:3}" 2>&1)"
@@ -770,6 +829,418 @@ else
                     || bad "the first registered secret SURVIVED the dead-stdout cleanup (rc=$DEAD_RC)"
   [ ! -e "$SEC_B" ] && ok "the SECOND registered secret was removed (the loop reached the end)" \
                     || bad "the second registered secret SURVIVED — a dead stdout truncated the cleanup (rc=$DEAD_RC)"
+fi
+
+# ── THE HARNESS PIN: a LINKED WORKTREE, or a refusal that names the path ────────────────────────
+# MEASURED 2026-10-21 on two fresh boxes: `$HOME/harness` was a DIRECTORY OF SHA-NAMED SUBDIRECTORIES —
+# copies, not worktrees — so the pin file named a path with no `.git` and no `orch-loop.sh` and every
+# consumer read `pinned=none` WHILE a pin file existed. The box certified clean and could not run a
+# controller. Both halves are pinned here: the refusal (naming the path, because the operator's next
+# move depends on WHICH path is wrong) and the materialisation (a real worktree + the sha+timestamp
+# record `cloud-cell-supervisor.sh status` reads).
+say_case "the harness pin is a LINKED WORKTREE — a directory of sha-named copies is REFUSED, named"
+PIN_ROOT="$T/home/harness"
+# The measured shape: sha-named DIRECTORIES that are only copies. (They are not git worktrees, so
+# `git -C <dir> rev-parse --git-dir` fails for each of them — that is the whole defect.)
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+mkdir -p "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness"
+printf '#!/bin/bash\n' > "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness/orch-loop.sh"
+printf '%s\n' "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness" > "$T/home/.harness-path"
+printf '%s\n' "abc1234def567" > "$T/home/.pi/agent/state/HARNESS-PIN" 2>/dev/null || {
+  mkdir -p "$T/home/.pi/agent/state"; printf '%s\n' "abc1234def567" > "$T/home/.pi/agent/state/HARNESS-PIN"; }
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up REFUSES a pin root that is a directory of copies (rc=$BR_RC)" \
+                   || bad "bring-up certified a box whose \$HOME/harness is not a worktree — the measured pinned=none state"
+case "$BR_OUT" in
+  *"$PIN_ROOT exists but is NOT a git worktree"*) ok "the refusal NAMES the path (the operator cannot fix a path nobody printed)" ;;
+  *) bad "the refusal does not name \$HOME/harness — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED CELL READY over a box whose harness pin points at nothing" ;;
+  *) ok "never claims CELL READY over a non-worktree pin root" ;;
+esac
+case "$BR_OUT" in
+  *"mv '"*) ok "the refusal carries the remedy (move the impostor aside), not just the diagnosis" ;;
+  *) bad "the refusal gives no remedy — output: $BR_OUT" ;;
+esac
+
+say_case "a GLOBAL GH_REPO pushed in keys.env is DROPPED and said out loud (#2235's class)"
+# MEASURED 2026-10-21: a cell's keys.env exported GH_REPO=daniel-ospina/tortoise. `gh` honours GH_REPO as
+# the DEFAULT repo for every command, so agent-infra rails on that box graded the TORTOISE repo and
+# printed `ALREADY MERGED` over zero work. The box must not be refused for it (it is a provisioning
+# detail, not a broken cell) — it must be NEUTRALISED, loudly, before anything reads a repo.
+# (the pin root is reset to a GOOD shape first: the preceding case deliberately leaves an impostor
+# there, and this case is about the env, not about the pin)
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+printf 'DEEPSEEK_API_KEY=fake\nexport GH_REPO=daniel-ospina/tortoise\n' > "$T/keys.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the pushed global GH_REPO is dropped and NAMED (silent neutralisation would be a mystery)" ;;
+  *) bad "bring-up did not report dropping a global GH_REPO — output: $BR_OUT" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the cell is NOT refused for a keys.env that carries GH_REPO (it is neutralised, not fatal)" \
+                   || bad "bring-up refused a cell merely because keys.env exports GH_REPO (rc=$BR_RC): $BR_OUT"
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+
+say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
+# The guard's own docstring claims it covers GH_REPO "from $ENV_FILE or the operator's shell". The
+# first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
+# exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
+# check below graded another repo. Nothing in the suite covered it: every `br …` case writes
+# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
+# missing provider key — the ORDERING is what proves the drop happened before any check ran).
+rm -f "$T/absent.env"
+BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" br ok normal --check
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
+  *) bad "with keys.env absent, bring-up did not drop an operator-shell GH_REPO — output: $BR_OUT" ;;
+esac
+drop_at="$(printf '%s\n' "$BR_OUT" | grep -n 'dropping GH_REPO' | head -1 | cut -d: -f1)"
+check_at="$(printf '%s\n' "$BR_OUT" | grep -n 'ok: gh login' | head -1 | cut -d: -f1)"
+[ -n "$drop_at" ] && [ -n "$check_at" ] && [ "$drop_at" -lt "$check_at" ] \
+  && ok "the drop precedes the first repo-reading check (line $drop_at < $check_at)" \
+  || bad "the GH_REPO drop did not precede the first repo-reading check (drop=${drop_at:-none} check=${check_at:-none}) — output: $BR_OUT"
+
+say_case "a REPO set to an owner/name SLUG is REPORTED (the guard's own stated class)"
+# The guard exists for "an operator who sets it to an owner/name slug gets a named refusal". The first
+# cut tested `*/*` — and a slug CONTAINS a slash, so the one shape it was written for was accepted
+# SILENTLY (an inert guard), while the warning that did fire described a bare name as a slug. Both
+# halves are pinned here so neither direction can go vacuous: the slug must warn, an absolute path
+# must stay silent.
+printf 'DEEPSEEK_API_KEY=fake\nexport REPO=daniel-ospina/tortoise\n' > "$T/keys.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a `*/*` test made this arm unreachable)" ;;
+  *) bad "bring-up accepted REPO=daniel-ospina/tortoise without a word — the guard is inert for the class it names: $BR_OUT" ;;
+esac
+printf 'DEEPSEEK_API_KEY=fake\nexport REPO=/srv/cell/checkout\n' > "$T/keys.env"
+br ok normal --check
+case "$BR_OUT" in
+  *"REPO='/srv/cell/checkout' is not an absolute path"*) bad "an ABSOLUTE path REPO was warned about — the guard now fires on the shape it must accept: $BR_OUT" ;;
+  *) ok "an absolute-path REPO stays silent (a guard that fires on everything is not a guard)" ;;
+esac
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+
+say_case "a NEW box is born PINNED: a linked worktree plus the sha+timestamp record"
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up succeeds with no pin present (it materialises one)" \
+                   || bad "bring-up failed on a box with no pin (rc=$BR_RC): $BR_OUT"
+PIN_SHA="$(git -C "$INFRA" rev-parse origin/main)"
+PIN_DIR="$T/home/harness/$(printf '%s' "$PIN_SHA" | cut -c1-12)"
+if [ -f "$PIN_DIR/.git" ] && git -C "$PIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  ok "the pin is a REAL LINKED WORKTREE ($PIN_DIR) — '.git' is a FILE linking it to the checkout"
+else
+  bad "no linked worktree at $PIN_DIR — the pin was not materialised (ls: $(ls -A "$T/home/harness" 2>/dev/null | tr '\n' ' '))"
+fi
+[ -f "$PIN_DIR/scripts/orchestrator-harness/orch-loop.sh" ] \
+  && ok "the pinned worktree carries the harness (orch-loop.sh)" \
+  || bad "the pinned worktree carries no harness — a controller started from it would exit at once"
+[ "$(head -1 "$T/home/.harness-path" 2>/dev/null)" = "$PIN_DIR/scripts/orchestrator-harness" ] \
+  && ok ".harness-path names the pinned harness (what cloud-cell-supervisor.sh start reads)" \
+  || bad ".harness-path is '$(head -1 "$T/home/.harness-path" 2>/dev/null)' (want $PIN_DIR/scripts/orchestrator-harness)"
+REC="$T/home/.pi/agent/state/HARNESS-PIN"
+[ "$(head -1 "$REC" 2>/dev/null)" = "$PIN_SHA" ] \
+  && ok "HARNESS-PIN line 1 is the FULL sha, so 'status' can read it with head -1" \
+  || bad "HARNESS-PIN line 1 is '$(head -1 "$REC" 2>/dev/null)' (want $PIN_SHA)"
+case "$(sed -n '2p' "$REC" 2>/dev/null)" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+    ok "HARNESS-PIN line 2 is the timestamp (a pin with no age cannot be judged stale)" ;;
+  *) bad "HARNESS-PIN carries no ISO timestamp on line 2 — got '$(sed -n '2p' "$REC" 2>/dev/null)'" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) ok "the pinned box reaches CELL READY" ;;
+  *) bad "the pinned box never reached CELL READY — output: $BR_OUT" ;;
+esac
+
+say_case "an EXISTING pin is recorded as the commit it is ON — never as origin/main by assumption"
+# ⛔ REVIEW FINDING (P1) ON THIS PR: the accept-existing arm used to write `$want` (origin/main's sha) into
+# HARNESS-PIN while accepting a worktree that was on an OLDER commit — so `status` printed a sha the box
+# was not deployed to: the "pin says one thing, deployment is another" false PASS this whole step exists
+# to remove. It also picked "whichever child the glob yielded first", so the choice depended on
+# lexicographic order. Both are pinned here: the record carries the worktree's OWN HEAD, the divergence
+# is said out loud with the verb that advances it, and a `--check` does not silently redeploy.
+PIN_OLD="$(git -C "$PIN_DIR" rev-parse HEAD 2>/dev/null)"
+printf 'advance\n' > "$INFRA/scripts/orchestrator-harness/marker.txt"
+git -C "$INFRA" add -A
+git -C "$INFRA" commit -q -m "advance origin/main past the pin"
+git -C "$INFRA" push -q origin main
+PIN_NEW="$(git -C "$INFRA" rev-parse origin/main)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$PIN_OLD" != "$PIN_NEW" ] && ok "fixture: origin/main advanced past the pinned commit (the state under test)" \
+  || bad "fixture: origin/main did not advance, so this case proves nothing"
+[ "$BR_RC" -eq 0 ] && ok "an existing (behind) pin does not fail the check (a check must not redeploy)" \
+                   || bad "the check failed on a box whose pin is merely behind (rc=$BR_RC): $BR_OUT"
+[ "$(head -1 "$REC" 2>/dev/null)" = "$PIN_OLD" ] \
+  && ok "HARNESS-PIN records the commit the worktree is ACTUALLY on ($(printf '%s' "$PIN_OLD" | cut -c1-12)), not origin/main's" \
+  || bad "HARNESS-PIN line 1 is '$(head -1 "$REC" 2>/dev/null | cut -c1-12)' — it claims a commit the pin is not on (want $(printf '%s' "$PIN_OLD" | cut -c1-12))"
+case "$BR_OUT" in
+  *"is NOT at origin/main"*) ok "the divergence is REPORTED, with the verb that advances it" ;;
+  *) bad "the box is behind its pin and nothing said so — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"run 'cloud-cell-supervisor.sh apply'"*|*"cloud-cell-supervisor.sh apply"*) ok "the report names 'apply' (the remedy), not just the gap" ;;
+  *) bad "the behind-pin report names no remedy — output: $BR_OUT" ;;
+esac
+[ "$(head -1 "$T/home/.harness-path" 2>/dev/null)" = "$PIN_DIR/scripts/orchestrator-harness" ] \
+  && ok ".harness-path still names the pin the box is ON (unchanged by the behind report)" \
+  || bad ".harness-path moved to '$(head -1 "$T/home/.harness-path" 2>/dev/null)' — a check redeployed the box"
+# ⛔ The glob-order defect, DETERMINISTICALLY (review P2 on this PR): the first version of this case put
+# the older pin at a random sha-named path, so whether "first glob match" picked the wrong child was a
+# ~50% coin flip — and with the RECORD bug still present, `$want` was written regardless of which child
+# was chosen, so the two defects masked each other and the case could not fail at all. Two changes make
+# it a real detector: the older pin is renamed to `000000000000`, which sorts BEFORE any sha, so
+# glob-order selection picks it EVERY time; and the record is read back as the OLD commit's sha, so the
+# only logic that can produce the right answer is "prefer the child at the ref".
+git -C "$INFRA" worktree remove --force "$PIN_DIR" >/dev/null 2>&1 || true
+git -C "$INFRA" worktree add -q --detach "$T/home/harness/000000000000" "$PIN_OLD" >/dev/null 2>&1
+PIN_REF_DIR="$T/home/harness/$(printf '%s' "$PIN_NEW" | cut -c1-12)"
+git -C "$INFRA" worktree add -q --detach "$PIN_REF_DIR" "$PIN_NEW" >/dev/null 2>&1
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(head -1 "$REC" 2>/dev/null)" = "$PIN_NEW" ] \
+  && ok "with a pin at the ref present AND an older pin that sorts first, the child AT THE REF is CHOSEN" \
+  || bad "the pin chosen was '$(head -1 "$REC" 2>/dev/null | cut -c1-12)' — selection follows GLOB ORDER (the older 000000000000 pin), not the ref"
+[ "$(head -1 "$T/home/.harness-path" 2>/dev/null)" = "$PIN_REF_DIR/scripts/orchestrator-harness" ] \
+  && ok "and .harness-path names THAT pin, so the controller starts from it" \
+  || bad ".harness-path names '$(head -1 "$T/home/.harness-path" 2>/dev/null)' — the harness path did not follow the selection"
+
+echo
+# ── 11) swap: a cell with NO swap must get one — the measured shape (agent-infra#2390) ───────────
+# cell-3 at 345M available with 17 lanes and two pytest runs has nowhere to put a spike: the next
+# allocation is an OOM kill. The bring-up is the one step that can escalate, so it must provision
+# swap, ACTIVATE it, and read it back from the kernel record rather than trust `swapon`'s status.
+say_case "swap absent -> provisioned, activated, persisted, swappiness pinned"
+# RESET to the measured shape: no swap row, no file, no fstab line (case 2 already ran this path).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+: > "$T/fstab"
+printf '60\n' > "$T/swappiness"
+rm -f "$T/swapfile" "$T/sysctl.d/99-cell-swap.conf"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up exits 0 with swap provisioned (rc=$BR_RC)" \
+  || bad "bring-up FAILED provisioning swap (rc=$BR_RC): $BR_OUT"
+[ -f "$T/swapfile" ] && ok "the swapfile was created at \$SWAPFILE" \
+  || bad "no swapfile was created"
+[ "$(grep -c '^fallocate ' "$SWAP_LOG" 2>/dev/null)" = 1 ] \
+  && ok "the file was ALLOCATED once (fallocate, not a sparse region of zeros)" \
+  || bad "expected exactly 1 fallocate call, got: $(cat "$SWAP_LOG" 2>/dev/null)"
+# The MODE, not just the file: a world-readable swapfile leaks the pages of every process on the box,
+# and nothing else here would notice `chmod 600` being dropped (the fixture stays private either way).
+[ "$(ls -l "$T/swapfile" 2>/dev/null | cut -c1-10)" = "-rw-------" ] \
+  && ok "the swapfile is mode 600 (not world-readable)" \
+  || bad "the swapfile mode is '$(ls -l "$T/swapfile" 2>/dev/null | cut -c1-10)', expected -rw-------"
+# ORDER, not presence: an implementation that swapped on before formatting would still log both.
+MK_LINE="$(grep -n '^mkswap ' "$SWAP_LOG" 2>/dev/null | cut -d: -f1)"
+SW_LINE="$(grep -n '^swapon ' "$SWAP_LOG" 2>/dev/null | cut -d: -f1)"
+[ -n "$MK_LINE" ] && [ -n "$SW_LINE" ] && [ "$MK_LINE" -lt "$SW_LINE" ] \
+  && ok "mkswap ran BEFORE swapon (an unformatted file is never activated)" \
+  || bad "mkswap/swapon order is wrong or a call is missing: $(cat "$SWAP_LOG" 2>/dev/null)"
+grep -qF "$T/swapfile file " "$T/proc-swaps" 2>/dev/null \
+  && ok "the kernel swap record carries the new area (the read-back, not swapon's exit status)" \
+  || bad "the swap record has no row for the file: $(cat "$T/proc-swaps" 2>/dev/null)"
+# 4096 MB = 4194304 KB, the SWAP_MB value pinned above.
+grep -qF "$T/swapfile file 4194304 " "$T/proc-swaps" 2>/dev/null \
+  && ok "the active area matches the requested size (4096M)" \
+  || bad "the active area is not the requested size: $(cat "$T/proc-swaps" 2>/dev/null)"
+case "$BR_OUT" in
+  *"swap: 4096M active"*) ok "the report states the measured swap total and target" ;;
+  *) bad "the swap line does not report the reading: $BR_OUT" ;;
+esac
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "an fstab entry was added, once (the swap survives a reboot)" \
+  || bad "expected exactly one fstab entry, got: $(cat "$T/fstab" 2>/dev/null)"
+[ "$(cat "$T/swappiness" 2>/dev/null)" = "30" ] \
+  && ok "vm.swappiness was pinned to 30 (not left at the image default of 60)" \
+  || bad "vm.swappiness is '$(cat "$T/swappiness" 2>/dev/null)', expected 30"
+grep -qxF 'vm.swappiness=30' "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null \
+  && ok "the boot-time pin is written to \$SWAP_SYSCTL_CONF" \
+  || bad "no boot-time swappiness pin: $(cat "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null)"
+
+# ── 12) IDEMPOTENCY: a second run must not touch a provisioned cell ────────────────────────────
+# Rewriting a LIVE swap area is an outage for every page in it, and re-appending the fstab line is
+# how a re-run slowly corrupts the boot path. So: no second fallocate/mkswap/swapon, no duplicate
+# fstab row, and the report says so.
+say_case "swap already provisioned -> nothing is re-created (idempotent)"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a re-run exits 0 (rc=$BR_RC)" || bad "a re-run FAILED (rc=$BR_RC): $BR_OUT"
+[ ! -s "$SWAP_LOG" ] && ok "a re-run issued NO fallocate/mkswap/swapon/swapoff (the area was left alone)" \
+  || bad "a re-run touched the live area: $(cat "$SWAP_LOG" 2>/dev/null)"
+case "$BR_OUT" in
+  *"already provisioned"*) ok "the report says the cell was already provisioned" ;;
+  *) bad "the re-run does not report the existing swap: $BR_OUT" ;;
+esac
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "the fstab entry was not duplicated" \
+  || bad "the fstab entry was duplicated: $(cat "$T/fstab" 2>/dev/null)"
+
+# ── 12b) ACTIVE but NOT PERSISTED: the fstab line is re-established on the "already provisioned"
+# path too. An area a hand `swapon` (or a first run whose append failed) left out of fstab is
+# otherwise certified for ever, and the cell comes back from a reboot with NO swap — the measured
+# defect, one power cycle later. The check must ADD the entry and still not touch the live area.
+say_case "active swap with NO fstab entry -> the entry is added, the area is not touched"
+: > "$T/fstab"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+[ "$(grep -cF "$T/swapfile none swap sw" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "the missing fstab entry was ADDED on the already-provisioned path" \
+  || bad "an active swap area was left unpersisted: $(cat "$T/fstab" 2>/dev/null)"
+[ ! -s "$SWAP_LOG" ] && ok "the live area was not swapped off or re-created to persist it" \
+  || bad "the live area was touched: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 12c) a `noauto` ENTRY IS NOT A BOOT MOUNT. It names the file in field 1 but explicitly does not
+# mount at boot, so a first-field-only match reports "survives a reboot" for the one entry that
+# guarantees it does not.
+say_case "an fstab entry with noauto does NOT count as persisted"
+printf '%s none swap noauto 0 0\n' "$T/swapfile" > "$T/fstab"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+[ "$(grep -cF "$T/swapfile none swap sw 0 0" "$T/fstab" 2>/dev/null)" = 1 ] \
+  && ok "a real boot entry was added beside the noauto one" \
+  || bad "the noauto entry was accepted as a boot mount: $(cat "$T/fstab" 2>/dev/null)"
+printf '%s none swap sw 0 0\n' "$T/swapfile" > "$T/fstab"   # restore the persisted shape
+
+# ── 12d) A LIVE AREA BELOW TARGET IS NOT RESIZED. `swapoff` faults every swapped page back into RAM,
+# and this step runs on a box already short of it — the one action that could OOM-kill the lanes the
+# swap exists to protect. It must be REPORTED, not performed: a failed re-allocation after a removal
+# is how a cell that had some swap ends up with NONE.
+say_case "a live area below target is reported, never swapped off"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 1048576 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"   # 1024M live, target 4096M
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the run exits 0 (rc=$BR_RC)" || bad "the run FAILED (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"NOT resizing a live area"*) ok "the shortfall is REPORTED as a decision not to resize" ;;
+  *) bad "the below-target live area was not reported: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"READING: MemTotal="*) ok "the report carries the reading" ;;
+  *) bad "the report does not carry the reading: $BR_OUT" ;;
+esac
+[ ! -s "$SWAP_LOG" ] && ok "nothing was swapped off, re-allocated or re-formatted" \
+  || bad "a live area was destroyed by a --check: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 12e) THE BOOT-TIME PIN IS VERIFIED ON ITS OWN. When the runtime value already reads 30, a
+# pin_swappiness that only writes the drop-in inside the "runtime differs" branch reports "pinned at
+# boot" while the file does not exist — and the cell reverts to the image default at the next reboot,
+# with the one line an operator greps reading as success.
+say_case "runtime already 30 -> the boot-time pin is still written and verified"
+printf '30\n' > "$T/swappiness"
+rm -f "$T/sysctl.d/99-cell-swap.conf"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+grep -qxF 'vm.swappiness=30' "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null \
+  && ok "the drop-in was written although the runtime value already matched" \
+  || bad "the boot-time pin was reported on the strength of the runtime value: $(cat "$T/sysctl.d/99-cell-swap.conf" 2>/dev/null)"
+case "$BR_OUT" in
+  *"runtime and pinned at boot"*) ok "the report distinguishes the runtime value from the boot pin" ;;
+  *) bad "the swappiness line does not name both halves: $BR_OUT" ;;
+esac
+
+# ── 12f) NOT ENOUGH FREE DISK: a swapfile is not reclaimable by the disk reaper, so allocating one
+# on a cell near the threshold trades an OOM kill for a dead cell (worktree/uv fail at ~97%).
+say_case "not enough free disk -> refused with the reading, no CELL READY"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '60\n' > "$T/swappiness"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal \
+          SWAP_AVAIL_KB=1024 \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) when the swapfile would not fit" \
+  || bad "bring-up returned 0 and allocated a swapfile on a full disk"
+case "$BR_OUT" in
+  *"not enough free disk"*"free 1024K"*) ok "the refusal names the free-space reading it acted on" ;;
+  *) bad "the refusal does not print the disk reading: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness after refusing to allocate" ;;
+  *) ok "never claims CELL READY after the refusal" ;;
+esac
+# restore the provisioned shape for the cases that follow
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 4194300 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"
+printf '30\n' > "$T/swappiness"
+
+# ── 13) REFUSAL: a cell that cannot get swap must not be certified ────────────────────────────
+# The failure this removes is a box that looks healthy at 345M available and then silently loses
+# lanes. The refusal must name the READING (MemTotal, SwapTotal, target) so an operator can act on
+# it, and must not print CELL READY over a cell with no swap.
+say_case "cannot escalate -> refused WITH the reading, no CELL READY"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+rm -f "$T/swapfile"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal \
+          SWAP_SUDO=false \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) when it cannot create swap" \
+  || bad "bring-up returned 0 with NO swap on the cell"
+case "$BR_OUT" in
+  *"cannot escalate to root"*) ok "the refusal names escalation as the reason" ;;
+  *) bad "the refusal does not name why it could not act: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"READING: MemTotal="*"SwapTotal="*"target="*) ok "the refusal PRINTS THE READING (MemTotal/SwapTotal/target)" ;;
+  *) bad "the refusal does not print the reading: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no swap on the cell (fail-open)" ;;
+  *) ok "never claims CELL READY without swap" ;;
+esac
+
+# ── 14) the KERNEL'S ROUNDING is not a shortfall (found on a live cell) ──────────────────────
+# A 4096M swapfile reports 4194300K = 4095M in /proc/swaps: the kernel rounds the area down to whole
+# pages and drops the swap header. Without slack that reads as "below target", so every bring-up
+# would WARN on a healthy cell and — worse — swapoff/re-create a LIVE area. Measured on this cell
+# (`/swapfile file 4194300 0 -2` for a `-l 4096M` file), pinned here so the rounding cannot come back
+# as a re-creation loop.
+say_case "a kernel-rounded area (4095M for a 4096M request) is NOT re-created"
+printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"
+printf '%s file 4194300 0 -2\n' "$T/swapfile" >> "$T/proc-swaps"
+: > "$SWAP_LOG"
+SWAP_STUB_LOG="$SWAP_LOG" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a re-run on the rounded area exits 0 (rc=$BR_RC)" \
+  || bad "a rounded area FAILED the run (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"already provisioned"*) ok "4095M counts as provisioned against a 4096M target" ;;
+  *) bad "the rounded area is not recognised as provisioned: $BR_OUT" ;;
+esac
+[ ! -s "$SWAP_LOG" ] && ok "nothing was swapped off or re-created (a live area was left alone)" \
+  || bad "the rounded area was re-created: $(cat "$SWAP_LOG" 2>/dev/null)"
+
+# ── 15) the SIZING PREDICATE, driven from the shipped function ─────────────────────────────────
+# Extracted and driven, not re-derived here: a copy of `max(4 GiB, MemTotal/4)` written into this
+# suite would pass against a build whose predicate had been changed to a flat number.
+say_case "sizing predicate: max(4 GiB, RAM/4), capped at 16 GiB"
+sed -n '/^swap_target_mb() {/,/^}/p' "$BRINGUP" > "$T/target.sh"
+if [ -s "$T/target.sh" ]; then
+  ( unset SWAP_MB
+    . "$T/target.sh"
+    t4096=$(swap_target_mb 8011)    # the measured 8 GiB cell: 25% is 2 GiB, below the floor
+    tfloor=$(swap_target_mb 2048)   # even a 2 GiB box gets 4 GiB
+    t32=$(swap_target_mb 32768)
+    t64=$(swap_target_mb 65536)     # capped
+    SWAP_MB=512; tover=$(swap_target_mb 32768)
+    printf '%s %s %s %s %s' "$t4096" "$tfloor" "$t32" "$t64" "$tover" ) > "$T/target.out"
+  got="$(cat "$T/target.out")"
+  [ "$got" = "4096 4096 8192 16384 512" ] \
+    && ok "8011M->4096M, 2048M->4096M (floor), 32768M->8192M, 65536M->16384M (cap), SWAP_MB=512->512M" \
+    || bad "predicate drift: got '$got', expected '4096 4096 8192 16384 512'"
+else
+  bad "swap_target_mb() is no longer extractable from the shipped script"
 fi
 
 echo

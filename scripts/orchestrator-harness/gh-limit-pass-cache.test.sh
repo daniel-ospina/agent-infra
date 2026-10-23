@@ -66,6 +66,16 @@ ghx "" "" -- api repos/o/r/pulls
 ghx "" "" -- api repos/o/r/pulls
 [ "$(stub_calls)" = "2" ] && ok "off: with GH_LIMIT_PASS_CACHE unset, two identical calls make two requests" \
                           || bad "off: a cached answer was served with the feature OFF ($(stub_calls) requests, want 2)"
+# ⛔ AND `0` IS OFF TOO. The value is a DIRECTORY, so `bool(value)` made the documented disable
+# ENABLE the cache — and `makedirs("0")` created a directory literally named `0` in the caller's cwd.
+# A switch that does the opposite of what it says is worse than none: the operator who turned the
+# cache off kept writing to disk.
+reset_log; _cwd="$T/.cwd0"; mkdir -p "$_cwd"
+ghx 0 "$_cwd" -- api repos/o/r/pulls
+ghx 0 "$_cwd" -- api repos/o/r/pulls
+[ "$(stub_calls)" = "2" ] && [ ! -e "$_cwd/0" ] \
+  && ok "off: GH_LIMIT_PASS_CACHE=0 disables the cache and creates no directory ($(stub_calls) requests)" \
+  || bad "off: GH_LIMIT_PASS_CACHE=0 enabled the cache or made a dir named 0 ($(stub_calls) requests, dir=$([ -e "$_cwd/0" ] && echo yes || echo no))"
 
 # ── 2) ON: THE SECOND CALL IS SERVED FROM THE MEMO, BYTE FOR BYTE ──────────────────────────────
 reset_log; rm -rf "$CACHE"
