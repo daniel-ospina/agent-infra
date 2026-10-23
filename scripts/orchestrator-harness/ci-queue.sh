@@ -24,12 +24,17 @@
 #
 # ── WHY THIS EXISTS (measured 2026-10-22 13:40 UTC, both repos) ─────────────────────────────────
 #   tortoise      queued=92  in_progress=6  runners online=5 (busy=5)   ← queue 18x the runner count
-#   agent-infra   queued=97  in_progress=7  (runner endpoint unreadable) ← 97 runs, 7 executing
+#   agent-infra   queued=97  in_progress=7  runners `total_count: 0`    ← 97 runs, 7 executing on
+#                                                                          GitHub-HOSTED runners (a)
 #   job wait created->started:  tortoise P50 0.0m P90  2.5m max 11.2m
 #                               agent-infra P50 5.0m P90 11.7m max 13.0m
 #   single longest job:         agent-infra `bash-suites` 20.3m; tortoise `queue-health` 11.3m
 # After a batch of rebases agent-infra went from 4 to 31 BLOCKED PRs at once, each needing a full CI
-# pass, against 5 self-hosted runners. NOTHING FINISHES BECAUSE EVERYTHING STARTED: throughput
+# pass. ⛔ The 5-runner self-hosted fleet is TORTOISE's, not agent-infra's: agent-infra's own
+# `actions/runners` answers `total_count: 0` because its jobs run on GitHub-HOSTED runners, and
+# which of those two shapes a repo is in selects the fail-direction below (a)/(b)/(c) — see
+# `ciq_ceiling`'s hosted arm, the ONE place the reading is interpreted. NOTHING FINISHES BECAUSE
+# EVERYTHING STARTED: throughput
 # (merges/hour) went DOWN while the work went up. This file is the reading that was missing: every
 # existing gate in this harness — `load=`, `mem_avail=`, `swap_free=`, `capacity-placement` — measures
 # THE BOX, and a box with 20 idle lane slots and a 90-deep CI queue looks perfectly healthy.
@@ -107,7 +112,11 @@ ciq_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) retu
 # bound, and it used to claim "three orders" in BOTH clauses — 10^2 vs 10^9 and 10^9 vs 10^19.)
 ciq_is_count() { ciq_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 
-# ── the two tuning values (the ONE place) ───────────────────────────────────────────────────────
+# ── the tuning functions (the ONE place) ────────────────────────────────────────────────────────
+# FIVE knobs total: the THREE functions below (`ciq_horizon_min`, `ciq_job_p90_min`,
+# `ciq_hosted_concurrency`) plus the two cache bounds read inline in `ciq_read` (`CIQ_TTL`,
+# `CIQ_STALE_MAX`). See the header's ⛔ block — an earlier version of THIS banner said "two".
+
 ciq_horizon_min() { # how long a lane will wait for its own CI verdict before the push is pointless
   local v="${CIQ_HORIZON_MIN:-20}"
   ciq_is_num "$v" && [ "$v" -ge 1 ] && [ "$v" -le 600 ] || v=20

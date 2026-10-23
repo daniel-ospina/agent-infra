@@ -493,7 +493,15 @@ ck "(e4c) …and its defer arm cannot fire for a PR that was simply not eligible
 n="$(grep -c 'ciq_defer_note_here "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "CI-red fixer' "$LOOP")"
 ck "(e5) each push arm emits the deferral line" "$( { [ "$n" -eq 1 ] && [ "$m" -eq 1 ]; } ; echo $? )"
 n="$(grep -c 'ci-queue(\${CIQ_VER:-unmeasured})' "$LOOP")"
-ck "(e6) every CI-SPENDING arm (both fixer spawns + the review-gate fixer + the rerun) writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet (n=$n)" "$( [ "$n" -eq 4 ]; echo $? )"
+# ⛔ WHAT THIS PINS, AND WHAT IT DOES NOT (#2333 review, P2). It pins the ROW COUNT — every one of
+# the four CI-spending arms carries a wait disposition naming the verdict — and that no arm
+# defaults to `deep` (e6b). It does NOT pin `${…:-unmeasured}`: every such row is reached only
+# THROUGH `ciq_push_ok`, which assigns `CIQ_VER` on both of its paths, so the default is a
+# defensive floor and never fires (orch-loop.sh states exactly that above the CONFLICTED arm).
+# An earlier label claimed the arm "says unmeasured when the cycle's own read has not run yet",
+# i.e. it asserted the cycle-6 P0 this wiring exists to prevent — the count would have stayed
+# green on exactly that regression.
+ck "(e6) every CI-SPENDING arm (both fixer spawns + the review-gate fixer + the rerun) writes a wait disposition carrying the verdict it decided on (n=$n)" "$( [ "$n" -eq 4 ]; echo $? )"
 ck "(e6b) no push arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
    "$( grep -q 'CIQ_VER:-deep' "$LOOP"; [ $? -ne 0 ]; echo $? )"
 grep -q 'ci-queue.sh' "$FIX" && grep -q 'ciq_ci_allowed "\$OR"' "$FIX"

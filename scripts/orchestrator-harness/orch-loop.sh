@@ -4457,7 +4457,7 @@ PY
           # `product = $PB/$FLOOR_N in this batch`, giving the same phrase a second denominator — the
           # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
           # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
-          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
         else
           # ⛔ THE MET VERDICT IS PRINTED, NOT INFERRED FROM SILENCE (agent-infra#2054 indicator (a)). The
           # arms above only ever spoke when the floor MISSED, so "the floor worked" was the absence of a
@@ -4517,12 +4517,12 @@ PY
             _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
             if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
             else
-              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
             fi ;;
           *)
-            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG" ;;
         esac
       fi
     fi
