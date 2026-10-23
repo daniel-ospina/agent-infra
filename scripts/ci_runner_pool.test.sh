@@ -123,6 +123,19 @@ cat >"$BIN/hostname" <<'STUB'
 #!/usr/bin/env bash
 printf 'fixturebox\n'
 STUB
+cat >"$BIN/ls" <<'STUB'
+#!/usr/bin/env bash
+# The pool listing is `ls -A "$RUNNER_ROOT"`. FIXTURE_LS_FAIL makes THAT readdir fail while the mode
+# bits still allow it (an ACL/SELinux denial, a transient error on a mounted root) — the one shape the
+# permission checks cannot reach, so it is the arm that genuinely proves the listing is checked.
+if [ "${FIXTURE_LS_FAIL:-0}" = 1 ]; then
+  for a in "$@"; do
+    [ "$a" = "${RUNNER_ROOT:-}" ] && { echo "ls: cannot open directory '$a': Permission denied" >&2; exit 2; }
+  done
+fi
+if [ -x /bin/ls ]; then exec /bin/ls "$@"; fi
+exec /usr/bin/ls "$@"
+STUB
 chmod +x "$BIN"/*
 
 # ── the runner release, stubbed to GitHub's real shape ──────────────────────────────────────
@@ -293,6 +306,44 @@ else
 fi
 assert_eq "$(listeners_for "$RUNNER_ROOT/_template")" "0" "no listener was started inside the pristine release"
 
+# ── the template exclusion must NOT depend on the release being NAMED `_template` ────────
+# The default name has its own arm, and it answers every fixture whose release IS `_template` — so
+# deleting the two NAME/PHYSICAL arms left this suite green while a release under any other name was
+# listed as a DEAD runner, counted against the ceiling (`reconcile` then stopped one slot short) and had
+# a listener started inside it — whose `.runner` every later `add` copies into the instance, voiding the
+# proof-of-registration check. This fixture uses a non-default name so only those two arms can answer.
+echo "── the template is excluded even under a DIFFERENT name ──"
+fresh_pool namedtpl; reset_logs
+cp -a "$TEMPLATE" "$RUNNER_ROOT/release-2"; : >"$RUNNER_ROOT/release-2/.runner"
+register pi-runner-real2
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/release-2" run status)"
+assert_contains "$out" "summary live=0 dead=1 slots=1" \
+  "a pristine release under a NON-default name is not a slot"
+if grep -qF "release-2" <<<"$out"; then
+  bad "a release under a non-default name is not listed as a runner"
+else
+  ok "a release under a non-default name is not listed as a runner"
+fi
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/release-2" run reconcile)"
+assert_eq "$(listeners_for "$RUNNER_ROOT/release-2")" "0" \
+  "no listener was started inside the non-default-named release"
+assert_contains "$out" "ceiling reached slots=3 ceiling=3" \
+  "and the pass still reached the ceiling (the release did not eat a slot)"
+
+# ── the pool ROOT's own readdir is the arm the permission checks cannot replace ────────
+# A root whose `readdir` fails while both mode bits pass (an ACL/SELinux denial, a transient error on a
+# mounted root) read as an EMPTY pool — the original over-add class. The `ls -A` probe is that arm; the
+# mode-bit fixtures (300/444/000) are all caught by `-r`/`-x` and cannot pin it.
+echo "── a readdir failure on a healthy-mode root ──"
+fresh_pool readdir; reset_logs
+register pi-runner-r1
+out="$(FIXTURE_LS_FAIL=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "2" "a failing readdir on a healthy-mode root is cannot-measure, not an empty pool"
+assert_contains "$out" "cannot-measure why=runner-root-unreadable" "it names the unreadable root"
+assert_eq "$(FIXTURE_LS_FAIL=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-r2)" "2" \
+  "and an add refuses rather than adding above an unreadable ceiling"
+assert_eq "$(count_lines "$CONFIG_LOG")" "0" "nothing was registered"
+
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"
 fresh_pool floor; reset_logs
@@ -347,6 +398,19 @@ assert_eq "$?" "4" "a regular file at the target path is name-unavailable (rc 4)
 assert_contains "$out" "already exists" "the refusal says the path exists"
 assert_eq "$(cat "$RUNNER_ROOT/pi-runner-file" 2>/dev/null)" "operator notes — not a runner" \
   "the operator's FILE was not deleted by add's failure cleanup"
+
+# ⛔ AND A DANGLING SYMLINK at the target is the same "already exists" case: `[ -e ]` is false for it,
+#   so without the `-L` half the check falls through to the CLAIM — which happens AFTER the
+#   registration token was minted. The refusal then costs a single-use token and blames "another pass"
+#   that does not exist.
+echo "── add: a dangling symlink at the target path ──"
+fresh_pool foreigndangle; reset_logs
+ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-dangle)"
+assert_eq "$?" "4" "a dangling symlink at the target path is name-unavailable (rc 4)"
+assert_contains "$out" "already exists" "the refusal says the path exists, not that another pass took it"
+assert_eq "$(grep -c 'registration-token' "$GH_LOG" 2>/dev/null || true)" "0" \
+  "and no single-use registration token was minted for it"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-file")" "0" "no listener was started for a file"
 
 # ══ 4. ADD above the CORE-AWARE ceiling ═════════════════════════════════════════════════════
@@ -590,6 +654,19 @@ assert_eq "$?" "0" "a pass through stale names exits 0 (it acted)"
 assert_contains "$out" "added name=pi-runner-fixturebox-7" \
   "reconcile SKIPPED the six stale names and added the first FREE one"
 assert_contains "$out" "ceiling reached slots=3 ceiling=3" "and it still stopped at the ceiling"
+
+# ⛔ THE rc-4 ARM *INSIDE* THE PASS. The name-scan only skips a name that EXISTS, and a DANGLING
+#   SYMLINK does not (`[ -e ]` is false for it) — so `add` answers 4 on it, a per-name accident the
+#   pass must SKIP. Folded into the cannot/break arm it ends the whole pass with rc 2 and leaves the box
+#   at ZERO capacity: the exact inversion of "one stale directory must not cost the box the capacity it
+#   is entitled to", and `skipped=` could then never be non-zero (a monitor keyed on it reads 0 forever).
+echo "── a name add cannot claim is SKIPPED, not the end of the pass ──"
+fresh_pool skipname; reset_logs
+ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-fixturebox-1"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "a name that cannot be claimed does not end the pass (rc 0)"
+assert_contains "$out" "skipped=1" "the unclaimable name is counted as skipped"
+assert_contains "$out" "added name=pi-runner-fixturebox-2" "and the pass moved on to the next name"
 
 # ⛔ A preview that announced ONE add where the pass makes THREE would under-report the very change
 # an operator is previewing. Own pool: 0 slots, ceiling 3.
@@ -999,6 +1076,19 @@ else
   assert_contains "$out" "cannot-measure why=instance-unreadable" "and it names the instance"
   chmod 700 "$RUNNER_ROOT/pi-runner-locked"
 fi
+
+# ⛔ A REGISTRATION WHOSE `.runner` IS A DANGLING SYMLINK IS STILL A REGISTRATION: `[ -e ]` is false for
+#   it, and without the `-L` half it vanishes from `slots` and from the report — the ceiling then
+#   under-counts (the OVER-add direction) and a live registration is invisible. The `-L` half of the
+#   marker test needs its own fixture for the same reason the root's did.
+echo "── a registration with a dangling-symlink marker ──"
+fresh_pool ghostmark; reset_logs
+register pi-runner-real3
+mkdir -p "$RUNNER_ROOT/pi-runner-ghost"
+ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-ghost/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "slots=2" "a dangling-symlink .runner is still a slot"
+assert_contains "$out" "pi-runner-ghost" "and it is listed as a registration"
 
 # ⛔ A RUNNER_ROOT THAT EXISTS BUT IS NOT A DIRECTORY is a misconfiguration, not an empty pool — the
 #   same false empty reading in a shape no permission bit produces. TWO shapes reach that branch and
