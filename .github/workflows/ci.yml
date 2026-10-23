@@ -170,24 +170,30 @@ jobs:
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-    # every extensions/ top-level entry except *.test.ts must be farm-wired
-    # into pi-bootstrap/pi-config/extensions (single source of truth — a new
-    # extension that isn't wired ships on NO machine) AND listed in manifest.json
-    # files.extensions.entries (the consumer ship-list — a tree entry with no
-    # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
-    # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
-    # checks 1–5 (materialized copy / mistargeted link / unwired entry /
-    # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
-    # exclusion. Check 5 is the ONE machine-local check: it aims at
-    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
-    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
-    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
+    # every extension THIS REPO CARRIES (see #2425 below) except *.test.ts must be
+    # farm-wired into pi-bootstrap/pi-config/extensions (single source of truth —
+    # a new extension that isn't wired ships on NO machine) AND listed in
+    # manifest.json files.extensions.entries (the consumer ship-list — a tree
+    # entry with no manifest row ships on NO consumer, #498 staleness class).
+    # #2425 — the tree-side questions (2-tracked-leg / 3 / 4a / 4b) are answered
+    # over TRACKED content, not the filesystem: `git ls-files --cached --others
+    # --exclude-per-directory=.gitignore`, so a git-ignored directory (an
+    # `npm install`'s node_modules) is not an "unwired extension" and cannot
+    # fail a bootstrap; a git-unavailable/empty reading FAILS CLOSED.
+    # Repo-tree only, no live ~/.pi/agent dependency, then the runtime-fixture
+    # suite exercising checks 1–5 (materialized copy / mistargeted link / unwired
+    # entry / manifest↔tree row drift / dangling live-farm link) + the *.test.ts
+    # exclusion + the #2425 reading cases 13, 13b, 14–21 (including the ambient
+    # GIT_DIR case). Check 5 is the ONE machine-local
+    # check: it aims at ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a
+    # runner it prints an explicit ⏭️ skip and the CI verdict stays repo-tree-only;
+    # its fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
         run: bash scripts/check-pi-config-extensions.sh
-      - name: Extension-farm parity gate tests (fixtures, checks 1-5)
+      - name: Extension-farm parity gate tests (fixtures, checks 1-5 + #2425 reading)
         run: bash tests/pi-config-extensions/run.sh
 
   actionlint:
