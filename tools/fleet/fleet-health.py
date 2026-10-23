@@ -544,6 +544,15 @@ def harness_apply_record():
     deployed = kv.get("deployed", kv.get("head", "?"))
     head = kv.get("head", "?")
     ref = kv.get("ref", "?")
+    # ⛔ A COMPARISON THAT WAS NOT FRESH IS NOT A GREEN. `--print-status` (the readiness gate) refuses a
+    # record whose `fetch=` is neither `ok` nor absent; this reader ignored the field entirely, so
+    # `rc=0 behind=0 fetch=failed` was RED at the gate and CLEAN on the fleet instrument — the same
+    # two-readers-one-record shape this PR already fixed twice, pointing the other way. Same allow-list,
+    # so neither side grows a second rule.
+    fetch_state = kv.get("fetch", "")
+    if fetch_state not in ("ok", ""):
+        return (f"record rc={rc} was written from a comparison that was NOT fresh (fetch={fetch_state}) — "
+                f"deployed={deployed} ref={ref} — cannot-verify is not current", True)
     if rc in ("0", "10", "11") and behind_n == 0:
         return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
                 f"action={kv.get('action', '?')}", False)

@@ -387,7 +387,8 @@ def leg_harness_apply(mod):
     def rec(**kv):
         base = dict(mode="pin", ok=1, rc=0, epoch=now, head="a" * 12, deployed="a" * 12,
                     ref="b" * 12, behind=0, ahead=0, dirty=0, pin="a" * 12, pin_tree="a" * 12,
-                    preserved="none", action="none", lanes="none-signalled", detail="current")
+                    preserved="none", action="none", lanes="none-signalled", fetch="ok",
+                    detail="current")
         base.update(kv)
         write(**base)
         return mod.harness_apply_record()
@@ -431,6 +432,11 @@ def leg_harness_apply(mod):
         detail, alarm = rec(epoch="")
         check(alarm and "no readable epoch" in detail,
               "HARNESS: an unreadable epoch is an alarm, not a healthy read")
+        detail, alarm = rec(fetch="failed")
+        check(alarm and "NOT fresh" in detail,
+              "HARNESS: a record written from a FAILED fetch alarms (the readiness gate refuses it too)")
+        detail, alarm = rec()
+        check(not alarm, "HARNESS: control — the same record with fetch=ok (the default fixture) is green")
         os.environ["HARNESS_APPLY_STALE_SECONDS"] = "not-a-number"
         detail, alarm = mod.harness_apply_record()
         check(alarm and "not a whole number" in detail,
