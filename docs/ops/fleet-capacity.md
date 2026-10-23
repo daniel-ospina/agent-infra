@@ -224,12 +224,12 @@ above) and the same box reports its real slots and can restart its real registra
   this read cannot close, and it is why the parents should be **consolidated under one directory**:
   pointing the root at `/opt` on a box that also keeps an install under `/tmp` strands the other one,
   and the refusal names the dirs it found rather than guessing which parent was meant. A listener
-  started through a wrapper (`nohup`, `env K=V`, `bash`, a service shim) is still read as a listener,
-  and a **symlinked** instance inside the root is still in-pool: `run.sh` resolves its own dir with
-  `cd -P`, so argv carries the target, while the listing counts the name. ⚠️ **The reading is the process table, so it only holds LIVE
-listeners**: a registration under another parent whose listener is DEAD is not enumerable at all —
-which is why `status` prints `pool_read=process-table-live-only` beside its count and `restart` names
-that limitation instead of asserting absence. Consolidating the parents is the real fix.
+  started through a wrapper (`nohup`, `env K=V`, `bash`, a service shim) is still read as a listener:
+  the instance dir is the **argv word that carries the binary**, with wrapper tokens stripped one at a
+  time (an instance dir may contain a space), and a dir that does not RESOLVE is
+  `cannot-measure why=instance-dir-unresolvable` (rc 2) — never judged by its spelling, and never
+  dropped. A **symlinked** instance inside the root is still in-pool: `run.sh` resolves its own dir
+  with `cd -P`, so argv carries the target, while the listing counts the name.
 - **Liveness is the process table, not a pid file.** A pid file records a past state and is never
   revalidated; a recycled pid reads "live" forever, and on a box without `/proc` it cannot be
   revalidated at all. The runner's argv (`<dir>/bin/Runner.Listener run`) cannot go stale, and it is

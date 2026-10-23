@@ -1458,6 +1458,46 @@ sleep 0.3
 assert_eq "$(pgrep -f -- "$T/.*bin/Runner\.Listener" 2>/dev/null | wc -l | tr -d ' ')" "0" \
   "cleanup's pattern kills every fixture listener shape (the leak fix is LIVE, not decorative)"
 
+# ⛔ A LITERAL PREFIX IS NOT CONTAINMENT (#2524 review, P1). `$RUNNER_ROOT/../outside/pi-x` starts
+#   with the root as a STRING and resolves outside it, so the literal-first arm judged it IN-POOL and
+#   the pool read as complete — the over-add this whole arm exists to prevent.
+DOTOUT="$T/dot-outside/pi-runner-dotout"
+mkdir -p "$DOTOUT/bin"; : >"$DOTOUT/.runner"
+DOTARGV="424246 $RUNNER_ROOT/../dot-outside/pi-runner-dotout/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$DOTARGV" run status --all)"
+assert_eq "$?" "2" "a '..' argv that RESOLVES outside the root is not in-pool (rc 2)"
+assert_contains "$out" "cannot-measure why=pool-root-incomplete" "it is refused, not silently counted"
+assert_contains "$out" "outside=$RUNNER_ROOT/../dot-outside/pi-runner-dotout" "and the outside dir is named"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$DOTARGV" rc_of add --name pi-runner-dot-add)" "2" \
+  "so add REFUSES instead of registering on a box it cannot count"
+
+# ⛔ A WRAPPER THAT CARRIES ITS OWN `cd` TARGET (#2524 review, P1). The strip loop stops at the first
+#   `/`-leading token, which is the wrapper's `cd` target — so the "dir" is no directory at all and a
+#   literal prefix test called it inside. It must be cannot-measure, never "complete".
+CDARGV="424247 bash -c cd $RUNNER_ROOT/pi-1 && exec $OUTSIDE_DIR/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$CDARGV" run status --all)"
+assert_eq "$?" "2" "an unresolvable wrapper argv is cannot-measure (rc 2), not a complete pool"
+assert_contains "$out" "cannot-measure why=instance-dir-unresolvable" "naming the argv it could not resolve"
+
+# ⛔ TWO outside dirs pin `join_lines` (#2524 review, P2): the old `tr '\n' ' '` glued the first dir
+#   onto the em dash and left the pair unquoted, so a caller could not read the field.
+SECOND_OUT="$T/outside-two/pi-runner-two"
+mkdir -p "$SECOND_OUT/bin"; : >"$SECOND_OUT/.runner"
+TWO_EXTRA="$(printf '%s\n' "424248 $OUTSIDE_DIR/bin/Runner.Listener run" "424249 $SECOND_OUT/bin/Runner.Listener run")"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$TWO_EXTRA" run status --all)"
+assert_eq "$?" "2" "two outside listeners still refuse (rc 2)"
+assert_contains "$out" "outside=$OUTSIDE_DIR,$SECOND_OUT " "both dirs are comma-joined, with no glued em dash"
+
+# ⛔ A ROOT OF `/` CONTAINS EVERY ABSOLUTE DIR (#2524 review, P2): normalising `/` away made the
+#   containment pattern `//*`, so every listener on the box reported outside it — with a remedy the
+#   operator had already applied.
+fresh_pool rootslash
+register pi-runner-slash
+RUNNER_ROOT=/: out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 env RUNNER_ROOT=/ bash "$POOL" status --all 2>&1)"
+assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "RUNNER_ROOT=/ does not report a listener outside itself"
+# (rc is NOT asserted here: a listener whose instance dir was deleted under it is legitimately
+#  `instance-dir-unresolvable`, and earlier cases leave such fixtures behind.)
+
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ $FAIL assertion(s) failed, $PASS passed"

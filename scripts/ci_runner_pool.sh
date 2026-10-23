@@ -368,6 +368,17 @@ listener_pid() {
 # first)" for a registration that was right there. Both are ACTIONS taken from a listing that was
 # not the pool — the class this file refuses everywhere else. The process table is the one reading
 # that holds regardless of where the installs live, and it is already this file's liveness evidence.
+# is_plain_path <s> — no whitespace and no shell syntax. A dir that does not RESOLVE is judged by its
+# spelling only when it is a plain path (#2524 review, P1): `bash -c 'cd <root>/pi-1 && exec
+# <outside>/bin/…'` leaves a "dir" whose literal prefix is under the root but which is not a path at
+# all, and calling that "inside" is how an outside listener read as in-pool.
+is_plain_path() {
+  case "${1:-}" in
+    *[[:space:]]*|*'&'*|*'|'*|*';'*|*'<'*|*'>'*) return 1 ;;
+  esac
+  return 0
+}
+
 outside_listener_dirs() {
   local out pid args dir root lroot pdir cand one
   if ! out="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
@@ -407,13 +418,31 @@ outside_listener_dirs() {
       *) err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir is not an absolute path, so it cannot be judged against RUNNER_ROOT)"; return 2 ;;
     esac
     dir="${dir%/}"
-    # INSIDE = under the LITERAL or the PHYSICAL root (`/` contains every absolute path).
-    for cand in "$root" "$lroot"; do
-      [ -n "$cand" ] || continue
-      [ "$cand" = "/" ] && continue 2
-      case "$dir" in "$cand"/*) continue 2 ;; esac
-    done
-    pdir="$(cd "$dir" 2>/dev/null && pwd -P)" || pdir="$dir"
+    # ⛔ RESOLVE FIRST, THEN JUDGE (#2524 review, P1): a LITERAL prefix test is defeated by `..`
+    # (`$RUNNER_ROOT/../outside/pi-x`) and by a wrapper whose argv contains its own `cd` target
+    # (`bash -c 'cd $RUNNER_ROOT/pi-1 && exec <outside>/bin/…'`), so those listeners read IN-POOL and
+    # the pool read as complete — the over-add this arm exists to prevent. The physical dir is the only
+    # evidence that can be trusted. A dir that does not RESOLVE is judged by spelling ONLY when the
+    # spelling is a plain path under our own root (a deleted instance is still our capacity), and is
+    # `cannot-measure` (rc 2) otherwise — never dropped, and never called "inside" on shell syntax.
+    if ! pdir="$(cd "$dir" 2>/dev/null && pwd -P)" || [ -z "$pdir" ]; then
+      # ⛔ AN UNRESOLVABLE DIR IS JUDGED BY SPELLING ONLY WHEN THE SPELLING IS A PLAIN PATH (#2524
+      # review, P1). A deleted instance dir under our OWN root is still a runner of ours — the capacity
+      # is on the box, its listing entry is simply gone (an operator `rm -rf`ed it under a live
+      # listener), so it stays IN-POOL rather than blocking every add. But a wrapper's own `cd` target
+      # is NOT a path: `bash -c 'cd <root>/pi-1 && exec <outside>/bin/…'` has a literal prefix under the
+      # root, and judging THAT by spelling is how an outside listener read as inside. Anything carrying
+      # shell syntax is `cannot-measure` (rc 2), never "inside".
+      is_plain_path "$dir" || {
+        err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir '$dir' is not a plain path and does not resolve, so it cannot be judged against RUNNER_ROOT)"; return 2; }
+      for cand in "$root" "$lroot"; do
+        [ -n "$cand" ] || continue
+        [ "$cand" = "/" ] && continue 2
+        case "$dir" in "$cand"/*) continue 2 ;; esac
+      done
+      err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir '$dir' does not resolve on this box, so it cannot be judged against RUNNER_ROOT)"; return 2
+    fi
+    # INSIDE = the PHYSICAL dir under the PHYSICAL or the LITERAL root (`/` contains every absolute path).
     for cand in "$root" "$lroot"; do
       [ -n "$cand" ] || continue
       [ "$cand" = "/" ] && continue 2
