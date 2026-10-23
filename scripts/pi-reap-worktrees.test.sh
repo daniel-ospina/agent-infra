@@ -2205,6 +2205,41 @@ else
     ok "P1 no catastrophic whitespace substitution on a list-sized string"
 fi
 
+# ── P2: every launchd template must PARSE — a silent parse failure installs a unit
+# ── with EMPTY ProgramArguments, which reads as a healthy job that does nothing ──
+# MEASURED 2026-10-23 (review of #2041/#2541): the comment block in this PR's own
+# com.tortoise.worktree-reaper.plist spelled flags with their leading double hyphen.
+# XML comments may not contain a double hyphen, so `plistlib.load` raised
+# `not well-formed (invalid token)` at line 30 — and install-launchd.sh's
+# plist_program_args swallows the exception (`|| true` / `except Exception: pass`),
+# so the box would have installed the job with NO arguments and reported success.
+# No assertion covered the template, so the suite stayed 297/297 GREEN over an
+# unparseable unit: the false-PASS shape this repo's own rule forbids. The check
+# runs on the REAL template AND on a synthesized render, because the placeholders
+# ({{HOME}}, {{WORKTREE_HYGIENE_MODE}}, …) are the shipped form.
+if command -v python3 >/dev/null 2>&1; then
+    _plist_bad=0
+    for _pl in "$SCRIPT_DIR/../templates/launchd"/*.plist "$SCRIPT_DIR/../templates/launchd"/*/*.plist; do
+        [ -f "$_pl" ] || continue
+        python3 -c 'import plistlib,sys;plistlib.load(open(sys.argv[1],"rb"))' "$_pl" 2>/dev/null \
+            || { bad "P2 launchd template does not PARSE: ${_pl#"$SCRIPT_DIR/../"} — a malformed unit installs with empty ProgramArguments (silent no-op job)"; _plist_bad=$((_plist_bad + 1)); }
+    done
+    [ "$_plist_bad" -eq 0 ] && ok "P2 every launchd template parses as a property list (a malformed one installs a silent no-op unit)"
+    # The SHIPPED form: placeholders substituted. `{{VAR}}` is the render input.
+    _reaper_tpl="$SCRIPT_DIR/../templates/launchd/com.tortoise.worktree-reaper.plist"
+    _rendered="$T/rendered-reaper.plist"
+    sed -E 's/\{\{[A-Za-z_][A-Za-z_0-9]*\}\}/\/rendered-placeholder/g' "$_reaper_tpl" > "$_rendered"
+    if _args="$(python3 -c 'import plistlib,sys;print(" ".join(plistlib.load(open(sys.argv[1],"rb"))["ProgramArguments"]))' "$_rendered" 2>/dev/null)"; then
+        ok "P2 the RENDERED reaper template parses (placeholders substituted)"
+        assert_contains "$_args" "pi-reap-worktrees-launchd.py" "P2 the rendered unit still runs the launcher (a parse failure would leave this EMPTY)"
+        assert_contains "$_args" "--dry-run" "P2 the rendered unit ships DRY-RUN, so removing the flag is not arming (#1678)"
+    else
+        bad "P2 the RENDERED reaper template does not parse — plutil/launchctl reject the unit, and install-launchd.sh swallows the error"
+    fi
+else
+    bad "P2 python3 is unavailable: the launchd template parse check could not run (an unrun check is not a green one)"
+fi
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
