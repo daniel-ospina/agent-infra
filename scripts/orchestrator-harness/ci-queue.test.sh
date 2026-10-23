@@ -1146,6 +1146,55 @@ fi
 
 
 
+printf '\n── (o) THE RUNNERS READ ASKS FOR EVERY PAGE, AND ASKS AFTER THE ENDPOINT ─────\n'
+# ⛔ THE FLAG AN EARLIER CYCLE CALLED A P1 WAS PINNED BY NOTHING (#2333 review, P3). The
+# `actions/runners` endpoint answers ONE page (30 objects) by default, so without `--paginate` a fleet
+# bigger than that is counted as 30, the ceiling is under-derived, and the gate DEFERS pushes and
+# issue work the real fleet would have drained inside the horizon — a silent over-block on exactly
+# the quantity the header derives from. The flag's POSITION matters too: every rig's `gh` stub
+# dispatches on `$2`, so a LEADING flag shifts the URL into `$3` and every stub takes its `*) exit 1`
+# arm. Measured before this arm existed: deleting ` --paginate` from the module left the whole suite
+# GREEN (125/0) — the arm below reds on both the deletion and the move.
+spy="$T/spy-gh"; args_f="$T/spy-args"
+cat > "$spy" <<'SPYBODY'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CIQ_SPY_ARGS"
+exec "$CIQ_SPY_REAL" "$@"
+SPYBODY
+chmod +x "$spy"
+# drive_spy <module>: one LIVE read (TTL 0, no record) through the recording wrapper.
+drive_spy() {
+  rm -rf "$T/spystate"; mkdir -p "$T/spystate"; : > "$args_f"
+  CIQ_GH="$spy"; CIQ_SPY_ARGS="$args_f"; CIQ_SPY_REAL="$STUB"
+  CIQ_TTL=0; CIQ_STALE_MAX=0; CIQ_STATE_DIR="$T/spystate"
+  export CIQ_GH CIQ_SPY_ARGS CIQ_SPY_REAL CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+  CIQ_TEST_QUEUED=1; CIQ_TEST_RUNNING=0; CIQ_TEST_RUNNERS=5; CIQ_TEST_BUSY=true
+  CIQ_TEST_OFFLINE=0; CIQ_TEST_NOTOTAL=0; OR="daniel-ospina/agent-infra"
+  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY
+  export CIQ_TEST_OFFLINE CIQ_TEST_NOTOTAL OR
+  # shellcheck source=/dev/null
+  ( . "$1" >/dev/null 2>&1; ciq_read "$OR" >/dev/null 2>&1 || true )
+}
+drive_spy "$MOD"
+line="$(grep -F 'actions/runners' "$args_f" | tail -1)"
+ck "(o1) the runners read asks for EVERY page, and asks for it AFTER the endpoint (recorded: ${line:-<no such call>})" \
+   "$( has "$line" 'actions/runners --paginate'; echo $? )"
+ck "(o1b) …and every read is recorded, so the arm cannot pass on an empty spy file" \
+   "$( { [ "$(grep -c . "$args_f")" -ge 3 ]; } ; echo $? )"
+# …and (o1) is not always-green: strip the flag from a copy and the recorded invocation loses it.
+sed 's|"repos/$repo/actions/runners" --paginate|"repos/$repo/actions/runners"|' \
+    "$MOD" > "$T/nopaginate.sh"
+if cmp -s "$MOD" "$T/nopaginate.sh"; then
+  bad "(o2) the --paginate mutation did not apply — (o1) would prove nothing"
+elif ! bash -n "$T/nopaginate.sh" 2>/dev/null; then
+  bad "(o2) the --paginate mutant does not parse — a broken mutant proves nothing"
+else
+  drive_spy "$T/nopaginate.sh"
+  mline="$(grep -F 'actions/runners' "$args_f" | tail -1)"
+  ck "(o2) MUTANT — without the flag the invocation loses it (recorded: ${mline:-<no such call>}), so (o1) is not always-green" \
+     "$( has "$mline" 'actions/runners --paginate'; [ $? -ne 0 ]; echo $? )"
+fi
+
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then printf '%s' "$FAILED_LINES" | sed 's/^/  - /'; exit 1; fi
