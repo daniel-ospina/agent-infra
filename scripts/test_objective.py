@@ -1278,8 +1278,14 @@ def test_a_fresh_attempt_is_not_hidden_by_a_stalled_namesake():
                                           collapse=False)
     assert [(n, round(a)) for n, _st, a in per_attempt] == [("script-validate", WEDGED_MIN)]
 
-    # THE DEFECT, through the classifier: the fresh namesake can still create the absent gate,
-    # so this is a WAIT -- today (name-level) it answered `rerun-checks` for the collapsed list.
+    # POST-FIX both list shapes are a WAIT: a fresh namesake can still create the absent gate.
+    # ⛔ THE PRE-FIX ANSWER IS NOT REPRODUCIBLE HERE (#1948 review cycle 4, P3 -- this comment said
+    # "today (name-level) it answered `rerun-checks`", directly under a docstring explaining that
+    # it cannot). Pre-fix the WIRING handed `classify_pr` the name-COLLAPSED list and the
+    # comparison was `len(collapsed aged list) == len(flight NAME SET)`; that equality has no
+    # argument in this signature, so no call here can replay it. The wiring is what the end-to-end
+    # test below pins -- `test_the_beat_does_not_re_trigger_a_fresh_duplicate_attempt` drives
+    # `classify_queue`, the path the fleet actually runs.
     assert objective.classify_pr(_a_pr(), cr, False, [], collapsed) == "running"
     assert objective.classify_pr(_a_pr(), cr, False, [], per_attempt) == "running"
     # ...and the wedge evidence agrees from both list shapes

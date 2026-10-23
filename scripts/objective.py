@@ -886,26 +886,36 @@ def rollup_checks(cr):
 # a `tested > 0` precondition; the only reachable clock would re-shape a shared run listing) do
 # not reach this read, which carries its own clocks.
 #
-# ⛔ SCOPE, STATED: the aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
-# (`drift-guard`/`flip-gate`/`provenance`) is not in it -- and, contrary to what this comment said
-# until review cycle 3, it is NOT dispatched either: `rail_block_reason` ACCEPTS an in-flight gate,
-# but arm 1 returns `blocked-by-rail` only when that gate is in `red` (`if _rail in red`), so a
-# wedged rail gate is non-`completed`, never `red`, and reads `running`. That is DELIBERATE, one
-# block above (#1872 review round 7: "an in-flight rail gate reads `running` and a RED one still
-# reads `blocked-by-rail`") -- an in-flight gate is not work to repair. So a wedged rail gate IS
-# silently waited on, exactly the never-ending wait this change bounds for the gated set, and it is
-# left UNBOUNDED on the rail surface: ageing it into `rerun-checks` would change the ladder for a
-# non-required surface. That is a separate call, deliberately not made here, and the honest
-# statement of it is this paragraph rather than a claim that the dispatch already exists.
+# ⛔ SCOPE, STATED -- AND THE TWO SHAPES ARE NOT THE SAME SHAPE (#1948 review cycle 4, P3).
+# The aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
+# (`drift-guard`/`flip-gate`/`provenance`) is not in it, and it is never a `blocked-by-rail`
+# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but arm 1 returns `blocked-by-rail` only
+# when that gate is in `red` (`if _rail in red`), so a wedged rail gate is non-`completed`, never
+# `red`. That is DELIBERATE, one block above (#1872 review round 7: "an in-flight rail gate reads
+# `running` and a RED one still reads `blocked-by-rail`") -- an in-flight gate is not work to
+# repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
+#   * EVERY gated context present: `rail_block_reason` names the wedged gate, arm 1 falls through
+#     to `running`, and the head WAITS -- unbounded, which is the one wait this change does not
+#     bound. Ageing it there would change the ladder for a non-required surface, and that is a
+#     separate call, deliberately not made here.
+#   * a REQUIRED gate ABSENT: `wedge_evidence`'s all-contexts read (below) ages EVERY context, so
+#     the rail gate can be the ONLY name in the reason -- `«drift-guard» queued <age>m` -- and the
+#     head reads `rerun-checks` even when it is DIRTY. Measured through `classify_one` with the
+#     suite's own fixture (review cycle 4): required gate absent + `drift-guard` queued PAST the
+#     bound -> `rerun-checks` with `why` naming only `drift-guard`; the same head with
+#     `drift-guard` FRESH -> `running`; and with the gated set complete and ATTESTED -> `running`
+#     (the unbounded wait above). So the ladder DOES depend on a non-required surface's age in the
+#     absence shape -- correct, because re-triggering a wedged run IS the repair and the gate has
+#     to be STARTED before any question about it can be answered.
 #
 # ⛔ THE ONE OTHER USE OF AN AGE, AND WHY IT IS NOT THAT CALL (#1926 review, P1):
 # `wedge_evidence` also ages EVERY context, but only to answer a narrower question -- *can the
 # ABSENT required gate ever be created?* `python-ci-gate` is created only after its matrix
 # children finish, so when a required gate is absent AND every check in flight is past the bound,
 # nothing can create it and the `gated_absent and flight` term of `running` would wait for ever.
-# A rail gate can appear in that read only as one of the stuck jobs; it is never the OBJECT of the
-# action (the class is `rerun-checks` for the suite), and it does not change the `blocked-by-rail`
-# ladder, which arm 1 still answers first on a fully-green gated set.
+# A rail gate appears in THAT read only as one of the stuck jobs to START -- it is named as work to
+# do, never as a `blocked-by-rail` repair -- and arm 1 still answers first on a fully-green gated
+# set, where nothing is named as an order at all.
 FLIGHT_BOUND_MIN = 90.0
 
 # The contexts a landing actually waits on. `ai-review-gate` is EXCLUDED for the same reason
