@@ -143,9 +143,9 @@ echo "== Case 5: no github-script body may embed a '\${{ }}' expression =="
 # direction — and it also false-RED a one-line `/* … */`. A rule that cannot be fooled beats
 # one that can be fooled in the expensive direction.
 #
-# The compile arm below is INDEPENDENT: it compiles the body AS WRITTEN, so it never sees a
-# substituted value and cannot stand in for the rule above — it only catches ordinary JS
-# syntax errors.
+# The compile arm below is INDEPENDENT: it compiles the body AS WRITTEN, with the same
+# parameter list `actions/github-script` compiles it with, so it never sees a substituted value
+# and cannot stand in for the rule above — it only catches ordinary JS syntax errors.
 CASE5_JSON="$(mktemp /tmp/actionlint-bodies.XXXXXX)"
 if ! command -v node >/dev/null 2>&1; then
   fail "node not found — github-script bodies CANNOT be checked (not a pass)"
@@ -205,7 +205,10 @@ found = []
 skipped = []
 pats.each do |pat|
   Dir.glob(File.join(root, pat)).sort.each do |f|
-    doc = YAML.load_file(f, aliases: true) || {}
+    # `aliases:` needs Psych 4 (Ruby 3.1+); older system rubies have no such keyword
+    # and would raise ArgumentError. Fall back rather than red the lane on a host where
+    # Case 4's kwargs-free load works.
+    doc = (YAML.load_file(f, aliases: true) rescue YAML.load_file(f)) || {}
     groups = (doc['jobs'] || {}).map { |jn, job| [jn, (job['steps'] || [])] }
     runs = doc['runs']
     groups << ['runs', runs['steps']] if runs.is_a?(Hash) && runs['steps'].is_a?(Array)
@@ -249,6 +252,13 @@ const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const bodies = data.bodies || [];
 const skipped = data.skipped || [];
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+// `actions/github-script` compiles the body with `new AsyncFunction(...Object.keys(args), src)`,
+// where args is this exact set (src/main.ts). Compiling with NO parameters is NOT equivalent:
+// a body that redeclares one of them (`const core = 1;`) is legal here and a SyntaxError in
+// the action — the body would die in production while this check stayed green, which is the
+// fail-open it exists to prevent. Pinned by a control below.
+const GH_SCRIPT_PARAMS = ['require', '__original_require__', 'github', 'octokit',
+  'getOctokit', 'context', 'core', 'exec', 'glob', 'io'];
 
 // The inspector. The control below runs THIS, not a re-implementation of its predicate —
 // an earlier version re-tested String.includes on literals built from the same constant,
@@ -258,7 +268,7 @@ const inspect = (list) => {
   for (const b of list) {
     const where = `${b.file} job=${b.job} step=${b.step}`;
     try {
-      new AsyncFunction(b.script);
+      new AsyncFunction(...GH_SCRIPT_PARAMS, b.script);
     } catch (e) {
       problems.push(`${where}: does not compile: ${e.name}: ${e.message}`);
     }
@@ -292,6 +302,15 @@ if (cleanProblems.length !== 0) {
 const syntaxProblems = inspect([{ file: '<control>', job: '<control>', step: 0, script: 'function (' }]);
 if (syntaxProblems.length !== 1 || !/does not compile/.test(syntaxProblems[0])) {
   console.log(`      control: a body with a syntax error produced ${JSON.stringify(syntaxProblems)}, want exactly one 'does not compile' finding`);
+  process.exit(4);
+}
+
+// ...and the compile must use github-script's PARAMETER LIST, not an empty argument list.
+// This body is legal with no parameters and a SyntaxError with them, so it goes green iff the
+// parameter list is dropped — the case where the check would certify a body that cannot run.
+const paramProblems = inspect([{ file: '<control>', job: '<control>', step: 0, script: 'const core = 0;' }]);
+if (paramProblems.length !== 1 || !/does not compile/.test(paramProblems[0])) {
+  console.log(`      control: a body redeclaring a github-script parameter produced ${JSON.stringify(paramProblems)}, want exactly one 'does not compile' finding`);
   process.exit(4);
 }
 
