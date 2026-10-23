@@ -675,7 +675,7 @@ def run_one(fn, gates=None):
 
 
 # ── the APPLY path — the only code here that can signal a pid ─────────────────────────────
-def _apply_run(box, live=None, post=None):
+def _apply_run(box, live=None, post=None, gate2_after=None):
     """Exercise `_apply_parked` with `os.kill` REPLACED, so no real pid can be signalled.
 
     FOUR reads are controllable, in this order, because each has its own guard: the census's
@@ -692,6 +692,8 @@ def _apply_run(box, live=None, post=None):
     def ps():
         n = calls["n"]
         calls["n"] += 1
+        if n >= 2:
+            swapped["now"] = True
         hook = getattr(box, "on_ps", None)
         if hook is not None:
             hook(n + 1)
@@ -700,9 +702,18 @@ def _apply_run(box, live=None, post=None):
 
     kills = []
     names = ("ps_pi_fields", "session_index", "_cwd_of_pid", "_stat", "time",
-             "SESSIONS_DIR", "STORE_PATH")
+             "SESSIONS_DIR", "STORE_PATH", "gate2_host_decision")
     saved = {n: getattr(mod, n) for n in names}
     real_kill = os.kill
+    # `gate2_after` swaps gate 2's ANSWER after the census has finished. Patching it outright
+    # would abstain the CENSUS too (no PARKED-REAPABLE row), so the apply-side check would pass
+    # vacuously; the swap happens on the pre-signal read (the third `ps` call), which is the first
+    # moment the apply path asks — so this exercises exactly the signal-time question.
+    real_gate2 = mod.gate2_host_decision
+    swapped = {"now": False}
+    if gate2_after is not None:
+        mod.gate2_host_decision = \
+            lambda chain: gate2_after if swapped["now"] else real_gate2(chain)
     mod.ps_pi_fields = ps
     mod.session_index = lambda sessions_dir=None: [(box.transcript, box.start_ts)]
     mod._cwd_of_pid = lambda pid: None
@@ -821,6 +832,18 @@ def apply_path() -> int:
         rc, out, kills = _apply_run(case_a(tmp), live={"100": _row(100, 1)})
         check("(g13) the ancestry is INCOMPLETE at signal time", rc, out, kills, 0, [],
               must=("REFUSED: ancestry INCOMPLETE", "not signalled: 100"),
+              must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
+
+        # (g14) an UNRECOGNISED host-decision kind at SIGNAL time. The census's allow-list is
+        # pinned by `unrecognised_host_kind`, but that case runs `apply=False` — so the apply
+        # path's own check named only `human`/`unknown-incomplete` and let a fourth kind (the
+        # header's report-only `cmux` class) fall through to `os.kill`. Pins the apply-side
+        # allow-list: the same kind that abstains in the census must never be signalled here.
+        rc, out, kills = _apply_run(
+            case_a(tmp), gate2_after=("cmux-report-only", "a cmux lane"))
+        check("(g14) an UNRECOGNISED host kind at signal time", rc, out, kills, 0, [],
+              must=("REFUSED: host decision `cmux-report-only` is not an AUTHORISING kind",
+                    "not signalled: 100"),
               must_not=("SIGTERM ->", "STILL ALIVE", "survived SIGTERM"))
 
         # (g9) the target survives but is a ZOMBIE: it keeps its comm and `etime`, and `os.kill`

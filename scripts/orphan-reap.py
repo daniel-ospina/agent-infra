@@ -1182,6 +1182,17 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None, *, liv=None,
                 f"under the recorded rule (#1207 option A): report-only until that decision is "
                 f"reopened")
             continue
+        # ⛔ THE ALLOW-LIST AGAIN, ON THE ONE PATH THAT CAN SIGNAL. The three refusals above name
+        # the kinds this file knows about, so a FOURTH kind — the `cmux` report-only class the
+        # header says "must stay report-only if it is ever added" — falls straight through them to
+        # `os.kill`. The census already refuses exactly that shape (`pi_verdict`: "AN ALLOW-LIST,
+        # NOT A DENY-LIST"); a re-check that refuses a shorter list than the census asked is not a
+        # re-check, and this is the only place where being wrong sends a signal.
+        if not (kind == "hostless" and AUTHORISE_HOSTLESS_CHAINS):
+            log(f"  {pid} REFUSED: host decision `{kind}` is not an AUTHORISING kind ({detail}) "
+                f"at signal time — a class this reaper does not recognise is report-only, never "
+                f"a licence to signal")
+            continue
         ok, why = _authorisation_holds(row, liv, store_path, sessions_dir)
         if not ok:
             log(f"  {pid} REFUSED: {why} — nothing done")
