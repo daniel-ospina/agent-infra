@@ -541,7 +541,7 @@ elif [ ! -d "$REPO" ]; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is no
 # (`orch-loop.sh` `derive_or`); handed a directory that is not a repo it WARNS and falls back to a
 # hardcoded literal — a controller grading a repo nobody named, while this launcher reports it started.
 # The pre-split code validated this (it was the only repo it had); the split must not lose it.
-elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo"
+elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness"
 fi
 # ⛔ THE VERDICT IS HELD HERE AND APPLIED BY THE VERB — a refusal is not a universal verb policy.
 # `up` STARTS a controller that would drain a repo nobody named, so it REFUSES (nothing is started).
@@ -846,21 +846,41 @@ hu_row_refresh() {
 # and an AGED record is LATE rather than OK: a stale "reachable" speaks about a probe nobody repeated.
 HU_CLAIMS_STALE="${HARNESS_UP_CLAIMS_STALE:-1800}"
 hu_row_claims() {
-  local f="$O/state/harness-claims" age verdict=""
+  local f="$O/state/harness-claims" age verdict="" rec_repo="" why=""
   if [ -f "$f" ]; then
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    # ⛔ THE FIELD IS THE REST OF THE LINE, anchored on both sides: a path containing a space is the
+    # ordinary macOS shape (`/Users/First Last`), and `[^ ]*` would truncate the launcher's OWN record into
+    # a "different repo", turning a healthy box BROKEN for no configuration error.
+    rec_repo="$(sed -n 's/^claims=[^ ]* repo=\(.*\) at=[^ ]*$/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
-  else
+  fi
+  # ⛔ A RECORD ABOUT ANOTHER REPO IS NOT AN ANSWER ABOUT THIS ONE, AND IT IS NOT A PERMANENT VERDICT
+  # EITHER: the split makes "which repo did this probe" a question with more than one answer, but a
+  # mismatch must RE-PROBE (one bounded read, the round trip the record would have saved) rather than stick
+  # on UNKNOWN. `hu_start_claims` is the only writer and `status` only reached it when the file was
+  # ABSENT, so a box repurposed to a different work repo — or one whose `keys.env` changed under a
+  # launchd/cloud-cell-supervisor restart that never runs `harness-up` — would have read BROKEN forever.
+  # ⛔ AND THE COMPARISON IS RESOLVED (hu_real, as every other path compare in this file is): `/var/…` and
+  # `/private/var/…`, a trailing slash, or a symlink are the SAME repo, not a repurposed box.
+  if [ -n "$rec_repo" ]; then
+    if [ -z "$REPO" ]; then
+      hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, and no work repo is resolved to attribute it)"; return 2
+    fi
+    if [ "$(hu_real "$rec_repo")" != "$(hu_real "$REPO")" ]; then
+      # Re-probe and re-read; the row is the FRESH answer, or UNKNOWN with the probe's reason.
+      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the record probed $rec_repo, not the work repo $REPO, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
+      verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+      age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
+      rec_repo="$(sed -n 's/^claims=[^ ]* repo=\(.*\) at=[^ ]*$/\1/p' "$f" 2>/dev/null | head -1)"
+      if [ -n "$rec_repo" ] && [ "$(hu_real "$rec_repo")" != "$(hu_real "$REPO")" ]; then
+        hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record still names $rec_repo, not the work repo $REPO)"; return 2
+      fi
+    fi
+  elif [ ! -f "$f" ]; then
     hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY}, and there is no record at $f)"; return 2; }
     verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
     age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
-  fi
-  # ⛔ A RECORD ABOUT ANOTHER REPO IS NOT AN ANSWER ABOUT THIS ONE (the split makes "which repo did this
-  # probe" a question with more than one answer). A record carrying a `repo=` that differs is UNKNOWN,
-  # never OK — otherwise a repurposed box reports a healthy claim registry for a repo it does not drain.
-  rec_repo="$(sed -n 's/.* repo=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
-  if [ -n "$rec_repo" ] && [ -n "$REPO" ] && [ "$rec_repo" != "$REPO" ]; then
-    hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, not the work repo $REPO)"; return 2
   fi
   if [ -n "$age" ] && [ "$age" -gt "$HU_CLAIMS_STALE" ]; then
     hu_row claims - "$(hu_age_txt "$age")" "LATE (last probe ${verdict:-none}, older than ${HU_CLAIMS_STALE}s)"; return 1

@@ -50,7 +50,7 @@ set -u
 # want the launcher's own fallback answer.
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE \
       HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
-      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB
+      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT
 # ⛔ THE BOX'S DISK IS NOT THIS SUITE'S INPUT EITHER: `df` is stubbed below ($TMP/df, 20000MB) so the disk
 # leg of the capacity decision is deterministic AND live — one arm makes it the binding leg on purpose.
 # The helpers pass the two knobs explicitly (an ambient `export` cannot reach them) and default to the
@@ -449,6 +449,35 @@ OUT="$( cd "$REPO_FIX" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE=
 cap_bad="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) a non-numeric disk knob falls back to 1100 (lanes=0, not the 1-lane answer 10) [$cap_bad]" \
    "$(case "$cap_bad" in *"lanes=0 "*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ A SECOND `df` AT 2000MB MAKES THE TWO DEFAULTS VALUE-SENSITIVE (review: the 20000MB fixture made
+# `lanes` a BUCKET — `lanes=3` holds for any floor in (0,1000], so a drifted 500 → 1000 stayed green, and
+# `lanes=0` holds for any cost above 10, so 1100 → 100 stayed green). At 2000MB with 300MB/lane the
+# documented reserve answers 5 and a 1000MB reserve would answer 3; with `abc` the 1100 default answers 1
+# and a 100 default would answer 15 → the load bound, 7.
+mkdir -p "$TMP/dfsmall"
+cat > "$TMP/dfsmall/df" <<'SH'
+#!/bin/sh
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+printf '%s\n' '/dev/small 10000000 1 2048000 60% /'
+SH
+chmod +x "$TMP/dfsmall/df"
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$REPO_FIX" && PATH="$TMP/dfsmall:$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_DISK_PER_LANE_MB=300 HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
+cap_small="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+ck "(c) on a 2000MB volume the documented 500MB reserve answers 5 lanes (a drifted 1000 would answer 3) [$cap_small]" \
+   "$(case "$cap_small" in *"lanes=5 "*"disk_free=2000MB"*) echo 0 ;; *) echo 1 ;; esac)"
+OUT="$( cd "$REPO_FIX" && PATH="$TMP/dfsmall:$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_DISK_PER_LANE_MB=abc HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
+cap_small2="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+ck "(c) …and a non-numeric knob uses the 1100 default there too (1 lane; a 100 default would answer 7) [$cap_small2]" \
+   "$(case "$cap_small2" in *"lanes=1 "*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ A LEADING ZERO IS OCTAL TO `$(( ))` (review round 3): `HU_LOAD_PER_LANE=0400` divided by 256 and
 # reported 10 lanes where the reading supports 7 (a 43% over-report, in the direction that over-places
 # work), and `HU_LOAD_PER_CPU=0800` did not parse at all. The same reading must give the same answer
@@ -838,6 +867,23 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIX
         HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
 ck "(e) with BOTH an env HARNESS_REPO and a DIFFERENT one in the config file, the env wins" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ AND THE CONFIG FILE BEATS THE LAUNCHER'S OWN CHECKOUT (review: swapping candidates 2 and 3 left the
+# suite green — the only arm reaching candidate 3 has no enclosing checkout, so both orders answered the
+# same). A deployed copy that sits INSIDE a checkout must still prefer its configured harness; otherwise
+# the pin is resolved in a repo nobody named, one candidate over from the #2356 class.
+# ⛔ PIN-LESS ON PURPOSE: the fixture's pin commit is not an object in $WORK, so a pin-checked run would
+# refuse before any child env exists and the precedence would be unobservable. A pin-less box (the Mac
+# shape) reaches the start, which is where the child's HARNESS_REPO is recorded.
+printf 'HARNESS_REPO=%s\n' "$WORK" > "$TMP/harness-cfg.env"
+CFGCELL="$TMP/cell-cfg2"; mkdir -p "$CFGCELL"
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$CFGCELL" REPO="$WORK" ENV_FILE="$TMP/harness-cfg.env" \
+        HARNESS_PIN_DIR= HARNESS_PIN_FILE= \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
+ck "(e) the config file's HARNESS_REPO BEATS the launcher's own enclosing checkout (candidate 2 before 3)" \
+   "$(grep -qx "env HARNESS_REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 # ⛔ AND THE BANNER NAMES THE FALLBACK WHEN THERE IS NO SOURCE AT ALL: removing the `${REPO_SRC:-…}`
 # clause renders `repo <path> ()`, which tells the operator nothing — and left the suite green.
 : > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
@@ -925,6 +971,10 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="
 ck "(e) 'up' REFUSES a REPO that is a directory but NOT a checkout (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "(e) …and the message names the value, its SOURCE, and the repo it is not a checkout of" \
    "$(case "$OUT" in *'is set (by the environment)'*'is not a git checkout'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE REMEDY IS THE RIGHT KNOB (review: the wording could revert to `point REPO at an agent-infra
+# checkout` — the silent retarget this PR removes — with the suite green).
+ck "(e) …and prescribes a WORK-repo remedy, never the retarget advice" \
+   "$(case "$OUT" in *'set REPO to a work-repo checkout'*) case "$OUT" in *'point REPO at an agent-infra'*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/no-such-dir" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
@@ -988,6 +1038,8 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIX
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_CLAIMS_TIMEOUT=5 bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
 ck "(e) 'up' REFUSES when no harness resolves (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and it prescribes `set HARNESS_REPO`, never `set REPO`, for a harness that did not resolve" \
+   "$(case "$OUT" in *'set HARNESS_REPO'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …says NOTHING WAS STARTED, and started nothing" \
    "$(HU_S=0; case "$OUT" in *'no agent-infra checkout resolved'*'Nothing was started'*) HU_S=1 ;; esac; if [ "$HU_S" -eq 1 ] && [ ! -s "$FIXCELL/fix.log" ]; then echo 0; else echo 1; fi)"
 ck "(e) …and the exit code is NOT spilled into the sentence (die formats its message, not its argv)" \
@@ -1021,10 +1073,45 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" R
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
 claimsrow2="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
-ck "(e) a claims record about ANOTHER repo reads UNKNOWN, never OK [$claimsrow2]" \
-   "$(case "$claimsrow2" in *'UNKNOWN'*'/some/other/checkout'*) echo 0 ;; *) echo 1 ;; esac)"
-ck "(e) …and it is not reported as a reachable registry" \
-   "$(case "$claimsrow2" in *'OK (refs/claims'*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(e) a claims record about ANOTHER repo is RE-PROBED, not read as an answer [$claimsrow2]" \
+   "$(case "$claimsrow2" in *'/some/other/checkout'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AND THE WRITER/READER ROUND TRIP IS THE POINT (review: only fixture-written records were ever read):
+# the re-probe must REWRITE the record with THIS box's work repo, so every later status is attributable.
+ck "(e) …and the re-probe REWRITES the record naming this box's work repo (the write path is asserted)" \
+   "$(grep -Eq "claims=[a-z-]+ repo=$WORK at=[0-9]+" "$FRESHCELL/orchestrator/state/harness-claims" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ A PATH WITH A SPACE IS THE ORDINARY MACOS SHAPE (`/Users/First Last`), and writer/reader must agree on
+# it: an unanchored parse truncated the launcher's OWN record at the space and read it as a FOREIGN repo,
+# sending a healthy box through a re-probe (and, before the re-probe existed, into a permanent UNKNOWN).
+SPACEREPO="$TMP/work space"
+mkdir -p "$SPACEREPO"
+( cd "$SPACEREPO" && git init -q -b main . && printf 'x\n' > README && git add README \
+  && git -c user.email=t@example.com -c user.name=t commit -qm s && git remote add origin "$SPACEREPO" ) >/dev/null 2>&1
+SPACECELL="$TMP/cell-space"
+mkdir -p "$SPACECELL/orchestrator/state" "$SPACECELL/.pi/agent/state"
+printf '%s\n' "$PIN_TREE" > "$SPACECELL/.harness-path"
+printf 'claims=reachable repo=%s at=%s\n' "$SPACEREPO" "$(date +%s)" > "$SPACECELL/orchestrator/state/harness-claims"
+before_space="$(cat "$SPACECELL/orchestrator/state/harness-claims")"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$SPACECELL" REPO="$SPACEREPO" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$SPACECELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+spacerow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) the launcher's OWN record round-trips when the repo path contains a space (no re-probe) [$spacerow]" \
+   "$([ "$(cat "$SPACECELL/orchestrator/state/harness-claims")" = "$before_space" ] && echo 0 || echo 1)"
+# ⛔ AND THE SAME REPO SPELLED DIFFERENTLY IS THE SAME REPO (review: a raw string compare fired on a
+# trailing slash / symlink / `/var` vs `/private/var`, i.e. a permanent false "wrong repo" on a healthy
+# macOS box). The observable again is the RECORD: an attributed record must not be rewritten.
+printf 'claims=reachable repo=%s/ at=%s\n' "$WORK" "$(date +%s)" > "$FRESHCELL/orchestrator/state/harness-claims"
+before_slash="$(cat "$FRESHCELL/orchestrator/state/harness-claims")"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" REPO="$WORK" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$FRESHCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+slashrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
+ck "(e) a trailing-slash spelling of the SAME repo is not a mismatch (no re-probe) [$slashrow]" \
+   "$([ "$(cat "$FRESHCELL/orchestrator/state/harness-claims")" = "$before_slash" ] && echo 0 || echo 1)"
+ck "(e) …and that record reads OK, not a mismatched repo" \
+   "$(case "$spacerow" in *'OK ('*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ AND THE EXEC ROW FAILS CLOSED TOO (review P1, fail-open): a controller IS running on the pin worktree,
 # the harness does not resolve, and the CWD is a checkout that HOLDS the pin commit — i.e. exactly where
 # `git -C ""` would answer. Without the guard this row printed `OK (executing …)`, a false row feeding the
