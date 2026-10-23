@@ -220,9 +220,18 @@ def read_record(repo, pr):
         return None, None
     try:
         with open(candidate, "rb") as fh:
-            return json.load(fh), candidate
+            parsed = json.load(fh)
     except Exception:
         return None, candidate
+    # ⛔ A RECORD THAT PARSES TO A NON-OBJECT IS AN ABSTENTION, NOT A CRASH (P2, fresh review). A
+    # legacy `<PR>.json` is not repo-qualified, so a foreign/hand-edited/array-shaped file is
+    # reachable; returning it made `record_binding`'s `record.get("verdict")` raise AttributeError,
+    # and `main()` catches only `Failure` — so the tool exited 1 with a traceback and `bulk.py`'s
+    # `except Failure` let the exception escape `ThreadPoolExecutor.map`, aborting the WHOLE batch.
+    # The same guard `parse_ndjson` applies to a check-run line, applied to the record read.
+    if not isinstance(parsed, dict):
+        return None, candidate
+    return parsed, candidate
 
 
 def head_matches(record_sha, head):

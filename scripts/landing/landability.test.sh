@@ -128,5 +128,27 @@ ck(m.record_binding(rec, "c" * 40, "d" * 64) == "NEEDS-REVIEW(diff-changed)",
 ck(m.record_binding(rec, "a" * 40, "") == "AT",
    "record_binding: a head match is AT without needing the diff")
 
+# (5) a record that parses to a NON-OBJECT is an abstention, never a traceback (P2, fresh review):
+# `main()` catches only Failure, and bulk.py catches only Failure too, so an AttributeError here
+# aborted a whole batch. Exercised through read_record() with a real file in a temp HOME.
+import tempfile, os, json as _json
+_tmp = tempfile.mkdtemp()
+os.makedirs(os.path.join(_tmp, ".pi", "agent", "reviews"), exist_ok=True)
+with open(os.path.join(_tmp, ".pi", "agent", "reviews", "1.json"), "w") as _fh:
+    _json.dump([], _fh)          # array-shaped legacy record: parses, but is not an object
+_old_home = os.environ.get("HOME")
+os.environ["HOME"] = _tmp
+try:
+    rec, path = m.read_record("daniel-ospina/agent-infra", 1)
+    ck(rec is None and path is not None,
+       "read_record: a non-object record is an ABSTENTION (never a crash)", (rec, path))
+    ck(m.record_binding(rec, "c" * 40, "b" * 64) == "NEEDS-REVIEW(no-record)",
+       "record_binding: an unreadable record reads as no-record, not an AttributeError")
+finally:
+    if _old_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _old_home
+
 print(f"── landability.test.sh: {ok} assertions passed ──")
 PY
