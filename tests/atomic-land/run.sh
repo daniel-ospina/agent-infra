@@ -190,6 +190,13 @@ case "${1:-} ${2:-}" in
             cat "$SCEN/base-tip" 2>/dev/null || echo 9999999999999999999999999999999999999999
             exit 0 ;;
         esac
+        # ⛔ #2342: a CONFIRMATION read that FAILED must not answer a STATE. The real
+        # shape is the spent REST budget (`API rate limit exceeded`, rc 1, empty stdout);
+        # the rail must be able to tell it apart from a read that SAID open.
+        if [ -f "$SCEN/pulls-unreadable" ]; then
+          printf 'gh: API rate limit exceeded for user ID 81560491.\n' >&2
+          exit 1
+        fi
         cat "$SCEN/merged" 2>/dev/null || echo OPEN; exit 0 ;;
     esac
     exit 1 ;;
@@ -570,6 +577,22 @@ run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "the rail reports failure (rc 1)" || fail "expected rc 1, got $rc (a false success)"
 grep -q "NOT confirmed" "$SCEN/err" && pass "the failure names the unconfirmed merge" || { fail "the failure does not name the unconfirmed merge"; echo "      --- err ---"; sed 's/^/      /' "$SCEN/err"; }
+
+# ⛔ #2342: THE OTHER DIRECTION. An unreadable confirmation is NOT "still OPEN" — that
+# fallback (`|| echo OPEN`) reported a merge the rail had just issued as an open PR, from a
+# read that never happened. A failed READ and a read that ANSWERED must be distinguishable.
+echo "── 6b. the confirmation READ failed (budget): UNREADABLE, never a fabricated OPEN"
+new_scen unreadable_confirm
+printf 'MERGED\n' > "$SCEN/merged"
+: > "$SCEN/pulls-unreadable"
+SCEN_RECORD_LOG=1
+ATOMIC_LAND_CONFIRM_MAX=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail still fails (never a false success)" || fail "expected rc 1, got $rc"
+grep -q "NOT confirmed" "$SCEN/err" && pass "the failure still names the unconfirmed merge" || fail "the failure lost the unconfirmed-merge phrase"
+grep -q "UNREADABLE" "$SCEN/err" && pass "… and names the FAILED READ as the reason" || { fail "the failure does not say the read failed"; echo "      --- err ---"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "still OPEN" "$SCEN/err" && fail "a FAILED read was reported as the state OPEN (the fabricated state #2342 removes)" || pass "no fabricated OPEN state from a failed read"
 
 # ═══ 7. a non-terminal head is not landed ════════════════════════════════
 echo "── 7. the terminal-check wait is bounded; its expiry stops the rail"

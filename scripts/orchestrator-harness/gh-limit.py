@@ -1655,6 +1655,7 @@ def single_flight(real_gh, gh_argv):
             # a cache entry, and this is not a cache: handing one out as current is the exact failure
             # #2243 clause 5 forbids.
             log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
+            stats_record("single-flight", "share")   # N lanes, ONE request: the coalescing saving
             return res["rc"], res["out"], res["err"]
         leader = _read_json(leader_path)
         # ⛔ A MISSING CLAIM IS NOT A STALE ONE. `_leader_stale(None, …)` answers True for an absent
@@ -1925,6 +1926,67 @@ def read_cache_put(key, rc, out, err):
             pass
 
 
+# ── THE SAVING MUST BE MEASURABLE (#2342) ────────────────────────────────────────────────────────
+# “A cache that cannot show its hit rate is not an instrument.” Every TTL hit and every single-flight
+# share is ONE `gh` request this box did NOT send, and the whole point of the layer is to turn the
+# fleet's spend into a number an operator can read instead of a suspicion. So each event is APPENDED
+# as one JSON line (`O_APPEND` on a small line is atomic, so concurrent lanes cannot lose each
+# other's counts the way a read-modify-write of one JSON document would), the log is rotated at 1 MiB
+# (one old file kept: counters must never be a disk leak), and `--stats` aggregates both files.
+# ⛔ IT IS A LOCAL FILE READ — no request, no credentials, so it is usable at the exact moment the
+# budget is gone, which is when the question “what did the cache save us?” is asked.
+STATS_FILE = "read-cache-stats.jsonl"
+STATS_ROTATE_BYTES = 1 << 20
+
+
+def stats_record(cls, kind):
+    """Count ONE cache event. Never fails a call and never touches the caller's streams."""
+    try:
+        p = os.path.join(state_dir(), STATS_FILE)
+        try:
+            if os.path.getsize(p) > STATS_ROTATE_BYTES:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass                        # absent, or unrotatable: appending still works
+        line = json.dumps({"at": int(clock()), "cls": cls, "kind": kind},
+                          separators=(",", ":")) + "\n"
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def stats_report():
+    """(earliest stamp, {class: {kind: count}}) from this box's counters.
+
+    ⛔ A TORN LINE IS A LOST COUNT, NEVER A WRONG ONE: it is skipped, so the totals can under-report
+    (an instrument that is honest about its floor) but never invent hits."""
+    d = state_dir()
+    since = None
+    out = {}
+    for name in (STATS_FILE + ".1", STATS_FILE):
+        try:
+            with open(os.path.join(d, name)) as fh:
+                for line in fh:
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    at, cls, kind = e.get("at"), e.get("cls"), e.get("kind")
+                    if not isinstance(cls, str) or not isinstance(kind, str):
+                        continue
+                    if isinstance(at, int) and (since is None or at < since):
+                        since = at
+                    one = out.setdefault(cls, {})
+                    one[kind] = one.get(kind, 0) + 1
+        except OSError:
+            continue
+    return since, out
+
+
 def read_cache_class(gh_argv):
     """The TTL class for this invocation, or None — the ADMISSION gate, one place.
 
@@ -1955,8 +2017,10 @@ def _run_shared(real_gh, gh_argv):
     key = flight_key(gh_argv)          # ONE key definition: host + credential + repo pin + request
     hit = read_cache_get(key, ttl)
     if hit is not None:
+        stats_record(name, "hit")      # ONE request this box did NOT send — counted where it happens
         log_event("read-cache: %s hit — within its %ds TTL, so no request was made" % (name, ttl))
         return hit
+    stats_record(name, "miss")
     if flight_eligible(gh_argv):
         rc, out, err = single_flight(real_gh, gh_argv)
     else:
@@ -2332,6 +2396,7 @@ def main(argv):
     self_path = None
     health = False
     budget = False
+    stats = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -2356,13 +2421,43 @@ def main(argv):
             # call it then makes reads the shared snapshot instead.
             budget = True
             i += 1
+        elif a in ("--stats", "--gh-stats"):
+            # ⛔ THE CACHE'S OWN HIT RATE, WHICH IS THE ONLY WAY TO PROVE THE SAVING (#2342). Local
+            # counters only: no request, no quota, no credentials. See `stats_report`.
+            stats = True
+            i += 1
         else:
-            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path>|--health|--budget -- <argv>)\n" % a)
+            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path>|--health|--budget|--stats -- <argv>)\n" % a)
             return 2
     if health:
         token, rc = health_token()
         sys.stdout.write(token + "\n")
         return rc
+    if stats:
+        since, doc = stats_report()
+        if not doc:
+            # ⛔ AN EMPTY COUNTER IS NOT “ZERO SAVING”. It is “nothing has been counted yet”, and
+            # printing `averted=0` would be a measurement nobody made — the same class of lie this
+            # layer exists to stop a caller from telling itself.
+            sys.stdout.write("gh-read-cache no-reads-counted\n")
+            return 0
+        ttl = {name: t for name, _pair, t in READ_SUBCOMMAND_CLASSES}
+        averted = 0
+        stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(since)) if since else "?"
+        sys.stdout.write("gh-read-cache since=%s\n" % stamp)
+        for cls in sorted(doc):
+            kinds = doc[cls]
+            hit, miss, share = (kinds.get("hit", 0), kinds.get("miss", 0), kinds.get("share", 0))
+            if cls == "single-flight":
+                sys.stdout.write("  %-14s share=%-6d \u2192 coalesced (N lanes, one request)\n"
+                                 % (cls, share))
+                averted += share
+                continue
+            sys.stdout.write("  %-14s hit=%-6d miss=%-6d ttl=%ds\n" % (cls, hit, miss, ttl.get(cls, 0)))
+            averted += hit
+        sys.stdout.write("  %-14s averted=%-6d \u2192 gh requests this box did not send (hits + shares)\n"
+                         % ("TOTAL", averted))
+        return 0
     gh_argv = list(argv[i:])
     if real_gh is None:
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
@@ -2463,11 +2558,42 @@ def resolve_real_gh(self_path):
 #      refused the same way, so the rail says the truth instead of “UNKNOWN”.
 BUDGET_TTL = cfg_secs("GH_LIMIT_BUDGET_TTL", 30, 5, 600)
 # Fail over while there is still a RESERVE left, because the tail of the pool is the only budget a
-# MUTATION can use: writes have no second pool, so spending the last 100 reads on polls would take
-# merges down before it took polling down.
-CORE_LOW_WATER = cfg_int("GH_LIMIT_CORE_LOW_WATER", 100, 0, 4950)
+# MUTATION can use: writes have no second pool, so spending the last reads on polls would take merges
+# down before it took polling down.
+#
+# ⛔ THE FLOOR IS A GUARD THAT ACTS BEFORE THE WALL (#2342, measured 2026-10-23 04:11Z). The reserve
+# was 100, which is a number small enough to never be noticed — and it was never reached before the
+# pool was GONE: one identity, one bucket, the Mac plus three cells and ~20 lanes, `core remaining=0`
+# at the same moment for all of them, so every lane lost the ability to read or write GitHub and the
+# instruments then reported the absence as a state. The pool is spent by POLLING inside the last
+# minutes of the window, and the last ~800 requests are the only budget a MUTATION has. So below the
+# floor a READ stops spending `core` at all:
+#   * it fails over to GraphQL where an EXACT equivalent exists (`graphql_plan`), and
+#   * where none exists it is REFUSED BY NAME — `gh-core-floor remaining=N floor=F resets_in=<Nm>` —
+#     unless the caller declares that this work cannot proceed without it (`GH_LIMIT_ESSENTIAL=1`).
+# The refusal asserts NOTHING about exhaustion: the pool still has `remaining`, and claiming otherwise
+# is the false diagnosis this file exists to delete (see `core_pressure`). The escape hatch is not a
+# convenience: a landing's protection read has no GraphQL equivalent, so the rail's own reader sets it
+# (`repo-authority.sh::required_checks`) — “essential” is exactly “this landing cannot proceed”.
+#
+# ⛔ ONE CONCEPT, ONE NUMBER. `GH_LIMIT_CORE_LOW_WATER` still works (it is what the runbook and the
+# deployed cells carry); `GH_LIMIT_CORE_FLOOR` is the name that says what it does, and it wins.
+CORE_FLOOR = cfg_int("GH_LIMIT_CORE_FLOOR",
+                     cfg_int("GH_LIMIT_CORE_LOW_WATER", 800, 0, 4950), 0, 4950)
+CORE_LOW_WATER = CORE_FLOOR
+ESSENTIAL_ENV = "GH_LIMIT_ESSENTIAL"       # "1" = this read cannot be deferred (a landing)
 FAILOVER_ENV = "GH_LIMIT_FAILOVER"          # "0" disables the failover (the named state still applies)
 HEALTH_FILE = "health"
+
+
+def essential():
+    """Has the CALLER declared this read cannot be deferred?
+
+    ⛔ IT IS OPT-IN AND IT IS NAMED, because the floor is a policy about SPEND and a policy that every
+    caller can silently set is not one. `essential` is true only for the work a landing cannot
+    complete without: the rail's own protection read. A poll is never essential — if polling were,
+    the reserve would be spent exactly the way the 2026-10-23 incident spent it."""
+    return cfg(ESSENTIAL_ENV, "0") == "1"
 
 
 def failover_enabled():
@@ -3334,6 +3460,30 @@ def _named_core_refusal(phrase, why):
         "token, or GitHub being down. %s\n" % (phrase, why))
 
 
+def _named_floor_refusal(remaining, floor, reset, dated):
+    """The floor's own refusal: NAMED, STDOUT-CLEAN, and TRUE about the pool.
+
+    ⛔ IT SAYS `remaining=<n>`, NOT `remaining=0`. The pool is not empty; it is inside the reserve
+    this layer keeps for writes, and a message that over-claimed emptiness would be the same false
+    diagnosis as `repo-authority.sh` printing “the merge contract is UNKNOWN” for a spent budget —
+    the defect the whole change exists to remove. `resets_in=?` when the window was never measured,
+    for the same reason (`_record_is_unreadable`).
+
+    ⛔ IT KEEPS THE WORDS `gh rate limit` because `objective.py`'s TRANSPORT_MARKERS classify a
+    refused read from that phrase, and here the budget genuinely IS the reason. It writes NO health
+    record: nothing was measured as exhausted, and a floor refusal is not evidence about the pool."""
+    sys.stderr.write(
+        "gh-limit: gh-core-floor remaining=%s floor=%d resets_in=%s — gh rate limit: this is the "
+        "GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down. The REST pool is "
+        "inside the reserve this layer keeps for WRITES (a merge has no second pool), and this read "
+        "has NO exact GraphQL equivalent, so it is refused rather than spending that reserve. "
+        "Nothing was sent. If this work cannot proceed without this read, re-run with %s=1"
+        "%s.\n"
+        % ("?" if remaining is None else remaining, floor,
+           resets_in(reset) if dated else "?", ESSENTIAL_ENV,
+           "" if dated else " (the window was never measured, so no reset is claimed)"))
+
+
 def _dispatch(real_gh, gh_argv):
     """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
 
@@ -3455,7 +3605,18 @@ def _dispatch(real_gh, gh_argv):
                             "This read has NO exact GraphQL equivalent, so it is refused rather "
                             "than approximated.")
                         return 1
-                # remaining > 0 but low and no equivalent: the read can still succeed, so let it.
+                elif isinstance(remaining, int) and 0 < remaining <= CORE_FLOOR and not essential():
+                    # ⛔ THE FLOOR, ENFORCED — and this is the branch #2342 is about. It used to say
+                    # “remaining > 0 but low and no equivalent: the read can still succeed, so let
+                    # it”, i.e. a read with no failover was allowed to spend the RESERVE. That is the
+                    # spend that empties the pool in the last minutes of every window and takes every
+                    # WRITE down with it (measured 2026-10-23 04:11Z: `core remaining=0` for the Mac
+                    # and all three cells at once). The reserve is for work that cannot be deferred;
+                    # a caller that says it cannot be deferred asks for it by name.
+                    _named_floor_refusal(remaining, CORE_FLOOR, reset, core_dated)
+                    return 1
+                # remaining UNKNOWN (an undated record — no measurement, so no floor claim), or the
+                # caller declared this read essential: it can still succeed, so it is sent.
     while True:
         attempt += 1
         lock = acquire_lock()

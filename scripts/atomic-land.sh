@@ -1279,16 +1279,32 @@ do_land() {
 }
 
 confirm_merged() { # <max polls: 1 = a single immediate check>
-  local max="${1:-${ATOMIC_LAND_CONFIRM_MAX:-60}}" i state
+  local max="${1:-${ATOMIC_LAND_CONFIRM_MAX:-60}}" i state="" read_failed=0
   case "$max" in ''|*[!0-9]*) max=1 ;; esac
   [ "$DRY_RUN" -eq 1 ] && return 0
   for i in $(seq 1 "$max"); do
-    state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)"
-    [ "$state" = "MERGED" ] && { say "atomic-land: ✅ merged PR #$PR"; return 0; }
+    # ⛔ A FAILED READ IS NOT A STATE (#2342). This used to be `... || echo OPEN`, so a
+    # spent REST budget answered the confirmation with the LITERAL STRING "OPEN" and the
+    # rail printed "the merge was NOT confirmed — PR #N is still OPEN" about a merge it had
+    # just issued: a confident diagnosis from a read that never happened (the 2026-10-23
+    # incident, measured as `PR states={None: 23}` in a sibling tool that cancelled nothing
+    # on the strength of it). The read's exit status now decides, and the two outcomes say
+    # different things: a READ that failed is UNREADABLE, a read that answered OPEN is OPEN.
+    if state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null)"; then
+      read_failed=0
+      [ "$state" = "MERGED" ] && { say "atomic-land: ✅ merged PR #$PR"; return 0; }
+    else
+      read_failed=1
+      state=""
+    fi
     [ "$max" -le 1 ] && break
     sleep 10
   done
-  err "atomic-land: ⛔ the merge was NOT confirmed — PR #$PR is still $state (the land step's exit status alone is not proof; #1359)"
+  if [ "$read_failed" -eq 1 ] && [ -z "$state" ]; then
+    err "atomic-land: ⛔ the merge was NOT confirmed — the CONFIRMATION READ FAILED (UNREADABLE: gh api repos/$REPO/pulls/$PR). This is not evidence that the PR is open: read its state before doing anything else (the rest of this box ran out of GitHub budget, so a re-read may be refused until the window resets)."
+  else
+    err "atomic-land: ⛔ the merge was NOT confirmed — PR #$PR is still $state (the land step's exit status alone is not proof; #1359)"
+  fi
   return 1
 }
 

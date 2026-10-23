@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2342, gh-rate-limits, gh-limit
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -419,6 +419,62 @@ the tail of the pool is preserved for **writes** — writes are refused ONLY at 
 failover-FAILURE path, where the honest name is `gh-graphql-unavailable`, not an empty core pool). A
 band that refused writes would preserve a reserve no caller could spend, and would assert "EMPTY"
 about a pool that is not.
+
+**The FLOOR is where reads stop spending the reserve (#2342, 2026-10-23).** The band above was 100
+requests — small enough that it was never reached before the pool was *gone*. Measured 2026-10-23
+04:11Z: one identity (`daniel-ospina`) shared by the Mac, three cells and ~20 lanes read `core
+remaining = 0` **at the same moment**, so every lane lost the ability to read or write GitHub at once.
+The same night's brief recorded what the instruments then did with it: `PR states={None: 23}` followed
+by "cancelled 0 of 69", ten autonomy rows reading `stalled` on boxes at load 3/8 with memory free, and
+a `KeyError: 'data'` that turned a landing count into no number. **A failed read must never be
+representable as a state**, and the pool is spent by POLLING in the last minutes of the window.
+
+* **`GH_LIMIT_CORE_FLOOR` (default 800)** — below it a READ stops spending `core`. Where an EXACT
+  GraphQL equivalent exists it fails over (unchanged, free to the caller). Where none exists it is
+  **refused by name**: `gh-core-floor remaining=<n> floor=<800> resets_in=<Nm>`, stdout EMPTY — never
+  an empty list/object, and never a claim that the pool is empty (it is not; `remaining` is printed
+  and `--health` stays `gh-ok`, because a floor refusal is not a measurement of an empty pool).
+* **`GH_LIMIT_ESSENTIAL=1`** is the caller's declaration that the work *cannot proceed* without the
+  read. It is used in exactly one place in-tree — `repo-authority.sh::required_checks`, whose
+  `branches/main/protection/required_status_checks` read has no exact GraphQL equivalent and gates
+  every landing. Without it the floor would refuse the merge contract for the last minutes of every
+  window, `REQ_SOURCE=fallback` would follow, and the rail would print "the merge contract is
+  UNKNOWN" — the misdiagnosis this whole change exists to remove. **A poll is never essential**: if
+  polling were, the reserve would be spent exactly the way the incident spent it.
+* `GH_LIMIT_CORE_LOW_WATER` still works (the deployed cells and this runbook carried it before);
+  `GH_LIMIT_CORE_FLOOR` is the same number under the name that says what it does, and it wins when
+  both are set.
+
+**The saving is an INSTRUMENT, not a claim.** `gh-limit.py --stats` reads local counters only — no
+request, no credentials — so it answers at the exact moment the budget is gone:
+
+```
+$ … gh-limit.py --stats
+gh-read-cache since=2026-10-23T04:41Z
+  pr-list        hit=212    miss=9      ttl=5s
+  run-list       hit=67     miss=8      ttl=10s
+  single-flight  share=41   → coalesced (N lanes, one request)
+  TOTAL          averted=320 → gh requests this box did not send (hits + shares)
+```
+
+Every TTL hit and every single-flight share is one request the box did NOT send; `averted` is their
+sum. An **empty** counter prints `gh-read-cache no-reads-counted`, never `averted=0` — a measurement
+nobody made is the defect this file exists to prevent, not the format of the report. Counters are
+appended as one JSON line per event (`O_APPEND`, so concurrent lanes cannot lose each other's counts,
+and the same line is also in `events.log`) and rotated at 1 MiB.
+
+**Why the TTLs are 5 s / 10 s and `gh pr checks` is NOT cached — the contradiction test (#2342).**
+The 2026-10-23 brief proposed `pr-list 60 s`, `checks 30 s`, `issue 120 s`. Two are declined on the
+record, and the reason is MEASURED rather than preferred: a check-run answer and a head sha **are the
+merge decision**, and both flip on the SAME head. `gh pr checks` went `SUCCESS` → `PENDING` between two
+reads 1 s apart (a re-run), and two `pr view` reads 1 s apart across a head flip both returned the OLD
+sha from one request. A TTL there does not make an answer older — it makes it **wrong in the direction
+that authorises a landing that must not happen**, because the other merge path in the fleet does not
+pin `--match-head-commit`. The hot poll the brief identified is real (30 of 41 calls in one measured
+merge cycle, 73 %), but it is `run list` + `jobs`, i.e. run STATE, and that IS cached at 10 s.
+Concurrent identical check reads are still coalesced by single flight, so 25 lanes asking within one
+second send ONE request and every one of them gets an answer that is fresh by construction — which is
+what the brief's "same freshness, a fraction of the calls" asks for.
 
 **A refusal we could not DATE is still evidence, for a bounded window.** A core call refused without a
 reset (no `--include` framing, and every `GH_LIMIT_NO_WAIT` caller skips the probe) is recorded as
