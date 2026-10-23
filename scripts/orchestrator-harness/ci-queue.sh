@@ -69,11 +69,15 @@
 #     back to the last successful record for up to `CIQ_STALE_MAX` seconds — reported as
 #     `cache(<age>s)` in every line it produces, so a stale reading is never presented as a fresh
 #     one. Past that window the record is dropped and the verdict is UNKNOWN again.
-#   * `runners` falls back to `max(1, in_progress)` when the runners endpoint cannot be read (it is
-#     admin-scoped and returned 404 on the org, and an EMPTY list on agent-infra while 7 runs were
-#     executing). `in_progress` is a MEASURED LOWER BOUND on parallelism — a runner is running, so a
-#     runner exists — and using it keeps the ceiling derived from a measurement instead of a guess.
-#     The record says `runners=<n>(busy)` when the endpoint answered, `runners=~<n>` when it did not.
+#   * `runners` is MEASURED when the repo endpoint answers with an online runner count. When no count
+#     is measured there are THREE cases and they do not share one answer (#2333 review cycles 9-11):
+#     the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners never
+#     appear in that list — it is agent-infra's measured shape) and derives from the account's
+#     concurrent-job allowance; the endpoint answering with a DECLARED fleet nothing online, and the
+#     endpoint REFUSING outright, both mean no parallelism was measured and fail CLOSED to the
+#     measured floor (`max(1, in_progress)` — a runner is running, so a runner exists). The record
+#     says `runners=<n>(busy)` when the endpoint answered with an online count, `runners=~<n>` when
+#     it did not.
 
 # `is_num` — the shared shape predicate (no leading zeros, exactly like spawn-gate.sh: a value that
 # reaches `$(( ))` must not be an invalid octal, and a non-number in a threshold makes `[ -gt ]`
@@ -152,7 +156,7 @@ ciq_now() { date +%s; }
 #               meaningful next to the repo it came from — orch-loop.sh learned that the hard way
 #               with its merge backlog)
 ciq_read() {
-  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn
+  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
   [ -n "$repo" ] || return 2
   dir="${dir:-$(ciq_state_dir)}"
@@ -196,7 +200,7 @@ ciq_read() {
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
   running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || running=""
-  busy=""; runners=""; declared=""
+  busy=""; runners=""; declared=""; rn_answered=""
   # ⛔ `--paginate` LAST, AFTER THE ENDPOINT (#2333 review P1). The endpoint returns ONE page by
   # default (30 objects), so a fleet bigger than that had its count TRUNCATED into an under-derived
   # ceiling that defers a queue which would have drained inside the horizon. The flag MUST come after
@@ -206,6 +210,9 @@ ciq_read() {
   # go unmeasured — with the suite red for a reason that hides the parse it exists to cover.
   # Concatenated pages still count correctly: the OBJECTS are counted, never `total_count`.
   if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate)"; then
+    # ANSWERED. `rn_answered` is what separates a measured hosted zero from an unreadable endpoint
+    # (see the three-branch decision below); without it both collapse into the permissive arm.
+    rn_answered=1
     # Count the online/busy runner objects. The endpoint returns `{"total_count":N,"runners":[…]}`;
     # a repo with no runners of its own (agent-infra, measured) yields 0 and is NOT an error — it
     # simply does not answer the question, so the inference below takes over.
@@ -257,33 +264,43 @@ ciq_read() {
     return 2
   fi
   if [ -z "${runners:-}" ]; then
-    # ⛔ TWO DIFFERENT ZEROES, AND COLLAPSING THEM IS A FAIL-OPEN (#2333 review P1).
+    # ⛔ THREE WAYS TO HAVE NO MEASURED RUNNER COUNT, AND THEY MUST NOT SHARE ONE ANSWER
+    # (#2333 review cycles 9-11, P1). The distinctions are the whole fail-direction of this gate:
     #
-    # (i) `total_count >= 1` with nothing online: a SELF-HOSTED FLEET EXISTS AND CANNOT RUN. The
-    #     honest reading is "nothing drains this queue", i.e. the fail-CLOSED direction — the ceiling
-    #     floors at 1 runner (ceiling 2). Claiming the hosted allowance here would quadruple the
-    #     ceiling and ALLOW the incident's own 31-deep queue with nothing able to drain it, destroying
-    #     head-bound review attestations: measured on `{"total_count":5,"runners":[{"status":"offline"}]}`.
+    # (a) ANSWERED, `total_count == 0` — no self-hosted fleet of its own: the HOSTED-CI shape, and
+    #     agent-infra's MEASURED shape (`{"total_count":0,"runners":[]}` while 7 runs executed: those
+    #     jobs run on GitHub-hosted runners, which never appear in this list). Hosted throughput is
+    #     the account's CONCURRENT-JOB allowance, so derive from that (declared and overridable here,
+    #     like every other tuning value). Deriving it from `in_progress` instead made the ceiling
+    #     SMALLEST when the box was idle: queued=4 running=1 => ceiling 2 => DEFERRED — the "a rule
+    #     that defers on 4 would be a fleet-wide stop" failure this module's header names as
+    #     unacceptable, on the very repo the gate was built for.
+    # (b) ANSWERED, `total_count >= 1` with nothing online — a SELF-HOSTED FLEET THAT CANNOT RUN.
+    #     NOT the hosted shape: claiming the allowance here quadruples the ceiling and ALLOWS the
+    #     incident's own 31-deep queue with nothing able to drain it (measured on
+    #     `{"total_count":5,"runners":[{"status":"offline"}]}`). Fail CLOSED to the measured floor.
+    # (c) REFUSED / unparseable — nothing was measured at all, so the allowance is a GUESS in the
+    #     permissive direction: measured, one refused `actions/runners` call turned `queued=31`
+    #     running=5 (a 5-runner fleet) into `~20`/ceiling 40 => ALLOWED, and OVERWROTE a good record
+    #     with the poisoned one for TTL+STALE_MAX (~16 min) — the one shape where the gate reports
+    #     `fresh` while permitting 4x its true ceiling. Fail CLOSED to the measured floor too.
     #
-    # An unanswerable endpoint is the HOSTED-CI shape, and it is agent-infra's MEASURED shape
-    # (`{"total_count":0,"runners":[]}` while 7 runs executed: those jobs run on GitHub-hosted
-    # runners, which never appear in this list). Deriving the runner count from `in_progress` there
-    # made the ceiling SMALLEST exactly when the box was idle — measured against the shipped bytes:
-    # queued=4 running=1 => ceiling 2 => DEFERRED, the "a rule that defers on 4 would be a fleet-wide
-    # stop" failure this module's header names as unacceptable, on the very repo the gate was built
-    # for. Hosted throughput is the account's CONCURRENT-JOB ALLOWANCE, so derive from that (declared
-    # and overridable here, like every other tuning value).
-    # `max(allowance, running)` keeps the one property `in_progress` really does carry: at least that
-    # many jobs demonstrably execute at once, so a busy hosted fleet is never under-derived either —
-    # and `ciq_is_count` (not `ciq_is_num`) bounds it, because an absurd reading must not become a
-    # ceiling the gate can never reach.
-    if ciq_is_num "${declared:-}" && [ "$declared" -ge 1 ]; then
-      runners="~1"
-    else
-      runners="$(ciq_hosted_concurrency)"
-      if ciq_is_count "${running:-}" && [ "${running:-0}" -gt "$runners" ]; then runners="$running"; fi
-      runners="~$runners"
+    # The measured floor applies to EVERY branch: every executing run occupies a runner, so `running`
+    # is parallelism that demonstrably exists — bounded by the allowance, because a garbled count must
+    # not become a ceiling the gate can never reach (9 digits pass `ciq_is_count` and would yield
+    # ceiling 999999998, switching back-pressure off while the token still reads like a measurement).
+    floor=1
+    if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ] \
+       && [ "${running:-0}" -le "$(ciq_hosted_concurrency)" ]; then
+      floor="$running"
     fi
+    if [ "${rn_answered:-0}" = 1 ] && { [ -z "${declared:-}" ] || [ "${declared:-0}" -eq 0 ]; }; then
+      runners="$(ciq_hosted_concurrency)"
+    else
+      runners="$floor"
+    fi
+    if [ "$floor" -gt "$runners" ]; then runners="$floor"; fi
+    runners="~$runners"
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
   CIQ_STATE=fresh; CIQ_AGE=0

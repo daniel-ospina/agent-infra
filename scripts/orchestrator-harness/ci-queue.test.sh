@@ -166,7 +166,27 @@ ciq_ci_allowed "$OR"; d0=$?
 ck "(b5) hosted CI, zero repo runners: the PRE-INCIDENT baseline (4) is ALLOWED" "$( [ "$d0" -eq 0 ]; echo $? )"
 feed 4 1 -
 ciq_ci_allowed "$OR"; d0=$?
-ck "(b6) hosted CI, runners endpoint REFUSING: the baseline (4) is still ALLOWED" "$( [ "$d0" -eq 0 ]; echo $? )"
+ck "(b6) a REFUSED runners read is NOT the hosted zero: it fails CLOSED (4 queued DEFERRED)" "$( [ "$d0" -eq 1 ]; echo $? )"
+# ⛔ AND THE REFUSED READ MUST NOT OVERWRITE A GOOD RECORD WITH THE GUESS (#2333 review P1).
+# Measured before the fix: one refused `actions/runners` call turned a 5-runner fleet's `queued=31`
+# into `~20`/ceiling 40 => ALLOWED, and the poisoned record then served as `cache` for
+# TTL+STALE_MAX (~16 min) — the one shape where the gate reported `fresh` while permitting 4x its
+# true ceiling, allowing the incident's own queue in a queue nothing could drain.
+feed 31 5 5
+ciq_read "$OR" >/dev/null 2>&1
+feed 31 5 -
+ciq_read "$OR" >/dev/null 2>&1
+v="$(ciq_eval)"
+ck "(b6b) a refused runner read falls back to the measured floor, never the allowance (got: ${v})" \
+   "$( case "$v" in *'ceiling=10'*) echo 0 ;; *) echo 1 ;; esac )"
+# A garbled `running` must not become a ceiling the gate can never reach: 9 digits pass
+# `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently. Driven on the
+# UNMEASURED path (refused endpoint), where the floor is the only runner source.
+feed 5 499999999 -
+ciq_read "$OR" >/dev/null 2>&1
+v="$(ciq_eval)"
+ck "(b6c) an absurd `running` is bounded by the allowance, never made the ceiling (got: ${v})" \
+   "$( case "$v" in *'runners=~1'*'ceiling=2'*) echo 0 ;; *) echo 1 ;; esac )"
 feed 97 7 0
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
@@ -187,6 +207,13 @@ feed 0 0 5 true 1
 ciq_read "$OR" >/dev/null 2>&1
 ck "(b11) …and it is recorded as inferred from a fleet, never as the hosted allowance (runners=${CIQ_RUNNERS:-?})" \
    "$( [ "${CIQ_RUNNERS:-}" = '~1' ]; echo $? )"
+# ⛔ THE OFFLINE FLEET MUST NOT DISCARD THE MEASURED FLOOR (#2333 review P1). A stale/decommissioned
+# self-hosted runner entry on a repo that actually runs on hosted capacity pinned the ceiling at 2, so
+# a 4-deep queue DEFERRED for ever — "a rule that defers on 4 would be a fleet-wide stop".
+feed 4 7 5 true 1
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b12) declared-but-offline still honours `running` (4 queued, 7 running => ceiling 14 => ALLOWED)" \
+   "$( [ "$d0" -eq 0 ]; echo $? )"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5
