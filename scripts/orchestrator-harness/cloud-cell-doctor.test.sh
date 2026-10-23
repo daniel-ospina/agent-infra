@@ -459,6 +459,31 @@ kill "$GRACE_PID" 2>/dev/null || true
   && ok "status: past the grace window, a role that never passed FAILS" \
   || bad "status: an old loop with no passes did not fail (rc=$RC) — $OUT"
 rm -f "$T/o/state/roles/loop.started" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+# ⛔ AND A STOPPED CELL THAT HAS RUN MUST NOT CLAIM IT NEVER DID (P2, fresh review). `cmd_stop` does
+# not remove `*.state`, so the stop/start population always has records: a role whose last pass
+# FAILED must still show that failure, not "this role has not run".
+say_case "status: a STOPPED cell still reports a role's RECORDED last pass, rc included"
+reset_state
+NOW="$(date +%s)"
+printf 'role=merge\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=3\nlast_rc=1\nlast_result=rail refusal\n' "$NOW" \
+  > "$T/o/state/roles/merge.state"
+doc status
+[ "$RC" -eq 0 ] && ok "status: a stopped cell still exits 0 with a recorded failing pass" \
+  || bad "status: rc=$RC on a stopped cell with a recorded pass — $OUT"
+printf '%s\n' "$OUT" | grep -qE '^merge +STOPPED .*last pass [0-9]+s ago rc=1' \
+  && ok "status: the row reports the recorded pass and its rc, not 'has not run'" \
+  || bad "status: a recorded failing pass was erased — $OUT"
+printf '%s\n' "$OUT" | grep -q '^merge .*has not run' \
+  && bad "status: a role that HAS run is claimed never to have run — $OUT" \
+  || ok "status: 'has not run' is reserved for a role with no record"
+
+# (a role with NO record still reads 'has not run' — the reserved wording, same fixture)
+reset_state
+doc status
+printf '%s\n' "$OUT" | grep -qE '^reap +STOPPED .*has not run' \
+  && ok "status: a role with no record still reads 'has not run'" \
+  || bad "status: the no-record STOPPED wording was lost — $OUT"
+
 
 # ── 11b) A DEAD LOOP IS NEVER "WAITING" (agent-infra#2306) ──────────────────────────────────────
 # `WAITING` asserts a pass is IN PROGRESS. It was derived from the loop's own start record alone, so a

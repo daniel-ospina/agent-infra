@@ -1592,11 +1592,25 @@ role_row() { # <role> <stale-bound-seconds>
   # it keep the previous behaviour).
   # ⛔ AND ONLY WHEN THE LOOP IS NOT ALIVE: a live loop outranks a missing `.desired` (the record can
   # be absent on a cell whose loop is up), so the rows must not go blind to a running scheduler.
+  f="$ROLES_DIR/$role.state"
   if [ "${CELL_DESIRED:-1}" = 0 ] && [ "${LOOP_STATE:-}" != alive ]; then
-    printf '%-8s STOPPED   the cell is not started, so this role has not run and is not expected to\n' "$role"
+    # ⛔ "HAS NOT RUN" IS A CLAIM, AND IT MUST BE TRUE (P2, fresh review). `cmd_stop` removes only
+    # `.desired`, `loop.pid` and `restart.ident` — NOT `*.state` — so every stop/start cycle lands
+    # here with a recorded pass, and the row erased it: measured, a role whose last pass FAILED
+    # (`last_rc=1`) printed "this role has not run", dropping the cell's last known failing state
+    # from the one surface an operator reads. A recorded pass is reported as a recorded pass; the
+    # "has not run" wording is reserved for a role with no record at all. rc stays 0.
+    if [ -f "$f" ]; then
+      rc="$(state_get "$role" last_rc)"; ep="$(state_get "$role" last_pass_epoch)"
+      case "${ep:-}" in ''|*[!0-9]*) ep=0 ;; esac
+      age=$(( $(date +%s) - ep ))
+      printf '%-8s STOPPED   the cell is not started; last pass %ss ago rc=%s — %s\n' \
+        "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
+    else
+      printf '%-8s STOPPED   the cell is not started, so this role has not run and is not expected to\n' "$role"
+    fi
     return 0
   fi
-  f="$ROLES_DIR/$role.state"
   if [ ! -f "$f" ]; then
     # ⛔ NO PASS RECORD IS NOT "IN PROGRESS" (#2306). `WAITING` is a claim that a pass is running, so
     # it requires POSITIVE evidence of both halves: the loop is ALIVE (the pid probe) and it is making
