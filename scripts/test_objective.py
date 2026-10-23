@@ -1442,15 +1442,19 @@ def test_the_wedge_reason_is_BOUNDED_and_says_how_many_it_hid():
     # budget can still hide names at or below MAX_NAMES -- see the long-name case below.
     four = objective.wedge_reason(rows[:4])
     assert "+0 more" not in four and "more" not in four, four
-    # ⛔ LONG NAMES: the CHAR budget (not the name cap) is what bites, and this arm needs its own
-    # pin (fresh review, P3): with the cap raised to 10**9 every assertion above still passed, so
-    # the second guard could be deleted without a test noticing. These two names are the shape a
-    # real matrix publishes -- the test fixture above (20-char `ctx-NN`) is the one shape where
-    # "four or fewer is never hidden" happens to hold.
+    # ⛔ LONG NAMES: the CHAR budget (not the name cap) is what bites -- two long matrix names are
+    # FEWER than MAX_NAMES and still hide one. Its old LENGTH assertion compared the output against
+    # `WEDGE_REASON_MAX_CHARS` -- the very constant a cap raise moves -- so at 10**9 that assertion
+    # passed, and the first failure pytest reported was the `uncapped` assertion above, which also
+    # compares against the moved constant (398 > 3 * 10**9). The arm was not wholly blind: its next
+    # assertion, `budget.endswith(",+1 more")`, is behavioural and does fail at 10**9 (the raised cap
+    # hides nothing, so the suffix disappears) -- it is simply never reached while `uncapped` fails
+    # first. Pinning a LITERAL makes the LENGTH bound itself fail on a cap raise (`144 <= 120` fails;
+    # `144 <= 10**9` passed), independent of `uncapped`.
     long_names = [("python-ci-gate / validate / pytest (3.12, ubuntu-latest)", "in_progress", 150),
                   ("legal-e2e / integration suite / cartola (desktop)", "in_progress", 140)]
     budget = objective.wedge_reason(long_names)
-    assert len(budget) <= objective.WEDGE_REASON_MAX_CHARS, budget
+    assert len(budget) <= 120, budget
     assert budget.endswith(",+1 more"), budget
     # EMPTY is None, never an empty order
     assert objective.wedge_reason([]) is None
