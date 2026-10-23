@@ -124,9 +124,13 @@ NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be 
 # `lib/fleet-inventory.sh`'s launchd predicate is "loaded AND last run exited 0" -- so the code is a
 # MACHINE surface, not prose. Two independent producers of `2` make it unreadable:
 #
-#   * `record_exit(EXIT_REFUSING, ...)` -- the sanctioned refusal (a blind open-PR read, or a pass
-#     where not one PR had readable checks). It RECORDS its reason in STATUS. This is `2`'s only
-#     legitimate meaning.
+#   * `record_exit(EXIT_REFUSING, ...)` -- the sanctioned refusal (a blind open-PR read, a pass where
+#     not one PR had readable checks, or -- since agent-infra#2409 -- a transport that cannot deliver
+#     the order: a DEPLOYED `$O/nonblocking-dispatch.sh` that predates the `[bg|prfix]` argument would
+#     spawn every repair as a creation worker and the creation gate would hold them). It RECORDS its
+#     reason in STATUS. This is `2`'s only legitimate meaning: **I could not act on the world**,
+#     whether the failure was reading it or delivering to it — the operator's first move is the same,
+#     fix the chain (the gh reads, or the `$O` install), and the recorded `reason` names which.
 #   * `argparse` -- a USAGE error exits 2 by default. Measured on this tree 2026-10-22:
 #       `python3 scripts/pr-doctor.py --bogus-flag`  ->  rc=2
 #     and it writes NO status record at all, so launchd reports 2 while the fleet's own record still
@@ -148,7 +152,7 @@ NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be 
 # -- the very conflation this table removes. 64 is the canonical value for the same meaning; a
 # consistency sweep that finds these two numbers must NOT collapse them.
 EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
-EXIT_REFUSING = 2     # I could not read the world (blind read) -- THE ONLY meaning of 2
+EXIT_REFUSING = 2     # I could not read the world, or could not deliver to it -- 2's only meaning
 EXIT_UNDELIVERED = 3  # I read it, I placed the work, no worker took it
 EXIT_CRASH = 4        # an uncaught exception (see __main__)
 EXIT_USAGE = 64       # the COMMAND LINE is unusable -- nothing was attempted

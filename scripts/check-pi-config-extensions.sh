@@ -333,6 +333,11 @@ if [ "$parse_ok" -eq 1 ]; then
   # 4a — every TRACKED extension (except *.test.ts) must have a manifest row.
   # Same index reading as check 3 (#2425): an untracked ignored directory ships
   # to nobody, so it needs no row.
+  # `verified` is what THIS RUN compared; the closing verdict reports it (#2121: a count of the
+  # directory's contents is state that existed before this run, so it is not evidence that this
+  # run observed anything). It is incremented where the manifest comparison actually happens —
+  # inside the INDEX walk (#2425), never by listing the directory.
+  verified=0
   if [ "$index_ok" -eq 1 ]; then
     while IFS= read -r base; do
       [ -n "$base" ] || continue
@@ -341,6 +346,7 @@ if [ "$parse_ok" -eq 1 ]; then
       esac
       if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
       [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue   # index/disk disagreement — see check 3
+      verified=$((verified + 1))
       if ! grep -Fqx -- "$base" <<<"$manifest_rows"; then
         echo "❌ tracked extension $base exists in extensions/ (git tracks it) but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
         FAILURES=$((FAILURES + 1))
@@ -387,7 +393,7 @@ if [ "$FAILURES" -gt 0 ]; then
   exit 1
 fi
 
-echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $(( $(ls -1 "$SRC" | wc -l | tr -d ' ') )) entries)"
+echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $verified extension(s) compared to the manifest by THIS run)"
 # The verdict names the reading it was reached from: checks 3/4a ask "which
 # extensions does GIT TRACK under extensions/", not "which directories exist"
 # (#2425 — an untracked, git-ignored node_modules tree is not an unwired
