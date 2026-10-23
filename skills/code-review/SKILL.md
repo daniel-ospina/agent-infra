@@ -1403,7 +1403,8 @@ a pre-loop landing spends none, because Step 4's round is the one that decided i
 is the 9-cycle case fixed at its source: the first round decides, and a follow-up never buys a second.
 
 **A review round cannot be skipped, only repeated.** `decideRound()` returns `continue`, never
-`land`, at zero cycles spent — nothing lands on an unreviewed head. The `#485` ≥1-dispatch floor, the
+`land`, at zero cycles spent — nothing lands on an unreviewed head. The `#485` ≥1-dispatch floor (which
+also accepts a review record bound to the exact pushed head — #2471), the
 fresh-context re-review requirement and the `ai-review-gate` evidence record (Step 10) are untouched
 by this rule: it bounds the **repeat**, not the review.
 

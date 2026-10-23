@@ -389,7 +389,9 @@ These checks are enforced by Pi extensions — each with per-gate scoping rather
 
 ### Review Enforcer Gate
 
-The `review-enforcer` extension blocks git operations unless at least one sub-agent was dispatched this session — the gate counts ANY sub-agent dispatch (the `task` tool or the specialized-agent `subagent` tool; content-free floor — see the micro rationale below) — **at every tier, micro included** (0 dispatches block; pre-#485 the micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe. The extension reads `/tmp/agent-issue-complexity` only to select the micro-specific remediation message below; it never selects allow/block).
+The `review-enforcer` extension blocks git operations unless ONE of two signals is positively read — the gate counts ANY sub-agent dispatch (the `task` tool or the specialized-agent `subagent` tool; content-free floor — see the micro rationale below), **or** it finds a review record bound to the EXACT head the op would publish (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json` whose `head_sha` equals the pushed commit, verdict accepted under the gate's own rules — #2471). It blocks at **every tier, micro included** (no dispatch and no head-bound record block; pre-#485 the micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe. The extension reads `/tmp/agent-issue-complexity` only to select the micro-specific remediation message below; it never selects allow/block).
+
+> **The record arm never weakens the floor (#2471).** It grants an allow only when the record binds the EXACT commit being published and its verdict passes the same binding `check-pipeline-compliance.sh` check (c) applies (a `clean-micro` needs a `complexity:micro` issue; a `clean-low` needs the producer's merge-base + diff-digest bindings). A record for a different head, a different repo, an unparseable file, or an op that cannot be attributed to ONE commit (a `--all`/glob/delete push, an unattributable `cd`) is exactly as blocking as no record. A record that binds the head with a verdict the gate does not accept blocks **even when the session dispatched** — the stricter signal wins.
 
 > **Task sub-agents are exempt from the commit-time dispatch floor** (#285/#825): their review DISPATCH is parent-enforced — the parent session runs the review ceremony, so a task sub-agent's own git ops do not re-trigger the floor. The merge-registry gate still requires a recorded clean review before merge. The "every tier blocks at 0 dispatches" uniform floor describes the tier dimension; the sub-agent session shape is this documented carve-out.
 
@@ -400,9 +402,9 @@ The `review-enforcer` extension blocks git operations unless at least one sub-ag
 ```
 
 **How to satisfy:**
-1. Before `git commit`, dispatch a `task` sub-agent (or `subagent`-tool agent) to review your changes
+1. Before `git commit`, dispatch a `task` sub-agent (or `subagent`-tool agent) to review your changes — **or** land a head whose review is already recorded (`git push` of a commit that carries a valid record at that exact sha needs no new dispatch)
 2. The reviewer must return a result (even "NO ISSUES FOUND")
-3. The gate counts any sub-agent dispatch (task or subagent tool) — 1 is enough
+3. The gate counts any sub-agent dispatch (task or subagent tool) — 1 is enough; the head-bound record is the second, durable signal
 4. **Micro tier:** code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff and returning a verdict on it (the floor counts the dispatch — content-free, #485 F2) — the multi-agent code-review gate stays skipped per 03-code-review.md
 
 **Failure:** "No reviewers were dispatched in this session before the git operation." (micro tier receives a micro-specific message directing a lightweight docs reviewer).  

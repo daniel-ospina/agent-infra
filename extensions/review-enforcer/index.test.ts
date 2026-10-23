@@ -98,6 +98,18 @@ import {
   classifyRecordMissState,
   describeCarryConjuncts,
   describeDispatchFloorRead,
+  // #2471: the head-bound record arm of the ≥1-dispatch floor.
+  evaluateDispatchFloorRecordArm,
+  floorRecordBinding,
+  VERDICT_BINDING,
+  parsePushSourceRef,
+  describeFloorRecordAllow,
+  readFloorRecordFacts as _readFloorRecordFacts,
+  FLOOR_RECORD_STATE_ACCEPTED,
+  FLOOR_RECORD_STATE_NO_RECORD,
+  FLOOR_RECORD_STATE_HEAD_MISMATCH,
+  FLOOR_RECORD_STATE_UNREADABLE,
+  FLOOR_RECORD_STATE_UNATTRIBUTABLE,
   getPrLiveDiffHashObserved,
   parseDiffHashHelperOutputObserved,
   adminMergeStateText,
@@ -2493,7 +2505,16 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         fs.writeFileSync("/tmp/agent-issue-complexity", "Micro\n");
         const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(blocked && blocked.block === true, "micro at 0 dispatches must block (#485)");
-        equal(blocked.reason, MICRO_BLOCK_MESSAGE, "micro block must carry the micro-specific remediation");
+        // #2471: the standing message is now the PREFIX of the refusal, extended
+        // with what the HEAD-BOUND arm read — the pinned remediation is intact.
+        ok(
+          blocked.reason.startsWith(MICRO_BLOCK_MESSAGE),
+          "micro block must carry the micro-specific remediation"
+        );
+        ok(
+          blocked.reason.includes("HEAD-BOUND RECORD"),
+          "…plus what the head-bound arm read (#2471)"
+        );
         // Positive remediation-outcome pins (not just self-referential equality
         // to the exported const): the blocked micro agent must be told docs-only
         // sets need a lightweight [REVIEW] dispatch and that it must NOT go read
@@ -2577,7 +2598,14 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
           fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
           const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
           ok(blocked && blocked.block === true, `${producerValue.trim()} at 0 dispatches must block (#485)`);
-          equal(blocked.reason, BLOCK_MESSAGE, `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`);
+          ok(
+            blocked.reason.startsWith(BLOCK_MESSAGE),
+            `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`
+          );
+          ok(
+            blocked.reason.includes("HEAD-BOUND RECORD"),
+            `${producerValue.trim()} block must also disclose what the head-bound arm read (#2471)`
+          );
           ok(
             blocked.reason.includes("code-review/SKILL.md"),
             "generic remediation must direct the agent to the code-review dispatch protocol"
@@ -2610,7 +2638,10 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
         fs.unlinkSync("/tmp/agent-issue-complexity");
         const unlabeled = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(unlabeled && unlabeled.block === true, "unlabeled (no marker) at 0 dispatches must block");
-        equal(unlabeled.reason, BLOCK_MESSAGE, "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE");
+        ok(
+          unlabeled.reason.startsWith(BLOCK_MESSAGE),
+          "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE"
+        );
         // #516 (cont.): the marker-ABSENT block audits tier "unlabeled" (the
         // TIER_RULE vocabulary key for no-marker sessions) so attribution stays
         // reconstructible when no marker file exists; Pass A blocked four ops
@@ -3784,7 +3815,10 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // the micro arm's own copy and empty the region vacuously — the full-file
   // lastIndexOf keeps the slice meaningful.
   ok(microCheck !== -1, "micro arm must exist");
-  const genericReturn = src.lastIndexOf("return { block: true, reason: BLOCK_MESSAGE }");
+  // #2471: the generic return now passes its standing message through
+  // `withFloorRecordLines`, so the anchor is the CONSTANT at that site (the
+  // invariant pinned below — generic return AFTER the micro arm — is unchanged).
+  const genericReturn = src.lastIndexOf("{ block: true, reason: BLOCK_MESSAGE }");
   ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
   const region = src.slice(microCheck, genericReturn);
   ok(!region.includes("return undefined"), "micro arm region must not contain a warn-allow return undefined (#485)");
@@ -6205,7 +6239,7 @@ testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git
         equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
         // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
         ok(first && first.block === true, "the push is still refused at 0 dispatches");
-        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(first.reason.startsWith(BLOCK_MESSAGE), "…with the existing block message");
         ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
         const audit = tempAuditLines();
         equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
@@ -6953,16 +6987,26 @@ test("#2349 evidence gate — its four block states print four DISTINCT lines (t
 });
 
 // ── The dispatch floor: says it read a DISPATCH COUNT, not a review ──
-test("#2349 dispatch floor — the refusal says it counts DISPATCHES and reads NO record", () => {
+test("#2349/#2471 dispatch floor — the refusal says WHICH TWO signals it read", () => {
   const staticText = BLOCK_MESSAGE + MICRO_BLOCK_MESSAGE;
   ok(staticText.includes("WHAT THIS GATE READ"), "both dispatch-floor messages disclose what they read");
-  ok(staticText.includes("reads NO review record"), "…and that no record is read at all");
-  ok(staticText.includes("PER-MACHINE"), "…and that the registry is per-machine");
+  ok(
+    staticText.includes("HEAD-BOUND record"),
+    "…and that the head-bound record (#2471) is now one of the two signals"
+  );
+  ok(
+    !/reads NO review record/i.test(staticText),
+    "…and MUST NOT still claim it reads no record — that sentence was the #2471 defect"
+  );
+  ok(staticText.includes("PER-MACHINE"), "…that the registry is per-machine");
   ok(staticText.includes("IN THIS SESSION"), "…and what the lane's next action is");
   const noPr = describeDispatchFloorRead("git commit -m x", "standard", 0);
   ok(noPr.recordState.startsWith("no-pr-named"), "a command naming no PR is diagnosed as such");
   ok(noPr.lines.join("\n").includes("= 0"), "prints the count it read (0)");
-  ok(noPr.lines.join("\n").includes("names no PR"), "explains why no record could be attributed");
+  ok(
+    noPr.lines.join("\n").includes("attributed by its HEAD"),
+    "explains that attribution is now by the published head (#2471), not only by a PR number"
+  );
   withTempHomeSync(() => {
     // An EMPTY registry on this box is the fragmentation datum, measured live rather
     // than asserted in prose: the refusal says how much of the registry is even here.
@@ -7161,6 +7205,606 @@ test("#2349 review2 P2 — a no-repo SINGLE-candidate corrupt file is named by i
     ok(reason.includes(resolvePath(dir, "a-repo-77.json")), "names the file that actually exists");
     ok(!reason.includes("<owner>-<repo>-77.json"), "must NOT render the path generator as a real file");
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// #2471 — the ≥1-dispatch floor's HEAD-BOUND RECORD ARM
+//
+// The floor used to decide from ONE datum: a count of sub-agent dispatches in
+// this pi process. A durable record bound to the exact commit could not clear
+// it, so every already-recorded PR paid a fresh reviewer child (measured
+// 2026-10-23 on cell-1: three children, each up to 900 s, for PRs carrying
+// valid records at their current heads).
+//
+// These tests drive the REAL `tool_call` hook — not a replicated predicate:
+// each fires the gate with a real temp git repo and a real record file on disk,
+// and asserts the decision AND the text the lane reads. All four directions are
+// covered, plus the two properties that keep it from being a weakening: a
+// disagreement resolves STRICTER, and the #485 zero-gate net still closes.
+// ════════════════════════════════════════════════════════════════════════════
+
+section("#2471 — the dispatch floor accepts a record bound to the EXACT head");
+
+const FLOOR_PR = 900401;
+const FLOOR_ISSUE = 900402;
+const FLOOR_MERGE_BASE = "d".repeat(40); // what the gh stub's `compare/` answers
+
+interface FloorFixture {
+  repoDir: string;
+  head: string;
+  recordFile: string;
+  logs: string[];
+  /** Fire a bash tool_call for a push from the fixture repo. */
+  push: (extra?: string) => Promise<any>;
+  /** Register a reviewer dispatch in THIS session, then fire the same push. */
+  pushAfterDispatch: () => Promise<any>;
+  ghCommands: string[];
+}
+
+/**
+ * A temp git repo with a GitHub origin, plus a gh stub answering only the three
+ * reads the arm can make. `tier` selects the linked issue's labels, so the
+ * clean-micro binding can be driven in both directions.
+ */
+async function withFloorFixture(
+  opts: { tier?: "micro" | "standard" },
+  fn: (f: FloorFixture) => Promise<void>
+): Promise<void> {
+  await withTempHome(async () => {
+    const prevKind = process.env.KIND;
+    delete process.env.KIND;
+    const repoDir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-floor-repo-"));
+    const sh = (c: string) => execSync(c, { stdio: "ignore" });
+    sh(`git init -q -b fix/probe "${repoDir}"`);
+    sh(`git -C "${repoDir}" config user.email t@t`);
+    sh(`git -C "${repoDir}" config user.name t`);
+    fs.writeFileSync(resolvePath(repoDir, "a.txt"), "a\n");
+    sh(`git -C "${repoDir}" add a.txt`);
+    sh(`git -C "${repoDir}" -c commit.gpgsign=false commit -qm one`);
+    sh(`git -C "${repoDir}" remote add origin https://github.com/owner/repo.git`);
+    const head = execSync(`git -C "${repoDir}" rev-parse HEAD`, { encoding: "utf8" }).trim();
+    const recordFile = reviewRecordFile("owner/repo", FLOOR_PR);
+    const ghCommands: string[] = [];
+
+    _setRunGhOverride((cmd: string) => {
+      ghCommands.push(cmd);
+      if (/pr list/.test(cmd)) {
+        return JSON.stringify([{ number: FLOOR_PR, headRefOid: head, headRefName: "fix/probe" }]);
+      }
+      if (/pr view/.test(cmd) && /closingIssuesReferences/.test(cmd)) {
+        return JSON.stringify({ closingIssuesReferences: [{ number: FLOOR_ISSUE }] });
+      }
+      if (/issue view/.test(cmd)) {
+        return JSON.stringify({
+          labels: [{ name: opts.tier === "micro" ? "complexity:micro" : "complexity:standard" }],
+        });
+      }
+      if (/compare\//.test(cmd)) return `${FLOOR_MERGE_BASE}\n`;
+      if (/\/pulls\//.test(cmd)) return `${"f".repeat(40)}\n`; // the PR's base sha
+      return "";
+    });
+
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+
+    const logs: string[] = [];
+    const realLog = console.log;
+    const firePush = async (extra?: string) => {
+      const cmd = extra
+        ? `cd "${repoDir}" && git push origin HEAD:fix/probe ${extra}`
+        : `cd "${repoDir}" && git push origin HEAD:fix/probe`;
+      console.log = (...a: any[]) => {
+        logs.push(a.map(String).join(" "));
+      };
+      try {
+        return await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      } finally {
+        console.log = realLog;
+      }
+    };
+    const fixture: FloorFixture = {
+      repoDir,
+      head,
+      recordFile,
+      logs,
+      ghCommands,
+      push: firePush,
+      pushAfterDispatch: async () => {
+        await fire("tool_result", { toolName: "task", input: { prompt: "review" }, details: {} });
+        return firePush();
+      },
+    };
+    try {
+      await fn(fixture);
+    } finally {
+      _setRunGhOverride(null);
+      fs.rmSync(repoDir, { recursive: true, force: true });
+      if (prevKind === undefined) delete process.env.KIND;
+      else process.env.KIND = prevKind;
+    }
+  });
+}
+
+function floorRecord(head: string, over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    pr: FLOOR_PR,
+    head_sha: head,
+    verdict: "clean",
+    reviewed_at: "2026-10-23T00:00:00Z",
+    repo: "owner/repo",
+    diff_sha256: "b".repeat(64),
+    ...over,
+  };
+}
+
+testAsync("#2471 (i) a record bound to the CURRENT head allows the op; the log names the file and the sha", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const res = await f.push();
+    equal(res, undefined, "ALLOWED — an already-reviewed head needs no new reviewer child");
+    const line = f.logs.join("\n");
+    ok(line.includes("HEAD-BOUND RECORD"), `the allow names the datum it read: ${line}`);
+    ok(line.includes(f.recordFile), "…the FILE it accepted");
+    ok(line.includes(f.head.slice(0, 12)), "…and the SHA it bound");
+    equal(f.ghCommands.length, 0, "a plain `clean` record costs ZERO API calls");
+    const audit = tempAuditLines().filter((e) => e.event === "review_record_allow");
+    equal(audit.length, 1, "the allow is audited once (durable, joinable trail)");
+    equal(audit[0].pr, FLOOR_PR, "the audit row names the PR");
+    equal(audit[0].reason, "head_bound_record", "and the reason is the record arm, not the dispatch counter");
+  });
+});
+
+testAsync("#2471 (ii) ONE character of head_sha altered → BLOCKED, with the mismatch named", async () => {
+  await withFloorFixture({}, async (f) => {
+    const last = f.head[39];
+    const altered = f.head.slice(0, 39) + (last === "a" ? "b" : "a");
+    writeReviewFile(f.recordFile, floorRecord(altered));
+    const res = await f.push();
+    ok(res && res.block, "a record that does not bind the head is as blocking as no record");
+    const reason = String(res.reason);
+    ok(reason.includes("DIFFERENT head"), `names the state: ${reason.slice(0, 200)}`);
+    ok(reason.includes(altered), "prints the recorded sha IN FULL");
+    ok(reason.includes(f.head), "prints the published sha IN FULL");
+    // A 12-char prefix pair would render two IDENTICAL strings for a tail edit.
+    ok(reason.includes("first difference at character 40"), `names WHERE they differ: ${reason}`);
+    ok(reason.includes("STALE"), "and states that an older-head record is stale");
+    const blocks = tempAuditLines().filter((e) => e.event === "gate_block");
+    equal(blocks.length, 1, "the refusal is audited");
+    ok(String(blocks[0].record_state).includes("DIFFERENT head"), "the audit row carries the state, not just a count");
+  });
+});
+
+testAsync("#2471 (iii) NO record at all is still BLOCKED (unchanged)", async () => {
+  await withFloorFixture({}, async (f) => {
+    const res = await f.push();
+    ok(res && res.block, "#485's zero-gate net stays closed: no record + no dispatch = block");
+    const reason = String(res.reason);
+    ok(reason.includes("NO repo-keyed record on this box binds head"), `says what it read: ${reason.slice(0, 260)}`);
+    ok(reason.includes("PER-MACHINE"), "and that the registry is per-machine — not 'no review happened'");
+    ok(reason.includes("Review enforcement gate is working correctly"), "carries the standing remediation block");
+    ok(
+      !reason.includes("BOUND to this exact commit"),
+      "a NO-RECORD refusal must not claim a record was bound (it read none) — #2349's rule"
+    );
+    ok(
+      reason.includes("No review record on this box authorizes"),
+      "the headline says what was actually found"
+    );
+  });
+});
+
+testAsync("#2471 (iv) an UNPARSEABLE record is BLOCKED, and the reason says so (fail closed)", async () => {
+  await withFloorFixture({}, async (f) => {
+    fs.mkdirSync(resolvePath(os.homedir(), ".pi", "agent", "reviews"), { recursive: true });
+    fs.writeFileSync(f.recordFile, "{ truncated");
+    const res = await f.push();
+    ok(res && res.block, "a corrupt record is not a pass");
+    const reason = String(res.reason);
+    ok(reason.includes("could not be parsed"), `distinguishes corrupt from absent: ${reason.slice(0, 260)}`);
+    ok(reason.includes("UNPARSEABLE"), "and says an unparseable record is not a pass");
+  });
+});
+
+testAsync("#2471 (v) the session-dispatch path still lands with NO registry file", async () => {
+  await withFloorFixture({}, async (f) => {
+    const res = await f.pushAfterDispatch();
+    equal(res, undefined, "a lane that reviewed in-session is not made to write a record first");
+  });
+});
+
+testAsync("#2471 (v-b) the #285/#825 sub-agent carve-out still ALLOWS a push with no record and no dispatch", async () => {
+  await withFloorFixture({}, async (f) => {
+    // A task child: TASK_HEARTBEAT=1 + PI_MODE=print are the markers both
+    // dispatchers force, and the parent forces the skip flag. Its in-band
+    // [VGATE] dispatches are never counted, so dispatchCount 0 is its NORMAL
+    // state — the record arm must not turn that into a block (VGATE round 2, P1).
+    const prev = { ...process.env };
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.PI_MODE = "print";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start", {});
+      const cmd = `cd "${f.repoDir}" && git push origin HEAD:fix/probe`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      equal(res, undefined, "the carve-out decides FIRST — a sub-agent push is not re-gated by the record arm");
+    } finally {
+      delete process.env.TASK_HEARTBEAT;
+      delete process.env.PI_MODE;
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prev.KIND) process.env.KIND = prev.KIND;
+    }
+  });
+});
+
+testAsync("#2471 (vi) DISAGREEMENT resolves STRICTER: a record at this head with a non-accepted verdict blocks even with a dispatch", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head, { verdict: "issues" }));
+    const res = await f.pushAfterDispatch();
+    ok(res && res.block, "the durable record bound to this commit outranks the (content-free) session counter");
+    const reason = String(res.reason);
+    ok(reason.includes("does NOT overrule"), `the reason says why: ${reason.slice(0, 260)}`);
+    ok(reason.includes('"issues"'), "and names the verdict it read");
+  });
+});
+
+testAsync("#2471 (vi-b) a STALE record does not block a session that reviewed the NEW head", async () => {
+  await withFloorFixture({}, async (f) => {
+    // The normal mid-work shape: the registry still carries the record from the
+    // PREVIOUS head, and this session has just reviewed and pushed a new one.
+    writeReviewFile(f.recordFile, floorRecord("f".repeat(40)));
+    const res = await f.pushAfterDispatch();
+    equal(res, undefined, "a record bound to an OLD head cannot block a dispatched session (it does not bind this head)");
+  });
+});
+
+testAsync("#2471 (vi-c) a CORRUPT record does not block a dispatched session either (it abstains)", async () => {
+  await withFloorFixture({}, async (f) => {
+    fs.mkdirSync(resolvePath(os.homedir(), ".pi", "agent", "reviews"), { recursive: true });
+    fs.writeFileSync(f.recordFile, "{ truncated");
+    const res = await f.pushAfterDispatch();
+    equal(res, undefined, "unparseable ⇒ cannot bind ⇒ abstain on the dispatched path");
+  });
+});
+
+testAsync("#2471 (vii) clean-micro is accepted ONLY on a micro issue", async () => {
+  await withFloorFixture({ tier: "micro" }, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head, { verdict: "clean-micro" }));
+    equal(await f.push(), undefined, "clean-micro + complexity:micro → allowed");
+  });
+  await withFloorFixture({ tier: "standard" }, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head, { verdict: "clean-micro" }));
+    const res = await f.push();
+    ok(res && res.block, "clean-micro + a NON-micro issue → blocked (check (c)'s own binding)");
+    ok(String(res.reason).includes("FAILS its own binding"), "and the reason names the binding that failed");
+  });
+});
+
+testAsync("#2471 (viii) clean-low needs the producer's base+digest binding", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(
+      f.recordFile,
+      floorRecord(f.head, { verdict: "clean-low", merge_base_sha: FLOOR_MERGE_BASE, diff_sha256: "b".repeat(64) })
+    );
+    equal(await f.push(), undefined, "clean-low bound to the live merge base + a content digest → allowed");
+  });
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(
+      f.recordFile,
+      floorRecord(f.head, { verdict: "clean-low", merge_base_sha: "e".repeat(40), diff_sha256: "b".repeat(64) })
+    );
+    const res = await f.push();
+    ok(res && res.block, "a clean-low record whose merge base moved certifies DIFFERENT content → blocked");
+  });
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(
+      f.recordFile,
+      floorRecord(f.head, { verdict: "clean-low", merge_base_sha: FLOOR_MERGE_BASE, diff_sha256: undefined })
+    );
+    const res = await f.push();
+    ok(res && res.block, "clean-low without a usable diff_sha256 cannot prove what it certified → blocked");
+  });
+});
+
+testAsync("#2471 (ix) a record for ANOTHER repo never clears this one (#426)", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head, { repo: "someone/else" }));
+    const res = await f.push();
+    ok(res && res.block, "a foreign-repo record is inert here");
+  });
+});
+
+testAsync("#2471 (x) an op that cannot be attributed to ONE commit is not cleared by even a valid record", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const res = await f.push("--all");
+    ok(res && res.block, "`--all` publishes many refs, so no single head can be bound → block");
+    ok(
+      String(res.reason).includes("cannot be attributed") || String(res.reason).includes("many refs"),
+      `the reason names the attribution failure: ${String(res.reason).slice(0, 260)}`
+    );
+  });
+});
+
+testAsync("#2471 (xi) `git push <remote>` publishes HEAD and is attributed like `git push`", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    // The lone token is a REMOTE here (the fixture repo's origin), so the
+    // published ref is HEAD — and the record at HEAD clears the floor.
+    const res = await f.push("").catch(() => null);
+    void res; // the helper always adds a refspec; use the raw hook below instead
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const cmd = `cd "${f.repoDir}" && git push origin`;
+    equal(await fire("tool_call", { toolName: "bash", input: { command: cmd } }), undefined,
+      "a remote-only push is attributed to HEAD and allowed by the record bound to HEAD");
+  });
+});
+
+testAsync("#2471 the pure arm: only a head-bound ACCEPT allows, and only a positively-wrong binding blocks", async () => {
+  const base: any = {
+    repo: "owner/repo",
+    headSha: "a".repeat(40),
+    pr: 7,
+    unattributableReason: null,
+    bound: [],
+    prRecord: null,
+    corruptFiles: [],
+    prTier: null,
+    liveMergeBase: null,
+  };
+  const rec = (over: Record<string, unknown> = {}) => ({
+    file: "/r/7.json",
+    record: { pr: 7, head_sha: "a".repeat(40), verdict: "clean", repo: "owner/repo", ...over },
+  });
+
+  equal(evaluateDispatchFloorRecordArm({ ...base, bound: [rec()] }).status, "allow", "head+verdict+repo → allow");
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [rec({ verdict: "nope" })] }, false).status,
+    "block",
+    "a bound record with an unacceptable verdict blocks EVEN when the session dispatched"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [] }, false).status,
+    "abstain",
+    "no record + a dispatch → abstain: the counter decides, and the record cannot block what it never saw"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, headSha: null }, true).status,
+    "abstain",
+    "an unattributable op is never an allow"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, corruptFiles: ["/r/7.json"] }).status,
+    "block",
+    "a corrupt file blocks the allow path"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [rec({ verdict: "clean-micro" })], prTier: null }).status,
+    "block",
+    "an unverifiable clean-micro binding blocks the ALLOW path (fail closed)"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [rec({ verdict: "clean-micro" })], prTier: null }, false).status,
+    "abstain",
+    "…but it does NOT manufacture a block over a session dispatch (that path was legitimate before)"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [], prRecord: rec({ head_sha: "f".repeat(40) }) }).status,
+    "block",
+    "a PR record naming another head blocks the ALLOW path (stale), and the text names the difference"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, bound: [], prRecord: rec({ head_sha: "f".repeat(40) }) }, false).status,
+    "abstain",
+    "…but a stale record must NEVER hard-block a dispatched session (it does not bind this head)"
+  );
+  equal(
+    evaluateDispatchFloorRecordArm({ ...base, corruptFiles: ["/r/7.json"] }, false).status,
+    "abstain",
+    "a corrupt record abstains on the dispatched path (unparseable ⇒ cannot bind)"
+  );
+});
+
+test("#2471 the verdict-binding table is keyed by the ACCEPTED vocabulary (no 4th verdict can slip through)", () => {
+  deepEqual(
+    [...VERDICT_BINDING.keys()].sort(),
+    [...ACCEPTED_VERDICTS].sort(),
+    "every accepted verdict needs exactly one binding row — otherwise a verdict the gate accepts has an ASSUMED binding"
+  );
+  // And the ARM's own body must not re-literalise the vocabulary at a call site
+  // (the C7 rule), which is what `record.verdict === "clean"` would be. Scoped to
+  // the function: the MERGE gate legitimately compares `=== "clean-low"` for its
+  // #1348 base binding, and that predates this change.
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const fnSrc = src.slice(src.indexOf("export function floorRecordBinding"));
+  const fnBody = fnSrc.slice(0, fnSrc.indexOf("\n}\n"));
+  ok(fnBody.includes("VERDICT_BINDING.get(record.verdict)"), "the arm consults the table");
+  ok(
+    !/record\.verdict === "/.test(fnBody),
+    "floorRecordBinding consults VERDICT_BINDING, never a re-literalised verdict"
+  );
+});
+
+testAsync("#2471 (xii) a COMMIT whose message mentions a push is never cleared by the record arm", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    // The measured fail-open (round-3 VGATE): the phrase `git push` lives inside
+    // the commit MESSAGE. It is data, so no head is published by this op and the
+    // #485 net must still block at 0 dispatches.
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const cmd = `cd "${f.repoDir}" && git commit -q -m "fix: git push flow"`;
+    const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    ok(res && res.block, "a commit message mentioning a push must NOT be cleared by a record at HEAD");
+  });
+});
+
+testAsync("#2471 (xv) `git push <name>` where <name> is BOTH a remote and a ref is not bound to the ref", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head)); // the REVIEWED commit is HEAD
+    // A second, UNREVIEWED tip on a branch whose name collides with a remote
+    // (round-5 VGATE, measured: git treats the first positional as the REPOSITORY
+    // and publishes the current branch, i.e. away from the reviewed sha).
+    execSync(`git -C "${f.repoDir}" checkout -q -b up`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" remote add up /tmp/does-not-exist-up`, { stdio: "ignore" });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const cmd = `cd "${f.repoDir}" && git push up`;
+    const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    ok(res && res.block, "a remote/ref name collision is AMBIGUOUS — the arm must not bind the ref's sha");
+  });
+});
+
+testAsync("#2471 (xvi) a PATH-repository whose name is also a local ref is not bound to the ref", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head)); // the REVIEWED commit is HEAD
+    // Round-6 VGATE, measured: git resolves the first positional as a repository
+    // for a PATH too, so this push publishes the CURRENT branch — not the sha the
+    // same-named local branch points at.
+    const bare = resolvePath(f.repoDir, "up");
+    execSync(`git init -q --bare "${bare}"`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" branch up HEAD`, { stdio: "ignore" });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push up` },
+    });
+    ok(res && res.block, "a PATH-repository/refl name collision is AMBIGUOUS — never bound to the ref");
+  });
+});
+
+testAsync("#2471 (xvii) `push.default=matching` makes a bare remote push unattributable", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    execSync(`git -C "${f.repoDir}" config push.default matching`, { stdio: "ignore" });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && git push origin` },
+    });
+    ok(
+      res && res.block,
+      "with push.default=matching a bare `git push <remote>` publishes EVERY matching branch, so no single head can be bound"
+    );
+  });
+});
+
+testAsync("#2471 (xiii) a multi-refspec push that publishes an UNREVIEWED ref is not cleared", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    // A second, UNREVIEWED branch tip in the same repo (measured fail-open,
+    // round-4 VGATE: plain git creates BOTH remote refs in one push).
+    execSync(`git -C "${f.repoDir}" checkout -q -b other`, { stdio: "ignore" });
+    fs.writeFileSync(resolvePath(f.repoDir, "b.txt"), "b\n");
+    execSync(`git -C "${f.repoDir}" add b.txt`, { stdio: "ignore" });
+    execSync(`git -C "${f.repoDir}" -c commit.gpgsign=false commit -qm two`, { stdio: "ignore" });
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const cmd = `cd "${f.repoDir}" && git push origin other:fix/y HEAD:fix/z`;
+    const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    ok(res && res.block, "a second refspec publishing an unreviewed commit must block (it rides along)");
+  });
+});
+
+testAsync("#2471 (xiv) a multi-refspec push where EVERY ref is the recorded commit IS allowed", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    const cmd = `cd "${f.repoDir}" && git push origin HEAD:fix/y HEAD:fix/z`;
+    const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    equal(res, undefined, "both refs publish the SAME reviewed commit, so the head is still bound");
+  });
+});
+
+testAsync("#2471 (xviii) a COMMAND-SCOPED git config override is not attributed (fail closed)", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    // Measured fail-open (round-7): the gate read push.default from the repo
+    // config while the command-scoped override made git publish every branch.
+    const cmd =
+      `cd "${f.repoDir}" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default ` +
+      `GIT_CONFIG_VALUE_0=matching git push origin HEAD:fix/probe`;
+    const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    ok(res && res.block, "a command-scoped git config makes the published refs unreadable → block");
+  });
+});
+
+testAsync("#2471 (xix) `gh pr create --head/--repo` is not bound to the local HEAD", async () => {
+  await withFloorFixture({}, async (f) => {
+    writeReviewFile(f.recordFile, floorRecord(f.head));
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start", {});
+    for (const extra of ["--head other", "--repo someone/else"]) {
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `cd "${f.repoDir}" && gh pr create --title t ${extra}` },
+      });
+      ok(res && res.block, `pr create ${extra} creates a PR this gate cannot bind → block`);
+    }
+    // The plain form keeps working.
+    const okRes = await fire("tool_call", {
+      toolName: "bash",
+      input: { command: `cd "${f.repoDir}" && gh pr create --title t --body x` },
+    });
+    equal(okRes, undefined, "a plain pr-create still publishes HEAD and is bound as before");
+  });
+});
+
+test("#2471 parsePushSourceRef is conservative — only a single, resolvable source ref binds", () => {
+  equal(parsePushSourceRef(`cd /x && git push`).source, "HEAD", "a bare push publishes HEAD");
+  // `git push origin` is ambiguous in TEXT alone: one token can be a remote
+  // (publishes HEAD) or a refspec. The pure parser reports the ambiguity and the
+  // I/O layer asks git (see the behavioural case below) — never a guess.
+  equal(parsePushSourceRef(`cd /x && git push origin`).source, "origin", "…reported as the ambiguous token");
+  ok(parsePushSourceRef(`cd /x && git push origin`).ambiguousRemote === true, "…flagged as possibly-a-remote");
+  equal(parsePushSourceRef(`cd /x && git push origin HEAD:fix/y`).source, "HEAD", "an explicit HEAD refspec");
+  equal(parsePushSourceRef(`cd /x && git push -f origin fix/y:fix/y`).source, "fix/y", "a branch refspec names its source");
+  equal(parsePushSourceRef(`cd /x && git push --all`).source, null, "--all publishes many refs");
+  equal(parsePushSourceRef(`cd /x && git push --mirror`).source, null, "--mirror publishes many refs");
+  equal(parsePushSourceRef(`cd /x && git push origin :fix/y`).source, null, "a delete publishes nothing to review");
+  equal(parsePushSourceRef("cd /x && git push origin 'refs/heads/*'").source, null, "a glob refspec publishes many refs");
+  equal(
+    parsePushSourceRef(`cd /x && git push origin a && git push origin b`).source,
+    null,
+    "two pushes in one command bind no single head"
+  );
+  // ⛔ Several refspecs in ONE push are all published; the caller must see them all.
+  const multi = parsePushSourceRef(`cd /x && git push origin other:fix/y HEAD:fix/z`);
+  equal(multi.source, "other", "the FIRST refspec source is reported");
+  deepEqual(multi.extraSources, ["HEAD"], "…and every other refspec with it");
+  equal(parsePushSourceRef(`cd /x && git push --follow-tags`).source, null, "--follow-tags publishes tags too");
+  equal(parsePushSourceRef(`cd /x && git push --tags`).source, null, "--tags publishes tag refs");
+  equal(parsePushSourceRef(`cd /x && gh pr create --title t`).source, "HEAD", "pr create publishes HEAD");
+  equal(parsePushSourceRef(`cd /x && gh pr create --head other --title t`).source, null, "--head creates another branch's PR");
+  equal(parsePushSourceRef(`cd /x && gh pr create --repo a/b --title t`).source, null, "--repo creates a PR elsewhere");
+  // ⛔ Data is not an op (#2471 round-3 VGATE, a measured fail-open).
+  equal(
+    parsePushSourceRef('git commit -q -m "fix: git push flow"').source,
+    null,
+    "a push named inside a commit MESSAGE publishes nothing"
+  );
+  equal(
+    parsePushSourceRef(`cd /x && cat > NOTES.md <<'EOF'\ngit push origin x\nEOF`).source,
+    null,
+    "a push named inside a heredoc BODY publishes nothing"
+  );
 });
 
 // ── Summary ───────────────────────────────────────────
