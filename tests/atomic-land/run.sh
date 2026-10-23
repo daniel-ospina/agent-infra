@@ -2601,8 +2601,15 @@ if true; then
   # makes 4 a NORMAL outcome, so the landing side is the half that must still refuse).
   # VERIFIED NECESSARY: before scenario 2b-vii existed, this mutation left the suite
   # green — every clause-(E) fixture was position-gated to the preflight. 2b-vii must
-  # redden.
-  mutate_and_expect_fail B5g  's/^  if ! do_record; then exit 1; fi$/  do_record; __r=$?; [ "\044__r" -eq 4 ] || [ "\044__r" -eq 0 ] || exit 1/m'
+  # redden, and it must be the ONLY thing that reddens: a mutant that also breaks the
+  # pre-existing refusal scenarios proves nothing about the landing side.
+  # ⛔ `\044?` is the RUNTIME STATUS: a bare `$?` here is interpolated by PERL (its own
+  # exit status, 0) at substitution time, so `__r=$?` became `__r=0` and the mutant
+  # accepted EVERY `do_record` failure — 6 assertions red including three that predate
+  # this change, while the harness still printed "class covered". It parses and it
+  # reddens, so neither the `cmp` nor the `bash -n` guard can tell (trap (1) above).
+  # With the escape, exactly 2 assertions redden and both are 2b-vii's.
+  mutate_and_expect_fail B5g  's/^  if ! do_record; then exit 1; fi$/  do_record; __r=\044?; [ "\044__r" -eq 4 ] || [ "\044__r" -eq 0 ] || exit 1/m'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
