@@ -561,6 +561,66 @@ check_operational_layer() {
   fi
 }
 
+# ── the cross-box review-record registry (agent-infra#2374) ─────────────────────
+# WHY THIS RUNS DURING BRING-UP. `~/.pi/agent/reviews/` is per-box, and a freshly booted cell that
+# has never minted a record would refuse every PR another box reviewed — the box is not "unable to
+# review", it is BLIND, and nothing on it said so (#2349 measured 142 such blocks on one box; 134
+# records existed nowhere but the box that minted them). `registry-sync.sh union` converges this
+# box's registry with the fleet's through the one store every box shares — the repository — so a
+# cell starts with the records that already exist instead of with none.
+#
+# NOT A REFUSAL, and deliberately. A box that cannot reach the store can still REVIEW (and record)
+# locally, so failing bring-up here would trade a blind box for a dead cell — the same
+# over-blocking the A/B test calls category B. What must not happen is SILENCE: an unreachable
+# store is reported as UNKNOWN (never "empty"), and the cell is told to re-run the verb.
+# The sync is bounded (registry-sync.sh --timeout) and its exit status is captured from the
+# COMMAND, never from a `| sed` decoration.
+check_review_registry() {
+  local sync="$CELL_HOME/.pi/agent/scripts/registry-sync.sh" out rc=0 store=""
+  # The farmed copy is what a lane will run, and the checkout that installed the layer is the one
+  # whose remote carries the refs — the farmed copy has no repo above it, so name the store.
+  [ -f "$sync" ] || sync="$LAYER_ROOT/scripts/registry-sync.sh"
+  if [ ! -f "$sync" ]; then
+    warn "registry-sync.sh is not on this cell (neither the farmed copy nor \$LAYER_ROOT) — the review-record"
+    warn "  registry stays LOCAL-ONLY here, so a PR reviewed on another box will read as unreviewed (#2374)."
+    return 0
+  fi
+  for store in "$LAYER_ROOT" "${AGENT_INFRA_PATH:-}"; do
+    [ -n "$store" ] && [ -d "$store" ] && break
+    store=""
+  done
+  # The store is passed as an ARRAY, not `${store:+--repo "$store"}`: the quotes inside that
+  # expansion are LITERAL words, so a $LAYER_ROOT containing a space arrived as two arguments and
+  # registry-sync.sh exited 2 — a cell reporting "the registry is unsynced" for a quoting bug.
+  local -a store_args=()
+  [ -n "$store" ] && store_args=(--repo "$store")
+  # `--dir` is passed EXPLICITLY, and the registry is named from CELL_HOME rather than assumed:
+  # `HOME` is repointed to $CELL_HOME by setup_home/check_provider, but that invariant lives in
+  # OTHER functions and this check must not silently certify a registry the cell's lanes never
+  # read. (The old `CELL_HOME="$CELL_HOME" bash …` prefix was inert — registry-sync.sh resolves
+  # REGISTRY_SYNC_DIR or $HOME and never reads CELL_HOME, which asserted a redirect that does not
+  # exist.)
+  out="$(bash "$sync" union --dir "$CELL_HOME/.pi/agent/reviews" "${store_args[@]+"${store_args[@]}"}" --timeout 30 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  case "$rc" in
+    0) ok "review-record registry synced with the fleet ($(printf '%s\n' "$out" | grep -E '^union:' | tail -1))"
+       # rc 0 is CONVERGED, not "nothing to say": a per-record notice (a store this cell could not
+       # use, a local legacy record kept local by rule 3) must still reach the operator.
+       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/    /' >&2 || true ;;
+    3) warn "the review-record registry DIVERGES from the fleet at the same reviewed_at — neither side was"
+       warn "  overwritten (#2374 rule 4); this cell keeps what it has. Reconcile by hand if this is not two"
+       warn "  boxes recording one revision." ;;
+    4) warn "the fleet's registry holds records this cell could NOT use (unreadable ref or stamp, or a"
+       warn "  mis-keyed record) — they were skipped and nothing was overwritten, but this is NOT a converged"
+       warn "  state. Re-run: bash $sync union ${store:+--repo \"$store\"}" ;;
+    *) warn "the cross-box review-record registry could NOT be synced (rc=$rc) — see the lines above for"
+       warn "  WHICH SIDE failed: a failed PULL leaves the fleet's records UNKNOWN here (not empty), a failed"
+       warn "  PUSH means this cell read them but its own are still LOCAL. Re-run:"
+       warn "  bash $sync union ${store:+--repo \"$store\"}" ;;
+  esac
+  return 0
+}
+
 # ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
 # REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
 # in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
@@ -718,6 +778,9 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer exists: registry-sync.sh arrives WITH it (the farm), and the checkout that
+      # installed the layer is the store whose remote carries the refs.
+      check_review_registry
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).
