@@ -1101,8 +1101,8 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
                         if (t ~ /^    /) continue
                         print ln[i]
                       }
-                    }' \
-             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tr -d '\r' > "$RUN_DIR/verdict-lines.txt"
+                    }' | tr -d '\r' > "$RUN_DIR/survivors.txt"
+  grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$RUN_DIR/survivors.txt" > "$RUN_DIR/verdict-lines.txt"
   LAST_LINE="$(tail -1 "$RUN_DIR/verdict-lines.txt" 2>/dev/null)"
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS KEPT (P1/P2, fresh review of #2288): the
   # contradiction guard read only this LAST line, so a counted CLEAN — or an `ISSUES 2` — one line
@@ -1111,6 +1111,13 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
   # unaffected; the count/binding checks below therefore iterate over it rather than over $LAST.)
 LAST="$LAST_LINE"
 VERDICT_LINES_FILE="$RUN_DIR/verdict-lines.txt"
+# ⛔ THE COUNT CHANNEL IS THE WHOLE SURVIVOR SET, NOT ONLY THE VERDICT-SHAPED LINES (P1, third fresh
+# review of #2288 — MEASURED: `I found two blocking issues:` on one line and a bare `CLEAN` on the
+# next recorded a signed clean record, because the counted line carried no verdict word). A reported
+# count of findings anywhere in the accepted region is a finding, whatever line the reviewer put it
+# on; the zero filter below keeps `0 blocking findings` clean, and quoted/fenced/indented regions
+# are already excluded by the map, so a clean report that QUOTES someone else's count is unaffected.
+SURVIVORS_FILE="$RUN_DIR/survivors.txt"
 # ⛔ THE VERDICT MUST BE THE LAST VERDICT-SHAPED LINE IN THE TRANSCRIPT (P1, fresh review of
 # #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
 # silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
@@ -1689,9 +1696,20 @@ refuse_counted_clean() {
   #       count channel read only the accepted line.
   # The file iterated here is the SAME survivor set the verdict comes from (quoted regions
   # excluded), so a clean report that QUOTES someone else's `ISSUES 2` is unaffected.
+  # ⛔ A MISSING/UNREADABLE FILE MUST NOT READ AS "NO COUNTED LINE" (P3, third fresh review of #2288 —
+  # MEASURED: under `set -uo pipefail` without `-e` a redirect failure skips the loop body, the function
+  # returns 0, and the guard passes exactly as if it had read zero counted lines). The sibling file gets
+  # the same explicit invariant at its own read site; this one gets it here.
+  for _src in "$SURVIVORS_FILE" "$VERDICT_LINES_FILE"; do
+  [ -r "$_src" ] \
+    || die "$E_SCAN" "the transcript-analysis file $_src is missing or unreadable — the count guard cannot be shown to have run, so no verdict is recorded (transcript: $TRANSCRIPT)"
   while IFS= read -r _vl; do
     [ -n "$_vl" ] || continue
     # (b) an EARLIER verdict-shaped line that says ISSUES is a contradiction, whatever its count.
+    # ONLY ON A VERDICT-SHAPED LINE: the count channel is the whole survivor set (a count can hide on
+    # an unshaped line), but a bare mention of the word "issues" in prose is not a verdict — so this
+    # half of the guard reads the verdict-shaped subset only.
+    if [ "$_src" = "$VERDICT_LINES_FILE" ]; then
     _vw="$(printf '%s' "$_vl" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
     if [ "$_vw" = "issues" ] && [ "$_vl" != "$LAST" ]; then
       err "$PROG: the transcript states ISSUES on an earlier verdict-shaped line and a CLEAN verdict last — a reviewer that reported issues and then closed with a bare CLEAN has not reviewed this revision clean."
@@ -1700,13 +1718,21 @@ refuse_counted_clean() {
       err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
       die "$E_ISSUES" "a self-contradicting transcript (an ISSUES verdict line, then CLEAN) is never recorded — re-run the review"
     fi
+    fi
     # (a) a non-zero count of findings on ANY verdict-shaped line.
     # ⛔ THE QUANTIFIER REACHES THE NOUN, AND A COPULA IS A PARTICIPLE (kept from the concurrent fix
     # this commit is rebased onto): the bridge between the numeral and `finding(s)` is any run of up
     # to three words, and a resolved participle may carry `was|is|are|were`. Vocabulary also carries
     # the word numerals this lane added (single/sole/lone/half a dozen/thirteen…twenty).
+    # ⛔ ONE CLOSED FINDING-NOUN LIST, NOT TWO (P1, third fresh review of #2288 — MEASURED fail-OPEN).
+    # The severity scanner's own `noun()` recognises `defects?|bugs?|…`, but this count guard knew only
+    # `findings?|issues?|blockers?|problems?`, so `CLEAN — 2 defects remain in scripts/x.sh`, `CLEAN —
+    # two blocking defects remain`, `ISSUES 0 — one blocking defect is pre-existing` and their
+    # `regressions?/vulnerabilit(y|ies)|violations?` twins all exited 0 and wrote a SIGNED clean record
+    # over a reported blocker. The vocabulary below is `noun()`'s, in the same source order, so the two
+    # readers cannot drift apart again without the §BB vocabulary arm going red.
     _hit="$(printf '%s' "$_vl" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|issues?|blockers?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
       | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
     [ -n "$_hit" ] || continue
     # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
@@ -1719,7 +1745,9 @@ refuse_counted_clean() {
       CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
     done <<<"$_hit"
     [ -n "$CLEAN_COUNT_WORDS" ] && break
-  done < "$VERDICT_LINES_FILE"
+  done < "$_src"
+  [ -n "$CLEAN_COUNT_WORDS" ] && break
+  done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
     err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
     err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
@@ -2092,6 +2120,22 @@ marker_state() { # <body> -> signed | unsigned | absent
   [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
   printf 'absent'
 }
+# ⛔ A FUNCTION CALLED IN A COMMAND SUBSTITUTION CANNOT PUBLISH A GLOBAL (P3, this lane — found by the
+# new arm going red for the WRONG reason): `MARKER_STATE="$(marker_state ...)"` runs in a subshell, so
+# the diff group it parsed died with it and the seam fell back to a live read that could itself fail.
+# The marker's `diff=` is therefore read by its own pass, here, with no network call.
+marker_diff_for() { # <body> -> the diff group of the marker bound to THIS pr/head/repo
+  local body="$1" line pr_re head_re repo_lc
+  pr_re="$PR"; head_re="$HEAD"; repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
+    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
+    [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
+    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
+    printf '%s' "${BASH_REMATCH[4]# diff=}"; return 0
+  done <<<"$body"
+  return 0
+}
 BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
 BODY_RC=$?
 [ "$BODY_RC" -eq 0 ] \
@@ -2104,6 +2148,29 @@ case "$MARKER_STATE" in
   *)
     die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its append is idempotent)." ;;
 esac
+# ⛔ THE RECORD'S OWN DIFF MUST BE THE DIFF THE REVIEWER READ (P2, third fresh review of #2288 —
+# MEASURED, a signed record minted over a diff nobody reviewed). The pre-post DIFF_AFTER check reads
+# the diff ONCE more, but `record-review.sh` then hashes the LIVE diff again at record time
+# (`diff_hash_for_pr`), so a BASE retarget landing in the window between those two reads — or between
+# the recorder's read and the gate's — mints a marker whose `diff=` is a diff the reviewer never saw,
+# at the unchanged head, and check (c) stays green because it binds the head sha. Every read is
+# separated by a network round trip, so the window is real. The marker's own `diff=` group is the
+# authoritative statement of what was signed: compare it to what was reviewed, and where the recorder
+# wrote no `diff=` group, fall back to one more live read. Cost on the clean path: zero extra calls
+# when the group is present, one read when it is not.
+MARKER_DIFF="$(marker_diff_for "$BODY_AFTER")"
+if [ -n "${MARKER_DIFF:-}" ]; then
+  DIFF_REVIEWED="$(printf '%s' "$DIFF_FULL" | sha256sum | cut -d' ' -f1)"
+  if [ "$MARKER_DIFF" != "$DIFF_REVIEWED" ]; then
+    die "$E_MOVED" "the SIGNED record's diff ($MARKER_DIFF) is NOT the diff the reviewer read ($DIFF_REVIEWED) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. Nothing to re-review: the head is unchanged, so re-run this command (the recorder's same-head write is idempotent) to re-sign the diff that was actually read."
+  fi
+else
+  DIFF_SIGNED="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \
+    || die "$E_RECORD" "the record carries no diff= group and the diff could not be re-read to check it — refusing to report success on an unverified attestation (transcript: $TRANSCRIPT)"
+  if [ "$DIFF_SIGNED" != "$DIFF_FULL" ]; then
+    die "$E_MOVED" "the diff CHANGED during the record step (head unchanged: a BASE retarget) and the record carries no diff= group to prove otherwise — re-run this command at the new base."
+  fi
+fi
 say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
 # ⛔ THE CLEAN PATH DOES NOT LEAVE THE SCRATCH TRANSCRIPT BEHIND (P3, fresh review of #2288):
 # `cleanup` removes only $RUN_DIR, so every invocation — success included — left

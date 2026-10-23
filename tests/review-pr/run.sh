@@ -130,7 +130,7 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
+       FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
        FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
@@ -335,6 +335,14 @@ fi
 # for the seam's post-record verification to be exercised at all.
 if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ] || [ "${FIXTURE_NO_RECORD_FILE:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
 marker="review recorded: reviews/$pr.json verdict=$verdict @ $sha ($repo)"
+# ⛔ THE RECORD'S OWN diff= GROUP (P2, third fresh review of #2288): `record-review.sh` hashes the LIVE
+# diff at record time, so a base retarget between the seam's DIFF_AFTER read and the recorder's own
+# read mints a marker attesting a diff nobody reviewed — at the unchanged head, so check (c) stays
+# green. The seam now compares the marker's own `diff=` to what it reviewed, which can only be driven
+# if the fixture can WRITE that group (the real recorder always does).
+if [ -n "${FIXTURE_MARKER_DIFF:-}" ]; then
+  marker="review recorded: reviews/$pr.json verdict=$verdict @ $sha diff=$FIXTURE_MARKER_DIFF ($repo)"
+fi
 if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
   # ⛔ THE UNSIGNED-MARKER ARM IS CHECKED FIRST (P3, freshest review of #2288): FIXTURE_SIGN_KEY is now
   # EXPORTED (it was not, which is why the real-HMAC branch below was dead), so keying this branch on
@@ -371,7 +379,7 @@ reset() {
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
-  FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
+  FIXTURE_MARKER_MISSING=0; FIXTURE_MARKER_DIFF=""; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
   FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
   FIXTURE_READ_FAIL=""; FIXTURE_NO_RECORD_FILE=0; FIXTURE_FLIP_DIFF=0
   # Every scenario signs with a FIXTURE key by default so the fake recorder writes a REAL HMAC (a
@@ -793,7 +801,12 @@ if [ -z "$UTF8_OK" ]; then
   fail "PROMPT_MAX re-compose arm SKIPPED: this box has no UTF-8 locale, so a multi-byte diff cannot be built (the branch is untested here)"
 else
 reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
-LC_ALL="$UTF8_OK" run "$SRC" 2284
+# ⛔ THE LOCALE MUST REACH THE SUT THROUGH THE HARNESS'S OWN SEAM (P2, third fresh review of #2288 —
+# MEASURED: `LC_ALL=C.UTF-8 run …` proves nothing, because `run()` assigns `LC_ALL="${RUN_LC_ALL-}"`
+# in its command prefix and OVERRIDES the caller — the SUT then ran in the C locale and this arm went
+# red on any runner whose ambient LANG is not UTF-8, the exact false signal the arm exists to prevent.
+# `RUN_LC_ALL` is the seam §AN already uses.
+RUN_LC_ALL="$UTF8_OK" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
 case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
 ck $rc "…via the no-diff re-compose branch (the PROMPT_MAX byte budget)"
@@ -1868,8 +1881,18 @@ echo; echo "§AT the scanner awk program compiles under $(command -v awk) and st
 SCANNER="$(sed -n "/^BLOCK_SPAN_AWK='/,/^'\$/p" "$SRC" | sed '1d;$d')"
 [ -n "$SCANNER" ]; ck $? "the scanner program was extracted from the SUT"
 printf '%s\n' "$SCANNER" > "$TMP/scanner.awk"
-awk -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
-[ "$sp" = "0" ]; ck $? "…and COMPILES under $(command -v awk) (rc=$sp)"
+AWKS_TRIED=""
+for _a in awk gawk mawk nawk; do
+  command -v "$_a" >/dev/null 2>&1 || continue
+  "$_a" -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
+  AWKS_TRIED="$AWKS_TRIED $_a"
+  [ "$sp" = "0" ]; ck $? "…and COMPILES under $_a (rc=$sp)"
+done
+# ⛔ ONE DIALECT IS NOT "THE DIALECTS" (P2, third fresh review of #2288): the defect this arm exists
+# for was gawk refusing a program mawk accepted, so compiling under whichever `awk` PATH happens to
+# resolve to proves that box's dialect and nothing else. Every discoverable implementation is compiled
+# above and the list is PRINTED, so a one-awk box says so instead of implying coverage.
+[ -n "$AWKS_TRIED" ]; ck $? "at least one awk implementation was exercised:$AWKS_TRIED"
 # A COMPILE WARNING is not a failure, but it is the signature of the class that produced the P1, so
 # show it when there is one instead of swallowing it into pass output.
 [ "$sp" = "0" ] && [ -s "$TMP/scanner.err" ] && echo "     · scanner warnings: $(head -2 "$TMP/scanner.err" | tr '\n' ' ')"
@@ -2111,6 +2134,63 @@ grep -qx 'KIND=reviewer' "$TMP/pi-env.txt" 2>/dev/null; ck $? "the child saw KIN
 grep -qx 'TAG=2284' "$TMP/pi-env.txt" 2>/dev/null; ck $? "  …and TAG=2284"
 reset
 
+# ── §BH the count guard's FINDING NOUN, the line it reads, and the signed diff ──
+echo; echo "§BH the count guard knows every noun the severity scanner knows, on any line"
+# ⛔ P1 (third fresh review of #2288, MEASURED — each of these exited 0 and wrote a SIGNED clean
+# record over a reported blocker). The severity scanner's `noun()` is
+# `findings?|blockers?|issues?|defects?|bugs?|…`, but this guard knew only findings/issues/blockers/
+# problems — so ordinary phrasing walked straight past it. The two readers now share one list; every
+# form below is pinned, in the same spirit as the qualifier-run loop above.
+for _sp in \
+  '**Verdict:** CLEAN — 2 defects remain in scripts/x.sh and scripts/y.sh.' \
+  '**Verdict:** CLEAN — one bug remains in the guard.' \
+  '**Verdict:** CLEAN — two blocking defects remain.' \
+  '**Verdict:** CLEAN — three regressions found.' \
+  '**Verdict:** CLEAN — 2 vulnerabilities remain.' \
+  '**Verdict:** CLEAN — one policy violation.' \
+  'ISSUES 0 — note that one blocking defect is pre-existing and out of scope.'
+do
+  reset; printf '%s\n' "$_sp" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused: $_sp (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# ⛔ AND THE COUNT CHANNEL IS THE WHOLE SURVIVOR SET, NOT THE VERDICT-SHAPED LINES (same P1, MEASURED:
+# `I found two blocking issues:` then a bare `CLEAN` recorded clean, because the counted line carries
+# no verdict word). A reported count anywhere in the accepted region is a finding.
+reset; printf 'I found two blocking issues:\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a count on an UNSHAPED line above a bare CLEAN is refused (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+# COUNTER-DIRECTIONS — the widened channel must not refuse a clean report that merely MENTIONS these
+# nouns with no count, nor a quoted count, nor a zero count.
+reset; printf 'No defects, no regressions and no violations were found.\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...while noun prose with no count still records (rc=$(rc_of))"
+reset; printf '```\nI found two blocking defects.\n```\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and a FENCED/quoted count is still somebody else's (rc=$(rc_of))"
+# ⚠️ DECLARED RESIDUAL: a `>` blockquote is NOT a quote region to this map (it is text the reviewer
+# chose to indent, not a fenced/HTML/indented-code quotation), so a count inside one is refused. The
+# direction is fail-closed and the remedy is the one the refusal prints (say what you mean, plainly).
+reset; printf '**Verdict:** CLEAN — 0 defects, 0 regressions.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and a ZERO noun report records (rc=$(rc_of))"
+reset
+# ⛔ THE RECORD'S OWN diff= MUST BE THE DIFF REVIEWED (P2, third fresh review of #2288 — MEASURED: a
+# signed marker minted with a diff= the reviewer never read, at the unchanged head, printed ✅ because
+# check (c) binds the head sha and the seam's own diff checks all run BEFORE the recorder re-reads
+# the live diff). The fixture can now write that group, exactly as record-review.sh does.
+DH="$(printf '%s' "$FIXTURE_DIFF" | sha256sum | cut -d' ' -f1)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$DH"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a marker whose diff= IS the reviewed diff records (rc=$(rc_of))"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$(printf '%064d' 1)"
+run "$SRC" 2284
+[ "$(rc_of)" = "8" ]; ck $? "  ...and a marker whose diff= is NOT the reviewed diff is exit 8 (rc=$(rc_of))"
+err_has "NOT the diff the reviewer read"; ck $? "    ...naming the mismatch"
+reset
+
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
 # `ck` runs AFTER this comparison, so on a fully green run PASS is 478 here and the RESULT line then
 # prints 479. A floor equal to the printed total could never pass — a permanently red tripwire is
@@ -2125,7 +2205,8 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 634 (concurrent-fixer merge) when §AS/§AT/§AU added 20, §AV-§AZ added 34, §BA-§BG added 30 and the concurrent-fix merge added 9 (the gawk-dialect P1, the wall-clock cap and the
+# Re-set to 661 when §BH (noun vocabulary, the survivor-set count channel, the marker diff=) added 22
+# assertions and §AT/§P/§AP were repaired (third fresh review). It was 634 (concurrent-fixer merge) when §AS/§AT/§AU added 20, §AV-§AZ added 34, §BA-§BG added 30 and the concurrent-fix merge added 9 (the gawk-dialect P1, the wall-clock cap and the
 # sent-argv body-write arm).
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
@@ -2193,10 +2274,17 @@ FIXEDSPELLINGS
 # finding remains" could pass because the line happened to fail some other check.
 MC="$TMP/mutant-count.sh"
 cp "$SRC" "$MC"; chmod +x "$MC"
-sed 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_cm"; break$/\1: "$_cm"/' "$SRC" > "$MC"
-# …and the per-MATCH assignment is a SECOND place the count can be dropped (P1 merge of two concurrent
-# fixes on this PR): mutate it too, so the merged guard cannot be half-dead.
-sed 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_one"; CLEAN_COUNT_LINE="\$_vl"; break$/\1: "$_one"/' "$SRC" > "$MC"
+# ⛔ CHAINED, AND EVERY STEP IS CHECKED (P3, third fresh review of #2288): the merged guard has ONE
+# live assignment site (`$_one`); the `$_cm` site the two concurrent fixes left behind no longer
+# exists, so that sed matched nothing — and because the second sed read $SRC again and wrote $MC, it
+# silently discarded the first while `cmp` passed on the second alone: the control claimed two sites
+# and proved one. A sed that matches nothing is now its own red.
+_mut_step() { # <sed-expr> <label>
+  sed "$1" "$MC" > "$MC.next" || { fail "mutation sed failed: $2"; return 1; }
+  cmp -s "$MC" "$MC.next" && { fail "the $2 mutation did not apply — this control proves NOTHING"; return 1; }
+  mv "$MC.next" "$MC"
+}
+_mut_step 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_one"; CLEAN_COUNT_LINE="\$_vl"; break$/\1: "$_one"/' 'per-match count assignment'
 if cmp -s "$SRC" "$MC"; then
   fail "the count-arm mutation did not apply - this control proves NOTHING"
 else
@@ -2287,6 +2375,12 @@ SLOW_CHILD="$(cat "$TMP/slow-child.pid" 2>/dev/null || true)"
 [ -n "$SLOW_CHILD" ] && kill -0 "$SLOW_CHILD" 2>/dev/null; ck $? "the slow reviewer child really started (pid=${SLOW_CHILD:-<none>})"
 kill -TERM "$SUT_PID" 2>/dev/null
 for _i in $(seq 1 200); do kill -0 "$SUT_PID" 2>/dev/null || break; sleep 0.05; done
+# ⛔ THE DOCUMENTED 143 HAD NO ASSERTION (P3, third fresh review of #2288): the arm checked that the
+# CHILD died and that nothing was recorded or posted, but never collected the seam's own exit status,
+# so a trap regressing to a plain `exit 1` (or no trap at all) stayed green while the header table and
+# every lane brief promise "143 = terminated by a signal".
+wait "$SUT_PID" 2>/dev/null; _sut_rc=$?
+[ "$_sut_rc" = "143" ]; ck $? "  ...and the seam itself exits 143 on SIGTERM (rc=$_sut_rc)"
 sleep 2
 [ -n "$SLOW_CHILD" ] && kill -0 "$SLOW_CHILD" 2>/dev/null && alive=1 || alive=0
 [ "$alive" = "0" ]; ck $? "  ...and SIGTERM to the seam takes the CHILD with it (alive=$alive)"
@@ -2294,6 +2388,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 634 ]; ck $? "assertion-count pin: >= 634 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 661 ]; ck $? "assertion-count pin: >= 661 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
