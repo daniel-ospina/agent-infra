@@ -59,7 +59,10 @@ condition is gone.
   `<state>/harness-apply-preserved/<UTC>/changes.patch`, every untracked file is copied
   under `untracked/`, and `MANIFEST` lists every path taken; each path is printed as it is
   saved. Only then are the tracked paths brought back to `HEAD` and the checkout advanced.
-  If anything cannot be preserved, the pass REFUSES (exit 20) and touches nothing.
+  If anything cannot be preserved, the pass REFUSES (exit 20). Preservation and the restore
+  are one pass over the same list, so a failure in the restore half can leave the checkout
+  **part-restored** — every affected byte is written to the preservation directory first, and
+  the refusal message says which of the two happened.
   This is the Mac defect: `sync.sh` aborting on a dirty tree is right — having no path
   that saves the work and finishes the advance is what cost 91 commits.
 - **A RUNNING LANE IS NEVER SIGNALLED.** The pass contains no `kill`, `pkill`,
@@ -104,7 +107,7 @@ epoch=1750000000
 at=2026-10-23T05:00:00Z
 head=ce987bb2c1de            <- the CHECKOUT (a pin advance never moves it)
 deployed=ce987bb2c1de        <- the commit this box RUNS (the pin tree); `behind` is measured from here
-ref=c51630de1f2a
+ref=ce987bb2c1de             <- equal to `deployed` exactly when `behind=0`
 behind=0
 ahead=0
 dirty=0
@@ -114,7 +117,7 @@ preserved=none
 action=none
 lanes=none-signalled
 fetch=ok                     <- the comparison was FRESH; a failure is rc=23, never `current`
-detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=c51630de1f2a behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de
+detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=ce987bb2c1de behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de
 ```
 
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
@@ -244,7 +247,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 175 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 186 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -267,13 +270,14 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
-| T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename** — each of the three used to leave the tree dirty while the pass reported `advanced` |
+| T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename**, and the checkout is **clean** afterwards; a later upstream commit to the renamed path still merges (a leftover untracked copy would block it for ever) |
 | T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
 | T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
 | T20 | an **unpreservable** dirty tree is REFUSED (20) and nothing moves — the other half of the DIRTY pair, which had no fixture |
+| T23 | a **converged** box needs no materialiser and no sync verb: it is a GREEN no-op (the existence check used to run before the "anything to do?" decision, reddening healthy boxes), while the same box BEHIND without one is a named failure (the control) |
 | T21 | a **failed `git fetch`** is `cannot-verify` (23), recorded as `fetch=failed`, refused by `--print-status` — and the same fixture is green once the origin is reachable (the control) |
 | T22 | the **user-scope** install (no sudo, user manager answering): it REFUSES when lingering cannot be enabled, succeeds with `linger: enabled` once it can, and `--status` fails when lingering is cleared afterwards |
-| T8a | an installed-but-**disabled** timer fails readiness (it will not survive a reboot) |
+| T8a | an installed-but-**disabled** timer fails readiness (it will not survive a reboot), and so does `is-enabled=static` (no `[Install]` section: gone at the next boot) |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`

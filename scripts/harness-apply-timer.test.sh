@@ -458,6 +458,23 @@ assert_eq "$(git -C "$CLONE" status --porcelain | grep -c '^ M tool.sh' | tr -d 
     "T17 the executable is no longer reported dirty"
 assert_eq "$(cat "$CLONE/has space.txt")" "spaced" \
     "T17 the path with a space was restored from HEAD (not skipped as an unresolvable pathspec)"
+# ⛔ THE TREE MUST CONVERGE, not merely the index. A rename DESTINATION left in the worktree (untracked)
+# keeps `git status` dirty for ever AND blocks the next merge the moment upstream adds that path — and
+# the pass then re-preserves the whole dirty set into a fresh directory on EVERY tick. Measured in
+# review; nothing asserted this because only the index half was read.
+assert_eq "$(git -C "$CLONE" status --porcelain | wc -l | tr -d ' ')" "0" \
+    "T17 the checkout is CLEAN after the advance (nothing left untracked by the restore)"
+assert_eq "$(sed -n 's/^dirty=//p' "$T/t17/state/harness-apply.status" 2>/dev/null | head -1)" "0" \
+    "T17 and the record records dirty=0"
+# THE BLOCKING SCENARIO: upstream now adds the path the rename had used. A lingering untracked copy would
+# make `merge --ff-only` refuse for ever ("untracked working tree files would be overwritten").
+printf 'now tracked upstream\n' >"$T/seed-t17/RENAMED.txt"
+git -C "$T/seed-t17" add RENAMED.txt >/dev/null 2>&1
+git -C "$T/seed-t17" -c user.email=t@example.test -c user.name=t commit -q -m "upstream adds the renamed path" >/dev/null 2>&1
+git -C "$T/seed-t17" push -q origin main >/dev/null 2>&1
+OUT="$(run_pass "$T/t17" 2>&1)"; RC=$?
+assert_eq "$RC" "10" "T17 a second pass advances even though upstream now owns the renamed path"
+assert_absent "$OUT" "would be overwritten" "T17 and the merge is not blocked by a leftover untracked file"
 # ⛔ THE RECORD'S OWN `dirty=` MUST AGREE WITH THE TREE. A bare `git status | wc -l` produced 0 for a
 # FAILED status and counted porcelain LINES rather than entries, so a rename read as 1 there and 2 in
 # the printed reading — two numbers for one tree. This is the only assertion that reads the field.
@@ -554,6 +571,37 @@ case "$1" in
 esac
 LC
 chmod +x "$T/bin/launchctl"
+
+say_case "T23 a CONVERGED box needs no materialiser and no sync verb"
+# ⛔ THE EXISTENCE CHECK RAN BEFORE THE "ANYTHING TO DO?" DECISION, so a box that was exactly on the ref
+# still had to own a file only an ADVANCE needs: it recorded rc=25 ("no way to advance its own pin")
+# beside `behind=0` — a red unit every ten minutes, `CELL READY` refused, and the documented no-op
+# cadence unreachable in pin mode unless the test handed it a stub (measured in review).
+mk_origin t23; mk_clone t23
+REPO_P="$CLONE"; MODE_P=pin
+mkdir -p "$T/t23/home/.pi/agent/state"
+git -C "$CLONE" worktree add --detach "$T/t23/pin" "$(git -C "$CLONE" rev-parse HEAD)" >/dev/null 2>&1
+mkdir -p "$T/t23/pin/scripts/orchestrator-harness"
+printf '%s\n' "$(git -C "$CLONE" rev-parse HEAD)" >"$T/t23/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t23/pin/scripts/orchestrator-harness" >"$T/t23/home/.harness-path"
+# No materialiser anywhere: the default path ($REPO/scripts/cloud-cell-supervisor.sh) points at the
+# fixture clone, which has none.
+OUT="$(run_pass "$T/t23" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T23 a converged pin with NO materialiser is a GREEN no-op"
+assert_absent "$OUT" "no materialiser" "T23 and it does not complain about a file it does not need"
+assert_contains "$(cat "$T/t23/state/harness-apply.status" 2>/dev/null || true)" "behind=0" \
+    "T23 the record says the box is on the ref"
+# The control: an ADVANCE without a materialiser is a named failure (the check still exists where it
+# belongs).
+mk_origin t23b; mk_clone t23b
+REPO_P="$CLONE"; MODE_P=pin
+mkdir -p "$T/t23b/home/.pi/agent/state" "$T/t23b/pin/scripts/orchestrator-harness"
+printf '%s\n' "$(git -C "$CLONE" rev-parse HEAD)" >"$T/t23b/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t23b/pin/scripts/orchestrator-harness" >"$T/t23b/home/.harness-path"
+advance_origin t23b A.txt "upstream, so an advance is needed" >/dev/null
+OUT="$(run_pass "$T/t23b" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T23 control: the same box BEHIND, with no materialiser, is a named failure"
+assert_contains "$OUT" "no materialiser" "T23 control: and the refusal names the materialiser"
 
 say_case "T20 an unpreservable dirty tree is REFUSED (exit 20), and nothing moves"
 # The DIRTY predicate's other half: `docs/ops/harness-apply.md` says "Each predicate is a pair — the
@@ -701,6 +749,15 @@ OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO
     SYSTEMCTL="$T/bin/systemctl-disabled" bash "$INST" --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8a --status FAILS when the timer is not enabled"
 assert_contains "$OUT" "not enabled" "T8a and it says the timer will not survive a reboot"
+
+printf '#!/usr/bin/env bash\ncase "$*" in *is-enabled*) echo static ;; *is-active*) echo active ;; *cat*) exit 0 ;; *) exit 0 ;; esac\n' \
+    >"$T/bin/systemctl-static"
+chmod +x "$T/bin/systemctl-static"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t3/home/.pi/agent/state" SYSTEMD_UNIT_DIR="$T/t3/units" \
+    SYSTEMCTL="$T/bin/systemctl-static" bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8a2 --status FAILS for is-enabled=static (no [Install] section: gone at the next boot)"
+assert_contains "$OUT" "not enabled" "T8a2 and it says the timer is not enabled"
 
 say_case "T8b a timer that HAS fired with no record is a failure, not a fresh install"
 # ⛔ THE OTHER HALF OF "status=never". A fresh install has no record because the first tick is pending —
