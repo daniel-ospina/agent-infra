@@ -771,6 +771,23 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
     return "PARKED-REAPABLE", readings, "parked-and-retired"
 
 
+def _census_unreadable(as_json: bool, error: str, message: str) -> None:
+    """A census that could not be read: rc 2, and `--json` STILL speaks JSON.
+
+    ⛔ THE JSON DOCUMENT OWNS STDOUT ON EVERY PATH — the FAILED reads included, not only the empty
+    one. These two returns printed a prose sentence on stdout, so a consumer parsing
+    `--pool pi --json` got a non-JSON document exactly when the read failed (the same shape that
+    made `| jq` break on the empty pool, one path over) and had to special-case prose on a stream
+    the contract says is the document. `error` names the failed read; `counts: null` keeps it
+    distinguishable from a real census of zero.
+    """
+    if as_json:
+        print(json.dumps({"pool": "pi", "error": error, "counts": None, "rows": [],
+                          "gates": None}, indent=2))
+    else:
+        print(message)
+
+
 def _self_chain(rows: Dict[str, dict]) -> set[str]:
     """Our own ancestry: this reaper must never classify a process it runs under."""
     chain, cur = set(), str(os.getpid())
@@ -803,12 +820,15 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
     liv = fleet_liveness()
     if liv is None:
         # without the canonical predicate there is no verdict to act on, only a process table
-        print("orphan-reap: UNVERIFIABLE — the fleet verdict module (tools/fleet/liveness.py) "
-              "could not be imported; no census was read")
+        _census_unreadable(
+            as_json, "liveness-unimportable",
+            "orphan-reap: UNVERIFIABLE — the fleet verdict module (tools/fleet/liveness.py) "
+            "could not be imported; no census was read")
         return 2
     before = ps_pi_fields()
     if not before:
-        print("orphan-reap: UNVERIFIABLE — `ps` returned nothing; no census was read")
+        _census_unreadable(as_json, "ps-unreadable",
+                           "orphan-reap: UNVERIFIABLE — `ps` returned nothing; no census was read")
         return 2
     # ⛔ THE FENCE REFERENCE IS THE MOMENT `etime` WAS READ, so it is taken HERE — before any
     # store glob or transcript stat. `now - etime` computed after those (let alone after the CPU

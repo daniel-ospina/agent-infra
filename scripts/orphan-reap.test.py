@@ -144,7 +144,7 @@ class Box:
     """An injected process table + session index + store + clock for one census."""
 
     def __init__(self, rows_before, rows_after, transcript, start_ts, sizes=None, store=None,
-                 sessions_dir=None):
+                 sessions_dir=None, pid_cwd=None, sessions_index=None):
         self.rows = [rows_before, rows_after]
         self.ps_calls = 0
         self.stat_calls = 0
@@ -156,6 +156,11 @@ class Box:
         # in `<sessions>/--<encoded-cwd>--/`, so a fixture that only ever writes FLAT cannot see
         # a reader that fails to descend (case_nested)
         self.sessions_dir = sessions_dir
+        # the pid's cwd, when the case is ABOUT the cwd filter (None = `_cwd_of_pid` reads
+        # nothing, which is what every other case wants: the filter is then skipped)
+        self.pid_cwd = pid_cwd
+        # an explicit [(path, stamp)] index, for a case that needs TWO same-fence candidates
+        self.sessions_index = sessions_index
         self.clock = Clock(time.time())
 
     # ── the injected readers ────────────────────────────────────────────
@@ -180,8 +185,11 @@ class Box:
         saved = {n: getattr(mod, n) for n in names}
         buf = io.StringIO()
         mod.ps_pi_fields = self.ps
-        mod.session_index = lambda sessions_dir=None: [(self.transcript, self.start_ts)]
-        mod._cwd_of_pid = lambda pid: None
+        mod.session_index = (lambda sessions_dir=None: list(self.sessions_index)
+                             if self.sessions_index is not None
+                             else [(self.transcript, self.start_ts)])
+        mod._cwd_of_pid = (lambda pid: self.pid_cwd) if self.pid_cwd is not None \
+            else (lambda pid: None)
         mod._stat = self.stat
         mod.time = self.clock          # sleep advances it: a post-window reference must drift
         mod.SESSIONS_DIR = self.sessions_dir or os.path.dirname(self.transcript)
@@ -372,6 +380,39 @@ def case_nested(tmp) -> Box:
     return Box(before, before, t, now - 5 * 3600, store=store, sessions_dir=tmp)
 
 
+def case_foreign_cwd(tmp) -> Box:
+    """A same-fence session file with NO readable `cwd` must not be bound for a pid whose cwd IS
+    known.
+
+    `_session_cwd(p) in (None, cwd)` accepted such a file for ANY pid — the one fail-open default
+    in the binding rule — and `session_index` globs every project subdirectory, so a foreign
+    checkout's transcript could supply this row's gate-3 age and own median gap. Both files are
+    inside the fence, so only the REASON distinguishes which one was bound:
+      * the matching file (readable `cwd` == the pid's) is 30 h old  => bound, so the host decision
+        decides the row: `host-decision-hostless`;
+      * the `cwd`-less file is 1 h old => it must be DROPPED. If it is kept, the pair is
+        `ambiguous-binding` — which is exactly what this case reads as when the tolerant filter is
+        restored (verified by deletion mutant).
+    """
+    now = time.time()
+    start = now - 5 * 3600
+    t = write_transcript(tmp, now - 30 * 3600)
+    foreign = os.path.join(tmp, "%s_%s.jsonl" % (_stamp_name(start), "ffffffff-0000-0000-0000-000000000000"))
+    with open(t, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    first = json.loads(lines[0])
+    first.pop("cwd", None)          # the foreign file records no checkout
+    lines[0] = json.dumps(first) + "\n"
+    with open(foreign, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    os.utime(foreign, (now - 3600, now - 3600))
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, start,
+               store=write_store(tmp, pid=100, start_s=start, cwd=tmp, fresh=False),
+               sessions_dir=tmp, pid_cwd=tmp,
+               sessions_index=[(t, start), (foreign, start)])
+
+
 TESTS = [
     ("(a) resolved chain, no host app: measured-and-NOT-AUTHORISED",
      case_a, "UNVERIFIABLE", "host-decision-hostless", None),
@@ -391,6 +432,8 @@ TESTS = [
      case_self, "KEEP-HUMAN", "self-ancestor", None),
     ("(h) the real nested layout, store record naming no `cwd`",
      case_nested, "UNVERIFIABLE", "host-decision-hostless", None),
+    ("(i) a same-fence file with no readable `cwd` is NOT bound",
+     case_foreign_cwd, "UNVERIFIABLE", "host-decision-hostless", None),
 ]
 
 
@@ -665,6 +708,43 @@ def empty_pool_json() -> int:
     return 0 if ok else 1
 
 
+def unreadable_json() -> int:
+    """The two `no census was read` returns must ALSO speak JSON in `--json` mode (rc 2).
+
+    The fixed empty-pool path was only one of three; the two FAILED reads still printed a prose
+    sentence on stdout, so a consumer got a non-JSON document exactly when the read failed. Both
+    are pinned here, with their own `error` code, and `counts: null` so a failed read is never
+    mistakable for a real census of zero.
+    """
+    fails = 0
+    for label, patch, want in (
+            ("`ps` returned nothing", {"ps_pi_fields": lambda: {}}, "ps-unreadable"),
+            ("the verdict module is unimportable",
+             {"fleet_liveness": lambda: None}, "liveness-unimportable"),
+    ):
+        saved = {n: getattr(mod, n) for n in patch}
+        buf = io.StringIO()
+        for n, v in patch.items():
+            setattr(mod, n, v)
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = mod.pi_census(1.0, apply=False, as_json=True)
+        finally:
+            for n, v in saved.items():
+                setattr(mod, n, v)
+        raw = buf.getvalue()
+        try:
+            doc = json.loads(raw)
+            ok = rc == 2 and doc.get("error") == want and doc.get("counts") is None
+        except ValueError:
+            ok, doc = False, {}
+        print(f"{'PASS' if ok else 'FAIL'} `--json` still speaks JSON when {label} "
+              f"(rc={rc}, error={doc.get('error')!r}, counts={doc.get('counts')!r})")
+        if not ok:
+            fails += 1
+    return fails
+
+
 def fence_matches_canon() -> int:
     """The fence default is the CANON's, and the two are pinned together.
 
@@ -694,7 +774,7 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
     fails = (suite(None) + four_states_reachable() + utc_stamp() + apply_path()
-             + empty_pool_json() + fence_matches_canon())
+             + empty_pool_json() + unreadable_json() + fence_matches_canon())
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1
