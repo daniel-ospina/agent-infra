@@ -42,6 +42,7 @@ import hook, {
   canonicalSkillFile,
   canonicalSkillsRoot,
   CANONICAL_FARM_ERROR,
+  commandMatches,
   skillRoots,
   skillDisplayPath,
   skillFileFor,
@@ -49,6 +50,9 @@ import hook, {
   _setSkillReadsFileForTest,
   _setManifestForTest,
 } from "./skill-enforcer.js";
+// The derivation itself is asserted in its own suite (extensions/shared/
+// git-command-parse.test.ts); this file only needs it for the OR property below.
+import { commandSpellings } from "./shared/git-command-parse.js";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const REAL_MANIFEST = join(REPO_ROOT, "enforcement", "dangerous-ops.txt");
@@ -797,6 +801,126 @@ async function main() {
     equal((await pi.fire("tool_call", TORTOISE_SEARCH))?.block, undefined, "an mcp nudge rule must not block");
     equal((await pi.fire("tool_call", { toolName: "bash", input: { command: "rg -n 'tortoise_' skills/" } }))?.block, undefined, "a bash nudge rule must not block");
     equal((await pi.fire("tool_call", TORTOISE_WRITE))?.block, true, "the hard verb list must still block a genuine write");
+  });
+
+  // ── #1329 — the command gate matched ONE spelling (the raw string) ────────
+  // MEASURED against the armed manifest before this change: the first list below
+  // ran ALLOWED because the pattern `git commit` is split by git's own global
+  // options — and `git -C <dir>` is how this fleet commits in a linked worktree,
+  // so a cooperating agent produces it without intending anything. The second
+  // list is the boundary the manifest header declares: shell state a static text
+  // gate cannot read. Both directions are pinned, so neither can be widened or
+  // silently narrowed without editing the declared boundary.
+  section("H. #1329 — command spelling: git/gh GLOBAL options closed, shell indirection DECLARED open");
+
+  // Every spelling in the closed list must fire the rule whose literal pattern it
+  // splits, and clearing the gate must stay POSSIBLE for each (the #1321 lesson:
+  // a remedy that does not exist is a permanent confusing block).
+  const GLOBAL_OPTION_SPELLINGS: Array<[string, string]> = [
+    ["git -C /tmp/wt commit -m x", "commit-workflow"],
+    ["git --no-pager commit -m x", "commit-workflow"],
+    ["git -c user.name=a commit -m x", "commit-workflow"],
+    ["git --git-dir=/x/.git commit -m x", "commit-workflow"],
+    ["git -C /x stash pop", "commit-workflow"],
+    ["git --work-tree /x add .", "commit-workflow"],
+    ["gh -R owner/name pr create --fill", "commit-workflow"],
+    ["gh --repo=owner/name pr merge 42", "commit-workflow"],
+    ["git -C /x worktree add /tmp/w", "using-git-worktrees"],
+    // ⛔ THE SEPARATOR IS NOT A TOKEN BOUNDARY (#1329 review, P2). These were ALLOWED at
+    // the head that DECLARED the class closed — measured — because the rule is the literal
+    // `git commit` with ONE space and the derivation left the original separator in place.
+    // A header that declares a class closed must be true of the class, not of one spelling
+    // of it; the tab form is the one a fleet lane produces from a table-driven command.
+    ["git -C /x\tcommit -m x", "commit-workflow"],
+    ["git\tcommit -m x", "commit-workflow"],
+    ["git  commit -m x", "commit-workflow"],
+    ["git -C /x  \t stash pop", "commit-workflow"],
+    // ⛔ AND THE CASE DIMENSION (#1329 review cycle 2, P2). The rule is compiled with the `i`
+    // flag and the header says "case-insensitive regex", but the derivation's command-word
+    // comparison was an exact lowercase match — so `GIT commit` was blocked by the raw rule while
+    // `GIT -C /x commit` was ALLOWED: the same "one spelling" asymmetry, surviving in the case
+    // dimension. On a case-insensitive filesystem (macOS APFS, a fleet platform) `GIT` resolves
+    // to /usr/bin/git, i.e. a LIVE ungated commit; on Linux it is at least a false declaration.
+    ["GIT -C /x commit -m x", "commit-workflow"],
+    ["Git -C /x commit -m x", "commit-workflow"],
+    ["gIT --no-pager commit -m x", "commit-workflow"],
+    ["GIT -C /x stash pop", "commit-workflow"],
+    ["GH -R owner/name pr create --fill", "commit-workflow"],
+    ["GIT -C /x worktree add /tmp/w", "using-git-worktrees"],
+  ];
+
+  await test("#1329 — git/gh GLOBAL options between the command word and the verb are CLOSED", async () => {
+    const { pi } = await newSession();
+    for (const [command, skill] of GLOBAL_OPTION_SPELLINGS) {
+      const res = await pi.fire("tool_call", { toolName: "bash", input: { command } });
+      ok(res && res.block === true, `${JSON.stringify(command)} must be blocked — it ran UNGATED before #1329`);
+      ok(String(res.reason).includes(skill), `${JSON.stringify(command)} must be attributed to ${skill}, got: ${String(res.reason).split("\n")[0]}`);
+    }
+  });
+
+  await test("#1329 — the newly-closed spellings remain SATISFIABLE (the governing read clears them)", async () => {
+    const { pi } = await newSession();
+    for (const skill of ["commit-workflow", "using-git-worktrees"]) {
+      await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", skill, "SKILL.md") } });
+    }
+    for (const [command] of GLOBAL_OPTION_SPELLINGS) {
+      equal((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, undefined,
+        `${JSON.stringify(command)} must clear after the governing skill is read — a spelling-only block must have a remedy`);
+    }
+  });
+
+  await test("#1329 — DECLARED OPEN: shell indirection bypasses the gate, and this is the boundary", async () => {
+    // NOT a desired behaviour — the manifest header states it, so it is asserted
+    // here. If a later change closes one of these, this test FAILS and the author
+    // must update the CLOSED/NOT CLOSED lists in enforcement/dangerous-ops.txt too.
+    const { pi } = await newSession();
+    const open = [
+      "g=commit; git $g -m x",          // variable indirection
+      'eval "$CMD"',                   // eval of a variable
+      "gc -m x",                        // an alias invocation (the definition is below)
+      'git com"mit" -m x',              // quote-splicing inside the verb
+      "git comm\\it -m x",              // backslash-splicing inside the verb
+      "git \\\ncommit -m x",            // a `\\` line continuation
+      'sh -c "git -C /x commit"',       // nesting: the quoted text is data, not a command word
+      "rg -n 'git -C x commit' skills/", // a quoted mention the raw pattern is split across
+    ];
+    for (const command of open) {
+      equal((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, undefined,
+        `${JSON.stringify(command)} is DECLARED OPEN in the manifest header — closing it means updating that declaration too`);
+    }
+    // The alias DEFINITION contains the literal pattern, so it IS caught — the
+    // asymmetry is deliberate and must stay visible.
+    ok((await pi.fire("tool_call", { toolName: "bash", input: { command: "alias gc='git commit'" } }))?.block,
+      "the alias DEFINITION is raw-matched; only its later use is not");
+    // Path-qualified / wrapper-prefixed commands contain the literal pattern, so the
+    // raw match already closed them. The issue body listed these as bypasses; they
+    // never were one (measured).
+    for (const command of ["/usr/bin/git commit -m x", "command git commit -m x", "env FOO=1 git commit -m x", "sudo git commit -m x", "bash -c 'git commit -m x'", "eval 'git commit -m x'", "echo 'git commit -m x'"]) {
+      ok((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, `${JSON.stringify(command)} contains the pattern and must be blocked`);
+    }
+  });
+
+  await test("#1329 — a QUOTED mention is match-by-text: the derivation does not reinterpret quotes", async () => {
+    const { pi } = await newSession();
+    // Pre-existing, unchanged bluntness: the gate matches command TEXT, so the
+    // literal pattern blocks wherever it appears.
+    ok((await pi.fire("tool_call", { toolName: "bash", input: { command: "rg -n 'git commit' skills/" } }))?.block,
+      "the literal pattern is matched inside quotes too — that is the raw match, unchanged");
+    // ... and the derivation must NOT reach INTO a quoted region to find a command
+    // word: this mention is split by the very options #1329 normalises, and it stays
+    // allowed. Closing it would mean reinterpreting quoted data as commands (and
+    // would block far more searches than it caught).
+    equal((await pi.fire("tool_call", { toolName: "bash", input: { command: "rg -n 'git -C x com' skills/" } }))?.block, undefined);
+  });
+
+  await test("#1329 — commandMatches ORs across spellings and always tries the raw command FIRST", async () => {
+    // The property that makes the hardening safe: a rule that matched the raw
+    // command cannot stop matching because a spelling was derived.
+    const raw = /git commit/i;
+    equal(commandMatches(raw, ["git commit -m x"]), true, "the raw command must always be tried");
+    equal(commandMatches(raw, ["echo hi", "git commit -m x"]), true, "the derived spelling must be tried too");
+    equal(commandMatches(raw, ["git -C /x commit -m x"]), false, "the RAW string alone does not match — the derivation is what closes it");
+    equal(commandMatches(raw, commandSpellings("git -C /x commit -m x")), true);
   });
 
   await test("prerequisite chain: writing-plans alone blocks write; with issue-scoping it does not", async () => {
