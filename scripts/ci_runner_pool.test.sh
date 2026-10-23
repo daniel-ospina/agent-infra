@@ -673,6 +673,31 @@ assert_contains "$out" "every runner on THIS box" "--help scopes --all to this b
 assert_eq "$(rc_of bogus-verb)" "1" "an unknown verb exits 1"
 assert_eq "$(rc_of add)" "1" "add with no --name exits 1"
 
+# ⛔ `shift 2` with ONE argument left FAILS WITHOUT DECREMENTING `$#`: `add --name` looped forever
+# instead of the documented rc 1, and `--name --dry-run` consumed the FLAG as a name, leaving DRY at 0
+# so a preview installed a runner for real.
+fresh_pool argv; reset_logs
+assert_eq "$(timeout 10 bash "$POOL" add --name >/dev/null 2>&1; echo $?)" "1" \
+  "'add --name' with no value exits 1 (it used to loop forever)"
+assert_eq "$(timeout 10 bash "$POOL" restart --name >/dev/null 2>&1; echo $?)" "1" \
+  "'restart --name' with no value exits 1"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name --dry-run)" "1" \
+  "the preview FLAG is not consumed as the name"
+assert_absent "$RUNNER_ROOT/--dry-run" "an 'add --name --dry-run' installed nothing"
+assert_eq "$(count_lines "$CONFIG_LOG")" "0" "and ran no config.sh"
+
+# ⛔ A LEADING ZERO is octal to bash arithmetic and 08/09 are FATAL there: rc 1 (the usage code) from a
+# start that already succeeded, or no output at all from status/add/reconcile.
+for bad in 08 09 010; do
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_START_SETTLE_S="$bad" run add --name "pi-runner-zero$bad")"
+  assert_eq "$?" "2" "RUNNER_START_SETTLE_S=$bad (octal) is cannot-measure (rc 2), never a fatal shift"
+  assert_contains "$out" "cannot-measure why=settle-unreadable" "it names the operand"
+  assert_absent "$RUNNER_ROOT/pi-runner-zero$bad" "nothing was created"
+done
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CORES_PER_SLOT=08 run status)"
+assert_eq "$?" "2" "a zero-padded CORES_PER_SLOT is cannot-measure (rc 2), never rc 1 with no output"
+assert_contains "$out" "cannot-measure why=cores-per-slot-unreadable" "it names the operand"
+
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ $FAIL assertion(s) failed, $PASS passed"

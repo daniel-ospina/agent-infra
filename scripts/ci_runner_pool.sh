@@ -139,7 +139,11 @@ usage() {
 # comparison, which reads as false — `[ 12000 -lt 99999999999999999999 ]` is rc 2, not true).
 is_uint() {
   local v="${1:-}"
-  case "$v" in ''|*[!0-9]*|0) return 1 ;; esac
+  # ⛔ `0?*` — a LEADING ZERO is OCTAL to bash's arithmetic, and `08`/`09` are fatal there: the
+  # arithmetic error kills the shell outright (rc 1, the documented USAGE code) mid-action, so a
+  # "validated" operand could still die inside `$((…))` with no verdict printed. `010` is worse than
+  # fatal: it is accepted, and means EIGHT where every other comparison reads it as ten.
+  case "$v" in ''|*[!0-9]*|0|0?*) return 1 ;; esac
   [ "${#v}" -le 15 ] || return 1
   return 0
 }
@@ -213,8 +217,22 @@ slots() { local n; n="$(registered_dirs | wc -l)"; printf '%s' "$((n))"; }
 
 # valid_name <name> — a runner name is a path component AND goes to `config.sh --name`.
 # Anything with a `/` or a leading dot escapes $RUNNER_ROOT and is invisible to `slots`/`status`, so
-# an escaped registration would sit outside the ceiling that is supposed to bound it.
-valid_name() { case "${1:-}" in ''|.*|*/*|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+# an escaped registration would sit outside the ceiling that is supposed to bound it. A leading `-` is
+# refused because `--name -x` would be read as a FLAG by config.sh (and `--name --dry-run` would
+# otherwise register a runner named `--dry-run` while leaving DRY at 0 — a preview that installs).
+valid_name() { case "${1:-}" in ''|.*|-*|*/*|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+
+# take_name_value <verb> <argc> <value> — the `--name` arm's own contract.
+# ⛔ `shift 2` with ONE argument left FAILS WITHOUT DECREMENTING `$#`, and under `set -uo pipefail`
+# (no `-e`) nothing stops it: `add --name` looped forever instead of returning the documented rc 1.
+take_name_value() {
+  local verb="$1" argc="$2" val="${3:-}"
+  if [ "$argc" -lt 2 ]; then err "usage: $verb --name <runner-name> [--dry-run]"; return 1; fi
+  case "$val" in
+    -*) err "usage: $verb --name <runner-name> — the name must not start with '-'"; return 1 ;;
+  esac
+  return 0
+}
 
 # listener_pid <dir> — pid of a LIVE listener for this instance dir, or empty.
 # rc 0 = measured (the pid printed, or nothing when there is none). rc 2 = CANNOT MEASURE.
@@ -305,7 +323,7 @@ cmd_add() {
   local name="" dir token rc
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="${2:-}"; shift 2 ;;
+      --name) take_name_value add "$#" "${2:-}" || return 1; name="${2:-}"; shift 2 ;;
       --dry-run) DRY=1; shift ;;
       *) err "usage: add --name <runner-name> [--dry-run]"; return 1 ;;
     esac
@@ -423,7 +441,7 @@ cmd_restart() {
   local name="" dir rc
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="${2:-}"; shift 2 ;;
+      --name) take_name_value restart "$#" "${2:-}" || return 1; name="${2:-}"; shift 2 ;;
       --dry-run) DRY=1; shift ;;
       *) err "usage: restart --name <runner-name> [--dry-run]"; return 1 ;;
     esac
@@ -433,7 +451,7 @@ cmd_restart() {
   # never validated (`bad name` is a legal directory). Rejecting those would leave that listener dead
   # forever AND make every reconcile pass exit 2 on an otherwise healthy box. Only path ESCAPES are
   # refused here.
-  case "$name" in ''|.|..|*/*) err "usage: restart --name <runner-name> — a name must not be empty, '.'/'..' or contain '/'"; return 1 ;; esac
+  case "$name" in ''|.|..|-*|*/*) err "usage: restart --name <runner-name> — a name must not be empty, start with '-', be '.'/'..', or contain '/'"; return 1 ;; esac
   dir="$RUNNER_ROOT/$name"
   if [ ! -f "$dir/.runner" ]; then
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
