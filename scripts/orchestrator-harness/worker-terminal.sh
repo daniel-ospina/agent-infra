@@ -129,10 +129,28 @@ wt_gh_hosts() {
   else printf '%s\n' "$home/.config/gh/hosts.yml"; fi
 }
 
+# `wt_gh_hosts_token <home>` — 0 iff the resolved `gh` hosts file is READABLE and carries a NON-EMPTY
+# token value. ⛔ NOT `-s` (review finding on this diff, measured 2026-10-23): `-s` is "exists and is
+# non-empty", so a `hosts.yml` of `{}`, or one whose host entry lost its `oauth_token:` line (a
+# half-written or hand-redacted file — the same leftover class as a `gh auth logout`), read as
+# PROVISIONED and started exactly the credential-less worker this gate exists to refuse, while the
+# worker record said `home=…` and the spawn returned 0. The keys.env arm below already demands a
+# VALUE for the same reason; this is that rule for the other file, so the two cannot disagree about
+# what "has a credential" means. Residual: an EXPIRED token is still a token — expiry cannot be read
+# offline and is not this probe's question.
+wt_gh_hosts_token() {
+  local f
+  f="$(wt_gh_hosts "${1:-}")"
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  # A missing/unreadable file makes grep fail, so absence and unreadability are both refusals — never
+  # a provision. The quote group rejects `oauth_token: ""` / `''` for the same reason keys.env does.
+  grep -qE '^[[:space:]]*oauth_token:[[:space:]]*["'\'']?[^[:space:]"'\'']' "$f" 2>/dev/null
+}
+
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
 # operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
 # Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential
-# (a non-empty `gh` hosts.yml; see `wt_launcher_env` for the full test). If none does (a box
+# (a `gh` hosts.yml that carries a token; see `wt_gh_hosts_token`). If none does (a box
 # authenticating from `GH_TOKEN` in the environment), the caller's HOME is used anyway and
 # `wt_launcher_env` decides. Returns 1 only when there is no HOME at all to export, which is a spawn
 # this file cannot make safely.
@@ -140,7 +158,7 @@ wt_launcher_home() {
   local c
   [ -n "${WT_WORKER_HOME:-}" ] && { printf '%s\n' "$WT_WORKER_HOME"; return 0; }
   for c in "${HOME:-}" /tmp/cell-home; do
-    [ -n "$c" ] && [ -s "$(wt_gh_hosts "$c")" ] && { printf '%s\n' "$c"; return 0; }
+    [ -n "$c" ] && wt_gh_hosts_token "$c" && { printf '%s\n' "$c"; return 0; }
   done
   [ -n "${HOME:-}" ] && { printf '%s\n' "$HOME"; return 0; }
   return 1
@@ -185,15 +203,16 @@ wt_tmux_has_server() {
 # environ had NO `GH_TOKEN` and `tmux show-environment -g GH_TOKEN` said `unknown variable`. So the
 # caller's token is credited only when there is positively no server; otherwise the server itself
 # must answer (below). A steady-state cell has exactly such a server, so this is the normal case.
-# ⛔ AND PRESENCE IS NOT PROVISION: an EMPTY `hosts.yml` (a `gh auth logout` leftover), a `keys.env`
-# that assigns no value, and a server variable set to the empty string are all refusals. A file or
-# variable counts only when it is non-empty; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
+# ⛔ AND PRESENCE IS NOT PROVISION: an EMPTY `hosts.yml` (a `gh auth logout` leftover), a `hosts.yml`
+# whose host entry carries no `oauth_token:` (the same leftover, half-written), a `keys.env` that
+# assigns no value, and a server variable set to the empty string are all refusals. A file or variable
+# counts only when it carries a VALUE; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
 # (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
   local home="${1:-}" keys have=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
-  [ -s "$(wt_gh_hosts "$home")" ] && have=1
+  wt_gh_hosts_token "$home" && have=1
   # ⛔ A VALUE IS NOT A QUOTED EMPTY (review finding, measured 2026-10-23). `=[^[:space:]]` counted
   # `GH_TOKEN=""` as provision — the character after `=` is a quote — so the file exported an EMPTY
   # token, `gh` fell back to the hosts.yml this HOME does not have, and the worker died at its first
@@ -592,7 +611,11 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         return 1
       fi
       envpfx="$(wt_launcher_env "$home")" || {
-        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $home/.config/gh/hosts.yml, $home/keys.env and the tmux server's GH_TOKEN, found none. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
+        # ⛔ THE MESSAGE NAMES THE FILE THE PROBE ACTUALLY READ (review finding, 2026-10-23): it used to
+        # hardcode `$home/.config/gh/hosts.yml` while the probe goes through `wt_gh_hosts` (GH_CONFIG_DIR,
+        # then XDG_CONFIG_HOME, then `$HOME/.config/gh`) — so on a repointed box the operator was sent to
+        # a path that does not exist. A refusal must name the places it looked, not a guess at them.
+        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $(wt_gh_hosts "$home") (no readable oauth_token), $home/keys.env (no GH_TOKEN/GITHUB_TOKEN value) and the tmux server's GH_TOKEN, found none. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
         return 1
       }
       if tmux new-session -d -s "$name" "$envpfx; cd $(wt_q "$cwd") && $cmd" 2>/dev/null; then

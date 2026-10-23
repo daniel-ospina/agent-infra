@@ -33,6 +33,15 @@ ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1));
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
+# A `hosts.yml` that ACTUALLY carries a token — the only shape `wt_gh_hosts_token` blesses. ⛔ The old
+# fixture was `printf 'github.com:\n'` (a host entry and nothing else), which the probe read as
+# PROVISIONED: a `gh auth logout`/half-write leftover starts the credential-less worker this gate
+# exists to refuse (review finding, 2026-10-23 — a fixture that pins the defect is not a fixture).
+gh_hosts_fixture() { # <home>
+  mkdir -p "$1/.config/gh"
+  printf 'github.com:\n    user: fixture\n    oauth_token: gho_fixture0token\n    git_protocol: https\n' \
+    > "$1/.config/gh/hosts.yml"
+}
 
 # ── the fake surface ───────────────────────────────────────────────────────────
 # ONE stub, parameterised by env, installed into each scenario's bin dir. It answers the guest CLI's
@@ -269,7 +278,7 @@ echo "── C) a Linux box with no cmux answer uses TMUX, with the environment 
 # ONE bare tmux server, `cd CWD && CMD` gave 7 lines and `gh auth status` rc=1 (`You are not logged
 # into any GitHub hosts`), while adding `export HOME=/tmp/cell-home; . $HOME/keys.env` gave 50 lines
 # and rc=0. So: tmux IS the Linux surface, and the spawn must carry HOME + keys.env or be refused.
-mkdir -p "$TMP/home-c/.config/gh"; printf "github.com:\n" > "$TMP/home-c/.config/gh/hosts.yml"   # NON-empty: presence is not provision
+gh_hosts_fixture "$TMP/home-c"   # a hosts.yml that CARRIES A TOKEN: presence is not provision
 printf 'export GH_TOKEN=%s\n' "ghp_from_keys_env" > "$TMP/home-c/keys.env"
 cat > "$TMP/c1.sh" <<'SH'
 set -u
@@ -294,7 +303,7 @@ ck "…and sources that HOME's keys.env, exactly like the cell's working manual 
 # that ASSIGNS without `export` is legal there, and a worker that sourced it plainly would keep those
 # values in its own launch shell and hand the lane it starts nothing: the credential-less worker this
 # gate removes, one layer lower. Driven for real — the prefix is EXECUTED and `env` is read back.
-mkdir -p "$TMP/home-plain/.config/gh"; printf 'github.com:\n' > "$TMP/home-plain/.config/gh/hosts.yml"
+gh_hosts_fixture "$TMP/home-plain"
 printf 'CELLPLAIN=plainvalue\n' > "$TMP/home-plain/keys.env"
 cat > "$TMP/c5.sh" <<'SH'
 set -u
@@ -405,7 +414,7 @@ ck "a QUOTED empty GH_TOKEN in keys.env is REFUSED (a quote is not a value)" $rc
 # then `${XDG_CONFIG_HOME}/gh`, then `$HOME/.config/gh`. A one-location probe refuses an AUTHENTICATED
 # box forever — the refusal starts no session, so nothing can ever change the answer.
 rm -rf "$TMP/home-ghcd" "$TMP/ghcd" "$TMP/O4r"; mkdir -p "$TMP/home-ghcd" "$TMP/ghcd"
-printf 'github.com:\n' > "$TMP/ghcd/hosts.yml"
+printf 'github.com:\n    oauth_token: gho_from_ghcd\n' > "$TMP/ghcd/hosts.yml"
 out="$(FAKE_UNAME=Linux GH_CONFIG_DIR="$TMP/ghcd" bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4r" "$TMP/tmux4r.log" "$TMP/home-ghcd" 2>&1)"
 case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…while a box whose credential lives in GH_CONFIG_DIR spawns (gh's own resolution order)" $rc
@@ -438,7 +447,7 @@ ck "an empty server variable is REFUSED too (presence is not provision on the se
 # worker this gate exists to refuse, reported as provisioned). Driven: the prefix is EXECUTED and $HOME
 # is read back, so this pins the ORDER of the launch line, not its text.
 rm -rf "$TMP/O4m"; mkdir -p "$TMP/home-repoint/.config/gh"
-printf 'github.com:\n' > "$TMP/home-repoint/.config/gh/hosts.yml"
+gh_hosts_fixture "$TMP/home-repoint"
 printf 'HOME=/home/cmux\nexport DEEPSEEK_API_KEY=sk-x\n' > "$TMP/home-repoint/keys.env"
 cat > "$TMP/c6.sh" <<'SH'
 set -u
@@ -463,6 +472,40 @@ for h in home-empty home-notok; do
   case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $h: $out";; esac
   ck "$h (a file that carries no credential) is REFUSED, not read as provisioned" $rc
 done
+# ⛔ A HOST ENTRY IS NOT A TOKEN (review finding, 2026-10-23, measured). The probe used to be `-s`
+# ("exists and is non-empty"), so a `hosts.yml` of `{}` — or one whose `github.com:` entry lost its
+# `oauth_token:` line, which is what a `gh auth logout` leftover or a half-written file looks like —
+# read as PROVISIONED and started the credential-less worker: `wt_spawn` returned 0 AND wrote
+# `home=…`, so the lane was recorded as started while it could never reach `gh`. That is the exact
+# silent dead lane #2210 records, reported as provisioned. Only a VALUE counts, the same rule the
+# keys.env arm already applies.
+rm -rf "$TMP/home-hostonly" "$TMP/home-braces" "$TMP/home-unreadable"
+mkdir -p "$TMP/home-hostonly/.config/gh" "$TMP/home-braces/.config/gh"
+printf 'github.com:\n    user: fixture\n    git_protocol: https\n' > "$TMP/home-hostonly/.config/gh/hosts.yml"
+printf '{}\n' > "$TMP/home-braces/.config/gh/hosts.yml"
+# An UNREADABLE hosts.yml is a refusal too (mode 000). Skipped as root, where 000 is readable and the
+# assertion would test the runtime user rather than the probe.
+unreadable_cases=(hostonly braces)
+if [ "$(id -u)" != "0" ]; then
+  gh_hosts_fixture "$TMP/home-unreadable"; chmod 000 "$TMP/home-unreadable/.config/gh/hosts.yml"
+  unreadable_cases+=(unreadable)
+fi
+for h in "${unreadable_cases[@]}"; do
+  rm -rf "$TMP/O-$h"
+  out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O-$h" "$TMP/tmux-$h.log" "$TMP/home-$h" 2>&1)"
+  case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $h: $out";; esac
+  ck "$h (hosts.yml carries no readable token VALUE) is REFUSED, not read as provisioned" $rc
+  grep -q 'new-session' "$TMP/tmux-$h.log" 2>/dev/null && rc=1 || rc=0
+  ck "…$h: and tmux is never asked to start the worker" $rc
+  [ -f "$TMP/O-$h/state/worker-lane-8" ] && rc=1 || rc=0
+  ck "…$h: and no worker record is left behind" $rc
+done
+# POSITIVE CONTROL for the same predicate: the SAME host entry PLUS a token spawns, so the refusals
+# above are a probe of the token and not a ban on `hosts.yml`.
+rm -rf "$TMP/O-hostok" "$TMP/home-hostok"; gh_hosts_fixture "$TMP/home-hostok"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O-hostok" "$TMP/tmux-hostok.log" "$TMP/home-hostok" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      hostok: $out";; esac
+ck "…while the same hosts.yml WITH an oauth_token spawns (the probe reads the token, not the file)" $rc
 rm -rf "$TMP/O4d"
 # ⛔ The `none` refusal is PROTECTIVE and stays: a box with no cmux answer AND no tmux binary has no
 # surface at all and must not pretend otherwise.
@@ -495,7 +538,7 @@ wt_launcher_env "" >/dev/null 2>&1; echo "env_empty_rc=$?"
 echo "home_knob=$(WT_WORKER_HOME="$4" wt_launcher_home)"
 echo "home_plain=$(HOME="$4" wt_launcher_home)"
 SH
-mkdir -p "$TMP/home-k/.config/gh"; printf "github.com:\n" > "$TMP/home-k/.config/gh/hosts.yml"
+gh_hosts_fixture "$TMP/home-k"
 out="$(bash "$TMP/c4.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4e" "$TMP/home-k" 2>&1)"
 case "$out" in *"env_empty_rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "no HOME to build a contract with => wt_launcher_env refuses (there is nothing to export)" $rc
@@ -510,7 +553,7 @@ echo "── D) the launchd surface still uses tmux (the other place it is corre
 # `$HOME` or the hardcoded `/tmp/cell-home` — so on a CI runner (no gh auth step, no /tmp/cell-home) the
 # spawn was refused and the assertion reded on a clean box while passing on a cell. The launchd path
 # gets an explicit WT_WORKER_HOME fixture, exactly as §C does.
-mkdir -p "$TMP/home-d/.config/gh"; printf "github.com:\n" > "$TMP/home-d/.config/gh/hosts.yml"
+gh_hosts_fixture "$TMP/home-d"
 cat > "$TMP/d1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
