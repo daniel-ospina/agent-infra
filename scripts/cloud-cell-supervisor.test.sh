@@ -926,6 +926,16 @@ case "$PROV_OUT" in
   *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
   *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
 esac
+# ⛔ A `chain-*` WORKER IS A WORKER FOR THIS DECISION TOO (review finding on #2210's fix). The census
+# filter in worker-terminal.sh counts `chain-<N>` (dispatch-merge.sh spawns them; they live ~90 min),
+# but this count listed only lane-/fix-/merge-, so a chain-only box read "no workers" — and
+# `workers_maybe_live()` is what authorises the DESTRUCTIVE cache/disk sweep to run. A census that
+# reports a worker the decision cannot see is a census the decision does not have.
+PROV_TMUX_SESSIONS='chain-9' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a chain-only worker (the census and the destructive gate are one population)" ;;
+  *) bad "status reports 0 for a chain-only census — the sweep would run under a live chain worker — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
 
 # (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
 # The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller

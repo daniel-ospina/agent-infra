@@ -203,7 +203,12 @@ worker_census() { # stdout: the live worker count; exit 3 when no answer can be 
     # right after "a worker is live" inherited the memo and stood down with no worker running.
     WT_TABLE_TTL=0
     command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
-    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    # ⛔ `chain-` IS COUNTED HERE TOO (review finding on #2210's fix). `dispatch-merge.sh` spawns
+    # `chain-<N>` workers that live up to ~90 min, and the census filter in worker-terminal.sh counts
+    # them — but this list did not, so a chain-only box read "no workers" and `workers_maybe_live()`
+    # (which gates the destructive cache/disk sweep) stood DOWN to "safe to delete" under a live
+    # chain. The population this decision reads and the population the census reports must be one list.
+    _c="$(wt_count lane- fix- merge- chain- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
     case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
     printf '%s\n' "$_c" )
 }

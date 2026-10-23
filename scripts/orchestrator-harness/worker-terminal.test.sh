@@ -95,21 +95,49 @@ printf '%s\n' "TMUX $*" >> "${TMUX_LOG:-/dev/null}"
 # that only records the kill would leave the list intact, and a close that is VERIFIED against it
 # could never be observed to succeed — the assertion would pass for the wrong reason.
 st="${TMUX_STATE:-}"
+# ⛔ A SERVER IS NOT A SESSION LIST (review finding, measured on tmux 3.4 2026-10-23). A LIVE server
+# with ZERO sessions (`exit-empty off`) answers `tmux ls` with rc 0 and an EMPTY list; a socket that was
+# never created answers with its own error. The production code tells those apart with a
+# `show-environment -g` probe, so this stub must be able to EXPRESS both — a stub that reports "no
+# sessions" and "no server" with the same bytes lets a pin pass for a state real tmux never reports.
+#   TMUX_SERVER_EXISTS=1  a server answers even with no session recorded (zero-session server)
+#   TMUX_SERVER_EXISTS=0  no server at all
+#   unset                 a server exists iff a session is recorded (the ordinary fixture)
+srv() {
+  case "${TMUX_SERVER_EXISTS:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [ -n "$st" ] && [ -s "$st" ]
+}
+noserver() { echo "error connecting to /tmp/tmux-501/default (No such file or directory)"; }
 case "${1:-}" in
   ls) if [ "${TMUX_LS_FAIL:-0}" = "1" ]; then
-        # tmux's own broken-socket answer: an ERROR, not "no sessions". The two must not read alike.
-        echo "error connecting to /tmp/tmux-501/default (No such file or directory)"; exit 1
+        # tmux's own UNREADABLE-socket answer, and deliberately NOT the "No such file" wording above:
+        # a broken socket must stay distinguishable from a box that never started a server, because
+        # the code treats them differently (unreadable = UNKNOWN/fail-closed, absent = EMPTY/positive).
+        echo "error connecting to /tmp/tmux-501/default (Permission denied)"; exit 1
       fi
+      srv || { noserver; exit 1; }
       [ -n "$st" ] && [ -f "$st" ] && sed '/^$/d' "$st" ;;
   # ⛔ a pid that CANNOT exist (above pid_max): `wt_close` really does `kill -TERM`/`-KILL` it, and a
   # plausible number here signalled whatever unrelated process happened to own it during a test run.
   list-panes) printf '%s\n' "${TMUX_PANE_PID:-4194305}" ;;
-  new-session) [ "${TMUX_SPAWN_RC:-0}" = "0" ]; [ -n "$st" ] && printf '%s\n' "${4#=}" >> "$st" ;;
+  new-session) [ "${TMUX_LS_FAIL:-0}" = "1" ] && exit 1   # an unreadable socket cannot start a session
+               [ "${TMUX_SPAWN_RC:-0}" = "0" ]; [ -n "$st" ] && printf '%s\n' "${4#=}" >> "$st" ;;
   # `tmux show-environment -g <name>` — the SERVER-environment credential probe `wt_launcher_env`
   # uses when a worker's HOME carries no credential file. Faithful: tmux exits 1 with
   # `unknown variable` when the name is not set (a different answer from an empty value, which it
   # prints as `NAME=`), and both names are probed because gh honours GITHUB_TOKEN too.
-  show-environment) if [ "${3:-}" = "GH_TOKEN" ] || [ "${3:-}" = "GITHUB_TOKEN" ]; then
+  show-environment) if [ -z "${3:-}" ]; then
+                      # `tmux show-environment -g` with NO name — the SERVER-existence probe
+                      # (`wt_tmux_has_server`). Faithful: a live server answers rc 0 even with ZERO
+                      # sessions; a socket that was never created answers with tmux's own error, rc 1.
+                      srv || { noserver; exit 1; }
+                      echo "PATH=/usr/bin:/bin"
+                      exit 0
+                    fi
+                    if [ "${3:-}" = "GH_TOKEN" ] || [ "${3:-}" = "GITHUB_TOKEN" ]; then
                       if [ "${3:-}" = "GITHUB_TOKEN" ] && [ "${TMUX_SERVER_GH_TOKEN:-0}" != "1" ]; then
                         echo "unknown variable: GITHUB_TOKEN"; exit 1
                       fi
@@ -334,6 +362,58 @@ case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a caller token against an EXISTING server is REFUSED (that session does not inherit it)" $rc
 grep -q 'new-session -d -s lane-8' "$TMP/tmux4h.log" && rc=1 || rc=0
 ck "…and no session is started for it" $rc
+# ⛔ WHICH "NO SESSION NAMES" IS WHICH (review findings 1 + 2, measured on tmux 3.4, 2026-10-23). Two
+# different boxes answer with NO session names, and they must not be conflated — the caller-token arm
+# turns on the difference:
+#   (i)  a LIVE server with ZERO sessions (`exit-empty off`): `tmux ls` → rc 0, EMPTY. The session does
+#        NOT inherit the caller's GH_TOKEN, so crediting it starts exactly the credential-less worker
+#        this gate exists to refuse. The old `-z "$(wt_tmux_names)"` inference did that (fail-open).
+#   (ii) a box that has NEVER started a server: `tmux ls` → tmux's own
+#        `error connecting to … (No such file or directory)`, rc 1. The spawn CREATES the server, so
+#        the caller's token IS portable — refusing it is the "refused every spawn, every cycle,
+#        forever" loop this change removes.
+rm -rf "$TMP/O4n" "$TMP/srv-empty"; : > "$TMP/srv-empty"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env TMUX_SERVER_EXISTS=1 TMUX_STATE="$TMP/srv-empty" bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4n" "$TMP/tmux4n.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "(i) a caller token is REFUSED against a LIVE server with ZERO sessions (that session does not inherit it)" $rc
+grep -q 'new-session -d -s lane-8' "$TMP/tmux4n.log" && rc=1 || rc=0
+ck "…and no session is started against it" $rc
+cat > "$TMP/c7.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_STATE="$O/never" TMUX_LOG="$O/tmux.log"
+. "$1"
+if out="$(wt_tmux_names)"; then echo "names_rc=0 names=[$out]"; else echo "names_rc=$? names=[$out]"; fi
+SH
+out="$(FAKE_UNAME=Linux bash "$TMP/c7.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4o" 2>&1)"
+case "$out" in *"names_rc=0 names=[]"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "(ii) a socket that was never created reads as 'no server' (rc 0, EMPTY) — not as unreadable (rc 3)" $rc
+rm -rf "$TMP/O4p"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4p" "$TMP/tmux4p.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "(ii) …so on a never-a-server box the spawn is NOT refused: it creates the server and inherits the token" $rc
+# ⛔ A QUOTED EMPTY VALUE IS STILL EMPTY (review finding, measured 2026-10-23): `=[^[:space:]]` counted
+# `GH_TOKEN=""` as provision — the character after `=` is a quote — so keys.env exported an EMPTY token,
+# gh fell back to a hosts.yml this HOME does not have, and the worker died at its first call while the
+# gate reported it provisioned.
+rm -rf "$TMP/home-qempty" "$TMP/O4q"; mkdir -p "$TMP/home-qempty"
+printf 'export GH_TOKEN=""\n' > "$TMP/home-qempty/keys.env"
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4q" "$TMP/tmux4q.log" "$TMP/home-qempty" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a QUOTED empty GH_TOKEN in keys.env is REFUSED (a quote is not a value)" $rc
+# ⛔ gh's CONFIG DIR IS NOT ALWAYS `$HOME/.config/gh` (review finding). gh resolves `GH_CONFIG_DIR`,
+# then `${XDG_CONFIG_HOME}/gh`, then `$HOME/.config/gh`. A one-location probe refuses an AUTHENTICATED
+# box forever — the refusal starts no session, so nothing can ever change the answer.
+rm -rf "$TMP/home-ghcd" "$TMP/ghcd" "$TMP/O4r"; mkdir -p "$TMP/home-ghcd" "$TMP/ghcd"
+printf 'github.com:\n' > "$TMP/ghcd/hosts.yml"
+out="$(FAKE_UNAME=Linux GH_CONFIG_DIR="$TMP/ghcd" bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4r" "$TMP/tmux4r.log" "$TMP/home-ghcd" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…while a box whose credential lives in GH_CONFIG_DIR spawns (gh's own resolution order)" $rc
+# …AND THE WORKER IS TOLD WHERE IT IS. A tmux session does not inherit this shell's environment, so a
+# probe that accepts a repointed config dir while the launch line omits it blesses a credential the
+# WORKER cannot see — a false provision one layer down (found reviewing this diff's own fix).
+grep -q "export GH_CONFIG_DIR=" "$TMP/tmux4r.log" && rc=0 || { rc=1; cat "$TMP/tmux4r.log" 2>/dev/null; }
+ck "…and the launch line carries GH_CONFIG_DIR, so the worker's gh resolves the same file the probe read" $rc
 # ... while the SAME pre-existing server is fine when IT carries the token (the positive control), so
 # the refusal is a probe of where the credential actually is, not a blanket ban.
 rm -rf "$TMP/O4i"

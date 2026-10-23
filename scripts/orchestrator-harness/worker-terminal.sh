@@ -117,6 +117,18 @@ wt_launcher() {
 # ~21 log lines" looks like from outside (measured 2026-10-22: 7 lines with no env, 50 lines with it,
 # same box, same bare server — see the header).
 #
+# `wt_gh_hosts <home>` — the `gh` credential file for that HOME. ⛔ NOT a bare `$HOME/.config/gh`
+# (review finding on this diff): `gh` resolves its config dir as `GH_CONFIG_DIR`, then
+# `${XDG_CONFIG_HOME}/gh`, then `$HOME/.config/gh`, so a box that repoints its config is AUTHENTICATED
+# while a one-location probe says otherwise — and the refusal that follows is terminal (no session is
+# started, so nothing can ever change the answer: refused every cycle, forever).
+wt_gh_hosts() {
+  local home="${1:-}"
+  if [ -n "${GH_CONFIG_DIR:-}" ]; then printf '%s\n' "$GH_CONFIG_DIR/hosts.yml"
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then printf '%s\n' "$XDG_CONFIG_HOME/gh/hosts.yml"
+  else printf '%s\n' "$home/.config/gh/hosts.yml"; fi
+}
+
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
 # operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
 # Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential
@@ -128,7 +140,7 @@ wt_launcher_home() {
   local c
   [ -n "${WT_WORKER_HOME:-}" ] && { printf '%s\n' "$WT_WORKER_HOME"; return 0; }
   for c in "${HOME:-}" /tmp/cell-home; do
-    [ -n "$c" ] && [ -s "$c/.config/gh/hosts.yml" ] && { printf '%s\n' "$c"; return 0; }
+    [ -n "$c" ] && [ -s "$(wt_gh_hosts "$c")" ] && { printf '%s\n' "$c"; return 0; }
   done
   [ -n "${HOME:-}" ] && { printf '%s\n' "$HOME"; return 0; }
   return 1
@@ -149,6 +161,18 @@ wt_tmux_server_token() {
   return 1
 }
 
+# `wt_tmux_has_server` — 0 iff a tmux SERVER answers on this socket. ⛔ DELIBERATELY NOT `tmux ls`
+# (review finding, measured on tmux 3.4, 2026-10-23): a live server with ZERO sessions (`exit-empty
+# off`) answers `tmux ls` with rc 0 and an EMPTY list, so "no session names" cannot be read as "no
+# server" — and it was, which credited a caller's `GH_TOKEN` for a server that does not inherit it
+# and started exactly the credential-less worker this gate exists to refuse. `show-environment -g`
+# talks to the SERVER, so it answers for a zero-session server (rc 0, 73 vars measured) and fails on
+# a socket that has none (rc 1) — the distinction the listing cannot make.
+wt_tmux_has_server() {
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux show-environment -g >/dev/null 2>&1
+}
+
 # `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
 # credential. ⛔ THIS IS THE LOUD HALF: a credential-less worker burns a dispatch and produces nothing,
 # which is indistinguishable from the launcher killing it — so the spawn is refused, naming every
@@ -166,20 +190,26 @@ wt_tmux_server_token() {
 # variable counts only when it is non-empty; `GITHUB_TOKEN` is accepted beside `GH_TOKEN` everywhere
 # (gh honours both) because a `GITHUB_TOKEN`-only box is otherwise refused forever.
 wt_launcher_env() {
-  local home="${1:-}" keys have=0 names
+  local home="${1:-}" keys have=0
   [ -n "$home" ] || return 1
   keys="$home/keys.env"
-  [ -s "$home/.config/gh/hosts.yml" ] && have=1
+  [ -s "$(wt_gh_hosts "$home")" ] && have=1
+  # ⛔ A VALUE IS NOT A QUOTED EMPTY (review finding, measured 2026-10-23). `=[^[:space:]]` counted
+  # `GH_TOKEN=""` as provision — the character after `=` is a quote — so the file exported an EMPTY
+  # token, `gh` fell back to the hosts.yml this HOME does not have, and the worker died at its first
+  # call while the gate reported it provisioned. Requiring one non-space, non-quote character after
+  # an optional opening quote rejects `=`, `=""` and `=''` and keeps `=ghp_x` / `="ghp_x"`.
+  # Residual: `GH_TOKEN="$SOMETHING"` is counted — a variable reference cannot be evaluated without
+  # sourcing the file here, and an operator who writes one is asserting it resolves.
   if [ "$have" = "0" ] && [ -f "$keys" ] \
-     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=[^[:space:]]' "$keys" 2>/dev/null; then
+     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=["'\'']?[^[:space:]"'\'']' "$keys" 2>/dev/null; then
     have=1
   fi
   if [ "$have" = "0" ] && [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
-    # ... but only if this spawn will CREATE the server (see above). `wt_tmux_names` answers rc=0 with
-    # EMPTY output for the genuine `no server` case and 3 for an unreadable socket — an unreadable
-    # socket is not evidence of a fresh start, so the caller's token is not credited for it.
+    # ... but only if this spawn will CREATE the server (see above), and that is decided by a
+    # POSITIVE server probe, never by an empty session list (see `wt_tmux_has_server`).
     command -v tmux >/dev/null 2>&1 || return 1
-    if names="$(wt_tmux_names)" && [ -z "$names" ]; then have=1; fi
+    if ! wt_tmux_has_server; then have=1; fi
   fi
   if [ "$have" = "0" ]; then
     # nothing in the HOME or a credit-bearing caller: the tmux SERVER's global env may still carry one,
@@ -202,6 +232,16 @@ wt_launcher_env() {
   # cell home; post-source so the file cannot repoint it). `O` is emitted after the source for the
   # same reason.
   printf '; export HOME=%s' "$(wt_q "$home")"
+  # ⛔ THE WORKER MUST RESOLVE `gh`'s CONFIG THE WAY THE PROBE DID. `wt_gh_hosts` accepts
+  # `GH_CONFIG_DIR` / `XDG_CONFIG_HOME`, but a tmux session does NOT inherit this shell's
+  # environment — so probing a repointed config dir and then starting a worker without it would be
+  # the same false provision this gate exists to refuse, one layer down (found reviewing this
+  # diff's own fix). Emitted only when it actually drove the probe.
+  if [ -n "${GH_CONFIG_DIR:-}" ]; then
+    printf '; export GH_CONFIG_DIR=%s' "$(wt_q "$GH_CONFIG_DIR")"
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '; export XDG_CONFIG_HOME=%s' "$(wt_q "$XDG_CONFIG_HOME")"
+  fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
   return 0
 }
@@ -337,6 +377,14 @@ wt_tmux_names() {
   if out="$(tmux ls -F '#{session_name}' 2>&1)"; then printf '%s\n' "$out"; return 0; fi
   case "$out" in
     *'no server running'*|*'no sessions'*|*'no current session'*) return 0 ;;
+    # ⛔ A SOCKET THAT WAS NEVER CREATED IS "NO SERVER", and tmux 3.4 says so in its own words:
+    # `error connecting to /tmp/tmux-1000/default (No such file or directory)`, rc=1. Not matching
+    # it made a FRESH box (no server ever started) answer 3 — "unreadable, not evidence of a fresh
+    # start" — so `wt_launcher_env` refused the very shape it credits (a caller carrying `GH_TOKEN`
+    # that will CREATE the server): refused every spawn, every cycle, forever, which is the loop this
+    # change exists to remove (review finding, measured on tmux 3.4, 2026-10-23). ECONNREFUSED and
+    # permission errors stay rc 3: a socket we cannot read is not evidence of a fresh start.
+    *'error connecting to'*'No such file or directory'*) return 0 ;;
   esac
   return 3
 }
