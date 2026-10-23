@@ -294,11 +294,14 @@ mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
 # Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
-# through ONE module. That is not tidiness: a tmux window on a cloud cell dies at ~21 log lines
-# (measured on all three cells, 2026-10-20) while the same lane in a DURABLE TERMINAL survives, so
-# the launcher, the census the caps read, and the reaper must all move together or the caps stop
-# binding (a census that still counts `tmux ls` reports 0 workers for durable terminals and the
-# ceiling never trips). See that file's header for the measurement and for the refusal stance.
+# through ONE module. That is not tidiness: the launcher, the census the caps read, and the reaper
+# must all move together or the caps stop binding (a census that still counts `tmux ls` reports 0
+# workers for durable terminals and the ceiling never trips). ⛔ On a Linux cell the module's own
+# `wt_launcher` decides between a durable terminal (cmux answers) and tmux with an explicit
+# HOME+keys.env contract (it does not) — the `~21 log lines` death that once made a cell resolve to
+# `none` was an ENVIRONMENT failure, not a tmux one (agent-infra#2210, reopened 2026-10-22), and
+# resolving to `none` refused every spawn on every cycle. See that file's header for the measurements
+# and for the refusal stance.
 for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
   [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
 done
@@ -1561,7 +1564,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   local yld="${5:-0}" ynote=""
   case "$yld" in ''|*[!0-9]*) yld=0 ;; esac
   if [ "$yld" -gt 0 ]; then
-    ynote=" | yields=$yld (yielded to peers for capacity — this is NOT \"the fleet has nothing to do\"; they stay free for other boxes until their yield expires)"
+    # ⛔ THE WORDS MUST MATCH THE GATE (#2409). A `land` refusal is REPO-WIDE: every box measures the
+    # same open count against the same landing rate, so telling the operator (and the funnel) that this
+    # was "for capacity" and the item is "free for other boxes" is FALSE for it — the remedy is to land
+    # an open PR, on this box or any other. `capacity_yield_live` exports the gate, so the sentence can
+    # name it instead of assuming load.
+    ynote=" | yields=$yld (stood down by a GATE refusal — this is NOT \"the fleet has nothing to do\"; a load/disk stand-down leaves them free for other boxes, a land-backlog one is repo-wide and clears only by landing)"
   fi
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
@@ -1948,6 +1956,7 @@ CAPACITY_YIELD_WHY=""
 capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consume), 1 = dispatch
   local n="${1:-}" f ep until gate now
   CAPACITY_YIELD_WHY=""
+  CAPACITY_YIELD_GATE=""
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   f="$O/state/capacity-refused-$n"
   [ -r "$f" ] || return 1
@@ -1962,6 +1971,9 @@ capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consu
   # yield, and `until - ep` is the window the writer used. Accept only a coherent pair.
   [ "$until" -gt "$ep" ] || return 1
   CAPACITY_YIELD_WHY="gate=${gate:-?} until=$until ($(( until - now ))s left)"
+  # The GATE, for callers whose words depend on it (#2409): a `land` refusal is repo-wide, so the
+  # dispatch line must not claim the item is a peer's to take.
+  CAPACITY_YIELD_GATE="${gate:-}"
   return 0
 }
 
@@ -3183,11 +3195,11 @@ while true; do
             echo "#$PR RED TREE at head=$HEAD_N — a worker already owns this PR (fix-$PR/merge-$PR live, or the cross-box claim holds it), NOT spawning a second (attempt $RF_N/${MAX_RED_FIX_TRIES:-2} spent). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "a worker already owns this PR — the rail refusal stands at this head"
           elif [ "$(wt_count fix-)" -lt "${MAX_RED_FIX:-4}" ] && can_spawn; then
-            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets a
-            # daemon-owned DURABLE TERMINAL exactly like every other worker — a tmux window or a
-            # transient `cloud exec` child dies at ~21 log lines (measured on all three cells, see
-            # `worker-terminal.sh`'s header), and a dead red-fixer is indistinguishable from one that
-            # found nothing to fix. Args go in a FILE so no PR-derived value reaches `sh -c`, and
+            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets the
+            # surface that box actually has — a daemon-owned DURABLE TERMINAL where cmux answers, tmux
+            # with an explicit HOME+keys.env contract where it does not (the `~21 log lines` death was
+            # the missing environment, and a dead red-fixer is indistinguishable from one that found
+            # nothing to fix). Args go in a FILE so no PR-derived value reaches `sh -c`, and
             # `fix-one.sh` — which materialises the branch's OWN worktree from origin, captures the
             # failing checks and their logs, and re-runs the merge chain (which re-rails) when it
             # pushes. A red-fixer never runs in the hub checkout: the fixer script cd's into the
@@ -4082,7 +4094,11 @@ PY
       # the `parked-*` failure R8 names, on a per-machine capacity signal.
       if capacity_yield_live "$ISS"; then
         Y=$((Y+1))
-        echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        if [ "${CAPACITY_YIELD_GATE:-}" = "land" ]; then
+          echo "[dispatch] #$ISS stood down — this box refused it at the LAND-BACKLOG gate (the repo's open-PR backlog is over its own landing ceiling; repo-wide, so NO peer can clear it by waiting — the remedy is to land an open PR) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        else
+          echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        fi
         continue
       fi
       # ── PLACEMENT: the LEAST-LOADED ELIGIBLE BOX takes it (measured, agent-infra 2026-10-21) ─────

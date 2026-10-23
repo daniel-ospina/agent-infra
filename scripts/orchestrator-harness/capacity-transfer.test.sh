@@ -112,16 +112,21 @@ PATH="$TMP/bin:$PATH"; export PATH
 #   lbgh-p0     lbgh-deep + issue labelled P0-blocker    -> EXEMPT
 #   lbgh-basered lbgh-deep + issue title 'main is red…'  -> EXEMPT
 #   lbgh-paged 250 open in 3 pages / 10 landings last 24h, 40 the 24h before -> OK (both rules)
-lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title]
-  local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}"
+#   lbgh-nopr   lbgh-deep with ZERO open PRs on the branch -> a `prfix` claim is UNPROVABLE -> HOLD
+lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title] [open-PR-count]
+  local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}" prn="${8:-1}"
   # A QUOTED heredoc, so nothing here is expanded by the test shell; the @TOKENS@ are the only
   # substitutions. `\001` is the field separator the reader cuts on, and bash's printf interprets it
   # in the FORMAT string (the stub's shebang is bash), so the label/title pair arrives verbatim.
   sed -e "s|@O1@|$o1|g" -e "s|@O2@|$o2|g" -e "s|@L24@|$l24|g" -e "s|@P24@|$p24|g" \
-      -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" > "$f" <<'STUB'
+      -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" -e "s|@PRN@|$prn|g" > "$f" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
   *broken*) exit 1 ;;
+  # ⛔ THE `prfix` EXEMPTION'S EVIDENCE (review cycle 4, P2-1): a repair worker is exempt only when
+  # this worktree's BRANCH already has an OPEN PR, so the gate asks `gh pr list --head <branch>`.
+  # The count is a shape parameter, because the arm that matters is the one where it is ZERO.
+  *pr\ list*) printf '%s\n' "@PRN@"; exit 0 ;;
   *"/issues/"*) printf '%s\001%s\n' "@LAB@" "@TITLE@"; exit 0 ;;
   # ⛔ `&page=1 ` — WITH THE TRAILING SPACE: the URL also carries `per_page=100`, which CONTAINS the
   # substring `page=1`, so a loose glob served page 1 for every page (measured: 5 x 100 = "500 open"
@@ -153,11 +158,18 @@ lbgh_shape "$TMP/lbgh-prior"  30  0   10 40
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/lbgh-broken"; chmod +x "$TMP/lbgh-broken"
 lbgh_shape "$TMP/lbgh-p0"     81  0   15 0 "P0-blocker,harness" "crash on boot"
 lbgh_shape "$TMP/lbgh-basered" 81 0   15 0 "bug" "main is red: lander.test.sh pipes"
+lbgh_shape "$TMP/lbgh-nopr"    81  0   15 0 "bug" "a normal issue" 0
 # A worktree whose origin names a real GitHub slug — the gate DERIVES the repo (there is no `LB_REPO`
 # env over-ride on purpose: pointing it at an empty repo would be a bypass). No commits needed; the
 # gate only reads `remote.origin.url`.
 LBWT="$TMP/lbwt"; mkdir -p "$LBWT"
 ( cd "$LBWT" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git ) >/dev/null 2>&1
+# A SECOND fixture WITH A COMMIT (and therefore a branch name). `git rev-parse --abbrev-ref HEAD` is
+# what the `prfix` evidence reads, and it fails on a repo with no commits — so the positive arm needs a
+# tree a branch can be named in, while the negative arm must be a real "branch exists, no PR" case.
+LBWT2="$TMP/lbwt2"; mkdir -p "$LBWT2"
+( cd "$LBWT2" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git \
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) >/dev/null 2>&1
 
 # The AUTHORITATIVE stubs: exported functions (see the header). Each records that it answered, so a
 # stub the tested script never resolved cannot pass as "stubbed".
@@ -612,7 +624,7 @@ else
   ck "with NO yields the funnel line is unchanged — no 'yields=' decoration ('$BASE')" $rc
   # Positive direction: the note names the count AND retracts the emptiness reading, in words.
   SOME="$(funnel 0 'READ(3)' '' '' 4)"
-  { grep -q 'yields=4' <<<"$SOME" && grep -q 'NOT "the fleet has nothing to do"' <<<"$SOME" && grep -q 'yielded to peers for capacity' <<<"$SOME"; }; rc=$?
+  { grep -q 'yields=4' <<<"$SOME" && grep -q 'NOT "the fleet has nothing to do"' <<<"$SOME" && grep -q 'stood down by a GATE refusal' <<<"$SOME"; }; rc=$?
   ck "with yields the funnel line names them and retracts the emptiness reading ('$SOME')" $rc
   # …and it is ADDITIVE: the reconciled decomposition is untouched, so a yields note can never make
   # an UNRECONCILED funnel read as summed (the #2040 property this must not weaken). Driven on a
@@ -764,12 +776,34 @@ ck "§LB no landing/merge script references the gate (checked:$([ -n "$lb_on_lan
 # ⛔ AND THE REPAIR INGRESSES THAT ARE NOT SHELL ARE COVERED TOO (review cycle 2, P1). The grep above
 # proves nothing about `pr-doctor.py`, and that is exactly where the gate was refusing the drain: every
 # PR repair goes through `nonblocking-dispatch.sh`, whose KIND was hardcoded `bg` — a CREATION label —
-# so at the first hold the workers that rebase and fix the open PRs were refused. Assert the two halves
-# that make it a drain: pr-doctor DECLARES `prfix` on the spawn, and spawn-gate EXEMPTS it.
-{ grep -q '"prfix"' "$HERE/../pr-doctor.py" && grep -q 'fixer|reviewer|prfix' "$HERE/spawn-gate.sh"; }; rc=$?
-ck "§LB pr-doctor's repair workers declare the kind the gate EXEMPTS (prfix) - the drain is not gated" $rc
-# …and the declaration reaches the dispatcher as an ARGUMENT, not an ambient `KIND`. An env value would
-# be lane-writable, i.e. a bypass; the argv is visible in the one command pr-doctor builds.
+# so at the first hold the workers that rebase and fix the open PRs were refused. Assert the halves that
+# make it a drain: pr-doctor DECLARES `prfix` on the spawn, and the gate PROVES it from GitHub.
+{ grep -q '"prfix"' "$HERE/../pr-doctor.py" && grep -q 'land_backlog_open_pr_evidence' "$HERE/spawn-gate.sh"; }; rc=$?
+ck "§LB pr-doctor's repair workers declare prfix, and the gate PROVES it (branch must have an open PR)" $rc
+# ⛔ A DECLARED KIND IS NOT EVIDENCE (review cycle 4, P2-1). `prfix` arrives in an argv a LANE can type,
+# so exempting it on the caller's word was a one-argument bypass: the reproduction started a worker on a
+# repo 5.4x over its ceiling. Both directions are driven below: unprovable -> HOLD, provable -> runs.
+: > "$PI_LOG"; rm -f "$O/logs/prfix-201.log"
+lbgh_install "$TMP/lbgh-nopr"
+( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             printf "prompt\n" > "$2/pf.txt"; run_agent 5 "$2/pf.log" "$2/pf.txt" "prfix 77"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+pfrc=$?
+{ [ "$pfrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB KIND=prfix with NO open PR on the branch is HELD (rc=$pfrc) — a declared kind cannot switch the gate off" $rc
+grep -q 'prfix was DECLARED but could not be PROVEN' "$TMP/pf.log"; rc=$?
+ck "§LB …and says so, naming the unprovable claim rather than a backlog reading" $rc
+# …and the PROVABLE case runs, which is the whole reason the kind exists.
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-deep"
+( cd "$LBWT2" && O="$O" KIND=prfix TAG=78 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             printf "prompt\n" > "$2/pg.txt"; run_agent 5 "$2/pg.log" "$2/pg.txt" "prfix 78"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+pgrc=$?
+{ [ "$pgrc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB …and with an OPEN PR on the branch it RUNS even over the ceiling (rc=$pgrc) — repair is the drain" $rc
+grep -q 'EXEMPT.*KIND=prfix' "$TMP/pg.log"; rc=$?
+ck "§LB …and the exemption is NAMED with its evidence (the open PR), not asserted" $rc
+# …and the declaration reaches the dispatcher as an ARGUMENT, not an ambient `KIND`.
 { grep -q 'str(SPAWN_TIMEOUT_S), "prfix"' "$HERE/../pr-doctor.py"; }; rc=$?
 ck "§LB …and it travels as the dispatcher's ARGV (a lane cannot set it), not as an inherited KIND" $rc
 # The dispatcher must also REFUSE an invented kind: the exempt set is what the gate switches on, so a
