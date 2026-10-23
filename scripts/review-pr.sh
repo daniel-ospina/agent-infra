@@ -411,10 +411,31 @@ SHA_CMD=""
 # ⛔ RESOLVED BY RUNNING IT, NOT BY `command -v` (P2, sixth fresh review): a sha256sum that exists but
 # FAILS (busybox stub, restrictive sandbox, a shim) would be chosen by a lookup and then yield an empty
 # token for every oversized diff — the run would die after the review was paid for, blaming the diff.
+# ⛔ `$_SHA_CMD` IS USED UNQUOTED AT ITS CALL SITES (it may be the two-word `shasum -a 256`), so it is
+# named with the leading underscore that marks a word-splitting command here. `$SHA_CMD` stays the
+# quoted display string; both are set from the same probe so they cannot disagree.
+_SHA_CMD=""
 if printf 'probe\n' | sha256sum >/dev/null 2>&1; then
-  SHA_CMD="sha256sum"
+  SHA_CMD="sha256sum"; _SHA_CMD="sha256sum"
 elif printf 'probe\n' | shasum -a 256 >/dev/null 2>&1; then
-  SHA_CMD="shasum -a 256"
+  SHA_CMD="shasum -a 256"; _SHA_CMD="shasum -a 256"
+fi
+# ⛔ THE RECORDER'S DIFF IDENTITY IS NORMALIZED, SO THE SEAM MUST KNOW THE NORMALIZER (P1, fourth fresh
+# review of #2288): `record-review.sh` signs sha256 over `scripts/lib/diff-normalize.py`'s output (raw
+# digest only as a loud fallback), and its normalizer rewrites `index` lines and hunk headers — so
+# hashing the raw capture produces a digest that NEVER matches a real marker. Resolved next to the
+# sibling repo layout; `DIFF_NORMALIZER_OK` is the arm switch the post-record check reads.
+# ⛔ ITS OWN DIRECTORY, NOT `$SELF_DIR` (P1, this lane — the first version read `$SELF_DIR`, which is
+# only assigned LATER, inside the recorder-resolution branch, so under the fixture override the
+# normalizer was never found and the very P1 this fixes would have survived on the clean path).
+_D="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+DIFF_NORMALIZER=""
+for _cand in "$_D/lib/diff-normalize.py" "$_D/../scripts/lib/diff-normalize.py" "$_D/../lib/diff-normalize.py"; do
+  if [ -s "$_cand" ]; then DIFF_NORMALIZER="$(cd "$(dirname "$_cand")" && pwd)/$(basename "$_cand")"; break; fi
+done
+DIFF_NORMALIZER_OK=""
+if command -v python3 >/dev/null 2>&1 && [ -n "$DIFF_NORMALIZER" ]; then
+  DIFF_NORMALIZER_OK=1
 fi
 DIFF_TAIL=""
 DIFF_LASTLINE=""
@@ -1686,7 +1707,7 @@ fi
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
 refuse_counted_clean() {
-  local _vl _vw _hit _one _dig
+  local _vl _vw _hit _hit2 _one _dig _bare _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -1724,23 +1745,70 @@ refuse_counted_clean() {
     # this commit is rebased onto): the bridge between the numeral and `finding(s)` is any run of up
     # to three words, and a resolved participle may carry `was|is|are|were`. Vocabulary also carries
     # the word numerals this lane added (single/sole/lone/half a dozen/thirteen…twenty).
-    # ⛔ ONE CLOSED FINDING-NOUN LIST, NOT TWO (P1, third fresh review of #2288 — MEASURED fail-OPEN).
-    # The severity scanner's own `noun()` recognises `defects?|bugs?|…`, but this count guard knew only
-    # `findings?|issues?|blockers?|problems?`, so `CLEAN — 2 defects remain in scripts/x.sh`, `CLEAN —
-    # two blocking defects remain`, `ISSUES 0 — one blocking defect is pre-existing` and their
-    # `regressions?/vulnerabilit(y|ies)|violations?` twins all exited 0 and wrote a SIGNED clean record
-    # over a reported blocker. The vocabulary below is `noun()`'s, in the same source order, so the two
-    # readers cannot drift apart again without the §BB vocabulary arm going red.
+    # ⛔ THE FINDING NOUNS ARE A SUPERSET OF THE SEVERITY SCANNER'S, AND THAT IS DELIBERATE (P1, third
+    # fresh review of #2288 — MEASURED fail-OPEN; P2, fourth review — the earlier comment here claimed
+    # the lists were identical, which they are NOT and should not be). `noun()` is
+    # `findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major`: its last five
+    # entries are SEVERITY words, which must never be read as a countable noun (`2 critical` is not a
+    # count of findings), so this list cannot be `noun()` verbatim — it is `noun()`'s finding nouns PLUS
+    # the general synonyms a reviewer actually writes, and §BI asserts every finding noun of `noun()` is
+    # present here, so an edit to one without the other goes red.
+    #   Before this arm the list was `findings?|issues?|blockers?|problems?`, so
+    #   `CLEAN — 2 defects remain in scripts/x.sh`, `CLEAN — two blocking defects remain`,
+    #   `ISSUES 0 — one blocking defect is pre-existing` and their `regressions?/vulnerabilit(y|ies)|
+    #   violations?` twins all exited 0 and wrote a SIGNED clean record over a reported blocker.
+    # ⚠️ DECLARED RESIDUAL, OVER-BLOCK (P2, fourth fresh review of #2288): a VERDICT-shaped line that
+    # reports a non-zero count and only explains later that those findings are REPAIRED — `CLEAN — the 2
+    # defects reported in #123 are fixed on this branch.` — is refused, because the participle exemption
+    # is positional and a mechanical reader cannot tell that sentence from `2 defects remain; 1 was
+    # fixed.` (which must refuse: a blocker is still open). Guessing wrong mints a signed clean record
+    # over a reported blocker, so the direction is fail-closed and the refusal prints the remedy: say it
+    # without a count (`the defects from #123 are fixed on this branch`) — the ordinary-line cue below
+    # exempts that shape, and §BI pins BOTH directions.
+    # ⛔ AND ON A LINE THAT IS NOT VERDICT-SHAPED, A COUNT NEEDS A LIVE-FINDING CUE (P2, fourth fresh
+    # review of #2288 — MEASURED over-block, the direction that costs a PAID re-run: widening the
+    # channel to every survivor line made `Fixed the 3 issues from round 1.` and
+    # `CLEAN — the 2 defects reported in #123 are fixed on this branch.` refuse, because the resolved
+    # participle has to sit immediately after the noun). A verdict-shaped line is self-contradictory by
+    # construction, so there a count always refuses; on an ordinary line the reviewer is describing work
+    # done unless the sentence says the findings are still there — `remain(s|ing)`, `unresolved`,
+    # `still`, `left`, `open`, `outstanding`, `blocking`, `found`, `located`. Both measured fail-opens
+    # from the third review (`I found two blocking issues:`, `2 defects remain`) carry a cue.
     _hit="$(printf '%s' "$_vl" \
       | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
       | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+    # ⛔ THE INVERSE COUNT FORM (P2, fourth fresh review of #2288 — PRE-EXISTING on main, MEASURED:
+    # `**Verdict:** CLEAN — P1 × 2 in scripts/x.sh.` recorded clean on BOTH revisions, and this file
+    # already PARSES the `3 × P1` spelling for an ISSUES verdict, so the multiplier is a count the
+    # reviewer is entitled to write). `<severity> × <n>` puts the number where the `<count> <noun>`
+    # grammar cannot see it, so it gets its own arm rather than a wider bridge.
+    _hit2="$(printf '%s' "$_vl" \
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+[[:space:]]*×[[:space:]]*P[0-3]|P[0-3][[:space:]]*×[[:space:]]*[0-9]+)' 2>/dev/null || true)"
+    if [ -n "$_hit2" ]; then _hit="${_hit:+$_hit
+}$_hit2"; fi
     [ -n "$_hit" ] || continue
+    # ⛔ ON AN ORDINARY LINE A COUNT NEEDS A LIVE-FINDING CUE (P2, fourth fresh review of #2288 —
+    # MEASURED over-block, the direction that costs a PAID re-run: widening the channel to every
+    # survivor line made `Fixed the 3 issues from round 1.` refuse, because the resolved participle had
+    # to sit immediately after the noun). A verdict-shaped line is self-contradictory by construction,
+    # so there a non-zero count always refuses unless a repaired participle sits in the slot the regex
+    # already allows; an ordinary line is only a contradiction when the sentence says the findings are
+    # STILL there — remain(s|ing), unresolved, still, left, open, outstanding, blocking, found,
+    # located, pending. Both measured fail-opens of the third review (`I found two blocking issues:`,
+    # `2 defects remain`) carry a cue.
+    if [ "$_src" != "$VERDICT_LINES_FILE" ]; then
+      printf '%s' "$_vl" | grep -qEi '(remain|remaining|remains|unresolved|still|left|open|outstanding|blocking|found|located|pending)' || continue
+    fi
     # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
     # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
     # the line keeps being scanned rather than being exempted whole.
     while IFS= read -r _one; do
       [ -n "$_one" ] || continue
-      _dig="$(printf '%s' "$_one" | grep -oE '[0-9]+' | head -1)"
+      # ⛔ THE SEVERITY LABEL'S OWN DIGIT IS NOT THE COUNT (P2, fourth fresh review of #2288 — the
+      # `P1 × 2` arm read `P1` as the count and refused `0 × P1`, a zero multiplier): strip the `P<n>`
+      # tokens first, then the first number left is the count, in every form and both directions.
+      _bare="${_one//P[0-3]/}"
+      _dig="$(printf '%s' "$_bare" | grep -oE '[0-9]+' | head -1)"
       [ -n "$_dig" ] && [ "$_dig" -eq 0 ] && continue
       CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
     done <<<"$_hit"
@@ -2160,9 +2228,24 @@ esac
 # when the group is present, one read when it is not.
 MARKER_DIFF="$(marker_diff_for "$BODY_AFTER")"
 if [ -n "${MARKER_DIFF:-}" ]; then
-  DIFF_REVIEWED="$(printf '%s' "$DIFF_FULL" | sha256sum | cut -d' ' -f1)"
-  if [ "$MARKER_DIFF" != "$DIFF_REVIEWED" ]; then
-    die "$E_MOVED" "the SIGNED record's diff ($MARKER_DIFF) is NOT the diff the reviewer read ($DIFF_REVIEWED) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. Nothing to re-review: the head is unchanged, so re-run this command (the recorder's same-head write is idempotent) to re-sign the diff that was actually read."
+  # ⛔ THE DIGEST MUST BE THE ONE THE RECORDER MINTS, NOT A PLAUSIBLE-LOOKING SHA (P1, fourth fresh
+  # review of #2288 — MEASURED: `sha256(raw capture)` is NOT what `record-review.sh` signs, so EVERY
+  # clean run on a healthy box exited 8 AFTER posting the comment and writing the record, and the
+  # re-run it advises hits E_ALREADY forever — an unsatisfiable wall on the tool's only success path).
+  # The recorder hashes the FETCHED FILE bytes (trailing newline included) through the shared
+  # normalizer `scripts/lib/diff-normalize.py`, and falls back to the RAW digest when python3 or the
+  # normalizer is unavailable. So this reproduces both of the recorder's forms and accepts either:
+  # both are identities of the bytes the reviewer read, which is the property being checked.
+  DIFF_RAW_HASH="$(printf '%s\n' "$DIFF_FULL" | $_SHA_CMD | cut -d' ' -f1 2>/dev/null)"
+  DIFF_NORM_HASH=""
+  if [ -n "$DIFF_NORMALIZER_OK" ]; then
+    DIFF_NORM_HASH="$(printf '%s\n' "$DIFF_FULL" | python3 "$DIFF_NORMALIZER" 2>/dev/null | $_SHA_CMD | cut -d' ' -f1 2>/dev/null)"
+  fi
+  if [ -z "$DIFF_RAW_HASH" ] && [ -z "$DIFF_NORM_HASH" ]; then
+    die "$E_SCAN" "no portable sha256 tool could digest the reviewed diff (tried sha256sum, shasum -a 256), so the record's diff identity cannot be checked — refusing to report success on an unverified attestation ($(printf '%s' "$SHA_CMD" | sed 's/^$/none resolved/'))"
+  fi
+  if [ "$MARKER_DIFF" != "$DIFF_RAW_HASH" ] && { [ -z "$DIFF_NORM_HASH" ] || [ "$MARKER_DIFF" != "$DIFF_NORM_HASH" ]; }; then
+    die "$E_MOVED" "the SIGNED record's diff ($MARKER_DIFF) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. Nothing to re-review: the head is unchanged, so re-run this command (the recorder's same-head write is idempotent) to re-sign the diff that was actually read."
   fi
 else
   DIFF_SIGNED="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \

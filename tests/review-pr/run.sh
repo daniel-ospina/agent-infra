@@ -2181,14 +2181,108 @@ reset
 # signed marker minted with a diff= the reviewer never read, at the unchanged head, printed ✅ because
 # check (c) binds the head sha and the seam's own diff checks all run BEFORE the recorder re-reads
 # the live diff). The fixture can now write that group, exactly as record-review.sh does.
-DH="$(printf '%s' "$FIXTURE_DIFF" | sha256sum | cut -d' ' -f1)"
+# ⛔ THE DIGEST IS THE RECORDER'S, NOT A PLAUSIBLE-LOOKING ONE (P1/P2, fourth fresh review of #2288 —
+# MEASURED: the seam hashed the RAW capture while `record-review.sh` signs sha256 over the shared
+# normalizer's output, so on a healthy box EVERY marker was refused — exit 8 AFTER the comment was
+# posted and the record written, with the advised re-run then hitting E_ALREADY forever. The fixture
+# therefore writes the digest the way the RECORDER computes it, through `scripts/lib/diff-normalize.py`,
+# and uses `fixture_sha256` (macOS has no `sha256sum`).
+_NORM="$ROOT/scripts/lib/diff-normalize.py"
+[ -s "$_NORM" ]; ck $? "the shared diff normalizer is where the seam looks for it"
+DH="$(printf '%s\n' "$(cat "$TMP/diff-body" 2>/dev/null || printf '%s' "$FIXTURE_DIFF")" | python3 "$_NORM" | fixture_sha256)"
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$DH"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "a marker whose diff= IS the reviewed diff records (rc=$(rc_of))"
+[ "$(rc_of)" = "0" ]; ck $? "a RECORDER-SHAPED marker diff= (normalized) records (rc=$(rc_of))"
+# …and the recorder's raw fallback form (no python3 / no normalizer on the box) is accepted too.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+FIXTURE_MARKER_DIFF="$(printf '%s\n' "$FIXTURE_DIFF" | fixture_sha256)"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and the recorder's RAW fallback digest is accepted (rc=$(rc_of))"
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$(printf '%064d' 1)"
 run "$SRC" 2284
 [ "$(rc_of)" = "8" ]; ck $? "  ...and a marker whose diff= is NOT the reviewed diff is exit 8 (rc=$(rc_of))"
 err_has "NOT the diff the reviewer read"; ck $? "    ...naming the mismatch"
+reset
+
+# ── §BI the over-block direction, the inverse count form, and the two vocabularies ──
+echo; echo "§BI a clean report describing REPAIRED findings still records; the P<n> × n form is a count"
+# ⛔ THE OVER-BLOCK DIRECTION IS A DEFECT TOO, AND IT COSTS A PAID RE-RUN (P2, fourth fresh review of
+# #2288 — MEASURED: widening the count channel to every survivor line made each line below refuse, so
+# a legitimate clean report could not be recorded at all). The cue requirement — `remain(s|ing)`,
+# `unresolved`, `still`, `left`, `open`, `outstanding`, `blocking`, `found`, `located` — separates "the
+# findings are still there" from "I dealt with them". Both directions are pinned together, because
+# this guard has now failed in BOTH.
+for _cl in \
+  'Fixed the 3 issues from round 1.\
+**Verdict:** CLEAN' \
+  'The defects from #123 are fixed on this branch.\
+**Verdict:** CLEAN' \
+  '**Verdict:** CLEAN — 1 finding fixed and re-reviewed.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "records clean: $_cl (rc=$(rc_of))"
+  [ -f "$TMP/record-argv.txt" ]; ck $? "    ...recorded"
+done
+# ⚠️ DECLARED RESIDUAL, OVER-BLOCK, PINNED SO IT CANNOT DRIFT SILENTLY (P2, fourth fresh review of
+# #2288): a VERDICT-shaped line whose repair explanation comes later in the sentence
+# (`CLEAN — the 2 defects reported in #123 are fixed on this branch.`) is refused. A mechanical reader
+# cannot separate it from `2 defects remain; 1 was fixed.` — which MUST refuse, a blocker is open — and
+# guessing wrong mints a signed clean record over a reported blocker. The remedy is in the refusal
+# message, and the line above shows the exempt shape that follows it.
+reset; printf '**Verdict:** CLEAN — the 2 defects reported in #123 are fixed on this branch.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "RESIDUAL: a later-sentence repair on a verdict line is refused (rc=$(rc_of))"
+err_has "resolved participle"; ck $? "    ...and the refusal names the remedy"
+no_record; ck $? "    ...nothing recorded"
+# …and the LIVE-FINDING cue keeps the fail-open closed: the same nouns with a cue still refuse.
+for _cl in \
+  'I found two blocking issues:\
+**Verdict:** CLEAN' \
+  '**Verdict:** CLEAN — 2 defects remain in scripts/x.sh.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (live-finding cue): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# ⛔ THE INVERSE COUNT FORM (P2, fourth fresh review of #2288 — PRE-EXISTING on main and MEASURED:
+# `P1 × 2` recorded clean on BOTH revisions, while this file already parses `3 × P1` for an ISSUES
+# verdict, so the multiplier is a spelling a reviewer is entitled to write).
+reset; printf '**Verdict:** CLEAN — P1 × 2 in scripts/x.sh.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…'P1 × 2' is a count, not a clean summary (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+reset; printf '**Verdict:** CLEAN — 2 × P2 in scripts/x.sh.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  ...and so is '2 × P2' (rc=$(rc_of))"
+reset
+
+# ══ §BI-2 the count vocabulary cannot silently drift from the severity scanner's ══
+echo; echo "§BI-2 every finding noun the severity scanner knows is also countable"
+# ⛔ THE EARLIER CLAIM WAS FALSE AND HAD NO ARM (P2, fourth fresh review of #2288): the comment said the
+# count list WAS `noun()`'s list "in the same source order", which it is not — `noun()` also carries
+# severity words that must never be read as a countable noun. The property that actually has to hold is
+# narrower and testable: every FINDING noun in `noun()` is described by the count list. This derives
+# both lists from the SUT, so an edit to either without the other is red.
+_NOUN_LINE="$(grep -n '^function noun()' "$SRC" | head -1 | cut -d: -f1)"
+[ -n "$_NOUN_LINE" ]; ck $? "the severity scanner's noun() was located (line ${_NOUN_LINE:-<none>})"
+_NOUNS="$(sed -n "${_NOUN_LINE}p" "$SRC" | sed -n 's/.*return "(\([^"]*\))".*/\1/p' | tr '|' ' ')"
+[ -n "$_NOUNS" ]; ck $? "…and its alternation was extracted"
+_COUNT_LINE="$(grep -n 'findings?|blockers?|issues?' "$SRC" | grep -v '^[0-9]*:function noun' | head -1 | cut -d: -f1)"
+[ -n "$_COUNT_LINE" ]; ck $? "the count guard's noun list was located (line ${_COUNT_LINE:-<none>})"
+_COUNT_TXT="$(sed -n "${_COUNT_LINE}p" "$SRC")"
+_missing=""
+for _n in $_NOUNS; do
+  case "$_n" in
+    severity|priority|critical|high|major) continue ;;   # severity words are not countable nouns
+  esac
+  case "$_COUNT_TXT" in
+    *"$_n"*) ;;
+    *) _missing="$_missing $_n" ;;
+  esac
+done
+[ -z "$_missing" ]; ck $? "…and every finding noun in noun() is in the count list (missing:${_missing:- none})"
 reset
 
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
@@ -2205,7 +2299,9 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 661 when §BH (noun vocabulary, the survivor-set count channel, the marker diff=) added 22
+# Re-set to 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
+# the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
+# was 661 when §BH (noun vocabulary, the survivor-set count channel, the marker diff=) added 22
 # assertions and §AT/§P/§AP were repaired (third fresh review). It was 634 (concurrent-fixer merge) when §AS/§AT/§AU added 20, §AV-§AZ added 34, §BA-§BG added 30 and the concurrent-fix merge added 9 (the gawk-dialect P1, the wall-clock cap and the
 # sent-argv body-write arm).
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
@@ -2388,6 +2484,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 661 ]; ck $? "assertion-count pin: >= 661 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 683 ]; ck $? "assertion-count pin: >= 683 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
