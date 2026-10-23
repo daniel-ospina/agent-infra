@@ -97,7 +97,11 @@ wt_warn() {
 # every spawn there would be the refusal loop this change exists to remove).
 wt_bounded() { # <secs> <cmd...>
   local s="${1:-10}"; shift || true
-  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  # ⛔ ZERO IS NOT A BOUND (P2 review finding, 2026-10-23, MEASURED): `perl -e 'alarm 0'` and
+  # `timeout 0` both mean "no alarm" — measured, `wt_bounded 0 sleep 2` returned after the full 2s. A
+  # `WT_PROBE_TIMEOUT=0` written as "turn it off" (the module's own `WT_TABLE_TTL=0` disable seam invites
+  # that reading) would silently disarm the probe that exists to stop the controller freezing.
+  case "$s" in ''|0|*[!0-9]*) s=10 ;; esac
   if command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$s" "$@"; return $?; fi
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
   "$@"
@@ -293,9 +297,20 @@ wt_tmux_server_token_value() {
 # and started exactly the credential-less worker this gate exists to refuse. `show-environment -g`
 # talks to the SERVER, so it answers for a zero-session server (rc 0, 73 vars measured) and fails on
 # a socket that has none (rc 1) — the distinction the listing cannot make.
-wt_tmux_has_server() {
+wt_tmux_has_server() { # 0 = a server answers · 1 = no server answers · 3 = no ANSWER (bound fired)
   command -v tmux >/dev/null 2>&1 || return 1
-  wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g >/dev/null 2>&1
+  local rc=0
+  wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g >/dev/null 2>&1 || rc=$?
+  # ⛔ THREE-VALUED (P2 review finding, 2026-10-23, MEASURED): a fired bound (142 perl / 124 timeout)
+  # used to be indistinguishable from "no server", and the caller-token arm CREDITED a caller's token on
+  # the strength of it — while a server that is merely slow keeps its OWN environment, so the session
+  # does not inherit that token: dead lane, reported provisioned. Only a POSITIVE absence (rc 1) may
+  # credit; "no answer" is UNKNOWN and refuses (`wt_launcher_env`).
+  case "$rc" in
+    0) return 0 ;;
+    124|142) return 3 ;;
+  esac
+  return 1
 }
 
 # `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
@@ -346,8 +361,12 @@ wt_launcher_env() {
   if [ "$have" = "0" ] && [ "$caller_val" = "1" ]; then
     # ... but only if this spawn will CREATE the server (see above), and that is decided by a
     # POSITIVE server probe, never by an empty session list (see `wt_tmux_has_server`).
+    # ⛔ ONLY rc 1 ("no server answers") CREDITS (P2 review finding, 2026-10-23, MEASURED): an UNREADABLE
+    # probe (rc 3, the bound fired) must never be read as absence — see `wt_tmux_has_server`'s note.
     command -v tmux >/dev/null 2>&1 || return 1
-    if ! wt_tmux_has_server; then have=1; fi
+    local srv_rc=0
+    wt_tmux_has_server || srv_rc=$?
+    [ "$srv_rc" = "1" ] && have=1
   fi
   if [ "$have" = "0" ]; then
     # nothing in the HOME or a credit-bearing caller: the tmux SERVER's global env may still carry one,
@@ -634,13 +653,21 @@ wt_tmux_names() {
   fi
   # A bound that fired is an UNREADABLE read, not an empty one: fall through to `return 3` (UNKNOWN),
   # which the census reads as ALIVE — the fail-closed direction.
-  # ⛔ A SOCKET THAT WAS NEVER CREATED IS "NO SERVER", and tmux 3.4 says so in its own words: it
-  # reports "error connecting to <socket> (No such file or directory)", rc=1. Not matching that made
-  # a FRESH box (no server ever started) answer 3 — "unreadable, not evidence of a fresh start" — so
-  # wt_launcher_env refused the very shape it credits (a caller carrying GH_TOKEN that will CREATE
-  # the server): refused every spawn, every cycle, forever, which is the loop this change exists to
-  # remove (review finding, measured on tmux 3.4, 2026-10-23). ECONNREFUSED and permission errors
-  # stay rc 3: a socket we cannot read is not evidence of a fresh start.
+  # ⛔ WHY THE WORDING IS NOT A POLARITY SIGNAL (P2 review finding, 2026-10-23, MEASURED — this block
+  # used to claim the opposite and was wrong): tmux's client messages do NOT partition the states the way
+  # one would like. An absent socket FILE answers `error connecting to <socket> (No such file or
+  # directory)`, rc 1 — and SO DOES a live server whose socket file was unlinked (`rm` it under a running
+  # server and panes keep running, measured). `no server running on <socket>` is what a STALE socket file
+  # (or a completely absent socket dir) answers. So `error connecting … No such file` cannot be read as
+  # "no sessions": the census treats it as UNREADABLE (rc 3 → UNKNOWN → ALIVE), which is the fail-closed
+  # direction, and the DECLARED COST is on the other side — on a genuinely fresh box a tmux record left in
+  # `$O/state` reads UNKNOWN, so `wt_count` never frees that slot and `wt_close` cannot prove death (no
+  # age escape exists). Pre-existing; it is the cheap side of the trade. `wt_launcher_env` does not read
+  # this function at all — it asks `wt_tmux_has_server`, whose rc is what credits a caller token. OLD NOTE,
+  # kept for the parse hazard it records: matching the `No such file` wording as "no sessions" made a
+  # FRESH box answer 3, so `wt_launcher_env` refused the very shape it credits (a caller carrying GH_TOKEN
+  # that will CREATE the server), i.e. refused every spawn, every cycle (measured on tmux 3.4). That is
+  # now fixed at the CORRECT seam (`wt_tmux_has_server`), not by widening this arm.
   #
   # ⛔ THE EXPLANATION LIVES ABOVE THE case, NOT INSIDE THE ARM. Measured on this change: with the
   # seven-line version of it inside the arm below, `/bin/bash -n` on the PR head (d635527b) exited 2 —
@@ -939,7 +966,13 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
           wt_forget
           return 0
         fi
-        wt_bounded "${WT_SPAWN_TIMEOUT:-30}" tmux kill-session -t "$name" >/dev/null 2>&1 || true
+        # ⛔ EXACT TARGET (`=$name`) — P1 review finding, 2026-10-23, MEASURED: a bare `-t` is a PREFIX
+        # match, and `tmux kill-session -t fix-8` really does kill a live `fix-82` (rc 0). This is the
+        # cleanup of THIS spawn's own session, and `wt_close` already pins `=$name` for the same reason —
+        # a cleanup that can kill a peer's mid-work lane is worse than the untracked session it closes.
+        # (A pre-existing same-name session is impossible here: `new-session -s fix-8` against a live
+        # `fix-8` answers `duplicate session` rc 1, so rc 0 above proves the session is this spawn's.)
+        wt_bounded "${WT_SPAWN_TIMEOUT:-30}" tmux kill-session -t "=$name" >/dev/null 2>&1 || true
         wt_warn "REFUSED $name: the tmux session started but its record in $dir could not be written, so the worker would be untrackable (no census, no cap, no reap) — the session was closed again"
         return 1
       fi
