@@ -175,6 +175,20 @@ case "$OUT" in
   *"exec"*"BEHIND"*) ck "(a) RED: the row says WHICH disagreement it is (BEHIND — one restart away)" 0 ;;
   *) ck "(a) RED: the row says WHICH disagreement it is (BEHIND — one restart away) [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
 esac
+# ⛔ THE RESTART-PENDING ANCESTRY TEST IS A HARNESS-REPO QUESTION TOO (review round 5, P2). Same box,
+# same two commits: `merge-base --is-ancestor "$got_head" "$sha"` decides between "restart-pending —
+# the pin is an ancestor of the tree being read, this start will materialise it" and "MISMATCH …
+# refusing". Asked of the WORK repo — the conflation #2356 removes — the harness objects are absent,
+# the ancestry answers NO, and a CORRECT pin is refused with the wrong remedy: #2356's own symptom on
+# the restart-pending branch. Measured (review round 5): with `scripts/harness-up:709` reverted to
+# `-C "$REPO"` the pin line flips to `pin: MISMATCH` and the suite stayed at 0 failed, so this pair is
+# the only thing that makes that one site discriminating. The VERDICT line is matched, never the whole
+# screen: `pin: commit <sha> (from …), pin root …` also starts with `pin: `.
+pin_line="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]*pin: (restart-pending|MISMATCH)' | head -1)"
+ck "(a) RED: the pin resolve calls an ANCESTOR tree restart-pending, decided in the HARNESS repo [$pin_line]" \
+   "$(case "$pin_line" in *'pin: restart-pending'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(a) RED: …and it is NOT refused as a MISMATCH (what a wrong-repo ancestry test answers)" \
+   "$(case "$pin_line" in *'pin: MISMATCH'*) echo 1 ;; *) echo 0 ;; esac)"
 
 # ⛔ AND THE MAC'S REAL LAYOUT IS NOT A GIT WORKTREE. `install.sh` deploys a FLAT COPY into `$O` and
 # the plist execs `__O__/orch-loop.sh` (launchd.plist.template:10, install.sh:26), so `git -C` on that
