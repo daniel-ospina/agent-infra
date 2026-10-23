@@ -206,7 +206,7 @@ ruling that there is no lane ceiling tied to cpu count.
   the measured `/tmp/actions-runner`, `RUNNER_TEMPLATE` holds one pristine unpacked release, and each
   `add` **copies** it — a shared install with per-name dirs would register runners whose `.runner`
   never appears where the tool looks.
-- **The pool is every runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
+- **The pool is every LIVE runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
 the directory that **CONTAINS** the instance dirs (one level above them) — its default
 `/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the
 installs may live elsewhere (measured: three live listeners under `/opt/gh-runner-*` while the
@@ -215,8 +215,21 @@ count of a per-BOX budget — memory and cores do not partition by directory —
 process table for instance dirs outside `RUNNER_ROOT` and refuses with
 `cannot-measure why=pool-root-incomplete … outside=<dirs>`: `add` would otherwise put a fourth runner
 on a three-slot box, and `restart` would call an existing registration "no registration … (add it
-first)". Set `RUNNER_ROOT` to the parent (`RUNNER_ROOT=/opt` above) and the same box reports its real
-slots and can restart its real registrations.
+first)". Set `RUNNER_ROOT` to the parent that contains **every** instance dir (`RUNNER_ROOT=/opt`
+above) and the same box reports its real slots and can restart its real registrations.
+  ⚠️ **The reading is the process table, so it holds LIVE listeners only**, and the report says so
+  (`pool_read=process-table-live-only`): an instance dir outside `RUNNER_ROOT` whose listener is
+  **DEAD** is invisible to it, so `status` cannot count it and `restart` cannot find it — the refusal
+  names that limitation instead of asserting the registration does not exist. That is the one class
+  this read cannot close, and it is why the parents should be **consolidated under one directory**:
+  pointing the root at `/opt` on a box that also keeps an install under `/tmp` strands the other one,
+  and the refusal names the dirs it found rather than guessing which parent was meant. A listener
+  started through a wrapper (`nohup`, `env K=V`, `bash`, a service shim) is still read as a listener,
+  and a **symlinked** instance inside the root is still in-pool: `run.sh` resolves its own dir with
+  `cd -P`, so argv carries the target, while the listing counts the name. ⚠️ **The reading is the process table, so it only holds LIVE
+listeners**: a registration under another parent whose listener is DEAD is not enumerable at all —
+which is why `status` prints `pool_read=process-table-live-only` beside its count and `restart` names
+that limitation instead of asserting absence. Consolidating the parents is the real fix.
 - **Liveness is the process table, not a pid file.** A pid file records a past state and is never
   revalidated; a recycled pid reads "live" forever, and on a box without `/proc` it cannot be
   revalidated at all. The runner's argv (`<dir>/bin/Runner.Listener run`) cannot go stale, and it is
@@ -257,10 +270,12 @@ its `.runner` and says so. `--all` widens nothing: the default view already list
 box, and the flag exists because #2373's clause names it.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
-message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: that
-name has no registration under `RUNNER_ROOT`, or its directory exists but carries no `.runner` (NOT a
-capacity verdict — in each case the message names the state and the action that clears it; "add it
-first" is only said when there is no directory at all) · 3 `status`: the
+message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: no
+registration for that name under `RUNNER_ROOT`, or something that is not a usable instance sits on it
+(a directory without `.runner`, a file, a dangling symlink) (NOT a capacity verdict — the message names
+the state and the action that clears it: "clear it, or pick another name" — and, for the "no
+registration" arm, that the reading is the **process table**, so an instance dir outside `RUNNER_ROOT`
+whose listener is DEAD is invisible there) · 3 `status`: the
 report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every

@@ -369,28 +369,72 @@ listener_pid() {
 # not the pool — the class this file refuses everywhere else. The process table is the one reading
 # that holds regardless of where the installs live, and it is already this file's liveness evidence.
 outside_listener_dirs() {
-  local out pid args dir root
+  local out pid args dir root lroot pdir cand one
   if ! out="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
     err "cannot-measure why=process-table-unreadable (ps -ww -eo pid=,args= failed)"; return 2
   fi
   [ -n "$out" ] || { err "cannot-measure why=process-table-empty (ps listed no processes)"; return 2; }
   # The PHYSICAL root when it resolves, the literal one otherwise: a symlinked root must not report
-  # every registration under it as "outside".
-  root="$(cd "$RUNNER_ROOT" 2>/dev/null && pwd -P)" || root="${RUNNER_ROOT%/}"
+  # every registration under it as "outside". ⛔ A ROOT OF `/` STAYS `/` — normalising it away made
+  # the containment pattern `//*`, which no absolute dir matches, so every listener on the box
+  # reported "outside" with a remedy the operator had already applied (#2381 review round 6).
+  root="$(cd "$RUNNER_ROOT" 2>/dev/null && pwd -P)" || root="$RUNNER_ROOT"
+  root="${root%/}"; [ -n "$root" ] || root="/"
+  lroot="${RUNNER_ROOT%/}"; [ -n "$lroot" ] || lroot="/"
   while read -r pid args; do
     [ -n "${pid:-}" ] || continue
     # Same invocation anchor as `listener_pid`: the ` run` after the binary is what separates a
     # LISTENER from any process that merely names the file.
     case "$args" in *"/bin/Runner.Listener run"*) ;; *) continue ;; esac
+    # ⛔ THE INSTANCE DIR IS THE ARGV WORD THAT CARRIES THE BINARY, NOT EVERYTHING BEFORE IT (#2381
+    # review round 6, P1): a listener started through a wrapper (`nohup`, `env K=V`, `bash`, `sudo`,
+    # a service shim) has `<wrapper> <dir>/bin/Runner.Listener run` as its argv, so the whole prefix
+    # was `nohup <dir>` — not an absolute path — and the old `continue` DROPPED it silently. Measured:
+    # `listener_pid` calls that same process LIVE while this arm called the pool complete, so `add`
+    # minted a token and REGISTERED a runner on a box already at its ceiling.
     dir="${args%%/bin/Runner.Listener run*}"
-    case "$dir" in /*) ;; *) continue ;; esac   # only an ABSOLUTE path is an instance dir
+    # Strip the WRAPPER tokens, not everything before the binary: `nohup <dir>/bin/…`, `env K=V <dir>/…`,
+    # `bash <dir>/bin/…` all carry a wrapper in front. ⚠️ One token at a time, because an INSTANCE DIR
+    # MAY CONTAIN A SPACE (measured: the suite's own `bad name` fixture) — splitting on the last space
+    # tore `…/bad name` into `name` and dropped a LIVE listener out of the pool.
+    while [ -n "$dir" ] && [ "${dir#/}" = "$dir" ] && [ "$dir" != "${dir#* }" ]; do dir="${dir#* }"; done
+    case "$dir" in
+      # ⛔ A RELATIVE INSTANCE DIR IS cannot-measure, NEVER "not an instance": GitHub's own `run.sh`
+      # starts `./bin/Runner.Listener`, and a relative dir cannot be judged inside or outside without
+      # the process's cwd — so dropping it is how an outside listener gets past the arm that exists to
+      # catch exactly that.
+      /*) ;;
+      *) err "cannot-measure why=instance-dir-unresolvable argv=$args (the instance dir is not an absolute path, so it cannot be judged against RUNNER_ROOT)"; return 2 ;;
+    esac
     dir="${dir%/}"
-    [ "$dir" = "$root" ] && continue
-    case "$dir" in "$root"/*) continue ;; esac
+    # INSIDE = under the LITERAL or the PHYSICAL root (`/` contains every absolute path).
+    for cand in "$root" "$lroot"; do
+      [ -n "$cand" ] || continue
+      [ "$cand" = "/" ] && continue 2
+      case "$dir" in "$cand"/*) continue 2 ;; esac
+    done
+    pdir="$(cd "$dir" 2>/dev/null && pwd -P)" || pdir="$dir"
+    for cand in "$root" "$lroot"; do
+      [ -n "$cand" ] || continue
+      [ "$cand" = "/" ] && continue 2
+      case "$pdir" in "$cand"/*) continue 2 ;; esac
+      # ⛔ A SYMLINKED INSTANCE INSIDE THE ROOT IS IN THE POOL (#2381 review round 6, P1): `run.sh`
+      # resolves its own dir with `cd -P`, so argv carries the TARGET and the dir is not literally
+      # under the root — while `registered_dirs` counts `$RUNNER_ROOT/$(basename)` as a slot and
+      # `listener_pid` reads it LIVE. Reporting it outside refused `add` and `reconcile` on a box whose
+      # only defect was a hand-made symlink, and printed a report that contradicted its own rows.
+      one="$cand/$(basename "$dir")"
+      if [ -d "$one" ] && [ "$(cd "$one" 2>/dev/null && pwd -P)" = "$pdir" ]; then continue 2; fi
+    done
     printf '%s\n' "$dir"
   done <<<"$out"
   return 0
 }
+
+# join_lines <text> — one comma-separated field from a newline-separated list (#2381 review round 6,
+# P2): the machine-readable `outside=` field was `tr '\n' ' '`, which glued the first dir to the em
+# dash (`outside=/opt/x— a LIVE…`) and left two dirs an unquoted space-separated list.
+join_lines() { local s; s="$(printf '%s' "$1" | tr '\n' ',')"; printf '%s' "${s%,}"; }
 
 # require_pool_complete <verb> — rc 0 = the listing under $RUNNER_ROOT IS the box's pool.
 # rc 2 = a LIVE listener runs from an instance dir OUTSIDE it, so the listing (and the ceiling
@@ -400,7 +444,7 @@ require_pool_complete() {
   local outside
   outside="$(outside_listener_dirs)" || return 2
   [ -z "$outside" ] && return 0
-  err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so the pool listing (and the ceiling counted from it) is incomplete; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) — $1 NOT attempted"
+  err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so the pool listing (and the ceiling counted from it) is incomplete; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) — $1 NOT attempted"
   return 2
 }
 
@@ -476,11 +520,15 @@ cmd_status() {
       *) return 2 ;;
     esac
   done <<<"$dirs"
-  printf 'summary live=%s dead=%s slots=%s ceiling=%s\n' "$live" "$dead" "$SLOTS" "$CEILING"
+  # ⛔ THE SUMMARY NAMES THE READING IT IS (#2381 review round 6, P1). The rows come from the PROCESS
+  # TABLE, which only holds LIVE listeners: an instance dir outside RUNNER_ROOT whose listener is DEAD
+  # is invisible here, and a bare `slots=N` over it read as "the box's pool" in exactly the incident
+  # `restart` exists for (two runners GitHub showed OFFLINE). The caveat travels WITH the count.
+  printf 'summary live=%s dead=%s slots=%s ceiling=%s pool_read=process-table-live-only\n' "$live" "$dead" "$SLOTS" "$CEILING"
   # After the measured rows, so the report is visible — but the count it publishes is NOT this box's
   # pool, so the rc must not claim a complete measurement.
   if [ -n "$outside" ]; then
-    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read"
+    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read — ⚠️ this reading is the process table, so consolidating the parents is what makes it complete; an instance dir outside RUNNER_ROOT whose listener is DEAD is not enumerable at all"
     return 2
   fi
   [ "$dead" -eq 0 ] || return 3
@@ -699,12 +747,25 @@ cmd_restart() {
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2
     fi
+    # ⛔ A PATH THAT EXISTS IS NOT A MISSING REGISTRATION (#2381 review round 2, P2): a FILE or a
+    # DANGLING SYMLINK squatting on the name is refused by `add` (rc 4, "clear it or pick another
+    # name"), so "add it first" here sent the operator to a verb that cannot help — the two-verb
+    # bounce this file exists to end, surviving for every non-directory shape because this arm only
+    # asked "is it a traversable directory".
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+      err "REFUSED restart name=$name path=$dir exists but is not a searchable directory (a file or a symlink) — clear it, or pick another name; nothing changed"; return 3
+    fi
     # ⛔ BEFORE CONCLUDING "NO REGISTRATION", ASK WHERE THE POOL ACTUALLY LIVES (#2381 review, P1).
     # A registration under another parent is not missing, and "add it first" is the one remedy that
     # cannot help (add refuses a name it cannot see, and the operator is sent to re-register a runner
     # that already exists).
     require_pool_complete restart || return 2
-    err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
+    # ⛔ THIS READ IS THE PROCESS TABLE, AND IT ONLY SEES LIVE LISTENERS (#2381 review round 6, P1).
+    # A registration under another parent whose listener is DEAD is invisible here, so "no
+    # registration" would be a measured claim the tool did not measure — and "(add it first)" is the
+    # one verb that cannot help (add refuses a held name and cannot see the other parent either). The
+    # message names the limitation and the real next step instead of asserting absence.
+    err "REFUSED restart name=$name no registration at $dir — nothing changed. ⚠️ this read is the PROCESS TABLE (ps), so an instance dir OUTSIDE RUNNER_ROOT=$RUNNER_ROOT whose listener is DEAD is invisible here: check the other parents on this box (e.g. the installs §'pool is every runner on the box' names), or set RUNNER_ROOT to the parent that CONTAINS every instance dir"; return 3
   fi
   # ⛔ ONE REGISTRATION, ONE DEFINITION (#2381 review, P2). The listing (`registered_dirs`) and `add`
   # both accept a `.runner` that is a FILE **or a SYMLINK** (`-e || -L`); this verb required `-f`,
@@ -813,7 +874,7 @@ cmd_reconcile() {
     cannot=$((cannot + 1))
   elif [ -n "$outside" ]; then
     cannot=$((cannot + 1))
-    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(printf '%s' "$outside" | tr '\n' ' ')— a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT: this pass could not enumerate it (the restart arm covers RUNNER_ROOT alone) and the ADD arm refuses on the same reading; set RUNNER_ROOT to the directory that CONTAINS every instance dir"
+    err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT: this pass could not enumerate it (the restart arm covers RUNNER_ROOT alone) and the ADD arm refuses on the same reading; set RUNNER_ROOT to the directory that CONTAINS every instance dir"
   fi
 
   # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no

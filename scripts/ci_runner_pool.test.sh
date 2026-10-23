@@ -70,17 +70,25 @@ slots() { local n; n="$(ls -d "$RUNNER_ROOT"/*/.runner 2>/dev/null | wc -l)" || 
 T="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-pool-test.XXXXXX")"
 # The ps shim filters the host table to fixture processes, so it needs the fixture root.
 export FIXTURE_T="$T"
+# ⛔ ONE PATTERN FOR EVERY LISTENER SHAPE, NOT JUST `root-` (#2381 review, P2): the
+# symlinked-instance case starts a listener from `$T/real/pi-runner-sym`, which no `$T/root-`
+# pattern matches — so one listener (and its `sleep 600`) leaked past cleanup on EVERY run, with the
+# instance dir deleted underneath it (measured: 5 orphans after 5 runs, each ppid=1). The suite runs
+# in both CI lanes, i.e. on the very boxes this tool manages. `bin/Runner.Listener` is the shape
+# every fixture listener has, and it matches no part of the suite's own command line.
+# ⛔ AND IT IS ITS OWN FUNCTION SO THE PATTERN IS ASSERTED, NOT MERELY PRESENT (#2381 review round 6,
+# P2): the arm was reachable only through a trap, so its regression was invisible — a killed run
+# (CI cancel, job timeout, a `timeout`-bounded mutation run) left the tree AND its listeners behind
+# (measured on this box: 9 abandoned `ci-runner-pool-test.*` trees, 13 orphaned listeners).
+kill_fixture_listeners() { pkill -f "$T/.*bin/Runner\.Listener" 2>/dev/null || true; }
 cleanup() {
-  # ⛔ ONE PATTERN FOR EVERY LISTENER SHAPE, NOT JUST `root-` (#2381 review, P2): the
-  # symlinked-instance case starts a listener from `$T/real/pi-runner-sym`, which no `$T/root-`
-  # pattern matches — so one listener (and its `sleep 600`) leaked past cleanup on EVERY run, with the
-  # instance dir deleted underneath it (measured: 5 orphans after 5 runs, each ppid=1). The suite runs
-  # in both CI lanes, i.e. on the very boxes this tool manages. `bin/Runner.Listener` is the shape
-  # every fixture listener has, and it matches no part of the suite's own command line.
-  pkill -f "$T/.*bin/Runner\.Listener" 2>/dev/null || true
+  kill_fixture_listeners
+  # the permission cases leave mode-000/444 dirs, which `rm -rf` cannot traverse
+  chmod -R u+rwX "$T" 2>/dev/null || true
   rm -rf "$T"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM INT HUP   # the EXIT trap then runs cleanup exactly once
 
 BIN="$T/bin"; mkdir -p "$BIN"
 export GH_LOG="$T/gh.log" CONFIG_LOG="$T/config.log"
@@ -132,10 +140,39 @@ cat >"$BIN/ps" <<'STUB'
 # exactly the boxes this tool manages. Filtering to lines that name a fixture path keeps the fixture
 # hermetic; FIXTURE_PS_EXTRA is the only way to plant a listener elsewhere.
 out="$(/bin/ps "$@")" || { printf '%s\n' "$out" >&2; exit 1; }
+# ⛔ THE FILTER IS THIS CASE'S POOL, NOT THE WHOLE FIXTURE TEMP DIR (#2381 review round 6, P2): a
+# `$FIXTURE_T/` filter lets every EARLIER case's leaked listener stay in the table, so once the
+# wrapper-prefix arm below was fixed the whole suite went red on fixtures it never planted — and the
+# "same box with no outside listener" control was really asserting "the leaked listeners are
+# invisible". `$T/real/` is included because the symlinked-instance case legitimately starts its
+# listener at the symlink's PHYSICAL target.
 printf '%s\n' "$out" | while IFS= read -r line; do
-  case "$line" in *"${FIXTURE_T:?}/"*) printf '%s\n' "$line" ;; esac
+  case "$line" in
+    *"${RUNNER_ROOT:?}/"*) printf '%s\n' "$line" ;;
+    *"${FIXTURE_T:?}/real/"*) printf '%s\n' "$line" ;;
+  esac
 done
-[ -n "${FIXTURE_PS_EXTRA:-}" ] && printf '%s\n' "$FIXTURE_PS_EXTRA"
+# ⛔ A REAL PROCESS TABLE IS NEVER EMPTY, and the script refuses an EMPTY one as `cannot-measure`
+#   (`ps` listed no processes = I could not look). The shim used to stay non-empty only because its OWN
+#   command line contained the fixture path; once the filter is per-case, that accident is gone, so a
+#   baseline system row stands in for the processes a real box always has. FIXTURE_PS_EMPTY still
+#   models the unmeasurable table, above.
+printf '    %s /sbin/init\n' 1
+# ⛔ FIXTURE_PS_OUTSIDE_AFTER=<n> plants the extra line only from the (n+1)-th ps call on — the seam
+# that reaches a guard on a LATER read, the same way FIXTURE_LS_FAIL_AFTER does for the listing. It is
+# the ONLY way to pin `add`'s POST-claim completeness re-check: an outside listener that appears
+# during the token mint (#2381 review round 6, P2).
+f="${FIXTURE_T:?}/.ps-count"
+c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
+case "$c" in ''|*[!0-9]*) c=0 ;; esac
+c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+if [ -n "${FIXTURE_PS_EXTRA:-}" ]; then
+  if [ -n "${FIXTURE_PS_OUTSIDE_AFTER:-}" ]; then
+    [ "$c" -gt "$FIXTURE_PS_OUTSIDE_AFTER" ] && printf '%s\n' "$FIXTURE_PS_EXTRA"
+  else
+    printf '%s\n' "$FIXTURE_PS_EXTRA"
+  fi
+fi
 exit 0
 STUB
 cat >"$BIN/hostname" <<'STUB'
@@ -232,7 +269,7 @@ export PATH="$BIN:$PATH"
 run()      { bash "$POOL" "$@" 2>&1; }
 rc_of()    { bash "$POOL" "$@" >/dev/null 2>&1; printf '%s' "$?"; }
 reset_logs() { : >"$GH_LOG"; : >"$CONFIG_LOG"; }
-fresh_pool() { RUNNER_ROOT="$T/root-$1"; export RUNNER_ROOT; rm -rf "$RUNNER_ROOT"; mkdir -p "$RUNNER_ROOT"; }
+fresh_pool() { RUNNER_ROOT="$T/root-$1"; export RUNNER_ROOT; rm -rf "$RUNNER_ROOT"; mkdir -p "$RUNNER_ROOT"; rm -f "$T/.ps-count"; }
 # register <name> — what a hand-provisioned runner looks like: a complete install with `.runner` and
 # NO pid file of ours. This is the migration population (two such runners were the incident).
 register() { cp -a "$TEMPLATE" "$RUNNER_ROOT/$1"; : >"$RUNNER_ROOT/$1/.runner"; }
@@ -990,6 +1027,54 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reconci
 assert_eq "$?" "2" "reconcile does not publish a clean summary over part of the box"
 assert_contains "$out" "why=pool-root-incomplete" "naming the same reading"
 
+# ⛔ A WRAPPED LISTENER IS STILL A LISTENER (#2381 review round 6, P1). A listener started through a
+#   wrapper (`nohup`, `env K=V`, `bash`, `sudo`, a service shim) has `<wrapper> <dir>/bin/…` as its
+#   argv. Taking EVERYTHING before the binary gave `nohup <dir>` — not an absolute path — and the arm
+#   DROPPED it: `listener_pid` called the same process LIVE while this arm called the pool complete,
+#   so `add` minted a token and REGISTERED a runner on a box already at its ceiling (measured: rc 0,
+#   `registered=1`, 2 unlisted runners). The same box native-shaped correctly refused — the two
+#   readers of one process table must not disagree.
+EXTRA_WRAPPED="424243 bash $OUTSIDE_DIR/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA_WRAPPED" run status --all)"
+assert_eq "$?" "2" "a WRAPPER-started outside listener is still an incomplete pool (rc 2)"
+assert_contains "$out" "cannot-measure why=pool-root-incomplete" "and it names the reading"
+assert_contains "$out" "outside=$OUTSIDE_DIR" "naming the instance dir behind the wrapper"
+reset_logs
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA_WRAPPED" rc_of add --name pi-runner-wrapped-add)" "2" \
+  "and add REFUSES over it — no runner registered on a box whose pool it cannot count"
+assert_absent "$RUNNER_ROOT/pi-runner-wrapped-add" "no instance dir was claimed"
+assert_eq "$(count_lines "$GH_LOG")" "0" "and no token was minted"
+
+# ⛔ A RELATIVE INSTANCE DIR IS cannot-measure, NEVER "not an instance" (#2381 review round 6, P1).
+#   GitHub's own `run.sh` starts `./bin/Runner.Listener`, and a relative dir cannot be judged inside
+#   or outside without the process's cwd — so dropping it lets an outside listener past the arm that
+#   exists to catch exactly that.
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="424244 ./bin/Runner.Listener run" run status --all)"
+assert_eq "$?" "2" "a listener whose instance dir cannot be resolved is cannot-measure (rc 2)"
+assert_contains "$out" "cannot-measure why=instance-dir-unresolvable" "and it names the argv it could not resolve"
+
+# ⛔ THE PASS'S OWN OUTSIDE-THE-ROOT ARM, PINNED WHERE `add` CANNOT ANSWER FOR IT (#2381 review round
+#   6, P2): with a FREE slot the child `add`'s refusal supplied both the rc and the string, so deleting
+#   this arm stayed green — and at the ceiling, where the add arm never runs, the pass then published
+#   `ceiling reached … cannot=0` over a partial pool and exited 0 (measured).
+fresh_pool outceil; reset_logs
+register pi-runner-oc1; register pi-runner-oc2; register pi-runner-oc3   # slots=3 == ceiling on 8 cores
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reconcile)"
+assert_eq "$?" "2" "reconcile AT THE CEILING with an outside listener is not a clean pass (rc 2)"
+assert_contains "$out" "cannot=1" "and its summary counts the pool it could not enumerate"
+assert_contains "$out" "added=0" "and the ADD arm added nothing over part of the box"
+
+# ⛔ THE POST-CLAIM COMPLETENESS RE-CHECK (#2381 review round 6, P2): the claim must be RELEASED when
+#   an outside listener appears during the token mint. Unreachable in every fixture before now (the
+#   only outside-add fixture has slots=0, so the PRE-claim read answers first), so the guard could be
+#   deleted with the suite green — and the add then registered a runner the ceiling never counted.
+fresh_pool postclaim; reset_logs
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_OUTSIDE_AFTER=1 FIXTURE_PS_EXTRA="$EXTRA" run add --name pi-runner-post)"
+assert_eq "$?" "2" "an outside listener that appears DURING the mint makes the add refuse (rc 2)"
+assert_contains "$out" "why=pool-root-incomplete" "naming the reading that changed"
+assert_absent "$RUNNER_ROOT/pi-runner-post" "the claimed directory was RELEASED, not registered"
+assert_eq "$(count_lines "$CONFIG_LOG")" "0" "and config.sh never ran for it"
+
 # ⛔ THE RESTART REMEDY MUST NOT BE ONE THAT ALWAYS REFUSES (#2381 review, P2): a directory that
 # exists without a registration is not "add it first" — `add` refuses that same path as unavailable,
 # so the operator bounced between two verbs forever.
@@ -999,6 +1084,21 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-noinstal
 assert_eq "$?" "3" "a directory without a .runner registration is still a refusal (rc 3)"
 assert_contains "$out" "carries no .runner registration" "the message names what was measured"
 assert_contains "$out" "clear it, or pick another name" "and the remedy that actually clears it"
+# ⛔ THE NON-DIRECTORY SHAPES TOO (#2381 review round 2, P2): a FILE or a DANGLING SYMLINK on the name
+# is refused by `add` (rc 4, "clear it or pick another name") — so `restart` must not answer "add it
+# first" for it. The arm only asked "is it a traversable directory", so the two-verb bounce survived
+# for every shape that is not a directory. Both verbs are asserted against the SAME path.
+: >"$RUNNER_ROOT/pi-runner-file"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-file)"
+assert_eq "$?" "3" "a FILE squatting on the name is a refusal (rc 3), not a missing registration"
+assert_contains "$out" "is not a searchable directory (a file or a symlink)" "restart names the shape it found"
+assert_contains "$out" "clear it, or pick another name" "and the remedy that clears it"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
+assert_eq "$?" "4" "and `add` refuses that SAME path — the two verbs agree on the state"
+ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dangle)"
+assert_eq "$?" "3" "a DANGLING SYMLINK (not a directory) is the same refusal, not 'add it first'"
+assert_contains "$out" "clear it, or pick another name" "with the same remedy"
 
 # ⛔ A SINGLE-USE TOKEN CANNOT SERVE A PASS (#2381 review, P2): every add after the first would fail
 # config.sh and the pass would burn its whole attempt budget reporting failed=N added=0.
@@ -1118,6 +1218,25 @@ assert_eq "$?" "0" "a live listener behind a SYMLINKED instance reads LIVE (rc 0
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-sym)"
 assert_contains "$out" "live name=pi-runner-sym" "restart sees it as live and does not touch it"
 assert_eq "$(listeners_for "$T/real/pi-runner-sym")" "1" "exactly one listener — no double start"
+# ⛔ A SYMLINKED INSTANCE INSIDE THE ROOT IS IN THE POOL (#2381 review round 6, P1). `run.sh` resolves
+#   its own dir with `cd -P`, so argv carries the TARGET and the dir is not LITERALLY under the root —
+#   while `registered_dirs` counts `$RUNNER_ROOT/pi-runner-sym` as a slot and `listener_pid` reads it
+#   LIVE. Reporting it outside refused `add`/`reconcile` on a box whose only defect was a hand-made
+#   symlink, with a remedy ("point RUNNER_ROOT at the parent") the operator had already applied.
+# A REAL listener argv is NATIVE (`<dir>/bin/Runner.Listener run`, no interpreter); the fixture's own
+# stub is a shebang script, so `ps` shows it as `bash <dir>/…`. Plant the native shape too, or this
+# pin would ride the wrapper arm and prove nothing about containment.
+SYM_EXTRA="424245 $T/real/pi-runner-sym/bin/Runner.Listener run"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$SYM_EXTRA" run status)"
+assert_eq "$?" "0" "a NATIVE listener behind an in-root symlink is still a complete pool (rc 0)"
+assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "the symlinked instance is NOT reported outside the pool"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$SYM_EXTRA" run add --name pi-runner-sym-add --dry-run)"
+assert_eq "$?" "0" "and add is not refused for it — the symlinked instance IS a slot"
+assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "with no incomplete-pool refusal"
+# its listener lives at the symlink's PHYSICAL target, outside every later case's root — kill it here so
+# the per-root process-table filter cannot make a LATER case read it as an outside listener
+pkill -f -- "$T/real/pi-runner-sym/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.3
 
 # ⛔ A POOL THAT EXISTS BUT CANNOT BE LISTED IS NOT AN EMPTY POOL, and this is the direction that
 #   SPENDS capacity: the ceiling is COUNTED FROM this listing, so a listing failure read as 0 lets
@@ -1310,6 +1429,34 @@ assert_eq "$?" "3" "an add that lost the last slot while minting REFUSES (rc 3),
 assert_contains "$out" "REFUSED add name=pi-runner-c4 slots=3 ceiling=3" "and it names both readings"
 assert_absent "$RUNNER_ROOT/pi-runner-c4" "the claimed directory was released"
 assert_eq "$(count_lines "$CONFIG_LOG")" "0" "and config.sh never ran for it"
+
+# ⛔ A DEAD LISTENER OUTSIDE THE ROOT IS NOT ENUMERABLE, AND THE MESSAGE MUST SAY SO (#2381 review
+#   round 6, P1): the reading is the PROCESS TABLE, so a registration under another parent whose
+#   listener is DEAD is invisible — and `restart` answered "no registration … (add it first)", the one
+#   verb that cannot help, for the population `restart` exists for. The refusal must name the reading
+#   instead of asserting absence as a measured fact.
+DEADOUT="$T/elsewhere2/pi-runner-deadout"
+mkdir -p "$DEADOUT"; cp -a "$TEMPLATE/." "$DEADOUT/"; : >"$DEADOUT/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-deadout)"
+assert_eq "$?" "3" "a DEAD registration outside the root is still a refusal (rc 3)"
+assert_contains "$out" "PROCESS TABLE" "the message names the reading, instead of asserting absence as fact"
+assert_eq "$(grep -cF 'add it first' <<<"$out")" "0" "and it does not send the operator to the verb that cannot help"
+assert_eq "$(listeners_for "$DEADOUT")" "0" "nothing was started there"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "pool_read=process-table-live-only" "and status's summary names the reading it is (live listeners only)"
+
+# ⛔ THE CLEANUP ARM ITSELF IS PINNED (#2381 review round 6, P2): the leak fix is reachable only
+#   through a trap, so nothing asserted it worked — a regression would leak one listener per run,
+#   invisibly, on the very boxes this tool manages.
+echo "── the cleanup arm kills every fixture listener shape ──"
+fresh_pool clean; reset_logs
+register pi-runner-clean
+bash "$POOL" restart --name pi-runner-clean >/dev/null 2>&1
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-clean")" "1" "a fixture listener is running before cleanup"
+kill_fixture_listeners
+sleep 0.3
+assert_eq "$(pgrep -f -- "$T/.*bin/Runner\.Listener" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+  "cleanup's pattern kills every fixture listener shape (the leak fix is LIVE, not decorative)"
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
