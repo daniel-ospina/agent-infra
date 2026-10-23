@@ -921,14 +921,29 @@ hu_row_claims() {
       hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record probed $rec_repo, and no work repo is resolved to attribute it)"; return 2
     fi
     if ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$(hu_origin "$REPO")"; then
+      # ⛔ NAME THE SIDE THAT FAILED (review P2). The sentence used to say "not the work repo $REPO" for
+      # EVERY mismatch, so a work repo that simply does not resolve printed
+      # `the record probed /tmp/gone, not the work repo /tmp/gone` — two identical strings, i.e. the row
+      # told an operator its own path was a different repo, which is a diagnostic that steers the reader
+      # away from the actual fault. Path-identity, origin-identity and unresolvable-work-repo are three
+      # different faults and are three different sentences.
+      local live_origin
+      live_origin="$(hu_origin "$REPO")"
+      if [ -z "$(hu_real "$REPO")" ]; then
+        why="the work repo $REPO does not resolve to a directory, so the record ($rec_repo${rec_origin:+ at origin $rec_origin}) cannot be attributed to it"
+      elif ! hu_same_repo "$rec_repo" "$REPO"; then
+        why="the record probed $rec_repo${rec_origin:+ ($rec_origin)}, not the work repo $REPO"
+      else
+        why="the record probed $rec_repo at origin ${rec_origin}, but $REPO's origin is ${live_origin:-<unreadable>}"
+      fi
       # Re-probe and re-read; the row is the FRESH answer, or UNKNOWN with the probe's reason.
-      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the record probed $rec_repo${rec_origin:+ ($rec_origin)}, not the work repo $REPO, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
+      hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN ($why, and the re-probe could not answer${HU_CLAIMS_WHY:+ — $HU_CLAIMS_WHY})"; return 2; }
       verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
       age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
       hu_rec_parse "$f" || true
       rec_repo="$HU_REC_REPO"; rec_origin="$HU_REC_ORIGIN"
-      if [ -n "$rec_repo" ] && { ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$(hu_origin "$REPO")"; }; then
-        hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the record still names $rec_repo, not the work repo $REPO)"; return 2
+      if [ -n "$rec_repo" ] && { ! hu_same_repo "$rec_repo" "$REPO" || ! hu_same_origin "$rec_origin" "$live_origin"; }; then
+        hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (the re-probe left a record for $rec_repo${rec_origin:+ at origin $rec_origin}, not for $REPO${live_origin:+ at origin $live_origin})"; return 2
       fi
     fi
   elif [ ! -f "$f" ]; then

@@ -50,7 +50,8 @@ set -u
 # want the launcher's own fallback answer.
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE \
       HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
-      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT
+      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT \
+      HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES
 # ⛔ THE BOX'S DISK IS NOT THIS SUITE'S INPUT EITHER: `df` is stubbed below ($TMP/df, 20000MB) so the disk
 # leg of the capacity decision is deterministic AND live — one arm makes it the binding leg on purpose.
 # The helpers pass the two knobs explicitly (an ambient `export` cannot reach them) and default to the

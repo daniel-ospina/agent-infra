@@ -30,7 +30,13 @@ set -u
 # `HARNESS_REF` in particular is a value a real cell shell carries. Arms that exercise one of these set
 # it per-arm, so clearing them here costs nothing.
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS \
-      HU_LOAD_PER_CPU HU_LOAD_PER_LANE HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE
+      HU_LOAD_PER_CPU HU_LOAD_PER_LANE HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
+      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES
+# ⛔ THE CAPACITY KNOBS ARE PART OF THAT LIST, NOT ONLY THE REF/PIN ONES (review P2): `hu_capacity` reads
+# HU_NCPU/HU_LOADAVG_FILE/HU_DISK_* directly, so an ambient `HU_LOADAVG_FILE=/nonexistent` (or
+# `HU_NCPU=abc`) made lanes=3 and every `up` arm REFUSE — measured **8 failed**, attributed to the launcher
+# this suite grades. Its sibling (harness-surface.test.sh) already clears exactly these; the two suites
+# must not disagree about what "ambient" means. HU_LAUNCHD_LABEL is the same class one row over.
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every
