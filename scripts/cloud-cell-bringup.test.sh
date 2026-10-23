@@ -312,6 +312,131 @@ else
   bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"
 fi
 
+# ── 2d) the REVIEW-RECORD REGISTRY crosses at bring-up (agent-infra#2374) ───────────────────────
+# The measured incident: `record-review.sh` writes only to the minting box, so a lander on another
+# box was refused with `no reviewers dispatched` for a PR that WAS reviewed (134 records existed
+# only on the box that minted them; of 104 open PRs only 55 were visible from any single box). The
+# bring-up now converges the box with a shared union BEFORE it dispatches, and NAMES both outcomes:
+# a box with no union is SAID to be blind rather than passed over, and a box with one adopts what it
+# is missing. Both cases below are red against the pre-fix script: it neither created the registry
+# nor ever mentioned the union, so neither named line could appear.
+say_case "a cell with NO registry union is said to be review-blind, not passed over (#2374)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+REVIEW_UNION="$T/no-such-union" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a box with no union is still a USABLE box (rc=0)" \
+                   || bad "bring-up REFUSED a cell that merely has no union (rc=$BR_RC) — a false block, not a fix: $BR_OUT"
+case "$BR_OUT" in
+  *"review registry: NO UNION at $T/no-such-union"*) ok "the missing union is NAMED, with its path" ;;
+  *) bad "bring-up does not name the missing review-registry union — the blind state is silent again (#2374): $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"#2374"*) ok "the warning names the consequence, so an operator can act on it" ;;
+  *) bad "the no-union warning names no consequence: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) ok "and the cell still reaches CELL READY (a union is not a readiness criterion)" ;;
+  *) bad "a cell with no union never reaches CELL READY: $BR_OUT" ;;
+esac
+
+say_case "a freshly-booted box ADOPTS a record minted on ANOTHER box before it dispatches (#2374)"
+# A box that has reviewed nothing: no registry directory at all, exactly as a new cell starts. The
+# union carries one record for this PR, minted on another machine.
+rm -rf "$T/home/.pi/agent/reviews" "$T/union2374"
+mkdir -p "$T/union2374"
+printf '%s\n' '{"pr":2374,"head_sha":"0123456789012345678901234567890123456789","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-22T20:00:00Z"}' \
+  > "$T/union2374/daniel-ospina-agent-infra-2374.json"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+REVIEW_UNION="$T/union2374" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the bring-up exits 0" || bad "bring-up FAILED with a union present (rc=$BR_RC): $BR_OUT"
+if [ -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-2374.json" ]; then
+  ok "the record minted on ANOTHER box is now visible on this one (it would no longer be refused as unreviewed)"
+else
+  bad "the box did NOT adopt the union's record — it would refuse this PR as unreviewed (#2374); registry now: $(ls "$T/home/.pi/agent/reviews" 2>&1 | tr '\n' ' ')"
+fi
+cmp -s "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-2374.json" "$T/union2374/daniel-ospina-agent-infra-2374.json" \
+  && ok "the adopted copy is BYTE-IDENTICAL (a re-serialized record is not the one that was minted)" \
+  || bad "the adopted record's bytes differ from the union's copy"
+case "$BR_OUT" in
+  *"nothing missing"*) ok "and it reports that nothing is missing here" ;;
+  *) bad "the bring-up never reports the registry as complete after adopting: $BR_OUT" ;;
+esac
+
+# The REPORTING arm #2374(5) asks for: counts that separate "minted elsewhere and missing here" from
+# "not in the union yet". A union record the gate would read as ABSENT (no `verdict`) must NOT be
+# adopted, so after the run exactly one record is visible here and one is still missing — the shape
+# in which a lander gets refused. Inverting the two counts, or forcing `missing` to 0, turns the
+# assertion below red (verified by mutation on a scratch copy).
+say_case "the counts NAME what is missing here, not merely that something is (#2374)"
+rm -rf "$T/home/.pi/agent/reviews" "$T/union2374b"
+mkdir -p "$T/union2374b"
+printf '%s\n' '{"pr":2374,"head_sha":"0123456789012345678901234567890123456789","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-22T20:00:00Z"}' \
+  > "$T/union2374b/daniel-ospina-agent-infra-2374.json"
+printf '%s\n' '{"pr":9,"head_sha":"0123456789012345678901234567890123456789","repo":"daniel-ospina/agent-infra"}' \
+  > "$T/union2374b/daniel-ospina-agent-infra-9.json"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+REVIEW_UNION="$T/union2374b" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "an unadoptable record does not refuse the cell (rc=0)" \
+                   || bad "bring-up REFUSED a cell over one unreadable record (rc=$BR_RC): $BR_OUT"
+[ -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-2374.json" ] \
+  && ok "the readable record was adopted" \
+  || bad "the readable record was NOT adopted, so the cell is blind for a readable review (#2374)"
+[ ! -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-9.json" ] \
+  && ok "the record the gate reads as ABSENT was not adopted (no evidence laundering)" \
+  || bad "a record missing head_sha/verdict was adopted into the registry"
+case "$BR_OUT" in
+  *"1 minted elsewhere and MISSING here"*) ok "the report NAMES the 1 record missing here" ;;
+  *) bad "the report does not say how many records are missing here — the counts are unasserted (or the fields are mapped wrongly): $BR_OUT" ;;
+esac
+
+# An operator-created EMPTY union: the sync succeeds and every count is 0, which must NOT read as
+# "nothing missing" — that is indistinguishable from the incident.
+say_case "an EMPTY union is named as blindness, never as 'nothing missing' (#2374)"
+rm -rf "$T/home/.pi/agent/reviews" "$T/union-empty"
+mkdir -p "$T/union-empty"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+REVIEW_UNION="$T/union-empty" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "an empty union does not refuse the cell (rc=0)" \
+                   || bad "bring-up REFUSED a cell over an empty union (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"holds NO records"*) ok "the empty union is stated, with its consequence" ;;
+  *) bad "an EMPTY union passes silently — or worse, claims nothing is missing (#2374): $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"review registry: "*"nothing missing"*) bad "an EMPTY union is reported as 'nothing missing' — the affirmative claim this case exists to forbid: $BR_OUT" ;;
+  *) ok "and it makes no 'nothing missing' claim over an empty union" ;;
+esac
+
+# The union default must be the TOOL's default (which honours $XDG_STATE_HOME). A bring-up that
+# hardcodes its own path reports NO UNION and skips the sync while a real union sits exactly where
+# the tool looks — and sends the operator off to create a second one.
+say_case "the union default is the tool's own default, XDG_STATE_HOME included (#2374)"
+rm -rf "$T/home/.pi/agent/reviews" "$T/xdgstate"
+mkdir -p "$T/xdgstate/review-registry-union"
+printf '%s\n' '{"pr":2374,"head_sha":"0123456789012345678901234567890123456789","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-22T20:00:00Z"}' \
+  > "$T/xdgstate/review-registry-union/daniel-ospina-agent-infra-2374.json"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+XDG_STATE_HOME="$T/xdgstate" br ok normal --check   # NOTE: no REVIEW_UNION — the DEFAULT is under test
+[ -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-2374.json" ] \
+  && ok "a union at the tool's own default (\$XDG_STATE_HOME/review-registry-union) is found and adopted" \
+  || bad "the bring-up looked somewhere ELSE than the tool's default union — it would report blindness over a real union ($BR_OUT)"
+
+# A sync that cannot even compile (a truncated farmed copy) exits 1, which is the engine's
+# "conflicts left for a human" code. That must NOT be reported as a benign conflict.
+say_case "a CRASHED sync is not reported as a conflict left for a human (#2374)"
+printf '%s\n' 'import sys' 'def broken(:' > "$T/broken-sync.py"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+REVIEW_REGISTRY_SYNC="$T/broken-sync.py" REVIEW_UNION="$T/union2374" br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "a crashed sync does not refuse the cell (rc=0)" \
+                   || bad "bring-up REFUSED a cell over a crashed sync (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"sync CRASHED"*|*"produced no transfer report"*) ok "the crash is reported as a crash, not as conflicts" ;;
+  *) bad "a crashed sync (rc=1) is reported as CONFLICTS — an operator would triage a conflict that does not exist: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CONFLICTS/COLLISIONS"*) bad "a crashed sync printed the conflicts message: $BR_OUT" ;;
+  *) ok "and it never claims conflicts were preserved" ;;
+esac
+
 say_case "a cell whose reaper timer cannot be ENABLED is refused (not certified)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 SYSTEMCTL_STUB_MODE=fail br ok normal --check

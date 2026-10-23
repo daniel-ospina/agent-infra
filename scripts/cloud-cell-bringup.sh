@@ -561,6 +561,110 @@ check_operational_layer() {
   fi
 }
 
+# ── the REVIEW-RECORD REGISTRY (agent-infra#2374) ────────────────────────────────────────────────
+# `record-review.sh` mints `~/.pi/agent/reviews/<owner>-<name>-<PR>.json` and NOTHING replicated that
+# directory, so a box refused a PR that WAS reviewed — on another machine — with the rail's
+# `no reviewers dispatched`. Measured: 134 records existed only on the box that minted them, and of
+# 104 open PRs only 55 were visible from any single box. `review-registry-sync.py` converges a box
+# with a shared UNION directory (it deliberately owns no transport: the union is moved by whatever
+# the box already has — a mount, an `rsync`, a git clone), so this step runs BEFORE the box
+# dispatches anything and a freshly-booted cell is never reviewing blind.
+#
+# VERDICT DISCIPLINE. The sync's 0 is the only pass, and its non-zero codes mean different things:
+# 1 = CONFLICTS/COLLISIONS left for a human (every copy preserved, nothing overwritten), 3 = UNKNOWN
+# (a store could not be read or written). Neither REFUSES the cell — a box that cannot converge its
+# registry is still a usable box, and refusing to boot it would be a false block — but neither is
+# reported as `ok`, because a review-blind cell is the defect this step exists to make visible.
+# A missing UNION is named explicitly rather than passed over: that is precisely the state in which
+# the box is blind, and the pre-fix silence is how 134 stranded records went unnoticed.
+check_review_registry() {
+  local sync_bin="" cand registry union out rc report here inunion missing only diverged newest_reg newest_union
+  registry="${REVIEW_REGISTRY:-$HOME/.pi/agent/reviews}"
+  # THE SAME DEFAULT THE TOOL COMPUTES (`default_union_dir()`), including $XDG_STATE_HOME — the
+  # convention this repo already uses elsewhere. Passing our own idea of the default would make the
+  # step report NO UNION and skip the sync while a REAL union sat exactly where the tool looks, and
+  # send the operator off to create a second one: the fragmentation this exists to remove.
+  union="${REVIEW_UNION:-${XDG_STATE_HOME:-$HOME/.pi/agent/state}/review-registry-union}"
+  for cand in "${REVIEW_REGISTRY_SYNC:-}" \
+              "$HOME/.pi/agent/scripts/review-registry-sync.py" \
+              "${LAYER_ROOT:+$LAYER_ROOT/scripts/review-registry-sync.py}" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/review-registry-sync.py"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { sync_bin="$cand"; break; }
+  done
+  if [ -z "$sync_bin" ]; then
+    warn "review registry: review-registry-sync.py is NOT installed (looked at \$REVIEW_REGISTRY_SYNC, $HOME/.pi/agent/scripts, \${LAYER_ROOT}/scripts and beside this script) — this box can only see the reviews minted ON it (#2374)"
+    return 0
+  fi
+  # A box that has never minted a record has no registry directory at all, and the sync REFUSES to
+  # answer for a missing push TARGET (exit 3) — so a first bring-up would report UNKNOWN on exactly
+  # the box this step exists to un-blind. Create the (empty) directory the enforcer reads and say so;
+  # it holds no record until one is minted or adopted below.
+  if [ ! -d "$registry" ]; then
+    if mkdir -p "$registry" 2>/dev/null; then
+      ok "review registry: created $registry (no record minted on this box yet)"
+    else
+      warn "review registry: cannot create $registry — this box can neither mint nor adopt a review record, so it will refuse every PR reviewed elsewhere (#2374)"
+      return 0
+    fi
+  fi
+  if [ ! -d "$union" ]; then
+    warn "review registry: NO UNION at $union — this box can only see the reviews minted ON it, so it will refuse a PR another box reviewed (#2374). Put the shared union there (mount, rsync, clone) or set REVIEW_UNION, then re-run this bring-up."
+    return 0
+  fi
+  rc=0
+  # `sync` both publishes this box's records INTO the union and adopts the union's here, so one pass
+  # leaves the box as converged as it can be. The output is indented: its report is evidence, and a
+  # conflict line must not read as bring-up chatter.
+  out="$(python3 "$sync_bin" sync --registry "$registry" --union "$union" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  # ⛔ rc=1 IS NOT PROOF OF A CONFLICT. CPython ALSO exits 1 on an uncaught exception and on a file
+  # it cannot compile — and this script is FARMED by a non-atomic `cp -f` (setup.sh), so a truncated
+  # copy is a real way to get here. Reporting a crash as "conflicts left for a human" sends the
+  # operator to triage a conflict that does not exist while the box stays blind. The discriminator is
+  # STRUCTURAL, not a phrase: the engine prints one `… changed (…)` summary per transfer it completed,
+  # so no summary = the transfers did not run, whatever the exit code says.
+  case "$out" in
+    *"Traceback (most recent call last)"*|*"SyntaxError:"*)
+      warn "review registry: the sync CRASHED (it did not converge) — this box may be reviewing blind. This is NOT a pass; read the failure above"
+      return 0 ;;
+    *"changed ("*) ;;
+    *)
+      warn "review registry: the sync produced no transfer report at all (rc=$rc) — it did not converge, and this is NOT a pass: $(printf '%s' "$out" | head -1)"
+      return 0 ;;
+  esac
+  case "$rc" in
+    0) ok "review registry: converged with the union at $union" ;;
+    1) warn "review registry: CONFLICTS/COLLISIONS are left for a human (sync rc=1) — every copy was preserved and nothing was overwritten; read the report above" ;;
+    *) warn "review registry: UNKNOWN (sync rc=$rc) — a store could not be read or written, so this box may be reviewing blind. This is NOT a pass; fix the reason above" ;;
+  esac
+  # #2374(5): name what THIS box is missing, so a lander does not rediscover it by being refused.
+  rc=0
+  report="$(python3 "$sync_bin" status --json --registry "$registry" --union "$union" 2>/dev/null)" || rc=$?
+  [ "$rc" -le 1 ] && [ -n "$report" ] || return 0
+  read -r here inunion missing only diverged newest_reg newest_union <<<"$(printf '%s' "$report" | python3 -c '
+import json, sys
+r = json.load(sys.stdin); n = r.get("newest") or {}
+# `registry`/`union` are COUNTS (ints); the key lists are the only sequences here.
+print(r.get("registry") or 0, r.get("union") or 0, len(r.get("only_union") or []),
+      len(r.get("only_registry") or []), len(r.get("diverged") or []),
+      n.get("registry") or "none", n.get("union") or "none")
+' 2>/dev/null)"
+  [ -n "${here:-}" ] || return 0
+  # ⛔ AN EMPTY UNION IS NOT "NOTHING MISSING". The precondition above only requires the directory to
+  # exist, and nothing else in the repo populates it — so the counts can all be 0 on a box that can
+  # see no review minted ANYWHERE. "nothing missing" over that state is an affirmative claim that
+  # reads exactly like the incident (#2374): say what is true.
+  if [ "${inunion:-0}" -eq 0 ]; then
+    warn "review registry: the union at $union holds NO records — this box can see no review minted anywhere, so it will refuse a PR that was reviewed on another box (#2374). Populate the union (mount, rsync, clone) and re-run."
+    return 0
+  fi
+  if [ "${missing:-0}" -eq 0 ] && [ "${only:-0}" -eq 0 ] && [ "${diverged:-0}" -eq 0 ]; then
+    ok "review registry: ${here} record(s) here, ${inunion} in the union — nothing missing, newest reviewed_at ${newest_reg} (union ${newest_union})"
+  else
+    warn "review registry: ${here} record(s) here, ${inunion} in the union — ${missing} minted elsewhere and MISSING here, ${only} not in the union yet, ${diverged} diverged; newest reviewed_at ${newest_reg} (union ${newest_union}). A PR whose record is missing here will be refused as unreviewed (#2374)."
+  fi
+}
+
 # ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
 # REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
 # in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
@@ -718,6 +822,10 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer: the registry sync is a FARMED script (setup.sh's merge-gate farm), so this
+      # step cannot run before the layer that installs it exists. It still runs before any lane is
+      # dispatched — which is the whole point of bring-up (#2374).
+      check_review_registry
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).

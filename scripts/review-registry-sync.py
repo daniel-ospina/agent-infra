@@ -586,12 +586,25 @@ def status(registry: Path, union: Path, tty: bool, as_json: bool, out: list[str]
     only_reg = sorted(set(reg) - set(uni))
     only_uni = sorted(set(uni) - set(reg))
     diverged = sorted(k for k in set(reg) & set(uni) if reg[k].raw != uni[k].raw)
+    # #2374(5) asks the report to name, PER BOX, when the newest review it holds was minted: the
+    # count alone cannot distinguish "this box has 40 records from last week" (blind to every review
+    # since) from "…one hour ago". A record whose `reviewed_at` cannot be placed on the clock is NOT
+    # dated here (see Record.stamp_note) — inventing a date would make the staleness unreadable.
+    def newest(store: dict[str, Record]) -> str | None:
+        stamps = [r.stamp for r in store.values() if r.stamp is not None]
+        if not stamps:
+            return None
+        return datetime.fromtimestamp(max(stamps), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     if as_json:
         out.append(json.dumps({"registry": len(reg), "union": len(uni), "only_registry": only_reg,
-                               "only_union": only_uni, "diverged": diverged}, indent=1) + "\n")
+                               "only_union": only_uni, "diverged": diverged,
+                               "newest": {"registry": newest(reg), "union": newest(uni)}},
+                              indent=1) + "\n")
         return EXIT_OK if not only_reg and not only_uni and not diverged else EXIT_CONFLICT
     out.append(f"registry {registry}: {len(reg)} records\n")
     out.append(f"union    {union}: {len(uni)} records\n")
+    out.append(f"newest reviewed_at: registry {newest(reg) or 'none'} · union {newest(uni) or 'none'}\n")
     out.append(f"only in registry: {len(only_reg)} · only in union: {len(only_uni)} · "
                f"same key/different bytes: {len(diverged)}\n")
     for k in only_reg[:40]:

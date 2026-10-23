@@ -206,6 +206,27 @@ mkrec "$TMP/uni12/2.json" 2 "$H40" clean "" 2026-01-01T00:00:00Z
 rc=$(run status --registry "$TMP/reg12" --union "$TMP/uni12")
 check "exit 1 (registry is behind the union)" "[ $rc -eq 1 ]"
 check "names the union-only record" "grep -q '2.json' '$TMP/out'"
+check "names the newest reviewed_at of each store (#2374: a count cannot tell a fresh box from a stale one)" \
+  "grep -q 'newest reviewed_at: registry 2026-01-01T00:00:00Z · union 2026-01-01T00:00:00Z' '$TMP/out'"
+# The store now holds THREE dates, and the newest is neither the smallest nor the largest filename,
+# so `min()` and a single arbitrary element are both wrong: the assertion pins the MAXIMUM across the
+# store. (It cannot pin the SCAN order — readdir order is the filesystem's, not ours — so the two
+# wrong implementations it deterministically rejects are `min` and "the newest of one record".)
+mkrec "$TMP/reg12/9.json" 9 "$H40" clean "" 2025-06-01T00:00:00Z
+mkrec "$TMP/reg12/5.json" 5 "$H40" clean "" 2026-03-04T05:06:07Z
+rc=$(run status --registry "$TMP/reg12" --union "$TMP/uni12")
+check "the newest date wins, whatever the filename order" \
+  "grep -q 'newest reviewed_at: registry 2026-03-04T05:06:07Z' '$TMP/out'"
+rc=$(run status --registry "$TMP/reg12" --union "$TMP/uni12" --json)
+check "--json carries the same newest stamps (a monitor has no prose to parse)" \
+  "python3 -c \"import json;d=json.load(open('$TMP/out'));assert d['newest']['registry']=='2026-03-04T05:06:07Z' and d['newest']['union']=='2026-01-01T00:00:00Z'\""
+rm -f "$TMP/reg12/9.json" "$TMP/reg12/5.json"
+# A store with NO record that can be placed on the clock answers `none` — never an invented date.
+mkdir -p "$TMP/reg12b" "$TMP/uni12b"
+mkrec "$TMP/reg12b/1.json" 1 "$H40" clean "" "2026-10-22 03:35:39 UTC"
+rc=$(run status --registry "$TMP/reg12b" --union "$TMP/uni12b")
+check "an unorderable record yields 'none', not a fabricated date" \
+  "grep -q 'newest reviewed_at: registry none' '$TMP/out'"
 
 echo "== §13 --dry-run changes nothing"
 before="$(ls "$TMP/reg12" | wc -l)"
