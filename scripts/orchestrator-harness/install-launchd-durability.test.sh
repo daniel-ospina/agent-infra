@@ -954,14 +954,18 @@ assert_contains "$out" "left untouched" "…and says so"
   # property being asserted is about the BANNER LINE, so that is what is scanned; the env is also
   # scrubbed above so the branch taken no longer depends on the caller's shell.
   _banner="$(printf '%s\n' "$out" | grep 'it and PROVED it' || true)"
-  if printf '%s' "$_banner" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
-     ! printf '%s' "$_banner" | grep -q 'printf '; then
+  # ⛔ NO PIPE INTO A QUIET GREP (scripts/check-no-sigpipe-grep.sh, #841/#864). `grep -q` exits at the
+  # first match, the writer takes SIGPIPE, and under `pipefail` the pipeline's status can invert: the
+  # predicate can read TRUE (or the negation FALSE) on a banner it should reject — a test that fails
+  # its own non-vacuity check in the safe direction. A here-string needs no pipe at all.
+  if grep -qE 'this run (started|RELOADED) it and PROVED it' <<<"$_banner" &&
+     ! grep -q 'printf ' <<<"$_banner"; then
     ok "no raw shell escaped into the banner text"
   else bad "raw shell (or an unresolved substitution) escaped into the banner text: $_banner"; fi
   # NON-VACUITY: the exact garbage the old inline `$(case … esac)` produced must fail the predicate.
   _BROKEN="The loop IS running — this run  printf 'RELOADED' ;; *) printf 'started' ;; esac) it and PROVED it"
-  if printf '%s' "$_BROKEN" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
-     ! printf '%s' "$_BROKEN" | grep -q 'printf '; then
+  if grep -qE 'this run (started|RELOADED) it and PROVED it' <<<"$_BROKEN" &&
+     ! grep -q 'printf ' <<<"$_BROKEN"; then
     bad "the banner detector does not fire on the broken substitution it exists for"
   else ok "the banner detector FIRES on the broken \$(case …) substitution (non-vacuous)"; fi
 
