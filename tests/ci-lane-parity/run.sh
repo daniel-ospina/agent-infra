@@ -826,21 +826,40 @@ else
 fi
 
 # A matrix list before `steps:` must not latch the step indent.
-# ⛔ THE INJECTION TARGET MOVED (#2482). It used to add a `strategy:` block to `bash-suites` — but
-# that job now carries a REAL `strategy:` (it runs the shard list as a matrix), so injecting a second
-# one produces a DUPLICATE MAPPING KEY and the guard correctly exits 2 ("cannot parse … duplicate key
-# `strategy`"). The fixture then measured YAML duplication, not the property it names. The shape under
-# test is PARSE-level (a list appearing between `runs-on:` and `steps:` must not latch the step
-# indent), so it is injected at the FIRST job that has no strategy: `drift-check`.
-awk 'BEGIN { done = 0 }
-     { print }
-     !done && /^    runs-on: ubuntu-latest$/ { print "    strategy:"; print "      matrix:"; print "        os:"; print "          - ubuntu-latest"; done = 1 }' \
+# ⛔ THE INJECTION MUST LAND INSIDE THE JOB THE GUARD AUDITS (#2482 review, 2026-10-23). An earlier
+# revision of this fixture injected a second `strategy:` into `bash-suites` — which broke when that job
+# gained a REAL matrix (duplicate mapping key, guard correctly exits 2, so the fixture measured YAML
+# duplication rather than the property it names) — and the first repair injected into `drift-check`,
+# which is VACUOUS: the guard reads `jobs["bash-suites"]` only, so the injection could not affect any
+# assertion it makes. The injection below adds an `os:` LIST to `bash-suites`' EXISTING matrix: no
+# duplicate key, the job's own steps stay intact, and the list really does precede `steps:` in the
+# job under audit — so if the parser latched the step indent on a list, the call would go unseen and
+# the guard would exit 2.
+awk '{ print }
+     /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ { print "        os:"; print "          - ubuntu-latest" }' \
   "$PR" >"$TMP/ci-pr-matrix.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-matrix.yml"
 if [ "$RC" -eq 0 ]; then
   pass "a strategy/matrix list before steps: does not hide the steps"
 else
   fail "a matrix list before steps: false-blocked the call (rc $RC): $OUT"
+fi
+
+# ⛔ AND THE GUARD ITSELF CANNOT BE SWITCHED OFF (#2482 review, 2026-10-23). The steps that run this
+# guard and its mutation self-test live in a SECOND job (`bash-suites-gate`), so a conditional or a
+# non-blocking failure there used to leave this check green over a disabled self-test. Measured on the
+# pre-change layout: exit 2; on the matrix layout before this fixture: exit 0.
+awk 'BEGIN { done = 0 }
+     { print }
+     !done && /^  bash-suites-gate:$/ { done = 1; next }
+     done && /^      - / { print "        if: false"; done = 2 }
+     done == 2 { done = 3 }' \
+  "$PR" >"$TMP/ci-pr-gateif.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-gateif.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "an `if:` on the guard-covering job's first step is refused (the guard cannot be switched off)"
+else
+  fail "an `if:` on bash-suites-gate's step returned rc $RC (want 2): $OUT"
 fi
 
 # A sibling `push:` block that filters paths must not be read as narrowing pull_request.
