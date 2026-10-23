@@ -375,7 +375,7 @@ fresh_pool latefail; reset_logs
 register pi-runner-lf1
 out="$(FIXTURE_LS_FAIL_AFTER=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
 assert_eq "$?" "2" "a listing failure inside the add loop stops the pass (rc 2, not a clean 0)"
-assert_contains "$out" "cannot=1" "the summary counts it"
+assert_contains "$out" "cannot=2" "the summary counts BOTH unmeasured listings (the loop's and the final one)"
 assert_contains "$out" "the pass stopped; nothing was added" "and the measured reason is published"
 if grep -qF "ceiling reached" <<<"$out"; then
   bad "the pass invents 'ceiling reached' when it never listed the pool"
@@ -383,6 +383,21 @@ else
   ok "the pass invents no ceiling verdict it did not measure"
 fi
 rm -f "$RUNNER_ROOT/.ls-count"
+
+# ⛔ THE FINAL LISTING IS ITSELF A GATE OPERAND (#2381 review, P1). `reconcile` re-lists the pool to
+#   print its summary, and that listing used to be written as `slots || SLOTS="unmeasured"` — a
+#   NON-INTEGER then reached `[ "$SLOTS" -lt "$CEILING" ]`, which ERRORS and, under `set -uo pipefail`
+#   with no `-e`, reads as FALSE: the "provisioned nothing" guard was silently DISABLED and the pass
+#   exited 0 over a pool it could not list. This case fails the LAST listing only (the restart arm's
+#   and the add loop's succeed, so `cannot` starts at 0), which is the only shape that discriminates:
+#   the pass must NOT certify an unmeasured pool, whatever the loop managed to do.
+echo "── reconcile: a listing that fails at the FINAL summary ──"
+fresh_pool finallist; reset_logs
+register pi-runner-fl1
+out="$(FIXTURE_LS_FAIL_AFTER=2 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=3 run reconcile)"
+assert_eq "$?" "2" "a listing failure at the FINAL summary refuses (rc 2, never a clean 0)"
+assert_contains "$out" "cannot=1" "the summary counts the unmeasured final listing"
+assert_contains "$out" "slots=unmeasured" "and it prints no stale slot count as if it had been read"
 
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"

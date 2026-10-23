@@ -780,14 +780,25 @@ cmd_reconcile() {
   # it would start, so `added` must count what it would add, or the machine-readable summary
   # under-reports the very change the preview announced.
   [ "$DRY" = 1 ] && added=$((added + dry_adds))
-  slots >/dev/null 2>&1 || SLOTS="unmeasured"
+  # ⛔ THE FINAL LISTING IS ITSELF A GATE OPERAND (#2381 review, P1). This used to be
+  # `slots >/dev/null 2>&1 || SLOTS="unmeasured"`, and the literal string then reached
+  # `[ "$SLOTS" -lt "$CEILING" ]` below: that test ERRORS, and under `set -uo pipefail` (no `-e`) an
+  # errored test is FALSE — so the "provisioned nothing" guard was SILENTLY DISABLED and the pass
+  # exited 0 over a pool it could not list. Exactly the class the header names for every other
+  # operand; the summary read must fail closed like them. `SLOTS` is CLEARED first so a failed read
+  # cannot leave the loop's earlier count in place and be printed as if it had just been measured.
+  SLOTS=""
+  if ! slots; then
+    cannot=$((cannot + 1))
+  fi
   printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
     "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
   # ⛔ A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS. Exit 5 is per-NAME (that is the whole point:
   # one taken name must not end the pass), so on its own it cannot report a box that could not register
   # ANYTHING — a GitHub 5xx, an expired runner scope, a full disk all arrive as the same code. When the
-  # pass ended short of the ceiling with every attempt failing, that IS cannot-act.
-  if [ "$added" -eq 0 ] && [ "$failed" -gt 0 ] && [ "${SLOTS:-0}" -lt "$CEILING" ]; then
+  # pass ended short of the ceiling with every attempt failing, that IS cannot-act. The `-n` operand
+  # check is load-bearing: without it an unmeasured `SLOTS` re-opens the silent-disable above.
+  if [ "$added" -eq 0 ] && [ "$failed" -gt 0 ] && [ -n "$SLOTS" ] && [ "$SLOTS" -lt "$CEILING" ]; then
     err "cannot-act why=no-runner-registered failed=$failed slots=${SLOTS:-unmeasured} ceiling=$CEILING — the box gained no capacity this pass"
     return 2
   fi
