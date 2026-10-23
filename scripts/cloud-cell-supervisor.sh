@@ -589,16 +589,46 @@ controller_unit_copies() { # every copy on the box, system then user
   done
   return 0
 }
-# The state dir a rendered unit supervises — its `Environment=O=` line (verify_unit REQUIRES that line on
-# every unit this repo installs). Prints nothing when the unit carries none, which is a HAND-WRITTEN unit:
-# unprovable either way, and treated as this state dir's (the pre-#2402 behaviour — the fail-safe side for
-# #1761 is "assume it may be ours, never launch a session beside it").
+# The state dir a rendered unit ACTUALLY supervises.
+#
+# ⛔ THE RENDERED `Environment=O=` IS NOT THE ANSWER ON ITS OWN (review P1, #2402). The unit also renders
+# `Environment=ENV_FILE=` and `Environment=CELL_HOME=`, and the controller SOURCES that env file before it
+# derives anything from $O (`source_env_file`, above): `keys.env` may repoint `O`, and both instruments say
+# so in their own words — the installer "never sources `$ENV_FILE`", and the installer's `$O` and the
+# controller's "can legitimately differ". Comparing the rendered value against the LIVE $O therefore
+# classified this cell's OWN installed, enabled unit as ANOTHER state dir's as soon as keys.env repointed
+# `O`: `stop` fell through to the pid teardown (a kill `Restart=always` undoes within RestartSec), printed
+# "released lock" with no `systemctl stop` behind it — the "reported stopped, still running" false pass this
+# file exists to remove — while `status` printed "nothing will restart it" over a supervised cell and
+# `start` fell through to the tmux path beside an enabled unit (#1761's duplicate).
+#
+# The fix is the RESOLUTION, not a wider guess: evaluate the unit's own env file the way the controller
+# will (`set -a; . file`), with the unit's own CELL_HOME/O in scope, and print the `O` that results. Only
+# the copy's own declared file is evaluated, and only in a throwaway subshell whose output is captured —
+# the same posture and the same completion guard `source_env_file` uses (a file with a top-level `exit`
+# ends the subshell silently, and an EMPTY answer here falls back to the rendered value rather than reading
+# as "no owner"). `env -u` is load-bearing: an inherited O/CELL_HOME must not shadow the unit's own.
+# Prints nothing when the unit carries neither a resolvable `Environment=O=` nor a readable env file, which
+# is a HAND-WRITTEN unit: unprovable either way, and treated as this state dir's (the pre-#2402 behaviour —
+# the fail-safe side for #1761 is "assume it may be ours, never launch a session beside it").
 unit_owner_dir() { # <unit file>
-  local v
-  [ -f "$1" ] || return 1
-  v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
-  [ -n "${v:-}" ] || return 1
-  printf '%s\n' "$v"
+  local f="$1" rendered_o envf unit_home eff
+  [ -f "$f" ] || return 1
+  rendered_o="$(sed -n 's/^Environment=O=//p' "$f" 2>/dev/null | head -1)"
+  envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
+  unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
+  eff=""
+  if [ -n "${envf:-}" ] && [ -r "$envf" ]; then
+    eff="$(env -u O -u CELL_HOME -u ENV_FILE bash -c '
+        CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
+        set -a; . "$1" >/dev/null 2>&1
+        printf "%s" "${O:-}"
+      ' _ "$envf" "${unit_home:-}" "${rendered_o:-}" 2>/dev/null || true)"
+  fi
+  [ -n "${eff:-}" ] || eff="${rendered_o:-}"
+  [ -n "${eff:-}" ] || return 1
+  # A trailing slash is a spelling difference, not a different state dir.
+  printf '%s\n' "${eff%/}"
 }
 # The copy the VERBS address, resolved once and remembered: `_UNIT_PATH` (empty = none of ours), plus the
 # FIRST copy that is NOT this state dir's (`_UNIT_FOREIGN`, provably another state dir) and the FIRST that
@@ -614,7 +644,7 @@ controller_unit_path() {
       [ -n "$_UNIT_UNPROVABLE" ] || _UNIT_UNPROVABLE="$f"
       continue
     fi
-    if [ "$own" != "$O" ]; then
+    if [ "$own" != "${O%/}" ]; then
       [ -n "$_UNIT_FOREIGN" ] || _UNIT_FOREIGN="$f"
       continue
     fi

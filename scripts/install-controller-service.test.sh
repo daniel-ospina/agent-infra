@@ -241,10 +241,10 @@ if [ -f "$UNIT" ]; then
   # completes its start job at fork, so `TimeoutStartSec` does not bound `ExecStart`; the wait is the
   # process's own, and if the artifact does not carry those values the process falls back to its 3600 s
   # default and a start that can never succeed reads `active (running)` for an hour.
-  u "TimeoutStartSec=120" && ok 'TimeoutStartSec is STATED in the artifact (not inherited from the host default)' \
+  u "TimeoutStartSec=60" && ok 'TimeoutStartSec is STATED in the artifact (not inherited from the host default)' \
     || bad 'TimeoutStartSec is not stated — the bound on a start that can never succeed is the host default'
-  u 'Environment=CONTROLLER_ORPHAN_TIMEOUT=120' && ok 'the ORPHAN ceiling is RENDERED into the unit — the supervisor reads it, systemd does not' \
-    || bad 'the orphan ceiling is not in the unit: the supervisor would fall back to its 60 s default and the value the artifact states would be inert'
+  u 'Environment=CONTROLLER_ORPHAN_TIMEOUT=60' && ok 'the ORPHAN ceiling is RENDERED into the unit — the supervisor reads it, systemd does not' \
+    || bad 'the orphan ceiling is not in the unit: the supervisor would fall back to its own default and the value the artifact states would be inert'
   u 'Environment=CONTROLLER_HANDOVER_TIMEOUT=3600' && ok 'the HANDOVER ceiling is RENDERED into the unit (the migration wait, long by design)' \
     || bad 'the handover ceiling is not in the unit — the supervised box would run on a default nobody can read'
   cp "$UNIT" "$T/unit.artifact" 2>/dev/null || true   # §J re-checks the RELATION after §A deletes the file
@@ -646,9 +646,11 @@ while [ "$starts" -lt 20 ]; do
     *)          restart=0 ;;
   esac
   [ "$restart" = 1 ] || break
-  # the start-limit window: more than `burst` starts inside `iv` seconds is a configuration fault
+  # the start-limit window: systemd refuses the start AFTER the burst is exceeded, i.e. the
+  # (burst + 1)-th start inside the window (`systemd.unit(5)`) — NOT the burst-th, which is one start
+  # early and hides an arithmetic error that overshoots the window (review P2, #2402)
   now="$(date +%s)"
-  if [ "$((now - window_start))" -lt "$iv" ] && [ "$starts" -ge "$burst" ]; then
+  if [ "$((now - window_start))" -lt "$iv" ] && [ "$starts" -gt "$burst" ]; then
     printf 'failed\n' > "${STATE_FILE:?}.state"; exit 0
   fi
   sleep "$sec"
@@ -707,8 +709,10 @@ N_FAIL="$(drive_f fail exit1)"
 grep -qxF 'failed' "$F/fail/state.out.state" 2>/dev/null \
   && ok '§F: a permanently-failing controller converges to `failed` at the start limit (not an endless 15s loop)' \
   || bad "§F: a permanently-failing controller never reached failed — state=$(cat "$F/fail/state.out.state" 2>/dev/null) starts=${N_FAIL:-?}"
-[ "${N_FAIL:-0}" -le 3 ] && ok "§F: the start limit fired at the declared burst (${N_FAIL} starts, burst=3)" \
-                        || bad "§F: ${N_FAIL} starts before the start limit fired (burst=3) — the limit is not the one the unit states"
+# systemd refuses the (burst+1)-th start inside the window, so a permanently-failing controller takes
+# `burst` attempts and is refused on the NEXT one: 4 starts at the artifact's StartLimitBurst=3.
+[ "${N_FAIL:-0}" -eq 4 ] && ok "§F: the start limit fired on the start AFTER the declared burst (${N_FAIL} starts, burst=3) — systemd refuses the (burst+1)-th, not the burst-th" \
+                        || bad "§F: ${N_FAIL} starts before the start limit fired (burst=3, expected 4 starts) — the limit is not the one the unit states"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §G — the installer refuses rather than half-installs, and is idempotent
@@ -1085,19 +1089,29 @@ HN2_RC=0; HN2_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst i2 --install 
 kill -9 "$HN_LP" 2>/dev/null || true
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-# §J — the ARTIFACT states its own start bound, below the start-limit window (review P2, #2402)
+# §J — the ARTIFACT states its own start bounds, and they FIT the start-limit window (review P2, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-say_case 'the unit states its REAL start bounds, and the impossible one sits below StartLimitIntervalSec'
+say_case 'the unit states its REAL start bounds, and an impossible start fits inside StartLimitIntervalSec'
 # the artifact was asserted in §A; this arm pins the RELATION and the installer's refusal of a bad value.
-# ⛔ THE RELATION THAT MATTERS IS THE ORPHAN CEILING'S (review P1, #2402). `TimeoutStartSec` does not bound a
-# `Type=simple` start; `CONTROLLER_ORPHAN_TIMEOUT` is what the supervisor reads, so that is the value whose
-# attempts must fit inside the start-limit window for an impossible start to converge to `failed`.
+# ⛔ THE RELATION THAT MATTERS IS THE ORPHAN CEILING'S, AND IT IS AN ARITHMETIC ONE (review P2, #2402).
+# `TimeoutStartSec` does not bound a `Type=simple` start; `CONTROLLER_ORPHAN_TIMEOUT` is what the supervisor
+# reads. systemd refuses the start AFTER the burst is exceeded, so `burst` failures must fit inside ONE
+# window: each attempt costs the orphan ceiling PLUS `RestartSec`. "orphan < interval" alone passed the old
+# 120 s default, whose 3 × (120 + 15) = 405 s overshoots the 300 s window — the oldest start ages out before
+# the fourth is refused, so the unit restarted forever while every instrument claimed `failed`.
 _si="$(sed -n 's/^StartLimitIntervalSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
+_sb="$(sed -n 's/^StartLimitBurst=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
+_sr="$(sed -n 's/^RestartSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
 _to="$(sed -n 's/^Environment=CONTROLLER_ORPHAN_TIMEOUT=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
-if [ -n "${_to:-}" ] && [ -n "${_si:-}" ] && [ "$_to" -lt "$_si" ]; then
-  ok "the orphan ceiling (${_to}s) is BELOW the start-limit window (${_si}s) — an impossible start fills the burst"
+_span=""
+case "${_to:-}:${_si:-}:${_sb:-}:${_sr:-}" in
+  ''|*[!0-9:]*) : ;;
+  *) _span=$(( _sb * (_to + _sr) )) ;;
+esac
+if [ -n "${_span:-}" ] && [ "$_span" -lt "$_si" ]; then
+  ok "the orphan ceiling (${_to}s) + RestartSec (${_sr}s) × StartLimitBurst (${_sb}) = ${_span}s fits INSIDE the ${_si}s window — an impossible start exceeds the burst and the unit converges to failed"
 else
-  bad "CONTROLLER_ORPHAN_TIMEOUT='${_to:-<absent>}' is not below StartLimitIntervalSec='${_si:-<absent>}' — a start that can never succeed would look supervised forever"
+  bad "StartLimitBurst='${_sb:-<absent>}' × (CONTROLLER_ORPHAN_TIMEOUT='${_to:-<absent>}' + RestartSec='${_sr:-<absent>}') does NOT fit StartLimitIntervalSec='${_si:-<absent>}' — a start that can never succeed would restart forever while every surface reads supervised"
 fi
 JR="$(arm_root j1)"; mk_systemctl "$JR/bin" "$JR/state" "$JR/sc.log"
 JR_RC=0; JR_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=400 inst j1 --install 2>&1)" || JR_RC=$?
@@ -1105,6 +1119,14 @@ JR_RC=0; JR_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=400 inst j1 --install 2>&1)"
   && ok 'install: REFUSES ORCH_START_TIMEOUT_SEC >= StartLimitIntervalSec' \
   || bad "install: rendered a start bound at or above the start-limit window — $JR_OUT"
 case "$JR_OUT" in *StartLimitIntervalSec*) ok 'install: the refusal names the window it would break' ;; *) bad "install: refused without naming the window — $JR_OUT" ;; esac
+# ⛔ THE REGRESSION PIN FOR THIS FINDING (review P2, #2402): 120 s was the shipped default and it SATISFIED
+# the old "orphan < interval" test while 3 × (120 + 15) = 405 s never fitted. It must be refused now.
+JR2="$(arm_root j2)"; mk_systemctl "$JR2/bin" "$JR2/state" "$JR2/sc.log"
+JR2_RC=0; JR2_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=120 inst j2 --install 2>&1)" || JR2_RC=$?
+[ "$JR2_RC" -ne 0 ] \
+  && ok 'install: REFUSES ORCH_START_TIMEOUT_SEC=120 — below the window, but its burst does not FIT (the old default)' \
+  || bad "install: accepted ORCH_START_TIMEOUT_SEC=120, whose 3 × (120 + 15) s overshoots the 300 s window — the unit would restart forever — $JR2_OUT"
+case "$JR2_OUT" in *StartLimitBurst*) ok 'install: the arithmetic refusal names the burst it cannot fit' ;; *) bad "install: refused without naming the burst — $JR2_OUT" ;; esac
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)

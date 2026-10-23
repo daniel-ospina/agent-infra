@@ -80,8 +80,11 @@ TimeoutStopSec=30
 #   CONTROLLER_HANDOVER_TIMEOUT  a controller this state dir OWNS is still running. That is the migration
 #                                path and it is LANDING WORK, so the wait is legitimately long.
 #   CONTROLLER_ORPHAN_TIMEOUT    the session outlived its loop. An orphan never exits, so this start can
-#                                NEVER succeed: the bound is short and below StartLimitIntervalSec, which
-#                                is what makes the burst fill and the unit converge to `failed`.
+#                                NEVER succeed: it must be short enough that StartLimitBurst of those attempts
+#                                FIT INSIDE StartLimitIntervalSec (`burst × (orphan + RestartSec) < interval`),
+#                                which is what makes the burst fill and the unit converge to `failed`. At one
+#                                start per `orphan + RestartSec`, "below the interval" is NOT enough — the
+#                                installer enforces the arithmetic for exactly that reason.
 # `TimeoutStartSec=` is kept as the systemd-side counterpart of the orphan bound — it keeps the pair true if
 # this unit ever changes `Type=` — but it is not what enforces either bound today.
 TimeoutStartSec={{START_TIMEOUT_SEC}}
