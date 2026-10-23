@@ -657,8 +657,20 @@ refund_bailed_fixer() {
   [ "$n" -gt 0 ] && n=$(( n - 1 ))
   echo "$n" > "$f"
   if [ "$restore" = "1" ]; then
-    touch "$O/state/needsfix-$pr-$head"
-    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+    # ⛔ RESTORE ONLY WHAT THIS DISPATCH ACTUALLY TOOK (review round 4, P3). `restore=1` is passed by the
+    # review-gate arm, but a bail can have been written by the CI-red or CONFLICTING arm — which never
+    # delete a findings marker — and refunded on a later gate-red cycle. Touching unconditionally then
+    # MANUFACTURED a findings record for a head no reviewer had reported findings at, and since
+    # agent-infra#2132 that marker is the SOLE fixer authorisation (`review_gate_state()`), so it could
+    # authorise a fixer with nothing to fix. `fixspend-<PR>-<head>` is written by the one site that
+    # consumes a findings marker (the gate arm's spawn), so its presence is the proof of a real spend.
+    if [ -f "$O/state/fixspend-$pr-$head" ]; then
+      rm -f "$O/state/fixspend-$pr-$head"
+      touch "$O/state/needsfix-$pr-$head"
+      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+    else
+      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+    fi
   else
     echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
   fi
@@ -667,6 +679,66 @@ refund_bailed_fixer() {
   return 0
 }
 
+# review_gate_state <pr> <head-sha> — WHY the repo's review gate is red, as the CONTROLLER must act:
+#   NEEDS-FIX     a reviewer reported findings at this head  -> a FIXER is authorised
+#   NEEDS-REVIEW  no findings exist at this head (evidence stale, or no verdict was produced)
+#                 -> re-run the REVIEW; a fixer is NEVER authorised
+# ⛔ ONE VOCABULARY WITH THE PRODUCER (agent-infra#2132). merge-one.sh's review_state_record() writes
+# exactly these two markers and nothing else may authorise a fixer, so the log line and the dispatch
+# decision cannot diverge. Before this the controller logged a bare `FAILED:ai-review-gate`, which is
+# indistinguishable from a genuine rejection: a fixer dispatched on stale evidence pushes, the push
+# invalidates the signed review by design, and one MAX_FIX_TRIES attempt is burnt per cycle until the
+# PR is parked with no owner. Absent BOTH markers reads NEEDS-REVIEW — the fail-closed direction,
+# because "nothing says findings exist" must never be spent as if it did.
+review_gate_state() {
+  if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
+}
+
+# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*`
+# markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
+# in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
+# listing it is never visited again, so its markers would live forever — the monotonic `state/` growth
+# this file rejects elsewhere. Delete-only, against the listing the cycle already read.
+# ⛔ THE GUARD IS "THE LISTING SUCCEEDED AND IS NOT TRUNCATED" — NOT "the row count is nonzero"
+# (review rounds 7-9). A row count of 0 WITH `last-open-prs` present is a genuinely EMPTY open set (the
+# drained state the fleet aims for), where every marker is orphaned and must go; an ABSENT file is a
+# FAILED read and deletes nothing; a row count at the 300 cap is a TRUNCATED read and deletes nothing.
+# The header used to claim "a row count of 0 deletes nothing", which the code below contradicts — and a
+# maintainer restoring that rule would re-open the drained-box leak.
+prune_orphan_markers() {
+  local rows="${1:-}" n="${2:-0}" mf mp
+  # ⛔ A MALFORMED ROW COUNT FAILS CLOSED (review round 9): coercing it to 0 turned garbage into the
+  # MOST destructive reading ("the open set is empty"). Refuse to prune instead.
+  case "${n:-}" in ''|*[!0-9]*) return 0 ;; esac
+  # `-e last-open-prs` is the success signal (a FAILED listing DELETES that file); the cap check is
+  # the other half: both listings are capped at 300, so when the row count reaches the cap the rows may
+  # omit open PRs and a marker could be deleted for a PR that IS open.
+  [ -e "$O/state/last-open-prs" ] || return 0
+  [ "$n" -lt 300 ] || return 0
+  # ⛔ `needsfix-*`, `reviewcount-*` AND `-n` (review round 10 final pass). `needsfix` was the one
+  # marker family that still leaked; `reviewcount-<PR>` was created by this branch and was in NO sweep
+  # family at all. And `sed` WITHOUT `-n` prints every non-matching line unchanged — so a name outside
+  # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
+  # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
+  # nothing, which the `[ -n "$mp" ]` guard then spares.
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-*; do
+    [ -e "$mf" ] || continue
+    # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
+    # written when the listing is read; this runs hundreds of lines later, so a marker written in
+    # between belongs to a PR the rows cannot contain (a lane's brand-new PR, via chain-merge.sh →
+    # merge-one.sh — this repo's main flow) and is TRUE. `-ot` is the cycle boundary.
+    [ "$mf" -ot "$O/state/last-open-prs" ] || continue
+    # ⛔ sed -E, NOT BRE `\|` (review round 6, P3). BRE has no alternation; BSD sed (macOS — the
+    # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
+    # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
+    # green. `-E` is portable to both.
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^reviewcount-([0-9][0-9]*)$/\1/p' | head -1)"
+    [ -n "$mp" ] || continue
+    printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
+    rm -f "$mf"
+  done
+  return 0
+}
 # ── SELF-REFRESH: the box re-pins itself, once per cycle (agent-infra#2215) ─────────────────────
 # MEASURED 2026-10-20: three cells sat on a checkout 27 commits behind origin/main with an EMPTY
 # harness pin, so fixes that had landed hours earlier were running nowhere. Nothing fetched, nothing
@@ -2412,6 +2484,7 @@ while true; do
     if ! pr_owned "$_op" "$_osha" "$_obr"; then SEL_PARKED=$(( SEL_PARKED + 1 )); fi
   done
   # [parked-count:end]
+  prune_orphan_markers "$OPEN_ROWS" "${_nrows:-0}"
   FIRST_PR="-"; SEL_OWN=0; SEL_UNOWNED=0
   while IFS="$(printf '\t')" read -r _p _b _d _o; do
     [ -z "${_p:-}" ] && continue
@@ -2555,7 +2628,19 @@ while true; do
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
+    # ⛔ AND ITS STALE-EVIDENCE MARKER GOES WITH IT (review round 1, P2 — agent-infra#2132): this
+    # `continue` runs BEFORE every other cleanup path, so a `needsreview-<PR>-<head>` marker written
+    # while the PR was open would outlive it and be counted forever by report.sh. The count is only
+    # worth publishing if it can return to zero. Kept on ONE line because selftest.sh pins this
+    # exact `case` form ("sweep skips CLOSED as well as MERGED").
+    # ⛔ TIDY THE STALE-EVIDENCE, FINDINGS AND SPEND MARKERS (review rounds 5-7). The spend sweep is
+    # local dispatch bookkeeping; the findings and stale-evidence markers are evidence state and die
+    # with the PR. All three on merge/close, because a PR that terminates is never visited again.
+    # ⛔ AND THE RAIL'S OWN RECORDS GO WITH IT (main's arm, kept in the SAME case — two consecutive
+    # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
+    # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" 2>/dev/null || true
       # A PR that leaves the queue carries no refusal and no budget: these are head-bound records, and
       # nothing else prunes them (review P3, cycle 4 — small, but one pair per abandoned PR, forever).
       [ "${REDFIX:-0}" = "1" ] && rail_refusal_clear "$O" "$PR" 2>/dev/null
@@ -3034,6 +3119,22 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     case "$V" in
       GREEN)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        # ⛔ ONLY WHERE GREEN MEANS THE EVIDENCE EXISTS (review round 2, P2 — agent-infra#2132). On a
+        # RAIL repo `ai-review-gate` is not in `$REQ`, so V=GREEN means "the required checks pass",
+        # NOT "a reviewer recorded something" — the exact premise agent-infra#1825 exists to refute.
+        # Sweeping there deleted the marker `merge-one.sh`'s rail fall-through had just written, so
+        # the stale-evidence count was structurally 0 on agent-infra itself (the repo this harness
+        # ships to). The MERGED|CLOSED sweep and `review_state_clear` still give the "can return to
+        # zero" property on a rail repo, so nothing leaks.
+        # ⛔ THE SPEND RECORD IS A LOCAL DISPATCH FACT, SO IT SWEEPS FOR EVERY AUTHORITY (review
+        # round 5, residual 2). ⛔ BUT THE EVIDENCE MARKER MUST NOT (review round 5, P1 — this was a
+        # REGRESSION): sweeping `needsreview-*` unconditionally here re-introduced the round-2 defect,
+        # because on a RAIL repo V=GREEN means "the required checks pass", NOT "a reviewer recorded
+        # something" (#1825). That deleted the marker the rail fall-through had just written and made
+        # the stale-evidence count structurally 0 on agent-infra itself. Two separate lines, and the
+        # authority test stays the ONLY needsreview sweep on this arm.
+        rm -f "$O/state/fixspend-$PR-"* 2>/dev/null || true
+        [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
           # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
@@ -3135,6 +3236,26 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
           # marker at spawn — so restore it too (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
+          # ⛔ ONE STATE, ONE REMEDY (agent-infra#2132). The gate being red is not a diagnosis: a head
+          # with FINDINGS needs a fixer, and a head with no findings needs another REVIEW. They were the
+          # same log line and the same dispatch before this, so a stale-evidence PR was handed to a
+          # fixer whose push invalidated the signed review again, burning one attempt per cycle until
+          # the cap parked an issue nobody owned. The classifier is the ONLY input to both the log line
+          # and the dispatch decision, so the two cannot disagree.
+          # ⛔ AND THIS ARM DOES NOT WRITE THE STALE-EVIDENCE STATE (review round 3, P2). It cannot
+          # establish the property the marker names: "no head-bound clean evidence at THIS head" is
+          # knowable only from the review store, which merge-one.sh consults and this controller does
+          # not. Writing it here published the state for every red gate with no findings marker — a
+          # brand-new PR that had simply not been reviewed, and (measured by review) a head whose
+          # SIGNED MARKER HAD JUST VERIFIED but whose gate never went green, so the log told the
+          # operator to re-record evidence that already existed. merge-one.sh is the single writer of
+          # `needsreview-*`; this arm only READS it, and the log line says only what is known here.
+          _rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"
+          if [ "$_rgs" = "NEEDS-FIX" ]; then
+            echo "#$PR NEEDS-FIX (reviewer findings at head=${HEAD_N:-?}) — a fixer is the remedy" >>"$LOG"
+          else
+            echo "#$PR NEEDS-REVIEW (no findings marker at head=${HEAD_N:-?}) — the remedy is another review, NOT a fixer" >>"$LOG"
+          fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
@@ -3144,8 +3265,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
-            # otherwise the gate is probably just missing evidence -> re-record (fresh review).
-            if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
+            # otherwise the gate is missing evidence -> re-record (fresh review).
+            if [ -n "${HEAD_N:-}" ] && [ "$_rgs" = "NEEDS-FIX" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && can_spawn \
                && [ "$(wt_count fix-)" -lt "$MF" ]; then
@@ -3156,15 +3277,25 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               # PR-derived value can reach `sh -c`. Only $O (validated at startup) and the
               # numeric $PR are embedded.
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              # ⛔ THE SPEND RECORD IS WRITTEN BEFORE THE SPAWN (review round 5, residual 1).
+              # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*`
+              # before this line returns — and `refund_bailed_fixer` requires this file to restore a
+              # findings marker, so a post-spawn write raced a bail into "no spend" (fail-closed: the
+              # marker is withheld and one extra review is paid, never a fixer authorised without
+              # findings). Writing it first closes the window; the spawn-failure arm removes it again.
+              # It is the counterpart `refund_bailed_fixer … 1` requires: this is the ONLY site that
+              # consumes a findings marker, so it is the only site that may authorise a restore.
+              : > "$O/state/fixspend-$PR-$HEAD_N"
               if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
               else
+                rm -f "$O/state/fixspend-$PR-$HEAD_N"
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
-            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
+            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
