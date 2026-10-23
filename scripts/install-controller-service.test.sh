@@ -211,7 +211,11 @@ if [ -f "$UNIT" ]; then
   # stop/restart (review P1, #2402). Pinned here so a future edit cannot quietly widen the kill.
   u 'KillMode=process' && ok 'KillMode=process — a stop signals the controller, never the shared tmux server' \
     || bad "KillMode is not 'process' — 'mixed' SIGKILLs the unit's whole cgroup, which contains the tmux server the doctor session forked ($UNIT)"
-  u 'KillMode=mixed' && bad 'the installed unit carries BOTH KillMode lines — systemd takes the last, so the safe one may not win' || true  u 'After=network-online.target' && ok 'After=network-online.target (the first cycle reads GitHub)' \
+  u 'KillMode=mixed' && bad 'the installed unit carries BOTH KillMode lines — systemd takes the last, so the safe one may not win' || true
+  # ⛔ ITS OWN STATEMENT, NOT A TAIL ON THE LINE ABOVE (review P2, #2402). Joined with a missing newline it
+  # read `true u 'After=network-online.target' && ok …` — `true` ignores its arguments and returns 0, so the
+  # ok fired whether or not the line was in the artifact, and this arm could never fail.
+  u 'After=network-online.target' && ok 'After=network-online.target (the first cycle reads GitHub)' \
     || bad 'network-online ordering missing'
   u 'Environment=ORCH_FOREGROUND=1' \
     && ok 'the unit asks for FOREGROUND mode (the controller is the main process)' \
@@ -233,11 +237,16 @@ if [ -f "$UNIT" ]; then
   u 'StartLimitIntervalSec=300' && u 'StartLimitBurst=3' \
     && ok 'the start limit is EXPLICIT (300s/3) — a config fault converges to failed, not an endless loop' \
     || bad 'StartLimitIntervalSec/StartLimitBurst are missing — at RestartSec=15 the default 10s window can never fill'
-  # ⛔ THE START BOUND IS THE ARTIFACT'S, NOT THE HOST'S (review P2, #2402): ExecStart runs the whole of
-  # `start`, which in service mode WAITS for a running controller. Without a stated value the bound is
-  # systemd's own default — true of today's hosts, not of this artifact.
-  u "TimeoutStartSec=120" && ok 'the start timeout is STATED in the artifact (not inherited from the host default)' \
+  # ⛔ THE START BOUND IS THE SUPERVISOR'S, AND IT IS RENDERED INTO THE UNIT (review P1, #2402). `Type=simple`
+  # completes its start job at fork, so `TimeoutStartSec` does not bound `ExecStart`; the wait is the
+  # process's own, and if the artifact does not carry those values the process falls back to its 3600 s
+  # default and a start that can never succeed reads `active (running)` for an hour.
+  u "TimeoutStartSec=120" && ok 'TimeoutStartSec is STATED in the artifact (not inherited from the host default)' \
     || bad 'TimeoutStartSec is not stated — the bound on a start that can never succeed is the host default'
+  u 'Environment=CONTROLLER_ORPHAN_TIMEOUT=120' && ok 'the ORPHAN ceiling is RENDERED into the unit — the supervisor reads it, systemd does not' \
+    || bad 'the orphan ceiling is not in the unit: the supervisor would fall back to its 60 s default and the value the artifact states would be inert'
+  u 'Environment=CONTROLLER_HANDOVER_TIMEOUT=3600' && ok 'the HANDOVER ceiling is RENDERED into the unit (the migration wait, long by design)' \
+    || bad 'the handover ceiling is not in the unit — the supervised box would run on a default nobody can read'
   cp "$UNIT" "$T/unit.artifact" 2>/dev/null || true   # §J re-checks the RELATION after §A deletes the file
   # and the interval really is larger than the restart delay, so the pair is not decorative
   _rs="$(sed -n 's/^RestartSec=//p' "$UNIT" | head -1)"
@@ -1078,14 +1087,17 @@ kill -9 "$HN_LP" 2>/dev/null || true
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §J — the ARTIFACT states its own start bound, below the start-limit window (review P2, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-say_case 'the unit states TimeoutStartSec, below StartLimitIntervalSec (a start that cannot succeed converges)'
+say_case 'the unit states its REAL start bounds, and the impossible one sits below StartLimitIntervalSec'
 # the artifact was asserted in §A; this arm pins the RELATION and the installer's refusal of a bad value.
+# ⛔ THE RELATION THAT MATTERS IS THE ORPHAN CEILING'S (review P1, #2402). `TimeoutStartSec` does not bound a
+# `Type=simple` start; `CONTROLLER_ORPHAN_TIMEOUT` is what the supervisor reads, so that is the value whose
+# attempts must fit inside the start-limit window for an impossible start to converge to `failed`.
 _si="$(sed -n 's/^StartLimitIntervalSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
-_ts="$(sed -n 's/^TimeoutStartSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
-if [ -n "${_ts:-}" ] && [ -n "${_si:-}" ] && [ "$_ts" -lt "$_si" ]; then
-  ok "the start bound (${_ts}s) is BELOW the start-limit window (${_si}s) — a stuck start can fill the burst"
+_to="$(sed -n 's/^Environment=CONTROLLER_ORPHAN_TIMEOUT=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
+if [ -n "${_to:-}" ] && [ -n "${_si:-}" ] && [ "$_to" -lt "$_si" ]; then
+  ok "the orphan ceiling (${_to}s) is BELOW the start-limit window (${_si}s) — an impossible start fills the burst"
 else
-  bad "TimeoutStartSec='${_ts:-<absent>}' is not below StartLimitIntervalSec='${_si:-<absent>}' — a start that can never succeed would look supervised forever"
+  bad "CONTROLLER_ORPHAN_TIMEOUT='${_to:-<absent>}' is not below StartLimitIntervalSec='${_si:-<absent>}' — a start that can never succeed would look supervised forever"
 fi
 JR="$(arm_root j1)"; mk_systemctl "$JR/bin" "$JR/state" "$JR/sc.log"
 JR_RC=0; JR_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=400 inst j1 --install 2>&1)" || JR_RC=$?

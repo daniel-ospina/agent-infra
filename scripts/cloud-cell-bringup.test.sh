@@ -198,6 +198,16 @@ printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login") 
 # SYSTEMCTL_STUB_MODE=fail makes `daemon-reload`/`enable` refuse, which is the shape of a cell whose
 # scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
 export SYSTEMD_UNIT_DIR="$T/systemd-units"
+# ⛔ THE READ SIDE TOO, OR THE SUITE CHANGES THE HOST (review P2, #2402). `SYSTEMD_UNIT_DIR` is the
+# installer's WRITE seam; `installed_units`/`find_installed_unit` READ `${CONTROLLER_SYSTEM_UNIT_DIR:-
+# /etc/systemd/system}` and `$HOME/.config/systemd/user`, and `--install` refuses when a second copy is
+# already installed. Pinning only the write side left every read-back arm reading this box — so on any cell
+# that has run install-controller-service.sh (the exact box shape this PR creates) the new controller check
+# sees a foreign copy, `--install` refuses, and the bring-up dies on its own deployment target. The
+# installer's own suite pins both seams for the same reason; HOME is pinned with them because the user-scope
+# directory is derived from it.
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
+export HOME="$T/home"
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
