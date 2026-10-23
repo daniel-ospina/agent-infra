@@ -51,7 +51,8 @@ set -u
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE \
       HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
       HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT \
-      HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES
+      HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES \
+      HARNESS_UP_CLAIMS_STALE HARNESS_UP_REFRESH_STALE HARNESS_UP_HEARTBEAT_STALE
 # ⛔ THE BOX'S DISK IS NOT THIS SUITE'S INPUT EITHER: `df` is stubbed below ($TMP/df, 20000MB) so the disk
 # leg of the capacity decision is deterministic AND live — one arm makes it the binding leg on purpose.
 # The helpers pass the two knobs explicitly (an ambient `export` cannot reach them) and default to the
@@ -1111,8 +1112,8 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FRESHCELL" R
 slashrow="$(printf '%s\n' "$OUT" | grep -E '^claims' | head -1)"
 ck "(e) a trailing-slash spelling of the SAME repo is not a mismatch (no re-probe) [$slashrow]" \
    "$([ "$(cat "$FRESHCELL/orchestrator/state/harness-claims")" = "$before_slash" ] && echo 0 || echo 1)"
-ck "(e) …and that record reads OK, not a mismatched repo" \
-   "$(case "$spacerow" in *'OK ('*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and that record reads OK, not a mismatched repo [$slashrow]" \
+   "$(case "$slashrow" in *'OK ('*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ TWO MISSING PATHS ARE NOT "THE SAME REPO" (review P1, fail-open): `hu_real` prints NOTHING for a path
 # that does not exist, so a bare `hu_real`-vs-`hu_real` compare declared two DIFFERENT nonexistent paths
 # EQUAL. In this row that reused a record written about a repo this box does not drain and printed

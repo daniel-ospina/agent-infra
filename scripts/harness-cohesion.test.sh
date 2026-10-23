@@ -32,7 +32,8 @@ set -u
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS \
       HU_LOAD_PER_CPU HU_LOAD_PER_LANE HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
       HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES \
-      HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT
+      HARNESS_UP_FORCED_VERB HARNESS_UP_TIMEOUT \
+      HARNESS_UP_CLAIMS_STALE HARNESS_UP_REFRESH_STALE HARNESS_UP_HEARTBEAT_STALE
 # ⛔ THE CAPACITY KNOBS ARE PART OF THAT LIST, NOT ONLY THE REF/PIN ONES (review P2): `hu_capacity` reads
 # HU_NCPU/HU_LOADAVG_FILE/HU_DISK_* directly, so an ambient `HU_LOADAVG_FILE=/nonexistent` (or
 # `HU_NCPU=abc`) made lanes=3 and every `up` arm REFUSE — measured **8 failed**, attributed to the launcher
@@ -40,6 +41,10 @@ unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_O
 # must not disagree about what "ambient" means. HU_LAUNCHD_LABEL is the same class one row over, and so
 # are the WRAPPER knobs (`HARNESS_UP_FORCED_VERB`/`_TIMEOUT`): a shell that exports FORCED_VERB=status made
 # every `up` arm refuse before it ran — measured **18 failed** — which reads as a launcher regression.
+# ⛔ AND THE ROW-STALENESS KNOBS ARE THE SAME CLASS AGAIN (review P2): `HARNESS_UP_CLAIMS_STALE=0` (or
+# `_REFRESH_STALE`/`_HEARTBEAT_STALE`) reds the GREEN-control arms of the sibling suite (2 failed) — the
+# stale thresholds are INPUTS this suite must own, not facts about the box. The `HU_*_STALE` aliases need
+# no entry: they are unconditionally overwritten from the HARNESS_UP_* names.
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every

@@ -264,8 +264,10 @@ line so it derives from that checkout (`resolve_repo_identity` in `scripts/orche
 reads those two values and nothing else, so this is the only remedy that changes either side of the
 comparison). `HARNESS_REPO` (or `--repo` on a `harness-up` run) names where the **harness** lives — a
 different question that this refusal never asks: on cell-3 the harness already resolved, and pointing
-those at agent-infra leaves the FATAL intact. And `REPO` is the **work** repo the controller drains, so
-it must NOT name the harness.
+those at agent-infra leaves the FATAL intact. `REPO` names the **work** repo the controller drains — it
+may legitimately *be* a checkout of the harness repo (the single-repo laptop shape, and the launcher's own
+fallback when nothing is configured), but pointing it at the harness does not repair a **harness**
+problem: `HARNESS_REPO`/`--repo` is how you name the harness, and `REPO` is what `OR` must agree with.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
