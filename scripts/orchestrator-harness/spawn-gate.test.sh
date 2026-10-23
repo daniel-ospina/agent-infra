@@ -567,6 +567,73 @@ dp_p="$(cd "$dp" 2>/dev/null && pwd -P)"; wt_p="$(cd "$RREPO/.worktrees/fix-7" 2
 [ -n "$dp_p" ] && [ "$dp_p" = "$wt_p" ]; rc=$?
 ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path='${dp:-<none>}')" $rc
 
+# ── 9b) THE PR-OWNER LOCK: a fixer never runs while a LANDER owns the PR ──────
+# ⛔ THE SUBJECT IS THE SHIPPED `fix-one.sh`, DRIVEN. The defect is that `merge-one.sh` and the
+# doctor's `merge` role serialise on `$O/state/mergeclaim-<PR>.lock` while the ONE worker whose
+# product is a PUSH did not, so a lander could re-resolve a head that a fixer then moved under it —
+# and the rail refuses, with the attestation the review chain had just minted gone stale. A grep for
+# the filename would pass on an arm that opens the lock and never tests it, so every check below runs
+# the real script and asserts on what it DID: whether the stub agent ran, whether the chain was
+# re-run, which marker was written, and whether a LIVE owner's lock survived.
+#
+# ⛔ THE HEAD IS STUBBED AS A FUNCTION, NOT AS A FILE, for the reason the `pi` stub above documents:
+# fix-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH, so a file stub is SHADOWED by a
+# system `gh` on any box that has one — and then these arms depend on the host. A function is
+# resolved before any PATH lookup, so it cannot be. It answers ONLY the head read and fails
+# everything else, which keeps the cross-box claim block and the check read on their documented
+# degraded paths (the head is what the bail marker needs).
+gh() { # exported: fix-one.sh's PATH prepend would shadow a file stub
+  case "$*" in
+    *"pr view"*) case "$*" in *"--json headRefOid"*) printf '%s\n' 0123456789abcdef0123456789abcdef01234567; return 0 ;; esac ;; esac
+  return 1
+}
+export -f gh
+# The chain stub records the HANDOFF's lock state: "the fixer released the PR-owner lock before
+# re-running the chain" is otherwise unobservable (a stub that ignores the lock passes either way).
+# MERGE_RC stays honoured — section 10 drives the wrappers through this same stub.
+printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\n[ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo MERGE_ONE_SAW_LOCK >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
+chmod +x "$RO/merge-one.sh"
+PRLOCK7="$RO/state/mergeclaim-7.lock"
+
+# A LIVE lander: the fixer must defer, refundably, and MUST NOT touch the lander's lock.
+sleep 300 & LANDER_PID=$!
+printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
+[ "$plrc" -eq 0 ]; rc=$?
+ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a lander-owned PR starts no agent and does NOT re-run the merge chain" $rc
+grep -q 'LANDER owns this PR (state/mergeclaim-7.lock held by live pid' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the lander and its pid, not a generic refusal" $rc
+[ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes the refundable bail marker for the head it saw (no attempt consumed)" $rc
+[ "$(cat "$RO/state/fixcount-7" 2>/dev/null)" = "2" ]; rc=$?
+ck "...and leaves fixcount alone — the controller refunds, the fixer does not decrement it" $rc
+{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = "$LANDER_PID" ]; }; rc=$?
+ck "...and the LIVE lander's lock SURVIVES — a deferred fixer must never clear another worker's claim" $rc
+kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
+
+# A STALE lock (its owner is gone) is NOT a refusal: the fixer takes it over, runs, and hands the PR
+# to the chain ONLY after releasing it — otherwise merge-one.sh, which takes the same lock first,
+# exits "already owns this PR" and the fixer's own re-review never happens (#2132's strand).
+sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
+printf '%s\n' "$STALE_PID" > "$PRLOCK7"
+fix_argv; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
+{ [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+ck "POSITIVE CONTROL: a STALE lock (owner not live) does not over-block — the fixer runs and the chain is re-run (rc=$plrc2)" $rc
+grep -q 'PR-owner lock: acquired' "$RO/logs/fix-7.log"; rc=$?
+ck "...and it says it TOOK the PR-owner lock over, so a takeover is not silent" $rc
+{ grep -q MERGE_ONE_RAN "$MERGE_LOG" && ! grep -q MERGE_ONE_SAW_LOCK "$MERGE_LOG"; }; rc=$?
+ck "...and it RELEASES the lock before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "...so no lock is left behind by a completed fixer run (a stale lock would defer the next cycle)" $rc
+unset -f gh; unset 'BASH_FUNC_gh%%'
+
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
 # adopt-fix.sh and chain-merge.sh are report-then-`echo` scripts: their LAST command used to be a
 # reporting `echo`, so `$?` was echo's — always 0 — and a wrapper doing `… && next` took the SUCCESS

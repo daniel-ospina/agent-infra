@@ -144,6 +144,81 @@ else
   # `report.sh`) passes `--repo <checkout>`; this one now does too.
   echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>)" >> "$L.log"
 fi
+# ── THE LANDER'S LOCK: a fixer must not be in flight on a PR a lander owns ─────────
+# ⛔ THE HOLE THIS CLOSES (measured 2026-10-23). `merge-one.sh` (the reviewer/lander chain) and the
+# doctor's `merge` role both take `$O/state/mergeclaim-<PR>.lock` before doing anything to a PR, and
+# the controller's `claim_live` reads that SAME file as its spawn guard. `fix-one.sh` took NEITHER
+# it nor anything else the lander reads — only the cross-box `<PR>-<head>` claim, which the doctor
+# also does not take. So on one box the lander and the ONE worker whose product is a PUSH could be
+# in flight on the same PR at the same time: the lander re-resolves the head, the fixer pushes under
+# it, and the rail refuses — with the attestation the review chain had just minted gone stale.
+# Measured on the tortoise queue the same day: of 11 open non-draft PRs, 6 carried a CLEAN record
+# bound to a head that had since moved, and `[merge] candidates=12 attempted=1 landed=0` — the
+# lander's own fixer lanes are a pusher it cannot see.
+#
+# ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
+# says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
+# guard that lives only in the controller leaves those paths pushing at a live lander — the same
+# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+#
+# ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
+# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
+# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
+# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+#
+# ⛔ THE LOOSE-LIVENESS READ IS THE FLEET'S EXISTING CONVENTION, NOT A NEW ONE. "Any live pid holds"
+# is `claim_live`'s documented spawn-guard direction (a recycled pid means "do not spawn", one lost
+# cycle, nothing deleted) and the doctor's `merge` role reads the same file the same way. The
+# recycled-pid risk of reclaiming on liveness alone is #1985's, already filed; this arm joins the
+# existing mechanism rather than inventing a second lock with its own semantics.
+PRLOCK="$O/state/mergeclaim-$PR.lock"
+prlock_live_owner() { # prints the owner pid and returns 0 only when the lock is held by a LIVE pid
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  case "${p:-}" in ''|*[!0-9]*) p=0 ;; esac
+  [ "$p" -gt 0 ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  printf '%s\n' "$p"
+  return 0
+}
+prlock_take() { ( set -o noclobber; printf '%s\n' "$$" > "$PRLOCK" ) 2>/dev/null; }
+release_prlock() { # never removes a lock we do not own: a lander that outlived us keeps its claim
+  [ -n "${PRLOCK:-}" ] || return 0
+  [ "$(cat "$PRLOCK" 2>/dev/null)" = "$$" ] && rm -f "$PRLOCK" 2>/dev/null
+  return 0
+}
+# The refusal has the SAME three arms as the other two gates: the controller refunds by consuming
+# `fixbail-<PR>-<HEAD>`, and an empty HEAD (the cross-box marker's own documented hole) or a manual
+# run must not pretend to have booked one.
+prlock_defer() { # prlock_defer <why>
+  echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+    : > "$O/state/fixbail-$PR-$HEAD"
+    echo "[fix $PR] attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+  elif [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] the head could NOT be read, so no bail marker could be written — the controller cannot refund this attempt (re-decided next cycle)" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: no attempt was booked and none is refunded" >> "$L.log"
+  fi
+  exit 0
+}
+if PL_OWNER="$(prlock_live_owner)"; then
+  prlock_defer "the LANDER owns this PR (state/mergeclaim-$PR.lock held by live pid $PL_OWNER) — a push now would move the head out from under the attestation it is landing"
+fi
+# A lock whose owner is NOT live is stale, not a refusal: take it over exactly as the lander does.
+# The LOCK IS NOT DELETED before the take, so the take is still a CAS rather than a clear-then-write
+# race; a lost race re-reads and defers if the winner is live.
+if ! prlock_take; then
+  if PL_OWNER="$(prlock_live_owner)"; then
+    prlock_defer "the LANDER claimed this PR while this lane was starting (state/mergeclaim-$PR.lock held by live pid $PL_OWNER)"
+  fi
+  rm -f "$PRLOCK" 2>/dev/null      # stale: an owner that is not live cannot be worked for
+  if ! prlock_take; then
+    prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) could not be taken and its holder is not live — refusing to push unserialised against a lander"
+  fi
+fi
+echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (no lander is in flight on this PR)" >> "$L.log"
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
@@ -162,7 +237,7 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
   kill "$w" 2>/dev/null
   return "$rc"
 }
-trap 'release_fix_claim' EXIT
+trap 'release_prlock; release_fix_claim' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
@@ -382,6 +457,13 @@ if [ -n "${CROSS_OWN:-}" ]; then
   fi
 fi
 # re-run the full chain at the new head
+# ⛔ RELEASE THE PR-OWNER LOCK FIRST, AND BEFORE THE CHAIN — not only at exit. `merge-one.sh` takes
+# this SAME lock as its first act and, finding a live pid, exits 0 with "already owns this PR" — so
+# keeping ours across the handoff would turn the fixer's own re-review into a silent no-op (the
+# "fixer pushed, nothing re-recorded" strand #2132 removed). Releasing here is the same reason the
+# cross-box claim above is released here: after a push the downstream worker claims the NEW head,
+# and without a push the SAME head is still ours, so leaving it held would refuse our own re-review.
+release_prlock
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
 # ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
