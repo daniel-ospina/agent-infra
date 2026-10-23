@@ -85,13 +85,16 @@
 # ENV: RUNNER_ROOT (one complete install per runner; default /tmp/actions-runner, the measured
 #        layout) · RUNNER_TEMPLATE (pristine unpacked release to copy; default $RUNNER_ROOT/_template)
 #      RUNNER_MEM_FLOOR_MB (3584 = the 3.5 GB the gate refused at) · RUNNER_CORES_PER_SLOT (3)
-#      RUNNER_POOL_REPO (the repo the registration-token is minted for) · RUNNER_TOKEN (skip gh)
+#      RUNNER_POOL_REPO (owner/name — BOTH the registration-token's scope and the URL the runner is
+#        registered at, so it must be bare `owner/name`; a URL form is refused) · RUNNER_TOKEN (skip gh)
 #      RUNNER_LABELS (overrides the derived self-hosted-<arch> marker; must still contain it)
 #      POOL_PREFIX (default pi-runner-<host>) · RUNNER_START_SETTLE_S (5)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
-#       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED by
-#       a gate (a floor/ceiling verdict), nothing changed · 4 name not available (that name is taken;
+#       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
+#       nothing changed — `add`: a gate verdict (a floor/ceiling refusal); `restart`: that name has no
+#       registration under $RUNNER_ROOT (NOT a capacity verdict — it needs `add`); `status`: the report
+#       it produced contains a DEAD listener (see below) · 4 name not available (that name is taken;
 #       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
 #       ⛔ 4 IS CHECKED BEFORE 3: a name that is already taken reports 4 even on a box that is also
@@ -121,7 +124,7 @@ POOL_LABEL_X64="self-hosted-x64"
 POOL_LABEL_ARM64="self-hosted-arm64"
 
 DRY=0
-MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""
+MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -161,6 +164,16 @@ validate_operands() {
   if ! is_uint "$SETTLE_S"; then
     err "cannot-measure why=settle-unreadable value=${SETTLE_S:-<empty>} (RUNNER_START_SETTLE_S must be a positive integer of seconds)"; return 2
   fi
+  # ⛔ THE REPO IS AN OPERAND TOO, and it now has TWO consumers: the `gh` token path
+  # (`repos/$POOL_REPO/...`) and the registration URL (`https://github.com/$POOL_REPO`). A URL-form or
+  # multi-slash value produces `https://github.com/https://github.com/o/r`; config.sh then fails at
+  # parse time per NAME, so `add` returns rc 5 for every name and `reconcile` grinds through its whole
+  # attempt budget before `cannot-act` — the only evidence a per-name `.config-<name>.log`.
+  case "$POOL_REPO" in
+    ''|/*|*/|*/*/*|*://*) err "cannot-measure why=repo-unreadable value=${POOL_REPO:-<empty>} (RUNNER_POOL_REPO must be owner/name — it is both the token scope and the registration URL)"; return 2 ;;
+    */*) : ;;
+    *) err "cannot-measure why=repo-unreadable value=$POOL_REPO (RUNNER_POOL_REPO must be owner/name)"; return 2 ;;
+  esac
   return 0
 }
 
@@ -206,6 +219,16 @@ pool_label_for_host() {
 registered_dirs() {
   local d tpl tpl_lit
   [ -d "$RUNNER_ROOT" ] || return 0
+  # ⛔ "THERE IS NO POOL" AND "I CANNOT READ THE POOL" ARE DIFFERENT ANSWERS, and only the first one is
+  # 0. The glob below expands to NOTHING on a root that exists but cannot be listed (mode 300, an ACL
+  # or SELinux denial, a transient readdir error on a mounted root), so the pool read as EMPTY — and
+  # an empty pool never trips the ceiling: `add` added on a box already at its bound and `reconcile`
+  # spent its whole attempt budget minting listeners on a box sized for a third as many (measured: 32
+  # listeners on a 3-slot box, rc 0, cannot=0). This is the same class as the unreadable process
+  # table — the one input whose absence would produce an ACTION instead of a refusal.
+  if [ ! -r "$RUNNER_ROOT" ] || ! ls -A "$RUNNER_ROOT" >/dev/null 2>&1; then
+    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT"; return 2
+  fi
   # ⛔ THE TEMPLATE EXCLUSION MUST NOT DEPEND ON THE TEMPLATE RESOLVING. `$tpl` used to be the only
   # bound, so an unresolvable RUNNER_TEMPLATE left it EMPTY and the `[ -z "$tpl" ] || …` guard
   # evaluated TRUE — the pristine release was then emitted as a runner, `reconcile` started a
@@ -236,9 +259,18 @@ registered_dirs() {
     printf '%s\n' "$d"
   done
 }
-# slots — how many runners this box carries. `wc -l` (never `grep -c .`) so an empty pool is 0 with
-# rc 0: an empty listing is a real reading, and a failed grep here would read as "no slots" too.
-slots() { local n; n="$(registered_dirs | wc -l)"; printf '%s' "$((n))"; }
+# count_dirs <listing> — 0 for an EMPTY listing (`wc -l` over an empty string is 1, not 0).
+count_dirs() { local s="${1:-}"; [ -n "$s" ] || { printf '0'; return 0; }; printf '%s\n' "$s" | wc -l | tr -d ' '; }
+
+# slots — refresh $SLOTS from the pool listing. rc 2 = CANNOT MEASURE, and EVERY consumer must refuse:
+# `n="$(registered_dirs | wc -l)"` (the old shape) turned "could not read the pool" into the integer 0,
+# which is the unsafe direction on both gates (0 never reaches the ceiling).
+slots() {
+  local out
+  out="$(registered_dirs)" || return 2   # pipefail is set; the listing error is not swallowed
+  SLOTS="$(count_dirs "$out")"
+  return 0
+}
 
 # valid_name <name> — a runner name is a path component AND goes to `config.sh --name`.
 # Anything with a `/` or a leading dot escapes $RUNNER_ROOT and is invisible to `slots`/`status`, so
@@ -306,6 +338,12 @@ listener_pid() {
 probe_listener() {
   local p
   LISTENER_PID=""
+  # ⛔ AN INSTANCE DIR WE CANNOT INSPECT IS cannot-measure, NOT DEAD. `listener_pid` cannot resolve its
+  # physical path, so a `chmod 000` registration used to report DEAD (rc 3) and `restart` refused it
+  # "no registration at … (add it first)" — both asserting a measured fact the tool never measured, on
+  # a registration that EXISTS. It is COUNTED as a slot (registered_dirs), so the two halves agree:
+  # counted against the ceiling, and reported unreadable rather than dead.
+  [ -r "$1" ] || { err "cannot-measure why=instance-unreadable path=$1"; return 2; }
   p="$(listener_pid "$1")" || return 2
   LISTENER_PID="$p"
   [ -n "$p" ] || return 1
@@ -333,7 +371,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 d rc
+  local dead=0 live=0 d rc dirs
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -342,9 +380,11 @@ cmd_status() {
     case "$1" in --all) shift ;; *) err "usage: status [--all]"; return 1 ;; esac
   done
   readings || return 2
+  slots || return 2
+  dirs="$(registered_dirs)" || return 2
   printf 'host=%s ncpu=%s ceiling=%s slots=%s mem_available=%s MB (%s GB) floor=%s MB (%s GB)\n' \
     "$(cap_host 2>/dev/null || hostname 2>/dev/null || printf box)" \
-    "$NCPU" "$CEILING" "$(slots)" "$MEM_MB" "$(mb_as_gb "$MEM_MB")" \
+    "$NCPU" "$CEILING" "$SLOTS" "$MEM_MB" "$(mb_as_gb "$MEM_MB")" \
     "$MEM_FLOOR_MB" "$(mb_as_gb "$MEM_FLOOR_MB")"
   printf '%-32s %-9s %s\n' NAME LISTENER STATE
   while read -r d; do
@@ -357,8 +397,8 @@ cmd_status() {
       # verdict a caller acts on, and rc 3 would claim it measured something.
       *) return 2 ;;
     esac
-  done <<<"$(registered_dirs)"
-  printf 'summary live=%s dead=%s slots=%s ceiling=%s\n' "$live" "$dead" "$(slots)" "$CEILING"
+  done <<<"$dirs"
+  printf 'summary live=%s dead=%s slots=%s ceiling=%s\n' "$live" "$dead" "$SLOTS" "$CEILING"
   [ "$dead" -eq 0 ] || return 3
   return 0
 }
@@ -399,8 +439,9 @@ cmd_add() {
     err "REFUSED add name=$name MemAvailable=$(mb_as_gb "$MEM_MB") GB is below the $(mb_as_gb "$MEM_FLOOR_MB") GB floor (read ${MEM_MB} MB, floor ${MEM_FLOOR_MB} MB) — nothing added"
     return 3
   fi
-  if [ "$(slots)" -ge "$CEILING" ]; then
-    err "REFUSED add name=$name slots=$(slots) ceiling=$CEILING ncpu=$NCPU cores_per_slot=$CORES_PER_SLOT MemAvailable=$(mb_as_gb "$MEM_MB") GB floor=$(mb_as_gb "$MEM_FLOOR_MB") GB — above the core-aware ceiling, nothing added"
+  slots || return 2
+  if [ "$SLOTS" -ge "$CEILING" ]; then
+    err "REFUSED add name=$name slots=$SLOTS ceiling=$CEILING ncpu=$NCPU cores_per_slot=$CORES_PER_SLOT MemAvailable=$(mb_as_gb "$MEM_MB") GB floor=$(mb_as_gb "$MEM_FLOOR_MB") GB — above the core-aware ceiling, nothing added"
     return 3
   fi
 
@@ -418,7 +459,7 @@ cmd_add() {
     *",$POOL_LABEL_X64,"*|*",$POOL_LABEL_ARM64,"*) ;;
     *) err "cannot-measure why=label-unknown value=$label — a runner without $POOL_LABEL_X64/$POOL_LABEL_ARM64 matches no job and is invisible to ci_runner_gate.sh"; return 2 ;;
   esac
-  say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$(slots) labels=$label"
+  say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
 
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
     err "cannot-act why=runner-template-absent path=$RUNNER_TEMPLATE/config.sh (one complete runner install to copy)"; return 2
@@ -444,17 +485,31 @@ cmd_add() {
   esac
 
   # ONE COMPLETE INSTALL PER INSTANCE (see the header): config.sh writes `.runner` beside ITSELF.
+  # ⛔ THE CLAIM IS ATOMIC. `mkdir` is the only filesystem verb here that FAILS when another pass has
+  # taken the name; the `[ -e "$dir" ]` check above is check-then-act, and `cp -aL <template> <existing
+  # dir>` NESTS into it rather than failing — so two overlapping invocations (a hand `add` during a
+  # scheduled `reconcile`, two operators) would both configure ONE instance: a second registration
+  # token spent, `.runner` overwritten, the GitHub-side registration orphaned, and both passes
+  # reporting an add neither uniquely made (measured: two simultaneous passes both reported
+  # `added name=pi-runner-…-1`).
+  if ! mkdir "$dir" 2>/dev/null; then
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+      err "name-unavailable name=$name path=$dir appeared while this add ran (another pass took it) — use restart"; return 4
+    fi
+    err "cannot-act why=template-copy-failed from=$RUNNER_TEMPLATE to=$dir (the instance dir could not be created)"; return 2
+  fi
   # ⛔ `-L`, NOT a bare `-a`: `cp -a` is `--no-dereference`, so a SYMLINKED template would produce a
   # symlinked instance — every alias then shares ONE install and one listener, `listener_pid` reads
   # them all LIVE through the shared physical path (so a dead one is never restarted), the template
-  # is mutated by the first config, and each alias eats a slot it does not own.
-  if ! cp -aL "$RUNNER_TEMPLATE" "$dir"; then
+  # is mutated by the first config, and each alias eats a slot it does not own. Dereferenced, the copy
+  # is a real install or it is nothing — so the install is checked, not assumed.
+  if ! cp -aL "$RUNNER_TEMPLATE/." "$dir/" 2>/dev/null; then
     rm -rf "$dir"   # a partial install is invisible to `slots` and would block this name forever
     err "cannot-act why=template-copy-failed from=$RUNNER_TEMPLATE to=$dir (the partial copy was removed)"; return 2
   fi
-  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+  if [ -L "$dir" ] || [ ! -f "$dir/config.sh" ]; then
     rm -rf "$dir"
-    err "cannot-act why=template-not-copied template=$RUNNER_TEMPLATE (still a symlink or not a directory — the copy was removed)"; return 2
+    err "cannot-act why=template-not-copied template=$RUNNER_TEMPLATE ($dir has no config.sh — the copy was removed)"; return 2
   fi
   # ⛔ THE LOG LIVES OUTSIDE THE INSTANCE DIR, because the instance dir is REMOVED on failure and
   # config.sh's stderr is the only diagnostic for the commonest real failures (name taken on GitHub,
@@ -468,7 +523,7 @@ cmd_add() {
   # token's repo. Without it every real add failed at config and reported it as a NAME problem
   # (rc 5, "a token it consumed may have registered the name") — and the suite stayed green because
   # its config stub ignored argv. Derived from POOL_REPO in ONE place so the two cannot drift.
-  local -r pool_url="https://github.com/$POOL_REPO"
+  local pool_url="https://github.com/$POOL_REPO"
   local -a args=(--unattended --url "$pool_url" --name "$name" --work "$dir/_work" --labels "$label" --token "$token")
   if ! "$dir/config.sh" "${args[@]}" >"$cfglog" 2>&1; then
     # Nothing valid exists yet, and a full runner install left behind is invisible to `slots`, never
@@ -513,6 +568,15 @@ cmd_restart() {
   # refused here.
   case "$name" in ''|.|..|-*|*/*) err "usage: restart --name <runner-name> — a name must not be empty, start with '-', be '.'/'..', or contain '/'"; return 1 ;; esac
   dir="$RUNNER_ROOT/$name"
+  # ⛔ AN UNREADABLE INSTANCE IS cannot-measure, NOT "no registration": `-f .runner` is FALSE for a
+  # registration we cannot read, and the message would send the operator to `add` a runner that is
+  # already registered (the same false verdict `status` must never print).
+  if [ ! -r "$dir" ]; then
+    if [ -d "$dir" ]; then
+      err "cannot-measure why=instance-unreadable path=$dir"; return 2
+    fi
+    err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
+  fi
   if [ ! -f "$dir/.runner" ]; then
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
   fi
@@ -586,8 +650,9 @@ cmd_reconcile() {
   # 2 — after the restarts, with the summary disclosing that the add arm did not run.
   if ! readings; then
     cannot=$((cannot + 1))
+    slots >/dev/null 2>&1 || SLOTS="unmeasured"
     printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=unmeasured mem_available=unmeasured floor=%s MB dry_run=%s\n' \
-      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$(slots)" "${MEM_FLOOR_MB:-unset}" "$DRY"
+      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "${MEM_FLOOR_MB:-unset}" "$DRY"
     err "cannot-measure why=capacity-readings-unavailable (the restart arm already ran; nothing was ADDED) — fix the reading, then re-run"
     return 2
   fi
@@ -604,13 +669,21 @@ cmd_reconcile() {
   #        the box the capacity it is entitled to.
   while [ "$budget" -gt 0 ]; do
     budget=$((budget - 1))
+    # ⛔ A POOL THAT CANNOT BE READ ENDS THE PASS (rc 2, nothing added): `slots` reads 0 for "cannot
+    # list the root", and 0 never reaches the ceiling — that is how one pass minted 32 listeners on a
+    # 3-slot box while reporting cannot=0.
+    if ! slots; then
+      cannot=$((cannot + 1))
+      err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the pass stopped; nothing was added)"
+      break
+    fi
     # Nothing is added in a dry run, so `slots` never moves: the ceiling is counted against
     # slots + what the preview has already announced.
     if [ "$DRY" = 1 ]; then
-      [ $(( $(slots) + dry_adds )) -lt "$CEILING" ] || {
-        say "dry-run: ceiling would be reached slots=$(slots)+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
+      [ $(( SLOTS + dry_adds )) -lt "$CEILING" ] || {
+        say "dry-run: ceiling would be reached slots=$SLOTS+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
     else
-      [ "$(slots)" -lt "$CEILING" ] || { say "ceiling reached slots=$(slots) ceiling=$CEILING ncpu=$NCPU"; break; }
+      [ "$SLOTS" -lt "$CEILING" ] || { say "ceiling reached slots=$SLOTS ceiling=$CEILING ncpu=$NCPU"; break; }
     fi
     scan=0
     while [ -e "$RUNNER_ROOT/$POOL_PREFIX-$n" ]; do
@@ -645,14 +718,15 @@ cmd_reconcile() {
   # it would start, so `added` must count what it would add, or the machine-readable summary
   # under-reports the very change the preview announced.
   [ "$DRY" = 1 ] && added=$((added + dry_adds))
+  slots >/dev/null 2>&1 || SLOTS="unmeasured"
   printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
-    "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$(slots)" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
+    "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
   # ⛔ A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS. Exit 5 is per-NAME (that is the whole point:
   # one taken name must not end the pass), so on its own it cannot report a box that could not register
   # ANYTHING — a GitHub 5xx, an expired runner scope, a full disk all arrive as the same code. When the
   # pass ended short of the ceiling with every attempt failing, that IS cannot-act.
-  if [ "$added" -eq 0 ] && [ "$failed" -gt 0 ] && [ "$(slots)" -lt "$CEILING" ]; then
-    err "cannot-act why=no-runner-registered failed=$failed slots=$(slots) ceiling=$CEILING — the box gained no capacity this pass"
+  if [ "$added" -eq 0 ] && [ "$failed" -gt 0 ] && [ "${SLOTS:-0}" -lt "$CEILING" ]; then
+    err "cannot-act why=no-runner-registered failed=$failed slots=${SLOTS:-unmeasured} ceiling=$CEILING — the box gained no capacity this pass"
     return 2
   fi
   [ "$cannot" -eq 0 ] || return 2

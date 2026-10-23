@@ -45,6 +45,10 @@ export CAPACITY_LIB
 
 PASS=0
 FAIL=0
+# ⏭ SKIPS ARE COUNTED AND NAMED: a case that cannot run on this host (a root shell bypasses the
+# directory permissions two cases below rely on) must not read as coverage it did not have.
+SKIPPED=0
+skip() { SKIPPED=$((SKIPPED + 1)); echo "  ⏭ NOT COVERED HERE: $1"; }
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
@@ -89,7 +93,7 @@ printf '#!/usr/bin/env bash\nexit 1\n' >"$BIN/sysctl"
 cat >"$BIN/uname" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in *-m*) printf '%s\n' "${FIXTURE_ARCH:-x86_64}"; exit 0 ;; esac
-exec /usr/bin/uname "$@"
+exec /bin/uname "$@"
 STUB
 cat >"$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -103,7 +107,7 @@ cat >"$BIN/ps" <<'STUB'
 # `cannot-measure` — never "no listeners", which would double-start a listener.
 [ "${FIXTURE_PS_FAIL:-0}" = 1 ] && { echo "ps: cannot read /proc" >&2; exit 1; }
 [ "${FIXTURE_PS_EMPTY:-0}" = 1 ] && exit 0
-exec /usr/bin/ps "$@"
+exec /bin/ps "$@"
 STUB
 cat >"$BIN/hostname" <<'STUB'
 #!/usr/bin/env bash
@@ -124,13 +128,13 @@ printf '%s | %s\n' "$PWD" "$*" >>"${CONFIG_LOG:?}"
 #   Required if unattended"), and the runner THROWS rather than defaulting it to the token's repo —
 #   so this stub refuses exactly as config.sh does. A stub that ignored argv let the shipped `add`
 #   omit --url and stay GREEN: this file modelled the cwd contract and the listener argv, but not
-#   the ONE argument that decides whether a registration happens at all.
-case " $* " in
-  *" --unattended "*)
-    case " $* " in
-      *" --url https://github.com/"*) : ;;
-      *) echo "config.sh: Invalid configuration provided for --url. Terminating unattended configuration." >&2; exit 1 ;;
-    esac ;;
+#   the ONE argument that decides whether a registration happens at all. The URL is PARSED, not
+#   prefix-matched, so `--url https://github.com/` (no owner/name) is refused the way config refuses it.
+cfg_url=""; cfg_prev=""
+for a in "$@"; do [ "$cfg_prev" = "--url" ] && cfg_url="$a"; cfg_prev="$a"; done
+case "$cfg_url" in
+  https://github.com/?*/?*) : ;;
+  *) echo "config.sh: Invalid configuration provided for url. Terminating unattended configuration." >&2; exit 1 ;;
 esac
 case " $* " in *" --name ${FIXTURE_CONFIG_FAIL_NAME:-__none__} "*) echo "config.sh: a runner with this name already exists" >&2; exit 1 ;; esac
 if [ -n "${FIXTURE_CONFIG_TAKEN:-}" ]; then
@@ -194,6 +198,24 @@ assert_contains "$(cat "$CONFIG_LOG")" "--token tok-fixture" "config.sh was give
 assert_contains "$(cat "$CONFIG_LOG")" "--url https://github.com/daniel-ospina/tortoise" \
   "config.sh was given the REPO URL — unattended config refuses to run without one"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-a")" "1" "a listener is running for the instance dir"
+
+# ⛔ …AND IT MUST FOLLOW THE REPO, not be the default written twice: this case runs a NON-default repo
+#   and asserts the URL follows it (a hardcoded default passes the assertion above and fails here).
+fresh_pool urlfollow; reset_logs
+out="$(RUNNER_POOL_REPO=acme/other FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-url)"
+assert_eq "$?" "0" "an add with a NON-DEFAULT RUNNER_POOL_REPO succeeds"
+assert_contains "$(cat "$CONFIG_LOG")" "--url https://github.com/acme/other" \
+  "config.sh was given a URL DERIVED from RUNNER_POOL_REPO (a hardcoded default would fail here)"
+
+# ⛔ The repo has TWO consumers (the gh token path and the registration URL), so a URL-form or
+#   multi-slash value must be refused as an OPERAND — not discovered per name, as rc 5, after a full
+#   runner install was copied and a token spent.
+for bad_repo in 'https://github.com/acme/other' 'acme' 'acme/' 'a/b/c'; do
+  out="$(RUNNER_POOL_REPO="$bad_repo" FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-badrepo)"
+  assert_eq "$?" "2" "RUNNER_POOL_REPO='$bad_repo' is cannot-measure (rc 2), never a malformed --url"
+  assert_contains "$out" "cannot-measure why=repo-unreadable" "it names the operand"
+  assert_absent "$RUNNER_ROOT/pi-runner-badrepo" "and nothing was created"
+done
 
 # ── (1) a symlinked template must still produce a COPY ─────────────────────────────────────
 # `cp -a` is `--no-dereference`: with a symlinked template it would create a SYMLINKED instance, so
@@ -840,9 +862,98 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_CORES_PER_SLOT=08 run status)"
 assert_eq "$?" "2" "a zero-padded CORES_PER_SLOT is cannot-measure (rc 2), never rc 1 with no output"
 assert_contains "$out" "cannot-measure why=cores-per-slot-unreadable" "it names the operand"
 
+# ⛔ THE NAME CLAIM IS ATOMIC. The `[ -e "$dir" ]` check is check-then-act, and `cp -aL template
+#   <existing dir>` NESTS into it rather than failing — so two overlapping adds for ONE name would BOTH
+#   configure the same instance: a second registration token spent, `.runner` overwritten, the
+#   GitHub-side registration orphaned, and both passes reporting an add neither uniquely made. That is
+#   the expected first production shape once a schedule arms the pass (doc §8).
+echo "── two concurrent adds for ONE name ──"
+fresh_pool race; reset_logs
+( FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$POOL" add --name pi-runner-race >/dev/null 2>&1; echo $? >"$T/race-a.rc" ) &
+race_a=$!
+( FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$POOL" add --name pi-runner-race >/dev/null 2>&1; echo $? >"$T/race-b.rc" ) &
+race_b=$!
+wait "$race_a" "$race_b"
+race_ok=0; race_taken=0
+for race_rc in "$(cat "$T/race-a.rc" 2>/dev/null)" "$(cat "$T/race-b.rc" 2>/dev/null)"; do
+  case "$race_rc" in 0) race_ok=$((race_ok + 1)) ;; 4) race_taken=$((race_taken + 1)) ;; esac
+done
+assert_eq "$race_ok" "1" "exactly ONE of two concurrent adds for one name succeeds"
+assert_eq "$race_taken" "1" "the other reports the name unavailable (rc 4), not a second registration"
+assert_eq "$(count_lines "$CONFIG_LOG")" "1" "config.sh ran exactly ONCE for that name"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-race")" "1" "and exactly one listener runs"
+
+# ── a SYMLINKED instance dir must still read LIVE ────────────────────────────────────────
+# ⛔ `run.sh` resolves its own dir with `cd -P`, so `ps` shows the PHYSICAL path whenever the instance
+#   is reached through a symlink — which the migration population (hand-provisioned dirs) legally is.
+#   Without the `$phys` arm of the match, a LIVE listener reads DEAD, and `restart` answers that by
+#   starting a SECOND listener for one registration (measured: 2 processes, reported as
+#   `cannot-act why=listener-never-appeared` for a listener that was running).
+echo "── liveness through a SYMLINKED instance dir ──"
+fresh_pool symlive; reset_logs
+mkdir -p "$T/real"
+register pi-runner-sym-real
+mv "$RUNNER_ROOT/pi-runner-sym-real" "$T/real/pi-runner-sym"
+ln -s "$T/real/pi-runner-sym" "$RUNNER_ROOT/pi-runner-sym"
+bash "$POOL" restart --name pi-runner-sym >/dev/null 2>&1
+assert_eq "$(listeners_for "$T/real/pi-runner-sym")" "1" "the symlinked registration has one listener"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "0" "a live listener behind a SYMLINKED instance reads LIVE (rc 0, not DEAD)"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-sym)"
+assert_contains "$out" "live name=pi-runner-sym" "restart sees it as live and does not touch it"
+assert_eq "$(listeners_for "$T/real/pi-runner-sym")" "1" "exactly one listener — no double start"
+
+# ⛔ A POOL THAT EXISTS BUT CANNOT BE LISTED IS NOT AN EMPTY POOL, and this is the direction that
+#   SPENDS capacity: the ceiling is COUNTED FROM this listing, so a listing failure read as 0 lets
+#   `add` add on a box already at its bound and lets `reconcile` mint listeners until its attempt
+#   budget runs out (measured before the guard: 32 listeners on a 3-slot box, rc 0, cannot=0 — the
+#   tool's central refusal silently defused). This is the same class as the unreadable process table.
+echo "── an unlistable RUNNER_ROOT is cannot-measure, never an empty pool ──"
+fresh_pool unlistable; reset_logs
+register pi-runner-k1; register pi-runner-k2; register pi-runner-k3
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unlistable RUNNER_ROOT (a root shell bypasses directory permissions)"
+else
+  chmod 300 "$RUNNER_ROOT"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "status on an unlistable pool exits 2, not 0 with slots=0"
+  assert_contains "$out" "cannot-measure why=runner-root-unreadable" "it names the unreadable root"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-k4)" "2" \
+    "add on an unlistable pool refuses (rc 2) instead of adding above an unmeasured ceiling"
+  assert_eq "$(count_lines "$CONFIG_LOG")" "0" "and it registered nothing"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+  assert_eq "$?" "2" "reconcile on an unlistable pool stops the pass (rc 2)"
+  assert_contains "$out" "cannot-measure why=runner-root-unreadable" "the pass says why it stopped"
+  assert_eq "$(count_lines "$CONFIG_LOG")" "0" "no attempt was spent minting listeners"
+  chmod 700 "$RUNNER_ROOT"
+fi
+
+# ⛔ A DIR WE CANNOT INSPECT IS COUNTED AS A SLOT **AND** REPORTED unreadable — the conservative
+#   direction for the ceiling (a chmod'd registration must not vanish from `slots`: the box would look
+#   EMPTIER than it is and the ceiling would under-count), while a DEAD verdict here would be a
+#   measured fact the tool never measured (`restart` would then refuse it "add it first").
+echo "── an unreadable instance dir: counted, and cannot-measure ──"
+fresh_pool locked; reset_logs
+register pi-runner-locked
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unreadable instance dir (a root shell bypasses directory permissions)"
+else
+  chmod 000 "$RUNNER_ROOT/pi-runner-locked"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "an unreadable instance is cannot-measure (rc 2), never DEAD (rc 3)"
+  assert_contains "$out" "cannot-measure why=instance-unreadable" "and it names the instance"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-locked)" "2" \
+    "restart refuses cannot-measure rather than claiming there is no registration"
+  chmod 700 "$RUNNER_ROOT/pi-runner-locked"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of status)" "3" \
+    "and with the mode restored it is a measurable DEAD listener again"
+fi
+
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
   echo "❌ $FAIL assertion(s) failed, $PASS passed"
+  if [ "$SKIPPED" -gt 0 ]; then echo "⏭ $SKIPPED case(s) NOT COVERED on this host (see the ⏭ lines)"; fi
   exit 1
 fi
 echo "✅ all $PASS assertions passed"
+if [ "$SKIPPED" -gt 0 ]; then echo "⏭ $SKIPPED case(s) NOT COVERED on this host (see the ⏭ lines)"; fi

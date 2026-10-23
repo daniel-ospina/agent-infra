@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-21
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, fleet, orchestrator-harness
+aboutObjects: agent-infra, issue-2373, fleet, orchestrator-harness, runner-pool
 ---
 
 # Fleet capacity placement & the self-dispatch proof
@@ -187,9 +187,10 @@ a predicate, not a wish (agent-infra#2344, comment 6347825624: *"must refuse to 
 free memory is below a stated floor, and must report the reading it used"*). A dead listener for an
 EXISTING registration costs ~200 MB to bring back and is capacity the box already paid for; refusing
 it on a low-memory box would leave the slot registered, advertised to GitHub and idle.
-- **The ceiling is core-aware and per box**: `ceil(ncpu / RUNNER_CORES_PER_SLOT)` — 3 slots on an
+- **The SLOT ceiling is core-aware and per box**: `ceil(ncpu / RUNNER_CORES_PER_SLOT)` — 3 slots on an
 8-core box, 2 on a 4-core box, the owner's sizing. A refusal names the core count, the ceiling, the
-slot count **and** the memory reading.
+slot count **and** the memory reading. This bounds runner slots, not lanes, and does not touch §4's
+ruling that there is no lane ceiling tied to cpu count.
 - **One complete runner install per instance dir**, which is GitHub's own layout, not a preference:
   `config.sh` and `run.sh` resolve **their own** directory (`DIR="$(cd -P … )"; cd "$DIR"`), so
   `.runner` is written beside the script and the caller's cwd is ignored. `RUNNER_ROOT` defaults to
@@ -223,14 +224,19 @@ slot count **and** the memory reading.
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
 
-`status --all` is scoped to **this box**: there is no cross-box read here (the fleet's cross-box view
-is `capacity.sh`'s probe and the fleet inventory), so a runner this box registered and then lost the
-local evidence for is not in the table — that is why an add whose listener fails keeps its `.runner`
-and says so. `--all` widens nothing: the default view already lists every runner on this box, and the
-flag exists because #2373's clause names it.
+`status --all` is scoped to **this box**: nothing in this repo reports runners **per cell** —
+`capacity.sh`'s probe knows host, cores, load, lanes and disk/memory and **nothing about runners**, and
+neither does the fleet inventory. The GitHub-side registry (names + online/offline) is readable with
+`scripts/ci_runner_gate.sh --status`; the per-cell runner report #2373's clause 2 words is **not**
+delivered by this change. Within this box the table is complete, so a runner this box registered and
+then lost the local evidence for is not in the table — that is why an add whose listener fails keeps
+its `.runner` and says so. `--all` widens nothing: the default view already lists every runner on this
+box, and the flag exists because #2373's clause names it.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
-message names) · 3 REFUSED by a gate · 4 name not available (that name is taken; try another) · 5 this
+message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: that
+name has no registration under `RUNNER_ROOT` (NOT a capacity verdict — it needs `add`); `status`: the
+report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
 local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
@@ -238,7 +244,10 @@ always taken). ⛔ **4 is checked before 3**: a name that is already taken repor
 is also at a gate, because the name condition is a fact about the request, not about the box — a
 caller that branches on 4 to try another name must be able to see it. `status`
 exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — never 0, never 3 — when it
-could not measure, which includes an unreadable **process table**: that is the one unreadable input
+could not measure, which includes an unreadable **process table** AND an unreadable **pool listing**:
+they are the unreadable inputs whose absence would produce an action (a second listener; an add above a
+ceiling counted from a listing that failed) instead of a refusal, so both fail closed. An unreadable
+**instance dir** is counted as a slot and reported `cannot-measure why=instance-unreadable`, never DEAD.
 whose absence would produce an action (a second listener) instead of a refusal, so it fails closed too.
 Tests:
 `scripts/ci_runner_pool.test.sh` (in both bash lanes), whose install stubs model GitHub's own cwd
