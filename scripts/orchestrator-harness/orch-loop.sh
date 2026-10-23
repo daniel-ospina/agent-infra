@@ -1490,7 +1490,8 @@ sess() { wt_alive "${1:-}"; }
 # spawn path must read it too.
 #
 # The polarity is the DISPATCH gate's, not the disk gate's: `mem_avail <= MIN_MEM_FREE_MB` refuses
-# (the same boundary, so the two can never disagree about one reading), and UNKNOWN is NOT ample — a
+# (the same boundary for THAT arm, so the two gates cannot disagree about the `mem_avail` reading
+# itself), and UNKNOWN is NOT ample — a
 # probe we could not take is not evidence of capacity. That is deliberately FAIL-CLOSED while the
 # load reading stays fail-open (an unreadable load file must not stop every merge on a host without
 # procfs); the two are different probes with different failure costs, and `MEMAVAIL_MB` is only ever
@@ -1499,6 +1500,10 @@ sess() { wt_alive "${1:-}"; }
 # It reads the CYCLE-LEVEL reading measured in the prologue — the same posture as `L`, which the
 # spawn sites have always read from the cycle's own `load1`. The [cap] gate re-measures, because it
 # decides a dispatch and must see the present.
+# ⚠️ NOT COVERED HERE, BY DESIGN: the dispatch gate's OTHER arms (`lanes=`, `swap_free=`, and the
+# swap-joint `mem_avail <= 2*MIN_MEM_FREE_MB` arm that only arms when swap is also tight). A spawn
+# refused by those is a different population's decision and is not this gate's to make — so the
+# shared boundary is the plain `<= MIN_MEM_FREE_MB` arm, and nothing more.
 mem_spawn_ok() { [ "${MEM_UNKNOWN:-0}" != "1" ] && [ "${MEMAVAIL_MB:-0}" -gt "$MIN_MEM_FREE_MB" ]; }
 can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok; }
 # spawn_gate_tok — the EVIDENCE a held-back spawn records, in the ONE shape all five slot refusals

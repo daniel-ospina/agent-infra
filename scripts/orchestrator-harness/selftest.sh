@@ -2560,8 +2560,13 @@ ck "the shipped loop MEASURES memory before the first spawn site reads it (line 
 # `load-gate=<L>/<MAX>` only, which was complete while load WAS the gate; with a memory arm it reads as
 # a load refusal. Assert both halves: every refusal site prints the token, and the token spells out an
 # UNKNOWN probe instead of printing a `0M` that looks like a measurement.
-_tok_sites=$(grep -c '\$(spawn_gate_tok)' "$LOOP")
-[ "$_tok_sites" = "5" ] && rc=0 || { rc=1; echo "      found '$_tok_sites' site(s) printing the token, expected 5"; }
+_slot_n=$(grep -cE 'but NO [a-z-]+ slot \(' "$LOOP")
+_slot_t=$(grep -E 'but NO [a-z-]+ slot \(' "$LOOP" | grep -cF '$(spawn_gate_tok)')
+# ⛔ ANCHORED TO THE REFUSAL LINES, NOT A FILE-WIDE COUNT (review, #1732). A bare `grep -c` of the
+# token is satisfied by a COMMENT that mentions it — and this very function's comment block discusses
+# the token, so a decoy there would keep the check green while a real refusal line lost its evidence.
+# The comment 40 lines below names the same class; this is it.
+[ "$_slot_n" = "5" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 5 of 5)"; }
 ck "all five held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
 sed -n '/^spawn_gate_tok() {/,/^}/p' "$LOOP" > "$TMP/spawntok.sh"
 if need "$TMP/spawntok.sh" "spawn_gate_tok() is extracted from the shipped loop"; then

@@ -44,6 +44,13 @@ done
 
 # ── extraction: the shipped fragments (markers, so a refactor that drops them fails loudly) ──────
 sed -n '/# \[redfix:begin\]/,/# \[redfix:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/redfix.sh"
+# ⛔ THE REFUSAL LINE'S EVIDENCE TOKEN IS EXTRACTED TOO (agent-infra#1732 review). The block calls
+# `spawn_gate_tok`, which is DEFINED OUTSIDE the block (up by `can_spawn`), so a drive that sources
+# only the block renders `(fix lanes=4/4, )` — an empty field where the gate's reading belongs — and,
+# because stderr is discarded, it does so SILENTLY. The suite stayed green while the thing its own
+# assertion names ("with its ceiling and the load gate") was gone; that is the false-record class this
+# file exists to catch, so the token is sourced from the shipped file and DRIVEN below.
+sed -n '/^spawn_gate_tok() {/,/^}/p' "$ORCH" > "$TMP/spawntok.sh"
 if [ -s "$TMP/redfix.sh" ] && grep -q 'RED TREE ->' "$TMP/redfix.sh"; then
   ok "the red-fixer router is extracted from the shipped loop ($(awk 'END{print NR}' "$TMP/redfix.sh") lines)"
 else
@@ -285,6 +292,10 @@ drive_route() {
     }
     wt_alive() { sess "$1"; }
     for _once in 1; do
+      # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs,
+      # so the driven line carries an actual reading instead of an empty field ($TMP/spawntok.sh).
+      . "$TMP/spawntok.sh"
+      L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
       . "$TMP/redfix.sh"
       echo FALLTHROUGH >> "$TMP/d.log"
       break
@@ -374,9 +385,9 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
   || bad "(3) spawns=$(spawns) with the box already saturated"
 [ -f "$TMP/rO/state/redfix-4242" ] && bad "(3) the box-cap refusal consumed an attempt" \
   || ok "(3) the box-cap refusal consumes NO attempt (it retries when a slot frees)"
-grep -q 'NO red-fixer slot' "$TMP/d.log" \
-  && ok "(3) the capacity refusal is PRINTED with its ceiling and the load gate (#2126 T5)" \
-  || bad "(3) the capacity refusal printed no reason"
+grep -q 'NO red-fixer slot' "$TMP/d.log" && grep -q 'mem-gate=9000M/512' "$TMP/d.log" \
+  && ok "(3) the capacity refusal is PRINTED with its ceiling and BOTH gate arms — load and memory (#2126 T5, #1732)" \
+  || bad "(3) the capacity refusal printed no reason, or lost its gate evidence: $(grep -o 'NO red-fixer slot ([^)]*)' "$TMP/d.log" | head -1)"
 drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 0 0 0 ""
 [ "$(spawns)" = "1" ] && ! grep -qE '^deadbeefdeadbeefdeadbeefdeadbeefdeadbeef [1-9]' "$TMP/rO/state/redfix-4242" 2>/dev/null \
   && [ "$(cat "$TMP/rO/state/fixcount-4242" 2>/dev/null)" = "0" ] \

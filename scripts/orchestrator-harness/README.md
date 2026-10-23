@@ -989,9 +989,13 @@ first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `
 The six spawn sites above used to be load-gated only, while lane dispatch was bounded by load + lanes
 + swap + available memory: two gates over two different populations, with the resource that actually
 kills this box consulted on only one of them. `can_spawn()` now ANDs `mem_spawn_ok()`, which refuses at
-`mem_avail <= MIN_MEM_FREE_MB` — the dispatch gate's own boundary, so the two can never disagree about
-one reading — and refuses when the probe is UNKNOWN: **fail-CLOSED, unlike the load reading's fail-open**
-(§8). A probe we could not take is not evidence of capacity. The reading is taken in the cycle
+`mem_avail <= MIN_MEM_FREE_MB` — the dispatch gate's own boundary **for that one arm**, so the two
+cannot disagree about the `mem_avail` reading itself — and refuses when the probe is UNKNOWN:
+**fail-CLOSED, unlike the load reading's fail-open** (§8). A probe we could not take is not evidence of
+capacity. ⚠️ The dispatch gate carries arms the spawn gate does not (`lanes=`, `swap_free=`, and the
+swap-joint `mem_avail <= 2*MIN_MEM_FREE_MB` that only arms when swap is also tight), so a box in the
+swap-joint band can still be refused a *dispatch* while the spawn sites proceed — those are different
+populations' decisions, and sharing them is not this change's scope. The reading is taken in the cycle
 prologue (`measure_mem`), BEFORE the first spawn site; the `[cap]` block re-measures because a dispatch
 decision must see the present. `MEM_UNKNOWN`/`MEMAVAIL_MB` are set in ONE place (`measure_mem`), so
 neither reading can be derived differently from the other, and `selftest.sh` pins the ORDER — a gate
