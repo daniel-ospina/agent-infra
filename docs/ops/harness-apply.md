@@ -239,7 +239,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 158 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 173 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -266,6 +266,8 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
 | T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
 | T20 | an **unpreservable** dirty tree is REFUSED (20) and nothing moves — the other half of the DIRTY pair, which had no fixture |
+| T21 | a **failed `git fetch`** is `cannot-verify` (23), recorded as `fetch=failed`, refused by `--print-status` — and the same fixture is green once the origin is reachable (the control) |
+| T22 | the **user-scope** install (no sudo, user manager answering): it REFUSES when lingering cannot be enabled, succeeds with `linger: enabled` once it can, and `--status` fails when lingering is cleared afterwards |
 | T8a | an installed-but-**disabled** timer fails readiness (it will not survive a reboot) |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no

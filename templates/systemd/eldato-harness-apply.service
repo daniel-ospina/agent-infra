@@ -11,9 +11,10 @@
 # running lane, and report the readings it decided from.
 Description=eldato harness apply — converge this box's harness on origin/main
 Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/harness-apply.md
-# It fetches. Sequencing behind the network only avoids a guaranteed first-fetch warning on a box that
-# boots disconnected; a failed fetch is NOT fatal to the pass (it compares against the locally resolved
-# ref and says so), so this ordering can never turn into a failed boot dependency.
+# It fetches. This ordering only avoids a guaranteed first-fetch failure on a box that boots
+# disconnected. ⛔ A FAILED FETCH IS NOT A PASS: the pass refuses with `cannot-verify` (exit 23) rather
+# than comparing against the stale remote-tracking ref, so a disconnected boot goes RED and heals on the
+# next tick. Being wrong about drift is the defect this whole feature removes.
 After=network-online.target
 Wants=network-online.target
 
@@ -53,5 +54,6 @@ ExecStart=/bin/bash {{PASS}}
 # ahead box in particular carries commits that may exist nowhere else (c4 lost three on 2026-10-22).
 # Greening them would hide the one condition this whole change exists to surface.
 SuccessExitStatus=0 10 11
-# Auditability: the pass writes $HARNESS_APPLY_STATE_DIR/harness-apply.status (one line of key=value)
+# Auditability: the pass writes $HARNESS_APPLY_STATE_DIR/harness-apply.status (one key=value PER LINE —
+# the shape every reader of this family parses; a single space-separated line parses to ONE key)
 # and appends to harness-apply.log; journald keeps the exit status and the per-pass readings.

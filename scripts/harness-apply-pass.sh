@@ -725,7 +725,13 @@ if [ "$PASS_MODE" = pin ]; then
         if [ "$PIN_TREE_SHA" = "$REF_SHA" ]; then
             REC_ACTION=advanced
         elif [ "$PIN_TREE_SHA" != "${BEFORE_PIN_TREE:-}" ]; then
-            REC_ACTION=advanced
+            # ⛔ A MOVE THAT DOES NOT REACH THE TIP IS NOT `advanced`. `apply` pins `$HARNESS_REF`; if the
+            # pin landed somewhere else the box is still off main, and calling that "advanced" (a GREEN
+            # unit code) beside `behind=N` made the comment above this block — and the doc's colour
+            # table — describe a rule the code did not enforce. 25 is the code for "behind, and this pass
+            # has nothing that reaches the ref", and BOTH readers red it on the number anyway.
+            REC_ACTION=partial-move
+            finish 0 25 "the pin moved to $(short "$PIN_TREE_SHA") but $REF is $(short "$REF_SHA") — the box is still off the ref"
         elif [ "$RELATION" = current ]; then
             REC_ACTION=none
         else
@@ -832,7 +838,30 @@ case "$REC_ACTION" in
             finish 0 25 "current for the checkout, but the PIN and the tree this box reads disagree — harness-up reports this as restart-pending, and nothing here restarts a live controller"
         fi
         if [ "$PASS_MODE" = pin ]; then
-            finish 1 0 "current: the pin already names $REF — nothing changed"
+            if [ "$REC_PIN_TREE" != "none" ]; then
+                finish 1 0 "current: the pin tree already names $REF — nothing changed"
+            fi
+            # NO PIN TREE IS MATERIALISED. The supervisor then resolves the harness from this checkout
+            # (the pin file is empty or absent), so the checkout IS the deployment and it matches the
+            # ref — that is a healthy box, and the message says which basis it used. But an ABSENT sha
+            # record is the measured 2026-10-20 fleet state, and recording what the box actually runs is
+            # strictly better than leaving the record empty: mend it from the checkout.
+            if [ -z "$REC_PIN" ] || [ "$REC_PIN" = "none" ]; then
+                if printf '%s\n' "$HEAD_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
+                   && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null; then
+                    say "pin: MENDED (was absent) -> $(short "$HEAD_SHA") (no pin tree; the checkout is the deployment)"
+                    REC_ACTION=mended
+                    finish 1 11 "mended: the pin was missing and now names the checkout this box runs"
+                fi
+                finish 0 23 "the pin record is absent and could not be written at $PIN_SHA_FILE — nothing here records what this box runs"
+            fi
+            # THE SHA RECORD NAMES SOMETHING ELSE, AND NO TREE CAN BE CHECKED AGAINST IT. That is the
+            # state this feature is about ("the pin stops lying"); it is NOT success, and the old message
+            # ("the pin already names $REF") contradicted the record's own `pin=` field.
+            if [ "$REC_PIN" != "$REC_REF" ]; then
+                finish 0 25 "the sha record names $REC_PIN but no pin tree resolves, so it cannot be compared with what this box RUNS ($REC_DEPLOYED) — the pin is still lying; nothing here can repair it without a materialised tree"
+            fi
+            finish 1 0 "current: no pin tree is materialised and the checkout already matches $REF — nothing changed"
         fi
         finish 1 0 "current: the checkout already matches $REF — nothing changed" ;;
     *)

@@ -470,6 +470,31 @@ assert_eq "$(wc -c <"$T/t19/err" | tr -d ' ')" "0" \
 assert_contains "$(cat "$T/t19/out" 2>/dev/null || true)" "harness: mode=sync" "T19 and the pass really ran"
 assert_contains "$(cat "$T/t19/state/harness-apply.status" 2>/dev/null || true)" "rc=0" "T19 and it recorded a pass"
 
+# ── T21: a FAILED fetch is cannot-verify, never "current" against a stale ref ────────────────
+# THE HEADLINE OF ONE REVIEW ROUND, and it had no test: the pass used to warn on stderr and compare
+# against the stale remote-tracking ref, so a box that lost egress wrote `behind=0 action=none rc=0`,
+# went green in the unit, and raised no alarm anywhere — every signal saying "auto" while it aged.
+say_case "T21 a failed fetch is cannot-verify, not current"
+mk_origin t21; mk_clone t21; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+# Move the origin away: `git fetch` cannot reach it, while `origin/main` STILL resolves locally to a
+# commit equal to HEAD — the exact state that used to read `relation=current`.
+mv "$T/o-t21" "$T/o-t21.gone"
+OUT="$(run_pass "$T/t21" 2>&1)"; RC=$?
+assert_eq "$RC" "23" "T21 a failed fetch refuses with 23 (cannot-verify)"
+assert_contains "$OUT" "cannot-verify" "T21 and it says the comparison is not fresh"
+REC21="$(cat "$T/t21/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$REC21" "fetch=failed" "T21 the record carries the fetch state"
+assert_contains "$REC21" "action=cannot-verify-fetch" "T21 and the action names it"
+OUT="$(run_pass "$T/t21" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T21 the readiness gate refuses that record (cannot-verify is not fresh)"
+# THE CONTROL: restore the origin and the same fixture is green, with fetch=ok.
+mv "$T/o-t21.gone" "$T/o-t21"
+OUT="$(run_pass "$T/t21" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T21 control: with the origin reachable the same box is current"
+assert_contains "$(cat "$T/t21/state/harness-apply.status" 2>/dev/null || true)" "fetch=ok" \
+    "T21 control: and the record says the comparison was fresh"
+
 # ── T3 + T5 + T8-T13: the INSTALLER ───────────────────────────────────────────────────────────
 # A shim that records every call, so "enabled" and "bootstrapped" are asserted on what the installer
 # DID, not on what it printed.
@@ -586,6 +611,66 @@ mkdir -p "$T/t3/home/.pi/agent/state"
 OUT="$(inst3 --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8 --status fails when the last pass recorded a refusal"
 assert_contains "$OUT" "action=refused-ahead" "T8 and it shows the pass record it judged from"
+
+say_case "T22 the USER-scope install and BOTH linger gates (no sudo path)"
+# ⛔ TARGET=user IS ONLY REACHABLE WHEN THE SUDO PROBE FAILS *AND* THE USER MANAGER ANSWERS, and every
+# other case here sets SYSTEMD_UNIT_DIR — which short-circuits `choose_target` to `override` BEFORE the
+# probe. So the branch that exists for "a cell without sudo still gets a clock", and the lingering leg
+# whose failure mode is "fires while you are logged in and never again", were both dead code under test.
+mkdir -p "$T/t22/bin" "$T/t22/home/.config/systemd/user"
+cat >"$T/t22/bin/systemctl" <<'SCU'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in
+  *show-environment*) exit 0 ;;                      # the user manager answers
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo active ;;
+  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 2min left Mon 2026-10-19 00:20:00 UTC 8min ago eldato-harness-apply.timer eldato-harness-apply.service" ;;
+  *show*LastTriggerUSec*|*show*ExecMainExitTimestamp*) exit 0 ;;
+  *show*ExecMainStatus*) echo 0 ;;
+  *cat*) f="${*: -1}"
+         for d in "${SYSTEMD_UNIT_DIR:-}" "$HOME/.config/systemd/user"; do
+             [ -n "$d" ] && [ -f "$d/$f" ] && exit 0
+         done
+         exit 1 ;;
+esac
+exit 0
+SCU
+chmod +x "$T/t22/bin/systemctl"
+cat >"$T/t22/bin/loginctl" <<'LG'
+#!/usr/bin/env bash
+case "$1" in
+  show-user)      cat "${LOGINCTL_STATE:-/dev/null}" 2>/dev/null || echo no ;;
+  enable-linger)  [ "${LOGINCTL_ENABLE:-1}" = 1 ] && echo yes >"${LOGINCTL_STATE:-/dev/null}"; exit 0 ;;
+esac
+exit 0
+LG
+chmod +x "$T/t22/bin/loginctl"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/t22/bin/sudo"; chmod +x "$T/t22/bin/sudo"
+echo no >"$T/t22/linger"
+inst22() { # inst22 <args…>  — SUDO=/bin/false pins the failing probe; PATH supplies the shims
+    PATH="$T/t22/bin:$PATH" SUDO=/bin/false HOME="$T/t22/home" HARNESS_APPLY_PASS="$PASS_SH" \
+    HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_STATE_DIR="$T/t22/home/.pi/agent/state" \
+    LOGINCTL_STATE="$T/t22/linger" SYSTEMCTL_CALLS="$T/t22/calls.log" \
+    bash "$INST" "$@"
+}
+OUT="$(LOGINCTL_ENABLE=0 inst22 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T22 a user-scope install REFUSES when lingering cannot be enabled"
+assert_contains "$OUT" "loginctl enable-linger" "T22 and it names the exact remedy"
+# The refusal message itself contains the words "report this as installed", so the banner is what is
+# asserted absent — not the substring.
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^installed: target=' | tr -d ' ')" "0" \
+    "T22 and it prints NO install banner"
+OUT="$(LOGINCTL_ENABLE=1 inst22 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T22 the same install succeeds once lingering is enabled"
+assert_contains "$OUT" "linger: enabled" "T22 and it says the timer survives logout"
+assert_file "$T/t22/home/.config/systemd/user/eldato-harness-apply.timer" \
+    "T22 the unit really landed in ~/.config/systemd/user (no sudo)"
+# The status verb re-checks it: lingering can be cleared later by an operator or an image rebuild.
+echo no >"$T/t22/linger"
+OUT="$(inst22 --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T22 --status FAILS when lingering was cleared after the install"
+assert_contains "$OUT" "will NOT fire after this session ends" "T22 and it says what that means"
 
 say_case "T8a an installed-but-DISABLED timer is not a schedule either"
 # A timer that is active now but NOT enabled does not come back at the next reboot, so the box stops

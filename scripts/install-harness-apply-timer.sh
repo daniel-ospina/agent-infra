@@ -44,7 +44,9 @@
 # through the checkout's own interpreter because TCC is per-binary (a launchd-spawned bash/git cannot
 # read a repo under ~/Documents) — the same launcher install-disk-reaper-timer.sh uses.
 #
-# CADENCE. Every 10 minutes (`OnCalendar=*:0/10`, `StartInterval=600`). The pass is a NO-OP when the
+# CADENCE. Every 10 minutes (`OnUnitActiveSec={{INTERVAL_MIN}}min` + `OnBootSec=2min`; `StartInterval=600`
+# on macOS), rendered from HARNESS_APPLY_INTERVAL_MIN — see the timer template for why it is NOT
+# `OnCalendar`. The pass is a NO-OP when the
 # pin already equals the ref tip (exit 0, `action=none`), so the cadence costs one `git fetch` per
 # tick and nothing else. `HARNESS_APPLY_INTERVAL_MIN` exists for tests and unusual boxes; the unit
 # renders the value that was validated, never an unvalidated one (a bad one is BAKED INTO A PERSISTENT
