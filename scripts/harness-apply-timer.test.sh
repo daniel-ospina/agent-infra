@@ -110,7 +110,7 @@ SYNC
 # run_pass <case-dir> [args…] — the pass with every seam pinned to <case-dir>.
 run_pass() {
     local d="$1"; shift
-    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH="${HARNESS_FETCH:-1}" \
     HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_MODE="${MODE_P:-}" \
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
     HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="$d/home" O="$d/home/orchestrator" \
@@ -457,6 +457,12 @@ git -C "$CLONE" mv C.txt RENAMED-C.txt >/dev/null 2>&1
 mv "$CLONE/D.txt" "$CLONE/MOVED-D.txt"
 printf 'changed\n' >>"$CLONE/tool.sh"
 printf 'edited\n' >>"$CLONE/has space.txt"
+# ⛔ BYTES THAT EXIST ONLY IN THE INDEX. `git diff HEAD` is WORKTREE-vs-HEAD and never reads the index as
+# a source of content, so without a `--cached` artifact this staged-then-deleted file was preserved in
+# NO file while the restore dropped its index entry — content loss recorded as a green `advanced`.
+printf 'PRECIOUS-STAGED-ONLY\n' >"$CLONE/staged-only.txt"
+git -C "$CLONE" add staged-only.txt >/dev/null 2>&1
+rm -f "$CLONE/staged-only.txt"
 OUT="$(run_pass "$T/t17" 2>&1)"; RC=$?
 assert_eq "$RC" "10" "T17 the pass advances with THREE renames, an exec-bit edit and a spaced name dirty"
 assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT17" "T17 and the checkout fast-forwarded"
@@ -480,6 +486,9 @@ assert_eq "$(git -C "$CLONE" status --porcelain | wc -l | tr -d ' ')" "0" \
     "T17 the checkout is CLEAN after the advance (nothing left untracked by the restore)"
 assert_eq "$(sed -n 's/^dirty=//p' "$T/t17/state/harness-apply.status" 2>/dev/null | head -1)" "0" \
     "T17 and the record records dirty=0"
+PDIR17="$(sed -n 's/^preserved=//p' "$T/t17/state/harness-apply.status" 2>/dev/null | head -1)"
+assert_contains "$(cat "$PDIR17/changes.index.patch" 2>/dev/null || true)" "PRECIOUS-STAGED-ONLY" \
+    "T17 the INDEX-ONLY bytes are in the preserved index patch (git diff HEAD cannot see them)"
 # THE BLOCKING SCENARIO: upstream now adds the path the rename had used. A lingering untracked copy would
 # make `merge --ff-only` refuse for ever ("untracked working tree files would be overwritten").
 printf 'now tracked upstream\n' >"$T/seed-t17/RENAMED.txt"
@@ -536,6 +545,12 @@ assert_contains "$REC21" "fetch=failed" "T21 the record carries the fetch state"
 assert_contains "$REC21" "action=cannot-verify-fetch" "T21 and the action names it"
 OUT="$(run_pass "$T/t21" --print-status 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T21 the readiness gate refuses that record (cannot-verify is not fresh)"
+# The OTHER way to be un-fresh: no fetch was attempted at all (the documented HARNESS_FETCH=0 seam). Same
+# answer, because the reason a comparison cannot be trusted is not what the reader acts on.
+OUT="$(HARNESS_FETCH=0 run_pass "$T/t21b" 2>&1)"; RC=$?
+assert_eq "$RC" "23" "T21 a run with NO fetch is cannot-verify too (never 'current' against an old ref)"
+assert_contains "$(cat "$T/t21b/state/harness-apply.status" 2>/dev/null || true)" "fetch=notfetched" \
+    "T21 and the record says no fetch was attempted"
 # THE CONTROL: restore the origin and the same fixture is green, with fetch=ok.
 mv "$T/o-t21.gone" "$T/o-t21"
 OUT="$(run_pass "$T/t21" 2>&1)"; RC=$?
@@ -986,6 +1001,18 @@ OUT="$(inst11 --status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T11 --status fails when the plist is gone although the job is still loaded"
 assert_contains "$OUT" "will not come back at the next login" "T11 and it says what that means"
 mv "$T/t11/plist.bak" "$T/t11/agents/com.eldato.harness-apply.plist"
+# The launchd arm's grace is bounded too: an agent loaded for hours that never ran a pass is inert, not
+# fresh. (The bound landed in the systemd arm first, and this arm kept returning 0.)
+printf '4242\t-\tcom.eldato.harness-apply\n' >"$T/t11/never-ran"
+mkdir -p "$T/t11/never-state"
+touch -d '2 hours ago' "$T/t11/agents/com.eldato.harness-apply.plist" 2>/dev/null || touch -t 202001010000 "$T/t11/agents/com.eldato.harness-apply.plist"
+OUT="$(HOME="$T/t11/home" HARNESS_APPLY_PASS="$PASS_SH" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t11/never-state" ELDATO_PLATFORM=Darwin \
+    LAUNCHD_AGENTS_DIR="$T/t11/agents" LAUNCHCTL="$T/bin/launchctl" LAUNCHCTL_CALLS=/dev/null \
+    LAUNCHCTL_LOADED="$T/t11/never-ran" bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T11 an agent armed past the grace that NEVER ran a pass is inert, not fresh"
+assert_contains "$OUT" "NEVER run a pass" "T11 and it says so"
+touch "$T/t11/agents/com.eldato.harness-apply.plist"
 OUT="$(inst11 --uninstall 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T11 --uninstall on macOS exits 0"
 assert_eq "$(ls -A "$T/t11/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" "T11 and the plist is gone"

@@ -56,7 +56,8 @@ condition is gone.
 - **DIVERGED → REFUSED (exit 22).** Neither ancestor nor descendant: a rebase is an
   operator decision, not a scheduled one.
 - **DIRTY → preserved BY NAME, then moved.** The bytes are written to
-  `<state>/harness-apply-preserved/<UTC>/changes.patch`, every untracked file is copied
+  `<state>/harness-apply-preserved/<UTC>-<pid>/changes.patch` (plus `changes.index.patch`,
+  the staged half that `git diff HEAD` never reads), every untracked file is copied
   under `untracked/`, and `MANIFEST` lists every path taken; each path is printed as it is
   saved. Only then are the tracked paths brought back to `HEAD` and the checkout advanced.
   If anything cannot be preserved, the pass REFUSES (exit 20). Preservation and the restore
@@ -200,8 +201,8 @@ can be dead while looking alive:
   can write a record (its previous `ok=1` record would otherwise stay fresh for an hour);
 - **the pass record** — refusing, stale, dated in the future, `behind>0`, or written from
   a comparison that was not fresh;
-- **never having fired at all** past the grace period (two intervals) — a job that has been
-  armed for hours and produced no record is inert, not fresh;
+- **never having fired at all** past the grace period (two intervals) — on BOTH platforms: a
+  job armed for hours that produced no record is inert, not fresh;
 - **a comparison that could not be made** — a failed `git fetch` is `cannot-verify`
   (exit 23), never `current` against a stale ref.
 
@@ -249,7 +250,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 192 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 197 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
