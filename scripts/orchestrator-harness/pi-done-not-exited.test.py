@@ -33,8 +33,9 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against THREE mutated copies of the tool and requires each to go RED
-(drop the growth veto, drop the open-turn veto, fold `abstain` into `stalled`). Prose cannot prove a
+`--mutations` re-runs this suite against SIX mutated copies of the tool and requires each to go RED
+(fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
+arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
 suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
 
 THE FIXTURES ARE INSULATED FROM THE AMBIENT ANCESTRY. `setsid --fork` makes each launcher a session
@@ -46,6 +47,7 @@ Exit 0 = every assertion held. Non-zero = the first failure printed with its exp
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -73,6 +75,21 @@ def cleanup() -> None:
         except OSError:
             pass
     LEADERS.clear()
+
+
+atexit.register(cleanup)
+
+
+def _on_signal(signum, _frame) -> None:
+    cleanup()
+    os._exit(128 + signum)
+
+
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    try:
+        signal.signal(_sig, _on_signal)
+    except (ValueError, OSError, AttributeError):
+        pass
 
 
 def fail(msg: str) -> None:
@@ -135,7 +152,34 @@ def launcher_script(root: str, tag: str, cwd: str, logname: str, *, append: bool
     return path
 
 
-def launch_detached(script: str, cwd: str, pidfile: str) -> int:
+def launcher_interpolating(root: str, tag: str, cwd: str, logname: str, *,
+                           child: bool = False, inherit_tag: bool = False) -> str:
+    """A launcher shaped like the SHIPPED ones: `TAG="$N"`, redirect `lane-$N.log`.
+
+    ⛔ This is the fixture cycle 3 was missing. `lane.sh` and `nonblocking-dispatch.sh` INTERPOLATE,
+    so their text contains neither the tag nor the log's real name — every text basis in
+    `ownership()` misses, and the row is `weak` (report-only). The suite's other launchers write the
+    tag literally, which is why the rung looked healthy while matching no shipped launcher.
+    """
+    log = os.path.join(root, "logs", "lane-%s.log" % logname)
+    rc = os.path.join(root, "logs", "lane-%s.rc" % logname)
+    arg = " child" if child else ""
+    path = os.path.join(root, "lane-%s.sh" % tag)
+    lines = ["#!/bin/bash"]
+    if not inherit_tag:
+        lines += ["N=%s" % logname, 'TAG="$N"', "export TAG"]
+    lines += ["cd %s || exit 4" % cwd,
+              # ⛔ EVERY redirection interpolates: `lane-$N.log`, `lane-$N.rc`. That is the shipped
+              # shape, and it is why no text basis in `ownership()` can name the tag.
+              "%s/pi 300%s >> %s/logs/lane-$N.log 2>&1" % (root, arg, root),
+              "rc=$?",
+              "echo \"$rc\" > %s/logs/lane-$N.rc" % root]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+def launch_detached(script: str, cwd: str, pidfile: str, env=None) -> int:
     """Run the launcher as a session leader reparented to init (ambient ancestry insulation)."""
     subprocess.run(["setsid", "--fork", "bash", "-c",
                     "echo $$ > %s; exec bash %s" % (pidfile, script)],
@@ -207,16 +251,27 @@ def main() -> int:
     leaders = LEADERS
 
     def case(tag: str, entry, marker: bool = True, transcript: bool = True, logname: str = None,
-             append: bool = False, ignore_term: bool = False, child: bool = False) -> int:
+             append: bool = False, ignore_term: bool = False, child: bool = False,
+             fresh_log: bool = False, interpolate: bool = False) -> int:
         cwd = os.path.join(root, "wt-" + tag)
         os.makedirs(cwd)
         started = time.time()
-        script = launcher_script(root, tag, cwd, tag if logname is None else logname,
-                                 append=append, ignore_term=ignore_term, child=child)
-        leaders[tag] = launch_detached(script, cwd, os.path.join(root, tag + ".leader"))
+        ln = tag if logname is None else logname
+        script = (launcher_interpolating(root, tag, cwd, ln, child=child, inherit_tag=interpolate) if interpolate
+                  else launcher_script(root, tag, cwd, ln, append=append, ignore_term=ignore_term,
+                                       child=child))
+        # ⛔ WEAK: the TAG is INHERITED from this process, never named by the launcher — the shape
+        # cycle 2 measured (`TAG=zombiepi` on a `lane-railprobe.sh` row). A launcher that names the
+        # tag (argv, `TAG=`, `<tag>.rc`, or the log it redirects) is `tag`, and correctly so.
+        # `N` comes from the environment too, so the launcher's own text interpolates the log's
+        # name and never contains it — the shape `lane.sh` has when its worktree slug is not the tag.
+        menv = dict(os.environ, TAG=tag, N=ln) if interpolate else None
+        leaders[tag] = launch_detached(script, cwd, os.path.join(root, tag + ".leader"), menv)
         pi_pid = child_pi(leaders[tag])
         procs[tag] = pi_pid
-        logged = os.path.join(root, "logs", (tag if logname is None else logname) + ".log")
+        # the interpolating shape writes `lane-<name>.log`, so the marker must land THERE
+        logged = os.path.join(root, "logs",
+                              ("lane-%s.log" % ln) if interpolate else (ln + ".log"))
         with open(logged, "w", encoding="utf-8") as fh:
             fh.write("the lane's report\n")
             if marker:
@@ -225,8 +280,9 @@ def main() -> int:
             paths[tag] = write_session(sessions, cwd, started, entry)
             old = time.time() - 600
             os.utime(paths[tag], (old, old))
-        old = time.time() - 600
-        os.utime(logged, (old, old))
+        if not fresh_log:                     # FRESHLOG keeps a fresh mtime: under --min-idle
+            old = time.time() - 600
+            os.utime(logged, (old, old))
         time.sleep(3.2)          # stagger past the canon's ±3 s fence: no two cases can share one
         return pi_pid
 
@@ -240,6 +296,8 @@ def main() -> int:
     case("child", TURN_ENDED, child=True)                    # DONE-shaped + a live child
     case("survive", TURN_ENDED, ignore_term=True)            # ignores SIGTERM
     case("bound", TURN_ENDED)                                # control: never reaped by pass 1
+    weak_pid = case("weak", TURN_ENDED, transcript=False, interpolate=True)   # interpolating launcher ⇒ weak owner
+    case("freshlog", TURN_ENDED, transcript=False, fresh_log=True)
 
     # no-owner: a `pi` under a plain `bash -c`, no launcher script anywhere in the chain
     cwd = os.path.join(root, "wt-noowner")
@@ -271,8 +329,11 @@ def main() -> int:
 
     # the LIVE lane writes to its log INSIDE the sample window — positive liveness evidence
     def keep_writing() -> None:
-        for _ in range(3):
-            time.sleep(0.8)
+        # ⛔ SLOW ENOUGH TO SPAN THE TOOL'S OWN STARTUP. Three appends at 0.8/1.6/2.4 s all landed
+        # BEFORE the census took its first reading on a loaded box (python + `ps` + a 395-file
+        # session index), so the growth veto saw nothing and the fixture read DONE.
+        for _ in range(200):
+            time.sleep(0.5)
             with open(os.path.join(root, "logs", "live.log"), "a", encoding="utf-8") as fh:
                 fh.write("still working: tool output\n")
 
@@ -280,7 +341,7 @@ def main() -> int:
     writer.start()
 
     tags = ["done", "live", "hung", "abstain", "nosession", "shared", "shared2", "child", "survive",
-            "noowner"]
+            "noowner", "weak", "freshlog"]
     pids = [procs[t] for t in tags]
     proc, rows = run_tool(sessions, pids, ["--authorise-hostless"])
     writer.join(timeout=5)
@@ -305,7 +366,8 @@ def main() -> int:
           "1/9 DONE: the launcher left `wait` and wrote its .rc (it completed, it did not crash)")
 
     check(cls("live") == "LIVE" and "GREW" in why("live"),
-          "2/9 LIVE: a log growing inside the window is LIVE and says why (got %r)" % cls("live"))
+          "2/9 LIVE: a log growing inside the window is LIVE and says why (got %r: %r)"
+          % (cls("live"), why("live")))
     check(os.path.exists("/proc/%d" % procs["live"]),
           "2/9 LIVE: --apply did NOT touch it — a reap-everything detector fails here")
 
@@ -346,9 +408,20 @@ def main() -> int:
           % cls("noowner"))
     check(os.path.exists("/proc/%d" % procs["noowner"]), "9/9 REFUSE: --apply did NOT touch it")
 
+    check(cls("weak") == "UNATTRIBUTABLE" and "weak-owner" in why("weak"),
+          "10/11 WEAK: a launcher that INTERPOLATES (`TAG=\"$N\"`, `lane-$N.log` — the shipped "
+          "shape) leaves no basis naming the tag, so ownership is `weak-owner` and the row is "
+          "report-only on BOTH DONE arms (got %r: %r)" % (cls("weak"), why("weak")))
+    check(os.path.exists("/proc/%d" % procs["weak"]), "10/11 WEAK: --apply did NOT touch it")
+
+    check(cls("freshlog") != "DONE-NOT-EXITED",
+          "11/11 FRESHLOG: no transcript + a log YOUNGER than --min-idle is not DONE — the silence "
+          "bound applies to the log-only arm too (got %r)" % cls("freshlog"))
+    check(os.path.exists("/proc/%d" % procs["freshlog"]), "11/11 FRESHLOG: --apply did NOT touch it")
+
     check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 3,
-          "exactly 3 of the 10 fixtures were DONE-NOT-EXITED (done + nosession + survive): a "
-          "detector that reaped all, or none, fails here")
+          "exactly 3 of the12 fixtures were DONE-NOT-EXITED (done + nosession + survive, and the "
+          "last of those ignored SIGTERM): a detector that reaped all, or none, fails here")
 
     # ── CONTROL: the --min-idle bound is real, in BOTH directions ──
     proc2, rows2 = run_tool(sessions, [procs["bound"]],
@@ -393,10 +466,43 @@ def main() -> int:
           "C4 REFUSED: the summary counts it as `refused 1` / `reaped 0` — not as a reap")
     check(os.path.exists("/proc/%d" % procs["bound"]), "C4 REFUSED: nothing was signalled")
 
+    # ── CONTROL: `verify_target` re-asks the LOG channel, not only its size (cycle 3, P2-3: a
+    # truncating reuse makes the file SMALLER, so a size-only test passes) ──
+    probe = os.path.join(root, "logs", "verifyprobe.log")
+    with open(probe, "w", encoding="utf-8") as fh:
+        fh.write("report\n" + MARKER)
+    # the incarnation must be read from a LIVE `ps`, not from pass 1's JSON (which never included
+    # this pid): an unparseable etime is an abstention in the tool, so the control would pass for
+    # the wrong reason — the same "absent reading" class the tool itself guards.
+    live_row = (pool.ps_pi_fields() or {}).get(str(procs["bound"])) or {}
+    prow = {"pid": procs["bound"], "etime": live_row.get("etime", ""),
+            "etime_after": live_row.get("etime", ""),
+            "transcript": None, "log": probe, "marker": "ok", "rc": None}
+
+    def touch_log_soon() -> None:
+        time.sleep(0.15)
+        with open(probe, "a", encoding="utf-8") as fh:
+            fh.write("<a later launcher invocation rewrote this>\n")
+
+    th = threading.Thread(target=touch_log_soon, daemon=True)
+    th.start()
+    ok_quiet, why_quiet = tool.verify_target(prow, canon, pool, 0.6)
+    th.join(timeout=5)
+    check(not ok_quiet and "log changed" in why_quiet,
+          "C6 VERIFY: a log that changes inside the verification window REFUSES the signal (got %r: "
+          "%r)" % (ok_quiet, why_quiet))
+
+    with open(probe, "w", encoding="utf-8") as fh:      # a genuinely QUIET log, back to its marker
+        fh.write("report\n" + MARKER)
+    ok_still, why_still = tool.verify_target(prow, canon, pool, 0.2)
+    check(ok_still, "C6 VERIFY: the same row with a QUIET log still verifies (%r) — so C6 is not "
+                    "always-false" % why_still)
+
     cleanup()
     shutil.rmtree(root, ignore_errors=True)
-    print("\nALL ASSERTIONS HELD (9 fixtures + a control lane: 3 reaped, 6 refused for six different "
-          "reasons; plus the bound, the arming gate and the refusal bucket)")
+    print("\nALL ASSERTIONS HELD (12 fixtures + a control lane: 3 DONE-NOT-EXITED, one of which "
+          "ignored SIGTERM; 8 refused for eight different reasons; plus the bound in both "
+          "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
     return 0
 
 
@@ -410,7 +516,7 @@ def load_tool():
 
 
 def run_mutations() -> int:
-    """Re-run this suite against three mutated copies of the tool; each MUST go RED."""
+    """Re-run this suite against each mutated copy of the tool; each MUST go RED."""
     mutations = [
         ("abstain folded into stalled (the cycle-1 P0)",
          "            stalled = None if turn.abstain else turn.stalled",
@@ -421,6 +527,17 @@ def run_mutations() -> int:
          "    if False:\n        return out\n"),
         ("the open-turn veto deleted",
          "    if stalled is True:", "    if False:"),
+        # cycle 3 measured these three staying GREEN on the shipped suite:
+        ("the log-only arm loses the silence bound",
+         '    if marker == "ok" and (out["log_age_s"] or 0) >= opts.min_idle:',
+         '    if marker == "ok":'),
+        ("verify_target stops re-asking the log channel",
+         '    if _size(r.get("log")) is not None and log_m0 is not None and '
+         '_size(r.get("log")) != log_m0:',
+         "    if False:"),
+        ("ownership grants `tag` for ANY tag",
+         "        if tag_on_argv:",
+         '        if True:'),
     ]
     for label, old, new in mutations:
         tmp = tempfile.mkdtemp(prefix="pi-dne-mut-")
@@ -441,21 +558,21 @@ def run_mutations() -> int:
                 fail("mutation %r: its anchor no longer matches the tool — the control is INERT"
                      % label)
             open(target, "w").write(text.replace(old, new, 1))
-            env = dict(os.environ, PI_DNE_NO_MUTATIONS="1")
             proc = subprocess.run([sys.executable, os.path.join(tmp, "scripts", "orchestrator-harness",
                                                                 "pi-done-not-exited.test.py")],
-                                  capture_output=True, text=True, timeout=900, env=env)
+                                  capture_output=True, text=True, timeout=900)
             if proc.returncode == 0:
                 fail("mutation %r was NOT caught — the suite stayed green, so the assertion that "
                      "should guard it is inert" % label)
             print("ok   mutation caught: %s → suite RED (rc=%d)" % (label, proc.returncode))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-    print("\nALL MUTATIONS CAUGHT (3/3): the suite can go RED for each defect it claims to guard")
+    print("\nALL MUTATIONS CAUGHT (%d/%d): the suite can go RED for each defect it claims to guard"
+          % (len(mutations), len(mutations)))
     return 0
 
 
 if __name__ == "__main__":
-    if "--mutations" in sys.argv and not os.environ.get("PI_DNE_NO_MUTATIONS"):
+    if "--mutations" in sys.argv:
         sys.exit(run_mutations())
     sys.exit(main())

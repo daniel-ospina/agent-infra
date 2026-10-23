@@ -319,15 +319,22 @@ def launcher_of(pid: str, rows: Dict[str, dict]) -> Tuple[Optional[str], Optiona
     return (pid or None), None, None
 
 
-def ownership(pid: str, launcher: Optional[str], log: Optional[str]) -> Tuple[Optional[str], str]:
+def ownership(pid: str, launcher: Optional[str], log: Optional[str],
+              launcher_argv: Optional[str] = None) -> Tuple[Optional[str], str]:
     """(rung, detail) — which KERNEL fact proves this process belongs to that launcher.
 
-    Rung `tag` (strong): `TAG` in the process's OWN environ names the launcher — exactly what
-    `lane.sh` exports (`KIND=lane; TAG=<issue>`) and what the launcher writes `<tag>.rc` for — AND
-    the launcher script confirms it: its text mentions the tag, or writes a `.rc`, or redirects into
-    the log this process holds, or it is one of the repo's own runners (whose contract IS the `.rc`).
-    Rung `launcher` (weaker, no `TAG`): the launcher's own text runs `pi`/`run_agent` and redirects
-    into the log this process holds. Anything else is `no-owner`.
+    Rung `tag` (strong) — the launcher NAMES the tag this process carries, by one of:
+      * the tag is on the launcher's own argv (`bash $O/lane.sh 1234 …`, `bash …/nonblocking-
+        dispatch.sh <NAME>`) — a kernel fact on both sides, and interpolation-proof, which is the
+        only basis that works for the SHIPPED launchers: `lane.sh` writes `KIND=lane; TAG="$N"` and
+        redirects `lane-$N.log`, so its TEXT contains neither the tag nor the log's real name
+        (cycle 3, P1: the text-only bases matched no shipped launcher at all);
+      * its text assigns `TAG=<tag>` or writes `<tag>.rc` (the generated per-lane wrappers, e.g.
+        `/tmp/lane-<tag>.sh`, are literal like this);
+      * it redirects into the very log this process holds, by name.
+    Rung `launcher` (weaker, no usable `TAG`): the launcher's text runs `pi`/`run_agent` and
+    redirects into that log. Anything else is `no-owner`; a TAG that NO basis names is `weak` and
+    the row is report-only on BOTH DONE arms (cycle 3, P1: the log-only arm ignored the veto).
     """
     if not launcher:
         return None, "no-owner: the parent is not a shell running a launcher script"
@@ -339,11 +346,12 @@ def ownership(pid: str, launcher: Optional[str], log: Optional[str]) -> Tuple[Op
     redirects_log = bool(log) and bool(text) and any(
         os.path.basename(t.strip("'\"")) == os.path.basename(log)
         for t in re.findall(r">>?\s*(\S+)", text or ""))
+    # ⛔ A TAG IS NOT A SUBSTRING: `TAG=1` must not match `lane-12.sh`. Whole-token on both sides.
+    tag_on_argv = bool(tag) and bool(re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(tag or ""),
+                                              launcher_argv or ""))
     if tag:
-        # ⛔ THE BASIS MUST BE THE TAG'S OWN. Cycle 2 measured a row whose INHERITED TAG (`zombiepi`)
-        # was reported as naming a launcher (`lane-railprobe.sh`) that merely wrote *some* `.rc`.
-        # So each accepted basis below is tied to THIS tag, and the detail names the one that held —
-        # an inherited tag plus an unrelated `.rc` write is `weak`, never `tag`.
+        if tag_on_argv:
+            return "tag", "its launcher %s carries %s on its own argv" % (base, tag)
         if re.search(r"(?m)(^|[\s;])(export[ \t]+)?TAG=['\"]?%s['\"]?(\s|;|$)" % re.escape(tag),
                      text or ""):
             return "tag", "its launcher %s ASSIGNS TAG=%s" % (base, tag)
@@ -352,10 +360,11 @@ def ownership(pid: str, launcher: Optional[str], log: Optional[str]) -> Tuple[Op
         if redirects_log:
             return "tag", "its launcher %s redirects into the log this process holds" % base
         if writes_rc or known_runner:
-            return "weak", ("TAG=%s is neither assigned by %s nor named by its .rc, and it does not "
-                            "redirect this log — ownership rests on its text alone" % (tag, base))
-        return None, ("no-owner: TAG=%r is not assigned by the launcher %s and it neither redirects "
-                      "this log nor writes %s.rc" % (tag, base, tag))
+            return "weak", ("TAG=%s is named by no basis of %s (not on its argv, not assigned, not "
+                            "its .rc, not its log redirect) — ownership rests on its text alone"
+                            % (tag, base))
+        return None, ("no-owner: TAG=%r is named by no basis of the launcher %s and it neither "
+                      "redirects this log nor writes %s.rc" % (tag, base, tag))
     if not text:
         return None, "no-owner: the launcher %s is unreadable and TAG is absent" % base
     if not re.search(r"(^|\s)(pi|run_agent)(\s|$)", text) or ">" not in text:
@@ -548,11 +557,18 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
         out.update(cls="UNATTRIBUTABLE", why="task-child: its parent is a `pi`, not a lane launcher")
         return out
 
-    rung, why = ownership(pid, launcher, log)
+    rung, why = ownership(pid, launcher, log, _lacmd)
     if rung is None:
         out.update(cls="UNATTRIBUTABLE", why=why)
         return out
     out["owner"] = rung
+    if rung == "weak":
+        # ⛔ ONE VETO, ON BOTH DONE ARMS. Cycle 3 measured the log-only arm reaping a row whose owner
+        # was `weak`, because the veto below only ran on the transcript arm — and a `--no-session`
+        # lane is decided by the log arm, i.e. the veto was absent exactly where it was needed.
+        out.update(cls="UNATTRIBUTABLE",
+                   why="weak-owner: %s — report only" % why)
+        return out
 
     # ── gate 2's safety intent, unchanged: a human above is a hard refusal ──
     kind, detail = pool.gate2_host_decision(pool.ancestry(pid, rows))
@@ -635,12 +651,6 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
         out.update(cls="HUNG",
                    why="the turn is still OPEN (%s) and the process is frozen — mid-turn work is "
                        "not ours to clear" % out["turn"])
-        return out
-
-    if stalled is False and out["owner"] == "weak":
-        out.update(cls="UNATTRIBUTABLE",
-                   why="weak-owner: TAG is present but not assigned by the launcher, so ownership "
-                       "rests on its text alone — report only")
         return out
 
     if stalled is False:
@@ -733,8 +743,14 @@ def verify_target(r: dict, canon, pool, window: float) -> Tuple[bool, str]:
     # comparable, and `classify` already refuses the same shape (cycle 2, P2-1).
     if c0 is None or c1 is None or c1 < c0 or c1 - c0 >= pool.TOLERANCE_S:
         return False, "cpu moved or became incomparable inside the verification window (%s -> %s)" % (c0, c1)
-    if _size(r.get("log")) is not None and log_m0 is not None and _size(r.get("log")) > log_m0:
-        return False, "the log grew inside the verification window"
+    if _size(r.get("log")) is not None and log_m0 is not None and _size(r.get("log")) != log_m0:
+        return False, "the log changed inside the verification window (grew, or was rewritten)"
+    if r.get("log"):
+        holders = sum(1 for q in again if held_log(q)[0] == r["log"])
+        marker_now, _d = log_marker(r["log"], holders)
+        if r.get("marker") in ("ok", "hook-failed") and marker_now != r.get("marker"):
+            return False, ("the log's deciding line changed at signal time (%s -> %s)"
+                           % (r.get("marker"), marker_now))
     if _size(r.get("transcript")) is not None and j_m0 is not None and _size(r["transcript"]) > j_m0:
         return False, "the transcript grew inside the verification window"
     return True, "still done-not-exited"
@@ -899,7 +915,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not opts.apply:
         if done:
-            print("dry run — re-run with --apply to SIGTERM the %d DONE-NOT-EXITED." % len(done))
+            print("dry run — %d DONE-NOT-EXITED found; re-run with --apply --authorise-hostless to "
+                  "SIGTERM them." % len(done))
+            # ⛔ 4, not 0: the same token as an unarmed `--apply`, because the meaning is the same —
+            # work was found and this pass was not authorised to act. A dry run that exits 0 here
+            # tells a supervisor the fleet is clean (cycle 3, P2).
+            return 4
         else:
             print("nothing to reap: %d live, %d hung, %d refused."
                   % (counts.get("LIVE", 0), counts.get("HUNG", 0), counts.get("UNATTRIBUTABLE", 0)))
