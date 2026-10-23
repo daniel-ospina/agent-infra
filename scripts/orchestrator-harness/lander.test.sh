@@ -154,7 +154,7 @@ ck "PENDING: the lander exits 0 — waiting is not an error ($OUT)" "$RC"
                         || bad "PENDING: a PR merely waiting on CI WAS merged (merge calls: '$(merged_nums)')"
 has "$OUT" "#102 waiting-on-CI" && ok "PENDING: reported as waiting-on-CI, the distinct third state" \
                                 || bad "PENDING: not reported as waiting-on-CI ($OUT)"
-if printf '%s\n' "$OUT" | grep -qE '^\[lander\] #102 .*(skipped|FAIL)'; then
+if grep -qE '^\[lander\] #102 .*(skipped|FAIL)' <<<"$OUT"; then
   bad "PENDING: a pending PR was reported as skipped/failed — the conflation this file exists to prevent ($(printf '%s\n' "$OUT" | grep '#102'))"
 else ok "PENDING: not reported as skipped, and not reported as failed"; fi
 has "$OUT" "summary: merged=0 enqueued=0 would_merge=0 waiting=1 skipped=0 errors=0" \
@@ -173,7 +173,7 @@ run_lander
 has "$OUT" "#103 skipped: 1 FAILED check(s): python-ci-gate (failure)" \
   && ok "FAILED: the failing check is named in the report" \
   || bad "FAILED: the failing check was not named ($OUT)"
-if printf '%s\n' "$OUT" | grep -qE '^\[lander\] #103 .*waiting'; then
+if grep -qE '^\[lander\] #103 .*waiting' <<<"$OUT"; then
   bad "FAILED: a red PR was reported as waiting (the inverse conflation): $(printf '%s\n' "$OUT" | grep '#103')"
 else ok "FAILED: not reported as waiting"; fi
 
@@ -203,7 +203,7 @@ has "$OUT" "#105 skipped: mergeStateStatus=BLOCKED" && ok "BLOCKED: the blocker 
   || bad "BLOCKED: no blocker in the report ($OUT)"
 has "$OUT" "protection rule or a required review" && ok "BLOCKED: the blocker is named as protection/review, not as CI" \
   || bad "BLOCKED: the blocker was not named ($OUT)"
-if printf '%s\n' "$OUT" | grep -qE '^\[lander\] #105 .*waiting'; then
+if grep -qE '^\[lander\] #105 .*waiting' <<<"$OUT"; then
   bad "BLOCKED: a blocked PR was misreported as waiting on CI"
 else ok "BLOCKED: not misreported as a CI wait"; fi
 
@@ -244,7 +244,7 @@ run_lander
 has "$OUT" "workflow-drift (cancelled) did not complete" \
   && ok "CANCELLED: reported as a non-red incomplete check, with the check named" \
   || bad "CANCELLED: not reported as an incomplete check ($OUT)"
-if printf '%s\n' "$OUT" | grep -qE '^\[lander\] #108 .*FAILED check'; then
+if grep -qE '^\[lander\] #108 .*FAILED check' <<<"$OUT"; then
   bad "CANCELLED: a non-red cancelled check was reported as a FAILED check (invents a red tree)"
 else ok "CANCELLED: not reported as a failed check"; fi
 
@@ -314,7 +314,7 @@ if [ "${1:-}" = "--nonvacuity" ]; then
   MOUT="$(LANDER_BIN="$MT/mutant.sh" bash "$0" 2>&1)"; MRC=$?
   if [ "$MRC" -ne 0 ]; then printf 'ok        — non-vacuity: the mutated lander makes the suite FAIL (rc=%s)\n' "$MRC"
   else printf 'FAIL      — non-vacuity: the suite PASSED against the mutated lander — the PENDING arm is vacuous\n'; exit 1; fi
-  if printf '%s\n' "$MOUT" | grep -q 'FAIL .*PENDING'; then
+  if grep -q 'FAIL .*PENDING' <<<"$MOUT"; then
     printf 'ok        — non-vacuity: the PENDING arm is the one that breaks (not an unrelated crash)\n'
   else
     printf 'FAIL      — non-vacuity: the mutant failed, but NOT on the PENDING arm — the arm may be passing for the wrong reason\n'

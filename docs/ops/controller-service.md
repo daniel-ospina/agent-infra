@@ -49,7 +49,7 @@ is not a launcher for a session:
 | `RestartSec=15` | stated in the artifact, not inherited (`ORCH_RESTART_SEC` overrides; a whole number of seconds ≥ 1) |
 | `After=network-online.target`, `Wants=` | the first cycle reads GitHub and the candidate board; started early it records "no work" and sleeps a whole `CYC` |
 | `StartLimitIntervalSec=300` / `StartLimitBurst=3` | systemd's **default 10 s window can never fill** at one start per 15 s, so a configuration fault (no key, foreign controller, bad pin) would restart the box forever, re-running `cmd_check`'s network reads each time. 3-in-5-minutes converges to `failed`, which `--status` prints |
-| `KillMode=mixed`, `TimeoutStopSec=30` | `orch-loop.sh` traps TERM and exits in ~0.1 s (#1715); the group is signalled after, so a stop leaves no half-spawned worker behind |
+| `KillMode=process`, `TimeoutStopSec=30` | `orch-loop.sh` traps TERM and exits in ~0.1 s (#1715), so the controller stops on its own. **Not `mixed`**: with no tmux server running (the measured #2402 shape) the doctor's session forks the *server* inside this unit's cgroup, and `mixed` would SIGKILL every session on that per-user server — peer repos' controllers and operators' shells included — before `stop`'s ownership proof could run |
 | `StandardOutput/Error=journal` | `journalctl -u eldato-orchestrator.service` is the controller's log in service mode |
 
 ## Install targets

@@ -115,10 +115,16 @@ if [ "${1:-}" = "-p" ]; then
     if [ -f "$S/lstart.$pid" ]; then cat "$S/lstart.$pid"; else printf 'Mon Jan  1 00:00:00 2020'; fi
     exit 0
   fi
+  # `etime=` — the lock-owner AGE read `service_controller_present` now performs (review P2, #2402).
+  # Default is 100 days, i.e. "this process began long before any lock" — the pre-fix reading, so an
+  # arm that wants a RECYCLED pid must say so explicitly with `$S/etime.<pid>`.
+  if [ "$fmt" = "etime=" ]; then
+    if [ -f "$S/etime.$pid" ]; then cat "$S/etime.$pid"; else printf '100-00:00:00\n'; fi
+    exit 0
+  fi
   if [ -f "$S/args.$pid" ]; then cat "$S/args.$pid"; else printf '1 (init)\n'; fi
   exit 0
 fi
-exit 0
 SH
 
 # sleep: appends to the lane log between the two observations when the suite asks for "still
@@ -200,8 +206,8 @@ doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session"; touch "$T/tmux/sessions"; }
-reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."*; }
-reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_state() { rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."* "$T/ps/etime."*; }
 mk_lane() { # <name> <pid> [<log mtime, `touch -t` form; default ancient>]
   printf '%s\n' "$1" >> "$T/tmux/sessions"
   printf '%s\n' "$2" > "$T/tmux/panes/$1"
@@ -418,6 +424,48 @@ doc doctor
 grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: the doctor's own loop record does not witness a controller — a missing one is still restarted" \
   || bad "doctor: reported a controller RUNNING from its OWN loop pid and did NOT restart it — $OUT"
 rm -f "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+
+# ⛔ THE LOCK OWNER IS THE AUTHORITY, AND ITS **AGE** IS PART OF THE CLAIM (review P2, #2402).
+# `lock_controller_pid` carries the shape AND the age for a written reason: `$O/.orch.lock` is data on
+# disk that outlives a `kill -9`, so the OS can RECYCLE that pid onto a peer repo's controller — and on
+# this box a peer repo's controller has the SAME basename from the SAME shared harness path, so the
+# shape alone matches. These two arms drive the age half through the ps stub: the pid here is the
+# test shell's own (so `kill -0` succeeds and the shape matches), and only `etime` differs.
+say_case "doctor: the lock owner's AGE decides — a recycled pid is not this cell's controller"
+reset_tmux; reset_ps; reset_state
+rm -f "$T/sup/calls" "$T/o/heartbeat"; : > "$T/o/state/roles/.desired"
+printf '%s\n' "$$" > "$T/o/.orch.lock"
+printf 'bash /x/harness/orch-loop.sh\n' > "$T/ps/args.$$"
+# (a) it began 30s ago and the lock was written just now → it IS the lock's owner → no restart.
+printf '00:00:30\n' > "$T/ps/etime.$$"
+doc doctor
+[ -s "$T/sup/calls" ] && bad "doctor: restarted over a lock owner that provably began BEFORE the lock — $OUT" \
+  || ok "doctor: a live lock owner that began before the lock is the controller (no restart)"
+result_has "RUNNING" && ok "doctor: reports the service-managed controller as RUNNING" \
+  || bad "doctor: did not report the service-managed controller — $OUT"
+# (b) SAME pid, SAME argv, a lock written in 2020 and a process that began 10s ago → the pid was
+#     RECYCLED onto a peer repo's controller. Reporting RUNNING here is the "witness that cannot say no"
+#     (the arm above this one), and it makes the ABSENT→restart arm unreachable on a dead controller.
+#     Without the age rule this arm FAILS: the shape matches, so the pre-fix read returned 0.
+touch -t 202001010000 "$T/o/.orch.lock"
+printf '00:00:10\n' > "$T/ps/etime.$$"
+rm -f "$T/sup/calls"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a RECYCLED pid (began after the lock was written) does not witness a controller — it is restarted" \
+  || bad "doctor: a recycled pid that began AFTER the lock was written was accepted as this cell's controller and the dead one was NOT restarted — $OUT"
+# (c) an UNREADABLE age (the ps seam cannot answer) is not ownership either: same safe direction. The
+#     stub answers `etime=` with an EMPTY body, which is what a ps that cannot compute the age returns.
+#     The argv stub is re-created FIRST: `reset_ps` clears it too, and without it this arm passes on the
+#     shape mismatch instead — which is already covered, so it would prove nothing about the age.
+reset_ps
+printf 'bash /x/harness/orch-loop.sh\n' > "$T/ps/args.$$"
+: > "$T/ps/etime.$$"
+rm -f "$T/sup/calls"
+touch "$T/o/.orch.lock"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: an UNREADABLE lock-owner age is NOT treated as ownership — it is restarted, not reported RUNNING" \
+  || bad "doctor: an unreadable age was read as ownership and a dead controller was left alone — $OUT"
+rm -f "$T/o/.orch.lock" "$T/ps/args.$$" "$T/ps/etime.$$"
 
 # Present but stale: report, do not start (a live-but-slow controller is a P0 kill decision).
 printf 'orch\n' >> "$T/tmux/sessions"
