@@ -536,7 +536,8 @@ jobs:
             // enforce-skills.yml:109), so an issue stays open after main recovers and later
             // same-set failures append to it. Both are bounded and disclosed rather than fixed
             // here — close-on-success is a new mechanism, not a dedup fix.
-            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // `|| {}` after the parse too: NEEDS is the JSON rendering of `needs` (the
+            // `toJSON` env injection in the `env:` block above), and a literal `null`
             // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
             // error out having filed nothing. Not reachable today (all 7 jobs are wired into
             // `needs:`, so it is always a populated object) — but it is the only throw-before-filing

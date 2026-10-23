@@ -59,7 +59,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THIS IS NOW A `gh` CONSUMER, SO IT RE-ASSERTS THE SHIMS (#2333 review P2). The `export PATH`
 # above puts the real `/opt/homebrew/bin/gh` FIRST, ahead of the controller's exported shim dirs, and
 # the CI-queue read below is this script's FIRST `gh` call — so without this it would run outside the
-# cell's rate-limit serialiser and the Mac REST adapter, while `README` §7.2g says every read goes
+# cell's rate-limit serialiser and the Mac REST adapter, while `README` §7.2h says every read goes
 # through them. `fix-one.sh` carries the identical pair for the same reason; adapter last so
 # `$O/gh-rest` (which itself calls the same helper) wins where it exists. `-d`-guarded, so a box
 # shipping neither is unchanged.

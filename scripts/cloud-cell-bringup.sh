@@ -67,6 +67,18 @@ ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 # must never touch the REAL /tmp/.gh-tok) — see the secret-lifetime block below.
 GH_TOKEN_FILE="${GH_TOKEN_FILE:-/tmp/.gh-tok}"
 MODE="${1:---check}"
+# ── swap seams (agent-infra#2390) — every path and knob overridable, for the same reason the token
+# path is: a hermetic suite must never create swap (or edit /etc) on the host that runs it.
+SWAPFILE="${SWAPFILE:-/swapfile}"
+SWAP_MB="${SWAP_MB:-}"                 # empty = derive from MemTotal (the predicate below)
+SWAP_PROC="${SWAP_PROC:-/proc/swaps}"  # the kernel's own swap record: the state, not a claim about it
+SWAP_FSTAB="${SWAP_FSTAB:-/etc/fstab}"
+SWAP_SYSCTL_CONF="${SWAP_SYSCTL_CONF:-/etc/sysctl.d/99-cell-swap.conf}"
+SWAP_SYSCTL_FILE="${SWAP_SYSCTL_FILE:-/proc/sys/vm/swappiness}"
+SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
+# The privilege seam. Word-split ON PURPOSE: `sudo -n` is TWO argv entries. Empty = run as we are
+# (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
+SWAP_SUDO="${SWAP_SUDO-sudo -n}"
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { say "FATAL: $*" >&2; exit 1; }
@@ -561,6 +573,66 @@ check_operational_layer() {
   fi
 }
 
+# ── the cross-box review-record registry (agent-infra#2374) ─────────────────────
+# WHY THIS RUNS DURING BRING-UP. `~/.pi/agent/reviews/` is per-box, and a freshly booted cell that
+# has never minted a record would refuse every PR another box reviewed — the box is not "unable to
+# review", it is BLIND, and nothing on it said so (#2349 measured 142 such blocks on one box; 134
+# records existed nowhere but the box that minted them). `registry-sync.sh union` converges this
+# box's registry with the fleet's through the one store every box shares — the repository — so a
+# cell starts with the records that already exist instead of with none.
+#
+# NOT A REFUSAL, and deliberately. A box that cannot reach the store can still REVIEW (and record)
+# locally, so failing bring-up here would trade a blind box for a dead cell — the same
+# over-blocking the A/B test calls category B. What must not happen is SILENCE: an unreachable
+# store is reported as UNKNOWN (never "empty"), and the cell is told to re-run the verb.
+# The sync is bounded (registry-sync.sh --timeout) and its exit status is captured from the
+# COMMAND, never from a `| sed` decoration.
+check_review_registry() {
+  local sync="$CELL_HOME/.pi/agent/scripts/registry-sync.sh" out rc=0 store=""
+  # The farmed copy is what a lane will run, and the checkout that installed the layer is the one
+  # whose remote carries the refs — the farmed copy has no repo above it, so name the store.
+  [ -f "$sync" ] || sync="$LAYER_ROOT/scripts/registry-sync.sh"
+  if [ ! -f "$sync" ]; then
+    warn "registry-sync.sh is not on this cell (neither the farmed copy nor \$LAYER_ROOT) — the review-record"
+    warn "  registry stays LOCAL-ONLY here, so a PR reviewed on another box will read as unreviewed (#2374)."
+    return 0
+  fi
+  for store in "$LAYER_ROOT" "${AGENT_INFRA_PATH:-}"; do
+    [ -n "$store" ] && [ -d "$store" ] && break
+    store=""
+  done
+  # The store is passed as an ARRAY, not `${store:+--repo "$store"}`: the quotes inside that
+  # expansion are LITERAL words, so a $LAYER_ROOT containing a space arrived as two arguments and
+  # registry-sync.sh exited 2 — a cell reporting "the registry is unsynced" for a quoting bug.
+  local -a store_args=()
+  [ -n "$store" ] && store_args=(--repo "$store")
+  # `--dir` is passed EXPLICITLY, and the registry is named from CELL_HOME rather than assumed:
+  # `HOME` is repointed to $CELL_HOME by setup_home/check_provider, but that invariant lives in
+  # OTHER functions and this check must not silently certify a registry the cell's lanes never
+  # read. (The old `CELL_HOME="$CELL_HOME" bash …` prefix was inert — registry-sync.sh resolves
+  # REGISTRY_SYNC_DIR or $HOME and never reads CELL_HOME, which asserted a redirect that does not
+  # exist.)
+  out="$(bash "$sync" union --dir "$CELL_HOME/.pi/agent/reviews" "${store_args[@]+"${store_args[@]}"}" --timeout 30 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  case "$rc" in
+    0) ok "review-record registry synced with the fleet ($(printf '%s\n' "$out" | grep -E '^union:' | tail -1))"
+       # rc 0 is CONVERGED, not "nothing to say": a per-record notice (a store this cell could not
+       # use, a local legacy record kept local by rule 3) must still reach the operator.
+       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/    /' >&2 || true ;;
+    3) warn "the review-record registry DIVERGES from the fleet at the same reviewed_at — neither side was"
+       warn "  overwritten (#2374 rule 4); this cell keeps what it has. Reconcile by hand if this is not two"
+       warn "  boxes recording one revision." ;;
+    4) warn "the fleet's registry holds records this cell could NOT use (unreadable ref or stamp, or a"
+       warn "  mis-keyed record) — they were skipped and nothing was overwritten, but this is NOT a converged"
+       warn "  state. Re-run: bash $sync union ${store:+--repo \"$store\"}" ;;
+    *) warn "the cross-box review-record registry could NOT be synced (rc=$rc) — see the lines above for"
+       warn "  WHICH SIDE failed: a failed PULL leaves the fleet's records UNKNOWN here (not empty), a failed"
+       warn "  PUSH means this cell read them but its own are still LOCAL. Re-run:"
+       warn "  bash $sync union ${store:+--repo \"$store\"}" ;;
+  esac
+  return 0
+}
+
 # ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
 # REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
 # in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
@@ -664,6 +736,229 @@ check_caches() {
   fi
 }
 
+# ── (6) swap: a memory spike must PAGE, not OOM-kill the lanes (agent-infra#2390) ───────────────
+# The cells ship with NO swap: /proc/swaps is empty, and `swapon` is not even on the non-root PATH.
+# Measured 2026-10-23T00:15Z on cell-3: 8011M total, 7665M used, **345M AVAILABLE** with 17 pi lanes,
+# 13 FalkorDB redis-servers and two pytest runs (1748M + 746M) resident. The next allocation is
+# therefore not slow — it is an OOM kill, and a killed lane's uncommitted work is gone. Swap is the
+# only thing that turns a spike into paging, and only root can create it, so it belongs HERE: the
+# bring-up is the one step on a cell that can escalate.
+#
+# SIZING IS A PREDICATE, not a magic number: `max(4 GiB, MemTotal/4)`, capped at 16 GiB — 4 GiB on
+# the measured 8 GiB cell (25% of RAM is below the floor), 4 GiB at 16 GiB, 8 GiB at 32 GiB.
+# `SWAP_MB` overrides it for a hand-tuned cell.
+#
+# IDEMPOTENT BY CONSTRUCTION: the state is read from the KERNEL's swap record, so a re-run on a
+# provisioned cell activates nothing and just re-reports the reading, and an existing area that is
+# already large enough is never rewritten (rewriting live swap would be an outage for its pages).
+# The fstab line keeps it across a reboot — a cell that reboots into no swap is this same defect one
+# power cycle later.
+#
+# SWAPPINESS IS PINNED DELIBERATELY at 30, not left to the image default: idle lanes hold a lot of
+# cold anonymous memory, and reclaiming that to the swapfile (instead of keeping it resident until
+# the OOM killer picks a victim) is what converts a spike into paging. It stays under the kernel's
+# 60 so a cell doing real work is not thrashing its hot pages.
+#
+# ⛔ A CELL THAT CANNOT GET SWAP IS REFUSED, AND THE REFUSAL PRINTS THE READING. The failure mode
+# this removes is a box that looks healthy at 345M available and then silently loses lanes.
+swap_mb_from_proc() {
+  local f="${SWAP_PROC:-/proc/swaps}" kb
+  [ -r "$f" ] || return 1
+  kb="$(awk 'NR > 1 { s += $3 } END { printf "%d", s + 0 }' "$f" 2>/dev/null)" || return 1
+  case "${kb:-}" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$(( kb / 1024 ))"
+}
+
+# swap_target_mb <mem_total_mb> — the sizing predicate, in one place.
+swap_target_mb() {
+  local mem="${1:-0}" t
+  case "${SWAP_MB:-}" in
+    ''|*[!0-9]*|0) ;;
+    *) printf '%s' "$SWAP_MB"; return 0 ;;
+  esac
+  t=$(( mem / 4 ))
+  [ "$t" -lt 4096 ] && t=4096
+  [ "$t" -gt 16384 ] && t=16384
+  printf '%s' "$t"
+}
+
+# sr <cmd…> — run through the privilege seam. Unquoted on purpose (see SWAP_SUDO).
+sr() {
+  if [ -n "${SWAP_SUDO:-}" ]; then
+    ${SWAP_SUDO} "$@"
+  else
+    "$@"
+  fi
+}
+
+# fstab_covers <path> — the entry is present in the FIRST field, so a commented-out or differently
+# optioned entry is read correctly (an `grep -F` anywhere in the file counts a comment as a mount).
+# fstab_covers <path> — a REAL boot mount, not just a line that names the file: field 1 is the
+# device, field 3 must be `swap`, and the options must not carry `noauto` (an entry that explicitly
+# does NOT mount at boot must not read as "survives a reboot"). A commented-out line simply does not
+# have the path in field 1, so it is not a mount either.
+fstab_covers() {
+  local f="${SWAP_FSTAB:-/etc/fstab}"
+  [ -r "$f" ] || return 1
+  awk -v p="$1" \
+      '$1 == p && $3 == "swap" && ("," $4 ",") !~ /,noauto,/ { found = 1 } END { exit !found }' \
+      "$f" 2>/dev/null
+}
+
+# ensure_swap_fstab — persist the area across a reboot, idempotently, and READ THE ENTRY BACK.
+# ⛔ Called from EVERY path that leaves swap active, INCLUDING "already provisioned": an area that
+# is active but unpersisted (a hand `swapon`, or a first run whose append failed) is certified
+# otherwise, and the cell returns from a reboot with no swap — this same defect, one power cycle
+# later. The append's exit status is not the proof; the read-back is.
+ensure_swap_fstab() {
+  if fstab_covers "$SWAPFILE"; then
+    ok "swap: $SWAP_FSTAB already mounts $SWAPFILE (survives a reboot)"
+  elif printf '%s none swap sw 0 0\n' "$SWAPFILE" | sr tee -a "$SWAP_FSTAB" >/dev/null 2>&1; then
+    fstab_covers "$SWAPFILE" \
+      && ok "swap: $SWAP_FSTAB entry added (survives a reboot)" \
+      || warn "swap: wrote to $SWAP_FSTAB but cannot read the entry back — the swap is active now and will not survive a reboot"
+  else
+    warn "swap: could not persist an entry in $SWAP_FSTAB — the swap is active NOW and will not survive a reboot"
+  fi
+}
+
+# pin_swappiness — pin the BOOT-TIME value and the RUNTIME one, and verify each INDEPENDENTLY.
+# ⛔ The report never claims one on the strength of the other: saying "pinned at boot" because the
+# RUNTIME value happens to read 30 is how a cell silently reverts to the image default at the next
+# reboot, with the one line an operator greps reading as success.
+pin_swappiness() {
+  local want="${SWAP_SWAPPINESS:-30}" now pinned=0
+  if grep -qxF "vm.swappiness=$want" "$SWAP_SYSCTL_CONF" 2>/dev/null; then
+    pinned=1
+  elif printf 'vm.swappiness=%s\n' "$want" | sr tee "$SWAP_SYSCTL_CONF" >/dev/null 2>&1 \
+       && grep -qxF "vm.swappiness=$want" "$SWAP_SYSCTL_CONF" 2>/dev/null; then
+    pinned=1
+  fi
+  [ "$pinned" = 1 ] \
+    || warn "swap: could not write $SWAP_SYSCTL_CONF — swappiness will revert to the image default on the next reboot"
+
+  now="$(cat "$SWAP_SYSCTL_FILE" 2>/dev/null)"
+  case "${now:-}" in ''|*[!0-9]*) now=unknown ;; esac
+  if [ "$now" != "$want" ]; then
+    sr sysctl -w "vm.swappiness=$want" >/dev/null 2>&1
+    now="$(cat "$SWAP_SYSCTL_FILE" 2>/dev/null)"
+    case "${now:-}" in ''|*[!0-9]*) now=unknown ;; esac
+  fi
+  if [ "$now" = "$want" ] && [ "$pinned" = 1 ]; then
+    ok "swap: vm.swappiness=$want (runtime and pinned at boot in $SWAP_SYSCTL_CONF)"
+  elif [ "$now" = "$want" ]; then
+    warn "swap: vm.swappiness=$want at runtime, but the boot-time pin is NOT in $SWAP_SYSCTL_CONF — it will revert on the next reboot"
+  else
+    warn "swap: vm.swappiness is ${now} at runtime, wanted $want (boot-time pin in $SWAP_SYSCTL_CONF)"
+  fi
+}
+
+# swap_avail_kb — free space on the filesystem that would hold the swapfile. Overridable so a suite
+# can exercise the refusal without filling a disk.
+swap_avail_kb() {
+  local dir kb
+  case "${SWAP_AVAIL_KB:-}" in
+    ''|*[!0-9]*) : ;;
+    *) printf '%s' "$SWAP_AVAIL_KB"; return 0 ;;
+  esac
+  dir="$(cd "$(dirname "$SWAPFILE")" 2>/dev/null && pwd)" || return 1
+  kb="$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { printf "%d", $4 }')" || return 1
+  case "${kb:-}" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$kb"
+}
+
+check_swap() {
+  local mem_mb cur target reading missing active=0 tol limit avail_kb need_kb
+  mem_mb="$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null)"
+  case "${mem_mb:-}" in ''|*[!0-9]*) mem_mb=0 ;; esac
+  cur="$(swap_mb_from_proc)" || cur=""
+  target="$(swap_target_mb "$mem_mb")"
+  # A few megabytes of slack, because the kernel rounds the area DOWN to whole pages and drops the
+  # swap header: measured on a cell, a 4096M file reports 4194300K = **4095M**. Without the slack
+  # every healthy cell would warn on each run, and the below-target branch would fire on a healthy
+  # cell. The slack is 1% (floor 8M) so it scales with the target and never hides a real shortfall.
+  tol=$(( target / 100 )); [ "$tol" -lt 8 ] && tol=8
+  limit=$(( target - tol ))
+  reading="MemTotal=${mem_mb}M SwapTotal=${cur:-UNREADABLE}M target=${target}M swapfile=$SWAPFILE"
+
+  # A reading we cannot take is NOT zero swap: an unreadable record decides nothing.
+  [ -n "$cur" ] || die "swap: cannot read the kernel swap record ($SWAP_PROC) — refusing to certify a cell whose swap state is unknown. READING: $reading"
+  grep -qF "$SWAPFILE" "$SWAP_PROC" 2>/dev/null && active=1
+
+  if [ "$active" = 1 ] && [ "$cur" -ge "$limit" ]; then
+    ok "swap: ${cur}M active, target ${target}M (${mem_mb}M RAM) — already provisioned"
+    ensure_swap_fstab
+    pin_swappiness
+    return 0
+  fi
+  if [ "$active" = 1 ]; then
+    # ⛔ NEVER resize a LIVE area from this check. `swapoff` faults every swapped page back into RAM,
+    # and this step runs on a box ALREADY measured short of it (345M available was the observed
+    # shape): resizing here can OOM-kill exactly the lanes the swap exists to protect, and a failed
+    # re-allocation after a removal would leave NO swap at all where there was some. So the live area
+    # is KEPT, the shortfall is REPORTED with the reading, and the convergence is the operator's, on
+    # a quiet box.
+    warn "swap: ${cur}M active at $SWAPFILE, below the ${target}M target — NOT resizing a live area: swapping it off faults its pages back into RAM on a cell short of it, and a failed re-allocation would leave NO swap. READING: $reading"
+    warn "  converge by hand when the box is quiet: sudo swapoff $SWAPFILE && sudo rm -f $SWAPFILE, then re-run this check"
+    ensure_swap_fstab
+    pin_swappiness
+    return 0
+  fi
+
+  # (2) CAN WE ACT AT ALL? Escalation first, because a missing tool under `sudo -n` may be present
+  # under root's secure PATH (measured: `swapon`/`mkswap` live in /sbin, which is not on a cell's
+  # non-root PATH — probing them as the caller would refuse a box that can in fact provision swap).
+  if ! sr true >/dev/null 2>&1; then
+    die "swap: cannot escalate to root (SWAP_SUDO='${SWAP_SUDO:-<direct>}' failed) — swap can only be created by root, so a memory spike on this cell OOM-kills lanes. READING: $reading"
+  fi
+  missing="$(sr sh -c 'for t in mkswap swapon fallocate sysctl; do command -v "$t" >/dev/null 2>&1 || printf "%s " "$t"; done' 2>/dev/null)"
+  [ -z "$missing" ] || die "swap: missing required tool(s):${missing}— cannot provision swap. READING: $reading"
+
+  # (3) FREE DISK IS THE SAME DEFECT FROM THE OTHER SIDE. This box reaps disk on a timer because a
+  # cell at ~97% cannot `git worktree add` or `uv sync`, and a swapfile is UNRECLAIMABLE by that
+  # reaper. Allocating up to 16 GiB on a cell near the threshold would trade an OOM kill for a dead
+  # cell, so the free-space reading decides BEFORE anything is written.
+  avail_kb="$(swap_avail_kb)" || avail_kb=""
+  case "${avail_kb:-}" in ''|*[!0-9]*) avail_kb="" ;; esac
+  need_kb=$(( (target + 512) * 1024 ))
+  if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
+    die "swap: not enough free disk for a ${target}M swapfile (free ${avail_kb:-UNREADABLE}K, need ${need_kb}K = the area plus a 512M margin) — a swapfile is NOT reclaimable by the disk reaper, so this cell is refused rather than pushed past the threshold where worktree/uv fail. READING: $reading"
+  fi
+
+  # (4) ALLOCATE — safe on this path whatever is already there, because the area is NOT active:
+  # `fallocate -l` sets the length of an EXISTING file too, so an inactive undersized file converges
+  # on the predicate instead of being activated at whatever size it happened to have. `dd` truncates
+  # by default, so the fallback cannot leave the old length behind either. Nothing is removed before
+  # the replacement is known to exist.
+  if ! sr fallocate -l "${target}M" "$SWAPFILE" >/dev/null 2>&1; then
+    # fallocate is refused on some filesystems (and on a sparse root): dd is the correct fallback,
+    # slow but real. A swap REGION of zeros would be a lie, so a sparse file is never used.
+    sr dd if=/dev/zero of="$SWAPFILE" bs=1M count="$target" status=none >/dev/null 2>&1 \
+      || die "swap: could not allocate ${target}M at $SWAPFILE (fallocate and dd both failed). READING: $reading"
+  fi
+  sr chmod 600 "$SWAPFILE" >/dev/null 2>&1 \
+    || die "swap: chmod 600 $SWAPFILE failed — an insecure swapfile is refused rather than activated. READING: $reading"
+  sr mkswap "$SWAPFILE" >/dev/null 2>&1 \
+    || die "swap: mkswap $SWAPFILE failed. READING: $reading"
+  sr swapon "$SWAPFILE" >/dev/null 2>&1 \
+    || die "swap: swapon $SWAPFILE failed. READING: $reading"
+
+  # (5) READ IT BACK FROM THE KERNEL — `swapon`'s exit status is not the state.
+  cur="$(swap_mb_from_proc)" || cur=""
+  reading="MemTotal=${mem_mb}M SwapTotal=${cur:-UNREADABLE}M target=${target}M swapfile=$SWAPFILE"
+  case "${cur:-}" in
+    ''|*[!0-9]*|0) die "swap: swapon succeeded but the kernel record ($SWAP_PROC) still shows no swap. READING: $reading" ;;
+  esac
+  if [ "$cur" -lt "$limit" ]; then
+    warn "swap: ${cur}M active, below the ${target}M target (beyond the ${tol}M page-rounding slack) — the kernel accepted a smaller area than requested. READING: $reading"
+  else
+    ok "swap: ${cur}M active (target ${target}M, ${mem_mb}M RAM) at $SWAPFILE"
+  fi
+
+  ensure_swap_fstab
+  pin_swappiness
+}
+
 # ── disk: the SCHEDULED reaper (agent-infra#2032) ────────────────────────────────────────────────
 # Disk exhaustion is the second reason the cloud cells stopped working, and it arrives as a THRESHOLD:
 # at ~97%% used a `git worktree add` or `uv sync` fails and a healthy controller cannot spawn a lane.
@@ -718,18 +1013,24 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer exists: registry-sync.sh arrives WITH it (the farm), and the checkout that
+      # installed the layer is the store whose remote carries the refs.
+      check_review_registry
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).
       check_provider_layer
       check_caches
+      # Before the reaper's install step: a cell that cannot get swap must be refused EARLY, not
+      # after the scheduler work — and the reading is what the operator needs from the refusal.
+      check_swap
       check_disk_reaper
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported, swap active)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;
