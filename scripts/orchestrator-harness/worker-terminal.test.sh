@@ -337,7 +337,7 @@ printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
 SH
 out="$(bash "$TMP/c5.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4k" "$TMP/home-plain" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-seen="$(env -i PATH=/usr/bin:/bin O="$TMP/O4k" /bin/bash -c "$pfx; env" 2>/dev/null | grep -c '^CELLPLAIN=plainvalue$')"
+seen="$(env -i PATH=/usr/bin:/bin O="$TMP/O4k" "$BASH" -c "$pfx; env" 2>/dev/null | grep -c '^CELLPLAIN=plainvalue$')"
 [ "$seen" = "1" ] && rc=0 || { rc=1; echo "      prefix=$pfx"; }
 ck "a keys.env that assigns WITHOUT export still reaches the worker (sourced under set -a)" $rc
 grep -q '^kind=tmux' "$TMP/O4/state/worker-lane-8" && grep -q '^home=' "$TMP/O4/state/worker-lane-8" && rc=0 || rc=1
@@ -362,8 +362,12 @@ case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a worker that would start with NO gh credential is REFUSED (loud, not a silent dead lane)" $rc
 grep -q 'new-session' "$TMP/tmux4b.log" && rc=1 || rc=0
 ck "…and tmux is never asked to START one (the credential probe is the only call it makes)" $rc
-grep -q 'NO gh credential' "$TMP/O4b/test.log" && rc=0 || { rc=1; cat "$TMP/O4b/test.log" 2>/dev/null; }
-ck "…naming all three places it looked (hosts.yml, keys.env, the tmux server's GH_TOKEN)" $rc
+grep -q 'NO gh credential' "$TMP/O4b/test.log" \
+  && grep -qF 'hosts.yml' "$TMP/O4b/test.log" \
+  && grep -qF 'keys.env (no GH_TOKEN/GITHUB_TOKEN value)' "$TMP/O4b/test.log" \
+  && grep -qF "tmux server's GH_TOKEN/GITHUB_TOKEN" "$TMP/O4b/test.log" \
+  && rc=0 || { rc=1; cat "$TMP/O4b/test.log" 2>/dev/null; }
+ck "…naming every place it looked (hosts.yml, keys.env, the caller's env, the tmux server)" $rc
 [ -f "$TMP/O4b/state/worker-lane-8" ] && rc=1 || rc=0
 ck "…and leaving NO worker record behind (a refusal is not a worker)" $rc
 # POSITIVE CONTROL: the same empty HOME is FINE when the tmux server's own environment carries the
@@ -463,7 +467,7 @@ printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
 SH
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4s" "$TMP/home-plain" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP/elsewhere" GH_CONFIG_DIR="$TMP/ghcd" /bin/bash -c "$pfx; printf 'XDG=[%s] GHCD=[%s]\n' \"\${XDG_CONFIG_HOME:-unset}\" \"\${GH_CONFIG_DIR:-unset}\"" 2>&1)"
+envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP/elsewhere" GH_CONFIG_DIR="$TMP/ghcd" "$BASH" -c "$pfx; printf 'XDG=[%s] GHCD=[%s]\n' \"\${XDG_CONFIG_HOME:-unset}\" \"\${GH_CONFIG_DIR:-unset}\"" 2>&1)"
 case "$envout" in *"XDG=[unset] GHCD=[unset]"*) rc=0 ;; *) rc=1; echo "      $envout";; esac
 ck "…and a DEFAULT-config probe UNSETS both, so an inherited config dir cannot repoint the worker's gh" $rc
 # ⛔ A `keys.env` THAT FAILS TO SOURCE IS FATAL (review finding): `wt_runfile` already dies (`|| exit
@@ -473,7 +477,7 @@ rm -rf "$TMP/home-badkeys" "$TMP/O4t"; gh_hosts_fixture "$TMP/home-badkeys"
 printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+env -i PATH=/usr/bin:/bin "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
 [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
 ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
 # ⛔ THAT GUARD IS NOW ENFORCED BEFORE ANY SESSION EXISTS (P1 review finding, 2026-10-23, MEASURED).
@@ -534,9 +538,21 @@ rm -rf "$TMP/home-lastfalse" "$TMP/O4t2"; gh_hosts_fixture "$TMP/home-lastfalse"
 printf 'GH_TOKEN=ghp_ok\n[ -d /tmp/definitely-not-a-dir-2396 ] && export EXTRA=1\n' > "$TMP/home-lastfalse/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t2" "$TMP/home-lastfalse" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a keys.env whose LAST statement is false still runs the worker (a non-zero status is not fatal while a credential was exported)" $rc
+# ⛔ …AND A FILE THAT TERMINATES THE SOURCING SHELL IS REFUSED (review finding, 2026-10-23, measured —
+# agent-infra#1713's class). `bash -n` accepts `GH_TOKEN=ghp_x` + `exit 0`, and a plain `. FILE` then ends
+# the WORKER's shell BEFORE the HOME re-assert and the credential re-check: the spawn returns 0, the
+# `home=` record is written, and the lane never starts. The sentinel probe's ABSENCE is the signal —
+# `exit 0` IS a success status, so a status-based guard cannot see this.
+rm -rf "$TMP/home-exit" "$TMP/O4t1x"; mkdir -p "$TMP/home-exit"
+printf 'GH_TOKEN=ghp_ok\nexit 0\n' > "$TMP/home-exit/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t1x" "$TMP/home-exit" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-exit" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
+[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env with a top-level 'exit 0' exits 98 (the file terminated its shell, so the token check never ran)" $rc
 # ⛔ …AND A FILE THAT PARSES BUT ABORTS **BEFORE** THE TOKEN IS STILL FATAL (the other half, measured):
 # `return 1` is legal in a sourced file and `sh -n` accepts it, so a syntax pre-check alone would let the
 # source stop before the token assignment and run the worker credential-less on an rc=0 spawn. The guard
@@ -547,7 +563,7 @@ rm -rf "$TMP/home-return" "$TMP/O4t3"; mkdir -p "$TMP/home-return"
 printf 'FOO=1\nreturn 1\nGH_TOKEN=ghp_ok\n' > "$TMP/home-return/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t3" "$TMP/home-return" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a keys.env that aborts BEFORE the token exits 98 (a parse check alone would have run it)" $rc
 # …and the same abort AFTER the token has been exported is NOT fatal — the environment holds the
@@ -556,9 +572,21 @@ rm -rf "$TMP/home-return2" "$TMP/O4t4"; mkdir -p "$TMP/home-return2"
 printf 'GH_TOKEN=ghp_ok\nreturn 1\n' > "$TMP/home-return2/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t4" "$TMP/home-return2" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return2" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return2" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a keys.env that aborts AFTER exporting the token still runs the worker (a credential is present)" $rc
+# ⛔ A CLEAN-SOURCING `keys.env` MUST NOT CLOBBER ANOTHER ARM'S CREDIT (review finding, 2026-10-23,
+# measured). The post-source re-check used to fire ONLY when the FILE had credited the token, so a CALLER
+# token (or a store credit) followed by a file carrying the blank `GH_TOKEN=` placeholder an operator
+# leaves when moving to store auth exported an EMPTY value over it — and nothing re-read it: a
+# credential-less worker on an rc=0 spawn, the ~21-line death this gate exists to refuse.
+rm -rf "$TMP/home-clobber" "$TMP/O4t8"; mkdir -p "$TMP/home-clobber"
+printf 'GH_TOKEN=\n' > "$TMP/home-clobber/keys.env"
+out="$(KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t8" "$TMP/home-clobber" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-clobber" GH_TOKEN=ghp_from_caller_env "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "a keys.env that blanks GH_TOKEN over a caller credit exits 98 (the credit is re-read after the source)" $rc
 # ⛔ A GREP MATCH IS NOT PROOF THE SOURCE EXPORTS IT (review finding, 2026-10-23, measured). A token line
 # the file never EXECUTES — inside an `if` that is false, or a function nobody calls — matches the static
 # grep, so the gate reports provisioned while the worker gets nothing and stops at its first `gh` call.
@@ -568,7 +596,7 @@ rm -rf "$TMP/home-cond" "$TMP/O4t7"; mkdir -p "$TMP/home-cond"
 printf 'if [ -n "${NEVER_SET:-}" ]; then\n  export GH_TOKEN=ghp_never_executed\nfi\n' > "$TMP/home-cond/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t7" "$TMP/home-cond" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-cond" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-cond" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a keys.env whose token line never EXECUTES exits 98 (the file credit is verified, not grepped)" $rc
 # ⛔ `wt_gh_hosts` RESOLUTION ORDER, PINNED DIRECTLY (review finding): its two consumers are the no-gh
@@ -690,7 +718,7 @@ rm -rf "$TMP/home-ws" "$TMP/O4t5"; mkdir -p "$TMP/home-ws"
 printf 'GH_TOKEN="$(printf '\''   '\'')"\nfalse\n' > "$TMP/home-ws/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t5" "$TMP/home-ws" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-ws" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-ws" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a WHITESPACE-only GH_TOKEN plus a non-zero source status exits 98 (blank is not a credential)" $rc
 # ⛔ THE PARSE CHECK MUST USE THE DIALECT THE FILE IS WRITTEN IN (review finding, 2026-10-23, measured):
@@ -700,7 +728,7 @@ rm -rf "$TMP/home-bashy" "$TMP/O4t6"; mkdir -p "$TMP/home-bashy"
 printf 'GH_TOKEN=ghp_ok\nARR=(1 2)\n' > "$TMP/home-bashy/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t6" "$TMP/home-bashy" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-bashy" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-bashy" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
 [ "$reach" = "REACHED" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
 ck "a BASH-only syntax in keys.env is not refused by the pre-check (bash decides, not dash)" $rc
 # ⛔ A `hosts.yml` THAT IS A DIRECTORY IS NOT A CREDENTIAL (review finding): `-s` was true for any
@@ -759,7 +787,7 @@ printf 'PFX<<%s>>\n' "$(wt_launcher_env "$4")"
 SH
 out="$(bash "$TMP/c6.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4m" "$TMP/home-repoint" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-worker_home="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent O="$TMP/O4m" /bin/bash -c "$pfx; printf '%s' \"\$HOME\"" 2>/dev/null)"
+worker_home="$(env -i PATH=/usr/bin:/bin HOME=/nonexistent O="$TMP/O4m" "$BASH" -c "$pfx; printf '%s' \"\$HOME\"" 2>/dev/null)"
 [ "$worker_home" = "$TMP/home-repoint" ] && rc=0 || { rc=1; echo "      worker_HOME=$worker_home  prefix=$pfx"; }
 ck "a HOME= line inside keys.env does NOT repoint the validated HOME (re-asserted after the source)" $rc
 # ⛔ PRESENCE IS NOT PROVISION (same review): an EMPTY hosts.yml (a `gh auth logout` leftover) or a
@@ -869,7 +897,7 @@ case "$out" in *"launcher=none"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "no cmux AND no tmux => launcher=none (a box with no surface at all is still reported, not guessed)" $rc
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the spawn is REFUSED" $rc
-grep -q 'tmux=absent' "$TMP/O4d/test.log" && rc=0 || { rc=1; cat "$TMP/O4d/test.log" 2>/dev/null; }
+grep -q 'tmux=absent' "$TMP/O4d/test.log" && grep -qE 'cmux=(present|absent)' "$TMP/O4d/test.log" && rc=0 || { rc=1; cat "$TMP/O4d/test.log" 2>/dev/null; }
 ck "…with a message that names BOTH surfaces it looked for (so it is a diagnosis, not a shrug)" $rc
 # ⛔ And a box that cannot produce a CONTRACT is refused, not started credential-less. Two arms:
 # the function itself refuses an empty HOME, and the knob an operator sets is the one that is used
@@ -891,6 +919,15 @@ case "$out" in *"home_knob=$TMP/home-k"*) rc=0 ;; *) rc=1; echo "      $out";; e
 ck "…WT_WORKER_HOME is the HOME used (the operator's answer, not a fall-through)" $rc
 case "$out" in *"home_plain=$TMP/home-k"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and with no knob, a HOME that HOLDS the credential is the one chosen" $rc
+# ⛔ …AND A HOME PROVISIONED BY ITS OWN `keys.env` IS ALSO CHOSEN (review finding, 2026-10-23,
+# measured): selection asked the gh STORE only, while acceptance also credits `keys.env`, so a box whose
+# working credential is that file (this file's own header's measured shape) was refused forever — a
+# false refusal is the #2210 loop, and it starts no session, so nothing can ever change the answer.
+rm -rf "$TMP/home-keysonly" "$TMP/O4e2"; mkdir -p "$TMP/home-keysonly"
+printf 'export GH_TOKEN=ghp_keysonly\n' > "$TMP/home-keysonly/keys.env"
+out="$(bash "$TMP/c4.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4e2" "$TMP/home-keysonly" 2>&1)"
+case "$out" in *"home_plain=$TMP/home-keysonly"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and a HOME whose own keys.env carries the token is chosen too (selection and acceptance agree)" $rc
 
 echo
 echo "── D) the launchd surface still uses tmux (the other place it is correct) ──"
