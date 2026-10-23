@@ -657,11 +657,19 @@ resolve_log() {
   distinct="$(printf '%s' "$cands" | cut -f1 | awk 'NF && !seen[$0]++')"
   n="$(printf '%s\n' "$distinct" | awk 'NF { n++ } END { print n + 0 }')"
   [ "$n" -gt 1 ] && return 3
+  # ⛔ A FAILED READ VETOES THE CANDIDATE, EVEN WHEN EXACTLY ONE WAS READ (#2163 review, P1). This
+  # test used to sit BELOW the single-candidate return, so a tree holding one readable 3 h-old lane log
+  # BESIDE a sibling whose descriptors could not be read resolved to that log and went on to be
+  # TERM/KILLed as a whole tree — including the process whose state was never read — while the pass
+  # printed `abstained=0` and exited 0. One candidate is not an answer to "what does THIS tree's
+  # evidence say" when part of the tree was invisible: the tree may hold a second (live) lane, and the
+  # file we happened to read belongs to the one that finished. Same rule as the blind arm below, one
+  # step earlier: a control that cannot see must not kill.
+  [ "$blind" = "1" ] && return 2
   if [ "$n" = "1" ]; then
     printf '%s\n' "$cands" | awk -F'\t' -v want="$distinct" '$1 == want { print; exit }'
     return 0
   fi
-  [ "$blind" = "1" ] && return 2
   [ "$unident" = "1" ] && return 4
   return 1
 }
