@@ -2881,11 +2881,35 @@ declaration, its argv, and the dispatcher's closed vocabulary).
 scripts that do the work; `prfix` arrives in an argv a **lane can type** (`bash $O/nonblocking-dispatch.sh
 … 300 prfix`), so exempting it on the caller's word was a one-argument bypass — reproduced in review
 cycle 4: a worker started on a repo 5.4× over its ceiling. The gate now proves it from GitHub: an OPEN
-PR must be **this worktree**, either because the branch it has checked out is that PR's head ref, or
-(because a fork PR's worktree is a detached `refs/pull/<n>/head`) because its HEAD commit is the PR's
-head. Neither is available to a creation worker — its HEAD is a commit no PR owns yet. Unprovable (no
-such PR, or the read failed) → **HELD**, with a refusal that says the claim could not be proven rather
-than reporting a backlog reading.
+PR must be **this worktree**, by one of two rules, and the exemption line names the PR it proved —
+
+- the **branch** rule: the PR whose head ref is this worktree's checked-out branch, **and** whose
+  `headRefOid` IS this worktree's `HEAD` (a branch NAME alone is satisfiable by a stale local branch or
+  by a name that collides with some other PR's head, so it is not accepted on its own);
+- the **commit** rule: the base repo's PAGED open-PR listing holds an OPEN PR whose `head.sha` is this
+  worktree's `HEAD` — the only rule that can answer for a FORK PR, whose worktree is a detached
+  `refs/pull/<n>/head`. Two shapes are rejected on measurement, not taste: `gh api
+  repos/<r>/commits/<sha>/pulls` (cycle 6) answers `[]` for a fork head — a fork PR's commit lives in the
+  FORK's network, so the base repo cannot see it: 12 of 12 measured fork PRs (cli/cli, pydantic,
+  home-assistant, vscode) were invisible to it and visible to the listing, which would have made every
+  fork repair unprovable and therefore held on exactly the deep repos this gate exists for. And a bare
+  `pr list` (cycle 5) is newest-first with a silently truncating `--limit`, so an older PR would be
+  unprovable — permanently held — as the backlog deepens. The listing is paged (5 × 100) and a page that
+  comes back exactly full is walked rather than read as “no match”.
+
+Unprovable is **not** a hold by itself: the claim falls through to the ordinary measurement, so under
+the ceiling it runs (nothing is being exempted from anything), over the ceiling the real backlog reason
+is reported, and a P0-blocker / base-red issue keeps its documented precedence. The log says `NOTE … not
+provably an OPEN PR`, never "unprovable, so refused" — a proof failure must not halt the drain on a
+healthy repo.
+
+⚠️ **THE NAMED RESIDUAL, BECAUSE THE EVIDENCE DOES NOT MEAN WHAT IT IS TEMPTING TO CLAIM.** These rules
+prove *"this worktree is an open PR"*, not *"this work is repair"*. A lane standing in a worktree that
+IS an open PR can still spawn arbitrary work there with `prfix`, and the gate will not see it. That is
+accepted rather than closed: the alternative is an ambient switch or a caller-set flag, which is exactly
+what review cycle 4 found opening this gate, and the gate's job is back-pressure on the fleet's DEFAULT
+behaviour, not a security boundary against a lane that already owns a PR. What the rules do close is the
+case that was measured — a lane with no PR at all naming itself `prfix` to skip the gate.
 
 ⚠️ **AND A STALE `$O` COPY WOULD SILENTLY UNDO THE EXEMPTION**, so `pr-doctor` refuses its whole pass
 when the deployed dispatcher predates the kind argument (it would ignore the extra argv and spawn every
