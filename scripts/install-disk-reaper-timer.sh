@@ -637,8 +637,25 @@ service_effective_unit() { # prints the bytes systemd will load; rc 1 when that 
 # (the same reset semantics `effective_execstarts` already implements for `ExecStart=`).
 # `env -i`-style edge cases (empty values, `NAME=` with no value) are preserved verbatim, because an
 # empty HOME is not the HOME the install rendered and must be refused by the caller.
+# normalize_unit_lines — systemd's OWN reading of `Key = value`: it strips whitespace AROUND the key,
+# around the `=`, and before the value, and it accepts indented lines. A parser anchored on
+# `^ExecStart=` therefore MISSES a legal `ExecStart =` — and a drop-in that spells BOTH the reset and
+# the replacement that way is invisible to the read-back, which then certifies the BASE unit's command
+# while systemd runs the drop-in's.
+# ⛔ MEASURED (review pass): with a drop-in carrying `ExecStart =` + `ExecStart = /bin/true` and
+# `Environment = HOME=/tmp/tmp.deadbeef/bg/home`, `effective_execstarts` still reported the base
+# `/bin/bash <reaper> --apply` and `effective_env` still reported the base HOME — the install printed
+# `verify: ExecStart + HOME read back`, exited 0 and armed the timer over a unit that ran /bin/true.
+# `systemd-analyze verify` ACCEPTS these spellings (a genuinely unknown key draws "Service has no
+# ExecStart= … Refusing."), so the unit really would run the drop-in's command. The indented spelling
+# (`  ExecStart=`) reproduces identically.
+# Normalising the TEXT once, rather than teaching every parser the grammar, keeps one definition.
+normalize_unit_lines() {
+    sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
+}
+
 effective_env() {
-    printf '%s\n' "$1" | awk '
+    printf '%s\n' "$1" | normalize_unit_lines | awk '
         function emit(tok,   eq, name) {
             eq = index(tok, "=")
             if (eq <= 1) return                     # not a NAME=VALUE assignment: systemd ignores it
@@ -681,10 +698,209 @@ effective_env() {
 }
 
 effective_execstarts() {
-    printf '%s\n' "$1" | awk '
+    printf '%s\n' "$1" | normalize_unit_lines | awk '
         /^ExecStart=$/ { n=0; next }
         /^ExecStart=/  { L[++n] = substr($0, 11); next }
         END            { for (i = 1; i <= n; i++) print L[i] }'
+}
+
+# split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
+# group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token
+# per line on stdout.
+# rc 3 = an UNTERMINATED QUOTE. systemd returns EINVAL, logs, and ABANDONS the whole directive, so
+# such a line is NOT a command this gate may read as a pass — the caller refuses naming it. (Same
+# rule `effective_env` applies to Environment=, and for the same measured reason.)
+split_words() {
+    printf '%s\n' "$1" | awk '
+        {
+            tok = ""; inq = 0; q = ""; esc = 0; started = 0; ntok = 0
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                ch = substr($0, i, 1)
+                if (esc) { tok = tok ch; esc = 0; started = 1; continue }
+                if (inq) {
+                    if (ch == "\\") { esc = 1; continue }
+                    if (ch == q) { inq = 0; continue }
+                    tok = tok ch; continue
+                }
+                if (ch == "\"" || ch == "\047") { inq = 1; q = ch; started = 1; continue }
+                if (ch == " " || ch == "\t") { if (started) { T[++ntok] = tok; tok = ""; started = 0 }; continue }
+                tok = tok ch; started = 1
+            }
+            if (started) T[++ntok] = tok
+            if (inq || esc) exit 3
+            for (i = 1; i <= ntok; i++) print T[i]
+        }'
+}
+
+# json_array_words <json-array-text> — one element per line, for the plist's ProgramArguments.
+# Not a JSON parser: it walks the ONE shape `plutil -extract … json` and the python3 fallback both
+# emit (an array of strings), which is all this gate is ever handed.
+json_array_words() {
+    printf '%s' "$1" | awk '
+        {
+            s = $0
+            sub(/^[[:space:]]*\[/, "", s); sub(/\][[:space:]]*$/, "", s)
+            n = length(s); i = 1; cur = ""; started = 0
+            while (i <= n) {
+                ch = substr(s, i, 1)
+                if (ch == "\"") {
+                    i++; started = 1
+                    while (i <= n) {
+                        c2 = substr(s, i, 1)
+                        if (c2 == "\\") { cur = cur substr(s, i + 1, 1); i += 2; continue }
+                        if (c2 == "\"") { i++; break }
+                        cur = cur c2; i++
+                    }
+                    continue
+                }
+                if (ch == ",") { if (started) { print cur; cur = ""; started = 0 }; i++; continue }
+                i++
+            }
+            if (started) print cur
+        }'
+}
+
+# plist_program_arguments_textual <plist-file> — the `ProgramArguments` array's <string> elements, in
+# order, one per line. This is the NO-PARSER arm of the plist read-back: it reads the array POSITIONALLY
+# so the same program-position rule applies (a bare "the path appears in the file" passes a stale or
+# masked job — the defect the parsed arm was fixed for). Prints nothing when the array is absent.
+plist_program_arguments_textual() {
+    awk '
+        {
+            s = $0
+            if (done) next
+            if (!inarr) {
+                if (!match(s, /<key>[[:space:]]*ProgramArguments[[:space:]]*<\/key>/)) next
+                s = substr(s, RSTART + RLENGTH)
+                if (!match(s, /<array>/)) next
+                inarr = 1
+                s = substr(s, RSTART + 7)
+            }
+            if (match(s, /<\/array>/)) { done = 1; s = substr(s, 1, RSTART - 1) }
+            buf = buf s "\n"
+        }
+        END {
+            while (match(buf, /<string>[^<]*<\/string>/)) {
+                print substr(buf, RSTART + 8, RLENGTH - 17)
+                buf = substr(buf, RSTART + RLENGTH)
+            }
+        }' "$1"
+}
+
+# plist_argv_runs_reaper — does this launchd ProgramArguments argv LAUNCH the reaper this install
+# rendered? Two shapes are legitimate, and each is pinned by its own identity:
+#   • the TCC launcher shape this installer renders (`<PY_BIN> <LAUNCHER> --script <REAPER> …`): the
+#     launcher must be in program position AND `--script` must carry THIS install's reaper;
+#   • a job that runs the reaper directly (a shell in program position, as the systemd unit does).
+# ⛔ Anything else is refused. `/bin/true --script <REAPER> --apply` matches neither: the launcher
+# identity is not there, and the program does not execute the reaper. That was the accepted case
+# before this check existed (a membership test over the JSON text), i.e. the same fail-open, in the
+# arm whose comment claimed to assert "the equivalent fact" for launchd.
+# rc 0 = launches the reaper · 1 = does not · 2 = empty argv.
+plist_argv_runs_reaper() {
+    local -a t=()
+    local line i
+    while IFS= read -r line; do t[${#t[@]}]="$line"; done
+    [ "${#t[@]}" -gt 0 ] || return 2
+    if [ -n "${LAUNCHER:-}" ] && [ "${#t[@]}" -ge 2 ] && [ "${t[1]}" = "$LAUNCHER" ]; then
+        # ⛔ argv[0] IS THE PROGRAM launchd EXECS — and it was not checked. Requiring only the launcher
+        # in argv[1] certified `[/bin/true, <launcher>, --script, <reaper>, --apply]`: launchd runs
+        # /bin/true and nothing else while the install reports success (found in review, reproduced).
+        # It also certified a STALE interpreter — the TCC class this installer warns about, where the
+        # rendered PY_BIN cannot read the repos — because only the launcher path was compared.
+        if [ -n "${PY_BIN:-}" ]; then
+            [ "${t[0]}" = "$PY_BIN" ] || return 1
+        else
+            case "${t[0]##*/}" in python*) : ;; *) return 1 ;; esac
+        fi
+        i=2
+        while [ "$i" -lt "${#t[@]}" ]; do
+            if [ "${t[$i]}" = "--script" ]; then
+                i=$((i + 1))
+                [ "${t[$i]:-}" = "$REAPER" ] && return 0
+                return 1
+            fi
+            i=$((i + 1))
+        done
+        return 1
+    fi
+    printf '%s\n' "${t[@]}" | argv_executes_reaper
+}
+
+# argv_executes_reaper — read a token list (one per line, PROGRAM FIRST) on stdin and answer the only
+# question the read-back is entitled to ask: does this command EXECUTE the reaper?
+#
+# ⛔ MEMBERSHIP IS NOT EXECUTION. The first cut of this gate asked
+#     case " $exec " in *" $REAPER "*) ok=1 ;;
+# which is a membership test over the WHOLE command line: a drop-in that REPLACED `ExecStart=` with
+# `/bin/true <reaper> --apply` matched, the install printed `verify: ExecStart + HOME read back`,
+# exited 0 and ran `enable --now` — a box with no reaper and every check green. That is the exact
+# fail-open this read-back exists to remove (found by an adversarial review pass, reproduced against a
+# stub `systemctl`). The doc already promised "a drop-in that replaces it is refused"; now the code
+# does too.
+# What is accepted is systemd's own rule: the FIRST token is the program, after the optional prefixes
+# systemd strips before resolving the executable — `-` (ignore failure), `@` (argv[0]), `+`, `!`, `!!`
+# (privilege/sandbox overrides) — or a shell/`env` in program position whose first NON-OPTION argument
+# is the reaper. `bash -c '<script text>'` never passes: the text is a single argument, and whether it
+# runs the reaper is not a fact this gate can prove.
+# rc 0 = executes the reaper · 1 = does not · 2 = no tokens at all.
+argv_executes_reaper() {
+    local -a t=()
+    local line prog i tok
+    while IFS= read -r line; do t[${#t[@]}]="$line"; done
+    [ "${#t[@]}" -gt 0 ] || return 2
+    i=0
+    prog="${t[0]}"
+    while :; do
+        # systemd exec prefixes — `-` (ignore failure), `@` (argv[0]), `+`/`!`/`!!` (privilege and
+        # sandbox overrides) — stripped in the order systemd applies them.
+        while :; do
+            case "$prog" in
+                '!!'*) prog="${prog#'!!'}" ;;
+                '+'*|'!'*|'@'*|'-'*) prog="${prog#?}" ;;
+                *) break ;;
+            esac
+        done
+        [ "$prog" = "$REAPER" ] && return 0
+        case "${prog##*/}" in
+            env)
+                # `env [-i] [VAR=value …] <program> …` — resolve THROUGH the wrapper rather than
+                # refusing a legal command line (systemd renders `/bin/bash` directly, but a hand-fixed
+                # unit or a drop-in that ADDS `/usr/bin/env bash <reaper>` is a healthy one).
+                i=$((i + 1))
+                while [ "$i" -lt "${#t[@]}" ]; do
+                    tok="${t[$i]}"
+                    case "$tok" in
+                        -*)  i=$((i + 1)); continue ;;
+                        *=*) i=$((i + 1)); continue ;;
+                    esac
+                    prog="$tok"; break
+                done
+                [ "$i" -lt "${#t[@]}" ] || return 1
+                continue ;;
+            bash|sh|dash|zsh|ksh)
+                i=$((i + 1))
+                while [ "$i" -lt "${#t[@]}" ]; do
+                    tok="${t[$i]}"
+                    i=$((i + 1))
+                    case "$tok" in -*) continue ;; esac   # an interpreter FLAG is not the script
+                    [ "$tok" = "$REAPER" ] && return 0
+                    return 1                               # first non-option arg is not the reaper
+                done
+                return 1 ;;
+        esac
+        return 1
+    done
+}
+
+# argv_has_token <token> — read a token list (one per line) on stdin, rc 0 if the exact token is present.
+# Used for the mode flag: a FLAG is an argument by nature, so membership is the right question for it
+# (unlike the program, where membership let a replaced ExecStart through).
+argv_has_token() {
+    local want="$1" line
+    while IFS= read -r line; do [ "$line" = "$want" ] && return 0; done
+    return 1
 }
 
 verify_installed_unit() {
