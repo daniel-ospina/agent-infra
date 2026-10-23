@@ -6128,6 +6128,15 @@ testAsync("#2148: session_start discloses the reviewer requirement ONCE, and inj
       ok(disclosure[0].includes("scripts/record-review.sh"), "it names the exact record command");
       ok(disclosure[0].includes("admin-merge.sh"), "it names the exact rail command");
       ok(disclosure[0].includes("task(prompt='[REVIEW]"), "it names the exact dispatch command");
+      // #2343: the line must also name the CARRY, or a lane holding a valid record at an unchanged
+      // DIFF reads it as "pay for a review" — measured 2026-11-19, two batch-landing lanes each spent
+      // 20-40 minutes on a review they did not owe and one stopped. Asserted on the EMITTED message
+      // (not the module) so a caller that loses the clause goes red here.
+      ok(disclosure[0].includes("CARRY"), "it names the CARRY (an unchanged reviewed artifact is not re-reviewed, #2343)");
+      ok(
+        disclosure[0].includes("A FRESH mint still requires the dispatched reviewer"),
+        "…and keeps the fresh-mint requirement, so the carry cannot be read as 'reviews are optional'",
+      );
       // The model-visible channel: a `pi -p` lane's prompt is its brief, so a console line alone
       // reaches the operator's log but not necessarily the lane.
       ok(injected && injected.message, "the first before_agent_start injects the requirement as a session message");
