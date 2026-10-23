@@ -94,7 +94,10 @@
 #     per lane in the dry run so a human can see it before arming.
 #   * a lane whose log was deleted AND whose age is under 12h is REPORTED, not reaped — that is the
 #     conservative side of the trap above, and it is why the measured reap population is old lanes.
-#   * ⚠️ CELL-INERT, A PRODUCT DECISION FOR THE PR AUTHOR (not a silent behaviour). Gate 2 now
+#   * ⚠️ CELL-INERT, A PRODUCT DECISION FOR THE PR AUTHOR (not a silent behaviour), WITH ITS OWN
+#     VERDICT (`reap` exits 4 for it, never 3): a completed pass that judged nothing by policy is not
+#     a failed read, and a consumer that treated it as one would show a permanent red on a surface
+#     where the policy below is working exactly as recorded. Gate 2 now
 #     requires POSITIVE fleet evidence, and the ONLY host app this tool recognises as the fleet is
 #     `cmux.app` — a Mac application. A Linux cell's supervisor is systemd / a container, so a cell
 #     lane's ancestry is `pi → bash → systemd → init`: `unknown`, refused. `--apply` on a cell is
@@ -1234,10 +1237,17 @@ cmd_reap() {
   # lane is `ancestry-unknown`, so the armed pass judged ZERO trees while refusing all of them and
   # exited 0; `cloud-cell-doctor.sh` recorded `state_write reap 0` — a healthy reaper, every pass,
   # from an instrument that is inert there by design. A pass that judged nothing while refusing a
-  # real lane is an ABSTENTION about the whole population, and it says so.
+  # real lane is not a clean pass, and it says so.
+  # ⛔ BUT IT IS NOT `3` (#2163 review r8, P1). `3` means CANNOT-VERIFY — a read that failed, which a
+  # consumer must escalate — and on a LINUX CELL this shape is the STEADY STATE, not an incident: the
+  # only fleet marker is `cmux.app`, so every cell lane is `ancestry-unknown` and refused, every
+  # pass. Reporting cannot-verify there made the cell's health verb red for ever, and made a REAL
+  # cannot-verify (and a failed controller restart beside it) indistinguishable from a policy verdict
+  # nobody can act on. `4` is its own verdict: the pass COMPLETED and JUDGED NOTHING because the
+  # policy refused the whole population — named, counted, and never folded into a failure.
   if [ "$total" -eq 0 ] && [ "$inert" -gt 0 ]; then
     logline "inert-pass — judged no tree and refused $inert lane(s) by policy"
-    return 3
+    return 4
   fi
   return 0
 }
@@ -1251,6 +1261,12 @@ lane-reap.sh — count fleet lanes by evidence, and reap the ones that provably 
   lane-reap.sh reap [--dry-run]      report what WOULD be reaped (the default)
   lane-reap.sh reap --apply          signal the lanes that pass all three gates
   lane-reap.sh reap --json           one machine-readable summary line
+
+exit codes for `reap`: 0 = a pass that completed (including one that judged lanes and refused some by
+policy); 3 = cannot-verify (a read failed, so the pass could not judge — never a clean pass);
+4 = policy-inert (the pass COMPLETED and judged NO tree because the policy refused every lane it
+found — the Linux-cell steady state, named apart from 3 so a consumer can report it without calling a
+working policy a failure).
 
 A lane is a `pi` process tree (the pi and its immediate shell wrapper) whose OWN pi — or a pipe-fed
 `tee` beside it — holds a fleet-namespace log open as stdout/stderr. It is reaped only when ALL
@@ -1267,10 +1283,12 @@ be shown to be its writer) is `pipe-identity-unusable` — also refused, and NOT
 The summary's `abstained=<n>` counts trees whose SAFETY read failed (descriptors, ancestry, CPU
 delta, log age); a pass with any abstention exits 3, so an abstaining pass never reads as idle.
 `inert=<n>` counts the LANES a POLICY refused (a resolved lane log under a human or unclassifiable
-ancestry): a pass that judged NO tree while refusing some of them is exit 3 too, because a reaper
-that judged nothing is not a clean pass. `unidentifiable=<n>` counts the trees refused because a pipe
-has no per-pipe name on this platform: an abstention (exit 3), counted apart from `abstained=` so an
-operator is never sent after a blind read that did not happen.
+ancestry): a pass that judged NO tree while refusing some of them exits 4 too, because a reaper that
+judged nothing is not a clean pass — but 4 is a POLICY verdict over a population this tool will not
+judge (the Linux-cell steady state), kept apart from 3 (a read that FAILED) so a consumer is never
+forced to report a permanent red it cannot act on. `unidentifiable=<n>` counts the trees refused
+because a pipe has no per-pipe name on this platform: an abstention (exit 3), counted apart from
+`abstained=` so an operator is never sent after a blind read that did not happen.
 EOF
 }
 

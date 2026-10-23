@@ -1481,18 +1481,29 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # The earlier wording here had the polarity BACKWARDS: an UNDER-count of live lanes makes
 # `[ "$LANES" -ge "$MAX_LANES" ]` FALSE and **dispatches more** — the exact direction that fills the
 # box — so falling back to the tmux count silently is a fail-OPEN on the capacity gate. So:
-#   * the script is MISSING (a `$O` that predates it) → tmux fallback, named once in the log: a
-#     transition, not a measurement;
+#   * the script is MISSING (a `$O` that predates it) → the LAUNCH SURFACE's own worker census,
+#     `wt_count lane-` (worker-terminal.sh), named once in the log: a transition, not a measurement;
 #   * the script EXISTS and the census is `?`/unreadable → `LANES_UNKNOWN=1`, and the gate refuses to
 #     add work with that reason, on the same doctrine as an unreadable memory probe (memory gate:
 #     "a failed probe is UNKNOWN, not ample"). `[cap]` prints `?` (never a fabricated `0`) and the
-#     internal `LANES` keeps a tmux lower bound ONLY so the numeric consumers stay numeric; the
+#     internal `LANES` keeps a lower bound ONLY so the numeric consumers stay numeric; the
 #     dispatch lines print `LANES_DISPLAY` too, so no line in the cycle reintroduces a `0` for a
 #     read that did not happen.
+# ⛔ THE FALLBACK IS A DURABLE-TERMINAL COUNT, NEVER `tmux ls` (#2163 review r8, P1). It used to be
+# `tmux ls | grep -c '^lane-'` with `LANES_UNKNOWN=0`, which is NOT the population it replaced: on a
+# Linux CELL tmux is never the launcher (`wt_launcher` selects `terminal` and refuses `none`,
+# worker-terminal.sh — "on a cell a tmux window is the measured 21-line death"), so the expression
+# reads **0 on a busy cell**, `LANES_UNKNOWN` stays 0, the `lanes_unknown` arm never fires and
+# `[ "$LANES" -ge "$MAX_LANES" ]` is false — the controller then dispatches onto a box that is
+# already full, the exact #2159 OOM direction `lane-reap.sh` exists to close. `wt_count` answers for
+# EVERY launcher (cmux durable terminals, launchd tmux sessions and the records of both) and treats a
+# worker it cannot measure as LIVE, so it cannot under-count either.
 LANES_UNKNOWN=0
-# Where the `lanes=` number CAME FROM, printed on the `[cap]` line. Without it, a tmux session count
-# and a process census are the same three letters, and a `$O` that predates `lane-reap.sh` silently
-# changes the population of the number the capacity gate acts on (#2163 review, P2).
+# Where the `lanes=` number CAME FROM, printed on the `[cap]` line. Without it, a launcher's session
+# count and a process census are the same three letters, and a `$O` that predates `lane-reap.sh`
+# silently changes the population of the number the capacity gate acts on (#2163 review, P2).
+# `terminals` = `wt_count lane-`, the LAUNCH SURFACE's own worker census (launcher-agnostic: durable
+# cmux terminals AND tmux sessions), which is the population the pre-census loop gated on.
 LANES_SOURCE="unset"
 LANE_REAP_SH=""
 for _c in "${O:-}/lane-reap.sh" "${_HERE_RS:-}/lane-reap.sh"; do
@@ -1516,27 +1527,29 @@ measure_lanes() {
     else
       # ⛔ READABLE TOTALS WITH AN UNREADABLE NUMERATOR IS STILL AN ABSTENTION (#2163 review, P2).
       # This cycle does not know how many lanes are working, so it does not add work — and it must
-      # not PRINT a fabricated 0 either: the internal `LANES` keeps a tmux lower bound because every
-      # other consumer (`mp_reason`, the log lines) takes a NUMBER, while `[cap]` prints `?` through
-      # LANES_DISPLAY. The earlier shape fell through to the tmux fallback here and printed
-      # `lanes=0/11 … lanes_src=unknown`, which reads as "no live lanes", the opposite of the truth.
+      # not PRINT a fabricated 0 either: the internal `LANES` keeps the LAUNCH SURFACE's own worker
+      # census as a lower bound because every other consumer (`mp_reason`, the log lines) takes a
+      # NUMBER, while `[cap]` prints `?` through LANES_DISPLAY. The earlier shape fell through to the
+      # fallback here and printed `lanes=0/11 … lanes_src=unknown`, which reads as "no live lanes",
+      # the opposite of the truth — which is also why the bound is `wt_count`, never `tmux ls` (see
+      # the fallback arm below).
       LANES_UNKNOWN=1
-      LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+      LANES="$(wt_count lane-)"
       is_num "${LANES:-}" || LANES=0
     fi
   else
     # The transition case (a `$O` seeded before lane-reap.sh existed). NAMED ONCE, so a cell that
     # silently lost the census is findable instead of reading like a census forever.
-    LANES_SOURCE="tmux"
+    LANES_SOURCE="terminals"
     if [ -n "${O:-}" ] && [ ! -f "$O/state/lane-census-fallback.flag" ]; then
       mkdir -p "$O/state" 2>/dev/null || true
       if [ -n "${LOG:-}" ]; then
-        printf '%s [cap] WARN lane-reap.sh NOT FOUND (looked in %s and %s) — lanes= is the OLD tmux session count until the cell is re-seeded; re-run start/apply\n' \
+        printf '%s [cap] WARN lane-reap.sh NOT FOUND (looked in %s and %s) — lanes= is the LAUNCHER WORKER COUNT (worker-terminal.sh wt_count lane-), not the evidence census, until the cell is re-seeded; re-run start/apply\n' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${O:-?}" "${_HERE_RS:-?}" >> "$LOG" 2>/dev/null || true
       fi
       : > "$O/state/lane-census-fallback.flag" 2>/dev/null || true
     fi
-    LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+    LANES="$(wt_count lane-)"
     is_num "${LANES:-}" || LANES=0
     LANES_DISPLAY="$LANES"
   fi
@@ -2215,7 +2228,14 @@ sess() { wt_alive "${1:-}"; }
 # refused by those is a different population's decision and is not this gate's to make — so the
 # shared boundary is the plain `<= MIN_MEM_FREE_MB` arm, and nothing more.
 mem_spawn_ok() { [ "${MEM_UNKNOWN:-0}" != "1" ] && [ "${MEMAVAIL_MB:-0}" -gt "$MIN_MEM_FREE_MB" ]; }
-can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok; }
+can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok && [ "${LANES_UNKNOWN:-0}" != "1" ]; }
+# ⛔ THE PR PATH IS CAPACITY-GATED ON THE SAME CENSUS AS THE ISSUE BATCH (#2163 review r8, P2).
+# `can_spawn` read LOAD (and, after #1732, memory) only, so a box whose lane census was `?/?` still
+# had merge-/fix-/review lanes added on the PR side while the cycle logged `[dispatch] skipped
+# (lanes_unknown …)` for the issue side — the docs promised "an unreadable census makes the controller
+# REFUSE to add work" and the promise stopped at the issue batch. The OOM direction is the reason the
+# census exists (#2159): an unreadable census cannot bound how full the box is, and a merge lane is a
+# `pi` like any other, so abstaining on ONE add-work path is abstaining on neither. Both paths refuse.
 # spawn_gate_tok — the EVIDENCE a held-back spawn records, in the ONE shape all five slot refusals
 # print (agent-infra#1732). Before the memory arm these lines printed `load-gate=<L>/<MAX_LOAD>` only,
 # and that was complete: load was the whole gate. It is not any more — a memory-only refusal would now
@@ -2226,7 +2246,13 @@ can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok; }
 spawn_gate_tok() {
   local mem="UNKNOWN"
   [ "${MEM_UNKNOWN:-0}" = "1" ] || mem="${MEMAVAIL_MB:-?}M"
-  printf 'load-gate=%s/%s mem-gate=%s/%s' "${L:-0}" "${MAX_LOAD:-?}" "$mem" "${MIN_MEM_FREE_MB:-?}"
+  # …and the CENSUS arm (#2163 review r8). A token that named only load/memory would print two
+  # healthy numbers for a refusal the census made — the silent-capacity-refusal shape #2126 T5 removed.
+  if [ "${LANES_UNKNOWN:-0}" = "1" ]; then
+    printf 'lanes_unknown (the lane census could not be read -> do not add work); load-gate=%s/%s mem-gate=%s/%s' "${L:-0}" "${MAX_LOAD:-?}" "$mem" "${MIN_MEM_FREE_MB:-?}"
+  else
+    printf 'load-gate=%s/%s mem-gate=%s/%s' "${L:-0}" "${MAX_LOAD:-?}" "$mem" "${MIN_MEM_FREE_MB:-?}"
+  fi
 }
 # head_reds <pr> -> GREEN | RED | UNKNOWN
 #
