@@ -150,5 +150,52 @@ finally:
     else:
         os.environ["HOME"] = _old_home
 
+# (6) `check()`'s PRECEDENCE LADDER — the fail-open guard the tool actually runs (P2, fresh review):
+# `elif not runs: BLOCKED(checks-unmeasured)` is the only arm that stops an EMPTY check surface from
+# falling through to the record binding, i.e. to `AT` on a head nobody tested. It was unpinned: a
+# reorder that dropped it left every assertion green. These stub the read layer, so no network.
+import types
+
+PR = {"state": "OPEN", "isDraft": False, "headRefOid": "a" * 40, "baseRefName": "main",
+      "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefName": "b"}
+_rec = {"verdict": "clean", "head_sha": "a" * 40, "diff_sha256": "b" * 64}
+
+def run_check(*, pr=None, runs="", diff=b"diff --git a/x b/x\n+1\n", record=_rec, bytes_rc=0):
+    saved = (m.gh_text, m.gh_bytes, m.read_record, m.normalize)
+    prj = dict(PR, **(pr or {}))
+    m.gh_text = lambda argv, d: (0, __import__("json").dumps(prj), "") if argv[:2] == ["pr", "view"] \
+        else (0, runs, "")
+    m.gh_bytes = lambda argv, d: types.SimpleNamespace(returncode=bytes_rc, stdout=diff, stderr=b"")
+    m.read_record = lambda repo, n: (record, "/home/x/.pi/agent/reviews/1.json")
+    m.normalize = lambda raw, n: raw
+    try:
+        return m.check(1, "o/r", ".", "/fake/diff-normalize.py")
+    finally:
+        m.gh_text, m.gh_bytes, m.read_record, m.normalize = saved
+
+# an EMPTY check surface must never read as clean, even with a matching record and a matching diff
+r = run_check(runs="")
+ck(r["verdict"] == "BLOCKED(checks-unmeasured)",
+   "check(): an EMPTY check surface is BLOCKED(checks-unmeasured), never AT", r["verdict"])
+# a RED check outranks an in-flight one, and both are named
+r = run_check(runs='{"id":1,"name":"t","status":"completed","conclusion":"failure"}\n'
+                    '{"id":2,"name":"u","status":"in_progress","conclusion":null}\n')
+ck(r["verdict"].startswith("BLOCKED(checks-failed)"), "check(): a failed check outranks in-flight", r["verdict"])
+ck(r["failed"] == ["t"] and r["in_flight"] == ["u"],
+   "check(): the failed and in-flight sets are both reported", (r["failed"], r["in_flight"]))
+# DRAFT outranks a conflict, and a conflict outranks a clean surface
+r = run_check(pr={"isDraft": True, "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
+ck(r["verdict"] == "BLOCKED(draft)", "check(): draft outranks merge-conflict", r["verdict"])
+r = run_check(pr={"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
+ck(r["verdict"] == "BLOCKED(merge-conflict)", "check(): a conflict blocks", r["verdict"])
+# a 2xx body that is NOT a diff must not be hashed and reported as "changed"
+try:
+    run_check(diff=b'{"message":"Not Found"}')
+except m.Failure as exc:
+    ck("no diff entry boundary" in str(exc),
+       "check(): a 2xx NON-DIFF body is a NAMED failure, never diff-changed", exc)
+else:
+    ck(False, "check(): a 2xx non-diff body was hashed as content")
+
 print(f"── landability.test.sh: {ok} assertions passed ──")
 PY

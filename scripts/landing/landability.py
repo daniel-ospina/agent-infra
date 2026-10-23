@@ -423,6 +423,18 @@ def check(pr, repo, repo_dir, normalizer):
                 f"{(r.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
             )
         raw = r.stdout or b""
+        # ⛔ A 2xx WHOSE BODY IS NOT A DIFF IS NOT A DIFF (P2, fresh review). A 200 carrying an error
+        # body (`{"message":"Not Found"}`) used to be normalized and hashed as if it were content, so
+        # the tool printed the definite claim `NEEDS-REVIEW(diff-changed)` — "the reviewed content
+        # changed" — from a read that returned no diff, inviting the re-review this module exists to
+        # prevent. The producer refuses to hash such a body for exactly this reason
+        # (record-review.sh::diff_fetch_once → rc 4 `nondiff`, "#1398 … NEVER hashed"). Only a
+        # NON-EMPTY body is checked: 0 bytes still means `diff-unmeasured`, as it did before.
+        if raw and not raw.lstrip().startswith(b"diff --git "):
+            raise Failure(
+                f"could not read the diff of {repo}#{pr}: the body carries no diff entry "
+                "boundary (an error body is not a diff)"
+            )
         normalized = normalize(raw, normalizer)
         live_diff = hashlib.sha256(normalized).hexdigest() if normalized else ""
         # `filter=all` is required: the default is not all, and it has returned
