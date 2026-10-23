@@ -717,54 +717,174 @@ AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
 # `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
 # shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
-# empty verdict would reach the verdict classifier and be handled as a review that produced nothing,
-# so a MAX_FIX_TRIES attempt would be burnt per refusal and the PR would eventually park "needs a
-# human" having never had a review. That is the #1716/#1720 class, one worker over.
-# ⛔ AND THE MARKER CLAIM IS NOW PRECISE (review P2, cycle 4): this comment used to say the empty
-# verdict "records `needsfix-<PR>-<head>`, authorising a FIXER" — but `verdict_kind` classifies an
-# empty reviewer output as `none` and writes NO marker (the #8602 fix, `:757` below). What this arm
-# still buys is the SPECIFIC exit code: 76 is the load-refusal signal the controller re-dispatches on,
-# where a bare empty verdict would be re-recorded as an ordinary no-verdict review.
-# So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
-# box quietens (75 is what adopt-fix/chain-merge already propagate for this).
+# empty verdict falls into the `*)` arm below, which — since #2132 — records `needsreview-<PR>-<head>`
+# rather than authorising a fixer, but would still spend one of the bounded MAX_REVIEW_TRIES re-reviews
+# per REFUSAL even though no review was attempted. So: no marker at all, the harness's own
+# AGENT_LOAD_REFUSED code, and the controller re-dispatches when the box quietens (75 is what
+# adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
-  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO needsfix marker; re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
+  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
 fi
-LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
+# ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
+# pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an
+# EMPTY `LAST` — the round-7 tolerance in `verdict_class` was unreachable, the fixer was withheld, up to
+# MAX_REVIEW_TRIES paid re-reviews were spent, and the head was parked. A classifier tolerance that the
+# producer can never deliver is an inert guard; the suite pinned only the helper, so it stayed green.
+# (Both halves are pinned now: this expression is driven by the suite against every accepted form.)
+LAST="$(grep -aE '^(CLEAN|ISSUES)([[:space:]]|:|-)' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 
-# ── the reviewer's verdict, and what it authorises ────────────────────────────────────────────────
-# ⛔ PORTED IN from the tortoise fork (tortoise#8468 follow-up; agent-infra#1741/#8602). Classify the
-# reviewer's FINAL message. A FUNCTION rather than an inline `case` so the self-test EXECUTES the
-# shipped rule: a grep for its text stays green when an arm is deleted or reworded (the #8469 review
-# P2 lesson; the same reasoning applied to `p0_merge_priority_override`, which this tree does NOT ship
-# — main's unconditional drain rule superseded it, so it is named here as a precedent, not as code).
-# `none` means there was NO verdict — the reviewer timed out, crashed, or was killed at
-# $REVIEW_TIMEOUT. It is NOT "the reviewer found issues", and the two must never share a caller arm:
-# that conflation is what turned a stall into a false park (measured: 43 of 124 reviewer runs ended
-# at the cap; 7 of 7 cap-hits in one window were verdict-less and 4 of them were then parked
-# "needs a human" with the reviewer's findings never addressed).
-verdict_kind() {
+# ── the VERDICT → STATE mapping (agent-infra#2132) ────────────────────────────────────────────
+# ONE place decides which state a reviewer's final line leaves a head in, because the CONTROLLER
+# acts on the state and on nothing else:
+#   ISSUES     -> needsfix-<PR>-<head>      findings exist, so a FIXER is the remedy
+#   NO-VERDICT -> needsreview-<PR>-<head>   nothing was reviewed, so the remedy is another REVIEW
+# ⛔ THESE ARE NOT THE SAME REMEDY, AND CONFLATING THEM IS THE LOOP #2132 NAMES. The reviewer cap is
+# measured, not hypothetical — the no-search bound above records 43 of 124 reviewer runs ending at
+# the cap with no verdict. The single `*)` arm this replaces wrote the FIXER marker for every one of
+# those, so the controller spent a MAX_FIX_TRIES attempt on a head nobody had reviewed: the fixer
+# pushed, the push invalidated the signed review by design, the gate stayed red, the next cycle did
+# it again — and the PR was finally parked "needs a human" having never converged, with the gate's
+# `FAILED:ai-review-gate` indistinguishable from a genuine rejection. A fixer cannot act on findings
+# that do not exist; only another review can.
+verdict_class() {
+  local n
   case "${1:-}" in
-    CLEAN*)  echo clean ;;
-    ISSUES*) echo issues ;;
-    *)       echo none ;;
+    CLEAN*)  printf 'CLEAN' ;;
+    # ⛔ THE COUNT IS PART OF THE VERDICT (review round 3, P3). "ISSUES" alone does not mean findings
+    # exist — `ISSUES 0` says the reviewer found NONE, and a bare prefix match turned that into a fixer
+    # authorisation, spending a MAX_FIX_TRIES attempt on a head with nothing to fix.
+    # ⛔ AND IT IS PARSED WITHOUT WORD SPLITTING (review round 4, P3). `set -- $n` is unquoted, so the
+    # count was GLOB-EXPANDED against merge-one's cwd (the repo): a final line of `ISSUES *` became the
+    # repo's first top-level entry, and a repo carrying a top-level all-digit name then yielded class
+    # ISSUES with no count — the very authorisation this function exists to refuse. Strip the leading
+    # blanks with parameter expansion and keep the leading digit run; no splitting, no globbing, and a
+    # 10-digit bound keeps the value away from `-ge` (which errs FALSE on bash 3.2).
+    ISSUES*)
+      n="${1#ISSUES}"
+      while :; do case "$n" in ' '*|'	'*) n="${n#?}" ;; *) break ;; esac; done
+      # ⛔ A SEPARATOR BEFORE THE COUNT IS TOLERATED (review round 7, P3). `ISSUES: 3` / `ISSUES - 3`
+      # are formatting variants of a verdict that DID report findings; treating them as "no verdict"
+      # withheld the fixer and parked the head with a reason telling a human to fix the reviewer's
+      # budget. The class decision is "does a count >= 1 exist", not "does the line match the
+      # prompt's template" — so strip a leading non-digit run. No splitting and no globbing: a bare
+      # `ISSUES *` still has no digit and reads NO-VERDICT.
+      n="${n#"${n%%[0-9]*}"}"
+      n="${n%%[!0-9]*}"
+      case "$n" in ''|*[!0-9]*) printf 'NO-VERDICT' ;; *)
+        if [ "${#n}" -le 9 ] && [ "$n" -ge 1 ]; then printf 'ISSUES'; else printf 'NO-VERDICT'; fi ;;
+      esac ;;
+    *)       printf 'NO-VERDICT' ;;
   esac
-  return 0
 }
 
-# Apply the reviewer's outcome marker. `needsfix-<PR>-<head>` is the ONLY thing that authorises
-# orch-loop.sh to spawn a FIXER at this head, so it is written for a real `ISSUES` verdict and for
-# nothing else. A verdict-less run writes NO marker: with one, a pure stall consumes one of
-# MAX_FIX_TRIES, and three stalls park the PR having never had a review. Echoes the marker path when
-# it wrote one.
-apply_verdict_marker() {
-  local kind="${1:-}" head="${2:-}" m
-  [ "$kind" = "issues" ] || return 0
-  [ -n "$head" ] || return 0
-  m="$O/state/needsfix-$PR-$head"
-  touch "$m" 2>/dev/null && printf '%s' "$m"
+# review_state_record <class> — write the state marker the CONTROLLER acts on, at $HEAD.
+# ⛔ NO-VERDICT IS BOUNDED AND KEYED ON THE HEAD. A reviewer that never returns a verdict must not
+# buy an unbounded succession of PAID reviews (the #1717 class, one input over): MAX_REVIEW_TRIES
+# (default 3) parks the head with a reason that names the truth — nothing was reviewed, so no signed
+# marker can be minted and no fixer can help — and a new push re-arms it. The count is per HEAD, the
+# same shape fixcount uses, so a push never inherits the previous head's attempts.
+review_state_record() {
+  local cls="${1:-}" rc_f="$O/state/reviewcount-$PR" rc_h="" rc_n=0
+  [ -n "${HEAD:-}" ] || return 0
+  # ⛔ ONE MARKER PER PR, NOT PER (PR, HEAD) (review round 1, P2). An older head's stale-evidence
+  # marker is not a fact about THIS head, and nothing swept it: the controller writes one on every red
+  # cycle, so with the per-head name alone the `needsreview-*` population only ever GREW — a counter
+  # that climbs and never falls is the false instrument report.sh's line would publish ("the count of
+  # open PRs stalled on stale evidence stays at 0" could never read 0 again). Prune the PR's other
+  # heads here, where the current state is known, so the marker set always describes NOW.
+  case "$cls" in
+    ISSUES)
+      # ⛔ ONE FINDINGS MARKER PER PR, NOT PER HEAD (review round 7, P3). Nothing deleted an old-head
+      # `needsfix-*`, so a PR that collected findings at five heads kept five markers for its whole
+      # life (inert — both readers are head-keyed — but the docs claim they are replaced, and a state
+      # directory that accumulates is how an operator stops trusting it).
+      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* 2>/dev/null || true
+      # ⛔ AND A FAILED MARKER WRITE IS REPORTED AS WHAT IT IS (kept from main's #8602 port): the
+      # controller decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`), so a marker that
+      # did not land sends the PR to the RE-RECORD arm — a fresh review — and never to a fixer. A log
+      # line claiming "a fixer is authorised" over a missing file would have an operator believe the
+      # findings were handed to a repair lane while the PR sat waiting for another review.
+      if touch "$O/state/needsfix-$PR-$HEAD" 2>/dev/null; then
+        echo "[merge $PR] NEEDS-FIX: the reviewer reported findings at head=$HEAD — a fixer is authorised" >> "$L.log"
+      else
+        echo "[merge $PR] NEEDS-FIX at head=$HEAD but the needsfix MARKER WAS NOT WRITTEN — the controller decides by a FILE TEST, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review" >> "$L.log"
+      fi
+      # ⛔ A USABLE VERDICT RESETS THE VERDICT-LESS COUNTER (review round 10, P2). The counter bounds
+      # CONSECUTIVE runs that produced no verdict; a reviewer that DID produce one — here, findings —
+      # restarts the count. Without this, N-1 timeouts before a findings verdict still parked the head
+      # on the next timeout, with a reason claiming "a fixer has no findings to act on" at a head that
+      # HAD findings (and, after a verified CLEAN, claiming nothing was reviewed at all).
+      rm -f "$O/state/reviewcount-$PR" 2>/dev/null || true
+      return 0 ;;
+    NO-VERDICT)
+      # ⛔ A VERDICT-LESS RUN DOES NOT SUPERSEDE A FINDINGS VERDICT AT THE SAME HEAD (review round 6,
+      # P3). Nothing was pushed, so a run that produced no verdict carries no information about the
+      # head — yet this branch used to DELETE `needsfix-<PR>-<head>` and then park with a reason saying
+      # "nothing was reviewed at this head", which is false for a PR a reviewer had already reported
+      # findings on. Keep NEEDS-FIX (a fixer is still the remedy), spend no re-review budget, and
+      # leave exactly one state for the PR.
+      if [ -f "$O/state/needsfix-$PR-$HEAD" ]; then
+        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+        echo "[merge $PR] no usable verdict at head=$HEAD, but FINDINGS are already recorded here — keeping NEEDS-FIX (a fixer is still the remedy); no re-review budget consumed" >> "$L.log"
+        return 0
+      fi
+      MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
+      is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
+      if [ -f "$rc_f" ]; then read -r rc_h rc_n < "$rc_f" 2>/dev/null || true; fi
+      # is_limit, not is_num (the same reason rail_attempt gives): the value feeds `-ge` and `$(( + 1 ))`.
+      is_limit "${rc_n:-}" || rc_n=0
+      [ "${rc_h:-}" = "$HEAD" ] || rc_n=0
+      rc_n=$(( rc_n + 1 ))
+      printf '%s %s\n' "$HEAD" "$rc_n" > "$rc_f" 2>/dev/null || true
+      # ⛔ PRUNE EVERY BRANCH, NOT JUST THE WRITE BRANCH (review round 5, P2). The park branch below
+      # removed only the marker AT the parked head, so a superseded marker at another head survived and
+      # satisfied neither of report.sh's attributions (its head ≠ parked-<PR>, so it was not read as
+      # "parked", while the PR was ALSO counted by the `parked (needs a human)` line) — one PR in two
+      # queues with two different remedies, the round-3/4 defect one branch over.
+      # ⛔ AND THE OTHER HEADS' FINDINGS MARKERS GO WITH IT (review round 9): the same-head marker was
+      # already excluded by the early return above, so only INERT old-head ones remain — leaving them is
+      # the growth the sibling markers no longer have, and it makes "replaced at a new head" false.
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true
+      if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
+        # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
+        # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
+        # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
+        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
+        return 0
+      fi
+      touch "$O/state/needsreview-$PR-$HEAD" 2>/dev/null || echo "[merge $PR] NEEDS-REVIEW at head=$HEAD but the needsreview MARKER WAS NOT WRITTEN — the controller will read this head as NEEDS-REVIEW by ABSENCE (fail-closed), so the remedy is unchanged; report.sh's stale-evidence count will under-count it" >> "$L.log"
+      echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD (${rc_n}/${MAX_REVIEW_TRIES}) — the remedy is another REVIEW; no fixer is authorised" >> "$L.log"
+      return 0 ;;
+  esac
+}
+
+# review_state_clear — the head now carries VERIFIED, signed evidence, so it is no longer in
+# stale-evidence state. ⛔ CALL IT ONLY AFTER THE MARKER VERIFIED, never after a bare rc=0 (#2132
+# review round 1): `record-review.sh` returning 0 is not evidence — the arm below proves the signed
+# marker is in the body before this runs, and the suite pins that ORDER (a clear placed above the
+# `marker_ok` guard would let a failed record read as a satisfied head).
+review_state_clear() {
+  [ -n "${HEAD:-}" ] || return 0
+  # ⛔ AND IT CLEARS THE FINDINGS STATE AT THAT HEAD TOO (review round 6, P2). A CLEAN verdict with a
+  # verified marker is the LATEST verdict at this head, so a `needsfix-<PR>-<head>` left by an earlier
+  # ISSUES run at the SAME head is false — and `review_gate_state()` reads only that marker, so keeping
+  # it authorised a fixer for a head whose reviewer had just said CLEAN (reachable whenever the first
+  # fixer spawn was blocked by slots/load and the re-record came back CLEAN).
+  # ⛔ AND THE SPEND RECORD GOES WITH IT (review round 7, P2). `fixspend-<PR>-<head>` exists for ONE
+  # purpose: to authorise `refund_bailed_fixer` to restore the findings state at that head. Once the
+  # clear declares that state superseded, keeping the spend record lets a later bail at the same head
+  # MINT a `needsfix` marker at a head with a signed CLEAN marker — the exact fixer-without-findings
+  # failure this issue exists to close, one round trip later.
+  # ⛔ AND THE VERDICT-LESS COUNTER, BECAUSE THAT RUN WAS NOT VERDICT-LESS (review round 10, P2).
+  # `reviewcount-<PR>` bounds CONSECUTIVE runs that produced no usable verdict; this one produced one
+  # (the signed marker just verified), so it restarts. Keeping it parked a head on the next timeout
+  # after two earlier timeouts, with a reason claiming nothing had been reviewed at a head whose
+  # review had in fact completed — a park (a human) bought by a run that never failed.
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" 2>/dev/null || true
+  echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }
 
@@ -886,6 +1006,11 @@ case "$LAST" in
       park "record-review.sh returned rc=0, but the signed marker ai-review-gate reads is not verifiably there: $marker_why — $marker_how"
       echo "[merge $PR] ABORT: rc=0 but $marker_why" >> "$L.log"; exit 3
     fi
+    # The head now carries VERIFIED, signed evidence (the guard above proved the marker is in the
+    # body and that its signature verifies), so the controller's stale-evidence state for it is no
+    # longer true — and report.sh counts exactly those (agent-infra#2132). This call MUST stay BELOW
+    # the guard: a clear above it would let a bare rc=0 read as a satisfied head.
+    review_state_clear
     # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
     # This repo's merge authority is its rail, which is WHY we dropped out of the rail branch to
     # mint the evidence: polling `$REVIEW_GATE` here would wait 15 minutes for a check that does
@@ -945,26 +1070,14 @@ for c in rows:
     fi
     ;;
   *)
-    # The reviewer found real issues, OR the reviewer produced no verdict at all — and those two must
-    # NOT authorise the same thing (agent-infra#8602, ported IN from the tortoise fork). The marker is
-    # written only for a real `ISSUES`; a stall/crash/timeout writes none, so it does not consume a
-    # MAX_FIX_TRIES attempt and cannot park a PR that was never actually reviewed.
-    KIND="$(verdict_kind "$LAST")"
-    if [ "$KIND" = "issues" ]; then
-      MARK="$(apply_verdict_marker "$KIND" "${HEAD:-}")"
-      # ⛔ THE FALLBACK TEXT NAMES WHAT ACTUALLY HAPPENS WHEN THE MARKER IS MISSING (review P2,
-      # cycle 3). It said "fixer still authorised by the verdict, not by the marker" — which is not how
-      # the loop works: `orch-loop.sh` decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`),
-      # so a missing marker sends the PR to the RE-RECORD arm (a fresh review), never to a fixer. The
-      # old wording would have an operator believe the findings were handed to a repair lane while the
-      # PR actually sat waiting for another review.
-      # ⛔ NO APOSTROPHE INSIDE `${VAR:-(word)}` — THE WORD IS RE-PARSED (caught by the suite, cycle 5).
-      # A literal `'` there opens a single-quote that never closes and the whole file stops parsing; the
-      # previous `\047` avoided that but rendered literally in the log. Reworded instead of escaped.
-      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
-    else
-      echo "[merge $PR] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect" >> "$L.log"
-    fi
+    # ⛔ TWO DIFFERENT REMEDIES LIVE HERE, and the reviewer's final line is the only thing that
+    # separates them (agent-infra#2132). `ISSUES <n>` means findings exist at this head → a FIXER.
+    # An EMPTY or unparseable verdict means the reviewer produced NOTHING (cap hit, kill, empty final
+    # message) → there is nothing to fix and the only remedy is another REVIEW. The pre-#2132 arm
+    # wrote the FIXER marker unconditionally, so every no-verdict run burned a MAX_FIX_TRIES attempt
+    # on an unreviewed head and the PR could never converge.
+    echo "[merge $PR] NOT CLEAN or no verdict at head=$HEAD (class=$(verdict_class "$LAST"))" >> "$L.log"
+    review_state_record "$(verdict_class "$LAST")"
     ;;
 esac
 echo "[merge $PR] end $(date)" >> "$L.log"
