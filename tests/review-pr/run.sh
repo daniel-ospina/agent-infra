@@ -1561,16 +1561,18 @@ echo
 # heading-per-severity SUMMARY counter-direction, and the scanner-failure arm (§Q is by far the
 # largest section, and the scanner arm is the only tripwire on the exit-10 fail-open).
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
-# `ck` runs AFTER this comparison, so on a fully green run PASS is 430 here and the RESULT line then
-# prints 431. A floor equal to the printed total could never pass — a permanently red tripwire is
+# `ck` runs AFTER this comparison, so on a fully green run PASS is 447 here and the RESULT line then
+# prints 448. A floor equal to the printed total could never pass — a permanently red tripwire is
 # worse than none.
 # ⛔ THE MARGIN WAS 49 ASSERTIONS AND IS NOW 1 (P3, fresh review of #2288): at 374 against 423, deleting
 # §AH + §AL (48 assertions) still left 375 >= 374 and the suite reported green — the exact
 # "a whole section was deleted and the suite still said ALL PASSED" failure the pin exists for. Re-set
-# from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim.
+# from a MEASURED total whenever sections are added; it is a tripwire, not a coverage claim. It was
+# re-set to 447 when §ROUND 9 added 17 assertions, for the same reason: a pin with slack lets that
+# section be deleted silently.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 430 ]; ck $? "assertion-count pin: >= 430 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 447 ]; ck $? "assertion-count pin: >= 447 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
