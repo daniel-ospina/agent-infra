@@ -179,6 +179,11 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
+# Repos whose open-PR gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
+# each. A SKIPPED repo is not a failed CLASS: its own checkouts are untouched (fail closed) while the
+# other repos in the same class are still reclaimed. Reported per repo so a single unverifiable repo
+# cannot hide what the pass did do, and cannot disable the repos it could not reach (#2443).
+SKIPPED_WT=""; SKIPPED_WT_N=0
 # Set when a class could not be set up AT ALL (delegate absent, no repo to scan). That is one of the
 # things exit 3 means; a delegate that RAN and DEFERRED is 6, and one that ran and failed closed is
 # also 3 but with a per-class verdict, not `misconfigured`. Keeping the two apart is the whole point
@@ -319,6 +324,10 @@ print_status() {
     say "verdict_uv=$(status_field verdict_uv)"
     say "verdict_venv=$(status_field verdict_venv)"
     say "verdict_worktree=$(status_field verdict_worktree)"
+    # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
+    # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
+    # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
+    say "skipped_worktree=$(status_field skipped_worktree)"
     # `classes=` and `repos=` were WRITTEN every pass and read by nobody, so "which sinks and which
     # checkouts did the last pass actually cover" — the first question after a bring-up changes
     # DISK_REAPER_REPOS — had no answer on any surface. The record is this feature's verdict channel,
@@ -1026,7 +1035,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE=""
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1051,6 +1060,23 @@ reap_worktree() {
         fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
+        # ⛔ A REPO THE OPEN-PR GATE CANNOT VERIFY IS SKIPPED BY NAME — never the whole class, and never
+        # a silent absence. The delegate fails closed for ONE repo (its checkouts untouched, which is
+        # the safety property and it is NOT weakened here); this ledger says WHICH repo and WHY, so the
+        # operator can fix the cause instead of reading `verdict=fail-closed` with no subject. Measured
+        # 2026-10-23 on a cell at 95% used: gh present and working but not authenticated under the
+        # pass's HOME -> both repos aborted -> `freed_df=0MB`, reported as "gh unavailable" (#2443).
+        # ⛔ THE REASON IS EVERYTHING AFTER `reason=`, not the token after `skipped=`: a repo path may
+        # contain a space (a checkout under `~/My Projects/…`), and anchoring on the path would then
+        # match nothing — silently turning a named skip back into an anonymous fail-closed class.
+        # `tr -d '[:space:]'` keeps a malformed/split token from becoming half a reason; the delegate
+        # emits space-free tokens, so this only ever removes trailing whitespace in practice (#2443 P1).
+        _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
+        if [ -n "$_skip" ]; then
+            SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
+            SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
+            say "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
+        fi
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.
         if [ "$rc" -gt 0 ]; then
@@ -1060,6 +1086,22 @@ reap_worktree() {
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
+    # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS
+    # than a clean class, so its verdict stays fail-closed (3) — skipping is not a pass — but the line
+    # names how much of the class DID run, which is what makes the difference actionable.
+    SKIP_NOTE=""
+    [ "$SKIPPED_WT_N" -gt 0 ] && SKIP_NOTE=" skipped=$SKIPPED_WT_N ($SKIPPED_WT)"
+    # ⛔ NOT MISCONFIG. That field is "a class that could not be SET UP at all" and is rendered as
+    # `cannot run: …` — the opposite of what happened here: the class RAN and reclaimed the repos it
+    # could verify. Adding it made `detail=` carry two contradictory causes, one of them false, on a
+    # record an operator reads to decide what to fix. `NOTE_WT` names the cause; the exit code and
+    # `verdict_worktree=fail-closed` already carry the red (#2443 review P2).
+    if [ "$SKIPPED_WT_N" -gt 0 ]; then
+        case "; $NOTE_WT;" in
+            *"; open-PR gate unverifiable;"*) : ;;
+            *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }open-PR gate unverifiable" ;;
+        esac
+    fi
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # The owner deliberately reports NO byte figure: whether its `.venv`s share cache blocks is a
     # PER-MACHINE property (#1851 — the old universal "84 GB du delta vs 22 GB freed" mechanism was
@@ -1100,12 +1142,12 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB${SKIP_NOTE}"
     else
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta)"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta)${SKIP_NOTE}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)${SKIP_NOTE}"
         fi
     fi
     return 0
@@ -1214,6 +1256,9 @@ UTMP="$STATUS.tmp.$$"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"
+    # empty=no repo was skipped; otherwise `<repo>[<reason>], ...` — the subject the class verdict
+    # never had (#2443).
+    printf 'skipped_worktree=%s\n' "$SKIPPED_WT"
     printf 'repos=%s\n' "$(printf '%s' "$REPOS" | tr '\n' ',')"
     printf 'detail=%s\n' "$DETAIL"
 } >"$UTMP" 2>/dev/null && mv -f "$UTMP" "$STATUS" 2>/dev/null \

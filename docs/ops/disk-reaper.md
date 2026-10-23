@@ -84,7 +84,37 @@ A live holder is **never** selected. The witnesses are mechanical and fail close
 A probe that cannot be evaluated is a refusal (`exit 3` **from the owner**), not a pass. Through the
 entry point that refusal arrives as exit **6** with `ok=0` in the pass record and
 `verdict=<class>=refused` — the unit stays green because the box is busy, and the RECORD is what
-alarms (see **Exit codes** below). The worktree owner additionally requires the checkout to be
+alarms (see **Exit codes** below).
+
+**The open-PR probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
+that store is per-`HOME` (`$HOME/.config/gh`, or `GH_TOKEN`); the installed unit renders
+`Environment=HOME={{HOME}}`, so the unit's own `HOME` decides whether the class can run at all. When
+the probe cannot answer, only the repo it could not answer FOR is skipped: its checkouts are left
+untouched (a checkout whose PR state is unknown is never removed) while the other repos in the same
+pass are still reclaimed. The skip is named twice — `skipped=<repo> reason=<why>` on the class output
+and `skipped_worktree=` in the pass record — and the class verdict stays **fail-closed (3)**: skipping
+a repo is not a pass. `reason=` says which thing failed, because the remedies differ:
+
+| `reason=` | what it means |
+|---|---|
+| `gh-not-authenticated(rc=4)` | `gh` is installed and working but has no credentials for this pass's `HOME`. The remedy is the unit's `HOME` (or `GH_TOKEN`), **not** an install |
+| `gh-missing(rc=127)` | `gh` is not executable for the pass (`GH_BIN`) |
+| `gh-timeout(rc=124)` | `gh` did not answer within `REAP_WT_GH_TIMEOUT` |
+| `gh-error(rc=N)` | the query failed for another reason; the pass log carries `gh`'s own message |
+| `origin-probe-failed(rc=N)` | the repo's `origin` remote could not be read — a git problem, never an auth one |
+| `origin-probe-timeout(rc=124)` | the bounded `git remote get-url origin` did not answer in `REAP_WT_GIT_TIMEOUT` |
+| `git-missing(rc=127)` | `git` is not executable for the pass (`GIT_BIN`) |
+| `scratch-unwritable` | the probe could not create its one scratch file (the path is named in the line above it) |
+
+A token never contains a space, so a repo path or a `TMPDIR` with a space in it cannot split the line
+and turn a named skip back into an anonymous class-wide verdict.
+
+`install-disk-reaper-timer.sh` names this prerequisite **at install time** (a warning, not a refusal:
+a box without working `gh` still wants its `uv` and `venv` classes). A unit installed with a `HOME`
+that cannot authenticate `gh` otherwise goes red every hour while nothing is reclaimed, and the red
+names a cause nobody can act on.
+
+The worktree owner additionally requires the checkout to be
 **clean** (uncommitted work is never destroyed), **reachable** (its commits survive the checkout's
 deletion), and not an open-PR head.
 
@@ -217,8 +247,15 @@ mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
+skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
 ```
+
+`skipped_worktree=` is empty on a pass where every repo could be verified; otherwise it lists
+`<repo>[<reason>], …` — the subject the class verdict never had, so "the worktree class is red" is
+answerable as "one repo, because `gh` has no credentials here" (#2443). It is also printed by
+`disk-reaper.sh --print-status`, which is the surface `cloud-cell-supervisor.sh` reads: a field the
+reader does not print does not exist.
 
 `rc=6` with `detail=… exited 7` is a **deferral**: `pi-cache-reap.sh` ran, found a live `uv` holding
 the cache, declined to act and claimed nothing. The condition is recorded (`ok=0`,
