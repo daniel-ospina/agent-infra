@@ -330,20 +330,35 @@ case "$PASS_MODE" in pin|sync) ;; *) err "HARNESS_APPLY_MODE must be pin|sync (g
 # exiting non-zero, so a plain capture reads an unresolvable ref as a resolved one.
 resolve() { git -C "$REPO" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null; }
 
-[ -n "$REPO" ] && [ -d "$REPO" ] || { REC_DETAIL="no checkout resolved (set HARNESS_REPO)"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
-git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { REC_DETAIL="$REPO is not a git checkout"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
+# ⛔ EVERY PRE-FLOW REFUSAL NAMES ITS ACTION. These four wrote `action=none` beside `ok=0 rc=23`, and
+# `none` is the vocabulary's NO-OP SUCCESS — one field carrying two meanings again, in the record the
+# fleet instrument prints.
+[ -n "$REPO" ] && [ -d "$REPO" ] || { REC_ACTION=no-checkout; REC_DETAIL="no checkout resolved (set HARNESS_REPO)"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { REC_ACTION=no-checkout; REC_DETAIL="$REPO is not a git checkout"; write_record 0 23; err "$REC_DETAIL"; exit 23; }
 
 FETCH_STATE="notfetched"
 if [ "$FETCH" = 1 ]; then
-    if git -C "$REPO" fetch --quiet origin main >/dev/null 2>&1; then FETCH_STATE=ok; else FETCH_STATE=failed; fi
+    # ⛔ FETCH THE BRANCH BEING COMPARED, not a hardcoded `main`. `$REF` is a seam rendered into both
+    # artifacts; fetching `main` while comparing `origin/<other>` refreshed a ref this pass never used,
+    # reported `fetch=ok`, and both readers greened a comparison that was never updated — the exact
+    # stale-comparison shape predicate 0 exists to delete.
+    case "$REF" in
+        origin/*) _fetch_ref="${REF#origin/}" ;;
+        *)        _fetch_ref="" ;;
+    esac
+    if [ -n "$_fetch_ref" ]; then
+        git -C "$REPO" fetch --quiet origin "$_fetch_ref" >/dev/null 2>&1 && FETCH_STATE=ok || FETCH_STATE=failed
+    else
+        git -C "$REPO" fetch --quiet origin >/dev/null 2>&1 && FETCH_STATE=ok || FETCH_STATE=failed
+    fi
 fi
 REF_SHA="$(resolve "$REF")"
 [ -n "$REF_SHA" ] || {
-    REC_REF="unresolved"; REC_DETAIL="cannot resolve $REF in $REPO (fetch=$FETCH_STATE) — cannot-verify is not a pass"
+    REC_ACTION=unresolvable-ref; REC_REF="unresolved"; REC_DETAIL="cannot resolve $REF in $REPO (fetch=$FETCH_STATE) — cannot-verify is not a pass"
     write_record 0 23; err "$REC_DETAIL"; exit 23; }
 HEAD_SHA="$(git -C "$REPO" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
 [ -n "$HEAD_SHA" ] || {
-    REC_REF="$(short "$REF_SHA")"; REC_DETAIL="cannot resolve HEAD in $REPO — cannot-verify is not a pass"
+    REC_ACTION=unresolvable-head; REC_REF="$(short "$REF_SHA")"; REC_DETAIL="cannot resolve HEAD in $REPO — cannot-verify is not a pass"
     write_record 0 23; err "$REC_DETAIL"; exit 23; }
 
 # The relation, by ANCESTRY — never by a count (see the header). The counts are printed, and the
@@ -404,6 +419,18 @@ list_dirty_paths() { # stdout: one path per NUL; a rename/copy yields BOTH sides
                     continue ;;
             esac
             [ -n "$p" ] && printf '%s\0' "$p"
+        done
+    }
+}
+list_rename_dests() { # stdout: the DESTINATION of every rename/copy record, one per NUL
+    local entry st p
+    git -C "$REPO" status --porcelain -z 2>/dev/null | {
+        while IFS= read -r -d '' entry; do
+            st="${entry:0:2}"
+            p="${entry:3}"
+            case "$st" in
+                R*|C*) IFS= read -r -d '' _old || true; printf '%s\0' "$p" ;;
+            esac
         done
     }
 }
@@ -482,7 +509,11 @@ recompute_deployed() {
     case "${REC_DIRTY:-}" in ''|*[!0-9]*) REC_DIRTY=unknown ;; esac
 }
 
-say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") ref_sha=$(short "$REF_SHA") relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
+# ⛔ TWO RELATIONS, BOTH NAMED. `$RELATION`/`$BEHIND` describe the CHECKOUT; the record's `behind` is
+# measured from the DEPLOYED commit. Printing only the checkout's made the log say `behind=1` on a box
+# whose record (correctly) said `behind=0` — two numbers for one box in one pass, and the log's was the
+# one an operator is told to trust.
+say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     say "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
@@ -603,10 +634,20 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         _info="$(git -C "$REPO" ls-tree HEAD -- "$p" 2>/dev/null)"
         read -r mode _type sha _rest <<<"$_info"
         if [ -z "${mode:-}" ] || [ -z "${sha:-}" ]; then
-            # NOT IN HEAD: a staged addition (or a file this pass is not the owner of). Unstage it if the
-            # index knows it, so the merge is not blocked by a change whose bytes are in the patch. The
-            # FILE is left in the worktree — it was copied as untracked above when it was untracked, and
-            # a staged addition's bytes are in `changes.patch`.
+            # NOT IN HEAD: a staged addition, or the DESTINATION of a rename.
+            # ⛔ A RENAME DESTINATION MUST LEAVE THE WORKTREE, or the tree never converges: its SOURCE is
+            # restored from HEAD, so the destination becomes an UNTRACKED file that (a) makes
+            # `git status` dirty for ever, and (b) BLOCKS the next merge the moment upstream adds that
+            # path ("untracked working tree files would be overwritten") — which then re-preserves the
+            # whole dirty set into a fresh directory every tick. Measured in review. Its bytes are in
+            # `changes.patch` and it is copied into `untracked/` first, so nothing is lost.
+            # A plain staged ADDITION is different: the file may be the only copy a lane has, so it stays
+            # in the worktree (its bytes are in the patch, and it is reported as dirty in the record).
+            if printf '%s\0' "$(list_rename_dests)" | tr '\0' '\n' | grep -qxF -- "$p"; then
+                mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || true
+                cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || true
+                rm -f "$REPO/$p" 2>/dev/null || true
+            fi
             git -C "$REPO" update-index --force-remove -- "$p" >/dev/null 2>&1 || true
             n_skipped=$((n_skipped + 1))
             continue
@@ -682,10 +723,6 @@ fi
 
 if [ "$PASS_MODE" = pin ]; then
     MATERIALISER="${HARNESS_MATERIALISER:-$REPO/scripts/cloud-cell-supervisor.sh}"
-    if [ ! -f "$MATERIALISER" ]; then
-        REC_ACTION=unmaterialisable
-        finish 0 25 "behind=$BEHIND but no materialiser at $MATERIALISER — this box has no way to advance its own pin (set HARNESS_MATERIALISER)"
-    fi
     # ⛔ THE ADVANCE DECISION IS ABOUT THE **DEPLOYED** COMMIT, NOT THE CHECKOUT. A pin advance never
     # moves the checkout, so `RELATION` (computed from HEAD) is `behind` on every tick for ever once
     # main passes it — and `apply --pin-only` exits 0 when the pin already names the tip. Deciding on
@@ -702,6 +739,14 @@ if [ "$PASS_MODE" = pin ]; then
         # has never been created) and the checkout IS the deployment: nothing to do.
         REC_ACTION=none
     else
+        # ⛔ THE MATERIALISER IS REQUIRED ONLY TO ADVANCE. Checking for it ABOVE the converged test made a
+        # healthy, up-to-date box record rc=25 ("no way to advance its own pin") beside `behind=0` — a RED
+        # unit every ten minutes, `CELL READY` refused, and the documented no-op cadence unreachable in
+        # pin mode unless the test happened to hand it a stub (measured in review).
+        if [ ! -f "$MATERIALISER" ]; then
+            REC_ACTION=unmaterialisable
+            finish 0 25 "this box has no materialiser at $MATERIALISER, so the pin cannot be advanced to $(short "$REF_SHA") (set HARNESS_MATERIALISER)"
+        fi
         BEFORE_PIN_TREE="$PIN_TREE_SHA"
         # ⛔ `--force --pin-only`, ALWAYS — BOTH FLAGS, AND FOR DIFFERENT REASONS.
         #   `--pin-only` because a SCHEDULER MUST NOT SEED $O. A plain `apply` runs `seed_and_stamp`,
@@ -753,16 +798,17 @@ else
     # sync path — the checkout's OWN verb (fetch + ff-only + config refresh + launchd), never a
     # second implementation of it.
     SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$REPO/sync.sh}"
-    [ -x "$SYNC_CMD" ] || [ -f "$SYNC_CMD" ] || {
-        REC_ACTION=no-sync-verb
-        finish 0 25 "behind=$BEHIND but there is no sync verb at $SYNC_CMD — this box has no way to advance its checkout"
-    }
     if [ "$RELATION" = current ]; then
         REC_ACTION=none
     else
         # The checkout is handed to the verb as $1: `./sync.sh` ignores arguments (it cds to its own
         # dir), and a configured verb that needs to know which tree it is syncing gets the answer
         # rather than having to guess it from its cwd. One seam, both shapes.
+        # ⛔ THE SYNC VERB IS REQUIRED ONLY TO ADVANCE (see the materialiser note above).
+        if [ ! -e "$SYNC_CMD" ]; then
+            REC_ACTION=no-sync-verb
+            finish 0 25 "this box has no sync verb at $SYNC_CMD, so the checkout cannot be advanced to $(short "$REF_SHA")"
+        fi
         OUT="$(bash "$SYNC_CMD" "$REPO" 2>&1)"; ACT_RC=$?
         printf '%s\n' "$OUT" | sed 's/^/  /'
         # ⛔ THE SYNC'S EXIT IS NOT THE ONLY FACT. `sync.sh` exits 0 when the checkout is not on main
