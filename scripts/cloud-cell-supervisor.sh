@@ -541,6 +541,47 @@ _pids_minus() { # <seen> <owned>
   comm -23 <(printf '%s\n' "$1" | awk 'NF' | sort -u) <(printf '%s\n' "$2" | awk 'NF' | sort -u)
 }
 _pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
+
+# ── the controller SERVICE (agent-infra#2402) ───────────────────────────────────────────────────
+# A cell's controller used to live and die as a tmux session, with nothing above it: when the last
+# session closed the server exited and no surface restarted the controller, so an empty box lost its
+# dispatcher and read as a healthy idle cell (measured 2026-10-23 on cell-1).
+# `install-controller-service.sh` installs `eldato-orchestrator.service` (Restart=always) whose ExecStart
+# is `cloud-cell-supervisor.sh start` with ORCH_FOREGROUND=1 — so `start` `exec`s the loop in this very
+# process instead of creating a session, and systemd's cgroup owns the controller's lifetime.
+# ⛔ THESE HELPERS EXIST BECAUSE THE OTHER VERBS MUST COOPERATE WITH THAT, and both directions are
+# false-pass shapes if they do not: a `stop` that only kills the pid is undone by Restart=always within
+# RestartSec ("stopped" over a dispatcher that is back seconds later), and a `start` that launches a
+# tmux session beside an ENABLED unit is two dispatchers on one queue (#1761).
+CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
+# The scopes the unit may live in, in the order install-controller-service.sh tries them (system first:
+# that is the cell's shape, because the cells have passwordless sudo and no queryable user manager).
+# A unit file's PRESENCE answers "is this box service-managed?"; whether it is ENABLED is a second
+# question, and only "enabled" means the manager will bring the controller back.
+controller_unit_path() {
+  local d
+  for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
+           "${CONTROLLER_USER_UNIT_DIR:-$HOME/.config/systemd/user}"; do
+    [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && { printf '%s\n' "$d/$CONTROLLER_UNIT"; return 0; }
+  done
+  return 1
+}
+# The scope is decided by WHERE the unit lives, never by $EUID: the cell's unit is a SYSTEM unit owned by
+# the operator's sudo, while the controller runs as the operator. SYSTEMCTL is the test seam (a shim),
+# exactly as install-disk-reaper-timer.sh spells it.
+sup_systemctl() { # <systemctl verb…>
+  local sc
+  if [ -n "${SYSTEMCTL:-}" ]; then sc="$SYSTEMCTL"
+  elif [ -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then sc="sudo -n systemctl"
+  else sc="systemctl --user"
+  fi
+  # shellcheck disable=SC2086  # deliberate word splitting: $sc may be "sudo -n systemctl"
+  $sc "$@"
+}
+controller_unit_enabled() { sup_systemctl is-enabled --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
+controller_unit_active()  { sup_systemctl is-active  --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
+
+
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
 # (`git -C $REPO remote get-url origin` → https://github.com/daniel-ospina/agent-infra.git) while the
@@ -1835,6 +1876,30 @@ cmd_start() {
     # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
     die "a controller runs from this machine's shared harness path (pid $(_pids_join "$live")) and is not provably this state dir's — refusing to start a second controller; it is left alone. Give this repo its own SESSION in $ENV_FILE, or stop it from the state dir that owns it"
   fi
+  # ── a box whose controller is a SERVICE is started BY the service manager (agent-infra#2402) ────
+  # Reaching this line means nothing of this cell's is running (every branch above returned or died), so
+  # an ENABLED unit means the controller is DOWN. Launching a tmux controller here would put a second
+  # dispatcher on this queue the moment the unit's `Restart=always` fires — the #1761 duplicate, produced
+  # by the fix for #2402. An INSTALLED-but-NOT-enabled unit deliberately falls through to the tmux path:
+  # "disabled" is an operator saying this box's controller is not service-managed.
+  # ⛔ NOT in the foreground: that IS the unit's own ExecStart, and delegating from there would ask the
+  # service manager to start the job this process is already running.
+  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && controller_unit_path >/dev/null 2>&1 && controller_unit_enabled; then
+    sup_systemctl start "$CONTROLLER_UNIT" \
+      || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
+    # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.
+    # Reporting success on an is-active alone is the false green this file refuses elsewhere — a unit can
+    # be `active` while its controller died before it took the lock.
+    local waited=0
+    while [ "$waited" -lt "${CONTROLLER_START_TIMEOUT:-60}" ]; do
+      if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
+      sleep 1; waited=$((waited + 1))
+    done
+    [ -n "$(owned_controller_pids 2>/dev/null)" ] \
+      || die "$CONTROLLER_UNIT is active but no controller of this state dir is running after ${waited}s — read: journalctl -u $CONTROLLER_UNIT -n 40"
+    say "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
+    return 0
+  fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
   # detached worktree, seed, record. A cell therefore cannot be started on a stale or hand-copied
@@ -1981,6 +2046,29 @@ cmd_start() {
   # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # ── SERVICE MODE: this process IS the controller (agent-infra#2402) ──────────────────────────────
+  # ⛔ THERE IS NO SECOND BOUNDARY HERE, SO THERE IS NO SECOND COPY OF THE ENVIRONMENT. The tmux command
+  # string just below exists because a session is served the SERVER's environment, not this shell's —
+  # which is why it re-sources $ENV_FILE and re-sets every value inside the session. In this process
+  # there is no server: `start` already sourced $ENV_FILE at load, cmd_check has just proved the merge
+  # key arrives, and these exports ARE the controller's environment. `exec` (not a child) is what makes
+  # the service manager's cgroup the owner of the controller — and the argv is the SAME
+  # `<bash> $HARNESS/orch-loop.sh` the tmux path runs, so every existing pid/ownership read still works.
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+    mkdir -p "$ROLES_DIR" 2>/dev/null && : > "$ROLES_DIR/.desired" 2>/dev/null || say "warn: could not record the desired running state at $ROLES_DIR/.desired"
+    export HOME="$CELL_HOME" CELL_HOME O REPO OR SCOPE ENV_FILE SESSION
+    export HARNESS_REPO HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_MATERIALISER="${SUP_SELF:-}"
+    # ⛔ THE gh-limit LAYER IS PART OF THE ENVIRONMENT, NOT OF THE TMUX PATH (#1988). The session string
+    # below puts `$O/gh-limit` FIRST on PATH; in service mode there is no session string, so the same
+    # export has to happen HERE or the controller silently loses the gh wrapper — every gh call
+    # unserialised and unbacked-off, on the one box shape this unit creates. `start` has already seeded
+    # it (cmd_check refuses a cell whose layer cannot run), so this only ever prepends a real directory;
+    # the guard keeps a cell that legitimately ships no layer (the "NOT serialised" warning above) from
+    # gaining a PATH entry that does not exist.
+    [ -d "$O/gh-limit" ] && export PATH="$O/gh-limit:$PATH"
+    say "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
+    exec bash "$HARNESS/orch-loop.sh"
+  fi
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
@@ -2055,6 +2143,22 @@ cmd_stop() {
   # doctor, and the loop's own identity record proves it directly.
   rm -f "$ROLES_DIR/.desired" 2>/dev/null || { say "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
   bump_stop_generation || { say "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
+  # ── a SERVICE-MANAGED controller is stopped by its service manager (agent-infra#2402) ─────────
+  # ⛔ THIS IS NOT AN OPTIMISATION. `Restart=always` re-creates the controller within RestartSec of ANY
+  # kill this function performs (the session kill, the pid TERM, the -9 sweep), so a stop that skips the
+  # unit returns success over a dispatcher that is back seconds later — the "reported stopped, still
+  # running" shape this whole verb exists to remove. Done BEFORE the pid logic so the reads below see the
+  # controller already gone instead of racing its restart; an INSTALLED-but-not-written-down unit is
+  # stopped anyway (stopping an inactive unit is a no-op), because the durable state must be "stopped"
+  # whatever the job was doing.
+  local stop_unit=""
+  if controller_unit_path >/dev/null 2>&1; then
+    if sup_systemctl stop "$CONTROLLER_UNIT" 2>/dev/null; then
+      stop_unit="$CONTROLLER_UNIT"
+    else
+      say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
+    fi
+  fi
   # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
   # signals), then the restart child, then the doctor loop, then its pid backstop, then the marker is
   # removed again defensively, and only then the controller. If the marker outlived the loop, a
@@ -2131,7 +2235,10 @@ cmd_stop() {
           rm -f "$LOCK" && say "released a stale lock $LOCK (its owner pid $lp is gone)"
         fi
       fi
-      say "not running"
+      # A stop that went through the SERVICE MANAGER says so: "not running" is true but reads as "there
+      # was nothing to stop", which is the opposite of what happened and hides the unit from the operator
+      # who is about to check that the box stays stopped.
+      if [ -n "$stop_unit" ]; then say "controller stopped (systemd $stop_unit)"; else say "not running"; fi
       # A doctor-loop stop failure recorded above still fails the verb: "not running" is about the
       # CONTROLLER, and this branch used to return 0 over it.
       [ "$rc" -eq 0 ] || return 1
@@ -2215,6 +2322,20 @@ cmd_status() {
     say "controller: STOPPED"
   fi
   [ -z "$foreign" ] || say "also seen:  pid $(_pids_join "$foreign") runs this machine's harness but does not hold $LOCK — another repo's controller; reported, never signalled"
+  # agent-infra#2402: is there anything ABOVE the controller that restarts it? A dead controller and an
+  # idle box print the same `controller: STOPPED` / `lanes: 0`, so "who would restart this" belongs in
+  # this output and not in an operator's memory. Reported, never refused: `status` must stay answerable
+  # on a box that has no service at all — that is exactly the box this line is for.
+  local _svc
+  if _svc="$(controller_unit_path)"; then
+    if controller_unit_active; then
+      say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human"
+    else
+      say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT"
+    fi
+  else
+    say "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
+  fi
   say "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
