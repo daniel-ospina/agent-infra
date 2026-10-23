@@ -13407,8 +13407,80 @@ grep -q "and run 7788" "$SCEN/err" \
   && pass "(d3) …and names the run whose identity could not be parsed" \
   || fail "(d3) the parse arm does not name its run: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
 grep -q "A FAILED READ over a window that WAS listed" "$SCEN/err" \
-  && pass "(d3) …under the "window WAS listed" disclosure (this one is measured)" \
+  && pass "(d3) …under the measured-window disclosure (this one is measured)" \
   || fail "(d3) the parse arm lost the measured-window disclosure"
+
+# (g) THE PRODUCER, NOT A MOCK. (d)/(d2)/(d3) intercept `--main-union-signatures` with
+# a wrapper that writes the report ITSELF, so they prove the RAIL reads a report — not
+# that `collect_union_signatures` writes one. Deleting any of its `write_runs_report`
+# calls would leave every assertion above green while the rail falls to its `*)` arm on
+# a LISTED window: an operator told "nothing was measured" when one log fetch died —
+# the misdiagnosis #2569 exists to end. These cases drive the REAL collector.
+new_scen sigproducerlog
+{
+  main_red_n mainsgl01 9801 2 'tests/test_other.py::test_red_on_main'
+  lane_fail mainsgl01 9805
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-9805"                # the log CANNOT be fetched…
+printf '3\n' > "$SCEN/jobs-count-9805"     # …and the run HAS jobs, so it may hide a failure
+cfs_run --main-union-signatures 10 --repo test-org/test-repo --runs-report "$TMP/sg-log-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g) the REAL signature collector fails closed on an unreadable log (exit $rc)" \
+  || fail "(g) expected a non-zero exit, got 0"
+grep -qx 'unreadable=log:9805' "$TMP/sg-log-rep.txt" 2>/dev/null \
+  && pass "(g) …and IT writes unreadable=log:9805 (not the test harness)" \
+  || fail "(g) the collector did not publish the failed fetch: $(tr '\n' ' ' < "$TMP/sg-log-rep.txt" 2>/dev/null)"
+grep -qx 'tested=3' "$TMP/sg-log-rep.txt" 2>/dev/null \
+  && pass "(g) …with the counters it reached (tested=3)" \
+  || fail "(g) the collector published no counters: $(tr '\n' ' ' < "$TMP/sg-log-rep.txt" 2>/dev/null)"
+
+# (g2)/(g3) THE `parse:` ARMS. `PYTHON_BIN` is resolved from PATH at startup
+# (`ci-failure-set.sh:236`), so a stub that fails ONLY for the sub-command under test
+# drives the two extraction sites without inventing a new seam; everything else
+# `exec`s the real interpreter.
+REAL_PY="$(command -v python3)"
+make_pystub() {  # <dir-name> <sub-command-to-fail>
+  local d="$TMP/$1" sub="$2"
+  mkdir -p "$d"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'for a in "$@"; do [ "$a" = "%s" ] && { echo "simulated parser failure" >&2; exit 1; }; done\n' "$sub"
+    printf 'exec "%s" "$@"\n' "$REAL_PY"
+  } > "$d/python3"
+  chmod +x "$d/python3"
+}
+new_scen sigparseids
+# ONE failing run, whose log DOES fetch: the stub then fails at the id parser, so the
+# label names that run unambiguously.
+{ main_red_n mainspi01 9821 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+make_pystub pystub-ids ids
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" PATH="$TMP/pystub-ids:$PATH" \
+  bash "$CFS" --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/sg-pids-rep.txt" >/dev/null 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g2) a failing ID PARSER fails the signature capture closed (exit $rc)" \
+  || fail "(g2) expected a non-zero exit, got 0"
+grep -qx 'unreadable=parse:9821' "$TMP/sg-pids-rep.txt" 2>/dev/null \
+  && pass "(g2) …and the collector labels it parse:9821 (a parser fault, not a fetch)" \
+  || fail "(g2) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-pids-rep.txt" 2>/dev/null)"
+
+new_scen sigparsesigs
+# Same shape, with the SIGNATURE extractor failing instead of the id parser: the label
+# proves this arm names its run too, not just the arm above.
+{ main_red_n mainsps01 9831 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+make_pystub pystub-sigs signatures
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" PATH="$TMP/pystub-sigs:$PATH" \
+  bash "$CFS" --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/sg-psig-rep.txt" >/dev/null 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g3) a failing SIGNATURE extractor fails the capture closed (exit $rc)" \
+  || fail "(g3) expected a non-zero exit, got 0"
+grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
+  && pass "(g3) …and the collector labels it parse:9831" \
+  || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
 
 
 if [ "$failures" -gt 0 ]; then
