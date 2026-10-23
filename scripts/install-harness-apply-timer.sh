@@ -707,8 +707,20 @@ do_status() {
             # own last trigger answers which. Both platforms are judged, not just launchd.
             case "$TARGET" in
                 launchd)
-                    case "${LAST_RUN:-}" in
-                        ''|-|0|unknown) say "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
+                    # ⛔ THE GRACE IS BOUNDED ON THIS ARM TOO. The head that added the bound put it in the
+                    # systemd branch only, and every member of this arm's "no pass completed" set returned
+                    # 0 — so on the Mac (the platform this feature exists for) an agent loaded for hours
+                    # that had never run a pass still certified `--status` green, while the same state on
+                    # systemd failed. `0` is also removed from the "never ran" set: it means a pass ran and
+                    # wrote no record WHERE THIS BOX LOOKS.
+                    case "$(printf '%s' "${LAST_RUN:-}" | tr -d '[:space:]')" in
+                        ''|-|unknown)
+                            if [ "${_armed_age:-0}" -gt $(( INTERVAL_MIN * 60 * 2 )) ]; then
+                                err "the agent has been armed for ${_armed_age}s (two intervals) and has NEVER run a pass, and no pass record exists — the job is inert, not fresh"
+                                return 1
+                            fi
+                            say "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
+                        0) say "  note=a pass completed with 0 but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
                         *) err "the job last exited ${LAST_RUN} and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
                     esac ;;
                 *)

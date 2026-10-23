@@ -555,10 +555,11 @@ finish() { # <ok> <rc> <verdict-phrase>
 # "auto" while the box aged. That is precisely the defect this feature exists to delete, and the file's
 # own vocabulary already has the answer: 23 cannot-verify. A transient blip costs one red tick and heals
 # on the next; being wrong about drift costs the whole point of the feature.
-if [ "$FETCH_STATE" = failed ]; then
-    REC_ACTION=cannot-verify-fetch
-    finish 0 23 "REFUSED cannot-verify: git fetch from origin failed in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched."
-fi
+case "$FETCH_STATE" in
+    ok) ;;
+    *) REC_ACTION=cannot-verify-fetch
+       finish 0 23 "REFUSED cannot-verify: no fresh fetch was made (fetch=$FETCH_STATE) in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched." ;;
+esac
 
 # ── PREDICATE 1: AHEAD / DIVERGED — refuse before anything is touched ──────────────────────────
 # ⛔ THIS IS THE c4 DEFECT. Its local commits existed in no other place; an advance would have
@@ -580,9 +581,16 @@ fi
 preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save everything
     local dest="$1" p n=0
     mkdir -p "$dest" || { err "cannot create the preservation dir $dest"; return 1; }
-    # The byte-exact record of every tracked change (staged and unstaged), then one line per path.
+    # ⛔ TWO PATCHES, NOT ONE. `git diff HEAD` is WORKTREE-vs-HEAD and never reads the INDEX as a source
+    # of content, so a path whose bytes exist ONLY in the index (`git add new.txt; rm new.txt` ⇒ `AD`)
+    # was in no preserved artifact at all — and the restore then dropped its index entry: measured
+    # content loss recorded as a green `advanced`. `--cached` is that half of the record.
     if ! git -C "$REPO" diff --binary HEAD >"$dest/changes.patch" 2>/dev/null; then
         err "cannot write $dest/changes.patch — refusing to touch a tree whose changes are not saved"
+        return 1
+    fi
+    if ! git -C "$REPO" diff --binary --cached HEAD >"$dest/changes.index.patch" 2>/dev/null; then
+        err "cannot write $dest/changes.index.patch — refusing to touch a tree whose STAGED changes are not saved"
         return 1
     fi
     : >"$dest/MANIFEST" || return 1
@@ -594,7 +602,7 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         # `%q` so a path with a space, quote or newline is still recoverable FROM the manifest; the
         # destination of a rename is what is listed, because that is what the tree now holds.
         printf '%q\n' "$p" >>"$dest/MANIFEST" || return 1
-        say "preserved: $p -> $dest/changes.patch"
+        say "preserved: $p -> $dest/changes.patch (+ changes.index.patch for the staged snapshot)"
         n=$((n + 1))
     done < <(list_dirty_paths)
     # ⛔ UNTRACKED FILES ARE COPIED, not just named: a patch cannot carry them, and they are the
@@ -635,7 +643,7 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # HEAD has as 100755 is a MODE CHANGE staged by any `git add` — the tree stays dirty, a later
     # upstream commit to that path makes the fast-forward refuse for ever, and this repo tracks 207
     # executable files (one of them is the very file the measured Mac defect was about).
-    local n_restored=0 n_skipped=0 tmp mode sha blob _info _type _rest d dests="" _h
+    local n_restored=0 n_skipped=0 n_removed=0 tmp mode sha blob _info _type _rest d dests="" _h
     # ⛔ THE RENAME-DESTINATION SET IS BUILT NUL-SAFELY, ONCE, BEFORE THE LOOP. `$(list_rename_dests)`
     # DROPS every NUL (bash warns "ignored null byte in input") and concatenates the destinations into
     # ONE WORD, so with two or more renames nothing matched: the destinations stayed untracked (the tree
@@ -683,9 +691,10 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
                 mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || true
                 cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || true
                 rm -f "$REPO/$p" 2>/dev/null || true
+                n_removed=$((n_removed + 1))
             fi
             git -C "$REPO" update-index --force-remove -- "$p" >/dev/null 2>&1 || true
-            n_skipped=$((n_skipped + 1))
+            [ "$_is_rename_dest" = 1 ] || n_skipped=$((n_skipped + 1))
             continue
         fi
         case "$mode" in
@@ -726,11 +735,15 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # whenever a path was skipped: a skipped staged addition (or a gitlink) is STILL IN THE WORKTREE and
     # keeps the tree dirty, which the record then reports — two contradictory statements about the same
     # edit, in the message an operator reads when recovering work.
-    if [ "$n_skipped" -gt 0 ]; then
-        say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); the hand edits of THOSE paths exist only in the preserved copies. $n_skipped path(s) were SKIPPED (not in HEAD, or a gitlink) and remain in the worktree — they are what keeps the tree dirty."
-    else
-        say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); the hand edits above exist only in the preserved copies"
-    fi
+    say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); their hand edits exist only in the preserved copies"
+    # ⛔ TWO COUNTERS, because the two outcomes are opposite. A move destination is REMOVED from the
+    # worktree (its bytes are preserved, and the tree then converges); a staged addition or a gitlink is
+    # SKIPPED and STAYS. Folding them into one count made the sentence claim that removed paths "remain
+    # in the worktree — they are what keeps the tree dirty" while the record in the same pass said
+    # `dirty=0` — the two-readers contradiction this line exists to avoid, reintroduced by the fix that
+    # added the move case.
+    [ "$n_removed" -gt 0 ] && say "restored: $n_removed move destination(s) removed from the worktree after preservation (a same-content copy of a deleted tracked path)"
+    [ "$n_skipped" -gt 0 ] && say "restored: $n_skipped path(s) SKIPPED (not in HEAD, or a gitlink) and still in the worktree — they are what keeps the tree dirty"
     say "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
     return 0
 }
