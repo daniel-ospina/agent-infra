@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """orphan-reap.test.py — the gate suite for the `pi` pool (scripts/orphan-reap.py).
 
-SIX tests, each with its own fixture, and THREE MUTATIONS that must go RED when a gate is
+TEN tests, each with its own fixture, and THREE MUTATIONS that must go RED when a gate is
 dropped. No live process is touched and nothing here can signal a pid: `ps`, the session index,
 `stat`, the clock and the cmux hook store are all injected, and the only thing read back is the
 census's own `--json` output (so the CLI path is exercised, not a copy of it).
-On top of those: EIGHT apply-path assertions (the only code here that signals), an empty-pool JSON
-contract check, and the fence-default pin against the canon.
+On top of those: EIGHT apply-path assertions (the only code here that signals), a
+four-states-reachable pin, the name-stamp-is-UTC pin (four timezones), an empty-pool JSON
+contract check, an UNREADABLE-`ps`-still-speaks-JSON check, and the fence-default pin against
+the canon.
 ⚠️ ONE READER IS REAL, ON PURPOSE: `canon_verdict` calls the canon's `gather`, which forks the
 fleet's identity probe (`scripts/lib/pid-identity.sh`) for the store record it is given. That is
 the RULE under test, not a fixture, so a provider machine without a working probe CLI fails these

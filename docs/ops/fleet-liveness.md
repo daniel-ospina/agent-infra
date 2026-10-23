@@ -188,8 +188,15 @@ Terminal/iTerm/login-shell/tmux ancestor is `KEEP-HUMAN`), and progress judged a
 process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap)) — and the four
 reported states are `LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`. Its declared blind
 spots are the ones §1 leaves it: a `pi` that leaves no bindable session file (a print-mode / `task`
-child, or a resumed session keeping its original name-stamp) reads `UNVERIFIABLE` with that reason,
-never `LIVE` and never "nothing to reap"; and on a box where the hook store is unreadable every
+child, or a resumed session keeping its original name-stamp) has **no progress channel**, so one
+of the three gates cannot be evaluated on it — a PARKED one abstains as `UNVERIFIABLE`
+(`no-progress-channel:<binding>`), never as "nothing to reap", while a BUSY one still reads `LIVE`
+off gate 1 (the CPU delta). That asymmetry is deliberate, not a gap: `PARKED-REAPABLE` is only
+reachable by a row that HAS a transcript (the abstention on a missing one sits on the same path),
+so nothing is reaped either way, and collapsing a busy unbound lane into an abstention would
+destroy the census's one diagnostic job — telling progress from parked. The guarantee is the
+abstention on the PARKED row, not a promise that an unbound row can never read `LIVE`. On a box
+where the hook store is unreadable every
 row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
 the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
 gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;
