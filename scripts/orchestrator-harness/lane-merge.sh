@@ -987,7 +987,12 @@ if [ "$WATCH" -eq 1 ]; then
       # last chunk could not read the merge confirmation, so this verdict says nothing about the PR: it
       # may well be merged" — instead of manufacturing a review verdict.
       if [ "$_readable" = 0 ]; then
-        if [ -n "${read_up:-}" ]; then
+        # ⛔ THE MESSAGE BRANCH MUST NOT REUSE THE GUARD'S EXACT TEST (reviewer finding, P2): suite §19
+        # asserts the good-read guard at the top of the tick STRUCTURALLY, by grepping for its literal
+        # expression — so repeating that expression here made the assertion match a message branch and
+        # pass even if the guard it names were deleted. `read_up` is assigned unconditionally at the top
+        # of this tick, so the plain `-n "$read_up"` form is set -u safe and leaves ONE grep site.
+        if [ -n "$read_up" ]; then
           say "… the PR read came back INCOMPLETE this chunk (state '${ST:-}' head '${HD:-}' from '${read_up}')"
           say "   — a truncated or partial response is not a fact about the PR, so nothing is decided:"
         else
