@@ -86,10 +86,19 @@ for concl in ("in_progress", "skipped", "cancelled", "neutral", "failure"):
          "conclusion": None if concl == "in_progress" else concl, "app": {"slug": "gh"}},
     ]
     try:
-        _g, in_flight, failed, untested, not_tested = m.check_state(runs)
+        res = m.check_state(runs)
     except TypeError as exc:
         ck(False, f"check_state: unnamed+named {concl} run must not raise", exc)
-    ck(True, f"check_state: unnamed+named {concl} runs are attributable in every name set")
+    # ⛔ THE ASSERTION CONSUMES THE RESULT (P2, fresh review): an unconditional `ck(True, …)` is a
+    # no-op that cannot fail, so it would keep ticking if the call above were dropped in a refactor
+    # — and it was 5 of the 17 assertions quoted as evidence of coverage. Shape-check the tuple.
+    ck(
+        len(res) == 5
+        and all(isinstance(x, list) for x in res)
+        and any(str(n).startswith("<unnamed:") for n in (res[1] + res[2] + res[3] + res[4])),
+        f"check_state: unnamed+named {concl} runs are attributable in every name set",
+        res,
+    )
 
 # (3) an unreadable merge base RAISES; it is never reported as a repoint
 real = m.gh_text
