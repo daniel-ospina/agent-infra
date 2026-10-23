@@ -375,6 +375,15 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
+    # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` (this job calls the one
+    # runner below, unsharded — main runs once per merge, so the queue a hang would starve is
+    # smaller than the PR lane's 80 open PRs). The bound is deliberately larger than the PR
+    # lane's per-slice bound: this job, not one slice, is what must fit inside it — 71 shards
+    # serially, measured at ~2x the per-slice wall of ci.yml's 8-way matrix. Before this line the
+    # job had no bound at all, so a hung shard could hold a runner indefinitely (#2055) and
+    # redden main without naming itself. ci.yml's `bash-suites` was measured at ~2h46m without a
+    # bound on PR #2412 and failed — this is the same sweep, same runner, same failure mode.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —

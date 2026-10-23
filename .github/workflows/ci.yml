@@ -904,7 +904,48 @@ jobs:
     # (`ADMIN_MERGE_LANE_JOB_PREFIX`, default `test`), so it stays outside that family and
     # cannot move the rail's lane-coverage comparison (#1349 — a separate remedy; nothing
     # here helps or hinders it).
+    #
+    # ⛔ DURATION, not runner capacity, was this job's defect (measured 2026-10-23, PR #2412):
+    # the run started 10:25:04Z, was still `in_progress` at 13:11Z — ~2h46m inside the ONE step
+    # "Bash shards — the ONE list both lanes run" — and then failed. Measured alongside that:
+    # 80 open PRs, and the account pool was NOT starved (agent-infra: 5 in progress / 3 queued
+    # against a 20-job pool). One unsharded job holding a serial sweep for hours starves CI by
+    # DURATION while every capacity signal reads healthy. Two defects, and the second is why the
+    # first was invisible:
+    #   1. ~71 shards ran SERIALLY in one job → the fix is the MATRIX below.
+    #   2. the job declared NO `timeout-minutes` (agent-infra #2055) → a hung shard burned hours
+    #      and then reddened the PR without naming itself. The bound below makes a hang FAIL FAST,
+    #      and the job that trips it names the slice it was running.
+    #
+    # ⛔ THE MATRIX CARRIES A SLICE, NEVER A LIST. `scripts/run-bash-shards.sh` remains the ONE
+    # source of the shard list (its header records why every duplicated-list form was proven
+    # unsound). This job contributes only a LANE WIDTH, and even that is not typed twice: the
+    # denominator is `strategy.job-total`, GitHub's own count of the jobs this matrix expands to,
+    # so widening or narrowing the matrix below is a ONE-LINE edit that cannot leave a stale `/N`
+    # behind. The slice arrives as `BASH_SHARD_SLICE` in the STEP's `env` — not as an argument —
+    # because the step's `run` must stay the bare call `bash scripts/run-bash-shards.sh`: that is
+    # what `check-ci-lane-parity` asserts (an argument there is a MENTION, not the call, and the
+    # lane un-wires — the #1369 class).
+    #
+    # COVERAGE IS ARITHMETIC, NOT TRUST. Each slice asserts it executed exactly its derived share
+    # and that `executed + skipped == listed`; the slices therefore sum to the whole list. A slice
+    # that runs nothing, or a neighbour's shards twice, fails its own assertion rather than
+    # reporting a green check over a hole.
     runs-on: ubuntu-latest
+    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Chosen from the
+    # measured p95 slice wall (the arithmetic is in the PR body), not a guess: 3x the measured
+    # worst slice, floored at 20 min — room for runner variance and a cold cache, and far below
+    # the multi-hour stall this job shipped with.
+    timeout-minutes: 25
+    strategy:
+      # false: every slice reports its own result, so one hang cannot hide the other slices'
+      # verdicts — the diagnostic this job lacked, since a single step reported nothing until
+      # it died.
+      fail-fast: false
+      matrix:
+        # Slices, not shards. Width = the number of entries here (8 measured slices of 71
+        # shards, ~9 each); the runner refuses a count wider than its own list.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
@@ -914,12 +955,39 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+        # hand-kept number, and never a list: the list is the runner's).
+        env:
+          BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: bash scripts/run-bash-shards.sh
+
+  bash-suites-gate:
+    # #1369's two guard steps, ONCE per PR — not once per slice. They lived in `bash-suites`
+    # while it was a single job; inside a MATRIX they would run 8 times, and
+    # `tests/ci-lane-parity/run.sh` is not cheap (it drives the runner's FAST copy several times —
+    # ~60 shards per invocation). Duplicating it per slice would re-create this PR's own defect in
+    # the job that exists to catch it: every slice would pay the self-test's wall time, and the
+    # matrix would buy back almost nothing.
+    #
+    # ⛔ NOT conditional and no `needs:` — `check-ci-lane-parity` refuses `if`/`needs`/
+    # `continue-on-error` on the call-carrying job exactly so a lane cannot be made to look wired
+    # while it never runs. This job is a plain sibling: it runs on every PR, and its failure reds
+    # the PR like any other. `bash-suites` still makes the bare call the guard asserts.
+    runs-on: ubuntu-latest
+    # #2055: the bound this job never had. The self-test's wall time tracks the fast copy of the
+    # shard list (measured; the fast copy drops the ~11 longest shards), so a bound sized to one
+    # slice would false-block it. This is the largest of the three bounds by design.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
         run: bash tests/ci-lane-parity/run.sh
-      - name: Bash shards — the ONE list both lanes run (#1369)
-        run: bash scripts/run-bash-shards.sh
 
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification

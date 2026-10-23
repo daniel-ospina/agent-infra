@@ -35,6 +35,28 @@
 #   bash scripts/run-bash-shards.sh                 # run them all
 #   bash scripts/run-bash-shards.sh --list          # print the shard list, run nothing
 #   bash scripts/run-bash-shards.sh --list-sweeps   # print the syntax-sweep globs, run nothing
+#
+#   BASH_SHARD_SLICE=<i>/<n> bash scripts/run-bash-shards.sh   # run ONE slice of the list
+#
+# SLICING — why it is an ENV VAR and not an argument (#2055 follow-up; the `bash-suites`
+# duration defect). Slicing exists because the JOB's DURATION, not runner capacity, was the
+# bottleneck: `bash-suites` ran every shard serially in one step, reached ~2h46m on PR #2412,
+# and reddened the PR — with no `timeout-minutes`, so nothing failed fast and nothing named
+# the shard. The fix runs the list as a MATRIX, one job per slice.
+#
+#   ⛔ The slice arrives in the ENVIRONMENT, never as `--shard i/n` on the command line, because
+#   the CALL SITE is load-bearing: `check-ci-lane-parity` asserts each lane's step `run` IS the
+#   bare line `bash scripts/run-bash-shards.sh` (CALL_RE). An argument there reads as a MENTION,
+#   not the call, and the lane un-wires — the #1369 class this file exists to close.
+#
+#   ⛔ The LIST is still HERE and only here. `n` is a LANE WIDTH — one integer — never a list of
+#   suites, so no second copy exists that could drift from this one. A slice's expected size is
+#   DERIVED below from the list length and `n`; nothing is enumerated in the workflow.
+#
+#   ⛔ Coverage is closed ARITHMETICALLY, not by trust: each slice asserts it executed EXACTLY its
+#   derived count, and every slice also asserts `executed + skipped == listed`. The slices' counts
+#   therefore sum to the whole list — a slice that silently runs nothing (or runs a neighbour's
+#   shards twice) fails its own assertion instead of reporting a green check over a hole.
 
 set -uo pipefail
 
@@ -63,9 +85,61 @@ fi
 # over this file's text could never catch that; running it can.
 shard_errors=0
 shard_ran=0
+shard_skipped=0
+shard_listed=0
+
+# The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
+# BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
+listed="$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" | grep -c .)"
+
+# ── slice selection — see SLICING in the header ────────────────────────────────────────────────
+# Default: no slice (run the whole list) — the behaviour every existing caller keeps.
+slice_index=-1
+slice_count=0
+if [ -n "${BASH_SHARD_SLICE:-}" ]; then
+  case "$BASH_SHARD_SLICE" in
+    *[!0-9/]*) echo "❌ BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is not <index>/<count>"; exit 2 ;;
+    */*/*)     echo "❌ BASH_SHARD_SLICE='$BASH_SHARD_SLICE' carries more than one '/' — want <index>/<count>"; exit 2 ;;
+    */|/*)     echo "❌ BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is missing its index or count — want <index>/<count>"; exit 2 ;;
+  esac
+  slice_index="${BASH_SHARD_SLICE%%/*}"
+  slice_count="${BASH_SHARD_SLICE##*/}"
+  # 10# so a leading zero stays decimal; `08` in arithmetic is otherwise an INVALID OCTAL error.
+  slice_index=$((10#$slice_index - 1))
+  slice_count=$((10#$slice_count))
+  if [ "$slice_count" -lt 1 ]; then
+    echo "❌ BASH_SHARD_SLICE count must be >= 1 (got '$BASH_SHARD_SLICE')"; exit 2
+  fi
+  if [ "$slice_index" -lt 0 ] || [ "$slice_index" -ge "$slice_count" ]; then
+    echo "❌ BASH_SHARD_SLICE index must be 1..$slice_count (got '$BASH_SHARD_SLICE')"; exit 2
+  fi
+  # A slice wider than the list would leave some slices EMPTY: a job that proves nothing while its
+  # check reads green. Refuse rather than report a vacuous pass (the #1369 shape, one level up).
+  if [ "$slice_count" -gt "$listed" ]; then
+    echo "❌ BASH_SHARD_SLICE asks for $slice_count slice(s) of $listed listed shard(s) — a slice would run nothing"; exit 2
+  fi
+fi
+
+# slice_skips <0-based position> — 0 (true) = this slice does NOT run it, 1 (false) = it does.
+# Slicing applies ONLY to list lines (`pos < listed`): the sentinels below sit past the list on
+# purpose, so the vacuity arms ALWAYS execute — a slice must never be able to leave "can a failing
+# shard fail this run?" untested. Positions are dealt round-robin (pos % n), so slow shards spread
+# across slices instead of clustering in one (contiguous chunks would stack the expensive suites).
+slice_skips() {
+  slice_pos=$shard_listed
+  shard_listed=$((shard_listed + 1))
+  [ "$slice_count" -gt 0 ] || return 1
+  [ "$slice_pos" -lt "$listed" ] || return 1
+  [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
+  shard_skipped=$((shard_skipped + 1))
+  return 0
+}
+
 # One line on purpose: the execution and the counter that proves it happened are inseparable,
-# so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion.
-run_shard() { shard_ran=$((shard_ran + 1)); bash "$1" || shard_errors=$((shard_errors + 1)); }
+# so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion. The skip
+# branch is that explicit rewrite, and it is COUNTED (`shard_skipped`) so a skipped shard can never
+# be mistaken for an executed one — see the coverage assertions at the end.
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); bash "$1" || shard_errors=$((shard_errors + 1)); }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -213,9 +287,27 @@ run_shard pi-bootstrap/tests/test-farm-unfarm.sh                            # #1
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
 # a helper whose execution was disabled — a text-only floor would still see the same listed count.
-listed="$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" | grep -c .)"
-if [ "$shard_ran" -ne "$listed" ]; then
-  echo "❌ executed $shard_ran of $listed listed shard(s) — the list and the execution disagree"
+# Runtime self-check 1: every listed shard must have been EXECUTED or DELIBERATELY SKIPPED for
+# this slice. This is the arm that catches a helper whose execution was disabled — a text-only
+# floor would still see the same listed count. `executed + skipped == listed` also means the list
+# was traversed end to end: a slice cannot quietly stop early.
+if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
+  echo "❌ executed $shard_ran of $listed listed shard(s) ($shard_skipped skipped) — the list and the execution disagree"
+  exit 1
+fi
+
+# Runtime self-check 1b: slice COVERAGE. Each slice must execute exactly its derived share, so the
+# slices' counts sum to the list: `expected = |{ p < listed : p % n == i }|`. A slice that runs the
+# wrong subset (off-by-one in the modulus, an unreadable env var, a stray `continue`) fails here,
+# and so does an unsharded run that skipped anything.
+if [ "$slice_count" -gt 0 ]; then
+  expected=$(( (listed - 1 - slice_index) / slice_count + 1 ))
+  if [ "$shard_ran" -ne "$expected" ]; then
+    echo "❌ slice $((slice_index + 1))/$slice_count executed $shard_ran shard(s), expected $expected — the slice does not cover its share of the list"
+    exit 1
+  fi
+elif [ "$shard_skipped" -ne 0 ]; then
+  echo "❌ $shard_skipped shard(s) skipped without a slice (BASH_SHARD_SLICE unset) — an unsharded run must execute every listed shard"
   exit 1
 fi
 
@@ -251,6 +343,8 @@ sentinel="$(mktemp)"
 printf 'exit 1\n' >"$sentinel"
 before_err=$shard_errors
 before_ran=$shard_ran
+before_skip=$shard_skipped
+before_listed=$shard_listed
 run_shard "$sentinel"
 rm -f "$sentinel"
 if [ "$shard_errors" -ne $((before_err + 1)) ]; then
@@ -259,9 +353,15 @@ if [ "$shard_errors" -ne $((before_err + 1)) ]; then
 fi
 shard_errors=$before_err
 shard_ran=$before_ran
+shard_skipped=$before_skip
+shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
   exit 1
 fi
-echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
+if [ "$slice_count" -gt 0 ]; then
+  echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
+else
+  echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
+fi
