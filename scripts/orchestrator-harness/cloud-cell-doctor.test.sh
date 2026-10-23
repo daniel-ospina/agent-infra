@@ -836,6 +836,58 @@ result_has "is not the root of a git worktree" \
   || bad "registry: the refusal is silent — $OUT"
 [ ! -e "$REC" ] && ok "registry: nothing was synced through the hub path" \
   || bad "registry: the pass used the hub as its store — $REC exists"
+# ⛔ AND THE REHEARSAL must say the same thing (the occupancy check needs no side effects). Leaving it
+# out let a box that skips EVERY hourly pass print `would sync`, and `state_write_rehearsal` keeps the
+# worse rc but REPLACES `last_result` — so the operator's first verb erased the recorded skip.
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene --dry-run ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: --dry-run reports an OCCUPIED store path as the skip too" \
+  || bad "registry: --dry-run claimed a sync on a box whose store path is unusable (rc=$RC) — $OUT"
+case "$OUT" in
+  *"WOULD run: registry-sync.sh"*) bad "registry: --dry-run still printed a positive WOULD — $OUT" ;;
+  *) ok "registry: no false WOULD when the store path is unusable" ;;
+esac
+rm -rf "$R/hub/.worktrees/registry-sync"
+
+say_case "hygiene: a REUSED store worktree of a DIFFERENT repository is refused (never a cross-repo push)"
+# ⛔ "is the root of SOME worktree" is not identity. A worktree carries the CONFIG of the repo that
+# registered it, so a leftover worktree of another repository at the store path makes the verb push this
+# box's `refs/reviews/*` to THAT repo's remote — permanently (rule 2 has no delete path) — while the
+# pass reports `converged with the fleet` and the fleet store receives nothing.
+reset_state
+git init --bare -q "$R/tortoise.git"
+git init -q "$R/foreign"
+printf 'y\n' > "$R/foreign/g"
+git -C "$R/foreign" add g
+"${GITQ[@]}" -C "$R/foreign" commit -qm init
+git -C "$R/foreign" remote add origin "$R/tortoise.git"
+git -C "$R/hub" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+git -C "$R/foreign" worktree add --detach --no-checkout "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 \
+  || bad "registry fixture: could not register the FOREIGN worktree at the store path"
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a worktree registered by ANOTHER repository is REFUSED as the store" \
+  || bad "registry: a foreign worktree was used as the store (rc=$RC) — $OUT"
+result_has "a worktree of a DIFFERENT repository" \
+  && ok "registry: the refusal names the hazard (a push to that repository's remote)" \
+  || bad "registry: the refusal is silent — $OUT"
+[ -z "$(git ls-remote "$R/tortoise.git" 'refs/reviews/*' 2>/dev/null)" ] \
+  && ok "registry: nothing was pushed to the foreign remote" \
+  || bad "registry: a review record reached the foreign repository — $(git ls-remote "$R/tortoise.git" 'refs/reviews/*' 2>/dev/null)"
+[ ! -e "$REC" ] && ok "registry: nothing was pulled from the foreign remote either" \
+  || bad "registry: a record was materialised from the foreign remote — $REC"
+git -C "$R/foreign" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
 rm -rf "$R/hub/.worktrees/registry-sync"
 
 say_case "hygiene: no registry-sync.sh anywhere is a SKIP (not cannot-verify, unlike every other step)"

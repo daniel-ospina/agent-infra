@@ -1291,6 +1291,15 @@ is_worktree_root() { # <path>
   [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$1" 2>/dev/null && pwd -P)" ]
 }
 
+is_same_repo() { # <a> <b> — same git COMMON dir, i.e. linked worktrees of ONE repository
+  local a b
+  a="$(cd "$1" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  b="$(cd "$2" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  a="$(cd "$1" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P)" || return 1
+  b="$(cd "$2" 2>/dev/null && cd "$b" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
+}
+
 # A WORKTREE (a linked one) rather than the PRIMARY checkout — the hub. `--git-common-dir` may come
 # back RELATIVE to the worktree (`.git`), so it is resolved before the comparison: an unresolved
 # relative path never equals an absolute one, which would call every checkout "linked".
@@ -1386,7 +1395,17 @@ registry_store() { # → the worktree to sync from (may provision one), or empty
   # A harness materialised INTO a worktree (a cell's layout) already IS the worktree this role has.
   if is_linked_worktree "$hub"; then printf '%s\n' "$hub"; return 0; fi
   wt="$hub/.worktrees/registry-sync"
-  if is_worktree_root "$wt"; then printf '%s\n' "$wt"; return 0; fi
+  if is_worktree_root "$wt"; then
+    # ⛔ AND IT MUST BE A WORKTREE OF *THIS* REPOSITORY. Every other store path is identity-checked
+    # against the fleet's store (the candidates and the override by their `origin`); a REUSED worktree
+    # inherits the config of whichever repo registered it — so a leftover worktree of some OTHER
+    # repository sitting at this path would have the verb push this box's `refs/reviews/*` to that
+    # repo's remote (permanent: rule 2 has no delete path), and report `converged with the fleet` while
+    # the fleet store received nothing.
+    if is_same_repo "$wt" "$hub"; then printf '%s\n' "$wt"; return 0; fi
+    log "[hygiene] registry: $wt is a worktree of a DIFFERENT repository — refusing to push review records to its remote (remove it, or set DOCTOR_REGISTRY_STORE)" >&2
+    return 1
+  fi
   if [ -e "$wt" ]; then
     # ⛔ No `rm -rf` here. A directory that is not a worktree is NOT this role's to delete — that is
     # the destructive-verb class this file's reap gates exist to prevent — so it is named and skipped.
@@ -1439,7 +1458,22 @@ registry_precheck() { # → the reason this box cannot sync (nothing = it can be
   # from)` while the rehearsal claimed `would sync`, and because `state_write_rehearsal` keeps the
   # worse rc but REPLACES `last_result`, the operator's first verb ERASED the skip from the role row —
   # a blind box reading clean, the class this sub-step exists to remove.
-  [ -n "$(registry_store_hub)" ] || printf 'no worktree to sync from'
+  local hub
+  hub="$(registry_store_hub)" || { printf 'no worktree to sync from'; return 0; }
+  [ -n "$hub" ] || { printf 'no worktree to sync from'; return 0; }
+  # An explicit store is used as given, and a harness living in a linked worktree IS the store — both
+  # are answered by `registry_store` without touching anything.
+  [ -n "$REGISTRY_SYNC_STORE" ] && return 0
+  is_linked_worktree "$hub" && return 0
+  # The OCCUPANCY of the worktree path is knowable with no side effects, and it is the third reason the
+  # live pass skips. Leaving it out meant a box that will skip EVERY hourly pass still got a rehearsal
+  # claiming `would sync` — and `state_write_rehearsal` keeps the worse rc but REPLACES `last_result`,
+  # so the operator's first verb erased the recorded skip.
+  if is_worktree_root "$hub/.worktrees/registry-sync"; then
+    is_same_repo "$hub/.worktrees/registry-sync" "$hub" || printf 'no worktree to sync from'
+  else
+    [ -e "$hub/.worktrees/registry-sync" ] && printf 'no worktree to sync from'
+  fi
   return 0
 }
 
