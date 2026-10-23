@@ -14,8 +14,11 @@
 #   (n) the FLOOR (#2342): below `GH_LIMIT_CORE_FLOOR` a read that cannot fail over is refused BY
 #       NAME — empty stdout, no request spent, no claim that the pool is empty — and a read that CAN
 #       fail over is still served; `GH_LIMIT_ESSENTIAL=1` spends the reserve (the landing path).
-#   (o) the INSTRUMENT (#2342): `--stats` reports the hits/misses/coalesced shares the calls
-#       actually wrote, and an empty box says `no-reads-counted` instead of inventing `averted=0`.
+#   (o) the INSTRUMENT (#2342): `--stats` reports the hits/misses coalesced shares the calls actually
+#       wrote, and an empty box says `no-reads-counted` instead of inventing `averted=0`.
+#   (p) the FLOOR CAN SEE (#2342 review P1): a core-only read with no snapshot and no durable record
+#       spends ONE exempt `/rate_limit` probe, so a MEASURED-empty pool refuses it without sending it —
+#       a healthy meter lets the same read through.
 #
 # ⛔ NO REAL SLEEP: every path asserted here fails fast or answers immediately, so the suite needs no
 # fake clock. `GH_LIMIT_NO_WAIT=1` is set for the refusal cases so a real backoff cannot turn this
@@ -235,6 +238,11 @@ echo "── (a2) the fleet LEARNS: ONE refusal + ONE exempt probe makes every l
 # bounded caller and must spend NO probe of its own: it reads the record and fails over. If every lane
 # had to probe to discover the pool was empty, the failover would cost the budget it exists to save.
 reset_env a2 core0
+# ⛔ PRIME A HEALTHY SNAPSHOT ON PURPOSE (#2342). With no snapshot the layer now MEASURES the meter
+# before a read that cannot fail over and refuses it instantly — which is the new, better behaviour,
+# and it is pinned by (p) below. This case is about the OTHER path: a read that WAS SENT, refused, and
+# then bounded by the in-call rule, so the snapshot is primed healthy and the pool unknown-to-empty.
+budget coreok
 unset GH_LIMIT_NO_WAIT
 : > "$STUB_LOG"
 run core0 api repos/o/r/pulls/7                  # lane A: refused, then the documented deferral
@@ -392,6 +400,7 @@ ck "(h) the SECOND core read still fails over rather than being sent to the empt
 
 echo "── (i) a GraphQL-served read must NOT mark the CORE bucket recovered (finding 3) ──────────────"
 reset_env i core0
+budget coreok                            # a primed snapshot: the read is SENT and refused on its own
 unset GH_LIMIT_NO_WAIT
 run core0 api repos/o/r/pulls/7          # lane A: refusal + the one exempt probe records core
 run core0 api repos/o/r/pulls/7 --jq .head.sha   # lane B: served from GraphQL
@@ -985,6 +994,34 @@ ck "(o) an EMPTY box says no-reads-counted — an invented averted=0 would be a 
    $(grep -q '^gh-read-cache no-reads-counted$' <<<"$OUT" && echo 0 || echo 1)
 ck "(o) … and still exits 0 (nothing to report is not an error)" \
    $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+
+echo "── (p) THE FLOOR CAN SEE (#2342 review P1): a blind box MEASURES before it refuses ────────────"
+# The floor acts on a MEASURED `remaining`, and before this the only writer of a non-zero one was the
+# `--budget` verb — which NO harness script calls — plus the refusal path's own probe, which runs only
+# once the pool is already empty. So the guard could never fire in production. A core-only read with no
+# local evidence now spends ONE exempt meter read; a measured-empty pool is refused WITHOUT sending it.
+reset_env p core0
+: > "$STUB_LOG"
+run core0 api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(p) the meter was READ exactly once (the blind box measures; it does not guess)" \
+   $([ "$(reqs 'api rate_limit')" -eq 1 ] && echo 0 || echo 1)
+ck "(p) … and the measured-empty pool refused the read WITHOUT sending it" \
+   $([ "$RC" -ne 0 ] && [ "$(reqs 'required_status_checks')" -eq 0 ] && echo 0 || echo 1)
+ck "(p) … by NAME (a measured empty pool, not a floor claim)" \
+   $(grep -q 'gh-core-exhausted' <<<"$ERR" && echo 0 || echo 1)
+ck "(p) … and the snapshot is recorded for every later lane, at no extra cost" \
+   $([ -f "$GH_LIMIT_DIR/budget.json" ] && echo 0 || echo 1)
+# … and a HEALTHY meter lets the same read through, with no pre-emptive refusal at all.
+: > "$STUB_LOG"
+# the window RESET: the durable evidence is gone too, so this is a box measuring afresh. A fresh
+# meter outranks an old record by design (the layer states it both ways), so a fixture that keeps
+# the stale empty record while the meter reads 3000 would be testing a contradiction, not the code.
+rm -f "$GH_LIMIT_DIR/budget.json" "$GH_LIMIT_DIR/budget-probe-at" "$GH_LIMIT_DIR/health" "$GH_LIMIT_DIR/last-limit"
+run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(p2) a HEALTHY meter lets the same read through (1 request, rc 0)" \
+   $([ "$RC" -eq 0 ] && [ "$(reqs 'required_status_checks')" -eq 1 ] && echo 0 || echo 1)
+ck "(p2) … and the probe it spent is what makes the next lane's decision possible" \
+   $([ "$(reqs 'api rate_limit')" -eq 1 ] && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
