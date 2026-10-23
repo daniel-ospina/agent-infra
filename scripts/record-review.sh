@@ -1949,6 +1949,15 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       # (E) (#1575) — the veto. Refuse BEFORE printing either arm's success line and
       # before re-binding SHA, so a red target never produces a signed `clean`.
       if target_head_red "$CURRENT_HEAD"; then
+        # ⛔ CONSUMER CONTRACT — the literal `(#1575 clause E)` in this message is READ
+        # by scripts/atomic-land.sh, which greps for it to tell a HEAD-HEALTH refusal
+        # from a CONTENT refusal (the #2369 update precondition PROCEEDS on the first —
+        # refreshing is the only remedy the rail has for a drift-caused red — and STOPS
+        # on the second). Both causes share exit 3, so this string is the only
+        # discriminator: reword it and the rail silently reads a red head as a changed
+        # artifact, making the drift-red population unlandable with no other signal.
+        # The pin is executable — `tests/atomic-land/run.sh` scenario 2b-vi asserts this
+        # literal is still here AND that the rail still greps it. Keep both ends in sync.
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD IS MEASURABLY RED." >&2
         echo "   A base-only move is still a change to the tree the verdict describes, so re-binding '$VERDICT' to it would put a SIGNED 'clean' on a head whose own checks are failing — an attestation that records a red tree as reviewed-green, and one the merge gate cannot see once the record outlives the run (#4823, #5395, #5292)." >&2
         echo "   The LANE's artifact IS unchanged — that is what the carry proved. Only the head's health is unknown or bad. Re-review at ${CURRENT_HEAD:0:12}…, or re-run the failing checks and re-record." >&2
