@@ -1089,6 +1089,57 @@ ck "…and NO attestation is recorded and NO hand-off comment is posted (a publi
    $([ "$(verdict_of 38 | cut -d' ' -f1)" != BLOCKED_ATTESTATION ] && ! grep -q 'green and mergeable' <<<"$OUT" \
       && ! grep -q 'issues/38/comments' "$T/gh-19b.log" && echo 0 || echo 1)
 
+# ── 19c. a TRUNCATED read is as unreadable as an empty one (landing-review P2, REPRODUCED) ─────────
+# ⛔ THE OLD GUARD ASKED WHETHER THE READ WAS EMPTY, NOT WHETHER WHAT IT PARSED IS USABLE. `read_up`
+# non-empty with EMPTY FIELDS is a different, MEASURED input — a rate-limited read returning
+# `open|||behind`, the shape the plain path refuses at exit 2 — and it sailed past the guard into a
+# JUDGEMENT. With a dead chain and an inconclusive merge log the loop ATTESTED (exit 12, posting
+# "green and mergeable … head ?" as a PUBLIC PR comment on a PR that may simply need a fix), and
+# `closed|||behind` reported "closed and was NOT merged" (exit 14). Both assert facts about fields
+# nothing populated. These two cases are the DISCRIMINATOR: against the pre-fix guard they produce
+# BLOCKED_ATTESTATION/12 and BLOCKED_CLOSED/14 with a comment posted, so they cannot pass by accident.
+for _tr in 'open|||behind' 'closed|||behind'; do
+  new_o "$T/junk-q19c.tsv"
+  printf '%s\n' "$_tr" > "$T/pr-trunc.tsv"
+  printf '%s deadbeef %s\n' 999981 "$OT/logs/lane-merge-39.log" > "$OT/state/lanemerge-39.chain"
+  printf 'nothing useful here\n' > "$OT/logs/merge-39.log"
+  : > "$T/gh-19c.log"
+  OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh-19c.log" O="$OT" HOME="$T/home" \
+        LANE_MERGE_POLL=0 bash "$SCRIPT" 39 --watch --repo o/r --pr-tsv "$T/pr-trunc.tsv" 2>&1)"; RC=$?
+  ck "a TRUNCATED read '$_tr' is WAITING_API (exit 11), not a judgement about fields nobody read" \
+     $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_API ] \
+        && [ "$(cat "$OT/state/lanemerge-39.lastdisp" 2>/dev/null)" = WAITING_API ] && echo 0 || echo 1)
+  ck "…and '$_tr' posts NO comment (neither 'green and mergeable … head ?' nor 'closed and NOT merged')" \
+     $(! grep -q BODY-BEGIN "$T/gh-19c.log" 2>/dev/null && ! grep -q 'green and mergeable' <<<"$OUT" \
+       && ! grep -q 'is closed and was not merged' <<<"$OUT" && echo 0 || echo 1)
+done
+# ⛔ THE FLAG MUST NOT PRE-EMPT THE NON-JUDGEMENT PATHS (reviewer finding, P1/P2, measured). This
+# started as an early exit at the top of the tick, which made a failed read swallow TWO things that are
+# not verdicts: with a LIVE chain the chunk used to WAIT (WAITING_CHAIN_RUNNING — the path that spreads
+# the chunk budget over the lane's wall clock, instead of letting MAX_WATCH failed reads burn it inside
+# one rate-limit window and reach BLOCKED_ATTEMPTS, which chain-merge treats as "stop waiting"), and
+# with no chain record at all it used to say the actionable thing (WAITING_CHAIN_ABSENT). The fix is a
+# FLAG consumed only by the two judgement sites, so both must survive a failed read.
+new_o "$T/junk-q19d.tsv"
+printf 'open|||behind\n' > "$T/pr-trunc2.tsv"
+sleep 60 & LIVE_TR=$!
+printf '%s oldhead %s\n' "$LIVE_TR" "$OT/logs/lane-merge-40b.log" > "$OT/state/lanemerge-40.chain"
+printf 'nothing useful here\n' > "$OT/logs/merge-40.log"
+: > "$T/gh-19d.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh-19d.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_POLL=0 bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-trunc2.tsv" 2>&1)"; RC=$?
+kill "$LIVE_TR" 2>/dev/null || true
+ck "a TRUNCATED read with a LIVE chain still WAITS (WAITING_CHAIN_RUNNING), it is not pre-empted into an API wait" \
+   $([ "$RC" = 11 ] && [ "$(cat "$OT/state/lanemerge-40.lastdisp" 2>/dev/null)" = WAITING_CHAIN_RUNNING ] \
+      && [ ! -f "$OT/state/lanemerge-40.verdict" ] && echo 0 || echo 1)
+new_o "$T/junk-q19e.tsv"
+: > "$T/gh-19e.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh-19e.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_POLL=0 bash "$SCRIPT" 41 --watch --repo o/r --pr-tsv "$T/no-such-pr-fixture-19e.tsv" 2>&1)"; RC=$?
+ck "a FAILED read with NO chain record still says WAITING_CHAIN_ABSENT (the actionable remedy), not a generic API wait" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 41 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] \
+      && ! grep -q BODY-BEGIN "$T/gh-19e.log" 2>/dev/null && echo 0 || echo 1)
+
 # ── 20. the DETACHED wrapper records MERGED from the chaid's own marker — and ONLY on confirmation ──
 # F5: without this the wrapper's MERGED branch is dead code as far as the suite is concerned, and the
 # whole point of the delta (a lane killed at its wall clock still leaves its merge visible) is

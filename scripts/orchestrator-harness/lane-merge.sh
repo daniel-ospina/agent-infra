@@ -845,6 +845,23 @@ if [ "$WATCH" -eq 1 ]; then
     # handoff at a NEW head was silently suppressed (reviewer finding, reproduced). A failed read
     # falls back to the last head this lane actually saw (persisted above) — never to "unknown".
     HEAD="${HD:-$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)}"
+    # ⛔ IS WHAT THE READ PARSED TO USABLE AT ALL? (reviewer finding, P2, REPRODUCED) `read_up` being
+    # NON-EMPTY is not the same as a usable read: a rate-limited or truncated response is `open|||behind`
+    # — the shape this file records at its plain-path guard below — non-empty, with an EMPTY state and
+    # head. Gating on the read being non-empty let that reach a JUDGEMENT. Measured on the shipped
+    # script with a dead chain and an inconclusive merge log: it ATTESTS (exit 12, posting "green and
+    # mergeable … head ?" as a PUBLIC PR comment on a PR that may simply need a fix), and
+    # `closed|||behind` reports "closed and was NOT merged" (exit 14) — both claims about fields nothing
+    # populated. So the test is on what was PARSED: a state AND a head, the same pair the plain path
+    # refuses at exit 2.
+    # ⛔ IT IS A FLAG, NOT AN EARLY EXIT (reviewer finding, P1, measured). Exiting here pre-empted three
+    # things that are NOT judgements and that must keep working when a read fails: a LIVE chain still
+    # WAITS (WAITING_CHAIN_RUNNING, which spreads the chunk budget over the lane's wall clock instead of
+    # letting MAX_WATCH failed reads burn it inside one rate-limit window), a missing chain record still
+    # says the actionable thing (WAITING_CHAIN_ABSENT), and the head-moved check is untouched (it needs
+    # HD, so it skips itself). Only the two judgement sites consume the flag: the `closed` arm below and
+    # the attestation path in the `! chain_alive` block.
+    if [ -z "${read_up:-}" ] || [ -z "${ST:-}" ] || [ -z "${HD:-}" ]; then _readable=0; else _readable=1; fi
     # ⛔ THE BUDGET CHECK RUNS HERE, NOT AT THE TOP OF THE CHUNK (reviewer finding, P2, measured): the
     # hand-off it posts is HEAD-BOUND, and at the top of the chunk HEAD is not yet read — so the marker
     # carried the literal "unknown", collapsing per-head dedup back to per-PR: the exact defect F4 fixed
@@ -907,8 +924,14 @@ if [ "$WATCH" -eq 1 ]; then
     say "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
     exit 13
   fi
+    # ⛔ A READ THAT PARSED TO NOTHING IS NOT "CLOSED AND NOT MERGED" (reviewer finding, P2, REPRODUCED).
+    # `closed|||<x>` is a TRUNCATED read, not a closed PR: with `_readable=0` this arm does nothing and the
+    # wait below answers instead — WAITING_API when the chain is dead, WAITING_CHAIN_RUNNING while one is
+    # still alive. A genuinely closed-unmerged PR carries its head, so `closed||<sha>|clean` still reaches
+    # BLOCKED_CLOSED.
     case "${ST:-}" in
-      closed) if [ -n "${MT:-}" ]; then
+      closed) if [ "$_readable" = 0 ]; then :
+              elif [ -n "${MT:-}" ]; then
                 # MT is `merged_at` off THIS repo's PR read (pr_read), so it is a confirmation, not a
                 # hint. ⛔ THE PAYLOAD MUST BE THE MERGE COMMIT HERE TOO (reviewer finding, P2): the
                 # other MERGED writers record `merge_commit_sha`, and the brief tells the lane to read
@@ -953,21 +976,23 @@ if [ "$WATCH" -eq 1 ]; then
       exit 11
     fi
     if ! chain_alive; then
-      # ⛔ AN UNREADABLE PR STATE IS A WAIT, NOT A JUDGEMENT (reviewer finding, P2, verified). When a
-      # chunk's `pr_read` fails (rate limit / DNS / auth), `read_up` is empty and ST/MT/HD keep their
-      # previous (or no) value — the guard at the top of the tick correctly refuses to BLANK the head,
-      # but nothing stopped the JUDGEMENT below. With a dead chain and an inconclusive merge log,
+      # ⛔ AN UNCLASSIFIABLE READ IS A WAIT, NOT A JUDGEMENT (reviewer finding, P2, verified). Reaching
+      # here means the chain is dead AND the read gave us nothing usable. With an inconclusive merge log,
       # `chain_verdict_from_log` returns UNKNOWN and the `*)` arm ATTESTS: "green and mergeable, but no
-      # signed review record exists for head ${HEAD:-?} …" — two facts asserted about a PR nothing was
-      # read for, posted as a public PR comment, with exit 12 ("stop fixing and hand off") on a PR that
-      # may be perfectly mergeable. The file already has the correct re-runnable disposition for exactly
-      # this: WAITING_API (exit 11). So it is taken here, BEFORE any classification, and nothing is
-      # posted. The chunk is CHARGED (not refunded) on purpose, so a permanently unreadable API
-      # converges on the budget hand-off that already says the truth — "the last chunk could not read
-      # the merge confirmation, so this verdict says nothing about the PR: it may well be merged"
-      # instead of manufacturing a review verdict.
-      if [ -z "${read_up:-}" ]; then
-        say "… the PR could not be READ this chunk (rate limit / auth / DNS) — nothing about it is decided:"
+      # signed review record exists for head ${HEAD:-?} …" — facts asserted about a PR nothing was read
+      # for, posted as a public PR comment, exit 12 ("stop fixing and hand off") on a PR that may be
+      # perfectly mergeable. WAITING_API (exit 11) is the disposition that exists for exactly this:
+      # nothing is classified, nothing is posted. The chunk is CHARGED (not refunded) on purpose, so a
+      # permanently unreadable API converges on the budget hand-off that already says the truth — "the
+      # last chunk could not read the merge confirmation, so this verdict says nothing about the PR: it
+      # may well be merged" — instead of manufacturing a review verdict.
+      if [ "$_readable" = 0 ]; then
+        if [ -n "${read_up:-}" ]; then
+          say "… the PR read came back INCOMPLETE this chunk (state '${ST:-}' head '${HD:-}' from '${read_up}')"
+          say "   — a truncated or partial response is not a fact about the PR, so nothing is decided:"
+        else
+          say "… the PR could not be READ this chunk (rate limit / auth / DNS) — nothing about it is decided:"
+        fi
         say "   no attestation, no hand-off comment, no fix round. Re-run when gh answers."
         disposition WAITING_API
         verdict WAITING_API "the PR read failed this chunk; no judgement about the PR was made"
