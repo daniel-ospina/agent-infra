@@ -1236,6 +1236,51 @@ OLA_U_RC=0; OLA_U_OUT="$(inst l1 --uninstall 2>&1)" || OLA_U_RC=$?
   && ok 'uninstall: the OWNING state dir still uninstalls its own unit (the ownership read discriminates)' \
   || bad "uninstall: refused to remove the caller's OWN unit — the ownership read over-blocks: $OLA_U_OUT"
 
+# — §L-iii: ownership is the RESOLUTION, not the rendered value (review P1, #2402) ———————————————————
+# The installer renders ITS `$O`; the controller re-sources `$ENV_FILE`, and this installer never sources it
+# — so the two "can legitimately differ", in both files' own words. Reading the rendered `O=` alone
+# therefore called this cell's OWN unit another state dir's the moment `keys.env` carried an `O=` line:
+# `--uninstall` said "not installed for $O" and left an ENABLED unit running, and `--install` could not see
+# the existing copy (so its "never arm a second supervisor in the other scope" guard was blind). The owner
+# is what the unit RESOLVES to, which is what `unit_owner_dir` must print.
+OLDIV="$(arm_root l3)"; mk_systemctl "$OLDIV/bin" "$OLDIV/state" "$OLDIV/sc.log"
+printf 'O=%s/o\n' "$OLDIV" > "$OLDIV/home/keys.env"
+cat > "$OLDIV/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLDIV/home
+Environment=ENV_FILE=$OLDIV/home/keys.env
+Environment=O=$OLDIV/installer-orchestrator
+Restart=always
+SH
+OLDIV_S_RC=0; OLDIV_S_OUT="$(inst l3 --status 2>&1)" || OLDIV_S_RC=$?
+case "$OLDIV_S_OUT" in
+  *"other_unit=$OLDIV/units"*) bad "status: reported THIS cell's own unit as another state dir's — the rendered O= was read as the owner, not the resolution: $OLDIV_S_OUT" ;;
+  *) ok 'status: a unit whose keys.env repoints $O is read as THIS cell (the resolution, not the rendered value)' ;;
+esac
+OLDIV_U_RC=0; OLDIV_U_OUT="$(inst l3 --uninstall 2>&1)" || OLDIV_U_RC=$?
+[ ! -f "$OLDIV/units/eldato-orchestrator.service" ] \
+  && ok 'uninstall: removes the unit of a cell whose keys.env repoints $O (it is ENABLED and supervised — leaving it would keep the controller coming back)' \
+  || bad "uninstall: refused to remove THIS cell's own unit because keys.env repoints \$O — an enabled unit left running, still supervised: $OLDIV_U_OUT"
+# NEGATIVE CONTROL: the same rendered shape, but its env file does NOT resolve this state dir — the widened
+# read must NOT claim every unit on the box (that would disable and delete another cell's supervisor).
+OLNEG="$(arm_root l4)"; mk_systemctl "$OLNEG/bin" "$OLNEG/state" "$OLNEG/sc.log"
+printf 'OTHER=1\n' > "$OLNEG/home/other-keys.env"
+cat > "$OLNEG/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLNEG/home
+Environment=ENV_FILE=$OLNEG/home/other-keys.env
+Environment=O=$OLNEG/installer-orchestrator
+Restart=always
+SH
+OLNEG_U_RC=0; OLNEG_U_OUT="$(inst l4 --uninstall 2>&1)" || OLNEG_U_RC=$?
+[ -f "$OLNEG/units/eldato-orchestrator.service" ] \
+  && ok 'uninstall: a unit whose env file resolves ANOTHER state dir SURVIVES (the negative control)' \
+  || bad 'uninstall: DELETED a unit whose env file resolves another state dir — the resolution must not become "everything is ours"'
+case "$OLNEG_U_OUT" in
+  *"other_unit=$OLNEG/units/eldato-orchestrator.service"*) ok 'uninstall: the untouched foreign unit is NAMED (not silent)' ;;
+  *) bad "uninstall: left the foreign unit alone without naming it: $OLNEG_U_OUT" ;;
+esac
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §M — the lock witness needs SHAPE *AND AGE* (review P1, #2402)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════

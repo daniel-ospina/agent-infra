@@ -728,14 +728,39 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
 # two-state-dir box: B's `--uninstall` disabled and deleted A's unit and reported "the controller is no
 # longer supervised" (rc 0), and B's `--status` answered enabled+active+MainPID with rc 0 over a unit B does
 # not own, i.e. the #2402 "reads as a healthy box" false green on the one verb the docs tell an operator to
-# trust. The rendered unit CARRIES its owner (`Environment=O=`, which verify_unit requires), so ownership is
-# a READ, not a guess. Same rule, same fallback as cloud-cell-supervisor.sh::unit_owner_dir.
+# trust. The rendered unit CARRIES its owner, so ownership is a READ, not a guess.
+#
+# ⛔ AND THE READ IS THE RESOLUTION, NOT THE RENDERED `Environment=O=` (review P1, #2402). This copy is a
+# PINNED MIRROR of `cloud-cell-supervisor.sh::unit_owner_dir`, and it exists because the two answers
+# DIVERGED: the unit also renders `Environment=ENV_FILE=`, the controller re-sources that file and
+# `keys.env` may repoint `O` — this installer "never sources `$ENV_FILE`", so its `$O` and the
+# controller's "can legitimately differ". A bare comparison therefore called this cell's OWN unit another
+# state dir's as soon as `keys.env` carried an `O=` line: `--uninstall` reported "not installed for $O" and
+# left an ENABLED unit running (`Restart=always`, still supervising), while `--install` could not see the
+# existing copy and armed a SECOND one in the other scope — two dispatchers on one queue (#1761). A
+# trailing slash is a spelling, not a different state dir. Keep this body identical to the supervisor's:
+# §L-iii pins the divergence case here, and cloud-cell-supervisor.test.sh pins the same arm there.
 unit_owner_dir() { # <unit file> -> the state dir it supervises; nothing when it carries no O= line
-    local v
-    [ -f "$1" ] || return 1
-    v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
-    [ -n "${v:-}" ] || return 1
-    printf '%s\n' "$v"
+    local f="$1" rendered_o envf unit_home eff
+    [ -f "$f" ] || return 1
+    rendered_o="$(sed -n 's/^Environment=O=//p' "$f" 2>/dev/null | head -1)"
+    envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
+    unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
+    eff=""
+    if [ -n "${envf:-}" ] && [ -r "$envf" ]; then
+        # The unit's own declared file, evaluated the way the controller evaluates it, in a throwaway
+        # subshell; `env -u` keeps an inherited O/CELL_HOME from shadowing the unit's own. A file with a
+        # top-level `exit` ends the subshell silently, and the empty answer falls back to the rendered
+        # value — never to "no owner".
+        eff="$(env -u O -u CELL_HOME -u ENV_FILE bash -c '
+            CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
+            set -a; . "$1" >/dev/null 2>&1
+            printf "%s" "${O:-}"
+        ' _ "$envf" "${unit_home:-}" "${rendered_o:-}" 2>/dev/null || true)"
+    fi
+    [ -n "${eff:-}" ] || eff="${rendered_o:-}"
+    [ -n "${eff:-}" ] || return 1
+    printf '%s\n' "${eff%/}"
 }
 # May this verb address <unit file>? YES for our own copy, and YES for an UNPROVABLE one (no O= line — a
 # hand-written or pre-#2402 unit), which is the fail-safe side of #1761: assume it may be ours and never
@@ -744,7 +769,7 @@ unit_owner_dir() { # <unit file> -> the state dir it supervises; nothing when it
 unit_is_ours() { # <unit file>
     local own
     own="$(unit_owner_dir "$1")" || return 0
-    [ "$own" = "$O" ]
+    [ "$own" = "${O%/}" ]
 }
 # Every installed copy that PROVABLY belongs to another state dir — reported, never addressed.
 foreign_units() {
