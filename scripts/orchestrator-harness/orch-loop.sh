@@ -278,6 +278,17 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
   || { echo "orch-loop: FATAL repo-authority.sh at $O is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >&2; exit 78; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
+# ── AGENT_GH_REAL: pin the ONE real gh this box resolves (agent-infra#2320) ──────────────────────
+# MEASURED 2026-10-22: the wrapper chain `gh-limit -> gh-rest -> .pi/agent/shims/gh` resolved to
+# ITSELF on the owner's Mac, gh-limit refused at depth 2, and every gh call returned EMPTY — so the
+# merge contract read UNREADABLE and NOTHING could land for hours. The shim's own resolution is what
+# hopped; a pin exported HERE (per box, DISCOVERED from PATH, never a hardcoded home) means no layer
+# needs to guess again. Best-effort and quiet by design: a box with no real gh keeps its current
+# behaviour, and `bin/harness status` NAMES that state — a controller that refuses to start because
+# its gh could not be pinned would be a worse failure than the one this prevents.
+# ⛔ GUARDED ON THE INTERFACE, like every other module here: an `$O` predating this change defines no
+# `ensure_agent_gh_real`, and an unguarded call would print a 127 into the cycle log on every pass.
+if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real || true; fi
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
