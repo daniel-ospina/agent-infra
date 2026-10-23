@@ -1277,6 +1277,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     owner: "#2246",
   },
   {
+    symbol: "CIQ_AGE",
+    rationale:
+      "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `ciq_stale_max`/`ciq_ttl`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
+    owner: "#2426",
+  },
+  {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",
     rationale:
       "durable task-run RECORD retention age (7 days) in shared/task-runs.ts — a disk-retention backstop for the run-record/log tree, not a session or child liveness bound (the byte cap binds first in practice); paired with the live-pid / settle-grace guard so it never evicts an in-flight lane",
