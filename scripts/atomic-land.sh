@@ -1169,12 +1169,15 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
     elif [ "$rec_rc" -ne 0 ]; then
       stop "a FRESH review is required at ${HEAD} before $REPO#$PR can be updated — the record is stale (${RECORD_HEAD:0:12}…) and the record step REFUSED that artifact at the CURRENT head (reason above). The branch was NOT updated and nothing was merged: a head move would only spend a full CI cycle on a PR whose record could not be carried (#2369). Review ${HEAD:0:12}… and record it, then re-run."
     fi
-    # On rc=0 do_record RE-READ the record, so RECORD_HEAD is now HEAD. That is the
-    # success arm ONLY. On rc=4 (head-health) the producer vetoed BEFORE its record
-    # write, so NOTHING was written and RECORD_HEAD is STILL the stale reviewed head:
-    # step [3/4] must hand that prior to the producer itself, and a reader must not
-    # take this line as "after a proceed the record already names HEAD". Tightening
-    # step 3 on that reading would break the carry this proceed depends on.
+    # RECORD_HEAD is NOT re-bound on every path through here, and step [3/4] must not
+    # be tightened on the assumption that it is:
+    #   • rc=4 (head-health): the producer vetoed BEFORE its record write, so NOTHING
+    #     was written and RECORD_HEAD is STILL the stale reviewed head — step [3/4]
+    #     hands that prior to the producer itself and re-earns the carry there.
+    #   • rc=5 (producer exited 0 without binding): same, nothing was written.
+    #   • --dry-run: do_record returns 0 at its OWN dry-run arm, above the producer and
+    #     above `read_record`, so nothing is written there either (and nothing lands).
+    # ONLY the real record step that reaches `read_record` re-binds RECORD_HEAD to HEAD.
   fi
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
