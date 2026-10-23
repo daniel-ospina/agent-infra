@@ -273,11 +273,14 @@ mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
 # Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
-# through ONE module. That is not tidiness: a tmux window on a cloud cell dies at ~21 log lines
-# (measured on all three cells, 2026-10-20) while the same lane in a DURABLE TERMINAL survives, so
-# the launcher, the census the caps read, and the reaper must all move together or the caps stop
-# binding (a census that still counts `tmux ls` reports 0 workers for durable terminals and the
-# ceiling never trips). See that file's header for the measurement and for the refusal stance.
+# through ONE module. That is not tidiness: the launcher, the census the caps read, and the reaper
+# must all move together or the caps stop binding (a census that still counts `tmux ls` reports 0
+# workers for durable terminals and the ceiling never trips). ⛔ On a Linux cell the module's own
+# `wt_launcher` decides between a durable terminal (cmux answers) and tmux with an explicit
+# HOME+keys.env contract (it does not) — the `~21 log lines` death that once made a cell resolve to
+# `none` was an ENVIRONMENT failure, not a tmux one (agent-infra#2210, reopened 2026-10-22), and
+# resolving to `none` refused every spawn on every cycle. See that file's header for the measurements
+# and for the refusal stance.
 for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
   [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
 done
@@ -2827,11 +2830,11 @@ while true; do
             echo "#$PR RED TREE at head=$HEAD_N — a worker already owns this PR (fix-$PR/merge-$PR live, or the cross-box claim holds it), NOT spawning a second (attempt $RF_N/${MAX_RED_FIX_TRIES:-2} spent). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "a worker already owns this PR — the rail refusal stands at this head"
           elif [ "$(wt_count fix-)" -lt "${MAX_RED_FIX:-4}" ] && can_spawn; then
-            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets a
-            # daemon-owned DURABLE TERMINAL exactly like every other worker — a tmux window or a
-            # transient `cloud exec` child dies at ~21 log lines (measured on all three cells, see
-            # `worker-terminal.sh`'s header), and a dead red-fixer is indistinguishable from one that
-            # found nothing to fix. Args go in a FILE so no PR-derived value reaches `sh -c`, and
+            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets the
+            # surface that box actually has — a daemon-owned DURABLE TERMINAL where cmux answers, tmux
+            # with an explicit HOME+keys.env contract where it does not (the `~21 log lines` death was
+            # the missing environment, and a dead red-fixer is indistinguishable from one that found
+            # nothing to fix). Args go in a FILE so no PR-derived value reaches `sh -c`, and
             # `fix-one.sh` — which materialises the branch's OWN worktree from origin, captures the
             # failing checks and their logs, and re-runs the merge chain (which re-rails) when it
             # pushes. A red-fixer never runs in the hub checkout: the fixer script cd's into the

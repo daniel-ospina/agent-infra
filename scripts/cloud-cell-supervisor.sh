@@ -9,12 +9,13 @@
 # worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
 # both platform shapes. (a) remains, and is what this supervisor is for.
 #
-# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
-# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
-# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
-# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
-# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
-# override, because a gate an agent can defeat with an export is not a gate.
+# The lanes were never launchd's, and they belong to neither launcher camp: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL wherever it answers
+# and otherwise uses tmux (the launchd Mac, and a cell whose guest CLI cannot run) **with an explicit
+# HOME + keys.env environment contract**. A tmux worker started without that contract is the measured
+# `~21 log lines` death (agent-infra#2210, reopened: the credential is HOME-bound, so a worker with the
+# wrong HOME has none). Where NO surface exists the launcher REFUSES loudly; there is no env override,
+# because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune

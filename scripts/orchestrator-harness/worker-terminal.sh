@@ -3,14 +3,28 @@
 # them, and KILLS one. Sourced by orch-loop.sh and dispatch-merge.sh.
 #
 # ⛔ WHY THIS FILE EXISTS — MEASURED 2026-10-20 ON ALL THREE CLOUD CELLS.
-# A lane launched as a tmux window (or a `setsid nohup` child of a transient `cmux cloud exec`
-# session) dies at ~21 log lines: its first `bash` tool call never returns and the child transcript
-# stops after ONE toolCall. The SAME lane launched as a DURABLE TERMINAL — a surface the cmux daemon
-# owns, not a child of the session that created it — stays alive (verified: `cmux vm terminal
-# wait-exit` reports `pending` while it runs, and a `ps` taken from an exec session cannot even see
-# the process, because the tree hangs off the daemon and not off the launcher). Bash-only rails
-# launched via tmux survive 20+ minutes, so the kill targets the LANE's process tree, not bash — the
-# launcher is what has to change, not the worker.
+# A lane launched by the harness produced nothing: the worker log stopped after ~21 lines and the
+# child transcript ended after ONE toolCall. agent-infra#2210 concluded "never a tmux window" and
+# made `wt_launcher` return `tmux` on macOS ONLY — so on a Linux cell, where the guest cmux CLI cannot
+# run at all, the launcher resolved to `none` and the controller refused EVERY spawn, every cycle,
+# forever. agent-infra#2210 was reopened for that reason; the conclusion is corrected here.
+#
+# ⛔ THE ~21-LINE DEATH IS AN ENVIRONMENT FAILURE, NOT A TMUX ONE — MEASURED 2026-10-22, cell-1.
+# The mechanism is #2210's own follow-up evidence read correctly: `gh`'s credential is HOME-BOUND
+# (`$HOME/.config/gh/hosts.yml`), and a tmux spawn inherits the SERVER's environment — whatever shell
+# happened to create that server. The pre-fix arm `tmux new-session -d -s X 'cd CWD && CMD'` therefore
+# got, against one bare server (`env -i HOME=/home/cmux`, no keys):
+#     7 lines, `gh auth status` rc=1, `You are not logged into any GitHub hosts`  → stops.
+# The SAME server, same box, with `export HOME=/tmp/cell-home; . $HOME/keys.env` in the launch line:
+#     50 lines, `gh auth status` rc=0 (account daniel-ospina), `SURVIVED` past 21 lines.
+# And every lane alive on that box carried the prefix by hand (33 min, 31 min, 24 min …), which is why
+# the death reproduced for the controller and never for an operator. So the fix is the ENVIRONMENT
+# CONTRACT (see `wt_launcher_env`), not the launcher choice: a durable terminal is still preferred
+# wherever the daemon answers, and tmux is used wherever it does not — with credentials, or not at all.
+#
+# The durable terminal remains the PREFERRED surface where the cmux daemon answers: its process tree
+# hangs off the daemon (`__terminal-host`, ppid = the daemon), and `cmux vm terminal wait-exit` reports
+# `pending` while it runs. That is a better surface; it is not the only workable one.
 #
 # ⛔ WHICH CMUX VERB, AND WHY IT IS NOT LITERALLY `surface new-terminal`. That spelling exists on the
 # Mac's host CLI; the CLI that ships INSIDE a cloud cell does not have it (`cmux surface ls` →
@@ -41,10 +55,11 @@
 # spawn without limit exactly when the daemon is in trouble. `dead` is only ever concluded from a
 # POSITIVE read (the workspace is gone; the session name is absent).
 #
-# ⛔ WHAT THIS FILE DELIBERATELY DOES NOT DO. No tmux fallback on a Linux cell (`wt_launcher` refuses
-# out loud instead): a silent fallback would make the 21-line death invisible again, which is the
-# defect being removed. No retry, no queue — a failed spawn returns non-zero and lets the caller's
-# own failure branch (every call site has one) record the wait.
+# ⛔ WHAT THIS FILE DELIBERATELY DOES NOT DO. No SILENT anything: a box with no surface at all is
+# refused out loud, and a tmux spawn that cannot be given an environment with a credential is refused
+# out loud too (a silent credential-less worker is how the 21-line death stayed invisible). No retry,
+# no queue — a failed spawn returns non-zero and lets the caller's own failure branch (every call site
+# has one) record the wait.
 
 # ── small helpers ──────────────────────────────────────────────────────────────────────────────
 # The shipped quoter, byte-identical to orch-loop.sh's shq() (a worker command is a shell LINE in the
@@ -63,28 +78,96 @@ wt_warn() {
 }
 
 # ── which launcher this surface gets ──────────────────────────────────────────────────────────
-# `terminal` — a cmux surface where the DAEMON answers (a cloud cell, or a Mac process started
-#              inside cmux). This is the only launcher a Linux host may use.
-# `tmux`     — macOS with no reachable cmux daemon, i.e. the launchd controller. THAT IS DELIBERATE
-#              AND NOT A DEGRADE: from launchd the cmux CLI is unusable by design ("Access denied -
-#              only processes started inside cmux can connect", measured and recorded in
-#              tools/fleet/lane_liveness.py), so tmux is the only launcher that works there — and
-#              it is where the current worker model has always worked.
-# `none`     — a Linux host with no reachable cmux. REFUSED, loudly, per spawn. Never tmux: on a
-#              cell a tmux window is the measured 21-line death.
-# ⛔ NO ENV OVERRIDE. It would be a one-line way to force tmux on a cell — i.e. to re-create the
-# defect this file removes — and a gate a PR or an agent can defeat is not a gate. The launcher is a
-# fact about the surface, read from the surface. (Tests choose a surface by stubbing PATH: `cmux` and
-# `uname` are the only inputs, and `wt_forget` re-probes within one shell.)
+# `terminal` — a cmux surface where the DAEMON answers (a Mac process started inside cmux, or a cell
+#              whose guest CLI can run). PREFERRED everywhere it answers.
+# `tmux`     — no reachable cmux daemon, but tmux exists. TWO surfaces, and BOTH are correct:
+#              the launchd MAC controller (from launchd the cmux CLI is unusable by design — "Access
+#              denied - only processes started inside cmux can connect", recorded in
+#              tools/fleet/lane_liveness.py), and a LINUX CELL, where the guest CLI cannot run at all
+#              (measured: `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui`, its
+#              `cmux-tui` symlink dangling, no daemon process — agent-infra#2368). On a cell this is
+#              the ONLY surface that can start a worker, and refusing it started nothing forever.
+# `none`     — no surface at all: no cmux answer AND no tmux binary. REFUSED, loudly, per spawn. That
+#              refusal is protective and stays: there is genuinely nothing to run a worker in.
+# ⛔ WHAT MADE `tmux` WRONG ON A LINUX CELL WAS NEVER TMUX (see this file's header, measured
+# 2026-10-22): it was that the arm passed NO ENVIRONMENT, so the worker inherited the tmux server's
+# and, with `HOME` never set to the cell home, had no `gh` credential and stopped at its first call.
+# The arm now carries the contract explicitly — `wt_launcher_env` — and REFUSES when it cannot.
+# ⛔ NO ENV OVERRIDE FOR THE LAUNCHER ITSELF. The launcher is a fact about the surface, read from the
+# surface; a gate a PR or an agent can defeat with an export is not a gate. (`WT_WORKER_HOME` is not
+# a launcher override — it names which HOME holds a worker's credentials, an input to the env
+# contract below.) Tests choose a surface by stubbing PATH: `cmux` and `tmux` are the inputs, and
+# `wt_forget` re-probes within one shell.
 wt_launcher() {
   if command -v cmux >/dev/null 2>&1 && cmux tree --json >/dev/null 2>&1; then
     WT_LAUNCHER=terminal
-  elif [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v tmux >/dev/null 2>&1; then
+  elif command -v tmux >/dev/null 2>&1; then
     WT_LAUNCHER=tmux
   else
     WT_LAUNCHER=none
   fi
   printf '%s\n' "$WT_LAUNCHER"
+}
+
+# ── the environment contract a tmux worker MUST get ──────────────────────────────────────────
+# `gh`'s credential is HOME-BOUND: it reads `$HOME/.config/gh/hosts.yml`. A tmux worker inherits the
+# SERVER's environment, so with no explicit HOME it gets whatever HOME that server was created with —
+# `/home/cmux` on a cell that keeps its credential in `/tmp/cell-home` — and its first `gh` call prints
+# `You are not logged into any GitHub hosts` before the lane has done anything. That is what "dies at
+# ~21 log lines" looks like from outside (measured 2026-10-22: 7 lines with no env, 50 lines with it,
+# same box, same bare server — see the header).
+#
+# `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
+# operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
+# Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential
+# (a non-empty `gh` hosts.yml; see `wt_launcher_env` for the full test). If none does (a box
+# authenticating from `GH_TOKEN` in the environment), the caller's HOME is used anyway and
+# `wt_launcher_env` decides. Returns 1 only when there is no HOME at all to export, which is a spawn
+# this file cannot make safely.
+wt_launcher_home() {
+  local c
+  [ -n "${WT_WORKER_HOME:-}" ] && { printf '%s\n' "$WT_WORKER_HOME"; return 0; }
+  for c in "${HOME:-}" /tmp/cell-home; do
+    [ -n "$c" ] && [ -s "$c/.config/gh/hosts.yml" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  [ -n "${HOME:-}" ] && { printf '%s\n' "$HOME"; return 0; }
+  return 1
+}
+
+# `wt_launcher_env <home>` — the launch-line prefix, or non-zero when the worker would start with no
+# credential. ⛔ THIS IS THE LOUD HALF: a credential-less worker burns a dispatch and produces nothing,
+# which is indistinguishable from the launcher killing it — so the spawn is refused, naming every
+# place a credential could have come from.
+# ⛔ THE CALLER'S OWN ENVIRONMENT IS ONE OF THOSE PLACES (review finding, 2026-10-22). `tmux new-session`
+# starts a SERVER that inherits the CALLER's environment, so a box whose gh authenticates from
+# `GH_TOKEN` in the environment is a working shape — and the pre-review probe (`tmux show-environment
+# -g GH_TOKEN` only) refused it forever, because that probe needs a server and a refusal starts none.
+# That is the same "refused every spawn, every cycle" failure this change removes, for a different
+# credential shape (the repo already treats a token-in-env cell as supported: refresh-candidates.sh).
+# ⛔ AND PRESENCE IS NOT PROVISION (same review): an EMPTY `hosts.yml` (a `gh auth logout` leftover) or a
+# `keys.env` that carries no token read as provisioned and start exactly the credential-less worker this
+# gate exists to stop. So a file counts only when it is non-empty AND (for keys.env) actually names a
+# token, and `GITHUB_TOKEN` is accepted beside `GH_TOKEN` because `gh` honours both.
+wt_launcher_env() {
+  local home="${1:-}" keys have=0
+  [ -n "$home" ] || return 1
+  keys="$home/keys.env"
+  [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && have=1
+  [ -s "$home/.config/gh/hosts.yml" ] && have=1
+  if [ "$have" = "0" ] && [ -f "$keys" ] \
+     && grep -qE '^[[:space:]]*(export[[:space:]]+)?(GH_TOKEN|GITHUB_TOKEN)=' "$keys" 2>/dev/null; then
+    have=1
+  fi
+  if [ "$have" = "0" ]; then
+    # nothing in the HOME or the caller: the tmux SERVER's environment may still carry one, and a
+    # worker inherits it. Probe it — but only when there IS a server to ask (see above).
+    command -v tmux >/dev/null 2>&1 || return 1
+    tmux show-environment -g GH_TOKEN >/dev/null 2>&1 || return 1
+  fi
+  printf 'export HOME=%s' "$(wt_q "$home")"
+  [ -f "$keys" ] && printf '; . %s' "$(wt_q "$keys")"
+  [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
+  return 0
 }
 
 # `surface` (the named primitive) vs `layout` (the guest CLI's equivalent). Probed ONCE, because a
@@ -396,7 +479,7 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
 }
 
 wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (reason on stderr)
-  local name cwd cmd kind grammar dir envf runf doc out id ws
+  local name cwd cmd kind grammar dir envf runf doc out id ws home envpfx
   [ "$#" -ge 3 ] || { wt_warn "wt_spawn needs <name> <cwd> <command>"; return 1; }
   name="$1"; cwd="$2"; shift 2; cmd="$*"
   case "$name" in
@@ -406,13 +489,26 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
   kind="$(wt_launcher)"
   case "$kind" in
     none)
-      wt_warn "REFUSED $name: no durable-terminal surface on this host (cmux is absent or its daemon does not answer) and this is not macOS — a tmux worker here dies at ~21 log lines (agent-infra#1702 follow-up), so nothing is started"
+      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer AND there is no tmux binary, so there is nothing to start a worker in (checked: cmux=$(command -v cmux >/dev/null 2>&1 && echo present || echo absent), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
       return 1 ;;
     tmux)
-      # The launchd surface, where tmux is the only launcher that works (see wt_launcher).
-      if tmux new-session -d -s "$name" "cd $(wt_q "$cwd") && $cmd" 2>/dev/null; then
+      # The launchd Mac surface and the Linux cell (see wt_launcher) — WITH the environment contract.
+      # ⛔ Never `cd CWD && CMD` alone: that inherits the tmux SERVER's environment, which carries no
+      # `HOME=/tmp/cell-home` on a cell, so the worker has no gh credential and stops at line ~7
+      # (measured 2026-10-22 — this file's header). The prefix is built by wt_launcher_env, and a box
+      # that cannot produce one is REFUSED rather than started credential-less.
+      home="$(wt_launcher_home)" || home=""
+      if [ -z "$home" ]; then
+        wt_warn "REFUSED $name: tmux is present but there is no HOME to run a worker with (WT_WORKER_HOME and HOME are both unset) — a worker with no HOME has no gh credential and no pi config, so it would stop at its first call rather than do any work"
+        return 1
+      fi
+      envpfx="$(wt_launcher_env "$home")" || {
+        wt_warn "REFUSED $name: tmux can start a session here but the worker would have NO gh credential — checked $home/.config/gh/hosts.yml, $home/keys.env and the tmux server's GH_TOKEN, found none. A lane started without one stops at its first \`gh\` call, which is the '~21-line death' agent-infra#2210 recorded; put the credential where the worker can read it, or set WT_WORKER_HOME to the HOME that holds it"
+        return 1
+      }
+      if tmux new-session -d -s "$name" "$envpfx; cd $(wt_q "$cwd") && $cmd" 2>/dev/null; then
         mkdir -p "$dir" 2>/dev/null || true
-        printf 'kind=tmux\ncwd=%s\ncreated=%s\n' "$cwd" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null || true
+        printf 'kind=tmux\nhome=%s\ncwd=%s\ncreated=%s\n' "$home" "$cwd" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null || true
         wt_forget
         return 0
       fi

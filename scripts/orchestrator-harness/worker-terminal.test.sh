@@ -102,6 +102,13 @@ case "${1:-}" in
   # plausible number here signalled whatever unrelated process happened to own it during a test run.
   list-panes) printf '%s\n' "${TMUX_PANE_PID:-4194305}" ;;
   new-session) [ "${TMUX_SPAWN_RC:-0}" = "0" ]; [ -n "$st" ] && printf '%s\n' "${4#=}" >> "$st" ;;
+  # `tmux show-environment -g GH_TOKEN` — the SERVER-environment credential probe `wt_launcher_env`
+  # uses when a worker's HOME carries no credential file. Faithful: tmux exits 1 with
+  # `unknown variable` when the name is not set, which is a different answer from an empty one.
+  show-environment) if [ "${3:-}" = "GH_TOKEN" ]; then
+                      [ "${TMUX_SERVER_GH_TOKEN:-0}" = "1" ] && { printf 'GH_TOKEN=ghp_test\n'; exit 0; }
+                      echo "unknown variable: GH_TOKEN"; exit 1
+                    fi ;;
   # The LOG keeps the target VERBATIM (the `=` prefix is the assertion); the STATE file needs the
   # bare name so membership still matches.
   kill-session) printf '%s\n' "${3:-}" >> "${TMUX_KILLED:-/dev/null}"; t="${3#=}"
@@ -119,6 +126,10 @@ chmod +x "$TMP/stub/uname"
 # cmux/uname/tmux a developer box or a cell may have).
 scenario() { mkdir -p "$TMP/bin-$1"; cp "$TMP/stub/cmux" "$TMP/stub/tmux" "$TMP/stub/uname" "$TMP/bin-$1/"; }
 scenario cmux; scenario absent; scenario darwin; scenario host
+# A box with NO surface at all: cmux cannot answer AND there is no tmux binary. `PATH` for this one is
+# the scenario dir ALONE (no `:$PATH`), or the real /usr/bin/tmux a developer box carries would be
+# found and the case could never be driven.
+scenario bare; rm -f "$TMP/bin-bare/tmux"
 
 # lib <scenario> <O> — a shell with the SHIPPED library sourced and nothing else set up.
 librun() { # librun <dir-name> <script-text...>
@@ -140,12 +151,19 @@ ck "orch-loop.sh and dispatch-merge.sh contain NO \`tmux new-session\` worker sp
 n_detach="$(grep -cE '(setsid|nohup)[^#]*\bpi\b' "$LOOP" "$DM" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
 [ "$n_detach" = "0" ] && rc=0 || rc=1
 ck "…and no \`setsid\`/\`nohup\` pi spawn (the transient-exec shape that dies at ~21 lines)" $rc
-# The tmux branch still exists, but ONLY on the launchd surface and only inside the launcher module.
-n_lib="$(grep -c 'tmux new-session' "$LIB")"
+# The tmux branch still exists, but only inside the launcher module, and it is NOT gated on Darwin:
+# agent-infra#2210's Linux refusal made the launcher resolve to `none` on every cloud cell, where the
+# guest cmux CLI cannot run at all — so the controller refused every spawn, every cycle, forever.
+# Measured 2026-10-22: with the environment contract (HOME + keys.env) a tmux worker on that box ran
+# 50 lines with `gh auth status` rc=0, against 7 lines without it. So the gate is "is there a tmux
+# binary", not "is this Darwin" — and the ENVIRONMENT is now the thing that is checked.
+n_lib="$(grep 'tmux new-session' "$LIB" | grep -vc '^[[:space:]]*#')"
 [ "$n_lib" = "1" ] && rc=0 || rc=1
-ck "the ONE remaining tmux spawn lives in worker-terminal.sh (found $n_lib)" $rc
-grep -q 'elif \[ "$(uname -s 2>/dev/null)" = "Darwin" \]' "$LIB" && rc=0 || rc=1
-ck "…and it is reachable only on macOS-without-cmux (the launchd surface)" $rc
+ck "the ONE remaining tmux spawn lives in worker-terminal.sh (found $n_lib, comments excluded)" $rc
+grep -q 'elif command -v tmux >/dev/null 2>&1; then' "$LIB" && rc=0 || rc=1
+ck "…and the tmux arm is selected by TMUX PRESENCE, not by uname=Darwin (reachable on Linux)" $rc
+grep -qE 'elif.*uname.*Darwin.*tmux' "$LIB" && rc=1 || rc=0
+ck "…the old Darwin-only condition is GONE (a Linux cell with tmux must not resolve to none)" $rc
 # Both launchers must source the module AND validate EVERY verb they call (a narrower guard passes a
 # module that is present but partial, and the controller then logs `launcher=` and a false 0 workers).
 for f in "$LOOP" "$DM"; do
@@ -208,27 +226,138 @@ grep -q 'CMUX workspace rm ws_half9' "$TMP/cmux3b.log" && rc=0 || { rc=1; cat "$
 ck "…and the workspace that create had already made is REMOVED, not leaked" $rc
 
 echo
-echo "── C) a cell with no cmux surface REFUSES — it never falls back to tmux ──"
+echo "── C) a Linux box with no cmux answer uses TMUX, with the environment contract (agent-infra#2210 reopened) ──"
+# ⛔ THE PREDICATE THIS BLOCK REPLACES made a Linux cell resolve to `none`, so the controller refused
+# EVERY spawn every cycle (`[startup] worker launcher=none (cmux=yes, uname=Linux)` then
+# `#9544 re-record spawn FAILED`), and nothing landed without a human. The reason recorded for it was
+# a ~21-line worker death — which is an ENVIRONMENT failure, measured 2026-10-22 on cell-1: against
+# ONE bare tmux server, `cd CWD && CMD` gave 7 lines and `gh auth status` rc=1 (`You are not logged
+# into any GitHub hosts`), while adding `export HOME=/tmp/cell-home; . $HOME/keys.env` gave 50 lines
+# and rc=0. So: tmux IS the Linux surface, and the spawn must carry HOME + keys.env or be refused.
+mkdir -p "$TMP/home-c/.config/gh"; printf "github.com:\n" > "$TMP/home-c/.config/gh/hosts.yml"   # NON-empty: presence is not provision
+printf 'export GH_TOKEN=%s\n' "ghp_from_keys_env" > "$TMP/home-c/keys.env"
 cat > "$TMP/c1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"; mkdir -p "$WT_DIR"
-export CMUX_ABSENT=1 TMUX_LOG="$4"; : > "$TMUX_LOG"
+export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5"; : > "$TMUX_LOG"
 . "$1"
 echo "launcher=$(wt_launcher)"
 wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
 SH
-out="$(FAKE_UNAME=Linux bash "$TMP/c1.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4" "$TMP/tmux4.log" 2>&1)"
+out="$(FAKE_UNAME=Linux bash "$TMP/c1.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4" "$TMP/tmux4.log" "$TMP/home-c" 2>&1)"
+case "$out" in *"launcher=tmux"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "no cmux answer + Linux + tmux => launcher=tmux (NOT none: there is a surface)" $rc
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the spawn SUCCEEDS" $rc
+grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+ck "…by starting a tmux session, as a worker that can actually run" $rc
+grep -qF "export HOME='$TMP/home-c'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+ck "…whose launch line exports the HOME that holds the gh credential (the credential is HOME-bound)" $rc
+grep -qF ". '$TMP/home-c/keys.env'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+ck "…and sources that HOME's keys.env, exactly like the cell's working manual dispatch" $rc
+grep -q '^kind=tmux' "$TMP/O4/state/worker-lane-8" && grep -q '^home=' "$TMP/O4/state/worker-lane-8" && rc=0 || rc=1
+ck "…and records the worker AND the HOME it was given, so an operator can audit it" $rc
+# ⛔ THE LOUD HALF: a tmux spawn whose worker would have NO credential is refused, not started.
+# A credential-less lane is the ~21-line death: it burns its dispatch and produces nothing, which looks
+# exactly like the launcher killing it.
+rm -rf "$TMP/O4b"; mkdir -p "$TMP/home-nocred"
+cat > "$TMP/c2.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5" TMUX_SERVER_GH_TOKEN="${TMUX_SERVER_GH_TOKEN:-0}"; : > "$TMUX_LOG"
+# The CALLER's own token is a credential source now (see wt_launcher_env), so a test of the REFUSAL
+# must clear it — otherwise this driver passes on a lane box and fails on a clean one, for a reason
+# that has nothing to do with what it asserts. The caller-token case sets it back deliberately.
+[ "${KEEP_CALLER_TOKEN:-0}" = "1" ] || unset GH_TOKEN GITHUB_TOKEN
+. "$1"
+wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
+SH
+out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4b" "$TMP/tmux4b.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a worker that would start with NO gh credential is REFUSED (loud, not a silent dead lane)" $rc
+grep -q 'new-session' "$TMP/tmux4b.log" && rc=1 || rc=0
+ck "…and tmux is never asked to START one (the credential probe is the only call it makes)" $rc
+grep -q 'NO gh credential' "$TMP/O4b/test.log" && rc=0 || { rc=1; cat "$TMP/O4b/test.log" 2>/dev/null; }
+ck "…naming all three places it looked (hosts.yml, keys.env, the tmux server's GH_TOKEN)" $rc
+[ -f "$TMP/O4b/state/worker-lane-8" ] && rc=1 || rc=0
+ck "…and leaving NO worker record behind (a refusal is not a worker)" $rc
+# POSITIVE CONTROL: the same empty HOME is FINE when the tmux server's own environment carries the
+# token — so the refusal is a real probe of the environment, not a blanket ban on a bare HOME.
+rm -rf "$TMP/O4c"
+out="$(FAKE_UNAME=Linux TMUX_SERVER_GH_TOKEN=1 bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4c" "$TMP/tmux4c.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "control: a HOME with no credential file still spawns when the tmux server carries GH_TOKEN" $rc
+# ⛔ THE CALLER'S OWN ENVIRONMENT IS A CREDENTIAL SOURCE (review finding, 2026-10-22). `tmux
+# new-session` starts a SERVER that inherits the CALLER's environment, so a box whose gh authenticates
+# from `GH_TOKEN` in the environment is a working shape — and a probe that asked only the tmux SERVER
+# refused it forever (`show-environment` needs a server, and a refusal starts none). That is the same
+# "refused every spawn, every cycle" failure this change removes, in a different credential shape.
+rm -rf "$TMP/O4f"
+out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4f" "$TMP/tmux4f.log" "$TMP/home-nocred" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a caller whose own environment carries GH_TOKEN spawns (no credential file needed)" $rc
+grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux4f.log" && rc=0 || rc=1
+ck "…and it is a tmux session the worker inherits the caller's GH_TOKEN through" $rc
+# ⛔ PRESENCE IS NOT PROVISION (same review): an EMPTY hosts.yml (a `gh auth logout` leftover) or a
+# keys.env that names no token reads as provisioned and starts exactly the credential-less worker the
+# gate exists to stop.
+rm -rf "$TMP/home-empty" "$TMP/home-notok" "$TMP/O4g"
+mkdir -p "$TMP/home-empty/.config/gh"; : > "$TMP/home-empty/.config/gh/hosts.yml"
+mkdir -p "$TMP/home-notok"; printf 'export DEEPSEEK_API_KEY=%s\n' sk-x > "$TMP/home-notok/keys.env"
+for h in home-empty home-notok; do
+  rm -rf "$TMP/O-$h"
+  out="$(FAKE_UNAME=Linux bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O-$h" "$TMP/tmux-$h.log" "$TMP/$h" 2>&1)"
+  case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $h: $out";; esac
+  ck "$h (a file that carries no credential) is REFUSED, not read as provisioned" $rc
+done
+rm -rf "$TMP/O4d"
+# ⛔ The `none` refusal is PROTECTIVE and stays: a box with no cmux answer AND no tmux binary has no
+# surface at all and must not pretend otherwise.
+cat > "$TMP/c3.sh" <<'SH'
+set -u
+O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"
+mkdir -p "$WT_DIR"          # still the caller's PATH here — this one is narrowed to the box below
+PATH="$2"                  # NO tmux anywhere, including the real /usr/bin/tmux a dev box carries
+export CMUX_ABSENT=1
+. "$1"
+echo "launcher=$(wt_launcher)"
+wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
+SH
+out="$(bash "$TMP/c3.sh" "$LIB" "$TMP/bin-bare" "$TMP/O4d" 2>&1)"
 case "$out" in *"launcher=none"*) rc=0 ;; *) rc=1; echo "      $out";; esac
-ck "no cmux + Linux => launcher=none (the surface fact is reported, not guessed)" $rc
-case "$out" in *"rc=1"*) rc=0 ;; *) rc=1;; esac
+ck "no cmux AND no tmux => launcher=none (a box with no surface at all is still reported, not guessed)" $rc
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the spawn is REFUSED" $rc
-[ -s "$TMP/tmux4.log" ] && rc=1 || rc=0
-ck "…WITHOUT falling back to tmux (the launcher that kills lanes) — tmux was never called" $rc
-grep -q 'REFUSED lane-8' "$TMP/O4/test.log" && rc=0 || rc=1
-ck "…and the refusal reaches the controller's log, not just stderr" $rc
+grep -q 'tmux=absent' "$TMP/O4d/test.log" && rc=0 || { rc=1; cat "$TMP/O4d/test.log" 2>/dev/null; }
+ck "…with a message that names BOTH surfaces it looked for (so it is a diagnosis, not a shrug)" $rc
+# ⛔ And a box that cannot produce a CONTRACT is refused, not started credential-less. Two arms:
+# the function itself refuses an empty HOME, and the knob an operator sets is the one that is used
+# (a silent fall-through to $HOME would make "the credential lives at X" a suggestion).
+rm -rf "$TMP/O4e"
+cat > "$TMP/c4.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+. "$1"
+wt_launcher_env "" >/dev/null 2>&1; echo "env_empty_rc=$?"
+echo "home_knob=$(WT_WORKER_HOME="$4" wt_launcher_home)"
+echo "home_plain=$(HOME="$4" wt_launcher_home)"
+SH
+mkdir -p "$TMP/home-k/.config/gh"; printf "github.com:\n" > "$TMP/home-k/.config/gh/hosts.yml"
+out="$(bash "$TMP/c4.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4e" "$TMP/home-k" 2>&1)"
+case "$out" in *"env_empty_rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "no HOME to build a contract with => wt_launcher_env refuses (there is nothing to export)" $rc
+case "$out" in *"home_knob=$TMP/home-k"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…WT_WORKER_HOME is the HOME used (the operator's answer, not a fall-through)" $rc
+case "$out" in *"home_plain=$TMP/home-k"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and with no knob, a HOME that HOLDS the credential is the one chosen" $rc
 
 echo
-echo "── D) the launchd surface still uses tmux (the one place it is correct) ──"
+echo "── D) the launchd surface still uses tmux (the other place it is correct) ──"
+# ⛔ HERMETIC (review finding, 2026-10-22): this block used to reach the machine's own credential —
+# `$HOME` or the hardcoded `/tmp/cell-home` — so on a CI runner (no gh auth step, no /tmp/cell-home) the
+# spawn was refused and the assertion reded on a clean box while passing on a cell. The launchd path
+# gets an explicit WT_WORKER_HOME fixture, exactly as §C does.
+mkdir -p "$TMP/home-d/.config/gh"; printf "github.com:\n" > "$TMP/home-d/.config/gh/hosts.yml"
 cat > "$TMP/d1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
@@ -243,7 +372,7 @@ echo "alive=$(wt_alive lane-9 && echo yes || echo no)"
 wt_close lane-9; echo "close_rc=$?"
 echo "record=$([ -f "$WT_DIR/worker-lane-9" ] && echo kept || echo gone)"
 SH
-out="$(FAKE_UNAME=Darwin bash "$TMP/d1.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O5" "$TMP/tmux5.log" "$TMP/killed5.log" 2>&1)"
+out="$(FAKE_UNAME=Darwin WT_WORKER_HOME="$TMP/home-d" bash "$TMP/d1.sh" "$LIB" "$TMP/bin-darwin" "$TMP/O5" "$TMP/tmux5.log" "$TMP/killed5.log" 2>&1)"
 case "$out" in *"launcher=tmux"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "no cmux + macOS => launcher=tmux (launchd cannot reach the cmux daemon by design)" $rc
 grep -q 'TMUX new-session -d -s lane-9' "$TMP/tmux5.log" && rc=0 || rc=1
