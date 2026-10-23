@@ -349,6 +349,36 @@ land_backlog_repo() { # [<checkout>] -> prints owner/name, rc!=0 when it cannot 
   return 1
 }
 
+# ⛔ AN OPEN PR WHOSE **HEAD** IS THIS COMMIT — the commit rule of the `prfix` exemption (review
+# cycles 4-6). Two things this must get right, both measured:
+#   * it reads the BASE repo's open-PR LISTING, not `repos/<r>/commits/<sha>/pulls`. A FORK PR's commit
+#     belongs to the fork's network: the base repo's `/commits/<sha>/pulls` answered `[]` for 12 of 12
+#     fork PRs (2026-10-23), which would have made every fork repair unprovable — and therefore held —
+#     on exactly the deep repos this gate exists for. The listing carries fork PRs with `head.sha`.
+#   * it matches `.head.sha`, not "some PR CONTAINS this commit". `/commits/<sha>/pulls` also answers for
+#     a commit in the MIDDLE of an open PR (measured on pydantic#14022 and cli#14781), and for a commit
+#     on the default branch it answers with the MERGED PR that introduced it — so a lane sitting on
+#     `main` would have "proven" itself a repair worker. Both filters are therefore explicit.
+# The read is PAGED the same way `land_backlog_open` is (5 x 100), and an inexact page (exactly 100
+# served with more to come) is treated as unreadable rather than as "no match" — a truncated listing
+# that silently proves nothing would hold the drain, so it must fail the same way a failed read does.
+land_backlog_pr_at_head() { # <owner/repo> <sha> -> prints the OPEN PR number, rc 0 iff its head IS this sha
+  local or_="${1:-}" sha="${2:-}" page=1 out match count jqf
+  case "$or_" in */*) ;; *) return 1 ;; esac
+  case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; *) return 1 ;; esac
+  # One call per page: the match and the page size come back together, so a full page can be walked.
+  jqf="([.[]|select(.state==\"open\" and .head.sha==\"$sha\")|.number][0] // 0) as \$m | \"\(\$m) \(length)\""
+  while [ "$page" -le 5 ]; do
+    out="$(gh api "repos/$or_/pulls?state=open&per_page=100&page=$page" --jq "$jqf" 2>/dev/null)" || return 1
+    match="${out%% *}"; count="${out##* }"
+    is_num "${match:-}" && is_num "${count:-}" || return 1
+    [ "$match" -ge 1 ] && { printf '%s\n' "$match"; return 0; }
+    [ "$count" -lt 100 ] && break
+    page=$(( page + 1 ))
+  done
+  return 1
+}
+
 # Open PRs, BOUNDED (5 pages x 100). An unbounded listing read is the load defect this repo has
 # already paid for (#1069/#1984), and 500 open PRs is not a backlog we need to count more precisely
 # than "greater than the ceiling".
@@ -435,34 +465,46 @@ land_backlog_verdict() { # <owner/repo> [<lead-hours = TEST SEAM>] [<min-ceiling
   return 0
 }
 
-# ⛔ THE `prfix` EXEMPTION'S EVIDENCE (review cycle 4, P2-1): an OPEN PR must be THIS worktree. That is
-# the property that separates repair from creation — creation is on a branch/commit with no PR yet —
-# and unlike a declared KIND it is not something a lane can type into an argument. Two rules, because
-# a worktree reaches a PR in two shapes; either one is proof, and neither is a bypass:
+# ⛔ THE `prfix` EXEMPTION'S EVIDENCE (review cycles 4 and 5): an OPEN PR must be THIS worktree, and
+# the proof must name the PR. Two rules, because a worktree reaches a PR in two shapes:
 #   1. the BRANCH rule — `pr-doctor` checks out the PR's head branch, so `gh pr list --head <branch>`
-#      finds it in one cheap call (the common case);
+#      finds it. ⛔ AND ITS HEAD MUST BE THIS WORKTREE'S HEAD (review cycle 5, P2-3): a branch NAME alone
+#      is satisfiable by a stale local branch, or by a lane whose branch happens to share a name with
+#      some other PR's head, so the rule is accepted only when the PR's `headRefOid` IS `git rev-parse
+#      HEAD`. That is exactly what pr-doctor guarantees before it dispatches (`_ensure_head`).
 #   2. the HEAD-SHA rule — a FORK PR's worktree is a DETACHED `refs/pull/<n>/head` (README: "THERE IS
-#      NO BRANCH HERE TO PUSH"), so there is no branch name to ask about; the PR is still identifiable
-#      by the commit it points at, which pr-doctor has just fetched.
-# Any unreadable answer returns 1, so an unprovable claim is HELD rather than trusted (the same polarity
-# as the verdict itself). A creation worker passes neither rule: its HEAD is a commit no PR owns yet.
-land_backlog_open_pr_evidence() { # <owner/repo> -> prints the open PR number, rc 0 iff proven
-  local or_="${1:-}" br sha n
+#      NO BRANCH HERE TO PUSH"), so there is no branch name to ask about; the PR is identified by the
+#      commit it points at. It reads the BASE repo's PAGED open-PR LISTING and requires `.head.sha` to be
+#      this `HEAD`. ⛔ NOT `gh api repos/<r>/commits/<sha>/pulls` (review cycle 6, P2-1): a fork PR's
+#      commit is in the FORK's network, so the base repo answered `[]` for 12 of 12 measured fork PRs
+#      (cli/cli, pydantic, home-assistant, vscode) while the listing returns them — which would have made
+#      every fork repair unprovable, and therefore held, on exactly the deep repos this gate exists for.
+#      ⛔ AND THE LISTING IS NOT `pr list` EITHER (cycle 5, P3-1): `pr list` is newest-first and silently
+#      truncates at `--limit`, so an older fork PR would have been unprovable — permanently held — as the
+#      backlog deepens. A paged REST listing has no such order dependence, and a page that comes back
+#      exactly full is walked rather than read as "no match".
+# ⛔ WHAT THIS DOES *NOT* PROVE, SAID PLAINLY (cycle 5, P2-3): a lane standing in a worktree that IS an
+# open PR can still spawn any work it likes with `prfix`. The evidence proves "this worktree is an open
+# PR", not "this work is repair". That is a named residual, not a closed hole — an ambient/argument
+# switch that opened the gate would be worse, and the gate's job is back-pressure on the fleet's default,
+# not a security boundary against a lane that owns a PR. Recorded in README §7.2g.
+# Any unreadable answer returns 1, so an unprovable claim is measured like any other creation claim (see
+# the caller: it FALLS THROUGH to the verdict, so under the ceiling it runs and over it the real reason
+# is reported).
+land_backlog_open_pr_evidence() { # <owner/repo> -> prints the OPEN PR number, rc 0 iff this worktree is it
+  local or_="${1:-}" br sha n head n2
   case "$or_" in */*) ;; *) return 1 ;; esac
+  sha="$(git rev-parse HEAD 2>/dev/null)"
   br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
   case "$br" in ''|HEAD|*[!A-Za-z0-9._/-]*) br="" ;; esac
-  if [ -n "$br" ]; then
-    n="$(gh pr list --repo "$or_" --head "$br" --state open --json number --jq 'length' 2>/dev/null)" || n=""
-    if is_num "$n" && [ "$n" -ge 1 ]; then printf '%s\n' "$n"; return 0; fi
+  if [ -n "$br" ] && [ -n "$sha" ]; then
+    n2="$(gh pr list --repo "$or_" --head "$br" --state open --json number,headRefOid \
+            --jq '.[0] | if . == null then empty else "\(.number) \(.headRefOid)" end' 2>/dev/null)" || n2=""
+    n="${n2%% *}"; head="${n2##* }"
+    if is_num "$n" && [ "$n" -ge 1 ] && [ "$head" = "$sha" ]; then printf '%s\n' "$n"; return 0; fi
   fi
-  sha="$(git rev-parse HEAD 2>/dev/null)" || return 1
   case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; *) return 1 ;; esac
-  n="$(gh pr list --repo "$or_" --state open --limit 200 --json number,headRefOid \
-        --jq "[.[]|select(.headRefOid==\"$sha\")][0].number // empty" 2>/dev/null)" || return 1
-  # `>= 1` as well as numeric: PR numbers start at 1, so a `0` from a stub (or a `// 0`) is NOT a PR.
-  { is_num "$n" && [ "$n" -ge 1 ]; } || return 1
-  printf '%s\n' "$n"
-  return 0
+  land_backlog_pr_at_head "$or_" "$sha"
 }
 
 # The two EVIDENCE exemptions. Read from GitHub (labels/title of the issue this lane was dispatched
@@ -633,9 +675,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # are set by the two scripts that DO the work; `prfix` comes from an argv a LANE can type
   # (`bash $O/nonblocking-dispatch.sh … 300 prfix`), so trusting it made a one-argument bypass of the
   # gate — reproduced: rc=143, worker started, on a repo 5.4x over its ceiling. It is now PROVEN from
-  # GitHub: the worktree's own branch must already have an OPEN PR. That is the property that actually
-  # separates repair from creation — creation happens on a branch with no PR yet — and it costs one
-  # `gh pr list` on prfix spawns only. Unprovable (no open PR, or the read failed) → HELD.
+  # GitHub: this worktree must BE an open PR — an OPEN PR is published with either this branch's name
+  # OR this exact HEAD commit (the commit rule is what answers for a detached, fork-shaped worktree).
+  # That is the property that separates repair from creation (creation happens on a branch with no PR
+  # yet), and it costs one `gh pr list` plus, only when the branch rule cannot answer, one paged
+  # listing read on `prfix` spawns only.
+  # ⛔ AND AN UNPROVABLE CLAIM FALLS THROUGH TO THE ORDINARY MEASUREMENT, it is not held (review cycle
+  # 5, P2-2) — see the NOTE branch below.
   case "${KIND:-}" in
     fixer|reviewer) : ;;
     *)
@@ -644,15 +690,31 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       echo "[land-backlog] REFUSED $label: UNREADABLE repo — this worktree's origin is not a GitHub owner/name slug, or repo-slug.sh is missing, so the landing ratio cannot be measured. Creation is HELD (a measurement that cannot be read is never an OK); landing is unaffected." >> "$log"
       return "$AGENT_LAND_BACKLOG"
     fi
-    if [ "${KIND:-}" = "prfix" ]; then
-      if lb_pr="$(land_backlog_open_pr_evidence "$lb_repo")"; then
-        echo "[land-backlog] EXEMPT $label: KIND=prfix and branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null) already has OPEN PR #$lb_pr — repairing an open PR is the drain, not the accumulation (#2409)" >> "$log"
-        # ⛔ NOT `return 0`: this function GOES ON TO START THE AGENT. An early return here would exempt
-        # the worker by never spawning it — the suite caught it (`rc=0` with an empty pi log) on the first
-        # run of the evidence arm, which is exactly why that arm asserts the spawn and not only the code.
+    if [ "${KIND:-}" = "prfix" ] && lb_pr="$(land_backlog_open_pr_evidence "$lb_repo")"; then
+      echo "[land-backlog] EXEMPT $label: KIND=prfix and this worktree is OPEN PR #$lb_pr ($(git rev-parse --abbrev-ref HEAD 2>/dev/null) at $(git rev-parse --short HEAD 2>/dev/null)) — repairing an open PR is the drain, not the accumulation (#2409)" >> "$log"
+      # ⛔ NOT `return 0`: this function GOES ON TO START THE AGENT. An early return here would exempt
+      # the worker by never spawning it — the suite caught it (`rc=0` with an empty pi log) on the first
+      # run of the evidence arm, which is why that arm asserts the spawn and not only the code.
+    elif [ "${KIND:-}" = "prfix" ]; then
+      # ⛔ AN UNPROVABLE CLAIM IS MEASURED, NOT HELD (review cycle 5, P2-2). It used to refuse outright,
+      # which meant that on a repo UNDER its ceiling — where the identical `bg` spawn runs — a gh hiccup
+      # or a detached worktree HALTED the repair, and a P0/base-red issue despatched as `prfix` was held
+      # while the refusal text said it was exempt. Falling through keeps both properties: under the
+      # ceiling it runs, over it the TRUE reason is reported, and the P0/base-red evidence path gets its
+      # documented precedence.
+      echo "[land-backlog] NOTE $label: KIND=prfix was declared but this worktree is not provably an OPEN PR at its HEAD (#2409) — either no open PR carries this branch or this commit, or the evidence read failed — so it is NOT exempt: the landing ratio decides, and OVER the ceiling that means HELD. A declared kind is not evidence." >> "$log"
+      if lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
+        echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
       else
-        echo "[land-backlog] REFUSED $label: KIND=prfix was DECLARED but could not be PROVEN — this worktree's branch has no OPEN PR (or the gh read failed), and a declared kind is not evidence. A creation worker that names itself prfix would otherwise switch the gate off, so creation is HELD. Actually repairing an open PR, or a P0-blocker / base-red repair, is exempt." >> "$log"
-        return "$AGENT_LAND_BACKLOG"
+        lb_line="$(land_backlog_verdict "$lb_repo")"; lb_rc=$?
+        case "$lb_why" in
+          *EXEMPTION-UNREADABLE*) lb_line="$lb_line [the $TAG exemption read ALSO failed: if this issue is a P0-blocker or a base-red repair it could not be proven, so fix the gh chain rather than assume it was judged non-urgent]" ;;
+        esac
+        if [ "$lb_rc" -ne 0 ]; then
+          echo "[land-backlog] REFUSED $label: $lb_line. No agent started, nothing consumed. Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The issue returns to the pool and is re-dispatched when the ratio clears." >> "$log"
+          return "$AGENT_LAND_BACKLOG"
+        fi
+        echo "[land-backlog] $lb_line" >> "$log"
       fi
     elif lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
       echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
