@@ -954,14 +954,21 @@ assert_contains "$out" "left untouched" "…and says so"
   # property being asserted is about the BANNER LINE, so that is what is scanned; the env is also
   # scrubbed above so the branch taken no longer depends on the caller's shell.
   _banner="$(printf '%s\n' "$out" | grep 'it and PROVED it' || true)"
-  if printf '%s' "$_banner" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
-     ! printf '%s' "$_banner" | grep -q 'printf '; then
+  # ⛔ HERE-STRINGS, NOT PIPES INTO A QUIET GREP (#841). `printf … | grep -q PAT` under `pipefail`
+  # reports the WRITER's SIGPIPE (141) when grep exits at its first match, so a present match can
+  # make the `if` take the ELSE branch — a fail-closed gate that reports the banner is broken when
+  # it is not. The tree-wide guard (`scripts/check-no-sigpipe-grep.sh`, wired into CI) is the
+  # authority: this pair was flagged there the moment the Mac fixes landed (#2020), red-ing the
+  # `sigpipe-grep-guard` job for every PR in the repo. A here-string is backed by a temp file, so
+  # there is no earlier writer left to kill and every grep flag behaves identically.
+  if grep -qE 'this run (started|RELOADED) it and PROVED it' <<<"$_banner" &&
+     ! grep -q 'printf ' <<<"$_banner"; then
     ok "no raw shell escaped into the banner text"
   else bad "raw shell (or an unresolved substitution) escaped into the banner text: $_banner"; fi
   # NON-VACUITY: the exact garbage the old inline `$(case … esac)` produced must fail the predicate.
   _BROKEN="The loop IS running — this run  printf 'RELOADED' ;; *) printf 'started' ;; esac) it and PROVED it"
-  if printf '%s' "$_BROKEN" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
-     ! printf '%s' "$_BROKEN" | grep -q 'printf '; then
+  if grep -qE 'this run (started|RELOADED) it and PROVED it' <<<"$_BROKEN" &&
+     ! grep -q 'printf ' <<<"$_BROKEN"; then
     bad "the banner detector does not fire on the broken substitution it exists for"
   else ok "the banner detector FIRES on the broken \$(case …) substitution (non-vacuous)"; fi
 
