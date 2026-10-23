@@ -312,21 +312,26 @@ assert_eq "$(listeners_for "$RUNNER_ROOT/_template")" "0" "no listener was start
 # listed as a DEAD runner, counted against the ceiling (`reconcile` then stopped one slot short) and had
 # a listener started inside it — whose `.runner` every later `add` copies into the instance, voiding the
 # proof-of-registration check. This fixture uses a non-default name so only those two arms can answer.
-echo "── the template is excluded even under a DIFFERENT name ──"
+echo "── the template is excluded even when it is reached through another path ──"
 fresh_pool namedtpl; reset_logs
 cp -a "$TEMPLATE" "$RUNNER_ROOT/release-2"; : >"$RUNNER_ROOT/release-2/.runner"
+# ⛔ THE TEMPLATE PATH MUST NOT RESOLVE LITERALLY TO THE ENUMERATED DIR, or the NAME arm answers the
+#   fixture and the PHYSICAL arm can be deleted alone with the suite green (measured). A symlinked
+#   template is the shape `tpl` exists for — and the measured outcome of losing it is a release listed
+#   as a DEAD runner with a listener started inside it.
+ln -s "$RUNNER_ROOT/release-2" "$T/rel-alias"
 register pi-runner-real2
-out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/release-2" run status)"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/rel-alias" run status)"
 assert_contains "$out" "summary live=0 dead=1 slots=1" \
-  "a pristine release under a NON-default name is not a slot"
+  "a pristine release reached through a symlinked template path is not a slot"
 if grep -qF "release-2" <<<"$out"; then
-  bad "a release under a non-default name is not listed as a runner"
+  bad "a release behind a symlinked template path is not listed as a runner"
 else
-  ok "a release under a non-default name is not listed as a runner"
+  ok "a release behind a symlinked template path is not listed as a runner"
 fi
-out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$RUNNER_ROOT/release-2" run reconcile)"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/rel-alias" run reconcile)"
 assert_eq "$(listeners_for "$RUNNER_ROOT/release-2")" "0" \
-  "no listener was started inside the non-default-named release"
+  "no listener was started inside the release behind the symlinked template path"
 assert_contains "$out" "ceiling reached slots=3 ceiling=3" \
   "and the pass still reached the ceiling (the release did not eat a slot)"
 
@@ -398,6 +403,7 @@ assert_eq "$?" "4" "a regular file at the target path is name-unavailable (rc 4)
 assert_contains "$out" "already exists" "the refusal says the path exists"
 assert_eq "$(cat "$RUNNER_ROOT/pi-runner-file" 2>/dev/null)" "operator notes — not a runner" \
   "the operator's FILE was not deleted by add's failure cleanup"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-file")" "0" "no listener was started for a file"
 
 # ⛔ AND A DANGLING SYMLINK at the target is the same "already exists" case: `[ -e ]` is false for it,
 #   so without the `-L` half the check falls through to the CLAIM — which happens AFTER the
@@ -411,7 +417,7 @@ assert_eq "$?" "4" "a dangling symlink at the target path is name-unavailable (r
 assert_contains "$out" "already exists" "the refusal says the path exists, not that another pass took it"
 assert_eq "$(grep -c 'registration-token' "$GH_LOG" 2>/dev/null || true)" "0" \
   "and no single-use registration token was minted for it"
-assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-file")" "0" "no listener was started for a file"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-dangle")" "0" "and no listener was started for it"
 
 # ══ 4. ADD above the CORE-AWARE ceiling ═════════════════════════════════════════════════════
 echo "── add: above the core-aware ceiling ──"
@@ -1075,6 +1081,25 @@ else
   assert_eq "$?" "2" "restart on a mode-444 instance is cannot-measure, not 'no registration'"
   assert_contains "$out" "cannot-measure why=instance-unreadable" "and it names the instance"
   chmod 700 "$RUNNER_ROOT/pi-runner-locked"
+fi
+
+# ⛔ `reconcile`'s PROBE-CANNOT ARM is the one that turns a fail-closed pass into a false PASS: with the
+#   counter gone the pass still prints `cannot-measure why=instance-unreadable` on stderr, but its exit
+#   code and its summary — the only two things a monitor reads — both say healthy, over a pool it never
+#   measured. `status`'s equivalent arm is pinned above; this is `reconcile`'s.
+echo "── reconcile: an unmeasurable registration is cannot, not a clean pass ──"
+fresh_pool recannot; reset_logs
+register pi-runner-rec1
+mkdir -p "$RUNNER_ROOT/pi-runner-rec2"; cp -a "$TEMPLATE/." "$RUNNER_ROOT/pi-runner-rec2/"; : >"$RUNNER_ROOT/pi-runner-rec2/.runner"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unmeasurable registration inside reconcile (a root shell bypasses directory permissions)"
+else
+  chmod 000 "$RUNNER_ROOT/pi-runner-rec2"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+  assert_eq "$?" "2" "reconcile exits 2 when a registration could not be measured"
+  assert_contains "$out" "cannot=1" "and its machine-readable summary counts it"
+  assert_contains "$out" "restarted name=pi-runner-rec1" "while the arm that could act still ran"
+  chmod 700 "$RUNNER_ROOT/pi-runner-rec2"
 fi
 
 # ⛔ A REGISTRATION WHOSE `.runner` IS A DANGLING SYMLINK IS STILL A REGISTRATION: `[ -e ]` is false for
