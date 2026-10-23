@@ -35,9 +35,11 @@
 #              file, under `<state>/harness-apply-preserved/<UTC>/`), each path is printed, and only
 #              then is the tree restored and fast-forwarded. A box that cannot preserve them is
 #              REFUSED (exit 20), never quietly cleaned.
-#   LANES      A running lane is NEVER signalled. This pass has no kill, no stop, no restart: the
-#              cell advance is PIN-PER-COMMIT (`apply --force --pin-only`), so a lane keeps the tree it
-#              started with and the restart is deferred to the next launch — the recorded design in
+#   LANES      A running lane is NEVER signalled. This pass contains no kill, no stop and no restart of
+#              any kind — not even a `kill -0` liveness probe, because it needs none: the advance is
+#              ALWAYS `apply --force --pin-only`, so no branch here depends on whether a controller is
+#              live. The cell advance is PIN-PER-COMMIT, so a lane keeps the tree it started with and
+#              the restart is deferred to the next launch — the recorded design in
 #              harness-refresh.sh's header, honoured rather than re-decided. BOTH flags: `--pin-only`
 #              keeps the scheduler out of $O (seeding is `start`'s job), and `--force` is what `apply`
 #              requires before it will touch a cell whose controller is live — without it the advance
@@ -119,8 +121,12 @@
 # same interaction is recorded for `scripts/pi-cache-reap.test.sh` in docs/ops/disk-reaper.md.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
+# ⛔ `${BASH_SOURCE[0]:-}` IS LOAD-BEARING, not tidiness. The macOS agent runs this file through
+# `pi-reap-worktrees-launchd.py`, which pipes it to `bash -s`: there is NO BASH_SOURCE[0] there, and with
+# `set -u` the unguarded form printed "BASH_SOURCE[0]: unbound variable" on EVERY tick, left $HERE empty
+# (silently degrading the repo-resolution fallback to `.`), and broke `--help` through the launcher. The
+# sibling artifact this launcher already runs carries the same note (scripts/disk-reaper.sh).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 say()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
@@ -434,7 +440,14 @@ recompute_deployed() {
     REC_DEPLOYED="$(short "${DEPLOYED_SHA:-}")"; [ -n "$REC_DEPLOYED" ] || REC_DEPLOYED=unknown
     relation_of "$DEPLOYED_SHA"
     REC_BEHIND="$R_BEHIND"; REC_AHEAD="$R_AHEAD"
-    REC_DIRTY="$(git -C "$REPO" status --porcelain 2>/dev/null | awk 'NF' | wc -l | tr -d ' ')"
+    # ⛔ ONE TREE, ONE NUMBER: the record's `dirty` uses the SAME guarded, NUL-safe read as the printed
+    # one. A bare `status | wc -l` reported 0 for a FAILED status (a corrupt index / a full disk — the
+    # conditions this runs under) and counted porcelain LINES rather than entries, so a rename read as
+    # 1 here and 2 above for the same tree.
+    REC_DIRTY="unknown"
+    if git -C "$REPO" status --porcelain >/dev/null 2>&1; then
+        REC_DIRTY="$(list_dirty_paths | tr -cd '\0' | wc -c | tr -d ' ')"
+    fi
     case "${REC_DIRTY:-}" in ''|*[!0-9]*) REC_DIRTY=unknown ;; esac
 }
 
@@ -503,7 +516,12 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         [ -n "$p" ] || continue
         case "$p" in /*) continue ;; esac
         mkdir -p "$dest/untracked/$(dirname "$p")" 2>/dev/null || return 1
-        cp -p "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || { err "cannot preserve untracked $p — refusing to touch the tree"; return 1; }
+        # ⛔ `-a` (`--no-dereference` among other things) IS REQUIRED. `cp -p` FOLLOWS a symlink: a link
+        # to a directory is not copyable without -r and a DANGLING link fails outright, so preservation
+        # refused (exit 20) for ever on a box holding either — the outcome this feature exists to end,
+        # on a state that is trivially preservable. It also recorded the TARGET's bytes instead of the
+        # link, so the recovery copy was not a faithful record of the tree.
+        cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || { err "cannot preserve untracked $p — refusing to touch the tree"; return 1; }
         say "preserved: $p -> $dest/untracked/$p"
     done < <(list_untracked_paths)
     # ── bring the tracked paths back to HEAD so a fast-forward is possible ──────────────────────
@@ -621,11 +639,23 @@ if [ "$PASS_MODE" = pin ]; then
         REC_ACTION=unmaterialisable
         finish 0 25 "behind=$BEHIND but no materialiser at $MATERIALISER — this box has no way to advance its own pin (set HARNESS_MATERIALISER)"
     fi
-    if [ "$RELATION" = current ] && [ -n "$REF_SHA" ]; then
-        # Nothing to advance. The pin is still re-read and repaired below — c1's state was exactly
-        # this: the pin at the ref tip while the sha RECORD named an older commit.
+    # ⛔ THE ADVANCE DECISION IS ABOUT THE **DEPLOYED** COMMIT, NOT THE CHECKOUT. A pin advance never
+    # moves the checkout, so `RELATION` (computed from HEAD) is `behind` on every tick for ever once
+    # main passes it — and `apply --pin-only` exits 0 when the pin already names the tip. Deciding on
+    # HEAD therefore made a CONVERGED cell call the materialiser every ten minutes and record
+    # `advanced` / rc=10 every time, asserting a move that did not happen and making the documented
+    # no-op cadence unreachable in pin mode (measured in review). The pin tree is what runs.
+    if [ -n "$PIN_TREE_SHA" ] && [ "$PIN_TREE_SHA" = "$REF_SHA" ]; then
+        # Converged. The pin RECORD may still disagree with that tree — c1's state — and it is repaired
+        # below.
+        say "advance: the pin already names $REF ($(short "$REF_SHA")) — no-op"
+        REC_ACTION=none
+    elif [ -z "$PIN_TREE_SHA" ] && [ "$RELATION" = current ]; then
+        # No pin tree materialised (first run on a box that has a pin record, or a checkout whose pin
+        # has never been created) and the checkout IS the deployment: nothing to do.
         REC_ACTION=none
     else
+        BEFORE_PIN_TREE="$PIN_TREE_SHA"
         # ⛔ `--force --pin-only`, ALWAYS — BOTH FLAGS, AND FOR DIFFERENT REASONS.
         #   `--pin-only` because a SCHEDULER MUST NOT SEED $O. A plain `apply` runs `seed_and_stamp`,
         #      which swaps the helpers a RUNNING loop is executing under it — the version skew
@@ -646,7 +676,21 @@ if [ "$PASS_MODE" = pin ]; then
             REC_ACTION=materialiser-failed
             finish 0 23 "the materialiser exited $ACT_RC — the pin was NOT advanced (nothing was seeded either)"
         }
-        REC_ACTION=advanced
+        # ⛔ "THE VERB EXITED 0" IS NOT EVIDENCE OF A MOVE. Re-read the pin and judge the RESULT: only a
+        # tree that is now at the ref tip is `advanced`; a box that did not move is `none` (exit 0) or,
+        # when it is still behind after a call that claimed success, a NAMED failure (25) — never a
+        # green `advanced` over an unchanged pin.
+        read_pin
+        if [ "$PIN_TREE_SHA" = "$REF_SHA" ]; then
+            REC_ACTION=advanced
+        elif [ "$PIN_TREE_SHA" != "${BEFORE_PIN_TREE:-}" ]; then
+            REC_ACTION=advanced
+        elif [ "$RELATION" = current ]; then
+            REC_ACTION=none
+        else
+            REC_ACTION=no-move
+            finish 0 25 "the materialiser exited 0 but the pin still names $(short "${PIN_TREE_SHA:-<none>}") while $REF is $(short "$REF_SHA") — nothing moved this box"
+        fi
     fi
 else
     # sync path — the checkout's OWN verb (fetch + ff-only + config refresh + launchd), never a

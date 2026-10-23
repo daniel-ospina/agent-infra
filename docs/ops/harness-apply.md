@@ -63,8 +63,9 @@ condition is gone.
   This is the Mac defect: `sync.sh` aborting on a dirty tree is right — having no path
   that saves the work and finishes the advance is what cost 91 commits.
 - **A RUNNING LANE IS NEVER SIGNALLED.** The pass contains no `kill`, `pkill`,
-  `systemctl restart` or `launchctl kickstart` (a static assertion pins that; the only
-  `kill` is the `kill -0` liveness probe). On a cell the advance is
+  `systemctl restart` or `launchctl kickstart` of any kind — not even a `kill -0` probe
+  (it needs none: the advance is always `--force --pin-only`, so no branch depends on
+  whether a controller is live). On a cell the advance is
   `apply --force --pin-only`: `--pin-only` keeps the scheduler out of `$O` (seeding is
   `start`'s job, and re-seeding under a live loop is the version skew
   `cloud-cell-supervisor.sh` refuses), and `--force` is what `apply` requires before it
@@ -224,7 +225,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 126 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 144 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -235,7 +236,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T4 | a **lying pin** (`HARNESS-PIN` ≠ the tree's HEAD) is repaired to the tree's head; an absent pin is mended from it |
 | T5 | a box with **no installable scheduler** exits non-zero, says so, and installs nothing |
 | T6 | the pass is a **no-op** when the pin already names the ref tip (`action=none`, HEAD unmoved) |
-| T7 | the pass **signals nothing** (static: no `pkill`/`killall`/restart/kickstart/SIGTERM/KILL; every `kill` is `kill -0`) |
+| T7 | the pass contains **no `kill` of any kind** — no signal, no restart, and no `kill -0` probe either (a plain zero, not a comparison that can pass as 0 == 0) |
 | T7b | the advance calls the materialiser with **both** `--force` and `--pin-only` — a stub that enforces the supervisor's own refusal makes a regression that drops either flag go red |
 | T8 | an enabled-but-**inactive** timer fails readiness; a record whose `rc` is a refusal fails it too |
 | T9 | `--dry-run` moves nothing and reports what it *would* preserve |
@@ -248,6 +249,8 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
 | T17 | the dirty set survives an **executable bit**, a **path with a space**, and a **rename** — each of the three used to leave the tree dirty while the pass reported `advanced` |
+| T18 | **DIVERGED** → 22; a sync verb that exits 0 **without moving the checkout** → 25 (never `advanced`); and the **pin-mode no-op** — a converged pin with a lagging checkout calls the materialiser not at all |
+| T19 | the pass runs through the **launchd TCC launcher** (`bash -s`, no `BASH_SOURCE`) with **nothing on stderr** — it used to print "BASH_SOURCE[0]: unbound variable" every tick on the Mac |
 
 `tools/fleet/fleet_health.test.py` gained the `HARNESS:` leg for the record reader: no
 record without a schedule is not an alarm, a scheduled box with no record is, `behind=91`
