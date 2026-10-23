@@ -167,6 +167,17 @@ STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, ne
 # the evidence — `pi -p`, `pi --print`, or `run_agent`, whose contract in spawn-gate.sh IS print mode.
 PRINT_MODE = re.compile(r"(?m)(^|[\s;/])pi\s+(?:[^\n]*?\s)?(?:-p|--print)(?=\s|$)|"
                         r"(^|[\s;])run_agent(\s|$)")
+
+
+def code_only(text: Optional[str]) -> str:
+    """The launcher's CODE, with comment lines dropped.
+
+    ⛔ A FREE-TEXT `search()` OVER THE WHOLE FILE is how a comment satisfies a safety predicate:
+    `lane.sh` documents its own `run_agent` in prose and `merge-one.sh` has `pi -p` in a comment, so
+    a launcher that only MENTIONS print mode would pass the predicate that exists to keep an
+    interactive agent from being signalled (cycle 5, P2). Comments are not code.
+    """
+    return "\n".join(ln for ln in (text or "").splitlines() if not ln.lstrip().startswith("#"))
 MIN_IDLE_S = 120                  # see the derivation in classify()'s guard, and the docstring
 LAUNCHER_SCRIPT = r"(?:^|\s)(/\S+\.sh)(?:\s|$)"   # a shell running a SCRIPT, not a `-c` one-liner
 RUNNERS = ("lane.sh", "nonblocking-dispatch.sh", "merge-one.sh", "chain-merge.sh", "fix-one.sh")
@@ -572,7 +583,7 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
         return out
 
     rung, why = ownership(pid, launcher, log, _lacmd)
-    if rung is not None and not PRINT_MODE.search(_read(launcher) or ""):
+    if rung is not None and not PRINT_MODE.search(code_only(_read(launcher))):
         out.update(cls="UNATTRIBUTABLE",
                    why="interactive-or-unknown-mode: the launcher's text does not show a PRINT-mode "
                        "invocation, so this `pi` may be an agent waiting at a prompt — which also "

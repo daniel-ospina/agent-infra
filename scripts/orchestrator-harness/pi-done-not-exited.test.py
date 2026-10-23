@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-done-not-exited.test.py — fifteen real process trees, plus the controls the review demanded.
+"""pi-done-not-exited.test.py — seventeen real process trees, plus the controls the review demanded.
 
 WHY PROCESS FIXTURES AND NOT MOCKS
 The bug is a property of REAL PROCESSES — a `pi` whose launcher is blocked on it, a log on its fd 1,
@@ -33,6 +33,8 @@ THE CASES — each guards a different way to be wrong
  13. INTERACTIVE a lane-shaped `pi` whose launcher does NOT invoke print mode ⇒ refused: an agent at a
                  human's prompt also reaches turn-ended and frozen CPU.
  14. BOUND       a control lane the first pass never reaps (the `--min-idle` bound, both directions).
+ 15. PEER (×2)   two `pi`, ONE cwd, ONE transcript, started inside the canon's fence ⇒ both are
+                 `peer-claimed` and neither may use that boundary — including under `--pid`.
 
 THREE SEQUENTIAL CONTROLS (not fixtures):
   * BOUND      a DONE-shaped lane that the first pass never reaps: not reaped at `--min-idle 100000`,
@@ -42,7 +44,7 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against EIGHT mutated copies of the tool and requires each to go RED
+`--mutations` re-runs this suite against TEN mutated copies of the tool and requires each to go RED
 (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
 arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
 suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
@@ -332,6 +334,24 @@ def main() -> int:
     case("interactive", TURN_ENDED, transcript=False, no_print=True)   # `pi` with no -p: refused
     case("freshlog", TURN_ENDED, transcript=False, fresh_log=True)
 
+    # ── PEER: two `pi`, ONE cwd, ONE transcript, started inside the canon's fence (cycle 5, P2-2:
+    # the stagger that keeps every other case clean is exactly what kept `peer-claimed` unexercised).
+    shared_cwd = os.path.join(root, "wt-peer")
+    os.makedirs(shared_cwd)
+    peer_started = time.time()
+    peer_paths = write_session(sessions, shared_cwd, peer_started, TURN_ENDED)
+    for tag in ("peerA", "peerB"):
+        sp = launcher_script(root, tag, shared_cwd, tag)
+        leaders[tag] = launch_detached(sp, shared_cwd, os.path.join(root, tag + ".leader"))
+        procs[tag] = child_pi(leaders[tag])
+        logged = os.path.join(root, "logs", tag + ".log")
+        with open(logged, "w", encoding="utf-8") as fh:
+            fh.write("the lane's report\n" + MARKER)
+        old = time.time() - 600
+        os.utime(logged, (old, old))
+    os.utime(peer_paths, (old, old))
+    time.sleep(0.6)
+
     # no-owner: a `pi` under a plain `bash -c`, no launcher script anywhere in the chain
     cwd = os.path.join(root, "wt-noowner")
     os.makedirs(cwd)
@@ -374,7 +394,7 @@ def main() -> int:
     writer.start()
 
     tags = ["done", "live", "hung", "abstain", "nosession", "shared", "shared2", "child", "survive",
-            "noowner", "weak", "freshlog", "argvtag", "interactive"]
+            "noowner", "weak", "freshlog", "argvtag", "interactive", "peerA", "peerB"]
     pids = [procs[t] for t in tags]
     proc, rows = run_tool(sessions, pids, ["--authorise-hostless"])
     writer.join(timeout=5)
@@ -459,6 +479,19 @@ def main() -> int:
     check(os.path.exists("/proc/%d" % procs["interactive"]),
           "13/14 PRINT-MODE: --apply did NOT touch it")
 
+    check(cls("peerA") == "UNATTRIBUTABLE" and "peer-claimed" in why("peerA")
+          and cls("peerB") == "UNATTRIBUTABLE" and "peer-claimed" in why("peerB"),
+          "14/15 PEER: two `pi` fenced onto ONE transcript BOTH abstain (got %r/%r)"
+          % (cls("peerA"), cls("peerB")))
+    check(os.path.exists("/proc/%d" % procs["peerA"]) and os.path.exists("/proc/%d" % procs["peerB"]),
+          "14/15 PEER: neither was reaped")
+    pproc, prows = run_tool(sessions, [procs["peerA"]], ["--authorise-hostless"], apply=False)
+    check(prows.get(procs["peerA"], {}).get("cls") == "UNATTRIBUTABLE"
+          and "peer-claimed" in prows.get(procs["peerA"], {}).get("why", ""),
+          "14/15 PEER: and a --pid-narrowed pass STILL abstains — the binding is over the whole "
+          "population, not the requested subset (got %r)"
+          % prows.get(procs["peerA"], {}).get("cls"))
+
     check(rows.get(procs["argvtag"], {}).get("owner") == "tag"
           and cls("argvtag") == "DONE-NOT-EXITED",
           "12/14 ARGV: a launcher whose ONLY basis is the tag on its own argv (`bash lane-argvtag.sh "
@@ -466,7 +499,7 @@ def main() -> int:
           "(got %r: %r)" % (rows.get(procs["argvtag"], {}).get("owner"), cls("argvtag")))
 
     check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 4,
-          "exactly 4 of the 14 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
+          "exactly 4 of the 16 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
           "survive, and the last of those ignored SIGTERM): a detector that reaped all, or none, "
           "fails here")
 
@@ -546,7 +579,7 @@ def main() -> int:
                     "always-false" % why_still)
 
     cleanup()                     # kills the groups AND removes the root
-    print("\nALL ASSERTIONS HELD (14 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
+    print("\nALL ASSERTIONS HELD (16 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
           "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
     return 0
@@ -591,8 +624,12 @@ def run_mutations() -> int:
          "        if False:"),
         # cycle 4: the only local discriminator between "lane finished" and "agent at a prompt".
         ("the print-mode predicate deleted",
-         '    if rung is not None and not PRINT_MODE.search(_read(launcher) or ""):',
+         "    if rung is not None and not PRINT_MODE.search(code_only(_read(launcher))):",
          "    if False:"),
+        ("the peer-claimed guard disabled", "    if path and path in peers:", "    if False:"),
+        ("--pid binds only the requested subset",
+         "    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)",
+         "    binds, peers = bind_map(pool, rows, pids, opts.ref_s)"),
     ]
     for label, old, new in mutations:
         tmp = tempfile.mkdtemp(prefix="pi-dne-mut-")
