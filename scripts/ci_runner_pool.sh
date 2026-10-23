@@ -624,7 +624,16 @@ cmd_restart() {
     fi
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
   fi
-  if [ ! -f "$dir/.runner" ]; then
+  # ⛔ ONE REGISTRATION, ONE DEFINITION (#2381 review, P2). The listing (`registered_dirs`) and `add`
+  # both accept a `.runner` that is a FILE **or a SYMLINK** (`-e || -L`); this verb required `-f`,
+  # which is FALSE for a symlink whose target is a directory or does not exist. The verbs then read
+  # ONE registration two ways and bounced the operator forever: `add` answered "already registered —
+  # use restart" (rc 4) and `restart` answered "no registration — add it first" (rc 3), so an
+  # enumerated, DEAD slot could never be restarted — it stayed advertised to GitHub and idle, which is
+  # the one state `restart` exists to end. `-f` here was also the false verdict the guard above
+  # refuses to print, arrived at by a different predicate: a registration we cannot inspect is
+  # `cannot-measure`, never "no registration".
+  if [ ! -e "$dir/.runner" ] && [ ! -L "$dir/.runner" ]; then
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
   fi
   # ⛔ NO MEMORY FLOOR ON THIS PATH, DELIBERATELY (#2373). The floor gates ADDING a new runner. A
@@ -686,7 +695,7 @@ cmd_reconcile() {
       "$SELF" restart --name "$(basename "$d")" --dry-run || rc=$?
       case "$rc" in
         0) restarted=$((restarted + 1)) ;;
-        3) refused=$((refused + 1)) ;;
+        3) cannot=$((cannot + 1)) ;;   # see the race note below — never `refused`
         *) cannot=$((cannot + 1)) ;;
       esac
       continue
@@ -695,7 +704,16 @@ cmd_reconcile() {
     "$SELF" restart --name "$(basename "$d")" || rc=$?
     case "$rc" in
       0) restarted=$((restarted + 1)) ;;
-      3) refused=$((refused + 1)) ;;
+      # ⛔ A RESTART REFUSAL IS NOT A PASS (#2381 review, P2). `refused` is the ADD arm's
+      # floor/ceiling refusal — a legitimate outcome that must not fail the pass — and it NEVER
+      # reaches the exit decision, so counting a `restart` rc 3 here printed `dead=1 refused=1` and
+      # exited 0: a false PASS over the pass's OWN first job, a slot it had enumerated as dead one
+      # line above and left dead. A restart rc 3 means the verb disagreed with the listing this pass
+      # just used (the registration vanished between the two, a TOCTOU), so it is cannot-act (exit
+      # 2), never success. The reachable half of that disagreement — a `.runner` this pass lists and
+      # `restart` calls missing — is pinned in `ci_runner_pool.test.sh` ("a dangling-symlink
+      # marker"); this arm is the residual race a static fixture cannot construct.
+      3) cannot=$((cannot + 1)) ;;
       # ⛔ A cannot-act is NOT a refusal: a scheduler branching on the documented codes must not see
       # a pass that could not act reported as success.
       *) cannot=$((cannot + 1)) ;;

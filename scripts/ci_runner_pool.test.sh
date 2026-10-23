@@ -1159,11 +1159,41 @@ fi
 echo "── a registration with a dangling-symlink marker ──"
 fresh_pool ghostmark; reset_logs
 register pi-runner-real3
-mkdir -p "$RUNNER_ROOT/pi-runner-ghost"
+# A COMPLETE INSTALL with an odd MARKER: the `-f`/`-e || -L` disagreement is a marker-classification
+# bug, so the rest of the instance must be valid or `restart` would fail for an unrelated reason.
+mkdir -p "$RUNNER_ROOT/pi-runner-ghost"; cp -a "$TEMPLATE/." "$RUNNER_ROOT/pi-runner-ghost/"
 ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-ghost/.runner"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_contains "$out" "slots=2" "a dangling-symlink .runner is still a slot"
 assert_contains "$out" "pi-runner-ghost" "and it is listed as a registration"
+
+# ⛔ ONE REGISTRATION, ONE DEFINITION (#2381 review, P2). `restart` used `-f` where the listing and
+#   `add` use `-e || -L`, so for this marker `add` answered "already registered — use restart" (rc 4)
+#   and `restart` answered "no registration — add it first" (rc 3): the two verbs bounced the operator
+#   forever and an ENUMERATED, DEAD slot stayed advertised to GitHub and idle. Both legs are asserted,
+#   because the bounce is only visible as the PAIR — either verb alone looks correct.
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-ghost)"
+assert_eq "$?" "4" "add calls the dangling-marker dir ALREADY REGISTERED (rc 4)"
+assert_contains "$out" "use restart" "and sends the operator to restart"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-ghost)"
+assert_eq "$?" "0" "restart acts on the registration add just called registered (no verb bounce)"
+assert_contains "$out" "restarted name=pi-runner-ghost" "its listener was started, not refused"
+assert_eq "$(grep -cF 'no registration' <<<"$out")" "0" \
+  "and restart did not claim an ENUMERATED registration is missing"
+
+# ⛔ THE PASS'S OWN FIRST JOB (#2381 review, P2): a slot `reconcile` ENUMERATES as dead must be
+#   started — and a `restart` refusal used to be counted as `refused`, a bucket the exit decision
+#   never reads, so the pass printed `dead=1 refused=1` and exited 0. Asserted through the same
+#   dangling-marker registration, so the arm is reached by a real disagreement and not by a stub.
+pkill -f -- "$RUNNER_ROOT/pi-runner-ghost/bin/Runner.Listener" 2>/dev/null || true
+pkill -f -- "$RUNNER_ROOT/pi-runner-real3/bin/Runner.Listener" 2>/dev/null || true
+sleep 0.3
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-ghost")" "0" "the ghost listener is gone before the pass"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "reconcile exits 0 when every enumerated dead registration was restarted"
+assert_contains "$out" "restarted name=pi-runner-ghost" \
+  "the pass restarted the dangling-marker slot it enumerated (never left it dead)"
+assert_contains "$out" "refused=0" "and counted no restart as a refusal"
 
 # ⛔ A RUNNER_ROOT THAT EXISTS BUT IS NOT A DIRECTORY is a misconfiguration, not an empty pool — the
 #   same false empty reading in a shape no permission bit produces. TWO shapes reach that branch and
