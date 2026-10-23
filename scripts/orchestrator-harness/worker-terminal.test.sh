@@ -152,7 +152,12 @@ case "${1:-}" in
   # uses when a worker's HOME carries no credential file. Faithful: tmux exits 1 with
   # `unknown variable` when the name is not set (a different answer from an empty value, which it
   # prints as `NAME=`), and both names are probed because gh honours GITHUB_TOKEN too.
-  show-environment) if [ -z "${3:-}" ]; then
+  show-environment) if [ "${TMUX_SERVER_SLOW:-0}" = "1" ]; then
+                      # A server that is REACHABLE BUT DOES NOT ANSWER — the state the bound exists for
+                      # (measured on tmux 3.4: a wedged server blocks `show-environment` indefinitely).
+                      sleep 3; exit 1
+                    fi
+                    if [ -z "${3:-}" ]; then
                       # `tmux show-environment -g` with NO name — the SERVER-existence probe
                       # (`wt_tmux_has_server`). Faithful: a live server answers rc 0 even with ZERO
                       # sessions; a socket that was never created answers with tmux's own error, rc 1.
@@ -169,8 +174,19 @@ case "${1:-}" in
                     fi ;;
   # The LOG keeps the target VERBATIM (the `=` prefix is the assertion); the STATE file needs the
   # bare name so membership still matches.
-  kill-session) printf '%s\n' "${3:-}" >> "${TMUX_KILLED:-/dev/null}"; t="${3#=}"
-                [ -n "$st" ] && [ -f "$st" ] && { grep -vx -- "$t" "$st" > "$st.n"; mv "$st.n" "$st"; } ;;
+  # ⛔ REAL tmux SEMANTICS, BOTH HALVES (review finding, 2026-10-23, MEASURED): `-t NAME` is a PREFIX
+  # match (a real `tmux kill-session -t fix-8` really kills `fix-82`), `-t =NAME` is EXACT. The stub
+  # used to remove by exact membership for BOTH shapes, so a pin asserting "a peer session whose name
+  # extends ours survives" could not fail — the stub had no prefix behaviour to get wrong, and the
+  # assertion passed for the wrong reason.
+  kill-session) printf '%s\n' "${3:-}" >> "${TMUX_KILLED:-/dev/null}"
+                tgt="${3:-}"
+                [ -n "$st" ] && [ -f "$st" ] || exit 0
+                case "$tgt" in
+                  =*) grep -vx -- "${tgt#=}" "$st" > "$st.n" ;;
+                  *)  awk -v p="$tgt" 'index($0, p) != 1' "$st" > "$st.n" ;;
+                esac
+                mv "$st.n" "$st" ;;
 esac
 exit 0
 SH
@@ -459,10 +475,13 @@ ck "…and no session is started for it" $rc
 #   (i)  a LIVE server with ZERO sessions (`exit-empty off`): `tmux ls` → rc 0, EMPTY. The session does
 #        NOT inherit the caller's GH_TOKEN, so crediting it starts exactly the credential-less worker
 #        this gate exists to refuse. The old `-z "$(wt_tmux_names)"` inference did that (fail-open).
-#   (ii) a box that has NEVER started a server: `tmux ls` → tmux's own
-#        `error connecting to … (No such file or directory)`, rc 1. The spawn CREATES the server, so
-#        the caller's token IS portable — refusing it is the "refused every spawn, every cycle,
-#        forever" loop this change removes.
+#   (ii) a box that has NEVER started a server. tmux answers rc 1 here — its WORDING depends on the
+#        shape (`no server running on …` for an absent/stale socket, `error connecting to … (No such
+#        file or directory)` when the socket FILE is missing; both measured on 3.4, and the second is
+#        ALSO what a live server with an unlinked socket answers). The credit below keys on the RC, not
+#        on the wording — `wt_tmux_has_server` returns 1 = "no server answers", 3 = "no answer". The
+#        spawn CREATES the server, so the caller's token IS portable — refusing it is the "refused
+#        every spawn, every cycle, forever" loop this change removes.
 rm -rf "$TMP/O4n" "$TMP/srv-empty"; : > "$TMP/srv-empty"
 out="$(FAKE_UNAME=Linux KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller_env TMUX_SERVER_EXISTS=1 TMUX_STATE="$TMP/srv-empty" bash "$TMP/c2.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4n" "$TMP/tmux4n.log" "$TMP/home-nocred" 2>&1)"
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
@@ -1216,6 +1235,57 @@ case "$out" in *"count=1"*) rc=0 ;; *) rc=1;; esac
 ck "…so the caps keep binding while the socket is unreachable" $rc
 case "$out" in *"record=kept"*) rc=0 ;; *) rc=1;; esac
 ck "…and a live worker's record is NOT deleted for a census that could not read it" $rc
+
+echo
+echo "── L) an unrecordable tmux session is closed by EXACT name, never a prefix ──"
+# ⛔ P1 review finding, 2026-10-23, MEASURED: `tmux kill-session -t fix-8` is a PREFIX match and really
+# kills a live `fix-82` (rc 0). The record-write cleanup must therefore pin `=fix-8` — the shape
+# `wt_close` already uses — or the failure path of one lane kills a peer's mid-work worker, whose record
+# still reads alive.
+rm -rf "$TMP/home-l" "$TMP/O13c"; gh_hosts_fixture "$TMP/home-l"
+cat > "$TMP/l1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"
+mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_LOG="$O/tmux.log" WT_WORKER_HOME="$4" TMUX_STATE="$O/sessions" TMUX_KILLED="$O/killed.log" TMUX_SERVER_EXISTS=1
+unset GH_TOKEN GITHUB_TOKEN
+printf 'fix-82\n' > "$TMUX_STATE"      # a PEER lane whose name EXTENDS the one we spawn
+: > "$TMUX_KILLED"
+. "$1"
+chmod 500 "$WT_DIR"                      # the record cannot be written
+wt_spawn fix-8 /tmp 'true' 2>/dev/null; echo "rc=$?"
+chmod 700 "$WT_DIR"
+echo "killed=[$(tr '\n' ' ' < "$TMUX_KILLED")]"
+echo "sessions=[$(tr '\n' ' ' < "$TMUX_STATE")]"
+SH
+out="$(bash "$TMP/l1.sh" "$LIB" "$TMP/bin-absent" "$TMP/O13c" "$TMP/home-l" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a tmux spawn whose record cannot be written FAILS (no untrackable worker)" $rc
+case "$out" in *"killed=[=fix-8 ]"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the cleanup names the session EXACTLY (=fix-8), not by prefix" $rc
+case "$out" in *"fix-82"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…so a peer session whose name extends ours (fix-82) is still alive" $rc
+
+echo
+echo "── M) a server probe that cannot ANSWER must not credit a caller token ──"
+# ⛔ P2 review finding, 2026-10-23, MEASURED (fail-open): `wt_tmux_has_server` folded "no answer"
+# (the bound fired) into "no server", so a SLOW server credited the caller's `GH_TOKEN` — while that
+# server keeps its OWN environment, so the new session does not inherit it: a dead lane, reported
+# provisioned. The probe is three-valued now (0 answers · 1 absent · 3 no answer) and only a POSITIVE
+# absence may credit.
+rm -rf "$TMP/O13d" "$TMP/home-m"; mkdir -p "$TMP/home-m"
+cat > "$TMP/m1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_LOG="$O/tmux.log" TMUX_SERVER_SLOW=1 WT_PROBE_TIMEOUT=1 WT_WORKER_HOME="$4"
+export GH_TOKEN=ghp_caller_only
+. "$1"
+if pfx="$(wt_launcher_env "$4" 2>/dev/null)"; then echo "verdict=CREDITED"; else echo "verdict=refused"; fi
+echo "prefix=[${pfx:-}]"
+SH
+out="$(bash "$TMP/m1.sh" "$LIB" "$TMP/bin-absent" "$TMP/O13d" "$TMP/home-m" 2>&1)"
+case "$out" in *"verdict=refused"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a server probe that cannot ANSWER refuses — it does not credit the caller's token" $rc
 # ⛔ A RECORD-LESS `chain-*` SESSION IS COUNTED TOO (review finding on this diff). dispatch-merge.sh
 # spawns and counts `chain-<N>` workers, so a chain the census cannot see is a cap that reads low — and
 # on a cell tmux is the only surface, so this covers the whole worker population there.
