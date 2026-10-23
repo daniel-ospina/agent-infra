@@ -456,6 +456,19 @@ representable as a state**, and the pool is spent by POLLING in the last minutes
 * `GH_LIMIT_CORE_LOW_WATER` still works (the deployed cells and this runbook carried it before);
   `GH_LIMIT_CORE_FLOOR` is the same number under the name that says what it does, and it wins when
   both are set.
+* **STATED CONSEQUENCE — during the band, landing SELECTION pauses.** The floor refuses the drain's own
+  classification reads (`gh pr checks`, the REST PR listing) because they are core-only and unbounded
+  per cycle — that per-candidate fan-out is exactly the spend this guard exists to stop (134 core
+  requests per refresh pass; three boxes ≈ 6,030/h against a 5,000/h pool). A lane that is TOLD to
+  land still can: `admin-merge.sh`, `atomic-land.sh` and `record-review.sh` declare their reads
+  essential, so the reserve is spent by the landing it was kept for. What stops is the sweep picking
+  NEW work. That is a deliberate trade, not an oversight — and its cost is that the drain reads
+  `wait`/`unreadable` for the last ~16 % of each window unless it names the reason. It does not yet:
+  `orch-loop.sh`'s three classification reads send stderr to `2>/dev/null`, so a `gh-core-floor`
+  refusal reaches the cycle as "check surface unreadable or empty" — the incident's own signature.
+  Tracked separately (agent-infra#2448); until it lands, a band-shaped stall must be diagnosed with
+  `gh-limit.py --stats` (`floor=`) and `events.log`'s `pressure: gh-core-floor` line, never from the
+  cycle's wording.
 
 **A REFUSAL IS NEVER “not red”.** `record-review.sh`'s clause-E veto exists to stop a signed `clean`
 being re-bound onto a head whose own checks are failing. It used to read a REFUSED `check-runs` call as

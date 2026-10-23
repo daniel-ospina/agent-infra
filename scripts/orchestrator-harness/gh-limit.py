@@ -582,11 +582,20 @@ class Result(object):
         self.rc, self.out, self.err, self.status = rc, out, err, status
 
 
-def run(real_gh, argv, extra=None):
+def run(real_gh, argv, extra=None, timeout=None):
     cmd = [real_gh] + list(argv) + list(extra or [])
     env = dict(os.environ)
     env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # ⛔ A BOUNDED CALLER MUST NOT BE HELD BY AN UNBOUNDED ONE (#2342 review P2). The meter probe
+        # runs while the box-wide LOCK is held, so a stalled `/rate_limit` (a proxy black hole, a TLS
+        # stall) would otherwise park every gh call on the box — including the landing rail's own —
+        # for the whole `GH_LIMIT_LOCK_TIMEOUT` and then de-serialise the box. A timeout is a FAILED
+        # call (rc 124, `timeout`'s own code), which every caller already treats as "no measurement".
+        return Result(124, b"", ("gh-limit: the call did not finish within %ss\n" % timeout).encode())
     return Result(p.returncode, p.stdout, p.stderr)
 
 
@@ -1987,11 +1996,20 @@ def stats_fold():
     only reader this instrument has. Folding first makes the total monotone; nothing is summed twice
     because a successful fold REMOVES the live file."""
     p = os.path.join(state_dir(), STATS_FILE)
+    # ⛔ RENAME BEFORE READING (#2342 review P2). Read-then-unlink lost every event appended between
+    # the two (measured 3/3 on a 300 k-line file) and let two folds contribute the same lines to the
+    # carry. The rename is atomic, so concurrent appends land in a FRESH live file, and the fold only
+    # ever owns the renamed one.
+    folded = p + ".folding-%d" % os.getpid()
     try:
-        with open(p) as fh:
-            lines = fh.readlines()
+        os.replace(p, folded)
     except OSError:
         return
+    try:
+        with open(folded) as fh:
+            lines = fh.readlines()
+    except OSError:
+        lines = []
     doc = stats_carry()
     for line in lines:
         try:
@@ -2003,7 +2021,7 @@ def stats_fold():
             _stats_add(doc, cls, kind, e.get("at"))
     if _stats_write_carry(doc):
         try:
-            os.unlink(p)
+            os.unlink(folded)
         except OSError:
             pass
 
@@ -2029,16 +2047,28 @@ def stats_record(cls, kind):
 
 
 def stats_readable():
-    """(ok, reason) — an instrument that cannot be READ is not `no-reads-counted`."""
-    p = os.path.join(state_dir(), STATS_FILE)
-    if not os.path.exists(p):
-        return (True, "")
-    try:
-        with open(p) as fh:
-            fh.read(1)
-        return (True, "")
-    except OSError as exc:
-        return (False, "%s (%s)" % (p, exc))
+    """(ok, reason) — an instrument that cannot be READ is not `no-reads-counted`.
+
+    ⛔ THE CARRY IS PART OF THE COUNTER (#2342 review P2). A corrupt `read-cache-totals.json` was
+    silently treated as zero, which made the cumulative `averted` DROP — the one property the fold
+    exists to guarantee — and the report then read as lost data or a cache regression."""
+    for name in (STATS_FILE, STATS_CARRY_FILE):
+        p = os.path.join(state_dir(), name)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as fh:
+                fh.read(1)
+        except OSError as exc:
+            return (False, "%s (%s)" % (p, exc))
+    p = os.path.join(state_dir(), STATS_CARRY_FILE)
+    if os.path.exists(p):
+        try:
+            with open(p) as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            return (False, "%s (unparseable carry — the cumulative totals cannot be trusted)" % p)
+    return (True, "")
 
 
 def stats_report():
@@ -2070,13 +2100,23 @@ def stats_report():
 
 
 def floor_source():
-    """WHICH knob set the floor — a stale legacy value must be visible, not silent (review P2).
+    """WHICH knob set the floor — the one whose VALUE is in force, not the one merely present.
 
     `GH_LIMIT_CORE_LOW_WATER` still works, so a box that carries the old value KEEPS it; without this
-    the fleet's effective floor can be 100 while the runbook and the PR say 800."""
-    if cfg("GH_LIMIT_CORE_FLOOR", ""):
-        return "GH_LIMIT_CORE_FLOOR"
-    if cfg("GH_LIMIT_CORE_LOW_WATER", ""):
+    the fleet's effective floor can be 100 while the runbook and the PR say 800.
+    ⛔ PRESENCE IS NOT PARSEABILITY (#2342 review P2). `GH_LIMIT_CORE_FLOOR=abc` is ignored by
+    `cfg_int` (which falls back to the legacy value), so reporting it as the source pointed an operator
+    at a knob the layer was not reading. A set-but-unparseable value is NAMED as such."""
+    new = cfg("GH_LIMIT_CORE_FLOOR", "")
+    legacy = cfg("GH_LIMIT_CORE_LOW_WATER", "")
+    if new:
+        try:
+            int(float(new))
+            return "GH_LIMIT_CORE_FLOOR"
+        except (TypeError, ValueError, OverflowError):
+            return ("GH_LIMIT_CORE_FLOOR (unparseable, ignored)"
+                    + (" — using GH_LIMIT_CORE_LOW_WATER" if legacy else " — using the default"))
+    if legacy:
         return "GH_LIMIT_CORE_LOW_WATER (legacy)"
     return "default"
 
@@ -2360,7 +2400,7 @@ def probe_rate_limit(real_gh, bucket):
     and the other lanes are most likely to be issuing their own. One invariant, no exemptions."""
     lock = acquire_lock()
     try:
-        r = run(real_gh, ["api", "rate_limit"])
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
         release_lock(lock)
     try:
@@ -2758,8 +2798,10 @@ def write_budget(doc):
 def probe_budget(real_gh):
     """ONE exempt `/rate_limit` read, under the single-flight lock (the `--budget` verb's work)."""
     lock = acquire_lock()
+    if lock is None:
+        return None                    # no lock, no probe (the same rule every other meter call keeps)
     try:
-        r = run(real_gh, ["api", "rate_limit"])
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
         release_lock(lock)
     if r.rc != 0:
@@ -2771,6 +2813,9 @@ def probe_budget(real_gh):
 
 
 PROBE_STAMP = "budget-probe-at"
+# The probe holds the box-wide lock, so it carries its OWN bound. It reads one small exempt
+# document: 20 s is generous, and a timeout costs only "no snapshot this window".
+PROBE_TIMEOUT_S = cfg_secs("GH_LIMIT_PROBE_TIMEOUT", 20.0, 1.0, 120.0)
 
 
 def _probe_due():
@@ -2811,6 +2856,12 @@ def budget_snapshot_or_probe(real_gh):
     if not (real_gh and os.path.isfile(real_gh)):
         return None
     lock = acquire_lock()
+    if lock is None:
+        # ⛔ NO LOCK, NO PROBE (#2342 review P2). A bounded caller (`GH_LIMIT_NO_WAIT`) that could not
+        # take the box lock has already spent its budget waiting; issuing the meter call anyway would
+        # put ONE gh request in flight UNSERIALISED — the single invariant this layer exists to keep —
+        # and would outlive the bound the caller asked for. No snapshot is a legitimate answer.
+        return None
     try:
         snap = read_budget()           # a peer may have probed while we waited for the lock
         if snap is not None:
@@ -2818,7 +2869,10 @@ def budget_snapshot_or_probe(real_gh):
         if not _probe_due():
             return None                # a probe was already ATTEMPTED this window and did not land
         _stamp_probe()
-        r = run(real_gh, ["api", "rate_limit"])
+        # ⛔ BOUNDED, LIKE THE OTHER LOCK-HOLDING PROBE (#2342 review P2). This one runs on the PRIMARY
+        # read path (`_dispatch`), so an unbounded `/rate_limit` here is the worse of the two: it would
+        # hold the box-wide lock for `GH_LIMIT_LOCK_TIMEOUT` and then de-serialise the box.
+        r = run(real_gh, ["api", "rate_limit"], timeout=PROBE_TIMEOUT_S)
     finally:
         release_lock(lock)
     if r.rc != 0:
@@ -2939,8 +2993,12 @@ def core_pressure():
 
     `dated` says whether the WINDOW is known, and that governs what the evidence may be used for (see
     `health_state`)."""
-    if not failover_enabled():
-        return None
+    # ⛔ THE FLOOR IS NOT THE FAILOVER (#2342 review P2). This used to return None whenever
+    # `GH_LIMIT_FAILOVER=0`, which silently removed the floor AND the dated-empty write guard — the two
+    # things the kill switch's own contract says still apply (“0 disables the failover (the named state
+    # still applies)”). An operator turning failover off during GraphQL trouble would have sent a
+    # measured-empty read (and, on the mutating arm, a WRITE) into the pool. Only the TRANSPORT choice
+    # is gated now, at the `graphql_plan` call site.
     now = clock()
     snap = read_budget()
     if snap is not None:
@@ -3636,10 +3694,10 @@ def _named_floor_refusal(remaining, floor, reset, dated):
     so a fleet-wide floor refusal was invisible everywhere — `--health` said `gh-ok`, no `last-limit`
     was written, and the only copy of the reason was the stderr the caller discarded. A local append
     costs no request, and it makes the policy findable after the fact."""
-    log_event("pressure: gh-core-floor remaining=%s floor=%d resets_in=%s — read refused, %d bytes "
-              "of the reserve kept for writes (GH_LIMIT_ESSENTIAL=1 defers this policy)"
+    log_event("pressure: gh-core-floor remaining=%s floor=%d resets_in=%s — read refused; the reserve "
+              "is kept for writes (GH_LIMIT_ESSENTIAL=1 defers this policy)"
               % ("?" if remaining is None else remaining, floor,
-                 resets_in(reset) if dated else "?", 0))
+                 resets_in(reset) if dated else "?"))
     sys.stderr.write(
         "gh-limit: gh-core-floor remaining=%s floor=%d resets_in=%s — gh rate limit: this is the "
         "GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down. The REST pool is "
@@ -3751,7 +3809,7 @@ def _dispatch(real_gh, gh_argv):
                     return 1
                 # In the band (or with undated evidence) a WRITE is what the reserve exists for.
             else:
-                fo = graphql_plan(read_plan)
+                fo = graphql_plan(read_plan) if failover_enabled() else None
                 if fo is not None:
                     log_event("failover: %s — serving `%s` from the GraphQL pool"
                               % (phrase or "core remaining=%s reset=%s"

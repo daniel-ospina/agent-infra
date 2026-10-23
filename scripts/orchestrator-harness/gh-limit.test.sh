@@ -507,6 +507,12 @@ ck "(b) 5 concurrent DIFFERENT reads make 5 calls (no over-collapsing) [$(calls)
    "$([ "$(calls)" -eq 5 ] && echo 0 || echo 1)"
 ck "(b) … and they are still SERIALISED, never 2 in flight (#2005 stands) [peak $(max_inflight)]" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ THE EXCLUSION MUST NOT HIDE AN UNBOUNDED PROBE (#2342 review P2). `calls()` above stops counting
+# the exempt `/rate_limit` meter so the coalescing assertions measure the READ; this is the assertion
+# that keeps the meter honest — five different reads on a box with no snapshot cost AT MOST one probe
+# (the TTL stamp), never one per call.
+ck "(b) … and the box spent AT MOST ONE exempt meter probe for them [meter=$(meter_calls)]" \
+   "$([ "$(meter_calls)" -le 1 ] && echo 0 || echo 1)"
 
 # (c) a FAILING leader: every follower learns the failure, with the leader's error, and none reports
 # the success a later call would have produced.
