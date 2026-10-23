@@ -43,6 +43,15 @@
 
 set -uo pipefail
 
+# HERMETIC MEANS HERMETIC. The rail resolves its gate key from $AI_REVIEW_GATE_KEY
+# FIRST, and only then from ~/.pi/agent/.ai-review-gate-key — so a host that exports
+# the REAL key (every fleet agent session does) makes the rail verify this suite's
+# FIXTURE marker with the wrong key: B5 then refuses every update scenario and the
+# whole suite reddens on unmodified `main`, for a reason unrelated to the code under
+# test. Rewriting HOME is not enough; the env var wins. Unset it at the top so the
+# fixture key is the only key in play.
+unset AI_REVIEW_GATE_KEY
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
@@ -59,6 +68,9 @@ fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
 
 HEAD_OLD="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HEAD_NEW="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# #2369: a head the RECORD names which is no longer the PR head — the stale-record
+# population (a lane pushed after recording, or a peer rail moved the head and died).
+HEAD_STALE="dddddddddddddddddddddddddddddddddddddddd"
 REPO="daniel-ospina/agent-infra"
 
 # ── fake gh ───────────────────────────────────────────────────────────────
@@ -208,6 +220,32 @@ printf 'record-review %s\n' "$*" >> "$SCEN/calls"
 case "${SCEN_RECORD_RC:-0}" in
   3) echo "carry-forward: no prior evidence for this PR's current diff (diff=deadbeefdeadbeef…) — the reviewed artifact cannot be shown unchanged" >&2; exit 3 ;;
 esac
+# #2369 — SCEN_RECORD_REFUSE_PREFLIGHT models a carry that cannot be re-derived at
+# the CURRENT head, while a record step at a LATER head is not this switch's
+# subject. Position, not a call count, identifies the rail's pre-flight: it is the
+# only record invocation that happens BEFORE `pr update-branch` is logged.
+if [ "${SCEN_RECORD_REFUSE_PREFLIGHT:-0}" = 1 ] && ! grep -qF -- 'pr update-branch' "$SCEN/calls" 2>/dev/null; then
+  echo "carry-forward: no prior evidence for this PR's current diff (diff=deadbeefdeadbeef…) — the reviewed artifact cannot be shown unchanged" >&2
+  echo "refusing to record stale sha $2 for the current head" >&2
+  exit 3
+fi
+# The OTHER cause of exit 3 (#1575 clause E): the artifact WAS proven unchanged and
+# the target head is measurably red. It is a function of the head at call time, so
+# the same position rule identifies it — and the rail must NOT read it as a content
+# refusal (the update is the remedy for a drift-caused red).
+if [ "${SCEN_RECORD_CLAUSE_E:-0}" = 1 ] && ! grep -qF -- 'pr update-branch' "$SCEN/calls" 2>/dev/null; then
+  echo "⛔ (#1575 clause E) refusing the carry onto the current head — the TARGET HEAD IS MEASURABLY RED." >&2
+  exit 3
+fi
+# …and the SAME refusal with NO position rule, so a clause-(E) veto can also be
+# modelled at step [3/4] — after the head moved. That is the path where the veto must
+# still stop the unit short of admin-merge; without it, nothing exercises the caller's
+# rejection of `do_record`'s return 4 (mutation B5g; measured: accepting 4 there left
+# the whole suite green).
+if [ "${SCEN_RECORD_CLAUSE_E_ALL:-0}" = 1 ]; then
+  echo "⛔ (#1575 clause E) refusing the carry onto the current head — the TARGET HEAD IS MEASURABLY RED." >&2
+  exit 3
+fi
 # The LIVE contract (#767): a zero exit leaves a record naming the PR's CURRENT
 # head — either it already did (sha == head), or the carry-forward arm re-bound it
 # because the reviewed diff is content-unchanged and the prior marker's signature
@@ -363,7 +401,13 @@ new_scen() {
   # reset every scenario-scoped switch (a leak between scenarios is a test bug)
   SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
   SCEN_RECORD_NO_WRITE=0
+  SCEN_RECORD_REFUSE_PREFLIGHT=0; SCEN_RECORD_CLAUSE_E=0; SCEN_RECORD_CLAUSE_E_ALL=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
+  # #2374: the cross-box review-registry union is OFF by default here — this suite
+  # is hermetic and executes the rail ~85 times; a live store would make every
+  # scenario depend on the fleet's records and on github.com reachability. The
+  # wiring scenarios below turn it ON with a stub script (never the network).
+  SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
@@ -438,12 +482,16 @@ rail_exec() { # <extra args...>
   cd "${SCEN_CWD:-$TMP/default-cwd}"
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
+  SCEN_RECORD_REFUSE_PREFLIGHT="${SCEN_RECORD_REFUSE_PREFLIGHT:-0}" \
+  SCEN_RECORD_CLAUSE_E="${SCEN_RECORD_CLAUSE_E:-0}" \
+  SCEN_RECORD_CLAUSE_E_ALL="${SCEN_RECORD_CLAUSE_E_ALL:-0}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
   SCEN_RECORD_NO_WRITE="${SCEN_RECORD_NO_WRITE:-0}" \
   SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
+  ATOMIC_LAND_REGISTRY_SYNC="${SCEN_REGISTRY_SYNC:-off}" \
   ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
   ATOMIC_LAND_DRIFT_TRIGGER="${SCEN_DRIFT_TRIGGER:-0}" \
     exec bash "$RAIL" "$@"
@@ -525,6 +573,279 @@ grep -q "diff normalizer" "$SCEN/err" \
   && pass "12/D1: a missing producer normalizer is named (partial install, not a changed diff)" \
   || fail "12/D1: the missing diff normalizer was NOT named — a partial install would masquerade as a changed diff"
 
+# ═══ 2b. #2369 — the RECORD step is a PRECONDITION of the head move ════
+# The measured defect (#9639): the record was ALREADY stale (`11a2ac6f…`), step
+# [1/4] refreshed the head anyway (`d35d37a2… → d34da3c7…`, BASE DRIFT), and step
+# [3/4] then refused — "no prior evidence for this PR's current diff" — so the unit
+# had spent a head move plus a full CI cycle at the new head on a PR no record
+# could name. The precondition is the PRODUCER's own decision at the CURRENT head,
+# so the lane-arm carry (#2982, which needs no marker) is never false-blocked by a
+# diff-only guess the rail is forbidden to make.
+echo "── 2b. #2369 — a stale record whose carry cannot fire stops BEFORE the update"
+new_scen stalerecord
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+SCEN_RECORD_REFUSE_PREFLIGHT=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+# ⛔ THE DEFECT ITSELF: before the fix this line is the failure — the rail moved
+# the head with a record step that provably could not follow it.
+called "pr update-branch" \
+  && fail "#2369: the head was MOVED although the record step cannot follow it" \
+  || pass "#2369: the head was NOT moved — no CI cycle spent on an unrecordable head"
+called "admin-merge" && fail "landed with no record for the head" || pass "the land step did NOT run"
+# The refusal must name the FULL sha a review has to cover — a short prefix cannot
+# be recorded against (record-review.sh binds the 40-hex sha).
+grep -q "FRESH review is required at $HEAD_OLD" "$SCEN/err" \
+  && pass "the refusal names the full head a review must cover" \
+  || fail "the refusal does not name the head the review must cover ($(tail -2 "$SCEN/err"))"
+# The HEADWORD is the plumbing's other half (#1362 D1): at the precondition no new
+# head exists yet, so a refusal that says "the new head" sends the operator after an
+# artifact that is not there. REGRESSION-SENSITIVE: reverting
+# `headword="CURRENT head"` back to `"new head"` left the whole suite green before
+# this assertion existed (measured), because no other scenario greps this message.
+grep -q "a FRESH review of the CURRENT head is required" "$SCEN/err" \
+  && pass "the refusal names the CURRENT head, not a 'new head' that does not exist yet" \
+  || fail "the refusal says 'new head' at the precondition — the #1362 D1 mislabel the plumbing exists to remove"
+grep -q "NOT updated" "$SCEN/err" \
+  && pass "and states that the branch was left alone" \
+  || fail "the refusal does not say the branch was left alone"
+# DISCRIMINATING, unlike a call-presence check: step 3 makes the SAME
+# `record-review <prior> clean <repo>` call, so grepping for it passes on the
+# pre-fix rail too (measured). The label only exists on the precondition path.
+grep -q "\[1/4\] record-precheck" "$SCEN/out" \
+  && pass "the attempt is labelled as the step-1 precondition, not as step [3/4]" \
+  || fail "the precondition did not run (no [1/4] record-precheck in the log)"
+
+# ═══ 2b-ii. the carry that CAN fire must still update and land ═════════
+# The #9658 measured class: the record is stale, the carry CAN re-bind it (its
+# `mint=carried`, same `diff=` on both heads). A precondition that refused that
+# population would be a false block on the rail's own recovery path.
+echo "── 2b-ii. #2369 — a stale record the carry CAN re-bind still updates and lands"
+new_scen stalerecordcarry
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+# ⚠️ WHAT THIS SCENARIO DOES *NOT* MODEL, stated precisely (review, cycle 5, then 6). Cycle 4 added a
+# PR-body marker bound to HEAD_STALE — "record AND marker at the reviewed/before head", the state a
+# lane that updated and then died at verify leaves — and claimed it reddens a tightening that required
+# the artifact to be IDENTIFIED AT THE CURRENT HEAD. It does not, and it could not: with
+# RECORD_HEAD=HEAD_STALE != HEAD=HEAD_OLD, B5's
+# `[ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence` short-circuits, so the rail never reads
+# the PR body in this state, and the producer double reads `$SCEN/head`/`$SCEN_RECORD_FILE`, never
+# `$SCEN/pr-body` (measured). That marker is therefore removed. What REMAINS is `new_scen`'s own
+# default marker (tests/atomic-land/run.sh:458), bound to HEAD_OLD — the LIVE head, i.e. the
+# "evidence already posted at the head being updated" population — and it is equally UNREAD here.
+# Nothing in this scenario turns on the body: a fixture nothing reads is not coverage, and a comment
+# claiming it is would be worse than none. The state this scenario really models is stated by its
+# inputs — a STALE record plus a producer whose carry SUCCEEDS, which is the precondition's job not
+# to block. If a future guard makes the rail read the body at the precondition, a marker bound to the
+# REVIEWED head belongs back here — WITH the mutant that reads it.
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+# ORDER, not merely presence: step 3 makes the SAME record-review call, so a
+# call-presence assertion would pass on the pre-fix rail too (measured).
+awk '/record-review/{if(!r) r=NR} /pr update-branch/{if(!u) u=NR} END{exit !(r && u && r<u)}' "$SCEN/calls" \
+  && pass "the record attempt ran BEFORE the update it guards" \
+  || fail "the record attempt did not precede the update (calls: $(calls))"
+called "pr update-branch 42" && pass "the update then proceeded (a restorable head is not blocked)" \
+  || fail "the precondition blocked a head the carry could restore"
+called "admin-merge 42" && pass "the unit landed" || fail "did not land"
+# A pre-flight record is NOT the landing reuse; the post-update step cites that one.
+[ "$(count_call 'reused verdict')" = 1 ] \
+  && pass "the reuse is cited ONCE (the precondition does not add a second citation)" \
+  || fail "the reuse citation was posted $(count_call 'reused verdict') time(s), expected 1"
+
+# ═══ 2b-iii. a FRESH record is NOT sent through the precondition ════════
+# The scope boundary, and a RECORDED DECISION: B5 is a PRESENCE test and a stale
+# marker does not block step 1 (see pr_has_carry_evidence's WHY). So a record bound
+# to the head, with a marker carrying a DIFFERENT diff, still updates. ⛔ The
+# `SCEN_RECORD_REFUSE_PREFLIGHT` switch set below is INERT in this scenario and is
+# NOT its discriminator: a FRESH record returns from `do_record` at its first
+# branch without ever invoking the producer, so the switch never fires. What
+# discriminates is the ABSENCE of the "the record is STALE" log line asserted
+# below. (An earlier revision of this comment claimed the switch would refuse here
+# and that a wrongly-widened gate would redden this scenario; measured, it cannot.
+# The switch is kept only so a future fixture that DOES reach the producer has the
+# refusal available.)
+echo "── 2b-iii. #2369 — a FRESH record still updates (the precondition is scoped to a STALE one)"
+new_scen freshstalemarker
+marker_fixture 42 clean "$HEAD_OLD" \
+  2222222222222222222222222222222222222222222222222222222222222222 > "$SCEN/pr-body"
+SCEN_RECORD_REFUSE_PREFLIGHT=1
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" \
+  && pass "B5's decision stands: a stale marker does not block the update of a FRESH record" \
+  || fail "#2369 fired on a FRESH record and pre-empted B5's presence decision"
+# The probe's own log line must be ABSENT. The switch above cannot see this case:
+# a fresh record returns from do_record at its first branch without ever calling
+# the producer, so an UNSCOPED guard (one that also fires here) would pass every
+# other assertion in this scenario — and would announce a stale record for a head
+# that is not stale. Measured: `if [ "$RECORD_HEAD" != "$HEAD" ]` mutated to
+# `if true` left the whole suite green before this line existed.
+grep -q "the record is STALE" "$SCEN/out" \
+  && fail "the precondition ran on a FRESH record (it is not scoped to a stale one)" \
+  || pass "the precondition did NOT run on a fresh record"
+# ═══ 2b-v. #2369 — a HEAD-HEALTH refusal (clause E) must NOT block the update ═
+# The probe answers CONTENT, not HEALTH. A stale base can make the CURRENT head's
+# required leg red (>20 commits behind ⇒ the drift-guard check FAILs ⇒ BLOCKED), and
+# the ONLY thing that clears it is the refresh — so reading clause (E) as a
+# precondition failure would make exactly that population unlandable by the rail's
+# own hand (#1533/#7727). Step [3/4] still enforces the veto at the NEW head.
+echo "── 2b-v. #2369 — a clause-(E) head-health refusal at the precondition does not block the update"
+new_scen stalerecorde
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+SCEN_RECORD_CLAUSE_E=1
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" \
+  && pass "the update PROCEEDED on a head-health refusal (the refresh is the remedy)" \
+  || fail "a clause-(E) refusal blocked the update — a drift-red head can never be repaired"
+grep -q "refused on the CURRENT head's HEALTH" "$SCEN/out" \
+  && pass "and the log says why it proceeded" \
+  || fail "the rail proceeded without naming the head-health exception"
+# The preflight neither lands nor merges, so its clause-(E) arm must NOT claim a
+# LANDING was refused. REGRESSION-SENSITIVE: deleting the `[ "$1" != preflight ]`
+# guard left the whole suite green before this assertion existed (measured) — the
+# transcript said "nothing was merged" and the rail then merged, which is exactly
+# the #1362 D1 step-mislabel class this branch was split to remove.
+grep -q "the landing path does NOT accept this refusal" "$SCEN/err" \
+  && fail "the preflight claimed a LANDING was refused — and the rail then merged" \
+  || pass "the preflight did not claim a landing was refused (a preflight does not land)"
+# ═══ 2b-vi. the two ends of the clause-(E) discriminator are pinned ═══
+# Exit 3 carries BOTH refusal causes, so `(#1575 clause E)` in the producer's stderr
+# is the ONLY thing separating "the artifact changed" from "the head is red". The
+# rail now decides CONTROL FLOW on it (proceed vs stop), so a reword upstream would
+# silently restore #2369 for every drift-red PR. Pin both ends in CI rather than
+# trusting two comments to stay in sync (a comment is not an instrument).
+echo "── 2b-vi. the clause-(E) discriminator is a pinned cross-script contract"
+# ⛔ GREP THE EMITTER LINE, not the file: a whole-file grep for the literal is
+# satisfied by the CONSUMER CONTRACT comment above the echo if the echo itself is
+# reworded — a probe proved exactly that (echo changed, comment kept, whole-file
+# grep still passed while the rail's grep would not match: #2369 silently restored,
+# suite green). The `^ *echo "` anchor is what makes this a test of the emitter.
+grep -qE '^[[:space:]]*echo "⛔ \(#1575 clause E\)' "$ROOT/scripts/record-review.sh" \
+  && pass "the producer still EMITS the literal the rail greps for" \
+  || fail "scripts/record-review.sh no longer EMITS '(#1575 clause E)' (a comment mentioning it is not the emitter) — the rail would read a red head as a changed artifact"
+# …and the CONSUMER half is anchored to the code line for the SAME reason (review, cycle 5):
+# a whole-file `grep -qF` is satisfied by the CONSUMER CONTRACT comment above the grep, so it
+# could stay green after the grep itself was reworded — the exact defect the emitter anchor
+# above was given, left in place on the other end.
+grep -qE '^[[:space:]]*if grep -qF .\(#1575 clause E\).*"\$log"; then' "$ROOT/scripts/atomic-land.sh" \
+  && pass "and the rail still greps that literal for the head-health classification" \
+  || fail "scripts/atomic-land.sh stopped grepping the clause-(E) literal (a comment mentioning it is not the grep) — the proceed/stop split is gone"
+# ═══ 2b-vii. a clause-(E) veto at step [3/4] still blocks the landing ═════
+# The landing side of the `return 4` contract. The preflight proceeds on this code;
+# step 3 must NOT. A caller that accepted 4 there would merge a measurably red head —
+# the #1575 defect itself — so this scenario exists to redden if that regresses.
+echo "── 2b-vii. a clause-(E) refusal at step [3/4] still stops short of the landing"
+new_scen laste
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+SCEN_RECORD_CLAUSE_E_ALL=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" \
+  && pass "the update itself proceeded (the preflight accepts a head-health refusal)" \
+  || fail "the update was blocked — this scenario is supposed to reach step [3/4]"
+called "admin-merge" \
+  && fail "the land step ran on a MEASURABLY RED head — the #1575 clause-(E) veto was accepted by the caller" \
+  || pass "the land step did NOT run on a red head"
+# CONDITIONAL on the land NOT having run: under the B5g mutant the clause-(E) arm
+# prints "nothing was merged" and the caller then MERGES, so an unconditional grep is
+# satisfied by the very mutant that merges (measured: it read ✅ beside
+# ❌ "the land step ran on a MEASURABLY RED head"). The message only certifies
+# anything when the unit actually stopped.
+if called "admin-merge"; then
+  fail "the step-3 path said nothing was merged but the land step RAN — the message certifies a false transcript"
+else
+  grep -q "nothing was merged" "$SCEN/err" \
+    && pass "and the step-3 path still says nothing was merged" \
+    || fail "the step-3 refusal left the transcript silent about the merge"
+fi
+
+# ═══ 2b-iv. dry-run with a STALE record writes nothing ═══════════════════
+echo "── 2b-iv. #2369 — dry-run reports the precondition it would take and writes nothing"
+new_scen stalerecorddry
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+run_rail 42 --repo "$REPO" --poll 0 --dry-run
+rc=$?
+[ "$rc" -eq 0 ] && pass "dry-run completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "record-review" && fail "dry-run recorded" || pass "no record in dry-run"
+called "pr update-branch" && fail "dry-run updated the branch" || pass "no update in dry-run"
+grep -q "the record is STALE" "$SCEN/out" \
+  && pass "the dry-run reports the stale-record precondition" \
+  || fail "the dry-run did not report the stale-record precondition"
+
+# ═══ 2b-viii. a producer FAILURE at the preflight must not claim a LANDING ═
+# The message split at do_record's `rc -ne 0` arm is a DIAGNOSIS contract: that arm is
+# reachable from step [1/4], where no head has moved and no landing was ever in
+# question, so "refusing to land without a record" there sends the operator after a
+# decision nobody made — the #1362 D1 mislabel class the `label`/`headword` plumbing
+# exists to remove, one message further out. It was UNPINNED (review, cycle 6): every
+# scenario drove the producer with rc 0 or 3, so either message could be restored
+# unnoticed. The sibling message at the [3/4] call site is pre-existing and unchanged
+# by #2369, so it is deliberately not pinned here.
+echo "── 2b-viii. a producer failure at the preflight does not claim a landing was refused"
+new_scen stalerecordfail
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+# Any exit the two refusal branches above do not own (a usage error, the clean-micro
+# tier refusal) — the fake writes its record and then exits with this code.
+SCEN_RECORD_RC=2
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "record-review" && pass "the precondition asked the producer" || fail "the precondition did not run"
+called "pr update-branch" && fail "the head was MOVED after a producer failure" || pass "no head move after a producer failure"
+called "admin-merge" && fail "landed with no record for the head" || pass "the land step did NOT run"
+grep -q "refusing to move the head without a record" "$SCEN/err" \
+  && pass "the refusal names the HEAD MOVE, which is what it withheld" \
+  || fail "the preflight producer failure did not name the head-move refusal ($(tail -2 "$SCEN/err"))"
+grep -q "refusing to land without a record" "$SCEN/err" \
+  && fail "a preflight failure claimed a LANDING was refused — no landing was in question" \
+  || pass "and it does NOT claim a landing was refused"
+
+# ═══ 2b-ix. the FAIL-OPEN delegate at the preflight is not a refusal ═════
+# The B8 binding arms are reachable from the [1/4] precondition, and there the producer
+# exited 0 — it did not refuse the artifact, it failed OPEN on a transient head read
+# (the reason B8 exists at all). Calling that "REFUSED" would print, at a step where no
+# head has moved and no landing was in question, both "the head it would LAND" and "a
+# FRESH review is required" — the #1362 D1 false obligation (re-review an unchanged
+# artifact) in the same transcript that admits nothing was written. Measured before
+# this scenario existed: with `return 5` reverted to `return 1` on the preflight path,
+# the whole suite stayed green and the transcript said "REFUSED that artifact".
+echo "── 2b-ix. #2369 — a zero-exit-without-binding at the preflight is not a review refusal"
+new_scen stalerecordnowrite
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
+  > "$SCEN_RECORD_FILE"
+# The FAIL-OPEN delegate: exit 0, write nothing — the record stays at HEAD_STALE.
+SCEN_RECORD_NO_WRITE=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch" && fail "the head was MOVED although no record could follow it" || pass "the head was NOT moved"
+called "admin-merge" && fail "landed with no record for the head" || pass "the land step did NOT run"
+grep -q "exited WITHOUT binding the CURRENT head" "$SCEN/err" \
+  && pass "the refusal names what actually happened (no binding), not a refusal of the artifact" \
+  || fail "the preflight did not name the missing binding ($(tail -2 "$SCEN/err"))"
+grep -q "a FRESH review is required" "$SCEN/err" \
+  && fail "a fail-open delegate was reported as a REFUSAL — the lane is sent to re-review an unchanged artifact" \
+  || pass "and it does NOT demand a fresh review (the artifact may be unchanged)"
+grep -q "the head it would land" "$SCEN/err" \
+  && fail "landing wording at the [1/4] precondition — nothing was going to be landed" \
+  || pass "and it does not use landing wording at the precondition"
+
 # ═══ 3. no record → refuse before any mutation ═══════════════════════════
 echo "── 3. no review record: refuse before ANY mutation"
 new_scen norec
@@ -535,6 +856,90 @@ rc=$?
 called "pr update-branch" && fail "mutated before the precondition (update-branch)" || pass "no update-branch before the precondition"
 called "admin-merge" && fail "landed without a record" || pass "no land without a record"
 grep -q "no review record" "$SCEN/err" && pass "the refusal names the missing record" || fail "the refusal does not name the missing record"
+
+# ═══ 3b. the cross-box registry union is WIRED (agent-infra#2374) ═══════
+# The owner's ruling on #2374 (2026-10-23) named this the ONE thing to verify at
+# review: "its cloud-cell-bringup.sh and atomic-land.sh wiring has no test … a wiring
+# step that silently does nothing is this fleet's most-repeated failure class". These
+# arms pin the three properties the design depends on, with a STUB script (no
+# network): the union runs BEFORE the record is read, a failing union does not stop
+# the landing, and a missing script does not stop it either.
+echo "── 3b. registry union runs BEFORE read_record, and never blocks the landing"
+# The test double for scripts/registry-sync.sh: NEVER the network, NEVER a real store.
+# It records the call and materialises the prepared record the way a real pull would.
+write_sync_stub() { # <path>
+  cat > "$1" <<'EOS'
+#!/usr/bin/env bash
+echo "registry-sync $*" >> "$SCEN/calls"
+if [ -f "$SCEN/stub-fail" ]; then
+  echo "registry-sync.sh: cannot READ the 'origin' registry from '/x' — it is UNKNOWN, not empty. Not syncing." >&2
+  exit 1
+fi
+if [ -f "$SCEN/stub-record.json" ]; then
+  mkdir -p "$HOME/.pi/agent/reviews" && cp "$SCEN/stub-record.json" "$HOME/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+fi
+echo "union: wrote=1 pushed=0 same=0 older_refused=0 conflicts=0 unkeyed=0 unreadable=0 failed=0"
+exit 0
+EOS
+  chmod +x "$1"
+}
+new_scen registrysync
+# (a) the union is the thing that makes the record appear: no local record, and the
+#     stub publishes one. If the call moved AFTER read_record the rail would refuse.
+rm -f "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+STUB="$SCEN/registry-sync-stub.sh"
+write_sync_stub "$STUB"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" > "$SCEN/stub-record.json"
+SCEN_REGISTRY_SYNC="$STUB"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: the landing completes when the UNION supplies the record" \
+  || fail "3b: expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+grep -q '^registry-sync union' "$SCEN/calls" && pass "3b: the union was invoked" \
+  || fail "3b: the rail never ran the registry union (calls: $(calls))"
+awk '/^registry-sync/{r=NR} /record-review/{v=NR} END{exit !(r && v && r<v)}' "$SCEN/calls" \
+  && pass "3b: the union ran BEFORE record-review read the record (the ordering is the design)" \
+  || fail "3b: the union did not run before the record was read (calls: $(calls))"
+# (b) a FAILING union is non-fatal: the box can still land a record it holds locally
+new_scen registrysync-fail
+STUB="$SCEN/registry-sync-stub.sh"
+write_sync_stub "$STUB"
+touch "$SCEN/stub-fail"
+SCEN_REGISTRY_SYNC="$STUB"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: a FAILED union does not block a landing whose record is local" \
+  || fail "3b: a failed union blocked the landing (rc $rc, $(tail -1 "$SCEN/err"))"
+called "admin-merge 42" && pass "3b: …and the land step still ran" || fail "3b: the land step did not run"
+grep -q 'UNKNOWN, not empty' "$SCEN/err" && pass "3b: the failure is NAMED on stderr (never silent)" \
+  || fail "3b: a failed union was silent — the #2349 silence this must not reintroduce"
+# (c) a MISSING sync script is named and is non-fatal
+new_scen registrysync-missing
+SCEN_REGISTRY_SYNC="$SCEN/no-such-registry-sync.sh"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: a PARTIAL install (no registry-sync.sh) does not block the landing" \
+  || fail "3b: a missing registry-sync.sh blocked the landing (rc $rc)"
+grep -q 'LOCAL-ONLY' "$SCEN/err" && pass "3b: …and the box is told its registry is LOCAL-ONLY" \
+  || fail "3b: a missing registry-sync.sh was silent"
+# (d) the seam's OFF arm is NAMED (a silent skip is the failure class this whole section exists for)
+new_scen registrysync-off
+SCEN_REGISTRY_SYNC=off
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: SCEN_REGISTRY_SYNC=off lands and does not fail the rail" \
+  || fail "3b: the off seam changed the landing (rc $rc)"
+grep -q 'SKIPPED by request' "$SCEN/out" && pass "3b: ...and says it SKIPPED the union (never silent)" \
+  || fail "3b: the off seam skipped the union silently"
+# (e) PRODUCTION DEFAULTS TO ON — pinned as the DEFAULT EXPRESSION, because a behavioural arm would
+#     need a real store (the rail would resolve the repo's own registry-sync.sh and reach the
+#     network). This catches the exact edit that silently stops every box replicating: flipping the
+#     default to `off` leaves every other arm green (measured by mutation, #2374 cycle-2 review).
+if grep -q 'ATOMIC_LAND_REGISTRY_SYNC:-\$SELF_DIR/registry-sync.sh' "$RAIL"; then
+  pass "3b: the union's PRODUCTION default is ON (\$SELF_DIR/registry-sync.sh)"
+else
+  fail "3b: the union's default is no longer \$SELF_DIR/registry-sync.sh — every box would silently stop replicating"
+fi
 
 # ═══ 4. a draft is refused ════════════════════════════════════════════════
 echo "── 4. a draft is refused before any CI work"
@@ -2353,6 +2758,47 @@ if true; then
   mutate_and_expect_fail B5b  's/if \[ "\$RECORD_HEAD" = "\$HEAD" \] && ! pr_has_carry_evidence; then/if false; then/'
   # B5c: accept a marker on SHAPE alone — the PR body is attacker-writable
   mutate_and_expect_fail B5c  's/\[ "\$sig" = "\$expect" \]/[ -n "\$sig" ]/'
+  # B5d (#2369): leave the STALE-record case to the record step, i.e. the revision
+  # before this fix — step [1/4] moves a head that no record can follow, and the
+  # unit spends a head move plus a full CI cycle to learn at step [3/4] what one
+  # delegated record attempt already knew (MEASURED #9639). Scenario 2b must
+  # redden on the "head was NOT moved" assertion.
+  # ⛔ ANCHORED TO THE CALL LINE, NOT to `if [ "$stale_record" ... ]`: B8b mutates
+  # `/^  if \[ "\$RECORD_HEAD" != "\$HEAD" \]; then/`, which is the step-3 BINDING
+  # guard a few hundred lines below. The first cut of this guard spelled that test
+  # inline, so B8b's unanchored-to-context pattern matched THE NEW GUARD FIRST and
+  # mutated it instead — B8b still "reddened the suite", while the binding guard it
+  # is supposed to pin shipped unpinned. That is the B19b/B20b trap, one site over:
+  # the guard is spelled through a named flag precisely so the two sites cannot
+  # collide, and this mutation targets the call so neither does.
+  mutate_and_expect_fail B5d  's/^    do_record preflight$/    true/m'
+  # B5e (#2369): widen the precondition to FRESH records. The failure it prevents: a
+  # head that is not stale being announced as STALE and pushed through a record step
+  # it does not need — and, on any producer refusal, an update that B5 deliberately
+  # allows. 2b-iii must redden on the ABSENCE of the probe's own log line (verified:
+  # before that assertion existed, this mutation left the suite green).
+  mutate_and_expect_fail B5e  's/^  if \[ "\$stale_record" -eq 1 \]; then/  if true; then/m'
+  # B5f (#2369): read the clause-(E) HEAD-HEALTH refusal as a CONTENT refusal, i.e.
+  # block the update on it. The failure it prevents: a head whose required leg is red
+  # only because its base is stale can never be refreshed, so it is unlandable by the
+  # rail's own hand (#1533/#7727). 2b-v must redden.
+  mutate_and_expect_fail B5f  's/if \[ "\$rec_rc" -eq 4 \]; then/if false; then/'
+  # B5g (#2369/#1575): let the LANDING path ACCEPT `do_record`'s return 4. The failure
+  # it prevents: a clause-(E) refusal at step [3/4] — a head that is measurably red —
+  # would fall through to admin-merge, merging exactly what the veto exists to stop,
+  # and only when a base move made the carry reachable (the preflight's proceed arm
+  # makes 4 a NORMAL outcome, so the landing side is the half that must still refuse).
+  # VERIFIED NECESSARY: before scenario 2b-vii existed, this mutation left the suite
+  # green — every clause-(E) fixture was position-gated to the preflight. 2b-vii must
+  # redden, and it must be the ONLY thing that reddens: a mutant that also breaks the
+  # pre-existing refusal scenarios proves nothing about the landing side.
+  # ⛔ `\044?` is the RUNTIME STATUS: a bare `$?` here is interpolated by PERL (its own
+  # exit status, 0) at substitution time, so `__r=$?` became `__r=0` and the mutant
+  # accepted EVERY `do_record` failure — 6 assertions red including three that predate
+  # this change, while the harness still printed "class covered". It parses and it
+  # reddens, so neither the `cmp` nor the `bash -n` guard can tell (trap (1) above).
+  # With the escape, exactly 2 assertions redden and both are 2b-vii's.
+  mutate_and_expect_fail B5g  's/^  if ! do_record; then exit 1; fi$/  do_record; __r=\044?; [ "\044__r" -eq 4 ] || [ "\044__r" -eq 0 ] || exit 1/m'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
@@ -2587,6 +3033,10 @@ if true; then
   mutate_and_expect_fail B13 's/behind="\$\(behind_by_of "\$BASE" "\$HEAD"\)"/behind=0/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
+  # #2374: the registry union must run BEFORE the record is read — the ordering is the
+  # whole design (a miss-only call could never PUBLISH). Verified live: deleting the
+  # call reddens scenario 3b, where the record only exists because the union made it.
+  mutate_and_expect_fail B14-registry-order 's/\nsync_review_registry\n/\n/'
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
