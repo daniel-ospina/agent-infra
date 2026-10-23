@@ -1014,9 +1014,17 @@ reap_venv() {
         # keeps the fallback and `detail=` still says the class did not finish.
         _vsum="$(printf '%s\n' "$out" | grep -m1 'venvs_found=' || true)"
         if [ -n "$_vsum" ]; then
-            have_venv_tally=1
-            venv_tally_repos=$((venv_tally_repos + 1))
-            _vn2="$(kv_field "$_vsum" venvs_found)";   case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_classified=$((sum_v_classified + _vn2)) ;; esac
+            # ⛔ THE TALLY IS ANSWERED ONLY IF ITS CORE COUNT PARSES. `venvs_found=` was set as
+            # "answered" before any field was read, so a TRUNCATED delegate stdout (a process dying
+            # mid-line) left every sum at 0 while coverage claimed the repo had answered — an invented
+            # `classified=0` presented as full coverage, which is the class this PR exists to remove.
+            _vn2="$(kv_field "$_vsum" venvs_found)"
+            case "${_vn2:-x}" in
+                ''|*[!0-9]*) : ;;
+                *) have_venv_tally=1
+                   venv_tally_repos=$((venv_tally_repos + 1))
+                   sum_v_classified=$((sum_v_classified + _vn2)) ;;
+            esac
             _vn2="$(kv_field "$_vsum" reapable)";      case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_cand=$((sum_v_cand + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" kept)";          case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_pres=$((sum_v_pres + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" recheck_kept)";  case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_pres=$((sum_v_pres + _vn2)) ;; esac
@@ -1092,12 +1100,16 @@ reap_venv() {
         # old to print a tally (it also counts a row the owner sized as `?`, which the scan handles).
         [ "$have_venv_tally" = 1 ] || CAND_VENV="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$CAND_VENV would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
     else
+        # ⛔ `candidates=` IS NOT OURS TO ASSUME IN AN ARMED PASS. It is the delegate's own `reapable=`
+        # (the armed pass already performed its `REAP` rows, so no row scan exists to fall back on),
+        # and a delegate that printed nothing left the initialised 0 to print as a MEASURED zero —
+        # beside a record that correctly said `?` (a review cycle caught the two surfaces disagreeing).
         if [ "${DF_VENV_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$CAND_VENV freed_df=${FREED_VENV}MB df_raw=${RAW_VENV}MB (df delta)"
+            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=${FREED_VENV}MB df_raw=${RAW_VENV}MB (df delta)"
         else
-            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$CAND_VENV freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
         fi
     fi
     return 0
@@ -1142,15 +1154,21 @@ reap_worktree() {
         # copy; the class line then says `?` for the counts instead of inventing a number.
         _sum="$(printf '%s\n' "$out" | sed -n 's/^SUMMARY //p' | tail -1)"
         if [ -n "$_sum" ]; then
-            have_tally=1
-            wt_tally_repos=$((wt_tally_repos + 1))
             f_classified="$(kv_field "$_sum" classified)"
             f_preserved="$(kv_field "$_sum" preserved)"
             f_remove="$(kv_field "$_sum" remove)"
             f_reasons="$(kv_field "$_sum" reasons)"
-            case "$f_classified$f_preserved$f_remove" in
+            # ⛔ ANSWERED ONLY IF THE CORE COUNTERS ALL PARSE. `have_tally=1` was set on the mere
+            # PRESENCE of a SUMMARY, so a truncated line (a delegate dying mid-write) left the sums at 0
+            # and the coverage at `1/1` — `classified=0` reported as a measured zero under full coverage.
+            # The tally is the delegate's ANSWER; an unparseable one is no answer (same fix in
+            # `reap_venv`). ⛔ `${f:-x}` per field, not a concatenation of the three: an EMPTY field
+            # concatenates away, so `classified=3` with `preserved`/`remove` ABSENT read as "all digits".
+            case "${f_classified:-x}${f_preserved:-x}${f_remove:-x}" in
                 ''|*[!0-9]*) : ;;
-                *) sum_classified=$((sum_classified + f_classified))
+                *) have_tally=1
+                   wt_tally_repos=$((wt_tally_repos + 1))
+                   sum_classified=$((sum_classified + f_classified))
                    sum_preserved=$((sum_preserved + f_preserved))
                    sum_remove=$((sum_remove + f_remove)) ;;
             esac
@@ -1203,6 +1221,12 @@ reap_worktree() {
     sum_reasons="$(printf '%s\n' "$REASON_ROWS" | awk 'NF==2 { c[$1] += $2 }
         END { for (k in c) printf "%d\t%s\n", c[k], k }' | sort -rn -k1,1 \
         | awk -F'\t' 'BEGIN{ORS=""} {printf "%s%s:%s", (n++ ? "," : ""), $2, $1}')"
+    # An ANSWERED `reasons=none` (a clean, fully-measured pass) must not degrade to `?`: no reasons is
+    # a result, not a missing one. ⛔ NORMALISED HERE, BEFORE the class line prints `${sum_reasons:-?}`:
+    # done after the `say`, it repaired the RECORD only, so every clean armed pass still printed
+    # `reasons=?` on its class line — the sentinel losing its meaning on the one pass it must not
+    # (a review cycle found the two surfaces disagreeing).
+    [ "$have_tally" = 1 ] && [ -z "$sum_reasons" ] && sum_reasons="none"
 
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # (the delegate's tally is lifted out of $out inside the repo loop above)
@@ -1257,9 +1281,8 @@ reap_worktree() {
             say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
         fi
     fi
-    # An ANSWERED `reasons=none` (a clean, fully-measured pass) must not degrade to `?`: no reasons is
-    # a result, not a missing one.
-    [ "$have_tally" = 1 ] && [ -z "$sum_reasons" ] && sum_reasons="none"
+    # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
+    # only here repaired the record while the class line still said `?`).
     CLASSIFIED_WT="$sum_classified"; PRESERVED_WT="$sum_preserved"; REASONS_WT="$sum_reasons"
     PROOF_WT="$proof"; PRM_WT="$prm"; HAVE_WT_TALLY="$have_tally"
     # ⛔ `candidates` is OUR measurement only where we measured it. In a DRY run it is the count of

@@ -2154,6 +2154,62 @@ OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T
     LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
     bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T55c the rendered launcher + --script <reaper> shape is ACCEPTED (positive control)"
+# ⛔ argv[0] IS THE PROGRAM launchd EXECS. Pinning only argv[1] (the launcher) and `--script` certified
+# `[/bin/true, <launcher>, --script, <reaper>, --apply]`: launchd runs /bin/true, nothing else, while
+# the install reports success — the same fail-open as the systemd arm, in the arm that claims to assert
+# "the equivalent fact" (found in review, reproduced).
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/bin/true</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a plist whose argv[0] is NOT the rendered interpreter is REFUSED (argv[0] is the program)"
+assert_contains "$OUT" "does not LAUNCH $REAPER" "T55c ... and names the defect"
+# A STALE interpreter is the same defect in a subtler shape (the TCC class this installer warns about):
+# the launcher and --script are right, argv[0] is an interpreter the render did not choose.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python2</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" PY_BIN="/usr/bin/python3" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a plist whose argv[0] is a STALE interpreter (not the rendered PY_BIN) is REFUSED"
+
+# ⛔ THE SPELLING IS PART OF THE ARTIFACT (T55d). systemd strips whitespace around `=` and accepts
+# indented lines, so `ExecStart =` / `  ExecStart=` are the SAME directive as `ExecStart=`, and
+# `ExecStart = /bin/true` REPLACES the command. A read-back anchored on `^ExecStart=` saw neither, so a
+# drop-in spelled this way was certified while the unit ran /bin/true (found in review; reproduced
+# against the stub systemctl below). One assertion per spelling, because a single one would be green
+# over the others.
+for _sp in 'ExecStart =\nExecStart = /bin/true' 'ExecStart=\nExecStart =/bin/true' 'ExecStart =\n  ExecStart=/bin/true' 'ExecStart=\nExecStart= /bin/true' 'ExecStart =\nExecStart = /bin/true --x' ; do
+    printf '[Service]\n%b\n' "$_sp" >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+    : >"$T/t55/calls.log"
+    OUT="$(inst55 --install 2>&1)"; RC=$?
+    assert_eq "$RC" "1" "T55d a spaced/indented replacement ExecStart is REFUSED (spelling: $(printf '%b' "$_sp" | tr '\n' '|'))"
+    assert_absent "$(cat "$T/t55/calls.log" 2>/dev/null || true)" "enable --now" \
+        "T55d ... and nothing is armed over it"
+done
+# ... and a spaced RESET alone (the base unit's own command stays last in force) must be VERIFIED, not
+# refused: the rule is "normalise the spelling", not "refuse anything spaced".
+printf '[Service]\nExecStart =\nExecStart = /bin/bash %s --apply\n' "$REAPER" \
+    >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55d a spaced RESET followed by the reaper's own spaced ExecStart is accepted"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T55d ... and verified, not skipped"
+# The same hole in the HOME arm: `Environment = HOME=…` moved HOME invisibly.
+printf '[Service]\nEnvironment = HOME=/tmp/tmp.deadbeef/bg/home\n' \
+    >"$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55d a SPACED Environment = HOME is judged (it moved HOME)"
+assert_contains "$OUT" "is not the home this install rendered" "T55d ... and names the disagreement"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/58-spelling.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55d removing the drop-in restores a clean install"
 
 # ── T56: an UNANSWERABLE tally is recorded as such, and per-repo tallies are SUMMED ────────────
 # Two defects a review cycle found in the tally lift, both of the "record lies" class:

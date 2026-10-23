@@ -565,8 +565,25 @@ service_effective_unit() { # prints the bytes systemd will load; rc 1 when that 
 # (the same reset semantics `effective_execstarts` already implements for `ExecStart=`).
 # `env -i`-style edge cases (empty values, `NAME=` with no value) are preserved verbatim, because an
 # empty HOME is not the HOME the install rendered and must be refused by the caller.
+# normalize_unit_lines — systemd's OWN reading of `Key = value`: it strips whitespace AROUND the key,
+# around the `=`, and before the value, and it accepts indented lines. A parser anchored on
+# `^ExecStart=` therefore MISSES a legal `ExecStart =` — and a drop-in that spells BOTH the reset and
+# the replacement that way is invisible to the read-back, which then certifies the BASE unit's command
+# while systemd runs the drop-in's.
+# ⛔ MEASURED (review pass): with a drop-in carrying `ExecStart =` + `ExecStart = /bin/true` and
+# `Environment = HOME=/tmp/tmp.deadbeef/bg/home`, `effective_execstarts` still reported the base
+# `/bin/bash <reaper> --apply` and `effective_env` still reported the base HOME — the install printed
+# `verify: ExecStart + HOME read back`, exited 0 and armed the timer over a unit that ran /bin/true.
+# `systemd-analyze verify` ACCEPTS these spellings (a genuinely unknown key draws "Service has no
+# ExecStart= … Refusing."), so the unit really would run the drop-in's command. The indented spelling
+# (`  ExecStart=`) reproduces identically.
+# Normalising the TEXT once, rather than teaching every parser the grammar, keeps one definition.
+normalize_unit_lines() {
+    sed -E 's/^[[:space:]]+//; s/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*/\1=/'
+}
+
 effective_env() {
-    printf '%s\n' "$1" | awk '
+    printf '%s\n' "$1" | normalize_unit_lines | awk '
         function emit(tok,   eq, name) {
             eq = index(tok, "=")
             if (eq <= 1) return                     # not a NAME=VALUE assignment: systemd ignores it
@@ -609,7 +626,7 @@ effective_env() {
 }
 
 effective_execstarts() {
-    printf '%s\n' "$1" | awk '
+    printf '%s\n' "$1" | normalize_unit_lines | awk '
         /^ExecStart=$/ { n=0; next }
         /^ExecStart=/  { L[++n] = substr($0, 11); next }
         END            { for (i = 1; i <= n; i++) print L[i] }'
@@ -715,6 +732,16 @@ plist_argv_runs_reaper() {
     while IFS= read -r line; do t[${#t[@]}]="$line"; done
     [ "${#t[@]}" -gt 0 ] || return 2
     if [ -n "${LAUNCHER:-}" ] && [ "${#t[@]}" -ge 2 ] && [ "${t[1]}" = "$LAUNCHER" ]; then
+        # ⛔ argv[0] IS THE PROGRAM launchd EXECS — and it was not checked. Requiring only the launcher
+        # in argv[1] certified `[/bin/true, <launcher>, --script, <reaper>, --apply]`: launchd runs
+        # /bin/true and nothing else while the install reports success (found in review, reproduced).
+        # It also certified a STALE interpreter — the TCC class this installer warns about, where the
+        # rendered PY_BIN cannot read the repos — because only the launcher path was compared.
+        if [ -n "${PY_BIN:-}" ]; then
+            [ "${t[0]}" = "$PY_BIN" ] || return 1
+        else
+            case "${t[0]##*/}" in python*) : ;; *) return 1 ;; esac
+        fi
         i=2
         while [ "$i" -lt "${#t[@]}" ]; do
             if [ "${t[$i]}" = "--script" ]; then

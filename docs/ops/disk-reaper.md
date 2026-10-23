@@ -154,8 +154,17 @@ merged_pr = "merged-pr:<short>"  iff  PR(branch) is MERGED
 
 and a row that uses it says so: `refs=branch-retained:feat/x … merged_pr=merged-pr:53a9205`.
 The `headRefOid` condition is what makes the evidence about *this commit*: a recycled
-branch name, a checkout that committed after the merge, and a post-merge force-push all
-fail it and keep the blanket floor. ⛔ This arm keys the **age floor only** — it never
+branch name and a checkout that committed after the merge both fail it and keep the
+blanket floor. ⛔ **Residual, stated rather than claimed away:** `headRefOid` is the
+branch's *current* head, so a **force-push to a merged PR's still-existing branch** — if
+GitHub moves the recorded head on such a push — would let a checkout sitting at that
+unmerged tip match. That case is *not* distinguishable by this proof, and no test in the
+tree pins GitHub's behaviour for it (every fixture here is a fabricated `gh` row). The
+consequence is bounded: the commits survive on a branch ref this pass never deletes, and
+`commits_survive` still gates reachability, so an over-waiver reclaims a checkout EARLY
+— it cannot orphan a commit. Closing it properly needs the PR's `mergedAt` compared
+against the head commit's committer date; recorded as a residual, not silently assumed
+away. ⛔ This arm keys the **age floor only** — it never
 satisfies the reachability gate (`commits_survive`), because on the gone-directory path
 the admin record's HEAD is a detached commit's last durable handle.
 

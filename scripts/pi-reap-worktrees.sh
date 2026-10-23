@@ -993,8 +993,17 @@ pr_merged_refs_load() { # <slug>
 # `refs=merged` can never fire (measured: PR #9307 MERGED, mergeCommit == origin/main, tip not an
 # ancestor). The merge commit IS on main, so the PR's own mergeCommit is the commit-level fact — but
 # only for the commit the PR actually merged, hence the headRefOid identity test. A recycled branch
-# name (lanes re-create `fix/<n>-<slug>`), a checkout that committed AFTER the merge, and a
-# post-merge force-push all fail the identity test and therefore keep the floor.
+# name and a checkout that committed AFTER the merge both fail the identity test and keep the floor.
+#
+# ⛔ RESIDUAL, STATED RATHER THAN CLAIMED AWAY (a review pass found this comment asserting more than
+# the code proves): `headRefOid` is the branch's CURRENT head, so a force-push to a merged PR's
+# still-existing branch — IF GitHub moves the recorded head on such a push — would let a checkout
+# sitting at that unmerged tip match. Nothing in this tree pins GitHub's behaviour for that case
+# (every fixture is a fabricated `gh` row), so the comment used to claim a fact no test measured. The
+# consequence is bounded: the commits survive on a branch ref this pass never deletes and
+# `commits_survive` still gates reachability, so an over-waiver reclaims a checkout EARLY — it cannot
+# orphan a commit. The closing fix is to compare the PR's `mergedAt` against the head commit's
+# committer date; recorded as a residual here, not implemented on this pass.
 #
 # ⛔ IT KEYS THE AGE FLOOR ONLY. It is never returned from commits_survive: the reachability gate
 # must keep proving that deleting the checkout cannot orphan a commit, and on the gone-directory path
