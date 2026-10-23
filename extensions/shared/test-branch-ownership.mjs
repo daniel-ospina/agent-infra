@@ -1034,10 +1034,12 @@ releaseRepoLock(lockKey, PID);
   git(ROOT, `clone -q "${fOrigin}" "${equal}"`);
 
   const bare = join(ROOT, "ff-bare");
-  // #2581 — deliberately NOT pinned: nothing clones this bare repo (it is the file's only bare
-  // repo that is never used as a clone source), so it inherits no default-branch dependency.
-  // Annotated because it is the file's SECOND `init --bare` and a reader grepping for "the sites
-  // that need a pin" must not add one here or conclude the pin set is incomplete.
+  // #2581 — unused fixture: created here and never referenced again, so it needs no pin. The set
+  // that DOES need one is the EMPTY-bare repos that get CLONED — in this file that is
+  // `ff-origin.git` alone (the `bare.git` at the top is a `clone --bare` of a non-empty repo and
+  // is used only as a git-dir/cwd target). Annotated because this is the file's second
+  // `init --bare`: a reader grepping for "the sites that need a pin" must not add one here or
+  // conclude the pin set is incomplete.
   git(ROOT, `init -q --bare "${bare}"`);
 
   const pBehind = fastForwardOntoUpstreamProof(behind, "main");

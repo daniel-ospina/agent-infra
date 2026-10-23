@@ -53,8 +53,10 @@
 #   (#1369), so the assertion runs on the PR and after it. One run site, no locked-file edit.
 #
 # ADD A SUITE HERE when it starts shelling out `git commit`/`git push` in a temp repo. It must
-#   print an aggregate line shaped `<n> passed, <m> failed` (arm 3 reads `[0-9]+ passed, 0 failed`);
-#   a suite that reports differently fails arm 3 LOUDLY rather than passing silently — adjust the
+#   print an aggregate line shaped `<n> passed, <m> failed` (arm 3 reads
+#   `[1-9][0-9]* passed, 0 failed` — a ZERO count does NOT satisfy it: a suite that runs no
+#   assertions has not passed, it has stopped testing, and exit status alone cannot see that).
+#   A suite that reports differently fails arm 3 LOUDLY rather than passing silently — adjust the
 #   arm when you add such a suite.
 #
 # NOTE ON STYLE: every capture is `cmd >file` + `cat file`, never `OUT="$(… git …)"` — the
@@ -131,10 +133,10 @@ for t in extensions/shared/test-branch-ownership.mjs \
   if [ "$rc" -ne 0 ]; then
     fail "$t exited $rc with no git config at all — it depends on the BOX's git config again (#2581); last lines:"
     tail -n 6 "$OUT" | sed 's/^/     | /'
-  elif ! grep -qE '[0-9]+ passed, 0 failed' "$OUT"; then
-    fail "$t exited 0 but printed no aggregate '<n> passed, 0 failed' line — a suite that cannot report is not a pass (#2188)"
+  elif ! grep -qE '[1-9][0-9]* passed, 0 failed' "$OUT"; then
+    fail "$t exited 0 but printed no aggregate '<n> passed, 0 failed' line with n>0 — a suite that cannot report, or that ran NO assertions, is not a pass (#2188)"
   else
-    pass "$t: $(grep -E '[0-9]+ passed, 0 failed' "$OUT" | tail -n 1 | sed 's/^[✅ ]*//')"
+    pass "$t: $(grep -E '[1-9][0-9]* passed, 0 failed' "$OUT" | tail -n 1 | sed 's/^[✅ ]*//')"
   fi
 done
 
