@@ -815,8 +815,16 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                         # ⛔ THE RUN IS MEASURED, NOT BOUNDED BY AN INTERVAL: mawk 1.3.4 treats
                         # `{3,}` as exactly three, so `/`{3,}/` matched three backticks of a
                         # four-backtick fence.
-                        if (!match(ln[i], /^[[:space:]]*(`+|~+)/)) continue
-                        run = substr(ln[i], RSTART, RLENGTH); gsub(/[[:space:]]/, "", run)
+                        # ⛔ A FENCE MAY BE A LIST ITEM CONTENT (P2, fresh review of #2288): the
+                        # matcher required the run to begin the line after whitespace, so
+                        # `- ```` ` opened nothing while its closing ```` ` was still a marker —
+                        # unbalanced by construction, and the quoted verdict inside became the
+                        # verdict. The optional list marker is consumed, and the run is then read
+                        # from the FIRST backtick/tilde so the bullet never becomes part of the
+                        # signature.
+                        if (!match(ln[i], /^[[:space:]]*([-*+]|[0-9]+[.)])?[[:space:]]*(`+|~+)/)) continue
+                        run = substr(ln[i], RSTART, RLENGTH)
+                        sub(/^[^`~]*/, "", run); gsub(/[[:space:]]/, "", run)
                         if (length(run) < 3) continue
                         nm++; mline[nm] = i; mch[nm] = substr(run, 1, 1); mlen[nm] = length(run)
                       }
@@ -845,21 +853,41 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                       # nothing around it) runs to end-of-file — markdown semantics, and the only
                       # direction this can err is over-skipping (a paid re-run, exit 6), never a
                       # clean attestation over a revision nobody reviewed.
-                      for (a = 1; a <= nm; a++) {
-                        closer = 0; opener = 0
+                      # ── (1) UNION OF EVERY VALID PAIRING, BOTH DIRECTIONS ────────────────
+                      # ⛔ NEVER ONE CHOSEN INTERPRETATION (P1, three fresh reviews of #2288).
+                      # Every single reading leaves a hole in the other: with markers
+                      # [open-diff, close-diff/open-quote, close-quote] the strict reading pairs
+                      # (1,2) and exposes the QUOTED verdict between 2 and 3, while pairing (2,3)
+                      # exposes what the first pair covered. Both readings are legitimate, so both
+                      # are skipped: a line is fenced if ANY valid pairing puts it inside a fence.
+                      # Validity is the markdown rule — same fence character, closer run at least as
+                      # long as the opener; a shorter or different-character marker is CONTENT,
+                      # which is what makes a nested wrapper work.
+                      for (a = 1; a <= nm; a++)
                         for (b = 1; b <= nm; b++) {
                           if (b == a || mch[b] != mch[a]) continue
-                          if (b > a && mlen[b] >= mlen[a]) {
-                            closer = 1
+                          if (b > a && mlen[b] >= mlen[a])
                             for (t = mline[a]; t <= mline[b]; t++) sk[t] = 1
-                          }
-                          if (b < a && mlen[a] >= mlen[b]) {
-                            opener = 1
+                          if (b < a && mlen[a] >= mlen[b])
                             for (t = mline[b]; t <= mline[a]; t++) sk[t] = 1
-                          }
                         }
-                        if (!closer && !opener) for (t = mline[a]; t <= NR; t++) sk[t] = 1
+                      # ── (2) THE TAIL OF AN UNCLOSED OPENER, BY A CANONICAL WALK ──────────
+                      # ⛔ NOT "the last marker", AND NOT "a marker with no relation" (P1, fresh
+                      # review of #2288 — both were tried and each rewrote the same class of input
+                      # differently). Two shapes must be told apart:
+                      #   * the last marker of a CLOSED pair ends the fence: what follows is prose,
+                      #     and a real verdict there must still be read (the §F control);
+                      #   * a marker that OPENS a fence nothing closes puts the rest of the
+                      #     transcript inside it (markdown semantics), and a quotation there must
+                      #     never be the verdict. A marker is an opener exactly when no fence is
+                      #     open at that point, which is a sequential property, not a relation —
+                      #     so it is taken from one canonical walk.
+                      inopen = 0
+                      for (a = 1; a <= nm; a++) {
+                        if (!inopen) { inopen = 1; ostart = a; continue }
+                        if (mch[a] == mch[ostart] && mlen[a] >= mlen[ostart]) inopen = 0
                       }
+                      if (inopen) for (t = mline[ostart]; t <= NR; t++) sk[t] = 1
                       for (i = 1; i <= NR; i++) {
                         if (sk[i]) continue
                         # ⛔ A TAB IS THE INDENTATION IT IS (P2, fresh review of #2288): a markdown
