@@ -9,12 +9,13 @@
 # worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
 # both platform shapes. (a) remains, and is what this supervisor is for.
 #
-# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
-# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
-# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
-# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
-# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
-# override, because a gate an agent can defeat with an export is not a gate.
+# The lanes were never launchd's, and they belong to neither launcher camp: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL wherever it answers
+# and otherwise uses tmux (the launchd Mac, and a cell whose guest CLI cannot run) **with an explicit
+# HOME + keys.env environment contract**. A tmux worker started without that contract is the measured
+# `~21 log lines` death (agent-infra#2210, reopened: the credential is HOME-bound, so a worker with the
+# wrong HOME has none). Where NO surface exists the launcher REFUSES loudly; there is no env override,
+# because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
@@ -202,7 +203,12 @@ worker_census() { # stdout: the live worker count; exit 3 when no answer can be 
     # right after "a worker is live" inherited the memo and stood down with no worker running.
     WT_TABLE_TTL=0
     command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
-    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    # ⛔ `chain-` IS COUNTED HERE TOO (review finding on #2210's fix). `dispatch-merge.sh` spawns
+    # `chain-<N>` workers that live up to ~90 min, and the census filter in worker-terminal.sh counts
+    # them — but this list did not, so a chain-only box read "no workers" and `workers_maybe_live()`
+    # (which gates the destructive cache/disk sweep) stood DOWN to "safe to delete" under a live
+    # chain. The population this decision reads and the population the census reports must be one list.
+    _c="$(wt_count lane- fix- merge- chain- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
     case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
     printf '%s\n' "$_c" )
 }
@@ -2349,8 +2355,11 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
-  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: where the cmux daemon answers a cell's lanes are durable
+  # terminals, so that answered 0 for a busy box. (The `grep -c` form is SIGPIPE-safe — it consumes all
+  # input — but it is still the wrong SOURCE: where the launcher is tmux (#2210) it lists only that
+  # surface, and the census is the one read that is right on both.) An unreadable census prints
+  # UNKNOWN, never 0.
   say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
