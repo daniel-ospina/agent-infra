@@ -49,6 +49,9 @@
 #   * two boxes pushing DIFFERENT records for one PR contend on one ref, and the loser is a plain
 #     non-fast-forward refusal, never a silent overwrite;
 #   * the ref name IS the collision detector for rule 4 (equal `reviewed_at`, different bytes).
+# The store's OWN listing (`ls-remote`) is the source of truth for what it holds — the local refs a
+# fetch leaves behind are a CACHE, and answering from them reported "converged" over a store that
+# had received nothing (see `fetch_refs`).
 # A single shared ref, or a file on `main`, was rejected: it serialises every box behind a
 # read-modify-write race, and a file on main additionally cannot carry a record for a PR that has
 # NOT merged yet — which is the only kind of record the merge gate reads.
@@ -65,7 +68,11 @@
 #      an ownership the file never claimed, which is precisely the #426 cross-repo collision.
 #   4. A record that DISAGREES on the same `reviewed_at` is REPORTED, never silently overwritten.
 #      Neither side wins: the local file stays byte-identical, a `CONFLICT` line names both heads,
-#      and the verb exits 3.
+#      and the verb exits 3. What counts as a DISAGREEMENT is the VERDICT (and, for two non-carries,
+#      the head): two records that agree on both and differ only in carry `carried_from` are the
+#      same revision recorded twice, and are not a conflict (see `same_stamp_relation`). A carry
+#      whose `carried_from` names neither side's head is still reported — the ordering is genuinely
+#      unknown there, and guessing is what this file exists not to do.
 #
 # ── IDEMPOTENCE (#2374 item 3) ────────────────────────────────────────────────────────────
 # A second run writes nothing, pushes nothing and reports zero work: identical content is compared
@@ -161,6 +168,60 @@ field() { # <file> <name>
   sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | command head -1
 }
 
+# ── what the CONSUMER can actually use ───────────────────────────────────────────────────
+# `read_record` (scripts/atomic-land.sh) parses the file as STRICT JSON and then requires a 40-hex
+# `head_sha` ("carries no usable head_sha") and a verdict; `review-enforcer` reads the same shape.
+# A peer record that fails that is not a NEWER verdict — it is an UNREADABLE one, and letting it win
+# the ordering comparison REPLACED a usable local record with bytes the rail refuses (reproduced: a
+# peer record with trailing garbage, at a newer stamp, was pulled over a valid `clean` record, and
+# the rail then refused with "carries no usable head_sha"; a record with no head_sha did the same
+# and the run reported `wrote=1 … unreadable=0`, exit 0). So usability is checked BEFORE a peer
+# record may win or be installed, and an unusable one is counted `unreadable` (exit 4).
+record_usable() { # <file> → 0 when this box's reader can use it
+  local f="$1" head verdict
+  head="$(field "$f" head_sha)"
+  [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || return 1
+  verdict="$(field "$f" verdict)"
+  [ -n "$verdict" ] || return 1
+  # The reader's own strictness, not a second parser of our own: `json.load` refuses trailing
+  # garbage that a field-wise sed happily reads past. python3 is already a hard dependency of
+  # `read_record`, so this adds none that the consumer does not already have.
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 -c 'import json,sys
+try:
+    json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)' "$f" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ── equal `reviewed_at`, different bytes: WHICH KIND of difference is it? ─────────────────
+# Rule 4 reports a DISAGREEMENT. Two records that agree on the verdict and on the HEAD are not
+# disagreeing — they differ only in carry PROVENANCE, and calling that a conflict made a carried
+# verdict unpublishable for ever: two boxes each carrying their own local record onto the same head
+# produce the same head and verdict with different `carried_from`, and every union then exited 3
+# with a "reconcile by hand" the operator cannot act on. (A carry of a carry, whose `carried_from`
+# names an intermediate head rather than the peer's, is still reported as a conflict — that is
+# genuinely ambiguous ordering, and rule 4 says report rather than guess.)
+same_stamp_relation() { # <a> <b> → a | b | same | conflict
+  local a="$1" b="$2" av bv ah bh am bm
+  av="$(field "$a" verdict)"; bv="$(field "$b" verdict)"
+  # A different VERDICT is the one real disagreement at a shared mint time — unchanged.
+  if [ -z "$av" ] || [ "$av" != "$bv" ]; then printf 'conflict'; return 0; fi
+  ah="$(field "$a" head_sha)"; bh="$(field "$b" head_sha)"
+  am="$(field "$a" mint)";     bm="$(field "$b" mint)"
+  if [ "$ah" = "$bh" ]; then
+    # Same head, same verdict: provenance-only. Prefer the carried side if exactly one is carried;
+    # two carries of one head are the same record for every reader, so neither is written.
+    if [ "$am" = "carried" ] && [ "$bm" != "carried" ]; then printf 'a'; return 0; fi
+    if [ "$bm" = "carried" ] && [ "$am" != "carried" ]; then printf 'b'; return 0; fi
+    printf 'same'; return 0
+  fi
+  # Different heads: the only thing that can certify which one supersedes is the record's own
+  # lineage (`supersedes`), which the callers test first. Anything else is a conflict.
+  printf 'conflict'
+}
+
 # ── the store ────────────────────────────────────────────────────────────────────────────
 # The store is the ONE repo whose `refs/reviews/*` namespace the fleet shares: an agent-infra
 # checkout, resolved from an explicit --repo, then $AGENT_INFRA_PATH, then this script's own
@@ -187,29 +248,50 @@ resolve_store() {
   return 1
 }
 
-# One fetch of the whole namespace. NOT `--prune` (rule 2). A fetch that fails for ANY reason is
-# fatal for a verb that would otherwise read an empty namespace and report "converged".
+# ── the STORE's own view — never this box's cache ────────────────────────────────────────
+# ⛔ THE STORE'S LISTING IS THE ONLY TRUTH ABOUT WHAT THE STORE HOLDS. The key list used to be
+# read from this checkout's LOCAL `refs/reviews/*` — a cache the fetch maintains — and because the
+# fetch is deliberately not `--prune` (rule 2), a ref deleted on the store survived locally for
+# ever. Measured consequence: after an out-of-band deletion, `push` compared a record against a
+# cached copy of ITSELF, answered `same`, pushed nothing and exited 0 while the store held ZERO
+# refs; `status` printed an `origin records=1` the store did not have. That is the false
+# "converged" this file exists to remove — and it also made the `--force-with-lease` value a stale
+# local OID, so a legitimate re-publish could never succeed ("stale info", every run).
+#
+# So the keys AND the OIDs come from `ls-remote` — the command the old fetch-failure arm already
+# trusted — and the local refs are CACHE ONLY: the fetch exists to bring the OBJECTS those OIDs
+# name into this checkout. An object we cannot read is reported per record as UNREADABLE (exit 4),
+# never answered from a stale local ref.
+STORE_REFS=""
 fetch_refs() {
   local listing=""
-  if git_b fetch --no-tags --quiet "$REMOTE" '+refs/reviews/*:refs/reviews/*' >/dev/null 2>&1; then
-    return 0
-  fi
-  # A namespace that does not exist yet makes some git versions exit non-zero on that fetch. That
-  # is benign ONLY when the remote answers and answers EMPTY. If the remote HAS refs and the fetch
-  # still failed, the local refs are a stale snapshot — answering from them would report
-  # "converged" from data this run never refreshed, which is the false PASS this file removes.
-  if listing="$(git_b ls-remote --quiet --refs "$REMOTE" 'refs/reviews/*' 2>/dev/null)"; then
-    [ -z "$listing" ] && return 0
-    warn "registry-sync.sh: the FETCH from '$REMOTE' failed while the remote still lists refs — the local"
-    warn "  namespace is a STALE SNAPSHOT, so no verb can answer from it. Not syncing (UNKNOWN, not empty)."
+  if ! listing="$(git_b ls-remote --quiet --refs "$REMOTE" 'refs/reviews/*' 2>/dev/null)"; then
+    warn "registry-sync.sh: cannot READ the '$REMOTE' registry from '$STORE' — it is UNKNOWN, not empty. Not syncing."
     return 1
   fi
-  warn "registry-sync.sh: cannot read the '$REMOTE' registry from '$STORE' — it is UNKNOWN, not empty. Not syncing."
-  return 1
+  STORE_REFS="$listing"
+  [ -z "$listing" ] && return 0
+  # NOT `--prune` (rule 2), and no longer load-bearing for the key list: it only carries objects.
+  if ! git_b fetch --no-tags --quiet "$REMOTE" '+refs/reviews/*:refs/reviews/*' >/dev/null 2>&1; then
+    warn "registry-sync.sh: the FETCH from '$REMOTE' failed while the store still lists refs — this run"
+    warn "  continues from the store's own listing, and every record whose objects are not already here"
+    warn "  is reported UNREADABLE (exit 4) rather than answered from a stale local ref."
+  fi
+  return 0
 }
 
-remote_refs() { git_b for-each-ref --format='%(refname:strip=2)' refs/reviews 2>/dev/null | LC_ALL=C sort; }
-remote_record() { git_b show "refs/reviews/$1:record.json" 2>/dev/null; }
+remote_refs() {
+  printf '%s\n' "$STORE_REFS" | awk 'NF >= 2 { sub(/^refs\/reviews\//, "", $2); print $2 }' | LC_ALL=C sort
+}
+store_oid() { # <key> → the commit the STORE names for that ref (empty: the store has no such ref)
+  printf '%s\n' "$STORE_REFS" | awk -v want="refs/reviews/$1" '$2 == want { print $1; exit }'
+}
+remote_record() { # <key> → the record bytes carried by the STORE's own object
+  local oid
+  oid="$(store_oid "$1")"
+  [ -n "$oid" ] || return 1
+  git_b show "$oid:record.json" 2>/dev/null
+}
 
 # ── the registry ─────────────────────────────────────────────────────────────────────────
 registry_names() { # one filename per line (absent dir → nothing)
@@ -236,7 +318,7 @@ write_local() { # <key> <content-file>
 
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
-PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0
+PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0
 CONFLICT_KEYS=""
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
@@ -259,7 +341,11 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
   lat="$(field "$f" reviewed_at)"
   # "No ref" and "a ref whose record this box cannot read" are DIFFERENT states, and the second
   # is a peer record that must not be replaced: a bare `remote_record` yields empty for both.
-  DEC_EXP="$(git_b rev-parse --verify --quiet "refs/reviews/$key" 2>/dev/null || true)"
+  # ⛔ THE LEASE VALUE COMES FROM THE STORE'S OWN LISTING, never from the local ref cache: a ref
+  # deleted on the store with nothing pruning it locally left the cache naming a commit the store no
+  # longer had, so every re-publish was refused `stale info` on every run (a record that could
+  # never be restored). An absent store ref is a CREATE, and `--force-with-lease` is not used.
+  DEC_EXP="$(store_oid "$key")"
   if [ -z "$DEC_EXP" ]; then return 0; fi
   tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-remote.XXXXXX")" || { DEC="unreadable"; DEC_MSG="could not stage the peer's record"; return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
@@ -293,7 +379,15 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
       rm -f "$tmp"; DEC="skip"; DEC_MSG="the peer's record CARRIES this one (carried_from=$(field "$tmp" carried_from | cut -c1-12)…), same mint time"
       return 0
     fi
-    rm -f "$tmp"; DEC="conflict"; return 0
+    # Neither side names the other's head. Agreeing on verdict AND head is provenance-only (the
+    # parallel-carry case) and must not be reported as a divergence for ever.
+    case "$(same_stamp_relation "$f" "$tmp")" in
+      a) rm -f "$tmp"; DEC="supersede"; DEC_MSG="same mint time, same head, and THIS box's record is the carried one; publishing it as a supersession" ;;
+      b) rm -f "$tmp"; DEC="skip"; DEC_MSG="same mint time and the peer's record is the carried one (same head, same verdict)" ;;
+      same) rm -f "$tmp"; DEC="same"; DEC_MSG="same mint time, head and verdict — only carry provenance differs" ;;
+      *) rm -f "$tmp"; DEC="conflict" ;;
+    esac
+    return 0
   fi
   rm -f "$tmp"
   return 0
@@ -325,7 +419,7 @@ push_one() { # <key> <source-file>
     case "$DEC" in
       skip)   say "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
               SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); return 0 ;;
-      same)   SAME=$((SAME + 1)); return 0 ;;
+      same)   [ -n "$DEC_MSG" ] && say "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
       supersede) say "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
       unreadable) warn "  ⚠️ skip $key — $DEC_MSG; refusing to overwrite it (#2374 rule 1)."
               UNREADABLE=$((UNREADABLE + 1)); return 0 ;;
@@ -357,7 +451,7 @@ push_one() { # <key> <source-file>
     fetch_refs >/dev/null 2>&1
   done
   warn "  ⚠️ FAILED $key — the push was refused twice (a peer moved the ref, or this box cannot push to $REMOTE). The record stays LOCAL and is not lost; re-run to retry."
-  FAILED=$((FAILED + 1)); return 0
+  FAILED=$((FAILED + 1)); PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
 }
 
 pull_one() { # <key>
@@ -378,25 +472,36 @@ pull_one() { # <key>
     warn "  ⚠️ skip $key — the peer's record carries no readable reviewed_at."
     rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
+  # ⛔ USABILITY BEFORE ORDERING. A record the rail cannot read must never win the comparison: it
+  # would replace a usable local record with bytes `read_record` refuses (see `record_usable`).
+  if ! record_usable "$tmp"; then
+    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
+    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
+  fi
   # ⛔ THE KEY MUST MATCH WHAT THE RECORD SAYS IT IS, on the way IN as well as out. `push` refuses
   # to publish a record whose own repo/pr disagree with its key; without the same test here, a
   # mis-keyed ref is MATERIALISED under that key, and `read_record` (which validates only
   # head_sha/verdict) then hands another repo's verdict to this PR's gate — the #426 collapse that
   # rule 3 exists to prevent, open on one side.
+  # ⚠️ COUNTED `unreadable`, NOT `unkeyed`: `unkeyed` is the INFORMATIONAL class for this box's own
+  # repo-less legacy files (rule 3, which must stay quiet or every box with one reports a defect
+  # for ever). A peer ref the store cannot attribute is a DEFECT IN THE STORE, and the header's
+  # exit-4 contract says so — counting it `unkeyed` reported `converged` (rc 0) over a store whose
+  # only record this box could not use, and the rail's rc-0 arm then discarded the warning.
   local rec_repo rec_pr
   rec_repo="$(field "$tmp" repo)"
   rec_pr="$(field "$tmp" pr)"
   if ! [[ "$rec_pr" =~ ^[0-9]+$ ]]; then
     warn "  ⚠️ skip $key — the peer's record carries no usable pr field, so the key it sits under cannot be verified."
-    UNKEYED=$((UNKEYED + 1)); rm -f "$tmp"; return 0
+    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
   fi
   if [ -z "$rec_repo" ]; then
     warn "  ⚠️ skip $key — the peer's record carries no repo field, so the key it sits under cannot be verified (#2374 rule 3)."
-    UNKEYED=$((UNKEYED + 1)); rm -f "$tmp"; return 0
+    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
   fi
   if [ "${rec_repo%/*}-${rec_repo#*/}-$rec_pr" != "$key" ]; then
     warn "  ⚠️ skip $key — the peer's record says ${rec_repo}#${rec_pr}, which is NOT this key; materialising it would transplant another repo's verdict (#2374 rule 3, #426)."
-    UNKEYED=$((UNKEYED + 1)); rm -f "$tmp"; return 0
+    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
   fi
   lf=""
   if lf="$(local_record_for_key "$key")" && [ -n "$lf" ]; then
@@ -420,7 +525,16 @@ pull_one() { # <key>
         say "  · keep $key — this box's record CARRIES the peer's (carried_from=$(field "$lf" carried_from | cut -c1-12)…), same mint time"
         SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0
       else
-        conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0
+        # Neither names the other's head: same verdict+head is provenance-only (the parallel carry
+        # two boxes make onto one head); a different verdict is the real disagreement.
+        case "$(same_stamp_relation "$tmp" "$lf")" in
+          a) pull_reason="same mint time, same head, and the peer's record is the carried one; taking it as a supersession" ;;
+          b) say "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
+             SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0 ;;
+          same) say "  · keep $key — same mint time, head and verdict; only carry provenance differs"
+             SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
+          *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
+        esac
       fi
     fi
   fi
@@ -444,7 +558,7 @@ pull_one() { # <key>
 # counters, and a subshell's increment is lost — a rule-3 refusal would then be reported as
 # `unkeyed=0`, and its `say` lines, written to the data stream, would be re-read as record names.
 local_keyed() { # <outfile>
-  local out="$1" name base repo pr
+  local out="$1" name base repo pr rec_pr
   : > "$out" || return 1
   while IFS= read -r name; do
     [ -n "$name" ] || continue
@@ -463,8 +577,18 @@ local_keyed() { # <outfile>
     fi
     if [[ "$base" =~ ^[0-9]+$ ]]; then
       repo="$(field "$REG_DIR/$name" repo)"; pr="$base"
-      if [ -z "$repo" ]; then
-        warn "  · skip $base.json — a legacy number-keyed record with no repo field cannot be attributed to a repo, so it is never replicated under a name that would claim one (#2374 rule 3)"
+      rec_pr="$(field "$REG_DIR/$name" pr)"
+      if [ -z "$repo" ] || [[ "$repo" != */* ]]; then
+        warn "  · skip $base.json — a legacy number-keyed record with no readable 'owner/name' repo field cannot be attributed to a repo, so it is never replicated under a name that would claim one (#2374 rule 3)"
+        UNKEYED=$((UNKEYED + 1)); continue
+      fi
+      # ⛔ THE LEGACY NAME IS NOT THE RECORD'S IDENTITY. The qualified branch compares the name to
+      # the record's own repo AND pr; this arm used to take `pr` from the FILENAME only, so
+      # `441.json` whose record says `"pr":442` was published as `…-441` — a ref whose name its own
+      # payload denies, which every peer then refuses (and, having no delete path, nothing can
+      # clear). Reproduced before this check.
+      if [ "${rec_pr:-}" != "$pr" ]; then
+        warn "  · skip $base.json — the filename says #$pr but the record's own pr field says #${rec_pr:-<none>}; publishing it would put a record under a key its own fields deny (#2374 rule 3)"
         UNKEYED=$((UNKEYED + 1)); continue
       fi
       printf '%s-%s-%s\t%s\n' "${repo%/*}" "${repo#*/}" "$pr" "$name" >> "$out"; continue
@@ -567,7 +691,15 @@ summary() { # <verb>
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
     "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$CONFLICT" "$UNKEYED" "$UNREADABLE" "$FAILED"
   if [ "$FAILED" -gt 0 ]; then
-    warn "registry-sync.sh: $FAILED record(s) could not be moved — re-run to retry (nothing was deleted, and no record was overwritten with an older one)."
+    # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
+    # failed PUSH means the records WERE read and this box could not publish. Naming both as "the
+    # fleet's records are UNKNOWN" sent an operator to re-run a path that fails identically.
+    if [ "$PUSH_FAILED" -gt 0 ] && [ "$FAILED" -eq "$PUSH_FAILED" ]; then
+      warn "registry-sync.sh: $FAILED record(s) could not be PUBLISHED — the pull side succeeded, so this box"
+      warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
+    else
+      warn "registry-sync.sh: $FAILED record(s) could not be moved — re-run to retry (nothing was deleted, and no record was overwritten with an older one)."
+    fi
     return 1
   fi
   if [ "$CONFLICT" -gt 0 ]; then

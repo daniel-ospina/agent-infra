@@ -22,6 +22,15 @@
 #   §8  `status` names the records the peer has and this box does not
 #   §9  fail-closed — an unreadable remote is UNKNOWN, never "empty, therefore converged"
 #   §10 nothing was deleted, in any direction, by any run above
+#   §18 the STORE is the truth: a ref deleted out-of-band is RE-PUBLISHED (a stale local cache
+#       must never answer `same`) and `status` counts what the store holds
+#   §19 a peer record this box's rail cannot USE (no 40-hex head_sha / not strict JSON) never
+#       replaces a usable local one, and is exit 4 — not "converged"
+#   §20 a store whose ONLY record is unusable is exit 4 (de-vacuumed: a store of its own)
+#   §21 a PARALLEL carry (same head, same stamp, different carried_from) is not a conflict
+#   §22 a legacy <pr>.json whose own `pr` field denies its filename is never published
+#   §23 `status` counts the STORE's records, not this box's cache
+#   §24 every network op is BOUNDED and cannot block on an invisible prompt
 
 set -uo pipefail
 
@@ -323,6 +332,10 @@ assert_contains "$(command cat "$BOX1/$KEY4.json")" "$HEAD_B" "§14 ...and box 1
 # but a real disagreement at the same stamp is still a CONFLICT
 mint "$BOX1" "$KEY4" "2026-10-29T10:00:00Z" "$HEAD_C" "daniel-ospina/agent-infra" 6666   # fresh, neither carries
 assert_contains "$(rs "$BOX1" pull)" "CONFLICT $KEY4" "§14 a genuine same-stamp disagreement is still a CONFLICT"
+# Clear §14's deliberate divergence, so every later section's summary is unambiguous — the same
+# hygiene §6 applies to §5's. Box 1 goes back onto the record the store holds.
+carried "$BOX1" "$KEY4" "$HEAD_A" "$HEAD_B"
+rs "$BOX1" push >/dev/null 2>&1 || true
 
 echo "── §15 a REFUSED push re-takes the decision instead of re-pushing blind"
 # Regression (review cycle 2, P0): the retry re-read the ref only to acquire a lease value, so it
@@ -418,6 +431,171 @@ assert_contains "$(git -C "$STORE" for-each-ref --format='%(refname:strip=2)' re
   "daniel-ospina-agent-infra-2374" "§10 the PR's ref survived every run"
 for r in "$KEY2" "$KEY3" daniel-ospina-tortoise-441 daniel-ospina-tortoise-9999; do
   if [ -n "$(ref_of "$STORE" "$r")" ]; then ok "§10 ref $r survived every run"; else bad "§10 ref $r vanished"; fi
+done
+
+# publish arbitrary bytes under a reviews ref — PLUMBING: no verb of this script writes these
+seed_payload() { # <store-checkout> <key> <payload-line>
+  local st="$1" k="$2" p="$3" b t c
+  b="$(printf '%s\n' "$p" | git -C "$st" hash-object -w --stdin)"
+  t="$(printf '100644 blob %s\trecord.json\n' "$b" | git -C "$st" mktree)"
+  c="$(git -C "$st" -c user.name=t -c user.email=t@t.invalid commit-tree "$t" -m "seed payload")"
+  git -C "$st" push -q --force origin "$c:refs/reviews/$k"
+  git -C "$st" update-ref "refs/reviews/$k" "$c"
+}
+
+# ═══ 18–23. review cycle 1 (fresh-context reviewers B, C, E, A) ═════════════════════════════
+
+echo "── §18 the STORE is the truth: a ref deleted out-of-band is re-published, never 'same'"
+# Review cycle 1 (P1): the key list was read from this checkout's LOCAL refs/reviews/*, a cache the
+# fetch maintains and never prunes. After a deletion on the store, `push` compared the record to a
+# cached copy of ITSELF, answered `same`, pushed nothing, and exited 0 while the store held nothing —
+# and `status` printed an `origin records=N` the store did not have.
+KEYA="daniel-ospina-agent-infra-1212"
+mint "$BOX1" "$KEYA" "2026-11-01T10:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1212
+rs "$BOX1" push >/dev/null
+assert_contains "$(git -C "$STORE" ls-remote --refs origin "refs/reviews/$KEYA")" "refs/reviews/$KEYA" \
+  "§18 precondition: the record reached the store"
+# delete it on the STORE only — the local cache keeps its ref on purpose (the fetch is not --prune)
+git -C "$STORE" push -q origin ":refs/reviews/$KEYA"
+assert_eq "$(git -C "$STORE" ls-remote --refs origin "refs/reviews/$KEYA")" "" \
+  "§18 precondition: the store no longer has the ref (the local cache still does)"
+# ═══ 23 (asserted HERE, where the two sources DISAGREE) ═════════════════════════════════
+# While the deletion is in place the store lists one FEWER ref than the local cache, so a
+# cache-sourced count is distinguishable here and only here (after the re-push below the two sets
+# coincide and both reads agree — a count assertion there cannot discriminate).
+CACHE_N="$(git -C "$STORE" for-each-ref --format='%(refname)' refs/reviews | wc -l | tr -d ' ')"
+STORE_N="$(git -C "$STORE" ls-remote --refs origin 'refs/reviews/*' | wc -l | tr -d ' ')"
+if [ "$STORE_N" -lt "$CACHE_N" ]; then
+  ok "§18 (premise) the store lists FEWER refs than the local cache ($STORE_N < $CACHE_N)"
+else
+  bad "§18 (premise) store ($STORE_N) and cache ($CACHE_N) agree — the count assertion cannot discriminate"
+fi
+assert_contains "$(rs "$BOX1" status)" "origin records=$STORE_N" \
+  "§23 status reports the STORE's count while the local cache disagrees"
+OUT="$(rs "$BOX1" push)"
+assert_contains "$OUT" "pushed $KEYA" "§18 push RE-PUBLISHES a store ref deleted out of band (not 'same')"
+assert_contains "$OUT" "pushed=1" "§18 ...and counts it as real work, not as an identical record"
+assert_contains "$(git -C "$STORE" ls-remote --refs origin "refs/reviews/$KEYA")" "refs/reviews/$KEYA" \
+  "§18 ...and the store holds it again"
+
+# ═══ 19. a peer record the rail cannot USE never wins the ordering ══════════════
+# A store of its OWN, so the `exit 4` here cannot be satisfied by another section's unreadable
+# fixture (the §20 lesson, applied to the usability gate — verified by mutation: with the shared
+# store the rc stayed 4 even when the gate was disabled).
+echo "── §19 an unusable peer record never replaces a usable local one (exit 4, not converged)"
+KEYB="daniel-ospina-agent-infra-1313"
+ORIGIN3="$T/origin3.git"; STORE3="$T/store3"; BOX5="$T/box5"
+git init -q --bare "$ORIGIN3"
+mkdir -p "$STORE3" "$BOX5"
+git -C "$STORE3" init -q
+git -C "$STORE3" remote add origin "$ORIGIN3"
+git -C "$STORE3" config user.email sync@test.invalid
+git -C "$STORE3" config user.name  sync-test
+git -C "$STORE3" commit -q --allow-empty -m seed
+git -C "$STORE3" push -q origin HEAD:refs/heads/main
+mint "$BOX5" "$KEYB" "2026-11-02T10:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1313
+rsx "$STORE3" "$BOX5" push >/dev/null                         # box 5 holds a usable record
+GOOD_B="$(command cat "$BOX5/$KEYB.json")"
+# a NEWER stamp, but no head_sha and not strict JSON: the rail's reader refuses this outright
+seed_payload "$STORE3" "$KEYB" '{"pr":1313,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2027-01-01T00:00:00Z"} GARBAGE'
+RS_LAST="$(rsx "$STORE3" "$BOX5" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§19 an unusable peer record is exit 4, not 'converged'"
+assert_contains "$RS_LAST" "unreadable=1" "§19 ...and the ONLY unusable record in the store is the one skipped"
+assert_contains "$RS_LAST" "not one this box's rail can USE" "§19 ...the skip NAMES why it was refused"
+assert_eq "$(command cat "$BOX5/$KEYB.json")" "$GOOD_B" \
+  "§19 the usable local record SURVIVED (a newer stamp does not let unreadable bytes win)"
+
+# ═══ 20. a store of its OWN, holding only an unusable record, is exit 4 ════════
+# (de-vacuumed from §17: that assertion was satisfied by §11/§11b's permanently-seeded
+#  unreadable refs, so a mis-keyed record alone still reported rc 0 — measured.)
+echo "── §20 a store whose ONLY record is unusable is NOT converged (de-vacuumed)"
+ORIGIN2="$T/origin2.git"; STORE2="$T/store2"; BOX4="$T/box4"
+git init -q --bare "$ORIGIN2"
+mkdir -p "$STORE2" "$BOX4"
+git -C "$STORE2" init -q
+git -C "$STORE2" remote add origin "$ORIGIN2"
+git -C "$STORE2" config user.email sync@test.invalid
+git -C "$STORE2" config user.name  sync-test
+git -C "$STORE2" commit -q --allow-empty -m seed
+git -C "$STORE2" push -q origin HEAD:refs/heads/main
+seed_payload "$STORE2" "daniel-ospina-tortoise-1414" '{"pr":999,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"clean","repo":"other/repo","reviewed_at":"2026-11-03T10:00:00Z"}'
+RS_LAST="$(rsx "$STORE2" "$BOX4" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§20 a store whose ONLY record is unusable is exit 4 (not rc 0)"
+assert_contains "$RS_LAST" "says other/repo#999" "§20 ...and it names the mis-keyed record"
+assert_absent "$BOX4" "$BOX4/daniel-ospina-tortoise-1414.json" "§20 ...and materialises nothing under that key"
+
+# ═══ 21. a PARALLEL carry is not a conflict ════════════════════════════════════
+echo "── §21 a parallel carry (same head + stamp, different carried_from) is not a divergence"
+KEYD="daniel-ospina-agent-infra-1515"
+# this box carries H1→H3; the store holds the peer's carry of the SAME head from a different base
+printf '{"pr":1515,"head_sha":"%s","mint":"carried","carried_from":"%s","carried_at":"2026-11-05T10:00:00Z","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-04T10:00:00Z"}\n' \
+  "$HEAD_C" "$HEAD_B" > "$BOX1/$KEYD.json"
+seed_payload "$STORE" "$KEYD" \
+  '{"pr":1515,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","mint":"carried","carried_from":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","carried_at":"2026-11-05T09:00:00Z","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-04T10:00:00Z"}'
+rs_rc "$BOX1" push
+assert_eq "$RS_RC" "0" "§21 the parallel carry is NOT a permanent divergence (rc 0)"
+assert_contains "$RS_LAST" "conflicts=0" "§21 ...and no conflict is reported"
+# the same code path in the PULL direction (rc is 4 here because §11/§11b's permanently-seeded
+# unreadable refs are on this store — the point is that KEYD is NOT a conflict)
+rs_rc "$BOX1" pull
+assert_contains "$RS_LAST" "only carry provenance differs" "§21 ...and the pulling direction reads the same supersession"
+if grep -qF "CONFLICT $KEYD" <<<"$RS_LAST"; then bad "§21 ...the pull reported a conflict for a parallel carry"; else ok "§21 ...and reports no conflict for it"; fi
+# a genuinely different VERDICT at the same stamp is still a conflict
+printf '{"pr":1515,"head_sha":"%s","mint":"carried","carried_from":"%s","verdict":"clean-micro","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-04T10:00:00Z"}\n' \
+  "$HEAD_C" "$HEAD_B" > "$BOX1/$KEYD.json"
+assert_contains "$(rs "$BOX1" push)" "CONFLICT $KEYD" "§21 a different VERDICT at one stamp is still a CONFLICT"
+
+# ═══ 22. a legacy record is never published under a key its own fields deny ════
+echo "── §22 a legacy <pr>.json whose own pr field denies its filename is never published"
+printf '{"pr":552,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/tortoise","reviewed_at":"2026-11-06T10:00:00Z"}\n' \
+  "$HEAD_A" > "$BOX1/551.json"
+OUT="$(rs "$BOX1" push)"
+assert_contains "$OUT" "the filename says #551" "§22 push NAMES the filename/record disagreement"
+assert_eq "$(git -C "$STORE" ls-remote --refs origin refs/reviews/daniel-ospina-tortoise-551)" "" \
+  "§22 ...and mints no ref its own payload denies (a ref nothing can delete)"
+assert_contains "$OUT" "unkeyed=1" "§22 ...and counts it (rule 3 stays informational on the PUSH side)"
+
+# ═══ 23. status counts the STORE, not this box's cache ═════════════════════════
+# §23's second read: after the re-publish both sources agree, so this pins the VALUE either way.
+echo "── §23b status's count after the re-publish"
+N_STORE="$(git -C "$STORE" ls-remote --refs origin 'refs/reviews/*' | wc -l | tr -d ' ')"
+assert_contains "$(rs "$BOX1" status)" "origin records=$N_STORE" \
+  "§23 status's origin count EQUALS the store's ref count (value, not just the label)"
+
+# ═══ 24. every network op is BOUNDED, and git cannot block on a prompt ════════
+echo "── §24 network ops are bounded and cannot block on an invisible prompt"
+SHIM="$T/shim"; mkdir -p "$SHIM"
+REAL_GIT="$(command -v git)"
+# The shim answers every NON-network git verb for real (store resolution must still work) and
+# SLEEPS on the network verbs — a store that never answers, the state the bound exists for.
+cat > "$SHIM/git" <<EOS
+#!/bin/sh
+case "\$*" in
+  *ls-remote*|*fetch*|*push*)
+    printf '%s' "\${GIT_TERMINAL_PROMPT:-<unset>}" > "$T/prompt-env"
+    sleep 30 ;;
+  *) exec "$REAL_GIT" "\$@" ;;
+esac
+EOS
+chmod +x "$SHIM/git"
+START="$(date +%s)"
+# ⛔ THE ENV IS FORCED, not inherited: this harness (and every fleet agent shell) already exports
+# GIT_TERMINAL_PROMPT=0, so a shim that simply reports the inherited value prints `0` even if `git_b`
+# dropped its own assignment — an assertion satisfied by the ambient environment is not a test
+# (verified by mutation: deleting git_b's assignment left the suite green until this sentinel
+# existed). With a sentinel, only git_b's own export can produce `0`.
+RS_LAST="$(GIT_TERMINAL_PROMPT=__ambient_must_not_win__ PATH="$SHIM:$PATH" bash "$SYNC" pull --repo "$STORE" --dir "$BOX2" --remote origin --timeout 2 2>&1)"; RS_RC=$?
+ELAPSED=$(( $(date +%s) - START ))
+assert_eq "$RS_RC" "1" "§24 a store that never answers is a non-zero exit (never a hang)"
+if [ "$ELAPSED" -le 12 ]; then ok "§24 ...and the run was BOUNDED (${ELAPSED}s against a 30s stub)"; else bad "§24 the run hung for ${ELAPSED}s — the wall-clock bound is not wired"; fi
+assert_eq "$(command cat "$T/prompt-env" 2>/dev/null)" "0" \
+  "§24 ...and every git it spawns carries GIT_TERMINAL_PROMPT=0 (no invisible credential prompt)"
+assert_contains "$RS_LAST" "UNKNOWN, not empty" "§24 ...and the refusal says the store is UNKNOWN, not empty"
+
+# ═══ 10 (continued). nothing above deleted a record either ══════════════════════
+for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
+  b="${pair%%:*}"; f="${pair##*:}"
+  if [ -f "$b/$f.json" ]; then ok "§18–19 $f.json still exists on $(basename "$b")"; else bad "§18–19 $f.json vanished"; fi
 done
 
 echo

@@ -594,19 +594,29 @@ check_review_registry() {
   # registry-sync.sh exited 2 — a cell reporting "the registry is unsynced" for a quoting bug.
   local -a store_args=()
   [ -n "$store" ] && store_args=(--repo "$store")
-  out="$(CELL_HOME="$CELL_HOME" bash "$sync" union "${store_args[@]+"${store_args[@]}"}" --timeout 30 2>&1)" || rc=$?
+  # `--dir` is passed EXPLICITLY, and the registry is named from CELL_HOME rather than assumed:
+  # `HOME` is repointed to $CELL_HOME by setup_home/check_provider, but that invariant lives in
+  # OTHER functions and this check must not silently certify a registry the cell's lanes never
+  # read. (The old `CELL_HOME="$CELL_HOME" bash …` prefix was inert — registry-sync.sh resolves
+  # REGISTRY_SYNC_DIR or $HOME and never reads CELL_HOME, which asserted a redirect that does not
+  # exist.)
+  out="$(bash "$sync" union --dir "$CELL_HOME/.pi/agent/reviews" "${store_args[@]+"${store_args[@]}"}" --timeout 30 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
   case "$rc" in
-    0) ok "review-record registry synced with the fleet ($(printf '%s\n' "$out" | grep -E '^union:' | tail -1))" ;;
+    0) ok "review-record registry synced with the fleet ($(printf '%s\n' "$out" | grep -E '^union:' | tail -1))"
+       # rc 0 is CONVERGED, not "nothing to say": a per-record notice (a store this cell could not
+       # use, a local legacy record kept local by rule 3) must still reach the operator.
+       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/    /' >&2 || true ;;
     3) warn "the review-record registry DIVERGES from the fleet at the same reviewed_at — neither side was"
        warn "  overwritten (#2374 rule 4); this cell keeps what it has. Reconcile by hand if this is not two"
        warn "  boxes recording one revision." ;;
     4) warn "the fleet's registry holds records this cell could NOT use (unreadable ref or stamp, or a"
        warn "  mis-keyed record) — they were skipped and nothing was overwritten, but this is NOT a converged"
-       warn "  state. Re-run: bash $sync union" ;;
-    *) warn "the cross-box review-record registry could NOT be synced (rc=$rc) — the fleet's records are"
-       warn "  UNKNOWN on this cell, not empty. Lanes still review and record locally; re-run:"
-       warn "  bash $sync union" ;;
+       warn "  state. Re-run: bash $sync union ${store:+--repo \"$store\"}" ;;
+    *) warn "the cross-box review-record registry could NOT be synced (rc=$rc) — see the lines above for"
+       warn "  WHICH SIDE failed: a failed PULL leaves the fleet's records UNKNOWN here (not empty), a failed"
+       warn "  PUSH means this cell read them but its own are still LOCAL. Re-run:"
+       warn "  bash $sync union ${store:+--repo \"$store\"}" ;;
   esac
   return 0
 }

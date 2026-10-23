@@ -799,7 +799,19 @@ resolve_state() {
 # named — and the "no review record" refusal below now names the sync as its remedy, so a lane
 # that hits it has a correct next action instead of an unexplained refusal (#2349).
 sync_review_registry() {
-  local sync="$SELF_DIR/registry-sync.sh" out="" rc=0
+  # `ATOMIC_LAND_REGISTRY_SYNC` is the suite's seam, in the same family as ATOMIC_LAND_GH /
+  # ATOMIC_LAND_RECORD_SH / ATOMIC_LAND_ADMIN_MERGE: `off` skips the union, and a PATH replaces the
+  # script so a test can drive the ORDERING without a network. PRODUCTION DEFAULTS TO ON (unset =
+  # the script beside this rail); tests/atomic-land/run.sh sets it because that suite executes THIS
+  # rail ~85 times and must stay hermetic — without the seam it made two real round trips to
+  # github.com per invocation, pulled the fleet's LIVE records into each scenario's fixture HOME,
+  # and on a box with blackholed egress would have blown the suite's own 30s watchdog per scenario.
+  local sync="${ATOMIC_LAND_REGISTRY_SYNC:-$SELF_DIR/registry-sync.sh}" out="" rc=0
+  case "$sync" in
+    off|none|0)
+      say "atomic-land: review-record registry union SKIPPED by request (ATOMIC_LAND_REGISTRY_SYNC=$sync)"
+      return 0 ;;
+  esac
   if [ ! -f "$sync" ]; then
     err "atomic-land: ⚠️ registry-sync.sh is not deployed beside this rail — the review-record registry on"
     err "   this box is LOCAL-ONLY, so a PR reviewed on another machine will still read as unreviewed (#2374)."
@@ -811,7 +823,11 @@ sync_review_registry() {
   fi
   out="$(bash "$sync" union 2>&1)" || rc=$?
   case "$rc" in
-    0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)" ;;
+    0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
+       # A converged run can still carry per-record notices, and this arm used to drop every one of
+       # them: a store holding a record this box could not use printed `ok … synced` with the warning
+       # discarded, which is the SILENCE the #2349 ruling forbids. Say what the run flagged.
+       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/   /' >&2 || true ;;
     3) printf '%s\n' "$out" >&2
        err "atomic-land: ⚠️ the review-record registry DIVERGES between boxes at the same reviewed_at (above)."
        err "   Neither side was overwritten (#2374 rule 4). Any record this box holds locally is still used below." ;;
@@ -1354,7 +1370,7 @@ fi
 # the record is missing would leave every freshly minted record local forever.
 sync_review_registry
 if ! read_record; then
-  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, its record is reachable with \`scripts/registry-sync.sh pull\` (#2374)."
+  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374)."
 fi
 if ! verdict_accepted "$RECORD_VERDICT"; then
   stop "the record for $REPO#$PR has verdict '$RECORD_VERDICT' — only [$ACCEPTED_VERDICTS] unlocks a merge"

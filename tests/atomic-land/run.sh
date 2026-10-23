@@ -364,6 +364,11 @@ new_scen() {
   SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
   SCEN_RECORD_NO_WRITE=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
+  # #2374: the cross-box review-registry union is OFF by default here — this suite
+  # is hermetic and executes the rail ~85 times; a live store would make every
+  # scenario depend on the fleet's records and on github.com reachability. The
+  # wiring scenarios below turn it ON with a stub script (never the network).
+  SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
@@ -444,6 +449,7 @@ rail_exec() { # <extra args...>
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
+  ATOMIC_LAND_REGISTRY_SYNC="${SCEN_REGISTRY_SYNC:-off}" \
   ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
   ATOMIC_LAND_DRIFT_TRIGGER="${SCEN_DRIFT_TRIGGER:-0}" \
     exec bash "$RAIL" "$@"
@@ -535,6 +541,72 @@ rc=$?
 called "pr update-branch" && fail "mutated before the precondition (update-branch)" || pass "no update-branch before the precondition"
 called "admin-merge" && fail "landed without a record" || pass "no land without a record"
 grep -q "no review record" "$SCEN/err" && pass "the refusal names the missing record" || fail "the refusal does not name the missing record"
+
+# ═══ 3b. the cross-box registry union is WIRED (agent-infra#2374) ═══════
+# The owner's ruling on #2374 (2026-10-23) named this the ONE thing to verify at
+# review: "its cloud-cell-bringup.sh and atomic-land.sh wiring has no test … a wiring
+# step that silently does nothing is this fleet's most-repeated failure class". These
+# arms pin the three properties the design depends on, with a STUB script (no
+# network): the union runs BEFORE the record is read, a failing union does not stop
+# the landing, and a missing script does not stop it either.
+echo "── 3b. registry union runs BEFORE read_record, and never blocks the landing"
+# The test double for scripts/registry-sync.sh: NEVER the network, NEVER a real store.
+# It records the call and materialises the prepared record the way a real pull would.
+write_sync_stub() { # <path>
+  cat > "$1" <<'EOS'
+#!/usr/bin/env bash
+echo "registry-sync $*" >> "$SCEN/calls"
+if [ -f "$SCEN/stub-fail" ]; then
+  echo "registry-sync.sh: cannot READ the 'origin' registry from '/x' — it is UNKNOWN, not empty. Not syncing." >&2
+  exit 1
+fi
+if [ -f "$SCEN/stub-record.json" ]; then
+  mkdir -p "$HOME/.pi/agent/reviews" && cp "$SCEN/stub-record.json" "$HOME/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+fi
+echo "union: wrote=1 pushed=0 same=0 older_refused=0 conflicts=0 unkeyed=0 unreadable=0 failed=0"
+exit 0
+EOS
+  chmod +x "$1"
+}
+new_scen registrysync
+# (a) the union is the thing that makes the record appear: no local record, and the
+#     stub publishes one. If the call moved AFTER read_record the rail would refuse.
+rm -f "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+STUB="$SCEN/registry-sync-stub.sh"
+write_sync_stub "$STUB"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" > "$SCEN/stub-record.json"
+SCEN_REGISTRY_SYNC="$STUB"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: the landing completes when the UNION supplies the record" \
+  || fail "3b: expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+grep -q '^registry-sync union' "$SCEN/calls" && pass "3b: the union was invoked" \
+  || fail "3b: the rail never ran the registry union (calls: $(calls))"
+awk '/^registry-sync/{r=NR} /record-review/{v=NR} END{exit !(r && v && r<v)}' "$SCEN/calls" \
+  && pass "3b: the union ran BEFORE record-review read the record (the ordering is the design)" \
+  || fail "3b: the union did not run before the record was read (calls: $(calls))"
+# (b) a FAILING union is non-fatal: the box can still land a record it holds locally
+new_scen registrysync-fail
+STUB="$SCEN/registry-sync-stub.sh"
+write_sync_stub "$STUB"
+touch "$SCEN/stub-fail"
+SCEN_REGISTRY_SYNC="$STUB"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: a FAILED union does not block a landing whose record is local" \
+  || fail "3b: a failed union blocked the landing (rc $rc, $(tail -1 "$SCEN/err"))"
+called "admin-merge 42" && pass "3b: …and the land step still ran" || fail "3b: the land step did not run"
+grep -q 'UNKNOWN, not empty' "$SCEN/err" && pass "3b: the failure is NAMED on stderr (never silent)" \
+  || fail "3b: a failed union was silent — the #2349 silence this must not reintroduce"
+# (c) a MISSING sync script is named and is non-fatal
+new_scen registrysync-missing
+SCEN_REGISTRY_SYNC="$SCEN/no-such-registry-sync.sh"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: a PARTIAL install (no registry-sync.sh) does not block the landing" \
+  || fail "3b: a missing registry-sync.sh blocked the landing (rc $rc)"
+grep -q 'LOCAL-ONLY' "$SCEN/err" && pass "3b: …and the box is told its registry is LOCAL-ONLY" \
+  || fail "3b: a missing registry-sync.sh was silent"
 
 # ═══ 4. a draft is refused ════════════════════════════════════════════════
 echo "── 4. a draft is refused before any CI work"
@@ -2587,6 +2659,10 @@ if true; then
   mutate_and_expect_fail B13 's/behind="\$\(behind_by_of "\$BASE" "\$HEAD"\)"/behind=0/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
+  # #2374: the registry union must run BEFORE the record is read — the ordering is the
+  # whole design (a miss-only call could never PUBLISH). Verified live: deleting the
+  # call reddens scenario 3b, where the record only exists because the union made it.
+  mutate_and_expect_fail B14-registry-order 's/\nsync_review_registry\n/\n/'
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
