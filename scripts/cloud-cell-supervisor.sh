@@ -578,8 +578,37 @@ sup_systemctl() { # <systemctl verb…>
   # shellcheck disable=SC2086  # deliberate word splitting: $sc may be "sudo -n systemctl"
   $sc "$@"
 }
-controller_unit_enabled() { sup_systemctl is-enabled --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
-controller_unit_active()  { sup_systemctl is-active  --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
+# ⛔ THREE ANSWERS, NOT TWO (review P1, #2402). `is-enabled --quiet` collapses "DISABLED" and "CANNOT
+# READ" into one false value, and the start branch reads that value as "this box is not service-managed"
+# — so a `sudo -n systemctl` that fails (no NOPASSWD entry, a locked sudo, a transient failure) would
+# launch a tmux controller beside a unit that IS enabled and WILL start at boot: two dispatchers on one
+# queue, which is the #1761 duplicate this branch exists to prevent. Everywhere else in this file an
+# unreadable read is fatal, and here it must be too.
+#   0 = enabled (the manager brings it back) · 1 = a real disabled/masked/static answer · 3 = cannot read
+# The state WORDS are systemd's own (`man systemctl`: enabled, enabled-runtime, linked, linked-runtime,
+# alias, masked, masked-runtime, static, indirect, disabled, generated, transient), so a real answer is
+# never mistaken for an unreadable one; anything else printed, or nothing at all, is unreadable.
+controller_unit_state() {
+  local out
+  out="$(sup_systemctl is-enabled "$CONTROLLER_UNIT" 2>/dev/null)"
+  case "$out" in
+    enabled|enabled-runtime) return 0 ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|transient|alias) return 1 ;;
+  esac
+  return 3
+}
+# Active is the same question one layer in, and the same trap: `is-active --quiet` answers "no" for both
+# `inactive` and `cannot read`. The status row uses this to say which one it saw.
+controller_unit_active()  { sup_systemctl is-active --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
+controller_unit_active_state() {
+  local out
+  out="$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null)"
+  case "$out" in
+    active|reloading|activating) return 0 ;;
+    inactive|failed|deactivating|maintenance|unknown) return 1 ;;
+  esac
+  return 3
+}
 
 
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
@@ -1794,6 +1823,26 @@ cmd_start() {
     rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"
     return 0
   }
+  # ── SERVICE MODE ADOPTS A RUNNING CONTROLLER (agent-infra#2402) ─────────────────────────────────
+  # ⛔ THIS IS THE MIGRATION PATH, NOT AN EDGE CASE: the box being upgraded is running a controller in
+  # a tmux session right now. Every "already running" branch below returns 0, and under
+  # `Restart=always` that is a start/exit/start loop — three immediate orderly exits inside the start
+  # window and systemd leaves the unit `failed`. The unit installed to catch an empty box is then
+  # `failed` exactly when the box empties, so the defect survives the fix (and now has a failed unit to
+  # explain). So the unit WAITS for the controller that is already running and takes over when it goes;
+  # the live controller keeps landing its PRs in the meantime.
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+    local _own _saidd=0
+    while :; do
+      _own="$(owned_controller_pids 2>/dev/null)" \
+        || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+      [ -n "$_own" ] || break
+      [ "$_saidd" = 1 ] || say "controller already running (pid $(_pids_join "$_own")) — this unit supervises the cell now: waiting for it to exit, then taking over (a stop or a restart ends this wait)"
+      _saidd=1
+      sleep 5
+      superseded && return 1
+    done
+  fi
   # Every value below is interpolated into the session command string, so every one must be
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
@@ -1884,21 +1933,36 @@ cmd_start() {
   # "disabled" is an operator saying this box's controller is not service-managed.
   # ⛔ NOT in the foreground: that IS the unit's own ExecStart, and delegating from there would ask the
   # service manager to start the job this process is already running.
-  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && controller_unit_path >/dev/null 2>&1 && controller_unit_enabled; then
-    sup_systemctl start "$CONTROLLER_UNIT" \
-      || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
-    # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.
-    # Reporting success on an is-active alone is the false green this file refuses elsewhere — a unit can
-    # be `active` while its controller died before it took the lock.
-    local waited=0
-    while [ "$waited" -lt "${CONTROLLER_START_TIMEOUT:-60}" ]; do
-      if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
-      sleep 1; waited=$((waited + 1))
-    done
-    [ -n "$(owned_controller_pids 2>/dev/null)" ] \
-      || die "$CONTROLLER_UNIT is active but no controller of this state dir is running after ${waited}s — read: journalctl -u $CONTROLLER_UNIT -n 40"
-    say "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
-    return 0
+  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && controller_unit_path >/dev/null 2>&1; then
+    local ust
+    controller_unit_state; ust=$?
+    # ⛔ rc 3 must NOT read as "not service-managed": see controller_unit_state's note. Continuing would
+    # start a tmux controller beside a unit that may be enabled, and that unit starts itself at boot.
+    [ "$ust" -eq 3 ] && die "cannot read whether $CONTROLLER_UNIT is enabled — refusing to start a tmux controller beside a unit that may be enabled and start at boot (two dispatchers on one queue, #1761). Read it yourself: systemctl is-enabled $CONTROLLER_UNIT"
+    # rc 1 is a real DISABLED answer: the operator said this box's controller is not service-managed, so
+    # fall through to the tmux path below.
+    if [ "$ust" -eq 0 ]; then
+      sup_systemctl start "$CONTROLLER_UNIT" \
+        || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
+      # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.
+      # Reporting success on an is-active alone is the false green this file refuses elsewhere — a unit can
+      # be `active` while its controller died before it took the lock.
+      local waited=0
+      while [ "$waited" -lt "${CONTROLLER_START_TIMEOUT:-60}" ]; do
+        if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
+        sleep 1; waited=$((waited + 1))
+      done
+      [ -n "$(owned_controller_pids 2>/dev/null)" ] \
+        || die "$CONTROLLER_UNIT is active but no controller of this state dir is running after ${waited}s — read: journalctl -u $CONTROLLER_UNIT -n 40"
+      say "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
+      # ⛔ THE FENCE APPLIES TO THIS PATH TOO (#2402 review P2). Every other launch in this function
+      # re-checks the stop generation; without it a STOP that landed between the pid read above and the
+      # unit start is UNDONE — `stop` prints "controller stopped (systemd …)" and returns 0, and the
+      # controller comes up seconds later. That is the "reported stopped, still running" shape this verb
+      # exists to remove, on the one path that controls a unit.
+      superseded && return 1
+      return 0
+    fi
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
@@ -2066,6 +2130,13 @@ cmd_start() {
     # the guard keeps a cell that legitimately ships no layer (the "NOT serialised" warning above) from
     # gaining a PATH entry that does not exist.
     [ -d "$O/gh-limit" ] && export PATH="$O/gh-limit:$PATH"
+    # ⛔ THE DOCTOR ROLE IS NOT OPTIONAL ON THIS PATH EITHER (#2402 review P1). The tmux path launches it a
+    # few lines below; `exec` REPLACES this process, so anything placed after it never runs. Without this
+    # call a service-managed cell dispatches but never reaps, lands, repairs or prunes — the "dispatches
+    # but cannot land" shape `start` refuses to report as started everywhere else. The fence is re-checked
+    # after it, for the same reason every other launch in this function re-checks it.
+    start_doctor_loop
+    superseded && return 1
     say "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
     exec bash "$HARNESS/orch-loop.sh"
   fi
@@ -2328,11 +2399,16 @@ cmd_status() {
   # on a box that has no service at all — that is exactly the box this line is for.
   local _svc
   if _svc="$(controller_unit_path)"; then
-    if controller_unit_active; then
-      say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human"
-    else
-      say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT"
-    fi
+    # ⛔ THE ROW NAMES WHICH ANSWER IT GOT (review P2, #2402). `is-active --quiet` says "no" for both
+    # `inactive` and "could not read", and printing "nothing will restart a dead controller" over an
+    # unreadable read is a false verdict about the one thing this row exists to be true about.
+    local _ast
+    controller_unit_active_state; _ast=$?
+    case "$_ast" in
+      0) say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
+      1) say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
+      *) say "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
+    esac
   else
     say "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
   fi

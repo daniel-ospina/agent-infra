@@ -103,6 +103,8 @@ mk_systemctl() { # <bin dir> <state dir> <log>
   cat > "$bin/systemctl" <<STUB
 #!/bin/bash
 printf '%s\n' "\$*" >> "$log"
+# The USER scope calls `systemctl --user <verb>`; the stub is scope-agnostic, so the verb is what counts.
+[ "\${1:-}" = "--user" ] && shift
 S="$st"
 has() { [ -f "\$S/\$1" ]; }
 case "\${1:-}" in
@@ -114,8 +116,10 @@ case "\${1:-}" in
       *) printf '\n' ;;
     esac
     exit 0 ;;
-  is-active)  has active  && exit 0 || exit 3 ;;
-  is-enabled) has enabled && exit 0 || exit 1 ;;
+  # ⛔ THE STATE WORD IS THE ANSWER, not the exit status: the supervisor distinguishes "disabled" from
+  # "could not read", so a stub that answered with silence would be modelling the unreadable case.
+  is-active)  if has active; then printf 'active\n'; exit 0; else printf 'inactive\n'; exit 3; fi ;;
+  is-enabled) if has enabled; then printf 'enabled\n'; exit 0; else printf 'disabled\n'; exit 1; fi ;;
   enable)     : > "\$S/enabled"; exit 0 ;;
   disable)    rm -f "\$S/enabled" "\$S/active" "\$S/mainpid"; exit 0 ;;
   start)
@@ -190,6 +194,12 @@ if [ -f "$UNIT" ]; then
     || bad "ExecStart does not name the shipped supervisor ($SUP)"
   u "User=$(id -un)" && ok 'the service runs as the invoking user, not root' \
     || bad "User= is not the invoking user ($(id -un))"
+  # The tmux path passes `O='$O'` explicitly, so the unit must carry it too: the supervisor sources
+  # $ENV_FILE, and a unit that omitted O would leave `--status` reading a different state dir.
+  u "Environment=O=$A/o" && ok 'the unit carries the state dir (the tmux path\u2019s `O=` equivalent)' \
+    || bad 'the unit does not carry O — the installer read-backs and the controller could disagree'
+  u 'WantedBy=multi-user.target' && ok 'a SYSTEM unit is wanted by multi-user.target (it comes back at boot)' \
+    || bad 'a system unit is not wanted by multi-user.target — it would not come back at boot'
   # ⛔ THE START LIMIT MUST BE ABLE TO FIRE AT THIS RestartSec. systemd's default window is 10s; at one
   # start per 15s the default burst is unreachable, so a configuration fault would restart the box
   # forever instead of converging to `failed`. Both keys are therefore required, and the interval must
@@ -234,6 +244,57 @@ grep -qE '(^| )(enable|start|daemon-reload)( |$)' "$A/sc.log" \
   || ok 'dry-run: called no mutating systemctl verb'
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §A2 — the USER scope (the documented no-sudo fallback): a boot target that EXISTS there, and linger
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+say_case 'the USER scope is wanted by default.target (multi-user.target does not exist there) and needs linger'
+# ⛔ THE MUTATION THIS ARM EXISTS FOR (review P2): with `WantedBy=multi-user.target` rendered into a USER
+# unit, `enable` writes a `multi-user.target.wants/` symlink for a target the per-user manager never loads
+# (`/usr/lib/systemd/user/` ships default/basic/graphical-session/timers — no multi-user). The unit runs
+# because the installer starts it now and NOTHING brings it back at next boot: the #2402 defect one layer
+# down, on the very scope whose linger gate exists to survive a logout.
+US="$(arm_root u)"; mk_systemctl "$US/bin" "$US/state" "$US/sc.log"
+printf '%s\n' '#!/bin/bash' 'case "$*" in *Linger*) printf "yes\n" ;; *) exit 0 ;; esac' > "$US/bin/loginctl"
+chmod +x "$US/bin/loginctl"
+: > "$US/sc.log"
+# SUDO=false makes the system probe fail, so the walk reaches the user manager (the stub answers
+# `--user show-environment`). SYSTEMD_UNIT_DIR is NOT set: it would pin the override target instead.
+UU_RC=0
+UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+          TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
+          ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
+          ELDATO_PLATFORM=Linux bash "$INST" --install 2>&1)" || UU_RC=$?
+[ "$UU_RC" -eq 0 ] && ok 'user scope: install rc=0' || bad "user scope: rc=$UU_RC — $UU_OUT"
+UUNIT="$US/home/.config/systemd/user/eldato-orchestrator.service"
+if [ -f "$UUNIT" ]; then
+  grep -qxF 'WantedBy=default.target' "$UUNIT" \
+    && ok 'user scope: WantedBy=default.target — the per-user manager brings it back at next boot' \
+    || bad 'user scope: WantedBy is not default.target, so `enable` arms a target the user manager never loads'
+  ! grep -qxF 'WantedBy=multi-user.target' "$UUNIT" \
+    && ok 'user scope: multi-user.target is NOT used (it does not exist in a per-user manager)' \
+    || bad 'user scope: the unit carries multi-user.target — it would never be enabled for boot'
+else
+  bad "user scope: no unit installed at $UUNIT — $UU_OUT"
+fi
+case "$UU_OUT" in
+  *"target=user"*) ok 'user scope: the install reports the scope it chose (not a silent fallback)' ;;
+  *) bad "user scope: the install does not report target=user — $UU_OUT" ;;
+esac
+case "$UU_OUT" in
+  *"WantedBy=default.target"*) ok 'user scope: the reported unit names its boot target' ;;
+  *) bad 'user scope: the install does not report the boot target it rendered' ;;
+esac
+# and a user manager with linger OFF must REFUSE rather than report a supervisor that dies at logout.
+printf '%s\n' '#!/bin/bash' 'case "$*" in *Linger*) printf "no\n" ;; *) exit 0 ;; esac' > "$US/bin/loginctl"
+chmod +x "$US/bin/loginctl"
+rm -f "$UUNIT"
+UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+          TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
+          ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
+          ELDATO_PLATFORM=Linux bash "$INST" --install 2>&1)" || UL_RC=$?
+[ "$UL_RC" -ne 0 ] && ok 'user scope: linger OFF is refused, never a green install over a supervisor that dies at logout' \
+                   || bad 'user scope: reported success with linger off'
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §B — FOREGROUND mode: exec, no session, full environment
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 say_case 'FOREGROUND mode execs the controller, creates NO tmux session, and exports the whole environment'
@@ -259,7 +320,7 @@ B_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" R
          OR="daniel-ospina/agent-infra" SCOPE=own ENV_FILE="$B/home/keys.env" \
          HARNESS="$B/harness" HARNESS_REPO=daniel-ospina/agent-infra SUP_SELF="$SUP" \
          PATH="$B/bin:/usr/bin:/bin" \
-         bash -c "$(cat "$FRAG"); printf 'NOT-EXECED\n'" 2>&1)"; B_RC=$?
+         bash -c "start_doctor_loop() { : > '$B/doctor.called'; }; superseded() { return 1; }; $(cat "$FRAG"); printf 'NOT-EXECED\n'" 2>&1)"; B_RC=$?
 [ "$B_RC" -eq 0 ] && ok '§B: the fragment exits cleanly' || bad "§B: fragment rc=$B_RC — $B_OUT"
 [ -f "$B/loop.ran" ] && ok '§B: the controller RAN (the fragment exec\x27d it)' \
   || bad "§B: the controller never ran — $B_OUT"
@@ -269,6 +330,12 @@ case "$B_OUT" in
 esac
 [ -f "$B/tmux.log" ] && bad "§B: FOREGROUND mode created a tmux session: $(cat "$B/tmux.log")" \
                     || ok '§B: no tmux session was created'
+# ⛔ `exec` REPLACES the process, so anything placed after it never runs. The tmux path launches the doctor
+# loop just above the branch this fragment replaces; a service-mode cell that skipped it would dispatch but
+# never reap, land, repair or prune (#1989). The arm supplies the function (the real script defines it) and
+# it RECORDS ITS CALL, so this is behaviour: deleting the call from the shipped script turns this red.
+[ -f "$B/doctor.called" ] && ok '§B: the doctor loop is launched on the service path too (before the exec)' \
+                          || bad '§B: service mode never launched the doctor loop — the cell would dispatch but never land (#1989)'
 # The environment the tmux session string used to re-establish by hand. HARNESS_REPO is the value that
 # matters most (a controller with no OR/HARNESS_REPO re-derives a different queue), and the gh-limit
 # layer is FIRST on PATH — #1988, which service mode dropped before this arm existed.
@@ -318,16 +385,26 @@ grep -qxF 'start eldato-orchestrator.service' "$C/sc.log" 2>/dev/null \
 grep -q 'controller started (systemd eldato-orchestrator.service' "$T/c.out" \
   && ok 'start: names the unit as the thing it started (the operator can find it)' \
   || bad "start: does not say it started the unit — $(cat "$T/c.out")"
-# the hook's controller is a real process; take it down now (its pid is recorded, never guessed)
-[ -f "$C/o/.orch.lock" ] && PIDS="$PIDS $(cat "$C/o/.orch.lock")"
+# the hook's controller is a real process; take it down NOW and wait for it to go — the next arm must not
+# see it, or `start` answers "already running" before reaching the path under test (the leftover is what
+# made the first version of the DISABLED arm vacuous).
+if [ -f "$C/o/.orch.lock" ]; then
+  _cp="$(cat "$C/o/.orch.lock")"
+  case "${_cp:-}" in ''|*[!0-9]*) ;; *) kill -9 "$_cp" 2>/dev/null || true; PIDS="$PIDS $_cp"
+    _w=0; while kill -0 "$_cp" 2>/dev/null && [ "$_w" -lt 20 ]; do sleep 0.2; _w=$((_w + 1)); done ;;
+  esac
+fi
 rm -f "$C/o/.orch.lock"
 
 # installed but DISABLED: an operator saying "this box is not service-managed" — the tmux path must
 # still work, and the unit must NOT be started behind their back.
-: > "$C/state/enabled"; rm -f "$C/state/enabled"; : > "$C/units/eldato-orchestrator.service"
-: > "$C/sc.log"; rm -f "$C/tmux.log"
-# This arm stops at the tmux launch: give it a session the stub reports exists, so `start` does not
-# need a real controller (the point is WHICH surface it chose, not that the loop survives).
+# ⛔ THE PREVIOUS VERSION OF THIS ARM WAS VACUOUS (review P1, #2402) and the mutation proves how: it
+# pre-created `session.flag`, so `tmux has-session` answered YES and `start` returned at the PRE-EXISTING
+# "already running" branch — before the #2402 delegation block ever ran. Deleting the whole block left the
+# arm green. The session is therefore created HERE by the tmux path (the stub records `new-session`), so
+# the arm observes the CHOICE rather than a leftover.
+: > "$C/units/eldato-orchestrator.service"; rm -f "$C/state/enabled"
+: > "$C/sc.log"; rm -f "$C/tmux.log" "$C/session.flag"
 cat > "$C/bin/tmux" <<STUB
 #!/bin/bash
 case "\${1:-}" in
@@ -337,14 +414,42 @@ case "\${1:-}" in
 esac
 STUB
 chmod +x "$C/bin/tmux"
-: > "$C/session.flag"
 sup c start > "$T/c2.out" 2>&1; C2_RC=$?
 ! grep -qxF 'start eldato-orchestrator.service' "$C/sc.log" 2>/dev/null \
-  && ok 'start: an INSTALLED-but-DISABLED unit is not started behind the operator\x27s back' \
+  && ok 'start: an INSTALLED-but-DISABLED unit is not started behind the operator'"'"'s back' \
   || bad 'start: started a DISABLED unit — a disabled unit is an operator decision'
-grep -q 'already running' "$T/c2.out" \
+case "$(cat "$T/c2.out")" in
+  *"controller started (systemd"*) bad 'start: reported the SERVICE path for a DISABLED unit' ;;
+  *) ok 'start: a DISABLED unit does not take the service path' ;;
+esac
+# The tmux path is reached (it prints the harness it applies before its own checks). This is the "fell
+# through" evidence; the arm does not need the loop to survive, only the CHOICE to be the session path.
+grep -q 'harness:' "$T/c2.out" \
   && ok 'start: a DISABLED unit falls through to the tmux path (the cell still starts)' \
-  || bad "start: a DISABLED unit did not fall through to tmux — rc=$C2_RC $(cat "$T/c2.out")"
+  || bad "start: a DISABLED unit did not fall through to the tmux path — rc=$C2_RC $(cat "$T/c2.out")"
+
+# ── an UNREADABLE is-enabled must REFUSE, not read as "not service-managed" ────────────────────────
+# ⛔ THE FAIL-OPEN THIS ARM EXISTS FOR (review P1): `systemctl is-enabled --quiet` answers "no" for both
+# `disabled` and "could not ask" (no NOPASSWD sudo, a locked sudo, a transient failure). Reading that as
+# "not service-managed" starts a tmux controller beside a unit that IS enabled and WILL start at boot —
+# two dispatchers on one queue (#1761), produced by the fix for #2402.
+CU="$(arm_root c2)"; mk_tmux "$CU/bin" "$CU/tmux.log"
+printf '%s\n' '#!/bin/bash' \
+  'printf "%s\n" "$*" >> "'"$CU"'/sc.log"' \
+  'case "${1:-}" in is-enabled) exit 0 ;; *) exit 0 ;; esac' > "$CU/bin/systemctl"
+chmod +x "$CU/bin/systemctl"
+: > "$CU/units/eldato-orchestrator.service"; : > "$CU/state/enabled"; : > "$CU/sc.log"
+sup c2 start > "$T/c2u.out" 2>&1; CU_RC=$?
+[ "$CU_RC" -ne 0 ] && ok 'start: an UNREADABLE is-enabled is refused (not read as "disabled")' \
+                    || bad 'start: started anyway on an unreadable is-enabled — the fail-open that duplicates a dispatcher'
+! grep -qE 'start eldato-orchestrator' "$CU/sc.log" 2>/dev/null \
+  && ok 'start: it did not start the unit either — it refused, which is the only safe answer' \
+  || bad 'start: started the unit on an unreadable answer instead of refusing'
+[ -f "$CU/tmux.log" ] && bad 'start: created a tmux session beside a unit whose state it could not read (#1761)' \
+                     || ok 'start: created no session on an unreadable answer'
+grep -q '1761' "$T/c2u.out" \
+  && ok 'start: the refusal names the reason (#1761, two dispatchers)' \
+  || bad "start: the unreadable refusal does not name the reason — $(cat "$T/c2u.out")"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §D — stop stops the UNIT
@@ -392,6 +497,19 @@ sup e status > "$T/e3.out" 2>&1
 grep -q 'supervision: eldato-orchestrator.service ACTIVE' "$T/e3.out" \
   && ok 'status: an active unit is reported as the thing that restarts the controller' \
   || bad "status: does not report the active unit — $(grep supervision: "$T/e3.out" || echo '<no supervision line>')"
+# (4) installed, but the state COULD NOT BE READ. `is-active --quiet` answers "no" for `inactive` and for
+# "could not ask", and printing "nothing will restart a dead controller" over the second is a false verdict
+# about the one thing this row exists to be true about (review P2).
+EU="$(arm_root e2)"; mk_tmux "$EU/bin" "$EU/tmux.log"
+printf '%s\n' '#!/bin/bash' 'case "${1:-}" in is-active) exit 0 ;; is-enabled) printf "enabled\n"; exit 0 ;; *) exit 0 ;; esac' > "$EU/bin/systemctl"
+chmod +x "$EU/bin/systemctl"
+: > "$EU/units/eldato-orchestrator.service"
+sup e2 status > "$T/e4.out" 2>&1
+if grep -q 'STATE COULD NOT BE READ' "$T/e4.out"; then
+  ok 'status: an UNREADABLE unit state is reported as UNKNOWN, not as "nothing will restart it"'
+else
+  bad "status: an unreadable state produced a definite verdict — $(grep supervision: "$T/e4.out" || echo '<no supervision line>')"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §F — the RESTART POLICY, both directions (issue bullets 3 and 5)
@@ -464,7 +582,8 @@ case "$mode" in
 esac
 STUB
   chmod +x "$r/harness/orch-loop.sh"
-  bnd env UNIT_FILE="$F/units/eldato-orchestrator.service" EXEC="$(cat "$FRAG")
+  bnd env UNIT_FILE="$F/units/eldato-orchestrator.service" EXEC="start_doctor_loop() { :; }; superseded() { return 1; }
+$(cat "$FRAG")
 bash \"$r/harness/orch-loop.sh\"" \
       STARTS_FILE="$r/starts" STATE_FILE="$r/state.out" POLICY_OVERRIDE="$override" \
       ORCH_FOREGROUND=1 CELL_HOME="$r/home" HOME="$r/home" O="$r/o" REPO="$F/repo" SCOPE=own \

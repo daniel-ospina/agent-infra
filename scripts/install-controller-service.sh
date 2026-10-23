@@ -114,7 +114,17 @@ resolve_supervisor() {
 }
 
 # ── choose a target ─────────────────────────────────────────────────────────────────────────────
-TARGET=""; UNIT_DIR=""; SC=""
+TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
+# ⛔ THE BOOT TARGET IS A PROPERTY OF THE SCOPE, NOT A CONSTANT (review P2, #2402). `multi-user.target`
+# does not exist in a per-user manager, so a user unit enabled against it would never be brought back —
+# the defect this installer removes, one layer down. Resolved here beside the scope so the two cannot
+# disagree, and the rendered line is asserted below.
+wanted_by() {
+    case "$1" in
+        user) printf 'default.target\n' ;;
+        *)    printf 'multi-user.target\n' ;;
+    esac
+}
 choose_target() {
     if [ "$PLATFORM" = "Darwin" ]; then
         err "REFUSING on Darwin: a Mac's controller is already a launchd agent with KeepAlive"
@@ -125,6 +135,7 @@ choose_target() {
     fi
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
+        WANTED_BY="$(wanted_by override)"
         return 0
     fi
     # ⛔ `${SUDO:-sudo -n}` CANNOT BE EMPTY (`:-` substitutes on empty too), so `SUDO=` would be
@@ -133,14 +144,17 @@ choose_target() {
     # overridden installs the unit as one identity and enables it as another.
     if [ -z "${SUDO+x}" ] && sudo -n true >/dev/null 2>&1; then
         TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-sudo -n systemctl}"
+        WANTED_BY="$(wanted_by system)"
         return 0
     fi
     if [ -n "${SUDO+x}" ] && { [ -z "$SUDO" ] || $SUDO true >/dev/null 2>&1; }; then
         TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-${SUDO:+$SUDO }systemctl}"
+        WANTED_BY="$(wanted_by system)"
         return 0
     fi
     if systemctl --user show-environment >/dev/null 2>&1; then
         TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SYSTEMCTL:-systemctl} --user"
+        WANTED_BY="$(wanted_by user)"
         return 0
     fi
     # ⛔ LOUD, NEVER SILENT. The header promises "nothing — a loud FAILURE with the remedy, never a silent
@@ -168,6 +182,8 @@ render() {
         -e "s|{{PATH}}|$(sed_esc "$PATH")|g" \
         -e "s|{{SUPERVISOR}}|$(sed_esc "$SUPERVISOR")|g" \
         -e "s|{{RESTART_SEC}}|$RESTART_SEC|g" \
+        -e "s|{{O}}|$(sed_esc "$O")|g" \
+        -e "s|{{WANTED_BY}}|$WANTED_BY|g" \
         "$tpl" >"$dest" || return 1
     if grep -q '{{' "$dest"; then
         err "unresolved placeholder in the rendered unit:"; grep -n '{{' "$dest" >&2; return 1
@@ -183,8 +199,9 @@ verify_unit() {
     local f="$1" k
     for k in "Restart=always" "RestartSec=$RESTART_SEC" "After=network-online.target" \
              "StartLimitIntervalSec=300" "StartLimitBurst=3" \
-             "Environment=ORCH_FOREGROUND=1" "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
-             "WantedBy=multi-user.target"; do
+             "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
+             "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
+             "WantedBy=${WANTED_BY:-multi-user.target}"; do
         grep -qxF -- "$k" "$f" || { err "REFUSING: the rendered unit does not carry '$k'"; return 1; }
     done
     # The ExecStart target must EXIST — see resolve_supervisor's note. Checked on the rendered text, not
@@ -310,6 +327,7 @@ do_install() {
 
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  unit:    $UNIT_NAME (Restart=always, RestartSec=${RESTART_SEC}s, After=network-online.target,"
+    say "           WantedBy=$WANTED_BY,"
     say "           StartLimitBurst=3/300s so a configuration fault converges to 'failed' instead of looping)"
     say "  exec:    /bin/bash $SUPERVISOR start   (ORCH_FOREGROUND=1 — the controller is the unit's main process)"
     say "  state:   $O   (env: $ENV_FILE)"
@@ -340,22 +358,48 @@ do_status() {
         local bound=$(( ${CYC:-240} * 2 + 300 ))
         [ "$age" -le "$bound" ] || { err "the controller has not ticked for ${age}s (> ${bound}s) — the unit is up but the loop is not cycling"; rc=1; }
     else
-        say "heartbeat_age_s=UNREADABLE (no $O/heartbeat)"
-        [ "$active" = "active" ] && rc=1
+        # ⛔ AN UNREADABLE HEARTBEAT IS NOT A FAILED UNIT (review P2, #2402). The supervisor sources
+        # $ENV_FILE with `set -a` and documents that `keys.env` may repoint $O, so this installer's $O and
+        # the controller's can legitimately differ — and the first cycle writes the file minutes later
+        # (CYC). Failing the verb over that was a false red on a healthy service-managed cell. The unit's
+        # own MainPID is the proof that a controller is running; the heartbeat is a fresher fact, not a gate.
+        say "heartbeat_age_s=UNREADABLE (no $O/heartbeat — path read: \$O=$O; a keys.env 'O=' line moves the controller's state dir, and the first cycle writes it after one CYC)"
+        if [ "${pid:-0}" = "0" ]; then
+            err "no heartbeat AND no MainPID — nothing is running under the unit: journalctl -u $UNIT_NAME -n 40"
+            rc=1
+        fi
     fi
     [ "$active" = "active" ] || { err "the unit is NOT active — nothing is supervising the controller"; rc=1; }
     [ "$enabled" = "enabled" ] || { err "the unit is NOT enabled — it will not come back after a reboot"; rc=1; }
     return "$rc"
 }
 
+# ⛔ FIND THE INSTALLED COPY, DO NOT RE-DERIVE THE SCOPE (review P2, #2402). `choose_target` answers "where
+# WOULD this go on THIS box now", which is not "where IS it": a box that installed a USER unit and later
+# gained passwordless sudo would resolve to the SYSTEM scope, print `not installed: /etc/systemd/system/…`
+# and exit 0 while the user unit stayed installed, enabled and running. The installed file is the evidence.
+find_installed_unit() {
+    local d
+    for d in "${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+        [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
+    done
+    return 1
+}
 do_uninstall() {
     local p
     if [ -z "$SC" ]; then choose_target >/dev/null 2>&1 || true; fi
-    if [ -z "$UNIT_DIR" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
-    p="$UNIT_DIR/$UNIT_NAME"
+    # the installed copy decides the scope; the resolved one is only the fallback when none is found
+    p="$(find_installed_unit)" || p="${UNIT_DIR:+$UNIT_DIR/$UNIT_NAME}"
+    if [ -z "$p" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
+    UNIT_DIR="$(dirname "$p")"
+    case "$UNIT_DIR" in "$HOME/.config/systemd/user") TARGET="user"; SC="${SYSTEMCTL:-systemctl} --user" ;; *) TARGET="${TARGET:-system}" ;; esac
     # disable BEFORE removing the file: a removed-but-enabled unit comes back on the next daemon-reload.
     [ -f "$p" ] || { say "not installed: $p"; return 0; }
-    sc_run disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+    # ⛔ NOT SWALLOWED (review P2). A failed disable leaves the `…target.wants` symlink in place, so the
+    # unit is still enabled after its file is gone — and removing the file does not stop a running
+    # controller either. Reporting success there is "uninstalled" over a supervisor that is still armed.
+    sc_run disable --now "$UNIT_NAME" >/dev/null 2>&1 \
+        || { err "could not disable $UNIT_NAME — it is still ENABLED (it would return on the next boot) and may still be running: systemctl disable --now $UNIT_NAME"; return 1; }
     if [ "$TARGET" = "system" ]; then
         ${SUDO-sudo -n} rm -f "$p" || { err "cannot remove $p"; return 1; }
     else

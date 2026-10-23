@@ -35,6 +35,11 @@ Environment=HOME={{HOME}}
 Environment=CELL_HOME={{CELL_HOME}}
 Environment=ENV_FILE={{ENV_FILE}}
 Environment=PATH={{PATH}}
+# The controller's state dir, carried EXPLICITLY for the same reason the tmux session string carries it
+# (`O='$O'`): the supervisor derives it from $ENV_FILE when that file sets it, and a unit that omitted it
+# would leave the installer's own read-backs (`--status`, the heartbeat) watching one directory while the
+# controller used another.
+Environment=O={{O}}
 # ⛔ THE CONTROLLER IS THIS UNIT'S MAIN PROCESS, NOT A CHILD IN A SESSION. `start` sees this variable and
 # `exec`s the loop instead of creating a tmux session, so the unit's cgroup owns the controller's
 # lifetime. Every other verb cooperates with that: `stop` stops the UNIT (a pid kill is undone by
@@ -56,4 +61,12 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+# ⛔ THE TARGET DIFFERS BY SCOPE, AND THE USER SCOPE'S IS NOT multi-user.target. `multi-user.target` does
+# not exist in a per-user manager (`systemd-analyze unit-paths --user` lists only the user dirs, and
+# `/usr/lib/systemd/user/` ships default/basic/graphical-session/timers — no multi-user), so `enable` in
+# the USER scope would write a `multi-user.target.wants/` symlink for a target that is never loaded: the
+# unit runs because the installer starts it now, and NOTHING brings it back at next boot — the #2402
+# defect one layer down, on the very scope whose linger gate exists to survive a logout. The installer
+# renders this line per target (`multi-user.target` system, `default.target` user) and refuses a render
+# that names the wrong one.
+WantedBy={{WANTED_BY}}
