@@ -5,9 +5,12 @@
 #   READ-ONLY: print `<status>\t<tier>` for the PR's CURRENT head and exit
 #   WITHOUT writing a record. `<tier>` is the HIGHEST verdict tier the diff's
 #   SURFACES justify — `full`, `low` or `micro` (see review_tier_cap below);
-#   `<status>` is `ok` when the diff was read, otherwise `empty` | `too_large` |
-#   `unavailable`, and every non-ok status is paired with an EMPTY tier so a
-#   degraded read can never be mistaken for a selection.
+#   `<status>` is `ok` when the diff was read, otherwise `empty` (no changed
+#   files) | `too_large` (a possibly-truncated list) | `unclassified` (the API
+#   ANSWERED with a payload this classifier cannot certify — positive evidence,
+#   no tier) | `unavailable` (transport failure), and every non-ok status is
+#   paired with an EMPTY tier so a degraded read can never be mistaken for a
+#   selection.
 #   This is the SELECTOR the lane path reads: it answers "which tier does this
 #   diff earn?" from the changed paths alone, so review depth is chosen from
 #   WHAT THE CHANGE CAN BREAK rather than from how small it looks. `clean` is
@@ -424,9 +427,17 @@ clean_low_shape_ok() {
 #     a defect here is a false PASS at the last gate before main;
 #   * `record-review.sh` itself — the producer of the attestation this cap
 #     protects; leaving it out would be a one-line bypass;
-#   * CI workflow definitions — the `[skip ci]` / job-wiring surface;
+#   * CI workflow + action definitions — the `[skip ci]` / job-wiring surface;
 #   * `extensions/**` — every local enforcement gate (review-enforcer,
-#     verification-gate, sequence-enforcer).
+#     verification-gate, sequence-enforcer);
+#   * `skills/**` and `templates/**` — AGENT-EXECUTABLE INSTRUCTIONS. `skills/`
+#     is the script an enforcement gate runs (a micro edit to
+#     `skills/code-review/SKILL.md` would rewrite what "reviewed" means, with no
+#     reviewer dispatched) and `templates/` materializes into every consumer
+#     repo's `AGENTS.md`. `clean_low_path_ok` already refuses to call this layer
+#     prose (it excludes root instruction files and any enforcement input); the
+#     cap must not be laxer than the class beneath it;
+#   * `enforcement/**` — the dangerous-ops manifest the skill enforcer reads.
 # Exact basenames under `scripts/` plus directory prefixes elsewhere: bash `case`
 # globs cross `/`, which is why the script files are enumerated EXACTLY rather
 # than as `scripts/*.sh` (that would put every script in the always-full class
@@ -450,7 +461,7 @@ review_full_surface_path() { # <path> → rc0 = ALWAYS-FULL, rc1 = not, rc2 = un
   esac
   case "$p" in
     scripts/admin-merge.sh|scripts/ci-failure-set.sh|scripts/atomic-land.sh|scripts/check-pipeline-compliance.sh|scripts/record-review.sh) return 0 ;;
-    .github/workflows/*|extensions/*) return 0 ;;
+    .github/workflows/*|.github/actions/*|extensions/*|skills/*|enforcement/*|templates/*) return 0 ;;
   esac
   return 1
 }
@@ -497,28 +508,39 @@ review_tier_cap() {
 
 # review_surface_rows <repo> <pr> <sha> — print the changed-file rows of
 # compare/<base>...<sha>, prefixed by one "mb\t<merge-base>\t<expected-count>"
-# line. rc 1 = unreadable.
+# line.
+#   rc 0 = rows printed (header + at least one row)
+#   rc 1 = TRANSPORT failure — gh absent, a non-2xx, an unreadable body. Absent
+#          evidence; the callers warn loudly and proceed.
+#   rc 2 = the API answered: the PR has NO changed files.
+#   rc 3 = the API ANSWERED but the payload is unusable (no merge base, no rows,
+#          a malformed row). That is POSITIVE evidence of a diff this classifier
+#          cannot certify, so the callers REFUSE — it must never be confused
+#          with rc 1, which was exactly how one `copied` row turned the cap into
+#          a no-op and let a rail edit record `clean-micro`.
 #
 # An EXPLICIT <sha>, not pulls/<n>/files, for the reason the clean-low guard
 # gives above: pulls/<n>/files always describes the CURRENT head, so a push
 # landing between the read and the write would let one revision be certified
 # while another merges. A compare against an explicit sha has no such window.
 review_surface_rows() {
-  local repo="$1" pr="$2" sha="$3" meta head base count cmp mb raw first rest
+  local repo="$1" pr="$2" sha="$3" meta head base count cmp mb first rest
   command -v gh >/dev/null 2>&1 || return 1
-  meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null || true)"
+  meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || return 1
   head="$(printf '%s' "$meta" | cut -f1)"
   base="$(printf '%s' "$meta" | cut -f2)"
   count="$(printf '%s' "$meta" | cut -f3)"
-  [[ "$base" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$base" =~ ^[0-9a-f]{40}$ ]] || return 3
+  [[ "$count" =~ ^[0-9]+$ ]] || return 3
+  # Zero changed files is the `empty` status, not a truncation and not a tier.
+  [ "$count" -gt 0 ] || return 2
   # An empty <sha> means "the PR's current head" (the --print-tier selector).
   # Every recording caller passes an explicit sha (see the header note above).
   if [ -z "$sha" ]; then
-    [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 3
     sha="$head"
   fi
-  cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
+  cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)" || return 1
   # Split the header line in BASH, never `printf … | head -1 | cut`. This script
   # runs `set -o pipefail`, and a `head` that exits after its one line sends
   # SIGPIPE to the writer — the substitution then fails and, under `set -e`, the
@@ -529,11 +551,18 @@ review_surface_rows() {
   first="${cmp%%$'\n'*}"
   if [[ "$cmp" == *$'\n'* ]]; then rest="${cmp#*$'\n'}"; else rest=""; fi
   IFS=$'\t' read -r _tag mb _tail <<< "$first"
-  [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [ -n "$rest" ] || return 1
-  raw="$(clean_low_rows <<< "$rest")" || return 1
+  [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || return 3
+  [ -n "$rest" ] || return 3
+  # FRAMING-AGNOSTIC validation: the cap only needs PATHS, so it must not inherit
+  # the clean-low attestation's status enum (`clean_low_rows` deliberately
+  # refuses `copied`, and reusing it here meant one unusual row discarded the
+  # whole read and the record PROCEEDED). Any non-empty path is accepted; a row
+  # with no path is rc 3, not silence.
+  if ! LC_ALL=C awk -F '\t' 'NF < 2 || $2 == "" { exit 1 }' <<< "$rest"; then
+    return 3
+  fi
   printf 'mb\t%s\t%s\n' "$mb" "$count"
-  printf '%s\n' "$raw"
+  printf '%s\n' "$rest"
   return 0
 }
 
@@ -1412,9 +1441,15 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     printf 'unavailable\t\n'; exit 0
   fi
-  if ! ROWS_T="$(review_surface_rows "$REPO" "$PR" "")"; then
-    printf 'unavailable\t\n'; exit 0
-  fi
+  TIER_RC_T=0
+  ROWS_T="$(review_surface_rows "$REPO" "$PR" "")" || TIER_RC_T=$?
+  case "$TIER_RC_T" in
+    0) ;;
+    2) printf 'empty\t\n'; exit 0 ;;
+    3) # The API ANSWERED with an unusable payload: positive evidence, no tier.
+       printf 'unclassified\t\n'; exit 0 ;;
+    *) printf 'unavailable\t\n'; exit 0 ;;
+  esac
   TIER_HEAD_T="${ROWS_T%%$'\n'*}"
   if [[ "$ROWS_T" == *$'\n'* ]]; then TIER_ROWS_T="${ROWS_T#*$'\n'}"; else TIER_ROWS_T=""; fi
   IFS=$'\t' read -r _tag_t _mb_t TIER_COUNT_T <<< "$TIER_HEAD_T"
@@ -1423,7 +1458,14 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   # cap the list may be short — and a short list could be missing the one rail
   # path that would have selected `full`. Report `too_large` (an EMPTY tier), not
   # a tier chosen from a list that may be incomplete.
-  TIER_DISTINCT_T="$(LC_ALL=C awk -F '\t' 'NF>=2 { print $2; if ($3 != "") print $3 }' <<< "$TIER_ROWS_T" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  #
+  # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
+  # (`:385`) — GitHub counts a rename as ONE changed file while the compare row
+  # carries the old path too, so counting both ends would report truncation for
+  # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
+  # (a rename out of a rail must not slip through); only the parity arithmetic is
+  # path-identity, not path-instance.
+  TIER_DISTINCT_T="$(LC_ALL=C awk -F '\t' 'NF>=2 && $2 != "" { print $2 }' <<< "$TIER_ROWS_T" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   if [ -z "$TIER_DISTINCT_T" ] || [ "$TIER_DISTINCT_T" -eq 0 ]; then
     printf 'empty\t\n'; exit 0
   fi
@@ -1431,7 +1473,7 @@ if [ "$PRINT_TIER" -eq 1 ]; then
     printf 'too_large\t\n'; exit 0
   fi
   if ! CAP_T="$(printf '%s\n' "$TIER_ROWS_T" | review_tier_cap)"; then
-    printf 'empty\t\n'; exit 0
+    printf 'unclassified\t\n'; exit 0
   fi
   printf 'ok\t%s\n' "$CAP_T"
   exit 0
@@ -2246,20 +2288,33 @@ if [ "$VERDICT" = "clean-micro" ]; then
     # being selected by how small the diff LOOKS, which is exactly what a
     # blast-radius selector must refuse.
     #
-    # Fail-CLOSED on POSITIVE evidence (a rail path is in the diff ⇒ refuse,
-    # exit 4, no record) and fail-OPEN on ABSENT evidence (a transient gh/API
-    # failure ⇒ loud UNVERIFIED warning, record proceeds), which is this
-    # guard's existing posture for arms (a)-(c): this cap is an honesty ceiling
-    # on a self-selected tier, not the attestation itself, and stranding a
-    # legitimate micro lane on API flakiness would trade a rare corner for a
-    # common false block. The truncation case is refused — a list that may be
-    # incomplete cannot clear a ceiling, and a 300-file diff is never micro.
-    if ! MICRO_ROWS="$(review_surface_rows "$REPO" "$PR" "$SHA")"; then
+    # Fail-CLOSED on POSITIVE evidence — a rail path in the diff, OR a payload the
+    # classifier cannot certify (rc 3: an unparseable row, no merge base, no
+    # rows) — and fail-OPEN only on a TRANSPORT failure (rc 1: gh absent, a
+    # non-2xx, an unreadable body), which is this guard's existing posture for
+    # arms (a)-(c). The split is load-bearing: reusing one code for both made the
+    # cap a NO-OP for any diff carrying a single row of an exotic status, which
+    # is the bypass this arm exists to close.
+    MICRO_RC=0
+    MICRO_ROWS="$(review_surface_rows "$REPO" "$PR" "$SHA")" || MICRO_RC=$?
+    if [ "$MICRO_RC" -eq 2 ]; then
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… has NO changed files, so there is no surface to certify. Refusing (exit 4, no record)." >&2
+      exit 4
+    fi
+    if [ "$MICRO_RC" -eq 3 ]; then
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… answered with a changed-path payload this classifier cannot certify (a malformed row, no merge base, or no rows) — an uncertifiable diff cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record)." >&2
+      echo "   → Run the code-review skill on the current head, then record clean with --evidence <artifact>." >&2
+      exit 4
+    fi
+    if [ "$MICRO_RC" -ne 0 ]; then
       echo "⚠️ clean-micro surface cap: could not read the changed paths of $REPO#$PR at ${SHA:0:12}… (gh/API failure?) — the surface cap is UNVERIFIED (record proceeds; a micro issue whose diff touches a merge/land rail must never be recorded clean-micro)" >&2
     else
       MICRO_PATHS="${MICRO_ROWS#*$'\n'}"
       IFS=$'\t' read -r _tag_m _mb_m MICRO_EXPECT <<< "${MICRO_ROWS%%$'\n'*}"
-      MICRO_DISTINCT="$(LC_ALL=C awk -F '\t' 'NF>=2 { print $2; if ($3 != "") print $3 }' <<< "$MICRO_PATHS" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+      # NEW path only — see the parity note at the --print-tier seam: GitHub counts
+      # a rename as one changed file, so counting both ends would refuse every
+      # rename as "truncated". Classification still reads both ends.
+      MICRO_DISTINCT="$(LC_ALL=C awk -F '\t' 'NF>=2 && $2 != "" { print $2 }' <<< "$MICRO_PATHS" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
       if [ -z "$MICRO_DISTINCT" ] || [ "$MICRO_DISTINCT" -eq 0 ]; then
         echo "❌ clean-micro surface cap: read no changed paths for $REPO#$PR at ${SHA:0:12}… — a diff with no readable surface cannot be certified micro. Refusing (exit 4, no record)." >&2
         exit 4
@@ -2392,8 +2447,17 @@ if [ "$VERDICT" = "clean-low" ]; then
   # only when the content can actually differ. Pinning the tip instead would
   # false-block every clean-low PR on the next unrelated merge to main.
   CMP="$(command gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
-  MB="$(printf '%s\n' "$CMP" | command head -1 | cut -f2)"
-  RAW="$(printf '%s\n' "$CMP" | command tail -n +2)"
+  # Same native split as review_surface_rows, and for the same measured reason
+  # (#2472 review): `printf … | head -1 | cut` under `set -o pipefail` lets a
+  # `head` exit after its one line, SIGPIPE the writer, fail the substitution and
+  # — under `set -e` — abort this script with NO output at all. That is a
+  # SILENTLY stranded `clean-low` record (9 of 40 identical runs, measured on the
+  # tier seam), so the idiom the new comment condemns is removed here too rather
+  # than left as the one surviving copy.
+  CMP_FIRST="${CMP%%$'\n'*}"
+  if [[ "$CMP" == *$'\n'* ]]; then CMP_REST="${CMP#*$'\n'}"; else CMP_REST=""; fi
+  MB="$(printf '%s' "$CMP_FIRST" | cut -f2)"
+  RAW="$CMP_REST"
   if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
     # Empty diff, a compare/API failure, a fork head not reachable from the
     # base repo (compare 404s there), or a response with no merge base. All are

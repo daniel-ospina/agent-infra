@@ -64,11 +64,14 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    surface (the merge/land/repair rails `scripts/admin-merge.sh`,
    `scripts/ci-failure-set.sh`, `scripts/atomic-land.sh`,
    `scripts/check-pipeline-compliance.sh`, the recorder `scripts/record-review.sh`,
-   `.github/workflows/**`, `extensions/**`), `record-review.sh` REFUSES (exit 4) a
+   `.github/workflows/**`, `.github/actions/**`, `extensions/**`, `skills/**`,
+   `templates/**`, `enforcement/**` — the last three because they are
+   agent-executable instructions), `record-review.sh` REFUSES (exit 4) a
    `clean-micro` record — a `complexity:micro` label does not make a merge-rail
    edit reviewable at micro depth. Ask first with
    `record-review.sh --print-tier <pr> [owner/repo]` → `<status>\t<full|low|micro>`
-   (see `proportional-gates` §Review Cycles, "The SURFACE CAP"). **Content-only
+   (only `ok` carries a tier; see `proportional-gates` §Review Cycles, "The
+   SURFACE CAP"). **Content-only
    diffs record `clean-low`** regardless of the linked issue's tier (#1348):
    when EVERY changed path is prose or a stylesheet (`docs/**` with a content
    extension, or a named root prose file) the Low value of the canonical tier

@@ -1810,7 +1810,7 @@ tier_for() { # <changed_files_count> <rows...> → "<status>\t<tier>"
   || fail "(30ii) a one-line scripts/admin-merge.sh change did NOT select full (got '$(tier_for 1 $'modified\tscripts/admin-merge.sh\t')')"
 
 # The rest of the ALWAYS-FULL class, and the inert class beside it.
-for f in scripts/ci-failure-set.sh scripts/atomic-land.sh scripts/check-pipeline-compliance.sh scripts/record-review.sh .github/workflows/ci-main.yml extensions/review-enforcer/index.ts; do
+for f in scripts/ci-failure-set.sh scripts/atomic-land.sh scripts/check-pipeline-compliance.sh scripts/record-review.sh .github/workflows/ci-main.yml .github/actions/x/action.yml extensions/review-enforcer/index.ts skills/code-review/SKILL.md templates/AGENTS.base.md enforcement/dangerous-ops.txt; do
   [ "$(tier_for 1 "$(printf 'modified\t%s\t' "$f")")" = "$(printf 'ok\tfull')" ] \
     && pass "(30ii) $f is ALWAYS-FULL" \
     || fail "(30ii) $f did NOT select full — the always-full class has a hole"
@@ -1836,10 +1836,36 @@ T30_TRUNC="$(tier_for 9 $'modified\tdocs/ops/x.md\t')"
 [ "$T30_TRUNC" = "$(printf 'too_large\t')" ] \
   && pass "(30vi) an inconsistent changed-file count yields too_large and an EMPTY tier — a possibly-truncated list cannot clear a ceiling" \
   || fail "(30vi) an inconsistent count was not refused (got '$T30_TRUNC')"
-T30_DOWN="$(PATH="$T30/empty:$PATH" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+mkdir -p "$T30/deadgh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$T30/deadgh/gh"
+chmod +x "$T30/deadgh/gh"
+T30_DOWN="$(PATH="$T30/deadgh:$PATH" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
 [ "$T30_DOWN" = "$(printf 'unavailable\t')" ] \
-  && pass "(30vii) an unreadable API yields unavailable and an EMPTY tier" \
-  || fail "(30vii) an unreadable API did not yield unavailable/empty (got '$T30_DOWN')"
+  && pass "(30vii) a TRANSPORT failure (gh exits non-zero) yields unavailable and an EMPTY tier" \
+  || fail "(30vii) a transport failure did not yield unavailable/empty (got '$T30_DOWN')"
+
+# rc 3 vs rc 1 — the split that closes the review's P1.2: a payload the API
+# ANSWERED with but this classifier cannot certify is POSITIVE evidence and must
+# NOT read as "the network failed" (which proceeded to write the record).
+T30_UNCL="$(tier_for 1 $'modified\t\t')"
+[ "$T30_UNCL" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xi) a row with no path yields unclassified + EMPTY tier — an uncertifiable payload is never a tier" \
+  || fail "(30xi) a pathless row was not reported unclassified (got '$T30_UNCL')"
+T30_EMPTY="$(tier_for 0)"
+[ "$T30_EMPTY" = "$(printf 'empty\t')" ] \
+  && pass "(30xii) a zero-file diff yields empty + EMPTY tier" \
+  || fail "(30xii) a zero-file diff did not yield empty (got '$T30_EMPTY')"
+
+# A RENAME carries the old path in column 3 while GitHub's changed_files counts
+# it as ONE file. Counting both ends (the review's P1.1) reported `too_large` for
+# every rename — a 1-file docs rename could not select `low`, and the recorder
+# refused `clean-micro` with a truncation message that was simply false.
+[ "$(tier_for 1 $'renamed\tdocs/b.md\tdocs/a.md')" = "$(printf 'ok\tlow')" ] \
+  && pass "(30xiii) a 1-file docs RENAME selects low, not too_large — the parity count is per new path, like clean_low_shape_ok" \
+  || fail "(30xiii) a docs rename was not classified low (got '$(tier_for 1 $'renamed\tdocs/b.md\tdocs/a.md')')"
+[ "$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')" = "$(printf 'ok\tfull')" ] \
+  && pass "(30xiv) a rename OUT of scripts/admin-merge.sh is FULL — both ends are classified even though only one is counted" \
+  || fail "(30xiv) a rename out of the rail was not full (got '$(tier_for 1 $'renamed\tdocs/b.md\tscripts/admin-merge.sh')')"
 
 # MUTATION: delete the rail from the always-full arm and (ii) must go RED — the
 # arm is load-bearing, not decoration.
@@ -1900,9 +1926,20 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t')"
   && pass "(30ix) the RECORD PATH refuses clean-micro for a rail diff: exit 4 and NO record written (the bypass is closed end-to-end)" \
   || fail "(30ix) clean-micro on a rail diff was NOT refused (rc=$REC_RC, reviews dir: $(ls -d "$T30H/.pi/agent/reviews" 2>/dev/null || echo absent))"
 rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
-[ "$REC_RC" -ne 4 ] \
-  && pass "(30x) the cap does NOT refuse an inert diff — it is a ceiling on the tier, never a blanket block on the micro flow" \
-  || fail "(30x) an inert docs diff was refused clean-micro (rc=$REC_RC) — the cap over-blocks"
+T30_REC="$T30H/.pi/agent/reviews/owner-repo-42.json"
+[ "$REC_RC" -eq 0 ] && [ -f "$T30_REC" ] \
+  && pass "(30x) the cap does NOT refuse an inert diff — it is a ceiling on the tier, never a blanket block on the micro flow (rc=0 and the record EXISTS)" \
+  || fail "(30x) an inert docs diff was not recorded (rc=$REC_RC, record: $([ -f "$T30_REC" ] && echo present || echo absent))"
+
+# THE REVIEW'S P1.2, as a fixture: a rail diff that ALSO carries one row of an
+# exotic status. Reading the cap's paths through the clean-low attestation's
+# enum discarded the whole read (rc 1 = "API failed") and the record PROCEEDED —
+# the bypass this arm exists to close, still reachable by adding one `copied` row.
+rm -rf "$T30H/.pi/agent/reviews"
+rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\tdocs/orig.md')"
+[ "$REC_RC" -eq 4 ] && [ ! -d "$T30H/.pi/agent/reviews" ] \
+  && pass "(30xv) a rail diff carrying an EXOTIC-status row is still refused (exit 4, no record) — an unusual row is positive evidence, never a transport failure" \
+  || fail "(30xv) a rail diff with a copied row was NOT refused (rc=$REC_RC) — the cap fails open on framing"
 
 # 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
 # "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
@@ -1918,7 +1955,7 @@ rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=150
+MIN_ASSERTIONS=159
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
