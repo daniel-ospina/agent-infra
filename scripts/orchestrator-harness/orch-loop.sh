@@ -300,6 +300,17 @@ done
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
   command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
+# ⛔ DEFINING THE VERBS IS NOT HAVING INITIALISED THE MODULE (#2248). The verbs above are FUNCTIONS;
+# the two embedded Python programs are VARIABLES assigned by a command substitution at source time,
+# and a substitution can come out empty while every function still parses. That is exactly what a
+# bash 3.2 mis-parse produced on macOS: `WT_TREE_PY` never got a value, the census fed `python3 -c ''`
+# and returned nothing — which reads identically to "no workers" — so the caps silently stopped
+# binding and the box logged a `controller … alive but the heartbeat is 3652s old` for an hour while
+# `launchctl` and `harness verify` both said GREEN. Check the DATA, and NAME the variable that is
+# empty, so the next occurrence costs one log line instead of an hour of false green.
+for _wt_py in WT_TREE_PY WT_WS_PY; do
+  [ -n "${!_wt_py:-}" ] || { echo "orch-loop: FATAL worker-terminal.sh did not initialise at ${WT_MOD:-$O} — $_wt_py is EMPTY (its embedded Python program was not assigned; on bash 3.2 this is the heredoc-in-command-substitution mis-parse, see agent-infra#2248) — refusing to run a controller whose census would read 0 workers and never trip its caps; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
+done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
 # workers cd to their own repo/worktree themselves, so this only has to be a sane, existing place.
