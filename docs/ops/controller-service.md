@@ -113,7 +113,7 @@ The systemd commands below are shown for the default **system** scope; on a box 
 bash scripts/install-controller-service.sh --status    # the verdict: scope, enabled, active, pid, restarts, heartbeat
 
 systemctl is-active eldato-orchestrator.service        # active
-systemctl show -p MainPID eldato-orchestrator.service  # the controller, not a launcher
+systemctl show -p MainPID eldato-orchestrator.service  # the unit's MAIN PROCESS: the launcher until it execs the controller — pair it with --status
 systemctl show -p NRestarts eldato-orchestrator.service # it came back on its own
 journalctl -u eldato-orchestrator.service -n 40        # a fresh [dispatch] line with lanes=0 moving on
 ```
@@ -124,6 +124,20 @@ UNKNOWN rather than as `not active` / `nothing will restart it`. When `$O/heartb
 reports its age and refuses a stale one (a unit can be `active` while its controller died before taking
 the lock); a missing heartbeat is tolerated only while a `MainPID` exists, because the first cycle writes
 the file after one `CYC` and a `keys.env` `O=` line can move the controller's state dir.
+
+**`MainPID` is not the same claim as "a controller is running".** Under `Type=simple` the unit's main
+process is the launcher (`… start`), which runs `harness_apply`/`cmd_check` — and waits out a handover —
+before it `exec`s the loop. So `--status` prints a separate `controller=` row built from the same witness
+`--install` requires (the lock's owner, age-bound, or a heartbeat newer than two cycles). It is reported,
+not gated: a start still inside its first `CYC` legitimately has neither, and refusing that would be a
+false red on every healthy start. The stale-heartbeat bound above is what refuses a dead controller, so
+the residual ambiguity is one heartbeat window (900 s), stated rather than hidden.
+
+The unit name is **machine-scoped** (`eldato-orchestrator.service`), so on a box with more than one state
+dir the installer reads each copy's `Environment=O=` line: a copy that provably supervises a different
+state dir is reported as `other_unit=` and is **never** disabled, removed, or answered for. A copy with no
+`O=` line at all (hand-written, or pre-#2402) counts as ours — the fail-safe side of #1761, where the
+danger is a tmux controller launched beside a unit that may be enabled.
 
 ## Tests
 
