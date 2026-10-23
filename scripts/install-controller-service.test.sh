@@ -233,6 +233,12 @@ if [ -f "$UNIT" ]; then
   u 'StartLimitIntervalSec=300' && u 'StartLimitBurst=3' \
     && ok 'the start limit is EXPLICIT (300s/3) — a config fault converges to failed, not an endless loop' \
     || bad 'StartLimitIntervalSec/StartLimitBurst are missing — at RestartSec=15 the default 10s window can never fill'
+  # ⛔ THE START BOUND IS THE ARTIFACT'S, NOT THE HOST'S (review P2, #2402): ExecStart runs the whole of
+  # `start`, which in service mode WAITS for a running controller. Without a stated value the bound is
+  # systemd's own default — true of today's hosts, not of this artifact.
+  u "TimeoutStartSec=120" && ok 'the start timeout is STATED in the artifact (not inherited from the host default)' \
+    || bad 'TimeoutStartSec is not stated — the bound on a start that can never succeed is the host default'
+  cp "$UNIT" "$T/unit.artifact" 2>/dev/null || true   # §J re-checks the RELATION after §A deletes the file
   # and the interval really is larger than the restart delay, so the pair is not decorative
   _rs="$(sed -n 's/^RestartSec=//p' "$UNIT" | head -1)"
   _si="$(sed -n 's/^StartLimitIntervalSec=//p' "$UNIT" | head -1)"
@@ -964,6 +970,173 @@ case "$HW_OUT" in
   *'refusing to become a second dispatcher'*|*'not provably this state dir'*) ok 'start: the refusal names what it saw' ;;
   *) bad "start: refused without naming what it saw — $HW_OUT" ;;
 esac
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §H — the unit a verb ADDRESSES is proven to be THIS state dir's (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# The unit name is MACHINE-scoped and the first copy found used to win. Two measured consequences: (a) with
+# an image-baked DISABLED system copy plus the live USER copy, every read answered for the system scope, so
+# `stop` took the pid-teardown shortcut, printed success, and the enabled unit's Restart=always re-created
+# the controller; (b) with the unit's Environment=O= naming ANOTHER state dir, `stop` stopped that cell's
+# controller and reported it as this one's. Every unit this repo installs carries Environment=O=, so
+# ownership is a READ, not a guess.
+say_case 'the addressed unit is proven to belong to THIS state dir (two copies; a foreign unit)'
+# (1) two copies of OUR unit: the system copy is DISABLED, the user copy is ENABLED+ACTIVE. The verb must
+# address the one the manager will bring back, i.e. the USER scope.
+SU2="$(arm_root h1)"; mk_tmux "$SU2/bin" "$SU2/tmux.log"
+mkdir -p "$SU2/userunits" "$SU2/state-system" "$SU2/state-user"
+cat > "$SU2/bin/systemctl" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$SU2/sc.log"
+sc=""; [ "\${1:-}" = "--user" ] && { sc=user; shift; }
+if [ "\$sc" = user ]; then S="$SU2/state-user"; else S="$SU2/state-system"; fi
+case "\${1:-}" in
+  is-enabled) if [ -f "\$S/enabled" ]; then printf 'enabled\n'; exit 0; else printf 'disabled\n'; exit 1; fi ;;
+  is-active)  if [ -f "\$S/active"  ]; then printf 'active\n';  exit 0; else printf 'inactive\n'; exit 3; fi ;;
+  stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
+  *)          exit 0 ;;
+esac
+STUB
+chmod +x "$SU2/bin/systemctl"
+printf 'Environment=O=%s\n' "$SU2/o" > "$SU2/units/eldato-orchestrator.service"      # OUR system copy, DISABLED
+printf 'Environment=O=%s\n' "$SU2/o" > "$SU2/userunits/eldato-orchestrator.service"  # OUR user copy, ENABLED
+: > "$SU2/state-user/enabled"; : > "$SU2/state-user/active"; : > "$SU2/sc.log"
+SUP_EXTRA_ENV="CONTROLLER_USER_UNIT_DIR=$SU2/userunits" sup h1 stop > "$T/h1.out" 2>&1; H1_RC=$?
+grep -qE '^--user stop eldato-orchestrator\.service$' "$SU2/sc.log" 2>/dev/null \
+  && ok 'stop: with two copies of OUR unit, addresses the ENABLED one (the user scope)' \
+  || bad "stop: did not address the enabled copy — the disabled system copy won: $(cat "$SU2/sc.log" 2>/dev/null)"
+grep -qxF 'stop eldato-orchestrator.service' "$SU2/sc.log" 2>/dev/null \
+  && bad 'stop: ALSO stopped the DISABLED system copy — not the supervisor it resolved' \
+  || ok 'stop: it did not stop the copy it was not addressing'
+grep -q 'controller stopped (systemd eldato-orchestrator.service)' "$T/h1.out" \
+  && ok 'stop: reports the stop it performed' \
+  || bad "stop: did not report the unit stop — rc=$H1_RC $(cat "$T/h1.out")"
+# (2) a unit for ANOTHER state dir: never stopped on our behalf.
+SF="$(arm_root h2)"; mk_systemctl "$SF/bin" "$SF/state" "$SF/sc.log"; mk_tmux "$SF/bin" "$SF/tmux.log"
+: > "$SF/state/enabled"; : > "$SF/state/active"
+printf 'Environment=O=%s\n' "$SF/some-other-cell" > "$SF/units/eldato-orchestrator.service"
+: > "$SF/sc.log"
+sup h2 stop > "$T/h2.out" 2>&1
+! grep -qxF 'stop eldato-orchestrator.service' "$SF/sc.log" 2>/dev/null \
+  && ok 'stop: a unit that supervises ANOTHER state dir is NOT stopped (it is not this cell)' \
+  || bad 'stop: stopped another cell controller and would report it as this one'
+grep -q 'supervises state dir' "$T/h2.out" \
+  && ok 'stop: says the unit belongs to another state dir (the operator can see the real shape)' \
+  || bad "stop: silently ignored a unit that is not ours — $(cat "$T/h2.out")"
+# (3) status must not call another state dir's unit this cell's supervision, and must still reveal it.
+sup h2 status > "$T/h2s.out" 2>&1
+grep -q "supervises state dir '.*some-other-cell'" "$T/h2s.out" \
+  && ok 'status: names the foreign unit and the state dir it belongs to' \
+  || bad "status: did not reveal the unit that exists for another state dir — $(grep supervision: "$T/h2s.out")"
+# (4) a unit with NO Environment=O= line is UNPROVABLE: still addressed (the #1761-safe side), and said out
+# loud — never silently read as either answer.
+SP2="$(arm_root h3)"; mk_systemctl "$SP2/bin" "$SP2/state" "$SP2/sc.log"; mk_tmux "$SP2/bin" "$SP2/tmux.log"
+: > "$SP2/units/eldato-orchestrator.service"          # empty: no O= line at all
+sup h3 status > "$T/h3.out" 2>&1
+grep -q 'ownership NOT proven' "$T/h3.out" \
+  && ok 'status: an unprovable unit is reported as UNKNOWN ownership, not as a verdict either way' \
+  || bad "status: gave a definite verdict over a unit that declares no owner — $(grep supervision: "$T/h3.out")"
+# ⛔ AND `stop` MUST SAY IT TOO (verification P1, #2402). This report used to sit in a branch an unprovable
+# copy can never reach — resolving it succeeds — so the warning was dead code and the verb stopped a unit
+# whose ownership it could not prove without a word. The arm drives the verb, not the branch.
+sup h3 stop > "$T/h3s.out" 2>&1
+grep -q 'carries no Environment=O= line' "$T/h3s.out" \
+  && ok 'stop: an unprovable unit is stopped WITH the ownership warning (the report is on the decision path)' \
+  || bad "stop: stopped a unit it could not prove is this state dir's without saying so — $(cat "$T/h3s.out")"
+grep -qxF 'stop eldato-orchestrator.service' "$SP2/sc.log" 2>/dev/null \
+  && ok 'stop: …and it is addressed rather than ignored (treating it as foreign would launch a second dispatcher, #1761)' \
+  || bad 'stop: ignored an unprovable unit — a tmux controller could then run beside a unit that may be enabled'
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §I — the install verdict's LOCK witness matches the argv a CELL actually runs (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# The controller a cell runs execs `$HARNESS/orch-loop.sh` (MEASURED, orchestrator-bringup.sh:225), not
+# `$O/orch-loop.sh`, so a witness that greps for the `$O/` prefix can NEVER fire — the documented second
+# witness was inert and the verdict rested on the heartbeat alone.
+say_case 'the lock witness accepts the argv a cell runs (and still refuses a non-loop lock holder)'
+HI="$(arm_root i1)"; mk_systemctl "$HI/bin" "$HI/state" "$HI/sc.log"
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$HI/harness/orch-loop.sh"
+chmod +x "$HI/harness/orch-loop.sh"
+bash "$HI/harness/orch-loop.sh" & HI_LP=$!; PIDS="$PIDS $HI_LP"
+printf '%s\n' "$HI_LP" > "$HI/o/.orch.lock"
+HI_RC=0; HI_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst i1 --install 2>&1)" || HI_RC=$?
+[ "$HI_RC" -eq 0 ] \
+  && ok 'install: a live controller with the HARNESS argv certifies the install via the lock (the witness fires)' \
+  || bad "install: refused a live controller whose argv is $HI/harness/orch-loop.sh — the witness is inert: $HI_OUT"
+case "$HI_OUT" in *'NO CONTROLLER PROVED ITSELF'*) bad 'install: refused naming the witness that should have matched' ;; *) : ;; esac
+kill -9 "$HI_LP" 2>/dev/null || true
+# NEGATIVE CONTROL: the same lock, held by a live process that is NOT the harness loop, must NOT certify.
+HN2="$(arm_root i2)"; mk_systemctl "$HN2/bin" "$HN2/state" "$HN2/sc.log"
+sleep 300 & HN_LP=$!; PIDS="$PIDS $HN_LP"
+printf '%s\n' "$HN_LP" > "$HN2/o/.orch.lock"
+HN2_RC=0; HN2_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst i2 --install 2>&1)" || HN2_RC=$?
+[ "$HN2_RC" -ne 0 ] \
+  && ok 'install: a lock held by a process that is NOT an orch-loop.sh does not certify (the shape check discriminates)' \
+  || bad "install: certified a unit whose lock is held by an arbitrary live pid — the witness is a blanket accept: $HN2_OUT"
+kill -9 "$HN_LP" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §J — the ARTIFACT states its own start bound, below the start-limit window (review P2, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+say_case 'the unit states TimeoutStartSec, below StartLimitIntervalSec (a start that cannot succeed converges)'
+# the artifact was asserted in §A; this arm pins the RELATION and the installer's refusal of a bad value.
+_si="$(sed -n 's/^StartLimitIntervalSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
+_ts="$(sed -n 's/^TimeoutStartSec=//p' "$T/unit.artifact" 2>/dev/null | head -1)"
+if [ -n "${_ts:-}" ] && [ -n "${_si:-}" ] && [ "$_ts" -lt "$_si" ]; then
+  ok "the start bound (${_ts}s) is BELOW the start-limit window (${_si}s) — a stuck start can fill the burst"
+else
+  bad "TimeoutStartSec='${_ts:-<absent>}' is not below StartLimitIntervalSec='${_si:-<absent>}' — a start that can never succeed would look supervised forever"
+fi
+JR="$(arm_root j1)"; mk_systemctl "$JR/bin" "$JR/state" "$JR/sc.log"
+JR_RC=0; JR_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=400 inst j1 --install 2>&1)" || JR_RC=$?
+[ "$JR_RC" -ne 0 ] \
+  && ok 'install: REFUSES ORCH_START_TIMEOUT_SEC >= StartLimitIntervalSec' \
+  || bad "install: rendered a start bound at or above the start-limit window — $JR_OUT"
+case "$JR_OUT" in *StartLimitIntervalSec*) ok 'install: the refusal names the window it would break' ;; *) bad "install: refused without naming the window — $JR_OUT" ;; esac
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §K — one staleness bound, two instruments (review P2, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# `--status` used CYC (which this installer never sources) while the doctor uses its own
+# `CONTROLLER_STALE_S` (default 900), so the two
+# disagreed: a healthy 800 s-old heartbeat made `--status` exit 1 while the doctor called the same
+# controller RUNNING. Two instruments must not disagree about whether a cell is alive.
+say_case 'the status staleness bound is never tighter than the doctor 900s bound'
+for _age in 800 1000; do
+  KS="$(arm_root "k$_age")"; mk_systemctl "$KS/bin" "$KS/state" "$KS/sc.log"
+  : > "$KS/units/eldato-orchestrator.service"; : > "$KS/state/enabled"; : > "$KS/state/active"
+  printf '4242\n' > "$KS/state/mainpid"
+  mkdir -p "$KS/o"; printf '%s\n' "$(( $(date +%s) - _age ))" > "$KS/o/heartbeat"
+  KS_RC=0; KS_OUT="$(inst "k$_age" --status 2>&1)" || KS_RC=$?
+  if [ "$_age" -eq 800 ]; then
+    [ "$KS_RC" -eq 0 ] \
+      && ok 'status: an 800s-old heartbeat on an ACTIVE unit with a live MainPID is NOT refused (the doctor calls the same controller RUNNING)' \
+      || bad "status: refused a heartbeat the doctor accepts — two instruments disagree: $KS_OUT"
+  else
+    [ "$KS_RC" -ne 0 ] \
+      && ok 'status: a 1000s-old heartbeat is still refused (the bound discriminates, not just widened)' \
+      || bad "status: accepted a 1000s-old heartbeat — the bound is no longer a bound: $KS_OUT"
+  fi
+done
+# the DOCTOR's own override is honoured, so an operator who raised it does not get a second, tighter opinion
+# from this verb over the same controller.
+KX="$(arm_root kx)"; mk_systemctl "$KX/bin" "$KX/state" "$KX/sc.log"
+: > "$KX/units/eldato-orchestrator.service"; : > "$KX/state/enabled"; : > "$KX/state/active"
+printf '4242\n' > "$KX/state/mainpid"
+mkdir -p "$KX/o"; printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$KX/o/heartbeat"
+KX_RC=0; KX_OUT="$(EXTRA_ENV=CONTROLLER_STALE_S=1200 inst kx --status 2>&1)" || KX_RC=$?
+[ "$KX_RC" -eq 0 ] \
+  && ok 'status: a RAISED CONTROLLER_STALE_S is honoured (one operator intent, one bound)' \
+  || bad "status: ignored CONTROLLER_STALE_S=1200 and refused at 900 — two instruments, two opinions: $KX_OUT"
+# …and a LOWERED one is the same authority, not silently clamped back up to 900.
+KL="$(arm_root kl)"; mk_systemctl "$KL/bin" "$KL/state" "$KL/sc.log"
+: > "$KL/units/eldato-orchestrator.service"; : > "$KL/state/enabled"; : > "$KL/state/active"
+printf '4242\n' > "$KL/state/mainpid"
+mkdir -p "$KL/o"; printf '%s\n' "$(( $(date +%s) - 800 ))" > "$KL/o/heartbeat"
+KL_RC=0; KL_OUT="$(EXTRA_ENV=CONTROLLER_STALE_S=600 inst kl --status 2>&1)" || KL_RC=$?
+[ "$KL_RC" -ne 0 ] \
+  && ok 'status: a LOWERED CONTROLLER_STALE_S is honoured too (the doctor is the authority both ways)' \
+  || bad "status: clamped CONTROLLER_STALE_S=600 back up to 900 — the operator tightened one instrument and got another opinion: $KL_OUT"
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

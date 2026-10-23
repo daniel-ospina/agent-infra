@@ -41,6 +41,8 @@
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
+#   ORCH_START_TIMEOUT_SEC the rendered TimeoutStartSec (default 120; a whole number, below the 300s
+#                          StartLimitIntervalSec so a start that can never succeed converges to `failed`)
 #   CELL_HOME              the cell's home whose keys.env/state the controller reads (default $HOME)
 #   ENV_FILE               the controller's env file (default $CELL_HOME/keys.env)
 #   O                      the controller's state dir, used only to READ BACK the heartbeat
@@ -77,6 +79,10 @@ fi
 TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
 RESTART_SEC="${ORCH_RESTART_SEC:-15}"
+# The bound on ONE start. Stated in the ARTIFACT and required to be BELOW StartLimitIntervalSec, so a start
+# that can never succeed (a handover that waits for a controller that never goes) is killed by its
+# supervisor and converges to `failed` through the start limit, instead of looking active forever.
+START_TIMEOUT_SEC="${ORCH_START_TIMEOUT_SEC:-120}"
 CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
@@ -182,6 +188,7 @@ render() {
         -e "s|{{PATH}}|$(sed_esc "$PATH")|g" \
         -e "s|{{SUPERVISOR}}|$(sed_esc "$SUPERVISOR")|g" \
         -e "s|{{RESTART_SEC}}|$RESTART_SEC|g" \
+        -e "s|{{START_TIMEOUT_SEC}}|$START_TIMEOUT_SEC|g" \
         -e "s|{{O}}|$(sed_esc "$O")|g" \
         -e "s|{{WANTED_BY}}|$WANTED_BY|g" \
         "$tpl" >"$dest" || return 1
@@ -199,6 +206,7 @@ verify_unit() {
     local f="$1" k
     for k in "Restart=always" "RestartSec=$RESTART_SEC" "After=network-online.target" \
              "StartLimitIntervalSec=300" "StartLimitBurst=3" "KillMode=process" \
+             "TimeoutStartSec=$START_TIMEOUT_SEC" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
@@ -263,6 +271,25 @@ heartbeat_age() {    local hb="$O/heartbeat" t now age
     [ "$age" -ge 0 ] || age=0
     printf '%s\n' "$age"
 }
+# Is the process at <pid> the harness loop? The argv SHAPE, not a path prefix.
+# ⛔ THE `$O/` PREFIX FORM WAS AN INERT WITNESS (review P1, #2402). MEASURED 2026-10-17 on `pi-cell-2`
+# (scripts/orchestrator-bringup.sh:225): the controller's argv is
+#   bash /tmp/bringup-1761/scripts/orchestrator-harness/orch-loop.sh
+# — the HARNESS path, NOT `$O/orch-loop.sh` (`$O` is seeded so the WORKERS can be invoked from it; the
+# controller execs the harness it was started from). A `grep -qF "$O/orch-loop.sh"` therefore never
+# matched on the only platform this installer supports, so the documented second witness could not fire
+# and the install verdict rested on the heartbeat alone — while the supervisor's own `lock_controller_pid`
+# called the very same process `controller: RUNNING`. Same rule, one implementation: a shell followed by
+# an `orch-loop.sh`, which is what both the loop and its wrapper look like.
+argv_is_orch_loop() { # <pid>
+    local c
+    c="$(ps -o command= -p "$1" 2>/dev/null)" || return 1
+    # shellcheck disable=SC2086
+    set -- $c
+    [ "$#" -ge 2 ] || return 1
+    case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+    case "${2##*/}" in orch-loop.sh) return 0 ;; *) return 1 ;; esac
+}
 # Is a CONTROLLER of this state dir running? (review P1, #2402) The harness's single-instance lock names
 # the loop's pid; identity is checked as well as liveness, because a recycled pid is not our loop (#1178).
 # A plausible heartbeat is the second witness (the loop's own first cycle), so a cell whose lock the loop
@@ -271,8 +298,7 @@ controller_proof() { # [<not_before_epoch>] — a heartbeat older than this star
     local pid hb now since="${1:-0}"
     pid=""
     [ ! -f "$O/.orch.lock" ] || pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-       && ps -o args= -p "$pid" 2>/dev/null | grep -qF "$O/orch-loop.sh"; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && argv_is_orch_loop "$pid"; then
         return 0
     fi
     hb=""
@@ -313,6 +339,16 @@ do_install() {
     esac
     [ "$RESTART_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_RESTART_SEC must be >= 1 (got '$RESTART_SEC') — 0 is not a delay"; return 1; }
+    # ⛔ THE START TIMEOUT MUST BE BELOW THE START-LIMIT WINDOW (review P2, #2402). A start bound at or above
+    # StartLimitIntervalSec can be attempted at most once per window, so the 3-in-5-minutes burst never fills
+    # and a start that can never succeed parks forever while `--status` reads active.
+    case "${START_TIMEOUT_SEC:-}" in
+        ''|*[!0-9]*) err "REFUSING: ORCH_START_TIMEOUT_SEC must be a whole number of seconds (got '$START_TIMEOUT_SEC')"; return 1 ;;
+    esac
+    [ "$START_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
+        || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be >= 1 (got '$START_TIMEOUT_SEC')"; return 1; }
+    [ "$START_TIMEOUT_SEC" -lt 300 ] \
+        || { err "REFUSING: ORCH_START_TIMEOUT_SEC=$START_TIMEOUT_SEC is not below StartLimitIntervalSec=300 — a start that can never succeed would never fill the burst, so the unit would look supervised forever"; return 1; }
     resolve_supervisor || return 1
     tpl="$TEMPLATES_DIR/$UNIT_NAME"
     [ -f "$tpl" ] || { err "template missing: $tpl (set TEMPLATES_DIR)"; return 1; }
@@ -501,7 +537,20 @@ do_status() {
         say "heartbeat_age_s=$age"
         # Two cycles + 300s is the same staleness bound install.sh uses for launchd: a quiet cell is not a
         # wedged one, and a wedged one must not read as fresh.
-        local bound=$(( ${CYC:-240} * 2 + 300 ))
+        # ⛔ AND NEVER TIGHTER THAN THE DOCTOR'S DEFAULT (review P2, #2402): `cloud-cell-doctor.sh` bounds
+        # staleness at `CONTROLLER_STALE_S` (default 900), and this installer never sources `$ENV_FILE`, so
+        # `CYC` is only whatever the caller's shell carries. At the DEFAULTS the two instruments disagreed
+        # (780 s vs 900 s) and a healthy 800 s-old heartbeat made `--status` exit 1 while the doctor called
+        # the same controller RUNNING. Two instruments must not disagree about whether a cell is alive, so
+        # the floor is the doctor's, and the doctor's OWN value — when the operator sets it — is the authority
+        # in BOTH directions: a raised bound is honoured (no second, tighter opinion here) and a lowered one
+        # too (an operator who tightened the doctor meant it for every instrument). Only the unset case needs
+        # a floor, and that floor is the doctor's default 900.
+        local bound
+        case "${CONTROLLER_STALE_S:-}" in
+            ''|*[!0-9]*) bound=$(( ${CYC:-240} * 2 + 300 )); [ "$bound" -ge 900 ] || bound=900 ;;
+            *) bound="$CONTROLLER_STALE_S" ;;
+        esac
         [ "$age" -le "$bound" ] || { err "the controller has not ticked for ${age}s (> ${bound}s) — the unit is up but the loop is not cycling"; rc=1; }
     else
         # ⛔ AN UNREADABLE HEARTBEAT IS NOT A FAILED UNIT (review P2, #2402). The supervisor sources

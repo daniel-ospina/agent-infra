@@ -69,6 +69,14 @@ RestartSec={{RESTART_SEC}}
 # rather than selectively, and the helpers that are genuine children are short-lived `gh`/`git` clients.
 KillMode=process
 TimeoutStopSec=30
+# ⛔ AN EXPLICIT START TIMEOUT, SMALLER THAN StartLimitIntervalSec (review P2, #2402). ExecStart runs the
+# WHOLE of `start`, and service mode WAITS for a controller that is already running before it takes over
+# (CONTROLLER_HANDOVER_TIMEOUT, 3600 s). Without a stated value the bound on a parks-forever start is
+# systemd's own default (90 s) — true today, but a property of the host rather than of this artifact, and
+# NOT what the handover code's comment claims. Stating it keeps the bound where an operator can read it and
+# keeps it below the start-limit window (300 s), so a start that can never succeed converges to `failed`
+# instead of looking supervised.
+TimeoutStartSec={{START_TIMEOUT_SEC}}
 StandardOutput=journal
 StandardError=journal
 
