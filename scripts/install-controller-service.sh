@@ -250,8 +250,7 @@ unit_main_pid() {
 #   * a very long run overflows `$(( ))`.
 # So: force decimal, bound the length, require a plausible epoch instant, tolerate <=60s of skew, and clamp
 # the age at 0 (an age is seconds SINCE the write; it can never be negative).
-heartbeat_age() {
-    local hb="$O/heartbeat" t now age
+heartbeat_age() {    local hb="$O/heartbeat" t now age
     [ -f "$hb" ] || return 1
     t="$(tr -dc '0-9' <"$hb" 2>/dev/null)" || return 1
     case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -263,6 +262,27 @@ heartbeat_age() {
     age=$(( now - t ))
     [ "$age" -ge 0 ] || age=0
     printf '%s\n' "$age"
+}
+# Is a CONTROLLER of this state dir running? (review P1, #2402) The harness's single-instance lock names
+# the loop's pid; identity is checked as well as liveness, because a recycled pid is not our loop (#1178).
+# A plausible heartbeat is the second witness (the loop's own first cycle), so a cell whose lock the loop
+# has not taken YET — harness_apply + cmd_check run first — is not refused for the seconds it needs.
+controller_proof() {
+    local pid hb now
+    pid="$(tr -dc '0-9' <"$O/.orch.lock" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+       && ps -o args= -p "$pid" 2>/dev/null | grep -qF "$O/orch-loop.sh"; then
+        return 0
+    fi
+    hb="$(tr -dc '0-9' <"$O/heartbeat" 2>/dev/null || true)"
+    case "${hb:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#hb}" -le 12 ] || return 1
+    hb=$(( 10#$hb ))
+    [ "$hb" -ge 1000000000 ] 2>/dev/null || return 1
+    now="$(date +%s)"
+    [ "$hb" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
+    # a heartbeat older than two cycles is not proof of a controller NOW (the same bound --status uses)
+    [ "$(( now - hb ))" -le "$(( ${CYC:-240} * 2 ))" ]
 }
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
@@ -289,6 +309,17 @@ do_install() {
     tpl="$TEMPLATES_DIR/$UNIT_NAME"
     [ -f "$tpl" ] || { err "template missing: $tpl (set TEMPLATES_DIR)"; return 1; }
     choose_target || return 1
+    # ⛔ NEVER ARM A SECOND SUPERVISOR IN THE OTHER SCOPE (review P2, #2402). `enable` is unconditional, so a
+    # box that installed a USER unit and later gained passwordless sudo would get a SYSTEM unit too — both
+    # enabled, both started at boot, and the loser parked in the adopt-wait forever. The bring-up re-runs
+    # --install on every --check, so this is not exotic: it is the next bring-up.
+    local other; other="$(installed_units)"
+    if [ -n "$other" ] && [ "$other" != "$UNIT_DIR/$UNIT_NAME" ]; then
+        err "REFUSING: a unit is already installed at $other, and this run targets $UNIT_DIR/$UNIT_NAME."
+        err "  Two ENABLED units are two supervisors for one queue (#1761). Remove the other one first:"
+        err "    bash $0 --uninstall   # resolves the INSTALLED copy, then re-run --install"
+        return 1
+    fi
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/controller-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$tpl" "$tmpd/$UNIT_NAME" || { rm -rf "$tmpd"; return 1; }
@@ -337,16 +368,40 @@ do_install() {
 
     # ⛔ THE VERDICT IS THE UNIT *AND* A CONTROLLER. `is-active` alone is the false green: the unit is
     # active for the seconds before `start` dies on a missing key, a wrong repo or a foreign controller,
-    # and it is also "active" forever if it fails its start limit at the same moment we ask. So ask for
-    # the MainPID and for a FRESH heartbeat, and REFUSE the install when the controller is not actually up.
-    if ! unit_active; then
-        err "the unit is NOT active after install — the cell still has no supervisor:"
+    # and it is also "active" forever if it fails its start limit at the same moment we ask.
+    # ⛔ AND A MAINPID IS STILL NOT A CONTROLLER (review P1, #2402): the process doing `cmd_check` — which
+    # `die`s on a missing key, a wrong repo or a foreign controller — IS that MainPID until it refuses, and
+    # the unit's StartLimit* then leaves it `failed`. So the verdict waits for the HARNESS's own proof: the
+    # single-instance lock `orch-loop.sh` takes ($O/.orch.lock) owned by a live orch-loop.sh invocation, or a
+    # plausible heartbeat. `Type=simple` forks, so the proof is POLLED, not read once.
+    local ast=3
+    unit_active_state; ast=$?
+    if [ "$ast" -ne 0 ]; then
+        [ "$ast" -eq 3 ] \
+          && err "cannot read whether $UNIT_NAME is active after install — the cell may have no supervisor:" \
+          || err "the unit is NOT active after install — the cell still has no supervisor:"
         sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
         err "  read the reason: journalctl -u $UNIT_NAME -n 40"
         return 1
     fi
     pid="$(unit_main_pid)" || { err "cannot read $UNIT_NAME's MainPID — the unit answers is-active but nothing here can say a controller is running"; return 1; }
     [ "${pid:-0}" != "0" ] || { err "$UNIT_NAME is active with MainPID 0 — no controller process; read: journalctl -u $UNIT_NAME -n 40"; return 1; }
+    local waited=0
+    while [ "$waited" -lt "${CONTROLLER_PROOF_TIMEOUT:-240}" ]; do
+        controller_proof && break
+        # a unit that has already converged to `failed` will not produce a controller — stop waiting
+        case "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" in failed) break ;; esac
+        sleep 2; waited=$((waited + 2))
+    done
+    controller_proof || {
+        err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s:"
+        err "  expected the harness's lock ($O/.orch.lock) held by a live orch-loop.sh, or a heartbeat at $O/heartbeat."
+        err "  An active unit whose start is about to die (no key, a foreign controller, a bad pin) converges to"
+        err "  'failed' at StartLimitBurst — the #2402 defect, with a green install on top of it. Read:"
+        sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
+        err "  journalctl -u $UNIT_NAME -n 40"
+        return 1
+    }
 
     # linger, for the USER target only: a user manager stops at the last logout, which would make the
     # supervisor die with the operator's ssh session — the tmux defect one layer down.
@@ -460,8 +515,16 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
     case "$1" in
         "$HOME/.config/systemd/user") TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
         *)                            TARGET="system"
+                                      # ⛔ THE SYSTEM SCOPE NEEDS THE PRIVILEGE THE INSTALL USED (review P2,
+                                      # #2402). `choose_target` resolves it as `sudo -n systemctl`; deriving
+                                      # a bare `systemctl` here meant `--uninstall` issued an UNPRIVILEGED
+                                      # `disable --now`, got "Interactive authentication required", reported
+                                      # "still ENABLED" and removed nothing — the documented uninstall path
+                                      # unusable on the cell's normal shape. `${SUDO+…}` is kept for the
+                                      # explicit-SUDO seam (it expands to nothing when SUDO is unset OR empty).
                                       if [ -n "${SYSTEMCTL:-}" ]; then SC="$SYSTEMCTL"
-                                      else SC="${SUDO+$SUDO }systemctl"; fi ;;
+                                      elif [ -n "${SUDO+x}" ]; then SC="${SUDO:+$SUDO }systemctl"
+                                      else SC="sudo -n systemctl"; fi ;;
     esac
 }
 # ⛔ FIND THE INSTALLED COPY, DO NOT RE-DERIVE THE SCOPE (review P2, #2402). `choose_target` answers "where
@@ -473,7 +536,7 @@ find_installed_unit() {
     # ⛔ `CONTROLLER_SYSTEM_UNIT_DIR` is the READ side of the system scope (the supervisor's own seam name);
     # `SYSTEMD_UNIT_DIR` stays the WRITE override. Conflating them is how a write-path override decided
     # which installed copy a read-back reported on.
-    for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
         [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
     done
     return 1
@@ -483,21 +546,42 @@ find_installed_unit() {
 # it did not remove.
 installed_units() {
     local d
-    for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
         [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && printf '%s\n' "$d/$UNIT_NAME"
     done
     return 0
 }
 do_uninstall() {
-    local p
+    local p left
+    # ⛔ AN ELEVATED UNINSTALL CANNOT SEE THE OPERATOR'S UNIT (review P2, #2402). Running the installer
+    # through `sudo` sets HOME=/root, so every reader here ($HOME/.config/systemd/user, the state dir)
+    # describes root's world: find_installed_unit found nothing, the verb printed "not installed" and
+    # returned 0 while the operator's user unit stayed installed, enabled and restarting the controller —
+    # the exact false pass --uninstall exists to refuse.
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        err "REFUSING to uninstall as root (SUDO_USER=$SUDO_USER): HOME=/root hides the operator's user unit,"
+        err "  so this verb would report 'not installed' over a supervisor that is still enabled. Re-run as"
+        err "  the operator: sudo -u $SUDO_USER -H bash $0 --uninstall"
+        return 1
+    fi
     if [ -z "$SC" ]; then choose_target >/dev/null 2>&1 || true; fi
     # the installed copy decides the scope; the resolved one is only the fallback when none is found
     p="$(find_installed_unit)" || p="${UNIT_DIR:+$UNIT_DIR/$UNIT_NAME}"
     if [ -z "$p" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
     UNIT_DIR="$(dirname "$p")"
     scope_for_dir "$UNIT_DIR"
-    # disable BEFORE removing the file: a removed-but-enabled unit comes back on the next daemon-reload.
-    [ -f "$p" ] || { say "not installed: $p"; return 0; }
+    # ⛔ "NOT INSTALLED" IS ONLY A SUCCESS WHEN NOTHING IS INSTALLED (review P2, #2402). The early return
+    # used to fire whenever the RESOLVED path was absent, before `installed_units` was ever consulted — so
+    # a differently-resolved scope could hide a live, enabled copy behind rc 0.
+    if [ ! -f "$p" ]; then
+        left="$(installed_units)"
+        if [ -n "$left" ]; then
+            err "not installed at $p, but a copy EXISTS elsewhere: $(printf '%s' "$left" | tr '\n' ' ')"
+            err "  re-run --uninstall so the installed copy decides the scope"
+            return 1
+        fi
+        say "not installed: $p"; return 0
+    fi
     # ⛔ NOT SWALLOWED (review P2). A failed disable leaves the `…target.wants` symlink in place, so the
     # unit is still enabled after its file is gone — and removing the file does not stop a running
     # controller either. Reporting success there is "uninstalled" over a supervisor that is still armed.

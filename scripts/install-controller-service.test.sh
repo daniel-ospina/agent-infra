@@ -127,6 +127,14 @@ case "\${1:-}" in
     { printf '%s\n' "\$(( \$(cat "\$S/restarts" 2>/dev/null || printf 0) + 1 ))" > "\$S/restarts"; }
     [ -n "\${SC_HOOK:-}" ] && [ -x "\${SC_HOOK}" ] && { "\$SC_HOOK" || true; }
     [ -f "\$S/mainpid" ] || printf '4242\n' > "\$S/mainpid"
+    # ⛔ THE INSTALL VERDICT WAITS FOR PROOF OF A *CONTROLLER*, NOT A PROCESS (review P1, #2402): the process
+    # doing cmd_check IS the MainPID until it refuses. The real loop proves itself by taking \$O/.orch.lock
+    # and by writing a heartbeat after its first cycle; the stub models the second, and SC_PROOF=none models a
+    # start that stays up doing nothing (the arm that must be refused).
+    if [ "\${SC_PROOF:-heartbeat}" != none ]; then
+      mkdir -p "\$(dirname "\$S")/o" 2>/dev/null
+      date +%s > "\$(dirname "\$S")/o/heartbeat" 2>/dev/null || true
+    fi
     exit 0 ;;
   stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
   status)     printf 'stub: %s\n' "\$*"; exit 3 ;;
@@ -849,6 +857,68 @@ esac
 case "$HN_OUT" in
   *'the unit is NOT active'*) bad 'status: asserted "NOT active" from a read that did not answer' ;;
   *) ok 'status: does not assert "NOT active" from an unreadable read' ;;
+esac
+
+
+# ── the install verdict requires PROOF OF A CONTROLLER, not just an active unit (review P1, #2402) ──
+# `is-active` plus a non-zero MainPID proves only that SOME process exists: the process doing `cmd_check`
+# IS that MainPID for the seconds before it dies on a missing key / a wrong repo / a foreign controller,
+# and then StartLimitBurst leaves the unit `failed`. An install that returned 0 there certified a cell
+# that dispatches nothing.
+say_case 'install refuses when the unit is up but no controller proved itself'
+HP="$(arm_root hp)"; mk_systemctl "$HP/bin" "$HP/state" "$HP/sc.log"
+HP_RC=0; HP_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst hp --install 2>&1)" || HP_RC=$?
+[ "$HP_RC" -ne 0 ] && ok 'install: an active unit with no controller proof is REFUSED' \
+                   || bad "install: certified a unit whose start never produced a controller — $HP_OUT"
+case "$HP_OUT" in
+  *'NO CONTROLLER PROVED ITSELF'*) ok 'install: the refusal names what was missing (the lock, or a heartbeat)' ;;
+  *) bad "install: refused without naming the missing proof — $HP_OUT" ;;
+esac
+
+# ── never arm a second supervisor in the OTHER scope (review P2, #2402) ───────────────────────────
+say_case 'install refuses to arm a second unit when one is already installed in the other scope'
+HO="$(arm_root ho)"; mk_systemctl "$HO/bin" "$HO/state" "$HO/sc.log"
+mkdir -p "$HO/home/.config/systemd/user"
+: > "$HO/home/.config/systemd/user/eldato-orchestrator.service"
+HO_RC=0; HO_OUT="$(inst ho --install 2>&1)" || HO_RC=$?
+[ "$HO_RC" -ne 0 ] && ok 'install: a unit already installed in the other scope is REFUSED (two enabled units = two supervisors)' \
+                   || bad "install: armed a second unit beside an existing one (#1761) — $HO_OUT"
+case "$HO_OUT" in
+  *'already installed at'*) ok 'install: the refusal names the installed copy and the remedy' ;;
+  *) bad "install: refused without naming the installed copy — $HO_OUT" ;;
+esac
+[ -f "$HO/units/eldato-orchestrator.service" ] && bad 'install: wrote the second unit anyway' \
+                                               || ok 'install: wrote nothing beside the existing unit'
+
+# ── an ELEVATED uninstall is refused (review P2, #2402) ──────────────────────────────────────────
+# HOME=/root hides the operator's user unit, so `--uninstall` under sudo printed "not installed" (rc 0)
+# over a unit that was still enabled and restarting the controller.
+say_case 'uninstall refuses an elevated (sudo) invocation'
+HU2="$(arm_root hu2)"; mk_systemctl "$HU2/bin" "$HU2/state" "$HU2/sc.log"
+printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU2/bin/id"
+chmod +x "$HU2/bin/id"
+HU2_RC=0; HU2_OUT="$(EXTRA_ENV=SUDO_USER=operator inst hu2 --uninstall 2>&1)" || HU2_RC=$?
+[ "$HU2_RC" -ne 0 ] && ok 'uninstall: an ELEVATED invocation is REFUSED' \
+                   || bad "uninstall: reported success under sudo, where HOME hides the operator's unit — $HU2_OUT"
+case "$HU2_OUT" in
+  *'REFUSING to uninstall as root'*) ok 'uninstall: the refusal names the reason and the operator re-run' ;;
+  *) bad "uninstall: refused without naming the root cause — $HU2_OUT" ;;
+esac
+
+# ── a service-mode start does not wait forever on a session that is not ours (review P2, #2402) ──
+# `$SESSION` is machine-scoped, so a peer repo's controller holds the same name. An unbounded wait parks
+# the unit's ExecStart forever: nothing dispatches and `--status` reads it as active with a live MainPID.
+say_case 'a service-mode start refuses a session it cannot prove is this state dir--s'
+HW="$(arm_root hw)"; mk_systemctl "$HW/bin" "$HW/state" "$HW/sc.log"
+: > "$HW/units/eldato-orchestrator.service"; : > "$HW/state/enabled"
+printf '#!/bin/bash\ncase "${1:-}" in\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$HW/bin/tmux"
+chmod +x "$HW/bin/tmux"
+HW_RC=0; HW_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4" sup hw start 2>&1)" || HW_RC=$?
+[ "$HW_RC" -ne 0 ] && ok 'start: a session that is not provably this state dir is REFUSED, not waited on forever' \
+                   || bad "start: waited/returned 0 over a session it could not attribute — $HW_OUT"
+case "$HW_OUT" in
+  *'refusing to become a second dispatcher'*|*'not provably this state dir'*) ok 'start: the refusal names what it saw' ;;
+  *) bad "start: refused without naming what it saw — $HW_OUT" ;;
 esac
 
 printf '\n────────────────────────────────────────────\n'
