@@ -88,7 +88,18 @@ cleanup_remote() {
   # ref a failed step created). Bounded to the run's own $$-scoped namespace, so it can never touch
   # a concurrent run's refs — the reason the namespace exists (see UNIQ below).
   local ns_ref all
-  all="$(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 2>/dev/null | awk '{print $2}')"
+  # ⛔ THE READ IS OBSERVED BEFORE THE SWEEP IS CERTIFIED (agent-infra#2121, empty-as-pass).
+  # `ls-remote … 2>/dev/null | awk` collapses a FAILED read (network, auth, a missing remote) into the
+  # same empty string as "there are no refs left", so the loop iterates ZERO times and this function
+  # still `return 0` — a cleanup that reports success over a sweep it never made, leaving refs in this
+  # run's namespace for the next run to trip on with nothing in the log to say why. The status is read;
+  # an unreadable sweep is UNKNOWN and SAID SO (cleanup stays best-effort and still returns 0, but no
+  # longer silently).
+  all="$(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 2>/dev/null)" || {
+    echo "WARN: ref sweep READ FAILED (git ls-remote rc=$?) — refs left in ${CLAIM_NS} are UNKNOWN, not none" >&2
+    all=""
+  }
+  all="$(printf '%s\n' "$all" | awk '{print $2}')"
   for ns_ref in $all; do
     [ -n "$ns_ref" ] || continue
     cur="$(git -C "$A" ls-remote origin "$ns_ref" 2>/dev/null | awk '{print $1}')"

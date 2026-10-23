@@ -136,10 +136,26 @@ fi
 # test-isolation, license-surface, pricing-artifact). Without this it would read only the review
 # comment — which for such a PR may not exist at all — and fix blind.
 : > "$L-failing.txt"
-FAILING_CHECKS="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
+# ⛔ THE READ IS OBSERVED BEFORE IT IS TRUSTED (agent-infra#2121, empty-as-pass). `gh pr checks …
+# 2>/dev/null | python3 -c` collapsed THREE different outcomes into the same empty string: the read
+# FAILED (gh non-zero, stderr discarded), the payload was UNPARSEABLE (the old `except: raise
+# SystemExit` exited 0 with nothing printed), and there genuinely ARE no failing checks. Only the
+# third is a fact — but this file is the fixer's ONLY evidence that CI is red, so a fixer was
+# dispatched believing the checks were green when the read had never happened. The read and the
+# parse are now observed separately, and an observation that did not happen is written INTO that
+# file as UNKNOWN (which also keeps it non-empty, so the fixer's prompt still sends it there).
+checks_json="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null)" || checks_rc=$?
+FAILING_CHECKS=''
+checks_unknown=''
+if [ "${checks_rc:-0}" -ne 0 ]; then
+  checks_unknown="the required-check read FAILED (gh rc=$checks_rc)"
+elif [ -z "$checks_json" ]; then
+  checks_unknown="the required-check read returned NO JSON"
+else
+FAILING_CHECKS="$(printf '%s' "$checks_json" | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)
-except Exception: raise SystemExit
+except Exception: raise SystemExit(1)
 # The SAME allow-list polarity the loop's classifier and admin-merge.sh use (agent-infra#1714): a
 # check is FAILING only when its state is neither a NAMED in-flight spelling nor one of the NON-RED
 # conclusions. CANCELLED/STALE are non-red by that rule - a superseded run
@@ -154,6 +170,20 @@ for c in (d if isinstance(d,list) else []):
     red.append(str(c.get('name') or ''))
 print(' '.join(red))
 " 2>/dev/null)"
+# ⛔ THE END LINE ABOVE IS PINNED BY SHAPE, deliberately: scripts/orchestrator-harness/selftest.sh
+# extracts this assignment with `awk '/^FAILING_CHECKS="/,/^" 2>\/dev\/null\)"$/'` and runs the
+# result as python. Appending `|| parse_rc=$?` to that line made the END MARKER unreachable, awk then
+# ran to EOF and the extracted "python" became the rest of the script — so the PARSE status is read
+# on the NEXT line instead of on the closing one. Keep the two marker lines exactly as they are.
+checks_parse_rc=$?
+if [ "$checks_parse_rc" -ne 0 ]; then
+  checks_unknown="the required-check payload could not be PARSED (rc=$checks_parse_rc)"
+fi
+fi
+if [ -n "$checks_unknown" ]; then
+  echo "=== NOTE: $checks_unknown — this file does NOT establish that CI is green. Treat the required checks as UNKNOWN and read them yourself before concluding the build is clean ===" >> "$L-failing.txt"
+  echo "[fix $PR] required-check read UNKNOWN ($checks_unknown) — proceeding (fail-open on purpose, and recorded in $L-failing.txt so the fixer sees it)" >> "$L.log"
+fi
 for c in $FAILING_CHECKS; do
   echo "=== failing required check: $c ===" >> "$L-failing.txt"
   RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
@@ -170,7 +200,7 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 cat > "$L-fixer.txt" <<EOF
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
