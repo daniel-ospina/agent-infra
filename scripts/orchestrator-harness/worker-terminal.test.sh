@@ -100,6 +100,10 @@ chmod +x "$TMP/stub/cmux"
 cat > "$TMP/stub/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "TMUX $*" >> "${TMUX_LOG:-/dev/null}"
+# ⛔ EACH ARGUMENT ON ITS OWN LINE. `$*` FLATTENS the argv, so `bash -c 'LINE'` and
+# `bash -c "'LINE'"` log IDENTICALLY — which is how a spawn-127 regression passed this suite
+# (2026-10-23). Pins that care about the SHAPE count these instead of grepping the flattened line.
+for _a in "$@"; do printf 'ARGV %s\n' "$_a" >> "${TMUX_LOG:-/dev/null}"; done
 # The session list lives in a FILE because `kill-session` must actually remove the session: a stub
 # that only records the kill would leave the list intact, and a close that is VERIFIED against it
 # could never be observed to succeed — the assertion would pass for the wrong reason.
@@ -295,9 +299,13 @@ case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the spawn SUCCEEDS" $rc
 grep -q 'TMUX new-session -d -s lane-8' "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
 ck "…by starting a tmux session, as a worker that can actually run" $rc
-grep -qF "export HOME='$TMP/home-c'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+# ⛔ The line now runs under `bash -c '<whole line>'` (the spawn pins the SOURCING shell, so the
+# pre-check's dialect and the runtime's dialect are the same one), so the log carries inner single
+# quotes escaped as `'\''`. Un-escape before asserting: these pins are about WHAT the line does.
+unesc() { sed "s/'\\\\''/'/g" "$1"; }
+unesc "$TMP/tmux4.log" | grep -qF "export HOME='$TMP/home-c'" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
 ck "…whose launch line exports the HOME that holds the gh credential (the credential is HOME-bound)" $rc
-grep -qF ". '$TMP/home-c/keys.env'" "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+unesc "$TMP/tmux4.log" | grep -qF ". '$TMP/home-c/keys.env'" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
 ck "…and sources that HOME's keys.env, exactly like the cell's working manual dispatch" $rc
 # ⛔ SOURCED UNDER `set -a` — the supervisor's own idiom (`set -a; . "$ENV_FILE"; set +a`). A keys.env
 # that ASSIGNS without `export` is legal there, and a worker that sourced it plainly would keep those
@@ -547,6 +555,100 @@ env_empty_rc() { ( set -u; PATH="$TMP/bin-absent:$PATH"; export TMUX_STATE="$TMP
                     . "$LIB" >/dev/null 2>&1; wt_launcher_env "" >/dev/null 2>&1; printf '%s' "$?" ); }
 [ "$(env_empty_rc)" != "0" ] && rc=0 || rc=1
 ck "wt_launcher_env with no HOME refuses even when the SERVER carries a token (there is nothing to export)" $rc
+# ⛔ AN INHERITED `GH_TOKEN` MUST NOT OVERRIDE THE STORE THE GATE VALIDATED (P1 review finding,
+# 2026-10-23, measured). gh prefers `GH_TOKEN`/`GITHUB_TOKEN` over ANY store, and a tmux pane inherits the
+# SERVER's environment — which this module can itself stamp (the caller-token arm creates the server with
+# the caller's env). Driven: the prefix is EXECUTED with a server token in the environment, and the
+# worker's own environment is read back.
+rm -rf "$TMP/home-store" "$TMP/O4u1"; gh_hosts_fixture "$TMP/home-store"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4u1" "$TMP/home-store" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+seen="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-store" GH_TOKEN=ghp_from_SERVER /bin/bash -c "$pfx; printf '%s' \"\${GH_TOKEN:-NONE}\"")"
+[ "$seen" = "NONE" ] && rc=0 || { rc=1; echo "      worker GH_TOKEN=[$seen]"; }
+ck "…and a STORE credit CLEARS an inherited GH_TOKEN, so the worker uses the store the probe read" $rc
+seen="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-store" GH_TOKEN='   ' /bin/bash -c "$pfx; printf '%s' \"\${GH_TOKEN:-NONE}\"")"
+[ "$seen" = "NONE" ] && rc=0 || { rc=1; echo "      worker GH_TOKEN=[$seen]"; }
+ck "…a BLANK inherited GH_TOKEN is cleared too (gh prefers it over a valid GITHUB_TOKEN)" $rc
+# …while the CALLER-token arm is deliberately EXEMPT: there the inherited value IS the credential.
+rm -rf "$TMP/home-callertok" "$TMP/O4u2"; mkdir -p "$TMP/home-callertok"
+out="$(KEEP_CALLER_TOKEN=1 GH_TOKEN=ghp_from_caller bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4u2" "$TMP/home-callertok" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+seen="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-callertok" GH_TOKEN=ghp_from_caller /bin/bash -c "$pfx; printf '%s' \"\${GH_TOKEN:-NONE}\"")"
+[ "$seen" = "ghp_from_caller" ] && rc=0 || { rc=1; echo "      worker GH_TOKEN=[$seen]"; }
+ck "…but a CALLER-token credit does NOT clear it (the worker inherits that token through the new server)" $rc
+# ⛔ AND A BLANK `GH_TOKEN` IS CLEARED EVEN ON THE EXEMPT ARMS (review finding): gh prefers `GH_TOKEN` over
+# a perfectly good `GITHUB_TOKEN`, so a stray space in one leaves a dead lane while the other is valid.
+# This arm is deliberately NOT cleared wholesale, which is exactly why the blank-name rule must stand alone.
+seen="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-callertok" GH_TOKEN='   ' GITHUB_TOKEN=ghp_valid /bin/bash -c "$pfx; printf '%s/%s' \"\${GH_TOKEN:-NONE}\" \"\${GITHUB_TOKEN:-NONE}\"")"
+[ "$seen" = "NONE/ghp_valid" ] && rc=0 || { rc=1; echo "      worker GH/GITHUB=[$seen]"; }
+ck "…a BLANK GH_TOKEN is cleared while GITHUB_TOKEN survives (gh prefers the blank one, so it must go)" $rc
+# ⛔ THE CLEAR MUST SEE WHAT `keys.env` WROTE (P1 review finding, 2026-10-23, MEASURED). The clear used
+# to be emitted BEFORE the source, so a file re-introducing `GH_TOKEN='   '` kept it — and on a STORE
+# credit the old post-source check (gated on the FILE credit or a non-zero status) never fired, so the
+# worker's gh answered `The token in GH_TOKEN is invalid` on a spawn that reported provisioned.
+rm -rf "$TMP/home-storews" "$TMP/O4ws"; gh_hosts_fixture "$TMP/home-storews"
+printf "export GH_TOKEN='   '\n" > "$TMP/home-storews/keys.env"
+out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4ws" "$TMP/home-storews" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+seen="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-storews" O="$TMP/O4ws" /bin/bash -c "$pfx; printf '%s' \"\${GH_TOKEN:-NONE}\"" 2>/dev/null)"
+[ "$seen" = "NONE" ] && rc=0 || { rc=1; echo "      worker GH_TOKEN=[$seen]"; }
+ck "…a blank GH_TOKEN written by keys.env is cleared AFTER the source, so the store the probe read is used" $rc
+# …and where the file's blank token has JUST DISPLACED an inherited one, no credential remains — so the
+# guard must REFUSE the worker instead of starting it credential-less (fail-closed, not fail-open).
+rm -rf "$TMP/home-wsdisp" "$TMP/O4ws2"; mkdir -p "$TMP/home-wsdisp"
+printf "export GH_TOKEN='   '\n" > "$TMP/home-wsdisp/keys.env"
+out="$(GH_TOKEN=ghp_from_caller bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4ws2" "$TMP/home-wsdisp" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-wsdisp" O="$TMP/O4ws2" /bin/bash -c "$pfx; printf 'REACHED'" 2>/dev/null)"
+[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
+ck "…and a file that blanks the ONLY credential EXITS 98 (no store to fall back to: refused, not started)" $rc
+# ⛔ gh's OWN OUTPUT is held to the same value rule (review finding): a whitespace token comes back rc 0
+# from `gh auth token`, so without the value test the gh arm credited a file its own file-arm refuses.
+tok_rc() { ( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts_token "$1" >/dev/null 2>&1; printf '%s' "$?" ); }
+rm -rf "$TMP/home-wstok"; mkdir -p "$TMP/home-wstok/.config/gh"
+printf 'github.com:\n    user: fixture\n    oauth_token: "   "\n' > "$TMP/home-wstok/.config/gh/hosts.yml"
+[ "$(tok_rc "$TMP/home-wstok")" != "0" ] && rc=0 || rc=1
+ck "wt_gh_hosts_token: a WHITESPACE token is refused by the gh arm too (one rule, both arms)" $rc
+# ⛔ AND THE SPAWN PINS THE SOURCING SHELL: the pre-check's dialect must be the runtime's dialect.
+grep -q 'TMUX new-session -d -s lane-8 bash -c' "$TMP/tmux4.log" && rc=0 || { rc=1; cat "$TMP/tmux4.log"; }
+ck "…the session runs under \`bash -c\`, so the parse check and the source use the same shell" $rc
+# ⛔ ONE SHELL-COMMAND ARGUMENT, AND IT MUST ACTUALLY RUN (P0 review finding, 2026-10-23, MEASURED).
+# tmux passes a SINGLE shell-command argument through the shell, but EXECs a MULTI-argument command
+# DIRECTLY — so the three-word form `bash -c "'<line>'"` handed bash a literally single-quoted word as
+# its command string, bash looked for a command by that name, every pane died with status 127, and
+# `new-session -d` still returned 0. That is the dead-lane-reported-provisioned this PR exists to
+# remove, and the pins above could not see it: `TMUX $*` renders both shapes identically.
+ns_argv() { awk '/^ARGV new-session$/{f=1;n=0;next} f&&/^ARGV /{n++;a[n]=substr($0,6);next} f{exit} END{printf "%d\t%s\n", n, a[n]}' "$1"; }
+rm -rf "$TMP/ran" "$TMP/O9"; mkdir -p "$TMP/ran"
+cat > "$TMP/c9.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_LOG="$4" WT_WORKER_HOME="$5"; : > "$TMUX_LOG"
+. "$1"
+wt_spawn "lane-9" "$6" 'printf RAN_OK > ran.txt'
+SH
+out="$(FAKE_UNAME=Linux bash "$TMP/c9.sh" "$LIB" "$TMP/bin-absent" "$TMP/O9" "$TMP/tmux9.log" "$TMP/home-c" "$TMP/ran" 2>&1)"
+[ "$(ns_argv "$TMP/tmux9.log" | cut -f1)" = "4" ] && rc=0 || { rc=1; echo "      argv=$(ns_argv "$TMP/tmux9.log" | cut -f1)"; sed -n '/^ARGV/p' "$TMP/tmux9.log"; }
+ck "…and hands tmux ONE shell-command argument (a multi-word command is exec'd directly: 127)" $rc
+cmdline="$(ns_argv "$TMP/tmux9.log" | cut -f2-)"
+( cd "$TMP/ran" && timeout 60 sh -c "$cmdline" ) >/dev/null 2>&1
+{ [ -f "$TMP/ran/ran.txt" ] && [ "$(cat "$TMP/ran/ran.txt" 2>/dev/null)" = "RAN_OK" ]; } && rc=0 || { rc=1; echo "      cmdline=$cmdline"; }
+ck "…and executing that argument the way tmux does (one argument → the shell) really RUNS the line" $rc
+# ⛔ AND THE REAL BINARY AGREES (the P0 was measured on tmux 3.4). Declared BLIND where tmux is absent —
+# never a silent pass.
+if command -v tmux >/dev/null 2>&1; then
+  _sock="wt2396-$$"; _conf="$TMP/tmux-real.conf"
+  printf 'set -g remain-on-exit on\nset -g exit-empty off\n' > "$_conf"
+  rm -f "$TMP/ran/ran.txt"
+  timeout 30 tmux -L "$_sock" -f "$_conf" new-session -d -s probe "$cmdline" >/dev/null 2>&1
+  _i=0; while [ "$_i" -lt 100 ] && [ ! -f "$TMP/ran/ran.txt" ]; do sleep 0.1; _i=$((_i+1)); done
+  _panes="$(tmux -L "$_sock" list-panes -F '#{pane_dead}:#{pane_dead_status}' 2>/dev/null | head -1)"
+  tmux -L "$_sock" kill-server >/dev/null 2>&1
+  { [ -f "$TMP/ran/ran.txt" ] && [ "$(cat "$TMP/ran/ran.txt" 2>/dev/null)" = "RAN_OK" ]; } && rc=0 || { rc=1; echo "      panes=$_panes ran=[$(cat "$TMP/ran/ran.txt" 2>/dev/null)]"; }
+  ck "…and a REAL tmux runs the same argv (multi-word would be exec'd directly and die 127)" $rc
+else
+  printf '  \033[33mSKIP\033[0m  real-tmux spawn leg DECLARED BLIND: no tmux on this box\n'
+fi
 # ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE TWO HALVES OF THIS GATE MUST AGREE ON THAT (review
 # finding, 2026-10-23, measured). `[ -z "$GH_TOKEN$GITHUB_TOKEN" ]` counted `GH_TOKEN='   '` as provision,
 # while the STATIC keys.env arm refuses whitespace (`[^[:space:]]`) — and gh rejects it at the first call.
@@ -1168,7 +1270,26 @@ done
 if [ -x /bin/bash ] && [ "$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null || echo 5)" -le 3 ]; then
   ck "parse: the /bin/bash legs ran on a 3.x parser, so they CAN see the macOS parse class" 0
 else
-  ck "parse DECLARED BLIND: no 3.x /bin/bash here — the legs cannot see the macOS 3.2 parse class" 0
+  # ⛔ THE LEG ABOVE PASSES BLIND ON A BASH-5 BOX (review finding, 2026-10-23): macOS /bin/bash is 3.2,
+  # and a comment placed inside a `case` arm stopped worker-terminal.sh PARSING there — `wt_spawn` was
+  # undefined and orch-loop.sh turns that into exit 78 FATAL — while every ubuntu-latest job parsed it
+  # happily. A green pass on the one leg that cannot see the class is the false PASS this suite exists to
+  # prevent, so when a 3.2 binary is not on the box, ask a real one: docker is present on the CI runners.
+  # Offline (no docker, or no image) is still reported as blind, never as a pass.
+  b32=0
+  if command -v docker >/dev/null 2>&1; then
+    if timeout 300 docker run --rm -v "$HERE:/h:ro" bash:3.2 bash -n /h/worker-terminal.sh >/dev/null 2>&1; then b32=0
+    else b32=$?; fi
+    if [ "$b32" = "0" ]; then
+      ck "parse: a real bash 3.2 (docker bash:3.2) accepts worker-terminal.sh — the macOS parse class" 0
+    elif [ "$b32" = "124" ] || [ "$b32" = "125" ]; then
+      ck "parse DECLARED BLIND: docker could not provide a 3.2 parser here (rc=$b32) — this leg checked nothing" 0
+    else
+      ck "parse: a real bash 3.2 (docker bash:3.2) REJECTS worker-terminal.sh (rc=$b32)" 1
+    fi
+  else
+    ck "parse DECLARED BLIND: no 3.x /bin/bash and no docker — the legs cannot see the macOS 3.2 parse class" 0
+  fi
 fi
 
 echo
