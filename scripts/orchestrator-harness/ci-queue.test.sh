@@ -582,19 +582,28 @@ ck "(e12) the gate's verdict is CAPTURED for the rows and MEMOIZED (one read per
 # PRESENT and none of the one that was missing. The names are literal in each message (a stale copy is
 # the case being reported, so they cannot be rendered from the module), which is exactly why they can
 # drift — this arm is the pin that catches the next widening.
-miss=""
-for _fn in ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count \
-           ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min; do
-  has "$(sed -n '/is present but INCOMPLETE/p' "$LOOP")" "$_fn" || miss="$miss $_fn"
+# ⛔ DERIVED FROM THE FILE, NEVER RESTATED HERE (#2333 review, P1). This arm used to iterate a
+# HARDCODED ten-name list and only ask "does the message contain each of these ten", so a WIDENING —
+# the guard gains an 11th name, the message untouched — left it GREEN: the cycle-10 recurrence this
+# comment claims to catch, reproduced in the pin itself (measured: add a name to the guard, run this
+# suite, 120/0 CLEAN). Both sides are now EXTRACTED from the file: the `declare -f` list the guard
+# requires, and the "needs a/b/c" list the operator reads. Equality is asserted, in order, so the
+# next widening is RED until the message follows it — and the derivation cannot silently find
+# nothing, because (e14) fails if either side is empty in any file.
+guard_names() { sed -n 's/.*declare -f \(ciq_[a-z0-9_ ]*\) >\/dev\/null.*/\1/p' "$1" | head -1 | sed 's/ *$//'; }
+# Anchored on the CI-QUEUE message: orch-loop.sh carries FOUR "is present but INCOMPLETE" lines
+# (live-ownership, rail-refusal, capacity, ci-queue) and the first one's names are not these.
+msg_names()   { sed -n 's/.*is present but INCOMPLETE (needs \(ciq_[^)]*\)).*/\1/p' "$1" | head -1 | tr '/' ' ' | sed 's/ *$//'; }
+_discrep=""; _derived=0
+for _f in "$LOOP" "$FIX" "$DISPATCH"; do
+  _g="$(guard_names "$_f")"; _m="$(msg_names "$_f")"
+  [ -n "$_g" ] && [ -n "$_m" ] && _derived=$(( _derived + 1 ))
+  [ "$_g" = "$_m" ] || _discrep="$_discrep $(basename "$_f")"
 done
-ck "(e13) orch-loop.sh's INCOMPLETE disclosure names every function its guard requires (missing:${miss:- none})" \
-   "$( [ -z "$miss" ]; echo $? )"
-n=0
-for _f in "$FIX" "$DISPATCH"; do
-  has "$(sed -n '/is present but INCOMPLETE/p' "$_f")" ciq_ceiling && n=$(( n + 1 ))
-done
-ck "(e14) …and both other callers name ciq_ceiling too — the newest member of the guard (named in $n/2)" \
-   "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e13) each INCOMPLETE disclosure names exactly the functions its own \`declare -f\` guard requires, in order — both sides derived from the file (discrepant:${_discrep:- none})" \
+   "$( [ -z "$_discrep" ]; echo $? )"
+ck "(e14) …and the derivation is non-vacuous: a guard list AND a message list were found in all three files (found in $_derived/3)" \
+   "$( [ "$_derived" -eq 3 ]; echo $? )"
 
 printf '\n── (h) THE PREDICATE ITSELF, DRIVEN (not grepped) ────────────────────────────\n'
 # ⛔ WHY THIS SECTION EXISTS (#2296 cycle 6, P0). `(e12)` was two textual greps, and no arm anywhere

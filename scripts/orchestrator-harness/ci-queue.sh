@@ -373,7 +373,8 @@ ciq_read() {
     # unacceptable, reached by a change of one digit, and arm (b6c) encoded it while its own label said
     # "bounded by the allowance". Clamping keeps the garble bound and bounds it at the module's OWN
     # accepted maximum ceiling (2x the hosted allowance — the same width the allowance path already
-    # yields), so `running=21` derives 42 and a 9-digit garble derives 40, never 999999998.
+    # yields), so `running=21` derives 40 — the CLAMP, not the allowance, is what bounds it — and
+    # a 9-digit garble derives 40 too, never 999999998.
     floor=1
     if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
       floor="$running"

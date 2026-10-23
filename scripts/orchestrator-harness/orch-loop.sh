@@ -619,8 +619,9 @@ if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict c
   # one that was MISSING: a false statement about the box's own state, in the one line an operator
   # reads to decide whether to re-seed. The names are LITERAL, not rendered from a variable defined
   # in the module — an old module would not define it, which is exactly the case being reported.
-  # Keep this list byte-identical to the `declare -f` list on the line above; (e8) in
-  # ci-queue.test.sh asserts it.
+  # Keep this list IDENTICAL — same names, same ORDER — to the `declare -f` list above. (e13) in
+  # ci-queue.test.sh now DERIVES both lists from this file and asserts equality (it used to
+  # restate the names, so a widening stayed green); (e8) is the fix-one bail marker, not this.
   [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
