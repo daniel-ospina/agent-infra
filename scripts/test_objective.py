@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import atexit
 import importlib.util
+import itertools
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import pytest
 
@@ -76,7 +79,7 @@ def _gql_ok():
 
 
 def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_remote=None,
-            rest_prs=None, gh_token="test-token"):
+            rest_prs=None, gh_token="test-token", runs=None):
     """Patch the ONE seam every read goes through, and dispatch on the command.
 
     `pr_list` may be a SEQUENCE of `_Result`s: one QUEUE response per read, the last one
@@ -99,6 +102,8 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     a fixture that had nothing to do with the network. In production "no second source" happens
     as `_queue_rest` returning None BEFORE any request (no credential) or as a body it could not
     read; neither is a failure to reach GitHub. Returning a non-list body says exactly that.
+
+    `runs` stubs the ATTEMPT clock the flight-age bound reads (#1926), keyed by run id.
     """
     queue_reads = {"n": 0}
     sleeps = []
@@ -130,6 +135,16 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
             return gql if gql is not None else _gql_ok()
         if "/check-runs" in s:
             return rest if rest is not None else _Result(1, "", "HTTP 504")
+        # The ATTEMPT clock the flight-age bound reads (#1926): `run_started_at` for one run,
+        # so a test states the age of ONE attempt. An id it did not stub is a 404 -- an
+        # unreadable clock, never a green.
+        # ⛔ ANCHORED ON THE EXACT PATH. A bare `/actions/runs/` substring also matches
+        # `.../actions/runs/{id}/jobs?per_page=100` (the CI-duration sample) and
+        # `.../job/{id}`, and `int()` on those raises INSIDE the fixture -- the first test that
+        # stubs a SUCCESSFUL CI sample would crash in the harness rather than fail on behaviour.
+        m = re.fullmatch(r".*/actions/runs/(\d+)", s)
+        if m:
+            return (runs or {}).get(int(m.group(1)), _Result(1, "", "HTTP 404"))
         # ⛔ MATCH THE ARGS, NOT THE BINARY'S SPELLING (2026-10-18). `objective.GH_BIN` resolves to
         # `~/bin/gh` (GH_REAL_PIN) or a layer shim on any box where that file exists, so a stub keyed
         # on `cmd[:3] == ["gh","pr","list"]` matched only where NO pin exists (a clean CI container)
@@ -963,6 +978,465 @@ def test_a_stale_sample_does_not_manufacture_a_growth_verdict(monkeypatch):
     assert "VERDICT=ADVANCING" in line, line
 
 
+# --- #1926: A CHECK-RUN THAT NEVER COMPLETES IS NOT "IN FLIGHT" FOREVER --------------------
+# GitHub does not reconcile a run that was never picked up (a cancelled workflow, a runner that
+# never came up, a job created and then orphaned): `status` stays non-`completed` at that head
+# PERMANENTLY. Nothing in the classifier looked at a check's AGE, so the shape could never
+# leave it: a wedged run is PRESENT in `seen` while never reaching `completed`, so every
+# absence-based arm is structurally blind to it -- and `rollup_checks` puts it in `flight`.
+# MEASURED on this branch's original base (main=57edbd7a0) `classify_queue` returns
+# `{'fix-ci': 1}` -- "go repair the code" for a job that never ran. On the MERGED tree (#1930
+# landed) the same state reads `running`: a wait that never ends, which is what #1930's own
+# commit body recorded as #1926 "(`running` has no age bound, so a wedged check-run parks a PR
+# forever)". Both are pinned below.
+#
+# The fix carries the ONE missing dimension: the ATTEMPT's age. Pinned below, both ways: below
+# the bound nothing changes (a slow shard is not a stuck one), above it the class is the
+# re-trigger the issue asks for, with a reason naming the check and its age.
+
+NOW = 1_800_000_000.0                  # a FIXED clock: the bound is pinned, not the wall clock
+# An age past the bound by a wide margin. A LITERAL, not `FLIGHT_BOUND_MIN + something`: the
+# constant's own range is pinned separately, so this cannot drift out of validity silently.
+WEDGED_MIN = 150
+# The contexts a landing waits on, spelled INDEPENDENTLY of the code. That does NOT make EVERY
+# test below fail behaviourally pre-fix: `stalled_flight` is a new symbol, so a pre-fix run
+# fails most of them with AttributeError. The BEHAVIOURAL ones are
+# `test_a_run_past_the_bound_is_rerun_checks_not_a_wait` (the classifier's own answer, no new
+# symbols needed: `running` on the merged tree, `fix-ci` on this branch's original base) and
+# `test_the_beat_names_the_wedged_check_and_its_age` (it drives `classify_queue` only); the
+# rest pin the contract.
+GATED_FOR_TEST = ("pricing-artifact", "docs", "test-isolation", "license-surface",
+                  "legal-e2e", "python-ci-gate")
+
+_SEQ = itertools.count(1)
+
+
+def _iso(ts):
+    """The shape GitHub returns: `2026-10-17T05:30:12Z`."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _run(name, status, *, started_min=None, conclusion=None, run=9001, app="github-actions"):
+    """A REST check-run in the shape `per_pr_checks()` reads (see a live body: `check_suite` is
+    an id, `started_at` is NULL for a run that never started, and `details_url` carries the
+    ACTIONS RUN id). The `id` is a counter, so the LAST one built is the NEWEST ATTEMPT -- the
+    rule the code groups by."""
+    cid = next(_SEQ)
+    c = {"id": cid, "name": name, "status": status, "conclusion": conclusion,
+         "details_url": f"https://x/actions/runs/{run}/job/{cid}",
+         "app": {"slug": app}}
+    if started_min is not None:
+        c["started_at"] = _iso(NOW - started_min * 60)
+    return c
+
+
+def _clock(*, attempt_min):
+    """The injected run clock: every run's current attempt started `attempt_min` ago."""
+    return lambda run_id: None if run_id is None else NOW - attempt_min * 60
+
+
+def _wedged_cr(*, age_min=WEDGED_MIN, status="queued", started=False, wedge="python-ci-gate",
+               run=9001):
+    """Gated checks green, `wedge` non-completed. Extras must be appended by the CALLER (the
+    fixture builds in order, and the newest attempt is the last one built)."""
+    cr = [_run(n, "completed", conclusion="success")
+          for n in GATED_FOR_TEST if n != wedge]
+    cr.append(_run(wedge, status, run=run,
+                   started_min=age_min if started else None))
+    return cr
+
+
+def _a_pr(ms="UNSTABLE"):
+    return {"number": 8822, "mergeStateStatus": ms, "headRefOid": "a" * 40, "files": []}
+
+
+def test_a_run_past_the_bound_is_rerun_checks_not_a_wait():
+    """THE DEFECT. A required check left `queued` -- the shape the issue names -- others green.
+
+    PRE-FIX `classify_pr` has no age term (no `stalled` argument at all), so the wedged check is
+    simply `in flight`. On the MERGED tree (#1930 landed) that answers `running`: the head is
+    assumed to be executing, both readers skip the PR, and nothing will ever complete it. On
+    this branch's original base it answered `fix-ci`: a lane sent to repair code for a job that
+    never ran. POST-FIX it is the actionable class the issue asks for, and the reason names the
+    check, its state and its age.
+    """
+    cr = _wedged_cr(age_min=WEDGED_MIN)
+    assert objective.classify_pr(_a_pr(), cr, False) == "running"     # no age term today
+    stalled = objective.stalled_flight(cr, now=NOW, run_clock=_clock(attempt_min=WEDGED_MIN))
+    assert [(n, st) for n, st, _a in stalled] == [("python-ci-gate", "queued")]
+    assert round(stalled[0][2]) == WEDGED_MIN
+    assert objective.classify_pr(_a_pr(), cr, False, stalled) == "rerun-checks"
+
+
+def test_below_the_bound_a_slow_run_is_still_a_wait(monkeypatch):
+    """THE OTHER SIDE, END TO END through `classify_queue` -- the fix must not turn a SLOW run
+    into a re-trigger. 20 minutes into a queued suite is the NORMAL state of a push."""
+    cr = _wedged_cr(age_min=20, status="in_progress", started=True)
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9001: _Result(0, json.dumps({"run_started_at": _iso(NOW - 20 * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 0, classes
+    assert "rerun-checks" not in by_class, by_class
+
+
+def test_the_bound_is_a_constant_pinned_on_both_sides():
+    """A bound nobody pins is a number that drifts. Just either side of it: +-1 minute."""
+    # ...and it must stay in the range `WEDGED_MIN` is above, so a retune cannot invalidate it.
+    assert 60.0 <= objective.FLIGHT_BOUND_MIN <= 120.0, objective.FLIGHT_BOUND_MIN
+    # ...and the set it ages is the required set MINUS the diff-bound gate, which has its own
+    # evidence (the attestation file) and cannot be repaired by a re-run.
+    assert objective.GATED_CHECKS == GATED_FOR_TEST, objective.GATED_CHECKS
+    # ...and above the queue-INCLUSIVE wall time this file documents (44.3m): the clock for a
+    # never-started run includes the runner queue, so a bound below that would fire on normal
+    # load. That is the derivation the constant's comment states.
+    assert objective.FLIGHT_BOUND_MIN > 44.3
+    below = _wedged_cr(age_min=objective.FLIGHT_BOUND_MIN - 1, status="in_progress",
+                       started=True)
+    above = _wedged_cr(age_min=objective.FLIGHT_BOUND_MIN + 1, status="in_progress",
+                       started=True)
+    assert objective.stalled_flight(below, now=NOW) == []
+    assert len(objective.stalled_flight(above, now=NOW)) == 1
+
+
+def test_a_re_trigger_resets_the_age(monkeypatch):
+    """THE ANTI-CHURN PIN. A re-run REUSES the check suite (MEASURED 2026-10-17, agent-infra run
+    39004542024: attempts 1 and 2 both carry suite 105706798511) while the RUN's
+    `run_started_at` advances. So the age must come from the run's CURRENT attempt: aged from
+    the suite's original `created_at`, a PR whose wedge was just re-triggered would read wedged
+    again on the very next beat and be re-triggered forever."""
+    # the same check, re-triggered into a NEW run whose current attempt started 2m ago
+    cr = _wedged_cr(age_min=None, run=9100)
+    clock = _clock(attempt_min=2)
+    assert objective.stalled_flight(cr, now=NOW, run_clock=clock) == []
+    # ...and the pre-re-trigger run, whose attempt started WEDGED_MIN ago, IS wedged
+    cr_old = _wedged_cr(age_min=None, run=9001)
+    assert len(objective.stalled_flight(cr_old, now=NOW,
+                                       run_clock=_clock(attempt_min=WEDGED_MIN))) == 1
+
+
+def test_the_attempt_clock_is_read_once_per_run_and_only_when_needed(monkeypatch):
+    """A started check carries its own `started_at`, so it must cost NO run read -- the fleet's
+    GitHub budget is shared and rate-limited. A queued one spends exactly one read per RUN."""
+    seen = []
+
+    def fake_run(cmd, **kw):
+        s = " ".join(cmd)
+        seen.append(s)
+        if "/actions/runs/" in s:
+            return _Result(0, json.dumps({"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))
+        return _Result(0, "{}")
+    monkeypatch.setattr(objective.subprocess, "run", fake_run)
+    clock = objective._pass_run_clock()
+    # Two gated checks in ONE run, plus one that has already STARTED -- in its OWN run, left
+    # UNSTUBBED (so a read for it is a 404). The pin is the CALL COUNT: one read for the run
+    # that needs a clock, none for the started check (which ages by its own `started_at`), and
+    # still one on the second pass (the per-pass memo). `docs` is asserted STALLED, so a clock
+    # that 404s and thereby LOST the started check would fail here too.
+    cr = [_run("python-ci-gate", "queued", run=9001),
+          _run("legal-e2e", "queued", run=9001),
+          _run("docs", "in_progress", started_min=WEDGED_MIN, run=9002)]
+    first = objective.stalled_flight(cr, now=NOW, run_clock=clock)
+    second = objective.stalled_flight(cr, now=NOW, run_clock=clock)
+    assert len(seen) == 1, seen
+    assert [n for n, _st, _a in first] == ["docs", "legal-e2e", "python-ci-gate"], first
+    assert [n for n, _st, _a in second] == ["docs", "legal-e2e", "python-ci-gate"], second
+
+
+def test_an_unreadable_clock_leaves_the_run_in_flight():
+    """ABSENCE IS NOT EVIDENCE. If the clock cannot be read the run stays in flight (unchanged
+    behaviour) -- an unreadable age must never manufacture a re-trigger."""
+    cr = _wedged_cr(age_min=None)
+    assert objective.stalled_flight(cr, now=NOW, run_clock=lambda rid: None) == []
+    assert objective.stalled_flight(cr, now=NOW, run_clock=None) == []
+    # ...and nothing about the class changes: it is still the in-flight WAIT (`running` on the
+    # merged tree, `fix-ci` on this branch's original base), never a manufactured re-trigger.
+    assert objective.classify_pr(_a_pr(), cr, False, []) == "running"
+
+
+def test_a_red_check_is_work_even_beside_a_wedged_one():
+    """A RED gated check is NEVER masked by the re-trigger: re-running the suite would only
+    hide real code work for a pass (the same rule the `running` verdict states, #1872)."""
+    cr = _wedged_cr(age_min=WEDGED_MIN)
+    cr.append(_run("docs", "completed", conclusion="failure"))     # newest docs attempt: RED
+    stalled = objective.stalled_flight(cr, now=NOW, run_clock=_clock(attempt_min=WEDGED_MIN))
+    assert stalled, "the wedge is still reported"
+    assert objective.classify_pr(_a_pr(), cr, False, stalled) == "fix-ci"
+
+
+def test_ordering_follows_the_recorded_ladder_and_the_gate_is_never_aged():
+    """Two ordering facts pinned by the arms, not by accident:
+    * a WEDGED check outranks a DIRTY one (`rerun-checks` sits ABOVE `resolve-conflict` in
+      `CLASS_ORDER`, which is the owner-designed ladder: a missing check tells you NOTHING and a
+      rebase CHANGES THE HEAD). An arm placed after the conflict arm would silently diverge from
+      that recorded order;
+    * `ai-review-gate` is DIFF-BOUND and is never in the aged set (a re-run cannot make an
+      attestation appear), so a stalled gate alone never reads `rerun-checks`."""
+    cr = _wedged_cr(age_min=WEDGED_MIN)
+    stalled = objective.stalled_flight(cr, now=NOW, run_clock=_clock(attempt_min=WEDGED_MIN))
+    assert objective.classify_pr(_a_pr(ms="DIRTY"), cr, False, stalled) == "rerun-checks"
+    gate = [_run(n, "completed", conclusion="success")
+            for n in GATED_FOR_TEST if n != "ai-review-gate"]
+    gate.append(_run("ai-review-gate", "queued", run=9002))
+    assert objective.stalled_flight(gate, now=NOW,
+                                    run_clock=_clock(attempt_min=WEDGED_MIN)) == []
+
+
+def test_two_workflows_sharing_a_job_name_are_named_once_by_the_older_attempt():
+    """`docs` published by two workflows, both stuck. `rollup_checks` collapses the pair to one
+    name, so the reason must too -- and it keeps the OLDER attempt, the one that has been stuck
+    longest. The clock VARIES by run id, so an implementation that kept the newest attempt
+    (the fixture's last one) would report WEDGED_MIN and fail here."""
+    cr = _wedged_cr(age_min=None, wedge="docs", run=9001)
+    cr.append(_run("docs", "queued", run=9003))                    # newest attempt, YOUNGER
+    ages = {_run_id: min for _run_id, min in (("9001", WEDGED_MIN + 30), ("9003", WEDGED_MIN))}
+    stalled = objective.stalled_flight(
+        cr, now=NOW, run_clock=lambda rid: NOW - ages[rid] * 60)
+    assert [(n, st) for n, st, _a in stalled] == [("docs", "queued")]
+    assert round(stalled[0][2]) == WEDGED_MIN + 30
+
+
+def _absent_gate_cr():
+    """Every gated context GREEN except `python-ci-gate`, which was never CREATED (it exists only
+    once its matrix children have finished, so a NON-required child is the only thing that can
+    produce it -- the shape #1926 calls the normal state rather than an edge case)."""
+    return [_run(n, "completed", conclusion="success")
+            for n in GATED_FOR_TEST if n != "python-ci-gate"]
+
+
+def test_a_fresh_attempt_is_not_hidden_by_a_stalled_namesake():
+    """⛔ "EVERY CHECK IN FLIGHT IS PAST THE BOUND" IS A QUESTION ABOUT JOBS, NOT NAMES
+    (#1926 review, P2).
+
+    `rollup_checks`' `flight` is a SET of names and the aged list was collapsed to ONE entry per
+    name (keeping the older attempt), so `len(flight_stalled) == len(flight)` compared NAMES:
+    `script-validate` published by two workflow RUNS at this head -- one attempt stalled past the
+    bound, one two minutes old -- read `1 == 1`, and the classifier re-triggered a suite that was still
+    PROGRESSING. A re-trigger is not free: it discards the fresh job's work and resets its age
+    (the very thing `newest_attempts`' per-run grouping exists to read honestly), and the reason
+    misnames a healthy sibling as stuck.
+
+    PRE-FIX the classifier call below answers `rerun-checks` (the name-level equality, reproduced
+    by handing it the NAME-COLLAPSED list); POST-FIX a fresh attempt makes the ATTEMPT counts
+    differ, and the head stays a WAIT.
+    """
+    cr = _absent_gate_cr()
+    cr.append(_run("script-validate", "queued", run=9101))                # stalled past bound
+    cr.append(_run("script-validate", "in_progress", run=9102,
+                   started_min=2))                                          # FRESH
+    ages = {"9101": WEDGED_MIN, "9102": 2}
+
+    def clock(rid):
+        return None if rid is None else NOW - ages[rid] * 60
+
+    # both attempts are read as separate JOBS (grouped per workflow run, not per name)
+    assert objective.inflight_attempts(cr) == [("script-validate", "in_progress"),
+                                               ("script-validate", "queued")]
+    collapsed = objective.stalled_flight(cr, now=NOW, run_clock=clock, restrict=None)
+    assert [(n, round(a)) for n, _st, a in collapsed] == [("script-validate", WEDGED_MIN)]
+    per_attempt = objective.stalled_flight(cr, now=NOW, run_clock=clock, restrict=None,
+                                          collapse=False)
+    assert [(n, round(a)) for n, _st, a in per_attempt] == [("script-validate", WEDGED_MIN)]
+
+    # THE DEFECT, through the classifier: the fresh namesake can still create the absent gate,
+    # so this is a WAIT -- today (name-level) it answered `rerun-checks` for the collapsed list.
+    assert objective.classify_pr(_a_pr(), cr, False, [], collapsed) == "running"
+    assert objective.classify_pr(_a_pr(), cr, False, [], per_attempt) == "running"
+    # ...and the wedge evidence agrees from both list shapes
+    assert objective.wedge_evidence([], ["python-ci-gate"],
+                                    objective.inflight_attempts(cr), per_attempt) == []
+
+
+def test_a_duplicate_job_name_with_every_attempt_stalled_is_still_a_re_trigger():
+    """THE OTHER SIDE of the per-attempt fix, so it cannot turn a real wedge into a wait: when
+    EVERY attempt of the duplicated name is past the bound nothing can create the absent gate,
+    and the reason still names the check ONCE with the OLDER age."""
+    cr = _absent_gate_cr()
+    cr.append(_run("script-validate", "queued", run=9101))
+    cr.append(_run("script-validate", "queued", run=9103))
+    ages = {"9101": WEDGED_MIN + 30, "9103": WEDGED_MIN}
+
+    def clock(rid):
+        return None if rid is None else NOW - ages[rid] * 60
+
+    per_attempt = objective.stalled_flight(cr, now=NOW, run_clock=clock, restrict=None,
+                                          collapse=False)
+    assert len(per_attempt) == 2, per_attempt
+    assert objective.inflight_attempts(cr) == [("script-validate", "queued")] * 2
+    assert objective.classify_pr(_a_pr(), cr, False, [], per_attempt) == "rerun-checks"
+    assert [(n, round(a)) for n, _st, a in
+            objective.wedge_evidence([], ["python-ci-gate"],
+                                     objective.inflight_attempts(cr), per_attempt)] == \
+        [("script-validate", WEDGED_MIN + 30)]
+
+
+def test_the_beat_does_not_re_trigger_a_fresh_duplicate_attempt(monkeypatch):
+    """END TO END through `classify_one`/`classify_queue`, i.e. the path the fleet actually runs:
+    a stalled attempt of `script-validate` beside a FRESH namesake keeps the head a WAIT. This
+    pins the WIRING too -- `classify_one` must hand `wedge_evidence` the per-attempt list
+    (`collapse=False`), not the name-collapsed one the beat prints."""
+    cr = _absent_gate_cr() + [_run("script-validate", "queued", run=9101),
+                              _run("script-validate", "in_progress", run=9102, started_min=2)]
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9101: _Result(0, json.dumps(
+                {"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 0, classes
+    assert classes["running"] == 1, classes
+    assert "rerun-checks" not in by_class, by_class
+
+
+def test_the_beat_names_a_stalled_duplicate_name_once_with_its_worst_age(monkeypatch):
+    """END TO END for the reason a lane reads: BOTH attempts of `script-validate` stalled is a
+    re-trigger, and the beat prints ONE line per name, aged by the OLDER attempt (`stalled_flight`'s
+    collapse is still what the TEXT wants)."""
+    cr = _absent_gate_cr() + [_run("script-validate", "queued", run=9103),
+                              _run("script-validate", "queued", run=9101)]
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9101: _Result(0, json.dumps(
+                      {"run_started_at": _iso(NOW - (WEDGED_MIN + 30) * 60)})),
+                  9103: _Result(0, json.dumps(
+                      {"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 1, classes
+    assert by_class["rerun-checks"] == [(8822, f"script-validate queued {WEDGED_MIN + 30}m")], \
+        by_class
+
+
+def test_the_beat_names_the_wedged_check_and_its_age(monkeypatch):
+    """END TO END through the classifier the beat actually prints: `rerun-checks=1:
+    #8822(python-ci-gate queued 150m)` -- WHICH check, in which state, for how long. A bare
+    `rerun-checks=1: #8822` would make a wedged run and a head whose checks never got created
+    look identical, and they need different repairs."""
+    cr = _wedged_cr(age_min=None)
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9001: _Result(0, json.dumps({"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 1, classes
+    why = f"python-ci-gate queued {WEDGED_MIN}m"
+    assert by_class["rerun-checks"] == [(8822, why)], by_class
+    assert (objective._class_token("rerun-checks", 1, by_class["rerun-checks"])
+            == f"rerun-checks=1: #8822({why})")
+
+
+def _child_cr(*, age_min, absent="python-ci-gate", child="test (a)", started=False, run=9001,
+              status=None):
+    """The OTHER shape #1926 names: the gate job was never CREATED (it is created only after its
+    matrix children finish) while a NON-required child sits at this head. `absent` says which
+    gated context is missing; the child is the check-run that keeps `gated_absent and flight`
+    true."""
+    cr = [_run(n, "completed", conclusion="success")
+          for n in GATED_FOR_TEST if n != absent]
+    cr.append(_run(child, status or ("in_progress" if started else "queued"), run=run,
+                   started_min=age_min if started else None))
+    return cr
+
+
+def test_an_absent_gate_beside_children_that_cannot_complete_is_a_re_trigger():
+    """⛔ THE SECOND HALF OF THE `running` ARM MUST BE BOUNDED TOO (#1926 review, P1).
+
+    Arm 5 is `(gated_flight or (gated_absent and flight)) and not gated_red`. The bound this
+    branch added covered `gated_flight` only, so `gated_absent and flight` -- a required gate
+    that is absent because its matrix children have not finished, which #1926 itself calls "the
+    normal state, not an edge case" -- waited with NO age term. A child left `queued` by a runner
+    that never came up therefore kept `python-ci-gate` from ever being created and answered
+    `running` for ever: the same never-ending wait, one level down.
+
+    PRE-FIX this shape is `running` at every age, and the UN-AGED call below still says so (it is
+    the only call a pre-fix build accepts -- the pre-fix signature has no `flight_stalled` at
+    all). Supplying the aged list is the whole difference, which is what makes this test
+    discriminating rather than a symbol check.
+    """
+    wedged = _child_cr(age_min=WEDGED_MIN)
+    clock = _clock(attempt_min=WEDGED_MIN)
+    all_stalled = objective.stalled_flight(wedged, now=NOW, run_clock=clock, restrict=None)
+    # `restrict=None` ages EVERY context -- the required set alone cannot see a child job
+    assert [(n, st) for n, st, _a in all_stalled] == [("test (a)", "queued")]
+    assert objective.stalled_flight(wedged, now=NOW, run_clock=clock) == [], "not a GATED check"
+    assert objective.classify_pr(_a_pr(), wedged, False) == "running"          # the un-aged wait
+    assert objective.classify_pr(_a_pr(), wedged, False, [], all_stalled) == "rerun-checks"
+    # ...and a wedged child outranks DIRTY for the same reason a wedged gate does
+    assert objective.classify_pr(_a_pr(ms="DIRTY"), wedged, False, [], all_stalled) == \
+        "rerun-checks"
+
+    # THE OTHER SIDE: the bound must not fire on a NORMAL push. A child 20 minutes into a queued
+    # suite (or an unreadable clock) is a WAIT, and a PARTIALLY wedged flight set is not "nothing
+    # can complete" either -- one fresh job can still create the gate.
+    slow = _child_cr(age_min=20, started=True)
+    assert objective.stalled_flight(slow, now=NOW, run_clock=clock, restrict=None) == []
+    assert objective.classify_pr(_a_pr(), slow, False, [], []) == "running"
+    no_clock = _child_cr(age_min=None)
+    assert objective.stalled_flight(no_clock, now=NOW, run_clock=lambda rid: None,
+                                   restrict=None) == []
+    assert objective.classify_pr(_a_pr(), no_clock, False, [], []) == "running"
+    mixed = _child_cr(age_min=WEDGED_MIN)
+    mixed.append(_run("test (b)", "in_progress", started_min=2, run=9002))
+    partial = objective.stalled_flight(mixed, now=NOW, run_clock=clock, restrict=None)
+    assert [n for n, _st, _a in partial] == ["test (a)"], partial    # not ALL of flight
+    assert objective.classify_pr(_a_pr(), mixed, False, [], partial) == "running"
+
+
+def test_the_beat_names_the_wedged_child_and_its_age(monkeypatch):
+    """END TO END for the absent-gate shape: `rerun-checks=1: #8822(test (a) queued 150m)`.
+
+    The reason is the difference between the two repairs, so it must reach the beat (and from
+    there `pr-doctor`'s brief) for THIS shape too -- not only for a wedged REQUIRED check.
+    """
+    cr = _child_cr(age_min=None)
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9001: _Result(0, json.dumps({"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 1, classes
+    assert by_class["rerun-checks"] == [(8822, f"test (a) queued {WEDGED_MIN}m")], by_class
+
+
+def test_a_run_id_that_is_not_all_digits_is_not_a_clock():
+    """⛔ `_run_id()` IS INTERPOLATED INTO A `gh api` PATH (#1926 review, P2).
+
+    The segment comes from the check-run's `details_url`, i.e. from the check-run's AUTHOR, and it
+    is pasted into `repos/<org>/<repo>/actions/runs/<id>`. `..` normalises that onto a DIFFERENT
+    endpoint, and any other crafted segment spends an authenticated GET on the fleet's shared,
+    rate-limited token. A real run id is always all digits, so anything else is not a clock --
+    None, which `flight_age_min` already treats as unreadable (fail-closed, no re-trigger).
+    """
+    good = "https://github.com/o/r/actions/runs/39004542024/job/123"
+    assert objective._run_id(good) == "39004542024"
+    for hostile in ("https://x/actions/runs/../job/1",
+                    "https://x/actions/runs/%2e%2e/job/1",
+                    "https://x/actions/runs/39004542024?x=1",
+                    "https://x/actions/runs/abc/job/1",
+                    "https://x/actions/runs//job/1",
+                    "",
+                    None):
+        assert objective._run_id(hostile) is None, hostile
+    # ...and an unparseable id reads as an UNREADABLE clock, never as age 0 ("just started")
+    lone = _run("python-ci-gate", "queued", run=1)
+    lone["details_url"] = "https://x/actions/runs/../job/1"
+    assert objective.flight_age_min(lone, now=NOW, run_clock=lambda rid: NOW) is None
+
+
+def test_the_gated_set_has_one_owner_in_this_file():
+    """STRUCTURAL: `classify_pr` may not carry its own copy of the gated set (#1926 review, P2).
+
+    `GATED_CHECKS` (the AGED set) and an inline `[n for n in REQUIRED if n != "ai-review-gate"]`
+    (the ARM's set) were two owners of one fact, and nothing pinned them equal -- an edit to
+    either left the bound and the arm silently divergent. The file's own rule is ONE grouping for
+    the whole file (`newest_attempts`), so the copy is pinned OUT.
+    """
+    src = pathlib.Path(objective.__file__).read_text()
+    assert 'for n in REQUIRED if n != "ai-review-gate"]' not in src
+    assert "gated = list(GATED_CHECKS)" in src
+    # ...and the behaviour agrees: the aged set is the six gated contexts, spelled independently
+    assert tuple(objective.GATED_CHECKS) == GATED_FOR_TEST
 # --- THE PER-CLASS SEGMENT IS **STATE**, NOT A SECOND DISPATCH LIST (#1872) ---------------
 # The beat printed `DO: call-rail=1: #8795 (STUCK 3 beats — land or say why)` while `pr-doctor`
 # was running its own pass over the SAME PRs -- two copies of one decision, and the fleet follows

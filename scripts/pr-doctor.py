@@ -18,8 +18,13 @@ fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
                      current head, and the rail itself would take it -> dispatch: call the rail
     blocked-by-rail  ...the same, but a gate `admin-merge.sh` enforces is refusing it
                      (`flip-gate`/`drift-guard`/`provenance`) -> dispatch: repair that gate
-    rerun-checks     a required check never ran at this head (absence is not green)
-                     -> dispatch: re-trigger the workflows
+    rerun-checks     a required check never ran at this head (absence is not green), OR a run at
+                     this head is WEDGED -- non-completed past `objective.FLIGHT_BOUND_MIN`, i.e.
+                     a run nothing will ever complete -- -> dispatch: re-trigger the workflows.
+                     The two shapes are NOT the same repair, so `why` tells them apart: a wedged
+                     run carries the check, its state and its age (`python-ci-gate queued
+                     150m`), and the brief says WEDGED; a head whose checks never got created
+                     carries `why is None` and the brief says NEVER RAN.
     resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
     record-review    the six gated checks green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
@@ -203,7 +208,11 @@ except BaseException as _exc:      # a sibling that cannot be executed, not mere
 # door; the contract cannot claim to be a partition while one of its doors bypasses it. A module
 # global is therefore set here and turned into a RECORDED refusal at the top of `main()`, where
 # `record_exit` exists (it is defined below this point, which is why the raise could not record).
-_SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
+_SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN",
+         # ⛔ AGED FROM #1926: a farmed pr-doctor.py beside a pre-#1926 objective.py must name
+         # the missing symbol in ONE line rather than failing per PR after the queue was read.
+         "FLIGHT_BOUND_MIN")
+
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
 SEAM_ERROR = _LOAD_ERROR or (
     ("%s is missing %s -- it is an older copy than this driver expects. Refusing to run rather "
@@ -1764,6 +1773,9 @@ def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     req = list(CLASSIFIER.REQUIRED)
     seen = {c.get("name") for c in (cr or []) if c.get("name")}
     absent = [c for c in req if c not in seen]
+    # `ai-review-gate` is DIFF-BOUND: a re-trigger cannot start it and its truth is the head-bound
+    # attestation FILE, so it is not one of the "never created" checks a wedged brief names.
+    gated_absent = [c for c in absent if c != "ai-review-gate"]
 
     # ⛔ HOW THE WORK GETS BACK ONTO THE PR -- ONE CONTRACT, BOTH WORKTREE SHAPES. A base-repo
     # worktree is attached to the branch, OR DETACHED at the PR head when a fork's ref, a lane's
@@ -1839,6 +1851,38 @@ is recorded at this head — so this is **not "not ready"**: it is a NAMED defec
 {common}""".format(n=n, title=title, head=head[:12], why=why or "?", common=common)
 
     if action == "rerun-checks":
+        # ⛔ TWO SHAPES, TWO BRIEFS (#1926 review, P1). A wedged run (past the flight bound) and a
+        # head whose checks never got created BOTH read `rerun-checks`, and they need different
+        # repairs. This branch used to describe EVERY `rerun-checks` as "these required checks
+        # never ran ... nothing is in flight" -- FALSE for a check that DOES exist at the head and
+        # IS pending, which is exactly the shape the bound exists to surface, and it named the
+        # absent names (typically `ai-review-gate`, which no re-trigger can start) while never
+        # naming the wedged one. `why` is the discriminator `classify_one()` already produces.
+        if why:
+            return """# #{n} — WEDGED RUN AT THIS HEAD. Re-trigger it, then merge it.
+
+**#{n}** {title}
+Head `{head}`. **A run here is stuck, not slow: {why}** -- non-completed past the
+{bound:.0f}-minute flight bound this predicate ages against. GitHub does not reconcile a run that
+was never picked up, so **nothing will ever complete it**. This is NOT a wait, and it is not a
+failure to repair: the run has to be STARTED again.
+
+**Absent at this head** (a re-trigger does not create these; they appear once their own jobs run):
+{gated_absent}
+
+So:
+1. Re-trigger the workflow run behind `{why}` -- `gh run rerun <run-id>` on this head (or
+   `gh workflow run` for the same ref if the run is unrecoverable). A re-run is a NEW attempt at
+   the SAME head, which is what resets the age.
+2. Confirm the 7 required contexts are present AND completing: `pricing-artifact docs
+   test-isolation license-surface legal-e2e python-ci-gate ai-review-gate`.
+3. Then run the loop below.
+{common}""".format(n=n, title=title, head=head[:12], why=why,
+                     bound=float(CLASSIFIER.FLIGHT_BOUND_MIN),
+                     gated_absent=", ".join(gated_absent)
+                     or "(none — every gated context is present; the wedged one is named above)",
+                     common=common)
+
         return """# #{n} — REQUIRED CHECK(S) NEVER RAN. Start them, then merge it.
 
 **#{n}** {title}

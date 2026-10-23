@@ -2324,6 +2324,52 @@ def test_a_failed_pr_read_refuses_with_its_own_exit_code(monkeypatch):
     monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None)
     assert pr.main() == 0
 
+
+
+
+
+
+
+
+
+def test_the_wedged_re_run_brief_states_the_measured_state():
+    """⛔ THE BRIEF IS THE ORDER A LANE EXECUTES (#1926 review, P1), and `rerun-checks` is TWO
+    shapes that need DIFFERENT repairs. `classify_one()` now produces `why` for a wedged run
+    (`python-ci-gate queued 150m`), and this file -- the one that renders the text -- described
+    every `rerun-checks` as "these required checks never ran ... nothing is in flight". That is
+    FALSE for a check that exists at the head and IS pending (the exact shape #1926 is about),
+    and it named the ABSENT names instead -- typically `ai-review-gate`, a diff-bound gate no
+    re-trigger can start -- while the wedged check was never named at all.
+    """
+    ready = dict(_pr(1))
+    wedged = pr.brief(ready, "rerun-checks", "python-ci-gate queued 150m",
+                      _cr(absent=["python-ci-gate"]))
+    # 1. the measured state and its age reach the order (they were dropped entirely before)
+    assert "python-ci-gate queued 150m" in wedged, wedged
+    # 2. the claims that are FALSE for this shape are gone
+    assert "Nothing is in flight" not in wedged, wedged
+    assert "never ran" not in wedged, wedged
+    # 3. the bound it was judged against is named, so the lane can tell a wedge from a slow run
+    assert "%d-minute" % int(pr.CLASSIFIER.FLIGHT_BOUND_MIN) in wedged, wedged
+    # 4. the ABSENT list it names is the re-triggerable one -- `ai-review-gate` is diff-bound and
+    #    clears by RECORDING, so naming it as "never ran" sends the lane at a gate no re-run opens
+    absent_line = [ln for ln in wedged.splitlines() if ln.startswith("**Absent at this head**")]
+    assert absent_line, wedged
+    names = wedged.splitlines()[wedged.splitlines().index(absent_line[0]) + 1]
+    assert "ai-review-gate" not in names, names
+    # 5. and it says what to DO about a wedge, which is a re-run of the RUN, not an empty commit
+    assert "gh run rerun" in wedged, wedged
+
+    # THE OTHER SIDE: a head whose checks never got CREATED (`why is None`) keeps the absence
+    # wording -- the two shapes must not collapse back into one text.
+    never = pr.brief(ready, "rerun-checks", None, _cr(absent=["docs"]))
+    assert "never ran" in never and "Nothing is in flight" in never, never
+    assert "WEDGED" not in never, never
+    assert "150m" not in never, never
+
+
+# ── 5. an unreadable queue is NOT an empty one: the exit codes differ ────────────────────
+
 def test_open_prs_separates_an_empty_queue_from_a_failed_read(monkeypatch):
     """`open_prs()` must report WHY, because `[]` is also the legitimate empty answer."""
     monkeypatch.setattr(pr, "log", lambda msg: None)
