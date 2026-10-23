@@ -310,8 +310,9 @@ never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
-Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty `*.sh` plus `gh-rest/gh`
-and `gh-limit.py` — twenty-two entries (`install.sh:810`) — and this file **is** on it (added when
+Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty-two `*.sh` plus `gh-rest/gh`
+and `gh-limit.py` — twenty-four entries (`install.sh:855`, moved by this PR's own added line) —
+and this file **is** on it (added when
 `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale `$O/nonblocking-dispatch.sh`
 names itself instead of silently leaving every background dispatch to fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
@@ -818,7 +819,7 @@ its deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`).
 recursive `find`, so **the rule is: every file that is not a top-level `*.sh` is outside that
 comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/gh`, `$O/gh-limit/gh`,
 `$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
-`install.sh`'s `DRIFTED` list (`install.sh:810`) carries exactly two of them — `gh-rest/gh` and
+`install.sh`'s `DRIFTED` list (`install.sh:855`) carries exactly two of them — `gh-rest/gh` and
 `gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
 `gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
 `launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
@@ -2940,6 +2941,45 @@ The refusal is a *different* refusal from a capacity one, and the vocabulary say
 own words that it is **not** a capacity transfer (the backlog is repo-wide, so handing the issue to a
 peer box cannot clear it — the remedy is to LAND). Full contract and the four cases: 
 `capacity-transfer.test.sh` §LB.
+
+---
+
+### 7.2h Every gate measured THE BOX — none measured the CI QUEUE (agent-infra#2296)
+
+A box with 20 free lane slots and a 90-deep CI queue measures as **healthy** on every gate this
+harness had (`load=`, `mem_avail=`, `swap_free=`, `capacity-placement`). Measured 2026-10-22 13:40
+UTC: tortoise `queued=92 in_progress=6` on 5 runners, agent-infra `queued=97 in_progress=7`. Nothing
+finished because everything started, and every push in that state buys a verdict that arrives after
+the lane has stopped waiting for it — while DESTROYING the head-bound review attestation of the PR it
+touched (a record certifies exactly one revision, agent-infra#2148).
+
+The remedy is `ci-queue.sh`: one sourced module (also runnable standalone —
+`bash ci-queue.sh status --repo owner/name`) that reads the queue over REST (`gh` through the same
+`gh-rest`/`gh-limit` shims as every other read: no GraphQL, no new credential) and answers ONE
+question — may this box send more CI-spending work yet. The ceiling is **derived**, not a constant:
+`ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
+owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
+nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
+(one read per PASS — the sweep's and the dispatch block's, so at most TWO live reads per cycle —
+in-shell, before dispatch — and THREE fixer spawn arms: the CONFLICTED one, the
+CI-red one, and the review-gate one, whose product is also a new head — plus the CI RERUN, which is
+the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
+whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes). ⛔ The FOURTH
+fixer spawn arm — the RED-TREE one — is NOT gated yet: it books its attempt and spawns before any
+`ciq_push_ok` call, so a deep queue still starts that lane and `fix-one.sh` defers its first push.
+Disclosed rather than implied; home agent-infra #2408. ⛔ That census is the SWEEP's, not the
+fleet's: `pr-doctor`'s `prfix` workers are a **second** ungated pusher and are not an orch-loop arm
+at all — `pr-doctor.py` spawns up to `MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or
+`gh run rerun`) with no queue read (`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd
+job still adds CI behind a deep queue; wiring that surface is agent-infra #2540.
+
+Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
+`run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
+(fail-closed, because the alternative makes a `gh` outage indistinguishable from an empty queue),
+and every deferral emits ONE line naming the depth, the runners, the ceiling and WHAT was deferred —
+silence is what makes a deferral look like a bug. A deferral writes the same bail marker the
+cross-box refusal writes, so it consumes no attempt and is re-decided from a fresh read next cycle.
+
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
