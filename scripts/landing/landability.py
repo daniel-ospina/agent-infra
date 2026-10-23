@@ -242,7 +242,12 @@ def head_matches(record_sha, head):
     """
     if not record_sha or not head:
         return False
-    a, b = record_sha.lower(), head.lower()
+    # ⛔ COERCE AT THE BOUNDARY (P2, fresh review): the record is an unqualified legacy file that can
+    # be hand-edited, so a non-string `head_sha` reached `.lower()` and raised AttributeError —
+    # exit 1 with a traceback (main() catches only Failure) and a whole `bulk.py` batch aborted,
+    # the same blast radius the non-object guard above closes one level up. Coercing keeps the
+    # direction fail-closed: a value that is not the head does not match it.
+    a, b = str(record_sha).lower(), str(head).lower()
     if a == b:
         return True
     n = min(len(a), len(b))
@@ -262,8 +267,9 @@ def record_binding(record, head, live_diff):
         return f"NEEDS-REVIEW(verdict={verdict or 'none'})"
     if head_matches(record.get("head_sha"), head):
         return "AT"
-    diff = record.get("diff_sha256") or ""
-    if not diff:
+    diff = record.get("diff_sha256")
+    # A non-string digest is not an identity we can compare — same abstention as an absent one.
+    if not diff or not isinstance(diff, str):
         return "NEEDS-REVIEW(no-diff-identity)"
     if not live_diff:
         # ⛔ NOT MEASURED IS NOT CHANGED (P2, fresh review). For a not-open/draft PR this

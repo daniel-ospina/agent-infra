@@ -150,6 +150,16 @@ finally:
     else:
         os.environ["HOME"] = _old_home
 
+# (5b) the record's FIELDS are coerced, not trusted (P2, fresh review): a hand-edited legacy record
+# with a non-string head_sha / diff_sha256 must abstain, never raise AttributeError (which main()
+# does not catch, so bulk.py aborted a whole batch).
+ck(m.record_binding({"verdict": "clean", "head_sha": 12345, "diff_sha256": "b" * 64},
+                    "a" * 40, "b" * 64) == "CARRY",
+   "record_binding: a non-string head_sha does not crash, and does not match the head")
+ck(m.record_binding({"verdict": "clean", "head_sha": "c" * 40, "diff_sha256": 999},
+                    "a" * 40, "b" * 64) == "NEEDS-REVIEW(no-diff-identity)",
+   "record_binding: a non-string digest is an abstention (at a non-matching head)")
+
 # (6) `check()`'s PRECEDENCE LADDER — the fail-open guard the tool actually runs (P2, fresh review):
 # `elif not runs: BLOCKED(checks-unmeasured)` is the only arm that stops an EMPTY check surface from
 # falling through to the record binding, i.e. to `AT` on a head nobody tested. It was unpinned: a
