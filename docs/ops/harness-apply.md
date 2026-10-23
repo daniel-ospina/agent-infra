@@ -113,8 +113,13 @@ pin_tree=ce987bb2c1de
 preserved=none
 action=none
 lanes=none-signalled
-detail=current: pin already names origin/main (ce987bb2c1de) — nothing changed
+fetch=ok                     <- the comparison was FRESH; a failure is rc=23, never `current`
+detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=c51630de1f2a behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de
 ```
+
+`detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
+an operator (or the fleet instrument) reads can never carry numbers from before a move.
+`fetch=` and `behind=` are the two fields BOTH readers gate on.
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and
@@ -239,7 +244,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 173 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 175 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

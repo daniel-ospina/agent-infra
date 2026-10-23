@@ -306,11 +306,28 @@ assert_contains "$OUT" "pin-repaired" "T7b the verdict says the pin was repaired
 assert_contains "$(cat "$T/t7/state/harness-apply.status" 2>/dev/null || true)" "behind=0" \
     "T7b and the record says the box is on the ref afterwards"
 assert_contains "$(cat "$PASS_SH")" "apply --force --pin-only" "T7b the pass pins that form in its source (the stub enforces it at runtime)"
-# THE NO-MOVE CASE: the verb exits 0, the pin does not move, the box is still behind → a NAMED failure,
-# never a green `advanced`.
-OUT="$(MOVE=0 PIN_DIR="$T/t7/pin" HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass "$T/t7n" 2>&1)"; RC=$?
-assert_eq "$RC" "25" "T7b a verb that exits 0 WITHOUT moving the pin is a named failure (25)"
+# THE NO-MOVE CASE, ON ITS OWN FIXTURE. ⛔ `run_pass "$T/t7n"` used to point at a directory that was
+# never created, so the case ran with NO pin record at all and took the empty-tree path — never the state
+# a real cell is in (a MATERIALISED pin tree that does not move). That is how a green `none` verdict over
+# a behind pin tree survived a round of review. Here the pin tree is real and at the OLD commit, the
+# checkout is at the tip, and the verb exits 0 without moving anything.
+mk_origin t7n; mk_clone t7n
+REPO_P="$CLONE"; MODE_P=pin
+mkdir -p "$T/t7n/home/.pi/agent/state"
+OLD7N="$(git -C "$CLONE" rev-parse HEAD)"
+git -C "$CLONE" worktree add --detach "$T/t7n/pin" "$OLD7N" >/dev/null 2>&1
+mkdir -p "$T/t7n/pin/scripts/orchestrator-harness"
+WANT7N="$(advance_origin t7n A.txt "upstream, so the checkout is at the tip")"
+git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
+git -C "$CLONE" merge -q --ff-only origin/main >/dev/null 2>&1   # the CHECKOUT is current; the PIN is not
+printf '%s\n' "$OLD7N" >"$T/t7n/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t7n/pin/scripts/orchestrator-harness" >"$T/t7n/home/.harness-path"
+OUT="$(MOVE=0 PIN_DIR="$T/t7n/pin" HARNESS_MATERIALISER="$T/t7/materialiser.sh" run_pass "$T/t7n" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T7b a verb that exits 0 WITHOUT moving a MATERIALISED pin is a named failure (25)"
 assert_contains "$OUT" "nothing moved this box" "T7b and it says the pin did not move"
+assert_absent "$OUT" "already names origin/main" "T7b and it does NOT claim the pin tree is current"
+assert_contains "$(cat "$T/t7n/state/harness-apply.status" 2>/dev/null || true)" "action=no-move" \
+    "T7b the record's action says no-move, not 'none'"
 
 # ── T18: the refusals and skips a scheduled pass must never confuse with success ────────────────
 # Three states no case reached before (measured in review: they behave correctly — this pins it):

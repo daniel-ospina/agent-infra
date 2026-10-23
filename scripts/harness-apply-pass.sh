@@ -82,8 +82,10 @@
 # ⛔ WHAT IT DELIBERATELY DOES NOT DO
 #   · No branch switch and no whole-tree discard anywhere: both are refused inside a cell's main
 #     checkout by the same guard the laptop runs, and both can lose work. On the sync path the tracked
-#     paths are brought back to HEAD one named path at a time, then re-staged with `git add -u` (which
-#     never touches an untracked file), and ONLY after every dirty path has been preserved and named.
+#     paths are brought back to HEAD one named path at a time — content, executable bit and symlink mode
+#     from HEAD, then each path's INDEX entry set to HEAD's own (mode, blob) with
+#     `git update-index --cacheinfo` (a blanket `git add -u` cannot carry a symlink or an exec bit) —
+#     and ONLY after every dirty path has been preserved and named.
 #   · No probing of `main` more than once per pass, and NO COMMIT COUNTS AS A RELATION: hash equality
 #     or `merge-base --is-ancestor`, exactly as the supervisor's provenance block requires (a count
 #     reads a tree that is not on main's line at all as "1 behind", and the count MOVES as main
@@ -655,7 +657,11 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)"
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
-            finish 0 20 "REFUSED dirty: $DIRTY_N path(s) in $REPO carry uncommitted work that could not be preserved — nothing was touched. Preserve them by hand, then re-run."
+            # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
+            # failure in the RESTORE half can leave the checkout part-restored — every affected byte was
+            # written to $PRESERVED_DIR first, but claiming the tree is untouched would be false in the
+            # one message an operator reads when this refuses.
+            finish 0 20 "REFUSED dirty: $DIRTY_N path(s) in $REPO carry uncommitted work that could not be preserved and restored. Everything that WAS saved is under $PRESERVED_DIR, and nothing was discarded; if the restore had begun the checkout may be part-restored. Fix the cause, then re-run."
         }
     fi
 fi
@@ -732,9 +738,13 @@ if [ "$PASS_MODE" = pin ]; then
             # has nothing that reaches the ref", and BOTH readers red it on the number anyway.
             REC_ACTION=partial-move
             finish 0 25 "the pin moved to $(short "$PIN_TREE_SHA") but $REF is $(short "$REF_SHA") — the box is still off the ref"
-        elif [ "$RELATION" = current ]; then
-            REC_ACTION=none
         else
+            # ⛔ NO `elif [ "$RELATION" = current ]` ARM. `RELATION` is the CHECKOUT's relation, and a pin
+            # advance never moves the checkout — so a pin tree that is BEHIND while the checkout is at the
+            # tip fell through here and was recorded `none`/rc=0 (a GREEN unit) with `deployed=<behind>`
+            # in the record beside a sentence claiming the pin tree "already names origin/main". The
+            # no-pin-tree + current-checkout case is handled in the DECISION above; anything that reaches
+            # here did not move and is not at the ref, which is exactly what 25 means.
             REC_ACTION=no-move
             finish 0 25 "the materialiser exited 0 but the pin still names $(short "${PIN_TREE_SHA:-<none>}") while $REF is $(short "$REF_SHA") — nothing moved this box"
         fi
@@ -832,9 +842,11 @@ case "$REC_ACTION" in
         # A pin path record that names nothing resolvable: the box cannot start from it, and this pass
         # must not call that "current" (see recompute_deployed).
         if [ "$REC_DEPLOYED" = "unknown" ] || [ -z "${DEPLOYED_SHA:-}" ]; then
+            REC_ACTION=cannot-verify
             finish 0 23 "cannot-verify: $PIN_PATH_FILE names a tree that is not resolvable, so what this box would RUN is unknown — nothing was touched"
         fi
         if [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && [ "$REC_PIN_TREE" != "$REC_PIN" ]; then
+            REC_ACTION=restart-pending
             finish 0 25 "current for the checkout, but the PIN and the tree this box reads disagree — harness-up reports this as restart-pending, and nothing here restarts a live controller"
         fi
         if [ "$PASS_MODE" = pin ]; then
@@ -853,12 +865,14 @@ case "$REC_ACTION" in
                     REC_ACTION=mended
                     finish 1 11 "mended: the pin was missing and now names the checkout this box runs"
                 fi
+                REC_ACTION=pin-unwritable
                 finish 0 23 "the pin record is absent and could not be written at $PIN_SHA_FILE — nothing here records what this box runs"
             fi
             # THE SHA RECORD NAMES SOMETHING ELSE, AND NO TREE CAN BE CHECKED AGAINST IT. That is the
             # state this feature is about ("the pin stops lying"); it is NOT success, and the old message
             # ("the pin already names $REF") contradicted the record's own `pin=` field.
             if [ "$REC_PIN" != "$REC_REF" ]; then
+                REC_ACTION=pin-lies
                 finish 0 25 "the sha record names $REC_PIN but no pin tree resolves, so it cannot be compared with what this box RUNS ($REC_DEPLOYED) — the pin is still lying; nothing here can repair it without a materialised tree"
             fi
             finish 1 0 "current: no pin tree is materialised and the checkout already matches $REF — nothing changed"
