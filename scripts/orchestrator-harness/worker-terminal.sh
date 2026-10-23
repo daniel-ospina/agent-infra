@@ -458,15 +458,26 @@ wt_tmux_names() {
   local out
   command -v tmux >/dev/null 2>&1 || return 0     # no binary ⇒ no tmux session can exist
   if out="$(tmux ls -F '#{session_name}' 2>&1)"; then printf '%s\n' "$out"; return 0; fi
+  # ⛔ A SOCKET THAT WAS NEVER CREATED IS "NO SERVER", and tmux 3.4 says so in its own words: it
+  # reports "error connecting to <socket> (No such file or directory)", rc=1. Not matching that made
+  # a FRESH box (no server ever started) answer 3 — "unreadable, not evidence of a fresh start" — so
+  # wt_launcher_env refused the very shape it credits (a caller carrying GH_TOKEN that will CREATE
+  # the server): refused every spawn, every cycle, forever, which is the loop this change exists to
+  # remove (review finding, measured on tmux 3.4, 2026-10-23). ECONNREFUSED and permission errors
+  # stay rc 3: a socket we cannot read is not evidence of a fresh start.
+  #
+  # ⛔ THE EXPLANATION LIVES ABOVE THE case, NOT INSIDE THE ARM. Measured on this change: with the
+  # seven-line version of it inside the arm below, `/bin/bash -n` on the PR head (d635527b) exited 2 —
+  # "syntax error near unexpected token" on a stray close-paren — so the module did not PARSE,
+  # wt_spawn was undefined,
+  # and orch-loop.sh turns that into exit 78 FATAL. Deleting the block restored rc=0 in both
+  # directions, so the block is the trigger. macOS /bin/bash is 3.2 and orch-loop.sh declares it;
+  # CI's bash 5 parses the same text happily, which is why nothing caught it before merge.
+  # It did NOT reduce to a standalone fixture (the same text in a fresh file parses), so the durable
+  # rule is not "avoid these characters" — it is that this file is parse-checked in the controller's
+  # own shell, which worker-terminal.test.sh now does (and which is blind where /bin/bash is bash 5).
   case "$out" in
     *'no server running'*|*'no sessions'*|*'no current session'*) return 0 ;;
-    # ⛔ A SOCKET THAT WAS NEVER CREATED IS "NO SERVER", and tmux 3.4 says so in its own words:
-    # `error connecting to /tmp/tmux-1000/default (No such file or directory)`, rc=1. Not matching
-    # it made a FRESH box (no server ever started) answer 3 — "unreadable, not evidence of a fresh
-    # start" — so `wt_launcher_env` refused the very shape it credits (a caller carrying `GH_TOKEN`
-    # that will CREATE the server): refused every spawn, every cycle, forever, which is the loop this
-    # change exists to remove (review finding, measured on tmux 3.4, 2026-10-23). ECONNREFUSED and
-    # permission errors stay rc 3: a socket we cannot read is not evidence of a fresh start.
     *'error connecting to'*'No such file or directory'*) return 0 ;;
   esac
   return 3

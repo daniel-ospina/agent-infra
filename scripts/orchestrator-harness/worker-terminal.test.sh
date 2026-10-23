@@ -1066,6 +1066,33 @@ got="$(bash -c "sysctl() { echo 'total = 2048.00M  used = 1.00M  free = 2047.00M
 [ "$got" = "2047 2048" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "swap_usage_mb(): the macOS path yields <free> <total> MB — '${got:-<empty>}'" $rc
 
+# (6) PARSE: a file that does not parse in the controller's OWN shell is a dead harness, and a COMMENT
+# can do it. Measured on this change: `/bin/bash -n worker-terminal.sh` exited 2 on the PR head
+# (d635527b) and 0 at the base, and 0 again once the offending arm comment was moved above the case —
+# macOS ships bash 3.2 as /bin/bash and orch-loop.sh declares it, so "does not parse" means wt_spawn
+# is undefined and orch-loop exits 78 FATAL. CI's bash 5 parses the same text, so CI cannot see the
+# class. The blind spot is DECLARED rather than papered over: no minimal fixture reproduced it in
+# isolation, so a canary asserting one would be a fake discriminator. TWO shells are checked because
+# they are two different answers: the RUNNING bash (always present, and what CI uses) and /bin/bash
+# when it exists (the macOS controller's 3.2, the shell orch-loop.sh declares). Hardcoding /bin/bash
+# alone is not portable — a musl bash:5 image ships bash at /usr/local/bin only, and the leg then
+# fails 127, which is a false red measured on this very change.
+for _f in "$LIB" "$LOOP" "$DM" "$HERE/worker-terminal.test.sh"; do
+  "$BASH" -n "$_f" >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "      bash -n $_f → rc=$rc"
+  ck "parse: the running bash accepts $(basename "$_f")" $rc
+  if [ -x /bin/bash ]; then
+    /bin/bash -n "$_f" >/dev/null 2>&1; rc=$?
+    [ $rc -ne 0 ] && echo "      /bin/bash -n $_f → rc=$rc"
+    ck "parse: /bin/bash (the controller shell) accepts $(basename "$_f")" $rc
+  fi
+done
+if [ -x /bin/bash ] && [ "$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null || echo 5)" -le 3 ]; then
+  ck "parse: the /bin/bash legs ran on a 3.x parser, so they CAN see the macOS parse class" 0
+else
+  ck "parse DECLARED BLIND: no 3.x /bin/bash here — the legs cannot see the macOS 3.2 parse class" 0
+fi
+
 echo
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
