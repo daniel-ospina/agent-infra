@@ -76,3 +76,4 @@ cd <target-repo> && node "$AGENT_INFRA_PATH/bin/agent-infra.js" update
 ```
 
 Each repo's pre-commit hook (copied from `templates/.husky/`) **blocks** commits when `.agent-infra-version` is behind — run `agent-infra update` or `./sync <repo>` to fix.
+
