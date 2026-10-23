@@ -462,6 +462,7 @@ if [ "$ispush" -eq 1 ]; then
   n=$((n+1))
   echo "$n" > "$SHDIR/attempts"
   printf '%s\n' "$@" > "$SHDIR/argv.$n"
+  echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}" >> "$SHDIR/attempts.env.$n"
   if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
   case "$MODE" in
     wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
@@ -532,17 +533,45 @@ WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
 # scope-less PAT and #2292 is unchanged) and reversing the pair (the retry ends with an EMPTY helper
 # list) both stayed GREEN — found by two independent fresh reviewers, each by mutation. Every shape
 # except clear-then-name is now a failure.
+# ⛔ NO FORCE, ON EITHER ATTEMPT, CHECKED PER ARGUMENT. The old pattern `*"+refs/"*` is DEAD for this
+# script's refspec: its source side is a raw sha, so the force form is `+<sha>:refs/wip/<slug>`, which
+# contains no `+refs/`. A fresh reviewer's mutation (`"+$C:refs/wip/$SLUG"`) was GREEN — and a forced
+# push is the one thing that can destroy a peer clone's snapshot, so this is the arm that must not be
+# vacuous. Every recorded argument is checked, on both attempts, and the two attempts must carry the
+# IDENTICAL refspec: a retry that publishes a different refspec than the first push is not a retry.
+wf_force=0
+for _n in 1 2; do
+  _p="$T/wfretry/shim/argv.$_n"
+  if [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null; then
+    wf_force=1; bad "wfretry: attempt $_n used a FORCE form (a forced rescue can overwrite a peer clone's snapshot): $(tr '\n' ' ' < "$_p")"
+  fi
+done
+[ "$wf_force" -eq 0 ] && ok "wfretry: NEITHER attempt carries a force form (per-argument, so a '+<sha>:refs/…' force is caught)"
+RS1="$(tail -1 "$T/wfretry/shim/argv.1" 2>/dev/null)"
+RS2="$(tail -1 "$T/wfretry/shim/argv.2" 2>/dev/null)"
+[ -n "$RS1" ] && [ "$RS1" = "$RS2" ] \
+  && ok "wfretry: both attempts push the SAME refspec (the retry cannot publish something the first would not)" \
+  || bad "wfretry: the retry's refspec differs from the first push's ('${RS1:-none}' vs '${RS2:-none}')"
+case "$RS2" in
+  [0-9a-f][0-9a-f]*) ok "wfretry: the refspec's source is a commit sha (not a ref or a force ref)" ;;
+  *) bad "wfretry: the retry's refspec does not start with a commit sha — $RS2" ;;
+esac
 if [ -f "$T/wfretry/shim/argv.2" ]; then
   ARGV2="$(tr '\n' ' ' < "$T/wfretry/shim/argv.2")"
   case "$ARGV2" in
-    *"--force"*|*" -f "*|*"+refs/"*) bad "wfretry: the retry used a FORCE form — it may only publish the same fast-forward: $ARGV2" ;;
     *"-c credential.helper= -c credential.helper=osxkeychain"*)
-      ok "wfretry: the retry CLEARS the configured helpers and then names the keychain one, in that order (no force, no config write)" ;;
+      ok "wfretry: the retry CLEARS the configured helpers and then names the keychain one, in that order (no config write)" ;;
     *) bad "wfretry: the retry does not clear-then-name the helper (no clear re-uses the scope-less token; a reversed pair leaves an EMPTY helper list) — $ARGV2" ;;
   esac
 else
   bad "wfretry: no recorded argv for the second attempt — the retry cannot be inspected"
 fi
+# ⛔ THE RETRY MAY NOT PROMPT: it runs in the second before a cap kill, so an absent keychain entry must
+# FAIL rather than wait on a terminal nobody is watching. The script's own comment promises this; without
+# this arm, deleting the `export GIT_TERMINAL_PROMPT=0` was green (a fresh reviewer's mutation).
+grep -qx 'GIT_TERMINAL_PROMPT=0' "$T/wfretry/shim/attempts.env.2" 2>/dev/null \
+  && ok "wfretry: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
+  || bad "wfretry: the retry did not disable the terminal prompt — a missing keychain entry could hang the rescue"
 # ⛔ ALL SCOPES, not `--local`: a write to `$HOME/.gitconfig` would be invisible to `--local` and would
 # also PERSIST on the machine that ran the suite. `--show-origin` names the file it came from.
 [ "$(git -C "$T/wfretry/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
@@ -552,6 +581,18 @@ case "$OUT" in
   *OSXKEYCHAIN*|*osxkeychain*) ok "wfretry: says WHICH credential published it (a clean run must not imply the PAT worked)" ;;
   *) bad "wfretry: the success message does not name the credential used — $OUT" ;;
 esac
+# ⛔ THE SHA IN THE MESSAGE IS THE SHA THAT WAS PUSHED. A message printing a re-chained or shortened sha
+# hands the operator a handle that does not resolve — and the failure hint recommends exactly that retry.
+# awk reads the input to EOF and takes the FIRST match itself: a `sed … | head -1` pipeline relies on a
+# short write, and under `set -o pipefail` an early-exiting consumer turns a MATCHING line into rc=141 —
+# the same SIGPIPE false negative `scripts/check-no-sigpipe-grep.sh` exists to keep out of the tree.
+CLAIMED="$(printf '%s\n' "$OUT" | awk '
+  found == "" && match($0, /refs\/wip\/[^ ]* \([0-9a-f]+\)/) {
+    t = substr($0, RSTART, RLENGTH); if (match(t, /\([0-9a-f]+\)/)) found = substr(t, RSTART+1, RLENGTH-2) }
+  END { print found }')"
+[ -n "$CLAIMED" ] && [ "$CLAIMED" = "$WSHA" ] \
+  && ok "wfretry: the sha the message claims is the sha origin's ref actually holds (a usable recovery handle)" \
+  || bad "wfretry: the claimed sha '${CLAIMED:-none}' is not origin's '${WSHA:-none}' — the message names a handle that does not resolve"
 
 # (1b) ⛔ THE OPPOSITE DIRECTION OF THE SUCCESS MESSAGE. A plain first-attempt push must NOT be reported
 # as a keychain push: an implementation that prints the keychain claim on BOTH success branches passed
