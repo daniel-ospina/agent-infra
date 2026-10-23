@@ -92,7 +92,9 @@
 # STATED LIMITS OF THE COURTESY GATE (#1910) — that layer's own, not the argv layer's:
 #   - it paces the callers that go THROUGH this shim. A caller that removes the PATH
 #     entry (the class above), or that resolves the real binary by ABSOLUTE PATH, is not
-#     paced. `scripts/queue-dispatch.py` does exactly that, deliberately and read-only.
+#     paced. `scripts/queue-dispatch.py` did exactly that, deliberately and read-only; it is retired
+#     (agent-infra#1874) and lives at `scripts/orchestrator-harness/retired/queue-dispatch.py`, so no
+#     live caller does it today (`docs/ops/gh-rate-limits.md` states the same).
 #   - it is per MACHINE and per USER (`~/.pi/agent/gh-gate`). The ceiling it protects is
 #     shared across the whole ACCOUNT, including boxes it cannot see, so the cap here is
 #     a courtesy between boxes, not a total: it can only be well under the real ceiling.
@@ -181,8 +183,70 @@ VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
 
 # The real gh. `AGENT_GH_REAL` is set by an OUTER invocation so that a nested call
 # (the verifier shells out to gh itself) cannot recurse back into this shim.
+#
+# ⛔ THE INHERITED VALUE IS NOT TRUSTED ON ITS OWN (#2266). The seam's whole purpose is
+# that a NESTED call does not recurse — but the value it carries is whatever an outer
+# process exported, and `find_real_gh` used to accept it on `-x` alone. One launcher in
+# the fleet exported `AGENT_GH_REAL` pointing AT THIS SCRIPT (it had resolved it the same
+# way), every descendant inherited it, and each generation re-`exec`ed the shim: a new
+# process every `AGENT_GH_GATE_ACQUIRE_TIMEOUT` (300 s) because each parent then waited for
+# a gh slot its own child was holding. Measured 2026-10-21: 2,543 shim processes, 2,460 of
+# them older than 20 minutes, load average 12.8, and EVERY gh call on the box deadlocked for
+# ~10 hours — the `-ef` skip below could not save it, because the env short-circuited before
+# the PATH walk that performs that check.
+# So a value that IS this script is refused, exactly like the `-ef` skip refuses a PATH hit
+# that is this script, and resolution falls through to the PATH walk. Fail-closed in the
+# same direction the skip already is: it can only send the call to a real gh.
+# ⛔ ONE IMPLEMENTATION, BOTH HALVES (#1988, review of #2295). The PATH walk and the env
+# seam make the SAME decision — "is this file a harness gh layer?" — so they must not each
+# carry their own copy of it: the `-f` half of this seam was fixed precisely because the two
+# halves of one decision had drifted apart. No pipe: `head | grep -q` can report failure
+# through SIGPIPE under `pipefail`, and a false negative here means recursion.
+_is_harness_layer() {  # a harness `gh` layer (`gh-rest`/`gh-limit`): its own sentinel line
+  # ⛔ NO COMMAND SUBSTITUTION OVER A BINARY (#2184/#2305, review of #2295). `$(head -c 8192 …)` on
+  # a 42 MB ELF makes bash >=4.4 print `warning: command substitution: ignored null byte in
+  # input` to THIS shim's stderr on a call that SUCCEEDS. Pre-fix the env seam read nothing, so
+  # that warning is newly reachable on every delegated call (the inherited value IS the genuine
+  # gh) — and #2305 is precisely a gate that grades stderr. `grep -a` reads a binary safely and
+  # prints nothing.
+  # ⛔ REDIRECTION, NOT AN OPERAND, because the path is caller-controlled. `-f`/`-x` accept a
+  # cwd-relative name beginning with `-`, and an operand is passed to the reader: without `--` a
+  # value of `-q` became a grep OPTION, and even WITH `--` the lone value `-` still means STDIN to
+  # `head`/`grep`, so the shim STALLED on a held-open stdin (both measured rc=124 — the incident's
+  # own class, reachable from the value this seam newly reads). A redirection operand is always a
+  # PATH, so `-` and `-q` both name the file the operator meant.
+  # ⛔ THE WINDOW IS 8 KiB, NOT THE WHOLE FILE (review of #2295). A whole-file scan widens the
+  # marker window: this shim's own sentinel sits OUTSIDE the first 8 KiB (pinned by §15(d)), so it is
+  # not a harness layer — which makes the `-ef` self-refusal redundant (so removing either half keeps
+  # the suite green), and puts this shim at odds with gh-rest/gh-limit, which both test the first
+  # 8 KiB. It also cost 0.17 s per call over the 42 MB ELF on the hot path. 8 KiB keeps all three
+  # consumers agreeing, keeps `-ef` the clause that refuses self-recursion, and keeps this shim
+  # out of its own marker window — which is what lets gh-rest still delegate mutations through us.
+  # Process substitution, not a pipe: its status is not in `$?`, so no SIGPIPE-under-`pipefail`.
+  # ⛔ AND THE REDIRECTION'S OWN FAILURE IS THE CALLER'S STDERR (#2305, review of #2295). A failed
+  # `< "$1"` is reported by the SHELL, not by `head`, and redirections apply LEFT TO RIGHT — so
+  # with `head -c 8192 < "$1" 2>/dev/null` an unreadable candidate (mode 111, an ACL/FUSE deny-read)
+  # prints `shim: line N: <path>: Permission denied` onto a call that SUCCEEDS (measured 82 bytes at
+  # rc=0), which is `gh-rest/gh`'s `2>&1 | jq` JSONDecodeError — the very class this seam was fixed
+  # for. `2>/dev/null` FIRST makes fd 2 /dev/null before the shell attempts the open. §10(a5) pins it.
+  LC_ALL=C grep -qa 'harness-gh-shim-marker' <(head -c 8192 2>/dev/null < "$1")
+}
 find_real_gh() {
-  [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] && { printf '%s' "$AGENT_GH_REAL"; return 0; }
+  # ⛔ `-f` TOO. `-x` is true for a SEARCHABLE DIRECTORY, so a directory-valued
+  # AGENT_GH_REAL was accepted here and `exec`'d as the real gh — rc 126 "Is a directory"
+  # on EVERY call. The PATH walk below has always carried `-f`; the env seam did not, so
+  # the two halves of one decision disagreed (review of #2295, sibling fix in
+  # scripts/orchestrator-harness/gh-rest/gh).
+  # ⛔ AND A HARNESS LAYER IS REFUSED HERE TOO (#1988, review of #2295). An inherited
+  # AGENT_GH_REAL naming `$O/gh-rest/gh` or `$O/gh-limit/gh` was accepted as "the real gh", so
+  # the call re-entered the shim chain and the harness's own depth guard ended it with rc 127
+  # for EVERY gh call in the tree — the same total outage the walk's marker skip exists to
+  # prevent, reached through the inherited value instead of PATH (measured by review of #2295).
+  if [ -n "${AGENT_GH_REAL:-}" ] && [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
+     && ! [ "${AGENT_GH_REAL}" -ef "$SELF_DIR/$(basename "$self")" ] \
+     && ! _is_harness_layer "${AGENT_GH_REAL}"; then
+    printf '%s' "$AGENT_GH_REAL"; return 0
+  fi
   local d
   local old_ifs="$IFS"
   IFS=:
@@ -204,7 +268,7 @@ find_real_gh() {
     # the harness layers still delegate MUTATIONS through here and #984's argv-level admin-merge guard
     # stays in force. No pipe: `head | grep -q` can report failure through SIGPIPE under `pipefail`.
     [ -f "$d/gh" ] || continue
-    case "$(head -c 8192 "$d/gh" 2>/dev/null)" in *harness-gh-shim-marker*) continue ;; esac
+    _is_harness_layer "$d/gh" && continue
     printf '%s' "$d/gh"; IFS="$old_ifs"; return 0
   done
   IFS="$old_ifs"
@@ -216,6 +280,37 @@ REAL="$(find_real_gh)" || {
   printf 'gh-shim: refusing to run an unresolvable gh — pass AGENT_GH_REAL if it lives elsewhere\n' >&2
   exit 127
 }
+# ⛔ AND REFUSE AT THE EXEC BOUNDARY TOO (#2266). `find_real_gh` is not the only way REAL can
+# end up being this script — a PATH entry appearing between the walk and the exec, or a future
+# caller of this seam, would reach the same recursion. One check here makes the SAME-INODE class
+# unreachable rather than merely unlikely, and it costs one `-ef`. NOTE, honestly: this clause is
+# DELIBERATELY UNREACHABLE from the finder today (both halves test the same device+inode), so no
+# deterministic case can pin it — it exists for a race between the walk and this exec, and the green
+# suite is NOT evidence that it works (a `if false` mutant is bit-identical to it; review of #2295).
+# It is defence in depth, kept cheap and loud on purpose. A refusal is loud: silently
+# re-entering is the failure that took the box's gh out for ten hours without a single error.
+# ⛔ SCOPE, stated honestly: `-ef` is device+inode, so a literal COPY of this script is a DIFFERENT
+# file and is NOT refused here (nor by the walk's `-ef` skip). Copies are reachable in production —
+# `extensions/review-enforcer` falls back to `fs.copyFileSync` when symlinking the neutral entry
+# fails — so two copies on PATH can still ping-pong, one hop per gate slot. The marker scan does
+# not rescue a copy either: the sentinel sits outside the first 8 KiB by design (so that this shim is
+# never classified as a harness layer, which is what keeps gh-rest delegating mutations through us),
+# so `-ef` cannot see a copy and the marker test will not either. That class
+# needs a sentinel of its own inside that window plus a hop-depth backstop: the depth-bound half
+# tracked in #2304, deliberately NOT duplicated here, so this change stays the env-seam fix it is.
+# …and a value that is not a REGULAR FILE is refused here too, for the same reason: `-x`
+# is true for a directory, and exec-ing one turns every gh call into rc 126. Cheap, loud, and
+# in the same fail-closed direction as the self-recursion refusal below.
+if ! [ -f "$REAL" ]; then
+  printf 'gh-shim: REFUSING to exec %s — not a regular file (`-x` is true for a directory, and exec-ing one fails rc 126 on every call)\n' "$REAL" >&2
+  printf 'gh-shim: unset AGENT_GH_REAL, or point it at the genuine gh binary (e.g. /usr/bin/gh)\n' >&2
+  exit 127
+fi
+if [ "$REAL" -ef "$SELF_DIR/$(basename "$self")" ]; then
+  printf 'gh-shim: REFUSING to exec the shim as the real gh (%s) — that is a self-recursion, not a real gh\n' "$REAL" >&2
+  printf 'gh-shim: unset AGENT_GH_REAL, or point it at the genuine gh binary (e.g. /usr/bin/gh)\n' >&2
+  exit 127
+fi
 export AGENT_GH_REAL="$REAL"
 
 # Resolve a PR URL to `<owner> <repo> <number>`, or return non-zero when the token is

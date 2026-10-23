@@ -1,7 +1,44 @@
 #!/usr/bin/env python3
-"""queue-dispatch.py — keep idle lanes fed from a DURABLE queue, with no orchestrator turn.
+# ⛔⛔ RETIRED 2026-10-17 (agent-infra#1874, the retirement half of agent-infra#1890). DO NOT RUN.
+# ⛔
+# ⛔ THIS FILE IS KEPT FOR THE RECORD ONLY. It is the DEPRECATED lane-table dispatcher: it fed
+# ⛔ work to lanes that ALREADY EXISTED and were idle, so it could not start work that had no
+# ⛔ lane -- the drain ceiling #1874 measured (8 DIRTY PRs undrained while `lane-actions` read
+# ⛔ `idle=2`, one of those a false idle). `#1867`'s stale session binding is why "idle" was not
+# ⛔ even trustworthy.
+# ⛔
+# ⛔ WHAT REPLACED IT: `scripts/pr-doctor.py`, which sources its work from GitHub (branch-protection
+# ⛔ reality, never a queue row). Its SPAWN half -- one load-gated background worker per item through
+# ⛔ `scripts/orchestrator-harness/nonblocking-dispatch.sh` -- LANDED in #1894 (agent-infra#1890):
+# ⛔ `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper and starts a fresh worker in the PR's
+# ⛔ own worktree, so a dispatch no longer needs a pre-existing idle lane, and `idle_lanes()` is not a
+# ⛔ function in `pr-doctor.py` any more. (`#1894` was unmerged when this file was retired, and this
+# ⛔ banner said so; it is corrected because a banner that understates the replacement is an argument
+# ⛔ for re-arming the retired file.) Read the code, not this banner, for which half is live.
+# ⛔ `pr-doctor.py` is the beat's ONLY dispatch entry point (`scripts/heartbeat-loop.sh`); this file
+# ⛔ is wired to nothing and delivered by nothing (`pi-bootstrap/setup.sh` no longer farms it). The
+# ⛔ retirement reaches a BOX through the farm's UNFARM leg, NOT by a human remembering to `rm`: the
+# ⛔ name is DECLARED in `pi-bootstrap/farm-retired.txt`, and `setup.sh` applies that list on the same
+# ⛔ sync that applies the copy legs (`lib/farm-retire.sh`, `farm_unfarm`) -- declared, never inferred
+# ⛔ from absence, and it cannot be forgotten from a hand-written chain. Ordering still matters: a
+# ⛔ plain `cp` over a RUNNING bash script applies nothing (the loop has already parsed it), so stop
+# ⛔ the loop (kill file) before the sync that replaces `~/.pi/agent/scripts/heartbeat-loop.sh` and
+# ⛔ removes this file, then start it again. The full recipe is step 4 of the retirement note in the
+# ⛔ REPO's `scripts/heartbeat-loop.sh` — not in the deployed copy, which predates it.
+# ⛔ `scripts/test_dispatch_wiring.py` is the gate that keeps a future dedup from re-inverting that
+# ⛔ (#1890 is the inversion being undone).
+# ⛔
+# ⛔ WHAT WAS NOT CARRIED OVER, stated rather than dropped silently: this dispatcher was the only
+# ⛔ consumer of the durable PR queues (`LANDABLE.tsv` / `CI-PRS.tsv` / `CONFLICTS.tsv` /
+# ⛔ `REMEDY.tsv`) and the only router for the `7-DRAFT-PROMOTE` / `8-CLOSE` / `6-SEMANTIC` rows.
+# ⛔ `pr-doctor` sources the same PR work from GitHub by required-check reality, but it SKIPS
+# ⛔ drafts and has no close/ask-owner action -- the coverage gap is filed as agent-infra#1912.
+# ⛔ Re-arming this file would restore a SECOND dispatch path, which is the divergence #1890
+# ⛔ exists to remove: fix the surviving path, do not resurrect this one.
+"""queue-dispatch.py — [RETIRED, see the banner above] keep idle lanes fed from a DURABLE queue.
 
 THE GAP THIS CLOSES (and it is stated in the code it replaces)
+[Everything below is the historical record as it shipped; it describes a path that no longer runs.]
     turn-end.py auto-nudges WIP-IDLE lanes, and says why it stops there:
         "It does NOT touch DONE-IDLE -- choosing the next issue needs the
          lane->label->rank judgement the orchestrator holds"

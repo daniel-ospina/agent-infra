@@ -121,8 +121,26 @@ else
     echo "  → on a cloud cell run: <repo>/scripts/cloud-cell-supervisor.sh status"
   fi
 fi
-sessions=0
-command -v tmux >/dev/null 2>&1 && sessions=$(tmux ls 2>/dev/null | wc -l | tr -d ' ')
+# ⛔ The worker population is NOT the tmux session list any more (agent-infra#2210): on a cloud cell
+# every worker is a cmux durable terminal, so `tmux ls | wc -l` printed `0` for a busy box. Read the
+# launcher's census; UNKNOWN when it cannot answer, never a confident 0.
+sessions=UNKNOWN
+if [ -f "$O/worker-terminal.sh" ]; then
+  # ⛔ CAPTURE FIRST, COUNT SECOND. A substitution that ends in `| wc -l` reports `wc`'s status, so a
+  # `|| sessions=UNKNOWN` after it can never fire (no pipefail here) — a module that cannot source
+  # printed a confident `sessions: 0`. And `wt_table` prints ONE newline for an empty table, so
+  # `wc -l` said 1 on an idle box: exactly the count a single live worker produces. Count NON-BLANK
+  # rows, and treat an empty capture as UNKNOWN rather than as zero.
+  # `if cmd=$(…)` keeps the SUBSHELL's exit status (a plain assignment in a pipe reports `wc`):
+  # rc 0 means the census ANSWERED, and an empty answer is then 0 workers — not UNKNOWN. Only a
+  # module that cannot source / defines no `wt_table` / exits non-zero leaves UNKNOWN standing.
+  if _wt_tbl=$( ( . "$O/worker-terminal.sh" >/dev/null 2>&1 && command -v wt_table >/dev/null 2>&1 && wt_table ) 2>/dev/null ); then
+    # Count LIVE worker rows: `wt_table` also emits `dead` rows (a record whose surface is gone,
+    # which the reap has not cleared yet), and "sessions" is a population, not a ledger size.
+    sessions=$(printf '%s\n' "${_wt_tbl:-}" | awk -F'\t' 'NF && $2 != "dead"' | wc -l | tr -d ' ')
+  fi
+  case "${sessions:-}" in ''|*[!0-9]*) sessions=UNKNOWN ;; esac
+fi
 echo "  sessions: $sessions   load: $(uptime | sed -E 's/.*load averages?: ([0-9.]+).*/\1/')"
 # ⛔ `wc -l < missing-file 2>/dev/null` still prints a bash REDIRECTION error: bash reports the
 # failed `<` itself, before `wc` (and its `2>/dev/null`) runs. Guard the redirection instead.
@@ -140,7 +158,10 @@ if [ -f "$O/.agent-infra-stamp.json" ]; then
   echo "  harness: ${hc:-UNKNOWN} [${hr:-unknown}]"
   if [ "$dm" = false ]; then
     echo "  ⚠️  the DEPLOYED copy at \$O differs from the recorded source commit — this box is NOT running those bytes"
-    echo "      re-sync and re-record: cp '<checkout>/scripts/orchestrator-harness'/*.sh \"\$O\"/ && O=\"\$O\" bash <checkout>/scripts/orchestrator-harness/install.sh"
+    # ⛔ NOT A BARE DEPTH-1 `cp` (agent-infra#2041): this line is printed whenever the record disagrees
+    # with the deployed bytes, so it is the single command an operator will paste. Name the verified
+    # redeploy, not the unverified copy #2041 measured.
+    echo "      re-sync and re-record: bash <checkout>/scripts/orchestrator-harness/deploy-harness.sh --repo <checkout> --o \"\$O\" && O=\"\$O\" bash <checkout>/scripts/orchestrator-harness/install.sh"
   fi
 else
   echo "  harness: UNKNOWN (no $O/.agent-infra-stamp.json — run install.sh to record it)"

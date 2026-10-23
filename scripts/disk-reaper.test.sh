@@ -2007,6 +2007,14 @@ rm -f "$T/t55b/bin/python3" "$T/t55b/bin/plutil"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$T/t55b/bin/plutil"
 chmod +x "$T/t55b/bin/plutil"
 {
+    # The plist read-back's helpers are extracted WITH it: the arm now parses ProgramArguments
+    # positionally (a membership test over the JSON text accepted `["/bin/true","<reaper>",…]` as
+    # "launches the reaper"), so a seam that extracted only the top-level function would drive a
+    # helper-less copy and refuse everything for the wrong reason.
+    for _f in plist_program_arguments_textual json_array_words argv_executes_reaper argv_has_token \
+              plist_argv_runs_reaper; do
+        sed -n "/^$_f()/,/^}/p" "$INST"
+    done
     sed -n '/^verify_installed_artifact_plist()/,/^}/p' "$INST"
 } >"$T/t55b/plist-fn.sh"
 REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
@@ -2064,6 +2072,88 @@ OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T
 assert_eq "$RC" "1" "T55b with NO parser at all the stale plist is still refused"
 assert_contains "$OUT" "(textual check only: no plist parser was available)" "T55b ... and it says no parser was available, not that one failed"
 assert_absent "$OUT" "the plist parser FAILED" "T55b ... never claiming a failure it did not observe"
+# ⛔ MEMBERSHIP IS NOT EXECUTION (T55c). The first cut of BOTH read-back arms asked "does the reaper's
+# PATH appear in this command line?" — `case " $exec " in *" $REAPER "*)` for systemd and
+# `*"\"$REAPER\""*` over the plist's JSON text. So a drop-in that REPLACED `ExecStart=` with
+# `/bin/true <reaper> --apply` matched: the install printed `verify: … read back`, exited 0 and ran
+# `enable --now` — a box with no reaper and every check green. Reproduced against the stub `systemctl`
+# in T55 before the fix; these assertions are that reproduction, pinned.
+mkdir -p "$T/t55/units/eldato-disk-reaper.service.d"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/bin/true $REAPER --apply
+DROPIN
+: >"$T/t55/calls.log"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a drop-in that only MENTIONS the reaper as an argument is REFUSED (membership != execution)"
+assert_contains "$OUT" "does not run the reaper this install rendered" "T55c ... and names the defect"
+assert_absent "$(cat "$T/t55/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T55c ... and the timer is NOT armed over it"
+# A shell whose first non-option argument is NOT the reaper is refused too: `bash -c '<text>'` is one
+# argument, and whether the text runs the reaper is not a fact this gate can prove.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/bin/bash -c "$REAPER --apply"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a shell whose first argument is a SCRIPT TEXT naming the reaper is REFUSED"
+# ... while the rendered shape itself still passes (the positive control that the rule is not a blanket
+# refusal), including a shell in program position taking the reaper as its first argument.
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/55-mention.conf"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/56-env.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/usr/bin/env bash $REAPER --apply
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55c a shell (incl. /usr/bin/env-prefixed) EXECUTING the reaper is accepted"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T55c ... and verified, not skipped"
+# systemd's own exec prefixes (`-` ignore-failure, `@` argv[0]) are stripped before the program is read.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/56-env.conf" <<'DROPIN'
+[Service]
+ExecStart=
+ExecStart=-/bin/true
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a PREFIXED different program (-/bin/true) is still refused"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/56-env.conf"
+# An ExecStart with an UNTERMINATED QUOTE is a directive systemd ABANDONS (EINVAL): the unit would
+# start without it, so "verified" over it is a claim about a command that will never run.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/57-quote.conf" <<DROPIN
+[Service]
+ExecStart=
+ExecStart="/bin/bash $REAPER --apply
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c an ExecStart with an unterminated quote is REFUSED (systemd rejects the directive)"
+assert_contains "$OUT" "cannot be tokenized" "T55c ... and says so, instead of reading it as a pass"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/57-quote.conf"
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55c removing the drop-in restores a clean install (the gate is about the artifact)"
+# The launchd arm's equivalent fact is a PAIR (`<LAUNCHER> --script <reaper>`), not "the path appears".
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python3</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>/bin/true</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55c a plist launcher whose --script is NOT the reaper is REFUSED"
+assert_contains "$OUT" "does not LAUNCH $REAPER" "T55c ... and names the defect"
+# ... and the rendered TCC shape (launcher + --script <reaper>) is ACCEPTED, so the pair rule is not a
+# blanket refusal of the shape this installer actually writes.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' \
+    '<string>/usr/bin/python3</string><string>/x/launcher.py</string>' \
+    "<string>--script</string><string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    LAUNCHER="/x/launcher.py" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55c the rendered launcher + --script <reaper> shape is ACCEPTED (positive control)"
 
 # ── T56: an UNANSWERABLE tally is recorded as such, and per-repo tallies are SUMMED ────────────
 # Two defects a review cycle found in the tally lift, both of the "record lies" class:
@@ -2147,6 +2237,27 @@ OUT="$(WORKTREE_REAPER="$T/t56-refuse.sh" run_reaper --dry-run --repo "$REPO_A" 
 ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
 assert_contains "$ST" "candidates_worktree=?" "T56 a delegate that only REFUSED leaves candidates unanswerable ('?'), not 0"
 assert_absent "$ST" "candidates_worktree=0" "T56 ... and never an invented 0 in a dry pass"
+# (b6) THE CLASS LINE MUST AGREE WITH THE RECORD — three surfaces, three defects a review cycle found:
+#   · an ARMED venv pass printed `candidates=0` from the initialised variable while the record said `?`;
+#   · `reasons=none` was normalised AFTER the class line printed `${sum_reasons:-?}`, so a clean armed
+#     pass said `reasons=?` ("not measured") about a measurement that answered "none";
+#   · a TRUNCATED SUMMARY (a delegate killed mid-line) set the coverage to `1/1` while every sum stayed
+#     at 0 — an invented zero presented as full coverage.
+OUT="$(VENV_REAPER="$T/t56-silent.sh" run_reaper --apply --repo "$REPO_A" --only venv 2>&1)"
+assert_contains "$OUT" "class=venv" "T56 a silent venv delegate still reports the class"
+assert_contains "$OUT" "candidates=?" "T56 ... with candidates '?', not the initialised 0 (class line agrees with the record)"
+OUT="$(WORKTREE_REAPER="$T/t56-clean.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+assert_contains "$OUT" "reasons=none" "T56 an answered reasons=none reaches the CLASS LINE as none, not '?'"
+assert_absent "$OUT" "reasons=?" "T56 ... and never as 'not measured'"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=3 classified=3 preserve"' \
+    'exit 0' >"$T/t56-trunc.sh"
+chmod +x "$T/t56-trunc.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-trunc.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_worktree=0/1" "T56 a TRUNCATED SUMMARY is not coverage: 0 of 1 repos answered"
+assert_contains "$ST" "classified_worktree=?" "T56 ... and the counts are '?', not the summed 0"
+assert_absent "$ST" "tally_worktree=1/1" "T56 ... never claiming the repo answered"
 # (c) a class that was NOT SELECTED is `not-run` — a different fact from `?`.
 ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
 assert_contains "$ST" "classified_worktree=" "T56 --print-status surfaces the tally fields at all"

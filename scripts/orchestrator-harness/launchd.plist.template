@@ -17,6 +17,26 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- ThrottleInterval: THE RETRY INTERVAL IS DECLARED, NOT INHERITED. 10 s is launchd's own
+       documented default (`man launchd.plist`: "by default, jobs will not be spawned more than once
+       every 10 seconds"), so this changes NO behaviour — it makes the value VISIBLE in the file an
+       operator reads, instead of one they have to know.
+       ⛔ IT DOES MOVE THE CRASH-LOOP WINDOW, AND SAYING OTHERWISE WAS WRONG (corrected 2026-10-22,
+       review round 3 — an earlier edit of this very comment had it backwards). `launchctl print`
+       reports this value as `minimum runtime = N`; that field IS this key (Apple's launchd
+       `j->min_run_time`, whose own default is 10). So `launchd-cycle.sh`'s `lc_min_runtime` reads
+       it, and `lc_assert_stable`'s window is `minimum runtime + 3` — raise this to 60 and that
+       window becomes 63 s. `launchd-cycle.sh:363-365` already states the equivalence. Declaring 10
+       here therefore keeps today's behaviour AND today's window exactly; it is not inert, it is
+       the same number written down.
+       10 is launchd's DEFAULT, not its floor: the key accepts any non-negative value, so a box may
+       legitimately declare more and must not be told "it is a floor".
+       With KeepAlive above, a transient spawn failure (fork exhaustion: `spawn /bin/bash EAGAIN`,
+       rc 128 — #2293) is retried on this interval, and `harness-up`'s launchd row names the job
+       DIED with launchd's own exit code rather than leaving it silent. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
   <key>StandardOutPath</key>
   <string>__O__/logs/launchd.out</string>
   <key>StandardErrorPath</key>
@@ -66,12 +86,18 @@
     <string>__MAX_FIX__</string>
     <key>MAX_FIX_TRIES</key>
     <string>__MAX_FIX_TRIES__</string>
+    <key>MAX_RED_FIX</key>
+    <string>__MAX_RED_FIX__</string>
+    <key>MAX_RED_FIX_TRIES</key>
+    <string>__MAX_RED_FIX_TRIES__</string>
     <key>MIN_SWAP_FREE</key>
     <string>__MIN_SWAP_FREE__</string>
     <key>MIN_MEM_FREE_MB</key>
     <string>__MIN_MEM_FREE_MB__</string>
     <key>BATCH</key>
     <string>__BATCH__</string>
+    <key>PRODUCT_FLOOR</key>
+    <string>__PRODUCT_FLOOR__</string>
     <key>CYC</key>
     <string>__CYC__</string>
   </dict>

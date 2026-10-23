@@ -40,12 +40,15 @@ documented policy, so this file does not restate the numbers — it names where 
 | Behaviour | Where |
 |---|---|
 | ONE `gh` call in flight per box (`flock` on `$GH_LIMIT_DIR/gh.lock`) — including the `/rate_limit` probe, which runs while the caller is in backoff | `acquire_lock` |
+| **Identical concurrent READS share ONE load** (`#2243`): the key is the normalised request (host + credential digest + cwd repo pin + endpoint + argv), a waiter shares the leader's result **or its failure** under a **bounded** wait, and a waiter past the bound gets a distinct `busy` (exit **75**, holder's age on stderr) instead of an unbounded queue. A leader that died or overran is taken over, so no orphan claim survives | `single_flight` / `flight_key` / `flight_eligible` / `prune_flights` |
+| **Never coalesced**: mutations (two merges are two merges), `auth` (its stdout is the credential) and `/rate_limit` (the pass's own meter) | `flight_eligible` |
+| A previous answer may be served **while a refresh is in flight** — opt-in only (`GH_LIMIT_FLIGHT_STALE_SERVE=1`, off by default) and then the age goes on stderr; stale is never presented as current | `single_flight` (stale branch) |
 | `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly | `plan_wait` / `dispatch` |
 | The failing **bucket** is named (`core` vs `graphql`) with its reset — never inferred from whichever counter looks healthy | `bucket_for` / `fail_loudly` |
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
-| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the six that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned) |
+| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
 
 Two properties worth knowing before you debug it:
 
@@ -79,8 +82,8 @@ Two properties worth knowing before you debug it:
   its PATH becomes the worker's; `gh-limit.test.sh` names the file and the missing stanza if one
   does not. A script written outside that directory is not covered by the check. Two paths
   cover the common callers without it: the Mac adapter resolves the layer for every call it serves,
-  and the heartbeat's telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
-  `queue-dispatch.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary —
+  and the heartbeat's telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`) prefer
+  `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary —
   `gh-rest` first, matching every shell call site, because the adapter is what serves a GraphQL
   refusal over REST (#1959).
 
@@ -88,6 +91,17 @@ Two properties worth knowing before you debug it:
 
 - **Cross-box concurrency is not serialised.** Boxes cannot see each other; the invariant is one
   call in flight *per box*.
+- **Coalescing is per box, and only for requests that are identical RIGHT NOW** (`#2243`). Two lanes
+  reading the same PR 10 s apart are two loads (the answer is not cached as current — only a flight
+  still in progress is shared), and two boxes reading it are still two loads. What the layer removes
+  is the *queued duplicate*: the measured 63 s `gh pr view` at 13 lane processes was ours, not
+  GitHub's. `GH_LIMIT_FLIGHT=0` turns it off; `GH_LIMIT_FLIGHT_WAIT` (5 s, Nginx's
+  `proxy_cache_lock_timeout` default) is the bound, `GH_LIMIT_FLIGHT_LEADER_MAX_AGE` (120 s,
+  `proxy_cache_lock_age`) is when a stalled holder is taken over.
+- **A `busy` outcome is a NOT-AN-ANSWER.** Exit **75** with `BUSY single-flight …` on stderr, naming
+  the holder's pid and age. It is deliberately not a rate limit and carries no bucket, so a caller
+  that classifies failures must retry it rather than record it as quota — and it never inherits the
+  wait: the bound is the whole wait.
 - **A degraded state dir**: if `$GH_LIMIT_DIR`/`$XDG_CACHE_HOME` cannot be created, the fallback is
   a per-user temp dir (`${TMPDIR}/gh-limit-<uid>`), which still shares one lock between that user's
   processes and records the degradation in its own `events.log` — but the controller's heartbeat
@@ -100,22 +114,25 @@ Two properties worth knowing before you debug it:
 - **`--jq` replay uses the external `jq` binary** (gh vendors its own engine); when `jq` is absent
   the call is left unintercepted rather than served by us.
 - **A layer that sleeps cannot outlive its caller, so a bounded caller gets no backoff.**
-  `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; NINE heartbeat tools set
-  it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py`,
-  `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
+  `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; EIGHT heartbeat tools set
+  it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`,
+  `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
   bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-90 s) that is
   consumed by the layer's first documented wait of 60 s, or shared with every other call the step
   makes — the outcome is a timeout, and the box then reports `UNKNOWN`/`STALL` instead of the
-  `RATE-LIMITED` verdict it can prove. (Two of the nine — `queue-dispatch.py`, `pr-doctor.py` — are
-  launched detached by `heartbeat-loop.sh` and reaped by their own locks, so their bound is per call,
-  not per pass; the decision is the same.) The shell call sites keep the waits: they have no
+  `RATE-LIMITED` verdict it can prove. (One of the eight — `pr-doctor.py` — is
+  launched detached by `heartbeat-loop.sh` and reaped by its own lock, so its bound is per call,
+  not per pass; the decision is the same. It was nine while `retired/queue-dispatch.py` was still part
+  of the beat — retired in agent-infra#1874, so it is no longer a resolver here.) The shell call sites
+  keep the waits: they have no
   subprocess bound of their own.
 - **The layer resolves the REAL gh by walking PATH.** A tool that has a pinned candidate hands it
   through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` — `objective.py`, `merge-queue.py`,
-  `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py` and `pr-doctor.py` (via `objective.py`'s
+  `beta-progress.py`, `ask-owner.py` and `pr-doctor.py` (via `objective.py`'s
   resolver) do — so #1872's pin survives for those. `turn-classify.py`, `turn-end.py` and
   `undelivered-answers.py` never had a pin: they resolve the layer through `$O`, and the layer then
-  walks PATH. On a box whose PATH puts a refusing wrapper first, any of these gets that wrapper
+  walks PATH. (A sixth, `retired/queue-dispatch.py`, did until agent-infra#1874 retired it — it is
+  not part of the beat, so it is not counted.) On a box whose PATH puts a refusing wrapper first, any of these gets that wrapper
   (rc 126 at runtime, `os.access` notwithstanding). The pin is the mitigation, not a guarantee.
 - **`ask-owner.py`'s bound equals the layer's whole budget.** Its per-call timeout is 420 s and the
   layer's full 4-attempt budget is up to 72+144+288 = 504 s (each wait is `base·2ⁿ` plus up to 20 %
@@ -166,7 +183,8 @@ Two properties worth knowing before you debug it:
   `gh=recovered(bucket=… <age>)`; the 15-minute age bound still applies to both forms.
 
 `$GH_LIMIT_DIR` defaults to `${XDG_CACHE_HOME:-~/.cache}/gh-limit`. Files you will find there:
-`gh.lock`, `etag/`, `last-mutation`, `last-limit`, `events.log`.
+`gh.lock`, `etag/`, `flights/` (one `<key>.leader` claim and one `<key>.json` last outcome per
+in-flight request — `#2243`), `last-mutation`, `last-limit`, `events.log`.
 
 Operator knobs (all optional): `GH_LIMIT_MAX_ATTEMPTS` (4 attempts in total), `GH_LIMIT_BASE_WAIT` (60 s),
 `GH_LIMIT_MAX_WAIT` (300 s — a reset beyond this fails FAST so the caller's own deferral takes
@@ -174,11 +192,21 @@ over), `GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
 `GH_LIMIT_CACHE_MAX_ENTRIES` (500), `GH_LIMIT_CACHE_MAX_BYTES` (67108864 — 64 MiB; the cache is
 bounded in entries AND bytes, whichever binds first), `GH_LIMIT_CONDITIONAL=0` (disable the ETag
 path), `GH_LIMIT_NO_WAIT=1` (never sleep in-process — set by callers that have their own bound) with
-`GH_LIMIT_NO_WAIT_LOCK_S` (5 s — the lock budget under `NO_WAIT`). Every knob
+`GH_LIMIT_NO_WAIT_LOCK_S` (5 s — the lock budget under `NO_WAIT`, and the flight budget with it).
+Coalescing (`#2243`): `GH_LIMIT_FLIGHT=0` (disable it), `GH_LIMIT_FLIGHT_WAIT` (5 s — Nginx's
+`proxy_cache_lock_timeout` default; past it a waiter returns `busy` at exit 75),
+`GH_LIMIT_FLIGHT_LEADER_MAX_AGE` (120 s — `proxy_cache_lock_age`; a holder older than this, or one
+whose pid is gone, is taken over), `GH_LIMIT_FLIGHT_KEEP_S` (30 s — how long a finished outcome stays
+on record), `GH_LIMIT_FLIGHT_STALE_SERVE=1` (serve a previous answer while a refresh is in flight,
+WITH its age on stderr; off by default), `GH_LIMIT_FLIGHT_STALE_MAX_AGE` (30 s), and
+`GH_LIMIT_FLIGHT_MAX_ENTRY` (4 MiB — a larger outcome is not shared; waiters take the key over).
+Every knob
 is range-clamped, and `nan`/`inf` fall back to the documented default rather than disabling a bound
 (an `inf` lock timeout would be a hang, a `nan` wait a traceback).
 `GH_LIMIT_NOW_CMD`/`GH_LIMIT_SLEEP_CMD` are the TEST seams for the fake clock — do not set them
-in production.
+in production. ⛔ The flight ledger deliberately does NOT use them: it measures a LIVE process's age
+and an answer's age, and both are safety labels (a stale answer must never read as current), so a
+knob must not be able to make one look like the other.
 
 ⛔ **Also corrected 2026-10-17 (agent-infra#1910): the section below that told you to read
 `rate_limit` for the secondary limit was WRONG, and it is the mistake that reopened this
@@ -234,8 +262,10 @@ Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, ins
   PID, so a killed lane cannot wedge the fleet.
 
 ⚠️ **A caller that resolves the real `gh` by absolute path, or clears PATH, is not paced.**
-`scripts/queue-dispatch.py` does that deliberately for read-only queries. When you add such
-a caller, you are adding an unpaced `gh` — say so in the comment, as that file does.
+The one that did deliberately for read-only queries was the retired
+`scripts/orchestrator-harness/retired/queue-dispatch.py` (agent-infra#1874); no live caller does it
+today. When you add such a caller, you are adding an unpaced `gh` — say so in the comment, as that
+file does.
 
 ## Detect
 

@@ -8,13 +8,23 @@
  *
  *   1. `.ts` files load as ESM with types stripped (node:module
  *      stripTypeScriptTypes, Node >= 22.13).
- *   2. `@earendil-works/pi-coding-agent` is aliased to a minimal stub exporting
- *      the one runtime value index.ts imports (`isToolCallEventType`); the
- *      `ExtensionAPI` import is type-only and erased by the strip.
+ *   2. `@earendil-works/pi-coding-agent` is aliased to a minimal stub that
+ *      RE-EXPORTS the repo's one shared predicate copy
+ *      (`../shared/tool-call-event.ts`); the `ExtensionAPI` import is type-only
+ *      and erased by the strip.
  *
- * Deliberately a SEPARATE copy rather than a cross-extension import: the sibling
- * copy lives under `extensions/main-worktree-guard/`, a directory under active
+ * #1330 — the stub used to carry its own copy of the predicate body, which made
+ * this file a second un-pinned copy of an SDK function (the very defect #1330
+ * exists to close). It now re-exports `shared/tool-call-event.ts`, so this
+ * suite exercises the copy that the SDK-bearing parity pin asserts against the
+ * real pi export.
+ *
+ * Deliberately a SEPARATE FILE rather than a cross-extension import: the sibling
+ * hook lives under `extensions/main-worktree-guard/`, a directory under active
  * edit (open PR #1153), and a test must not break when a foreign lane moves it.
+ * The PREDICATE, however, is single-homed by #1330 — both hooks re-export
+ * `extensions/shared/tool-call-event.ts` rather than each carrying their own
+ * copy, so the SDK-bearing parity pin covers whichever hook a test loads.
  */
 
 import { stripTypeScriptTypes } from "node:module";
@@ -29,10 +39,11 @@ const PI_PACKAGE_SPECIFIERS = new Set([
   "@mariozechner/pi-coding-agent",
 ]);
 
+/** The repo's ONE predicate copy — the same module production imports (#1330). */
+const SHARED_PREDICATE_URL = new URL("../shared/tool-call-event.ts", import.meta.url).href;
+
 const PI_STUB_SOURCE = `
-export function isToolCallEventType(toolName, event) {
-  return event.toolName === toolName;
-}
+export { isToolCallEventType } from ${JSON.stringify(SHARED_PREDICATE_URL)};
 export default {};
 `;
 

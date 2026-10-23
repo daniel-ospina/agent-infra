@@ -21,7 +21,24 @@
 #   bin/harness doctor --json     # machine-readable
 #   bin/harness doctor --quiet    # verdict line only
 #
-# EXIT: 0 healthy · 1 drift · 2 UNKNOWN (cannot verify — never a pass)
+#   bin/harness status            # IS THE CONTROLLER SELF-DISPATCHING? the last N cycle records
+#   bin/harness status --last 20  # …and how far back
+#   bin/harness status --json     # machine-readable
+#
+# EXIT: doctor — 0 healthy · 1 drift · 2 UNKNOWN (cannot verify — never a pass)
+#       status — 0 HEALTHY · 1 DEGRADED · 2 ABSENT/UNREADABLE (no answer is never a pass)
+#
+# ── `status`: THE SELF-DISPATCH PROOF (measured 2026-10-21) ─────────────────────────────────────
+# MEASURED: the controller log on cell-1 was 37h STALE and on the other two cells no log was found
+# at its expected path, so "the controller is looping" could not be answered by anyone — and an
+# absent log/state file read as "nothing to say", i.e. as fine. `orch-loop.sh` now writes ONE record
+# per cycle (start, selected, dispatched, why nothing, the placement verdict and the bound it hit),
+# and this verb grades the NEWEST of them:
+#   HEALTHY     the newest record is younger than TWO of the box's own cycles
+#   DEGRADED    it is older than that — the controller is not cycling (rc 1)
+#   ABSENT      there is no record at all — never healthy, never "nothing to do" (rc 2)
+#   UNREADABLE  the record cannot be parsed or the clock cannot be read (rc 2)
+# A live pane is not evidence of a dispatch; a fresh record is.
 set -u
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +51,94 @@ usage() {
 
 cmd="${1:-}"; shift 2>/dev/null || true
 [ -n "$cmd" ] || { usage; exit 2; }
-[ "$cmd" = "doctor" ] || { echo "harness: unknown command '$cmd' (try: doctor)" >&2; exit 2; }
+case "$cmd" in doctor|status) : ;; *) echo "harness: unknown command '$cmd' (try: doctor, status)" >&2; exit 2 ;; esac
+
+# ── THE JSON STRING ESCAPER, defined BEFORE `status` ─────────────────────────────────────────
+# ⛔ `status` runs and EXITS before the doctor section defines its own `j()` (#2160), so it must not
+# re-implement escaping — a second escaper is a second definition of "safe in JSON", and this one
+# was WRONG: `cycle_history` separates its fields with a RAW TAB (`age=<n>\t<record>`) and the state
+# dir path was interpolated unquoted, so `status --json` emitted **invalid JSON** (`json.loads`:
+# `Invalid control character at line 5 column 24`) while a substring grep still passed. Both surfaces
+# now escape through this one function: backslash, quote, the C0 whitespace that JSON forbids RAW
+# (tab/CR/LF), and every other C0 control byte, which no JSON string may carry unescaped. The
+# doctor's `j()` stays where it is and keeps its extra UTF-8 verification; this is the shared floor,
+# not a replacement for it.
+_json() {
+  printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+    | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'
+}
+
+# ── status ───────────────────────────────────────────────────────────────────────────────────
+# The verdict, the last N records and the fields that answer "why did nothing dispatch" all come
+# from ONE module (`cycle-record.sh`) that the CONTROLLER also writes with, so the writer and the
+# reader cannot drift: two implementations of "older than two cycles" is the duplicate-contract
+# defect this repo keeps naming.
+if [ "$cmd" = "status" ]; then
+  O_DIR="${O:-$HOME/orchestrator}"
+  LAST=10; INTERVAL=""; JSON=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --last) LAST="${2:-10}"; shift 2 ;;
+      --interval) INTERVAL="${2:-}"; shift 2 ;;
+      --dir|--o) O_DIR="${2:-}"; shift 2 ;;
+      --json) JSON=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "harness status: unknown argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  case "$LAST" in ''|*[!0-9]*) LAST=10 ;; esac
+  _crmod=""
+  for _d in "$O_DIR" "$CANON"; do
+    [ -n "$_crmod" ] && break
+    [ -f "$_d/cycle-record.sh" ] && _crmod="$_d/cycle-record.sh"
+  done
+  [ -n "$_crmod" ] || {
+    echo "harness status: ABSENT — no cycle-record.sh in \$O or the harness (cannot grade: an absent instrument is not a pass)"
+    exit 2
+  }
+  # shellcheck source=/dev/null
+  . "$_crmod"
+  declare -f cycle_verdict >/dev/null 2>&1 || { echo "harness status: ABSENT — cycle-record.sh is present but defines no cycle_verdict"; exit 2; }
+  _out="$(cycle_verdict "$O_DIR" "$INTERVAL")"; _rc=$?
+  _verdict="${_out%% *}"
+  if [ "$JSON" -eq 1 ]; then
+    _h="$(cycle_history "$O_DIR" "$LAST" 2>/dev/null)"
+    printf '{\n  "verdict": "%s",\n  "detail": "%s",\n  "stateDir": "%s",\n  "cycles": [' \
+      "$(_json "$_verdict")" "$(_json "$_out")" "$(_json "$O_DIR")"
+    _first=1
+    printf '%s\n' "$_h" | while IFS= read -r _line; do
+      [ -n "$_line" ] || continue
+      [ "$_first" -eq 1 ] || printf ',\n'
+      _first=0
+      printf '    "%s"' "$(_json "$_line")"
+    done
+    printf '\n  ]\n}\n'
+  else
+    echo "harness status — $_verdict"
+    echo "  $_out"
+    echo
+    _h="$(cycle_history "$O_DIR" "$LAST" 2>/dev/null)"
+    if [ -n "$_h" ]; then
+      echo "  last $LAST cycle(s), oldest first (state dir $O_DIR):"
+      printf '%s\n' "$_h" | while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        _age="${_line%%	*}"; _rec="${_line#*	}"
+        echo "    $_age   $_rec"
+      done
+    else
+      echo "  NO CYCLE RECORD in $O_DIR/state — nothing to show, and that is NOT a healthy box."
+    fi
+    echo
+    case "$_verdict" in
+      HEALTHY)  echo "  The controller wrote a record within its last two cycles: it is self-dispatching." ;;
+      DEGRADED) echo "  The newest record is older than two cycles — the controller is NOT cycling." ;
+                echo "  Start it (cloud-cell-supervisor.sh start / install.sh) and read its own log for the last stage it reached." ;;
+      *)        echo "  No usable record: the controller may never have run on this box, or \$O is not the state" ;
+                echo "  directory it writes to. An absent record is never evidence that it is fine." ;;
+    esac
+  fi
+  exit "$_rc"
+fi
 
 O_DIR="${O:-$HOME/orchestrator}"
 JSON=0; QUIET=0

@@ -615,8 +615,197 @@ effective_execstarts() {
         END            { for (i = 1; i <= n; i++) print L[i] }'
 }
 
+# split_words <line> — systemd's OWN word splitting for one command line: double and single quotes
+# group, a backslash escapes the next character inside quotes, runs of whitespace separate. One token
+# per line on stdout.
+# rc 3 = an UNTERMINATED QUOTE. systemd returns EINVAL, logs, and ABANDONS the whole directive, so
+# such a line is NOT a command this gate may read as a pass — the caller refuses naming it. (Same
+# rule `effective_env` applies to Environment=, and for the same measured reason.)
+split_words() {
+    printf '%s\n' "$1" | awk '
+        {
+            tok = ""; inq = 0; q = ""; esc = 0; started = 0; ntok = 0
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                ch = substr($0, i, 1)
+                if (esc) { tok = tok ch; esc = 0; started = 1; continue }
+                if (inq) {
+                    if (ch == "\\") { esc = 1; continue }
+                    if (ch == q) { inq = 0; continue }
+                    tok = tok ch; continue
+                }
+                if (ch == "\"" || ch == "\047") { inq = 1; q = ch; started = 1; continue }
+                if (ch == " " || ch == "\t") { if (started) { T[++ntok] = tok; tok = ""; started = 0 }; continue }
+                tok = tok ch; started = 1
+            }
+            if (started) T[++ntok] = tok
+            if (inq || esc) exit 3
+            for (i = 1; i <= ntok; i++) print T[i]
+        }'
+}
+
+# json_array_words <json-array-text> — one element per line, for the plist's ProgramArguments.
+# Not a JSON parser: it walks the ONE shape `plutil -extract … json` and the python3 fallback both
+# emit (an array of strings), which is all this gate is ever handed.
+json_array_words() {
+    printf '%s' "$1" | awk '
+        {
+            s = $0
+            sub(/^[[:space:]]*\[/, "", s); sub(/\][[:space:]]*$/, "", s)
+            n = length(s); i = 1; cur = ""; started = 0
+            while (i <= n) {
+                ch = substr(s, i, 1)
+                if (ch == "\"") {
+                    i++; started = 1
+                    while (i <= n) {
+                        c2 = substr(s, i, 1)
+                        if (c2 == "\\") { cur = cur substr(s, i + 1, 1); i += 2; continue }
+                        if (c2 == "\"") { i++; break }
+                        cur = cur c2; i++
+                    }
+                    continue
+                }
+                if (ch == ",") { if (started) { print cur; cur = ""; started = 0 }; i++; continue }
+                i++
+            }
+            if (started) print cur
+        }'
+}
+
+# plist_program_arguments_textual <plist-file> — the `ProgramArguments` array's <string> elements, in
+# order, one per line. This is the NO-PARSER arm of the plist read-back: it reads the array POSITIONALLY
+# so the same program-position rule applies (a bare "the path appears in the file" passes a stale or
+# masked job — the defect the parsed arm was fixed for). Prints nothing when the array is absent.
+plist_program_arguments_textual() {
+    awk '
+        {
+            s = $0
+            if (done) next
+            if (!inarr) {
+                if (!match(s, /<key>[[:space:]]*ProgramArguments[[:space:]]*<\/key>/)) next
+                s = substr(s, RSTART + RLENGTH)
+                if (!match(s, /<array>/)) next
+                inarr = 1
+                s = substr(s, RSTART + 7)
+            }
+            if (match(s, /<\/array>/)) { done = 1; s = substr(s, 1, RSTART - 1) }
+            buf = buf s "\n"
+        }
+        END {
+            while (match(buf, /<string>[^<]*<\/string>/)) {
+                print substr(buf, RSTART + 8, RLENGTH - 17)
+                buf = substr(buf, RSTART + RLENGTH)
+            }
+        }' "$1"
+}
+
+# plist_argv_runs_reaper — does this launchd ProgramArguments argv LAUNCH the reaper this install
+# rendered? Two shapes are legitimate, and each is pinned by its own identity:
+#   • the TCC launcher shape this installer renders (`<PY_BIN> <LAUNCHER> --script <REAPER> …`): the
+#     launcher must be in program position AND `--script` must carry THIS install's reaper;
+#   • a job that runs the reaper directly (a shell in program position, as the systemd unit does).
+# ⛔ Anything else is refused. `/bin/true --script <REAPER> --apply` matches neither: the launcher
+# identity is not there, and the program does not execute the reaper. That was the accepted case
+# before this check existed (a membership test over the JSON text), i.e. the same fail-open, in the
+# arm whose comment claimed to assert "the equivalent fact" for launchd.
+# rc 0 = launches the reaper · 1 = does not · 2 = empty argv.
+plist_argv_runs_reaper() {
+    local -a t=()
+    local line i
+    while IFS= read -r line; do t[${#t[@]}]="$line"; done
+    [ "${#t[@]}" -gt 0 ] || return 2
+    if [ -n "${LAUNCHER:-}" ] && [ "${#t[@]}" -ge 2 ] && [ "${t[1]}" = "$LAUNCHER" ]; then
+        i=2
+        while [ "$i" -lt "${#t[@]}" ]; do
+            if [ "${t[$i]}" = "--script" ]; then
+                i=$((i + 1))
+                [ "${t[$i]:-}" = "$REAPER" ] && return 0
+                return 1
+            fi
+            i=$((i + 1))
+        done
+        return 1
+    fi
+    printf '%s\n' "${t[@]}" | argv_executes_reaper
+}
+
+# argv_executes_reaper — read a token list (one per line, PROGRAM FIRST) on stdin and answer the only
+# question the read-back is entitled to ask: does this command EXECUTE the reaper?
+#
+# ⛔ MEMBERSHIP IS NOT EXECUTION. The first cut of this gate asked
+#     case " $exec " in *" $REAPER "*) ok=1 ;;
+# which is a membership test over the WHOLE command line: a drop-in that REPLACED `ExecStart=` with
+# `/bin/true <reaper> --apply` matched, the install printed `verify: ExecStart + HOME read back`,
+# exited 0 and ran `enable --now` — a box with no reaper and every check green. That is the exact
+# fail-open this read-back exists to remove (found by an adversarial review pass, reproduced against a
+# stub `systemctl`). The doc already promised "a drop-in that replaces it is refused"; now the code
+# does too.
+# What is accepted is systemd's own rule: the FIRST token is the program, after the optional prefixes
+# systemd strips before resolving the executable — `-` (ignore failure), `@` (argv[0]), `+`, `!`, `!!`
+# (privilege/sandbox overrides) — or a shell/`env` in program position whose first NON-OPTION argument
+# is the reaper. `bash -c '<script text>'` never passes: the text is a single argument, and whether it
+# runs the reaper is not a fact this gate can prove.
+# rc 0 = executes the reaper · 1 = does not · 2 = no tokens at all.
+argv_executes_reaper() {
+    local -a t=()
+    local line prog i tok
+    while IFS= read -r line; do t[${#t[@]}]="$line"; done
+    [ "${#t[@]}" -gt 0 ] || return 2
+    i=0
+    prog="${t[0]}"
+    while :; do
+        # systemd exec prefixes — `-` (ignore failure), `@` (argv[0]), `+`/`!`/`!!` (privilege and
+        # sandbox overrides) — stripped in the order systemd applies them.
+        while :; do
+            case "$prog" in
+                '!!'*) prog="${prog#'!!'}" ;;
+                '+'*|'!'*|'@'*|'-'*) prog="${prog#?}" ;;
+                *) break ;;
+            esac
+        done
+        [ "$prog" = "$REAPER" ] && return 0
+        case "${prog##*/}" in
+            env)
+                # `env [-i] [VAR=value …] <program> …` — resolve THROUGH the wrapper rather than
+                # refusing a legal command line (systemd renders `/bin/bash` directly, but a hand-fixed
+                # unit or a drop-in that ADDS `/usr/bin/env bash <reaper>` is a healthy one).
+                i=$((i + 1))
+                while [ "$i" -lt "${#t[@]}" ]; do
+                    tok="${t[$i]}"
+                    case "$tok" in
+                        -*)  i=$((i + 1)); continue ;;
+                        *=*) i=$((i + 1)); continue ;;
+                    esac
+                    prog="$tok"; break
+                done
+                [ "$i" -lt "${#t[@]}" ] || return 1
+                continue ;;
+            bash|sh|dash|zsh|ksh)
+                i=$((i + 1))
+                while [ "$i" -lt "${#t[@]}" ]; do
+                    tok="${t[$i]}"
+                    i=$((i + 1))
+                    case "$tok" in -*) continue ;; esac   # an interpreter FLAG is not the script
+                    [ "$tok" = "$REAPER" ] && return 0
+                    return 1                               # first non-option arg is not the reaper
+                done
+                return 1 ;;
+        esac
+        return 1
+    done
+}
+
+# argv_has_token <token> — read a token list (one per line) on stdin, rc 0 if the exact token is present.
+# Used for the mode flag: a FLAG is an argument by nature, so membership is the right question for it
+# (unlike the program, where membership let a replaced ExecStart through).
+argv_has_token() {
+    local want="$1" line
+    while IFS= read -r line; do [ "$line" = "$want" ] && return 0; done
+    return 1
+}
+
 verify_installed_unit() {
-    local unit="" execs="" exec="" want_home="" got_home="" envmap="" ok=0 bad=""
+    local unit="" execs="" exec="" tokens="" rc=0 want_home="" got_home="" envmap="" ok=0 bad=""
     if ! unit="$(service_effective_unit)"; then
         err "REFUSING to report this as installed: the installed unit could not be READ BACK from the"
         err "  $TARGET manager (\`$SC cat $UNIT_NAME.service\`). An unreadable artifact is not a"
@@ -629,13 +818,22 @@ verify_installed_unit() {
         err "  write, or a drop-in that reset the list). Re-run after fixing $UNIT_DIR/$UNIT_NAME.service"
         return 1
     }
-    # Rule: OUR command is among the effective ones. A drop-in that REPLACES it (the mask) leaves ours
-    # absent, which is the case this catches.
+    # Rule: one of OUR effective commands EXECUTES the reaper — the program in program position, or a
+    # shell whose first non-option argument is it. A drop-in that REPLACES it (the mask) leaves ours
+    # absent, which is the case this catches; a drop-in that merely NAMES it in another program's
+    # arguments is the same defect wearing a disguise, and is refused the same way (see
+    # argv_executes_reaper for the measured reproduction).
+    local found=0
     while IFS= read -r exec; do
         [ -n "$exec" ] || continue
-        case " $exec " in
-            *" $REAPER "*) ok=1; break ;;
-        esac
+        tokens="$(split_words "$exec")"; rc=$?
+        if [ "$rc" -eq 3 ]; then
+            err "REFUSING: the installed ExecStart line cannot be tokenized (an unterminated quote), so"
+            err "  systemd REJECTS it and abandons the directive — the service would start without it:"
+            err "  $exec"
+            return 1
+        fi
+        if printf '%s\n' "$tokens" | argv_executes_reaper; then ok=1; found=1; break; fi
     done <<<"$execs"
     if [ "$ok" != 1 ]; then
         bad="$(printf '%s' "$execs" | head -1)"
@@ -658,11 +856,9 @@ verify_installed_unit() {
         return 1
     fi
     # The mode flag is the ARMING DECISION and is visible in the artifact (never hidden in a default).
-    case " $exec " in
-        *" $MODE_FLAG "*) : ;;
-        *) err "REFUSING: the installed ExecStart does not carry $MODE_FLAG — the arming decision is not in the artifact"
-           return 1 ;;
-    esac
+    printf '%s\n' "$tokens" | argv_has_token "$MODE_FLAG" \
+        || { err "REFUSING: the installed ExecStart does not carry $MODE_FLAG — the arming decision is not in the artifact"
+             return 1; }
     # HOME is what `gh` resolves its auth from; the measured exit-3 class ("gh unavailable") is exactly
     # a service whose HOME is not the cell's home.
     want_home="$HOME"
@@ -721,23 +917,29 @@ verify_installed_artifact_plist() {
         if ! args="$(python3 -c 'import json,sys,plistlib;print(json.dumps(plistlib.load(open(sys.argv[1],"rb")).get("ProgramArguments",[])))' "$f" 2>&1)"; then perr="$args"; args=""; fi
     fi
     if [ -n "$args" ]; then
-        case "$args" in
-            *"\"$REAPER\""*) : ;;
-            *) err "REFUSING: the installed plist does not launch $REAPER (ProgramArguments=$args)"
-               err "  a scheduled job that runs a DIFFERENT reaper is the stale-farm/mask defect this pin exists to remove"
-               return 1 ;;
-        esac
+        # ⛔ A PAIR, NOT A MEMBERSHIP. `*"\"$REAPER\""*` matched if the path appeared ANYWHERE in the
+        # JSON text, so `["/bin/true","<reaper>","--apply"]` was certified as launching the reaper —
+        # the same fail-open the systemd arm had, in the arm that claims to assert "the equivalent fact"
+        # for launchd. The rendered job's identity is a TWO-part fact: the TCC launcher in program
+        # position AND `--script <this install's reaper>`. Parsed into argv and checked as such.
+        local pargv=""
+        pargv="$(json_array_words "$args")"
+        if ! printf '%s\n' "$pargv" | plist_argv_runs_reaper; then
+            err "REFUSING: the installed plist does not LAUNCH $REAPER (ProgramArguments=$args)"
+            err "  a scheduled job that runs a DIFFERENT program — even one that names the reaper as an"
+            err "  argument — is the stale-farm/mask defect this pin exists to remove"
+            return 1
+        fi
         # ⛔ THE SAME TWO FACTS THE SYSTEMD ARM REFUSES ON. A plist whose ProgramArguments carry
         # `--dry-run` reclaims NOTHING while `launchctl list` shows the job loaded, and a plist whose
         # EnvironmentVariables.HOME is another tree cannot see the gh auth — the two shapes a stale
         # (not re-rendered) install produces, and the arm that only checked the executable path
         # reported both as "installed".
-        case "$args" in
-            *"\"$MODE_FLAG\""*) : ;;
-            *) err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
-               err "  ProgramArguments=$args"
-               return 1 ;;
-        esac
+        if ! printf '%s\n' "$pargv" | argv_has_token "$MODE_FLAG"; then
+            err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
+            err "  ProgramArguments=$args"
+            return 1
+        fi
         local ph=""
         if command -v plutil >/dev/null 2>&1; then
             ph="$(plutil -extract EnvironmentVariables.HOME raw -o - "$f" 2>/dev/null || true)"
@@ -758,26 +960,39 @@ verify_installed_artifact_plist() {
     else
         # ⛔ THE FALLBACK MUST NOT QUIETLY VERIFY LESS THAN THE PARSED ARM. A textual "the path appears
         # somewhere in the file" passes a stale plist (a `--dry-run` argument, or the path inside an
-        # unused `EnvironmentVariables` entry) — the exact defect the parsed arm was fixed for. It also
-        # used to claim the parser was ABSENT even when one was present but failed, so the message
-        # asserted a reason that was false. Both facts are now required textually, and the message
-        # names what was NOT verified instead of what was.
-        grep -qF -- "$REAPER" "$f" \
-            || { err "REFUSING: the installed plist does not mention $REAPER — it would run something else"; return 1; }
-        grep -qF -- "$MODE_FLAG" "$f" \
-            || { err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
-                 local _why="no plist parser was available"
-                 # ⛔ `${perr:-word}` is NOT an else — it expands to `$perr` when `perr` is non-empty,
-                 # so the old one-liner printed a present-but-failing parser's error TWICE, the second
-                 # copy unflattened and jammed against the first. A real else, built once.
-                 [ -n "$perr" ] && _why="the plist parser FAILED — $(printf '%s' "$perr" | tr '\n' ' ')"
-                 err "  (textual check only: $_why)"
-                 return 1; }
+        # unused `EnvironmentVariables` entry) — the exact defect the parsed arm was fixed for — and it
+        # is the SAME membership-is-not-execution flaw the parsed arm just had. It also used to claim
+        # the parser was ABSENT even when one was present but failed, so the message asserted a reason
+        # that was false. The ProgramArguments array is therefore read TEXTUALLY but POSITIONALLY (the
+        # elements, in order, are the argv), and the message names what was NOT verified.
+        local targv=""
+        targv="$(plist_program_arguments_textual "$f")"
+        if [ -z "$targv" ]; then
+            err "REFUSING: the installed plist carries no readable ProgramArguments array — nothing to verify"
+            return 1
+        fi
+        if ! printf '%s\n' "$targv" | plist_argv_runs_reaper; then
+            err "REFUSING: the installed plist does not LAUNCH $REAPER — ProgramArguments[0] is not it and no"
+            err "  shell in program position takes it as its first argument:"
+            printf '%s\n' "$targv" | sed 's/^/    /' >&2
+            return 1
+        fi
+        if ! printf '%s\n' "$targv" | argv_has_token "$MODE_FLAG"; then
+            err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
+            local _why="no plist parser was available"
+            # ⛔ `${perr:-word}` is NOT an else — it expands to `$perr` when `perr` is non-empty,
+            # so the old one-liner printed a present-but-failing parser's error TWICE, the second
+            # copy unflattened and jammed against the first. A real else, built once.
+            [ -n "$perr" ] && _why="the plist parser FAILED — $(printf '%s' "$perr" | tr '\n' ' ')"
+            err "  (textual check only: $_why)"
+            return 1
+        fi
         if [ -n "$perr" ]; then
             err "WARNING: the plist parser FAILED on $f — the text below is the PARSER's own error, and only"
             err "  the TEXTUAL checks (executable + $MODE_FLAG) verified this artifact: $(printf '%s' "$perr" | tr '\n' ' ')"
         fi
-        say "  verify: plist checked textually — $MODE_FLAG present; EnvironmentVariables.HOME NOT verified (no usable plist parser)"
+        say "  verify: plist checked textually — $MODE_FLAG present in ProgramArguments, the reaper is in"
+        say "    program position; EnvironmentVariables.HOME NOT verified (no usable plist parser)"
     fi
     return 0
 }
