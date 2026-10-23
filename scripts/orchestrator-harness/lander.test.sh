@@ -75,9 +75,28 @@ case "$sub" in
     printf '%s\n' "$*" >>"$STUB_CALLS.merge"
     printf '✓ Merged #%s (abc1234) (squashed)\n' "$num" ;;
   api*)
+    # ── the stale-by-base re-run: the ONE mutation this step may make ─────────────────────────────
+    # `gh api -X POST repos/<o>/<r>/actions/runs/<id>/rerun-failed-jobs`. Logged to its OWN file so an
+    # arm can assert what was RE-RUN, and that nothing was re-run when the answer is "no".
+    case "$*" in
+      *"-X POST"*"rerun-failed-jobs"*)
+        printf '%s\n' "$*" >>"${STUB_CALLS}.rerun"
+        if [ -e "$FX/rerun_fail" ]; then printf 'gh: Forbidden (HTTP 403)\n' >&2; exit 1; fi
+        printf '{}\n'; exit 0 ;;
+    esac
     path="${2:-}"
+    case "$path" in
+      rate_limit) printf '%s\n' "$(cat "$FX/rate.json" 2>/dev/null || printf '{"resources":{"core":{"remaining":1000}}}')" ;;
+      graphql)
+        case "$*" in
+          *defaultBranchRef*) cat "$FX/base.json" 2>/dev/null || printf '{"data":{"repository":{"defaultBranchRef":{"target":{"committedDate":"2026-10-23T12:51:03Z"}}}}}\n' ;;
+          *pullRequests*)     cat "$FX/rollup.json" 2>/dev/null || printf '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}\n' ;;
+          *) printf '{"data":{}}\n' ;;
+        esac ;;
+    esac
     pn="$(printf '%s' "$path" | sed -n 's#.*/pulls/\([0-9][0-9]*\).*#\1#p')"
     case "$path" in
+      rate_limit|graphql) : ;;
       *"actions/runs?status=queued"*)      sed -n 1p "$FX/queue" ;;
       *"actions/runs?status=in_progress"*) sed -n 2p "$FX/queue" ;;
       *"rules/branches/main"*)             cat "$FX/rules" 2>/dev/null || printf '0\n' ;;
@@ -92,7 +111,46 @@ esac
 STUB
   chmod +x "$O/gh-rest/gh"
   : >"$STUB_CALLS.merge"
+  : >"$STUB_CALLS.rerun"
+  printf '{"resources":{"core":{"remaining":1000}}}\n' >"$FX/rate.json"
+  printf '{"data":{"repository":{"defaultBranchRef":{"target":{"committedDate":"2026-10-23T12:51:03Z"}}}}}\n' >"$FX/base.json"
 }
+
+# base_tip <iso8601 Z> — the clock the staleness rule measures against
+base_tip() { printf '{"data":{"repository":{"defaultBranchRef":{"target":{"committedDate":"%s"}}}}}\n' "$1" >"$FX/base.json"; }
+
+# surface <pr> <name|conclusion|startedAt|run_id|check_run_id> ... — the check surface for one PR.
+# Several attempts of ONE name can be listed: the newest by databaseId is the one that counts, which
+# is what a re-run produces (a re-run ADDS a check run, it never replaces one).
+surface() {
+  local pr="$1"; shift
+  python3 - "$FX/rollup.json" "$pr" "$@" <<'PY'
+import json, sys
+p, pr = sys.argv[1], int(sys.argv[2])
+checks = []
+for spec in sys.argv[3:]:
+    name, concl, started, run, cid = spec.split("|")
+    checks.append({"__typename": "CheckRun", "databaseId": int(cid), "name": name,
+                   "status": "COMPLETED", "conclusion": concl, "startedAt": started,
+                   "checkSuite": {"app": {"slug": "github-actions"},
+                                  "workflowRun": {"databaseId": int(run), "workflow": {"name": "CI"}}}})
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {"data": {"repository": {"pullRequests": {"nodes": []}}}}
+nodes = d["data"]["repository"]["pullRequests"]["nodes"]
+nodes = [n for n in nodes if n["number"] != pr]
+nodes.append({"number": pr, "commits": {"nodes": [{"commit": {"statusCheckRollup":
+              {"contexts": {"nodes": checks}}}}]}})
+# ⛔ RE-ATTACH. `nodes` is a NEW list; appending to it does nothing to `d` until it is put back.
+# (Found by the suite: the fixture was written, and every arm read an EMPTY surface.)
+d["data"]["repository"]["pullRequests"]["nodes"] = nodes
+json.dump(d, open(p, "w"))
+PY
+}
+
+rerun_calls() { cat "$STUB_CALLS.rerun" 2>/dev/null | awk 'NF{print}' | tr '\n' ' '; }
+state_file() { printf '%s/state/stale-rerun-stub-repo.tsv' "$O"; }
 
 # seed <n> <mergeable> <mstate> <draft> <head> — one PR in the candidate list
 seed() {
@@ -291,6 +349,160 @@ run_lander
 [ -z "$(merged_nums)" ] && ok "BOARD: nothing merged on an unreadable board" || bad "BOARD: merged something without a readable board"
 has "$OUT" "FATAL: the open-PR board could not be read" && ok "BOARD: the failure is named" || bad "BOARD: the failure is not named ($OUT)"
 
+# ══ CASES 11-18 — STALE-BY-BASE RE-RUN ═══════════════════════════════════════════════════════════
+# The rule: a RED check whose `started_at` PREDATES the current base tip's committer date measured a
+# tree that no longer exists → RE-MEASURE it. BOTH directions are asserted, because a one-directional
+# suite passes for a tool that re-runs EVERYTHING (a bypass, not a measurement).
+BASE_ISO=2026-10-23T12:51:03Z          # the base tip every arm below measures against
+
+say_case "case 11 — (i) a RED check started BEFORE the base tip IS selected and re-run (run-scoped)"
+new_case
+base_tip "$BASE_ISO"
+seed 111 MERGEABLE CLEAN false aaaa111122223333444455556666777788889999
+checks 111 sigpipe-grep:failure test:success
+surface 111 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5001|1001" "test|SUCCESS|2026-10-23T01:05:00Z|5001|1002"
+run_lander
+has "$(rerun_calls)" "actions/runs/5001/rerun-failed-jobs" \
+  && ok "STALE: the run carrying the stale red was re-run (rerun calls: $(rerun_calls))" \
+  || bad "STALE: a stale red was NOT re-run (rerun calls: '$(rerun_calls)')"
+has "$OUT" "#111 sigpipe-grep RE-RUN (run 5001, check 1001 started 2026-10-23T01:00:00Z" \
+  && ok "STALE: the report names the check id, its start time and the base tip it was measured against" \
+  || bad "STALE: the re-run is not reported with its evidence ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -2))"
+grep -q "^R" "$(state_file)" 2>/dev/null \
+  && ok "STALE: the re-run was recorded in the state file (so its outcome is read on a later pass)" \
+  || bad "STALE: nothing was recorded in $(state_file)"
+has "$(rerun_calls)" "test" && bad "STALE: the re-run was issued per check, not per run" \
+                             || ok "STALE: one POST for the run — the green sibling was not re-run by name"
+
+say_case "case 12 — (ii) a RED check started AFTER the base tip is NOT selected (this tree is current)"
+new_case
+base_tip "$BASE_ISO"
+seed 112 MERGEABLE CLEAN false bbbb111122223333444455556666777788889999
+checks 112 sigpipe-grep:failure
+surface 112 "sigpipe-grep|FAILURE|2026-10-23T13:30:00Z|5002|1003"
+printf '1\n' >"$FX/checks_rc-112"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "NOT-STALE: a red started AFTER the base tip was NOT re-run" \
+                         || bad "NOT-STALE: a red that measured the CURRENT tree was re-run (calls: '$(rerun_calls)')"
+has "$OUT" "stale-by-base=0" && ok "NOT-STALE: the step counts it as not-stale, and says so" \
+                              || bad "NOT-STALE: the report does not say stale-by-base=0 ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+has "$OUT" "#112 skipped: 1 FAILED check(s): sigpipe-grep (failure)" \
+  && ok "NOT-STALE: the PR is still reported RED by the drain loop — 'not re-run' is not 'not red'" \
+  || bad "NOT-STALE: the PR stopped being reported red ($OUT)"
+
+say_case "case 13 — (iii) a non-base failure comes back STILL-RED: reported, never dropped or greened"
+new_case
+base_tip "$BASE_ISO"
+seed 113 MERGEABLE CLEAN false cccc111122223333444455556666777788889999
+checks 113 sigpipe-grep:failure
+# The re-run produced a NEW attempt (id 2001, started AFTER the tip) and it is STILL a failure:
+# the red belongs to the branch. The tool must say so, and must NOT re-run it a second time.
+surface 113 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5003|1003" \
+            "sigpipe-grep|FAILURE|2026-10-23T13:40:00Z|5003|2001"
+printf 'R\t%s\t113\t5003\tsigpipe-grep\t1003\t2026-10-23T01:00:00Z\n' "$(date -u +%s)" >"$(state_file)"
+run_lander
+has "$OUT" "#113 sigpipe-grep is STILL-RED (check 2001, replacing 1003)" \
+  && ok "STILL-RED: reported as still-red against the NEW attempt id (newest by id, not a rollup state)" \
+  || bad "STILL-RED: a non-base failure was not reported as still-red ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -3))"
+case "$OUT" in *"#113 sigpipe-grep is now SUCCESS"*) bad "STILL-RED: a still-red check was reported as SUCCESS" ;; *) ok "STILL-RED: not reported as success" ;; esac
+[ -z "$(rerun_calls)" ] && ok "STILL-RED: the still-red check was NOT re-run a second time" \
+                         || bad "STILL-RED: an already-re-run still-red check was re-run again ('$(rerun_calls)')"
+grep -q '^O.*still-red' "$(state_file)" 2>/dev/null && ok "STILL-RED: the outcome is written to the state as still-red" \
+                                                 || bad "STILL-RED: the outcome was not recorded ($(cat "$(state_file)" 2>/dev/null | tr '\n' ' '))"
+
+say_case "case 14 — (iv) the state file stops a re-run loop (same run, no new attempt yet)"
+new_case
+base_tip "$BASE_ISO"
+seed 114 MERGEABLE CLEAN false dddd111122223333444455556666777788889999
+checks 114 sigpipe-grep:failure
+surface 114 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5004|1004"    # SAME id still newest: no new attempt
+printf 'R\t%s\t114\t5004\tsigpipe-grep\t1004\t2026-10-23T01:00:00Z\n' "$(date -u +%s)" >"$(state_file)"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "LOOP: the same run was NOT re-run twice inside the window" \
+                         || bad "LOOP: the state file did not prevent a re-run loop ('$(rerun_calls)')"
+has "$OUT" "#114 sigpipe-grep skipped — run 5004 was already re-run inside the" \
+  && ok "LOOP: the skip is NAMED (a silent skip would hide a red)" \
+  || bad "LOOP: the skip is not reported ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -2))"
+
+say_case "case 15 — a re-run that resolved the red is reported SUCCESS against the newest attempt"
+new_case
+base_tip "$BASE_ISO"
+seed 115 MERGEABLE CLEAN false eeee111122223333444455556666777788889999
+checks 115 sigpipe-grep:success
+surface 115 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5005|1005" \
+            "sigpipe-grep|SUCCESS|2026-10-23T13:41:00Z|5005|2005"
+printf 'R\t%s\t115\t5005\tsigpipe-grep\t1005\t2026-10-23T01:00:00Z\n' "$(date -u +%s)" >"$(state_file)"
+run_lander
+has "$OUT" "#115 sigpipe-grep is now SUCCESS (check 2005, replacing 1005)" \
+  && ok "SUCCESS: reported from the NEWEST attempt by id" \
+  || bad "SUCCESS: a resolved re-run was not reported as success ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -3))"
+
+say_case "case 16 — an unreadable base tip re-runs NOTHING (fail-closed, and named)"
+new_case
+printf '{"data":{"repository":{"defaultBranchRef":{"target":null}}}}\n' >"$FX/base.json"
+seed 116 MERGEABLE CLEAN false ffff111122223333444455556666777788889999
+checks 116 sigpipe-grep:failure
+surface 116 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5006|1006"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "NO-CLOCK: nothing re-run without a base tip to measure against" \
+                         || bad "NO-CLOCK: a re-run was issued with no base tip ('$(rerun_calls)')"
+has "$OUT" "the base tip could not be read over GraphQL" \
+  && ok "NO-CLOCK: the refusal is named, not silent" || bad "NO-CLOCK: the refusal is silent ($OUT)"
+
+say_case "case 17 — pipeline-compliance is EXCLUDED by name (a different defect, a different owner)"
+new_case
+base_tip "$BASE_ISO"
+seed 117 MERGEABLE CLEAN false aaaa2222333344445555666677778888999900001
+checks 117 pipeline-compliance:failure
+surface 117 "pipeline-compliance|FAILURE|2026-10-23T01:00:00Z|5007|1007"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "EXCLUDED: the required check was NOT swept into this mechanism" \
+                         || bad "EXCLUDED: pipeline-compliance was re-run by the stale-by-base step ('$(rerun_calls)')"
+has "$OUT" "excluded-by-name=1" && ok "EXCLUDED: the exclusion is COUNTED, so it cannot hide a red" \
+                                    || bad "EXCLUDED: the exclusion is invisible ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+has "$OUT" "is #2467's class" && ok "EXCLUDED: the owner of the other mechanism is named" \
+                               || bad "EXCLUDED: the report does not name the other mechanism ($OUT)"
+
+say_case "case 18 — the REST budget decides N: with no headroom beyond the reserve, NOTHING is re-run"
+new_case
+base_tip "$BASE_ISO"
+printf '{"resources":{"core":{"remaining":504}}}\n' >"$FX/rate.json"   # 504 - 500 reserve = 4 -> 0 runs at 5 pts
+seed 118 MERGEABLE CLEAN false aaaa3333444455556666777788889999000011112
+checks 118 sigpipe-grep:failure
+surface 118 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5008|1008"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "BUDGET: N=0 means no mutation is spent when the bucket has no headroom" \
+                         || bad "BUDGET: a re-run was spent with no budget ('$(rerun_calls)')"
+has "$OUT" "budget N=0 run(s) (REST core 504 left" \
+  && ok "BUDGET: the derived N and the budget it came from are PRINTED" \
+  || bad "BUDGET: the budget line is wrong/missing ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+has "$OUT" "stale-by-base=1" && ok "BUDGET: the stale check is still COUNTED even when it cannot be re-run" \
+                               || bad "BUDGET: the stale check vanished from the count ($OUT)"
+say_case "case 19 — a REFUSED re-run (403: workflow already running) is named, recorded, and not retried"
+new_case
+base_tip "$BASE_ISO"
+: >"$FX/rerun_fail"                       # the API refuses every re-run this pass
+seed 119 MERGEABLE CLEAN false aaaa4444555566667777888899990000111122223
+checks 119 sigpipe-grep:failure
+surface 119 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|5009|1009"
+run_lander
+has "$OUT" "#119 sigpipe-grep re-run REFUSED by the API (run 5009)" \
+  && ok "REFUSED: the refusal is reported, with what the API said" \
+  || bad "REFUSED: a refused re-run is silent ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -2))"
+has "$OUT" "NOT treated as green" && ok "REFUSED: it is explicitly NOT read as a pass" \
+                                   || bad "REFUSED: the report does not say the red still stands ($OUT)"
+grep -q '^D' "$(state_file)" 2>/dev/null && ok "REFUSED: recorded as a deferral (D), not as an outcome" \
+                                          || bad "REFUSED: the refusal was not recorded ($(cat "$(state_file)" 2>/dev/null | tr '\n' ' '))"
+grep -q '^O' "$(state_file)" 2>/dev/null && bad "REFUSED: a refused re-run was resolved into an outcome" \
+                                         || ok "REFUSED: it was NOT resolved into a success/still-red outcome"
+# Second pass, same run, API now healthy: the DEFERRAL from above must stop a second POST.
+: >"$STUB_CALLS.rerun"; rm -f "$FX/rerun_fail"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "REFUSED: the next pass does NOT pay another POST for the same run inside the window" \
+                         || bad "REFUSED: a deferred run was retried immediately ('$(rerun_calls)')"
+has "$OUT" "#119 sigpipe-grep skipped — run 5009 was already re-run inside the" \
+  && ok "REFUSED: the deferral is reported as a windowed skip, so the red is still visible" \
+  || bad "REFUSED: the deferral is silent on the next pass ($(printf '%s\n' "$OUT" | grep 'stale-rerun' | head -2))"
 # ══ summary ═════════════════════════════════════════════════════════════════════════════════
 printf '\n%s of %s assertions passed, %s failed\n' "$PASS" "$((PASS+FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
