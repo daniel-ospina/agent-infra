@@ -2669,6 +2669,62 @@ if true; then
   RUN_MUTATIONS="${ATOMIC_LAND_MUTATIONS:-1}"
   echo "── 18. mutation coverage — each declared bypass class must be caught"
   MUT="$TMP/mut"; mkdir -p "$MUT"
+  # ⛔ BATCHED, NOT SERIAL (agent-infra#2483). Every mutation re-runs this WHOLE suite in a child
+  # (~31 s on ubuntu-latest); 65 of them one after another measured 32m51s — 43% of the
+  # `bash-suites` step and the largest single element of every PR's critical path. The children share
+  # nothing: each gets its own `mktemp -d` ($TMP above), its own `$MUT/<name>.sh|.log`, and the three
+  # ATOMIC_LAND_* values explicitly — only this loop serialised them. A batch is launched, waited on,
+  # and its verdicts are reported in CALL ORDER, so every mutation still runs exactly once and still
+  # reports its own name: nothing is skipped, no assertion changes. `ATOMIC_LAND_MUTATION_JOBS=1`
+  # restores the old serial execution.
+  MUTATION_JOBS="${ATOMIC_LAND_MUTATION_JOBS:-4}"
+  case "$MUTATION_JOBS" in ''|*[!0-9]*) MUTATION_JOBS=4 ;; esac
+  [ "$MUTATION_JOBS" -ge 1 ] 2>/dev/null || MUTATION_JOBS=4
+  MUT_QUEUE=()          # "<name>\t<mutated rail>" per queued mutation, in call order
+  mut_reported=0
+  # The declared population. Two guards read it, and they catch DIFFERENT things (below): the
+  # queue→drain comparison catches a mutation that a batching bug lost or repeated, and this floor
+  # catches a call site that was DELETED — the comparison cannot see that, because deleting a
+  # `mutate_and_expect_fail` line moves both sides of it. Bump this when you add a class; that a
+  # deletion has to walk past a number is the whole point (same doctrine as the shard runner's
+  # `MIN_SUITES` floor).
+  MUTATION_FLOOR=65
+  mutation_drain() { # run the queued mutations in batches, reporting each by name
+    local total="${#MUT_QUEUE[@]}" i=0 k n name src rc
+    local -a pids names
+    [ "$total" -eq 0 ] && return 0
+    while [ "$i" -lt "$total" ]; do
+      pids=(); names=(); n=0
+      while [ "$i" -lt "$total" ] && [ "$n" -lt "$MUTATION_JOBS" ]; do
+        IFS=$'\t' read -r name src <<< "${MUT_QUEUE[$i]}"
+        ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" \
+          bash "$0" >"$MUT/$name.log" 2>&1 &
+        pids+=("$!"); names+=("$name")
+        i=$((i + 1)); n=$((n + 1))
+      done
+      k=0
+      while [ "$k" -lt "${#pids[@]}" ]; do
+        rc=0; wait "${pids[$k]}" || rc=$?
+        mut_reported=$((mut_reported + 1))
+        # ⛔ A NON-ZERO EXIT IS NOT A VERDICT BY ITSELF. The child is a WHOLE suite run, and a child
+        # that died for a reason unrelated to the mutation — OOM-killed (137), a full /tmp (1), a
+        # watchdog bound lost to contention (124) — exits non-zero exactly like a caught mutation.
+        # Serial execution made that rare; concurrent children widen it, and reading it as "class
+        # covered" is a FALSE PASS over an unchecked class. So require the child's OWN summary line:
+        # the suite prints "❌ N of M atomic-land test(s) failed" on every failing path, including a
+        # crash-free run of a mutated rail, and prints nothing of the sort when it dies mid-run.
+        if [ "$rc" -ne 0 ] \
+           && grep -qE '^❌ [0-9]+ of [0-9]+ atomic-land test\(s\) failed$' "$MUT/$name.log"; then
+          pass "mutation ${names[$k]} reddens the suite (class covered)"
+        elif [ "$rc" -ne 0 ]; then
+          fail "mutation ${names[$k]} exited $rc with NO failure verdict — it did not run to a verdict, so it covers nothing: $(tail -1 "$MUT/$name.log" 2>/dev/null)"
+        else
+          fail "mutation ${names[$k]} did NOT redden the suite (class NOT covered)"
+        fi
+        k=$((k + 1))
+      done
+    done
+  }
   # Two perl traps have cost this harness real coverage (all four instances fixed
   # here, found by a fresh review of this file): (1) `$` is NOT literal in a perl
   # REPLACEMENT — `"$GH"` becomes `""` unless it is spelled `\044GH`, silently
@@ -2710,12 +2766,8 @@ if true; then
       pass "anchor $name applies"
       return
     fi
-    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
-    if [ $? -ne 0 ]; then
-      pass "mutation $name reddens the suite (class covered)"
-    else
-      fail "mutation $name did NOT redden the suite (class NOT covered)"
-    fi
+    # QUEUED, not run here: `mutation_drain` batches these after the list (see its note above).
+    MUT_QUEUE+=("$name"$'\t'"$src")
   }
   # The four predicate anchors below are separated by INDENTATION, not by content:
   # the same predicate text sits at four sites. If two ever share a
@@ -3046,6 +3098,23 @@ if true; then
   # D2b: --paginate emits ONE result per page; reading only the first page hides a
   # later pending check and turns it into a false terminal verdict.
   mutate_and_expect_fail D2b  's/ --paginate//g'
+  mutation_drain
+  # ⛔ TWO GUARDS, because they catch different failures:
+  #  (a) QUEUE → DRAIN: every call site that QUEUED a mutation reported exactly once. This is the
+  #      batching risk — a queue entry never launched, or launched twice.
+  #  (b) POPULATION FLOOR: the call sites themselves did not shrink. (a) structurally cannot see a
+  #      DELETED `mutate_and_expect_fail` line, because deleting one moves both sides of that
+  #      comparison together — so a deletion is made loud by a number instead.
+  # Anchor-only mode (a CHILD run) has an empty queue and is exempt: it queues nothing by design.
+  if [ "$RUN_MUTATIONS" != "0" ]; then
+    mut_listed="$(grep -cE '^[[:space:]]*mutate_and_expect_fail ' "${BASH_SOURCE[0]}")"
+    [ "$mut_reported" -eq "$mut_listed" ] \
+      && pass "every queued mutation reported exactly once ($mut_reported of $mut_listed call site(s))" \
+      || fail "$mut_reported mutation(s) reported for $mut_listed call site(s) — the batching lost or repeated one"
+    [ "$mut_listed" -ge "$MUTATION_FLOOR" ] \
+      && pass "the mutation population has not shrunk ($mut_listed call site(s), floor $MUTATION_FLOOR)" \
+      || fail "only $mut_listed mutation call site(s) — below the $MUTATION_FLOOR floor, so a class was deleted and its coverage went with it"
+  fi
 fi
 
 if [ "$failures" -gt 0 ]; then
