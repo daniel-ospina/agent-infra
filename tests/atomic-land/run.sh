@@ -594,6 +594,14 @@ called "admin-merge" && fail "landed with no record for the head" || pass "the l
 grep -q "FRESH review is required at $HEAD_OLD" "$SCEN/err" \
   && pass "the refusal names the full head a review must cover" \
   || fail "the refusal does not name the head the review must cover ($(tail -2 "$SCEN/err"))"
+# The HEADWORD is the plumbing's other half (#1362 D1): at the precondition no new
+# head exists yet, so a refusal that says "the new head" sends the operator after an
+# artifact that is not there. REGRESSION-SENSITIVE: reverting
+# `headword="CURRENT head"` back to `"new head"` left the whole suite green before
+# this assertion existed (measured), because no other scenario greps this message.
+grep -q "a FRESH review of the CURRENT head is required" "$SCEN/err" \
+  && pass "the refusal names the CURRENT head, not a 'new head' that does not exist yet" \
+  || fail "the refusal says 'new head' at the precondition — the #1362 D1 mislabel the plumbing exists to remove"
 grep -q "NOT updated" "$SCEN/err" \
   && pass "and states that the branch was left alone" \
   || fail "the refusal does not say the branch was left alone"
@@ -647,9 +655,15 @@ called "admin-merge 42" && pass "the unit landed" || fail "did not land"
 # ═══ 2b-iii. a FRESH record is NOT sent through the precondition ════════
 # The scope boundary, and a RECORDED DECISION: B5 is a PRESENCE test and a stale
 # marker does not block step 1 (see pr_has_carry_evidence's WHY). So a record bound
-# to the head, with a marker carrying a DIFFERENT diff, still updates. The switch
-# refuses any record call that arrives BEFORE the update, so a gate that wrongly
-# covered fresh records would refuse here and this scenario would redden.
+# to the head, with a marker carrying a DIFFERENT diff, still updates. ⛔ The
+# `SCEN_RECORD_REFUSE_PREFLIGHT` switch set below is INERT in this scenario and is
+# NOT its discriminator: a FRESH record returns from `do_record` at its first
+# branch without ever invoking the producer, so the switch never fires. What
+# discriminates is the ABSENCE of the "the record is STALE" log line asserted
+# below. (An earlier revision of this comment claimed the switch would refuse here
+# and that a wrongly-widened gate would redden this scenario; measured, it cannot.
+# The switch is kept only so a future fixture that DOES reach the producer has the
+# refusal available.)
 echo "── 2b-iii. #2369 — a FRESH record still updates (the precondition is scoped to a STALE one)"
 new_scen freshstalemarker
 marker_fixture 42 clean "$HEAD_OLD" \
@@ -692,6 +706,14 @@ called "pr update-branch 42" \
 grep -q "refused on the CURRENT head's HEALTH" "$SCEN/out" \
   && pass "and the log says why it proceeded" \
   || fail "the rail proceeded without naming the head-health exception"
+# The preflight neither lands nor merges, so its clause-(E) arm must NOT claim a
+# LANDING was refused. REGRESSION-SENSITIVE: deleting the `[ "$1" != preflight ]`
+# guard left the whole suite green before this assertion existed (measured) — the
+# transcript said "nothing was merged" and the rail then merged, which is exactly
+# the #1362 D1 step-mislabel class this branch was split to remove.
+grep -q "the landing path does NOT accept this refusal" "$SCEN/err" \
+  && fail "the preflight claimed a LANDING was refused — and the rail then merged" \
+  || pass "the preflight did not claim a landing was refused (a preflight does not land)"
 # ═══ 2b-vi. the two ends of the clause-(E) discriminator are pinned ═══
 # Exit 3 carries BOTH refusal causes, so `(#1575 clause E)` in the producer's stderr
 # is the ONLY thing separating "the artifact changed" from "the head is red". The
@@ -732,9 +754,18 @@ called "pr update-branch 42" \
 called "admin-merge" \
   && fail "the land step ran on a MEASURABLY RED head — the #1575 clause-(E) veto was accepted by the caller" \
   || pass "the land step did NOT run on a red head"
-grep -q "nothing was merged" "$SCEN/err" \
-  && pass "and the step-3 path still says nothing was merged" \
-  || fail "the step-3 refusal left the transcript silent about the merge"
+# CONDITIONAL on the land NOT having run: under the B5g mutant the clause-(E) arm
+# prints "nothing was merged" and the caller then MERGES, so an unconditional grep is
+# satisfied by the very mutant that merges (measured: it read ✅ beside
+# ❌ "the land step ran on a MEASURABLY RED head"). The message only certifies
+# anything when the unit actually stopped.
+if called "admin-merge"; then
+  fail "the step-3 path said nothing was merged but the land step RAN — the message certifies a false transcript"
+else
+  grep -q "nothing was merged" "$SCEN/err" \
+    && pass "and the step-3 path still says nothing was merged" \
+    || fail "the step-3 refusal left the transcript silent about the merge"
+fi
 
 # ═══ 2b-iv. dry-run with a STALE record writes nothing ═══════════════════
 echo "── 2b-iv. #2369 — dry-run reports the precondition it would take and writes nothing"
