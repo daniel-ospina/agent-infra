@@ -87,6 +87,9 @@ shard_errors=0
 shard_ran=0
 shard_skipped=0
 shard_listed=0
+shard_time=0
+shard_slowest_secs=0
+shard_slowest=""
 
 # The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
 # BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
@@ -128,6 +131,8 @@ fi
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
+  # Whether this call is a LIST line or one of the sentinels below (used by the timing report).
+  if [ "$slice_pos" -lt "$listed" ]; then shard_is_listed=1; else shard_is_listed=0; fi
   [ "$slice_count" -gt 0 ] || return 1
   [ "$slice_pos" -lt "$listed" ] || return 1
   [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
@@ -135,11 +140,25 @@ slice_skips() {
   return 0
 }
 
+# shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
+# from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
+# that whole line; everything they must disable has to live on it).
+shard_note() {
+  shard_time=$((shard_time + $2))
+  if [ "$2" -gt "$shard_slowest_secs" ]; then shard_slowest_secs=$2; shard_slowest="$1"; fi
+  printf '  ▸ %4ss  %s\n' "$2" "$1"
+}
+
 # One line on purpose: the execution and the counter that proves it happened are inseparable,
 # so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion. The skip
 # branch is that explicit rewrite, and it is COUNTED (`shard_skipped`) so a skipped shard can never
 # be mistaken for an executed one — see the coverage assertions at the end.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); bash "$1" || shard_errors=$((shard_errors + 1)); }
+#
+# The timing report is why the DURATION half of this file's own defect (a hung shard burning hours
+# anonymously) can be measured at all: until now no lane printed how long a shard took, so "which
+# shard is slow, which one hangs" was answerable only by watching a job's clock. It prints ONLY for
+# list lines (`shard_is_listed`), so the sentinels cannot print a bogus row.
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -362,6 +381,8 @@ if [ "$shard_errors" -gt 0 ]; then
 fi
 if [ "$slice_count" -gt 0 ]; then
   echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
+  echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s (${shard_slowest})"
 else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
+  echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s (${shard_slowest})"
 fi
