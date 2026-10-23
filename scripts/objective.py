@@ -907,6 +907,15 @@ FLIGHT_BOUND_MIN = 90.0
 # never its check-run -- and re-triggering it does not make an attestation appear.
 GATED_CHECKS = tuple(n for n in REQUIRED if n != "ai-review-gate")
 
+# The contexts whose check-run is NOT their truth. `ai-review-gate` is DIFF-BOUND: it is red by
+# construction whenever the head-bound attestation is older than the head, and a re-trigger cannot
+# make an attestation appear. So it must never be NAMED as the thing to re-trigger either -- the
+# name in the reason becomes the ORDER the lane is dispatched on (pr-doctor's brief renders
+# "Re-trigger the workflow run behind `<why>`"), and naming this one sends a lane at a gate that a
+# re-run provably cannot start. Excluding it from the WAIT (GATED_CHECKS, above) and from the
+# REPORT (`DIFF_BOUND_CHECKS`, here) are the same ruling on the same fact (#1926 review, P1).
+DIFF_BOUND_CHECKS = ("ai-review-gate",)
+
 
 def _epoch_ts(v):
     """Unix seconds for a GitHub ISO-8601 timestamp, or None -- never a silent 0."""
@@ -1388,9 +1397,21 @@ def classify_one(p):
         # shapes are named: a stalled REQUIRED check, and an absent gate beside children that
         # cannot complete (`wedge_evidence`). A head whose checks never got created has NOTHING to
         # name here, so `why` stays None and the brief's "never ran" branch is the right one.
+        # ⛔ `why` OMITS THE DIFF-BOUND GATES (#1926 review, P1). The aged set is over EVERY
+        # context, so it legitimately contains `ai-review-gate` -- but these names become the
+        # brief's ORDER ("Re-trigger the workflow run behind `<why>`"), and a re-trigger provably
+        # cannot start a gate whose truth is the head-bound attestation FILE. Naming it sends a
+        # lane at a no-op; the re-run creates a fresh attempt, the next pass reads the head as
+        # `running`, and the head oscillates re-trigger -> wait -> re-trigger for ever while the
+        # gate that DOES need starting is only listed as absent.
+        # ⛔ THE DECISION IS UNTOUCHED -- `classify_pr` above still sees the full aged list, so
+        # this shape is still `rerun-checks` (never an eternal `running`): only the ORDER loses the
+        # unstartable name, and `why` becoming None correctly hands the brief to its absent-gate
+        # branch, which names the gate that was never created.
         why = ",".join(f"{n} {st} {a:.0f}m" for n, st, a in
                        wedge_evidence(stalled, gated_absent,
-                                      inflight_attempts(cr), flight_stalled)) or None
+                                      inflight_attempts(cr), flight_stalled)
+                       if n not in DIFF_BOUND_CHECKS) or None
     elif cr and k == "blocked-by-rail":
         why = rail_block_reason(red, flight, _seen)
     elif cr and k == "fix-ci":

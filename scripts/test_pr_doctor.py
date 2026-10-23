@@ -2357,6 +2357,17 @@ def test_the_wedged_re_run_brief_states_the_measured_state():
     assert absent_line, wedged
     names = wedged.splitlines()[wedged.splitlines().index(absent_line[0]) + 1]
     assert "ai-review-gate" not in names, names
+    # 4b. AND THE FILTER IS PINNED, NOT MERELY SATISFIED (#1926 review, P2). In the fixture above
+    #     `ai-review-gate` is GREEN, so deleting the `gated_absent` filter at pr-doctor.py:1778
+    #     leaves this test passing -- the assertion claimed to pin the exclusion and pinned
+    #     nothing. Make it ABSENT and the exclusion becomes the only thing keeping it out.
+    both = pr.brief(ready, "rerun-checks", "python-ci-gate queued 150m",
+                    _cr(absent=["python-ci-gate", "ai-review-gate"]))
+    absent_both = [ln for ln in both.splitlines() if ln.startswith("**Absent at this head**")]
+    assert absent_both, both
+    names_both = both.splitlines()[both.splitlines().index(absent_both[0]) + 1]
+    assert "ai-review-gate" not in names_both, names_both
+    assert "python-ci-gate" in names_both, names_both
     # 5. and it says what to DO about a wedge, which is a re-run of the RUN, not an empty commit
     assert "gh run rerun" in wedged, wedged
 

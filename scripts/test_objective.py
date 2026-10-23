@@ -1098,6 +1098,39 @@ def test_the_bound_is_a_constant_pinned_on_both_sides():
                        started=True)
     assert objective.stalled_flight(below, now=NOW) == []
     assert len(objective.stalled_flight(above, now=NOW)) == 1
+    # ...and the threshold's SIDEDNESS is pinned (#1926 review, P2): a check EXACTLY at the bound
+    # is still a wait. Without this, flipping `age <= bound` to `age < bound` leaves the whole
+    # suite green, and the one thing an age gate must not leave free is which side of the line
+    # it is on.
+    at = _wedged_cr(age_min=objective.FLIGHT_BOUND_MIN, status="in_progress", started=True)
+    assert objective.stalled_flight(at, now=NOW) == []
+
+
+def test_the_order_never_names_the_diff_bound_gate(monkeypatch):
+    """#1926 review, P1. The absent-gate arm ages EVERY context, so the aged list legitimately
+    contains `ai-review-gate` -- and those names become the brief's ORDER ("Re-trigger the
+    workflow run behind `<why>`"). `ai-review-gate` is DIFF-BOUND: a re-trigger cannot make an
+    attestation appear, so naming it dispatches a lane at a provable no-op; the fresh attempt
+    resets the age, the next pass reads the head as `running`, and the head oscillates
+    re-trigger -> wait -> re-trigger while the gate that DOES need starting (`python-ci-gate`,
+    never created) is only listed as absent.
+
+    The DECISION must not be collateral damage: this shape stays `rerun-checks` (an eternal
+    `running` would be the very wedge #1926 is about), and only the ORDER loses the unstartable
+    name -- `why` is None, so the brief falls to its absent-gate branch.
+    """
+    cr = _absent_gate_cr() + [_run("ai-review-gate", "queued", run=9401)]
+    install(monkeypatch, rest=_Result(0, json.dumps([{"check_runs": cr}])),
+            runs={9401: _Result(0, json.dumps(
+                {"run_started_at": _iso(NOW - (WEDGED_MIN + 60) * 60)}))})
+    monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
+    monkeypatch.setattr(objective.time, "time", lambda: NOW)
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
+    assert classes["rerun-checks"] == 1, classes
+    assert classes.get("running", 0) == 0, classes
+    reasons = [r for _n, r in by_class["rerun-checks"]]
+    assert reasons, by_class
+    assert all("ai-review-gate" not in (r or "") for r in reasons), by_class
 
 
 def test_a_re_trigger_resets_the_age(monkeypatch):
