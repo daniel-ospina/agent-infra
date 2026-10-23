@@ -451,6 +451,60 @@ grep -q '1761' "$T/c2u.out" \
   && ok 'start: the refusal names the reason (#1761, two dispatchers)' \
   || bad "start: the unreadable refusal does not name the reason — $(cat "$T/c2u.out")"
 
+# ── a STOP that lands DURING the delegated start must UNDO it (review P1, #2402) ────────────────
+# The delegated start hands the controller to the service manager, so the teardown `superseded` performs
+# (tmux sessions, the doctor loop, the marker files) ends NOTHING — and under `Restart=always` any kill
+# would be undone within RestartSec anyway. Only stopping the unit leaves "nothing running", which is what
+# the fence promises. The hook bumps the stop generation during `systemctl start`, i.e. mid-window.
+CD="$(arm_root c3)"; mk_systemctl "$CD/bin" "$CD/state" "$CD/sc.log"; mk_tmux "$CD/bin" "$CD/tmux.log"
+: > "$CD/units/eldato-orchestrator.service"; : > "$CD/state/enabled"
+# ⛔ WRITE THE FIXTURE HERE, do not copy it from the previous arm's state dir: `cmd_start` SEEDS the
+# harness's own scripts into `$O`, so `$C/o/orch-loop.sh` is the real loop by now — copying it made this
+# arm die on the harness's own FATAL before the fence was ever reached (and looked like a missing stop).
+cat > "$CD/o/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$CD/o/orch-loop.sh"
+cat > "$CD/hook.sh" <<STUB
+#!/bin/bash
+bash "$CD/o/orch-loop.sh" &
+printf '%s\n' \$! > "$CD/o/.orch.lock"
+mkdir -p "$CD/o/state/roles"
+printf '1\n' > "$CD/o/state/roles/.stop-generation"
+STUB
+chmod +x "$CD/hook.sh"
+SC_HOOK="$CD/hook.sh" sup c3 start > "$T/c3.out" 2>&1; C3_RC=$?
+[ "$C3_RC" -ne 0 ] && ok 'start: a STOP that lands during the delegated start fails the verb' \
+                  || bad 'start: reported success over a start a STOP had already superseded'
+grep -qxF 'stop eldato-orchestrator.service' "$CD/sc.log" 2>/dev/null \
+  && ok 'start: ...and STOPS the unit it just started (the fence leaves nothing running)' \
+  || bad "start: the superseded delegated start left the unit running — $(cat "$CD/sc.log" 2>/dev/null)"
+if [ -f "$CD/o/.orch.lock" ]; then
+  _cp="$(cat "$CD/o/.orch.lock")"
+  case "${_cp:-}" in ''|*[!0-9]*) ;; *) kill -9 "$_cp" 2>/dev/null || true; PIDS="$PIDS $_cp" ;; esac
+fi
+
+# ── `not-found` is a DEFINITE answer, not "cannot read" (review P2, #2402) ──────────────────────
+# A failed `daemon-reload` leaves the unit FILE installed while the manager has not loaded it: `is-enabled`
+# answers `not-found` (exit 4). Scoring that as "cannot read" made `start` REFUSE on a box that is simply
+# not service-managed, where the tmux path is the right answer.
+CN="$(arm_root c4)"; mk_tmux "$CN/bin" "$CN/tmux.log"
+printf '%s\n' '#!/bin/bash' \
+  'printf "%s\n" "$*" >> "'"$CN"'/sc.log"' \
+  'case "${1:-}" in is-enabled) printf "not-found\n"; exit 4 ;; *) exit 0 ;; esac' > "$CN/bin/systemctl"
+chmod +x "$CN/bin/systemctl"
+: > "$CN/units/eldato-orchestrator.service"; : > "$CN/state/enabled"; : > "$CN/sc.log"
+sup c4 start > "$T/c4.out" 2>&1; C4_RC=$?
+case "$(cat "$T/c4.out")" in
+  *"cannot read whether"*) bad 'start: refused on a definite `not-found` answer — the tmux path was correct there' ;;
+  *) ok 'start: a `not-found` answer is not read as "cannot read"' ;;
+esac
+! grep -qE 'start eldato-orchestrator' "$CN/sc.log" 2>/dev/null \
+  && ok 'start: it did not start a unit the manager does not know' \
+  || bad 'start: started a unit systemd answered `not-found` for'
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §D — stop stops the UNIT
 # ═══════════════════════════════════════════════════════════════════════════════════════════════

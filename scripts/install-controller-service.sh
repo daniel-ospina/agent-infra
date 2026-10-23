@@ -339,9 +339,21 @@ do_install() {
 }
 
 do_status() {
-    local active enabled pid age rc=0
-    [ -n "${SYSTEMD_UNIT_DIR:-}" ] && { TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"; }
-    if [ -z "$SC" ]; then choose_target || { err "no service manager available — nothing is supervising the controller"; return 1; }; fi
+    local active enabled pid age rc=0 _found=""
+    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
+        TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
+    else
+        # ⛔ THE INSTALLED COPY DECIDES, NOT WHAT THIS INVOCATION WOULD CHOOSE (review P2, #2402). As root
+        # (`sudo bash … --status`) the probe prefers the SYSTEM manager, so a healthy USER-scope install
+        # answered `is-enabled` with `not-found`, `show` failed, and the verb reported "the unit is NOT
+        # enabled — it will not come back after a reboot" with rc 1: a false negative on the exact property
+        # this verb exists to check, from the command the docs tell operators to run.
+        if _found="$(find_installed_unit)"; then
+            UNIT_DIR="$(dirname "$_found")"; scope_for_dir "$UNIT_DIR"
+        else
+            choose_target || { err "no service manager available — nothing is supervising the controller"; return 1; }
+        fi
+    fi
     say "unit=$UNIT_NAME target=$TARGET"
     if ! enabled="$(sc_run is-enabled "$UNIT_NAME" 2>/dev/null)"; then enabled="unreadable"; fi
     if unit_active; then active="active"; else active="not-active"; fi
@@ -374,6 +386,19 @@ do_status() {
     return "$rc"
 }
 
+# ⛔ THE DIRECTORY A UNIT WAS FOUND IN DECIDES ITS MANAGER (review P2, #2402). Deriving the scope from
+# what this box would choose NOW is a different question: a box whose /etc copy is installed but whose
+# probe currently prefers the user manager would send `disable --now` to the wrong systemd, get a failure
+# (or a silent no-op on a unit that is not there) and then report on the wrong unit. Three callers share
+# this: --status, --uninstall, and the supervisor's own scope helper.
+scope_for_dir() { # <unit dir> -> sets TARGET and SC
+    case "$1" in
+        "$HOME/.config/systemd/user") TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
+        *)                            TARGET="system"
+                                      if [ -n "${SYSTEMCTL:-}" ]; then SC="$SYSTEMCTL"
+                                      else SC="${SUDO+$SUDO }systemctl"; fi ;;
+    esac
+}
 # ⛔ FIND THE INSTALLED COPY, DO NOT RE-DERIVE THE SCOPE (review P2, #2402). `choose_target` answers "where
 # WOULD this go on THIS box now", which is not "where IS it": a box that installed a USER unit and later
 # gained passwordless sudo would resolve to the SYSTEM scope, print `not installed: /etc/systemd/system/…`
@@ -392,7 +417,7 @@ do_uninstall() {
     p="$(find_installed_unit)" || p="${UNIT_DIR:+$UNIT_DIR/$UNIT_NAME}"
     if [ -z "$p" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
     UNIT_DIR="$(dirname "$p")"
-    case "$UNIT_DIR" in "$HOME/.config/systemd/user") TARGET="user"; SC="${SYSTEMCTL:-systemctl} --user" ;; *) TARGET="${TARGET:-system}" ;; esac
+    scope_for_dir "$UNIT_DIR"
     # disable BEFORE removing the file: a removed-but-enabled unit comes back on the next daemon-reload.
     [ -f "$p" ] || { say "not installed: $p"; return 0; }
     # ⛔ NOT SWALLOWED (review P2). A failed disable leaves the `…target.wants` symlink in place, so the
