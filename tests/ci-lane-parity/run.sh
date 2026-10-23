@@ -826,7 +826,15 @@ else
 fi
 
 # A matrix list before `steps:` must not latch the step indent.
-awk '{ print } /^  bash-suites:$/ { inb = 1; next } inb && /^    runs-on: ubuntu-latest$/ { print "    strategy:"; print "      matrix:"; print "        os:"; print "          - ubuntu-latest"; inb = 0 }' \
+# ⛔ THE INJECTION TARGET MOVED (#2482). It used to add a `strategy:` block to `bash-suites` — but
+# that job now carries a REAL `strategy:` (it runs the shard list as a matrix), so injecting a second
+# one produces a DUPLICATE MAPPING KEY and the guard correctly exits 2 ("cannot parse … duplicate key
+# `strategy`"). The fixture then measured YAML duplication, not the property it names. The shape under
+# test is PARSE-level (a list appearing between `runs-on:` and `steps:` must not latch the step
+# indent), so it is injected at the FIRST job that has no strategy: `drift-check`.
+awk 'BEGIN { done = 0 }
+     { print }
+     !done && /^    runs-on: ubuntu-latest$/ { print "    strategy:"; print "      matrix:"; print "        os:"; print "          - ubuntu-latest"; done = 1 }' \
   "$PR" >"$TMP/ci-pr-matrix.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-matrix.yml"
 if [ "$RC" -eq 0 ]; then
