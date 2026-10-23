@@ -872,7 +872,7 @@ jobs:
         run: npx tsx extensions/verification-gate/tool-call-event-parity.test.ts
 
   # ⛔ NO `setup-suite` JOB (agent-infra#2439). Its one step was
-  # `pi-bootstrap/tests/test-setup-no-nesting.sh`, which is ALREADY shard 192 of
+  # `pi-bootstrap/tests/test-setup-no-nesting.sh`, which is ALREADY a shard of
   # `scripts/run-bash-shards.sh` — so this job re-ran it on every PR push (17 s of
   # the 23 s job was the suite itself). The #449 rationale stands and is cited on
   # that shard line; only the second run site is gone.

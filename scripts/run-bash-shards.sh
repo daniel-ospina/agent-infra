@@ -113,14 +113,27 @@ done
 echo "── hermetic suites ────────────────────────────────────────────────"
 # Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
-# PROVENANCE, and one caveat: these lines were moved out of ci-main.yml's `script-validate`, so
-# each keeps the note that workflow carried. Some of them are ALSO run by a dedicated per-PR job or
-# step in ci.yml (each such line carries an "(also a per-PR … in ci.yml)" note). That
-# duplication is deliberate here: this file is the ONE list both lanes run, so the PR lane runs
-# those twice (once in their own job, once inside this list). Dropping them from this list to
-# save the minutes would recreate the second, hand-kept list that #1369 exists to remove — the
-# alternative is to retire the dedicated jobs and let this list be the PR lane's only coverage,
-# which changes PR feedback granularity and is the owner's call, not a silent edit.
+# PROVENANCE: these lines were moved out of ci-main.yml's `script-validate`, so each keeps the
+# note that workflow carried. A line that is ALSO run by a dedicated per-PR job or step in ci.yml
+# still carries its "(also a per-PR … in ci.yml)" note.
+#
+# ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
+# It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
+# from this list to save the minutes would recreate the second, hand-kept list that #1369 exists
+# to remove — the alternative is to retire the dedicated jobs and let this list be the PR lane's
+# only coverage, which changes PR feedback granularity and is the owner's call, not a silent edit."
+# OVERRIDES: that reservation — the owner directed the fold (agent-infra#2439), so the alternative
+# named there is now the layout: the dedicated `admin-merge` job and `setup-suite` job are GONE
+# from ci.yml and this list is the only run site for their suites. What was traded, exactly:
+# PR feedback granularity (a red now names a shard of `bash-suites` rather than a dedicated job),
+# measured at 3,110 runner-seconds per push on PR #2385's head. What was NOT traded: coverage.
+# This list is the ONE list BOTH lanes run (#1369), so every folded suite still runs on every PR
+# push and every push to main — and `tests/admin-merge-evidence-contract/run.sh`, which was the
+# only step of the deleted job that was not already a shard, now runs POST-MERGE as well.
+# ⛔ Do not "restore" the deleted jobs from this list's absence: the run site moved, it did not go.
+# The fold assumes this step actually EXECUTES — a sibling step failing ahead of it skips the whole
+# list, which is why agent-infra#2417 (the lane-parity self-test's live-gate control fixture) is a
+# coverage hole for every shard, not just the folded five.
 run_shard scripts/checkout-hygiene/deepseek-balance-watch.test.sh          # #476 balance poller (network-free seam)
 run_shard scripts/checkout-hygiene/hub-state-check.test.sh                 # #1313 the DETECTOR (clean-but-stale PASS matrix)
 run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #1309/#1313 the RECOVERY half
