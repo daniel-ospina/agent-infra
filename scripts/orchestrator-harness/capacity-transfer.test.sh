@@ -113,19 +113,37 @@ PATH="$TMP/bin:$PATH"; export PATH
 #   lbgh-basered lbgh-deep + issue title 'main is red…'  -> EXEMPT
 #   lbgh-paged 250 open in 3 pages / 10 landings last 24h, 40 the 24h before -> OK (both rules)
 #   lbgh-nopr   lbgh-deep with ZERO open PRs on the branch -> a `prfix` claim is UNPROVABLE -> HOLD
-lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title] [open-PR-count]
-  local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}" prn="${8:-1}"
+lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title] [branch-rule PR#] [PR-head-sha] [commit-rule PR#]
+  local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}"
+  local prn="${8:-1}" prhead="${9:-HEAD}" cprn="${10:-}"
+  # The commit-rule count defaults to the branch-rule one (the common shape); a shape that must prove
+  # ONE rule only passes an explicit 0 for the other, which is what makes the two rules separable.
+  [ -n "$cprn" ] || cprn="$prn"
   # A QUOTED heredoc, so nothing here is expanded by the test shell; the @TOKENS@ are the only
   # substitutions. `\001` is the field separator the reader cuts on, and bash's printf interprets it
   # in the FORMAT string (the stub's shebang is bash), so the label/title pair arrives verbatim.
   sed -e "s|@O1@|$o1|g" -e "s|@O2@|$o2|g" -e "s|@L24@|$l24|g" -e "s|@P24@|$p24|g" \
-      -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" -e "s|@PRN@|$prn|g" > "$f" <<'STUB'
+      -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" -e "s|@PRN@|$prn|g" -e "s|@PRHEAD@|$prhead|g" \
+      > "$f.raw" <<'STUB'
 #!/usr/bin/env bash
+# ⛔ THE EVIDENCE ARMS MUST APPLY THE GATE'S OWN `--jq`, OR THEY TEST PLUMBING INSTEAD OF LOGIC.
+# A stub that prints a fixed answer regardless of the filter makes the gate's selection UNEXERCISED:
+# measured in review cycle 5, breaking the commit rule's `select(.state=="open")` (and the branch
+# rule's whole body) left the suite GREEN, because the stub never looked at the filter. These two arms
+# therefore emit JSON and run the filter the gate passed, like `$O/gh-rest/gh` does.
+jqf() { local a prev=""; for a in "$@"; do if [ "$prev" = "--jq" ]; then printf '%s' "$a"; return 0; fi; prev="$a"; done; return 1; }
+cjq() { local f; if f="$(jqf "$@")"; then printf '%s\n' "$1" | jq -r "$f"; else printf '%s\n' "$1"; fi; }
 case "$*" in
   *broken*) exit 1 ;;
-  # ⛔ THE `prfix` EXEMPTION'S EVIDENCE (review cycle 4, P2-1): a repair worker is exempt only when
-  # this worktree's BRANCH already has an OPEN PR, so the gate asks `gh pr list --head <branch>`.
-  # The count is a shape parameter, because the arm that matters is the one where it is ZERO.
+  # ⛔ THE `prfix` EXEMPTION'S EVIDENCE, AND THE STUB MUST TELL THE TWO RULES APART (review cycle 5,
+  # P2-4: with one answer for every `pr list`, BOTH rules could be broken and the suite stayed green).
+  #   rule 1 (branch): `gh pr list --head <br> --json number,headRefOid` -> "<pr#> <headRefOid>"
+  #                                       → @PRN@ @PRHEAD@   (the gate compares the sha to this HEAD)
+  *pr\ list*headRefOid*) cjq "[{\"number\":@PRN@,\"headRefOid\":\"@PRHEAD@\"}]" "$@"; exit 0 ;;
+  #   rule 2 (commit): `gh api repos/<r>/commits/<sha>/pulls`   -> @CPRN@ or EMPTY
+  *"/commits/"*pulls*)
+    if [ "@CPRN@" = "0" ]; then cjq '[]' "$@"; else cjq "[{\"number\":@CPRN@,\"state\":\"open\"}]" "$@"; fi
+    exit 0 ;;
   *pr\ list*) printf '%s\n' "@PRN@"; exit 0 ;;
   *"/issues/"*) printf '%s\001%s\n' "@LAB@" "@TITLE@"; exit 0 ;;
   # ⛔ `&page=1 ` — WITH THE TRAILING SPACE: the URL also carries `per_page=100`, which CONTAINS the
@@ -143,6 +161,7 @@ case "$*" in
   *) exit 0 ;;
 esac
 STUB
+  sed -e "s|@CPRN@|$cprn|g" "$f.raw" > "$f"; rm -f "$f.raw"
   chmod +x "$f"
 }
 # Install/uninstall the adapter the tested scripts actually resolve (see above).
@@ -739,8 +758,9 @@ ck "§LB an inherited LB_GH cannot open the gate (rc=$l107rc): the measurement i
 lbgh_install "$TMP/lbgh-deep"
 : > "$PI_LOG"
 ( O="$O" KIND=bg TAG=107 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
-             printf "prompt\n" > "$2/bg.txt"; run_agent 5 "$2/bg.log" "$2/bg.txt" "bg 107"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
+             printf "prompt\n" > "$2/bg.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/bg.log" "$2/bg.txt" "bg 107"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 bgrc=$?
 { [ "$bgrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "§LB a KIND=bg (nonblocking-dispatch) creator IS gated (rc=$bgrc) - the gate is a deny-list, not KIND=lane" $rc
@@ -761,8 +781,9 @@ ck "§LB lambda is the BEST of the two 24h windows (10 today / 40 yesterday -> c
 : > "$PI_LOG"
 lbgh_install "$TMP/lbgh-broken"
 ( O="$O" KIND=fixer TAG=42 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
-             printf "prompt\n" > "$2/p.txt"; run_agent 5 "$2/fix.log" "$2/p.txt" "fixer 42"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
+             printf "prompt\n" > "$2/p.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/fix.log" "$2/p.txt" "fixer 42"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 frc=$?
 { [ "$frc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
 ck "§LB a FIXER (KIND=fixer) is never held by the creation gate, even on a broken measurement (rc=$frc)" $rc
@@ -782,27 +803,69 @@ ck "§LB no landing/merge script references the gate (checked:$([ -n "$lb_on_lan
 ck "§LB pr-doctor's repair workers declare prfix, and the gate PROVES it (branch must have an open PR)" $rc
 # ⛔ A DECLARED KIND IS NOT EVIDENCE (review cycle 4, P2-1). `prfix` arrives in an argv a LANE can type,
 # so exempting it on the caller's word was a one-argument bypass: the reproduction started a worker on a
-# repo 5.4x over its ceiling. Both directions are driven below: unprovable -> HOLD, provable -> runs.
-: > "$PI_LOG"; rm -f "$O/logs/prfix-201.log"
-lbgh_install "$TMP/lbgh-nopr"
-( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
-             printf "prompt\n" > "$2/pf.txt"; run_agent 5 "$2/pf.log" "$2/pf.txt" "prfix 77"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
-pfrc=$?
-{ [ "$pfrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
-ck "§LB KIND=prfix with NO open PR on the branch is HELD (rc=$pfrc) — a declared kind cannot switch the gate off" $rc
-grep -q 'prfix was DECLARED but could not be PROVEN' "$TMP/pf.log"; rc=$?
-ck "§LB …and says so, naming the unprovable claim rather than a backlog reading" $rc
-# …and the PROVABLE case runs, which is the whole reason the kind exists.
-: > "$PI_LOG"; lbgh_install "$TMP/lbgh-deep"
+# repo 5.4x over its ceiling. It is now PROVEN from GitHub, and BOTH RULES ARE EXERCISED SEPARATELY
+# (review cycle 5, P2-4: with one answer for every `pr list`, either rule could be broken in silence).
+#   a) branch rule with the PR's head == this HEAD        -> EXEMPT, runs over the ceiling
+#   b) branch rule whose head is a DIFFERENT sha, no commit match -> NOT exempt -> falls through
+#   c) no proof at all, OVER the ceiling                  -> the backlog reason (not "unprovable")
+#   d) no proof at all, UNDER the ceiling                 -> RUNS (it is measured, not held)
+#   e) DETACHED worktree (a fork PR's shape), commit rule -> EXEMPT
+LB2SHA="$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)"
+lbgh_shape "$TMP/lbgh-prfix-yes"    81 0 15 0 "bug" "a normal issue" 7 "$LB2SHA" 0
+lbgh_shape "$TMP/lbgh-prfix-name"   81 0 15 0 "bug" "a normal issue" 7 "0123456789abcdef0123456789abcdef01234567" 0
+# a) the branch rule, tied to this HEAD
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-yes"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=78 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
-             printf "prompt\n" > "$2/pg.txt"; run_agent 5 "$2/pg.log" "$2/pg.txt" "prfix 78"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pg.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/pg.log" "$2/pg.txt" "prfix 78"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pgrc=$?
 { [ "$pgrc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
-ck "§LB …and with an OPEN PR on the branch it RUNS even over the ceiling (rc=$pgrc) — repair is the drain" $rc
-grep -q 'EXEMPT.*KIND=prfix' "$TMP/pg.log"; rc=$?
-ck "§LB …and the exemption is NAMED with its evidence (the open PR), not asserted" $rc
+ck "§LB KIND=prfix with this worktree at an OPEN PR's head RUNS over the ceiling (rc=$pgrc) — repair is the drain" $rc
+grep -q "EXEMPT.*KIND=prfix and this worktree is OPEN PR #7" "$TMP/pg.log"; rc=$?
+ck "§LB …and the exemption NAMES the PR it proved, not a count or a bare 'yes'" $rc
+# b) a branch NAME alone is not proof: the PR found by name is at a different commit
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-name"
+( cd "$LBWT2" && O="$O" KIND=prfix TAG=79 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/ph.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/ph.log" "$2/ph.txt" "prfix 79"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+phrc=$?
+{ [ "$phrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB …and a PR whose HEAD is NOT this worktree is not proof (rc=$phrc): the branch NAME alone does not exempt" $rc
+grep -q 'KIND=prfix was declared but this worktree is not provably an OPEN PR' "$TMP/ph.log"; rc=$?
+ck "§LB …and the log says it was not exempt and that the RATIO decided" $rc
+grep -q 'LAND-BACKLOG' "$TMP/ph.log"; rc=$?
+ck "§LB …and the reason reported is the BACKLOG, not an unprovable claim (the refusal a reader acts on)" $rc
+# d) the same unprovable claim UNDER the ceiling RUNS — an unprovable kind is measured, not held
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-ok"
+( cd "$LBWT2" && O="$O" KIND=prfix TAG=80 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pi.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/pi.log" "$2/pi.txt" "prfix 80"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+pirc=$?
+{ [ "$pirc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB …and unprovable prfix UNDER the ceiling RUNS (rc=$pirc) — a proof failure must not halt the drain on a healthy repo" $rc
+# e) a DETACHED worktree is a FORK PR's shape: only the commit rule can answer, and it must
+git -C "$LBWT2" worktree add -q --detach "$TMP/lbdet" HEAD >/dev/null 2>&1
+lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 0 "" 9
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-fork"
+( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=81 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pk.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/pk.log" "$2/pk.txt" "prfix 81"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+pkrc=$?
+{ [ "$pkrc" -eq 0 ] && [ -s "$PI_LOG" ] && grep -q 'OPEN PR #9' "$TMP/pk.log"; }; rc=$?
+ck "§LB …and a DETACHED (fork-shape) worktree is proven by its COMMIT (rc=$pkrc) — the rule that keeps fork repairs running" $rc
+# c) no proof and over the ceiling — the arm that keeps the bypass shut
+: > "$PI_LOG"; lbgh_install "$TMP/lbgh-nopr"
+( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pf.txt"; \
+             MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             run_agent 5 "$2/pf.log" "$2/pf.txt" "prfix 77"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+pfrc=$?
+{ [ "$pfrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB KIND=prfix with NO provable open PR and a deep backlog is HELD (rc=$pfrc) — a declared kind cannot switch the gate off" $rc
 # …and the declaration reaches the dispatcher as an ARGUMENT, not an ambient `KIND`.
 { grep -q 'str(SPAWN_TIMEOUT_S), "prfix"' "$HERE/../pr-doctor.py"; }; rc=$?
 ck "§LB …and it travels as the dispatcher's ARGV (a lane cannot set it), not as an inherited KIND" $rc
