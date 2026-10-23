@@ -161,6 +161,21 @@ ciq_gh() { # <args...> -> JSON on stdout, non-zero when the read failed
 # ciq_now -> epoch seconds (one seam, so the TTL is drivable in the suite).
 ciq_now() { date +%s; }
 
+# ciq_record_usable <record> <repo> -> 0 iff the record was written FOR <repo>.
+# ⛔ THE RECORD FILENAME IS LOSSY, SO THE RECORD MUST CARRY ITS OWN IDENTITY (#2333 review, P2).
+# `ciq_slug` maps `/` to `_`, so `a/b_c` and `a_b/c` collapse onto one `ci-queue-*` file: without
+# this check the cache arms would decode one repo's `queued/running/runners` as the other's and
+# decide a push with them, printing `state=cache` and a number the module believed it had
+# validated. A record with NO `repo=` line (written by an older module) is also not usable — the
+# direction of that refusal is a LIVE READ, and if that read fails the verdict is UNKNOWN (defer),
+# so an unverifiable record can never widen the gate.
+ciq_record_usable() {
+  local rec="${1:-}" want="${2:-}" got
+  [ -n "$rec" ] && [ -n "$want" ] || return 1
+  got="$(printf '%s\n' "$rec" | sed -n 's/^repo=//p' | head -1)"
+  [ -n "$got" ] && [ "$got" = "$want" ]
+}
+
 # ciq_read <owner/repo> [<state-dir>] -> sets the CIQ_* record; 0 = usable reading, 2 = UNKNOWN.
 # Record fields (all set on every call, so a caller never reads a previous call's leftovers):
 #   CIQ_QUEUED  runs waiting for a runner
@@ -170,9 +185,12 @@ ciq_now() { date +%s; }
 #   CIQ_CEILING the derived ceiling for CIQ_RUNNERS
 #   CIQ_STATE   fresh | cache | unknown
 #   CIQ_AGE     seconds the record has been standing (0 for a fresh read)
-#   CIQ_REPO    the repo the read was made against (the wrong-surface guard: a number is only
-#               meaningful next to the repo it came from — orch-loop.sh learned that the hard way
-#               with its merge backlog)
+#   CIQ_REPO    the repo the read was made against — and a RECORD carries its own `repo=` field,
+#               so this is a real wrong-surface guard, not a label: a record whose `repo=` differs
+#               from the repo being read is NOT usable (see ciq_record_usable), because the record
+#               FILENAME is lossy — ciq_slug maps `/` to `_`, so `a/b_c` and `a_b/c` collide onto
+#               one `ci-queue-*` file and one repo's queue would otherwise answer for the other's
+#               (#2333 review, P2: this field was documented as the guard while nothing read it)
 ciq_read() {
   local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
@@ -194,7 +212,8 @@ ciq_read() {
       # `state=cache age=0s` for ever — neither `ttl` nor `stale_max` could ever bind, so the ONE
       # fail-open here was unbounded. The record is simply not usable; the live read decides, and if
       # that fails the staleness arm applies the same rule and the verdict is UNKNOWN (fail closed).
-      if [ "$age" -ge 0 ] && [ "$ttl" -ge 1 ] && [ "$age" -le "$ttl" ]; then
+      if [ "$age" -ge 0 ] && [ "$ttl" -ge 1 ] && [ "$age" -le "$ttl" ] \
+         && ciq_record_usable "$cached" "$repo"; then
         CIQ_QUEUED="$(printf '%s\n' "$cached" | sed -n 's/^queued=//p' | head -1)"
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
@@ -259,7 +278,8 @@ ciq_read() {
       age=$(( now - at ))
       # …and the same rule on the staleness fallback: a record stamped in the FUTURE is not evidence
       # of a recent reading (see the TTL arm above).
-      if [ "$age" -ge 0 ] && [ "$age" -le "$stale_max" ]; then
+      if [ "$age" -ge 0 ] && [ "$age" -le "$stale_max" ] \
+         && ciq_record_usable "$cached" "$repo"; then
         CIQ_QUEUED="$(printf '%s\n' "$cached" | sed -n 's/^queued=//p' | head -1)"
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
@@ -342,8 +362,8 @@ ciq_read() {
   CIQ_STATE=fresh; CIQ_AGE=0
   CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
   mkdir -p "$dir" 2>/dev/null || true
-  { printf 'queued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nat=%s\n' \
-      "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "$now"; } > "$f" 2>/dev/null || true
+  { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nat=%s\n' \
+      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "$now"; } > "$f" 2>/dev/null || true
   return 0
 }
 

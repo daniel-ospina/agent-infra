@@ -268,7 +268,10 @@ ck "(c4) a TTL answer is labelled cache WITH its age (state=${CIQ_STATE:-?} age=
 # predicate — `ciq_is_num "~6"` is false — so an inferred record could NEVER be served: every call
 # re-read live (defeating the documented one-read-per-burst) and a transient gh error became
 # UNKNOWN. The NUMERIC PART is what must parse.
-printf 'queued=31\nrunning=5\nrunners=~6\nbusy=\nat=%s\n' "$(date +%s)" > "$REC"
+# ⛔ EVERY HAND-MADE RECORD CARRIES `repo=` (#2333 review, P2). The record's identity is part of
+# its SHAPE now that ciq_record_usable refuses a mismatch — an arm that omitted it would be testing
+# the guard's refusal instead of the window it names. `$OR` is the repo these arms read.
+printf 'repo=%s\nqueued=31\nrunning=5\nrunners=~6\nbusy=\nat=%s\n' "$OR" "$(date +%s)" > "$REC"
 qenv /nonexistent-gh 0 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c4b) an INFERRED record (runners=~6) is served as cache, with age (rc=$rc state=${CIQ_STATE:-?})" \
@@ -278,7 +281,7 @@ ck "(c4b) an INFERRED record (runners=~6) is served as cache, with age (rc=$rc s
 # the staleness window could bind, so the one fail-open in this module was unbounded. A future stamp
 # is unusable: the live read decides, and when it fails the verdict is UNKNOWN (fail closed).
 future=$(( $(ciq_now) + 600 ))
-printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$future" > "$REC"
+printf 'repo=%s\nqueued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$OR" "$future" > "$REC"
 qenv /nonexistent-gh 900 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c4c) a FUTURE-stamped record is NOT served (rc=$rc state=${CIQ_STATE:-?}) — no unbounded cache" \
@@ -316,7 +319,23 @@ drive_read() { # <module> <state-dir> -> "<rc>|<state>" for a 1000s-old record w
 got="$(drive_read "$MOD" "$T/cache-shipped")"
 ck "(c4d2) CONTROL — the SHIPPED module answers '$got' through the same driver, so (c4e) is a mutation and not a restatement" \
    "$( [ "$got" = '2|unknown' ]; echo $? )"
-sed 's/&& \[ "\$age" -le "\$ttl" \]; then/; then/' "$MOD" > "$mutcad/ci-queue.sh"
+# ⛔ THE MUTATION IS LINE-SHAPE INDEPENDENT (#2333 review). It used to `sed` the single-line
+# `&& [ "$age" -le "$ttl" ]; then` form; when the condition grew a continuation (the wrong-surface
+# guard on the next line) the pattern stopped matching, the mutant came out byte-identical and this
+# arm went red for the WRONG reason — it proved nothing about the bound. The awk below replaces the
+# WHOLE two-line condition with `if true; then`, so it survives any re-wrapping of the bound.
+awk '
+  /^      if \[ "\$age" -ge 0 \] && \[ "\$ttl" -ge 1 \] && \[ "\$age" -le "\$ttl" \] \\$/ {
+    print "      if true; then"
+    getline   # drop the continuation line (`&& ciq_record_usable …; then`)
+    next
+  }
+  { print }
+' "$MOD" > "$mutcad/ci-queue.sh"
+# Fallback for a module whose condition is still ONE line: rewrite it in place.
+if cmp -s "$MOD" "$mutcad/ci-queue.sh"; then
+  sed 's/&& \[ "\$age" -le "\$ttl" \]; then/; then/' "$MOD" > "$mutcad/ci-queue.sh"
+fi
 if cmp -s "$MOD" "$mutcad/ci-queue.sh"; then
   bad "(c4e) the cache-bound mutation did not apply — this arm would prove nothing"
 elif ! bash -n "$mutcad/ci-queue.sh" 2>/dev/null; then
@@ -330,13 +349,13 @@ fi
 # is UNREADABLE, and an unreadable queue is never "empty".
 feed 31 5 5
 ciq_read "$OR" >/dev/null 2>&1
-printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=1\n' > "$REC"
+printf 'repo=%s\nqueued=31\nrunning=5\nrunners=5\nbusy=5\nat=1\n' "$OR" > "$REC"
 qenv /nonexistent-gh 0 0
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c5) an unreadable queue PAST the staleness window is UNKNOWN (rc 2), never 'empty'" \
    "$( [ "$rc" -eq 2 ]; echo $? )"
 now="$(date +%s)"; old=$(( now - 10 ))
-printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$old" > "$REC"
+printf 'repo=%s\nqueued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$OR" "$old" > "$REC"
 qenv /nonexistent-gh 0 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c6) an unreadable queue INSIDE the window falls back to the record and SAYS so (state=cache)" \
@@ -817,6 +836,61 @@ else
   i2="$(drive_note "$T/mutant-note/ci-queue.sh")"
   ck "(i2) MUTANT — a SILENCED in-shell note keeps the same decision (allowed=1) and LOSES the line, so (i1) is not always-green" \
      "$( { has "$i2" 'allowed=1' && has "$i2" 'note=[ci-queue] DEFERRED'; [ $? -ne 0 ]; } ; echo $? )"
+fi
+
+printf '\n── (k) a RECORD names its repo (the wrong-surface guard, DRIVEN) ────────────────\n'
+# ⛔ WHY (#2333 review, P2). `CIQ_REPO` was documented as "the wrong-surface guard" and read
+# NOWHERE, so a record could decide a push for a repo it was never read against. The FILENAME is
+# lossy — `ciq_slug` maps `/` to `_`, so `a/b_c` and `a_b/c` share ONE `ci-queue-*` file — meaning
+# a collision is not hypothetical arithmetic, it is the identifier scheme. The guard is now real
+# (the record carries `repo=`, ciq_record_usable refuses a mismatch) and these arms drive it.
+drive_read() { # <module> <repo> <state-dir> -> "state=<CIQ_STATE> queued=<CIQ_QUEUED>"
+  (
+    unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_hosted_concurrency ciq_ceiling ciq_slug \
+             ciq_state_dir ciq_gh ciq_now ciq_read ciq_eval ciq_record_usable ciq_verdict \
+             ciq_defer_note ciq_defer_note_here ciq_ci_allowed ciq_defer_line 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
+    declare -f ciq_read ciq_record_usable >/dev/null 2>&1 || { echo 'INTERFACE-MISSING'; exit 0; }
+    CIQ_GH="$STUB"; CIQ_TTL=300; CIQ_STALE_MAX=900; CIQ_STATE_DIR="$3"
+    export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+    CIQ_TEST_QUEUED=7; CIQ_TEST_RUNNING=1; CIQ_TEST_RUNNERS=2; CIQ_TEST_BUSY=true
+    CIQ_TEST_OFFLINE=0; CIQ_TEST_NOTOTAL=0
+    export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY CIQ_TEST_OFFLINE CIQ_TEST_NOTOTAL
+    ciq_read "$2" >/dev/null 2>&1
+    printf 'state=%s queued=%s' "${CIQ_STATE:-}" "${CIQ_QUEUED:-}"
+  ) 2>/dev/null
+}
+mkdir -p "$T/recstate"
+REC_A="$T/recstate/ci-queue-a_b_c"      # the SLUG for BOTH a/b_c and a_b/c
+r="$(drive_read "$MOD" "a/b_c" "$T/recstate")"
+ck "(k1) a real read WRITES the repo into its record (the writer, not a hand-made file)" \
+   "$( grep -q '^repo=a/b_c$' "$REC_A"; echo $? )"
+# Make the record's NUMBER distinguishable from the stub's (7), so "used the record" is visible.
+sed 's/^queued=.*/queued=99/' "$REC_A" > "$REC_A.tmp" && mv "$REC_A.tmp" "$REC_A"
+r="$(drive_read "$MOD" "a/b_c" "$T/recstate")"
+ck "(k2) the SAME repo is answered from its record ((k2: $r) = state=cache queued=99)" \
+   "$( { has "$r" 'state=cache' && has "$r" 'queued=99'; } ; echo $? )"
+r="$(drive_read "$MOD" "a_b/c" "$T/recstate")"
+ck "(k3) a repo that COLLIDES on the slug is NOT answered from the other's record ((k3: $r) — it reads LIVE)" \
+   "$( { has "$r" 'state=fresh' && has "$r" 'queued=7' && ! has "$r" 'queued=99'; } ; echo $? )"
+# A record written by an OLDER module has no `repo=` — "cannot verify" must read as "not usable",
+# never as "matches": the direction of the refusal is a live read, and a failing read is UNKNOWN.
+printf 'queued=99\nrunning=1\nrunners=2\nbusy=true\nat=%s\n' "$(ciq_now)" > "$REC_A"
+r="$(drive_read "$MOD" "a_b/c" "$T/recstate")"
+ck "(k4) an UNVERIFIABLE record (no repo= line) reads LIVE, never as a match ((k4: $r))" \
+   "$( { has "$r" 'state=fresh' && has "$r" 'queued=7'; } ; echo $? )"
+# …and (k3)/(k4) are not always-green: without the guard the collided record WINS.
+sed 's/&& ciq_record_usable "\$cached" "\$repo"//' "$MOD" > "$T/noguard.sh"
+printf 'repo=a/b_c\nqueued=99\nrunning=1\nrunners=2\nbusy=true\nat=%s\n' "$(ciq_now)" > "$REC_A"
+if cmp -s "$MOD" "$T/noguard.sh"; then
+  bad "(k5) the guard mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$T/noguard.sh" 2>/dev/null; then
+  bad "(k5) the guard mutant does not parse — a broken mutant proves nothing about the guard"
+else
+  r="$(drive_read "$T/noguard.sh" "a_b/c" "$T/recstate")"
+  ck "(k5) MUTANT — without ciq_record_usable the collided record WINS ((k5: $r) = state=cache queued=99), so (k3) is not always-green" \
+     "$( { has "$r" 'state=cache' && has "$r" 'queued=99'; } ; echo $? )"
 fi
 
 # ⛔ (j) THE DEFERRAL'S EFFECT, DRIVEN — NOT THE PRESENCE OF ITS LINES (#2333 review, P2).
