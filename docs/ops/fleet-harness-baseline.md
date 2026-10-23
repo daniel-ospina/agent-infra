@@ -257,8 +257,10 @@ FATAL: the QUEUE and the CHECKOUT name DIFFERENT repos … (agent-infra#1901)
 **first** (before `harness_apply`), so `start` refuses *without touching the harness tree*. But the
 documented deploy is `stop` → `start` (because `cmd_apply` refuses while a controller runs), and the
 refusal then lands *after* the stop. So the sequence would leave the box **stopped, with the harness not
-refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first (point `REPO` at an
-agent-infra checkout, or drop the `OR` line so it derives from the checkout), then `stop` → `start`.
+refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first (point `HARNESS_REPO`, or
+`--repo` on a `harness-up` run, at an agent-infra checkout — `REPO` is the **work** repo the controller
+drains and must NOT name the harness; or drop the `OR` line so it derives from the checkout), then
+`stop` → `start`.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 

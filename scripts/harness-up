@@ -13,6 +13,9 @@
 #          ⛔ `--repo` is THE HARNESS CHECKOUT (the repo the pin commit and `--ref` are commits OF), NOT the
 #          repo the controller drains: that one is `REPO=<work repo>` in the environment, and it is left
 #          alone. On a cell the two differ (harness=agent-infra, work=tortoise) — see the TWO repos block.
+#          Without `--repo` the harness resolves from `HARNESS_REPO` (env, then this machine's `ENV_FILE`)
+#          and then the launcher's OWN checkout; a candidate that is not a checkout ROOT is skipped.
+#          An unusable `--repo` REFUSES, naming the value; an unusable inherited candidate is skipped.
 #   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to
 #   capacity.sh's CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units), HU_DISK_PER_LANE_MB
 #   (1100), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a
@@ -486,6 +489,14 @@ else
     [ -d "$cand" ] || { warn "harness: ignoring '$cand' (not a directory) — trying the next candidate"; continue; }
     git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 \
       || { warn "harness: ignoring '$cand' (not a git checkout) — trying the next candidate"; continue; }
+    # ⛔ `rev-parse --git-dir` WALKS UP, so it answers "is this inside some repo", not "is this the repo".
+    # A pruned or mistyped path that now sits INSIDE another checkout (the ordinary way a stale path comes
+    # to exist) would be accepted and the pin resolved in that foreign object DB — the #2356 symptom, one
+    # inherited candidate further in. Require the candidate to BE a toplevel.
+    if [ "$(git -C "$cand" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$cand" && pwd -P)" ]; then
+      warn "harness: ignoring '$cand' (inside another checkout, not a checkout root) — trying the next candidate"
+      continue
+    fi
     HREPO="$cand"; break
   done
   [ -n "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
@@ -509,14 +520,25 @@ fi
 # CONFIGURATION ERROR and is refused, because substituting the harness here would export
 # `REPO=<agent-infra>` to the controller and `orch-loop.sh` would derive `$OR` from agent-infra's origin —
 # the silent wrong-backlog retarget this whole block exists to prevent, one case further down.
+REPO_BAD=""
 if [ -z "$REPO" ]; then REPO="$HREPO"
-elif [ ! -d "$REPO" ]; then die "REPO=$REPO is set (by $REPO_SRC) but is not a directory — REPO names the WORK repo the controller drains, not the harness; --repo sets the HARNESS checkout and cannot change REPO — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness" 2
+elif [ ! -d "$REPO" ]; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a directory — REPO names the WORK repo the controller drains, not the harness; --repo sets the HARNESS checkout and cannot change REPO — set REPO to a work-repo checkout, or remove it from $REPO_SRC to fall back to the harness"
 # ⛔ A DIRECTORY IS NOT A CHECKOUT. The controller derives its owner/repo from `$REPO`'s ORIGIN
 # (`orch-loop.sh` `derive_or`); handed a directory that is not a repo it WARNS and falls back to a
 # hardcoded literal — a controller grading a repo nobody named, while this launcher reports it started.
 # The pre-split code validated this (it was the only repo it had); the split must not lose it.
-elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then die "REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo" 2
+elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then REPO_BAD="REPO=$REPO is set (by $REPO_SRC) but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo"
 fi
+# ⛔ THE VERDICT IS HELD HERE AND APPLIED BY THE VERB — a refusal is not a universal verb policy.
+# `up` STARTS a controller that would drain a repo nobody named, so it REFUSES (nothing is started).
+# Every OTHER verb must stay answerable: `down`/`status` are what an operator reaches for on a machine
+# that is wrong, and that is the authority's own stated rule (`orchestrator-bringup.sh` `cmd_stop`:
+# "REPORT, never die: `stop` is the verb an operator reaches for on a machine that is wrong, and it must
+# stay answerable"). It also closes an escape this split would otherwise remove: `--repo` no longer sets
+# REPO, so a launcher that died for every verb would leave a box with a stale REPO unstoppable until the
+# operator edited their shell.
+# ⛔ AND THE BAD VALUE IS NOT SUBSTITUTED for the non-`up` verbs: exporting the harness as REPO is the
+# silent wrong-backlog retarget this whole block exists to prevent, so it is passed through and NAMED.
 
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.
 PIN_ROOT="${A_PINDIR:-${HARNESS_PIN_DIR:-}}"
@@ -1436,6 +1458,9 @@ hu_start_component() { # <name>
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────────
 cmd_up() {
   local c rc pin_rc=0 bad=0 cap="" cap_rc=0 cap_lanes="" cap_fixed="none"
+  # ⛔ THE ONE VERB THAT REFUSES ON A BAD `REPO`: it would START a controller that drains a repo nobody
+  # named. Nothing is started, so the refusal is safe here and nowhere else (see the REPO_BAD block).
+  [ -z "$REPO_BAD" ] || die "$REPO_BAD — and 'up' STARTS a controller that would drain it. Nothing was started." 2
   # ⛔ NAME WHERE `REPO` CAME FROM. `--repo` can no longer set it, so the only ways to have a wrong
   # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
   # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
@@ -1558,6 +1583,9 @@ cmd_status() {
 HU_TMP="$(hp_mktemp_d)" || die "cannot create a temp dir (TMPDIR unset, full or read-only) — nothing is verifiable here" 2
 trap 'rm -rf "$HU_TMP"' EXIT
 
+if [ -n "$REPO_BAD" ] && [ "$VERB" != up ]; then
+  warn "$REPO_BAD — continuing, because '$VERB' starts nothing (a box with a stale REPO must still be stoppable)"
+fi
 case "$VERB" in
   up)     cmd_up ;;
   down)   cmd_down ;;

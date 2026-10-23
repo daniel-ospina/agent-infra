@@ -50,6 +50,13 @@ set -u
 # want the launcher's own fallback answer.
 unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS HU_LOAD_PER_CPU HU_LOAD_PER_LANE \
       HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE
+# ⛔ THE BOX'S DISK IS NOT THIS SUITE'S INPUT EITHER — and a top-level `export` CANNOT fix it: both
+# capacity helpers below re-set the two knobs per-command, so an ambient export never reaches an arm.
+# The helpers therefore default the DISK leg to non-binding (`DISKCOST=1`, `DISKFLOOR=0`); an arm that
+# wants the disk leg passes them explicitly. Without this the (c) ceiling arms assert a lane count the box
+# cannot support: measured at 94% free (`disk_free=7731MB`), `(7731-500)/1100 = 6` lanes and **2 arms
+# red** — the same false-RED class the block above exists to remove, and those arms' subject is the LOAD
+# leg. The knobs are measurements, not a cap: capacity stays a measurement.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 fails=0
@@ -146,7 +153,7 @@ run_status() { # <harness-dir>; knobs via the exported shell vars read below
           HU_PS="$TMP/ps-probe" PS_TABLE="${PS_TABLE:-$TMP/ps-none}" \
           HU_LOADAVG_FILE="${LOADFILE-$TMP/load}" HU_NCPU="${NCPUV:-4}" \
           HARNESS_UP_MAX_LANES="${MAXL:-}" HARNESS_UP_OS="${OSV:-}" \
-          HU_DISK_FLOOR_MB="${DISKFLOOR:-500}" HU_DISK_PER_LANE_MB="${DISKCOST:-1100}" \
+          HU_DISK_FLOOR_MB="${DISKFLOOR:-0}" HU_DISK_PER_LANE_MB="${DISKCOST:-1}" \
           bash "$UP" status --repo "$REPO_FIX" --harness "$1" --no-fetch 2>&1 )"
   RC=$?
 }
@@ -271,7 +278,7 @@ case "${1:-}" in
       exit 1
     fi
     exit 0 ;;
-  stop) printf 'stop\n' >> "$FIX_LOG"; exit 0 ;;
+  stop) printf 'stop\n' >> "$FIX_LOG"; printf 'stoprepo %s\n' "${REPO:-}" >> "$FIX_LOG"; exit 0 ;;
   *) printf '%s\n' "$*" >> "$FIX_LOG"; exit 0 ;;
 esac
 SH
@@ -337,7 +344,7 @@ run_status_fix() { # uses the caller's PS_TABLE (the fixture launcher)
           HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
           HU_PS="$TMP/ps-probe" PS_TABLE="${PS_TABLE:-$TMP/ps-none}" HU_LOADAVG_FILE="${LOADFILE-$TMP/load}" HU_NCPU="${NCPUV:-4}" \
           HARNESS_UP_MAX_LANES="${MAXL:-}" HARNESS_UP_OS="${OSV:-}" \
-          HU_DISK_FLOOR_MB="${DISKFLOOR:-500}" HU_DISK_PER_LANE_MB="${DISKCOST:-1100}" \
+          HU_DISK_FLOOR_MB="${DISKFLOOR:-0}" HU_DISK_PER_LANE_MB="${DISKCOST:-1}" \
           bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
   RC=$?
 }
@@ -737,6 +744,11 @@ ck "(e) the controller is told REPO=<work repo> (never the harness repo)" \
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and HARNESS_REPO=<the harness checkout>" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ THE OTHER HALF OF THE BANNER: a shell-exported REPO is named as such. Only the config-file branch was
+# asserted, so deleting `REPO_SRC="the environment"` told the operator their ambient value was the
+# FALLBACK — the one thing the line exists to distinguish — while staying 112/0.
+ck "(e) …and the banner says an exported REPO came from the ENVIRONMENT" \
+   "$(case "$OUT" in *"repo $WORK (the environment)"*) echo 0 ;; *) echo 1 ;; esac)"
 # ── CANDIDATE 2 OF REPO's PRECEDENCE: THIS MACHINE'S CONFIG FILE ─────────────────────────────────
 # `REPO` is "the caller's `REPO`, then the config file, then the harness checkout", and the config file
 # is the CELL path, not a theoretical one: `docs/ops/fleet-harness-baseline.md` shows `keys.env` carrying
@@ -806,29 +818,55 @@ ck "(e) with no HARNESS-PIN the REF tip is resolved in the harness repo (pin: AB
    "$(case "$pinline" in *"resolved $B12 from"*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …and it is never UNRESOLVABLE for a ref the harness repo does hold" \
    "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
-# ── the WORK repo's OWN validation (review cycle 2): the split must not accept a REPO it cannot use ─
+# ── the WORK repo's OWN validation (review cycles 2/3): a REPO the controller cannot use is refused ─
 # Set-but-wrong is never "unset": a directory that is not a checkout makes `orch-loop.sh` fall back to a
-# hardcoded owner/repo, so the controller grades a repo nobody named. Both arms are REFUSALS (rc 2).
-# ⛔ THESE TWO `rc=2` ARMS ARE REGRESSION GUARDS, NOT DETECTORS OF THIS BUG: `origin/main` already ran
-# `die "$REPO is not a git checkout" 2` and the `-d` guard already exited 2, so both PASS on the
-# pre-change launcher (measured: main + this file = 5 failures, neither arm among them). They exist
-# because the split must not DROP the pre-split validation, which #2356 requires. The signal that the
-# behaviour changed is in the paired MESSAGE arms below — the new text names `REPO=` and the remedy.
+# hardcoded owner/repo, so the controller grades a repo nobody named.
+# ⛔ THE REFUSAL BELONGS TO `up`, NOT TO THE LAUNCHER — a refusal is not a universal verb policy. `up`
+# STARTS a controller that would drain the repo, so it refuses and starts nothing. `down`/`status` must
+# stay answerable: an operator reaches for them on a machine that is wrong, and the authority states the
+# same rule for itself (`orchestrator-bringup.sh` `cmd_stop`: "REPORT, never die … `stop` is the verb an
+# operator reaches for on a machine that is wrong, and it must stay answerable"). Since `--repo` no
+# longer sets REPO, a launcher that refused EVERY verb on a stale ambient REPO would leave a live
+# controller unstoppable until the operator edited their shell — which the pre-split launcher never did.
+# ⛔ THESE `up` ARMS ARE REGRESSION GUARDS, NOT DETECTORS OF THIS BUG: `origin/main` already ran
+# `die "$REPO is not a git checkout" 2` and the `-d` guard already exited 2. They exist because the
+# split must not DROP the pre-split validation, which #2356 requires. The signal that the behaviour
+# changed is the MESSAGE arms, which name `REPO=`, its SOURCE, and the remedy.
 mkdir -p "$TMP/plaindir"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/plaindir" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
-        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a REPO that is a directory but NOT a checkout is STILL REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
-ck "(e) …and the message says it is not a git checkout" \
-   "$(case "$OUT" in *'REPO='*'is not a git checkout'*) echo 0 ;; *) echo 1 ;; esac)"
+        bash "$UP" up --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) 'up' REFUSES a REPO that is a directory but NOT a checkout (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and the message names the value, its SOURCE, and the repo it is not a checkout of" \
+   "$(case "$OUT" in *'is set (by the environment)'*'is not a git checkout'*) echo 0 ;; *) echo 1 ;; esac)"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/no-such-dir" HARNESS_REPO="$REPO_FIX" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
-        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a REPO that does not exist is STILL REFUSED, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+        bash "$UP" up --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) 'up' REFUSES a REPO that does not exist, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 ck "(e) …and the message says it is not a directory" \
    "$(case "$OUT" in *'REPO='*'is not a directory'*) echo 0 ;; *) echo 1 ;; esac)"
+# …AND THE SAME BAD VALUE MUST NOT SILENCE THE ONE VERB THAT HAS TO ANSWER (review cycle 3).
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$TMP/no-such-dir" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" down --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+ck "(e) …while 'down' still REACHES the authority on that same bad REPO (rc=$RC)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "(e) …and the stop was actually delegated" \
+   "$(grep -qx 'stop' "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and the bad value is passed through and NAMED, never swapped for the harness" \
+   "$(case "$OUT" in *'REPO='*'is not a directory'*) if grep -qx "stoprepo $TMP/no-such-dir" "$FIXCELL/fix.log" 2>/dev/null; then echo 0; else echo 1; fi ;; *) echo 1 ;; esac)"
+# ── THE SOURCE IS NAMED FOR A CONFIG-FILE REPO TOO: `unset REPO` is INERT for this value ──────────
+printf 'REPO=%s\n' "$TMP/plaindir" > "$TMP/badrepo.env"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ENV_FILE="$TMP/badrepo.env" \
+        HARNESS_REPO="$REPO_FIX" HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" up --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a bad REPO from the CONFIG FILE names the config file, not the environment (rc=$RC)" \
+   "$(case "$OUT" in *"(by the config file $TMP/badrepo.env)"*) echo 0 ;; *) echo 1 ;; esac)"
 # ── THE HARNESS SIDE: an EXPLICIT bad `--repo` is refused, an INHERITED bad candidate is skipped ─────
 # Two different answers, and both are load-bearing. `--repo` is the operator's assertion about this run:
 # refusing it (naming the value) is what stops a mistyped flag from being silently answered by a
@@ -840,14 +878,30 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$UP" status --harness "$PIN_TREE" --repo "$TMP/no-such-dir" --no-fetch 2>&1 )"; RC=$?
-ck "(e) an unusable --repo is REFUSED (rc=$RC), never silently replaced by another checkout" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) an unusable --repo is REFUSED (rc=$RC), never silently replaced by another checkout" \
+   "$([ "$RC" -eq 2 ] && case "$OUT" in *"--repo $TMP/no-such-dir is not a directory"*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …and the refusal NAMES the flag and the value it refused" \
    "$(case "$OUT" in *"--repo $TMP/no-such-dir is not a directory"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ THE FLAG BEATS AN INHERITED CANDIDATE THAT DISAGREES (review P1): every other arm sets `--repo` and
+# `HARNESS_REPO` to the SAME path, so "explicit wins" was never distinguished from "inherited wins" — a
+# launcher preferring `HARNESS_REPO` over `--repo` stayed at 112/0. Both values here are VALID checkouts,
+# so only the precedence can decide, and the child env records which one the launcher actually used.
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" HARNESS_REPO="$WORK" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --repo "$REPO_FIX" --no-fetch 2>&1 )"
+ck "(e) an EXPLICIT --repo BEATS a valid but different inherited HARNESS_REPO" \
+   "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and the banner names that same harness repo" \
+   "$(case "$OUT" in *"harness repo $REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$UP" status --harness "$PIN_TREE" --repo "$TMP/plaindir" --no-fetch 2>&1 )"; RC=$?
-ck "(e) a --repo that is a directory but NOT a checkout is REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) a --repo that is a directory but NOT a checkout is REFUSED (rc=$RC)" \
+   "$([ "$RC" -eq 2 ] && case "$OUT" in *"--repo $TMP/plaindir is not a git checkout"*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …and the message names it as not a git checkout" \
    "$(case "$OUT" in *"--repo $TMP/plaindir is not a git checkout"*) echo 0 ;; *) echo 1 ;; esac)"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_REPO="$TMP/pruned-pin-worktree" \
@@ -859,6 +913,19 @@ ck "(e) …so the pin still resolves in the next candidate (the launcher's own c
    "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(e) …and the skip is SAID, not silent" \
    "$(case "$OUT" in *"ignoring '$TMP/pruned-pin-worktree'"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `rev-parse --git-dir` WALKS UP (review P2): a candidate that is a plain SUBDIR of some checkout used
+# to be accepted as the harness, and the pin was then resolved in that foreign object DB — the #2356
+# symptom one inherited candidate further in, with no warning. The acceptance test now requires the
+# candidate to BE the toplevel, so this arm answers "is this the repo" rather than "is this inside one".
+mkdir -p "$WORK/sub"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_REPO="$WORK/sub" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --harness "$FH" --no-fetch 2>&1 )"
+ck "(e) a HARNESS_REPO that is a SUBDIR of a checkout is SKIPPED, not accepted as the harness" \
+   "$(case "$OUT" in *"ignoring '$WORK/sub' (inside another checkout"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …so the pin is read in the launcher's own checkout, never in the foreign repo" \
+   "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
 # ── THE FLAT-COPY LAYOUT CAN STILL NAME ITS HARNESS — under the key that means ONE thing ───────────
 # A deployed copy lives outside any checkout (`install.sh` writes a flat copy; a plist execs it), so the
 # own-checkout fallback has nothing to read. The config file is that box's only statement of where its
@@ -874,6 +941,27 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ENV_FI
 ck "(e) a flat copy outside any checkout resolves its harness from the config file's HARNESS_REPO (rc=$RC, not a refusal)" "$([ "$RC" -ne 2 ] && echo 0 || echo 1)"
 ck "(e) …and the pin resolves there (pin: OK, never UNRESOLVABLE)" \
    "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND WITH NO CANDIDATE AT ALL IT REFUSES: a launcher that fell through here would print a full
+# component/VERDICT table about a path derived from the copy's own location — grading a tree nobody
+# named, which is the class this block exists to refuse.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FLAT/harness-up" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a flat copy with NO candidate REFUSES (rc=$RC) instead of grading a tree nobody named" \
+   "$([ "$RC" -eq 2 ] && case "$OUT" in *'no agent-infra checkout resolved'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AN UNRESOLVABLE PIN NAMES THE REPO IT LOOKED IN — naming the WORK repo there is the refusal that
+# sends the reader to the wrong place (the class this PR removes), and it was unasserted.
+BADPIN2="$TMP/cell-badpin2"
+mkdir -p "$BADPIN2/.pi/agent/state"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$BADPIN2/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$PIN_TREE" > "$BADPIN2/.harness-path"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$BADPIN2" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$BADPIN2/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+ck "(e) an UNRESOLVABLE pin names the HARNESS repo it searched, not the work repo" \
+   "$(case "$OUT" in *"is not an object in the harness repo $REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── the RED control: the check still REFUSES a pin that names nothing this box can resolve ───────
 BAD="$TMP/cell-badpin"
