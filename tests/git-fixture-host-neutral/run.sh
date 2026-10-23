@@ -32,10 +32,12 @@
 #
 # WHAT THIS SUITE PINS
 # --------------------
-#   1. SEAM — the sanitised child environment provably reads NO global git config. Without this
-#      arm the runs below could be green because neutralisation failed (a misspelled
-#      GIT_CONFIG_GLOBAL on a configured dev box is exactly that vacuity), and the dependency
-#      would survive every green run.
+#   1. SEAM — the sanitised child environment provably reads NO git config, on BOTH channels the
+#      dependency could arrive through: (a) the global file is absent AND the probe fails closed
+#      when it cannot be read (a misspelled GIT_CONFIG_GLOBAL on a configured dev box is exactly
+#      that vacuity), and (b) an all-channels listing taken from outside any repo is empty (a
+#      system/ambient leak). Without these arms the runs below could be green because
+#      neutralisation silently did nothing, and the dependency would survive every green run.
 #   2. MODEL — an empty bare repo created with `-b main` clones onto `main` in that environment:
 #      the deterministic property the fixtures now rest on, asserted directly rather than only
 #      through them.
@@ -86,19 +88,28 @@ bare_env() {
       "$@"
 }
 
-echo "== 1. the sanitised environment reads no global git config =="
+echo "== 1. the sanitised environment reads no git config, on either channel =="
 bare_env git config --global --list >"$OUT" 2>&1
 seam_rc=$?
 if [ "$seam_rc" -ne 0 ]; then
-  # Reading the (empty) global file at all failed — e.g. the path is relative, or the var is
-  # misspelled so git falls back to a HOME that does not exist. Fail closed and NAME that.
+  # Reading the (empty) global file failed — e.g. the path is relative, or the var is misspelled
+  # so git falls back to a HOME that does not exist. Fail closed and NAME that.
   fail "the child cannot read its global config file at all (rc=$seam_rc) — the neutralisation is not wired, so every assertion below would be vacuous (first lines:)"
   indent '1,4p' <"$OUT"
 elif [ -s "$OUT" ]; then
-  fail "the child environment STILL reads a git config file — the neutralisation is not wired, so every assertion below would be vacuous (first lines:)"
+  fail "the child environment STILL reads a global git config file — the neutralisation is not wired, so every assertion below would be vacuous (first lines:)"
   indent '1,4p' <"$OUT"
 else
-  pass "no global config is readable in the child environment"
+  pass "the global channel is empty and readable (an unwired seam fails closed, not green)"
+fi
+# The second channel: a listing of EVERY source, taken from outside any repo (a repo-local file
+# would otherwise be expected output). Any line here is a config the child inherited.
+( cd "$TMP" && bare_env git config --list --show-origin ) >"$OUT" 2>&1
+if [ -s "$OUT" ]; then
+  fail "the child environment inherits git config from a SYSTEM/AMBIENT source — the suites below would be reading the box (first lines:)"
+  indent '1,4p' <"$OUT"
+else
+  pass "no git config of any origin is visible to the child"
 fi
 
 echo "== 2. an empty bare repo created with -b main clones onto main =="
@@ -118,8 +129,8 @@ for t in extensions/shared/test-branch-ownership.mjs \
   bare_env node "$t" >"$OUT" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    fail "$t exited $rc with no global git config — it depends on the HOST's git config again (#2581); last lines:"
-    indent '$p' <"$OUT" | tail -n 6
+    fail "$t exited $rc with no git config at all — it depends on the BOX's git config again (#2581); last lines:"
+    tail -n 6 "$OUT" | sed 's/^/     | /'
   elif ! grep -qE '[0-9]+ passed, 0 failed' "$OUT"; then
     fail "$t exited 0 but printed no aggregate '<n> passed, 0 failed' line — a suite that cannot report is not a pass (#2188)"
   else

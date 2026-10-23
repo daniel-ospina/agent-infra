@@ -1034,10 +1034,10 @@ releaseRepoLock(lockKey, PID);
   git(ROOT, `clone -q "${fOrigin}" "${equal}"`);
 
   const bare = join(ROOT, "ff-bare");
-  // #2581 — deliberately NOT pinned: nothing clones this bare repo (it is only handed to
-  // fastForwardOntoUpstreamProof as an unclonable target), so it inherits no default-branch
-  // dependency. Annotated because it is the file's SECOND `init --bare` and a reader grepping
-  // for "the sites that need a pin" must not add one here or conclude the pin set is incomplete.
+  // #2581 — deliberately NOT pinned: nothing clones this bare repo (it is the file's only bare
+  // repo that is never used as a clone source), so it inherits no default-branch dependency.
+  // Annotated because it is the file's SECOND `init --bare` and a reader grepping for "the sites
+  // that need a pin" must not add one here or conclude the pin set is incomplete.
   git(ROOT, `init -q --bare "${bare}"`);
 
   const pBehind = fastForwardOntoUpstreamProof(behind, "main");
