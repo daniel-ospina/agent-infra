@@ -360,9 +360,94 @@ def leg_unrecognised(mod):
           "UNRECOGNISED: an unregistered code alarms")
 
 
+def leg_harness_apply(mod):
+    """#2416 — the harness-apply pass record. The HEADLINE is `behind`, not the exit code.
+
+    The measured defect this row exists for: a box 91 commits behind `main` whose every signal read
+    "auto". A record can therefore be perfectly well formed, recent, and `rc=0`-adjacent while the
+    checkout has not moved — so `behind>0` alarms on the NUMBER, and every refusal (an ahead box, a
+    tree that could not be preserved) alarms on the ACTION it names.
+    """
+    import time as _time
+    d = tempfile.mkdtemp(prefix="ha-record-")
+    keys = ("HARNESS_APPLY_STATE_DIR", "HARNESS_APPLY_STALE_SECONDS", "HARNESS_APPLY_SCHEDULE_ASSERT")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ["HARNESS_APPLY_STATE_DIR"] = d
+    os.environ["HARNESS_APPLY_STALE_SECONDS"] = "3600"
+    path = os.path.join(d, "harness-apply.status")
+    now = int(_time.time())
+
+    def write(**kv):
+        # ONE `key=value` PER LINE — the shape the pass writes and this reader parses. A single
+        # space-separated line parses to ONE key (measured: every record read as "no readable epoch"),
+        # so writing the wrong shape here would have pinned a reader that cannot read its artifact.
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join("%s=%s\n" % (k, v) for k, v in kv.items()))
+
+    def rec(**kv):
+        base = dict(mode="pin", ok=1, rc=0, epoch=now, head="a" * 12, deployed="a" * 12,
+                    ref="b" * 12, behind=0, ahead=0, dirty=0, pin="a" * 12, pin_tree="a" * 12,
+                    preserved="none", action="none", lanes="none-signalled", detail="current")
+        base.update(kv)
+        write(**base)
+        return mod.harness_apply_record()
+
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        # The "no schedule" arm must ALSO clear the state-dir seam: that variable is itself a
+        # schedule probe in the reader (`STATE_DIR` set ⇒ a scheduled box), so leaving it set would
+        # make this arm test the wrong branch and pass for the wrong reason.
+        os.environ.pop("HARNESS_APPLY_STATE_DIR", None)
+        os.environ["HARNESS_APPLY_SCHEDULE_ASSERT"] = "0"
+        detail, alarm = mod.harness_apply_record()
+        check(not alarm and "no harness-apply schedule" in detail,
+              "HARNESS: no record and no schedule is NOT an alarm (a box without this job)")
+        os.environ["HARNESS_APPLY_STATE_DIR"] = d
+        os.environ["HARNESS_APPLY_SCHEDULE_ASSERT"] = "1"
+        detail, alarm = mod.harness_apply_record()
+        check(alarm and "no pass record" in detail,
+              "HARNESS: a SCHEDULED box with no record alarms")
+        detail, alarm = rec()
+        check(not alarm and "behind=0" in detail, "HARNESS: a current record is green")
+        # The measured 91-commits-behind shape: the pass cannot advance (25 = behind, nothing here can
+        # move it), and the NUMBER is what a human must see.
+        detail, alarm = rec(rc=25, action="unmaterialisable", behind=91)
+        check(alarm and "BEHIND" in detail and "91" in detail,
+              "HARNESS: `behind=91` alarms on the NUMBER (the 91-commits-behind defect)")
+        # ... and a record whose CODE is clean but whose READING says the box is behind still alarms:
+        # the number is a fact about the checkout, the code is only a fact about the pass.
+        detail, alarm = rec(rc=0, behind=91)
+        check(alarm and "BEHIND" in detail and "91" in detail,
+              "HARNESS: a clean exit code does NOT suppress a behind=91 reading")
+        detail, alarm = rec(rc=21, action="refused-ahead", ahead=3)
+        check(alarm and "refused-ahead" in detail,
+              "HARNESS: an ahead refusal alarms and names the action")
+        detail, alarm = rec(epoch=now - 4000)
+        check(alarm and "STALE" in detail, "HARNESS: a record older than the bound alarms")
+        detail, alarm = rec(epoch=now + 3600)
+        check(alarm and "STALE" in detail,
+              "HARNESS: a FUTURE-dated epoch is stale too, never fresh for ever")
+        detail, alarm = rec(epoch="")
+        check(alarm and "no readable epoch" in detail,
+              "HARNESS: an unreadable epoch is an alarm, not a healthy read")
+        os.environ["HARNESS_APPLY_STALE_SECONDS"] = "not-a-number"
+        detail, alarm = mod.harness_apply_record()
+        check(alarm and "not a whole number" in detail,
+              "HARNESS: an unreadable staleness seam alarms instead of crashing the scan")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def run_legs(mod):
     leg_registered(mod)
     leg_launchctl_abstention(mod)
+    leg_harness_apply(mod)
     # 0 ok — the shipped dry-run stance, and a pass that never had a candidate.
     leg_meaning(mod, 0, "ok", expect_alarm=False, tag="OK")
     # 3 fail-closed: ps/lsof/identity/launchctl unusable, or the lock held — NOTHING signalled.

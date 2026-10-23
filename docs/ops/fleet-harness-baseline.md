@@ -44,6 +44,14 @@ are actually invoked by a LaunchAgent: `pi-cache-reap.sh` → `com.eldato.pi-cac
 `com.eldato.disk-reaper` runs `disk-reaper.sh` through that same wrapper, because a launchd-spawned
 `bash` cannot read a repo under `~/Documents`. It is installed by `install-disk-reaper-timer.sh`, not
 by `install-launchd.sh` — see `docs/ops/disk-reaper.md`.)
+
+⛔ **AND ACTIVATION ITSELF IS ON A CLOCK SINCE #2416** (`com.eldato.harness-apply` on Darwin,
+`eldato-harness-apply.timer` on a cell). Every row above answers *what is deployed*; none of them
+answers *whether the deployed code is still main* — and measured 2026-10-23 it was not: the Mac ran 91
+commits behind while every signal read `auto`. `scripts/harness-apply-pass.sh` calls the box's existing
+verb (`cloud-cell-supervisor.sh apply` on a cell, `./sync.sh` on a Mac) behind the safety predicates
+that decide whether the box may be moved at all, repairs a pin that disagrees with its own checkout, and
+writes a pass record that `tools/fleet/fleet-health.py` alarms on. See `docs/ops/harness-apply.md`.
 **`orphan-reap.py` and `lane-watchdog.py` are referenced by no LaunchAgent on this box** — they are
 armed elsewhere or not at all; do not infer that they run from their presence.
 

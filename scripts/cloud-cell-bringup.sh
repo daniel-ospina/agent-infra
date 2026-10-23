@@ -705,6 +705,75 @@ check_disk_reaper() {
   ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
 }
 
+# check_harness_apply — put ACTIVATION on the clock too (#2416), through the SAME one-install-verb
+# split as the disk reaper above. The pass calls the box's existing verbs (`cloud-cell-supervisor.sh
+# apply`, or the checkout's `./sync.sh`) and owns only the safety predicates; this function owns WHERE
+# and HOW the schedule lives, and REFUSES rather than skipping — a cell that runs whatever code it had
+# when it was last started is the drift the pass exists to stop, and "no timer" must never be quiet.
+check_harness_apply() {
+  local installer="" pass="" cand out rc next repo
+  for cand in "${HARNESS_APPLY_TIMER_INSTALLER:-}" \
+              "${HOME:-}/.pi/agent/scripts/install-harness-apply-timer.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-harness-apply-timer.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  for cand in "${HARNESS_APPLY_PASS:-}" \
+              "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/harness-apply-pass.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { pass="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-harness-apply-timer.sh not found — cannot schedule harness activation, and an unscheduled activation never happens (the measured state: a cell 91 commits behind main with every signal reading auto)"
+  [ -n "$pass" ] || die "harness-apply-pass.sh not found — the timer would have nothing to run"
+  # ⛔ THE CHECKOUT IS RESOLVED HERE, NOT INHERITED FROM ONE VARIABLE. The farmed installer has no
+  # checkout beside it ($HOME/.pi/agent is not a git repo), so leaving it to that default would refuse
+  # on every cell — or, worse, be defaulted onto a directory that is not a checkout and fail every tick
+  # while list-timers showed the job healthy. `LAYER_ROOT` alone is not enough either: measured on this
+  # suite's own fixture, it was empty at this point and the install REFUSED on a perfectly good box.
+  # Same candidate order the installer and harness-refresh use, and the MAIN worktree is what is taken.
+  repo=""
+  # ⛔ THE TREE THE LAYER CAME FROM OUTRANKS AN AMBIENT `$AGENT_INFRA_PATH`. Measured: with a stale
+  # ambient path in the environment, the timer was rendered from a DIFFERENT checkout than the layer
+  # this run just installed — and that checkout had no harness-apply templates at all, so the whole
+  # bring-up died on a box that was perfectly healthy.
+  for cand in "${HARNESS_APPLY_REPO:-}" "${LAYER_ROOT:-}" "${INFRA_ROOT:-}" "${AGENT_INFRA_PATH:-}" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    [ -n "$cand" ] && [ -d "$cand" ] || continue
+    # `rev-parse --git-dir` is the TEST that this is a checkout; `worktree list` only PREFERS the main
+    # worktree (so a pin is never taken for the repo). A listing that cannot be read must not turn a
+    # confirmed checkout into "no checkout on this box" — that false refusal is measured, under this
+    # very suite's functional `git` stub.
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    repo="$(git -C "$cand" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+    repo="${repo:-$cand}"
+    break
+  done
+  [ -n "$repo" ] || die "no agent-infra checkout resolved for the harness-apply timer (looked at \$HARNESS_APPLY_REPO, \$AGENT_INFRA_PATH, \$LAYER_ROOT, \$INFRA_ROOT, and this script's own checkout) — set HARNESS_APPLY_REPO=<checkout>"
+  # The templates come from the tree that SHIPS this installer when that tree carries them (the farmed
+  # copy at $HOME/.pi/agent/scripts has no ../templates, so it falls back to the resolved checkout).
+  # Without this split the unit and the pass it runs can come from two different versions of the repo.
+  local inst_root tpl_sys tpl_launchd
+  inst_root="$(cd "$(dirname "$installer")/.." 2>/dev/null && pwd)"
+  tpl_sys="$repo/templates/systemd"
+  [ -n "$inst_root" ] && [ -f "$inst_root/templates/systemd/eldato-harness-apply.timer" ] && tpl_sys="$inst_root/templates/systemd"
+  tpl_launchd="${tpl_sys%/systemd}/launchd/harness-apply"
+
+  rc=0
+  out="$(HARNESS_APPLY_PASS="$pass" HARNESS_APPLY_REPO="$repo" \
+         TEMPLATES_DIR="$tpl_sys" LAUNCHD_TEMPLATES_DIR="$tpl_launchd" \
+         bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the harness-apply timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
+
+  rc=0
+  out="$(HARNESS_APPLY_PASS="$pass" HARNESS_APPLY_REPO="$repo" \
+         TEMPLATES_DIR="$tpl_sys" LAUNCHD_TEMPLATES_DIR="$tpl_launchd" \
+         bash "$installer" --status 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the harness-apply timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
+  ok "harness activation scheduled — timer next=${next:-?} (record: ${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.status)"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -724,12 +793,13 @@ main() {
       check_provider_layer
       check_caches
       check_disk_reaper
+      check_harness_apply
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported, harness activation scheduled)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;
