@@ -105,7 +105,36 @@ COLD_MIN = 2 * 60              # decision tree Step 4: "< 2 min -> TOOL-IN-FLIGH
 WARM_MIN = 10 * 60             # decision tree Step 4: "> 10 min -> STEP 5"
 NUDGE_SUPPRESS_S = 3600        # orchestrator-heartbeat.sh NUDGE_SUPPRESS_S
 REGISTRY_GRACE = 6             # a snapshot with fewer lanes than registry-grace is PARTIAL
-PROTECTED = ("DMeer", "DMer", "HANG")   # the owner's own lanes: never offered as work
+# PROTECTED BY A DECLARED LIST, NOT NAMES BURIED IN CODE (owner report 2026-10-20, twice).
+# The tuple below was the ONLY protection, so a workspace the owner created or renamed --
+# "Personal website" -- was classified as an idle FLEET LANE and received a lane brief for
+# tortoise PR #9150. Protection that depends on remembering which strings are the owner's is
+# the "passes only by remembering" failure the fleet forbids.
+_OWNER_WS_FILE = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state",
+                              "owner-workspaces.txt")
+
+
+def _owner_workspaces() -> tuple:
+    # ⛔ A MALFORMED FILE MUST NOT TAKE THE TOOL DOWN. This is read at IMPORT time, so an exception
+    # here kills every lane-actions.py invocation -- roster, doctor triage, every classify_row
+    # consumer -- instead of degrading to the historical tuple. Two measured shapes (review, P1):
+    #   * a non-UTF-8 byte, or the UTF-16LE that a PowerShell `>` redirect produces, raises
+    #     UnicodeDecodeError -- whose MRO parent is ValueError, NOT OSError -- so `except OSError`
+    #     missed it and the whole triage tool died at import;
+    #   * a UTF-8 BOM is not whitespace to str.strip(), so a plain `open()` left the FIRST declared
+    #     name as "\ufeffPersonal website", which can never match a lane -- the owner first entry
+    #     would stay unprotected while the roster printed it as PROTECTED.
+    # `utf-8-sig` strips the BOM, `errors="replace"` turns any remaining bad byte into U+FFFD rather
+    # than raising, and ValueError stays caught as the belt to that brace.
+    try:
+        with open(_OWNER_WS_FILE, encoding="utf-8-sig", errors="replace") as f:
+            return tuple(x.strip() for x in f
+                         if x.strip() and not x.lstrip().startswith("#"))
+    except (OSError, ValueError):
+        return ()
+
+
+PROTECTED = ("DMeer", "DMer", "HANG") + _owner_workspaces()   # the owner's own lanes
 MAX_NAMES = 4                  # names inline in the beat clause; the rest live in the file
 SUMMARY_MAX = 300
 LAST_MSG_CHARS = 200
