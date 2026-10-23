@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- controller watchdog (#2303): restart a controller that is ALIVE BUT NOT CYCLING, once,
+         and STOP restarting when restarting cannot help.
+
+         ⛔ WHY (measured 2026-10-21 on this box). The controller was up and wedged for a full hour.
+         `launchctl` said the job was loaded and `harness.sh verify` said GREEN while the supervisor
+         logged `controller pid … is alive but the heartbeat is 3652s old` every 30s — restarting it
+         into the SAME crash (a macOS bash 3.2 parse failure, agent-infra#2248) and dispatching
+         nothing. Nothing in the fleet looked at the one datum that differs between a healthy box and
+         that box: whether $O/heartbeat ADVANCED. A process-existence predicate cannot see it, and a
+         predicate that only logs it (the supervisor's) cannot stop it.
+
+         THE CONTRACT THE SCRIPT IMPLEMENTS (scripts/orchestrator-harness/watchdog-loop.sh, pinned by
+         watchdog-loop.test.sh):
+           fresh heartbeat + pid   → HEALTHY, nothing touched
+           fresh heartbeat, no pid → UNCERTAIN: NOT restarted (the heartbeat proves the loop is
+                                     cycling; killing it on a bookkeeping miss is the P0) and NOT
+                                     healthy (the contract requires a pid)
+           pid alive + stale hb    → WEDGED  → exactly ONE restart, re-checked after SETTLE
+           no pid + stale hb       → DOWN    → one restart
+           no usable heartbeat     → DOWN    (never healthy, and never dated from the file's mtime)
+           N consecutive restart-worthy observations (WEDGED or DOWN — a crash-on-start leaves no pid)
+                                   → <VERDICT>_STOPPED: restarting stops for that EPISODE and ONE
+                                     crash block is written quoting the last lines of the
+                                     controller's own log (the path is RESOLVED by the script — the
+                                     launchd job's StandardError/OutPath, else the cell supervisor's
+                                     controller.log, else orch-loop.log),
+                                     so the repeating crash is visible instead of restarted forever.
+                                     After a further N stopped observations ONE probe restart is
+                                     allowed within the SAME episode, so a dead box is not dead for
+                                     ever: MEASURED steady state, 3 initial restarts then one per 4
+                                     passes at MAX_CONSEC=3 (~20 min at this 300s cadence).
+
+         ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
+         FRESH box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
+         must not be defeated). The installer renders it from resolve_infra_main() — this repo's MAIN
+         checkout, worktree-safe — so a passing worktree's teardown cannot leave this job pointing at
+         nothing. (That canary script is farmed to $HOME/.pi/agent/scripts for the CELL, which has no
+         launchd; this Mac job runs the checkout's copy so it moves with the merge, not with a sync.)
+
+         ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's
+         shell env nor its rc files, so an unset variable silently keeps the script's default — and
+         for THIS job the defaults are the contract. They are written out for that reason:
+           HB_STALE=780  the supervisor's own limit (CYC*2+300 at CYC=240). A watchdog that waited
+                         LONGER than the supervisor's report would let the box sit wedged for the
+                         report's duration plus its own window; a SHORTER one would restart a healthy
+                         controller mid-cycle, which is the P0 the supervisor refuses to do.
+           SETTLE=60     the re-check window after a restart. The loop writes $O/heartbeat as the
+                         FIRST act of a cycle, so a restored controller proves itself in seconds and
+                         a crash-on-start is still unambiguous at 60s.
+           MAX_CONSEC=3  three consecutive WEDGED/DOWN observations, i.e. three restarts that each
+                         failed to restore cycling, then restarting STOPS for that episode and the
+                         crash is recorded; one probe restart follows after a further 3 stopped
+                         observations. Without this the job is the measured hour, on a timer.
+
+         ⛔ AN UNWRITABLE STATE DIR DISABLES RESTARTING, BY DESIGN (it is not a silent no-op). The
+         restart cap is a count on disk; when the count cannot be kept, restarting is treated as
+         EXHAUSTED and `PERSIST-FAILED` is logged on every pass — because restarting on a counter that
+         never advances is the tight loop this job exists to prevent — and a probe whose own write
+         fails is not issued. ⛔ THE LOG IS INSIDE THAT DIRECTORY, so a fully unwritable state dir loses
+         the log as well: the verdict then reaches only stdout, captured below at
+         /tmp/controller-watchdog.launchd.err, and `status` will look like a job that never ran. A
+         `PERSIST-FAILED` line means a state-dir/permission problem; `RESTART-FAILED` means the
+         platform verb refused (most often a wrong LABEL — see the note on it below), which is a
+         different repair.
+
+         ⛔ EXIT 0 ALWAYS. A non-zero exit here would be a watchdog CRASH reported as a watchdog
+         VERDICT: the fleet reads "the watchdog failed" when the fact is "the controller is wedged".
+         (NOT because "nobody reads launchd's last-exit-status" — `scripts/lib/fleet-inventory.sh`
+         does read it, `fleet_job_exit` on the `controller-watchdog` row, and reports `FAILING`.)
+         The decision is the OUTPUT: at least one line per pass
+         in $HOME/.pi/agent/state/controller-watchdog.log (bounded, rotated with a line saying so),
+         plus the crash record at $HOME/.pi/agent/state/controller-watchdog.crash. The script's own
+         `status` verb reprints both, which is the surface a human and `status` read.
+         The launchd capture below is only for a death BEFORE the script can log anything (a bash
+         syntax error in the script itself, a missing interpreter) — the same class that wedged the
+         controller, so the watchdog must not reproduce it silently.
+
+         ⛔ ON A LINUX CELL there is no launchd and this template is not installed; the script's own
+         restart branch calls the cell supervisor's `start` verb there, which is the same verb the
+         cell doctor role uses to bring a controller back — no second launch path is invented. -->
+    <key>Label</key>
+    <string>com.eldato.controller-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/watchdog-loop.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>O</key>
+        <string>{{HOME}}/orchestrator</string>
+        <!-- ⛔ THE RESTART TARGET IS CONFIGURABLE, because the fleet ships TWO controller labels:
+             install.sh's launchd job is com.eldato.orchestrator-loop (orch-loop.sh directly) while
+             this box's stack is com.eldato.orchestrator-stack (supervisor.sh). Hardcoding the wrong
+             one makes every pass exit `RESTART-FAILED` while the wedge persists. This box's label is
+             the default and is written out so an operator can see and change it here. -->
+        <key>LABEL</key>
+        <string>com.eldato.orchestrator-stack</string>
+        <key>HB_STALE</key>
+        <string>780</string>
+        <key>SETTLE</key>
+        <string>60</string>
+        <key>MAX_CONSEC</key>
+        <string>3</string>
+    </dict>
+    <key>StartInterval</key>
+    <!-- 300s = 5 min. The supervisor's own tick is 30s and its limit is 780s, so a 5-minute pass
+         detects a wedge within ~13-18 minutes of it starting — while the heartbeat datum only moves
+         once per controller cycle (240s), so a tighter timer would read the same instant again.
+         This is the cadence the live box was hand-armed at. -->
+    <integer>300</integer>
+    <!-- ⛔ /tmp, like every other template here: launchd opens both files BEFORE exec, and nothing in
+         install-launchd.sh creates $HOME/.pi/agent/state. This capture is only for a death BEFORE the
+         script can log (a syntax error in the watchdog itself) — the durable decision record is the
+         script's own bounded log. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/controller-watchdog.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/controller-watchdog.launchd.err</string>
+</dict>
+</plist>

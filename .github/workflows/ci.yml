@@ -141,11 +141,15 @@ jobs:
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-    # every extensions/ top-level entry except *.test.ts must be farm-wired
+    # every TRACKED extensions/ top-level entry except *.test.ts, and except
+    # dot-named repo furniture such as .gitkeep, must be farm-wired
     # into pi-bootstrap/pi-config/extensions (single source of truth — a new
     # extension that isn't wired ships on NO machine) AND listed in manifest.json
     # files.extensions.entries (the consumer ship-list — a tree entry with no
-    # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
+    # manifest row ships on NO consumer, #498 staleness class). #2425: "tracked"
+    # means git lists it under extensions/ (the index is read); an untracked,
+    # git-ignored directory such as extensions/<x>/node_modules is not an
+    # extension and cannot false-block. Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
     # checks 1–5 (materialized copy / mistargeted link / unwired entry /
     # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
@@ -912,7 +916,7 @@ jobs:
     # against a 20-job pool). One unsharded job holding a serial sweep for hours starves CI by
     # DURATION while every capacity signal reads healthy. Two defects, and the second is why the
     # first was invisible:
-    #   1. 74 shards ran SERIALLY in one job → the fix is the MATRIX below.
+    #   1. every shard ran SERIALLY in one job → the fix is the MATRIX below.
     #   2. the job declared NO `timeout-minutes` (agent-infra #2055) → a hung shard burned hours
     #      and then reddened the PR without naming itself. The bound below makes a hang FAIL FAST,
     #      and the job that trips it names the slice it was running.
@@ -933,7 +937,8 @@ jobs:
     # reporting a green check over a hole.
     runs-on: ubuntu-latest
     # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
-    # measurements (PR #2412 job 120365087427: 74 shards in 73.6 min, 59.7 s/shard mean; #2483's
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards, 73.6 min, 59.7 s/shard
+    # mean; #2483's
     # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
     # other 70 shards 26m25s).
     #
@@ -958,11 +963,10 @@ jobs:
       # it died.
       fail-fast: false
       matrix:
-        # Slices, not shards. Width = the number of entries here; the sizes (10,10,9,9,9,9,9,9) are
-        # DERIVED by the runner's own round-robin (`pos % n`) over the current 74-line list, not
-        # asserted here — they shift by one when a `run_shard` line is added, and the runner
-        # re-derives them, so nothing in this file goes stale. The runner refuses a count wider than
-        # its own list.
+        # Slices, not shards. Width = the number of entries here; the per-slice sizes are DERIVED by
+        # the runner's own round-robin (`pos % n`) over whatever the list holds today, not asserted
+        # here — they shift when a `run_shard` line is added, and the runner re-derives them, so
+        # nothing in this file goes stale. The runner refuses a count wider than its own list.
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       # ⛔ checkout and setup-node carry their own bounds too. Unbounded, a hang in EITHER would be

@@ -810,6 +810,48 @@ st="$(state_of "$ROWS" controller-watchdog)"
                         || bad "§9g two identical watchdogs should be DUPLICATE, got [$st]"
 kill9 "$WL" "$WL2"
 
+# §9g2 (#2303) THE TRACKED LABEL IS SEEN. This row hard-wired `com.eldato.orchestrator-watchdog`, the
+# Mac's HAND-PROVISIONED job — which templates/launchd/RETIRED now makes install-launchd.sh remove. So
+# on a box that had been through the installer, nothing matched the row and the ONE component that takes
+# a destructive action (a `launchctl kickstart -k`) sat outside the table built to catch "silently off,
+# missing, or running twice".
+say_case "§9g2 the TRACKED com.eldato.controller-watchdog job is not invisible"
+seed_quiet_box
+rm -f "$A/com.eldato.orchestrator-watchdog.plist"
+mk_plist "com.eldato.controller-watchdog" 300 ""
+printf 'PID\tStatus\tLabel\n-\t0\tcom.eldato.controller-watchdog\n' > "$LC_LIST"
+sleep 0.2
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"
+[ "$st" = "OK" ] && ok "§9g2 the tracked controller-watchdog job reads OK" \
+                 || bad "§9g2 the tracked job should read OK, got [$st] — $(detail_of "$ROWS" controller-watchdog)"
+d="$(printf '%s\n' "$ROWS" | awk -F'\t' -v n=controller-watchdog '$1 == n { print $3; exit }')"
+case "$d" in
+  *com.eldato.controller-watchdog*) ok "§9g2 …and the row NAMES the job it read" ;;
+  *) bad "§9g2 the row does not name the tracked label — [$d]" ;;
+esac
+# An installed-but-unloaded job is MISSING (actionable, fails the table), never SKIPPED — §9c's rule,
+# and the whole reason a silent job is dangerous is that it reads like a healthy one.
+printf 'PID\tStatus\tLabel\n' > "$LC_LIST"
+sleep 0.2
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"
+[ "$st" = "MISSING" ] && ok "§9g2 an installed-but-NOT-loaded tracked job reads MISSING" \
+                      || bad "§9g2 a job definition with nothing loaded should read MISSING, got [$st]"
+# …and the verbs act on the SAME label the row reports, or `start` boots a job the row never read.
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.controller-watchdog" ] && ok "§9g2 start/stop resolve the TRACKED label" \
+                                              || bad "§9g2 the verbs resolved [$LBL], not the tracked label"
+# …and the retired label is still resolvable on a box the installer has not touched since (fallback).
+mk_plist "com.eldato.orchestrator-watchdog" 20 ""
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.controller-watchdog" ] && ok "§9g2 …and the TRACKED label still wins when BOTH are installed" \
+                                              || bad "§9g2 both installed should resolve the tracked label, got [$LBL]"
+rm -f "$A/com.eldato.controller-watchdog.plist"
+LBL="$(run_rows '_fleet_label_for controller-watchdog')"
+[ "$LBL" = "com.eldato.orchestrator-watchdog" ] && ok "§9g2 …and the retired label remains the fallback where only it exists" \
+                                               || bad "§9g2 the retired-label fallback resolved [$LBL]"
+
 # §9h (E-8) a bootstrapped job must be KICKED, or "start" produces no evidence at all. A job that is
 # not RunAtLoad reads "loaded, last exit 0" without ever having run under this start.
 say_case "§9h start kicks a job it bootstraps, so the verdict is about a RUN"
