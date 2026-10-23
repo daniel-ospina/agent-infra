@@ -536,6 +536,33 @@ case "$(cat "$T/c3.out")" in
   *'NOT re-arming'*) ok 'start: says WHY it did not re-arm, and how a human re-arms it' ;;
   *) bad "start: refused silently — an operator sees a stopped cell with no reason: $(cat "$T/c3.out")" ;;
 esac
+# ⛔ CANNOT-READ IS NOT "STOPPED" (review P1, #2402). `is-active` answers with an empty (or unrecognised)
+# word when it could not ASK — an expired `sudo -n` timestamp, a user-scope manager with no DBus from inside
+# the doctor's tmux session, a transient. Folding that answer into the rc-4 "the manager stopped it" outcome
+# let the doctor record a CLEAN pass over a cell with no dispatcher, for ever — the "reads as healthy" false
+# PASS this whole change removes — while the branch that reads `is-enabled` treats the same unreadable answer
+# as fatal. Only a READ not-active may skip the re-arm.
+say_case 'an UNREADABLE is-active is fatal, never "the manager stopped it"'
+C4="$(arm_root c4)"; mk_tmux "$C4/bin" "$C4/tmux.log"; : > "$C4/units/eldato-orchestrator.service"; : > "$C4/state/enabled"
+cat > "$C4/bin/systemctl" <<SH
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$C4/sc.log"
+[ "\${1:-}" = "--user" ] && shift
+case "\${1:-}" in
+  is-enabled) printf 'enabled\\n'; exit 0 ;;
+  is-active)  printf '\\n'; exit 0 ;;   # unreadable: no state WORD at all
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$C4/bin/systemctl"; : > "$C4/sc.log"
+SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup c4 start > "$T/c4.out" 2>&1; C4_RC=$?
+[ "$C4_RC" -ne 4 ] \
+  && ok 'start: an unreadable is-active is NOT reported as "the manager stopped it" (rc=4)' \
+  || bad 'start: an unreadable is-active answered rc=4 — the doctor would record a CLEAN pass over a cell with no dispatcher'
+case "$(cat "$T/c4.out")" in
+  *'cannot read whether'*) ok 'start: says it could not READ the state (cannot-verify, not a verdict)' ;;
+  *) bad "start: an unreadable is-active was not reported as a cannot-verify: $(cat "$T/c4.out")" ;;
+esac
 # CONTROL: the SAME fixture, WITHOUT the marker — a human `start` still resets the counter and starts the
 # unit (the fence is the caller, not the state). CONTROLLER_START_TIMEOUT is short because this arm's stub
 # start produces no controller process, so `start` ends in its own proof failure (rc 1) after the calls the
@@ -1240,6 +1267,24 @@ JR2_RC=0; JR2_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=120 inst j2 --install 2>&1
   && ok 'install: REFUSES ORCH_START_TIMEOUT_SEC=120 — below the window, but its burst does not FIT (the old default)' \
   || bad "install: accepted ORCH_START_TIMEOUT_SEC=120, whose 3 × (120 + 15) s overshoots the 300 s window — the unit would restart forever — $JR2_OUT"
 case "$JR2_OUT" in *StartLimitBurst*) ok 'install: the arithmetic refusal names the burst it cannot fit' ;; *) bad "install: refused without naming the burst — $JR2_OUT" ;; esac
+# ⛔ THE OVERFLOW PIN (review P2, #2402): the digits-only shape test accepts a 19-digit value, and the OLD
+# guard MULTIPLIED it — `3 * (3074457345618258602 + 15)` WRAPS NEGATIVE, so `-lt 300` passed and a unit with
+# an orphan ceiling of ~1e11 years installed looking validated: a start that can never fail inside the window,
+# a burst that never fills, a controller that never comes back. The guard divides now, and the refusal must
+# quote the bound it actually enforced (the old message printed 85 s, which the guard then refused).
+JR3="$(arm_root j3)"; mk_systemctl "$JR3/bin" "$JR3/state" "$JR3/sc.log"
+JR3_RC=0; JR3_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=3074457345618258602 inst j3 --install 2>&1)" || JR3_RC=$?
+[ "$JR3_RC" -ne 0 ] \
+  && ok 'install: REFUSES a digits-only ORCH_START_TIMEOUT_SEC that overflows the arithmetic (19 digits, wraps negative under multiplication)' \
+  || bad "install: accepted ORCH_START_TIMEOUT_SEC=3074457345618258602 — 3 × (x + 15) wraps NEGATIVE, so a multiplicative guard passes and the unit would restart forever — $JR3_OUT"
+case "$JR3_OUT" in *'Use ORCH_START_TIMEOUT_SEC <= 84s'*) ok 'install: the overflow refusal quotes the bound the guard enforced (84s, not the 85s the old message printed)' ;; *) bad "install: the refusal did not quote the enforced bound ('<= 84s') — $JR3_OUT" ;; esac
+# ...and the boundary is INCLUSIVE: 84 s fits the relation exactly (3 × (84 + 15) = 297 < 300). A guard that
+# refused its own recommended value would be a new false red on every cell the message is meant to repair.
+JR4="$(arm_root j4)"; mk_systemctl "$JR4/bin" "$JR4/state" "$JR4/sc.log"
+JR4_RC=0; JR4_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=84 inst j4 --install 2>&1)" || JR4_RC=$?
+[ "$JR4_RC" -eq 0 ] \
+  && ok 'install: ACCEPTS the boundary value the refusal names (84 s — the relation is enforced exactly, not tightened into a new refusal)' \
+  || bad "install: refused the very value its own refusal recommends (84 s) — the bound and the message disagree — $JR4_OUT"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)
@@ -1394,6 +1439,83 @@ case "$OLNEG_U_OUT" in
   *"other_unit=$OLNEG/units/eldato-orchestrator.service"*) ok 'uninstall: the untouched foreign unit is NAMED (not silent)' ;;
   *) bad "uninstall: left the foreign unit alone without naming it: $OLNEG_U_OUT" ;;
 esac
+
+# — §L-iv: the REVERSE direction — this installer's OWN unit keeps its RENDERED O= (review P1 round 9) ———
+# `verify_unit` REQUIRES `Environment=O=$O`, so a unit THIS installer rendered ALWAYS carries the installer's
+# own $O — while the controller it starts runs in the state dir `keys.env` resolves. Reading ownership from
+# the RESOLUTION ALONE (which is what §L-iii above introduced) therefore called this installer's OWN unit
+# another state dir's as soon as `keys.env` carried an `O=` line: `--status` exited 1 without asking the
+# manager at all (cloud-cell-bringup treats that as a dead cell), `--uninstall` printed "not installed for
+# $O … nothing to do" over an ENABLED unit that `Restart=always` keeps supervising, and `--install` could not
+# see the copy its "never arm a second supervisor in the other scope" guard keys on (#1761).
+# The two reads answer the unit's own two claims, so ownership is the UNION — this arm pins the side §L-iii
+# alone would have broken, and §L-iii's negative control still pins the case that must stay foreign.
+say_case 'a unit this installer rendered stays OURS when keys.env repoints $O (rendered read, not resolution only)'
+OLREV="$(arm_root l5)"; mk_systemctl "$OLREV/bin" "$OLREV/state" "$OLREV/sc.log"
+printf 'O=%s/elsewhere\n' "$OLREV" > "$OLREV/home/keys.env"
+cat > "$OLREV/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLREV/home
+Environment=ENV_FILE=$OLREV/home/keys.env
+Environment=O=$OLREV/o
+Restart=always
+SH
+: > "$OLREV/state/enabled"; : > "$OLREV/state/active"; printf '4242\n' > "$OLREV/state/mainpid"
+printf '%s\n' "$(( $(date +%s) - 30 ))" > "$OLREV/o/heartbeat"
+OLREV_S_RC=0; OLREV_S_OUT="$(inst l5 --status 2>&1)" || OLREV_S_RC=$?
+[ "$OLREV_S_RC" -eq 0 ] \
+  && ok 'status: rc 0 for the installer’s OWN unit whose keys.env repoints $O (the rendered O= is an owner too)' \
+  || bad "status: exited $OLREV_S_RC on THIS cell's own unit — the rendered O= was ignored, and bringup dies on this verb: $OLREV_S_OUT"
+case "$OLREV_S_OUT" in
+  *"other_unit="*) bad "status: reported the installer's OWN unit as another state dir's: $OLREV_S_OUT" ;;
+  *) ok 'status: does not call the installer’s own unit foreign' ;;
+esac
+OLREV_U_RC=0; OLREV_U_OUT="$(inst l5 --uninstall 2>&1)" || OLREV_U_RC=$?
+[ "$OLREV_U_RC" -eq 0 ] && [ ! -f "$OLREV/units/eldato-orchestrator.service" ] \
+  && ok 'uninstall: REMOVES the installer’s own unit when keys.env repoints $O (an enabled unit left behind keeps supervising)' \
+  || bad "uninstall: reported nothing to do over an ENABLED unit that is still armed: $OLREV_U_OUT"
+
+# — §L-v: a ROOT invocation must not EXECUTE the operator's keys.env (review P2 round 9) ————————————
+# The resolution is obtained by SOURCING the unit's `Environment=ENV_FILE=`. `keys.env` is the operator's
+# file and `--status` is documented as `sudo bash … --status`, so sourcing it as root lets any account that
+# can write that file run code with root's authority — from a verb that only READS. As root the file must be
+# evaluated only through a privilege-correct runner (`runuser -u <the file's owner>`), and NOT AT ALL when
+# that runner is unavailable or fails; the fallback is the RENDERED owner, which the unit carries in
+# cleartext and which the union above makes lossless for OWNERSHIP. These two arms pin both halves: the
+# §L-iii shape (rendered ≠ $O, resolves to $O) is the only one where the two reads disagree, so it is the
+# only fixture that can tell "evaluated" from "fell back".
+say_case "as root, the operator's keys.env is never executed without a privilege-correct runner"
+OLROOT="$(arm_root l6)"; mk_systemctl "$OLROOT/bin" "$OLROOT/state" "$OLROOT/sc.log"
+printf '#!/bin/bash\n[ "${1:-}" = "-u" ] && { printf "0\\n"; exit 0; }\nexec /usr/bin/id "$@"\n' > "$OLROOT/bin/id"
+printf '#!/bin/bash\nexit 127\n' > "$OLROOT/bin/runuser"
+chmod +x "$OLROOT/bin/id" "$OLROOT/bin/runuser"
+printf 'O=%s/o\n: > %s/SOURCED-BY-ROOT\n' "$OLROOT" "$OLROOT" > "$OLROOT/home/keys.env"
+cat > "$OLROOT/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLROOT/home
+Environment=ENV_FILE=$OLROOT/home/keys.env
+Environment=O=$OLROOT/installer-orchestrator
+Restart=always
+SH
+OLROOT_S_RC=0; OLROOT_S_OUT="$(EXTRA_ENV="PATH=$OLROOT/bin:/usr/bin:/bin" inst l6 --status 2>&1)" || OLROOT_S_RC=$?
+[ ! -f "$OLROOT/SOURCED-BY-ROOT" ] \
+  && ok 'root: the env file was NOT sourced when no privileged runner could evaluate it' \
+  || bad 'root: SOURCED the operator-writable keys.env directly — an account that can write that file runs code as root'
+[ "$OLROOT_S_RC" -ne 0 ] \
+  && ok 'root: falls back to the rendered owner (reports the copy as not provably this state dir’s, rc!=0)' \
+  || bad "root: answered rc 0 from a read it could not perform: $OLROOT_S_OUT"
+# POSITIVE CONTROL: with a privilege-correct runner present, the SAME root invocation DOES resolve — as the
+# file's OWNER, never as root — so the refusal above is about privilege, not about never reading the file.
+printf '#!/bin/bash\nprintf "%%s\\n" "$2" >> %s/runuser.log\nshift 3\nexec "$@"\n' "$OLROOT" > "$OLROOT/bin/runuser"
+chmod +x "$OLROOT/bin/runuser"
+OLROOT2_RC=0; OLROOT2_OUT="$(EXTRA_ENV="PATH=$OLROOT/bin:/usr/bin:/bin" inst l6 --status 2>&1)" || OLROOT2_RC=$?
+[ -f "$OLROOT/SOURCED-BY-ROOT" ] \
+  && ok 'root: with a privileged runner the resolution IS obtained (the runner is used, not bypassed)' \
+  || bad "root: never evaluated the env file even through the runner: $OLROOT2_OUT"
+OLROOT2_OWNER="$(stat -c %U -- "$OLROOT/home/keys.env")"
+[ -s "$OLROOT/runuser.log" ] && [ -z "$(grep -vxF "$OLROOT2_OWNER" "$OLROOT/runuser.log" 2>/dev/null)" ] \
+  && ok 'root: EVERY runner call used the FILE’S OWNER — the file never ran with root authority' \
+  || bad "root: the runner was invoked as '$(tr '\n' ' ' < "$OLROOT/runuser.log" 2>/dev/null)' instead of the file's owner ($OLROOT2_OWNER)"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §M — the lock witness needs SHAPE *AND AGE* (review P1, #2402)

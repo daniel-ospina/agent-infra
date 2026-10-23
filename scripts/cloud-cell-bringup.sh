@@ -1196,8 +1196,11 @@ check_controller_service() {
   # read here would refuse a healthy Mac on any context where that read is unavailable, and this PR's
   # scope deliberately excludes the macOS path. So the claim is withdrawn and the gap is NAMED instead
   # of hidden — the bring-up certifies the cell, and it says exactly what it did not look at.
+  # ⛔ `warn`, NOT `ok` (review P2, #2402): `ok "…NOT VERIFIED…"` printed a GREEN line for something no read
+  # produced, so the pass tally counted a pass over an unread surface — the "claim nobody measured" shape in
+  # miniature, on the one arm whose whole point is that nothing was measured.
   if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-    ok "controller supervision on macOS is NOT VERIFIED by this check — the launchd agent (com.eldato.orchestrator-loop) is out of scope here and nothing in this run read launchctl; verify with: launchctl print gui/\$UID/com.eldato.orchestrator-loop"
+    warn "controller supervision on macOS is NOT VERIFIED by this check — the launchd agent (com.eldato.orchestrator-loop) is out of scope here and nothing in this run read launchctl; verify with: launchctl print gui/\$UID/com.eldato.orchestrator-loop"
     return 0
   fi
   for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \
