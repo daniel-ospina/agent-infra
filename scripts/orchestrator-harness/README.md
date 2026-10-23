@@ -205,7 +205,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `check-port-drift.sh` + `port-provenance.txt` | gates removal of the tortoise-side copy |
 | `check-deployed-drift.sh` | answers "which harness commit is this box running?" |
 | `report.sh`, the wall-time series, the `[res]` line | cheap measurement — it is how the reviewer stall rate was found |
-| `install.sh` + `launchd.plist.template` | renders config, refuses out-of-range values, and prints (never runs) the start command |
+| `install.sh` + `launchd.plist.template` | renders config from one source, refuses an out-of-range value instead of writing it, and prints the start command **without running it** unless asked — `--start` starts **and proves it started** (pid + heartbeat), `--restart` is the un-wedging path (§0.6) |
 | `nonblocking-dispatch.sh` | removes the blocking-caller problem |
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
@@ -227,7 +227,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 
 | component | status |
 |---|---|
-| `parked-*` / `parkreason-*` as a terminal state | **written and read on every cycle** — `park_ctrl` (`orch-loop.sh:1503`) is called from the red-tree caps (`:2727`, `:2793`, `:2799`, `:2821`, `:2881`), the conflicted cap (`:3008`) and the needs-fix cap (`:3170`), and `:2899` reads the park back each sweep. It becomes retired **only** when `ask-owner.py` is wired into the loop (R5) — until then `parked-*` **is** the terminal state, and ripping it out early leaves a stuck PR with no destination at all |
+| `parked-*` / `parkreason-*` as a terminal state | **written and read on every cycle** — `park_ctrl` (`orch-loop.sh:1503`) is called from the red-tree caps (`:2727`, `:2793`, `:2799`, `:2821`, `:2881`), the conflicted cap (`:3008`), the needs-fix cap (`:3170`) and the CI-red cap (`:3219`), and `:2899` reads the park back each sweep. It becomes retired **only** when `ask-owner.py` is wired into the loop (R5) — until then `parked-*` **is** the terminal state, and ripping it out early leaves a stuck PR with no destination at all |
 
 **Legacy — retired, must not run:**
 
@@ -244,19 +244,21 @@ this harness was **dormant** while six swarm-era dispatchers fired every 120 s. 
 answer the question, and neither is a separate script to invent:
 
 * **"Is this box up, and on which tree?"** — `scripts/harness-up status` prints one line per
-  component (pid + age) and **ONE verdict**; `harness-up` / `harness-down` bring the stack up and
-  down in dependency order, and re-running `up` is a no-op on an already-running tree
-  (`scripts/harness-up:2-6`). `install.sh` is not a substitute: it renders config, refuses
+  component (pid + age) and **ONE verdict** (`scripts/harness-up:9`); `harness-up` / `harness-down`
+  bring the stack up and down in dependency order, and re-running `up` is a no-op on an
+  already-running tree (`:6-7`). `install.sh` is not a substitute: it renders config, refuses
   out-of-range values, and never touches a loaded job unless asked — its `--start` / `--restart`
-  render + install **then prove it started** (pid + heartbeat, `install.sh:8-10`).
+  (`install.sh:8-9`) render + install **then prove it started** (pid + heartbeat,
+  `:1096`/`:1142`).
 * **"Which system is this box provisioned for?"** — `docs/ops/ACTIVATION-MATRIX.md` is the measured
   provisioned-vs-improvised record, Mac and cell, with a per-row re-measurement recipe.
 
 **Retiring a legacy job is a declared list, not a new script.** Add the label to
-`templates/launchd/RETIRED`; `install-launchd.sh` unloads and removes any job listed there
-(`is_retired`, `:571`; `:584` prints `RETIRED (unloaded + removed)`) and **refuses** a label that
-still has a template in the directory (`:594`). A label in `RETIRED` must not also have a `.plist`
-template.
+`templates/launchd/RETIRED`; `retire_pass` → `retire_job` (`install-launchd.sh:578-598`) unloads and
+removes each listed job (`:584` prints `RETIRED (unloaded + removed)`) and refuses a label that still
+has a template in the directory (`:594`). `is_retired` (`:571`) is that same list read as a
+predicate, and it is what stops a retired label's template being installed (`:730`). A label in
+`RETIRED` must not also have a `.plist` template.
 
 ### 0.7 The load ceiling
 
