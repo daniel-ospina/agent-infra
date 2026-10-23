@@ -600,16 +600,24 @@ cmd_restart() {
   case "$name" in ''|.|..|-*|*/*) err "usage: restart --name <runner-name> — a name must not be empty, start with '-', be '.'/'..', or contain '/'"; return 1 ;; esac
   dir="$RUNNER_ROOT/$name"
   # ⛔ JUDGE THE ROOT BEFORE CONCLUDING "NO REGISTRATION". Every test on `$RUNNER_ROOT/$name` needs `x`
-  # on the ROOT, so a non-searchable root made this verb report a registration that EXISTS as missing and
-  # send the operator to `add` it (which then refuses rc 4 on the existing directory) — the same false
-  # verdict `status` refuses to print. An ABSENT root still falls through to rc 3 "no registration".
-  if [ -d "$RUNNER_ROOT" ] && { [ ! -r "$RUNNER_ROOT" ] || [ ! -x "$RUNNER_ROOT" ]; }; then
-    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT"; return 2
+  # on the ROOT (traversal — NOT `r`: `restart` addresses a KNOWN name and never lists the pool, so a
+  # mode-111 root is legitimate here and must not be refused). A non-searchable root made this verb
+  # report a registration that EXISTS as missing and send the operator to `add` it (which then refuses
+  # rc 4 on the existing directory) — the same false verdict `status` refuses to print. An ABSENT root
+  # still falls through to rc 3 "no registration"; a root that is not a directory is named as such.
+  if [ -e "$RUNNER_ROOT" ] || [ -L "$RUNNER_ROOT" ]; then
+    if [ ! -d "$RUNNER_ROOT" ]; then
+      err "cannot-measure why=runner-root-not-a-directory path=$RUNNER_ROOT"; return 2
+    fi
+    if [ ! -x "$RUNNER_ROOT" ]; then
+      err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT"; return 2
+    fi
   fi
   # ⛔ AN UNREADABLE INSTANCE IS cannot-measure, NOT "no registration": `-f .runner` is FALSE for a
-  # registration we cannot read, and the message would send the operator to `add` a runner that is
-  # already registered (the same false verdict `status` must never print).
-  if [ ! -r "$dir" ] || [ ! -x "$dir" ]; then
+  # registration we cannot reach, and the message would send the operator to `add` a runner that is
+  # already registered (the same false verdict `status` must never print). Traversal is `x`; `restart`
+  # never lists the instance, so `r` is not required here either.
+  if [ ! -x "$dir" ]; then
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2
     fi
@@ -657,8 +665,8 @@ cmd_reconcile() {
     # runner-root-not-a-directory), so this line does not invent one — and the pass still publishes its
     # machine-readable summary, as every other cannot-measure exit of this verb does.
     printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=unmeasured ceiling=%s mem_available=unmeasured floor=%s MB dry_run=%s\n' \
-      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "$CEILING" "${MEM_FLOOR_MB:-unset}" "$DRY"
-    err "cannot-act why=pool-unreadable (the restart arm could not enumerate the pool; the cause is named on the line above)"
+      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${CEILING:-unmeasured}" "${MEM_FLOOR_MB:-unset}" "$DRY"
+    err "cannot-act (the restart arm could not enumerate the pool; the reason is the line above the summary)"
     return 2
   fi
   while read -r d; do

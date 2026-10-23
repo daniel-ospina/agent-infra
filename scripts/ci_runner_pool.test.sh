@@ -936,6 +936,12 @@ else
   assert_contains "$out" "cannot-measure why=runner-root-unreadable" "the pass says why it stopped"
   assert_contains "$out" "the restart arm could not enumerate the pool" \
     "the RESTART arm refuses too — an empty here-string had made it silently report dead=0"
+  assert_contains "$out" "ceiling=unmeasured" "its summary still prints, naming the fields it could not measure"
+  if grep -qF 'why=pool-unreadable' <<<"$out"; then
+    bad "the restart arm invented a reason of its own (the enumeration already named the cause)"
+  else
+    ok "the restart arm invents no reason of its own"
+  fi
   assert_eq "$(count_lines "$CONFIG_LOG")" "0" "no attempt was spent minting listeners"
   chmod 700 "$RUNNER_ROOT"
   # ⛔ READ **AND** SEARCH are different permissions, and `-r` alone was enough to pass the guard while
@@ -984,6 +990,13 @@ else
   out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
   assert_eq "$?" "2" "a mode-444 instance is cannot-measure, never silently dropped"
   assert_contains "$out" "slots=1" "and it is STILL counted as a slot"
+  # ⛔ AND `restart`'s OWN ARM, which is a DELETION target: mode 444 has `r` but no `x`, so a
+  #   `[ ! -r ]`-only guard passes it and `[ -f .runner ]` then fails — the verb would answer a
+  #   registration that EXISTS with "no registration (add it first)" and rc 3. This assertion is what
+  #   makes deleting `[ ! -x "$dir" ]` red; the mode-000 case above cannot (it is caught by `-r`).
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-locked)"
+  assert_eq "$?" "2" "restart on a mode-444 instance is cannot-measure, not 'no registration'"
+  assert_contains "$out" "cannot-measure why=instance-unreadable" "and it names the instance"
   chmod 700 "$RUNNER_ROOT/pi-runner-locked"
 fi
 
@@ -996,6 +1009,8 @@ printf 'not a pool\n' >"$RUNNER_ROOT"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_eq "$?" "2" "a RUNNER_ROOT that is a regular file is cannot-measure, not an empty pool"
 assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it says which misconfiguration"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-x)" "2" \
+  "restart names the not-a-directory root too, instead of 'no registration'"
 rm -f "$RUNNER_ROOT"
 
 # ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED, which is what catches a competing pass that
