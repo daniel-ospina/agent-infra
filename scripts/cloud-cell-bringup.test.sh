@@ -193,7 +193,7 @@ printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login") 
 # scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
 export SYSTEMD_UNIT_DIR="$T/systemd-units"
 export SYSTEMCTL="$STUB/systemctl"
-printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
@@ -311,6 +311,36 @@ if grep -q 'Environment=DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper
 else
   bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"
 fi
+
+# #2402 — the CONTROLLER is supervised by a service unit the bring-up INSTALLS and reads back. Without
+# this the installer exists but nothing invokes it, so a rebuilt cell keeps the measured defect (the
+# controller dies with the last tmux session) while the banner says CELL READY.
+case "$BR_OUT" in
+  *"controller supervised"*) ok "bring-up INSTALLS the controller service unit and reports it (#2402)" ;;
+  *) bad "bring-up does not put the controller under a service — the installer is never invoked, so an empty box still loses its dispatcher: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
+  ok "the controller unit was rendered and installed"
+  grep -qxF 'Restart=always' "$T/systemd-units/eldato-orchestrator.service" \
+    && ok "the installed controller unit carries Restart=always (an orderly exit 0 is restarted)" \
+    || bad "the installed controller unit does not carry Restart=always — the measured defect is re-shipped"
+else
+  bad "no controller unit was installed under $T/systemd-units"
+fi
+
+say_case "a cell whose CONTROLLER cannot be supervised is refused (not certified)"
+# A REAL installer that fails is the shape: the fix must not be "install it, ignore the exit code".
+printf '%s\n' '#!/bin/sh' 'echo "installer: no service manager available" >&2' 'exit 1' > "$T/broken-controller-installer.sh"
+chmod +x "$T/broken-controller-installer.sh"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+CONTROLLER_SERVICE_INSTALLER="$T/broken-controller-installer.sh" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero when the controller service cannot be installed (rc=$BR_RC)" \
+                   || bad "bring-up returned 0 with an unsupervised controller"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness on a cell whose controller has nothing above it" ;;
+  *) ok "does not claim CELL READY when the controller is unsupervised" ;;
+esac
+rm -f "$T/broken-controller-installer.sh"
 
 say_case "a cell whose reaper timer cannot be ENABLED is refused (not certified)"
 printf '%s\n' "$TOK_BODY" > "$TOK"

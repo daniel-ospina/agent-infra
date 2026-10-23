@@ -705,6 +705,44 @@ check_disk_reaper() {
   ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
 }
 
+# ── controller: the SERVICE that keeps the dispatcher alive (agent-infra#2402) ──────────────────
+# The controller lived and died as a tmux SESSION, and a tmux session has nothing above it: when the box
+# emptied, the last session closed, the tmux server exited and the dispatcher was gone — the cell read as
+# a healthy idle box (measured 2026-10-23 on cell-1). `install-controller-service.sh` puts it under a
+# systemd unit with `Restart=always`; this check RUNS that verb and READS IT BACK, exactly as
+# `check_disk_reaper` does for the timer. ⛔ A CELL WHOSE CONTROLLER HAS NOTHING ABOVE IT IS REFUSED, not
+# certified: `CELL READY` over a box that stops dispatching the moment it empties is the false PASS this
+# script exists to remove — and the installer is never invoked anywhere else, so without this the fix is
+# inert on every cell the bring-up provisions.
+check_controller_service() {
+  local installer="" cand out rc
+  # macOS is REFUSED by the installer ON PURPOSE: the launchd agent already has `KeepAlive`, so a second
+  # supervisor there would be a second dispatcher on one queue. Running the check would only produce a
+  # false red against a healthy Mac.
+  if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    ok "controller supervised by the launchd agent (macOS) — the service installer is Linux-only by design"
+    return 0
+  fi
+  for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \
+              "${HOME:-}/.pi/agent/scripts/install-controller-service.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-controller-service.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$HOME/.pi/agent/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
+
+  rc=0
+  # TEMPLATES_DIR from the SAME checkout the layer came from (the farmed installer copy lives at
+  # $HOME/.pi/agent/scripts, whose ../templates does not exist) — same rule as check_disk_reaper.
+  out="$(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the controller service could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager with linger) before this cell is used; an unsupervised controller dies with the last lane"
+
+  rc=0
+  out="$(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" bash "$installer" --status 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the controller service is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  ok "controller supervised — eldato-orchestrator.service is enabled and active (Restart=always: a dead controller comes back without a human; stop it with 'cloud-cell-supervisor.sh stop')"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -724,6 +762,9 @@ main() {
       check_provider_layer
       check_caches
       check_disk_reaper
+      # AFTER the operational layer exists: the installer is resolved from that layer (#2402), and the
+      # unit's ExecStart names the supervisor it ships.
+      check_controller_service
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.

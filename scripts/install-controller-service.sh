@@ -213,7 +213,20 @@ verify_unit() {
 # ── read-backs ────────────────────────────────────────────────────────────────────────────────
 # $SC is a COMMAND STRING (it may be "sudo -n systemctl"), so it is expanded unquoted on purpose.
 sc_run() { $SC "$@"; }
-unit_active()  { sc_run is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; }
+# ⛔ THREE ANSWERS, NOT TWO (review P2, #2402). `is-active --quiet` answers "no" for BOTH `inactive` and
+# "cannot read", and `--status` is the verb an operator reads as a verdict: folding an unreadable read
+# into "nothing is supervising the controller" is a definite claim about a state nobody observed.
+# 0 = active · 1 = a real inactive/failed WORD · 3 = cannot read. The words are systemd's own.
+unit_active_state() {
+    local out
+    out="$(sc_run is-active "$UNIT_NAME" 2>/dev/null)"
+    case "$out" in
+        active|reloading|activating) return 0 ;;
+        inactive|failed|deactivating|maintenance|unknown|not-found|bad) return 1 ;;
+    esac
+    return 3
+}
+unit_active() { unit_active_state >/dev/null 2>&1; }
 unit_enabled() { sc_run is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; }
 # MainPID via `show -p` (the `--value` spelling needs systemd >= 230). An UNREADABLE answer is reported
 # as such by the caller, never folded into "no pid".
@@ -226,18 +239,47 @@ unit_main_pid() {
 }
 # Seconds since the controller's last cycle, from the heartbeat the loop itself writes. Empty when it
 # cannot be read — and empty is NEVER printed as healthy (see do_status).
+# ⛔ A DIGIT RUN IS NOT NECESSARILY AN INSTANT (review P2, #2402; the same four guards `lc_hb_age` in
+# orchestrator-harness/launchd-cycle.sh carries, measured there):
+#   * `[ "$t" -le M ]` parses a LEADING-ZERO run as DECIMAL while `$(( ))` parses it as OCTAL, so the value
+#     compared is not the value subtracted — `0001234567` yielded a FABRICATED ~1.79e9s age, i.e. a healthy
+#     controller reported as stale;
+#   * a heartbeat in the FUTURE (a clock correction, a state dir copied from another clock) makes
+#     `now - t` NEGATIVE, and `[ -N -le bound ]` is true for every negative N — so a DEAD controller would
+#     read as FRESH forever, on the one surface documented as stricter than `is-active`;
+#   * a very long run overflows `$(( ))`.
+# So: force decimal, bound the length, require a plausible epoch instant, tolerate <=60s of skew, and clamp
+# the age at 0 (an age is seconds SINCE the write; it can never be negative).
 heartbeat_age() {
-    local hb="$O/heartbeat" t
+    local hb="$O/heartbeat" t now age
     [ -f "$hb" ] || return 1
     t="$(tr -dc '0-9' <"$hb" 2>/dev/null)" || return 1
     case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$t" -gt 0 ] 2>/dev/null || return 1
-    printf '%s\n' "$(( $(date +%s) - t ))"
+    [ "${#t}" -le 12 ] || return 1
+    t=$(( 10#$t ))
+    [ "$t" -ge 1000000000 ] 2>/dev/null || return 1
+    now="$(date +%s)"
+    [ "$t" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
+    age=$(( now - t ))
+    [ "$age" -ge 0 ] || age=0
+    printf '%s\n' "$age"
 }
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
 do_install() {
     local tpl tmpd changed=0 linger=0 pid rc
+    # ⛔ REFUSE AN ELEVATED INSTALL (review P2, #2402). `sudo bash install-controller-service.sh` renders
+    # User=root / HOME=/root / O=/root/orchestrator, and verify_unit *requires* that — so the unit is green,
+    # runs as root with root's keys.env and gh auth, and, because it is ENABLED, a later `start` delegates
+    # to it and the cell's controller can never come up until someone runs --uninstall. The sibling this
+    # installer follows refuses exactly this; so does this one.
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the controller would run as root, with root's"
+        err "  keys.env, gh auth and state dir — and an enabled unit that fails stays enabled, so 'start' would"
+        err "  keep delegating to a controller that cannot run."
+        err "  Re-run as the operator: sudo -u $SUDO_USER -H bash $0 --install"
+        return 1
+    fi
     case "${RESTART_SEC:-}" in
         ''|*[!0-9]*) err "REFUSING: ORCH_RESTART_SEC must be a whole number of seconds (got '$RESTART_SEC')"; return 1 ;;
     esac
@@ -355,8 +397,21 @@ do_status() {
         fi
     fi
     say "unit=$UNIT_NAME target=$TARGET"
-    if ! enabled="$(sc_run is-enabled "$UNIT_NAME" 2>/dev/null)"; then enabled="unreadable"; fi
-    if unit_active; then active="active"; else active="not-active"; fi
+    # ⛔ AN UNREADABLE IS NOT A "NO" (review P2, #2402): both reads below report UNKNOWN rather than a
+    # definite verdict, because `--status` is the documented verification verb. `is-enabled` prints a state
+    # WORD on success; an EMPTY answer is not a state (a shim, a truncated read).
+    case "$(sc_run is-enabled "$UNIT_NAME" 2>/dev/null)" in
+        enabled|enabled-runtime|alias) enabled="enabled" ;;
+        disabled|masked|masked-runtime|static|indirect|generated|transient|linked|linked-runtime|not-found|bad) enabled="not-enabled" ;;
+        *) enabled="unreadable" ;;
+    esac
+    local _ast=3
+    unit_active_state; _ast=$?
+    case "$_ast" in
+        0) active="active" ;;
+        1) active="not-active" ;;
+        *) active="UNREADABLE" ;;
+    esac
     say "enabled=$enabled"
     say "active=$active"
     if pid="$(unit_main_pid 2>/dev/null)"; then say "main_pid=$pid"; else say "main_pid=UNREADABLE"; rc=1; fi
@@ -375,14 +430,24 @@ do_status() {
         # the controller's can legitimately differ — and the first cycle writes the file minutes later
         # (CYC). Failing the verb over that was a false red on a healthy service-managed cell. The unit's
         # own MainPID is the proof that a controller is running; the heartbeat is a fresher fact, not a gate.
-        say "heartbeat_age_s=UNREADABLE (no $O/heartbeat — path read: \$O=$O; a keys.env 'O=' line moves the controller's state dir, and the first cycle writes it after one CYC)"
+        say "heartbeat_age_s=UNREADABLE (no READABLE $O/heartbeat — path read: \$O=$O; the file can be absent, or present with a value that is not a plausible instant (too small to be an epoch second, future-dated beyond 60s of skew, or over-long), and a keys.env 'O=' line moves the controller's state dir; the first cycle writes the file after one CYC)"
         if [ "${pid:-0}" = "0" ]; then
             err "no heartbeat AND no MainPID — nothing is running under the unit: journalctl -u $UNIT_NAME -n 40"
             rc=1
         fi
     fi
-    [ "$active" = "active" ] || { err "the unit is NOT active — nothing is supervising the controller"; rc=1; }
-    [ "$enabled" = "enabled" ] || { err "the unit is NOT enabled — it will not come back after a reboot"; rc=1; }
+    [ "$active" = "active" ] || {
+        [ "$active" = "UNREADABLE" ] \
+          && err "cannot read whether the unit is active — whether anything is supervising the controller is UNKNOWN, not 'no'" \
+          || err "the unit is NOT active — nothing is supervising the controller"
+        rc=1
+    }
+    [ "$enabled" = "enabled" ] || {
+        [ "$enabled" = "unreadable" ] \
+          && err "cannot read whether the unit is enabled — whether it comes back after a reboot is UNKNOWN, not 'no'" \
+          || err "the unit is NOT enabled — it will not come back after a reboot"
+        rc=1
+    }
     return "$rc"
 }
 
@@ -405,10 +470,23 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
 # and exit 0 while the user unit stayed installed, enabled and running. The installed file is the evidence.
 find_installed_unit() {
     local d
-    for d in "${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+    # ⛔ `CONTROLLER_SYSTEM_UNIT_DIR` is the READ side of the system scope (the supervisor's own seam name);
+    # `SYSTEMD_UNIT_DIR` stays the WRITE override. Conflating them is how a write-path override decided
+    # which installed copy a read-back reported on.
+    for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
         [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && { printf '%s\n' "$d/$UNIT_NAME"; return 0; }
     done
     return 1
+}
+# every installed copy, in the order the scopes are tried. ONE is the normal case; two is an operator who
+# installed both, and the second is why `--uninstall` must not report "no longer supervised" over a copy
+# it did not remove.
+installed_units() {
+    local d
+    for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+        [ -n "$d" ] && [ -f "$d/$UNIT_NAME" ] && printf '%s\n' "$d/$UNIT_NAME"
+    done
+    return 0
 }
 do_uninstall() {
     local p
@@ -431,6 +509,15 @@ do_uninstall() {
         rm -f "$p" || { err "cannot remove $p"; return 1; }
     fi
     sc_run daemon-reload >/dev/null 2>&1 || true
+    # ⛔ A SECOND INSTALLED COPY IS STILL A SUPERVISOR (review P2, #2402). Reporting "no longer supervised"
+    # over a copy this verb did not remove is the false pass; name it and fail, so the operator finishes
+    # the job instead of walking away from a unit that is still enabled and will start at boot.
+    local left; left="$(installed_units)"
+    if [ -n "$left" ]; then
+        err "uninstalled $p, but ANOTHER copy remains: $(printf '%s' "$left" | tr '\n' ' ')"
+        err "  that unit is still installed (and may still be enabled) — remove it too: re-run --uninstall"
+        return 1
+    fi
     say "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $SUPERVISOR start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0
 }
