@@ -1044,7 +1044,7 @@ BLOCKING_FINDINGS="$(cat "$RUN_DIR/blocking-findings.txt")"
 # rejected as a count.
 ISSUE_N=""
 case "$LAST_LC" in
-  *issues*) ISSUE_N="$(printf '%s' "${LAST_LC#*issues}" | sed -n 's/^[[:space:]]*[][(:]*[[:space:]]*\([0-9][0-9]*\).*/\1/p')" ;;
+  *issues*) ISSUE_N="$(printf '%s' "${LAST_LC#*issues}" | sed -n 's/^[[:space:]]*[][(:,—–,-]*[[:space:]]*\([0-9][0-9]*\).*/\1/p')" ;;
 esac
 # ⛔ THE VERDICT WORD IS THE **FIRST** ONE ON THE LINE (P1, ninth fresh review). Matching
 # `*clean*` anywhere meant `**Verdict: ISSUES — … the code is not clean**` recorded CLEAN:
@@ -1059,12 +1059,20 @@ case "$VWORD" in
       # the number of blocking lines, and only then 1 — never under-report (P3, eleventh review).
       ISSUE_N="$(printf '%s' "$LAST" | grep -oE '[0-9]+[[:space:]]*[×x]' | head -1 | tr -cd '0-9' || true)"
       [ -n "${ISSUE_N:-}" ] || ISSUE_N="$(printf '%s\n' "$BLOCKING_FINDINGS" | grep -c . || true)"
-      # ⛔ ONLY AN *UNPARSED* COUNT DEFAULTS TO 1 (`[ -n ]`, not `-gt 0`): a ZERO the reviewer
-      # actually printed — from the count, or from "no blocking lines parsed" — is a real
-      # answer ('no blocking findings'), and clamping it to 1 inverted the clean arm below
-      # (P2, fresh review of #2288). A `CLEAN`-only zero is still safe: the contradiction
-      # guard after that arm refuses it when blocking LINES are present.
-      [ -n "${ISSUE_N:-}" ] || ISSUE_N=1
+      # ⛔ THE SCANNER'S NUMBER IS A *REPORTED* NUMBER, NEVER A CLEAN CERTIFICATE (P1, fresh
+      # review of #2288 — this arm is where the two-channel contract lives). `grep -c .`
+      # PRINTS `0` when it matches nothing, so this assignment is NEVER empty: an UNCOUNTED
+      # `ISSUES` verdict over findings the severity scan cannot label (a bullet list, prose)
+      # therefore reached the clean arm below as "ISSUES 0" and posted a `Verdict: CLEAN`
+      # artifact over a reviewer that had just said ISSUES. `0` here means ONLY "the scanner
+      # parsed no blocking line", which is not the reviewer's answer to anything, so it
+      # fails CLOSED to 1.
+      # The two arms are deliberately asymmetric and BOTH are required: an extracted count
+      # (`ISSUES 0`, `ISSUES: 0`, `ISSUES (0)`, `ISSUES — 0 × P1`) is the reviewer's own
+      # answer and short-circuits the `[ -z ]` above, so a printed ZERO stays clean; an
+      # UNPARSED one must never become 0 (that is the fail-open) and must never be invented
+      # from a scan that saw nothing.
+      [ "${ISSUE_N:-0}" -gt 0 ] || ISSUE_N=1
     fi ;;
   *)
     err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line in its transcript (rc=$AGENT_RC)."

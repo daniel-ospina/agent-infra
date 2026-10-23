@@ -66,6 +66,8 @@
 #      digest is refused (rc=3, nothing posted, nothing recorded) — including when the diff's final
 #      line is SHORTER than the token (the case that silently disabled the handshake) — while an
 #      untruncated diff needs no proof at all
+#   §AM an UNCOUNTED `ISSUES` verdict over findings the severity scan cannot label FAILS CLOSED
+#      (`ISSUES` is never read as `ISSUES 0`), and a printed dash-count (`ISSUES — 2`) survives
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -203,6 +205,11 @@ printf 'ran\n' >> "$TMP/pi-runs.txt"
 # whose context reads came from a different tree.
 printf '%s\n' "$PWD" > "$TMP/pi-cwd.txt"
 printf 'GHREPO=%s\n' "${GH_REPO:-<unset>}" >> "$TMP/pi-env.txt"
+# ⛔ THE SIGNING SECRET IS AN OBSERVABLE TOO (P2, fresh review of #2288): the strip was
+# unasserted, so deleting `env -u AI_REVIEW_GATE_KEY` from the spawn left the suite fully
+# green — a guard that can be removed with no red check is not a guard. Written to its own
+# line so §U can read it next to GHREPO.
+printf 'GATEKEY=%s\n' "$(if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then printf present; else printf absent; fi)" >> "$TMP/pi-env.txt"
 # A BASE retarget during the review: the head sha is untouched, the three-dot diff is not.
 [ "${FIXTURE_FLIP_DIFF:-0}" = "1" ] && printf 'diff --git a/x b/x\n+BASE RETARGETED\n' > "$TMP/diff-body"
 # A head move DURING the review (the caller must refuse to record it).
@@ -723,6 +730,12 @@ reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
 GH_REPO="evil-org/evil-repo" run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "succeeds (rc=$(rc_of))"
 grep -qx "GHREPO=$REPO_FIXTURE" "$TMP/pi-env.txt" 2>/dev/null; ck $? "the reviewer child ran with GH_REPO=$REPO_FIXTURE (a bare \`gh pr view\` inside it cannot read another repo)"
+# ⛔ …AND DOES NOT GET THE SIGNING SECRET (P2, fresh review of #2288). The parent DOES hold it:
+# `run()` exports AI_REVIEW_GATE_KEY and the fake recorder has to mint a signature, so a green
+# record is the proof the key was present in the parent — which is what makes "absent" below
+# the CHILD's doing rather than a fixture that never set it.
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record was signed, so the PARENT held the key"
+grep -qx 'GATEKEY=absent' "$TMP/pi-env.txt" 2>/dev/null; ck $? "  …while the reviewer child saw AI_REVIEW_GATE_KEY ABSENT (its stdout is pasted into a public comment)"
 
 # ── §V an `ISSUES n` over ONLY P3 lines is clean — reconciled, never assumed ─
 echo; echo "§V ISSUES 0 is clean; ISSUES n>0 is never converted to clean"
@@ -1032,6 +1045,32 @@ reset; printf 'Two blockers, no lines.\nISSUES: 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…and 'ISSUES: 2' with NO finding lines still blocks (rc=$(rc_of))"
 err_has "found 2 blocking issue(s)"; ck $? "  …reporting the count the reviewer printed"
+
+# ── §AM an UNCOUNTED `ISSUES` fails CLOSED, and a dash-count survives ────────
+echo; echo "§AM an UNCOUNTED 'ISSUES' is never read as 'ISSUES 0' (the severity scan is not the count)"
+# The fresh review of #2288 filed this as a P1 in the fix that CLOSED §AK's P2, which is exactly
+# why both directions are pinned. `grep -c .` PRINTS `0` when it matches nothing, so the
+# "no count printed, fall back to the blocking-line count" arm could never be empty: a reviewer
+# whose last line was `**Verdict: ISSUES**` over findings the severity scan cannot LABEL (a bullet
+# list, prose) produced `ISSUES 0`, which the clean arm then converted — rc 0, a `Verdict: CLEAN`
+# artifact, and a signed clean record for a revision its own reviewer had just called ISSUES.
+# A count the reviewer PRINTED is a different thing from a count the scan FAILED to find, and the
+# two are pinned separately: §AK is the printed-zero direction, this is the unparsed one.
+reset; printf 'Found problems but did not label them.\n- scripts/x.sh:42 — unvalidated shell interpolation allows injection\n- scripts/y.sh:7 — the guard returns 0 on a failed read\n**Verdict: ISSUES**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an UNCOUNTED 'ISSUES' over unlabelled findings FAILS CLOSED (rc=$(rc_of))"
+no_record; ck $? "  …NO record — 'the scan saw nothing' is not 'the reviewer found nothing'"
+err_has "found 1 blocking issue(s)"; ck $? "  …and it says 1, not the scan's 0"
+reset; printf 'Two blockers.\n**Verdict: ISSUES — 2**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a PRINTED dash-count ('ISSUES — 2') blocks (rc=$(rc_of))"
+err_has "found 2 blocking issue(s)"; ck $? "  …reporting 2, not silently lowered to the scan's 0"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'Problems.\nVerdict = ISSUES\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and the equals form 'Verdict = ISSUES' fails closed too (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# …while the PRINTED-zero direction §AK pins still records (§AK's first three scenarios).
 
 # ── §AH the bare label that NAMES ITS LOCATION AFTER IT (the filed P1) ───────
 echo; echo "§AH a bare P1 with a location after it cannot hide from CLEAN"
