@@ -1716,7 +1716,7 @@ fi
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
 refuse_counted_clean() {
-  local _vl _vw _hit _hit2 _one _dig _bare _scan _src
+  local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
   # review of #2288 — both MEASURED, both minted a signed clean record):
@@ -1811,10 +1811,22 @@ refuse_counted_clean() {
     # `LANG=C LC_ALL=`): inside `[...]` the multi-byte `×` is a pair of BYTES that a C-locale regcomp
     # does not match, so the very form this arm exists for went silent exactly where the suite was
     # already being run in the C locale. As a plain alternative it matches in both locales.
+    # ⛔ AND THE COUNT GRAMMAR IS ORDER-BOUND, SO ITS MIRROR IS A SEPARATE ARM (P1, sixth fresh review of
+    # #2288 — MEASURED fail-OPEN on the VERDICT line itself, where nothing gates it:
+    # `**Verdict:** CLEAN — blocking findings: 2 in scripts/x.sh.` and
+    # `**Verdict:** CLEAN — defects remaining: 2 (scripts/x.sh:42, scripts/y.sh:7).` both recorded a
+    # SIGNED clean record, on main as well, so this is a remaining hole and not one this branch opened).
+    # The severity scanner already carries the same mirror arm for P tokens ((b4)) — a `P2: 2 findings`
+    # shape — so the two grammars had drifted one over; a colon/equals/dash separator is REQUIRED, or
+    # `issue 3 of the tracker` would read as a count.
+    _hit3="$(printf '%s' "$_scan" \
+      | grep -oiE '(^|[^[:alnum:]])(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]]+[[:alpha:]][[:alpha:]-]*){0,2}[[:space:]]*([[:space:]]*[:=][[:space:]]*|[[:space:]]+[-—–][[:space:]]*)[0-9]+' 2>/dev/null || true)"
     _hit2="$(printf '%s' "$_scan" \
       | grep -oiE '(^|[^[:alnum:]])([0-9]+[[:space:]]*(×|x|X|\*|times)[[:space:]]*P[0-3]|P[0-3][[:space:]]*(×|x|X|\*|times)[[:space:]]*[0-9]+)' 2>/dev/null || true)"
     if [ -n "$_hit2" ]; then _hit="${_hit:+$_hit
 }$_hit2"; fi
+    if [ -n "$_hit3" ]; then _hit="${_hit:+$_hit
+}$_hit3"; fi
     [ -n "$_hit" ] || continue
     # ⛔ ON AN ORDINARY LINE A COUNT NEEDS A LIVE-FINDING CUE (P2, fourth fresh review of #2288 —
     # MEASURED over-block, the direction that costs a PAID re-run: widening the channel to every
@@ -1825,8 +1837,17 @@ refuse_counted_clean() {
     # STILL there — remain(s|ing), unresolved, still, left, open, outstanding, blocking, found,
     # located, pending. Both measured fail-opens of the third review (`I found two blocking issues:`,
     # `2 defects remain`) carry a cue.
-    if [ "$_src" != "$VERDICT_LINES_FILE" ]; then
-      printf '%s' "$_vl" | grep -qEi '(remain|remaining|remains|unresolved|still|left|open|outstanding|blocking|found|located|pending)' || continue
+    # ⛔ THE CUE LIST WAS THE WRONG SHAPE OF GUARD (P1, sixth fresh review of #2288 — MEASURED fail-OPEN:
+    # `Two defects, both in the guard:` then `**Verdict:** CLEAN`, and
+    # `Reviewed the whole diff. Two issues in the retry path.`, and `Noted 2 problems in the guard` all
+    # recorded a SIGNED clean record, because a fixed list of 11 words is a whitelist of sentences and a
+    # reviewer only has to phrase it differently). The contract is the FILE's own: a reported count of
+    # findings anywhere in the accepted region is a finding. So the default is REFUSE, and the only
+    # exemption is the one the protocol actually licenses — the line says it REPAIRED them, in the
+    # clause before the count (`Fixed the 3 issues from round 1.`). The repair participle immediately
+    # after the noun is exempted by the match filter above, and nothing else is.
+    if printf '%s' "$_scan" | grep -qiE '^[^0-9]*(fixed|addressed|resolved|closed|removed|repaired|re-review)' ; then
+      continue
     fi
     # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
     # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
@@ -1837,7 +1858,12 @@ refuse_counted_clean() {
       # `P1 × 2` arm read `P1` as the count and refused `0 × P1`, a zero multiplier): strip the `P<n>`
       # tokens first, then the first number left is the count, in every form and both directions.
       _bare="${_one//P[0-3]/}"
+      # …and in the MIRROR form (`defects remaining: 2`) the count is the LAST number, so both ends are
+      # read and the count is whichever exists: first form takes the head, mirror takes the tail. A
+      # zero at EITHER end is a zero report, which is what both spellings mean.
       _dig="$(printf '%s' "$_bare" | grep -oE '[0-9]+' | head -1)"
+      _tail="$(printf '%s' "$_bare" | grep -oE '[0-9]+' | tail -1)"
+      [ -n "$_tail" ] && [ "$_dig" != "$_tail" ] && _dig="$_tail"
       [ -n "$_dig" ] && [ "$_dig" -eq 0 ] && continue
       CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
     done <<<"$_hit"
@@ -2229,8 +2255,12 @@ marker_diff_for() { # <body> -> the diff group of the marker bound to THIS pr/he
     [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
     [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
     [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
-    printf '%s' "${BASH_REMATCH[4]# diff=}"; return 0
+    printf '%s\n' "${BASH_REMATCH[4]# diff=}"
+    _seen=1
   done <<<"$body"
+  # EVERY same-head marker is printed, not just the first (P3, sixth fresh review of #2288): a head can
+  # carry two (an earlier recorder run, then a re-run the E_ALREADY message advises), and a first-match
+  # read would keep seeing the STALE one and refuse forever.
   return 0
 }
 BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
@@ -2255,8 +2285,9 @@ esac
 # authoritative statement of what was signed: compare it to what was reviewed, and where the recorder
 # wrote no `diff=` group, fall back to one more live read. Cost on the clean path: zero extra calls
 # when the group is present, one read when it is not.
-MARKER_DIFF="$(marker_diff_for "$BODY_AFTER")"
-if [ -n "${MARKER_DIFF:-}" ]; then
+MARKER_DIFFS="$(marker_diff_for "$BODY_AFTER")"
+MARKER_DIFF="$(printf '%s' "$MARKER_DIFFS" | grep -oE '[0-9a-f]{64}' | head -1)"
+if [ -n "${MARKER_DIFFS//[[:space:]]/}" ]; then
   # ⛔ THE DIGEST MUST BE THE ONE THE RECORDER MINTS, NOT A PLAUSIBLE-LOOKING SHA (P1, fourth fresh
   # review of #2288 — MEASURED: `sha256(raw capture)` is NOT what `record-review.sh` signs, so EVERY
   # clean run on a healthy box exited 8 AFTER posting the comment and writing the record, and the
@@ -2281,8 +2312,16 @@ if [ -n "${MARKER_DIFF:-}" ]; then
   if [ -z "$DIFF_RAW_HASH" ] && [ -z "$DIFF_NORM_HASH" ]; then
     die "$E_SCAN" "no portable sha256 tool could digest the reviewed diff (tried sha256sum, shasum -a 256), so the record's diff identity cannot be checked — refusing to report success on an unverified attestation ($(printf '%s' "$SHA_CMD" | sed 's/^$/none resolved/'))"
   fi
-  if [ "$MARKER_DIFF" != "$DIFF_RAW_HASH" ] && { [ -z "$DIFF_NORM_HASH" ] || [ "$MARKER_DIFF" != "$DIFF_NORM_HASH" ]; }; then
-    die "$E_MOVED" "the SIGNED record's diff ($MARKER_DIFF) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. Nothing to re-review: the head is unchanged, so re-run this command (the recorder's same-head write is idempotent) to re-sign the diff that was actually read."
+  # ANY same-head marker matching is enough: the record is one artifact and its diff= is stated once
+  # per marker, so a second marker written by a re-run of the recorder must be able to CLEAR the first
+  # (P3, sixth fresh review of #2288 — a first-match read made the E_ALREADY remedy unsatisfiable).
+  _dok=0
+  while IFS= read -r _md; do
+    [ -n "$_md" ] || continue
+    if [ "$_md" = "$DIFF_RAW_HASH" ] || { [ -n "$DIFF_NORM_HASH" ] && [ "$_md" = "$DIFF_NORM_HASH" ]; }; then _dok=1; fi
+  done <<<"$MARKER_DIFFS"
+  if [ "$_dok" != "1" ]; then
+    die "$E_MOVED" "the SIGNED record's diff ($(printf '%s' "$MARKER_DIFFS" | tr '\n' ' ')) is NOT the diff the reviewer read (raw $DIFF_RAW_HASH, normalized ${DIFF_NORM_HASH:-n/a}) — the base moved between the review and the recorder's own read, so the marker attests a diff nobody reviewed. ⛔ THE REMEDY IS THE RECORDER, NOT A RE-RUN OF THIS SEAM (P3, sixth fresh review of #2288): this run already wrote the record, so re-running the seam would exit at the unchanged-head guard. Re-run it by hand — \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` — which appends a marker for the diff on disk now, and a same-head marker that matches CLEARS this check."
   fi
 else
   DIFF_SIGNED="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \

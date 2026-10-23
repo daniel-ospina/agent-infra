@@ -2224,7 +2224,20 @@ else
   run "$MN" 2284
   [ "$(rc_of)" = "8" ]; ck $? "the MUTANT (normalized arm deleted) refuses a normalized marker (rc=$(rc_of))"
 fi
+# ⛔ THE NORMALIZER MUST BE FOUND BESIDE THE **RECORDER**, AND THAT CANDIDATE WAS UNEXERCISED (P3, sixth
+# fresh review of #2288): every other arm runs the SUT from the repo, where a seam-relative candidate
+# finds `scripts/lib/diff-normalize.py`, so deleting the recorder-relative candidate left the suite
+# green — the P2 that was just fixed had no tripwire. Here the SUT runs from a directory with no `lib/`
+# of its own, and the ONLY normalizer sits beside the fake recorder, exactly the installed layout.
+mkdir -p "$TMP/bin/lib" "$TMP/sut"
+cp "$_NORM" "$TMP/bin/lib/diff-normalize.py"
+cp "$SRC" "$TMP/sut/review-pr.sh"; chmod +x "$TMP/sut/review-pr.sh"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF="$_PATCH"; FIXTURE_MARKER_DIFF="$DH"
+run "$TMP/sut/review-pr.sh" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and with the normalizer ONLY beside the recorder, a normalized marker records (rc=$(rc_of))"
+err_has "normalizer" && fail "the seam reported a normalizer problem although it was beside the recorder" || true
 reset
+rm -rf "$TMP/bin/lib" "$TMP/sut"
 reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_DIFF="$(printf '%064d' 1)"
 run "$SRC" 2284
 [ "$(rc_of)" = "8" ]; ck $? "  ...and a marker whose diff= is NOT the reviewed diff is exit 8 (rc=$(rc_of))"
@@ -2316,6 +2329,48 @@ reset; printf '**Verdict:** CLEAN — 1 defect remains; 3 bug fixes applied.\n' 
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "  ...while a real count beside an attributive pair still refuses (rc=$(rc_of))"
 reset
+# ⛔ THE CUE WHITELIST WAS THE WRONG SHAPE (P1, sixth fresh review of #2288 — MEASURED fail-OPEN: none of
+# the sentences below contains one of the eleven cue words, so each recorded a SIGNED clean record). The
+# contract is refuse-by-default: a reported count anywhere in the accepted region is a finding, and the
+# only exemption is a repair stated in the clause BEFORE the count.
+for _cl in \
+  'Two defects, both in the guard:\
+**Verdict:** CLEAN' \
+  'Reviewed the whole diff. Two issues in the retry path.\
+**Verdict:** CLEAN' \
+  'Noted 2 problems in the guard.\
+**Verdict:** CLEAN'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (no cue word at all): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# …and the repair-stated-first exemption is what keeps that direction from burning a paid run.
+reset; printf 'Fixed the 3 issues from round 1.\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...while 'Fixed the 3 issues …' still records (rc=$(rc_of))"
+# ⛔ THE MIRROR FORM (P1, sixth fresh review of #2288 — MEASURED on the VERDICT line, where nothing gated
+# it, and on main too, so it is a remaining hole and not one this branch opened).
+for _cl in \
+  '**Verdict:** CLEAN — blocking findings: 2 in scripts/x.sh.' \
+  '**Verdict:** CLEAN — defects remaining: 2 (scripts/x.sh:42, scripts/y.sh:7).' \
+  '**Verdict:** CLEAN — problems = 1, in the retry path.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (mirror form): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# COUNTER-DIRECTIONS: a zero mirror report and a zero multiplier in the severity-first spelling both
+# record — the zero filter reads the RIGHT number in each direction.
+reset; printf '**Verdict:** CLEAN — blocking findings: 0 in scripts/x.sh.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...while 'blocking findings: 0' records (rc=$(rc_of))"
+reset; printf '**Verdict:** CLEAN — P1 x 0 in scripts/x.sh.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  ...and 'P1 x 0' is a zero, not a count of one (rc=$(rc_of))"
+reset
 
 # ══ §BI-2 the count vocabulary cannot silently drift from the severity scanner's ══
 echo; echo "§BI-2 every finding noun the severity scanner knows is also countable"
@@ -2364,7 +2419,8 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
+# Re-set to 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
+# the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
 # was 661 when §BH (noun vocabulary, the survivor-set count channel, the marker diff=) added 22
@@ -2550,6 +2606,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 706 ]; ck $? "assertion-count pin: >= 706 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 722 ]; ck $? "assertion-count pin: >= 722 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
