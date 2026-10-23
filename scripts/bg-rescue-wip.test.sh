@@ -409,6 +409,285 @@ else
   bad "nopush: the local ref could not be pushed even after the remote was repaired"
 fi
 
+echo; echo "── a WORKFLOW-SCOPE refusal is retried ONCE with the credential that can push (#2292) ──"
+# ⛔ THE DEFECT (agent-infra#2292): a fine-grained PAT without `Workflows: write` is refused by
+# github.com for any snapshot touching `.github/workflows/`, so the rescue exited 2 "STILL ONLY ON THIS
+# DISK" for EXACTLY the lanes whose work touches CI — while the osxkeychain credential on the same host
+# could push the same ref. Measured: one snapshot stranded this way, and 52 branches blocked fleet-wide.
+#
+# The arms below run a stub `git` that models each refusal the REAL remote can give, because the whole
+# question is a PREDICATE: which refusal justifies selecting a different credential, and which must go
+# straight to the loud failure. Asserting "it retries" alone would pass a blanket retry, and a blanket
+# retry turns an auth outage, a hook rejection or a network stall into a push attempted twice with the
+# wrong credential — and, when the second attempt happens to succeed, into a GREEN run that hid the
+# first cause. So each arm pins attempts, exit code, whether the ref landed, and the message.
+REALGIT="$(command -v git)"
+# mk_pushshim <dir> <mode> — a `git` that intercepts ONLY `push`; everything else execs real git with
+# the environment intact (an `env -i` shim once hid GIT_INDEX_FILE and silently wrote the real index).
+# It records every attempt's argv and which credential it selected, so "was it retried, and with what"
+# is read from EVIDENCE, not from the message the script prints.
+# Generated from a QUOTED heredoc with __TOKEN__ placeholders: an unquoted one turned `$(cat …)` into a
+# generation-time substitution and `"$@"` into shell-quoting soup, i.e. the stub itself was broken.
+mk_pushshim() { # mk_pushshim <dir> <mode>
+  local d="$1" mode="$2" slug="$3"
+  mkdir -p "$d" || return 1
+  cat > "$d/git" <<'SHIM'
+#!/usr/bin/env bash
+REAL="__REALGIT__"
+MODE="__MODE__"
+SHDIR="__SHDIR__"
+SLUG="__SLUG__"
+ispush=0; iskey=0
+for a in "$@"; do
+  [ "$a" = push ] && ispush=1
+  [ "$a" = credential.helper=osxkeychain ] && iskey=1
+done
+# The real github.com refusal, verbatim (backticks included) — so the matcher is tested on the text
+# that actually arrives, not on a simplified version written to fit the regex.
+wf_reject() {
+  printf '%s\n' \
+    "remote: error: GH013: refusing to allow a Personal Access Token to create or update workflow \`.github/workflows/ci.yml\` without \`workflow\` scope" \
+    " ! [remote rejected] aaaaaaa -> refs/wip/$SLUG (pre-receive hook declined)" >&2
+}
+# A generic hook rejection that ECHOES the ref name. The trap for a `grep workflow` matcher: a branch
+# merely NAMED "workflow" must not look like a scope refusal.
+other_reject() {
+  printf '%s\n' " ! [remote rejected] aaaaaaa -> refs/wip/$SLUG (pre-receive hook declined)" >&2
+}
+auth_reject() {
+  printf '%s\n' "fatal: Authentication failed for 'https://github.com/example/repo.git/'" >&2
+}
+if [ "$ispush" -eq 1 ]; then
+  n=0; [ -f "$SHDIR/attempts" ] && n=$(cat "$SHDIR/attempts")
+  n=$((n+1))
+  echo "$n" > "$SHDIR/attempts"
+  printf '%s\n' "$@" > "$SHDIR/argv.$n"
+  echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}" >> "$SHDIR/attempts.env.$n"
+  if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
+  case "$MODE" in
+    wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
+    wf_always)    wf_reject; exit 1 ;;
+    wf_then_auth) if [ "$iskey" -eq 1 ]; then auth_reject; exit 1; else wf_reject; exit 1; fi ;;
+    plain_ok)     : ;;
+    other)        [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
+    authfail)     auth_reject; exit 1 ;;
+  esac
+fi
+exec "$REAL" "$@"
+SHIM
+  [ -f "$d/git" ] || return 1
+  # Placeholders are substituted with awk (a value containing '/' or '&' must not corrupt the stub).
+  awk -v real="$REALGIT" -v mode="$mode" -v d="$d" -v slug="$slug" '
+    { gsub(/__REALGIT__/, real); gsub(/__MODE__/, mode); gsub(/__SHDIR__/, d); gsub(/__SLUG__/, slug); print }
+  ' "$d/git" > "$d/git.new" && mv "$d/git.new" "$d/git" || return 1
+  chmod +x "$d/git" || return 1
+  # The stub must be syntactically valid BEFORE an arm depends on it: a broken stub fails as "not a
+  # worktree", which reads like a rescue bug and hides the real one (measured in this file's own
+  # development — a mangled heredoc produced five confident reds about the wrong thing).
+  bash -n "$d/git" 2>/dev/null || { echo "❌ generated stub is not valid bash: $d/git"; return 1; }
+  return 0
+}
+# try_rescue <fixture> <mode> — build a worktree that touches .github/workflows, run the rescue under
+# the stub, and export RC/OUT/ATTEMPTS/WHO for the assertions.
+try_rescue() { # try_rescue <name> <mode> <branch>
+  local n="$1" mode="$2" br="${3:-fix/lane-one}" d="$T/$1"
+  mk_repo "$n" || { echo "❌ fixture failed ($n)"; return 1; }
+  if [ "$br" != "fix/lane-one" ]; then git -C "$d/wt" checkout -q -b "$br"; fi
+  mkdir -p "$d/wt/.github/workflows"
+  printf 'name: ci\non: push\n' > "$d/wt/.github/workflows/ci.yml"
+  printf 'the work the rescue exists for\n' > "$d/wt/lane-work.txt"
+  # The stub embeds the ref slug it refuses, so its rejection text echoes the REAL ref name — that is
+  # what makes the "workflow-NAMED branch" arm a genuine test of the matcher.
+  local slug; slug="$(printf '%s' "$br" | tr '/' '-')"
+  mk_pushshim "$d/shim" "$mode" "$slug" || { echo "❌ shim failed ($n)"; return 1; }
+  CFG_BEFORE="$(git -C "$d/wt" config --list --show-origin 2>/dev/null | sort)"
+  OUT="$(PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
+  ATTEMPTS=0; [ -f "$d/shim/attempts" ] && ATTEMPTS="$(cat "$d/shim/attempts")"
+  WHO=""; [ -f "$d/shim/attempts.who" ] && WHO="$(tr '\n' ' ' < "$d/shim/attempts.who")"
+  return 0
+}
+
+# (1) THE DEFECT ITSELF: a workflow-scope refusal, a keychain credential that works.
+try_rescue wfretry wf_then_ok
+WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 0 ] \
+  && ok "wfretry: exit 0 — a workflow-bearing snapshot is RESCUED, not degraded to local-only" \
+  || bad "wfretry: exit $RC (want 0) — the credential that can push was never tried — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfretry: exactly TWO push attempts (one plain, one with the keychain credential)" \
+  || bad "wfretry: ${ATTEMPTS:-0} push attempt(s) (want exactly 2) — no retry, or a retry storm"
+[ "${WHO:-}" = "plain keychain " ] \
+  && ok "wfretry: the retry used the KEYCHAIN credential (sameness of the two attempts is not enough)" \
+  || bad "wfretry: the retry did not select the keychain credential — attempts were: ${WHO:-none}"
+[ -n "$WSHA" ] && has_blob "$T/wfretry/origin.git" "$WSHA" .github/workflows/ci.yml 'name: ci' \
+  && ok "wfretry: the WORKFLOW FILE ITSELF reached origin (the content that used to strand the snapshot)" \
+  || bad "wfretry: origin has no snapshot carrying the workflow file (ref: ${WSHA:-none})"
+[ -n "$WSHA" ] && has_blob "$T/wfretry/origin.git" "$WSHA" lane-work.txt 'the work the rescue exists for' \
+  && ok "wfretry: the lane's other work is in the same snapshot" \
+  || bad "wfretry: the lane's work is missing from the published snapshot"
+# ⛔ A rescue may never FORCE, and may never write credential config. Both are asserted on the
+# recorded argv and on the repo's own config, not on the message that claims it.
+# ⛔ THE ORDERED PAIR, NOT THE PRESENCE OF EACH FLAG. `-c credential.helper=` CLEARS the configured
+# helper list and `-c credential.helper=osxkeychain` then names the one to use; the order is the whole
+# mechanism. This arm had two `ok` branches, so deleting the clear (the retry then re-uses the SAME
+# scope-less PAT and #2292 is unchanged) and reversing the pair (the retry ends with an EMPTY helper
+# list) both stayed GREEN — found by two independent fresh reviewers, each by mutation. Every shape
+# except clear-then-name is now a failure.
+# ⛔ NO FORCE, ON EITHER ATTEMPT, CHECKED PER ARGUMENT. The old pattern `*"+refs/"*` is DEAD for this
+# script's refspec: its source side is a raw sha, so the force form is `+<sha>:refs/wip/<slug>`, which
+# contains no `+refs/`. A fresh reviewer's mutation (`"+$C:refs/wip/$SLUG"`) was GREEN — and a forced
+# push is the one thing that can destroy a peer clone's snapshot, so this is the arm that must not be
+# vacuous. Every recorded argument is checked, on both attempts, and the two attempts must carry the
+# IDENTICAL refspec: a retry that publishes a different refspec than the first push is not a retry.
+wf_force=0
+for _n in 1 2; do
+  _p="$T/wfretry/shim/argv.$_n"
+  if [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null; then
+    wf_force=1; bad "wfretry: attempt $_n used a FORCE form (a forced rescue can overwrite a peer clone's snapshot): $(tr '\n' ' ' < "$_p")"
+  fi
+done
+[ "$wf_force" -eq 0 ] && ok "wfretry: NEITHER attempt carries a force form (per-argument, so a '+<sha>:refs/…' force is caught)"
+RS1="$(tail -1 "$T/wfretry/shim/argv.1" 2>/dev/null)"
+RS2="$(tail -1 "$T/wfretry/shim/argv.2" 2>/dev/null)"
+[ -n "$RS1" ] && [ "$RS1" = "$RS2" ] \
+  && ok "wfretry: both attempts push the SAME refspec (the retry cannot publish something the first would not)" \
+  || bad "wfretry: the retry's refspec differs from the first push's ('${RS1:-none}' vs '${RS2:-none}')"
+case "$RS2" in
+  [0-9a-f][0-9a-f]*) ok "wfretry: the refspec's source is a commit sha (not a ref or a force ref)" ;;
+  *) bad "wfretry: the retry's refspec does not start with a commit sha — $RS2" ;;
+esac
+if [ -f "$T/wfretry/shim/argv.2" ]; then
+  ARGV2="$(tr '\n' ' ' < "$T/wfretry/shim/argv.2")"
+  case "$ARGV2" in
+    *"-c credential.helper= -c credential.helper=osxkeychain"*)
+      ok "wfretry: the retry CLEARS the configured helpers and then names the keychain one, in that order (no config write)" ;;
+    *) bad "wfretry: the retry does not clear-then-name the helper (no clear re-uses the scope-less token; a reversed pair leaves an EMPTY helper list) — $ARGV2" ;;
+  esac
+else
+  bad "wfretry: no recorded argv for the second attempt — the retry cannot be inspected"
+fi
+# ⛔ THE RETRY MAY NOT PROMPT: it runs in the second before a cap kill, so an absent keychain entry must
+# FAIL rather than wait on a terminal nobody is watching. The script's own comment promises this; without
+# this arm, deleting the `export GIT_TERMINAL_PROMPT=0` was green (a fresh reviewer's mutation).
+grep -qx 'GIT_TERMINAL_PROMPT=0' "$T/wfretry/shim/attempts.env.2" 2>/dev/null \
+  && ok "wfretry: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
+  || bad "wfretry: the retry did not disable the terminal prompt — a missing keychain entry could hang the rescue"
+# ⛔ ALL SCOPES, not `--local`: a write to `$HOME/.gitconfig` would be invisible to `--local` and would
+# also PERSIST on the machine that ran the suite. `--show-origin` names the file it came from.
+[ "$(git -C "$T/wfretry/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
+  && ok "wfretry: git config is byte-identical at EVERY scope after the retry (read-only rescue, global included)" \
+  || bad "wfretry: the rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
+case "$OUT" in
+  *OSXKEYCHAIN*|*osxkeychain*) ok "wfretry: says WHICH credential published it (a clean run must not imply the PAT worked)" ;;
+  *) bad "wfretry: the success message does not name the credential used — $OUT" ;;
+esac
+# ⛔ THE SHA IN THE MESSAGE IS THE SHA THAT WAS PUSHED. A message printing a re-chained or shortened sha
+# hands the operator a handle that does not resolve — and the failure hint recommends exactly that retry.
+# awk reads the input to EOF and takes the FIRST match itself: a `sed … | head -1` pipeline relies on a
+# short write, and under `set -o pipefail` an early-exiting consumer turns a MATCHING line into rc=141 —
+# the same SIGPIPE false negative `scripts/check-no-sigpipe-grep.sh` exists to keep out of the tree.
+CLAIMED="$(printf '%s\n' "$OUT" | awk '
+  found == "" && match($0, /refs\/wip\/[^ ]* \([0-9a-f]+\)/) {
+    t = substr($0, RSTART, RLENGTH); if (match(t, /\([0-9a-f]+\)/)) found = substr(t, RSTART+1, RLENGTH-2) }
+  END { print found }')"
+[ -n "$CLAIMED" ] && [ "$CLAIMED" = "$WSHA" ] \
+  && ok "wfretry: the sha the message claims is the sha origin's ref actually holds (a usable recovery handle)" \
+  || bad "wfretry: the claimed sha '${CLAIMED:-none}' is not origin's '${WSHA:-none}' — the message names a handle that does not resolve"
+
+# (1b) ⛔ THE OPPOSITE DIRECTION OF THE SUCCESS MESSAGE. A plain first-attempt push must NOT be reported
+# as a keychain push: an implementation that prints the keychain claim on BOTH success branches passed
+# the arm above, and would tell an operator the scope-less token works on a run where it was never used.
+try_rescue plainok plain_ok
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "plainok: a first-attempt success is one attempt, exit 0" \
+  || bad "plainok: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 1)"
+case "$OUT" in
+  *OSXKEYCHAIN*|*osxkeychain*) bad "plainok: a push that was NEVER retried claims the keychain credential — $OUT" ;;
+  *) ok "plainok: a non-retried push does not claim the keychain credential (the claim is evidence, not decoration)" ;;
+esac
+
+# (2) ⛔ A NON-WORKFLOW rejection is NOT retried. The stub would SUCCEED on the keychain attempt, so a
+# blanket retry reports a false GREEN here — and the branch is named "workflow-scope" so the rejection
+# text echoes the word, which is what a `grep workflow` matcher would trip over.
+try_rescue noscopeblind other fix/workflow-scope
+NSHA="$(ref_of "$T/noscopeblind/origin.git" refs/wip/fix-workflow-scope)"
+[ "$RC" -eq 2 ] \
+  && ok "noscopeblind: a hook rejection of a workflow-NAMED branch exits 2 (not retried into a green run)" \
+  || bad "noscopeblind: exit $RC (want 2) — a non-workflow rejection was retried — $OUT"
+[ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "noscopeblind: exactly ONE attempt (only a workflow-SCOPE refusal may select a credential)" \
+  || bad "noscopeblind: ${ATTEMPTS:-0} attempts — the retry is gated on \"the push failed\", not on the refusal"
+[ -z "$NSHA" ] \
+  && ok "noscopeblind: nothing was published, so the exit 2 is true (a retry here WOULD have pushed a ref)" \
+  || bad "noscopeblind: a ref landed on origin while the run reported failure — a false success"
+case "$OUT" in
+  *"STILL ONLY ON THIS DISK"*) ok "noscopeblind: still names the work as at risk" ;;
+  *) bad "noscopeblind: the at-risk warning is missing — $OUT" ;;
+esac
+case "$OUT" in
+  *"cause: REMOTE REJECTED THE UPDATE"*) ok "noscopeblind: names the CAUSE as a remote rejection (not a bare 'push failed')" ;;
+  *) bad "noscopeblind: the failure does not name its cause — $OUT" ;;
+esac
+
+# (3) the retry is tried ONCE, and a second refusal is reported as a failure with BOTH causes — never as
+# a success, and never as an endless loop.
+try_rescue wfalways wf_always
+WASHA="$(ref_of "$T/wfalways/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 2 ] \
+  && ok "wfalways: exit 2 when even the keychain credential is refused (no false success)" \
+  || bad "wfalways: exit $RC (want 2) — a refused retry was reported as a rescue — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfalways: exactly ONE retry (a refused retry must not loop)" \
+  || bad "wfalways: ${ATTEMPTS:-0} attempt(s) (want exactly 2)"
+[ -z "$WASHA" ] \
+  && ok "wfalways: no ref reached origin, consistent with the exit code" \
+  || bad "wfalways: a ref landed on origin while the run reported failure"
+case "$OUT" in
+  *"cause: WORKFLOW SCOPE"*) ok "wfalways: names WORKFLOW SCOPE as the first cause" ;;
+  *) bad "wfalways: does not name the workflow-scope cause — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*) ok "wfalways: reports the retry's own outcome instead of hiding it" ;;
+  *) bad "wfalways: says nothing about the retry's own failure — $OUT" ;;
+esac
+case "$OUT" in
+  *"rescued"*) bad "wfalways: claimed a rescue that did not happen — $OUT" ;;
+  *) ok "wfalways: does not claim a rescue it did not perform" ;;
+esac
+
+# (3b) ⛔ THE FIRST CAUSE SURVIVES THE RETRY. The stub refuses the first attempt for WORKFLOW SCOPE and
+# the retry for AUTHENTICATION — a different reason. Reporting only the LAST cause sends the operator
+# after a keychain entry that is fine while the real blocker (the token's scope) goes unnamed; that
+# implementation passed the `wfalways` arm, where both attempts fail for the SAME reason.
+try_rescue wfthenauth wf_then_auth
+[ "$RC" -eq 2 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfthenauth: exit 2 after exactly one retry" \
+  || bad "wfthenauth: rc=$RC attempts=${ATTEMPTS:-0} (want 2 and 2)"
+case "$OUT" in
+  *"cause: WORKFLOW SCOPE"*) ok "wfthenauth: the FIRST cause (workflow scope) is still named" ;;
+  *) bad "wfthenauth: the first cause was overwritten by the retry's — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*AUTHENTICATION*|*AUTHENTICATION*"ALSO failed"*)
+    ok "wfthenauth: the retry's DIFFERENT cause is reported separately (both reasons reachable to the operator)" ;;
+  *) bad "wfthenauth: the retry's own cause is not reported alongside the first — $OUT" ;;
+esac
+[ -z "$(ref_of "$T/wfthenauth/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "wfthenauth: nothing published, consistent with the failure" \
+  || bad "wfthenauth: a ref landed while the run reported failure"
+
+# (4) the cause is NAMED for the ordinary failures too (#2292, item 2) — 'the push failed' is what sent a
+# diagnosis cycle after the wrong cause.
+try_rescue authbad authfail
+[ "$RC" -eq 2 ] && ok "authbad: exit 2" || bad "authbad: exit $RC (want 2)"
+[ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "authbad: an AUTH failure is not retried (a different credential would not be the fix)" \
+  || bad "authbad: ${ATTEMPTS:-0} attempts — an auth failure took the workflow-scope retry path"
+case "$OUT" in
+  *"cause: AUTHENTICATION"*) ok "authbad: names AUTHENTICATION as the cause" ;;
+  *) bad "authbad: does not name the auth cause — $OUT" ;;
+esac
+
 echo; echo "── a dispatcher that CALLS the rescue before it kills ──"
 # The contract that matters in production: the watchdog must rescue, not just the rescuer work.
 #
