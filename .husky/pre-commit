@@ -80,7 +80,9 @@ if [ -n "$staged_agents" ]; then
 fi
 
 # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-# every TRACKED extensions/ top-level entry except *.test.ts must be farm-wired
+# every TRACKED extensions/ top-level entry except *.test.ts, and except
+# dot-named repo furniture such as .gitkeep (a dot-named entry is furniture only
+# when it is NOT extension-shaped — see is_furniture), must be farm-wired
 # into pi-bootstrap/pi-config/extensions (single source of truth) AND listed in
 # manifest.json files.extensions.entries (consumer ship-list, #502). Blocks
 # commits that add an extension without wiring it — unwired extensions ship on

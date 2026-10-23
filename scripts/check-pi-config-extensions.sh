@@ -223,7 +223,12 @@ fi
 if [ "$index_ok" -eq 1 ]; then
   untracked_exts=""
   present_exts=""
-  for e in "$DST"/* "$DST"/.[!.]*; do
+  # Three globs, because no single shell glob covers every top-level name:
+  # `*` skips dot-named entries, `.[!.]*` skips `..`-prefixed ones (its second
+  # character is a dot), and `..?*` is what reaches those. Dropping the third
+  # arm silently omitted a `..hidden.ts` — which is_furniture() classifies as
+  # EXTENSION-shaped, i.e. gated — so an untracked one was never named.
+  for e in "$DST"/* "$DST"/.[!.]* "$DST"/..?*; do
     # `-L` too: a DANGLING SYMLINK is a tracked entry that ships and loads
     # nothing, so it must be examined (and named), not treated as absent — the
     # checks 1/2 loops already make this distinction.

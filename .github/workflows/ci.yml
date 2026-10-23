@@ -141,7 +141,8 @@ jobs:
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-    # every TRACKED extensions/ top-level entry except *.test.ts must be farm-wired
+    # every TRACKED extensions/ top-level entry except *.test.ts, and except
+    # dot-named repo furniture such as .gitkeep, must be farm-wired
     # into pi-bootstrap/pi-config/extensions (single source of truth — a new
     # extension that isn't wired ships on NO machine) AND listed in manifest.json
     # files.extensions.entries (the consumer ship-list — a tree entry with no

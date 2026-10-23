@@ -93,7 +93,8 @@ if [ -x ./scripts/check-cost-config.sh ]; then
 fi
 
 # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-# every extensions/ top-level entry GIT TRACKS (except *.test.ts) must be
+# every extensions/ top-level entry GIT TRACKS (except *.test.ts, and except
+# dot-named repo furniture such as .gitkeep) must be
 # farm-wired into pi-bootstrap/pi-config/extensions (single source of truth) AND
 # listed in manifest.json files.extensions.entries (consumer ship-list, #502 —
 # closes the tree↔manifest drift class). A merged-but-unwired extension would

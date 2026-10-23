@@ -112,7 +112,7 @@ write_manifest() {
 #       manifest-stale | no-manifest | bad-manifest | live-healthy |
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
 #       all-untracked | nested-git | newline-name | dash-name |
-#       dangling-ext | dotfile-ext | dot-extension
+#       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -196,6 +196,12 @@ build_farm() {
               : > "$TMP/extensions/.hidden.ts"
               mkdir -p "$TMP/extensions/.adapter"
               : > "$TMP/extensions/.adapter/index.ts" ;;
+    # #2425 review — `..`-prefixed and extension-shaped, therefore GATED, but
+    # untracked. No single glob reaches it (`*` skips dot-named names and
+    # `.[!.]*` skips a name whose second character is a dot), so without the
+    # `..?*` arm the gate never NAMED it — a silent skip, which is the class
+    # this gate's header says it does not do.
+    dotdot-untracked) ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;
   esac
 
   # manifest.json rows: tree extensions a.ts + d/ always present; b.ts unless
@@ -242,6 +248,15 @@ build_farm() {
     git -C "$TMP" add -- pi-bootstrap || return 1
     if [ -f "$TMP/manifest.json" ]; then git -C "$TMP" add -- manifest.json || return 1; fi
     if [ -f "$TMP/.gitignore" ]; then git -C "$TMP" add -- .gitignore || return 1; fi
+  fi
+
+  # #2425 review — an UNTRACKED `..`-prefixed, extension-shaped file. It MUST be
+  # created AFTER the index is staged: `git add -- extensions` indexes everything
+  # under extensions/, so a file written before that line is genuinely TRACKED and
+  # the gate would be right to red it. Created here, it is what the case names —
+  # a path no glob reaches, that git does not ship.
+  if [ "$mode" = "dotdot-untracked" ]; then
+    : > "$TMP/extensions/..hidden.ts" || return 1
   fi
 
   # #2425 review — the nested-repo shape: the repo toplevel is $TMP but the gate's
@@ -419,6 +434,12 @@ run_gate 1 "dot-named extension-shaped entries" dot-extension \
   "tracked extension .hidden.ts exists in extensions/" \
   "tracked extension .adapter exists in extensions/" \
   "has no manifest.json files.extensions.entries row"
+
+echo ""
+echo "23. #2425 review — an UNTRACKED '..'-prefixed extension is NAMED, never silently skipped"
+run_gate 0 "untracked ..-prefixed extension is named" dotdot-untracked \
+  "not gated (UNTRACKED" \
+  "..hidden.ts"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
