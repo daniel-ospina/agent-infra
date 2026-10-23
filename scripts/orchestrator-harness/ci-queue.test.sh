@@ -306,6 +306,42 @@ msg="$(ciq_defer_note "CI-red fixer for #9")"; rc=$?
 ck "(c7) an unreadable queue DEFERS rather than opening the gate" "$( [ "$rc" -eq 0 ]; echo $? )"
 has "$msg" 'unknown('
 ck "(c8) and the line says UNKNOWN, not a made-up depth" "$?"
+# ⛔ THE PREDICATE'S FAIL-CLOSED BRANCH WAS PINNED BY NOTHING (#2333 review, P1 — a FALSE PASS). (c7)
+# drives `ciq_defer_note`, which goes through `ciq_verdict`; it never touches `ciq_ci_allowed` — the ONE
+# predicate the shipping callers branch on (fix-one.sh:99, dispatch-merge.sh:119). Widening its
+# whitelist from `1)` to `1|2)` therefore makes an UNREADABLE queue ALLOW every fixer and every batch —
+# exactly the fail-open the module header forbids — while this suite stayed 91 passed / 0 failed CLEAN,
+# because every other `ciq_ci_allowed` arm in this file runs against a READABLE feed. Driven here, and
+# the mutant below proves the arm can go red.
+ciq_ci_allowed "$OR"; prc=$?
+ck "(c9) the PREDICATE the wiring branches on refuses an UNKNOWN queue (ciq_ci_allowed rc=$prc)" \
+   "$( [ "$prc" -eq 1 ]; echo $? )"
+mutp="$T/mutant-pred"
+mkdir -p "$mutp"
+# The mutant is a PARSED widening of that one line, driven in a CLEARED function namespace (a subshell
+# inherits this suite's functions otherwise, and the arm would read green on code it never ran).
+drive_pred() { # <module-path> <state-dir> -> the predicate's rc on an UNREADABLE queue
+  ( unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_ceiling ciq_slug ciq_state_dir \
+             ciq_gh ciq_now ciq_read ciq_eval ciq_verdict ciq_defer_line ciq_defer_note \
+             ciq_defer_note_here ciq_ci_allowed 2>/dev/null
+    mkdir -p "$2"
+    CIQ_GH=/nonexistent-ciq-gh; CIQ_TTL=0; CIQ_STALE_MAX=0; CIQ_STATE_DIR="$2"
+    export CIQ_GH CIQ_TTL CIQ_STALE_MAX CIQ_STATE_DIR
+    # shellcheck source=/dev/null
+    . "$1" >/dev/null 2>&1 || { printf 'NO-LOAD'; return; }
+    ciq_ci_allowed "daniel-ospina/agent-infra"; printf '%s' "$?"
+  ) 2>/dev/null
+}
+sed 's/in 1) return 0 ;; \*) return 1 ;; esac/in 1|2) return 0 ;; *) return 1 ;; esac/' "$MOD" > "$mutp/ci-queue.sh"
+if cmp -s "$MOD" "$mutp/ci-queue.sh"; then
+  bad "(c10) the predicate mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$mutp/ci-queue.sh" 2>/dev/null; then
+  bad "(c10) the predicate mutant does not parse — a broken mutant proves nothing"
+else
+  mprc="$(drive_pred "$mutp/ci-queue.sh" "$T/predstate-mutant")"
+  ck "(c10) MUTANT — a whitelist widened to '1|2' ALLOWS an UNKNOWN queue (rc=$mprc), so (c9) is not always-green" \
+     "$( [ "$mprc" = 0 ]; echo $? )"
+fi
 
 printf '\n── (d) MUTATION: remove the queue read => the gate OPENS, (a) goes RED ────\n'
 mkdir -p "$T/mutant"
@@ -581,6 +617,46 @@ qenv /nonexistent-gh 0 0
 ciq_push_ok; rc=$?
 ck "(h5) an UNREADABLE queue DEFERS through the shipped predicate (rc=$rc) — fail closed, and it SAYS unknown" \
    "$( { [ "$rc" -eq 1 ] && has "${CIQ_VER:-}" 'unknown('; } ; echo $? )"
+# ⛔ THE ISSUE-PATH ARM'S "UNKNOWN ALSO DEFERS" POLARITY WAS PINNED BY NOTHING (#2333 review, P1 — a FALSE
+# PASS). `(e3)` greps for the literal `GATE_WHY="ci-queue($CIQ_VER)"`, which a POLARITY mutant preserves
+# verbatim: changing the shipped `${CIQ_RC:-1}" != "1"` to `= "0"` opens the ISSUE path on an UNREADABLE
+# queue — fail-open on the one cycle the fleet cannot see — and the suite stayed 91/0 CLEAN (`grep -n
+# CIQ_RC` finds the variable only in orch-loop.sh and this file, and product-floor's P6 scans the
+# dispatch BODY, where the mutant keeps the matched text). The arm is EXTRACTED (not restated) and
+# driven in four states, the way (h0)/(h0b) drive the predicate and its reset.
+printf '\n── (h6) the ISSUE-path gate ARM, EXTRACTED and driven in both polarities ──────\n'
+ARM_RAW="$T/gatearm.raw"
+awk '/^  elif \[ "\$\{CIQ:-0}" = "1" \] && \[ "\$\{CIQ_RC:-1}" != "1" \]; then/{print; exit}' "$LOOP" > "$ARM_RAW"
+ck "(h6) the ISSUE-path ci-queue arm was EXTRACTED from orch-loop.sh (not a restatement)" \
+   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW"; } ; echo $? )"
+mkarm() { # <raw elif line> <out> — wrap the shipped line in a drivable if/elif chain
+  { printf 'GATE_WHY=""\nif false; then :\n'; sed 's/^ *elif /elif /' "$1"; printf 'fi\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
+}
+ARM="$T/gatearm.sh"; mkarm "$ARM_RAW" "$ARM"
+gaw() { # <arm-file> <CIQ> <CIQ_RC> -> GATE_WHY as the arm renders it
+  ( CIQ="$2"; CIQ_RC="$3"; CIQ_VER="deep(queued=31 running=5 runners=5 busy=5 ceiling=10)"
+    # shellcheck source=/dev/null
+    . "$1" )
+}
+g="$(gaw "$ARM" 1 1)"
+ck "(h6a) an ALLOWED (rc=1) queue leaves the ISSUE path OPEN (GATE_WHY='${g:-}')" "$( [ -z "$g" ]; echo $? )"
+g="$(gaw "$ARM" 1 0)"
+ck "(h6b) a DEEP queue CLOSES it and names ci-queue (GATE_WHY='${g:-}')" "$( { [ -n "$g" ] && has "$g" 'ci-queue('; } ; echo $? )"
+g="$(gaw "$ARM" 1 2)"
+ck "(h6c) an UNKNOWN queue CLOSES it too — an unreadable queue is not an empty one (GATE_WHY='${g:-}')" "$( [ -n "$g" ]; echo $? )"
+g="$(gaw "$ARM" 0 0)"
+ck "(h6d) with the arm INERT (CIQ=0) even a DEEP queue leaves it open (GATE_WHY='${g:-}')" "$( [ -z "$g" ]; echo $? )"
+ARM_MUT="$T/gatearm-mutant.sh"
+sed 's/\[ "\${CIQ_RC:-1}" != "1" \]/[ "${CIQ_RC:-1}" = "0" ]/' "$ARM" > "$ARM_MUT"
+if cmp -s "$ARM" "$ARM_MUT"; then
+  bad "(h6e) the polarity mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$ARM_MUT" 2>/dev/null; then
+  bad "(h6e) the polarity mutant does not parse — a broken mutant proves nothing about polarity"
+else
+  g="$(gaw "$ARM_MUT" 1 2)"
+  ck "(h6f) MUTANT — a polarity flip OPENS the path on UNKNOWN (GATE_WHY='${g:-}'), so (h6c) is not always-green" \
+     "$( [ -z "$g" ]; echo $? )"
+fi
 
 printf '\n── (f) A READING THAT DOES NOT FIT IS NOT A READING (an errored [ ] is FALSE) ──\n'
 # ⛔ `[ … -gt … ]` ERRORS above intmax, an errored test is FALSE, and a FALSE test here lands on the
@@ -620,6 +696,37 @@ n="$(tr -d '\n' < "$T/g2.out")"
 ck "(g2) 'ceiling --runners 7' => 14 (got '$n')" "$( [ "$n" = 14 ]; echo $? )"
 bash "$MOD" status --repo >/dev/null 2>&1; rc=$?
 ck "(g3) '--repo' as the LAST word exits 64 instead of looping for ever (rc=$rc)" "$( [ "$rc" -eq 64 ]; echo $? )"
+# ⛔ THE DOCUMENTED EXIT-CODE CONTRACT WAS EXERCISED BY NOTHING (#2333 review, P2 — a FALSE PASS). The
+# header promises "exit code follows the verdict (0 deep, 1 ok, 2 unknown) so an operator (or a hook)
+# can branch on it without parsing", and the (g) section above drove only `ceiling`/`--runners`/`--repo`.
+# Replacing the shipped `return "$rc"` with `return 0` — every state reporting DEEP, which is the code
+# an operator reads as "defer" — left this suite 91 passed / 0 failed CLEAN. The contract is driven here
+# against the same stub feed, one FRESH state dir per state so no cache can stand in for a read.
+cl() { # <state-dir> <gh> <queued> <running> <runners> -> the CLI's exit code
+  mkdir -p "$1"
+  CIQ_GH="$2" CIQ_TEST_QUEUED="$3" CIQ_TEST_RUNNING="$4" CIQ_TEST_RUNNERS="$5" CIQ_TEST_BUSY=true \
+  CIQ_TTL=0 CIQ_STALE_MAX=0 \
+    bash "$MOD" status --repo "$OR" --state-dir "$1" > "$T/cli.out" 2>/dev/null
+  printf '%s' "$?"
+}
+rc="$(cl "$T/cli-deep" "$STUB" 31 5 5)"
+ck "(g4) a DEEP queue exits 0 (rc=$rc) — the operator/hook contract, not just a printed line" "$( [ "$rc" -eq 0 ]; echo $? )"
+rc="$(cl "$T/cli-shallow" "$STUB" 1 0 3)"
+ck "(g5) a SHALLOW queue exits 1 (rc=$rc) — a CRUCIAL distinction for anything branching on it" "$( [ "$rc" -eq 1 ]; echo $? )"
+rc="$(cl "$T/cli-unknown" /nonexistent-ciq-gh 0 0 0)"
+ck "(g6) an UNREADABLE queue exits 2 (rc=$rc) — UNKNOWN is its own code, neither deep nor ok" "$( [ "$rc" -eq 2 ]; echo $? )"
+mutc="$T/mutant-cli"
+mkdir -p "$mutc"
+sed 's/^      return "\$rc" ;;$/      return 0 ;;/' "$MOD" > "$mutc/ci-queue.sh"
+if cmp -s "$MOD" "$mutc/ci-queue.sh"; then
+  bad "(g7) the exit-code mutation did not apply — this arm would prove nothing"
+elif ! bash -n "$mutc/ci-queue.sh" 2>/dev/null; then
+  bad "(g7) the exit-code mutant does not parse — a broken mutant proves nothing about the contract"
+else
+  mc="$( CIQ_GH=/nonexistent-ciq-gh CIQ_TTL=0 CIQ_STALE_MAX=0 bash "$mutc/ci-queue.sh" status --repo "$OR" --state-dir "$T/cli-mut" >/dev/null 2>&1; echo $? )"
+  ck "(g7) MUTANT — a hard-printed 'return 0' makes UNKNOWN report DEEP (rc=$mc), so (g4)-(g6) are not always-green" \
+     "$( [ "$mc" = 0 ]; echo $? )"
+fi
 
 printf '\n── (i) the note the WIRING calls is EXECUTED — and can go red ─────────────────\n'
 # ⛔ EXECUTED, NOT GREPPED (#2333 merge review, P2). (a)/(b)/(c) drive `ciq_defer_note`, the
