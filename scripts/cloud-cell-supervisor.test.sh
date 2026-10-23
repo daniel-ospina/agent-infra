@@ -934,6 +934,16 @@ case "$PROV_OUT" in
   *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
   *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
 esac
+# ⛔ A `chain-*` WORKER IS A WORKER FOR THIS DECISION TOO (review finding on #2210's fix). The census
+# filter in worker-terminal.sh counts `chain-<N>` (dispatch-merge.sh spawns them; they live ~90 min),
+# but this count listed only lane-/fix-/merge-, so a chain-only box read "no workers" — and
+# `workers_maybe_live()` is what authorises the DESTRUCTIVE cache/disk sweep to run. A census that
+# reports a worker the decision cannot see is a census the decision does not have.
+PROV_TMUX_SESSIONS='chain-9' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a chain-only worker (the census and the destructive gate are one population)" ;;
+  *) bad "status reports 0 for a chain-only census — the sweep would run under a live chain worker — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
 
 # (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
 # The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
@@ -1267,7 +1277,9 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
 # ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
-# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cell is in. The
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cmux-ANSWERING
+# cell is in (a cell whose guest cmux cannot answer runs tmux sessions instead, #2210, which the two
+# PROV_TMUX_ arms above cover). The
 # pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
 # lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
 rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"
