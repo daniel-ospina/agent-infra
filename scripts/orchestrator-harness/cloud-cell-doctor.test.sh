@@ -1355,6 +1355,42 @@ OUT="$(bash -u -c "source '${PRELUDE:-/dev/null}'; run_reap" 2>&1)"; RC=$?
 killed lane-42 && ok "live: run_reap with NO argument REAPED the lane (empty mode = a live pass, rc=$RC)" \
   || bad "live: run_reap with NO argument did NOT reap — an absent mode took the rehearsal path, rc=$RC — $OUT"
 
+# Arm E — the SAME rule the reap arm above proves, for the OTHER thing a live loop now really does:
+# a real-sized queue read must not GRIND. `run_merge` used to ask "is the answer empty?" with
+# `[ -z "${prs//[[:space:]]/}" ]`, which is SUPERLINEAR: measured on this cell's bash 5.2.21, this
+# repo's actual `pulls?state=open` payload (349 KB) spent 84s of PURE CPU inside that one builtin —
+# no syscalls, merge lock held, so MERGE_BUDGET_S could not bound it and the whole sequential loop
+# (doctor, reap, hygiene) stalled behind it on the first tick. cleanup-stale-branches.sh:694
+# documents the identical hole and its fix: a `case` glob, same set, O(n).
+# ⛔ The fixture is a REAL-SHAPED payload of ~500 KB, and the bound is what DISCRIMINATES: the
+# pre-fix code cannot finish it inside 30s, the fixed code finishes in well under a second.
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+python3 - "$T/gh/prs.json" <<'PYJSON'
+import json, sys
+# 1200 entries, pretty-printed: the whitespace-heavy shape a real answer has. Drafts, so every one is
+# skipped cheaply and the ONLY cost measured is the empty-check itself.
+# A real PR carries a title and a body; the SIZE is what this arm needs, and the iteration count is
+# what keeps the FIXED path fast, so the size comes from the text, not from more candidates.
+body = ("this pull request touches the harness and explains, at length, why the change is safe; " * 6)
+rows = [{"number": 1000 + i, "head": {"sha": "%040d" % i}, "draft": True,
+         "title": "fix(harness): a title of ordinary length", "body": body} for i in range(1200)]
+open(sys.argv[1], "w").write(json.dumps(rows, indent=2))
+PYJSON
+PAYLOAD_BYTES="$(wc -c < "$T/gh/prs.json")"
+[ "${PAYLOAD_BYTES:-0}" -gt 300000 ] && ok "merge: the fixture is a real-sized payload (${PAYLOAD_BYTES} bytes)" \
+  || bad "merge: the fixture is only ${PAYLOAD_BYTES:-0} bytes — too small to discriminate"
+START_S="$(date +%s)"
+OUT="$(timeout 30 bash "$DOCTOR" merge --dry-run 2>&1)"; RC=$?
+ELAPSED_S=$(( $(date +%s) - START_S ))
+[ "$RC" -ne 124 ] && ok "merge: a ${PAYLOAD_BYTES}-byte queue read COMPLETES (rc=$RC in ${ELAPSED_S}s, not killed at 30s)" \
+  || bad "merge: the pass was KILLED at 30s on a real-sized payload (rc=$RC) — the empty-check is superlinear again"
+# …and it must still reach a verdict, not merely survive: the record says what it did with the queue.
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state" 2>/dev/null)" in
+  '') bad "merge: no verdict recorded after the big-payload pass" ;;
+  *)  ok "merge: it recorded a verdict on the big payload — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state" | cut -c1-80)" ;;
+esac
+rm -f "$T/gh/prs.json"
+
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
