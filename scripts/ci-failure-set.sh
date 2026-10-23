@@ -108,7 +108,16 @@
 #                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
 #   --runs-report <file>      write `examined=` / `extracted=` / `completed=` /
-#                             `tested=` / `pending=` counts for the lane runs
+#                             `tested=` / `pending=` counts for the lane runs.
+#                             ⛔ WRITTEN ON BOTH EXITS (#2569): a capture that
+#                             fails closed AFTER reading its window still writes
+#                             these counters plus `unreadable=log:<run-id>`, so a
+#                             refusal can name a MEASURED window instead of
+#                             reading like an empty one. A capture whose LISTING
+#                             failed writes NO report — a window that was never
+#                             listed must not be readable as a baseline, and the
+#                             report's ABSENCE is what tells the rail the window
+#                             itself could not be read.
 #
 # --exclude MATCHES the run's headSha, whatever the projection looks like. It is
 # compared against the PARSED sha field, never a blind awk `$1` — the listing's
@@ -879,6 +888,59 @@ extract_failed_signatures() {
 
 # ── modes ─────────────────────────────────────────────────
 
+# write_runs_report <report> <examined> <extracted> <completed> <tested> <pending>
+#                   [unreadable]
+#
+# ONE writer for the `--runs-report` file, called on BOTH exits (#2569).
+#
+# ⛔ WHY THE FAIL-CLOSED PATH WRITES IT TOO. Every collector used to write the
+# report ONLY after its loop completed, so a capture that returned 1 wrote NO
+# report at all — and the rail, which prints `parser exit 1`, then had no counts
+# to say HOW FAR it got. Measured on the fleet's own refusals (2026-10-23):
+# `BLOCK — could not extract main's rate table (parser exit 1)` was the only line
+# an operator got, and it is the same line whether main was GREEN and the table
+# legitimately empty, or a single `gh` log fetch died. Those are opposite claims
+# and the evidence could not tell them apart. `unreadable=` is that missing
+# fourth state, and `tested=`/`completed=` are the measurement it was missing.
+#
+# ⛔ WHAT `unreadable` MAY AND MAY NOT SAY. Two labels, because two different
+# things can fail once the window HAS been listed, and an operator's remedy
+# differs (re-fetch the log vs fix/move the parser):
+#   `log:<run-id>`   — the run's failed-step LOG could not be FETCHED (checked at
+#                      the `fetch_failed_log` status, so this label is not a guess).
+#   `parse:<run-id>` — the run's log was read but no failure IDS could be
+#                      extracted from it: a missing/updated id parser, a moved log
+#                      format, or a job-level fallback that failed. This label also
+#                      covers the composite extractor (`extract_failed_tests`),
+#                      whose rc=1 does not say which of the two it was — claiming
+#                      `log:` there would name a remedy that cannot work.
+# Either label means the window was fully LISTED and partially measured, so the
+# counters are a real partial measurement of a real window, and nothing downstream
+# can mistake them for a shrunken baseline: the capture still exits 1, so no
+# consumer reads a table from it. Neither is written when the LISTING fails: a
+# window that was never listed has no counters to publish, and writing `tested=0`
+# there would let a partial window be read as a baseline — the assertion at the end
+# of `tests/admin-merge/run.sh` ("a failed widened listing still wrote a
+# runs-report") pins exactly that.
+write_runs_report() {
+  local report="$1" examined="$2" extracted="$3" completed="$4" tested="$5" pending="$6" unreadable="${7:-}"
+  [ -n "$report" ] || return 0
+  {
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending"
+    if [ -n "$unreadable" ]; then
+      printf 'unreadable=%s\n' "$unreadable"
+    fi
+  } > "$report" 2>/dev/null || {
+    # ⛔ NOT SILENT (#2569 review). A swallowed write makes "the report is absent" —
+    # which the rail reads as "the LISTING failed" — also reachable from an unwritable
+    # path, i.e. a local disk problem would be reported as an unread GitHub listing
+    # and send triage at the wrong system. Say it out loud instead.
+    say_err "ci-failure-set: ✗ could not write the runs report at '$report' — the counters will not reach the caller"
+  }
+  return 0
+}
+
 # Sets a union of the FAILED nodeids across every FAILING run in <lane-file>,
 # and counts the lane's completion state from the SAME listing. Also writes
 # provenance/counts when requested. Returns 1 on extraction failure.
@@ -942,17 +1004,19 @@ collect_union() {
       # that actually exercised the revision" and is the main-side gate's signal,
       # so the credit is taken back rather than left to dilute the rate table.
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
-      *) rm -f "$tmp_set"; return 1 ;;
+      # #2569: the counters reached so far are PUBLISHED before failing closed, so
+      # the refusal can name a measured window instead of reading like an empty one.
+      # `parse:` — `extract_failed_tests` is COMPOSITE (fetch, then ids, then a
+      # job-level fallback for a pruned log), so its rc=1 does not say which step
+      # failed; see `write_runs_report`.
+      *) rm -f "$tmp_set"; write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"; return 1 ;;
     esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_set"
     fi
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   sort -u "$tmp_set"
   rm -f "$tmp_set"
 }
@@ -1007,17 +1071,17 @@ collect_union_rates() {
     case "$rc" in
       0) ;;
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
-      *) rm -f "$tmp_all"; return 1 ;;
+      # #2569: publish the partial counters before failing closed — see
+      # `write_runs_report` for why this is not a shrunken baseline. `parse:`
+      # because `extract_failed_tests` is composite (fetch, ids, pruned fallback).
+      *) rm -f "$tmp_all"; write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"; return 1 ;;
     esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_all"
     fi
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   # No tested runs -> emit NOTHING. An empty rate table must never be read as
   # "main never fails anything", which would exempt every PR failure.
   if [ "$tested" -gt 0 ]; then
@@ -1079,7 +1143,10 @@ collect_union_signatures() {
       continue
     fi
     if [ "$frc" -ne 0 ]; then
-      rm -f "$log_file" "$tmp_sigs"; return 1
+      # #2569: publish the partial counters before failing closed.
+      rm -f "$log_file" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "log:$run_id"
+      return 1
     fi
     # A failing run with NO failure identity contributes nothing to either table
     # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
@@ -1088,18 +1155,23 @@ collect_union_signatures() {
     # for a run we already know carried no parseable failure (the
     # `extracted < examined` gate in admin-merge.sh owns that case).
     local ids="" one=""
-    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+    ids="$(failed_ids_from_log "$log_file")" || {
+      rm -f "$log_file" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+      return 1
+    }
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
-      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+      one="$(extract_failed_signatures "$log_file")" || {
+        rm -f "$log_file" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
     fi
     rm -f "$log_file"
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   # No tested run -> emit NOTHING. An empty signature table is not evidence; the
   # caller BLOCKS on it rather than exempting from it.
   if [ "$tested" -gt 0 ]; then
@@ -1164,7 +1236,11 @@ collect_union_rows() {
       # run and the fallback buys nothing. NO signature is emitted, so the
       # decision's signature gate fails CLOSED and the key can never be exempted.
       rm -f "$log_file"
-      ids="$(run_failed_job_ids "$run_id")" || { rm -f "$tmp_ids" "$tmp_sigs"; return 1; }
+      ids="$(run_failed_job_ids "$run_id")" || {
+        rm -f "$tmp_ids" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       if [ -n "$ids" ]; then
         extracted=$((extracted + 1))
         printf '%s\n' "$ids" >> "$tmp_ids"
@@ -1175,9 +1251,16 @@ collect_union_rows() {
       continue
     fi
     if [ "$frc" -ne 0 ]; then
-      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
+      # #2569: publish the partial counters before failing closed.
+      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "log:$run_id"
+      return 1
     fi
-    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+    ids="$(failed_ids_from_log "$log_file")" || {
+      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+      write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+      return 1
+    }
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$ids" >> "$tmp_ids"
@@ -1194,15 +1277,16 @@ collect_union_rows() {
       # Only a run that CARRIED ids is fed to the signature extractor: the
       # `signatures` CLI exits 1 on a capture with no ids (correct for a capture
       # that proves nothing, wrong for a run already known to carry none).
-      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+      one="$(extract_failed_signatures "$log_file")" || {
+        rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
+        write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
+        return 1
+      }
       [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
     fi
     rm -f "$log_file"
   done < "$lane_file"
-  if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
-  fi
+  write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
   if [ "$tested" -gt 0 ]; then
     # Join per-id failure counts (and the id universe, so an UNSIGNED id still
     # gets a row) with the signature rows. awk only; no second signature parser.
@@ -1312,6 +1396,15 @@ main() {
       rm -f "$runs"
       ;;
     main-union-rates)
+      # ⛔ A LISTING FAILURE WRITES NO `--runs-report`, deliberately (#2569). A window
+      # that was never listed has no counters, and publishing `tested=0` for it would
+      # hand a consumer a report it could read as a baseline — the assertion at the
+      # end of `tests/admin-merge/run.sh` pins that no report exists on this path.
+      # So the report's ABSENCE is the signal the rail reads for "no read window".
+      # It is the most likely cause, not the only one: a capture killed mid-loop, or a
+      # report that could not be WRITTEN (which `write_runs_report` now says out
+      # loud), also leaves no report — which is why the rail's wording says "nothing
+      # was measured that could be read" rather than naming the network as the cause.
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
