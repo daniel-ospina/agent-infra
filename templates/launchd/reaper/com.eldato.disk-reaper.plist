@@ -84,6 +84,11 @@
              backoff window, and IN THE PLIST because a launchd job inherits no shell rc files. -->
         <key>REAP_WT_GH_TIMEOUT</key>
         <string>300</string>
+        <!-- The worktree owner resolves `gh` from PATH unless GH_BIN names one. RENDERED (empty = the
+             delegate's own default `gh`) because the installer's preflight reads GH_BIN: validating a
+             binary the unit does not carry would report "authenticated" for an env it will never have. -->
+        <key>GH_BIN</key>
+        <string>{{GH_BIN}}</string>
     </dict>
     <key>StartInterval</key>
     <integer>3600</integer>

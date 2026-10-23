@@ -40,6 +40,10 @@ Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
 # that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
 # is never guessed at) and the supervisor shows which class failed.
 Environment=REAP_WT_GH_TIMEOUT=300
+# The worktree owner resolves `gh` from PATH unless GH_BIN names one. RENDERED (empty = the delegate's
+# own default) because the installer's preflight reads GH_BIN: validating a binary the unit does not
+# carry would print "authenticated" for an env the unit will never have (#2443 review P1).
+Environment=GH_BIN={{GH_BIN}}
 # Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
 Nice=10
 IOSchedulingClass=idle

@@ -1282,7 +1282,11 @@ run() {
             # is the remedy for THIS cause. `skipped=` is on stderr like every other abort line and
             # `run_class` merges both streams, so the entry point sees it either way.
             echo "FAIL-CLOSED abort: the open-PR gate cannot be verified for this repo (exit 3)" >&2
-            echo "SKIPPED-REPO: skipped=${REPO_CANON:-$REPO} reason=${PR_SKIP_REASON:-unknown}" >&2
+            # ⛔ A REPO PATH MAY CONTAIN A NEWLINE (legal in POSIX, legal in git), and a raw one would split
+            # this line: the caller parses `reason=` out of it, so a split before that field turns a
+            # named skip back into an anonymous one — and a forged second line could name a repo that
+            # was not skipped. Same class as the newline-in-a-label forging already fixed in ci-main.yml.
+            echo "SKIPPED-REPO: skipped=$(printf '%s' "${REPO_CANON:-$REPO}" | tr -d '\n\r') reason=${PR_SKIP_REASON:-unknown}" >&2
             echo "   ${PR_SKIP_REMEDY:-set REAP_WT_REPO_SLUG, or replace the origin remote with a GitHub URL}" >&2
             echo "   NOTHING in this repo was touched: a checkout whose PR state is unknown is never removed (the other repos in the pass are unaffected)" >&2
             log "FAIL-CLOSED abort: open-PR gate unverifiable for ${REPO_CANON:-$REPO} (reason=${PR_SKIP_REASON:-unknown}) with candidates (exit 3)"

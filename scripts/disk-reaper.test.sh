@@ -1918,7 +1918,13 @@ cp "$REAPER" "$T/t56/reaper.sh"
 cp "$HERE/pi-cache-reap.sh" "$HERE/reap-lane-venvs.sh" "$HERE/pi-reap-worktrees.sh" "$T/t56/"
 mkdir -p "$T/t56/lib"; cp "$HERE/lib/bounded.sh" "$T/t56/lib/bounded.sh"
 inst56() { # inst56 <bindir> — a full self-contained systemd install into a scratch unit dir
+    # ⛔ TEMPLATES_DIR IS PINNED. Its default resolution prefers $AGENT_INFRA_PATH, so on a box that
+    # sets it (every cell) an unpinned case renders the HUB's templates and asserts things about a
+    # different checkout than the one under test — green here, red in CI, or worse, green about the
+    # wrong file.
     PATH="$1:$PATH" HOME="$T/t56/home" DISK_REAPER="$T/t56/reaper.sh" DISK_REAPER_REPOS="$REPO" \
+    TEMPLATES_DIR="$HERE/../templates/systemd" \
+    LAUNCHD_TEMPLATES_DIR="$HERE/../templates/launchd/reaper" \
     SYSTEMD_UNIT_DIR="$T/t56/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t56/calls.log" \
     bash "$INST" --install
 }
@@ -1932,6 +1938,33 @@ OUT="$(inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T56 a healthy gh still installs"
 assert_absent "$OUT" "WILL SKIP EVERY REPO" "T56 and no warning is emitted when the credentials are there (no false alarm)"
 assert_contains "$OUT" "gh:     authenticated" "T56 the summary states the positive verdict too"
+# ⛔ THE VERDICT MUST BE ABOUT THE ENVIRONMENT THE UNIT ACTUALLY GETS. The preflight reads GH_BIN, so the
+# same pin has to reach the unit — otherwise `GH_BIN=/opt/gh/gh` prints "authenticated" for a binary the
+# hourly pass never resolves, and the class skips every repo while the installer said it was fine.
+assert_contains "$(cat "$T/t56/units/eldato-disk-reaper.service")" "Environment=GH_BIN=" \
+    "T56 the rendered unit carries the GH_BIN the preflight read (a verdict about a binary the unit lacks is a false PASS)"
+# ⛔ AND THE PROBE IS BOUNDED. `gh auth status` reaches the API, and a plain gh auth probe can hang for
+# the life of the shell (rc=142 measured) — which would block the install before the unit is written,
+# leaving the box with no reaper and no warning. A stub that never answers must time out and be
+# reported as UNKNOWN, not as "skip" (a claim the probe could not make).
+mkdir -p "$T/t56/bin-hang"
+cat >"$T/t56/bin-hang/gh" <<'SHIM'
+#!/usr/bin/env bash
+case "$1 $2" in
+    "auth status") sleep 30 ;;
+esac
+exit 0
+SHIM
+chmod +x "$T/t56/bin-hang/gh"
+START=$SECONDS
+OUT="$(inst56 "$T/t56/bin-hang" 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - START))
+assert_eq "$RC" "0" "T56 a hanging auth probe does not block the install for ever"
+if [ "$ELAPSED" -lt 25 ]; then ok "T56 the probe was BOUNDED (install finished in ${ELAPSED}s, not the stub's 30s)"
+else bad "T56 the probe was not bounded (install took ${ELAPSED}s)"; fi
+assert_contains "$OUT" "CANNOT say whether the worktree class will run" \
+    "T56 a timed-out probe is reported as UNKNOWN, never as a skip it cannot prove"
+assert_contains "$OUT" "gh:     UNKNOWN" "T56 and the summary says UNKNOWN rather than a verdict"
 # and with NO gh at all the same prerequisite is named rather than silently assumed. GH_BIN is the
 # seam BOTH sides share (the delegate already honours it), so this arm is a real assertion about the
 # installer instead of a claim about whether this host happens to ship gh in /usr/bin.

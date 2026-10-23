@@ -377,6 +377,7 @@ render() { # render <template> <dest>
         -e "s|{{MODE_FLAG}}|$MODE_FLAG|g" \
         -e "s|{{MODE_SUCCESS_EXIT}}|$MODE_SUCCESS_EXIT|g" \
         -e "s|{{BOUNDED_LIB}}|$(xml_sed_repl "${REAPER%/*}/lib/bounded.sh")|g" \
+        -e "s|{{GH_BIN}}|$(xml_sed_repl "${GH_BIN:-}")|g" \
         -e "s|{{LABEL}}|$LABEL|g" \
         -e "s|{{PY_BIN}}|$(xml_sed_repl "${PY_BIN:-}")|g" \
         -e "s|{{LAUNCHER}}|$(xml_sed_repl "${LAUNCHER:-}")|g" \
@@ -493,20 +494,43 @@ choose_target() {
 # refusing would leave it with NO reaper at all — worse than a reaper whose third class skips every
 # repo BY NAME. The answer is kept in GH_PREFLIGHT so the install summary carries it too.
 GH_PREFLIGHT=""
-gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated
-    local home="$1" ghbin="${GH_BIN:-gh}"
+# One formatter for both install arms: the summary must never say "will skip every repo" about a
+# probe that TIMED OUT (unknown is not the same answer as a skip) — the same conflation this PR exists
+# to remove, one layer up (#2443 review).
+gh_preflight_summary() {
+    case "${GH_PREFLIGHT:-}" in
+        '')            printf 'authenticated via HOME=%s — the open-PR gate can run' "$HOME" ;;
+        probe-timeout) printf 'UNKNOWN — the auth probe timed out; the worktree class may skip every repo (see the WARNING above)' ;;
+        *)             printf '%s — the worktree class will skip every repo (see the WARNING above)' "$GH_PREFLIGHT" ;;
+    esac
+}
+gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated | probe-timeout
+    local home="$1" ghbin="${GH_BIN:-gh}" rc=0
     # ⛔ GH_BIN IS THE SAME SEAM THE DELEGATE USES, and it is what makes the `missing` arm testable
     # without doctoring PATH (a suite that asserts an AMBIENT host property — "gh happens to be in
-    # /usr/bin" — goes red for an environment reason unrelated to the change). A pin also lets an
-    # operator install a unit for a gh that is not on the unit's PATH.
+    # /usr/bin" — goes red for an environment reason unrelated to the change). It is RENDERED into
+    # both units (templates/*/), so the verdict below is about the environment the unit really gets:
+    # probing a binary the unit does not carry would be a false PASS of the kind this hunk removes.
     command -v "$ghbin" >/dev/null 2>&1 || { printf 'missing'; return 0; }
     # Run it with the SAME HOME the unit will carry, and with any inherited token removed, so the
     # answer is about the UNIT's environment rather than this shell's.
-    if HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1; then
-        printf ''
+    # ⛔ BOUNDED. `gh auth status` validates the token against the API, and a plain gh auth probe can
+    # hang for the life of the shell (rc=142 measured, recorded in orchestrator-harness/README.md).
+    # An installer that blocks before writing the unit gives the operator neither the warning nor an
+    # install — and the reaper it was replacing has already been stopped. 10s is a probe, not a
+    # pass: no timeout(1) means the probe runs unbounded, which is stated rather than hidden.
+    if command -v timeout >/dev/null 2>&1; then
+        HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN timeout 10 "$ghbin" auth status >/dev/null 2>&1
+        rc=$?
     else
-        printf 'unauthenticated'
+        HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1
+        rc=$?
     fi
+    case "$rc" in
+        0)   printf '' ;;
+        124) printf 'probe-timeout' ;;
+        *)   printf 'unauthenticated' ;;
+    esac
 }
 
 warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
@@ -518,6 +542,9 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
         missing)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its open-PR gate cannot be evaluated"
             err "  install gh (or point GH_BIN at it), or accept that only the uv and venv classes run on this box" ;;
+        probe-timeout)
+            err "WARNING: gh did not answer 'auth status' within 10s, so this installer CANNOT say whether the worktree class will run on this box"
+            err "  install anyway and check later: bash $REAPER --print-status, or  gh auth status  by hand" ;;
         *)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
             err "  the credential store is per-HOME (\$HOME/.config/gh, or GH_TOKEN), and the rendered HOME decides it"
@@ -613,7 +640,7 @@ except ET.ParseError as e:
     say "  reaper: $REAPER"
     say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     $(gh_preflight_summary)"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
         say "  agent:  loaded"
@@ -725,7 +752,7 @@ do_install_systemd() {
     say "  reaper: $REAPER"
     say "  mode:   $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     $(gh_preflight_summary)"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
         say "  timer:  enabled"

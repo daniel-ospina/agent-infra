@@ -247,14 +247,24 @@ mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
-skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
+skipped_worktree=
 freed_mb_unmeasured=
 ```
 
-`skipped_worktree=` is empty on a pass where every repo could be verified; otherwise it lists
-`<repo>[<reason>], …` — the subject the class verdict never had, so "the worktree class is red" is
-answerable as "one repo, because `gh` has no credentials here" (#2443). It is also printed by
-`disk-reaper.sh --print-status`, which is the surface `cloud-cell-supervisor.sh` reads: a field the
+`skipped_worktree=` is empty on a pass where every repo could be verified. When it is not, a skip has
+forced the worktree class to fail closed, so the record for that pass reads `rc=3` — a skip can never
+share a record with `rc=6`:
+
+```
+mode=apply ok=0 rc=3 classes=uv,venv,worktree
+verdict_uv=ok verdict_venv=ok verdict_worktree=fail-closed
+skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
+detail=pi-reap-worktrees.sh exited 3 — it FAILED CLOSED (could not do the work; see its log); open-PR gate unverifiable
+```
+
+The list is `<repo>[<reason>], …` — the subject the class verdict never had, so "the worktree class
+is red" is answerable as "one repo, because `gh` has no credentials here" (#2443). It is also printed
+by `disk-reaper.sh --print-status`, which is the surface `cloud-cell-supervisor.sh` reads: a field the
 reader does not print does not exist.
 
 `rc=6` with `detail=… exited 7` is a **deferral**: `pi-cache-reap.sh` ran, found a live `uv` holding
