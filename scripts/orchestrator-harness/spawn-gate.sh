@@ -275,6 +275,184 @@ load1() { # [<loadavg-file>]
 # is asserted rather than left to be rediscovered).
 can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 
+# ── THE CREATION BACK-PRESSURE GATE: land before you open (agent-infra#2409) ─────────────────────
+#
+# WHY THIS EXISTS, MEASURED (2026-10-23T11:50Z, REST, both repos, trailing 48h):
+#
+#   daniel-ospina/agent-infra   73 opened (1.52/h)   25 merged (0.52/h)   ratio 2.9:1, 81 open
+#   daniel-ospina/tortoise     131 opened (2.73/h)  115 merged (2.40/h)   ratio 1.1:1,  19 open
+#
+# A repo that opens 1.5 PRs an hour and lands 0.5 accumulates ~24 PRs a day and nothing drains it.
+# Every capacity gate this module already had — MAX_LOAD, DISK_MIN_FREE_MB, the spawn point — measures
+# THE BOX, so a box with 20 free lane slots in front of an 81-PR queue reads perfectly healthy and
+# opens the 82nd. That is the shape this gate removes: it is the ONE gate here whose input is not a
+# property of this machine.
+#
+# ⛔ WHY A RATIO AND NOT A COUNT. A fixed count cannot be right for two repos: 19 open is a healthy
+# queue on tortoise (which lands 2.4/h) and would be a catastrophic backlog on a repo that lands
+# 0.1/h. The sizing rule is Little's law, L = λW — a system in steady state holds λ×W items for a
+# throughput λ and a lead time W — so the ceiling is the repo's OWN measured landing rate times the
+# lead time we are willing to accept (LB leads, below). That is what makes the bound defensible
+# instead of arbitrary, and it self-calibrates: a repo that lands faster is allowed to hold more.
+#
+# ⛔ λ IS THE BEST OF THE TWO TRAILING 24h WINDOWS, NOT THE LATEST ONE. Sizing the limit from the
+# CONGESTED throughput is the WIP-limit pathology: a bad day lowers λ, which lowers the ceiling, which
+# holds more creation, which (if the hold is not also a drain) lowers λ further. Taking the better of
+# two windows means a suppressed day can never shrink the ceiling, and the floor below keeps a repo
+# that has landed nothing for 48h from collapsing to a ceiling of zero. Residual, disclosed: a repo
+# whose throughput genuinely collapses keeps a ceiling sized on its last good day until the hold
+# itself reduces it — which is the direction we want, and it is bounded by the floor.
+#
+# ⛔ IT NEVER BLOCKS LANDING, AND THAT IS STRUCTURAL, NOT A PROMISE. This module is sourced by the
+# CREATION callers (lane.sh, nonblocking-dispatch.sh) and the fixer (fix-one.sh); `run_agent` applies the
+# gate for every KIND **except** `fixer` and `reviewer`. That is a DENY-LIST on purpose: `bg` creators
+# (nonblocking-dispatch.sh) were the first thing an allow-list on `KIND=lane` missed, and a KIND nobody
+# has written yet is gated by default instead of riding through unmeasured. A fixer (KIND=fixer) and
+# every merge path (merge-one.sh, chain-merge.sh, orch-loop.sh) never reach this code, so a deep backlog
+# cannot stop the very work that drains it. Pinned by test-gates.sh's structural arm, which asserts no
+# landing script mentions these functions.
+#
+# ⛔ NO AMBIENT BYPASS. There is deliberately no `LB_SKIP`/`LAND_BACKLOG_OFF` variable: an env var
+# that opens the gate is not a gate (the same rule spawn-gate.sh's own PI_GATE_REFUSED docstring and
+# ci-queue.sh's header both state). The two exemptions that DO exist are EVIDENCE, read from GitHub:
+#   * an issue labelled `P0-blocker` (the repo's own convention), and
+#   * a `base-red` / `main-red` repair (detected in the issue title — landing one is the single
+#     highest-leverage way to REDUCE the backlog, and holding it would be exactly backwards).
+# A refusal is still not a dead end: it names the state, the numbers and the remedy, and the issue
+# stays in the pool — the same contract as every other refusal in this file.
+#
+# ⛔ THERE IS NO MEASUREMENT SEAM, AND THAT IS THE FIX (review cycle 1, P1). A first draft read the
+# measuring binary from `LB_GH` so the suite could stub it. That is a BYPASS, not a seam: pointing it
+# at a five-line script that prints `0` for the open listing made the gate print
+# `OK 0 open / 0.0 landings per hour` on a repo with 82 open PRs — reproduced — and `worker-terminal.sh`
+# snapshots the dispatcher's env into every lane, so a value set once rides every spawn. The gate now
+# calls `gh` like every other read in this harness, and the suite supplies its readings the way a BOX
+# does: by installing `$O/gh-rest/gh`, the REST adapter that `lane.sh`/`fix-one.sh` already prepend to
+# PATH (install.sh ships it; it is in the drift list). Writing a fake REST adapter is a visible act on
+# the box's own tooling, not an ambient variable — `capacity-transfer.test.sh` §LB pins both the
+# reading it produces AND that `LB_GH` no longer opens anything (the same spawn with `LB_GH` set now
+# reads UNREADABLE and HOLDS).
+
+# The repo is DERIVED, never handed in: an `LB_REPO` env var would be the bypass above with extra
+# steps (point it at a repo with no open PRs and every lane starts). repo-slug.sh is the ONE parser
+# (#2040) and it deliberately refuses a local-path remote rather than minting `gh --repo /tmp/foo`.
+land_backlog_repo() { # [<checkout>] -> prints owner/name, rc!=0 when it cannot be derived
+  local c="${1:-$PWD}" slug sh dir
+  # ⛔ THE MODULE DIRECTORY IS RESOLVED TO AN ABSOLUTE PATH. `dirname "${BASH_SOURCE[0]}"` is
+  # relative when the caller sourced this file by a relative path, and the gate runs with the cwd
+  # inside a WORKTREE — so a relative module dir resolves to nothing there and every lane would read
+  # UNREADABLE for a reason that has nothing to do with the repo (measured).
+  dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || return 1
+  sh="$dir/repo-slug.sh"
+  [ -f "$sh" ] || return 1
+  slug="$( . "$sh" >/dev/null 2>&1; derive_or "$c" "" 2>/dev/null )" || return 1
+  case "${slug:-}" in */*) printf '%s\n' "$slug"; return 0 ;; esac
+  return 1
+}
+
+# Open PRs, BOUNDED (5 pages x 100). An unbounded listing read is the load defect this repo has
+# already paid for (#1069/#1984), and 500 open PRs is not a backlog we need to count more precisely
+# than "greater than the ceiling".
+land_backlog_open() { # <owner/repo> -> count, rc!=0 when unreadable
+  local or_="${1:-}" page=1 out total=0
+  while [ "$page" -le 5 ]; do
+    out="$(gh api "repos/$or_/pulls?state=open&per_page=100&page=$page" --jq 'length' 2>/dev/null)" || return 1
+    is_num "${out:-}" || return 1
+    total=$(( total + out ))
+    [ "$out" -lt 100 ] && break
+    page=$(( page + 1 ))
+  done
+  printf '%s\n' "$total"
+}
+
+# Landings, as `<last 24h> <prior 24h>`. THE EPOCH IS COMPUTED SERVER-SIDE (`fromdateiso8601`, jq),
+# not parsed here: macOS `date -j -f` and GNU `date -d` disagree about every detail of the format and
+# a portable timestamp parser in bash is a third thing to get wrong. 2 pages x 100 closed PRs, which
+# covers the 48h window on both repos today (measured) and UNDER-reads if a repo ever lands more than
+# 200 in two days — that direction can only make the ceiling smaller, i.e. it fails toward holding.
+land_backlog_lands() { # <owner/repo> -> "<last24> <prior24>", rc!=0 when unreadable
+  local or_="${1:-}" page=1 now epochs line last24=0 prior24=0 pages=0
+  now="$(date +%s)"; is_num "${now:-}" || return 1
+  while [ "$page" -le 2 ]; do
+    epochs="$(gh api "repos/$or_/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=$page" \
+      --jq '.[] | select(.merged_at != null) | (.merged_at|fromdateiso8601)' 2>/dev/null)" || return 1
+    pages=$(( pages + 1 ))
+    while IFS= read -r line; do
+      is_num "${line:-}" || continue
+      if [ "$line" -gt "$(( now - 86400 ))" ]; then last24=$(( last24 + 1 ))
+      elif [ "$line" -gt "$(( now - 172800 ))" ]; then prior24=$(( prior24 + 1 )); fi
+    done <<LB_LANDS_EOF
+$epochs
+LB_LANDS_EOF
+    page=$(( page + 1 ))
+  done
+  [ "$pages" -ge 1 ] || return 1
+  printf '%s %s\n' "$last24" "$prior24"
+}
+
+# The THREE-STATE VERDICT. Prints exactly ONE line whose FIRST WORD is the state, and returns
+# 0 = OK (creation allowed), 1 = LAND-BACKLOG (hold creation), 2 = UNREADABLE (hold creation).
+# ⛔ `UNREADABLE` HOLDS. A measurement we cannot trust must never read as OK — that is the whole
+# difference between an instrument and a decoration, and it is what makes a broken gh chain
+# (agent-infra#2320) show up as a hold with a named cause instead of as permission to mint more PRs.
+# The direction is affordable in a way the reverse is not: a false hold costs one re-dispatch when
+# the next read works, while a false OK costs 1.5 PRs an hour that nothing lands. The two EVIDENCE
+# exemptions are evaluated BEFORE this (see run_agent), so a FULLY READABLE call never holds a P0 —
+# ⛔ but a TOTAL gh outage fails the exemption read too, and then a P0 IS held (review cycle 1, P2:
+# the earlier wording claimed it could not be, which is false). The refusal line says so explicitly
+# rather than letting an operator conclude the issue was judged non-urgent.
+land_backlog_verdict() { # <owner/repo> [<lead-hours = TEST SEAM>] [<min-ceiling = TEST SEAM>]
+  local or_="${1:-}" lh="${2:-24}" minc="${3:-5}" open lands last24 prior24 peak ceiling rate10 why
+  case "$or_" in */*) ;; *) printf 'UNREADABLE repo %s (not an owner/name slug)\n' "${or_:-"<empty>"}"; return 2 ;; esac
+  # A malformed tunable is REPAIRED to the shipped value, never allowed to open the gate.
+  { is_num "$lh" && [ "$lh" -ge 1 ] && [ "$lh" -le 720 ]; } || lh=24
+  { is_num "$minc" && [ "$minc" -ge 1 ] && [ "$minc" -le 1000000 ]; } || minc=5
+  if ! open="$(land_backlog_open "$or_")"; then
+    printf 'UNREADABLE open-PR count for %s (the gh read failed) — creation stays HELD, landing is unaffected\n' "$or_"; return 2
+  fi
+  if ! lands="$(land_backlog_lands "$or_")"; then
+    printf 'UNREADABLE landing rate for %s (the gh read failed) — creation stays HELD, landing is unaffected\n' "$or_"; return 2
+  fi
+  last24="${lands%% *}"; prior24="${lands##* }"
+  { is_num "$last24" && is_num "$prior24"; } || { printf 'UNREADABLE landing counts for %s (%s)\n' "$or_" "${lands:-<empty>}"; return 2; }
+  peak=$last24; [ "$prior24" -gt "$peak" ] && peak=$prior24
+  ceiling=$(( (peak * lh + 23) / 24 )); [ "$ceiling" -lt "$minc" ] && ceiling=$minc
+  rate10=$(( (peak * 10) / 24 ))
+  if [ "$open" -gt "$ceiling" ]; then
+    printf 'LAND-BACKLOG %s open / %s.%s landings per hour (ceiling %s = %s.%s/h x %sh) — hold new creation, land the open queue first\n' \
+      "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$lh"
+    return 1
+  fi
+  printf 'OK %s open / %s.%s landings per hour (ceiling %s)\n' "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling"
+  return 0
+}
+
+# The two EVIDENCE exemptions. Read from GitHub (labels/title of the issue this lane was dispatched
+# for), so a lane cannot mint one for itself. Any failure to read is "no exemption" — the verdict
+# still decides. ⛔ THAT IS NOT THE SAME AS "a P0 is never held", and an earlier comment here claimed
+# it was (review cycle 1, P2): a TOTAL gh outage fails the label read too, so a P0 lane IS refused.
+# Nothing in this function can fix that — an exemption it cannot read is an exemption it cannot
+# prove — so it reports `EXEMPTION-UNREADABLE` up to the refusal line, and the operator is told to fix
+# the gh chain instead of believing the issue was judged non-urgent.
+land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0 when exempt
+  local n="${1:-}" or_="${2:-}" row labels title
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  if ! row="$(gh api "repos/$or_/issues/$n" --jq '((.labels|map(.name)|join(",")) + "\u0001" + (.title // ""))' 2>/dev/null)"; then
+    printf 'EXEMPTION-UNREADABLE '; return 1
+  fi
+  [ -n "${row:-}" ] || { printf 'EXEMPTION-UNREADABLE '; return 1; }
+  labels="$(printf '%s' "$row" | cut -d$'\001' -f1 | tr 'A-Z' 'a-z')"
+  title="$(printf '%s' "$row" | cut -d$'\001' -f2- | tr 'A-Z' 'a-z')"
+  case "$labels" in
+    *p0*) printf 'P0 work (issue label P0-blocker) reduces the backlog — exempt. '; return 0 ;;
+  esac
+  case "$title" in
+    *base-red*|*main-red*|*base\ red*|*main\ is\ red*|*main\ goes\ red*|*red\ main*)
+      printf 'a base-red repair reduces the backlog for every PR behind it — exempt. '; return 0 ;;
+  esac
+  return 1
+}
+
 # ── the ONE agent invocation ─────────────────────────────────────────────────────
 # run_agent <seconds> <logfile> <promptfile> [label]
 #
@@ -310,6 +488,14 @@ AGENT_LOAD_REFUSED=75
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
 # the two as one waits for an event that cannot happen.
 AGENT_DISK_REFUSED=77
+# The CREATION back-pressure refusal (agent-infra#2409). A FOURTH code because it has a fourth
+# remedy, and it is the only one whose remedy is not about this box at all: the box is healthy, no
+# filesystem is full, and waiting will not clear it — the REPO has more open PRs than its own
+# measured landing rate can absorb, so the work is to LAND what is already open. Treating it as 75
+# would tell an operator to wait for load that is already fine; treating it as 77 would send them to
+# reclaim a disk that is not full. 74, 79 and friends: 75/76/77/78 were taken, and `gate`/`chain`
+# read this code to name the refusal (see `land` in lane.sh and chain-merge.sh's cap_refusal_gate).
+AGENT_LAND_BACKLOG=74
 # The SPAWN POINT's refusal code (agent-infra#1884, see the last section of this file). It is a THIRD
 # code because it is a third process: run_agent launches `pi`, and the installed `pi` may itself
 # refuse. 75 cannot be reused for that — `pi` shares the 0-255 namespace, and the contract below
@@ -384,6 +570,40 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     echo "[load-gate] REFUSED $label: load=$l >= max_load=$MAX_LOAD — no agent started; the controller re-dispatches when load falls, and nothing was consumed" >> "$log"
     return "$AGENT_LOAD_REFUSED"
   fi
+  # ── THE CREATION GATE (agent-infra#2409) ────────────────────────────────────────────────────
+  # LAST, and only for a CREATION worker. Two ordering decisions, both load-bearing:
+  #   * AFTER the disk and load gates, so a box that is genuinely out of room reports the refusal
+  #     whose remedy is real (the disk one never clears by waiting); a backlog hold is the wrong
+  #     message on a box that cannot run the worker anyway.
+  #   * A DENY-LIST, not an allow-list (review cycle 1, P2). It read `KIND = lane` at first, so
+  #     `nonblocking-dispatch.sh`'s background worker (`KIND=bg`) — "a fleet lane in every respect
+  #     except that nobody waits for it" by its own header — was never measured, and every future
+  #     KIND would inherit the hole. The two kinds this gate must never hold are named instead,
+  #     because their product IS the drain: `fixer` pushes to an open PR and `reviewer` produces the
+  #     verdict that lets one land. No merge path calls run_agent at all, so they need no entry.
+  case "${KIND:-}" in
+    fixer|reviewer) : ;;
+    *)
+    local lb_repo lb_line lb_rc lb_why=""
+    if ! lb_repo="$(land_backlog_repo)"; then
+      echo "[land-backlog] REFUSED $label: UNREADABLE repo — this worktree's origin is not a GitHub owner/name slug, or repo-slug.sh is missing, so the landing ratio cannot be measured. Creation is HELD (a measurement that cannot be read is never an OK); landing is unaffected." >> "$log"
+      return "$AGENT_LAND_BACKLOG"
+    fi
+    if lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
+      echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
+    else
+      lb_line="$(land_backlog_verdict "$lb_repo")"; lb_rc=$?
+      case "$lb_why" in
+        *EXEMPTION-UNREADABLE*) lb_line="$lb_line [the $TAG exemption read ALSO failed: if this issue is a P0-blocker or a base-red repair it could not be proven, so fix the gh chain rather than assume it was judged non-urgent]" ;;
+      esac
+      if [ "$lb_rc" -ne 0 ]; then
+        echo "[land-backlog] REFUSED $label: $lb_line. No agent started, nothing consumed. Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The issue returns to the pool and is re-dispatched when the ratio clears." >> "$log"
+        return "$AGENT_LAND_BACKLOG"
+      fi
+      echo "[land-backlog] $lb_line" >> "$log"
+    fi
+    ;;
+  esac
   AGENT_STARTED=1
   start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &

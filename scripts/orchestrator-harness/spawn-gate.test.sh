@@ -253,6 +253,14 @@ echo "PI_RAN" >> "$PI_LOG"
 exit 0
 PI
 chmod +x "$TMP/bin/pi"
+# ⛔ THE CREATION BACK-PRESSURE GATE IS SUPPLIED A READING, NOT SWITCHED OFF (#2409). `run_agent` now
+# measures the repo's landing ratio immediately before any spawn, through `gh` — and these arms drive
+# it straight from this checkout (whose origin IS agent-infra), so the system `gh` would answer
+# `LAND-BACKLOG` and every positive control below would be refused by the WRONG gate (measured: 14
+# arms). Supplying the reading is the fix the #2333 review established for its CI-queue gate: an env
+# var that opens a gate is not a gate, so this puts a calm answer where the gate actually reads.
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
 
 # drive <load> <label> [<max-load>] — runs the SHIPPED run_agent under a controlled reading. `load1`
 # is re-declared AFTER sourcing, which is the seam described at the top. `pi` is a stub; every

@@ -95,6 +95,70 @@ STUB
 chmod +x "$TMP/bin/pi" "$TMP/dbin/df" "$TMP/bin/gh"
 PATH="$TMP/bin:$PATH"; export PATH
 
+# ── the CREATION back-pressure readings (agent-infra#2409) ────────────────────────────────────
+# `run_agent` now measures the repo's landing ratio before it starts a CREATION worker (#2409), via
+# spawn-gate.sh's `land_backlog_*`. That is a gh read of the repo the worktree's origin names, so
+# every arm that lets a lane actually start must SUPPLY the reading — the same rule #2333 applied to
+# its CI-queue gate: an env var that switches a gate off would not be a gate, so the reading is given.
+# ⛔ IT IS GIVEN THE WAY A BOX GIVES IT: by installing `$O/gh-rest/gh`, the REST adapter that
+# `lane.sh`/`fix-one.sh` prepend to PATH (install.sh ships it; it is in the drift list). There is
+# deliberately NO `LB_GH`-style env seam — review cycle 1 reproduced one opening the gate on a repo
+# with 82 open PRs, and §LB pins that setting it now changes nothing.
+#
+# Shapes, all against `daniel-ospina/agent-infra` (the slug the fixture worktree's origin names):
+#   lbgh-ok     3 open  / 40 landings in the last 24h -> ceiling 40 -> OK
+#   lbgh-deep  81 open  / 15 landings in the last 24h -> ceiling 15 -> LAND-BACKLOG
+#   lbgh-broken  every read fails                    -> UNREADABLE (must HOLD, never OK)
+#   lbgh-p0     lbgh-deep + issue labelled P0-blocker    -> EXEMPT
+#   lbgh-basered lbgh-deep + issue title 'main is red…'  -> EXEMPT
+#   lbgh-paged 250 open in 3 pages / 10 landings last 24h, 40 the 24h before -> OK (both rules)
+lbgh_shape() { # <file> <open1> <open2(page 2+)> <lands-last-24h> <lands-prior-24h> [labels] [title]
+  local f="$1" o1="$2" o2="$3" l24="$4" p24="$5" lab="${6:-}" ti="${7:-a normal issue}"
+  # A QUOTED heredoc, so nothing here is expanded by the test shell; the @TOKENS@ are the only
+  # substitutions. `\001` is the field separator the reader cuts on, and bash's printf interprets it
+  # in the FORMAT string (the stub's shebang is bash), so the label/title pair arrives verbatim.
+  sed -e "s|@O1@|$o1|g" -e "s|@O2@|$o2|g" -e "s|@L24@|$l24|g" -e "s|@P24@|$p24|g" \
+      -e "s|@LAB@|$lab|g" -e "s|@TITLE@|$ti|g" > "$f" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *broken*) exit 1 ;;
+  *"/issues/"*) printf '%s\001%s\n' "@LAB@" "@TITLE@"; exit 0 ;;
+  # ⛔ `&page=1 ` — WITH THE TRAILING SPACE: the URL also carries `per_page=100`, which CONTAINS the
+  # substring `page=1`, so a loose glob served page 1 for every page (measured: 5 x 100 = "500 open"
+  # for a 150-PR fixture, and the reader could not tell it from a real 500).
+  *state=open*'&page=1 '*) printf '%s\n' "@O1@"; exit 0 ;;
+  *state=open*) printf '%s\n' "@O2@"; exit 0 ;;
+  # PAGE 2 HAS NOTHING: the real listing is paged, and a stub that re-served page 1 doubled every
+  # count, which the reader cannot tell from a genuinely longer list (measured: it did).
+  *state=closed*page=2*) exit 0 ;;
+  *state=closed*)
+    for i in $(seq 1 @L24@); do printf '%s\n' "$(( $(date +%s) - (i % 20) * 3600 ))"; done
+    for i in $(seq 1 @P24@); do printf '%s\n' "$(( $(date +%s) - 86400 - (i % 20) * 3600 ))"; done
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$f"
+}
+# Install/uninstall the adapter the tested scripts actually resolve (see above).
+lbgh_install() { mkdir -p "$O/gh-rest"; cp "$1" "$O/gh-rest/gh"; chmod +x "$O/gh-rest/gh"; }
+lbgh_clear()   { rm -f "$O/gh-rest/gh"; rmdir "$O/gh-rest" 2>/dev/null || true; }
+lbgh_shape "$TMP/lbgh-ok"      3  0   40 0
+lbgh_shape "$TMP/lbgh-deep"   81  0   15 0
+lbgh_shape "$TMP/lbgh-paged" 100 50  120 0
+lbgh_shape "$TMP/lbgh-prior"  30  0   10 40
+# A gh chain that cannot answer AT ALL (agent-infra#2320's shape): every read fails, so the ratio is
+# UNREADABLE. It is its own file rather than a `lbgh_shape` marker because the shape stub dispatches
+# on the ARGUMENTS, which never contain the word "broken".
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/lbgh-broken"; chmod +x "$TMP/lbgh-broken"
+lbgh_shape "$TMP/lbgh-p0"     81  0   15 0 "P0-blocker,harness" "crash on boot"
+lbgh_shape "$TMP/lbgh-basered" 81 0   15 0 "bug" "main is red: lander.test.sh pipes"
+# A worktree whose origin names a real GitHub slug — the gate DERIVES the repo (there is no `LB_REPO`
+# env over-ride on purpose: pointing it at an empty repo would be a bypass). No commits needed; the
+# gate only reads `remote.origin.url`.
+LBWT="$TMP/lbwt"; mkdir -p "$LBWT"
+( cd "$LBWT" && git init -q . && git remote add origin https://github.com/daniel-ospina/agent-infra.git ) >/dev/null 2>&1
+
 # The AUTHORITATIVE stubs: exported functions (see the header). Each records that it answered, so a
 # stub the tested script never resolved cannot pass as "stubbed".
 GH_FUNC_MARK="$TMP/gh-func.mark"; DF_FUNC_MARK="$TMP/df-func.mark"; GH_LOG="$TMP/gh-calls.log"
@@ -103,7 +167,15 @@ GH_FUNC_MARK="$TMP/gh-func.mark"; DF_FUNC_MARK="$TMP/df-func.mark"; GH_LOG="$TMP
 # non-exported variable ACROSS an exec boundary aborts with `unbound variable` — which reads as "the
 # chain failed" and is the wrong reason for a red check.
 export GH_FUNC_MARK DF_FUNC_MARK GH_LOG STUB_DISK_FULL
-gh() { printf '%s\n' "$*" >> "$GH_LOG"; printf 'used\n' > "$GH_FUNC_MARK"; return 0; }
+gh() {
+  printf '%s\n' "$*" >> "$GH_LOG"; printf 'used\n' > "$GH_FUNC_MARK"
+  # ⛔ A `gh` BASHLESS-FUNCTION OUTRANKS EVERY PATH LOOKUP, so it would SHADOW the box's own REST
+  # adapter (`$O/gh-rest/gh`, which lane.sh/fix-one.sh prepend to PATH). The creation gate reads its
+  # measurement through exactly that adapter (there is no env seam, by design — see §LB), so this
+  # stub defers to one when it is installed, which is what a real box's PATH does too.
+  if [ -x "${O:-}/gh-rest/gh" ]; then command "$O/gh-rest/gh" "$@"; return $?; fi
+  return 0
+}
 df() {
   printf 'used\n' > "$DF_FUNC_MARK"
   if [ "${STUB_DISK_FULL:-0}" = "1" ]; then
@@ -199,9 +271,12 @@ rm -f "$PI_FUNC_MARK"
 ( pi probe ) >/dev/null 2>&1
 if [ -e "$PI_FUNC_MARK" ]; then
   printf '1\t2\tload\n' > "$O/state/capacity-refused-9"
-  ( cd "$TMP" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
+  # The creation gate's reading, supplied as a box supplies it (see the adapter fixtures above).
+  lbgh_install "$TMP/lbgh-ok"
+  ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
       bash "$LANE" 9 feat/9-tm daniel-ospina/agent-infra ) > "$TMP/lane9.out" 2>&1
   l9rc=$?
+  lbgh_clear
   { [ "$l9rc" -eq 0 ] && [ ! -f "$O/state/capacity-refused-9" ]; }; rc=$?
   ck "a lane that RAN clears a stale refusal record (rc=$l9rc, pi invoked=$([ -e "$PI_FUNC_MARK" ] && echo yes || echo no))" $rc
 else
@@ -558,6 +633,148 @@ else
   { grep -q 'Y=\$((Y+1))' "$ORCH" && grep -q 'dispatch_funnel 0 "\$(queue_state_token)" "" "" "\${Y:-0}"' "$ORCH"; }; rc=$?
   ck "  …and the dispatch loop counts yields into that line (a note nobody can make say 'yields=1' is inert)" $rc
 fi
+
+# ═══ §LB THE CREATION BACK-PRESSURE GATE (agent-infra#2409) ═════════════════════════════════════
+# The measured shape this exists for (2026-10-23, REST, trailing 48h): agent-infra opened 73 PRs
+# (1.52/h) and merged 25 (0.52/h) — 81 open, ratio 2.9:1 — while tortoise opened 131 and merged 115
+# (1.1:1, 19 open). A box with free lane slots in front of that queue reads healthy and opens the
+# 82nd PR. So run_agent measures `open` against the repo's OWN landing rate x the lead time we
+# accept (Little's law, L = λW) before it starts a CREATION worker — every KIND except `fixer` and
+# `reviewer`, a deny-list, so lane.sh and nonblocking-dispatch.sh's KIND=bg are both measured (never the
+# fixer, whose product IS a push to an open PR, and never any merge path).
+#
+# ⛔ THE FOUR CASES BELOW ARE THE CONTRACT: over the ceiling holds; under it allows; an unreadable
+# measurement HOLDS (a measurement we cannot read must never be the default that reads as OK); and a
+# P0/base-red item is exempt BY EVIDENCE read from GitHub, because it REDUCES the backlog.
+echo
+echo "=== §LB creation back-pressure: land before you open (#2409) ==="
+# Drives the SHIPPED function with a supplied reading (see lbgh_install).
+lb_drive() { # <shape-file> <lead-hours> <min-ceiling>
+  lbgh_install "$1"
+  ( . "$HERE/spawn-gate.sh" >/dev/null 2>&1; land_backlog_verdict daniel-ospina/agent-infra "$2" "$3" )
+}
+lane_run() { # <shape-file> <issue> -> sets LANE_RC, never spawns a real agent
+  lbgh_install "$1"
+  ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
+      LANE_TIMEOUT=5 bash "$LANE" "$2" "feat/$2-tm" daniel-ospina/agent-infra ) > "$TMP/lane-$2.out" 2>&1
+  LANE_RC=$?
+}
+: > "$PI_LOG"; rm -f "$O/logs/lane-101.log" "$O/state/capacity-refused-101"
+lane_run "$TMP/lbgh-deep" 101
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB over the ceiling: lane.sh HOLDS creation with exit 74 and spawns no agent (rc=$LANE_RC)" $rc
+grep -q 'LAND-BACKLOG 81 open / 0.6 landings per hour' "$O/logs/lane-101.log"; rc=$?
+ck "§LB …and the verdict is a NAMED state carrying the two measured numbers (81 open / 0.6 per hour)" $rc
+grep -q 'NOT started: LAND-BACKLOG' "$O/logs/lane-101.log"; rc=$?
+ck "§LB …and the lane log names it as LAND-BACKLOG, not as a load/disk capacity refusal" $rc
+{ read -r _le _lu lblgate < "$O/state/capacity-refused-101" 2>/dev/null; [ "${lblgate:-}" = "land" ]; }; rc=$?
+ck "§LB …and the durable refusal record carries gate='land' (got '${lblgate:-<none>}') so chain-merge stops waiting" $rc
+
+: > "$PI_LOG"; rm -f "$O/logs/lane-102.log"
+lane_run "$TMP/lbgh-ok" 102
+{ [ "$LANE_RC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB under the ceiling: the same lane RUNS (rc=$LANE_RC, agent invoked=$([ -s "$PI_LOG" ] && echo yes || echo no))" $rc
+
+: > "$PI_LOG"; rm -f "$O/logs/lane-103.log"
+lane_run "$TMP/lbgh-broken" 103
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB unreadable: HOLDS creation (rc=$LANE_RC) — a failed read never degrades to OK" $rc
+grep -q 'REFUSED .*UNREADABLE' "$O/logs/lane-103.log"; rc=$?
+ck "§LB …and it says UNREADABLE with the cause, not a silent pass" $rc
+LC_ALL=C grep -q 'land-backlog\] OK' "$O/logs/lane-103.log" && rc=1 || rc=0
+ck "§LB …and it never prints OK on that path (the state is one of three, never a default)" $rc
+
+: > "$PI_LOG"; rm -f "$O/logs/lane-104.log"
+lane_run "$TMP/lbgh-p0" 104
+{ [ "$LANE_RC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB P0 BYPASS: a P0-blocker issue is started despite the same deep backlog (rc=$LANE_RC)" $rc
+grep -q 'EXEMPT .*P0 work' "$O/logs/lane-104.log"; rc=$?
+ck "§LB …and the exemption is NAMED in the log, not silent" $rc
+
+: > "$PI_LOG"; rm -f "$O/logs/lane-105.log"
+lane_run "$TMP/lbgh-basered" 105
+{ [ "$LANE_RC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB BASE-RED BYPASS: a base-red repair is started too — landing it drains the queue (rc=$LANE_RC)" $rc
+
+# ⛔ NO AMBIENT SEAM OPENS THE GATE (review cycle 1, P1 reproduced it). A first draft read the
+# measuring binary from `LB_GH`; with a stub that printed `0` for the open listing the gate answered
+# `OK 0 open / 0.0 landings per hour` on a repo with 82 open PRs. The variable is gone, and setting it
+# must change nothing: the reading still comes from the box's REST adapter, which here is BROKEN.
+: > "$PI_LOG"; rm -f "$O/logs/lane-107.log"
+lbgh_install "$TMP/lbgh-broken"
+( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
+    LB_GH="$TMP/lbgh-ok" bash "$LANE" 107 feat/107-tm daniel-ospina/agent-infra ) > "$TMP/lane-107.out" 2>&1
+l107rc=$?
+{ [ "$l107rc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB an inherited LB_GH cannot open the gate (rc=$l107rc): the measurement is the box's own gh, and a dead one HOLDS" $rc
+
+# ⛔ A BACKGROUND WORKER IS A CREATION WORKER TOO (review cycle 1, P2). `nonblocking-dispatch.sh`
+# exports KIND=bg and calls the SAME run_agent; an allow-list on KIND=lane left it unmeasured.
+lbgh_install "$TMP/lbgh-deep"
+: > "$PI_LOG"
+( O="$O" KIND=bg TAG=107 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             printf "prompt\n" > "$2/bg.txt"; run_agent 5 "$2/bg.log" "$2/bg.txt" "bg 107"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+bgrc=$?
+{ [ "$bgrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§LB a KIND=bg (nonblocking-dispatch) creator IS gated (rc=$bgrc) - the gate is a deny-list, not KIND=lane" $rc
+
+# ⛔ THE TWO RULES IN THE SIZING FUNCTION ARE MEASURED, NOT ASSERTED IN PROSE (review cycle 1, P3).
+# (i) PAGING: 150 open served as 100 + 50 must read as 150. A one-page reader sees 100 and allows.
+outpg="$(lb_drive "$TMP/lbgh-paged" 24 5)"; rpg=$?
+{ [ "$rpg" -eq 1 ] && grep -q '^LAND-BACKLOG 150 open' <<<"$outpg"; }; rc=$?
+ck "§LB the open count is PAGED (150 served as 100+50 reads as 150 open, not 100) ('$outpg')" $rc
+# (ii) BEST OF TWO WINDOWS: 10 landings today, 40 yesterday, 30 open -> OK. A latest-window-only
+# reader gets ceiling 10, holds, and would tighten the limit every time a bad day lowers throughput.
+outpw="$(lb_drive "$TMP/lbgh-prior" 24 5)"; rpw=$?
+{ [ "$rpw" -eq 0 ] && grep -q '^OK 30 open' <<<"$outpw"; }; rc=$?
+ck "§LB lambda is the BEST of the two 24h windows (10 today / 40 yesterday -> ceiling 40 -> OK, not a hold) ('$outpw')" $rc
+
+# ⛔ A FIXER IS NEVER GATED BY THIS. `fix-one.sh` runs with KIND=fixer and its product IS a push to an
+# open PR, i.e. the drain. Driven, not grepped: a broken measurement must not stop it.
+: > "$PI_LOG"
+lbgh_install "$TMP/lbgh-broken"
+( O="$O" KIND=fixer TAG=42 \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             printf "prompt\n" > "$2/p.txt"; run_agent 5 "$2/fix.log" "$2/p.txt" "fixer 42"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
+frc=$?
+{ [ "$frc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "§LB a FIXER (KIND=fixer) is never held by the creation gate, even on a broken measurement (rc=$frc)" $rc
+# …and it is structurally off every LANDING path, so a deep backlog cannot stop the work that drains it.
+lb_on_landing=""
+for f in orch-loop.sh merge-one.sh fix-one.sh dispatch-merge.sh chain-merge.sh; do
+  grep -q 'land_backlog' "$HERE/$f" 2>/dev/null && lb_on_landing="$lb_on_landing $f"
+done
+[ -z "$lb_on_landing" ]; rc=$?
+ck "§LB no landing/merge script references the gate (checked:$([ -n "$lb_on_landing" ] && echo "$lb_on_landing" || echo ' none, as intended'))" $rc
+
+# …and the AWAIT side maps `land` to its own exit code and its own words, because the remedy is not a
+# capacity transfer: no peer box can clear a repo-wide backlog.
+acquire_claim 106
+NOW2="$(date +%s)"; EP2=$(( NOW2 - 1 ))
+printf '%s\t%s\t%s\n' "$EP2" "$(( EP2 + 900 ))" "land" > "$O/state/capacity-refused-106"
+run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+  CHAIN_CLAIM_COMMIT="$(chain_gen 106)" \
+  bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 106 feat/106-tm
+{ [ "$BOUNDED_RC" -eq 74 ]; }; rc=$?
+ck "§LB chain-merge.sh maps a 'land' record to exit 74 (got $BOUNDED_RC) — not 75, not a 90-minute wait" $rc
+grep -q 'land-backlog: lane-106' "$O/logs/chain-106.log"; rc=$?
+ck "§LB …and says it is NOT a capacity transfer (the remedy is to land, not to wait for a peer)" $rc
+
+# ── the derivation, driven directly, so the SIZING RULE is a measurement and not a slogan ──
+# Little's law in practice: L_max = λW. 40 landings/24h with a 24h lead budget allows 40 open; with a
+# 48h budget it allows 80. A fixed count could not tell agent-infra (0.6/h) from tortoise (2.6/h).
+lbgh_shape "$TMP/lbgh-40"     40 0 40 0
+lbgh_shape "$TMP/lbgh-81of40" 81 0 40 0
+out24="$(lb_drive "$TMP/lbgh-40" 24 5)"; rc24=$?
+out48="$(lb_drive "$TMP/lbgh-40" 48 5)"; rc48=$?
+out41="$(lb_drive "$TMP/lbgh-81of40" 24 5)"; rc41=$?
+{ [ "$rc24" -eq 0 ] && [ "$rc48" -eq 0 ] && [ "$rc41" -eq 1 ]; }; rc=$?
+ck "§LB sizing is Little's law: 40 open against λ=1.7/h is OK at a 24h and a 48h budget, and 81 is LAND-BACKLOG ('$out24' / '$out41')" $rc
+outmin="$(lb_drive "$TMP/lbgh-broken" 24 5)"; rcm=$?
+{ [ "$rcm" -eq 2 ] && grep -q '^UNREADABLE' <<<"$outmin"; }; rc=$?
+ck "§LB an unreadable ratio returns 2 (hold) and the line STARTS with UNREADABLE — the three states are exhaustive" $rc
+
 
 echo
 echo "───────────────────────────────────────"

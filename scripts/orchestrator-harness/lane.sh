@@ -116,7 +116,11 @@ EOF
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, `gate` one of `load` or `disk`. The epoch is
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, `gate` one of `load`, `disk` or `land`.
+# (`land` is the CREATION back-pressure refusal, agent-infra#2409 — see run_agent in spawn-gate.sh.
+# It is written by the same line and read by the same two readers; chain-merge.sh maps it to exit 74
+# and says in its own words that it is NOT a capacity transfer, because no peer box can clear a
+# repo-wide backlog.) The epoch is
 # what makes the record PER-DISPATCH: a chain compares it against its own start time, so a record
 # left by an earlier run of the same issue can never make a live lane's chain exit early.
 # ⛔ The gate is named, not implied, for the reason lane.sh's own reporting line below spells out: a
@@ -155,14 +159,27 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `load` and `disk` are the only
-  # two values the gate can refuse on; the disk one is chosen by the same code the exit status
-  # already distinguishes, so the two can never disagree.
+  # CAPACITY TRANSFER block above for the format and its two readers. `load`, `disk` and `land` are
+  # the three values the gate can refuse on, and each is chosen by the code its own caller already
+  # distinguishes, so the record can never disagree with the exit status.
   if [ -n "${capacity_record:-}" ]; then
-    if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk; else _cap_gate=load; fi
+    case "$rc" in
+      "${AGENT_DISK_REFUSED:-77}") _cap_gate=disk ;;
+      "${AGENT_LAND_BACKLOG:-74}") _cap_gate=land ;;
+      *)                          _cap_gate=load ;;
+    esac
+    # ⛔ A `land` REFUSAL GETS A SHORT STAND-DOWN, AND THE REASON IS THE POINT OF THE WHOLE RECORD.
+    # For load/disk the window is a CAPACITY TRANSFER: this box is short, a peer may not be, so standing
+    # down long is the useful thing. A `land` refusal is REPO-WIDE — every box measures the same open
+    # count against the same landing rate, so a long yield would only circulate the issue through every
+    # peer's claim/spawn/measure cycle for an answer that cannot differ (review cycle 1, P3). 120s is
+    # enough to cover the chain's ordering slack (CAPACITY_REFUSAL_GRACE_SECS, 60) and to let a landing
+    # that is already in flight change the ratio, which is the one event that can clear it.
+    _cap_yield="$CAPACITY_YIELD_SECS"
+    [ "$_cap_gate" = "land" ] && _cap_yield=120
     _cap_now="$(date +%s)"
-    if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + CAPACITY_YIELD_SECS ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
-      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
+    if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + _cap_yield ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
+      echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal will still release the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi
@@ -176,6 +193,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
   if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
+    # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
+    # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
+    # already idle; the reading they need is the repo's open-PR count against its landing rate, which
+    # is on the `[land-backlog] REFUSED` line in the same log.
+    echo "[lane $N] NOT started: LAND-BACKLOG — the repo holds more open PRs than its own measured landing rate can absorb (#2409), so new creation is held. This is NOT a capacity refusal: the box is fine and waiting will not clear it. The work is the PR queue — review, rebase or land an open PR; a P0-blocker or a base-red repair is exempt by evidence. Issue returns to the pool." >> "$O/logs/lane-$N.log"
   else
     echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
   fi
