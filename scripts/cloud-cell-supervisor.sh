@@ -592,8 +592,15 @@ controller_unit_state() {
   local out
   out="$(sup_systemctl is-enabled "$CONTROLLER_UNIT" 2>/dev/null)"
   case "$out" in
-    enabled|enabled-runtime) return 0 ;;
-    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|transient|alias) return 1 ;;
+    # ⛔ THE WHOLE TABLE, not the words that came to mind (review P2). `not-found` and `bad` are DEFINITE
+    # answers ("this manager does not have a usable unit"), and folding them into "cannot read" made
+    # `start` refuse on a box that is simply not service-managed — the case a failed `daemon-reload`
+    # during install leaves behind (file on disk, manager has not loaded it). `alias` is exit 0 in
+    # systemd's table (the unit IS enabled through an alias); scoring it as "disabled" would start a tmux
+    # controller beside a boot-enabled unit, the #1761 duplicate. `generated`/`transient`/`indirect` are
+    # not enabled-by-unit-file, so they stay on the "not service-managed" side.
+    enabled|enabled-runtime|alias) return 0 ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|transient|not-found|bad) return 1 ;;
   esac
   return 3
 }
@@ -605,7 +612,7 @@ controller_unit_active_state() {
   out="$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null)"
   case "$out" in
     active|reloading|activating) return 0 ;;
-    inactive|failed|deactivating|maintenance|unknown) return 1 ;;
+    inactive|failed|deactivating|maintenance|unknown|not-found|bad) return 1 ;;
   esac
   return 3
 }
@@ -1821,6 +1828,15 @@ cmd_start() {
     # enough, and the fence makes a double-kill safe.)
     end_loop_pid || say "warn: the doctor loop survived the abort and could not be ended"
     rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"
+    # ⛔ A UNIT THIS START STARTED IS NOT KILLED BY ANY OF THE ABOVE (review P1, #2402). The delegated start
+    # hands the controller to the service manager, so the teardown above ends nothing — and under
+    # `Restart=always` ANY kill would be undone within RestartSec anyway. The only way to leave nothing
+    # running, which is what this function promises, is to stop the unit. Best-effort: a failure is said
+    # out loud, because the operator's `stop` has already returned successfully.
+    if controller_unit_path >/dev/null 2>&1; then
+      sup_systemctl stop "$CONTROLLER_UNIT" >/dev/null 2>&1 \
+        || say "warn: a STOP arrived, but $CONTROLLER_UNIT could not be stopped — it may restart the controller within RestartSec (systemctl stop $CONTROLLER_UNIT)"
+    fi
     return 0
   }
   # ── SERVICE MODE ADOPTS A RUNNING CONTROLLER (agent-infra#2402) ─────────────────────────────────
@@ -1831,18 +1847,26 @@ cmd_start() {
   # `failed` exactly when the box empties, so the defect survives the fix (and now has a failed unit to
   # explain). So the unit WAITS for the controller that is already running and takes over when it goes;
   # the live controller keeps landing its PRs in the meantime.
-  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+  # ⛔ IT WAITS ON THE SESSION TOO, NOT JUST ON A PID (review P2). The wait's first version broke as soon
+  # as `owned_controller_pids` went empty, so a lingering tmux session with no owned pid — the orphaning
+  # `cmd_stop` documents, where the pane's `bash … | tee` outlives the loop — fell through to the
+  # "already running" branches below and returned 0. Under `Restart=always` that is three orderly exits
+  # and a `failed` unit, i.e. the P1 this wait exists to remove, in the state the migration itself
+  # produces. The branch-level returns are therefore not reachable in service mode (they hand over).
+  foreground_handover() {
     local _own _saidd=0
     while :; do
       _own="$(owned_controller_pids 2>/dev/null)" \
         || die "cannot read the process table (ps) — refusing to start on an unreadable read"
-      [ -n "$_own" ] || break
-      [ "$_saidd" = 1 ] || say "controller already running (pid $(_pids_join "$_own")) — this unit supervises the cell now: waiting for it to exit, then taking over (a stop or a restart ends this wait)"
+      if [ -z "$_own" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then break; fi
+      [ "$_saidd" = 1 ] || say "controller already running (${_own:+pid $(_pids_join "$_own")}${_own:-tmux session '$SESSION'}) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
       sleep 5
       superseded && return 1
     done
-  fi
+    return 0
+  }
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
   # Every value below is interpolated into the session command string, so every one must be
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
@@ -1877,6 +1901,9 @@ cmd_start() {
     seen0="$(seen_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
     if [ -n "$down" ]; then
+      # ⛔ SERVICE MODE NEVER RETURNS 0 HERE (see foreground_handover): an orderly exit is a start/exit
+      # loop under `Restart=always`, and the handover is what makes the unit converge instead.
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
       say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
@@ -1892,6 +1919,7 @@ cmd_start() {
     # `start` spends in check/seed — report it, do not refuse), or the session belongs to ANOTHER
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
       start_doctor_loop
       superseded && return 1
@@ -1947,8 +1975,13 @@ cmd_start() {
       # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.
       # Reporting success on an is-active alone is the false green this file refuses elsewhere — a unit can
       # be `active` while its controller died before it took the lock.
+      # ⛔ 600 s, NOT THE 60 s THE REST OF THIS FILE USES (review P2, #2402). The unit's ExecStart runs the
+      # WHOLE of `start` — harness_apply (a git fetch into a detached worktree) and cmd_check (network
+      # reads) — BEFORE the loop takes the lock, and cloud-cell-doctor.sh already defaults this same call
+      # to 600 s. At 60 s a healthy service-managed start was reported as FATAL while its controller came
+      # up a minute later, and the doctor recorded the restart as failed.
       local waited=0
-      while [ "$waited" -lt "${CONTROLLER_START_TIMEOUT:-60}" ]; do
+      while [ "$waited" -lt "${CONTROLLER_SERVICE_START_TIMEOUT:-${CONTROLLER_START_TIMEOUT:-600}}" ]; do
         if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
         sleep 1; waited=$((waited + 1))
       done
@@ -2226,6 +2259,21 @@ cmd_stop() {
   if controller_unit_path >/dev/null 2>&1; then
     if sup_systemctl stop "$CONTROLLER_UNIT" 2>/dev/null; then
       stop_unit="$CONTROLLER_UNIT"
+      # ⛔ A SUCCESSFUL `stop` ON THE UNIT WE ADDRESSED IS NOT PROOF THE CONTROLLER IS GONE (review P3,
+      # #2402). The scope is "the first unit FILE found", which is not necessarily "the unit that is
+      # running": with two unit files on the box (an image-baked disabled system unit plus the live user
+      # unit) the stop lands on the wrong manager, the live unit's `Restart=always` brings the controller
+      # straight back, and the pid reads below can conclude before the new controller writes its lock —
+      # so this verb would print "controller stopped (systemd …)" over a live dispatcher. Verify the
+      # EFFECT, like every other read in this function: nothing of this state dir alive after the stop.
+      local _sw=0
+      while [ "$_sw" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
+        if [ -z "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
+        sleep 1; _sw=$((_sw + 1))
+      done
+      if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then
+        say "warn: $CONTROLLER_UNIT was stopped but a controller of this state dir (pid $(_pids_join "$(owned_controller_pids)")) is STILL running after ${_sw}s — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"; rc=1
+      fi
     else
       say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
     fi
