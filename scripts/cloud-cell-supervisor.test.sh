@@ -768,8 +768,16 @@ stub_missing "$P/bin" pi
 cat > "$P/bin/tmux" <<'SH'
 #!/bin/bash
 case "${1:-}" in
-  has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
-  new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
+  has-session)
+    # #2306: the doctor session is made to FAIL its launch while the controller's still succeeds, so
+    # the two new-session calls are told apart by NAME (the doctor session is `cell-doctor`).
+    case " $* " in *"=cell-doctor"*) [ -n "${PROV_TMUX_FAIL:-}" ] && exit 1 ;; esac
+    [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
+  new-session)
+    case " $* " in
+      *"-s cell-doctor"*) [ -n "${PROV_TMUX_FAIL:-}" ] && { printf 'server exited unexpectedly\n' >&2; exit 1; } ;;
+    esac
+    : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
   ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then
         # BARE names, like `tmux ls -F '#{session_name}'`: the census reads the field, not the
         # human description, so a stream of "merge-1: x" lines names no worker at all.
@@ -1014,6 +1022,32 @@ prov start
 GOT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
 [ "$GOT" = "$WANT" ] && ok "start recorded origin/main's commit, not the stale tree it was pointed at" \
                      || bad "start recorded '$GOT', want '$WANT'"
+
+# (g2) A PRESENT DOCTOR THAT FAILS TO LAUNCH IS NOT A RETIRED ARTIFACT (agent-infra#2306).
+# The measured cell had the doctor at $O/cloud-cell-doctor.sh — `doctor_path` had already succeeded, or
+# it would have warned the other way — while `tmux new-session` printed "server exited unexpectedly"
+# into a DISCARDED stderr. `start` then reported "cloud-cell-doctor.sh not shipped" (a false CAUSE:
+# #2160's retirement message, for a file that was right there) and returned 0 (a false SUCCESS).
+PROV_TMUX_FAIL=1 prov start
+case "$PROV_OUT" in
+  *"not shipped"*) bad "start: blamed a retired artifact for a LAUNCH failure (the doctor is IN \$O)" ;;
+  *) ok "start: does not report a doctor that is present as 'not shipped'" ;;
+esac
+case "$PROV_OUT" in
+  *"LAUNCH failure"*) ok "start: names the launch failure for what it is" ;;
+  *) bad "start: the launch failure is not named — $(printf '%s' "$PROV_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+case "$PROV_OUT" in
+  *"server exited unexpectedly"*) ok "start: carries tmux's own stderr into the report (it was discarded)" ;;
+  *) bad "start: tmux's stderr was dropped — $(printf '%s' "$PROV_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+[ "$PROV_RC" -ne 0 ] && ok "start: a present-but-unlaunchable doctor is NOT a successful start" \
+                     || bad "start: returned 0 with no doctor loop running (a false success)"
+# …and the POSITIVE control: the same fixture WITHOUT the launch failure starts the doctor loop and
+# returns 0, so the arm above is decided by the failure and not by a fixture that always fails.
+prov start
+[ "$PROV_RC" -eq 0 ] && case "$PROV_OUT" in *"doctor loop started"*) ok "start: the same fixture with a working tmux starts the doctor loop (non-vacuity)" ;; *) bad "start: no doctor-loop start reported — $(printf '%s' "$PROV_OUT" | tail -2 | tr '\n' ' ')" ;; esac \
+                     || bad "start: the control arm failed — $(printf '%s' "$PROV_OUT" | tail -2 | tr '\n' ' ')"
 
 # (h) THE FREE-SPACE FLOOR — a full disk is what breaks a cell FIRST, and it used to read healthy.
 # ⛔ PH is re-read from the record FIRST: (g) left it pointing at the diverged tree, so without this
@@ -3143,7 +3177,13 @@ while [ $# -gt 0 ]; do case "$1" in -s|-t) n="$2"; shift 2 ;; *) shift ;; esac; 
 n="${n#=}"
 case "$sub" in
   has-session) [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
-  new-session) [ -n "$n" ] && : > "$S/up.$n"; exit 0 ;;
+  new-session) [ -n "$n" ] && : > "$S/up.$n"
+               # ⛔ #2306: the supersede fence used to be reached only because a flat `sleep 2` gave a
+               # racing `stop` its window. The launch now returns as soon as the session appears, so
+               # the arm triggers the stop INSIDE the launch — deterministic, and still exactly the
+               # "a stop landed while start was running" shape it has to cover.
+               [ -n "${AI1989_BUMP_GEN:-}" ] && printf '9\n' > "$AI1989_BUMP_GEN"
+               exit 0 ;;
   kill-session) [ -n "$n" ] && rm -f "$S/up.$n"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -3178,14 +3218,17 @@ rm -f "$W2/o/state/roles/.stop-generation"
 SG2="$W2/state.supersede2"; rm -rf "$SG2"; mkdir -p "$SG2"
 : > "$W2/o/state/roles/.stop-generation"
 : > "$SG2/up.ai1989-busy-$$"        # the controller session already exists
-( sleep 1; printf '9\n' > "$W2/o/state/roles/.stop-generation" ) & SUP_BG2=$!
 SUP_SRC2=0
+# ⛔ The stop is triggered from INSIDE the launch (#2306). A flat `sleep 2` in the doctor launch used
+# to supply this window, and it was the only reason this arm could pass: with the launch returning as
+# soon as tmux reports the session, a `( sleep 1; bump )` race would land AFTER the fence had already
+# been checked — green on the clock, not on the fence.
 env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG2" AI1711_SOCK="" \
+    AI1989_BUMP_GEN="$W2/o/state/roles/.stop-generation" \
     CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
     SESSION="ai1989-busy-$$" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
     HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
     bash "$SUP" start >"$W2/start.supersede2.out" 2>&1 || SUP_SRC2=$?
-wait "$SUP_BG2" 2>/dev/null || true
 [ "$SUP_SRC2" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.supersede2.out" \
   && ok "start: the 'already running' heal is fenced too (rc=$SUP_SRC2, not a silent re-arm)" \
   || bad "start: the already-running heal ignored a concurrent stop (rc=$SUP_SRC2) — $(tail -2 "$W2/start.supersede2.out" | tr '\n' ' ')"

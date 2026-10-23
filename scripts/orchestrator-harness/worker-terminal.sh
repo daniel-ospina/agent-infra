@@ -438,7 +438,17 @@ wt_forget() {
 # The program is held in a variable and passed with `-c`, NOT fed to python through a heredoc:
 # stdin carries the daemon's JSON, and a heredoc here consumes it, leaving `json.load` to read the
 # program text. Measured: the census silently returned nothing, which reads exactly like "no workers".
-WT_TREE_PY="$(cat <<'PY'
+#
+# ⛔ THE HEREDOC LIVES IN A FUNCTION BODY, AND THE SUBSTITUTION CARRIES NONE (#2248). Apple ships
+# bash 3.2, which mis-parses a heredoc nested inside a command substitution: the WORDS OF THE
+# HEREDOC BODY are executed as commands, and the mis-parse runs on into the rest of the file. At
+# `WT_TREE_PY="$(cat <<'PY'"` the comment ending `…like "no workers".` was executed as a command,
+# then `WT_TREE_PY: unbound variable`, and every function below it was never defined — so the
+# controller died AT SOURCE TIME on macOS while `launchctl` and `harness verify` both said GREEN
+# (box log: `controller … alive but the heartbeat is 3652s old`). `bash -n` PASSES on the broken
+# form — it is a runtime mis-parse, not a syntax error — so nothing catches it until a macOS box
+# sources the file. Function-body-then-substitute parses identically under 3.2 and 5.x; keep it.
+_wt_tree_py_body() { cat <<'PY'
 import json,sys
 try:
     d=json.load(sys.stdin)
@@ -487,7 +497,8 @@ for n,v in sorted(state.items()):
 for tid,v in sorted(run.items()):
     print("t:%s\t%s" % (tid, "alive" if v else "dead"))
 PY
-)"
+}
+WT_TREE_PY="$(_wt_tree_py_body)"
 wt_tree_probe() { # stdin: `cmux tree --json`; stdout: "w:<worker>"|"t:<terminal-id>" TAB verdict
   python3 -c "$WT_TREE_PY" 2>/dev/null
 }
@@ -496,7 +507,8 @@ wt_tree_probe() { # stdin: `cmux tree --json`; stdout: "w:<worker>"|"t:<terminal
 # `term<TAB><terminal-id>` for its `wt-<name>` workspace. Needed because the census counts a worker
 # whose RECORD is gone (a wiped $O/state, a lane from an older harness) — and a reap that cannot
 # resolve that worker leaves it holding a slot forever while logging "could NOT be proven gone".
-WT_WS_PY="$(cat <<'PY'
+# ⛔ FUNCTION BODY, NOT AN INLINE HEREDOC IN THE SUBSTITUTION — see the bash 3.2 note above (#2248).
+_wt_ws_py_body() { cat <<'PY'
 import json,sys
 name=sys.argv[1]
 try:
@@ -525,7 +537,8 @@ for s in d.get("screens",[]) or []:
 for k,v in seen:
     print("%s\t%s" % (k,v))
 PY
-)"
+}
+WT_WS_PY="$(_wt_ws_py_body)"
 
 # The tmux half of the census: session names, read once. Exact membership (`grep -qx`), never `-t`
 # prefix matching — `tmux has-session -t fix-82` matches `fix-820`, which is how a healthy worker

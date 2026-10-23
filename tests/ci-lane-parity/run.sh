@@ -460,7 +460,16 @@ echo ""
 echo "8n. SWEEP BODY NEUTERED → the RUNNER must fail at runtime (and pass unneutered)"
 # A synthetic cheap shard replaces every listed target so this pair costs ~1s instead of the
 # whole suite, while keeping the runner's own self-check arithmetic (listed == executed) intact.
-CHEAP="scripts/check-no-sigpipe-grep.sh"
+#
+# The stand-in MUST be hermetic: its rc has to depend on nothing but itself. It was
+# `scripts/check-no-sigpipe-grep.sh` until 2026-10-23 — a REPO-WIDE guard, so its verdict was a
+# function of every file in the tree. Five `printf … | grep -q` idioms in
+# `scripts/orchestrator-harness/lander.test.sh` (#2301) therefore reddened THIS control fixture on
+# every PR, reported as `the control fixture returned rc 1` — a message that blames the fixture and
+# never names the cause (another job's subject, `sigpipe-grep-guard`). It also cost 9.6 s per
+# invocation × 59 replaced shards × 2 sites, i.e. ~38 min of this suite's runtime. Never point
+# CHEAP at anything whose rc can move without this file changing.
+CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
 awk -v cheap="$CHEAP" '
   /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
   { print }
@@ -905,7 +914,7 @@ echo ''
 echo '8ac7. A DUPLICATED SHARD LIST -> rc 2 (a repeated target is not extra coverage)'
 # 13 of the 14 lines pointed at one cheap script: any length floor is satisfied while 13 suites
 # never run (ledger-sourced, cycle 2 — the substitution variant of the runner-body residual).
-awk -v cheap="scripts/check-no-sigpipe-grep.sh" '
+awk -v cheap="$CHEAP" '
   /^run_shard [a-z]/ && n < 13 { print "run_shard " cheap; n++; next }
   { print }
 ' "$RUNNER" >"$TMP/runner-dupes.sh"

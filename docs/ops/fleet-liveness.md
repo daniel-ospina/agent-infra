@@ -716,6 +716,21 @@ boundary below is stated rather than implied. It lives in **`scripts/lib/fleet-i
 point — `scripts/orchestrator-bringup.sh` (`check | start | stop | restart | status`), the same script
 that owns the per-`(machine, repo)` redundancy guard. No fourth launcher.
 
+### The same doctrine on the CELL DOCTOR loop (#2306)
+
+`scripts/orchestrator-harness/cloud-cell-doctor.sh status` derives every role row from ONE three-valued
+read of the loop's record — `alive` / `dead:<reason>` / `unknown:<reason>` / `absent:<reason>` — because
+its predecessor answered yes/no, so `return 1` folded "the recorded incarnation is GONE" and "I could
+not read the record" into one no, and the rows ignored it entirely: `loop: NOT RUNNING` printed *beside*
+four `WAITING … 274s ago` rows that quoted the dead loop's start time as if it were progressing. The
+states are this document's, not a new vocabulary — identity decides first and is the only source of
+`dead`; an unreadable read is a NAMED abstention (`UNKNOWN`, exit 3), never a death witness; `absent`
+(no record at all) is neither, because nothing was unreadable *and* there is no incarnation whose death
+could be witnessed. `WAITING` — a promise that something is in progress — is only printed under an
+`alive` loop with a transcript that moved inside the worst-case pass window: a live pid is a process,
+not a scheduler. `DEAD` never falls through to a clean last pass: a dead scheduler means no further
+pass, whatever the last one said.
+
 **`status` prints one table and its exit code is the worst row:**
 
 ```
