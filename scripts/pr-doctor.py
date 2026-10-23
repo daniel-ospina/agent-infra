@@ -1933,14 +1933,14 @@ def read_rc(path: str):
 
 
 def gate_refused(name: str, code) -> bool:
-    """True iff a 75/77 `.rc` was written by the GATE, not by a `pi` that exited 75 itself.
+    """True iff a 74/75/77 `.rc` was written by the GATE, not by a `pi` that exited 74/75 itself.
 
-    Both codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
+    The codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
     two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
     ran, record it"). The discriminator is durable and already on disk: `spawn-gate.sh` appends
-    `[load-gate] REFUSED` / `[disk-gate] REFUSED` to the worker log BEFORE run_agent returns, and
-    the harness writes `.rc` only after that -- so at the instant the code is readable the marker
-    is too. A `pi` that failed on its own writes no gate line.
+    `[load-gate] REFUSED` / `[disk-gate] REFUSED` / `[land-backlog] REFUSED` to the worker log BEFORE
+    run_agent returns, and the harness writes `.rc` only after that -- so at the instant the code is
+    readable the marker is too. A `pi` that failed on its own writes no gate line.
 
     The READ is bounded to the first REFUSAL_LOG_WINDOW bytes: a refusal verdict is written at the
     head of a freshly truncated log, so a short read answers the question and a log big enough to
@@ -2387,6 +2387,39 @@ class _UsageParser(argparse.ArgumentParser):
         raise SystemExit(rc)
 
 
+def dispatcher_kind_support() -> str:
+    """'' when `$O/nonblocking-dispatch.sh` takes the repair kind, else WHY IT CANNOT.
+
+    ⛔ A STALE DISPATCHER SILENTLY DOWNGRADES EVERY REPAIR TO A CREATION SPAWN (#2409, review cycle 4
+    P2-2, measured). This file passes `prfix` as the dispatcher's 5th argument so its PR-REPAIR workers
+    are not held by the creation back-pressure gate. The copy it actually reaches is
+    `$O/nonblocking-dispatch.sh`, which `install.sh` seeds and which can be OLDER than the shipped one
+    (the same hazard the PIPE-SHAPE note above records). An older copy ignores an extra argument with
+    no error and hardcodes `KIND=bg`, so on exactly the condition the gate exists for -- a deep backlog
+    -- pr-doctor's repairs are refused again, and NOTHING at spawn time says the kind was dropped. Two
+    drift instruments (check-deployed-drift.sh, the provenance stamp) report that the COPY differs, but
+    neither says "the drain is now gated".
+
+    Refusing is the honest response: a pass that cannot spawn repair workers must not report a quiet
+    queue. The marker below is the dispatcher's own vocabulary line, and the test suite pins that the
+    shipped script still carries it, so this check cannot rot into a false refusal.
+    """
+    try:
+        with open(NONBLOCKING_DISPATCH) as fh:
+            src = fh.read(200000)
+    except OSError as e:
+        # A MISSING dispatcher is not this check's business: `worker_live()` reports it as an
+        # unreadable transport and the pass refuses on that axis already.
+        return "" if not os.path.exists(NONBLOCKING_DISPATCH) else \
+            "the dispatcher cannot be read (%s)" % e
+    if "is not bg or prfix" in src:
+        return ""
+    return ("$O/nonblocking-dispatch.sh predates the repair kind: it has no `[bg|prfix]` argument, so "
+            "it would ignore the `prfix` argv and spawn every repair as `KIND=bg` — which the creation "
+            "back-pressure gate HOLDS exactly when the backlog is deep, i.e. pr-doctor could not drain "
+            "the queue it exists for. Refresh $O with install.sh (agent-infra#2409)")
+
+
 def main() -> int:
     # ⛔ ASSIGNED BEFORE THE PARSE, THEN RE-ASSIGNED FROM THE PARSED FLAGS. `record_exit` can be
     # reached by `_UsageParser.error()` while no flag has been parsed, so a run whose flags are
@@ -2432,6 +2465,12 @@ def main() -> int:
         log("REFUSING: the classifier seam is stale -- %s" % SEAM_ERROR)
         return record_exit(EXIT_REFUSING, "the classifier seam is stale -- %s" % SEAM_ERROR,
                            read="seam")
+    # ⛔ THE TRANSPORT'S OWN CAPABILITY, CHECKED BEFORE ANY ORDER IS PLACED (#2409, review cycle 4
+    # P2-2). Same axis as the seam: an order this file cannot deliver must not be reported as a pass.
+    kind_why = dispatcher_kind_support()
+    if kind_why:
+        log("REFUSING: %s" % kind_why)
+        return record_exit(EXIT_REFUSING, kind_why, read="transport")
     # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review), and neither is `--dry-run` or
     # `--status`: everything downstream -- the empty-queue exit, `un_owned`, `issue_work` -- is
     # computed from a ONE-PR universe, so recording it would publish `queue is empty` while PRs are

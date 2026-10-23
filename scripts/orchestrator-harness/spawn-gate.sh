@@ -304,13 +304,12 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # itself reduces it — which is the direction we want, and it is bounded by the floor.
 #
 # ⛔ IT NEVER BLOCKS LANDING, AND THAT IS STRUCTURAL, NOT A PROMISE. This module is sourced by the
-# CREATION callers (lane.sh, nonblocking-dispatch.sh) and the fixer (fix-one.sh); `run_agent` applies the
-# gate for every KIND **except** `fixer` and `reviewer`. That is a DENY-LIST on purpose: `bg` creators
-# (nonblocking-dispatch.sh) were the first thing an allow-list on `KIND=lane` missed, and a KIND nobody
-# has written yet is gated by default instead of riding through unmeasured. A fixer (KIND=fixer) and
-# every merge path (merge-one.sh, chain-merge.sh, orch-loop.sh) never reach this code, so a deep backlog
-# cannot stop the very work that drains it. Pinned by test-gates.sh's structural arm, which asserts no
-# landing script mentions these functions.
+# CREATION callers (lane.sh, nonblocking-dispatch.sh) and the fixer (fix-one.sh); `run_agent` gates
+# every KIND except `fixer` and `reviewer` (which their own scripts set), and `prfix` — which a lane
+# CAN name in an argument — only when the worktree's branch cannot be shown to have an open PR. A
+# fixer (KIND=fixer) and every merge path (merge-one.sh, chain-merge.sh, orch-loop.sh) never reach this
+# code, so a deep backlog cannot stop the very work that drains it. Pinned by capacity-transfer.test.sh
+# §LB, which asserts no landing script mentions these functions.
 #
 # ⛔ NO AMBIENT BYPASS. There is deliberately no `LB_SKIP`/`LAND_BACKLOG_OFF` variable: an env var
 # that opens the gate is not a gate (the same rule spawn-gate.sh's own PI_GATE_REFUSED docstring and
@@ -425,14 +424,44 @@ land_backlog_verdict() { # <owner/repo> [<lead-hours = TEST SEAM>] [<min-ceiling
   # defeats the purpose. The rate stays (it is the readable figure) and the DERIVATION is stated in
   # the units it is actually computed from: the best 24h window's landing count times the lead.
   if [ "$open" -gt "$ceiling" ]; then
-    printf 'LAND-BACKLOG %s open / %s.%s landings per hour (ceiling %s = %s landings in the best 24h window x %sh lead / 24h%s) — hold new creation, land the open queue first\n' \
+    printf 'LAND-BACKLOG %s open / %s.%s landings per hour (ceiling %s = ceil(%s landings in the best 24h window x %sh lead / 24h)%s) — hold new creation, land the open queue first\n' \
       "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$peak" "$lh" \
-      "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ' , floored at %s' "$minc" )"
+      "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ', floored at %s' "$minc" )"
     return 1
   fi
-  printf 'OK %s open / %s.%s landings per hour (ceiling %s = %s landings in the best 24h window x %sh lead / 24h%s)\n' \
+  printf 'OK %s open / %s.%s landings per hour (ceiling %s = ceil(%s landings in the best 24h window x %sh lead / 24h)%s)\n' \
     "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$peak" "$lh" \
-    "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ' , floored at %s' "$minc" )"
+    "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ', floored at %s' "$minc" )"
+  return 0
+}
+
+# ⛔ THE `prfix` EXEMPTION'S EVIDENCE (review cycle 4, P2-1): an OPEN PR must be THIS worktree. That is
+# the property that separates repair from creation — creation is on a branch/commit with no PR yet —
+# and unlike a declared KIND it is not something a lane can type into an argument. Two rules, because
+# a worktree reaches a PR in two shapes; either one is proof, and neither is a bypass:
+#   1. the BRANCH rule — `pr-doctor` checks out the PR's head branch, so `gh pr list --head <branch>`
+#      finds it in one cheap call (the common case);
+#   2. the HEAD-SHA rule — a FORK PR's worktree is a DETACHED `refs/pull/<n>/head` (README: "THERE IS
+#      NO BRANCH HERE TO PUSH"), so there is no branch name to ask about; the PR is still identifiable
+#      by the commit it points at, which pr-doctor has just fetched.
+# Any unreadable answer returns 1, so an unprovable claim is HELD rather than trusted (the same polarity
+# as the verdict itself). A creation worker passes neither rule: its HEAD is a commit no PR owns yet.
+land_backlog_open_pr_evidence() { # <owner/repo> -> prints the open PR number, rc 0 iff proven
+  local or_="${1:-}" br sha n
+  case "$or_" in */*) ;; *) return 1 ;; esac
+  br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  case "$br" in ''|HEAD|*[!A-Za-z0-9._/-]*) br="" ;; esac
+  if [ -n "$br" ]; then
+    n="$(gh pr list --repo "$or_" --head "$br" --state open --json number --jq 'length' 2>/dev/null)" || n=""
+    if is_num "$n" && [ "$n" -ge 1 ]; then printf '%s\n' "$n"; return 0; fi
+  fi
+  sha="$(git rev-parse HEAD 2>/dev/null)" || return 1
+  case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; *) return 1 ;; esac
+  n="$(gh pr list --repo "$or_" --state open --limit 200 --json number,headRefOid \
+        --jq "[.[]|select(.headRefOid==\"$sha\")][0].number // empty" 2>/dev/null)" || return 1
+  # `>= 1` as well as numeric: PR numbers start at 1, so a `0` from a stub (or a `// 0`) is NOT a PR.
+  { is_num "$n" && [ "$n" -ge 1 ]; } || return 1
+  printf '%s\n' "$n"
   return 0
 }
 
@@ -589,10 +618,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   #   * A DENY-LIST, not an allow-list (review cycle 1, P2). It read `KIND = lane` at first, so
   #     `nonblocking-dispatch.sh`'s background worker (`KIND=bg`) — "a fleet lane in every respect
   #     except that nobody waits for it" by its own header — was never measured, and every future
-  #     KIND would inherit the hole. The kinds this gate must never hold are named instead, because
-  #     their product IS the drain: `fixer` pushes to an open PR, `reviewer` produces the verdict
-  #     that lets one land, and `prfix` (pr-doctor's repair worker) rebases/fixes an ALREADY OPEN PR.
-  #     No merge path calls run_agent at all, so they need no entry.
+  #     KIND would inherit the hole. The kinds this gate must never hold unconditionally are named
+  #     instead, because their product IS the drain: `fixer` pushes to an open PR and `reviewer`
+  #     produces the verdict that lets one land. No merge path calls run_agent at all, so they need no
+  #     entry.
   # ⛔ `prfix` EXISTS BECAUSE `KIND` IS NOT A CREATION/REPAIR DISCRIMINATOR (review cycle 2, P1).
   # pr-doctor dispatches EVERY repair through nonblocking-dispatch.sh, which hardcoded `KIND=bg` —
   # so gating `bg` refused the very workers that repair the backlog, in exactly the state that
@@ -600,15 +629,32 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # <name> <wt> <brief> <timeout> [bg|prfix]`, default `bg`), so a caller DECLARES what it is
   # spawning instead of the spawn inheriting a creation label. An undeclared caller still gets
   # `bg` and is still gated: the default is the refusing direction.
+  # ⛔ BUT `prfix` IS NOT AN EXEMPTION ON THE CALLER'S WORD (review cycle 4, P2-1). `fixer`/`reviewer`
+  # are set by the two scripts that DO the work; `prfix` comes from an argv a LANE can type
+  # (`bash $O/nonblocking-dispatch.sh … 300 prfix`), so trusting it made a one-argument bypass of the
+  # gate — reproduced: rc=143, worker started, on a repo 5.4x over its ceiling. It is now PROVEN from
+  # GitHub: the worktree's own branch must already have an OPEN PR. That is the property that actually
+  # separates repair from creation — creation happens on a branch with no PR yet — and it costs one
+  # `gh pr list` on prfix spawns only. Unprovable (no open PR, or the read failed) → HELD.
   case "${KIND:-}" in
-    fixer|reviewer|prfix) : ;;
+    fixer|reviewer) : ;;
     *)
-    local lb_repo lb_line lb_rc lb_why=""
+    local lb_repo lb_line lb_rc lb_why="" lb_pr
     if ! lb_repo="$(land_backlog_repo)"; then
       echo "[land-backlog] REFUSED $label: UNREADABLE repo — this worktree's origin is not a GitHub owner/name slug, or repo-slug.sh is missing, so the landing ratio cannot be measured. Creation is HELD (a measurement that cannot be read is never an OK); landing is unaffected." >> "$log"
       return "$AGENT_LAND_BACKLOG"
     fi
-    if lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
+    if [ "${KIND:-}" = "prfix" ]; then
+      if lb_pr="$(land_backlog_open_pr_evidence "$lb_repo")"; then
+        echo "[land-backlog] EXEMPT $label: KIND=prfix and branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null) already has OPEN PR #$lb_pr — repairing an open PR is the drain, not the accumulation (#2409)" >> "$log"
+        # ⛔ NOT `return 0`: this function GOES ON TO START THE AGENT. An early return here would exempt
+        # the worker by never spawning it — the suite caught it (`rc=0` with an empty pi log) on the first
+        # run of the evidence arm, which is exactly why that arm asserts the spawn and not only the code.
+      else
+        echo "[land-backlog] REFUSED $label: KIND=prfix was DECLARED but could not be PROVEN — this worktree's branch has no OPEN PR (or the gh read failed), and a declared kind is not evidence. A creation worker that names itself prfix would otherwise switch the gate off, so creation is HELD. Actually repairing an open PR, or a P0-blocker / base-red repair, is exempt." >> "$log"
+        return "$AGENT_LAND_BACKLOG"
+      fi
+    elif lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
       echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
     else
       lb_line="$(land_backlog_verdict "$lb_repo")"; lb_rc=$?

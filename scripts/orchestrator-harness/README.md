@@ -153,9 +153,9 @@ without a human in the loop:
   free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
   account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
   mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
-  worker gate's own refusal, whatever it bound on (that gate binds on **load or disk**; the
-  lanes/swap/memory terms belong to the controller's separate gate, which refuses before any claim is
-  taken), because load is a
+  worker gate's own refusal, whatever it bound on (that gate binds on **load, disk or land** — the
+  last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap/memory terms
+  belong to the controller's separate gate, which refuses before any claim is taken), because load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
@@ -2784,10 +2784,26 @@ the work that drains it). The dispatcher now takes the kind as an **argument** �
 `nonblocking-dispatch.sh <name> <wt> <brief> <timeout> [bg|prfix]`, default `bg` — and refuses any other
 value, so a caller DECLARES what it spawns and an undeclared caller still gets the refusing default.
 The exempt set is therefore: `fixer` (fix-one.sh: pushes to an open PR), `reviewer` (merge-one.sh: the
-verdict that lets one land), `prfix` (pr-doctor: rebases/fixes an already-open PR). No merge path calls
-`run_agent`, so a deep backlog can never stop the work that drains it (`capacity-transfer.test.sh`
-asserts the shell paths AND the non-shell ones — the pr-doctor declaration, its argv, and the
-dispatcher's closed vocabulary).
+verdict that lets one land), `prfix` (pr-doctor: rebases/fixes an already-open PR — **PROVEN from
+GitHub**, see below). No merge path calls `run_agent`, so a deep backlog can never stop the work that
+drains it (`capacity-transfer.test.sh` asserts the shell paths AND the non-shell ones — the pr-doctor
+declaration, its argv, and the dispatcher's closed vocabulary).
+
+⛔ **A DECLARED KIND IS NOT EVIDENCE, SO `prfix` IS PROVEN.** `fixer`/`reviewer` are set by the two
+scripts that do the work; `prfix` arrives in an argv a **lane can type** (`bash $O/nonblocking-dispatch.sh
+… 300 prfix`), so exempting it on the caller's word was a one-argument bypass — reproduced in review
+cycle 4: a worker started on a repo 5.4× over its ceiling. The gate now proves it from GitHub: an OPEN
+PR must be **this worktree**, either because the branch it has checked out is that PR's head ref, or
+(because a fork PR's worktree is a detached `refs/pull/<n>/head`) because its HEAD commit is the PR's
+head. Neither is available to a creation worker — its HEAD is a commit no PR owns yet. Unprovable (no
+such PR, or the read failed) → **HELD**, with a refusal that says the claim could not be proven rather
+than reporting a backlog reading.
+
+⚠️ **AND A STALE `$O` COPY WOULD SILENTLY UNDO THE EXEMPTION**, so `pr-doctor` refuses its whole pass
+when the deployed dispatcher predates the kind argument (it would ignore the extra argv and spawn every
+repair as `KIND=bg`): `REFUSING: $O/nonblocking-dispatch.sh predates the repair kind … refresh with
+install.sh`, exit 2, recorded. A drift instrument can see that the copy differs; none of them can say
+“the drain is now gated”, which is what this refusal says.
 
 The verdict is a **named state, never a silent pass** — exactly one line, first word the state:
 

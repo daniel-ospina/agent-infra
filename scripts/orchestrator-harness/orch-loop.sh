@@ -1514,7 +1514,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   local yld="${5:-0}" ynote=""
   case "$yld" in ''|*[!0-9]*) yld=0 ;; esac
   if [ "$yld" -gt 0 ]; then
-    ynote=" | yields=$yld (yielded to peers for capacity — this is NOT \"the fleet has nothing to do\"; they stay free for other boxes until their yield expires)"
+    # ⛔ THE WORDS MUST MATCH THE GATE (#2409). A `land` refusal is REPO-WIDE: every box measures the
+    # same open count against the same landing rate, so telling the operator (and the funnel) that this
+    # was "for capacity" and the item is "free for other boxes" is FALSE for it — the remedy is to land
+    # an open PR, on this box or any other. `capacity_yield_live` exports the gate, so the sentence can
+    # name it instead of assuming load.
+    ynote=" | yields=$yld (stood down by a GATE refusal — this is NOT \"the fleet has nothing to do\"; a load/disk stand-down leaves them free for other boxes, a land-backlog one is repo-wide and clears only by landing)"
   fi
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
@@ -1864,6 +1869,7 @@ CAPACITY_YIELD_WHY=""
 capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consume), 1 = dispatch
   local n="${1:-}" f ep until gate now
   CAPACITY_YIELD_WHY=""
+  CAPACITY_YIELD_GATE=""
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   f="$O/state/capacity-refused-$n"
   [ -r "$f" ] || return 1
@@ -1878,6 +1884,9 @@ capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consu
   # yield, and `until - ep` is the window the writer used. Accept only a coherent pair.
   [ "$until" -gt "$ep" ] || return 1
   CAPACITY_YIELD_WHY="gate=${gate:-?} until=$until ($(( until - now ))s left)"
+  # The GATE, for callers whose words depend on it (#2409): a `land` refusal is repo-wide, so the
+  # dispatch line must not claim the item is a peer's to take.
+  CAPACITY_YIELD_GATE="${gate:-}"
   return 0
 }
 
@@ -3998,7 +4007,11 @@ PY
       # the `parked-*` failure R8 names, on a per-machine capacity signal.
       if capacity_yield_live "$ISS"; then
         Y=$((Y+1))
-        echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        if [ "${CAPACITY_YIELD_GATE:-}" = "land" ]; then
+          echo "[dispatch] #$ISS stood down — this box refused it at the LAND-BACKLOG gate (the repo's open-PR backlog is over its own landing ceiling; repo-wide, so NO peer can clear it by waiting — the remedy is to land an open PR) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        else
+          echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        fi
         continue
       fi
       # ── PLACEMENT: the LEAST-LOADED ELIGIBLE BOX takes it (measured, agent-infra 2026-10-21) ─────
