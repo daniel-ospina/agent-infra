@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-done-not-exited.test.py — seventeen real process trees, plus the controls the review demanded.
+"""pi-done-not-exited.test.py — eighteen real process trees, plus the controls the review demanded.
 
 WHY PROCESS FIXTURES AND NOT MOCKS
 The bug is a property of REAL PROCESSES — a `pi` whose launcher is blocked on it, a log on its fd 1,
@@ -35,6 +35,7 @@ THE CASES — each guards a different way to be wrong
  14. BOUND       a control lane the first pass never reaps (the `--min-idle` bound, both directions).
  15. PEER (×2)   two `pi`, ONE cwd, ONE transcript, started inside the canon's fence ⇒ both are
                  `peer-claimed` and neither may use that boundary — including under `--pid`.
+ 16. COMMENT     a launcher that mentions print mode ONLY in a comment ⇒ refused (`code_only()`).
 
 THREE SEQUENTIAL CONTROLS (not fixtures):
   * BOUND      a DONE-shaped lane that the first pass never reaps: not reaped at `--min-idle 100000`,
@@ -44,7 +45,7 @@ THREE SEQUENTIAL CONTROLS (not fixtures):
   * REFUSED    the pre-signal re-check must REFUSE a target whose incarnation moved, and the summary
                must say `refused 1` with exit 1 (cycle-1 P1: a refused target was counted as reaped).
 
-`--mutations` re-runs this suite against TEN mutated copies of the tool and requires each to go RED
+`--mutations` re-runs this suite against ELEVEN mutated copies of the tool and requires each to go RED
 (fold `abstain` into `stalled`, drop the growth veto, drop the open-turn veto, drop the log-only
 arm's silence bound, stop re-asking the log at signal time, grant `tag` for any TAG). Prose cannot prove a
 suite has teeth; this can, in CI, which is why the repo's other zero-dep suites carry the same mode.
@@ -148,7 +149,7 @@ MARKER = ("[reflect-hook] Hosted tortoise capture OFF (cloud-not-enabled) — se
 
 def launcher_script(root: str, tag: str, cwd: str, logname: str, *, append: bool = False,
                     ignore_term: bool = False, child: bool = False,
-                    no_print: bool = False) -> str:
+                    no_print: bool = False, comment_mentions: bool = False) -> str:
     """A real lane launcher: TAG exported AND ASSIGNED, `pi` on fd 1, `.rc` written AFTER it exits."""
     log = os.path.join(root, "logs", logname + ".log")
     rc = os.path.join(root, "logs", tag + ".rc")
@@ -156,9 +157,14 @@ def launcher_script(root: str, tag: str, cwd: str, logname: str, *, append: bool
     redirect = ">>" if append else ">"
     arg = " child" if child else ""
     pm = "" if no_print else "-p "
+    # ⛔ A COMMENT IS NOT PRINT MODE (cycle 5/6). `lane.sh` and `merge-one.sh` both mention print
+    # mode in prose, so a launcher that only DOCUMENTS it must not pass the predicate that decides
+    # whether an idle interactive agent may be signalled.
+    note = "# this lane runs pi -p, see run_agent in spawn-gate.sh\n" if comment_mentions else ""
     path = os.path.join(root, "lane-%s.sh" % tag)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/bash\n"
+                 + note +
                  "export TAG=%s\n"
                  "cd %s || exit 4\n"
                  "%s"
@@ -281,7 +287,7 @@ def main() -> int:
     def case(tag: str, entry, marker: bool = True, transcript: bool = True, logname: str = None,
              append: bool = False, ignore_term: bool = False, child: bool = False,
              fresh_log: bool = False, interpolate: bool = False, positional: bool = False,
-             no_print: bool = False) -> int:
+             no_print: bool = False, comment_mentions: bool = False) -> int:
         cwd = os.path.join(root, "wt-" + tag)
         os.makedirs(cwd)
         started = time.time()
@@ -289,7 +295,8 @@ def main() -> int:
         script = (launcher_interpolating(root, tag, cwd, ln, child=child, inherit_tag=interpolate,
                                          positional=positional) if interpolate
                   else launcher_script(root, tag, cwd, ln, append=append, ignore_term=ignore_term,
-                                       child=child, no_print=no_print))
+                                       child=child, no_print=no_print,
+                                       comment_mentions=comment_mentions))
         # ⛔ WEAK: the TAG is INHERITED from this process, never named by the launcher — the shape
         # cycle 2 measured (`TAG=zombiepi` on a `lane-railprobe.sh` row). A launcher that names the
         # tag (argv, `TAG=`, `<tag>.rc`, or the log it redirects) is `tag`, and correctly so.
@@ -332,6 +339,7 @@ def main() -> int:
     # which is the shipped `lane.sh <N>` shape and the basis cycle 3 added.
     argv_pid = case("argvtag", TURN_ENDED, transcript=False, interpolate=True, positional=True)
     case("interactive", TURN_ENDED, transcript=False, no_print=True)   # `pi` with no -p: refused
+    case("commentonly", TURN_ENDED, transcript=False, no_print=True, comment_mentions=True)
     case("freshlog", TURN_ENDED, transcript=False, fresh_log=True)
 
     # ── PEER: two `pi`, ONE cwd, ONE transcript, started inside the canon's fence (cycle 5, P2-2:
@@ -394,7 +402,8 @@ def main() -> int:
     writer.start()
 
     tags = ["done", "live", "hung", "abstain", "nosession", "shared", "shared2", "child", "survive",
-            "noowner", "weak", "freshlog", "argvtag", "interactive", "peerA", "peerB"]
+            "noowner", "weak", "freshlog", "argvtag", "interactive", "peerA", "peerB",
+            "commentonly"]
     pids = [procs[t] for t in tags]
     proc, rows = run_tool(sessions, pids, ["--authorise-hostless"])
     writer.join(timeout=5)
@@ -492,6 +501,13 @@ def main() -> int:
           "population, not the requested subset (got %r)"
           % prows.get(procs["peerA"], {}).get("cls"))
 
+    check(cls("commentonly") == "UNATTRIBUTABLE"
+          and "interactive-or-unknown-mode" in why("commentonly"),
+          "15/16 COMMENT: a launcher that mentions print mode ONLY IN A COMMENT does not satisfy the "
+          "predicate (got %r)" % cls("commentonly"))
+    check(os.path.exists("/proc/%d" % procs["commentonly"]),
+          "15/16 COMMENT: --apply did NOT touch it")
+
     check(rows.get(procs["argvtag"], {}).get("owner") == "tag"
           and cls("argvtag") == "DONE-NOT-EXITED",
           "12/14 ARGV: a launcher whose ONLY basis is the tag on its own argv (`bash lane-argvtag.sh "
@@ -499,7 +515,7 @@ def main() -> int:
           "(got %r: %r)" % (rows.get(procs["argvtag"], {}).get("owner"), cls("argvtag")))
 
     check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 4,
-          "exactly 4 of the 16 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
+          "exactly 4 of the 17 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
           "survive, and the last of those ignored SIGTERM): a detector that reaped all, or none, "
           "fails here")
 
@@ -579,7 +595,7 @@ def main() -> int:
                     "always-false" % why_still)
 
     cleanup()                     # kills the groups AND removes the root
-    print("\nALL ASSERTIONS HELD (16 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
+    print("\nALL ASSERTIONS HELD (17 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
           "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
     return 0
@@ -627,12 +643,16 @@ def run_mutations() -> int:
          "    if rung is not None and not PRINT_MODE.search(code_only(_read(launcher))):",
          "    if False:"),
         ("the peer-claimed guard disabled", "    if path and path in peers:", "    if False:"),
+        ("code_only() reverted to identity (inline/whole-line comments count again)",
+         '        code = ln.split("#", 1)[0]', '        code = ln'),
         ("--pid binds only the requested subset",
          "    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)",
          "    binds, peers = bind_map(pool, rows, pids, opts.ref_s)"),
     ]
-    for label, old, new in mutations:
+    def one(label_old_new):
+        label, old, new = label_old_new
         tmp = tempfile.mkdtemp(prefix="pi-dne-mut-")
+        ROOT.append(tmp)                     # removed by cleanup() even if this run is killed
         try:
             shutil.copytree(os.path.join(SCRIPTS, "..", "tools", "fleet"),
                             os.path.join(tmp, "tools", "fleet"))
@@ -654,13 +674,30 @@ def run_mutations() -> int:
                                                                 "pi-done-not-exited.test.py")],
                                   capture_output=True, text=True, timeout=900)
             if proc.returncode == 0:
-                fail("mutation %r was NOT caught — the suite stayed green, so the assertion that "
-                     "should guard it is inert" % label)
-            print("ok   mutation caught: %s → suite RED (rc=%d)" % (label, proc.returncode))
+                return (label, False, proc.returncode)
+            return (label, True, proc.returncode)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            if tmp in ROOT:
+                ROOT.remove(tmp)
+
+    # ⛔ THREE AT A TIME. Sequentially the control is ~11 x 90 s of wall clock; a control that
+    # cannot finish inside a CI step is a control that gets disabled. Each run owns its temp root and
+    # its own fixtures, so they do not interact.
+    from concurrent.futures import ThreadPoolExecutor
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for res in pool.map(one, mutations):
+            results.append(res)
+    missed = [r[0] for r in results if not r[1]]
+    for label, caught, rc in results:
+        if caught:
+            print("ok   mutation caught: %s → suite RED (rc=%d)" % (label, rc))
+    if missed:
+        fail("NOT caught (the suite stayed green, so the assertion that should guard them is inert): "
+             + "; ".join(missed))
     print("\nALL MUTATIONS CAUGHT (%d/%d): the suite can go RED for each defect it claims to guard"
-          % (len(mutations), len(mutations)))
+          % (len(results), len(mutations)))
     return 0
 
 

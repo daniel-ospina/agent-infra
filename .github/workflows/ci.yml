@@ -315,7 +315,7 @@ jobs:
         # 46 bare `pi`, 27 finished, oldest 6 h 21 m). `pi-done-not-exited.py` imports the canon's
         # turn boundary (`tools/fleet/liveness.py`) and the pool owner's session binding / gate 2
         # (`scripts/orphan-reap.py`) and adds ONE predicate: launcher ownership (`TAG` in the
-        # process's own environ). The suite builds SEVENTEEN real process trees (a script named `pi`, a
+        # process's own environ). The suite builds EIGHTEEN real process trees (a script named `pi`, a
         # real launcher, a real fd-1 log, a pi-named transcript) plus a control lane, and requires
         # BOTH directions: the finished ones are reaped, while a growing log, an OPEN turn, an
         # ABSTAINING turn boundary, a shared log, a live child, a SIGTERM-ignoring target and a
@@ -330,7 +330,7 @@ jobs:
         # log-growth veto dropped, the open-turn veto dropped, the log-only arm's silence bound
         # dropped, the pre-signal log re-read removed, `tag` granted for ANY TAG, the argv ownership
         # rung deleted, the print-mode predicate deleted, the peer-claimed guard disabled, and `--pid`
-        # binding only the requested subset — and requires the suite to fail.
+        # binding only the requested subset, and `code_only()` reverted — and requires the suite to fail.
         run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was

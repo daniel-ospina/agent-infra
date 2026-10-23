@@ -175,9 +175,18 @@ def code_only(text: Optional[str]) -> str:
     ⛔ A FREE-TEXT `search()` OVER THE WHOLE FILE is how a comment satisfies a safety predicate:
     `lane.sh` documents its own `run_agent` in prose and `merge-one.sh` has `pi -p` in a comment, so
     a launcher that only MENTIONS print mode would pass the predicate that exists to keep an
-    interactive agent from being signalled (cycle 5, P2). Comments are not code.
+    interactive agent from being signalled (cycle 5, P2).
+    ⛔ AND A TRAILING COMMENT IS STILL A COMMENT (cycle 6): `TAG=1  # run_agent does the spawn` and
+    `echo 'usage: run_agent [opts]'` both matched. Everything from the first `#` is dropped —
+    deliberately OVER-stripping, because every lost match can only produce an ABSTENTION here, never
+    a signal, and that is the correct direction for a predicate that permits a kill.
     """
-    return "\n".join(ln for ln in (text or "").splitlines() if not ln.lstrip().startswith("#"))
+    out = []
+    for ln in (text or "").splitlines():
+        code = ln.split("#", 1)[0]
+        if code.strip():
+            out.append(code)
+    return "\n".join(out)
 MIN_IDLE_S = 120                  # see the derivation in classify()'s guard, and the docstring
 LAUNCHER_SCRIPT = r"(?:^|\s)(/\S+\.sh)(?:\s|$)"   # a shell running a SCRIPT, not a `-c` one-liner
 RUNNERS = ("lane.sh", "nonblocking-dispatch.sh", "merge-one.sh", "chain-merge.sh", "fix-one.sh")
