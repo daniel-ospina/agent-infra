@@ -173,6 +173,12 @@ PY
     # driven line carries a reading instead of an empty field (see the extraction above).
     . "$TMP/spawntok.sh"
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
+    # ⛔ AND `is_num`, WHICH THE BLOCKS CALL TOO (review of #1732; pre-existing, latent, same class).
+    # `arm.sh`'s cap guards do `is_num "$NF" || NF=0`: with the predicate UNDEFINED that is
+    # `command not found` (discarded with stderr), so a drive that seeds `fixcount-<PR>` reads 0 and
+    # silently grades the UNCAPPED path — the cap assertions would pass against a cap that never
+    # bound. No drive seeds one today, which is why this was invisible rather than red.
+    . "$TMP/isnum.sh"
     # shellcheck disable=SC1090
     . "$TMP/arm.sh"
   ) >/dev/null 2>&1
@@ -231,6 +237,7 @@ PY
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     . "$TMP/shq.sh"
     . "$TMP/spawntok.sh"
+    . "$TMP/isnum.sh"        # the blocks' `is_num "$NFC" || NFC=0` guards (see drive() for why)
     L=0; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=9000; MEM_UNKNOWN=0
     . "$TMP/disp.sh"
     for _once in 1; do
