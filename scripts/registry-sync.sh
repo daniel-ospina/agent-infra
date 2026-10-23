@@ -178,20 +178,31 @@ field() { # <file> <name>
 # and the run reported `wrote=1 … unreadable=0`, exit 0). So usability is checked BEFORE a peer
 # record may win or be installed, and an unusable one is counted `unreadable` (exit 4).
 record_usable() { # <file> → 0 when this box's reader can use it
-  local f="$1" head verdict
-  head="$(field "$f" head_sha)"
-  [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || return 1
-  verdict="$(field "$f" verdict)"
-  [ -n "$verdict" ] || return 1
-  # The reader's own strictness, not a second parser of our own: `json.load` refuses trailing
-  # garbage that a field-wise sed happily reads past. python3 is already a hard dependency of
-  # `read_record`, so this adds none that the consumer does not already have.
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 -c 'import json,sys
+  local f="$1"
+  # ⛔ THE CHECK IS THE READER'S OWN, at the TOP LEVEL of the JSON — not `field` (a greedy sed that
+  # takes the LAST match on the line). A record whose top-level `head_sha` is empty but which
+  # carries a nested 40-hex one inside, say, an `evidence` object PASSED the old sed-based gate and
+  # was installed over a usable local record; `read_record` then read `head_sha=''` and refused
+  # ("carries no usable head_sha") — the exact regression this gate exists to prevent, reached
+  # through the value parse instead of the syntax parse.
+  command -v python3 >/dev/null 2>&1 || {
+    warn "  ⚠️ python3 is not available, so a record cannot be checked against this box's reader — refusing to install one."
+    return 1
+  }
+  python3 - "$f" <<'PY' >/dev/null 2>&1 || return 1
+import json, re, sys
 try:
-    json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[1]))
 except Exception:
-    sys.exit(1)' "$f" >/dev/null 2>&1 || return 1
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+h, v = d.get("head_sha", ""), d.get("verdict", "")
+if not (isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{40}", h)):
+    sys.exit(1)
+if not (isinstance(v, str) and v.strip()):
+    sys.exit(1)
+PY
   return 0
 }
 
@@ -204,12 +215,16 @@ except Exception:
 # names an intermediate head rather than the peer's, is still reported as a conflict — that is
 # genuinely ambiguous ordering, and rule 4 says report rather than guess.)
 same_stamp_relation() { # <a> <b> → a | b | same | conflict
-  local a="$1" b="$2" av bv ah bh am bm
+  local a="$1" b="$2" av bv ah bh am bm amb bmb
   av="$(field "$a" verdict)"; bv="$(field "$b" verdict)"
   # A different VERDICT is the one real disagreement at a shared mint time — unchanged.
   if [ -z "$av" ] || [ "$av" != "$bv" ]; then printf 'conflict'; return 0; fi
   ah="$(field "$a" head_sha)"; bh="$(field "$b" head_sha)"
   am="$(field "$a" mint)";     bm="$(field "$b" mint)"
+  # The merge base is GATE-READ (the rail's B10/B12 comparison; clean-low's binding), so two records
+  # that agree on verdict and head but disagree on it are a real disagreement, not provenance.
+  amb="$(field "$a" merge_base_sha)"; bmb="$(field "$b" merge_base_sha)"
+  if [ -n "$amb" ] && [ -n "$bmb" ] && [ "$amb" != "$bmb" ]; then printf 'conflict'; return 0; fi
   if [ "$ah" = "$bh" ]; then
     # Same head, same verdict: provenance-only. Prefer the carried side if exactly one is carried;
     # two carries of one head are the same record for every reader, so neither is written.
@@ -273,7 +288,7 @@ fetch_refs() {
   [ -z "$listing" ] && return 0
   # NOT `--prune` (rule 2), and no longer load-bearing for the key list: it only carries objects.
   if ! git_b fetch --no-tags --quiet "$REMOTE" '+refs/reviews/*:refs/reviews/*' >/dev/null 2>&1; then
-    warn "registry-sync.sh: the FETCH from '$REMOTE' failed while the store still lists refs — this run"
+    warn "registry-sync.sh: ⚠️ the FETCH from '$REMOTE' failed while the store still lists refs — this run"
     warn "  continues from the store's own listing, and every record whose objects are not already here"
     warn "  is reported UNREADABLE (exit 4) rather than answered from a stale local ref."
   fi
@@ -384,7 +399,7 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
     case "$(same_stamp_relation "$f" "$tmp")" in
       a) rm -f "$tmp"; DEC="supersede"; DEC_MSG="same mint time, same head, and THIS box's record is the carried one; publishing it as a supersession" ;;
       b) rm -f "$tmp"; DEC="skip"; DEC_MSG="same mint time and the peer's record is the carried one (same head, same verdict)" ;;
-      same) rm -f "$tmp"; DEC="same"; DEC_MSG="same mint time, head and verdict — only carry provenance differs" ;;
+      same) rm -f "$tmp"; DEC="same"; DEC_MSG="same mint time, verdict, head and merge base — the records differ only in carry provenance" ;;
       *) rm -f "$tmp"; DEC="conflict" ;;
     esac
     return 0
@@ -397,6 +412,13 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
 # a `carried_from` that names <other>'s head. Anything else is a disagreement, not a supersession.
 supersedes() {
   [ "$(field "$1" mint)" = "carried" ] || return 1
+  # ⛔ A CARRY MAY NOT SUPERSEDE A DISAGREEING VERDICT. `supersedes` runs BEFORE
+  # `same_stamp_relation` (whose first act is the verdict comparison), so without this test a
+  # carried `clean` was published straight over a peer's `not-clean` at the SAME mint time —
+  # silently replacing a refusal with a mergeable verdict on the fleet-visible record AND on the
+  # pulling box (both reproduced). A legitimate carry re-binds the SAME verdict, so nothing real
+  # is lost by requiring it.
+  [ "$(field "$1" verdict)" = "$(field "$2" verdict)" ] || return 1
   local from
   from="$(field "$1" carried_from)"
   [ -n "$from" ] || return 1
@@ -461,8 +483,14 @@ pull_one() { # <key>
     # The ref exists (it came from remote_refs) but carries no readable record.json: that is a
     # DEFECT in the store, not "nothing to pull". Reported, because `status` would otherwise list
     # it as `missing here` forever while every other verb said "converged".
-    if [ -n "$(git_b rev-parse --verify --quiet "refs/reviews/$key" 2>/dev/null || true)" ]; then
-      warn "  ⚠️ skip $key — the peer's ref carries no readable record.json."
+    # ⛔ THE TEST IS THE STORE'S OWN LISTING, never this box's cache. It used to be
+    # `git rev-parse refs/reviews/$key`, which succeeds only when the box ALREADY cached the ref —
+    # so a store ref whose OBJECTS were never fetched (a failed fetch, or a box that had never seen
+    # it) was skipped with no counter and no warning, and `union` exited 0 over a registry it did
+    # not receive: the false "converged" this file exists to delete, in the one state a BLIND box
+    # is in. The key came from the store's listing, so the store demonstrably has the ref.
+    if [ -n "$(store_oid "$key")" ]; then
+      warn "  ⚠️ skip $key — the store lists this ref but its record.json is not readable here (the fetch did not bring its objects)."
       UNREADABLE=$((UNREADABLE + 1))
     fi
     rm -f "$tmp"; return 0
@@ -531,7 +559,7 @@ pull_one() { # <key>
           a) pull_reason="same mint time, same head, and the peer's record is the carried one; taking it as a supersession" ;;
           b) say "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
              SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0 ;;
-          same) say "  · keep $key — same mint time, head and verdict; only carry provenance differs"
+          same) say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
              SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac

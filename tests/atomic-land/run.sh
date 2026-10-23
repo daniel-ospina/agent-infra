@@ -607,6 +607,24 @@ rc=$?
   || fail "3b: a missing registry-sync.sh blocked the landing (rc $rc)"
 grep -q 'LOCAL-ONLY' "$SCEN/err" && pass "3b: …and the box is told its registry is LOCAL-ONLY" \
   || fail "3b: a missing registry-sync.sh was silent"
+# (d) the seam's OFF arm is NAMED (a silent skip is the failure class this whole section exists for)
+new_scen registrysync-off
+SCEN_REGISTRY_SYNC=off
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "3b: SCEN_REGISTRY_SYNC=off lands and does not fail the rail" \
+  || fail "3b: the off seam changed the landing (rc $rc)"
+grep -q 'SKIPPED by request' "$SCEN/out" && pass "3b: ...and says it SKIPPED the union (never silent)" \
+  || fail "3b: the off seam skipped the union silently"
+# (e) PRODUCTION DEFAULTS TO ON — pinned as the DEFAULT EXPRESSION, because a behavioural arm would
+#     need a real store (the rail would resolve the repo's own registry-sync.sh and reach the
+#     network). This catches the exact edit that silently stops every box replicating: flipping the
+#     default to `off` leaves every other arm green (measured by mutation, #2374 cycle-2 review).
+if grep -q 'ATOMIC_LAND_REGISTRY_SYNC:-\$SELF_DIR/registry-sync.sh' "$RAIL"; then
+  pass "3b: the union's PRODUCTION default is ON (\$SELF_DIR/registry-sync.sh)"
+else
+  fail "3b: the union's default is no longer \$SELF_DIR/registry-sync.sh — every box would silently stop replicating"
+fi
 
 # ═══ 4. a draft is refused ════════════════════════════════════════════════
 echo "── 4. a draft is refused before any CI work"

@@ -538,7 +538,7 @@ assert_contains "$RS_LAST" "conflicts=0" "§21 ...and no conflict is reported"
 # the same code path in the PULL direction (rc is 4 here because §11/§11b's permanently-seeded
 # unreadable refs are on this store — the point is that KEYD is NOT a conflict)
 rs_rc "$BOX1" pull
-assert_contains "$RS_LAST" "only carry provenance differs" "§21 ...and the pulling direction reads the same supersession"
+assert_contains "$RS_LAST" "differ only in carry provenance" "§21 ...and the pulling direction reads the same supersession"
 if grep -qF "CONFLICT $KEYD" <<<"$RS_LAST"; then bad "§21 ...the pull reported a conflict for a parallel carry"; else ok "§21 ...and reports no conflict for it"; fi
 # a genuinely different VERDICT at the same stamp is still a conflict
 printf '{"pr":1515,"head_sha":"%s","mint":"carried","carried_from":"%s","verdict":"clean-micro","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-04T10:00:00Z"}\n' \
@@ -591,6 +591,78 @@ if [ "$ELAPSED" -le 12 ]; then ok "§24 ...and the run was BOUNDED (${ELAPSED}s 
 assert_eq "$(command cat "$T/prompt-env" 2>/dev/null)" "0" \
   "§24 ...and every git it spawns carries GIT_TERMINAL_PROMPT=0 (no invisible credential prompt)"
 assert_contains "$RS_LAST" "UNKNOWN, not empty" "§24 ...and the refusal says the store is UNKNOWN, not empty"
+
+# ═══ 25. cycle-2 findings: the two P1s the re-review reproduced ═════════════════
+
+# (a) the usability gate reads the TOP LEVEL of the record, like the reader does. A nested 40-hex
+#     `head_sha` (inside an `evidence` object) with an EMPTY top-level one must not pass: the old
+#     sed-based check took the LAST match on the line and let these bytes replace a usable record.
+echo "── §25 a nested head_sha does not satisfy the usability gate (the reader's parse, not a sed match)"
+ORIGIN4="$T/origin4.git"; STORE4="$T/store4"; BOX6="$T/box6"
+git init -q --bare "$ORIGIN4"
+mkdir -p "$STORE4" "$BOX6"
+git -C "$STORE4" init -q
+git -C "$STORE4" remote add origin "$ORIGIN4"
+git -C "$STORE4" config user.email sync@test.invalid
+git -C "$STORE4" config user.name  sync-test
+git -C "$STORE4" commit -q --allow-empty -m seed
+git -C "$STORE4" push -q origin HEAD:refs/heads/main
+KEYE="daniel-ospina-agent-infra-1616"
+mint "$BOX6" "$KEYE" "2026-11-07T10:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1616
+rsx "$STORE4" "$BOX6" push >/dev/null
+GOOD_E="$(command cat "$BOX6/$KEYE.json")"
+seed_payload "$STORE4" "$KEYE" '{"pr":1616,"head_sha":"","evidence":{"head_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2027-02-02T00:00:00Z"}'
+RS_LAST="$(rsx "$STORE4" "$BOX6" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§25 a record whose TOP-LEVEL head_sha is empty is refused (exit 4)"
+assert_contains "$RS_LAST" "not one this box's rail can USE" "§25 ...and the skip is named"
+assert_eq "$(command cat "$BOX6/$KEYE.json")" "$GOOD_E" \
+  "§25 the usable record SURVIVED — a nested head_sha cannot impersonate the reader's field"
+
+# (b) a CARRY may not supersede a DISAGREEING verdict. `supersedes` ran before the verdict
+#     comparison, so a carried `clean` overwrote a peer's `not-clean` at the same mint time.
+echo "── §25b a carry cannot overwrite a different VERDICT at the same mint time"
+KEYF="daniel-ospina-agent-infra-1717"
+seed_payload "$STORE4" "$KEYF" '{"pr":1717,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mint":"fresh","verdict":"not-clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-08T10:00:00Z"}'
+printf '{"pr":1717,"head_sha":"%s","mint":"carried","carried_from":"%s","carried_at":"2026-11-09T10:00:00Z","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-08T10:00:00Z"}\n' \
+  "$HEAD_B" "$HEAD_A" > "$BOX6/$KEYF.json"
+RS_LAST="$(rsx "$STORE4" "$BOX6" push 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "3" "§25b push REFUSES the carry over a different verdict (exit 3)"
+assert_contains "$RS_LAST" "CONFLICT $KEYF" "§25b ...and reports it as a divergence"
+assert_contains "$(git -C "$STORE4" show "$(git -C "$STORE4" ls-remote --refs origin "refs/reviews/$KEYF" | awk '{print $1}'):record.json")" "not-clean" \
+  "§25b the peer's not-clean record was NOT overwritten"
+RS_LAST="$(rsx "$STORE4" "$BOX6" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "3" "§25b ...and the pulling direction refuses it too"
+assert_contains "$(command cat "$BOX6/$KEYF.json")" "\"verdict\":\"clean\"" \
+  "§25b the local record is untouched (the pull did not write)"
+
+# ═══ 26. cycle-2 finding: a store ref whose OBJECTS were never fetched must not read as converged
+# The pre-fix gate was `git rev-parse refs/reviews/<key>` — TRUE only when this box already cached
+# the ref — so a fresh box whose fetch failed skipped every record with NO counter and exited 0.
+echo "── §26 a listed store ref whose objects did not arrive is UNREADABLE, never 'converged'"
+STORE5="$T/store5"; BOX7="$T/box7"
+# A fresh box that has never seen the reviews namespace: fetch only the BRANCHES, so every
+# refs/reviews object is genuinely absent. (A plain `git clone` of a LOCAL bare repo hardlinks the
+# whole object store, which silently defeats this fixture — measured.)
+git init -q "$STORE5"
+git -C "$STORE5" remote add origin "$ORIGIN4"
+git -C "$STORE5" fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+mkdir -p "$BOX7"
+SHIM2="$T/shim2"; mkdir -p "$SHIM2"
+cat > "$SHIM2/git" <<EOS
+#!/bin/sh
+case "\$*" in
+  *ls-remote*) exec "$REAL_GIT" "\$@" ;;
+  *fetch*)     echo "fatal: could not write object" >&2; exit 128 ;;
+  *)           exec "$REAL_GIT" "\$@" ;;
+esac
+EOS
+chmod +x "$SHIM2/git"
+RS_LAST="$(PATH="$SHIM2:$PATH" bash "$SYNC" pull --repo "$STORE5" --dir "$BOX7" --remote origin --timeout 10 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§26 a store whose objects could not be fetched is NOT converged (exit 4)"
+assert_contains "$RS_LAST" "not readable here" "§26 ...and each such key is NAMED, not silently dropped"
+assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
+assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
+if printf '%s' "$RS_LAST" | grep -qE 'unreadable=0'; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
