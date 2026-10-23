@@ -96,7 +96,8 @@ for N in "$@"; do
   # same line — the launcher names HOW it was spawned (durable terminal vs tmux), the token names
   # WHAT it was spawned from.
   # ⛔ THE DISCLOSURE IS NOT CONDITIONAL ON THE SPAWN SUCCEEDING (agent-infra#2215's C2 arm drives a
-  # box where the launcher REFUSES — Linux with no cmux surface — and a refusal that says nothing
+  # box where the launcher REFUSES — no surface at all (no cmux answer AND no tmux), or a spawn the
+  # credential contract refuses — and a refusal that says nothing
   # about the harness is the case where the operator most needs it: "why did this box not start a
   # lane?" and "which tree is it running?" are one question. So BOTH outcomes carry the token, and
   # the success line still only appears when the lane really started.
