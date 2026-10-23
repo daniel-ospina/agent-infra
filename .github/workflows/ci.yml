@@ -912,7 +912,7 @@ jobs:
     # against a 20-job pool). One unsharded job holding a serial sweep for hours starves CI by
     # DURATION while every capacity signal reads healthy. Two defects, and the second is why the
     # first was invisible:
-    #   1. ~71 shards ran SERIALLY in one job → the fix is the MATRIX below.
+    #   1. 74 shards ran SERIALLY in one job → the fix is the MATRIX below.
     #   2. the job declared NO `timeout-minutes` (agent-infra #2055) → a hung shard burned hours
     #      and then reddened the PR without naming itself. The bound below makes a hang FAIL FAST,
     #      and the job that trips it names the slice it was running.
@@ -944,18 +944,34 @@ jobs:
     # runner variance, and it still fails fast against the unbounded 1h52m this job shipped with.
     # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
     # of shard work) and nothing can make it shorter.
-    timeout-minutes: 75
+    #
+    # ⛔ THIS JOB BOUND IS A PURE BACKSTOP, AND THE INVARIANT IS ARITHMETIC: it sits ABOVE the sum
+    # of its steps' bounds, so it can never fire before the step that is actually running trips its
+    # OWN bound. That matters because the two produce different conclusions — a step trip is
+    # `failure` (RED), a job trip is `cancelled`, which this repo's merge rail names NON-RED. A job
+    # bound below the sum would let the non-red one win: 10 (checkout) + 10 (node) + 70 (shards) =
+    # 90 < 100.
+    timeout-minutes: 100
     strategy:
       # false: every slice reports its own result, so one hang cannot hide the other slices'
       # verdicts — the diagnostic this job lacked, since a single step reported nothing until
       # it died.
       fail-fast: false
       matrix:
-        # Slices, not shards. Width = the number of entries here (8 measured slices of 71
-        # shards, ~9 each); the runner refuses a count wider than its own list.
+        # Slices, not shards. Width = the number of entries here; the sizes (10,10,9,9,9,9,9,9) are
+        # DERIVED by the runner's own round-robin (`pos % n`) over the current 74-line list, not
+        # asserted here — they shift by one when a `run_shard` line is added, and the runner
+        # re-derives them, so nothing in this file goes stale. The runner refuses a count wider than
+        # its own list.
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      # ⛔ checkout and setup-node carry their own bounds too. Unbounded, a hang in EITHER would be
+      # caught by the JOB bound above — i.e. reported `cancelled`, which the rail reads as NON-RED,
+      # while no shard had run: all 74 shards ungated behind a non-red check, which is worse than
+      # losing one slice. `timeout-minutes` applies to `uses:` steps as well as `run:` steps (the
+      # runner sets the step deadline before `step.RunAsync()` for either kind).
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
       # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
       # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
@@ -963,11 +979,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+        timeout-minutes: 10
       - name: Bash shards — the ONE list both lanes run (#1369)
         # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
         # hand-kept number, and never a list: the list is the runner's).
         env:
           BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
+        # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
+        # `cancelled`: the service cancels the job, the job-cancellation callback sets
+        # `jobContext.Result = TaskResult.Canceled` (`StepsRunner.cs:149-155`, the `Canceled` arm at
+        # :154), and a step still running when that happens takes `TaskResult.Canceled`
+        # (`StepsRunner.cs:331-336`). (`JobRunner.cs` has NO timeout handling at all — its
+        # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.)
+        # A `cancelled` check is NON-RED to this repo's rail (`scripts/admin-merge.sh`
+        # `NON_RED_CONC`), so a job-only bound would let a PR merge with THIS slice's shards never
+        # executed — a false PASS dressed as a fail-fast, which is the #1369 shape one level up.
+        # A STEP that trips its own bound takes the other branch in the same file: at
+        # `StepsRunner.cs:324-329`, `timeoutMinutes` fires with `jobCancellationToken` NOT
+        # cancelled, so the result is `TaskResult.Failed` — which the job reports as `failure`,
+        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays ~1.9x
+        # the measured worst slice (~37 min), so it cannot false-block a slow-but-healthy slice.
+        timeout-minutes: 70
         run: bash scripts/run-bash-shards.sh
 
   bash-suites-gate:
@@ -989,15 +1022,25 @@ jobs:
     # ~1.9x the measured value: generous, because a bound BELOW the measured run would false-block
     # every PR (a red that is not a defect is how a gate loses its authority), while still failing
     # fast against the multi-hour stall this PR exists to stop.
-    timeout-minutes: 75
+    #
+    # ⛔ SAME ARITHMETIC AS `bash-suites`: the job bound sits ABOVE the sum of the step bounds below
+    # (10 + 10 + 10 + 70 = 100 < 110), so a running step always trips its OWN bound first — which is
+    # `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+        timeout-minutes: 10
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
+        # Step bounds, not just the job bound, for the reason recorded on `bash-suites` above: a
+        # step timeout is `failed` (red), a job timeout is `cancelled` (non-red to the rail).
+        timeout-minutes: 10
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        timeout-minutes: 70
         run: bash tests/ci-lane-parity/run.sh
 
   vendor-drift:

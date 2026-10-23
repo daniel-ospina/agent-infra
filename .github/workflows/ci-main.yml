@@ -388,16 +388,37 @@ jobs:
     # the real fix for the main lane's duration is sharding it like the PR lane, which is a
     # separate change (it needs its own parity-guard review: `check-ci-lane-parity` asserts THIS
     # job makes the bare call).
-    timeout-minutes: 180
+    #
+    # ⛔ THE JOB BOUND IS A PURE BACKSTOP; THE BLOCKING BOUNDS ARE ON THE STEPS BELOW. A job that
+    # trips `jobs.<id>.timeout-minutes` is reported `cancelled` — the service cancels the job, the
+    # job-cancellation callback sets `jobContext.Result = TaskResult.Canceled`
+    # (`StepsRunner.cs:149-155`, the `Canceled` arm at :154), and a step still running then takes
+    # `TaskResult.Canceled` (`StepsRunner.cs:331-336`). `JobRunner.cs` has NO timeout handling — its
+    # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.
+    # `cancelled` is NON-RED to this repo's rail (`scripts/admin-merge.sh` NON_RED_CONC) — so a
+    # job-only bound on MAIN would let a hang certify as a non-red and the tree's only unsharded
+    # sweep would silently stop gating. A STEP bound is `TaskResult.Failed` (`StepsRunner.cs:324-329`)
+    # = `failure` = red.
+    #
+    # ⛔ AND THE JOB BOUND SITS ABOVE THE SUM OF THE STEP BOUNDS, so it can never pre-empt a step:
+    # 10 (checkout) + 10 (node) + 10 (node --check) + 10 (parity) + 70 (self-test) + 110 (shards) =
+    # 220 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
+    # step-level `failure` — the whole defect this block exists to close, re-entering through the
+    # backstop. 230 is also ~2.0x the 112.4 min this job measured on PR #2412, so it cannot
+    # false-block.
+    timeout-minutes: 230
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
       # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
       # lanes run the same list under the same runtime.
       - uses: actions/setup-node@v4
+        timeout-minutes: 10
         with:
           node-version: '22'
       - name: Validate Node.js scripts
+        timeout-minutes: 10
         run: |
           errors=0
           for f in scripts/*.{cjs,mjs,js} bin/*.js; do
@@ -413,8 +434,11 @@ jobs:
         # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
         # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
         # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
+        timeout-minutes: 10
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        # 38m41s measured on PR #2412 (job 120365087427); 70 min is ~1.8x.
+        timeout-minutes: 70
         run: bash tests/ci-lane-parity/run.sh
       - name: Bash shards — the ONE list both lanes run (#1369)
         # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
@@ -422,6 +446,10 @@ jobs:
         # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
+        # 73m37s measured on PR #2412 (job 120365087427) for the whole unsharded list; 110 min is
+        # ~1.5x. STEP-level for the reason in this job's header: a job-level trip is `cancelled`
+        # and non-red to the rail, a step-level trip is `failure` and red.
+        timeout-minutes: 110
         run: bash scripts/run-bash-shards.sh
 
   skill-lint:
