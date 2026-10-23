@@ -612,6 +612,16 @@ echo "── 2b-ii. #2369 — a stale record the carry CAN re-bind still updates
 new_scen stalerecordcarry
 printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_STALE" "$REPO" \
   > "$SCEN_RECORD_FILE"
+# ⛔ THE MARKER BELONGS TO THE REVIEWED COMMIT, NOT THE LIVE HEAD (review, cycle 4). The population
+# this scenario exists to protect is the one the rail's own comment names — "a lane that updated and
+# then died at verify", i.e. record AND marker at the reviewed/before head, with the live head a
+# clean re-merge of it. `new_scen`'s default marker is bound to HEAD_OLD (the LIVE head), so the
+# faithful state was modelled by no scenario: a tightening that also required the artifact to be
+# IDENTIFIED AT THE CURRENT HEAD before the head may move — it reads like B5's authority test — left
+# this suite fully green while false-blocking the rail's own recovery path. Binding the marker here
+# reddens that mutant, and the unmodified rail stays green (the delegated probe reads the RECORD, and
+# the DIFF carry re-binds it).
+marker_fixture 42 clean "$HEAD_STALE" > "$SCEN/pr-body"
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
