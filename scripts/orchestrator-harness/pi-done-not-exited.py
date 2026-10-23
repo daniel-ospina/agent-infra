@@ -34,9 +34,11 @@ implementation is the defect #1178 removed, so every liveness fact is IMPORTED, 
   * PRE-SIGNAL DISCIPLINE — `is_pi`, `_same_incarnation`, `ancestry`, `gate2_host_decision` from the
     same file, re-run per target immediately before each `os.kill` (the #1696 lesson).
 
-The ONE predicate added is **launcher ownership**: the process's parent is a shell running a script
-(an absolute `*.sh`, or one of the repo's runners), and the process carries that launcher's own
-`TAG` in `/proc/<pid>/environ`. That is a kernel fact about WHO OWNS the process rather than an
+The ONE predicate added is **launcher ownership**, in two named rungs: `tag` — the launcher's own
+text ASSIGNS the `TAG` this process carries in `/proc/<pid>/environ` (a kernel fact on both sides);
+`launcher` — no usable TAG, but the launcher's text runs `pi`/`run_agent` AND redirects into the log
+this process holds. A TAG the launcher does NOT assign is `weak-owner` and is report-only: ownership
+then rests on the launcher's text alone, which is not what this paragraph claims. That is a kernel fact about WHO OWNS the process rather than an
 inference from an ancestry host — and it is the datum the existing reapers cannot obtain on a cell:
 
   * `cloud-cell-doctor.sh::run_reap` enumerates TMUX sessions and judges `pane_pid`; a cell lane is a
@@ -51,7 +53,8 @@ inference from an ancestry host — and it is the datum the existing reapers can
     is the only thing separating them, which is why this file states its population.
 
 ⛔ OVERRIDES: `AUTHORISE_HOSTLESS_CHAINS = False` (orphan-reap.py, #1207/#1297 option A) — that
-decision keeps a chain whose OWNER cannot be identified report-only. The chains this file acts on
+decision keeps a chain whose OWNER cannot be identified report-only, and it is NOT flipped here: the
+ARMING paragraph below is why the default pass signals nothing. The chains this file acts on
 are not ownerless: the owner is the process's own PARENT, a named launcher script that is blocked on
 this exact child (`ownership()`, rung `tag`), which is established from the kernel — `ppid` plus the
 child's own `environ` — not from an ancestry host. The seam is `ownership()`; it is the only place
@@ -81,20 +84,35 @@ THE EVIDENCE, AND WHAT EACH CHANNEL CANNOT SEE
   E. LAUNCHER STATE — `<tag>.rc` is used for VERIFICATION ONLY (after the signal, it proves the
      launcher left `wait`). It is never the reason to act: a missing `.rc` is the bug's signature.
      When the tag's `.rc` is NEWER than this process, it belongs to another invocation of the same
-     tag and the row says `rc=shared-incarnation` so nobody reads it as this lane's status.
+     tag and the row carries `rc_note: "shared-incarnation: …"`, so nobody reads that `.rc` as this
+     lane's status.
 
 CLASSES (printed for every candidate)
-  DONE-NOT-EXITED  the turn ended, CPU frozen, no live child, no human, ownership proven. The ONLY
-                   class `--apply` signals.
+  DONE-NOT-EXITED  CPU frozen, no live child, no human, ownership proven (rung `tag`/`launcher`), and
+                   EITHER the canon says `turn-ended` OR — when no transcript can be bound — an
+                   EXCLUSIVELY-held log whose last line is one of the extension's SHUTDOWN completion
+                   lines, aged past `--min-idle`. The row says which channel decided it, so "turn
+                   ended" is never claimed for a row its log decided. The only class `--apply`
+                   signals, and only under `--authorise-hostless` (see ARMING).
   HUNG             the turn is still OPEN (canon `turn-open:*`) and frozen. Reported, NEVER reaped.
   LIVE             CPU moved, a log/transcript grew, or a live child exists.
   KEEP-HUMAN       a terminal/login-shell/ssh ancestor. Never touched.
-  UNATTRIBUTABLE   a NAMED refusal — `no-owner`, `task-child`, `no-transcript`, `peer-claimed`,
-                   `shared`/`reused` log with no transcript, `ancestry-unreadable`,
-                   `cpu-unreadable`. Never reaped. An unmeasured liveness is not freedom.
+  UNATTRIBUTABLE   a NAMED refusal — `no-owner`, `weak-owner` (TAG present but not assigned by the
+                   launcher), `task-child`, `proc-unreadable`, `peer-claimed`, `shared`/`reused`/
+                   `startup` log with no usable transcript, `ancestry-unreadable`, `cpu-unreadable`.
+                   Never reaped. An unmeasured liveness is not freedom.
+  CENSUS           this process's own chain. Printed, never a candidate.
 
-PLATFORM: this tool reads `/proc`, so it is Linux-only by construction. On a box without `/proc` every
-fd/environ read abstains and the pass exits 3 (CANNOT-VERIFY) rather than reporting a clean fleet.
+⛔ ARMING IS NOT THIS FILE'S TO DECIDE. A cell lane's ancestry reaches init, so every row here is
+`hostless` — the class owner-approved option A on #1207/#1297 keeps REPORT-ONLY. Its reopen,
+**agent-infra#2391**, is still OPEN and states "No code is proposed for adoption here", so the
+DEFAULT pass reports and signals NOTHING (exit 4: a complete pass that was not authorised to act).
+`--authorise-hostless` is the named, deliberate operator act #2391 would bless; no supervisor pass
+may set it.
+
+PLATFORM: `/proc` is the platform. An unreadable `/proc/<pid>/{environ,fd}` is `proc-unreadable`, an
+abstention — so on a box without `/proc` nothing can be classified and the pass exits 3, exactly as
+promised below.
 
 USAGE
   pi-done-not-exited.py                     # dry run: classify every candidate, reap nothing
@@ -102,10 +120,12 @@ USAGE
   pi-done-not-exited.py --sample 20 --json  # longer window / machine-readable rows
   pi-done-not-exited.py --pid 1234 --apply  # one named lane only
 
-Exit: 0 = a complete pass (reaped, or nothing to do) · 1 = a target is STILL RESIDENT after
-`--apply` (it survived SIGTERM, or it was refused because its evidence changed) · 3 = CANNOT-VERIFY
-(a read did not happen, the imports are missing, every candidate abstained, or `--pid` names
-something that is not a `pi`) — never 0 on a read that did not happen.
+Exit: 0 = a complete pass that had nothing to reap · 1 = a target is STILL RESIDENT after `--apply`
+(it survived SIGTERM, or it was refused because its evidence changed at signal time) ·
+3 = CANNOT-VERIFY (a read did not happen, the imports are missing, every candidate abstained, or
+`--pid` names something that is not a `pi` / is this process's own chain) · 4 = REPORT-ONLY (DONE rows
+were found and nothing was signalled because `--authorise-hostless` was not passed) — never 0 on a
+read that did not happen, and never 0 for a pass that found work it was not allowed to do.
 """
 from __future__ import annotations
 
@@ -123,7 +143,22 @@ HERE = os.path.dirname(os.path.realpath(__file__))      # realpath: a symlinked 
 SCRIPTS = os.path.abspath(os.path.join(HERE, os.pardir))
 PROG = "pi-done-not-exited"
 
-MARKER = "[reflect-hook]"         # pi's end-of-turn hook line
+MARKER = "[reflect-hook]"         # pi's hook-line prefix
+# ⛔ A POSITIVE ALLOW-LIST, because the same prefix is printed at STARTUP (`captureStatusLine`:
+# `[reflect-hook] capture ON/OFF — …`) as well as at shutdown. A `startswith(MARKER)` test with a
+# `failed|error` exclusion called the startup line a completion (cycle 2, P1) — and on a
+# `pi -p --no-session` lane the log channel is the ONLY one, so that was a kill licence.
+COMPLETION_OK = (                # written by extensions/reflect-hook.ts AFTER the turn
+    "[reflect-hook] Hosted tortoise capture OFF (",
+    "[reflect-hook] Captured session ",
+    "[reflect-hook] Skipped — empty session",
+)
+COMPLETION_FAILED = (            # the same extension's three failure shapes
+    "[reflect-hook] Failed: ",
+    "[reflect-hook] Hosted capture FAILED (",
+    "[reflect-hook] Attribution resolution failed",
+)
+STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
 MIN_IDLE_S = 120                  # see the derivation in classify()'s guard, and the docstring
 LAUNCHER_SCRIPT = r"(?:^|\s)(/\S+\.sh)(?:\s|$)"   # a shell running a SCRIPT, not a `-c` one-liner
 RUNNERS = ("lane.sh", "nonblocking-dispatch.sh", "merge-one.sh", "chain-merge.sh", "fix-one.sh")
@@ -305,16 +340,27 @@ def ownership(pid: str, launcher: Optional[str], log: Optional[str]) -> Tuple[Op
         os.path.basename(t.strip("'\"")) == os.path.basename(log)
         for t in re.findall(r">>?\s*(\S+)", text or ""))
     if tag:
-        named = (tag in (text or "")) or writes_rc or redirects_log or known_runner
-        if named:
-            return "tag", "TAG=%s in this process's own environ names its launcher %s" % (tag, base)
-        return None, ("no-owner: TAG=%r is not named by the launcher %s (no tag, no .rc write, no "
-                      "redirect to the log this process holds)" % (tag, base))
+        # ⛔ THE BASIS MUST BE THE TAG'S OWN. Cycle 2 measured a row whose INHERITED TAG (`zombiepi`)
+        # was reported as naming a launcher (`lane-railprobe.sh`) that merely wrote *some* `.rc`.
+        # So each accepted basis below is tied to THIS tag, and the detail names the one that held —
+        # an inherited tag plus an unrelated `.rc` write is `weak`, never `tag`.
+        if re.search(r"(?m)(^|[\s;])(export[ \t]+)?TAG=['\"]?%s['\"]?(\s|;|$)" % re.escape(tag),
+                     text or ""):
+            return "tag", "its launcher %s ASSIGNS TAG=%s" % (base, tag)
+        if re.search(r">>?\s*\S*%s\.rc\b" % re.escape(tag), text or ""):
+            return "tag", "its launcher %s writes %s.rc" % (base, tag)
+        if redirects_log:
+            return "tag", "its launcher %s redirects into the log this process holds" % base
+        if writes_rc or known_runner:
+            return "weak", ("TAG=%s is neither assigned by %s nor named by its .rc, and it does not "
+                            "redirect this log — ownership rests on its text alone" % (tag, base))
+        return None, ("no-owner: TAG=%r is not assigned by the launcher %s and it neither redirects "
+                      "this log nor writes %s.rc" % (tag, base, tag))
     if not text:
         return None, "no-owner: the launcher %s is unreadable and TAG is absent" % base
     if not re.search(r"(^|\s)(pi|run_agent)(\s|$)", text) or ">" not in text:
         return None, "no-owner: the launcher %s does not invoke pi / redirect a log" % base
-    if redirects_log or writes_rc:
+    if redirects_log:
         return "launcher", "the launcher %s redirects into the log this process holds" % base
     return None, "no-owner: the launcher's log is not the one this process holds"
 
@@ -371,10 +417,14 @@ def log_marker(log: Optional[str], holders: int) -> Tuple[str, str]:
     if re.match(r"^EXIT rc=\d+\b", lines[-1]):
         return "reused", "a later invocation of the same launcher wrote EXIT rc= into this log"
     last = lines[-1]
-    if last.startswith(MARKER):
-        if re.search(r"(?i)\b(failed|error)\b", last):
-            return "hook-failed", last[:160]
+    if last.startswith(STARTUP):
+        return "startup", "the last line is the STARTUP capture status, not a completion: %s" % last[:120]
+    if any(last.startswith(f) for f in COMPLETION_FAILED):
+        return "hook-failed", last[:160]
+    if any(last.startswith(c) for c in COMPLETION_OK):
         return "ok", last[:160]
+    if last.startswith(MARKER):
+        return "absent", "an unrecognised [reflect-hook] line authorises nothing: %s" % last[:120]
     return "absent", "the last line is not a completion line: %s" % last[:120]
 
 
@@ -477,7 +527,17 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
 
     log, _src = held_log(pid)
     out["log"] = log
-    tag = (environ(pid) or {}).get("TAG")
+    env = environ(pid)
+    if env is None or log is None:
+        # ⛔ `/proc` is the platform (see the docstring). An unreadable environ or fd is NOT
+        # "no tag" and NOT "no log": it is cannot-verify, and the pass says so instead of
+        # signalling on a weaker channel (cycle 2, P2-3).
+        out.update(cls="UNATTRIBUTABLE",
+                   why="proc-unreadable: /proc/%s/%s could not be read, so ownership cannot be "
+                       "established (this tool is Linux-only by construction)"
+                       % (pid, "environ" if env is None else "fd/1"))
+        return out
+    tag = env.get("TAG")
     out["tag"] = tag
     out["rc"] = rc_path_for(launcher, tag, log)
 
@@ -577,6 +637,12 @@ def classify(pid: str, rows: Dict[str, dict], canon, pool, binds, peers, obs, op
                        "not ours to clear" % out["turn"])
         return out
 
+    if stalled is False and out["owner"] == "weak":
+        out.update(cls="UNATTRIBUTABLE",
+                   why="weak-owner: TAG is present but not assigned by the launcher, so ownership "
+                       "rests on its text alone — report only")
+        return out
+
     if stalled is False:
         if marker in ("shared", "reused"):
             out.update(cls="DONE-NOT-EXITED",
@@ -646,7 +712,11 @@ def verify_target(r: dict, canon, pool, window: float) -> Tuple[bool, str]:
         return False, "a child appeared at signal time — it may be working"
     if r.get("transcript"):
         turn = canon.turn_from_jsonl(r["transcript"])
-        if turn is not None and (turn.stalled or turn.abstain):
+        # ⛔ `None` means the boundary could not be established — an ABSTENTION, and the tool's own
+        # doctrine is that a check against an absent reading is not a check (cycle 2, P2-2).
+        if turn is None:
+            return False, "the turn boundary could not be re-established at signal time"
+        if turn.stalled or turn.abstain:
             return False, "the turn is no longer ended (%s) at signal time" % turn.reason
     # the liveness channels, re-sampled: CPU, the held log, the transcript
     c0 = pool_cpu(pool, fresh, pid)
@@ -655,9 +725,14 @@ def verify_target(r: dict, canon, pool, window: float) -> Tuple[bool, str]:
     again = pool.ps_pi_fields()
     if not again:
         return False, "CANNOT-VERIFY: the verification read returned nothing"
+    if not pool.is_pi(again.get(pid) or {}):
+        return False, "the pid is no longer a `pi` at the end of the verification window"
     c1 = pool_cpu(pool, again, pid)
-    if c0 is None or c1 is None or c1 - c0 >= pool.TOLERANCE_S:
-        return False, "cpu moved inside the verification window (%s -> %s)" % (c0, c1)
+    # ⛔ A DECREASE is not "frozen": cumulative CPU cannot shrink for a fixed process, so a lower
+    # reading means the pid was RECYCLED (or the read was truncated) — the readings are not
+    # comparable, and `classify` already refuses the same shape (cycle 2, P2-1).
+    if c0 is None or c1 is None or c1 < c0 or c1 - c0 >= pool.TOLERANCE_S:
+        return False, "cpu moved or became incomparable inside the verification window (%s -> %s)" % (c0, c1)
     if _size(r.get("log")) is not None and log_m0 is not None and _size(r.get("log")) > log_m0:
         return False, "the log grew inside the verification window"
     if _size(r.get("transcript")) is not None and j_m0 is not None and _size(r["transcript"]) > j_m0:
@@ -666,7 +741,23 @@ def verify_target(r: dict, canon, pool, window: float) -> Tuple[bool, str]:
 
 
 def apply_done(done: List[dict], canon, pool, opts) -> int:
-    """SIGTERM every DONE-NOT-EXITED; report reaped / refused / survived as THREE buckets."""
+    """SIGTERM every DONE-NOT-EXITED; report reaped / refused / survived as THREE buckets.
+
+    ⛔ A cell lane's ancestry reaches init, so every row here is `hostless` — the class owner-approved
+    option A on #1207/#1297 keeps REPORT-ONLY, and whose reopen (**agent-infra#2391**, still OPEN) says
+    "No code is proposed for adoption here". This file therefore signals nothing on that class unless
+    the operator passes `--authorise-hostless`, whose help text names the decision. The census still
+    reports every row; only the ACT is gated. Exit 4 is the repo's existing token for a complete pass
+    that judged finish-ness and was not authorised to act (the shape `lane-reap.sh` uses for a
+    policy-inert reap) — never 0, and never confused with a failed read (3).
+    """
+    if not opts.authorise_hostless:
+        print("REPORT-ONLY: %d DONE-NOT-EXITED row(s) not signalled — a cell lane's chain is "
+              "`hostless`, which #1207/#1297 option A keeps report-only and whose reopen "
+              "(agent-infra#2391) is still open. Re-run with --authorise-hostless once the owner "
+              "has ruled." % len(done))
+        print("\nreaped 0, refused 0, survived 0, report-only %d" % len(done))
+        return 4
     reaped = refused = survived = 0
     for r in done:
         pid = str(r["pid"])
@@ -715,6 +806,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="the lane must have been silent this long (transcript and log)")
     ap.add_argument("--json", action="store_true", help="print one JSON row per candidate")
     ap.add_argument("--quiet", action="store_true", help="summary only")
+    ap.add_argument("--authorise-hostless", action="store_true",
+                    help="signal rows whose ancestry is `hostless` (a cell lane always is). This is "
+                         "the act #1207/#1297 option A reserves for an owner ruling, and the reopen "
+                         "agent-infra#2391 is still OPEN with 'no code proposed' — so it is a named, "
+                         "deliberate operator act, never a default and never set by a supervisor pass")
     ap.add_argument("--pid", action="append", type=int, default=None,
                     help="judge ONLY this pid (repeatable) — for one named lane, and for a test that "
                          "must not touch the box's real population")
@@ -759,7 +855,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     after = pool.ps_pi_fields() or {}
     for r in out:
         r["etime_after"] = (after.get(str(r["pid"])) or {}).get("etime", r["etime"])
+    census = [r for r in out if r["cls"] == "CENSUS"]
     out = [r for r in out if r["cls"] != "CENSUS"]
+    if census:
+        # ⛔ Never silently dropped (cycle 2, P2-4): a named `--pid` that happens to be this process's
+        # own chain must be distinguishable from "there was nothing to do".
+        print("· %d candidate(s) are this process's own chain and are never candidates: %s"
+              % (len(census), ", ".join(str(r["pid"]) for r in census)))
+    if opts.pid and not out:
+        print("%s: CANNOT-VERIFY — every --pid given is this process's own chain; nothing was judged"
+              % PROG, file=sys.stderr)
+        return 3
 
     if opts.json:
         for r in out:

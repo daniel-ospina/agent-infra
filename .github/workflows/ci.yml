@@ -315,12 +315,20 @@ jobs:
         # 46 bare `pi`, 27 finished, oldest 6 h 21 m). `pi-done-not-exited.py` imports the canon's
         # turn boundary (`tools/fleet/liveness.py`) and the pool owner's session binding / gate 2
         # (`scripts/orphan-reap.py`) and adds ONE predicate: launcher ownership (`TAG` in the
-        # process's own environ). The suite builds SIX real process trees (a symlink named `pi`, a
-        # real launcher, a real fd-1 log, a pi-named transcript) and requires BOTH directions: the
-        # finished one is reaped, while a growing log, an OPEN turn, an ABSTAINING turn boundary,
-        # a SIGTERM-ignoring target and a no-owner `pi` all survive. Its own step, so one verdict
-        # cannot suppress another.
+        # process's own environ). The suite builds NINE real process trees (a script named `pi`, a
+        # real launcher, a real fd-1 log, a pi-named transcript) plus a control lane, and requires
+        # BOTH directions: the finished ones are reaped, while a growing log, an OPEN turn, an
+        # ABSTAINING turn boundary, a shared log, a live child, a SIGTERM-ignoring target and a
+        # no-owner `pi` all survive — plus the silence bound, the arming gate (#2391) and the
+        # refusal bucket. Its own step, so one verdict cannot suppress another.
         run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py
+      - name: finished-lane reaper — mutation control (#2163, zero-dep)
+        # The repo's rule for a zero-dep suite: a suite whose ability to go RED is only CLAIMED in
+        # prose is the false-PASS shape (see the siblings' --mutations/--red-control steps). This
+        # patches a temp copy of the tool with each defect the suite claims to guard — an abstaining
+        # turn boundary folded into `turn-ended` (the state that shipped a P0 in cycle 1), the
+        # log-growth veto dropped, the open-turn veto dropped — and requires the suite to fail.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had
