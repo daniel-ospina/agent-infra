@@ -663,7 +663,7 @@ check_harness_pin() {
       fi
     fi
     if [ "$root_ok" -ne 1 ]; then
-      die "$HARNESS_PIN_DIR exists but is NOT a git worktree of $repo and holds no linked worktree — a pin file can name it while pointing at NOTHING (the measured 'pinned=none although a pin file exists' state, 2026-10-21). Move it aside and re-run:\n       mv '$HARNESS_PIN_DIR' '$HARNESS_PIN_DIR'.not-a-worktree && INFRA_ROOT=$repo bash $0 --check"
+      die "$HARNESS_PIN_DIR exists but is NOT a git worktree of $repo and holds no linked worktree — a pin file can name it while pointing at NOTHING (the measured 'pinned=none although a pin file exists' state, 2026-10-21). Move it aside and re-run: mv '$HARNESS_PIN_DIR' '$HARNESS_PIN_DIR'.not-a-worktree && INFRA_ROOT=$repo bash $0 --check"
     fi
   else
     mkdir -p "$(dirname "$HARNESS_PIN_DIR")" || die "cannot create $(dirname "$HARNESS_PIN_DIR")"
@@ -1157,6 +1157,14 @@ main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
   setup_home
+  # ⛔ UNCONDITIONALLY, BEFORE ANY CHECK READS A REPO — not only after `$ENV_FILE` is sourced. A
+  # MISSING keys.env is a supported, non-fatal path (`check_provider` only warns), and every check
+  # below then runs against an operator shell that may itself carry `GH_REPO` (it is sticky
+  # per-shell): the guard would skip exactly the run that has no file to restore it from, and
+  # `check_gh`/`check_repo`/`check_dispatch` would grade another repo while printing `CELL READY`.
+  # `source_env_file` repeats it AFTER sourcing, because the file can set it too; both calls are
+  # idempotent, so the pair covers both carriers.
+  neutralise_gh_repo
   check_tools
   check_network
   case "$MODE" in
