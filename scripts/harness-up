@@ -472,10 +472,16 @@ cfg_value() { # <key> <file>
 # answer than resolving the harness from the next candidate. So: explicit → refuse; inherited → skip,
 # SAY SO on stderr, and continue.
 HREPO=""
+HREPO_BAD=""
 if [ -n "${A_REPO:-}" ]; then
   HREPO="$A_REPO"
   [ -d "$HREPO" ] || die "--repo $HREPO is not a directory — --repo names the HARNESS checkout, the repo the pin commit and --ref are commits OF (on a cell that is agent-infra, not the repo the controller drains)" 2
   git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "--repo $HREPO is not a git checkout — the pin commit and --ref must be commits OF it" 2
+  # ⛔ THE ROOT RULE APPLIES TO THE FLAG TOO: `git -C` WALKS UP, so `--repo <a subdir of a checkout>`
+  # would satisfy both guards above and then resolve the pin in the ENCLOSING object DB — the same
+  # wrong-repo resolution the inherited candidates are refused for, on the path an operator asserts.
+  [ "$(git -C "$HREPO" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$HREPO" && pwd -P)" ] \
+    || die "--repo $HREPO is inside another checkout, not the checkout root — the pin commit and --ref are commits OF the harness repo ROOT" 2
 else
   # The candidates, in order: the environment, this machine's config file, then the launcher's OWN
   # checkout — the operative cell path, because a cell's `keys.env` carries `REPO`/`OR` but NOT
@@ -499,7 +505,11 @@ else
     fi
     HREPO="$cand"; break
   done
-  [ -n "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
+  # ⛔ UNRESOLVABLE IS A HELD VERDICT TOO, NOT A UNIVERSAL REFUSAL (review P1): `down` reads no harness at
+  # all — it delegates to the authority's own `stop` — so a box that names its work repo but not a harness
+  # (the flat-copy layout, or a cell whose agent-infra main worktree was pruned) must still be stoppable.
+  # on `origin/main` that invocation REACHED cmd_down; dying here would have removed it one verb at a time.
+  [ -n "$HREPO" ] || HREPO_BAD="no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout"
 fi
 # The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
 # only then the harness checkout — the pre-split behaviour for a box that configures neither.
@@ -1461,6 +1471,7 @@ cmd_up() {
   # ⛔ THE ONE VERB THAT REFUSES ON A BAD `REPO`: it would START a controller that drains a repo nobody
   # named. Nothing is started, so the refusal is safe here and nowhere else (see the REPO_BAD block).
   [ -z "$REPO_BAD" ] || die "$REPO_BAD — and 'up' STARTS a controller that would drain it. Nothing was started." 2
+  [ -z "$HREPO_BAD" ] || die "$HREPO_BAD — and 'up' needs the harness repo to resolve the pin. Nothing was started." 2
   # ⛔ NAME WHERE `REPO` CAME FROM. `--repo` can no longer set it, so the only ways to have a wrong
   # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
   # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
@@ -1585,6 +1596,9 @@ trap 'rm -rf "$HU_TMP"' EXIT
 
 if [ -n "$REPO_BAD" ] && [ "$VERB" != up ]; then
   warn "$REPO_BAD — continuing, because '$VERB' starts nothing (a box with a stale REPO must still be stoppable)"
+fi
+if [ -n "$HREPO_BAD" ] && [ "$VERB" != up ]; then
+  warn "$HREPO_BAD — continuing, because '$VERB' reads no harness (a box with an unresolvable harness must still be stoppable)"
 fi
 case "$VERB" in
   up)     cmd_up ;;
