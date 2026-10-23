@@ -52,10 +52,22 @@ ExecStart=/bin/bash {{SUPERVISOR}} start
 # restarts on a crash, a kill AND a clean exit, which is the whole requirement.
 Restart=always
 RestartSec={{RESTART_SEC}}
-# orch-loop.sh traps TERM and exits in ~0.1s (agent-infra#1715). `mixed` signals the controller first and
-# only then the group, so a stop does not leave a half-spawned worker behind — a `stop` that orphans a
-# lane is a lane that keeps landing PRs.
-KillMode=mixed
+# ⛔ `process`, NOT `mixed` (review P1, #2402). `mixed` SIGKILLs "all remaining processes of the
+# unit's control group" after the main process exits — and this unit's cgroup does NOT contain only
+# this controller. In the foreground branch `start_doctor_loop` creates the doctor's tmux session, and
+# when no tmux server is running (the MEASURED #2402 shape: "no server running on /tmp/tmux-1000/default")
+# the `tmux` client forks the SERVER as a child of this process, so the server is BORN in this cgroup
+# and keeps that membership after it detaches. A `systemctl stop`/`restart` would therefore SIGKILL
+# the whole per-user tmux server and every session on it — this cell's lanes, a peer repo's controller,
+# an operator's shell — silently, mid-flight, and BEFORE `cmd_stop`'s ownership proof runs. That proof
+# is the discipline that lets `stop` kill a session only once it has shown the session is this state
+# dir's (#1856); a cgroup kill cannot make that distinction and does not try.
+# `orch-loop.sh` traps TERM and exits in ~0.1s (agent-infra#1715), so `process` signals the controller
+# and nothing else, and `cmd_stop` stays the ONE place that tears sessions down. The old `mixed`
+# rationale — "a stop must not orphan a half-spawned worker" — does not survive contact with the
+# measured shape: a LANE lives in a tmux session on the shared server, which `mixed` kills wholesale
+# rather than selectively, and the helpers that are genuine children are short-lived `gh`/`git` clients.
+KillMode=process
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
