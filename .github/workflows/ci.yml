@@ -309,6 +309,18 @@ jobs:
         # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
         # go RED). Its own step, so one verdict cannot suppress another.
         run: python3.12 scripts/orphan-reap.test.py --mutations
+      - name: finished-lane reaper suite (#2163, zero-dep)
+        # A lane's reader treats a missing `<tag>.rc` as RUNNING, so a print-mode `pi` whose turn
+        # ended but which never exited reads as work in progress for hours (measured 2026-10-23:
+        # 46 bare `pi`, 27 finished, oldest 6 h 21 m). `pi-done-not-exited.py` imports the canon's
+        # turn boundary (`tools/fleet/liveness.py`) and the pool owner's session binding / gate 2
+        # (`scripts/orphan-reap.py`) and adds ONE predicate: launcher ownership (`TAG` in the
+        # process's own environ). The suite builds SIX real process trees (a symlink named `pi`, a
+        # real launcher, a real fd-1 log, a pi-named transcript) and requires BOTH directions: the
+        # finished one is reaped, while a growing log, an OPEN turn, an ABSTAINING turn boundary,
+        # a SIGTERM-ignoring target and a no-owner `pi` all survive. Its own step, so one verdict
+        # cannot suppress another.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had

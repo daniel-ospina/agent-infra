@@ -30,6 +30,8 @@ The artifacts, one authority:
 | `tools/fleet/liveness.py` | the verdict function (pure over evidence) and the evidence acquisition (`gather`) |
 | `tools/fleet/lane_liveness.py` | the **scheduled** driver: enumerates lanes, calls `gather`+`evaluate`, escalates a `dead` lane to a deduped issue. A driver, never a second opinion |
 | `scripts/lib/pid-identity.sh` | the one **process-identity rule** — sourced by the kill-path reaper (Bash), forked as a CLI by the classifier (Python) |
+| `scripts/orphan-reap.py` | the `pi` **pool's owner**: enumerates it, binds pid↔transcript with the fence above, and authorises only the canon's `idle` (24 h). Four states, dry-run by default; `AUTHORISE_HOSTLESS_CHAINS` keeps a hostless chain report-only (#1207/#1297 option A) |
+| `scripts/orchestrator-harness/pi-done-not-exited.py` | a **launcher-contract** reaper, not a liveness verdict: it asks whether a `pi` FINISHED its turn and never exited, leaving its launcher blocked so `<tag>.rc` was never written (#2163). It imports `turn_from_jsonl`/`jsonl_state`, the pool owner's session binding and gate 2, and its own CPU gate/tolerance; the one predicate it adds is launcher ownership (`TAG` in the process's own `environ` naming its `lane-*.sh`/runner parent), which an ancestry-only gate cannot establish on a Linux cell (`/proc` is Linux-only, and every read abstains elsewhere) |
 
 The kill path (`scripts/pi-reap-idle.sh`) is a *consumer of the same identity rule*, not a second
 liveness rule: it is documented in `docs/ops/pi-idle-repl-reaper-policy.md`. **A wrong verdict here
