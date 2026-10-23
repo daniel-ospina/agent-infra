@@ -476,6 +476,18 @@ printf '%s\n' "$OUT" | grep -qE '^merge +STOPPED .*last pass [0-9]+s ago rc=1' \
 printf '%s\n' "$OUT" | grep -q '^merge .*has not run' \
   && bad "status: a role that HAS run is claimed never to have run — $OUT" \
   || ok "status: 'has not run' is reserved for a role with no record"
+# ⛔ AND AN UNREADABLE PASS TIME IS NAMED, NOT INVENTED (P2, fresh review): coercing an empty epoch to
+# 0 printed "last pass 1792742143s ago" — epoch-0 arithmetic as if it were a measurement.
+reset_state
+printf 'role=merge\nlast_pass_at=x\npasses=1\nlast_rc=1\nlast_result=rail refusal\n' \
+  > "$T/o/state/roles/merge.state"
+doc status
+printf '%s\n' "$OUT" | grep -qE '^merge +STOPPED .*UNREADABLE time rc=1' \
+  && ok "status: a record with no readable pass time says so, and keeps its rc" \
+  || bad "status: the unreadable pass time is not named — $OUT"
+printf '%s\n' "$OUT" | grep -qE '^merge .*last pass [0-9]{9,}s ago' \
+  && bad "status: a fabricated epoch-0 age is printed — $OUT" \
+  || ok "status: no fabricated age for an unreadable pass time"
 
 # (a role with NO record still reads 'has not run' — the reserved wording, same fixture)
 reset_state

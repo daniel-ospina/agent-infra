@@ -1602,10 +1602,19 @@ role_row() { # <role> <stale-bound-seconds>
     # "has not run" wording is reserved for a role with no record at all. rc stays 0.
     if [ -f "$f" ]; then
       rc="$(state_get "$role" last_rc)"; ep="$(state_get "$role" last_pass_epoch)"
-      case "${ep:-}" in ''|*[!0-9]*) ep=0 ;; esac
-      age=$(( $(date +%s) - ep ))
-      printf '%-8s STOPPED   the cell is not started; last pass %ss ago rc=%s — %s\n' \
-        "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)"
+      # ⛔ NO FABRICATED AGE (P2, fresh review): an empty/non-numeric epoch used to be coerced to 0,
+      # so the row printed "last pass 1792742143s ago" — epoch-0 arithmetic presented as a
+      # measurement, on the surface this branch was added to make truthful. The sibling path already
+      # refuses to invent an unreadable rc (`FAILED  the record holds no readable rc`); do the same.
+      case "${ep:-}" in
+        ''|*[!0-9]*)
+          printf '%-8s STOPPED   the cell is not started; last pass at an UNREADABLE time rc=%s — %s\n' \
+            "$role" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)" ;;
+        *)
+          age=$(( $(date +%s) - ep ))
+          printf '%-8s STOPPED   the cell is not started; last pass %ss ago rc=%s — %s\n' \
+            "$role" "$age" "${rc:-?}" "$(state_get "$role" last_result | cut -c1-150)" ;;
+      esac
     else
       printf '%-8s STOPPED   the cell is not started, so this role has not run and is not expected to\n' "$role"
     fi
