@@ -134,6 +134,13 @@
 
 set -uo pipefail
 
+# ⛔ THE LANDING RAIL'S READS ARE ESSENTIAL (#2342). `gh-limit.py` keeps a reserve below
+# `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read that could not be served from
+# GraphQL — the reserve exists so a LANDING can still spend it. This script IS that landing, so it
+# declares its reads essential rather than being refused by its own reserve. Nothing else in-tree sets
+# this; a poll is never essential.
+export GH_LIMIT_ESSENTIAL=1
+
 PR=""
 REPO=""
 # The cwd checkout's repo slug AND root, resolved alongside $REPO in resolve_repo().
@@ -1279,35 +1286,39 @@ do_land() {
 }
 
 confirm_merged() { # <max polls: 1 = a single immediate check>
-  local max="${1:-${ATOMIC_LAND_CONFIRM_MAX:-60}}" i state="" read_failed=0
+  local max="${1:-${ATOMIC_LAND_CONFIRM_MAX:-60}}" i state="" read_failed=0 why="" errf
   case "$max" in ''|*[!0-9]*) max=1 ;; esac
   [ "$DRY_RUN" -eq 1 ] && return 0
+  errf="$(mktemp "${TMPDIR:-/tmp}/atomic-land-confirm.XXXXXX" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/atomic-land-confirm.$$")"
   for i in $(seq 1 "$max"); do
-    # ⛔ A FAILED READ IS NOT A STATE (#2342). This used to be `... || echo OPEN`, so a
-    # spent REST budget answered the confirmation with the LITERAL STRING "OPEN" and the
-    # rail printed "the merge was NOT confirmed — PR #N is still OPEN" about a merge it had
-    # just issued: a confident diagnosis from a read that never happened (the 2026-10-23
-    # incident, measured as `PR states={None: 23}` in a sibling tool that cancelled nothing
-    # on the strength of it). The read's exit status now decides, and the two outcomes say
-    # different things: a READ that failed is UNREADABLE, a read that answered OPEN is OPEN.
-    if state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null)"; then
+    # ⛔ A FAILED READ IS NOT A STATE (#2342). This used to be `... || echo OPEN`, so a spent REST
+    # budget answered the confirmation with the LITERAL STRING "OPEN" and the rail printed "the merge
+    # was NOT confirmed — PR #N is still OPEN" about a merge it had just issued: a confident diagnosis
+    # from a read that never happened (the 2026-10-23 incident, measured as `PR states={None: 23}` in
+    # a sibling tool that then cancelled nothing on the strength of it).
+    # ⛔ AND THE REASON IS KEPT, NOT INVENTED. `2>/dev/null` used to discard the ONE line that says
+    # WHICH failure this was — the budget (`gh-core-floor` / `gh-core-exhausted`), an auth problem, a
+    # 404 — and the replacement message then asserted "the box ran out of budget" for a cause this
+    # function never established. The layer's own words are carried through and quoted.
+    if state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>"$errf")"; then
       read_failed=0
-      [ "$state" = "MERGED" ] && { say "atomic-land: ✅ merged PR #$PR"; return 0; }
+      [ "$state" = "MERGED" ] && { say "atomic-land: ✅ merged PR #$PR"; rm -f "$errf" 2>/dev/null || true; return 0; }
     else
       read_failed=1
       state=""
+      why="$(tail -n 3 "$errf" 2>/dev/null | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/ $//')"
     fi
     [ "$max" -le 1 ] && break
     sleep 10
   done
+  rm -f "$errf" 2>/dev/null || true
   if [ "$read_failed" -eq 1 ] && [ -z "$state" ]; then
-    err "atomic-land: ⛔ the merge was NOT confirmed — the CONFIRMATION READ FAILED (UNREADABLE: gh api repos/$REPO/pulls/$PR). This is not evidence that the PR is open: read its state before doing anything else (the rest of this box ran out of GitHub budget, so a re-read may be refused until the window resets)."
+    err "atomic-land: ⛔ the merge was NOT confirmed — the CONFIRMATION READ FAILED (UNREADABLE: gh api repos/$REPO/pulls/$PR).${why:+ It said: $why} That is not evidence the PR is open: read its state before doing anything else."
   else
     err "atomic-land: ⛔ the merge was NOT confirmed — PR #$PR is still $state (the land step's exit status alone is not proof; #1359)"
   fi
   return 1
 }
-
 # ── main ─────────────────────────────────────────────────────────────────
 resolve_repo
 [ "$DRY_RUN" -eq 1 ] && say "atomic-land: DRY RUN — nothing will be mutated"

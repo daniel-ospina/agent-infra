@@ -1655,7 +1655,12 @@ def single_flight(real_gh, gh_argv):
             # a cache entry, and this is not a cache: handing one out as current is the exact failure
             # #2243 clause 5 forbids.
             log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
-            stats_record("single-flight", "share")   # N lanes, ONE request: the coalescing saving
+            if res["rc"] == 0:
+                # ⛔ A SHARED **FAILURE** IS NOT AN AVERTED REQUEST (review P2). Counting every share
+                # made the instrument read BEST during the incident it exists to measure: a refusal
+                # shared by 25 lanes reported `averted=24` while nothing was served and nothing was
+                # saved. Only a SERVED share is one request the box did not send.
+                stats_record("single-flight", "share")
             return res["rc"], res["out"], res["err"]
         leader = _read_json(leader_path)
         # ⛔ A MISSING CLAIM IS NOT A STALE ONE. `_leader_stale(None, …)` answers True for an absent
@@ -1936,7 +1941,71 @@ def read_cache_put(key, rc, out, err):
 # ⛔ IT IS A LOCAL FILE READ — no request, no credentials, so it is usable at the exact moment the
 # budget is gone, which is when the question “what did the cache save us?” is asked.
 STATS_FILE = "read-cache-stats.jsonl"
+STATS_CARRY_FILE = "read-cache-totals.json"
 STATS_ROTATE_BYTES = 1 << 20
+
+
+def _stats_add(doc, cls, kind, at=None):
+    one = doc["classes"].setdefault(cls, {})
+    one[kind] = one.get(kind, 0) + 1
+    if isinstance(at, int) and (doc.get("since") is None or at < doc["since"]):
+        doc["since"] = at
+
+
+def stats_carry():
+    try:
+        with open(os.path.join(state_dir(), STATS_CARRY_FILE)) as fh:
+            doc = json.load(fh)
+        if isinstance(doc.get("classes"), dict):
+            return {"since": doc.get("since"), "classes": doc["classes"]}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"since": None, "classes": {}}
+
+
+def _stats_write_carry(doc):
+    p = os.path.join(state_dir(), STATS_CARRY_FILE)
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, p)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def stats_fold():
+    """Rotation: fold the live file into a CUMULATIVE carry, then empty it.
+
+    ⛔ ROTATION MUST NOT MAKE THE COUNT GO DOWN (review P2). Replacing a `…jsonl.1` dropped the totals
+    it held, so `averted` could read SMALLER on a later run — “lost data, or a cache regression” to the
+    only reader this instrument has. Folding first makes the total monotone; nothing is summed twice
+    because a successful fold REMOVES the live file."""
+    p = os.path.join(state_dir(), STATS_FILE)
+    try:
+        with open(p) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    doc = stats_carry()
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        cls, kind = e.get("cls"), e.get("kind")
+        if isinstance(cls, str) and isinstance(kind, str):
+            _stats_add(doc, cls, kind, e.get("at"))
+    if _stats_write_carry(doc):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 def stats_record(cls, kind):
@@ -1945,9 +2014,9 @@ def stats_record(cls, kind):
         p = os.path.join(state_dir(), STATS_FILE)
         try:
             if os.path.getsize(p) > STATS_ROTATE_BYTES:
-                os.replace(p, p + ".1")
+                stats_fold()
         except OSError:
-            pass                        # absent, or unrotatable: appending still works
+            pass                        # absent, or unfreezable: appending still works
         line = json.dumps({"at": int(clock()), "cls": cls, "kind": kind},
                           separators=(",", ":")) + "\n"
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -1959,32 +2028,57 @@ def stats_record(cls, kind):
         pass
 
 
+def stats_readable():
+    """(ok, reason) — an instrument that cannot be READ is not `no-reads-counted`."""
+    p = os.path.join(state_dir(), STATS_FILE)
+    if not os.path.exists(p):
+        return (True, "")
+    try:
+        with open(p) as fh:
+            fh.read(1)
+        return (True, "")
+    except OSError as exc:
+        return (False, "%s (%s)" % (p, exc))
+
+
 def stats_report():
-    """(earliest stamp, {class: {kind: count}}) from this box's counters.
+    """(earliest stamp, {class: {kind: count}}) — the CUMULATIVE counters of this box.
 
     ⛔ A TORN LINE IS A LOST COUNT, NEVER A WRONG ONE: it is skipped, so the totals can under-report
     (an instrument that is honest about its floor) but never invent hits."""
-    d = state_dir()
-    since = None
-    out = {}
-    for name in (STATS_FILE + ".1", STATS_FILE):
-        try:
-            with open(os.path.join(d, name)) as fh:
-                for line in fh:
-                    try:
-                        e = json.loads(line)
-                    except ValueError:
-                        continue
-                    at, cls, kind = e.get("at"), e.get("cls"), e.get("kind")
-                    if not isinstance(cls, str) or not isinstance(kind, str):
-                        continue
-                    if isinstance(at, int) and (since is None or at < since):
-                        since = at
-                    one = out.setdefault(cls, {})
-                    one[kind] = one.get(kind, 0) + 1
-        except OSError:
-            continue
+    doc = stats_carry()
+    out = doc["classes"]
+    since = doc.get("since")
+    try:
+        with open(os.path.join(state_dir(), STATS_FILE)) as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                cls, kind = e.get("cls"), e.get("kind")
+                if not isinstance(cls, str) or not isinstance(kind, str):
+                    continue
+                one = out.setdefault(cls, {})
+                one[kind] = one.get(kind, 0) + 1
+                at = e.get("at")
+                if isinstance(at, int) and (since is None or at < since):
+                    since = at
+    except OSError:
+        pass
     return since, out
+
+
+def floor_source():
+    """WHICH knob set the floor — a stale legacy value must be visible, not silent (review P2).
+
+    `GH_LIMIT_CORE_LOW_WATER` still works, so a box that carries the old value KEEPS it; without this
+    the fleet's effective floor can be 100 while the runbook and the PR say 800."""
+    if cfg("GH_LIMIT_CORE_FLOOR", ""):
+        return "GH_LIMIT_CORE_FLOOR"
+    if cfg("GH_LIMIT_CORE_LOW_WATER", ""):
+        return "GH_LIMIT_CORE_LOW_WATER (legacy)"
+    return "default"
 
 
 def read_cache_class(gh_argv):
@@ -2434,6 +2528,12 @@ def main(argv):
         sys.stdout.write(token + "\n")
         return rc
     if stats:
+        ok, why = stats_readable()
+        if not ok:
+            # ⛔ AN UNREADABLE INSTRUMENT IS NOT “NOTHING COUNTED” (review P2). `--health` already
+            # refuses to call an unparseable record `gh-ok`; the same rule applies to the counters.
+            sys.stdout.write("gh-read-cache UNREADABLE %s\n" % why)
+            return 0
         since, doc = stats_report()
         if not doc:
             # ⛔ AN EMPTY COUNTER IS NOT “ZERO SAVING”. It is “nothing has been counted yet”, and
@@ -2444,7 +2544,8 @@ def main(argv):
         ttl = {name: t for name, _pair, t in READ_SUBCOMMAND_CLASSES}
         averted = 0
         stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(since)) if since else "?"
-        sys.stdout.write("gh-read-cache since=%s\n" % stamp)
+        sys.stdout.write("gh-read-cache since=%s floor=%d (%s)\n"
+                         % (stamp, CORE_FLOOR, floor_source()))
         for cls in sorted(doc):
             kinds = doc[cls]
             hit, miss, share = (kinds.get("hit", 0), kinds.get("miss", 0), kinds.get("share", 0))
@@ -2658,6 +2759,65 @@ def probe_budget(real_gh):
     """ONE exempt `/rate_limit` read, under the single-flight lock (the `--budget` verb's work)."""
     lock = acquire_lock()
     try:
+        r = run(real_gh, ["api", "rate_limit"])
+    finally:
+        release_lock(lock)
+    if r.rc != 0:
+        return None
+    try:
+        return write_budget(json.loads(r.out.decode("utf-8", "replace")))
+    except ValueError:
+        return None
+
+
+PROBE_STAMP = "budget-probe-at"
+
+
+def _probe_due():
+    """Is a `/rate_limit` probe allowed in this window?
+
+    ⛔ A FAILED PROBE MUST NOT BECOME A PROBE PER CALL. `write_budget` only lands on SUCCESS, so
+    without this stamp a box whose probe fails (a torn state dir, a proxy error) would probe on every
+    single gh call — the “cost depends on how often callers call” defect `read_budget` documents."""
+    try:
+        with open(os.path.join(state_dir(), PROBE_STAMP)) as fh:
+            at = float((fh.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return True
+    if at > clock() + 60:
+        return True                    # a stamp from the FUTURE is not a stamp (a clock stepped back)
+    return (clock() - at) >= BUDGET_TTL
+
+
+def _stamp_probe():
+    try:
+        with open(os.path.join(state_dir(), PROBE_STAMP), "w") as fh:
+            fh.write("%d" % int(clock()))
+    except OSError:
+        pass
+
+
+def budget_snapshot_or_probe(real_gh):
+    """A FRESH meter snapshot: the free file read, or at most ONE exempt probe per box per TTL.
+
+    ⛔ THE LOCK IS WHAT MAKES “ONE PROBE PER BOX” TRUE. The snapshot is re-read INSIDE the lock, so a
+    burst of lanes arriving together costs one request and the rest read the answer — the same shape
+    as every other coalescing in this file. The probe is exempt from the primary limit (it answered
+    with `core` at 0 on 2026-10-22), so it spends no quota; the stamp bounds it when the probe FAILS.
+    """
+    snap = read_budget()
+    if snap is not None:
+        return snap
+    if not (real_gh and os.path.isfile(real_gh)):
+        return None
+    lock = acquire_lock()
+    try:
+        snap = read_budget()           # a peer may have probed while we waited for the lock
+        if snap is not None:
+            return snap
+        if not _probe_due():
+            return None                # a probe was already ATTEMPTED this window and did not land
+        _stamp_probe()
         r = run(real_gh, ["api", "rate_limit"])
     finally:
         release_lock(lock)
@@ -3471,7 +3631,15 @@ def _named_floor_refusal(remaining, floor, reset, dated):
 
     ⛔ IT KEEPS THE WORDS `gh rate limit` because `objective.py`'s TRANSPORT_MARKERS classify a
     refused read from that phrase, and here the budget genuinely IS the reason. It writes NO health
-    record: nothing was measured as exhausted, and a floor refusal is not evidence about the pool."""
+    record: nothing was measured as exhausted, and a floor refusal is not evidence about the pool.
+    ⛔ BUT IT DOES RECORD ITSELF IN `events.log` (review P2). Every rail caller passes `2>/dev/null`,
+    so a fleet-wide floor refusal was invisible everywhere — `--health` said `gh-ok`, no `last-limit`
+    was written, and the only copy of the reason was the stderr the caller discarded. A local append
+    costs no request, and it makes the policy findable after the fact."""
+    log_event("pressure: gh-core-floor remaining=%s floor=%d resets_in=%s — read refused, %d bytes "
+              "of the reserve kept for writes (GH_LIMIT_ESSENTIAL=1 defers this policy)"
+              % ("?" if remaining is None else remaining, floor,
+                 resets_in(reset) if dated else "?", 0))
     sys.stderr.write(
         "gh-limit: gh-core-floor remaining=%s floor=%d resets_in=%s — gh rate limit: this is the "
         "GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down. The REST pool is "
@@ -3536,6 +3704,22 @@ def _dispatch(real_gh, gh_argv):
     # burst this layer exists to prevent.)
     _bucket = bucket_for(gh_argv)
     if reaches_api(gh_argv) and (_bucket == "core" or (mutating and _bucket == "graphql")):
+        # ⛔ MEASURE THE POOL BEFORE DECIDING ON IT (#2342 review P1). The floor can only act on a
+        # MEASURED `remaining`, and the only non-zero source of one is `budget.json` — whose only
+        # writer WAS the `--budget` verb, which NO harness script calls, plus the refusal path's own
+        # probe (which by definition runs once the pool is already EMPTY). So the floor was a gate
+        # that could never fire in production: the no-op-enforcer class it exists to prevent, and the
+        # suite only reached it because a test called `--budget` explicitly. `read_budget()` stays the
+        # free hot path; this spends ONE exempt `/rate_limit` per box per TTL, and only when there is
+        # no fresh snapshot to read.
+        # ⛔ ONLY WHERE THE FLOOR COULD ACT, AND ONLY WHEN NOTHING LOCAL IS KNOWN. A probe on every
+        # read would spend a request to learn something the existing mechanisms already record (the
+        # refusal path probes once for the whole box), and a read that CAN fail over needs no floor: it
+        # is served from GraphQL either way. So a probe happens for a read that has NO exact
+        # equivalent, when no snapshot and no durable record exists — the exact case in which the
+        # guard would otherwise be blind.
+        if read_budget() is None and core_pressure() is None and graphql_plan(read_plan) is None:
+            budget_snapshot_or_probe(real_gh)
         pressure = core_pressure()
         if pressure is not None:
             reset, remaining, core_dated = pressure
@@ -3613,8 +3797,20 @@ def _dispatch(real_gh, gh_argv):
                     # WRITE down with it (measured 2026-10-23 04:11Z: `core remaining=0` for the Mac
                     # and all three cells at once). The reserve is for work that cannot be deferred;
                     # a caller that says it cannot be deferred asks for it by name.
-                    _named_floor_refusal(remaining, CORE_FLOOR, reset, core_dated)
-                    return 1
+                    # ⛔ BUT A CACHED VALIDATOR IS CONSULTED FIRST (review P1). Refusing a read whose
+                    # 304 would have cost NOTHING is stricter than total exhaustion, and the arm above
+                    # already states the rule: “refusing it before trying would be an over-block
+                    # against the guarantee that makes polling affordable”. Same bet, same bound: a
+                    # 304 succeeds free, a CHANGED resource is refused without a retry.
+                    if plan is not None and cache_get(cache_key(plan)) is not None:
+                        _speculative_read = True
+                        log_event("floor: core remaining=%d <= floor=%d but a validator is cached for "
+                                  "`%s` — attempting the conditional GET ONCE (a 304 spends no "
+                                  "quota; a changed resource is refused, not retried)"
+                                  % (remaining, CORE_FLOOR, _flight_label(gh_argv)))
+                    else:
+                        _named_floor_refusal(remaining, CORE_FLOOR, reset, core_dated)
+                        return 1
                 # remaining UNKNOWN (an undated record — no measurement, so no floor claim), or the
                 # caller declared this read essential: it can still succeed, so it is sent.
     while True:

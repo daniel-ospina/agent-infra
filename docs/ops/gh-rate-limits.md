@@ -430,38 +430,66 @@ a `KeyError: 'data'` that turned a landing count into no number. **A failed read
 representable as a state**, and the pool is spent by POLLING in the last minutes of the window.
 
 * **`GH_LIMIT_CORE_FLOOR` (default 800)** — below it a READ stops spending `core`. Where an EXACT
-  GraphQL equivalent exists it fails over (unchanged, free to the caller). Where none exists it is
-  **refused by name**: `gh-core-floor remaining=<n> floor=<800> resets_in=<Nm>`, stdout EMPTY — never
-  an empty list/object, and never a claim that the pool is empty (it is not; `remaining` is printed
-  and `--health` stays `gh-ok`, because a floor refusal is not a measurement of an empty pool).
+  GraphQL equivalent exists it fails over (unchanged, free to the caller); where none exists it is
+  **refused by name** — `gh-core-floor remaining=<n> floor=<800> resets_in=<Nm>`, stdout EMPTY, no
+  request spent — unless the caller declares that the work cannot proceed without it
+  (`GH_LIMIT_ESSENTIAL=1`). The refusal asserts NOTHING about exhaustion (`remaining` is printed and
+  `--health` stays `gh-ok`), and it records itself in `events.log`, because every rail caller passes
+  `2>/dev/null` and a policy that leaves no trace is the "absence reported as a state" failure this
+  whole change is about.
+  * **A BLIND BOX MEASURES.** The floor can only act on a MEASURED `remaining`, and the only non-zero
+    source of one is the shared `budget.json`. The `--budget` verb is not called by any harness
+    script, so a core-only read with no snapshot and no durable record now spends **one exempt
+    `/rate_limit` probe** (under the layer's own lock, re-reading the snapshot inside it, so a burst
+    of lanes costs ONE probe) — otherwise the guard would be a gate that can never fire. A probe that
+    fails is stamped and not retried inside the TTL. A core-only read whose validator is already
+    cached is allowed the same single speculative conditional GET the empty-pool arm allows, so a
+    free `304` is never refused as if it cost quota.
 * **`GH_LIMIT_ESSENTIAL=1`** is the caller's declaration that the work *cannot proceed* without the
-  read. It is used in exactly one place in-tree — `repo-authority.sh::required_checks`, whose
-  `branches/main/protection/required_status_checks` read has no exact GraphQL equivalent and gates
-  every landing. Without it the floor would refuse the merge contract for the last minutes of every
-  window, `REQ_SOURCE=fallback` would follow, and the rail would print "the merge contract is
-  UNKNOWN" — the misdiagnosis this whole change exists to remove. **A poll is never essential**: if
-  polling were, the reserve would be spent exactly the way the incident spent it.
+  read. It is set in-tree by the LANDING scripts only — `repo-authority.sh::required_checks` (the
+  protection read, which has no exact GraphQL equivalent and gates every landing), and the top of
+  `admin-merge.sh`, `atomic-land.sh` and `record-review.sh`, whose reads are the landing. Without it
+  the floor would refuse the merge contract for the last minutes of every window, `REQ_SOURCE=fallback`
+  would follow, and the rail would print "the merge contract is UNKNOWN" — the misdiagnosis this
+  whole change exists to remove. **A poll is never essential**: if polling were, the reserve would be
+  spent exactly the way the incident spent it.
 * `GH_LIMIT_CORE_LOW_WATER` still works (the deployed cells and this runbook carried it before);
   `GH_LIMIT_CORE_FLOOR` is the same number under the name that says what it does, and it wins when
   both are set.
+
+**A REFUSAL IS NEVER “not red”.** `record-review.sh`'s clause-E veto exists to stop a signed `clean`
+being re-bound onto a head whose own checks are failing. It used to read a REFUSED `check-runs` call as
+an EMPTY surface (`2>/dev/null || true` then `[ -n "$raw" ] || return 1`), i.e. as “not red” — the
+fail-open the veto exists to close, and a floor refusal would have made it deterministic for the last
+minutes of every window. The read is now **tri-state**: `0` red, `1` not shown red, `2` the surface
+COULD NOT BE READ — and `2` refuses the carry with its own message. `atomic-land.sh`'s merge
+confirmation got the same treatment: `... || echo OPEN` became a branch on the read's exit status that
+says `UNREADABLE` and quotes the layer's own reason (the old text asserted “the box ran out of budget”
+for a cause it never established — a 404 and a spent pool produced the same sentence).
 
 **The saving is an INSTRUMENT, not a claim.** `gh-limit.py --stats` reads local counters only — no
 request, no credentials — so it answers at the exact moment the budget is gone:
 
 ```
 $ … gh-limit.py --stats
-gh-read-cache since=2026-10-23T04:41Z
+gh-read-cache since=2026-10-23T04:41Z floor=800 (default)
   pr-list        hit=212    miss=9      ttl=5s
   run-list       hit=67     miss=8      ttl=10s
   single-flight  share=41   → coalesced (N lanes, one request)
-  TOTAL          averted=320 → gh requests this box did not send (hits + shares)
+  TOTAL          averted=320 → gh requests this box did not send (served hits + successful coalesces)
 ```
 
-Every TTL hit and every single-flight share is one request the box did NOT send; `averted` is their
-sum. An **empty** counter prints `gh-read-cache no-reads-counted`, never `averted=0` — a measurement
-nobody made is the defect this file exists to prevent, not the format of the report. Counters are
-appended as one JSON line per event (`O_APPEND`, so concurrent lanes cannot lose each other's counts,
-and the same line is also in `events.log`) and rotated at 1 MiB.
+Every TTL hit and every **successful** single-flight share is one request the box did NOT send;
+`averted` is their sum. A shared FAILURE is not counted: a refusal that 25 lanes coalesce into would
+otherwise report `averted=24` at the exact moment nothing was served and nothing was saved — the
+instrument reading best during the incident it exists to measure. An **empty** counter prints
+`gh-read-cache no-reads-counted`, never `averted=0`, and an unreadable one prints
+`gh-read-cache UNREADABLE <path> (<reason>)` — a measurement nobody made is the defect this file exists
+to prevent, not the format of the report. Counters are appended as one JSON line per event
+(`O_APPEND`, so concurrent lanes cannot lose each other's counts), folded into a cumulative carry at
+1 MiB (so `averted` can never go DOWN after a rotation), and `floor=` names WHICH knob set the floor —
+a stale legacy `GH_LIMIT_CORE_LOW_WATER=100` on a deployed cell would otherwise shadow the 800 default
+silently.
 
 **Why the TTLs are 5 s / 10 s and `gh pr checks` is NOT cached — the contradiction test (#2342).**
 The 2026-10-23 brief proposed `pr-list 60 s`, `checks 30 s`, `issue 120 s`. Two are declined on the

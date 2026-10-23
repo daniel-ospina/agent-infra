@@ -595,6 +595,13 @@
 
 set -uo pipefail
 
+# ⛔ THE LANDING RAIL'S READS ARE ESSENTIAL (#2342). `gh-limit.py` keeps a reserve below
+# `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read that could not be served from
+# GraphQL — the reserve exists so a LANDING can still spend it. This script IS that landing, so it
+# declares its reads essential rather than being refused by its own reserve. Nothing else in-tree sets
+# this; a poll is never essential.
+export GH_LIMIT_ESSENTIAL=1
+
 # File-scope so the EXIT trap can read it after `main` returns (P1-2).
 TMP=""
 # The stderr-capture file for the two READ PROBES (`resolve_head` / `resolve_draft`).
