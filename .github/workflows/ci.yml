@@ -943,16 +943,19 @@ jobs:
     # what `check-ci-lane-parity` asserts (an argument there is a MENTION, not the call, and the
     # lane un-wires — the #1369 class).
     #
-    # COVERAGE IS ARITHMETIC, NOT TRUST. Each slice asserts it executed exactly its derived share
-    # and that `executed + skipped == listed`; the slices therefore sum to the whole list. A slice
-    # that runs nothing, or a neighbour's shards twice, fails its own assertion rather than
-    # reporting a green check over a hole.
+    # COVERAGE IS ARITHMETIC, NOT TRUST. Each slice asserts that the SET of shards it executed is
+    # exactly the set its index derives from the list (a sorted-path comparison, not a count — a
+    # broken modulus that runs the right NUMBER of the wrong shards is caught too), AND that
+    # `executed + skipped == listed`. The slices therefore sum to the whole list. A slice that runs
+    # nothing, or a neighbour's shards twice, fails its own assertion rather than reporting a green
+    # check over a hole.
     runs-on: ubuntu-latest
     # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
-    # measurements (PR #2412 job 120365087427: the list then held 74 shards, 73.6 min, 59.7 s/shard
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards — it is 78 today, and
+    # the per-slice sizes are DERIVED, so no number here goes stale — 73.6 min, 59.7 s/shard
     # mean; #2483's
     # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
-    # other 70 shards 26m25s).
+    # remaining shards 26m25s).
     #
     # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
     # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
