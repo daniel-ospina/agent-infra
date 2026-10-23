@@ -163,24 +163,77 @@ The mirror failure is real too: a working child was once declared `wedged` with
 > classifier forks it. Adding a second identity probe anywhere is the "two contracts for one
 > safety rule" defect #1178 exists to remove.
 
-**Three consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
+**Four consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
 CLI **at signal time**, immediately before each `os.kill`: it supplies the incarnation it recorded
 when it measured the subtree, and signals only on `holder`. It derives no identity of its own — an
 earlier version signalled by pid alone, which is the superseded form recorded in §6.
+
+**A fourth consumer: the `pi` POOL's owner** (`scripts/orphan-reap.py --pool pi`, 2026-10-22). The
+`ppid=1` orphan class above could not see a lane's `pi` at all — bare argv, reparented to launchd
+or sitting under tmux — so the session pool had no owner and grew without bound. That reaper
+derives the session **from the pid** (the JSONL whose name-stamp is within the canon's
+`FENCE_TOLERANCE_SECONDS` of `now - etime`; an argv `--session` form is left to
+`scripts/lib/pid-identity.sh`, never re-parsed), then calls **`liveness.gather`** — so the store is
+read and its vetoes apply — appends the live pid it is holding as a `HOLDER` candidate (the C2
+direction), and acts **only** when `evaluate` returns `idle`. ⛔ **And in the shipped default it
+does not act AT ALL**: the canon verdict is necessary, not sufficient. The chain must also pass the
+recorded HOST DECISION (§`#1207`, owner-approved as option A on `#1297`): a human terminal or
+login shell is `KEEP-HUMAN`, and a chain that is **unparseable OR carries no host app at all** is
+`unknown` — *report only, never reap*. A `pi` reparented to launchd has no ancestry left to show a
+host, which is exactly this pool's target population, so its reapable set is **empty by decision**:
+the census ships, arming it is a reopen (one named constant), never a flag flip. Three process
+gates sit in front of
+that verdict — CPU delta < 0.10 s over the printed window, ancestry walked to the top (a
+Terminal/iTerm/login-shell/tmux ancestor is `KEEP-HUMAN`), and progress judged against the
+process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap)) — and the four
+reported states are `LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`. Its declared blind
+spots are the ones §1 leaves it: a `pi` that leaves no bindable session file (a print-mode / `task`
+child, or a resumed session keeping its original name-stamp) has **no progress channel**, so one
+of the three gates cannot be evaluated on it — a PARKED one abstains as `UNVERIFIABLE`
+(`no-progress-channel:<binding>`), never as "nothing to reap", while a BUSY one still reads `LIVE`
+off gate 1 (the CPU delta). That asymmetry is deliberate, not a gap: `PARKED-REAPABLE` is only
+reachable by a row that HAS a transcript (the abstention on a missing one sits on the same path),
+so nothing is reaped either way, and collapsing a busy unbound lane into an abstention would
+destroy the census's one diagnostic job — telling progress from parked. The guarantee is the
+abstention on the PARKED row, not a promise that an unbound row can never read `LIVE`. A **second**
+declared blind spot is the SWITCHED session (`/new`, `/fork`, `/clone`): pi writes a fresh stamped
+file and leaves the abandoned one behind, so the fence binds the dead transcript and the row can
+read `PARKED-REAPABLE` for a lane that was writing seconds ago — masked to `UNVERIFIABLE` under the
+shipped host decision, and a wrong kill only where that decision is reopened (#2475). A **third** is
+the HOST ALLOWLIST: an interactive host that is not listed in `HUMAN` is invisible to gate 2
+(WezTerm/Ghostty/Zed are covered; a VS Code `Code Helper` cannot be matched at all, because
+`ps -Ao comm=` is space-split, so such a session is caught only through a shell/terminal ancestor,
+or not at all). That list is an allowlist of owners, so a NEW host is a real gap rather than a bug.
+On a box where the hook store is unreadable every
+row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
+the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
+gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;
+gate 2 supersedes its answer). The safe property holds either way — nothing is reaped — but
+`counts.UNVERIFIABLE == pool size` is **not** a store-health probe, and 0 UNVERIFIABLE does not
+mean the store was readable. Beyond those three, the pool inherits §1's remaining blind spots
+verbatim: a same-fence start in the same cwd (`ambiguous-binding`), another uid's processes (the
+pid-side cwd filter is skipped and `binding_detail` shows it), memory/fd pressure, and a live child
+of a parked parent it does not enumerate — the runtime `declared blind spots:` line prints the same
+list, so the header, the report and this section name one set.
 
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):
 
 1. **Candidates are a UNION.** The candidate set for a session id is the current store record,
-   **every** `priorProcessGenerations` entry, and every pid whose **argv names the session** in a
-   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`). The union —
+   **every** `priorProcessGenerations` entry, every pid whose **argv names the session** in a
+   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`), and — for
+   the `pi` pool below — the pid that pool's reaper is itself holding (a *positive* observation
+   from a fresh `ps` read; a bare-argv `pi` is invisible to the argv source). The union —
    not the newest, not the first — is what stops a resumed session's stale tag from calling a live
    lane dead. Without the argv source, "the record's incarnation is gone" would be silently
    equated with "the lane is dead".
 
 2. **A pid holds the session its store record names only if the fence matches.** A fresh `ps`
    read must show it present, **not a zombie**, and its `lstart` must be within
-   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. The fence
+   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. ⚠️ The `pi`
+   pool below fences against a DIFFERENT datum on the SAME bound: the session JSONL's
+   **name-stamp** (UTC, ms) against `now - etime`. Same tolerance, different evidence — stated
+   here so the two are not read as one reading. The fence
    exists because second-granularity rounding differs by up to ~1 s; its whole purpose is to make
    an identity *uncertainty* fail safe. An unrelated process that inherits a dead session's pid
    fails the fence and is **not** its holder. A pid whose **argv** names the session is a *direct*
@@ -409,7 +462,12 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 24 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
+python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
+
+The last suite is also the only place the fence default is pinned against
+`scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
+it leaves that divergence unpinned.
 
 ---
 

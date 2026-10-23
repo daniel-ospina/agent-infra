@@ -1591,19 +1591,26 @@ gate is a lane-killer, not a reaper.
 mean. The table below is the per-carrier gate inventory this section asks for; a carrier that ships
 with a weaker set says so here rather than being discovered at arming time.
 
+⛔ **`orphan-reap.py` is cited by SYMBOL, not by line** — except the header's numbered gates, which
+are pinned as a RANGE (`:13-34`) because the header is where a reader starts. `--pool pi`
+(2026-10-22) added ~700 lines above these definitions, so every `:`-citation into that file that
+this section used to carry had become wrong: a doc that names `:175` for `ancestry()` now points
+into an unrelated function.
+
 | carrier | scheduled by | ancestry | gate 4 launchd-registered | gate 5 designed-daemon | gate order |
 |---|---|---|---|---|---|
-| `orphan-reap.py` (`:175`, rule at `:17-19`) | **nothing** (§6.5.1); ships dry-run (`:195`) | walk to the top | yes (`registered_launchd_pids`, `:109`) | yes — pidfile / daemon argv / recently-touched output / live holder of a socket it owns (`designed_daemon`, `:132`) | the sanctioned owner — the reference set |
+| `orphan-reap.py --pool orphan` (`ancestry()`, rule at `:13-34`) | **nothing** (§6.5.1); ships dry-run (`--apply` opt-in) | walk to the top | yes (`registered_launchd_pids()`) | yes — pidfile / daemon argv / recently-touched output / live holder of a socket it owns (`designed_daemon()`) | the sanctioned owner — the reference set |
+| `orphan-reap.py --pool pi` (2026-10-22) | **nothing** (§6.5.1); ships dry-run (`--apply` opt-in) | walk to the top, **and an unparseable walk or a chain carrying NO host app is NOT rejected as "no human" — it is `unknown` and abstains** (`gate2_host_decision()`) | **NO** | **NO** | ⚠️ a WEAKER gate set than the row above, stated here because that is what this table is for: no launchd or designed-daemon gate, so its safety rests on gate 2 plus the canon's own `idle` verdict. Under the recorded rule (#1207, owner-approved option A on #1297) the hostless chain — this pool's TARGET population, since a reparented `pi` has no ancestry left — is `unknown` and **report-only**, so the census ships and the reapable set is EMPTY BY DECISION until that decision is reopened (`AUTHORISE_HOSTLESS_CHAINS`) |
 | `lane-watchdog.py` (`human_above()`, `:467`) | `heartbeat-loop.sh:365-368` (armed) | walk only | no | no | two-gate carrier; ARMED |
 | `pi-reap-idle.sh` (`:55`, `:381-429`) | hourly job, ships armed | additive third gate, can only REFUSE | no | no | REFUSE-only |
 | `pi-reap-orphans.sh` (this restore, #1862) | `com.eldato.pi-reap-orphans.plist`, hourly, ships **DISARMED** (`REAP_ORPHAN_DRY_RUN=1`) | candidate's OWN command must not be an anchor — a `ppid==1` candidate has no observable ancestor above launchd, so a reparented **descendant** of a human session is NOT detectable here | yes (`launchd_pids_load`; unreadable/unshaped probe aborts the pass, a host without `launchctl` logs the gate INERT) | argv + pidfile arms only — the socket-holder arm is deliberately NOT carried (it needs a second fleet-wide `lsof` pass on a host this tool exists to unload) | listed in the script header |
 
-`orphan-reap.py` walks to the top (`ancestry()`, `:175`) **and** adds the two gates `ppid 1` cannot
+`orphan-reap.py` walks to the top (`ancestry()`) **and** adds the two gates `ppid 1` cannot
 express: launchd registration (gate 4 — a managed daemon has an owner) and designed-daemon (gate 5 —
 pidfile, daemon flag, recently-touched output, or any live holder of a socket it owns). Gate 5 was
 added AFTER a dry run passed gates 1-4 on three processes and all three were wrong to reap (gate 4
-came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (`:195`) and nothing
-schedules it today (§6.5.1).
+came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (`--apply` is the
+opt-in) and nothing schedules it today (§6.5.1).
 `lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
@@ -1647,11 +1654,12 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
 
 **MUST.** The following stay out of automation, with the reason stated rather than assumed:
 
-- **A candidate with diagnostic value stays.** Evidence beats tidiness — `orphan-reap.py:36`
-  ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
+- **A candidate with diagnostic value stays.** Evidence beats tidiness — the `orphan-reap.py`
+  header line "Reapable != right to reap" (cited by symbol, per the rule above), and
+  `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The process reaper restored by
+  `orphan-reap.py` (its `--apply` default, cited by symbol) — with nothing scheduling it. The process reaper restored by
   #1862/#1863 (`pi-reap-orphans.sh`) is now SCHEDULED (hourly
   `com.eldato.pi-reap-orphans.plist`) **and ships DISARMED**
   (`REAP_ORPHAN_DRY_RUN=1`, pinned by `install-launchd.test.sh`), so the schedule and the arming
