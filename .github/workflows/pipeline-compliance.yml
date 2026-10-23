@@ -51,6 +51,18 @@ on:
       - reopened
       - edited
 
+# NO `concurrency:` BLOCK, DELIBERATELY (#2474) — and the same reasoning applies to
+# `.github/workflows/workflow-lock.yml`. A per-PR group cannot tell a head from its
+# successor (the key is the PR, not the sha), so a `gh run rerun` of a SUPERSEDED
+# head arrives in the SAME group as the newest head and cancels its in-flight run.
+# Concurrency orders by ARRIVAL, not head age. That is a fail-open here, not a
+# speed-up: `cancelled` is in `NON_RED_CONC` (scripts/admin-merge.sh) and counts as
+# measured-nothing, so the repo's ONLY required status check (#646) would read
+# non-red with no verdict on the newest tree — and stale-head reruns are observed
+# on this workflow. Fix the rail first (#2474), then add supersession.
+#
+# A superseded-head run here IS wasted work (measured on #2474); it is left in place
+# because the alternative loses verdicts rather than runner-minutes.
 permissions:
   contents: read
   issues: read
