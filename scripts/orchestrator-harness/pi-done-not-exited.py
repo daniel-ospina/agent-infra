@@ -159,12 +159,21 @@ COMPLETION_FAILED = (            # the same extension's three failure shapes
     "[reflect-hook] Attribution resolution failed",
 )
 STARTUP = "[reflect-hook] capture "     # captureStatusLine: BEFORE the turn, never completion
-# ⛔ PRINT MODE, read from the LAUNCHER's text. An interactive `pi` waiting at a human's prompt also
+# ⛔ PRINT MODE, read from the LAUNCHER's CODE. An interactive `pi` waiting at a human's prompt also
 # reaches `turn-ended` + frozen CPU + no child, so without this predicate the tool would signal an
 # agent that is simply idle — the one local discriminator between that and "the lane finished and
 # never exited" (cycle 4, P2). The CHILD's own argv cannot answer it here: pi rewrites its argv to
-# the bare word `pi` on a cell (measured: `/proc/<pid>/cmdline` == "pi"), so the launcher's text is
+# the bare word `pi` on a cell (measured: `/proc/<pid>/cmdline` == "pi"), so the launcher's code is
 # the evidence — `pi -p`, `pi --print`, or `run_agent`, whose contract in spawn-gate.sh IS print mode.
+# ⚠️ THE CLAIM IS SCOPED TO THE LAUNCHER, NOT TO THE INVOCATION (cycle 7): the check is one search
+# over the launcher's code, so a launcher that BOTH runs a print-mode lane and spawns a bare
+# interactive `pi` satisfies it for both, and a quoted string (`echo 'usage: pi -p'`) matches. No
+# shipped launcher has either shape (the only `pi -p` invokers are spawn-gate.sh/merge-one.sh, and
+# none spawns an interactive `pi`), and the remaining gates — ownership rung, no human ancestor, no
+# live child, frozen CPU, `--min-idle`, and the explicit `--authorise-hostless` — still stand in
+# front of any signal. Narrowing this to an invocation would need the launcher's argv or its
+# held-fd topology, which the interpolating launchers do not expose; it is recorded as a residual,
+# not papered over.
 PRINT_MODE = re.compile(r"(?m)(^|[\s;/])pi\s+(?:[^\n]*?\s)?(?:-p|--print)(?=\s|$)|"
                         r"(^|[\s;])run_agent(\s|$)")
 

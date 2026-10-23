@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-done-not-exited.test.py — eighteen real process trees, plus the controls the review demanded.
+"""pi-done-not-exited.test.py — nineteen real process trees, plus the controls the review demanded.
 
 WHY PROCESS FIXTURES AND NOT MOCKS
 The bug is a property of REAL PROCESSES — a `pi` whose launcher is blocked on it, a log on its fd 1,
@@ -35,7 +35,9 @@ THE CASES — each guards a different way to be wrong
  14. BOUND       a control lane the first pass never reaps (the `--min-idle` bound, both directions).
  15. PEER (×2)   two `pi`, ONE cwd, ONE transcript, started inside the canon's fence ⇒ both are
                  `peer-claimed` and neither may use that boundary — including under `--pid`.
- 16. COMMENT     a launcher that mentions print mode ONLY in a comment ⇒ refused (`code_only()`).
+ 16. COMMENT     a launcher that mentions print mode ONLY in a whole-line comment ⇒ refused.
+ 17. TRAILCOMMENT the same mention as a TRAILING comment ⇒ refused too (a trailing comment is not
+                 code); this is what pins the `code_only()` increment.
 
 THREE SEQUENTIAL CONTROLS (not fixtures):
   * BOUND      a DONE-shaped lane that the first pass never reaps: not reaped at `--min-idle 100000`,
@@ -160,19 +162,25 @@ def launcher_script(root: str, tag: str, cwd: str, logname: str, *, append: bool
     # ⛔ A COMMENT IS NOT PRINT MODE (cycle 5/6). `lane.sh` and `merge-one.sh` both mention print
     # mode in prose, so a launcher that only DOCUMENTS it must not pass the predicate that decides
     # whether an idle interactive agent may be signalled.
-    note = "# this lane runs pi -p, see run_agent in spawn-gate.sh\n" if comment_mentions else ""
+    note = ""
+    if comment_mentions == "trailing":
+        # the increment cycle 6 shipped: a TRAILING comment is not code (cycle 7, P2-1)
+        note = ""
+    elif comment_mentions:
+        note = "# this lane runs pi -p, see run_agent in spawn-gate.sh\n"
     path = os.path.join(root, "lane-%s.sh" % tag)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/bash\n"
                  + note +
-                 "export TAG=%s\n"
+                 "export TAG=%s%s\n"
                  "cd %s || exit 4\n"
                  "%s"
                  "%s/pi %s300%s %s %s 2>&1\n"
                  "rc=$?\n"
                  "printf 'EXIT rc=%%s\\n' \"$rc\" >> %s\n"
                  "printf '%%s %%s\\n' \"$rc\" \"$(date -u +%%FT%%TZ)\" > %s\n"
-                 % (tag, cwd, trap, root, pm, arg, redirect, log, log, rc))
+                 % (tag, ("  # this lane runs pi -p here" if comment_mentions == "trailing" else ""),
+                    cwd, trap, root, pm, arg, redirect, log, log, rc))
     return path
 
 
@@ -340,6 +348,7 @@ def main() -> int:
     argv_pid = case("argvtag", TURN_ENDED, transcript=False, interpolate=True, positional=True)
     case("interactive", TURN_ENDED, transcript=False, no_print=True)   # `pi` with no -p: refused
     case("commentonly", TURN_ENDED, transcript=False, no_print=True, comment_mentions=True)
+    case("trailcomment", TURN_ENDED, transcript=False, no_print=True, comment_mentions="trailing")
     case("freshlog", TURN_ENDED, transcript=False, fresh_log=True)
 
     # ── PEER: two `pi`, ONE cwd, ONE transcript, started inside the canon's fence (cycle 5, P2-2:
@@ -403,7 +412,7 @@ def main() -> int:
 
     tags = ["done", "live", "hung", "abstain", "nosession", "shared", "shared2", "child", "survive",
             "noowner", "weak", "freshlog", "argvtag", "interactive", "peerA", "peerB",
-            "commentonly"]
+            "commentonly", "trailcomment"]
     pids = [procs[t] for t in tags]
     proc, rows = run_tool(sessions, pids, ["--authorise-hostless"])
     writer.join(timeout=5)
@@ -508,6 +517,13 @@ def main() -> int:
     check(os.path.exists("/proc/%d" % procs["commentonly"]),
           "15/16 COMMENT: --apply did NOT touch it")
 
+    check(cls("trailcomment") == "UNATTRIBUTABLE"
+          and "interactive-or-unknown-mode" in why("trailcomment"),
+          "16/17 TRAILING-COMMENT: `export TAG=x  # this lane runs pi -p here` does not satisfy the "
+          "print-mode predicate — a trailing comment is not code (got %r)" % cls("trailcomment"))
+    check(os.path.exists("/proc/%d" % procs["trailcomment"]),
+          "16/17 TRAILING-COMMENT: --apply did NOT touch it")
+
     check(rows.get(procs["argvtag"], {}).get("owner") == "tag"
           and cls("argvtag") == "DONE-NOT-EXITED",
           "12/14 ARGV: a launcher whose ONLY basis is the tag on its own argv (`bash lane-argvtag.sh "
@@ -515,7 +531,7 @@ def main() -> int:
           "(got %r: %r)" % (rows.get(procs["argvtag"], {}).get("owner"), cls("argvtag")))
 
     check(sum(1 for r in rows.values() if r["cls"] == "DONE-NOT-EXITED") == 4,
-          "exactly 4 of the 17 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
+          "exactly 4 of the 18 judged fixtures were DONE-NOT-EXITED (done + nosession + argvtag + "
           "survive, and the last of those ignored SIGTERM): a detector that reaped all, or none, "
           "fails here")
 
@@ -584,7 +600,7 @@ def main() -> int:
     th.start()
     ok_quiet, why_quiet = tool.verify_target(prow, canon, pool, 0.6)
     th.join(timeout=5)
-    check(not ok_quiet and "log changed" in why_quiet,
+    check(not ok_quiet and ("log changed" in why_quiet or "deciding line changed" in why_quiet),
           "C6 VERIFY: a log that changes inside the verification window REFUSES the signal (got %r: "
           "%r)" % (ok_quiet, why_quiet))
 
@@ -595,7 +611,7 @@ def main() -> int:
                     "always-false" % why_still)
 
     cleanup()                     # kills the groups AND removes the root
-    print("\nALL ASSERTIONS HELD (17 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
+    print("\nALL ASSERTIONS HELD (18 judged fixtures + a control lane: 4 DONE-NOT-EXITED, one of "
           "which ignored SIGTERM; 10 refused for ten different reasons; plus the bound in both "
           "directions, the arming gate, the refusal bucket and the verify-time log re-read)")
     return 0
@@ -626,10 +642,19 @@ def run_mutations() -> int:
         ("the log-only arm loses the silence bound",
          '    if marker == "ok" and (out["log_age_s"] or 0) >= opts.min_idle:',
          '    if marker == "ok":'),
+        # the whole log re-read (size AND marker), because either check alone still refuses the
+        # probing log — a one-branch mutation is a partial change, not a defect (cycle 7)
         ("verify_target stops re-asking the log channel",
          '    if _size(r.get("log")) is not None and log_m0 is not None and '
-         '_size(r.get("log")) != log_m0:',
-         "    if False:"),
+         '_size(r.get("log")) != log_m0:\n'
+         '        return False, "the log changed inside the verification window (grew, or was rewritten)"\n'
+         '    if r.get("log"):\n'
+         '        holders = sum(1 for q in again if held_log(q)[0] == r["log"])\n'
+         '        marker_now, _d = log_marker(r["log"], holders)\n'
+         '        if r.get("marker") in ("ok", "hook-failed") and marker_now != r.get("marker"):\n'
+         "            return False, (\"the log's deciding line changed at signal time (%s -> %s)\"\n"
+         '                           % (r.get("marker"), marker_now))',
+         "    pass"),
         ("ownership grants `tag` for ANY tag",
          "        if tag_on_argv:",
          '        if True:'),
@@ -643,8 +668,9 @@ def run_mutations() -> int:
          "    if rung is not None and not PRINT_MODE.search(code_only(_read(launcher))):",
          "    if False:"),
         ("the peer-claimed guard disabled", "    if path and path in peers:", "    if False:"),
-        ("code_only() reverted to identity (inline/whole-line comments count again)",
-         '        code = ln.split("#", 1)[0]', '        code = ln'),
+        ("code_only() reverted to the cycle-5 body (whole-line comments only, TRAILING ones count)",
+         '        code = ln.split("#", 1)[0]',
+         '        code = "" if ln.lstrip().startswith("#") else ln'),
         ("--pid binds only the requested subset",
          "    binds, peers = bind_map(pool, rows, all_pids, opts.ref_s)",
          "    binds, peers = bind_map(pool, rows, pids, opts.ref_s)"),
@@ -673,9 +699,11 @@ def run_mutations() -> int:
             proc = subprocess.run([sys.executable, os.path.join(tmp, "scripts", "orchestrator-harness",
                                                                 "pi-done-not-exited.test.py")],
                                   capture_output=True, text=True, timeout=900)
-            if proc.returncode == 0:
-                return (label, False, proc.returncode)
-            return (label, True, proc.returncode)
+            # ⛔ A CATCH IS AN ASSERTION HIT, not any non-zero exit: a traceback, an OOM kill or a
+            # flake would otherwise be reported as "the suite caught it" (cycle 7, P2-2) — the
+            # anti-inertness control manufacturing the teeth it exists to prove.
+            hit = proc.returncode != 0 and "FAIL:" in proc.stdout
+            return (label, hit, proc.returncode, proc.stdout[-400:])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             if tmp in ROOT:
@@ -690,9 +718,11 @@ def run_mutations() -> int:
         for res in pool.map(one, mutations):
             results.append(res)
     missed = [r[0] for r in results if not r[1]]
-    for label, caught, rc in results:
+    for label, caught, rc, tail in results:
         if caught:
-            print("ok   mutation caught: %s → suite RED (rc=%d)" % (label, rc))
+            print("ok   mutation caught: %s → suite RED (rc=%d, assertion hit)" % (label, rc))
+        else:
+            print("   NOT a catch: %s (rc=%d, no FAIL: line) tail: %r" % (label, rc, tail))
     if missed:
         fail("NOT caught (the suite stayed green, so the assertion that should guard them is inert): "
              + "; ".join(missed))
