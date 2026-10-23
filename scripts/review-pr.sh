@@ -514,6 +514,19 @@ for _sv in $(compgen -e 2>/dev/null || true); do
   esac
 done
 unset _sv _svv
+# ⛔ THE REVIEW-SIGNING KEY HAS NO SHAPE, SO IT IS SCRUBBED BY VALUE OR NOT AT ALL (P0, fresh review
+# of #2288 — MEASURED: a reviewer told `cat ~/.pi/agent/.ai-review-gate-key` printed it, and the
+# not-clean artifact published that value VERBATIM into a public PR comment). This process knows the
+# value — it asks the recorder to MINT A SIGNED MARKER with it, and its own refusal messages name the
+# file — so the value can be added explicitly. A random HMAC key cannot be recognised by ANY shape
+# list, and it is the one secret whose disclosure lets any PR author mint a valid `sig=` for their own
+# head and green the merge gate. Scrubbing the value here is the only boundary that can cover it.
+_ark="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$_ark" ] && [ -r "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  _ark="$(tr -d '[:space:]' < "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+if [ "${#_ark}" -ge 8 ]; then SECRET_VALUES+=("$_ark"); fi
+unset _ark
 # redact_file <src> <dst> — write <src> to <dst> with credential values/shapes replaced. The caller
 # must post <dst> (not <src>), so the body-equality fallback in `post_comment` still compares the
 # bytes that were actually published.
@@ -936,7 +949,7 @@ VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:s
 # is allowed (§AB) — closing it would mean requiring the verdict to be the final non-empty line,
 # which changes that decision rather than fixing a bug. Quote it inside a fence or indent it and
 # it is correctly refused; narrate it as plain prose and it is not.
-LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
+grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | awk '{ ln[NR] = $0 }
                     END {
                       # ── FENCED REGIONS: PAIR THE WAY MARKDOWN DOES, FAIL CLOSED ─────────────
@@ -1089,8 +1102,15 @@ LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space
                         print ln[i]
                       }
                     }' \
-             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
+             | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tr -d '\r' > "$RUN_DIR/verdict-lines.txt"
+  LAST_LINE="$(tail -1 "$RUN_DIR/verdict-lines.txt" 2>/dev/null)"
+  # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS KEPT (P1/P2, fresh review of #2288): the
+  # contradiction guard read only this LAST line, so a counted CLEAN — or an `ISSUES 2` — one line
+  # above a bare `CLEAN` was never re-read and the run recorded clean. The file is the SAME survivor
+  # set (quoted regions excluded), so a clean report that QUOTES someone else's `ISSUES 2` is
+  # unaffected; the count/binding checks below therefore iterate over it rather than over $LAST.)
 LAST="$LAST_LINE"
+VERDICT_LINES_FILE="$RUN_DIR/verdict-lines.txt"
 # ⛔ THE VERDICT MUST BE THE LAST VERDICT-SHAPED LINE IN THE TRANSCRIPT (P1, fresh review of
 # #2288 — this was a FAIL-OPEN). The map above skips quoted regions, so `tail -1` over the SURVIVORS
 # silently promotes an EARLIER verdict: measured, `**Verdict:** CLEAN` … an unclosed ``` … then
@@ -1469,6 +1489,17 @@ END {
     if (after ~ /^[[:space:]*_:|.,;—–-]*$/ && L[i + 1] != "" && counts_only(L[i + 1])) continue
     loc   = (raw ~ /[[:alnum:]_\/.-]+:[0-9]+/)
     table = (raw ~ /^[[:space:]]*\|/)
+    # ⛔ A TABLE SCAFFOLD IS NOT A FINDING (P3, fresh review of #2288 — over-block: a paid review
+    # discarded). A clean report that closes with `| P0 | P1 | P2 |` / `|---|---|---|` /
+    # `| 0 | 0 | 0 |` was refused: the HEADER row leads with a severity token and sits in a table,
+    # so the positional rule printed it as a blocking finding. A row whose every CELL is a severity
+    # token (a header) or a separator run is scaffold. A row carrying a NUMBER keeps being read —
+    # `| P1 | 2 |` states two blockers and must still block.
+    if (table) {
+      t = raw; gsub(/[[:space:]]/, "", t)
+      if (t ~ /^(\|(\*\*|__)?P[0-3](\*\*|__)?)+\|$/) continue
+      if (t ~ /^(\|[-:]+)+\|$/) continue
+    }
     cue   = (lead || loc || table || NOUN_CUE == 1 || (DEC == 1 && (noun_before(raw) || sepafter(after))))
     if (cue) print raw
   }
@@ -1503,7 +1534,16 @@ fi
 # pattern tolerates the `**`/`__` around the token — a clean report refused for its own table.
 # `| P1 | 2 |` is NOT a summary and still blocks: only a ZERO count is a count.
 SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*(\*\*|__)?[[:space:]]*P[0-3][[:space:]]*(\*\*|__)?[[:space:]]*\|?[[:space:]]*0+[[:space:]]*\|?[[:space:]]*$'
-FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
+# ⛔ A MULTI-COLUMN SEVERITY TABLE IS A SUMMARY, AND ITS HEADER IS NOT A FINDING (P3, fresh review of
+# #2288 — over-block: a paid review discarded). A clean report that closes with
+# `| P0 | P1 | P2 |` / `|---|---|---|` / `| 0 | 0 | 0 |` refused: the HEADER row leads with a
+# severity token, is not a numeric row, and counts_only() over `| P1 | P2 |` finds no count, so it
+# printed as a blocking finding. A row whose cells are ALL severity tokens (a header) or all
+# separators is a table SCAFFOLD, never a finding; `| P1 | 2 |` still blocks, because a number in a
+# cell is not a severity token.
+TABLE_HDR_RE='^[[:space:]]*\|([[:space:]]*(\*\*|__)?[[:space:]]*P[0-3][[:space:]]*(\*\*|__)?[[:space:]]*\|)+[[:space:]]*$'
+TABLE_SEP_RE='^[[:space:]]*\|([[:space:]]*[-:]+[[:space:]]*\|)+[[:space:]]*$'
+FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" | grep -avE "$TABLE_HDR_RE" | grep -avE "$TABLE_SEP_RE" || true)"
 # The union is composed HERE — composing it above `SUMMARY_ROW_RE` (the first attempt at this fix)
 # left it assigned before the row filter existed and then silently OVERWRITTEN, so the widened scan
 # was dead code and the fail-open survived.
@@ -1622,20 +1662,46 @@ fi
 # makes the digits a token of their own, so a numeral that is part of a SEVERITY label (`P2`) is
 # never a count.
 refuse_counted_clean() {
-  local _cm _cn
-  CLEAN_COUNT_WORDS=""
-  while IFS= read -r _cm; do
-    [ -n "$_cm" ] || continue
-    _cn="$(printf '%s' "$_cm" | grep -oE '[0-9]+' | head -1)"
-    [ -n "$_cn" ] || _cn=1      # a WORD numeral is a non-zero count by definition
-    [ "${_cn:-0}" -gt 0 ] || continue
-    CLEAN_COUNT_WORDS="$_cm"; break
-  done <<<"$(printf '%s' "$LAST" \
-    | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
-    | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+  local _vl _vw _hit _one _dig
+  CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
+  # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS READ, NOT ONLY THE FINAL ONE (P1/P2, fresh
+  # review of #2288 — both MEASURED, both minted a signed clean record):
+  #   (a) `**Verdict:** CLEAN — 1 blocking finding remains …` followed by a bare `CLEAN` — the
+  #       counted line was never re-read, so the count was discarded;
+  #   (b) `**Verdict:** ISSUES 2` followed by `CLEAN` — the reviewer counted two blockers and the
+  #       count channel read only the accepted line.
+  # The file iterated here is the SAME survivor set the verdict comes from (quoted regions
+  # excluded), so a clean report that QUOTES someone else's `ISSUES 2` is unaffected.
+  while IFS= read -r _vl; do
+    [ -n "$_vl" ] || continue
+    # (b) an EARLIER verdict-shaped line that says ISSUES is a contradiction, whatever its count.
+    _vw="$(printf '%s' "$_vl" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
+    if [ "$_vw" = "issues" ] && [ "$_vl" != "$LAST" ]; then
+      err "$PROG: the transcript states ISSUES on an earlier verdict-shaped line and a CLEAN verdict last — a reviewer that reported issues and then closed with a bare CLEAN has not reviewed this revision clean."
+      err "  earlier verdict line: $_vl"
+      err "  accepted verdict line: $LAST"
+      err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+      die "$E_ISSUES" "a self-contradicting transcript (an ISSUES verdict line, then CLEAN) is never recorded — re-run the review"
+    fi
+    # (a) a non-zero count of findings on ANY verdict-shaped line.
+    _hit="$(printf '%s' "$_vl" \
+      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]]+of)?|half([[:space:]]+a)?[[:space:]]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)[[:space:]]+(blocking[[:space:]]+)?(findings?|issues?|blockers?|problems?)([[:space:]]+(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
+      | grep -viE '[[:space:]](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
+    [ -n "$_hit" ] || continue
+    # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
+    # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
+    # the line keeps being scanned rather than being exempted whole.
+    while IFS= read -r _one; do
+      [ -n "$_one" ] || continue
+      _dig="$(printf '%s' "$_one" | grep -oE '[0-9]+' | head -1)"
+      [ -n "$_dig" ] && [ "$_dig" -eq 0 ] && continue
+      CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
+    done <<<"$_hit"
+    [ -n "$CLEAN_COUNT_WORDS" ] && break
+  done < "$VERDICT_LINES_FILE"
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
-    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and the same line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
-    err "  accepted verdict line: $LAST"
+    err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
+    err "  offending line: ${CLEAN_COUNT_LINE:-$LAST}"
     err "  A CLEAN that reports no findings at all is the only CLEAN; if the reviewer repaired one, it must say so with a resolved participle (fixed/addressed/resolved/closed/removed)."
     err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_ISSUES" "a self-contradicting CLEAN verdict (clean + a reported count) is never recorded — re-run the review"
@@ -1661,8 +1727,11 @@ case "$VWORD" in
     fi
     # The count-word contradiction guard is refuse_counted_clean(), called BELOW the case so that
     # EVERY spelling that reaches a final `clean` passes it — including the `ISSUES 0` conversion
-    # (P0, fresh review at a8656b9; the full rationale lives on the function).
+    # (P0, fresh review at a8656b9; the full rationale lives on the function). That function now also
+    # reads EVERY verdict-shaped line in the accepted region, not only $LAST (P1/P2, fresh review of
+    # #2288: a counted CLEAN, or an `ISSUES 2`, one line above a bare `CLEAN`, recorded clean).
     refuse_counted_clean
+
     VERDICT=clean ;;   # a CLEAN line carries no count of its own
   issues)
     VERDICT=issues

@@ -289,6 +289,10 @@ printf 'GHREPO=%s\n' "${GH_REPO:-<unset>}" >> "$TMP/pi-env.txt"
 # green — a guard that can be removed with no red check is not a guard. Written to its own
 # line so §U can read it next to GHREPO.
 printf 'GATEKEY=%s\n' "$(if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then printf present; else printf absent; fi)" >> "$TMP/pi-env.txt"
+# ⛔ THE SPAWN-GATE LEDGER TAG IS AN OBSERVABLE TOO (P3, fresh review of #2288): the file's own
+# comment calls an untagged refusal an observability defect and records that KIND was once mistagged
+# with a VERDICT, yet nothing read KIND/TAG — deleting the export left every assertion green.
+printf 'KIND=%s\nTAG=%s\n' "${KIND:-<unset>}" "${TAG:-<unset>}" >> "$TMP/pi-env.txt"
 # A BASE retarget during the review: the head sha is untouched, the three-dot diff is not.
 [ "${FIXTURE_FLIP_DIFF:-0}" = "1" ] && printf 'diff --git a/x b/x\n+BASE RETARGETED\n' > "$TMP/diff-body"
 # A head move DURING the review (the caller must refuse to record it).
@@ -1784,9 +1788,14 @@ sed 's/^\( *\)hpos = index(lo, "<" tg)$/\1hpos = 0/' "$SRC" > "$MH"
 if cmp -s "$SRC" "$MH"; then
   fail "the HTML-arm mutation did not apply — the anchored line changed shape, so this control proves NOTHING"
 else
-  reset; printf '**Verdict:** ISSUES — 2\n\n<pre>\n**Verdict:** CLEAN — no blocking findings.\n</pre>\n' > "$TMP/reviewer-out"
+  # ⛔ THE DISCRIMINATOR IS THE QUOTED-ONLY TRANSCRIPT (P2, fresh review of #2288). The earlier
+  # mutant drove `ISSUES 2` + a quoted CLEAN, which the CROSS-LINE contradiction guard now refuses on
+  # its own — so the mutant stayed red for a reason unrelated to the HTML arm, and the control proved
+  # nothing about it. With the quoted CLEAN as the ONLY verdict-shaped line, only the HTML arm stands
+  # between the mutant and a false clean record.
+  reset; printf 'The PR already carries this from an earlier head:\n<pre>\n**Verdict:** CLEAN — no blocking findings.\n</pre>\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
   run "$MH" 2284
-  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT exits 0 on a quoted CLEAN over an earlier ISSUES — so the arm is what refuses it"
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT exits 0 on a QUOTED, only verdict — so the HTML arm is what refuses it"
   [ -f "$TMP/record-argv.txt" ]; ck $? "  …and the MUTANT records the false clean, exactly the fail-open §AO exists to catch"
 fi
 # ⛔ A CLEAN THAT CARRIES A NON-ZERO COUNT IS A VERDICT OF CONVENIENCE (fail-open class, measured):
@@ -1992,6 +2001,116 @@ err_has "could not post the review comment"; ck $? "  …naming the failed post"
 no_record; ck $? "  …and NOTHING recorded (the artifact is the record's evidence)"
 reset
 
+# ── §BA the REVIEW-SIGNING KEY never reaches the public comment ───────────────
+echo; echo "§BA the signing key is scrubbed BY VALUE (it has no shape, so a shape list can never cover it)"
+# ⛔ P0 (fresh review of #2288, MEASURED): the reviewer child keeps $HOME, so it can read the key file
+# the script itself names in its refusals — and the redaction chokepoint seeded SECRET_VALUES from
+# `compgen -e` only. A prompt-injected `cat "$HOME/.pi/agent/.ai-review-gate-key"` therefore published
+# the fleet's review-signing key VERBATIM, and with it any author can mint a valid `sig=` for their
+# own head. A random HMAC key has NO shape, so this can only be closed by VALUE.
+KEYVAL="9f2c4a7e1b8d3056fa1c9e7b2d4a6083c5e9f1a7b3d6058e2c4a7f9b1d3056aa"
+reset; printf 'signing key: %s\n**Verdict:** ISSUES 1\n' "$KEYVAL" > "$TMP/reviewer-out"
+FIXTURE_SIGN_KEY="$KEYVAL" run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an ISSUES verdict still posts the not-clean artifact (rc=$(rc_of))"
+grep -q "$KEYVAL" "$TMP/comment.md" 2>/dev/null && rc=1 || rc=0; ck $rc "  …and the KEY VALUE from the environment does not appear in it"
+grep -q 'REDACTED:secret' "$TMP/comment.md" 2>/dev/null; ck $? "  …it is replaced by the redaction marker"
+# …and the FILE form, which is how a cell carries the key when the env var is absent.
+reset; printf 'signing key: %s\n**Verdict:** ISSUES 1\n' "$KEYVAL" > "$TMP/reviewer-out"
+mkdir -p "$TMP/home/.pi/agent"; printf '%s\n' "$KEYVAL" > "$TMP/home/.pi/agent/.ai-review-gate-key"
+# FIXTURE_SIGN_KEY="" is what makes this the FILE arm: run() exports AI_REVIEW_GATE_KEY from it, and a
+# non-empty env var short-circuits the file read the scenario is about.
+FIXTURE_SIGN_KEY="" run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "the same verdict with the key only in \$HOME/.pi/agent/.ai-review-gate-key (rc=$(rc_of))"
+grep -q "$KEYVAL" "$TMP/comment.md" 2>/dev/null && rc=1 || rc=0; ck $rc "  …and the FILE-carried key does not appear either"
+rm -f "$TMP/home/.pi/agent/.ai-review-gate-key"
+reset
+
+# ── §BB a contradiction ONE LINE ABOVE the accepted verdict still refuses ────
+echo; echo "§BB the contradiction guard reads every verdict-shaped line, not just the last"
+# ⛔ P1/P2 (fresh review of #2288, both MEASURED, both minted a signed clean record): the count guard
+# read $LAST only, so a counted CLEAN — or an `ISSUES 2` — one line above a bare `CLEAN` was never
+# re-read. Both are ordinary transcripts: a reviewer summarises, then signs off.
+reset; printf '**Verdict:** CLEAN — 1 blocking finding remains, in a file outside this diff.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a counted CLEAN followed by a bare CLEAN is refused (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf '**Verdict:** ISSUES 2\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "an ISSUES line followed by a bare CLEAN is refused (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# COUNTER-DIRECTION: one clean verdict plus prose mentioning no severity is still clean.
+reset; printf 'No blocking findings at all.\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "  …while a clean report keeps recording (rc=$(rc_of))"
+# …and the widened vocabulary: 'single' / 'half a dozen' are counts too.
+reset; printf '**Verdict:** CLEAN — a single blocking finding remains.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  …'a single blocking finding' is a count (rc=$(rc_of))"
+reset; printf '**Verdict:** CLEAN — half a dozen blocking findings remain.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  …'half a dozen blocking findings' is a count (rc=$(rc_of))"
+reset
+
+# ── §BC a summary TABLE closes clean ─────────────────────────────────────────
+echo; echo "§BC a multi-column severity table with zero counts is a summary, not a finding"
+reset; printf '| P0 | P1 | P2 |\n|---|---|---|\n| 0 | 0 | 0 |\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a zero severity TABLE records clean (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …recorded"
+# COUNTER-DIRECTION: a LABELLED row with a non-zero count still blocks — only a zero is a count.
+reset; printf '| P1 | 2 |\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  …while a LABELLED row stating 2 blockers is still refused (rc=$(rc_of))"
+# ⚠️ DECLARED RESIDUAL: an UNLABELLED all-numeric row (`| 0 | 2 | 0 |`) is not a finding to this
+# scanner — the column ORDER of a counts table is not something the label grammar can know, and
+# guessing it would refuse every unrelated numeric table. A reviewer that means "2 blockers" says so
+# with a label (`| P1 | 2 |`), which is refused above.
+reset
+
+# ── §BD an EMPTY diff is a failed read, not an empty review ──────────────────
+echo; echo "§BD gh pr diff returning NOTHING refuses (a CLEAN over a diff nobody saw)"
+# ⛔ THE GUARD HAD NO TEST (P2, fresh review of #2288 — mutation-verified: replacing it with `:` left
+# every assertion green) because the fixture defaulted an empty FIXTURE_DIFF back to a real diff.
+# Whitespace survives the `:-` default and is what a truncated read actually looks like.
+reset; FIXTURE_DIFF="   "
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "an empty diff is exit 3 (rc=$(rc_of))"
+err_has "gh pr diff returned NOTHING"; ck $? "  …naming the failed read"
+no_comment; ck $? "  …nothing posted"
+no_record; ck $? "  …nothing recorded"
+reset
+
+# ── §BE evidence-shape guards: a short head, and a url for ANOTHER PR ────────
+echo; echo "§BE a malformed head and a url belonging to another PR are refused"
+reset; printf 'deadbeef\n' > "$TMP/head"
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "a head that is not 40 hex refuses (rc=$(rc_of))"
+err_has "40-char"; ck $? "  …naming the shape it wanted"
+no_reviewer; ck $? "  …before any review is paid for"
+reset; FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/9999"
+run "$SRC" 2284
+[ "$(rc_of)" = "3" ]; ck $? "a url for PR #9999 when asked for #2284 refuses (rc=$(rc_of))"
+err_has "9999"; ck $? "  …naming the mismatch"
+no_record; ck $? "  …nothing recorded"
+reset
+
+# ── §BF the notes-comment post failure is its own exit 9 ─────────────────────
+echo; echo "§BF a failed NOTES comment post => exit 9 naming it, nothing recorded"
+reset; printf '[P3] scripts/x.sh:9 — a nit\n**Verdict:** CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_COMMENT_RC=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "a refused notes post is exit 9 (rc=$(rc_of))"
+err_has "notes comment post FAILED"; ck $? "  …naming the notes comment"
+no_record; ck $? "  …nothing recorded"
+reset
+
+# ── §BG the reviewer child is TAGGED for the spawn-gate ledger ───────────────
+echo; echo "§BG the spawned reviewer carries KIND=reviewer and TAG=<PR>"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+grep -qx 'KIND=reviewer' "$TMP/pi-env.txt" 2>/dev/null; ck $? "the child saw KIND=reviewer (the spawn-gate ledger tag)"
+grep -qx 'TAG=2284' "$TMP/pi-env.txt" 2>/dev/null; ck $? "  …and TAG=2284"
+reset
+
 # ⛔ ONE LESS THAN THE PRINTED TOTAL, AND THAT IS NOT A TYPO (P2, third fresh review): the pin's own
 # `ck` runs AFTER this comparison, so on a fully green run PASS is 478 here and the RESULT line then
 # prints 479. A floor equal to the printed total could never pass — a permanently red tripwire is
@@ -2006,7 +2125,7 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 579 when §AS/§AT/§AU added 20 and §AV-§AZ added 34 (the gawk-dialect P1, the wall-clock cap and the
+# Re-set to 618 when §AS/§AT/§AU added 20, §AV-§AZ added 34, §BA-§BG added 30 and the concurrent-fix merge added 9 (the gawk-dialect P1, the wall-clock cap and the
 # sent-argv body-write arm).
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
@@ -2045,6 +2164,9 @@ run "$SRC" 2284
 MC="$TMP/mutant-count.sh"
 cp "$SRC" "$MC"; chmod +x "$MC"
 sed 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_cm"; break$/\1: "$_cm"/' "$SRC" > "$MC"
+# …and the per-MATCH assignment is a SECOND place the count can be dropped (P1 merge of two concurrent
+# fixes on this PR): mutate it too, so the merged guard cannot be half-dead.
+sed 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_one"; CLEAN_COUNT_LINE="\$_vl"; break$/\1: "$_one"/' "$SRC" > "$MC"
 if cmp -s "$SRC" "$MC"; then
   fail "the count-arm mutation did not apply - this control proves NOTHING"
 else
@@ -2142,6 +2264,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 579 ]; ck $? "assertion-count pin: >= 579 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 618 ]; ck $? "assertion-count pin: >= 618 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
