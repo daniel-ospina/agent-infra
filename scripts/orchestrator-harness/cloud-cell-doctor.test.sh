@@ -43,7 +43,27 @@ trap cleanup EXIT
 [ -f "$DOCTOR" ] && ok "shipped doctor present: $(basename "$DOCTOR")" || { bad "missing $DOCTOR"; exit 1; }
 [ -f "$SUP" ]    && ok "shipped supervisor present" || { bad "missing $SUP"; exit 1; }
 
-mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps"
+mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps" "$T/tmp"
+# ⛔ $T/repo MUST BE A REAL CHECKOUT (agent-infra#2573). The cache sweep enumerates worktree roots with
+# `git worktree list`, and an EMPTY-enumeration read is cannot-verify (rc=3) by design — so on a plain
+# directory every hygiene arm here would assert against a pass that abstained instead of deciding.
+git init -q "$T/repo" 2>/dev/null || true
+
+# ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
+# stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
+# those seams pointed at the HOST would delete a fixture of the operator's and run a real
+# `docker image prune -af` on every green run. Both decisions are driven, on real fixtures, by
+# `cloud-cell-doctor.hygiene.test.sh`; here they point at throwaway paths so no arm can reach the box.
+export HYGIENE_TMP_DIR="$T/tmp"
+cat > "$T/bin/docker-stub" <<'SH'
+#!/bin/bash
+# `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
+# about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
+case "${1:-}" in info) printf 'Server Version: stub\n'; exit 0 ;; esac
+exit 0
+SH
+chmod +x "$T/bin/docker-stub"
+export DOCTOR_DOCKER_BIN="$T/bin/docker-stub"
 
 # ── stubs ────────────────────────────────────────────────────────────────────────────────────────
 # tmux: sessions list, pane pid per session, attached clients per session, and a kill LOG so the
