@@ -153,6 +153,12 @@ FLEET_LANDER_DRAIN_LATE_S="${FLEET_LANDER_DRAIN_LATE_S:-1800}"
 # Set by `fleet_start_component` to WHAT IT DID, so a caller cannot print "started" for a no-op (cycle-3
 # review: the verb said "already running, left alone" and the caller then printed "started heartbeat-loop").
 FLEET_START_ACTION=""
+# Bound on `start`'s SETTLE wait (#2221): how long the post-launch read-back keeps RE-reading after a
+# process is up, waiting for the record the row reads to name the process that actually runs it. A
+# pidfile loop re-execs itself detached, so the pid the FIRST read sees is the transient LAUNCHER; one
+# snapshot inside that handover printed `pid ... pidfile says ... FAILING` for a loop that was healthy
+# one second later. `status` never had this defect because it reads once, later.
+FLEET_START_SETTLE_S="${FLEET_START_SETTLE_S:-3}"
 # Tolerated scheduling slack for launchd periodic jobs, added on top of 2×StartInterval.
 FLEET_JOB_SLACK_S="${FLEET_JOB_SLACK_S:-300}"
 
@@ -1075,7 +1081,27 @@ fleet_start_component() { # <name>
   case "$name" in
     controller) return 0 ;;   # the platform verb owns it, with its redundancy guard
     heartbeat-loop|cadence-timer)
-      local script i pids
+      local script i pids pf_now p hit nopf alive settle_polls
+      # ⛔ THE BOUND IS VALIDATED, not trusted (#9v's lesson: an env value of `1.5` makes bash
+      # arithmetic a SYNTAX ERROR, which turns a fence into an abort). A bad value falls back to the
+      # shipped window instead of skipping the wait.
+      # ⛔ AND "ALL DIGITS" IS NOT A VALID ARITHMETIC TOKEN: `08`, `09` and `010` are OCTAL, and
+      # `$(( 08 * 5 ))` is a FATAL "value too great for base" that kills the whole bringup shell
+      # (measured: with FLEET_START_SETTLE_S=08 the verb never printed its table and exited 1 —
+      # exactly the abort this fence exists to prevent). `10#` pins the base, so every digit string
+      # means what the operator wrote. The result is CAPPED: a typo (or an intmax value that wraps)
+      # must not turn `start` into an unbounded wait.
+      # ⛔ THE CAP IS IN POLLS, NOT SECONDS. A poll is `sleep 0.2` PLUS one `fleet_pids_for` (a `ps`
+      # read under load), so 300 polls is on the order of minutes, not the "60 s" an earlier comment
+      # claimed — and the cap is only reachable when the operator asks for a window beyond it AND the
+      # record stays wrong. Stated so the number is not read as a wall-clock bound.
+      case "$FLEET_START_SETTLE_S" in
+        ''|*[!0-9]*) settle_polls=15 ;;
+        *) settle_polls=$(( 10#$FLEET_START_SETTLE_S * 5 ))
+           if [ "$settle_polls" -lt 0 ]; then settle_polls=15
+           elif [ "$settle_polls" -gt 300 ]; then settle_polls=300    # ~300 polls (see below)
+           fi ;;
+      esac
       if [ "$name" = "heartbeat-loop" ]; then
         script="$FLEET_AGENT_SCRIPTS/heartbeat-loop.sh"
       else
@@ -1128,9 +1154,53 @@ fleet_start_component() { # <name>
       i=0
       while [ "$i" -lt 25 ]; do
         pids="$(fleet_pids_for "$script")" || return 1
-        [ -n "$(printf '%s' "$pids" | tr -d '[:space:]')" ] && return 0
+        [ -n "$(printf '%s' "$pids" | tr -d '[:space:]')" ] && break
         sleep 0.2; i=$(( i + 1 ))
       done
+      [ "$i" -lt 25 ] || return 1
+      # ⛔ SETTLE, THEN JUDGE (#2221). A process being up is NOT the same as the read being about the
+      # process that runs this component: `heartbeat-loop.sh` re-execs itself DETACHED, so the pid the
+      # read-back above returns on is the LAUNCHER, and `fleet_pids_for` cannot even see the daemon
+      # while it is the launcher's child (a descendant of a match is not a second instance — out of
+      # `_fleet_ps_awk`, correctly). MEASURED on the owner's Mac: `start` printed
+      # `pid 67710, pidfile says 67715 FAILING` and `status` said OK a second later, with ONE loop
+      # alive the whole time — the row's verdict was about the handover, not about the loop.
+      #
+      # So this verb does not print a verdict about a process it has just created and not yet seen
+      # settle. It re-reads until the component's OWN record names a pid the row will also count
+      # (the row's OK predicate, i.e. exactly what the table `start` prints is about to read), or
+      # until the wait is spent — and then it still returns 0, because a process IS alive: if the
+      # record is genuinely wrong after that, that is the row's FAILING to report, not a start to
+      # negate (a start that negates it would also hide the record defect the row names).
+      # ⛔ A CACHED TABLE HERE WOULD NEVER SETTLE: `fleet_ps_snapshot` answers `FLEET_PS_CACHE` when it
+      # is set, so every poll must clear it or the loop re-reads the launcher forever.
+      i=0; nopf=0; alive=1     # alive=1: a process WAS seen (the read-back above broke out on it)
+      while [ "$i" -lt "$settle_polls" ]; do
+        sleep 0.2; i=$(( i + 1 ))
+        FLEET_PS_CACHE=""
+        pids="$(fleet_pids_for "$script")" || return 1
+        if [ -z "$(printf '%s' "$pids" | tr -d '[:space:]')" ]; then
+          alive=0; nopf=0; continue      # it came up and then went: keep watching, end on the last read
+        fi
+        alive=1
+        pf_now=""
+        [ -f "$pf" ] && pf_now="$(tr -dc '0-9' 2>/dev/null < "$pf")"
+        if [ -n "$pf_now" ]; then
+          hit=0
+          for p in $pids; do [ "$p" = "$pf_now" ] && { hit=1; break; }; done
+          [ "$hit" -eq 1 ] && return 0  # settled: the record names the live loop, so the row reads OK
+          nopf=0
+        else
+          # NO RECORD AT ALL, for a whole second of polls: nothing here can hand over or go stale, and
+          # this row cannot read FAILING on an ABSENT pidfile (it reports LATE/MISSING instead), so
+          # there is nothing about this component for the window to fix.
+          nopf=$(( nopf + 1 ))
+          [ "$nopf" -ge 5 ] && return 0
+        fi
+      done
+      # ⛔ RETURN, do not fall through: a `case` branch that only EVALUATES its last test runs on into
+      # the launchd path below, which has no plist for these two components and answers a bare 1.
+      [ "$alive" -eq 1 ] && return 0
       return 1 ;;
   esac
   label="$(_fleet_label_for "$name")"
