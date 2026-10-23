@@ -218,7 +218,13 @@ pool_label_for_host() {
 # say what it has registered (and GitHub's view is the thing that lies when a listener has died).
 registered_dirs() {
   local d tpl tpl_lit
-  [ -d "$RUNNER_ROOT" ] || return 0
+  # ⛔ AN ABSENT ROOT IS AN EMPTY POOL (a fresh box); a root that EXISTS but is not a DIRECTORY is a
+  # misconfiguration, and reading it as "0 slots, rc 0" is the same false empty-pool reading the guard
+  # below closes.
+  [ -e "$RUNNER_ROOT" ] || [ -L "$RUNNER_ROOT" ] || return 0
+  if [ ! -d "$RUNNER_ROOT" ]; then
+    err "cannot-measure why=runner-root-not-a-directory path=$RUNNER_ROOT"; return 2
+  fi
   # ⛔ "THERE IS NO POOL" AND "I CANNOT READ THE POOL" ARE DIFFERENT ANSWERS, and only the first one is
   # 0. The glob below expands to NOTHING on a root that exists but cannot be listed (mode 300, an ACL
   # or SELinux denial, a transient readdir error on a mounted root), so the pool read as EMPTY — and
@@ -226,7 +232,10 @@ registered_dirs() {
   # spent its whole attempt budget minting listeners on a box sized for a third as many (measured: 32
   # listeners on a 3-slot box, rc 0, cannot=0). This is the same class as the unreadable process
   # table — the one input whose absence would produce an ACTION instead of a refusal.
-  if [ ! -r "$RUNNER_ROOT" ] || ! ls -A "$RUNNER_ROOT" >/dev/null 2>&1; then
+  # ⛔ READ **AND** SEARCH (`r`+`x`). `-r` alone is not enough for a listing: `readdir` needs `r`, but
+  # every `[ -d "$d" ]`/`[ -e "$d/.runner" ]` on the entries needs `x` — so a mode-444 root SUCCEEDED
+  # `ls -A` while the glob matched nothing, and the pool read empty with rc 0 (measured).
+  if [ ! -r "$RUNNER_ROOT" ] || [ ! -x "$RUNNER_ROOT" ] || ! ls -A "$RUNNER_ROOT" >/dev/null 2>&1; then
     err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT"; return 2
   fi
   # ⛔ THE TEMPLATE EXCLUSION MUST NOT DEPEND ON THE TEMPLATE RESOLVING. `$tpl` used to be the only
@@ -250,7 +259,10 @@ registered_dirs() {
     # it is and the core-aware ceiling (the owner's sizing bound) under-counted — the OVER-add
     # direction. Counting it keeps the ceiling conservative, and the probe downstream then reports
     # cannot-measure instead of inventing a number.
-    if [ ! -r "$d" ]; then printf '%s\n' "$d"; continue; fi
+    # ⛔ READ **AND** SEARCH: a dir with `r` but not `x` (mode 444) passes `-r` and then fails every
+    # `-d`/`-e` on its contents, so it was DROPPED from the listing — the box looked emptier than it is
+    # and the ceiling under-counted, which is the OVER-add direction this arm exists to prevent.
+    if [ ! -r "$d" ] || [ ! -x "$d" ]; then printf '%s\n' "$d"; continue; fi
     [ -e "$d/.runner" ] || [ -L "$d/.runner" ] || continue
     # The pristine template is never a runner, even if something wrote a `.runner` into it.
     [ "$d" != "${RUNNER_ROOT%/}/_template" ] || continue
@@ -343,7 +355,7 @@ probe_listener() {
   # "no registration at … (add it first)" — both asserting a measured fact the tool never measured, on
   # a registration that EXISTS. It is COUNTED as a slot (registered_dirs), so the two halves agree:
   # counted against the ceiling, and reported unreadable rather than dead.
-  [ -r "$1" ] || { err "cannot-measure why=instance-unreadable path=$1"; return 2; }
+  [ -r "$1" ] && [ -x "$1" ] || { err "cannot-measure why=instance-unreadable path=$1"; return 2; }
   p="$(listener_pid "$1")" || return 2
   LISTENER_PID="$p"
   [ -n "$p" ] || return 1
@@ -380,8 +392,11 @@ cmd_status() {
     case "$1" in --all) shift ;; *) err "usage: status [--all]"; return 1 ;; esac
   done
   readings || return 2
-  slots || return 2
+  # ONE listing, one count: `slots` (listing #1) and `dirs` (listing #2) could disagree while
+  # registrations appeared, and the report then printed more DEAD rows than `slots=` (measured:
+  # `live=0 dead=30 slots=17`). The rows and the count now come from the SAME read.
   dirs="$(registered_dirs)" || return 2
+  SLOTS="$(count_dirs "$dirs")"
   printf 'host=%s ncpu=%s ceiling=%s slots=%s mem_available=%s MB (%s GB) floor=%s MB (%s GB)\n' \
     "$(cap_host 2>/dev/null || hostname 2>/dev/null || printf box)" \
     "$NCPU" "$CEILING" "$SLOTS" "$MEM_MB" "$(mb_as_gb "$MEM_MB")" \
@@ -498,6 +513,22 @@ cmd_add() {
     fi
     err "cannot-act why=template-copy-failed from=$RUNNER_TEMPLATE to=$dir (the instance dir could not be created)"; return 2
   fi
+  # ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED. The gate above is a SNAPSHOT taken before the
+  # token mint, so two passes adding DIFFERENT names both clear it and the box ends ABOVE the owner's
+  # core-aware bound with both rc 0 (measured: 4 registrations on a 3-slot box). `mkdir` is the
+  # serialisation point: a pass that lost the race hears it here and gives the directory back.
+  # ⚠️ Residual: two passes can still both read `slots` before either writes its `.runner`; closing that
+  # completely needs a pool-level lock, which is a declared follow-up (a lock that survives a killed
+  # pass is machinery of its own).
+  if ! slots; then
+    rm -rf "$dir"
+    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the ceiling could not be re-read after claiming $name; the claim was released)"; return 2
+  fi
+  if [ "$SLOTS" -ge "$CEILING" ]; then
+    rm -rf "$dir"
+    err "REFUSED add name=$name slots=$SLOTS ceiling=$CEILING — another pass took the free slot while this add ran; nothing added"
+    return 3
+  fi
   # ⛔ `-L`, NOT a bare `-a`: `cp -a` is `--no-dereference`, so a SYMLINKED template would produce a
   # symlinked instance — every alias then shares ONE install and one listener, `listener_pid` reads
   # them all LIVE through the shared physical path (so a dead one is never restarted), the template
@@ -571,7 +602,7 @@ cmd_restart() {
   # ⛔ AN UNREADABLE INSTANCE IS cannot-measure, NOT "no registration": `-f .runner` is FALSE for a
   # registration we cannot read, and the message would send the operator to `add` a runner that is
   # already registered (the same false verdict `status` must never print).
-  if [ ! -r "$dir" ]; then
+  if [ ! -r "$dir" ] || [ ! -x "$dir" ]; then
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2
     fi
@@ -608,6 +639,15 @@ cmd_reconcile() {
   # (a) every EXISTING registration must have a live listener. This is the half the fleet had no
   #     automation for at all: a dead listener on a live registration reads OFFLINE to GitHub while
   #     the registration still occupies the slot.
+  # ⛔ A CHECKED ENUMERATION, like `cmd_status`: a here-string DISCARDS the producer's status, so an
+  # unlistable root made this arm silently do nothing and the summary print `dead=0 restarted=0` — a
+  # "nothing to do" reading where nothing was measured. The pass still exited 2, but a monitor keyed on
+  # `dead=` read a healthy pool.
+  local dirs
+  if ! dirs="$(registered_dirs)"; then
+    err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the restart arm could not enumerate the pool)"
+    return 2
+  fi
   while read -r d; do
     [ -n "$d" ] || continue
     rc=0; probe_listener "$d" || rc=$?
@@ -638,7 +678,7 @@ cmd_reconcile() {
       # a pass that could not act reported as success.
       *) cannot=$((cannot + 1)) ;;
     esac
-  done <<<"$(registered_dirs)"
+  done <<<"$dirs"
 
   # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no
   # capacity reading at all — no floor, no ceiling (see cmd_restart) — so gating the WHOLE pass on

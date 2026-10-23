@@ -98,6 +98,16 @@ STUB
 cat >"$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GH_LOG:?}"
+# ⛔ FIXTURE_GH_LATE_REGISTER plants a registration at TOKEN-MINT time — i.e. AFTER `add` read the
+# ceiling but BEFORE it claimed its name. That is the window two passes race in: without the re-check
+# after the claim, both clear the same stale snapshot and the box ends above the ceiling (measured: 4
+# registrations on a 3-slot box, both rc 0). Planting it here makes the window deterministic.
+if [ -n "${FIXTURE_GH_LATE_REGISTER:-}" ]; then
+  case "$*" in *registration-token*)
+    cp -a "${RUNNER_TEMPLATE:?}" "${RUNNER_ROOT:?}/${FIXTURE_GH_LATE_REGISTER}" 2>/dev/null || true
+    : >"${RUNNER_ROOT:?}/${FIXTURE_GH_LATE_REGISTER}/.runner" 2>/dev/null || true ;;
+  esac
+fi
 case "$*" in *registration-token*) printf 'tok-fixture\n'; exit 0 ;; esac
 exit 1
 STUB
@@ -924,7 +934,17 @@ else
   out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
   assert_eq "$?" "2" "reconcile on an unlistable pool stops the pass (rc 2)"
   assert_contains "$out" "cannot-measure why=runner-root-unreadable" "the pass says why it stopped"
+  assert_contains "$out" "the restart arm could not enumerate the pool" \
+    "the RESTART arm refuses too — an empty here-string had made it silently report dead=0"
   assert_eq "$(count_lines "$CONFIG_LOG")" "0" "no attempt was spent minting listeners"
+  chmod 700 "$RUNNER_ROOT"
+  # ⛔ READ **AND** SEARCH are different permissions, and `-r` alone was enough to pass the guard while
+  #   every `[ -d "$d" ]` on the entries failed for want of `x`: a mode-444 ROOT listed as an empty,
+  #   healthy pool (rc 0). Same false empty reading, one permission bit over.
+  chmod 444 "$RUNNER_ROOT"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "a mode-444 root (readable, not searchable) is cannot-measure, not an empty pool"
+  assert_contains "$out" "cannot-measure why=runner-root-unreadable" "and it names the root"
   chmod 700 "$RUNNER_ROOT"
 fi
 
@@ -947,7 +967,38 @@ else
   chmod 700 "$RUNNER_ROOT/pi-runner-locked"
   assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of status)" "3" \
     "and with the mode restored it is a measurable DEAD listener again"
+  # mode 444: readable but not searchable → `-r` passes, every test on its CONTENTS fails, so the
+  # instance was dropped from `slots` (ceiling under-counted → the OVER-add direction).
+  chmod 444 "$RUNNER_ROOT/pi-runner-locked"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "a mode-444 instance is cannot-measure, never silently dropped"
+  assert_contains "$out" "slots=1" "and it is STILL counted as a slot"
+  chmod 700 "$RUNNER_ROOT/pi-runner-locked"
 fi
+
+# ⛔ A RUNNER_ROOT THAT EXISTS BUT IS NOT A DIRECTORY is a misconfiguration, not an empty pool — the
+#   same false empty reading in a shape no permission bit produces.
+echo "── a RUNNER_ROOT that is a FILE ──"
+fresh_pool notadir; reset_logs
+rmdir "$RUNNER_ROOT"
+printf 'not a pool\n' >"$RUNNER_ROOT"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "2" "a RUNNER_ROOT that is a regular file is cannot-measure, not an empty pool"
+assert_contains "$out" "cannot-measure why=runner-root-not-a-directory" "and it says which misconfiguration"
+rm -f "$RUNNER_ROOT"
+
+# ⛔ THE CEILING IS RE-READ AFTER THE NAME IS CLAIMED. The gate is a SNAPSHOT taken before the token
+#   mint; two passes adding DIFFERENT names both clear it, so the box ends above the owner's bound with
+#   both rc 0 (measured: 4 registrations on a 3-slot box). The gh stub plants the competing
+#   registration at mint time, which is exactly that window.
+echo "── the ceiling cannot be breached by the token-mint window ──"
+fresh_pool lateclaim; reset_logs
+register pi-runner-c1; register pi-runner-c2      # slots=2, ceiling=3
+out="$(FIXTURE_GH_LATE_REGISTER=pi-runner-c3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-c4)"
+assert_eq "$?" "3" "an add that lost the last slot while minting REFUSES (rc 3), it does not over-add"
+assert_contains "$out" "REFUSED add name=pi-runner-c4 slots=3 ceiling=3" "and it names both readings"
+assert_absent "$RUNNER_ROOT/pi-runner-c4" "the claimed directory was released"
+assert_eq "$(count_lines "$CONFIG_LOG")" "0" "and config.sh never ran for it"
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then

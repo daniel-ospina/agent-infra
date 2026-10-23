@@ -181,6 +181,12 @@ bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT 
 
 Rules, each measured rather than preferred:
 
+- **Which repo, and the token.** `RUNNER_POOL_REPO` (bare `owner/name`, default
+`daniel-ospina/tortoise`) is **both** the registration-token's scope and the URL the runner registers
+at; a URL form is `cannot-measure why=repo-unreadable`, not a runner. `add` needs `RUNNER_TOKEN` or an
+authenticated `gh` (a token is single-use and expires in ~1h, so one is minted per add and never
+stored). `bash scripts/ci_runner_pool.sh --help` prints every seam and the full EXIT contract.
+
 - **The memory floor gates ADDING, never RESTARTING.** An add below `RUNNER_MEM_FLOOR_MB` (3584 =
 the 3.5 GB the gate refused at) is REFUSED and **prints the reading it used** — the owner made that
 a predicate, not a wish (agent-infra#2344, comment 6347825624: *"must refuse to add a runner when
@@ -226,9 +232,12 @@ ruling that there is no lane ceiling tied to cpu count.
 
 `status --all` is scoped to **this box**: nothing in this repo reports runners **per cell** —
 `capacity.sh`'s probe knows host, cores, load, lanes and disk/memory and **nothing about runners**, and
-neither does the fleet inventory. The GitHub-side registry (names + online/offline) is readable with
-`scripts/ci_runner_gate.sh --status`; the per-cell runner report #2373's clause 2 words is **not**
-delivered by this change. Within this box the table is complete, so a runner this box registered and
+neither does the fleet inventory. Nor does any tool list the GitHub-side registry:
+`scripts/ci_runner_gate.sh --status` prints only the gate's mode (`mode=… repo=…`) and counts
+`ubuntu-latest` runners without naming them. The per-cell runner report #2373's clause 2 words is **not**
+delivered by this change; the registry itself is only readable directly, e.g.
+`gh api repos/<owner/name>/actions/runners --jq '.runners[] | {name, status, busy}'`. Within this box the
+table is complete, so a runner this box registered and
 then lost the local evidence for is not in the table — that is why an add whose listener fails keeps
 its `.runner` and says so. `--all` widens nothing: the default view already lists every runner on this
 box, and the flag exists because #2373's clause names it.
@@ -247,8 +256,10 @@ exits 3 when a listener is DEAD (the verdict a caller branches on) and 2 — nev
 could not measure, which includes an unreadable **process table** AND an unreadable **pool listing**:
 they are the unreadable inputs whose absence would produce an action (a second listener; an add above a
 ceiling counted from a listing that failed) instead of a refusal, so both fail closed. An unreadable
-**instance dir** is counted as a slot and reported `cannot-measure why=instance-unreadable`, never DEAD.
-whose absence would produce an action (a second listener) instead of a refusal, so it fails closed too.
+**instance dir** is counted as a slot and reported `cannot-measure why=instance-unreadable`, never DEAD
+— the third unreadable input whose absence would produce an action (a start) instead of a refusal. A
+root that exists but is **not a directory** is `cannot-measure why=runner-root-not-a-directory`, not an
+empty pool.
 Tests:
 `scripts/ci_runner_pool.test.sh` (in both bash lanes), whose install stubs model GitHub's own cwd
 contract and listener argv, and which includes a mutant with the floor comparison defused that must
