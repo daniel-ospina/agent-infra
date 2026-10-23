@@ -121,9 +121,15 @@ chmod +x "$LSHIMDIR/sysctl"
 #   direct → `pi …` typed straight into a shell
 # The PATH order is the production order: the shim directory is FIRST, so `pi` IS the gate.
 # FAKE_LOAD / MAX_LOAD / TAG / PI_FAKE_RC come from the caller's environment.
+# ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER, for the same reason $LSHIMDIR stubs the LOAD
+# probe: every arm below is about the LOAD ceiling, and since agent-infra#2387 the shim consults
+# available memory BEFORE load. Without this a memory-tight box answers 72 to a load arm and the arm
+# reports a #1884 regression that is not one. Section 6 drives the memory arm on purpose, at a floor
+# this box cannot meet; the SHIPPED default floor is asserted in spawn-gate.test.sh (env -u), which owns
+# the arithmetic.
 run_shim() { # run_shim runner|direct [argv…]
   local how="$1"; shift
-  PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" \
+  PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-1}" \
   PATH="$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
   bash -c '
     how="$1"; runner="$2"; shift 2
@@ -357,6 +363,66 @@ for f in "$SETUP_SH" "$CELL_INSTALL"; do
   label="$(basename "$f") installs the spawn-point gate as \$DEST/bin/pi"
   [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the gate would reach no box through this installer"
 done
+
+# ── 12. the spawn point is MEMORY-gated too, and says so in its own words (#2387) ──
+# WHY IT IS THIS SUITE'S BUSINESS: the memory arm's whole justification is the population that reaches
+# the gate HERE and nowhere else — merge-one.sh's unported `run_agent` (the `chain-<N>` first review of
+# every own-lane PR), a hand-written `tmux new-session … pi` runner, and an interactive session. If the
+# arm did not exist at the spawn point, that population would still be bounded by memory only through
+# the controller's decision to start it. The floor is driven to a value this box cannot meet, so the
+# REFUSAL is real: the reading is the box's own (`mem_avail_mb`), not a stub.
+reset_probe
+before="$(ledger_rows)"
+err="$(TAG=mem-2387 FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=999999999 run_shim runner 2>&1 >/dev/null)"; rc=$?
+after="$(ledger_rows)"
+[ "$rc" -eq 72 ] \
+  && pass "the spawn point REFUSES on memory with its own code (72), distinct from the load one (76)" \
+  || fail "a memory-refused spawn returned $rc — 76 would make every caller report a load refusal"
+[ ! -s "$TMP/probe" ] \
+  && pass "…and the real pi was NOT started on that refusal" \
+  || fail "a memory-refused spawn still started the real pi: $(tr '\n' ' ' < "$TMP/probe")"
+grep -q 'REFUSED (memory) LOW MemAvailable=[0-9]*M < mem_min_avail_mb=999999999M' <<<"$err" \
+  && pass "…and the line carries the MEASURED reading, the floor and (below) the arithmetic" \
+  || fail "the memory refusal does not carry the reading/floor: $(head -1 <<<"$err")"
+grep -q 'mem_lane_reserve_mb=.*x mem_spawn_reserve_lanes=' <<<"$err" \
+  && pass "…the DERIVATION of the floor, so the operator can recompute it against the box" \
+  || fail "the memory refusal does not state how its floor was derived: $(head -1 <<<"$err")"
+grep -q 'NOT clear by waiting for load' <<<"$err" \
+  && pass "…and the remedy says it does NOT clear by waiting for load (it clears when lanes finish)" \
+  || fail "the memory refusal's remedy points at load, which is the whole false-cause class: $(head -1 <<<"$err")"
+{ [ "$after" -eq "$(( before + 1 ))" ] && [ "$(ledger_field "$after" 2)" = "refused" ]; } \
+  && pass "…and it is counted in the SAME durable ledger as a load refusal, verdict=refused ($before -> $after, no second ledger)" \
+  || fail "the memory refusal was not counted in the spawn-point ledger ($before -> $after)"
+# The OTHER direction at the spawn point: with a floor the box meets, the real pi RUNS. Without this
+# pair the refusal above would pass on a gate that refuses every spawn.
+reset_probe
+FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$TMP/probe" ] \
+  && pass "POSITIVE CONTROL: with a floor this box meets, the spawn point RUNS the real pi (rc=$rc)" \
+  || fail "the memory gate refused a spawn the box could afford (rc=$rc)"
+# ── and the TRANSLATION, 72 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
+mkdir -p "$TMP/bin72"
+printf '#!/usr/bin/env bash\nexit 72\n' > "$TMP/bin72/pi"
+chmod +x "$TMP/bin72/pi"
+cp "$TMP/bin76/gh" "$TMP/bin72/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin72/gh"
+chmod +x "$TMP/bin72/gh"
+rm -f "$TMP/O/state/walltime.tsv"; : > "$TMP/agent.log"
+res="$(PATH="$TMP/bin72:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+  . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
+  load1() { printf "1"; }
+  run_agent 1 "$2" "$3" "layered mem refusal" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" "$FIXREPO" 2>/dev/null)"
+[ "$res" = "rc=73 started=0" ] \
+  && pass "run_agent turns the spawn point's 72 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
+  || fail "a spawn-point MEMORY refusal was not translated for the callers ($res)"
+grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP/agent.log" \
+  && pass "…and the translated line NAMES memory (not load), which is what the callers' remedy keys on" \
+  || fail "the translated refusal did not name memory: $(cat "$TMP/agent.log")"
+[ ! -s "$TMP/O/state/walltime.tsv" ] \
+  && pass "…and writes NO walltime row (no agent ran, so no zero-duration sample may be fabricated)" \
+  || fail "a spawn-point memory refusal fabricated a walltime row: $(cat "$TMP/O/state/walltime.tsv")"
 
 echo
 if [ "$failures" -gt 0 ]; then

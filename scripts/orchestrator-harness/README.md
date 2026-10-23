@@ -968,7 +968,8 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). Keyed on the head — `state/reviewcount-<PR>` records `"<head> <n>"`, a push resets it, and any run that DID produce a verdict (findings, or a verified CLEAN) resets it too — it bounds CONSECUTIVE verdict-less runs — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews. ⚠ It does NOT bound a head whose signed marker verified but whose gate never reaches SUCCESS: that path is deliberately not parked (the gate may go green next cycle) and is the agent-infra#1756 unbounded-re-record class |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
-| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
+| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it. ⛔ This is the CONTROLLER's dispatch arm; the SPAWN gate's own floor is `MEM_MIN_AVAIL_MB` below — two populations, one probe (`mem_avail_mb`, byte-identical in both files and pinned by `spawn-gate.test.sh`) |
+| `MEM_MIN_AVAIL_MB` | **derived**: `MEM_LANE_RESERVE_MB * MEM_SPAWN_RESERVE_LANES` = `1024 * 2` = `2048` | MB of available memory the SPAWN gate requires before it starts any agent (`spawn-gate.sh`, agent-infra#2387 — **fail-CLOSED**, unlike the disk and load probes). The reserve is MEASURED, not chosen: a lane's peak is `pi` PLUS the pytest shard it runs, and both halves were measured on a 10-core/32 GB box — all 54 resident `pi` processes (mean 56 MB, max **449 MB** RSS) and four EXECUTING shards against a private FalkorDB (`/usr/bin/time -l` max RSS: 151 / 164 / 359 / **564** MB). 449 + 564 = 1013 MB, so the reserve is **1024 MB**, and the ×2 pays for the lane being spawned AND a peer already inside its own peak window — the allocation that lands on a peaking box. ⛔ Both figures are SAMPLE MAXIMA (n=54, n=4) and a sample maximum is a LOWER bound on the real peak, which is why the floor carries two. The refusal prints all three numbers so it can be re-computed against the box (`mem_min_avail_mb=2048M = mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2`). ⚠️ It is a capacity POLICY knob, not a lane cap: raising it refuses earlier, lowering it refuses later, and neither changes how many lanes may run. ⚠️ A floor is a floor, not a headroom policy — see the #2387 note below for what it does and does not refuse |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `PRODUCT_FLOOR` | `1` | how many slots of each batch are filled from `candidates.product.txt` FIRST (§2 "State files (`$O/`)" `candidates.txt` row, agent-infra#2054). Clamped to `[0, BATCH]`; `0` **disables** the floor and is a legitimate setting. A missing or non-numeric value falls back to the default `1` — never to `0`, which would silently switch the guarantee off. An UNMET floor LOGS AND DEGRADES (`product-floor unmet … queue=<state>`), and it never refuses a batch or caps the fleet, because a floor is not a quota. The report names its verdict either way — `product-floor MET product=<n> batch=<n> floor=<n>` on a batch that met it, `product-floor unmet (product=… batch=… floor=…) queue=<state>` on one that did not, `product-floor N/A` where no product channel exists — so "the floor worked" is never inferred from silence. ⛔ **THE FLOOR YIELDS TO AN EMERGENCY, AND SAYS SO.** Before it reorders, `floor_emergency` asks two questions of state already on disk: is a `P0-blocker` candidate inside the batch window (`candidates.emergency.txt`, derived from the item's own label), and is there a `red-tree` rail refusal for a PR that is not parked? Either one — or an emergency class that could not be read (`p0-unknown`) — stands the floor down for that cycle and logs `product-floor OVERRIDDEN emergency=<reason>` with the counts the batch actually got. The floor reorders a SEVERITY-ordered queue, so this is the one failure it must never cause; a missed product slot re-asserts itself next cycle, a P0 delayed behind a share target does not. Its intake side (`refresh-candidates.sh` → `write_product_queues`) classifies by PRODUCT_REPOS + the `harness` LABEL and records what it decided in `state/product-class`, which the dispatch line repeats: `NOT-A-PRODUCT-REPO` / `BUDGET-SKIPPED` / `LISTING-FAILED` / `LISTING-TRUNCATED` / `WRITE-FAILED` / `OK product=<n> harness=<m>`. ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, so only the function that WRITES them invalidates it: `write_product_queues` writes `PENDING …` as its first action and every arm below overwrites it, while a pass that refuses before reaching the writer (the environment check, the budget, the pool read) or SKIPS because the pool is unchanged (#1984) leaves the previous record alone — it is still true, because neither queue file changed. `PENDING` therefore means *a split started and did not record a class*, and the loop reports it as an UNKNOWN class, never as `the split RAN and found none`. A SHORTFALL is unmet too — `PB < PRODUCT_FLOOR`, not only `PB = 0` — so a floor of 2 that fills one slot still logs `product-floor unmet … queue=<state>` |
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
@@ -1060,12 +1061,34 @@ pre-fix inline read sat ~620 lines below the FIRST spawn site, ~225 below the la
 obey; raising the default floor is a separate decision (it is a capacity policy, not a wiring bug)
 and is deliberately not made here.
 
-⚠️ **The SPAWN POINT is still memory-blind** (agent-infra#2387): `spawn-gate.sh`'s `run_agent()` gates
-on load and the disk floor and consults no memory probe, so a worker started by `lane.sh`/`fix-one.sh`
-— or by an installed `pi` — is bounded by memory only through the controller's decision to start it.
-A different population from these six sites, and it needs its own polarity decision: that file's disk
-gate fails OPEN on purpose (a live dispatch path must not stop every lane on the box for ever), while
-this memory arm fails CLOSED.
+✅ **The SPAWN POPULATION is memory-gated too** (agent-infra#2387 **FIXED**). It used to be the one
+gap: `spawn-gate.sh`'s `run_agent()` gated on load, the disk floor and the land ratio and consulted
+**no memory probe at all**, so a worker started by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`,
+by `merge-one.sh`'s own unported `run_agent` (the `chain-<N>` first review of every own-lane PR), by a
+hand-written `tmux new-session … pi` runner, or by an interactive session was bounded by memory only
+through the controller's decision to start it. Both of that file's spawn surfaces now read it —
+`run_agent()` (after the disk gate, before the load gate) and the installed-`pi` SHIM — with the
+`mem_avail_mb` probe this file already carries, and the polarity is the DISPATCH gate's, not the disk
+gate's: **fail-CLOSED**, verdict `UNREADABLE`, spawn refused. That is a deliberate divergence from
+the disk gate's fail-open, and the reason is structural rather than stylistic — an unreadable `df` is
+a per-volume nuisance on a live path, while an unreadable memory probe is indistinguishable from "the
+box is fine" and treating it as capacity is exactly how a box talks itself into an OOM. Refusals are
+`AGENT_MEM_REFUSED` (73) from `run_agent` and `PI_GATE_MEM_REFUSED` (72) at the spawn point, the
+latter translated into the former so no caller learns a new code; `lane.sh` records the capacity
+yield with `gate=mem` and `fix-one.sh` names the memory gate rather than the load one.
+
+⛔ **WHAT THIS DOES NOT BUY, again stated rather than implied.** The floor is `2048 MB` by default
+(see the `MEM_MIN_AVAIL_MB` row) and it is a HEADROOM floor, not a headroom policy: a box reading
+`available=8379 MB` clears it. So the cell-4 figures in #2387 are NOT all refused by the shipped
+default, and the note in that issue deserves one correction: `rc=143` is SIGTERM — this harness's own
+wall-clock watchdog, or the stale-worker reaper — and NOT the OOM killer's SIGKILL (137), so those
+eight lane deaths are evidence that lanes died, not evidence that memory killed them. The memory
+evidence is the six `dmesg` OOM lines, and the surviving `free -m` snapshot cannot be dated against
+them (memory freed by the dead lanes is indistinguishable from memory that was free throughout). What
+the change removes is the STRUCTURAL gap: no floor — not even a raised one — could bind a spawn path
+that read no memory figure. What would have refused the documented cell-3 reading (`653 MB`) is the
+shipped default, and an operator who wants a higher floor sets `MEM_MIN_AVAIL_MB` — a capacity
+policy, deliberately not made here.
 
 ⚠️ **The account's CONCURRENCY cap is a shared FLEET resource — the ceiling on parallelism is
 neither CPU, RAM nor disk.** Every limit in the table above bounds *this box*: load, lanes, swap,
@@ -2529,8 +2552,8 @@ already holding):
   remedy is on neither this box nor any peer's), and the transfer is driven by the refusal event. Load
   is a symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is
   also why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
-  can carry: the WORKER gate binds on **load, disk or land** (`spawn-gate.sh`), so those are the three
-  values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
+  can carry: the WORKER gate binds on **load, memory, disk or land** (`spawn-gate.sh`), so those are
+  the four values field 3 can ever hold (`mem` is #2387's memory refusal); the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
   refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
   predates #2409 and knows only two values must treat `land` as `load` (it is non-numeric for its
   purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal".
@@ -3074,8 +3097,9 @@ were deleted.
   (`mem_spawn_ok()`, measured once per cycle by `measure_mem` before the first site) with the load
   arm, refusing at `mem_avail <= MIN_MEM_FREE_MB` and on an UNKNOWN probe. It is recorded here rather
   than deleted because the failure mode is the point: two gates over two populations, the resource
-  that actually kills the box consulted on one of them. ⚠️ The **spawn point** (`spawn-gate.sh`'s
-  `run_agent`) is still memory-blind — a different population, tracked as agent-infra#2387.
+  that actually kills the box consulted on one of them. ✅ The **spawn point** (`spawn-gate.sh`'s
+  `run_agent`, and the installed-`pi` shim beside it) was still memory-blind at the time — a
+  different population, tracked as agent-infra#2387 and fixed since (`MEM_MIN_AVAIL_MB`).
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
   at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
   no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a

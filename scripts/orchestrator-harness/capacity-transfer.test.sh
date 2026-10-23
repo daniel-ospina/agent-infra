@@ -61,6 +61,13 @@ ck() { # ck <name> <0|1>
 }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
+# ⛔ THE MEMORY GATE'S NEUTRALISER (agent-infra#2387), for exactly the reason every arm below pins
+# `DISK_MIN_FREE_MB=1`: since #2387 `run_agent` refuses a spawn when available memory is below its
+# floor, so without this a memory-tight box answers 73 to a LOAD arm and the suite reports a
+# capacity-transfer regression that is not one. It is a FLOOR, not a switch — there is still a probe,
+# still a comparison, still a refusal path (driven in spawn-gate.test.sh §12, which owns the floor's
+# arithmetic and asserts the shipped default under `env -u`).
+export MEM_MIN_AVAIL_MB=1
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
