@@ -662,7 +662,7 @@ assert_eq "$RS_RC" "4" "§26 a store whose objects could not be fetched is NOT c
 assert_contains "$RS_LAST" "not readable here" "§26 ...and each such key is NAMED, not silently dropped"
 assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
 assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
-if printf '%s' "$RS_LAST" | grep -qE 'unreadable=0'; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
+if grep -qE 'unreadable=0' <<<"$RS_LAST"; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
