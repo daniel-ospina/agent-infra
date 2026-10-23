@@ -699,6 +699,14 @@ cmd_restart() {
     if [ -d "$dir" ]; then
       err "cannot-measure why=instance-unreadable path=$dir"; return 2
     fi
+    # ⛔ A PATH THAT EXISTS IS NOT A MISSING REGISTRATION (#2381 review round 2, P2): a FILE or a
+    # DANGLING SYMLINK squatting on the name is refused by `add` (rc 4, "clear it or pick another
+    # name"), so "add it first" here sent the operator to a verb that cannot help — the two-verb
+    # bounce this file exists to end, surviving for every non-directory shape because this arm only
+    # asked "is it a traversable directory".
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+      err "REFUSED restart name=$name path=$dir exists but is not a searchable directory (a file or a symlink) — clear it, or pick another name; nothing changed"; return 3
+    fi
     # ⛔ BEFORE CONCLUDING "NO REGISTRATION", ASK WHERE THE POOL ACTUALLY LIVES (#2381 review, P1).
     # A registration under another parent is not missing, and "add it first" is the one remedy that
     # cannot help (add refuses a name it cannot see, and the operator is sent to re-register a runner

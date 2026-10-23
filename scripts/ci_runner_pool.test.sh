@@ -999,6 +999,21 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-noinstal
 assert_eq "$?" "3" "a directory without a .runner registration is still a refusal (rc 3)"
 assert_contains "$out" "carries no .runner registration" "the message names what was measured"
 assert_contains "$out" "clear it, or pick another name" "and the remedy that actually clears it"
+# ⛔ THE NON-DIRECTORY SHAPES TOO (#2381 review round 2, P2): a FILE or a DANGLING SYMLINK on the name
+# is refused by `add` (rc 4, "clear it or pick another name") — so `restart` must not answer "add it
+# first" for it. The arm only asked "is it a traversable directory", so the two-verb bounce survived
+# for every shape that is not a directory. Both verbs are asserted against the SAME path.
+: >"$RUNNER_ROOT/pi-runner-file"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-file)"
+assert_eq "$?" "3" "a FILE squatting on the name is a refusal (rc 3), not a missing registration"
+assert_contains "$out" "is not a searchable directory (a file or a symlink)" "restart names the shape it found"
+assert_contains "$out" "clear it, or pick another name" "and the remedy that clears it"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
+assert_eq "$?" "4" "and `add` refuses that SAME path — the two verbs agree on the state"
+ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dangle)"
+assert_eq "$?" "3" "a DANGLING SYMLINK (not a directory) is the same refusal, not 'add it first'"
+assert_contains "$out" "clear it, or pick another name" "with the same remedy"
 
 # ⛔ A SINGLE-USE TOKEN CANNOT SERVE A PASS (#2381 review, P2): every add after the first would fail
 # config.sh and the pass would burn its whole attempt budget reporting failed=N added=0.

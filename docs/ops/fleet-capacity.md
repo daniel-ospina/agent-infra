@@ -258,9 +258,10 @@ box, and the flag exists because #2373's clause names it.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: that
-name has no registration under `RUNNER_ROOT`, or its directory exists but carries no `.runner` (NOT a
-capacity verdict — in each case the message names the state and the action that clears it; "add it
-first" is only said when there is no directory at all) · 3 `status`: the
+name has no registration under `RUNNER_ROOT`, or something that is not a usable instance sits on it
+(a directory without `.runner`, a file, a dangling symlink) (NOT a capacity verdict — in each case the
+message names the state and the action that clears it; "add it first" is only said when nothing at all
+exists there, which is the one case `add` can actually serve) · 3 `status`: the
 report contains a DEAD listener · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
