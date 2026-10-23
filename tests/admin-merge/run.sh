@@ -986,12 +986,20 @@ run_admin() {
   # the pre-fix rail behaved: every pre-existing scenario that expected an instant
   # refusal keeps it, and a test that wants the WAIT sets SUITE_FIRST_CHECKS_WAIT /
   # SUITE_MERGE_REF_WAIT (seconds) on the function call.
-  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
-    ADMIN_MERGE_FIRST_CHECKS_WAIT="${SUITE_FIRST_CHECKS_WAIT:-0}" \
-    ADMIN_MERGE_MERGE_REF_WAIT="${SUITE_MERGE_REF_WAIT:-0}" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
-    bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
+  #
+  # SUITE_NOSLEEP=1 puts the stub `sleep` first on the rail's own PATH (see the note on
+  # NOSLEEP_BIN below): for a scenario whose subject is the ACCUMULATED clock, not the waiting.
+  # An array, like run_admin_here, so the extra variable is one element rather than a
+  # conditional word inside a line continuation.
+  local -a env_args=(
+    "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_REPRO_CMD=${REPRO_CMD:-true}"
+    "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+    "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
+  )
+  [ "${SUITE_NOSLEEP:-0}" = "1" ] && env_args+=("PATH=$NOSLEEP_BIN:$PATH")
+  env "${env_args[@]}" bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
 
@@ -1016,6 +1024,25 @@ run_admin_here() {
   env "${env_args[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
+
+# ── the virtual-clock scenarios must not REAL-sleep (agent-infra#2483) ──────────
+# `wait_for_run` accumulates its own clock arithmetically — `waited=$((waited + adv))` at
+# scripts/admin-merge.sh:4698 — and never reads the wall clock. The step is clamped at :4652
+# (`step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1`), so the `ADMIN_MERGE_POLL_INTERVAL=0`
+# this suite already passes still means ONE arithmetic second per poll; the only real time is
+# `sleep "$adv"` at :4699, which merely PACES a `gh` that is stubbed here. Three scenarios drive
+# that clock across a bound by issuing 605/60/60 polls, which used to cost 614 s + 62 s + 62 s of
+# real sleeping for an arithmetic clock — ~13 of this shard's ~17 minutes, i.e. ~22% of the whole
+# `bash-suites` step (measured 2026-10-22, run 39857849778).
+# This stub removes the pacing and nothing else: the poll COUNT, the accumulated clock and every
+# assertion are unchanged, which is why (a2) below asserts the clock still passes 600 s. Same shape
+# as the `sleep() { :; }` probes in this file, but on PATH because the rail is a child process.
+# Applied per-scenario (SUITE_NOSLEEP=1 / an explicit PATH), never globally: the W7702 scenario
+# kills the rail from a `sleep 90` subshell, which must stay a REAL 90 s.
+NOSLEEP_BIN="$TMP/nosleep-bin"
+mkdir -p "$NOSLEEP_BIN"
+printf '#!/bin/sh\n# a stubbed pace: the subject is the accumulated clock, not the waiting (agent-infra#2483)\nexit 0\n' >"$NOSLEEP_BIN/sleep"
+chmod +x "$NOSLEEP_BIN/sleep"
 
 # ── bound-based wait fixtures (#1167 follow-on) ────────────────────────────
 # A remote run has NO within-job activity signal: `updatedAt` advances on
@@ -5005,10 +5032,17 @@ green_shard 9663 "test (b)" 2796        # 46.6m — the recorded MEDIAN
 : > "$SCEN/status-9661"
 _i=0; while [ "$_i" -lt 605 ]; do printf 'in_progress\n' >> "$SCEN/status-9661"; _i=$((_i + 1)); done
 printf 'completed\n' >> "$SCEN/status-9661"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+# SUITE_NOSLEEP=1: the 605 polls must still HAPPEN — that is the whole scenario — but they no
+# longer each sleep a real second for a clock the rail accumulates arithmetically (agent-infra#2483).
+# The assertion below pins that the clock really did cross 600 s, so the stub cannot silently
+# shrink the window under test.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "(a2) a 46.6m shard healthy past 600s is NOT stalled (exit 0)" \
   || { fail "(a2) the healthy long shard was blocked (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -qE ', 60[0-9]s of the ' "$TMP/out" \
+  && pass "(a2) the ACCUMULATED clock passed 600s (the window under test was not shortened)" \
+  || fail "(a2) the wait never passed 600s — the stub shrank the window instead of the pacing"
 grep -q 'STALLED' "$TMP/err" && fail "(a2) the healthy long run was called STALLED" \
   || pass "(a2) …and it is NOT called STALLED"
 grep -q 'pr merge 42 --admin' "$SCEN/calls" && pass "(a2) the merge proceeded for the healthy long run" \
@@ -5029,7 +5063,9 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9612"
 target_shard 9611 "test (b)"
 green_shard 9613 "test (b)" 30
 printf 'in_progress\n' > "$SCEN/status-9611"
+# PATH: the bound is arithmetic (waited += step) — a real second per poll adds nothing (agent-infra#2483).
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" \
   ADMIN_MERGE_RERUN_FLOOR=1 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(b) a STALLED re-run blocks (exit $rc)" || fail "(b) a stalled run did not block"
@@ -5386,7 +5422,9 @@ cat > "$SCEN/jobs-9733.json" <<'JOBS'
 ]}
 JOBS
 printf 'in_progress\n' > "$SCEN/status-9731"
+# PATH: the derived bound is arithmetic too — no real second per poll (agent-infra#2483).
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" \
   ADMIN_MERGE_RERUN_FLOOR=1 \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?

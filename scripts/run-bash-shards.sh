@@ -65,7 +65,15 @@ shard_errors=0
 shard_ran=0
 # One line on purpose: the execution and the counter that proves it happened are inseparable,
 # so "stop executing but keep counting" is an explicit rewrite, not a one-line deletion.
-run_shard() { shard_ran=$((shard_ran + 1)); bash "$1" || shard_errors=$((shard_errors + 1)); }
+# ⏱ PER-SHARD DURATION — the histogram this list did not have (agent-infra#2483).
+# Without it a single 33-minute shard sat inside this step for months and the ONLY way to find it
+# was to reconstruct a timeline from a finished job's log timestamps (a running job's log is not
+# published at all, so an `in_progress` job has no per-shard data anywhere). The measurement is a
+# `SECONDS` delta around the same one-line execution: integer seconds, no subprocess, and it prints
+# AFTER the shard's own output so the line still reads as that shard's verdict.
+shard_times="$(mktemp "${TMPDIR:-/tmp}/bash-shard-times.XXXXXX")"
+trap 'rm -f "$shard_times"' EXIT
+run_shard() { shard_ran=$((shard_ran + 1)); _shard_started=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); _shard_elapsed=$((SECONDS - _shard_started)); printf '%s\t%s\n' "$_shard_elapsed" "$1" >>"$shard_times"; printf '   ⏱ %5ss  %s\n' "$_shard_elapsed" "$1"; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -259,6 +267,15 @@ if [ "$shard_errors" -ne $((before_err + 1)) ]; then
 fi
 shard_errors=$before_err
 shard_ran=$before_ran
+
+# The histogram, BEFORE the verdict so it prints on a red run too — on a red run it is the shard a
+# diagnoser needs. Wall time is the slowest shard plus whatever it queues behind, so an unbalanced
+# list is invisible in the total and obvious here. `sort -rn` on the recorded seconds (the raw data is
+# the per-shard ⏱ lines above).
+echo "── slowest shards (this run) ────────────────────────────────"
+sort -rn "$shard_times" 2>/dev/null | grep -E '\.sh$' | head -5 | while IFS=$'\t' read -r _s _p; do
+  printf '   ⏱ %5ss  %s\n' "$_s" "$_p"
+done
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
