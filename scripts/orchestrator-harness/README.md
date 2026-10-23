@@ -293,7 +293,7 @@ It is deliberately thin. It carries **no agent invocation of its own** — it ba
 equality: a direct spawn here would be a fourth, ungated launch path.
 
 ```bash
-bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [bg|prfix]
 bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed rc=N | lost
 ```
 

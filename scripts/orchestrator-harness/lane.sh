@@ -180,7 +180,16 @@ if [ "$AGENT_STARTED" = "0" ]; then
     _cap_yield="$CAPACITY_YIELD_SECS"
     _cap_now="$(date +%s)"
     if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + _cap_yield ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
-      echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
+      # ⛔ THE WORDS MUST MATCH THE GATE (review cycle 3, P2). This line used to call EVERY refusal a
+      # "capacity transfer ... yielded to peers", so a `land` lane log carried that claim three lines
+      # above its own "This is NOT a capacity refusal" — and an operator grepping `capacity transfer`
+      # found the false one first. The WINDOW stays uniform (README §7.2 records it as gate-independent);
+      # only the description of what the stand-down buys changes.
+      if [ "$_cap_gate" = "land" ]; then
+        echo "[lane $N] stand-down recorded: gate=land, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the ratio is re-read; it does NOT free the item for a peer to clear, because the backlog is repo-wide. chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min; the drain is landing the open queue, not waiting." >> "$O/logs/lane-$N.log"
+      else
+        echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
+      fi
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal will still release the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi

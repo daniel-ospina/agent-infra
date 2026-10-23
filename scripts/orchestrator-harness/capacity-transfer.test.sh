@@ -667,6 +667,13 @@ grep -q 'LAND-BACKLOG 81 open / 0.6 landings per hour' "$O/logs/lane-101.log"; r
 ck "§LB …and the verdict is a NAMED state carrying the two measured numbers (81 open / 0.6 per hour)" $rc
 grep -q 'NOT started: LAND-BACKLOG' "$O/logs/lane-101.log"; rc=$?
 ck "§LB …and the lane log names it as LAND-BACKLOG, not as a load/disk capacity refusal" $rc
+# ⛔ AND THE WRITER MUST NOT CALL IT A CAPACITY TRANSFER (review cycle 3, P2). The record line used to
+# read "capacity transfer: yielded to peers" for every gate, so a `land` lane log carried that claim a
+# few lines above its own "This is NOT a capacity refusal" — and an operator grepping the phrase found
+# the false one first. Both HALVES are asserted: the load path still says it (a peer CAN clear a load
+# refusal) and the land path does not.
+{ ! grep -q 'capacity transfer' "$O/logs/lane-101.log" && grep -q 'does NOT free the item for a peer' "$O/logs/lane-101.log"; }; rc=$?
+ck "§LB …and its stand-down line does NOT claim a capacity transfer (the backlog is repo-wide)" $rc
 { read -r _le _lu lblgate < "$O/state/capacity-refused-101" 2>/dev/null; [ "${lblgate:-}" = "land" ]; }; rc=$?
 ck "§LB …and the durable refusal record carries gate='land' (got '${lblgate:-<none>}') so chain-merge stops waiting" $rc
 # ⛔ THE YIELD STAYS GATE-INDEPENDENT, AND IT IS PINNED (review cycle 2, P2). A `land` refusal looks

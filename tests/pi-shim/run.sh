@@ -293,13 +293,21 @@ chmod +x "$TMP/bin76/pi"
 # red). The calm answer goes where the gate reads; nothing here disables the gate.
 printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin76/gh"
 chmod +x "$TMP/bin76/gh"
+# ⛔ AND THE REPO, NOT ONLY THE NUMBERS (review cycle 3, P2 — the SAME defect review cycle 2 found in
+# spawn-gate.test.sh, left in this file). `land_backlog_repo` derives owner/name from the CURRENT
+# worktree's origin, and this arm never `cd`s, so it only passed when the runner happened to start in a
+# GitHub checkout: measured `cd /tmp` -> 2 of 29 red, `rc=74 started=0`. A fixture with a GitHub origin
+# makes the input explicit, so the arm tests the 76 -> 75 translation and not the runner's ambient cwd.
+FIXREPO="$TMP/repofix"; mkdir -p "$FIXREPO"
+git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com/owner/repo.git
 : > "$TMP/agent.log"; rm -f "$TMP/O/state/walltime.tsv"
 res="$(PATH="$TMP/bin76:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 bash -c '
   . "$1"
+  cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "1"; }
   run_agent 1 "$2" "$3" "layered refusal" >/dev/null 2>&1
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
-' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" 2>/dev/null)"
+' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" "$FIXREPO" 2>/dev/null)"
 [ "$res" = "rc=75 started=0" ] \
   && pass "run_agent turns a spawn-point refusal into AGENT_LOAD_REFUSED with AGENT_STARTED=0 ($res)" \
   || fail "a spawn-point refusal was not translated for the callers ($res)"

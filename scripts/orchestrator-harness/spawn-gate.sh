@@ -418,12 +418,21 @@ land_backlog_verdict() { # <owner/repo> [<lead-hours = TEST SEAM>] [<min-ceiling
   peak=$last24; [ "$prior24" -gt "$peak" ] && peak=$prior24
   ceiling=$(( (peak * lh + 23) / 24 )); [ "$ceiling" -lt "$minc" ] && ceiling=$minc
   rate10=$(( (peak * 10) / 24 ))
+  # ⛔ THE PRINTED LINE MUST ADD UP (review cycle 3, P3). It used to read `ceiling 15 = 0.6/h x 24h`,
+  # and that is arithmetically FALSE: the rate is truncated to tenths for display, so 0.6 x 24 = 14.4,
+  # not 15 (measured: `ceiling 30 = 1.2/h x 24h` where 1.2 x 24 = 28.8). The line exists so whoever
+  # reads the refusal can check the number against the repo; a formula that does not reproduce it
+  # defeats the purpose. The rate stays (it is the readable figure) and the DERIVATION is stated in
+  # the units it is actually computed from: the best 24h window's landing count times the lead.
   if [ "$open" -gt "$ceiling" ]; then
-    printf 'LAND-BACKLOG %s open / %s.%s landings per hour (ceiling %s = %s.%s/h x %sh) — hold new creation, land the open queue first\n' \
-      "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$lh"
+    printf 'LAND-BACKLOG %s open / %s.%s landings per hour (ceiling %s = %s landings in the best 24h window x %sh lead / 24h%s) — hold new creation, land the open queue first\n' \
+      "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$peak" "$lh" \
+      "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ' , floored at %s' "$minc" )"
     return 1
   fi
-  printf 'OK %s open / %s.%s landings per hour (ceiling %s)\n' "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling"
+  printf 'OK %s open / %s.%s landings per hour (ceiling %s = %s landings in the best 24h window x %sh lead / 24h%s)\n' \
+    "$open" "$(( rate10 / 10 ))" "$(( rate10 % 10 ))" "$ceiling" "$peak" "$lh" \
+    "$( [ "$ceiling" -gt "$(( (peak * lh + 23) / 24 ))" ] && printf ' , floored at %s' "$minc" )"
   return 0
 }
 
@@ -463,8 +472,10 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
 # of defence.
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
-# AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting) or
-# AGENT_LOAD_REFUSED (75, which clears when the box quietens). The code selects the REMEDY.
+# AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting),
+# AGENT_LOAD_REFUSED (75, which clears when the box quietens), or AGENT_LAND_BACKLOG (74, the creation
+# back-pressure gate: the repo's open-PR count is over its own measured landing ceiling, which clears
+# only by LANDING an open PR — no amount of waiting on this box helps). The code selects the REMEDY.
 # ⛔ THE SIGNAL THAT NO AGENT RAN IS `AGENT_STARTED=0`, NOT EITHER CODE (review round 2, P2).
 # AGENT_STARTED is 0 at function entry — BEFORE either gate — and is set to 1 only once both gates have
 # passed and `pi` has actually been launched. A refusal therefore always leaves it 0 (that is exactly

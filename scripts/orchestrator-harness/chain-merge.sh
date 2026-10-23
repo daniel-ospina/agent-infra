@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was capacity-refused
+cap_refusal_gate() { # -> prints `load|disk|land` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
