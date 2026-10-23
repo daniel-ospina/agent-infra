@@ -447,6 +447,19 @@ ck "(e10c) the module contains no lane-cap COMPARISON in executable lines (got '
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
 ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
    "$( { [ "$n" -eq 4 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
+# ⛔ THE RE-READING ENTRY POINT IS A REFERENCE, NOT A WIRING TARGET (#2333 merge review, P3). Every
+# shipping site must call the IN-SHELL note. `ciq_defer_note` RE-READS, and a second read can
+# DISAGREE with the decision it was handed — and on a disagreement it prints NOTHING, i.e. a
+# deferral with no line, the single failure this module exists to prevent. The module keeps it only
+# as the differential reference the (a)/(b)/(c) arms drive; an edit that "restores" it at a call
+# site is precisely the regression this arm makes red.
+_wired=""
+for _wf in "$LOOP" "$FIX" "$DISPATCH"; do
+  _hit="$(grep -nE 'ciq_defer_note([^_]|$)' "$_wf" || true)"
+  [ -n "$_hit" ] && _wired="${_wired}${_wf}:${_hit} "
+done
+ck "(e15) no shipping file calls the RE-READING ciq_defer_note — the wiring uses the in-shell note (found:${_wired:- none})" \
+   "$( [ -z "$_wired" ]; echo $? )"
 # ⛔ ONE READ PER PASS — INCLUDING WHEN THE READ FAILS (#2296 cycle 5, P2). The module's cache covers
 # only a SUCCESSFUL read, so on the outage path every arm re-read live (measured: 15 `gh api` calls for
 # 5 arms against a failing feed, versus 3 against a working one) — the gate's own cost then grew with

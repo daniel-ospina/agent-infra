@@ -13,9 +13,10 @@
 # ⛔ AND ONE FIXER ARM IS NOT GATED YET, DISCLOSED RATHER THAN IMPLIED: the RED-TREE fixer
 # (`orch-loop.sh`'s `MAX_RED_FIX` spawn) books its attempt and spawns BEFORE any `ciq_push_ok` call,
 # so on a deep queue that lane still starts, is deferred by `fix-one.sh` on its first push, and hands
-# the attempt back through `fixbail` on a later cycle — churn and a false "another box holds the
-# claim" log line, not added CI. It is the fourth pusher and the only ungated one; home agent-infra
-# #2408.
+# the attempt back through `fixbail` on a later cycle. The cost is CHURN — a fixer spawned to do work
+# it then declines to push — not added CI; the refund line names BOTH causes (`another box holds the
+# claim, or the CI-queue gate deferred the push`), so it does not misdirect anyone to a lease that
+# never existed. It is the fourth pusher and the only ungated one; home agent-infra #2408.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
@@ -407,7 +408,15 @@ ciq_defer_line() { # <what> <verdict-token> <rc>
   esac
 }
 
-# ciq_defer_note <what> [<state-dir>] -> read, then print (standalone/CLI entry point).
+# ciq_defer_note <what> [<state-dir>] -> RE-READ, then print. ⛔ NOT WIRED, AND IT MUST NOT BE
+# (#2333 merge review, P3). No shipping surface calls it: `ciq_cli` reads in-shell and calls
+# `ciq_eval` directly, and every wiring site calls `ciq_defer_note_here`. It survives ONLY as the
+# re-reading REFERENCE the suite checks the in-shell path against — the differential arm that proves
+# `ciq_defer_note_here` cannot disagree with the decision it was handed. The docstring used to call
+# it "the standalone/CLI entry point", which invited exactly the re-wiring this module removed: a
+# second read can DISAGREE with the decision whenever the queue moves between the two calls, and on
+# a disagreement the old code printed NOTHING — a deferral with no line, the single failure this
+# module exists to prevent. `ci-queue.test.sh` (e15) asserts no shipping file calls it.
 ciq_defer_note() {
   local v rc
   v="$(ciq_verdict "${CIQ_REPO_ARG:-${OR:-}}" "${CIQ_STATE_DIR:-}")"; rc=$?
@@ -428,7 +437,8 @@ ciq_defer_note_here() {
 }
 
 # ciq_ci_allowed <owner/repo> [<state-dir>] -> 0 = send CI-spending work, 1 = defer (and the caller
-# must print ciq_defer_note's line). This is the predicate the wiring calls; it never prints, so a
+# must print ciq_defer_note_here's line). This is the predicate the wiring calls; it never prints,
+# so a
 # caller inside a `$( )` cannot swallow the log.
 ciq_ci_allowed() {
   ciq_verdict "${1:-${OR:-}}" "${2:-${CIQ_STATE_DIR:-}}" >/dev/null 2>&1
