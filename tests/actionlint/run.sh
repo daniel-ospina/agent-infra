@@ -14,6 +14,16 @@
 #      where `sigpipe-grep-guard` was missing). Parses with python3+PyYAML, falling
 #      back to ruby (the CI runner's python3 has no PyYAML — 2f34ed3); FAILS loudly
 #      if neither parser is available rather than passing silently.
+#   5. github-script bodies: NO body may embed the `${{ … }}` sequence (#2454).
+#      Actions substitutes every `${{ … }}` across the whole `script:` input BEFORE the
+#      body is compiled, so an expression inside a body is spliced in as raw text — in a
+#      `//` comment it un-comments the remainder and the job dies with
+#      `SyntaxError: Unexpected token ':'`, while every other gate reports the file as
+#      valid. That killed `auto-file-on-failure`, the fleet's post-merge failure filer, so
+#      a red main filed NOTHING. Values go through `env:`. Each body must also compile as
+#      written (with the action's own parameter list). A github-script step whose body
+#      cannot be read is a FAILURE, not a skip, and the check fails loudly if node, a YAML
+#      parser, the composite-action fixture, or `ci-main.yml` itself is missing.
 #
 # Fixtures under tests/fixtures/actionlint/.
 set -uo pipefail
@@ -256,8 +266,14 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 // where args is this exact set (src/main.ts). Compiling with NO parameters is NOT equivalent:
 // a body that redeclares one of them (`const core = 1;`) is legal here and a SyntaxError in
 // the action — the body would die in production while this check stayed green, which is the
-// fail-open it exists to prevent. Pinned by a control below.
+// fail-open it exists to prevent. Pinned by a control that exercises EVERY name below.
+// ...and the expected set is declared a SECOND time on purpose. Driving the control off the
+// working constant alone is self-referential: dropping a name from it also drops that name's
+// control, so all ten removals would stay green (measured). The two lists must agree, so a
+// removal changes the comparison and fails here.
 const GH_SCRIPT_PARAMS = ['require', '__original_require__', 'github', 'octokit',
+  'getOctokit', 'context', 'core', 'exec', 'glob', 'io'];
+const GH_SCRIPT_PARAMS_EXPECTED = ['require', '__original_require__', 'github', 'octokit',
   'getOctokit', 'context', 'core', 'exec', 'glob', 'io'];
 
 // The inspector. The control below runs THIS, not a re-implementation of its predicate —
@@ -308,10 +324,22 @@ if (syntaxProblems.length !== 1 || !/does not compile/.test(syntaxProblems[0])) 
 // ...and the compile must use github-script's PARAMETER LIST, not an empty argument list.
 // This body is legal with no parameters and a SyntaxError with them, so it goes green iff the
 // parameter list is dropped — the case where the check would certify a body that cannot run.
-const paramProblems = inspect([{ file: '<control>', job: '<control>', step: 0, script: 'const core = 0;' }]);
-if (paramProblems.length !== 1 || !/does not compile/.test(paramProblems[0])) {
-  console.log(`      control: a body redeclaring a github-script parameter produced ${JSON.stringify(paramProblems)}, want exactly one 'does not compile' finding`);
+// EVERY element is load-bearing. A single hand-written probe pins one name, and the other
+// nine can then be dropped from the list with the suite still green — a body redeclaring one
+// of those would compile here and be a SyntaxError in the action. Driving the control from
+// the constant means removing ANY name fails here.
+const canon = (a) => a.slice().sort().join(',');
+if (canon(GH_SCRIPT_PARAMS) !== canon(GH_SCRIPT_PARAMS_EXPECTED)) {
+  console.log(`      control: the parameter list drifted from actions/github-script's — ` +
+    `got [${canon(GH_SCRIPT_PARAMS)}], want [${canon(GH_SCRIPT_PARAMS_EXPECTED)}]`);
   process.exit(4);
+}
+for (const param of GH_SCRIPT_PARAMS_EXPECTED) {
+  const r = inspect([{ file: '<control>', job: '<control>', step: 0, script: `const ${param} = 0;` }]);
+  if (r.length !== 1 || !/does not compile/.test(r[0])) {
+    console.log(`      control: a body redeclaring '${param}' produced ${JSON.stringify(r)}, want exactly one 'does not compile' finding`);
+    process.exit(4);
+  }
 }
 
 // A SKIPPED step is a body the gate cannot speak about. Reporting it as green is the
@@ -357,7 +385,7 @@ JS
     case "$case5_nrc" in
       0) pass "all $case5_node github-script body/bodies compile and embed no expression" ;;
       3) fail "no github-script bodies were found — the check verified nothing" ;;
-      4) fail "the expression rule FAILED ITS OWN POSITIVE CONTROL — the check is not trustworthy: $case5_node" ;;
+      4) fail "Case 5 control failed — the check is not trustworthy: $case5_node" ;;
       *) fail "github-script body check failed: $case5_node" ;;
     esac
   fi
