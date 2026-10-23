@@ -973,7 +973,7 @@ run_merge() {
   # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). ABSENT `$1` is
   # the loop's own call shape, so a bare `"$1"` here kills the scheduler on its first tick — see
   # "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
-  local dry="${1:-}" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started
+  local dry="${1:-}" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started ws_only
   local candidates=0 attempted=0 landed=0 skipped=0 unverifiable=0 result="" out rc
   if [ -z "$OR" ]; then
     log "[merge] CANNOT-VERIFY: \$OR is unset (the queue target is resolved by the supervisor)"
@@ -995,7 +995,17 @@ run_merge() {
   err="$ROLES_DIR/.merge-read.$$"
   prs="$(bounded "$MERGE_READ_TIMEOUT" "$GH_BIN" api "repos/$OR/pulls?state=open&per_page=$MERGE_MAX_PRS" 2>"$err")"
   rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "${prs//[[:space:]]/}" ]; then
+  # ⛔ NEVER `[ -z "${prs//[[:space:]]/}" ]` HERE (the same hole `cleanup-stale-branches.sh:694`
+  # documents). The pattern substitution is SUPERLINEAR, and a real open-PR answer is large: measured
+  # on this cell's bash 5.2.21, a 349 KB payload — this repo's actual `pulls?state=open` size — took
+  # 84 s of PURE CPU (no syscalls at all), with the merge lock held the whole time. `MERGE_BUDGET_S`
+  # cannot bound it: the cost sits inside one builtin, so the whole sequential loop (doctor, then
+  # reap, then hygiene) stalls behind it on the first tick of every cell. The `case` glob answers "empty
+  # or whitespace-only" in O(n) and matches exactly the same set (POSIX `[:space:]`); a NUL cannot
+  # reach here (command substitution strips it), so the question is complete.
+  ws_only=0
+  case "$prs" in *[![:space:]]*) ;; *) ws_only=1 ;; esac
+  if [ "$rc" -ne 0 ] || [ "$ws_only" = 1 ]; then
     local why; why="$(head -3 "$err" 2>/dev/null | tr '\n' ' ')"
     rm -f "$err"
     log "[merge] CANNOT-VERIFY: the open-PR read failed (rc=$rc) ${why:+— $why}"
