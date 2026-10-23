@@ -14,11 +14,16 @@
 #      ships on NO machine). See "TRACKED, NOT PRESENT (#2425)" below.
 #   4. Manifest parity: manifest.json files.extensions.entries (the consumer
 #      ship-list materialized by bin/agent-infra.js into ~/.pi/agent/extensions/)
-#      and the TRACKED extensions/ tree must name the SAME set (dirs normalized — the
-#      manifest records "dir/", the tree "dir" — and *.test.ts excluded from
-#      both sides). A new extension with no manifest row ships on NO consumer
-#      (#498 staleness class); a stale manifest row for a deleted extension
-#      breaks every consumer bootstrap.
+#      and the extensions/ tree must agree BOTH WAYS, each side asked the
+#      question it can answer truthfully: 4a asks every TRACKED extension for a
+#      row (a new extension with no manifest row ships on NO consumer), and 4b
+#      asks every row for an entry that EXISTS on disk (a stale row for a
+#      deleted extension breaks every consumer bootstrap). 4b is deliberately
+#      not tracked-scoped: a row for a present-but-untracked path is a
+#      machine-local inconsistency, not a ship defect, and failing it here would
+#      reinstate the false red this issue fixes. Dirs normalized (the manifest
+#      records "dir/", the tree "dir"), *.test.ts excluded from both sides
+#      (#498 staleness class).
 #   5. LIVE-FARM LIVENESS (machine-local — checks 1-4 gate the repo, this one
 #      gates the materialized farm at ~/.pi/agent/extensions/). Every
 #      manifest-listed entry that IS a symlink there must RESOLVE to a path
@@ -186,7 +191,7 @@ if [ "$index_ok" -eq 1 ]; then
       *.test.ts) continue ;;
     esac
     present_exts="${present_exts:+$present_exts }$base"
-    grep -Fqx "$base" <<<"$TRACKED_EXTENSIONS" || untracked_exts="${untracked_exts:+$untracked_exts }$base"
+    grep -Fqx -- "$base" <<<"$TRACKED_EXTENSIONS" || untracked_exts="${untracked_exts:+$untracked_exts }$base"
   done
   if [ -n "$untracked_exts" ]; then
     echo "⏭️  not gated (UNTRACKED — git does not ship these, so they cannot be 'not wired'): $untracked_exts"
@@ -284,7 +289,7 @@ if [ "$parse_ok" -eq 1 ]; then
         *.test.ts) continue ;;   # test files are not shipped; never in manifest
       esac
       [ -e "$DST/$base" ] || continue   # index/disk disagreement — see check 3
-      if ! grep -Fqx "$base" <<<"$manifest_rows"; then
+      if ! grep -Fqx -- "$base" <<<"$manifest_rows"; then
         echo "❌ tracked extension $base exists in extensions/ (git tracks it) but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
         FAILURES=$((FAILURES + 1))
       fi
@@ -335,4 +340,4 @@ echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of
 # extensions does GIT TRACK under extensions/", not "which directories exist"
 # (#2425 — an untracked, git-ignored node_modules tree is not an unwired
 # extension, and the old wording sent readers hunting a packaging defect).
-echo "✅ manifest.json files.extensions.entries ↔ TRACKED extensions/ tree parity holds (check 4 — tracked = git lists it under extensions/; untracked/ignored paths cannot ship and are not drift)"
+echo "✅ manifest.json files.extensions.entries ↔ extensions/ parity holds (check 4 — 4a asks whether every TRACKED extension has a row; 4b whether every row has an on-disk entry; tracked = git lists it under extensions/, and an untracked/ignored path cannot ship so it is not drift)"

@@ -41,14 +41,20 @@
 #      (the name is derived line-wise, so such a path would be silently
 #      truncated — and an LF-bearing `grep -F` pattern can match another entry,
 #      hiding the directory from the ⏭️ line; refuse instead of mis-name)
+#  19. a TRACKED extension whose name begins with `-`                  → BLOCK,
+#      naming it as TRACKED (not as UNTRACKED). `grep -Fqx` needs the `--`
+#      terminator: without it a dash-leading pattern is parsed as an OPTION,
+#      grep exits 2, and the membership test reads that as "not tracked" —
+#      reporting a tracked extension as untracked, the #2425 class inverted)
 #
 # Fixture trees mirror the real farm: relative symlinks ../../../extensions/<e>
 # from pi-bootstrap/pi-config/extensions/ into extensions/, plus a manifest.json
 # at the tree root (the consumer ship-list check 4 gates).
 #
-# EVERY fixture is a real git repo (`git init` + an explicit `git add`, #2425): checks 3
-# and 4a ask what GIT TRACKS under extensions/, so a fixture that was not a repo
-# would only ever exercise the fail-closed branch. `git add` needs no identity;
+# EVERY fixture EXCEPT the deliberate `no-git` case (15) is a real git repo
+# (`git init` + an explicit `git add`, #2425): checks 3 and 4a ask what GIT TRACKS
+# under extensions/, so a fixture that was not a repo would only ever exercise the
+# fail-closed branch — which is exactly what 15 pins. `git add` needs no identity;
 # the fixture's own .gitignore is what keeps an ignored node_modules tree
 # untracked, exactly as on a developer machine.
 #
@@ -92,7 +98,7 @@ write_manifest() {
 # mode: clean | copy | retarget | broken | unwired | manifest-missing |
 #       manifest-stale | no-manifest | bad-manifest | live-healthy |
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
-#       all-untracked | nested-git | newline-name
+#       all-untracked | nested-git | newline-name | dash-name
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -158,6 +164,11 @@ build_farm() {
     newline-name) ln -s ../../../extensions/b.ts "$FARM/b.ts"
               mkdir -p "$TMP/extensions/ext"$'\n'"ing"
               : > "$TMP/extensions/ext"$'\n'"ing/index.ts" ;;
+    # #2425 review — a TRACKED extension whose name begins with `-`. Pins the
+    # `grep -Fqx --` terminator: without it, grep parses "-e" as an option,
+    # exits 2, and the membership test reads a TRACKED name as UNTRACKED.
+    dash-name) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+              : > "$TMP/extensions/-e" ;;
   esac
 
   # manifest.json rows: tree extensions a.ts + d/ always present; b.ts unless
@@ -222,8 +233,13 @@ build_farm() {
   return 0
 }
 
-# run_gate <expected-exit> <label> <mode> [grep-for]... — each grep-for must
-# appear in the gate output (multiple = all required).
+# run_gate <expected-exit> <label> <mode> [pattern]... — each pattern must
+# appear in the gate output (multiple = all required). A pattern prefixed with
+# `!` must NOT appear: presence-only assertions cannot see a WRONG diagnostic
+# that accompanies the right one (measured: case 19 stayed green when the `--`
+# terminator was stripped from a `grep -Fqx` membership test, because the exit
+# code and the required line were unaffected while a false "not gated
+# (UNTRACKED) …" line appeared — the suite was not pinning the thing it named).
 run_gate() {
   local expected="$1"; shift
   local label="$1"; shift
@@ -243,12 +259,25 @@ run_gate() {
     sed -n '1,60p' "$OUT"
   fi
   for grep_for in "$@"; do
-    if grep -q "$grep_for" "$OUT"; then
-      pass "diagnostic present: $grep_for"
-    else
-      fail "expected diagnostic: $grep_for"
-      sed -n '1,40p' "$OUT"
-    fi
+    case "$grep_for" in
+      '!'*)
+        local forbidden="${grep_for#!}"
+        if grep -q -- "$forbidden" "$OUT"; then
+          fail "forbidden diagnostic present: $forbidden"
+          sed -n '1,40p' "$OUT"
+        else
+          pass "forbidden absent: $forbidden"
+        fi
+        ;;
+      *)
+        if grep -q -- "$grep_for" "$OUT"; then
+          pass "diagnostic present: $grep_for"
+        else
+          fail "expected diagnostic: $grep_for"
+          sed -n '1,40p' "$OUT"
+        fi
+        ;;
+    esac
   done
   rm -rf "$TMP"
 }
@@ -308,7 +337,7 @@ echo "13. #2425 — directory whose ONLY content is a git-ignored node_modules t
 run_gate 0 "ignored node_modules-only dir is not an extension" ignored-node-modules \
   "⏭️  not gated (UNTRACKED" \
   "vision-interceptor" \
-  "TRACKED extensions/ tree parity"
+  "4a asks whether every TRACKED extension has a row"
 
 echo ""
 echo "14. #2425 constraint 2 — a TRACKED extension carrying an ignored node_modules tree is STILL gated"
@@ -332,6 +361,17 @@ run_gate 1 "nested tree inside another repo" nested-git "cannot read the git ind
 echo ""
 echo "18. #2425 review — a TRACKED path whose name contains a newline: refuse, never mis-name"
 run_gate 1 "tracked newline name" newline-name "contains a newline"
+
+echo ""
+echo "19. #2425 review — a TRACKED name beginning with '-' is still recognised as TRACKED (grep --)"
+# The negative assertions are the pin: without the `--` terminator grep exits 2,
+# the membership test reads a TRACKED name as untracked, and the gate emits a
+# FALSE `not gated (UNTRACKED) …: -e` line (plus a grep usage error) while the
+# exit code and the tracked-extension diagnostic stay unchanged.
+run_gate 1 "dash-leading tracked name" dash-name \
+  "tracked extension -e exists in extensions/" \
+  "!not gated (UNTRACKED" \
+  "!option requires an argument"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
