@@ -250,9 +250,15 @@ EOS
 chmod +x "$CONFLICT_REBASE_RECORD_SH"
 run_bot --max 1 --interval-s 0 >/dev/null
 BODY="$(cat "$TMP/fake/comment-301.md" 2>/dev/null || echo)"
-has "$BODY" "could not be read" "§3c an unreadable diff is reported as unreadable"
-has "$BODY" "UNKNOWN" "§3c …and its relation to the record as UNKNOWN"
+has "$BODY" "**could not be read**" "§3c an unreadable diff is reported as unreadable"
+has "$BODY" "Treat this head as UNREVIEWED" "§3c …and its relation to the record as UNKNOWN"
 ck "$(case "$BODY" in *"DIFFERENT diff"*) echo claimed-changed ;; *) echo honest ;; esac)" "honest" "§3c …and NEVER as a changed diff (the arm-order trap)"
+# ⛔ THE ASSERTIONS ABOVE MUST TARGET THE ARM'S PROSE, NOT `record_state`'s RETURN STRING
+# (#2698 review, cycle 3, P2). `_success_body` always echoes `**Review record**: {rec}.`,
+# and that machine string contains "could not be read" — so a bare substring check passed
+# under the exact mutation it was named for. `**could not be read**` and "Treat this head
+# as UNREVIEWED" exist ONLY in the unverified arm's prose; verified by moving the generic
+# `elif` above it (then these two go red and the rename assertion stays green).
 ck "$(ls "$TMP/reviews" | grep -c 'superseded')" "1" "§3c …and the record was still moved aside (no attestation over an unverified head)"
 
 # ═══════════════════════ §4: peer-pushing ═════════════════════════════════════
@@ -554,6 +560,39 @@ PY
 write_prs "$(cat "$TMP/prs-mixed.json")"
 OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
 has "$OUT" '"action": "would-rebase"' "§18f an untimestamped context whose attempts ALL agree green is green"
+# ⛔ A TIE ON THE NEWEST ATTEMPT IS AMBIGUOUS ONLY WHEN IT DISAGREES (#2698 review,
+# cycle 3, P2). The first fix rejected EVERY tie, so SUCCESS+NEUTRAL landing on the same
+# second became a FALSE RED: the arm went inert for a green PR and the skip text blamed a
+# fixer who did not exist. Pair the two probes so a "reject every tie" regression and an
+# "accept every tie" regression each show up.
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"name": "pipeline-compliance", "conclusion": "SUCCESS", "startedAt": "2026-10-24T11:00:00Z"},
+        {"name": "pipeline-compliance", "conclusion": "NEUTRAL", "startedAt": "2026-10-24T11:00:00Z"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" '"action": "would-rebase"' "§18g an all-GREEN tie on the newest stamp is green (not a false red)"
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"name": "pipeline-compliance", "conclusion": "SUCCESS", "startedAt": "2026-10-24T11:00:00Z"},
+        {"name": "pipeline-compliance", "conclusion": "FAILURE", "startedAt": "2026-10-24T11:00:00Z"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" 'behind but not green' "§18h a DISAGREEING tie on the newest stamp is not green"
 
 # ═══════════════════════ §19: the schedule can actually run (#2698 review P1) ═══
 # `timeout` is GNU coreutils; a Mac has none. A bare `timeout 1800 python3 …` exited 127

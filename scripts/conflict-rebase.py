@@ -569,8 +569,11 @@ def checks_green(pr: dict, required: list[str]) -> bool:
         if len(stamped) == len(rows):
             newest = max(w for w, _ in stamped)
             top = {k for w, k in stamped if w == newest}
-            if len(top) > 1:
-                return False          # a tie on the newest attempt, disagreeing: ambiguous
+            # ⛔ A TIE IS AMBIGUOUS ONLY WHEN IT DISAGREES (#2698 review, cycle 3, P2).
+            # Rejecting every tie made an all-green tie a FALSE RED — the arm went inert
+            # for a legitimately green PR and the skip text blamed "a fixer who will move
+            # it" when no fixer was needed. The contract above is "every attempt at an
+            # ambiguous context must be green", and a green-only tie satisfies it.
             if not GREEN_CONCLUSIONS >= top:
                 return False
             continue
