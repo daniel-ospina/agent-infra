@@ -22,6 +22,21 @@
 #   detached-reachable      G3b/c (merged / held by another ref => REMOVE)
 #   live-process            G4a  (ps argv holds the path => PRESERVE)
 #   live-cwd                G4b  (lsof cwd inside the path => PRESERVE)
+#   live-cwd PREFIX         G4d  (a process in a SUBDIRECTORY holds the tree,
+#                                and a mere name-prefix sibling does not — #2721)
+#   live-cwd real process   G4e  (a REAL process standing in a subdirectory
+#                                survives an --apply pass, and the same fixture is
+#                                reclaimed once it exits: no shim can pass this)
+#   pr-merged               G14  (squash merge: head NOT an ancestor, PR MERGED
+#                                => REMOVE, with the proof printed)
+#   pr-merged (detached)    G14b (a detached head matched by head sha, #2721)
+#   pr-open on detached     G14e (the gate is now read for detached-only repos;
+#                                unreadable => exit 3, nothing removed)
+#   pr-closed-unmerged      G14c (=> PRESERVE and NAME the PR — human decision)
+#   no-pr                   G14d (=> PRESERVE, "cannot prove it is landed")
+#   rule 7 age floor        G6e  (a 60s-old checkout with a MERGED PR is
+#                                too-young; the SAME fixture reclaims at 60m)
+#   rule 7 real clock       G6f  (seconds-old checkout, HEAD commit 76d old)
 #   open-pr                 G5a  (branch is an open PR head => PRESERVE)
 #   gh-unavailable          G5c  (=> exit 3, dry AND armed)
 #   no-github-remote        G5d  (PR gate N/A => still reclaims)
@@ -125,6 +140,10 @@ REAL_GIT="$(command -v git)"
 [ -n "$REAL_GIT" ] || { echo "git is required" >&2; exit 1; }
 REAL_RM="$(command -v rm)"
 [ -n "$REAL_RM" ] || { echo "rm is required" >&2; exit 1; }
+# The REAL cwd probe, for the one fixture that must not be able to pass on a
+# shim's opinion (G4e). Absent lsof, that fixture skips its apply leg rather
+# than asserting against the shim twice.
+REAL_LSOF="$(command -v lsof 2>/dev/null)"
 
 ep() { python3 -c 'import datetime,sys;print(int(datetime.datetime.fromisoformat(sys.argv[1]).timestamp()))' "$1"; }
 NOW="$(ep 2026-09-15T20:00:00+00:00)"
@@ -164,6 +183,11 @@ cat >"$T/bin/gh" <<'SHIM'
 # FAKE_GH_EXIT carries an ARBITRARY exit code, so the auth arm (gh documents 4 as "requires
 # authentication") is testable — a real cell failure that `exit 1` cannot express.
 [ -n "${FAKE_GH_EXIT:-}" ] && exit "$FAKE_GH_EXIT"
+# FAKE_GH_PRS is the POST-#2721 shape — one PR per line as `headRefName<TAB>headRefOid<TAB>
+# state<TAB>number` — which is what `--state all --json …` returns. FAKE_GH_REFS is the
+# pre-#2721 shape (bare head refs, implicitly OPEN); both are supported because the script
+# must read either without silently losing the open-PR veto.
+[ -n "${FAKE_GH_PRS:-}" ] && printf '%s\n' "$FAKE_GH_PRS"
 [ -n "${FAKE_GH_REFS:-}" ] && printf '%s\n' "$FAKE_GH_REFS"
 exit 0
 SHIM
@@ -416,6 +440,9 @@ run_reaper() {
     FAKE_PS_LIVE_PATH="${FAKE_PS_LIVE_PATH:-}" \
     FAKE_LSOF_CWD="${FAKE_LSOF_CWD:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
+    FAKE_GH_PRS="${FAKE_GH_PRS:-}" \
+    REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
+    REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
     FAKE_GH_EXIT="${FAKE_GH_EXIT:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
@@ -556,6 +583,46 @@ FAKE_LSOF_CWD=""
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=reclaimable" \
     "G4c same worktree is reclaimable once unreferenced (not a lingering veto)"
+# G4d — the PREFIX rule (#2721). The gate that deleted a live lane compared the
+# path EXACTLY, and the lane's process was standing in a SUBDIRECTORY of it. The
+# same fixture is asserted both ways: a sibling whose name shares the prefix must
+# still be reclaimable (over-matching would protect the whole estate forever).
+FAKE_LSOF_CWD="$WT_LIVE/nested/deeper" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=live-cwd" \
+    "G4d process cwd in a SUBDIRECTORY holds the worktree (prefix, never equality)"
+FAKE_LSOF_CWD="$WT_LIVE-sibling" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=reclaimable" \
+    "G4d a path that merely STARTS WITH the worktree name is not a holder"
+FAKE_LSOF_CWD=""
+# G4e — the same claim with a REAL process and the REAL cwd probe: no shim, so a
+# shim that lies about the prefix cannot make this pass. It is asserted in APPLY
+# mode (a dry-run only proves the classifier's opinion) and then once more after
+# the holder exits, because a guard that never releases is not a guard.
+ENV=G4e; REPO="$(mk_repo $ENV)"
+WT_HOLD="$(add_named_wt "$REPO" "$ENV-sub" feat/g4e-sub)"
+if [ -n "$REAL_LSOF" ]; then
+    mkdir -p "$WT_HOLD/nested/deeper"
+    (
+        cd "$WT_HOLD/nested/deeper" || exit 1
+        exec sleep 120
+    ) &
+    HOLDER_PID=$!
+    sleep 1
+    OUT="$(LSOF_BIN_OVERRIDE="$REAL_LSOF" REAP_WT_CWD_TIMEOUT=30 run_reaper $ENV --apply --repo "$REPO")"
+    assert_contains "$(footer $ENV)" "CWD_PROBE=ok" "G4e the REAL cwd probe ran (a degraded probe proves nothing here)"
+    assert_contains "$(row_for "$OUT" "$WT_HOLD")" "reason=live-cwd" \
+        "G4e a real process standing in a subdirectory => live-cwd"
+    assert_dir "$WT_HOLD" "G4e --apply did NOT remove a worktree a live lane merely STANDS INSIDE"
+    assert_dir "$WT_HOLD/nested/deeper" "G4e the subdirectory the lane was standing in still exists"
+    kill "$HOLDER_PID" 2>/dev/null || true
+    wait "$HOLDER_PID" 2>/dev/null || true
+    OUT="$(LSOF_BIN_OVERRIDE="$REAL_LSOF" REAP_WT_CWD_TIMEOUT=30 run_reaper $ENV --apply --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_HOLD")" "reason=reclaimable" \
+        "G4e the same fixture is reclaimable once the holder is gone (not a permanent veto)"
+    assert_nodir "$WT_HOLD" "G4e --apply removed it only after the holder exited"
+else
+    echo "  → G4e real-process leg skipped (no lsof on this host)"
+fi
 
 # ── G5: unreferenced (open PR) ─────────────────────────────────────────
 ENV=G5; REPO="$(mk_repo $ENV)"
@@ -570,10 +637,10 @@ assert_absent "$(row_for "$OUT" "$WT_NOPR")" "reason=open-pr" "G5b no false open
 FAKE_GH_REFS=""; FAKE_GH_FAIL=1
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "G5c gh unavailable with candidates => exit 3 (dry-run)"
-assert_contains "$OUT" "the open-PR gate cannot be verified" "G5c abort names the unverifiable gate"
+assert_contains "$OUT" "the PR-state gate cannot be verified" "G5c abort names the unverifiable gate"
 assert_contains "$OUT" "SKIPPED-REPO: skipped=" "G5c and names the repo it skipped, machine-readably (#2443)"
 assert_contains "$OUT" "reason=gh-error(rc=1)" "G5c a generic gh failure is NOT reported as an auth failure"
-assert_contains "$(cat "$T/$ENV/reap.log")" "open-PR gate unverifiable" "G5c abort is logged with its reason"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PR-state gate unverifiable" "G5c abort is logged with its reason"
 OUT="$(run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "G5c armed gh-unavailable => exit 3"
 assert_dir "$WT_PR" "G5c armed abort removed nothing (PR branch kept)"
@@ -698,6 +765,124 @@ OUT="$(
 )"
 assert_contains "$(row_for "$OUT" "$WT_SELF")" "reason=self-checkout" \
     "G8 reaper never removes the checkout it is running inside"
+
+# ── G14: PR STATE as a proof — merged, closed-unmerged, no PR (#2721) ──
+# The rule these fixtures pin: after a SQUASH merge the branch head is NOT an
+# ancestor of main, so the ancestor test (rule 3) can never fire for that class
+# and the checkout is loggable only as "cannot prove it is pushed". Measured on
+# this fleet: /tmp/cell-wt-p9555b — clean, PR #9862 MERGED — was kept for days
+# while the box sat at ~2.3 GB free; removing it freed 6004 MB.
+ENV=G14; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_SQ="$(add_named_wt "$REPO" "$ENV-squash" feat/g14-squash)"
+commit_in_wt "$WT_SQ" "$OLD_DATE" squash          # landed by SQUASH: not an ancestor
+SQ_SHA="$("$REAL_GIT" -C "$WT_SQ" rev-parse HEAD)"
+if "$REAL_GIT" -C "$REPO" merge-base --is-ancestor "$SQ_SHA" main; then
+    bad "G14 precondition: the squash-merge fixture must NOT be an ancestor of main"
+else
+    ok "G14 precondition: the branch head is NOT an ancestor of main (rule 3 cannot see it)"
+fi
+FAKE_GH_PRS="$(printf 'feat/g14-squash\t%s\tMERGED\t4242' "$SQ_SHA")"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=reclaimable" \
+    "G14 a MERGED PR for this head => reclaimable even though the head is not an ancestor"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "rule=4" "G14 the row names rule 4"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" \
+    "proof=pr-merged head-ref feat/g14-squash state=MERGED (#4242)" \
+    "G14 the row prints the PROOF it used (not just a verdict)"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS" run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_SQ" "G14 --apply removed the squash-merged checkout"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g14-squash | wc -l | tr -d ' ')" "1" \
+    "G14 the branch ref survives — removal is the CHECKOUT, never the branch"
+
+# G14b — a DETACHED head has no branch name, so the PR is matched by its commit
+# sha (`headRefOid`). This is the class the two unprovable cell-4 worktrees were
+# in: `git worktree list` says `detached`, and rule 4 could not name it.
+WT_DET="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_DET" "$SQ_SHA"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DET")" "rule=4" "G14b a detached head is matched to its PR by head sha"
+assert_contains "$(row_for "$OUT" "$WT_DET")" "proof=pr-merged head-sha ${SQ_SHA:0:12}" \
+    "G14b the sha it matched on is printed"
+# G14c — CLOSED without a merge: nobody can tell whether that work should land,
+# so it is KEPT and NAMED. This is the one class that genuinely needs a human.
+WT_CLOSED="$(add_named_wt "$REPO" "$ENV-closed" feat/g14-closed)"
+commit_in_wt "$WT_CLOSED" "$OLD_DATE" closed
+CLOSED_SHA="$("$REAL_GIT" -C "$WT_CLOSED" rev-parse HEAD)"
+GH_MIXED="$(printf 'feat/g14-squash\t%s\tMERGED\t4242\nfeat/g14-closed\t%s\tCLOSED\t4243' \
+    "$SQ_SHA" "$CLOSED_SHA")"
+OUT="$(FAKE_GH_PRS="$GH_MIXED" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_CLOSED")" "reason=pr-closed-unmerged" \
+    "G14c a CLOSED-unmerged PR => preserve (not a removal)"
+assert_contains "$(row_for "$OUT" "$WT_CLOSED")" "rule=5" "G14c the row names rule 5"
+assert_contains "$(row_for "$OUT" "$WT_CLOSED")" "(#4243)" "G14c the PR the operator must look at is NAMED"
+OUT="$(FAKE_GH_PRS="$GH_MIXED" run_reaper $ENV --apply --repo "$REPO")"
+assert_dir "$WT_CLOSED" "G14c --apply kept it — a closed-unmerged PR is a human decision"
+# G14d — NO PR at all, inside the aged window: KEEP and SAY SO. The old row read
+# `too-recent` and told the operator nothing about why no proof existed.
+WT_NOPR="$(add_named_wt "$REPO" "$ENV-nopr" feat/g14-nopr)"
+commit_in_wt "$WT_NOPR" "$RECENT_DATE" nopr              # 2d old: inside the 7d floor
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_NOPR")" "reason=no-pr" "G14d no PR => preserve, reason=no-pr"
+assert_contains "$(row_for "$OUT" "$WT_NOPR")" "no PR — cannot prove it is landed" \
+    "G14d the row says WHY it cannot be proven"
+assert_contains "$(row_for "$OUT" "$WT_NOPR")" "rule=6" "G14d the row names rule 6"
+assert_dir "$WT_NOPR" "G14d --apply kept it"
+
+# G14e — the gate must now be consulted for a repo of DETACHED records too. It
+# used to be loaded only when some record had a branch, so a repo whose only
+# candidates were detached silently skipped the PR read entirely — and the
+# detached class is exactly the one that needs it (no branch name to match, no
+# ancestor proof after a squash). An unreadable gate is still fail-closed.
+ENV=G14e; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det" main
+FAKE_GH_FAIL=1 OUT="$(run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "G14e a detached-only repo with an unreadable PR gate => exit 3"
+assert_contains "$OUT" "skipped=$REPO" "G14e the repo whose PR state is unknown is NAMED"
+assert_dir "$T/$ENV-det" "G14e armed abort removed nothing"
+# ⚠️ `FAKE_GH_FAIL=1 OUT=$(…)` is an ASSIGNMENT-ONLY statement, so the variable
+# PERSISTS in this shell (there is no command word to scope it to). Every later
+# fixture would then see an unreadable gh and abort — a cascade that reads as
+# ten unrelated failures, which is exactly what it produced once.
+FAKE_GH_FAIL=""
+
+# ── G6e/6f: RULE 7, the age floor (#2721) ──────────────────────────────
+# A lane dispatched FOUR MINUTES ago is detached at main and clean for exactly
+# the same reason an abandoned checkout is. The floor is the only thing that
+# separates them, and the age must be the YOUNGER of HEAD's commit date and the
+# checkout's own ctime — a checkout created minutes ago from an hours-old main
+# has an hours-old HEAD, which is precisely how the live lane was classified as
+# aged and deleted.
+# G6e is deterministic: the witness is supplied (REAP_WT_TREE_TS), and the SAME
+# fixture flips verdict when only the witness moves across the floor.
+ENV=G6e; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_YOUNG="$(add_named_wt "$REPO" "$ENV-young" feat/g6e-young)"
+commit_in_wt "$WT_YOUNG" "$OLD_DATE" young                # HEAD 76d old
+YOUNG_SHA="$("$REAL_GIT" -C "$WT_YOUNG" rev-parse HEAD)"
+FAKE_GH_PRS_YOUNG="$(printf 'feat/g6e-young\t%s\tMERGED\t4244' "$YOUNG_SHA")"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS_YOUNG" REAP_WT_TREE_TS=$((NOW - 60)) \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_YOUNG")" "reason=too-young" \
+    "G6e a 60s-old checkout with a MERGED PR is too-young (rule 7 gates rule 4)"
+assert_contains "$(row_for "$OUT" "$WT_YOUNG")" "rule=7" "G6e the row names rule 7"
+assert_contains "$(row_for "$OUT" "$WT_YOUNG")" "witness=worktree-ctime" \
+    "G6e the row names WHICH witness decided the age"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS_YOUNG" REAP_WT_TREE_TS=$((NOW - 3600)) \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_YOUNG")" "reason=reclaimable" \
+    "G6e the SAME fixture is reclaimable at 60m — the floor, not the fixture, decided"
+
+# G6f — the incident shape with the REAL clock and the REAL ctime: a checkout
+# created seconds ago whose HEAD commit is 76 days old must be too-young.
+ENV=G6f; REPO="$(mk_repo $ENV)"
+WT_FRESH="$(add_named_wt "$REPO" "$ENV-fresh" feat/g6f-fresh)"   # HEAD = main's OLD tip
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_FRESH")" "reason=too-young" \
+    "G6f a seconds-old checkout is too-young even though its HEAD commit is 76d old"
+assert_contains "$(footer $ENV)" "MIN_AGE_MINUTES=45" "G6f the floor in force is recorded in the pass record"
+assert_dir "$WT_FRESH" "G6f --apply did not remove a checkout younger than the floor"
 
 # ── G9: existing-but-unresolvable path (P0 pin) ────────────────────────
 ENV=G9; REPO="$(mk_repo $ENV)"
@@ -865,16 +1050,24 @@ assert_dir "$WT_SLOW" "A6b --apply does not remove a status-timeout worktree"
 # Margins are deliberately wide: a fork on a loaded host costs ~1s, so
 # BUDGET=8 leaves the one fast row (main) ~4x headroom, while the 12s status
 # probe overruns it decisively.
+# ⛔ REAP_WT_TREE_TS=1 + MIN_AGE=0 are part of the FIXTURE, not a convenience:
+# these trees are created seconds before the pass, so under rule 7 (the 45-minute
+# floor, #2721) they are `too-young` and there is NO removal for the budget to
+# defer — the assertion would then pass or fail on how slowly the host forked.
+# Pinning the witness to an ancient timestamp restores the pre-#2721 age model
+# this fixture is about; the floor itself is covered by R7 below.
 ENV=A7; REPO="$(mk_repo $ENV)"
 WT_A="$(add_named_wt "$REPO" "$ENV-a" feat/a7-a)"
 WT_B="$(add_named_wt "$REPO" "$ENV-b" feat/a7-b)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
     REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
 # `git worktree list` order after the main worktree is readdir order, so WHICH
 # worktree is deferred is not fixed — assert the ROW SHAPE, not a path.
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A7 budget exhausted => exactly one deferred row"
 assert_contains "$(footer $ENV)" "DEFERRED=1" "A7 footer DEFERRED=1"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
     REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
 assert_contains "$(cat "$T/$ENV/reap.log")" "DEFERRED-REMOVE" "A7 armed overrun defers the removal too"
 assert_dir "$WT_A" "A7 armed overrun removed nothing"
@@ -889,7 +1082,11 @@ FAKE_GH_ARGS_LOG="$T/$ENV/gh-args.log" OUT="$(run_reaper $ENV --dry-run --repo "
 assert_eq "$(wc -l <"$T/$ENV/gh-args.log" | tr -d ' ')" "1" "A8 exactly ONE batched gh call for the pass"
 GH_CALL="$(head -1 "$T/$ENV/gh-args.log")"
 assert_contains "$GH_CALL" "--limit 1000" "A8 gh limit is explicit and not the unsafe default of 30"
-assert_contains "$GH_CALL" "--state open" "A8 gh call queries open PRs"
+# #2721: the read must see MERGED/CLOSED as well as OPEN (rule 4/5/6), and must carry the
+# head sha so a DETACHED worktree (no branch name) can be matched to the PR that carried it.
+assert_contains "$GH_CALL" "--state all" "A8 gh call queries ALL PR states (#2721)"
+assert_contains "$GH_CALL" "headRefName,state,number,headRefOid" \
+    "A8 gh call carries state and headRefOid (a detached head has no branch name)"
 
 # ── A9: no disk-savings claim, and du is never invoked ─────────────────
 ENV=A9; REPO="$(mk_repo $ENV)"; add_named_wt "$REPO" "$ENV-x" feat/a9-x >/dev/null
@@ -1090,7 +1287,7 @@ assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_DGONE
     "A18b --apply did NOT prune the record — it is the last handle on that HEAD"
 
 # ── A19: an unverifiable origin-slug probe must not read as "no remote" ──
-# `pr_head_refs_load` used to discard the exit status of `git remote get-url
+# `pr_state_load` used to discard the exit status of `git remote get-url
 # origin` and treat an empty URL as "no GitHub remote", which sets
 # PR_APPLICABLE=0 and skips the open-PR veto ENTIRELY — a gate defeated by
 # making its probe unverifiable (the same class as an empty `ps` table).
@@ -1107,7 +1304,7 @@ assert_contains "$(row_for "$OUT" "$WT_A19")" "reason=open-pr" \
 FAKE_GH_REFS="feat/a19-p" OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" \
     run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "A19 a failing origin probe => exit 3 (never 'the PR gate is N/A')"
-assert_contains "$OUT" "the open-PR gate cannot be verified" "A19 the abort names the unverifiable open-PR gate"
+assert_contains "$OUT" "the PR-state gate cannot be verified" "A19 the abort names the unverifiable gate"
 assert_contains "$OUT" "reason=origin-probe-failed(rc=1)" \
     "A19 ... and names the PROBE, not `gh`, as the thing that failed (the remedies differ)"
 assert_absent "$OUT" "gh-not-authenticated" "A19 a git-level probe failure is never blamed on gh authentication"

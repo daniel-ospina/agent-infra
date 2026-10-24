@@ -86,7 +86,7 @@ entry point that refusal arrives as exit **6** with `ok=0` in the pass record an
 `verdict=<class>=refused` — the unit stays green because the box is busy, and the RECORD is what
 alarms (see **Exit codes** below).
 
-**The open-PR probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
+**The PR-state probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
 that store is per-`HOME` (`$HOME/.config/gh`, or `GH_TOKEN`); the installed unit renders
 `Environment=HOME={{HOME}}`, so the unit's own `HOME` decides whether the class can run at all. When
 the probe cannot answer, only the repo it could not answer FOR is skipped: its checkouts are left
@@ -116,7 +116,9 @@ names a cause nobody can act on.
 
 The worktree owner additionally requires the checkout to be
 **clean** (uncommitted work is never destroyed), **reachable** (its commits survive the checkout's
-deletion), and not an open-PR head.
+deletion), and not an open-PR head — and, since #2721, no younger than
+`REAP_WT_MIN_AGE_MINUTES` (45) with a live-cwd check that matches a process standing
+ANYWHERE INSIDE the tree, not only at its root (see the seven-rule table below).
 
 `disk-reaper.test.sh` T2 is the load-bearing test: a real process cwd'd into a real
 linked worktree is kept by both the worktree and venv classes, and the *same*
@@ -167,6 +169,55 @@ separately required to be clean — so `REAP_WT_MERGED_AGE_DAYS` (default `0`) g
 that row. Unmerged heads keep the blanket floor, where age still separates a stale
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
+
+## The seven-rule decision table, PR state as a proof, and the freshness floor (#2721)
+
+The floor above is a *staleness* floor. It does not answer the opposite question —
+"is anything using this tree RIGHT NOW" — and until 2026-10-24 the tool answered it
+with an **exact-match** cwd test. Measured: a worktree dispatched to a lane four
+minutes earlier was deleted underneath it while the lane stood in a SUBDIRECTORY of
+it; the lane then sat at 0% CPU in a deleted cwd logging `getcwd() failed`. The gate
+tested the path, not the tree.
+
+Every row now prints the rule that decided it and the proof it used
+(`rule=4 … proof=pr-merged head-ref fix/x state=MERGED (#9862)`), so a KEEP that
+cannot name its evidence is visibly a bug rather than a verdict:
+
+| # | condition (all previously applicable rules still hold) | verdict |
+|---|---|---|
+| 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
+| 2 | dirty, or a clean gate that cannot be evaluated | KEEP |
+| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE |
+| 4 | clean + a PR for this head is `MERGED` (merge, squash or rebase) | REMOVE |
+| 5 | clean + PR `CLOSED` unmerged + head not an ancestor | KEEP, and **name the PR** |
+| 6 | clean + no PR matches this head | KEEP (`no PR — cannot prove it is landed`) |
+| 7 | younger than `REAP_WT_MIN_AGE_MINUTES` (45) | KEEP |
+| P | pre-existing gates: main/self checkout, `worktree lock`, unreadable path, bare repo, OPEN PR head, commit held only by a revocable ref, detached on no ref | KEEP |
+
+**Rule 4 is why this exists.** `git merge-base --is-ancestor` cannot see a squash
+merge: the branch head is not an ancestor of `main` even though the work landed. So a
+fully landed, clean, holder-free checkout was loggable only as `no upstream — cannot
+prove it is pushed` and kept indefinitely. Measured on cell-4: `/tmp/cell-wt-p9555b`
+was clean, its PR **#9862 was MERGED**, and removing it freed **6004 MB**. The read is
+ONE batched `gh pr list --state all --json headRefName,state,number,headRefOid` per
+pass — never one call per worktree (the fleet's `gh` budget is real) — and it now runs
+for **detached** records too, matched by `headRefOid`, because a detached head has no
+branch name to match and is exactly the class that sat unprovable. A PR beyond the
+limit is simply not found, which is rule 6: truncation errs toward KEEP.
+
+**Rule 7 is the freshness floor, and its witness is two-sided.** A lane dispatched
+minutes ago is detached at `main`, clean and holder-free for exactly the same reason an
+abandoned checkout is; only time separates them. HEAD's *commit* date does not measure
+that time — a checkout created minutes ago from an hours-old `main` has an hours-old
+HEAD — so the age is the **younger** of HEAD's commit date and the checkout's own
+ctime (`REAP_WT_TREE_TS` supplies an already-measured value for a caller that probed
+the tree). Nothing younger than 45 minutes is removable by rules 3–4, and the footer
+records `MIN_AGE_MINUTES=` so the floor in force is auditable.
+
+⛔ Rules 3–4 still require the commit to be *survivable*: a checkout whose commits are
+held only by `refs/remotes/*`, a tag, stash or a bisect ref is preserved with that ref
+named, **except** when a PR is `MERGED` — GitHub durably holds that head sha, so the
+merged PR is the stronger proof and rule 4 applies.
 
 ## Scheduling — installed by the bring-up, armed by owner instruction
 
