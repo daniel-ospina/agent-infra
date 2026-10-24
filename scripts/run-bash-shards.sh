@@ -168,7 +168,17 @@ shard_note() {
 # anonymously) can be measured at all: until now no lane printed how long a shard took, so "which
 # shard is slow, which one hangs" was answerable only by watching a job's clock. It prints ONLY for
 # list lines (`shard_is_listed`), so the sentinels cannot print a bogus row.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
+# ⛔ A FAILING SHARD MUST LEAVE AN IDENTITY THE MERGE RAIL CAN COMPARE (measured 2026-10-24: THREE
+# failing PR runs, `ids=0`, and `scripts/admin-merge.sh` refused with "yielded NO parseable failure
+# identity" — the block every lane hits while ANY suite on main is red). The rail's parser keys on a
+# pytest `FAILED <nodeid>` or an attributable guard-step `::error::` annotation (ci_exemption.py,
+# `guard_step_failures`), and this runner printed NEITHER: only `PASS=n FAIL=m` and
+# "❌ FAILURES — fix and re-run". A red suite on main therefore made every PR unattributable (#1185).
+# This annotation comes from THIS step, which the runner marks failed, so it is attributable by the
+# parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
+# of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
+# a PR-unique failure and still blocks.
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
