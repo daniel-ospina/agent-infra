@@ -51,7 +51,21 @@ trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
 if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
   trap - EXIT
 fi
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319)
+# This line used to export `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY — a permanent
+# bypass the canon calls emergency-only, on the one machine that lands the most work. The decision is
+# now made by `gate-policy.sh`, which probes whether the lane path can SATISFY both gates and — when it
+# cannot — records an audited line naming #2319 and the missing component. When the satisfier lands the
+# export disappears by itself, with no second change and no forgotten flip.
+. "$SELF/gate-policy.sh" 2>/dev/null || { echo "[lane $N] FATAL: $SELF/gate-policy.sh missing — refusing to start a carrier that cannot say whether its gates are on" >&2; exit 78; }
+# ⛔ A DRY RUN WRITES NOTHING TO STDERR (it runs no agent, so a warning about a worker that never
+# started is noise an operator would learn to ignore — `reviewer-preflight.test.sh` asserts this). The
+# DECISION is still recorded; only the human-facing line is suppressed.
+[ "${LANE_DRY_RUN:-0}" = "1" ] && export GP_QUIET=1
+apply_gate_policy lane
+# ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
+# checkout, not a review bypass, and #2319 does not rule on it.
+export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"

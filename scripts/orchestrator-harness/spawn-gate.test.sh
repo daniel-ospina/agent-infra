@@ -45,7 +45,10 @@ done
 # `run_agent` undefined and a 127 at the SPAWN SITE — would ship green. So drive it: copy each caller
 # into a scratch dir with NO helper beside it and require the loud, non-zero refusal.
 NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
-cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
+# ⛔ gate-policy.sh IS COPIED DELIBERATELY (agent-infra#2319): fix-one.sh now sources it, and this rig
+# exists to prove a MISSING spawn-gate.sh refuses — not to prove a missing policy refuses. Without it
+# here the rig would pass for the wrong reason (rc=78 from the policy, with the right-looking message).
+cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/gate-policy.sh" "$NX/"
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
 # A here-string, NOT `printf | grep -q`: `grep -q` exits on first match, `printf` takes SIGPIPE, and
 # under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A MATCH, which is
@@ -488,7 +491,7 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
-cp "$HERE/fix-one.sh" "$RIG/stale/"
+cp "$HERE/fix-one.sh" "$HERE/gate-policy.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -574,7 +577,7 @@ ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
