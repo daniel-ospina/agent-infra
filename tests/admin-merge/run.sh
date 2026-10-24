@@ -13736,11 +13736,13 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # subject took a `gh api` survey by hand, and in the meantime the refusal read as
 # "unattributable", which is a conclusion this rail must never deliver without evidence.
 #
-# ⛔ WHAT THIS DOES **NOT** PIN. The base comparison in this rail is by FAILURE IDENTITY (the
-# exemption decision), not by check name, so a name answer is CONTEXT — it never exempts. The
-# fixture deliberately carries the real agent-infra split (the PR lane's `bash-suites (5)` vs
-# main's `script-validate`), and the assertions pin that the rail STATES the split rather than
-# resolving it into an exemption.
+# ⛔ WHAT THIS DOES **NOT** PIN. The EXEMPTION DECISION compares failures by IDENTITY, not by
+# check name, so a name answer is CONTEXT — it never exempts. The fixture carries the real
+# agent-infra split (the PR lane's `bash-suites (5)` vs main's `script-validate`) in its REAL
+# shape: main's red sits on a `push` run of a workflow that declares no `pull_request`
+# trigger, so the base probe measures it and then EXEMPTS it as not-PR-evaluable. A reader
+# built on the blocking-red set alone would answer "no such red" about the one red that
+# exists — that is the shape pinned here, not the `unknown`-evaluability arm.
 echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
 new_scen named-refusal
 HEAD_NR="f9f90000000000000000000000000000000000ab"
@@ -13751,6 +13753,8 @@ echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
 write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
 # The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
 write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6101"
+wf_declares .github/workflows/ci-main.yml push          # …declaring NO pull_request trigger
 main_run_map 6101 push 'CI on main'
 { main_red_n mainnr01 9902 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
@@ -13769,14 +13773,49 @@ grep -q "run 9901" "$SCEN/err" \
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
   && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
   || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
-grep -q ": script-validate" "$SCEN/err" \
-  && pass "(c) …naming what the base DID carry, so the other name for the same suite is visible" \
-  || fail "(c) the base's own red names are not stated: $(grep -n 'measured on' "$SCEN/err" 2>/dev/null | head -2)"
-grep -q "by FAILURE IDENTITY (the exemption decision), not by" "$SCEN/err" \
+# ⛔ THE EXEMPTED-BASE-RED ARM. main's `script-validate` is measured by the probe and then
+# EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
+# An arm reading only the blocking reds prints an EMPTY list here — the false absence this
+# fixture exists to catch, and the exact shape of the real repo tonight.
+grep -q "red: script-validate" "$SCEN/err" \
+  && pass "(c) …naming the base's own red even though the probe EXEMPTED it as not-PR-evaluable" \
+  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader answers 'none'): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+grep -q "The EXEMPTION DECISION compares failures by FAILURE IDENTITY" "$SCEN/err" \
   && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
   || fail "(d) the message could be read as an exemption — the two questions are not separated"
-# A base whose surface carries the SAME red name is reported as that, not as an absence: an
-# arm that answered "no counterpart" unconditionally would pass (c) and lie on this fixture.
+# ── (e)/(f) THE RUN'S OWN ATTRIBUTION, NOT THE RUN'S MERE PRESENCE (#2610 review, P1-2) ────
+# `--provenance` holds EVERY examined failing run, so a refusal derived from it names runs
+# that DID yield ids. The subset comes from the collector's `--unattributed`, and this
+# fixture proves the two are told apart: run A yields an id (exempt on main, so it does not
+# change the verdict), run B yields nothing. Only B may be named.
+new_scen named-refusal-partial
+HEAD_NP="f9f90000000000000000000000000000000000ef"
+printf '%s\n' "$HEAD_NP" > "$SCEN/head"
+{ lane_fail "$HEAD_NP" 9921; lane_fail "$HEAD_NP" 9922; } > "$SCEN/runs-$HEAD_NP"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9921"
+: > "$SCEN/log-9922"
+echo 'test (z)' > "$SCEN/jobs-failed-9922"
+write_pr_checks "$(check_run 5021 'test (z)' completed failure 9922)"
+write_main_checks "$(check_run 4021 'script-validate' completed failure 6103)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6103"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6103 push 'CI on main'
+{ main_red_n mainnp01 9923 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) a partially attributing head still BLOCKS (exit $rc)" \
+  || fail "(e) the rail merged with one failing run unattributable"
+grep -q "BLOCKED — 1 of 2 failing PR run(s)" "$SCEN/err" \
+  && pass "(e) …reporting 1 of 2 unattributable" \
+  || fail "(e) the 1c refusal did not fire as expected: $(head -3 "$SCEN/err" 2>/dev/null)"
+grep -q "run 9922" "$SCEN/err" \
+  && pass "(f) the refusal NAMES the run that yielded nothing (9922)" \
+  || fail "(f) the unattributable run is not named: $(grep -n 'run 99' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9921" "$SCEN/err" \
+  && fail "(f) it ALSO named run 9921, which DID yield an id — provenance was used as the subset" \
+  || pass "(f) …and does NOT name run 9921, which contributed an id"
+# ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
+# lie about this surface, so a blocking base red with the same NAME is its own case.
 new_scen named-refusal-shared
 HEAD_NS="f9f90000000000000000000000000000000000cd"
 printf '%s\n' "$HEAD_NS" > "$SCEN/head"
@@ -13789,28 +13828,31 @@ main_run_map 6102 push 'CI on main'
 { main_red_n mainns01 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(e) a shared red NAME still REFUSES (a name match is not an exemption)" \
-  || fail "(e) a same-named base red exempted the PR by NAME — the decision is by identity"
+[ "$rc" -ne 0 ] && pass "(g) a shared red NAME still REFUSES (a name match is not an exemption)" \
+  || fail "(g) a same-named base red exempted the PR by NAME — the decision is by identity"
 grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
-  && pass "(e) …and reports the base as carrying the same name RED (not as an absence)" \
-  || fail "(e) the same-name arm is wrong: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+  && pass "(g) …and reports the base as carrying the same name RED (not as an absence)" \
+  || fail "(g) the same-name arm is wrong: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
-  && fail "(e) it ALSO claimed no counterpart — the arms are not exclusive" \
-  || pass "(e) …and does NOT claim an absent counterpart on the same surface"
+  && fail "(g) it ALSO claimed no counterpart — the arms are not exclusive" \
+  || pass "(g) …and does NOT claim an absent counterpart on the same surface"
 # ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
 MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
-grep -v 'named_unattributable_runs "$TMP/pr-runs.txt"' "$ADM" > "$MUTD/admin-merge.sh"
+grep -v 'named_unattributable_runs "$TMP/pr-unattributed.txt"' "$ADM" > "$MUTD/admin-merge.sh"
 cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
 bash -n "$MUTD/admin-merge.sh" \
   && pass "(m) the mutant (naming arm deleted) is still valid bash" \
   || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
   bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
 mrc=$?
-[ "$mrc" -ne 0 ] \
+# The SAME refusal must still fire — a mutant that died earlier would make the absence arm
+# vacuously true, so the arm below is only meaningful once THIS one holds.
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/mut-err" 2>/dev/null \
   && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
-  || fail "(m) the mutant merged: this fixture does not reach the naming path at all"
+  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN/mut-err" 2>/dev/null)"
 grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"

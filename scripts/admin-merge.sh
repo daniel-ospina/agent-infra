@@ -1139,8 +1139,16 @@ fetch_run_failed_job_names() {
     slug="repos/{owner}/{repo}/actions/runs/$run_id/jobs?per_page=100"
   fi
   $GH api "$slug" --paginate \
-    --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | .name'
+    --jq '.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped" and .conclusion != "cancelled" and .conclusion != "stale") | .name'
 }
+# ⛔ THE PREDICATE IS AN ALLOW-LIST, NOT A DENY-LIST (review, P3-9). `run_failed_job_ids`
+# in ci-failure-set.sh names three conclusions and misses the rest, but the rail's own
+# polarity (NON_RED_CONC in this file) is the opposite: a completed check with an
+# UNRECOGNISED conclusion is RED. A deny-list here would silently drop such a job — and
+# the arm would then print "no job reports a failure conclusion", which is a FALSE
+# statement about a job that plainly failed. `null` is excluded because a job list is
+# only read for a run already known to be failed, where an unfinished job is not the
+# failure the log was fetched for; every NAMED non-red is excluded for the same reason.
 
 # named_unattributable_runs <provenance> <base-ref> — THE NAMED REFUSAL (#2610).
 #
@@ -1156,29 +1164,37 @@ fetch_run_failed_job_names() {
 # cause.
 #
 # WHAT IT ASKS, AND WHAT IT DOES NOT CLAIM. For each failed check it answers ONE
-# question: does the BASE's own measured surface carry a RED check of the same NAME?
-# That is the name question, answered from the base probe every other base read uses
-# (the `push` lane's own check names, so `script-validate` on a trigger-split repo
-# appears as itself). It does NOT claim a name match makes a red exempt: this rail's
-# base comparison is by FAILURE IDENTITY (the exemption decision), so a same-named
-# red is reported as context and an absent one is reported as an absent NAME — never
-# as "this red is the PR's". The two questions are stated apart on purpose, because
-# conflating them is how "no base counterpart" would become a silent exemption.
+# question: does the BASE's own measured surface carry a RED check of the same NAME, and
+# was that red BLOCKING or EXEMPTED there? Both kinds are reported, from
+# `MAIN_HEALTH_ALL_REDS` — `MAIN_HEALTH_RED_TS` holds only the blocking ones, so a
+# reader built on it would answer "no such red" about the one red agent-infra's main
+# actually carries (`script-validate` on a `push` run of ci-main.yml: measured, and
+# correctly exempted as not-PR-evaluable).
+# It does NOT claim a name match makes a red exempt: the EXEMPTION DECISION compares
+# failures by IDENTITY, so a same-named red is reported as context and an absent one is
+# reported as an absent NAME — never as "this red is the PR's". (The rail's only
+# NAME-keyed comparison is the lane-coverage gate, and it selects the `test*` job family,
+# which neither surface's suite name is in.) The two questions are stated apart on
+# purpose: conflating them is how "no base counterpart" would become a silent exemption.
 #
 # A refusal whose only fact is a count is unfalsifiable from the operator's side; a
 # refusal that names its runs, its checks and its base answer can be checked, fixed,
 # or escalated. Costs one base-surface probe, on a path that terminates the run.
+#
+# ⛔ THE INPUT IS THE COLLECTOR'S `--unattributed` FILE, NOT `--provenance` (#2610 review,
+# P1-2). `--provenance` holds EVERY examined failing run, including the ones that DID
+# yield ids — so naming from it would label a contributing run as unattributable. The
+# subset is written by `collect_union_rows`, the one place that decides `extracted`.
 named_unattributable_runs() {
-  local provenance="${1:-}" base="${2:-}" line runref run_id names name
+  local unattributed="${1:-}" base="${2:-}" line runref run_id names name kind
   local base_reds base_status base_total
-  [ -s "$provenance" ] || return 0
+  [ -s "$unattributed" ] || return 0
   # The base's own surface, through the ONE probe (#1261) — never a second reader.
   check_surface_probe "$base" "the base branch '$base'" 1
   base_status="${MAIN_HEALTH_STATUS:-}"
   base_total="${MAIN_HEALTH_TOTAL:-}"
-  # The base's BLOCKING red NAMES. `MAIN_HEALTH_RED_TS` is the structured form the
-  # staleness comparison already consumes; its first field IS the job name.
-  base_reds="$(printf '%s\n' "${MAIN_HEALTH_RED_TS:-}" | cut -f1 | sed '/^$/d' | sort -u)"
+  # `<name>\t<classification>` for every red the base's surface carried.
+  base_reds="$(printf '%s\n' "${MAIN_HEALTH_ALL_REDS:-}" | sed '/^$/d' | sort -u)"
   say_err "   The failing run(s), NAMED — each check below is one whose failed-step log"
   say_err "   yielded no failure identity, so it entered NEITHER side of the comparison:"
   while IFS= read -r line; do
@@ -1191,8 +1207,9 @@ named_unattributable_runs() {
       continue
     fi
     if [ -z "$names" ]; then
-      say_err "   • run $run_id — no job in it reports a failure conclusion (the run failed"
-      say_err "       without a failed job: a startup or annotation failure)"
+      say_err "   • run $run_id — the API reports NO failed job: either the run was never"
+      say_err "       expanded into jobs (#1623), or it failed before/without a job (a startup or"
+      say_err "       annotation failure). Two different causes, both unattributable here."
       continue
     fi
     while IFS= read -r name; do
@@ -1200,12 +1217,16 @@ named_unattributable_runs() {
       say_err "   • run $run_id — check '${name}' — no parseable failure identity in its log"
       case "$base_status" in
         green|red)
-          if printf '%s\n' "$base_reds" | grep -qxF -- "$name"; then
-            say_err "       base: '${name}' IS red on '${base}' — the same check NAME fails on both"
-            say_err "       surfaces; the decision still compares IDENTITIES, and this run has none"
+          # `kind` is the classification the probe already made, so an EXEMPTED base red
+          # is reported as the red it is — with the reason it did not block there.
+          kind="$(printf '%s\n' "$base_reds" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')"
+          if [ -n "$kind" ]; then
+            say_err "       base: '${name}' IS red on '${base}' (${kind}) — the same check NAME fails on"
+            say_err "       both surfaces; the decision still compares IDENTITIES, and this run has none"
           else
             say_err "       base: NO BASE COUNTERPART FOR THIS CHECK — '${name}' is not among the"
-            say_err "       red check NAME(s) measured on '${base}' (${base_total:-?} measured): $(printf '%s\n' "$base_reds" | sed '/^$/d' | paste -sd, - 2>/dev/null || printf 'none')"
+            say_err "       ${base_total:-?} check(s) the base surface reports, of which these NAME(s) are"
+            say_err "       red: $(printf '%s\n' "$base_reds" | cut -f1 | sed '/^$/d' | paste -sd, - | sed 's/^$/none/')"
           fi
           ;;
         *)
@@ -1214,12 +1235,12 @@ named_unattributable_runs() {
           ;;
       esac
     done <<< "$names"
-  done < "$provenance"
-  say_err "   This rail's base comparison is by FAILURE IDENTITY (the exemption decision), not by"
-  say_err "   check name: an identity is what makes a red comparable to the base, and (with a"
-  say_err "   matching signature) exempt. NONE of the runs above yielded one, so nothing about them"
-  say_err "   is comparable yet — a name answer alone cannot exempt a red, and an absent name is not"
-  say_err "   a verdict. Remedy: make the failing step print a parseable identity — a"
+  done < "$unattributed"
+  say_err "   The EXEMPTION DECISION compares failures by FAILURE IDENTITY, not by check name: an"
+  say_err "   identity is what makes a red comparable to the base, and (with a matching signature)"
+  say_err "   exempt. NONE of the runs above yielded one, so nothing about them is comparable yet —"
+  say_err "   a name answer alone cannot exempt a red, and an absent name is not a verdict."
+  say_err "   Remedy: make the failing step print a parseable identity — a"
   say_err "   '::error::<message>' annotation or a 'FAILED <nodeid>' line — then re-run the rail."
   return 0
 }
@@ -4243,6 +4264,16 @@ check_surface_probe() {
   # Structured BLOCKING reds, for the staleness comparison (step 4.6):
   # `<name>\t<started_iso>\t<started_epoch>\t<url>`, one per code-measuring red.
   MAIN_HEALTH_RED_TS=""
+  # EVERY red the surface carried, whatever the probe then did with it, as
+  # `<name>\t<classification>` — one line per red (#2610). `MAIN_HEALTH_RED_TS` above is
+  # the BLOCKING reds only (it feeds the staleness comparison), and a red that is
+  # measured and then EXEMPTED (a non-code event, or a workflow that declares no PR
+  # trigger) never enters it. A reader that asks "does the base carry a red check with
+  # this NAME?" needs the wider set: on agent-infra main's only red is `script-validate`
+  # on a `push` run from ci-main.yml, which the probe correctly calls not-PR-evaluable —
+  # so a reader built on RED_TS alone would answer "no such red" about the one red that
+  # exists. ONE probe, one extra accumulator: not a second reader.
+  MAIN_HEALTH_ALL_REDS=""
   # The surface's own last-production time (max completed_at over its completed
   # checks) and that time as epoch seconds. Empty when the surface has no
   # completed check at all.
@@ -4642,10 +4673,14 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev:-(unresolved)}' — ${concl}${red_note_suffix} — NOT pull-request-evaluable (this workflow declares no pull_request/pull_request_target trigger, so no PR can attach its checks to a head sha), so NOT blocking — ${url}"
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"exempt: this workflow declares no PR trigger, so a PR can never run it"
             other_noneval=$((other_noneval + 1))
         elif [ "$noncode" -eq 1 ] && [ "$allow_noncode" -eq 1 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — NOT a code measurement, so NOT blocking — ${url}"
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"exempt: a non-code event (${ev:-(unresolved)}) measures no revision"
             other=$((other + 1))
         else
             [ -n "$MAIN_HEALTH_REDS" ] && MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}"$'\n'
@@ -4657,6 +4692,8 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
             # Keep the red's own START time for the staleness comparison: a red
             # whose run began after the PR's surface was produced cannot have
             # been measured by it (step 4.6).
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"blocking: ${concl}"
             [ -n "$MAIN_HEALTH_RED_TS" ] && MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}"$'\n'
             MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}${job}"$'\t'"${started_iso}"$'\t'"${started_epoch}"$'\t'"${url}"
             blocking=$((blocking + 1))
@@ -6040,6 +6077,7 @@ main() {
     # that used to be visible on stderr is silenced.
     run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
       --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
+      --unattributed "$TMP/pr-unattributed.txt" \
       > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
     if [ -s "$TMP/pr-drops.err" ]; then
       local pr_drops_cur
@@ -6337,7 +6375,7 @@ main() {
     local named_base_ref
     named_base_ref="$(resolve_base_ref "$PR" ${repo_args[@]+"${repo_args[@]}"})"
     [ -n "$named_base_ref" ] || named_base_ref="main"
-    named_unattributable_runs "$TMP/pr-runs.txt" "$named_base_ref" || true
+    named_unattributable_runs "$TMP/pr-unattributed.txt" "$named_base_ref" || true
     exit 1
   fi
 
