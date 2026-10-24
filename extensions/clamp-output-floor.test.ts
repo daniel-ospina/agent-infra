@@ -290,12 +290,46 @@ test("resolvePiRoot honors an explicit PI_ROOT", () => {
 		else process.env.PI_ROOT = previous;
 	}
 });
-test("detectSourcePatch reports PRESENT on this install (the patch is applied)", () => {
+test("detectSourcePatch reports PRESENT for a PATCHED bundle (hermetic fixture)", () => {
+	// The positive arm used to be the LIVE install only, so the detector's "present" answer was
+	// pinned nowhere else — and a box whose pi is unpatched failed here for a reason that has
+	// nothing to do with this checkout. Measured 2026-10-24: `verify` PASSED on a GitHub-hosted
+	// runner (npm pi, unpatched ⇒ `detectSourcePatch` answers false) and FAILED on the self-hosted
+	// cell runner, same commit, same job — a host dependency wearing a test's clothes, and one that
+	// reddens every PR's evaluated tree (§4.5 of the merge rail) whichever runner picks the job.
+	// The detector's answer is now pinned against a FIXTURE, exactly as its negative control is.
+	const dir = mkdtempSync(join(tmpdir(), "clamp-floor-probe-ok-"));
+	mkdirSync(join(dir, "dist", "bundle", "chunks"), { recursive: true });
+	writeFileSync(
+		join(dir, "dist", "bundle", "chunks", "chunk-AXIIZGTV.js"),
+		'var CONTEXT_SAFETY_TOKENS=4096,MIN_USABLE_MAX_TOKENS=1024,MIN_MAX_TOKENS=1;' +
+			'function clampMaxTokensToContext(model,context,maxTokens){const available=(model?.contextWindow??context)-CONTEXT_SAFETY_TOKENS;' +
+			'return available<MIN_USABLE_MAX_TOKENS?Math.max(1,available):Math.min(maxTokens,available)}',
+	);
+	strictEqual(detectSourcePatch(dir), true);
+	rmSync(dir, { recursive: true, force: true });
+});
+test("detectSourcePatch reports the LIVE install's state, and refuses only where the box REQUIRES the patch", () => {
 	if (!piPaths) {
-		console.log("     (skipped — no pi install to probe)");
+		console.log("     (skipped — no pi install to probe: `pi` is not on PATH here)");
 		return;
 	}
-	strictEqual(detectSourcePatch(piPaths.root), true);
+	const state = detectSourcePatch(piPaths.root);
+	if (state === true) return; // the fleet box shape: patched, nothing to report
+	// ⛔ NOT A FAILURE BY DEFAULT, and the reason is named. Whether THIS BOX carries the upstream
+	// source patch is a per-box OPERATION owned by `scripts/pi-patches/` (its `verify.sh` is the
+	// authority, and its evidence directory is the record) — not a property of this checkout, and
+	// not something a CI runner installs. A box that must be patched DECLARES it; then absence is a
+	// real failure and this arm fails for the right reason.
+	if (process.env.PI_SOURCE_PATCH_REQUIRED !== "1") {
+		console.log(
+			`     (skipped — this box's pi install (${piPaths.root}) answers ${JSON.stringify(state)} ` +
+				`for the source patch; the patch is applied per box by scripts/pi-patches/, whose verify.sh ` +
+				`owns that claim. Set PI_SOURCE_PATCH_REQUIRED=1 on a box that must be patched.)`,
+		);
+		return;
+	}
+	strictEqual(state, true, "PI_SOURCE_PATCH_REQUIRED=1 declares this box must carry the source patch");
 });
 test("NEGATIVE CONTROL detectSourcePatch reports ABSENT for an unpatched bundle", () => {
 	const dir = mkdtempSync(join(tmpdir(), "clamp-floor-probe-"));
