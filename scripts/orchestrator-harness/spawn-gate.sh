@@ -317,14 +317,16 @@ DISK_LANE_RESERVE_MB="${DISK_LANE_RESERVE_MB:-}"
 # and it fails toward the EXPENSIVE pair: over-estimating a harness lane's cost withholds a few
 # spawns on an almost-full cell, under-estimating a python lane's cost fills the cell.
 python_target() { # python_target <path>
-  local p="${1:-.}" f
-  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
-    [ -e "$p/$f" ] && return 0
-  done
+  local p="${1:-.}" f f2
   # One level down (a monorepo whose installable project is a subdirectory) — BOUNDED, and globs
   # only: this runs in the dispatch path, so it must never walk a tree.
-  for f in "$p"/*/uv.lock "$p"/*/pyproject.toml "$p"/*/requirements.txt; do
-    [ -e "$f" ] && return 0
+  # ⛔ THE SAME MARKER SET, NOT A SUBSET (review round 2, P2): the first version checked only
+  # uv.lock/pyproject.toml/requirements.txt one level down, so a `backend/poetry.lock` or a
+  # `backend/Pipfile` + `setup.py` service still derived the harness pair — the exact false pass this
+  # function exists to close, wearing DEPTH instead of the marker as its disguise.
+  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
+    [ -e "$p/$f" ] && return 0
+    for f2 in "$p"/*/"$f"; do [ -e "$f2" ] && return 0; done
   done
   return 1
 }
@@ -1301,7 +1303,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # this gate targets, and the first signal an operator got was the refusal. This arm is the
     # warning that CAN fire: within one marginal lane tree of the bound, i.e. the next spawn after
     # this one is the one that gets refused.
-    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — the NEXT lane will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
+    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — the next lane OF THIS KIND will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
   fi
   l="$(load1)"
   if ! can_spawn "$l"; then
