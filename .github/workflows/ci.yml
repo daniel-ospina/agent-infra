@@ -297,6 +297,18 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: pi pool reaper gate suite (zero-dep)
+        # The `pi` session pool had NO owner: the `ppid=1 + our-checkout + testish` orphan class
+        # cannot see a lane's `pi` (bare argv, reparented to launchd or under tmux), so days-old
+        # stopped sessions accumulated while the box's own lanes waited for capacity (measured
+        # 2026-10-22: 64 `pi`, 21 of them 1-9 days old at a 0.00 s CPU delta). `scripts/
+        # orphan-reap.py --pool pi` owns them, and it consumes `tools/fleet/liveness.py::evaluate`
+        # (`idle` is the only kill authorisation) rather than forming a second opinion. The suite
+        # drives the census through injected ps / session-index / stat / clock readers (NO live
+        # process is touched), asserts the four states stay distinguishable, and its --mutations
+        # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
+        # go RED). Its own step, so one verdict cannot suppress another.
+        run: python3.12 scripts/orphan-reap.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had
@@ -908,9 +920,78 @@ jobs:
     # (`ADMIN_MERGE_LANE_JOB_PREFIX`, default `test`), so it stays outside that family and
     # cannot move the rail's lane-coverage comparison (#1349 — a separate remedy; nothing
     # here helps or hinders it).
+    #
+    # ⛔ DURATION, not runner capacity, was this job's defect (measured 2026-10-23, PR #2412):
+    # the run started 10:25:04Z, was still `in_progress` at 13:11Z — ~2h46m inside the ONE step
+    # "Bash shards — the ONE list both lanes run" — and then failed. Measured alongside that:
+    # 80 open PRs, and the account pool was NOT starved (agent-infra: 5 in progress / 3 queued
+    # against a 20-job pool). One unsharded job holding a serial sweep for hours starves CI by
+    # DURATION while every capacity signal reads healthy. Two defects, and the second is why the
+    # first was invisible:
+    #   1. every shard ran SERIALLY in one job → the fix is the MATRIX below.
+    #   2. the job declared NO `timeout-minutes` (agent-infra #2055) → a hung shard burned hours
+    #      and then reddened the PR without naming itself. The bound below makes a hang FAIL FAST,
+    #      and the job that trips it names the slice it was running.
+    #
+    # ⛔ THE MATRIX CARRIES A SLICE, NEVER A LIST. `scripts/run-bash-shards.sh` remains the ONE
+    # source of the shard list (its header records why every duplicated-list form was proven
+    # unsound). This job contributes only a LANE WIDTH, and even that is not typed twice: the
+    # denominator is `strategy.job-total`, GitHub's own count of the jobs this matrix expands to,
+    # so widening or narrowing the matrix below is a ONE-LINE edit that cannot leave a stale `/N`
+    # behind. The slice arrives as `BASH_SHARD_SLICE` in the STEP's `env` — not as an argument —
+    # because the step's `run` must stay the bare call `bash scripts/run-bash-shards.sh`: that is
+    # what `check-ci-lane-parity` asserts (an argument there is a MENTION, not the call, and the
+    # lane un-wires — the #1369 class).
+    #
+    # COVERAGE IS ARITHMETIC, NOT TRUST. Each slice asserts that the SET of shards it executed is
+    # exactly the set its index derives from the list (a sorted-path comparison, not a count — a
+    # broken modulus that runs the right NUMBER of the wrong shards is caught too), AND that
+    # `executed + skipped == listed`. The slices therefore sum to the whole list. A slice that runs
+    # nothing, or a neighbour's shards twice, fails its own assertion rather than reporting a green
+    # check over a hole.
     runs-on: ubuntu-latest
+    # #2055: a bound, so a hang fails fast and the failing job NAMES its slice. Sized from CI's own
+    # measurements (PR #2412 job 120365087427: the list then held 74 shards — it is 78 today, and
+    # the per-slice sizes are DERIVED, so no number here goes stale — 73.6 min, 59.7 s/shard
+    # mean; #2483's
+    # main-lane profile: tests/atomic-land/run.sh 32m51s, tests/admin-merge/run.sh 16m37s, the
+    # remaining shards 26m25s).
+    #
+    # ⛔ THE FLOOR IS THE SINGLE SLOWEST SHARD, NOT THE SLICE COUNT. `tests/atomic-land/run.sh` is
+    # ~33 min ON ITS OWN (66 serial mutation re-runs, each <81 s — which is why a gap analysis over
+    # the log cannot see it), so with 8 round-robin slices the worst slice is ≈ 33 min + its 9
+    # siblings ≈ 37 min, and no wider matrix goes below 33. The shard step's own bound below is 70
+    # min = ~1.9x that slice: enough for runner variance, and it still fails fast against the
+    # unbounded 1h52m this job shipped with.
+    # Splitting those two shards is #2483 — until it lands, slicing halves the wall (73.6 → ~37 min
+    # of shard work) and nothing can make it shorter.
+    #
+    # ⛔ THIS JOB BOUND IS A PURE BACKSTOP, AND THE INVARIANT IS ARITHMETIC: it sits ABOVE the sum
+    # of its steps' bounds, so it can never fire before the step that is actually running trips its
+    # OWN bound. That matters because the two produce different conclusions — a step trip is
+    # `failure` (RED), a job trip is `cancelled`, which this repo's merge rail names NON-RED. A job
+    # bound below the sum would let the non-red one win: 10 (checkout) + 10 (node) + 70 (shards) =
+    # 90 < 100.
+    timeout-minutes: 100
+    strategy:
+      # false: every slice reports its own result, so one hang cannot hide the other slices'
+      # verdicts — the diagnostic this job lacked, since a single step reported nothing until
+      # it died.
+      fail-fast: false
+      matrix:
+        # Slices, not shards. Width = the number of entries here; the per-slice sizes are DERIVED by
+        # the runner's own round-robin (`pos % n`) over whatever the list holds today, not asserted
+        # here — they shift when a `run_shard` line is added, and the runner re-derives them, so
+        # nothing in this file goes stale. The runner refuses a count wider than its own list.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      # ⛔ checkout and setup-node carry their own bounds too. Unbounded, a hang in EITHER would be
+      # caught by the JOB bound above — i.e. reported `cancelled`, which the rail reads as NON-RED,
+      # while no shard had run: every shard ungated behind a non-red check, which is worse than
+      # losing one slice. `timeout-minutes` applies to `uses:` steps as well as `run:` steps (the
+      # runner sets the step deadline before `step.RunAsync()` for either kind).
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
       # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
       # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
@@ -918,12 +999,69 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+        timeout-minutes: 10
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+        # hand-kept number, and never a list: the list is the runner's).
+        env:
+          BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        # ⛔ THE BOUND IS ON THE STEP, NOT ONLY ON THE JOB — the two are DIFFERENT conclusions, and
+        # only one of them blocks. A JOB that trips `jobs.<id>.timeout-minutes` is reported
+        # `cancelled`: the service cancels the job, the job-cancellation callback sets
+        # `jobContext.Result = TaskResult.Canceled` (`StepsRunner.cs:149-155`, the `Canceled` arm at
+        # :154), and a step still running when that happens takes `TaskResult.Canceled`
+        # (`StepsRunner.cs:331-336`). (`JobRunner.cs` has NO timeout handling at all — its
+        # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.)
+        # A `cancelled` check is NON-RED to this repo's rail (`scripts/admin-merge.sh`
+        # `NON_RED_CONC`), so a job-only bound would let a PR merge with THIS slice's shards never
+        # executed — a false PASS dressed as a fail-fast, which is the #1369 shape one level up.
+        # A STEP that trips its own bound takes the other branch in the same file: at
+        # `StepsRunner.cs:324-329`, `timeoutMinutes` fires with `jobCancellationToken` NOT
+        # cancelled, so the result is `TaskResult.Failed` — which the job reports as `failure`,
+        # which the rail reds. 70 min leaves 20 min of job bound for checkout/setup and stays ~1.9x
+        # the measured worst slice (~37 min), so it cannot false-block a slow-but-healthy slice.
+        timeout-minutes: 70
+        run: bash scripts/run-bash-shards.sh
+
+  bash-suites-gate:
+    # #1369's two guard steps, ONCE per PR — not once per slice. They lived in `bash-suites`
+    # while it was a single job; inside a MATRIX they would run 8 times, and
+    # `tests/ci-lane-parity/run.sh` is not cheap (it drives the runner's FAST copy several times —
+    # ~60 shards per invocation). Duplicating it per slice would re-create this PR's own defect in
+    # the job that exists to catch it: every slice would pay the self-test's wall time, and the
+    # matrix would buy back almost nothing.
+    #
+    # ⛔ NOT conditional and no `needs:` — `check-ci-lane-parity` refuses `if`/`needs`/
+    # `continue-on-error` on the call-carrying job exactly so a lane cannot be made to look wired
+    # while it never runs. This job is a plain sibling: it runs on every PR, and its failure reds
+    # the PR like any other. `bash-suites` still makes the bare call the guard asserts.
+    runs-on: ubuntu-latest
+    # #2055: the bound this job never had, sized to CI's own measurement. The self-test ran
+    # 38m41s on PR #2412 (job 120365087427, step 5: 10:25:08Z → 11:03:49Z) — it drives the
+    # runner's FAST copy of the shard list several times, so its wall tracks that copy. The shipped
+    # step bound is 70 min = ~1.8x that measured 38m41s: generous, because a bound BELOW the
+    # measured run would false-block every PR (a red that is not a defect is how a gate loses its
+    # authority), while still failing fast against the multi-hour stall this PR exists to stop.
+    #
+    # ⛔ SAME ARITHMETIC AS `bash-suites`: the job bound sits ABOVE the sum of the step bounds below
+    # (10 + 10 + 10 + 70 = 100 < 110), so a running step always trips its OWN bound first — which is
+    # `failure` (red), never the job-level `cancelled` this repo's rail reads as non-red.
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+        timeout-minutes: 10
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
+        # Step bounds, not just the job bound, for the reason recorded on `bash-suites` above: a
+        # step timeout is `failed` (red), a job timeout is `cancelled` (non-red to the rail).
+        timeout-minutes: 10
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        timeout-minutes: 70
         run: bash tests/ci-lane-parity/run.sh
-      - name: Bash shards — the ONE list both lanes run (#1369)
-        run: bash scripts/run-bash-shards.sh
 
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification

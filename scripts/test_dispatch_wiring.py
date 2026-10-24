@@ -785,6 +785,27 @@ _OPEN_CASE = re.compile(r"^case\s+(.+?)\s+in\b")
 _OPEN_FUNC = re.compile(r"^(?:function\s+)?([A-Za-z_][\w-]*)\s*(?:\(\s*\))?\s*\{")
 _CLOSER = re.compile(r"^(?:fi|done|esac)\b|^\}")
 
+# ⛔ A ONE-LINER'S CLOSER MUST BE A COMMAND, NOT A WORD IN A TRAILING COMMENT (measured by an
+# independent verifier on this change, 2026-10-23). Searching the whole raw line for `\besac\b` /
+# `\bdone\b` makes `while :; do   # until done` and `case "$x" in   # esac closes it` read as
+# ONE-LINERS, i.e. as opening nothing — a FALSE GREEN in the parser whose entire job is to prove the
+# launch is not enclosed. The closer is only real at the END of the code, preceded by a statement
+# separator or the start of the line: `case x in a) : ;; esac`, `while :; do :; done`.
+_ONE_LINE_CLOSER = re.compile(r"(?:^|[;&]\s*)(?:esac|done)\s*;?\s*$")
+# A `#` comment is stripped for this test only. Stripping a real `#` inside quotes can only SHORTEN the
+# line, which makes the construct look MORE like an opener — the fail-closed direction for this gate.
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _closes_on_its_own_line(s: str, word: str) -> bool:
+    """True when `s` opens a construct AND closes it with `word` on the same line."""
+    code = _TRAILING_COMMENT.sub("", s)
+    m = _ONE_LINE_CLOSER.search(code)
+    # `m.group(0)` may include the separator AND the `;` that terminates the construct
+    # (`'; done;'`), so strip both sides before the word test — `rstrip()` alone left the `;`
+    # attached and the check silently returned False for `while :; do :; done;`.
+    return bool(m) and m.group(0).strip(" \t;").endswith(word)
+
 
 def _opened_construct(s: str):
     """The construct `s` opens, as `(kind, subject)`, or None.
@@ -799,19 +820,38 @@ def _opened_construct(s: str):
     """
     m = _OPEN_CASE.match(s)
     if m:
-        return ("case", m.group(1))
+        # ⛔ A ONE-LINER (`case x in a) … ;; esac`) OPENS AND CLOSES ON ITS OWN LINE — the same
+        # rule the `if …; then …; fi` arm below already applies. Missing it here is not cosmetic:
+        # the `case` frame was pushed and never popped, so the NEXT `}` popped the case instead of
+        # the function that contained it. MEASURED 2026-10-23 on main: `slack()` gained
+        # `case "$r" in ''|*[!0-9]*) r=20 ;; esac` (agent-infra#2121, the `local r=$(remaining)`
+        # discarded-status fix), `slack()`'s own closer then popped the phantom case frame, and the
+        # dispatch launch came back enclosed by `('func', 'slack')` — a FALSE RED on a correct
+        # beat, reddening `ci / test` on main for three tests at once (`…surviving_dispatcher`,
+        # `…else_arm_with_a_trailing_comment…`, `…defeat_matrix_does_not_red_the_real_beat`).
+        # A false red here is not harmless: it trains the next lane to widen the pin, which is how
+        # a real enclosing construct gets waved through (the same failure shape as #1954's
+        # `report_detached_rc`, one matching closer later).
+        return None if _closes_on_its_own_line(s, "esac") else ("case", m.group(1))
     m = _OPEN_FUNC.match(s)
     if m and "}" not in s[m.end():]:
         return ("func", m.group(1))
+    # ⛔ THE CLOSER IS SEARCHED FOR IN THE WHOLE LINE, NOT IN `s[m.end():]`. `_OPEN_LOOP`'s subject
+    # group is lazy but its `$` anchor makes it consume the REST of the line (`while [ -n "$x" ]; do
+    # x=; done` comes back with the whole line as `group(2)`), so `m.end()` is the end of the string
+    # and `s[m.end():]` is ALWAYS empty — the one-liner would never be recognised. Measured while
+    # writing this test: the check passed for `case` and silently failed for `while`/`for`.
     m = _OPEN_LOOP.match(s)
     if m:
-        return ("loop", "%s %s" % (m.group(1), m.group(2)))
+        # Same one-line rule, for the same reason: `while …; do …; done` on one line would leave a
+        # phantom loop frame and shift every later pop by one.
+        return None if _closes_on_its_own_line(s, "done") else ("loop", "%s %s" % (m.group(1), m.group(2)))
     m = _OPEN_FOR.match(s)
     if m:
-        return ("for", m.group(1))
+        return None if _closes_on_its_own_line(s, "done") else ("for", m.group(1))
     m = _OPEN_SELECT.match(s)
     if m:
-        return ("select", m.group(1))
+        return None if _closes_on_its_own_line(s, "done") else ("select", m.group(1))
     m = _OPEN_IF.match(s)
     if m:
         # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
@@ -2450,6 +2490,27 @@ def test_the_opener_table_opens_if_select_and_groups_but_not_elif():
     assert _opened_construct('if false; then') == ("if", "false")
     # A one-liner opens AND closes on its own line, so it opens nothing.
     assert _opened_construct('if [ -f "$X" ]; then continue; fi') is None
+    # ⛔ THE SAME RULE FOR `case`/`while`/`for`/`select` (measured 2026-10-23, main). `slack()`'s
+    # `case "$r" in ''|*[!0-9]*) r=20 ;; esac` pushed a frame that nothing ever popped, so the
+    # function's own `}` popped the case instead and the launch read as enclosed by `('func',
+    # 'slack')`. The one-liner rule existed only for `if`; a construct the table opens and the line
+    # itself closes must open nothing, whichever construct it is.
+    assert _opened_construct('case "$r" in \'\'|*[!0-9]*) r=20 ;; esac') is None
+    assert _opened_construct('while [ -n "$x" ]; do x=; done') is None
+    assert _opened_construct('for f in a b; do :; done') is None
+    # …and the multi-line spelling of the same construct is still an opener, so the rule above did
+    # not turn the whole construct off.
+    assert _opened_construct('case "$r" in') == ("case", '"$r"')
+    assert _opened_construct('while :; do') is not None
+    # ⛔ AND A CLOSER WORD IN A TRAILING COMMENT IS NOT A CLOSER (independent-verifier finding on this
+    # change, 2026-10-23). A whole-line search for `\\besac\\b`/`\\bdone\\b` read these as one-liners,
+    # i.e. as opening NOTHING — a false GREEN in the parser whose only job is to prove the launch is
+    # not enclosed. The closer must be a COMMAND at the end of the code.
+    assert _opened_construct('while :; do            # until done') is not None
+    assert _opened_construct('case "$x" in       # esac closes it') == ("case", '"$x"')
+    # …and the real one-liner still closes, including when it carries its own trailing comment.
+    assert _opened_construct('case "$r" in x) : ;; esac   # done') is None
+    assert _opened_construct('while :; do :; done;') is None
     # Any unpinned `{` opener is a group, whatever precedes it.
     assert _opened_construct('[ -n "$X" ] && {') == ("group", '[ -n "$X" ] && {')
 
@@ -2478,6 +2539,39 @@ def test_an_elif_inside_a_function_does_not_leave_a_phantom_frame(tmp_path):
     assert _enclosing_constructs(p, "dispatch-marker") == [], (
         "an `elif` arm left a phantom frame open, so every closer after it pops the wrong entry: "
         "the enclosing-construct list stops describing what actually encloses the launch")
+
+
+def test_a_one_line_case_inside_a_function_does_not_leave_a_phantom_frame(tmp_path):
+    """The MEASURED regression (2026-10-23, on main): `case … esac` on ONE LINE left a frame open.
+
+    `slack()` in `heartbeat-loop.sh` gained `case "$r" in ''|*[!0-9]*) r=20 ;; esac` in the
+    #2121 fix. `_OPEN_CASE` matched the line and pushed a `case` frame; the line's own `esac` was
+    never seen as a closer, so `slack()`'s `}` popped the CASE and the function stayed on the
+    stack — the dispatch launch then came back enclosed by `('func', 'slack')`, reddening three
+    tests on main (`…surviving_dispatcher`, `…else_arm_with_a_trailing_comment…`,
+    `…defeat_matrix_does_not_red_the_real_beat`). A false red here is not harmless: it is exactly
+    what teaches a lane to widen the pin, and one widened pin later a REAL enclosing construct
+    reads green (the #1954 shape). Pinned on a minimal fixture rather than the beat's own shape.
+    """
+    p = tmp_path / "case_balance.sh"
+    p.write_text(
+        "#!/bin/bash\n"
+        "f() {\n"
+        "  local r\n"
+        "  r=\"x\"\n"
+        "  case \"$r\" in ''|*[!0-9]*) r=20 ;; esac\n"
+        "  echo \"$r\"\n"
+        "}\n"
+        "g() {\n"
+        "  for f in a b; do :; done\n"
+        "  while [ -n \"$1\" ]; do shift; done\n"
+        "}\n"
+        "dispatch-marker\n")
+    assert subprocess.run(["bash", "-n", str(p)]).returncode == 0, (
+        "the one-liner fixture is not valid bash — fix the fixture, not the gate")
+    assert _enclosing_constructs(p, "dispatch-marker") == [], (
+        "a one-line `case`/`while`/`for` left a phantom frame open, so every closer after it pops "
+        "the wrong entry: the launch reads as inside a function that does not enclose it")
 
 
 # ⛔ T4 — A HEREDOC DELIMITER THE REGEX COULD NOT SEE. `<<'1'` (a digit-leading word) and `<<\W`
