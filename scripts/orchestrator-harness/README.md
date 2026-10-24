@@ -3716,6 +3716,54 @@ and over a copy whose bytes matched `main` but which carried no git identity. Th
 same class with a worse starting point — no record at all — so its absence fails the check loudly
 instead of reading as healthy.
 
+### The Mac runs the PIN, not a home-dir copy (agent-infra#2231)
+
+**The defect, in one line.** The launchd job exec'd `$O/orch-loop.sh` — `~/orchestrator/orch-loop.sh`,
+a **copy** of a script this repo carries, in a directory that is not a git checkout at all
+(`git rev-parse --show-toplevel` there → `fatal: not a git repository`). The cells never had it: they
+exec `<pin root>/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, a detached worktree **at the
+pinned commit**, recorded in `HARNESS-PIN`. So the Mac was the one machine whose harness identity had
+no answer — and the one whose fixes could vanish.
+
+**The parity table, as measured against the paths the Mac was configured to exec.** "In the repo" is
+a `file:line` for the *content*; the third column is the question that matters — whether the path the
+job NAMES is a tree the repo can be pinned to.
+
+| what the Mac runs | path it was configured with | the same content in the repo? | repo version vs the Mac's copy |
+|---|---|---|---|
+| controller program (`com.eldato.orchestrator-loop`) | `~/orchestrator/orch-loop.sh` | yes — `scripts/orchestrator-harness/orch-loop.sh` (named by `launchd.plist.template:11` **before** this change) | **stale**: `$O` is a deploy snapshot with no commit; the deployed copy measured behind main in `check-deployed-drift.sh` |
+| the controller's entrypoint *on this box's installed plist* | `~/orchestrator/launchd-controller.sh` | **NO — absent from every commit** (`docs/ops/ACTIVATION-MATRIX.md:43`, `git ls-tree origin/main` → absent) | home-only; the tmux/Full-Disk-Access wrapper §3.1 of `docs/ops/fleet-harness-baseline.md` describes; lifted by **PR #2020 (open, conflicting)** |
+| the 21 helpers the controller sources (`claims.sh`, `merge-one.sh`, …) | `~/orchestrator/<name>.sh` | yes — same directory | **stale** in both directions; `install.sh`'s `DRIFTED` list names them, and it only WARNS |
+| `~/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist` → `~/orchestrator/watchdog.sh` | absolute home path in the plist | **NO template ships it** — `git grep -l orchestrator-watchdog -- templates/launchd` → 0 (`ACTIVATION-MATRIX.md:44`) | home-only |
+| the beat's classifier | `~/.pi/agent/scripts/lane-status.py` | yes — `scripts/lane-status.py`, which now **carries the #1777 liveness text** (commit `7728022e`) | repo **current**; the farm exemption that says the live copy is ahead (`pi-bootstrap/setup.sh:394`, `tests/test-setup-no-nesting.sh:423`) is **stale in its reason** |
+| the beat loop / pr-doctor | `~/.pi/agent/scripts/heartbeat-loop.sh`, `pr-doctor.py` | yes — `scripts/heartbeat-loop.sh`, `scripts/pr-doctor.py` | byte-identical at the last measurement (`test-setup-no-nesting.sh:427`) |
+| `~/orchestrator/orchestrator-heartbeat.sh` (`com.eldato.harness-heartbeat`) | resolved from `$O` first (`RESOLVER_SET` in `scripts/orchestrator-bringup.sh`) | yes — `scripts/orchestrator-heartbeat.sh` | **stale** whenever `$O` is |
+| **`~/.cache/orc/main-orch-loop.sh`** | outside any `$O`, any pin and any installer | **NO — ZERO references in the repo** (`grep -rn 'main-orch-loop' .` → 0) | **worst row**: a controller-shaped script nothing in the repo creates, names, or replaces |
+
+**The two halves of the fix, and why it is not a second launcher.**
+
+1. **`install.sh` resolves the PIN and refuses anything else.** Before rendering, it reads the two
+   records the cells read — `.harness-path` (the dir) and `~/.pi/agent/state/HARNESS-PIN` (the sha) —
+   and requires the resolved directory to be a **`git worktree` at that commit** carrying
+   `orch-loop.sh`. When no pin is recorded it **materialises one through the cells' own materialiser**
+   (`cloud-cell-supervisor.sh apply --force --pin-only`); when the resolved dir is a copy, a different
+   commit, unreadable, or unexaminable, it **refuses (rc=78) naming both paths**. After rendering it
+   parses the plist back and refuses unless the `ProgramArguments` program IS
+   `<pin>/<entrypoint>`. The render therefore cannot name `$O`, `~/orchestrator` or `~/.cache/orc`,
+   and `$O` keeps its real job — the **worker** surface, exactly as on a cell.
+2. **`scripts/harness-up` gained a `box` row**, so `harness-status` names the machine AND the pin sha it
+   runs (`box | <host> | <sha12> | OK (darwin via scutil ComputerName; harness <pin dir>)`). The Mac is
+   now one of the boxes that answers "which harness?" in the same shape as a cell, instead of the
+   exception that printed `pin: SKIPPED (no pin machinery on this box)`.
+
+**What is deliberately NOT done here.** `deploy-mac-orchestrator.sh` still copies a staged tree into
+`$O` by `git archive` — it is the *worker* seed and it is idempotent; the controller no longer reads
+`$O`, so it can no longer be the thing that runs. And when a box's live entrypoint
+(`launchd-controller.sh`) is not in the pinned tree, the installer **refuses** rather than rendering
+the pin's `orch-loop.sh`: moving a Mac off that wrapper would silently drop the TCC workaround, so the
+content has to land (PR #2020) before the pin may replace it — the "do not delete before it is landed"
+rule, enforced mechanically.
+
 **Portability edits applied to the shipped loop.** Three per-box constants became overridable — with
 this box's values still the default for `OR` and `O`, and **no default in the scripts that refuse
 their own REPO**; SEVEN shipped shell scripts still carry one, plus an eighth instance in a `.py`
