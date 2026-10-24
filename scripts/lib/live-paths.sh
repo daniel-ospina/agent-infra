@@ -182,12 +182,37 @@ lp_path_held() { # <census> <canonical-path>
 # was pointed at, so argv is a different witness from cwd.
 LP_NAME_WHY=""
 lp_path_named() { # <census> <canonical-path>
-    local f="$1" path="$2" kind pid p
+    local f="$1" path="$2" kind pid p _pp base _cand
+    base="${path##*/}"
     LP_NAME_WHY=""
     [ -n "$path" ] && [ -r "$f" ] || return 1
     while IFS="$(printf '\t')" read -r kind pid p; do
         [ "$kind" = arg ] || continue
         if _lp_rel "$p" "$path"; then LP_NAME_WHY="argv pid $pid"; return 0; fi
+        # ⛔ THE TOKEN IS A RAW SPELLING; THE CANDIDATE IS A PHYSICAL ONE. Comparing them directly made
+        # this arm miss whenever the holder spelled the tree differently — a controller pointed at the
+        # tree THROUGH A SYMLINK named `/tmp/link/wt/f`, the candidate's canonical path was
+        # `/tmp/real/wt`, no prefix matched, and the tree the live controller was working in was reaped
+        # (measured: one sweep, two identical holders, one kept and one REAPED). On macOS the default
+        # `--root /tmp` makes every candidate `/private/tmp/…`, so the arm was dead BY CONSTRUCTION
+        # there — the same defect the pin path arm had.
+        #
+        # Cost control: only a token whose LAST PATH COMPONENT matches the candidate's earns the one
+        # `lp_canon` call it takes to prove it, so a table of thousands of args costs string compares
+        # and no subprocesses unless something could plausibly match.
+        case "$p" in
+            /*/*)
+                # (A) the token ENDS at the candidate's own name, or (B) it sits UNDER it. Either way the
+                # spelling is canonicalised from the token's own prefix, never guessed from the candidate.
+                _cand=""
+                case "$p" in
+                    *"/$base")   _pp="$(lp_canon "${p%/$base}")" || _pp=""; _cand="${_pp%/}/$base" ;;
+                    *"/$base/"*) _pp="$(lp_canon "${p%%/$base/*}")" || _pp=""; _cand="${_pp%/}/$base" ;;
+                esac
+                if [ -n "${_cand:-}" ] && _lp_rel "$_cand" "$path"; then
+                    LP_NAME_WHY="argv pid $pid (canonicalised)"; return 0
+                fi ;;
+        esac
     done <"$f"
     return 1
 }
