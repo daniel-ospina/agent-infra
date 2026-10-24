@@ -5317,3 +5317,55 @@ def test_the_status_pointer_excludes_the_canonical_file_and_the_verdict_sidecars
     assert "NO canonical state file" in missing, missing
     assert "pr-doctor.daniel-ospina-tortoise.json" in missing, missing
     assert "--status --all-repos" in missing, missing
+
+
+def test_a_live_worker_under_the_OTHER_modes_name_still_blocks_a_spawn(monkeypatch):
+    """One worktree, two worker names: probing only this mode's name spawns a second agent (#2280).
+
+    The worktree is `prd-<n>` in EVERY mode (`materialise_worktree`), while `worker_name()` is
+    mode-qualified. Measured shape: the armed single-repo job runs `prd-42` while an `--all-repos`
+    pass grades the same repo, asks about `prd-<tag>-42`, hears "not running", adopts the live
+    worker's worktree and starts a second agent in it — the second spawn `rm`s that worker's log,
+    `.rc` and `.pid`.
+    """
+    asked = []
+
+    def _status(name):
+        asked.append(name)
+        return True if name == "prd-42" else False
+
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-tortoise-")
+    monkeypatch.setattr(pr, "worker_live", _status)
+    assert pr.worker_name(42) == "prd-daniel-ospina-tortoise-42"
+    assert pr.worker_live_for(42) is True, asked        # the OTHER mode's live worker
+    assert "prd-42" in asked and "prd-daniel-ospina-tortoise-42" in asked, asked
+    # An unanswerable read still wins over a negative one: the safe direction is not to spawn.
+    monkeypatch.setattr(pr, "worker_live", lambda n: None if n == "prd-42" else False)
+    assert pr.worker_live_for(42) is None
+    # And nothing live anywhere is False, so the ordinary path is unchanged.
+    monkeypatch.setattr(pr, "worker_live", lambda n: False)
+    assert pr.worker_live_for(42) is False
+
+
+def test_a_set_whose_repos_share_a_TAG_is_REFUSED_before_anything_is_read(tmp_path, monkeypatch):
+    """`owner-name` is lossy, and a shared tag is one record for two repos (#2280 review cycle 3).
+
+    `acme/tools-api` and `acme-tools/api` both tag to `acme-tools-api`: one repo's cooldown rows
+    decide the other's budget, a live `prd-acme-tools-api-42` suppresses the other repo's #42, and
+    `--status` prints the shared file under whichever header asked. Refused, before any read.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "acme/tools-api,acme-tools/api")
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("a refused set must read nothing"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    joined = "\n".join(logs)
+    assert "acme-tools-api" in joined and "acme/tools-api" in joined, joined
+    assert "acme-tools/api" in joined, joined
+    # And the ordinary, unambiguous set is NOT refused by this guard.
+    assert pr.set_tag_collisions(["daniel-ospina/agent-infra", "daniel-ospina/tortoise"]) == ""
+    assert pr.repo_tag("daniel-ospina/tortoise") == "daniel-ospina-tortoise"
