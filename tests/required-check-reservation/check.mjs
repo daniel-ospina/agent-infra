@@ -133,7 +133,32 @@ function parseJobs(file) {
       current = null;
       continue;
     }
-    // A job id with an optional trailing comment (`  workflow-drift: # drift guard`) is still a
+// stripComment — remove a YAML trailing comment, quote-aware. `#` starts a comment only at the
+// start of the text or after whitespace, and never inside a quoted scalar. ⛔ This must run BEFORE
+// any bracket search: a `]` INSIDE a comment is not a bracket, and searching first both truncated a
+// real label list (a false PASS: `[ubuntu-latest  # ]` + `, required-check]`) and produced a bogus
+// label from a comment's own brackets (a false BLOCK on a clean job). Review round 5, both classes.
+function stripComment(s) {
+  let q = null;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (q === null) {
+      if (ch === '"' || ch === "'") {
+        q = ch;
+      } else if (ch === "#" && (i === 0 || /\s/.test(s[i - 1]))) {
+        return s.slice(0, i).trimEnd();
+      }
+    } else if (q === '"' && ch === "\\") {
+      i += 1;
+    } else if (ch === q) {
+      if (q === "'" && s[i + 1] === "'") i += 1;
+      else q = null;
+    }
+  }
+  return s;
+}
+
+// A job id with an optional trailing comment (`  workflow-drift: # drift guard`) is still a
     // job start. Without this, that job's lines were appended to the PREVIOUS job, overwriting its
     // routing — a clean tree then reddened with T1/T3 blaming the wrong job (review round 4).
     const job = /^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(line);
@@ -146,6 +171,7 @@ function parseJobs(file) {
         runsOnOpaque: false,
         pendingBare: false,
         pendingFlow: null,
+        runsOnResolved: false,
         timeout: null,
         uses: false,
       };
@@ -159,41 +185,67 @@ function parseJobs(file) {
     // PASS while YAML had a second job on the reservation (review round 4, P1). Accumulate until
     // the `]`; the job stays OPAQUE (exit 2) for as long as it is unresolved.
     if (current.pendingFlow !== null) {
-      const buf = current.pendingFlow + " " + line.trim();
+      const buf = current.pendingFlow + " " + stripComment(line.trim());
       const close = buf.indexOf("]");
       if (close >= 0) {
+        // Anything other than a comment after the closing bracket is a shape this reader does not
+        // model — fail closed rather than silently reading a prefix. Otherwise the job is RESOLVED:
+        // clear the OPAQUE flag that was set when the sequence opened.
+        const tail = stripComment(buf.slice(close + 1)).trim();
+        current.runsOnOpaque = tail.length > 0;
         current.runsOnLabels = buf
           .slice(0, close)
           .split(",")
           .map((s) => normLabel(s))
           .filter((s) => s.length > 0);
         current.runsOn = current.runsOnLabels.join(",");
-        current.runsOnOpaque = false;
         current.pendingFlow = null;
+        current.runsOnResolved = true;
       } else {
         current.pendingFlow = buf;
       }
       continue;
+    }
+    // After a job's `runs-on` is resolved, only a 4-space job key may follow. Any deeper line means
+    // the routing did not END where this reader thinks it did (a stray continuation) — fail closed
+    // rather than certifying a routing over YAML that does not even parse (review round 5).
+    if (current.runsOnResolved) {
+      if (/^    [A-Za-z_][A-Za-z0-9_-]*:/.test(line)) {
+        current.runsOnResolved = false; // a sibling key — modelled, keep going
+      } else if (/^\s*$/.test(line) || /^\s*#/.test(line)) {
+        continue;
+      } else {
+        current.runsOnOpaque = true;
+        continue;
+      }
     }
     // A single-line `runs-on: <value>` — inline scalar or one-line FLOW sequence.
     const roInline = /^    runs-on:\s*(\S.*?)\s*$/.exec(line);
     if (roInline) {
       const raw = roInline[1].trim();
       current.runsOnSeq = null;
-      // A one-line FLOW sequence. The closing `]` is located FIRST, so a trailing `# comment` after
-      // the bracket (and inner spaces between items) cannot turn the whole span into one bogus
-      // label. Round 4's VGATE caught `[ubuntu-latest]  # hosted` being read as `[ubuntu-latest]`.
-      if (/^\[/.test(raw)) {
-        const close = raw.lastIndexOf("]");
+      // A FLOW sequence. The trailing comment is stripped BEFORE the bracket is located, so a `]`
+      // in a comment cannot terminate (or invent) the label list.
+      const code = stripComment(raw);
+      if (/^\[/.test(code)) {
+        const close = code.lastIndexOf("]");
         if (close > 0) {
-          current.runsOnLabels = raw
+          const tail = stripComment(code.slice(close + 1)).trim();
+          if (tail.length > 0) {
+            current.runsOnLabels = [];
+            current.runsOn = "";
+            current.runsOnOpaque = true;
+            continue;
+          }
+          current.runsOnLabels = code
             .slice(1, close)
             .split(",")
             .map((s) => normLabel(s))
             .filter((s) => s.length > 0);
+          current.runsOnResolved = true;
         } else {
           // Opened but not closed on this line: keep accumulating.
-          current.pendingFlow = raw.slice(1);
+          current.pendingFlow = code.slice(1);
           current.runsOnLabels = [];
           current.runsOn = "";
           current.runsOnOpaque = true;
@@ -201,6 +253,7 @@ function parseJobs(file) {
         }
       } else {
         current.runsOnLabels = [normLabel(raw)];
+        current.runsOnResolved = true;
       }
       current.runsOn = current.runsOnLabels.join(",");
       continue;
@@ -254,6 +307,15 @@ function parseJobs(file) {
       // An indented continuation of something this reader did not model: fail closed.
       if (/^\s{5,}\S/.test(line)) {
         current.runsOnOpaque = true;
+        continue;
+      }
+      // The sequence ENDS on this line, so this line must be a sibling (4-space) job key. Anything
+      // else is a continuation this reader did not model, and DROPPING it certified a routing over
+      // a file `yaml.safe_load` rejects — the same false-green class as the flow arm, reachable
+      // by keeping `runs-on:` in its block form (review round 5).
+      if (!/^    [A-Za-z_][A-Za-z0-9_-]*:/.test(line)) {
+        current.runsOnOpaque = true;
+        current.runsOnSeq = null;
         continue;
       }
       current.runsOnSeq = null; // a real sibling key ends the sequence; fall through to the keys

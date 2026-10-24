@@ -80,6 +80,20 @@ run_expect() {
   LAST_OUT="$out"
 }
 
+# run_expect_nonzero <label> <workflow> <doc> — the invariant is "never green"; the exact non-zero
+# code depends on which modelled check fires first, and pinning one would make the arm brittle
+# without adding safety.
+run_expect_nonzero() {
+  local label="$1" wf="$2" doc="$3" rc
+  RC_WORKFLOW_FILE="$wf" RC_DOC_FILE="$doc" node "$CHECK" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "$label (rc=$rc, non-zero)"
+  else
+    fail "$label — expected a NON-ZERO rc (an unmodelled shape must never be green), got rc=0"
+  fi
+}
+
 # mutate <src> <dst> <find> <repl> — exact, verified replacement. rc 3 = the finding text was
 # absent, which means the mutation never happened and the arm would otherwise prove nothing.
 mutate() {
@@ -248,6 +262,57 @@ else
 fi
 
 run_expect 2 "12 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
+
+# ── 13–15. Round 5: the closing bracket is located AFTER the trailing comment is stripped ──────
+# FINDING 13 (P1, false PASS): a `]` inside a trailing comment terminated the label list, so the
+# continuation line carrying the real second label was dropped and a job that YAML put ON the
+# reservation graded GREEN. It truncated to exactly `ubuntu-latest`, so T2's changed-routing arm
+# never fired either. The comment is now stripped BEFORE the bracket is sought.
+if mutate "$WF" "$TMP/wf-bracketcomment.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest   # ]
+      , required-check]'; then
+  run_expect 1 "13 MUTANT a ']' inside a comment cannot truncate a reservation (false-PASS arm)" "$TMP/wf-bracketcomment.yml" "$DOC"
+else
+  fail "13 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# FINDING 14 (P2, false BLOCK): the mirror image on a CLEAN job — a comment that merely CONTAINS a
+# bracket produced a bogus label (`[ubuntu-latest]`) and reddened an unchanged routing.
+if mutate "$WF" "$TMP/wf-bracketclean.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest]  # NOTE [hosted] default'; then
+  run_expect 0 "14 CONTROL a comment containing ']' does not redden a clean routing" "$TMP/wf-bracketclean.yml" "$DOC"
+else
+  fail "14 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# FINDING 15 (P2, green on unparseable YAML): once a job's runs-on resolved, any indented line the
+# reader did not model was silently dropped — certifying a routing over a file `yaml.safe_load`
+# REJECTS. Such a leftover now makes the job OPAQUE (exit 2), never green.
+if mutate "$WF" "$TMP/wf-stray.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest]
+      , required-check]'; then
+  run_expect 2 "15 UNREADABLE a stray continuation after a resolved runs-on is NOT green" "$TMP/wf-stray.yml" "$DOC"
+else
+  fail "15 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# FINDING 16 — the same false-green class via the BLOCK form: a block-sequence `runs-on:` followed by
+# a stray continuation line exited 0 while PyYAML REJECTS the file, because the line that ended the
+# sequence was dropped when it was not a 4-space key.
+if mutate "$WF" "$TMP/wf-blockstray.yml" '    runs-on: ubuntu-latest' '    runs-on:
+      - ubuntu-latest
+    , required-check]'; then
+  run_expect 2 "16 UNREADABLE a stray line after a BLOCK sequence is NOT green" "$TMP/wf-blockstray.yml" "$DOC"
+else
+  fail "16 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# FINDING 17 — the quoted/annotated variant of the same shape. This one is caught by a DIFFERENT
+# arm (the bogus joined label is a routing violation, rc 1) rather than as unreadable (rc 2). Both
+# are fail-closed, so the invariant asserted is "never green" rather than one exact code.
+if mutate "$WF" "$TMP/wf-flowstray2.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest # ]
+      required-check]'; then
+  run_expect_nonzero "17 a ']' in a comment followed by a stray line is NEVER green" "$TMP/wf-flowstray2.yml" "$DOC"
+else
+  fail "17 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
 
 echo
 if [ "$fails" -ne 0 ]; then
