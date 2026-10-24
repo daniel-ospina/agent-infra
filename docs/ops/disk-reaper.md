@@ -12,7 +12,13 @@ aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, workt
 # Disk reaper (#2032)
 
 One entry point — `scripts/disk-reaper.sh` — that runs, accounts for and reports
-the three sinks that exhaust a cell's disk. It **owns no deletion rule**. Each
+the three sinks that exhaust a cell's disk. The **scheduled** entry point is
+`scripts/disk-reaper-run.sh`, which wraps it and supplies exactly what a
+timer-started process does not inherit: `HOME` and `keys.env`, the REAL `gh`
+binary by absolute path (rejecting any `gh-shim`/`gh-limit` interposer and
+unsetting a poisoned `AGENT_GH_REAL`), `AGENT_GH_GATE_NO_WAIT=1`, and
+`REAP_WT_GH_TIMEOUT=120`. Without that wrapper the worktree class fails CLOSED
+on a box whose only `gh` on PATH is the interactive pacing shim (#2354). It **owns no deletion rule**. Each
 class has one owner, and the owners are the only code that deletes:
 
 | class | owner (policy) | reclaims |
@@ -167,6 +173,24 @@ separately required to be clean — so `REAP_WT_MERGED_AGE_DAYS` (default `0`) g
 that row. Unmerged heads keep the blanket floor, where age still separates a stale
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
+
+A **squash-merged** head is never an ancestor of `MAIN_REF`, so the ancestry test
+alone cannot see it. `patch_equivalent()` (`git cherry MAIN_REF <head>`, no `+`
+line) supplies that evidence and takes the same `REAP_WT_MERGED_AGE_DAYS` floor.
+⛔ It is an AGE-FLOOR signal only, never a reachability proof: a detached head on
+no ref is still `detached-unreachable` and preserved, because `git cherry` matches
+patch-ids against all of main's history (a reverted change still matches, and
+whitespace is ignored) and says nothing about whether any ref still holds the
+commit. Multi-commit squash merges do not match either, so they stay on the floor.
+
+A lane **scratch** checkout — a directory whose basename matches
+`REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
+`REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
+week's worth of review surface. The cap only ever lowers, so a value above the
+floor in force has no effect (14 does not mean "keep longer"), and a
+merged/patch-equivalent scratch row keeps `REAP_WT_MERGED_AGE_DAYS`. Every other
+gate still applies, and the pattern is anchored (`wtfoo/` is not `wt-*`), so a
+named checkout is unaffected.
 
 ## Scheduling — installed by the bring-up, armed by owner instruction
 

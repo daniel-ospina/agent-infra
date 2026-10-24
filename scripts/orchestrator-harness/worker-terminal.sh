@@ -58,8 +58,11 @@
 # POSITIVE read: (1) the workspace is gone, (2) the session name is absent, or (3) — added
 # deliberately with agent-infra#2653, see the `wt_table` absent-owner arm — the session OWNER is
 # confirmed ABSENT (`Connection refused` from an empty `cmux tree`, i.e. a socket nobody is listening
-# on, or the CLI's own `no server running`), because a durable terminal lives INSIDE the owner: no
-# owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is deliberately narrow —
+# on, or the CLI's own `no server running`) and CONFIRMED BY TWO SAMPLES at least `WT_ABSENT_CONFIRM`
+# (default 60s) apart — a single refusal only opens the window and keeps the caps binding, because a
+# hard-killed owner leaves pty children behind. A terminal spawn proves the owner answered and closes
+# the window. No owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is
+# deliberately narrow —
 # the errno-agnostic `cannot connect to session socket <path>: <reason>` wrapper does NOT qualify
 # (ENOENT / EACCES / EAGAIN are reachable with the daemon and its terminals ALIVE), so a merely
 # illegible or unreachable answer still leaves its workers UNKNOWN and the caps binding.
@@ -83,6 +86,45 @@ wt_dir() { printf '%s\n' "${WT_DIR:-${O:-$HOME/orchestrator}/state}"; }
 wt_warn() {
   printf '[worker-terminal] %s\n' "$*" >&2
   if [ -n "${LOG:-}" ]; then printf '[worker-terminal] %s\n' "$*" >> "$LOG" 2>/dev/null || true; fi
+  # ⛔ A REFUSAL IS A MEASUREMENT, NOT ONLY A LOG LINE (measured 2026-10-22 on a cloud cell).
+  # The cmux registry's own volume reached 100% (`database or disk is full`), so EVERY `wt_spawn`
+  # returned 1 with that reason — 1,562 refusals in ONE controller log, and not one lane started for
+  # six hours. The controller recorded each refusal as a per-PR `wait` and its cycle line still read
+  # `N acted, M named wait(s)`: the reason lived in a line nobody reads and never reached the decision
+  # line. Recording it HERE is what makes it reachable: this is the single point every LAUNCHER
+  # refusal passes through, so a future spawn site cannot forget it. (Two earliest guards — a missing
+  # argument and an unsafe worker name — are ARGUMENT errors rather than launcher refusals and are
+  # deliberately not recorded: they mean the caller is broken, not that the actuator refused.)
+  case "$*" in
+    'REFUSED '*)
+      _wt_refmsg="${*#REFUSED }"
+      wt_refusal_record "${_wt_refmsg%%:*}" "${_wt_refmsg#*: }"
+      ;;
+  esac
+  return 0
+}
+
+# ── the refusal record the CONTROLLER's summary reads ─────────────────────────────────────────────
+# ONE TAB-delimited row per refused spawn: `<worker name>\t<the launcher's reason>`. The controller
+# TRUNCATES it per cycle (orch-loop.sh, beside the per-PR disposition ledger) and folds the count and
+# the first reason into the `[pr]` line, the `[dispatch]` tail and the DRAIN STALLED line — so
+# `lanes=0` can never again be printed without the actuator's own answer beside it.
+# ⛔ BOUNDED BY CONSTRUCTION, NOT BY HOPE: at most 200 REFUSAL rows per cycle (201 lines, because
+# the controller's probe row occupies one). A refusal storm is exactly the moment a growing file
+# must not become the next full volume.
+wt_refused_file() { printf '%s\n' "$(wt_dir)/spawn-refused.tsv"; }
+wt_refusal_record() { # <name> <reason>
+  local f name reason n=0
+  f="$(wt_refused_file)" 2>/dev/null || return 0
+  [ -n "${f:-}" ] || return 0
+  name="${1:-?}"; reason="${2:-no reason given}"
+  if [ -f "$f" ]; then
+    n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+    case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  fi
+  [ "$n" -ge 201 ] && return 0
+  { printf '%s\t%s\n' "$(printf '%s' "$name" | tr -d '\t\n')" \
+      "$(printf '%s' "$reason" | tr '\t\n' '  ' | cut -c1-240)" >> "$f"; } 2>/dev/null || true
   return 0
 }
 
@@ -788,11 +830,52 @@ wt_tmux_names() {
 # WT_ABSENT_CONFIRM — how long an absent session owner must persist before its records are concluded
 # dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
 WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
-case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
+case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*|0*) WT_ABSENT_CONFIRM=60 ;; *) WT_ABSENT_CONFIRM=$(( 10#$WT_ABSENT_CONFIRM )) ;; esac
+# ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" (review round 7 of #2653, P2): any `export` could
+# set it, and a gate an export can defeat is not a gate (the same reasoning `wt_bounded` records for its
+# own `0`). An ALREADY-ELAPSED window is a different input and still confirms on this sample.
+# ⛔ AND IT IS COERCED **BEFORE** `WT_ABSENT_STALE_MIN` IS DERIVED (review round 11 of #2653): done the
+# other way round, `0` made the `2*window` floor 0, leaving `4*CYC` = 20s at the sanctioned `CYC=5` —
+# NARROWER than the 60s window it must be wider than, so every stamp was discarded as stale before it
+# could confirm and the release could never fire, silently.
+[ "$WT_ABSENT_CONFIRM" -ge 1 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
+# ⛔ CYC IS READ BY THE STALENESS RULE BELOW, SO IT IS COERCED HERE, NOT ASSUMED (review round 10 of
+# #2653). This module is sourced by `dispatch-merge.sh` and `report.sh`, which do NOT coerce CYC for
+# it (`orch-loop.sh` repairs only its own shell), so a non-numeric value from the environment reaches
+# `$(( 4 * 10#$CYC ))` — and an arithmetic-expansion error TERMINATES `wt_table` before it prints.
+# An empty table is read as "this box has no workers": the caps stop binding and `wt_close` deletes a
+# record it never looked at. `CYC` also floors at 5 (install.sh, orch-loop), so a legitimate small
+# cycle is preserved.
+# ⛔ NORMALISE INTO A LOCAL, DO NOT CLASS-CHECK AND DO NOT TOUCH THE CALLER'S `CYC` (review round 13 of
+# #2653, P1). `case ''|*[!0-9]*)` ACCEPTS `08`, `[ 08 -ge 1 ]` is true (test parses decimal), and then
+# `$(( 4 * CYC ))` reads `08` as OCTAL and ERRORS — the assignment fails, and with `set -u` (every
+# consumer: orch-loop.sh, dispatch-merge.sh, report.sh) `WT_ABSENT_STALE_MIN` is UNBOUND, which is fatal
+# at SOURCE time: the controller and the merge dispatcher exit before a cycle runs, and KeepAlive
+# relaunches a process that dies in the same place — the `CYC=08` relaunch-loop the `is_num` doctrine
+# records. `0*` is therefore rejected as well, and `10#` makes the rest decimal.
+CYCN=240
+case "${CYC:-}" in
+  ''|*[!0-9]*|0*) : ;;
+  *) [ "${#CYC}" -le 9 ] && CYCN=$(( 10#$CYC )) ;;
+esac
+[ "$CYCN" -ge 1 ] 2>/dev/null || CYCN=240
+# A stamp older than this is not continuity for the CURRENT outage: it is re-stamped, never confirmed.
+# ⛔ AND IT MUST BE WIDER THAN THE CONFIRMATION WINDOW (review round 10 of #2653), or a sanctioned
+# small cycle (`CYC` floors at 5) would discard every stamp before it could ever confirm — the release
+# #2653 provides would silently never happen. Whichever is larger: 4 cycles, or twice the window.
+WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
+[ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
-  now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
+  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
+  # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
+  # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
+  # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
+  # census freezes at the pre-step verdict, and a frozen `dead` row is the under-count direction (the
+  # caps stop binding). The age must be non-negative AND under the TTL.
+  now="$(date +%s 2>/dev/null)" || now=""
+  case "$now" in ''|*[!0-9]*) now="" ;; esac
+  ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
     hdr="$(head -1 "$cache" 2>/dev/null)"
@@ -800,7 +883,10 @@ wt_table() {
       '# at='*)
         case "${hdr#\# at=}" in
           ''|*[!0-9]*) : ;;
-          *) [ $(( now - ${hdr#\# at=} )) -lt "$ttl" ] && { sed '1d' "$cache"; return 0; } ;;
+          *) if [ -n "$now" ]; then
+               _mage=$(( now - 10#${hdr#\# at=} ))
+               [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
+             fi ;;
         esac ;;
     esac
   fi
@@ -821,10 +907,39 @@ wt_table() {
   # something undecodable (a banner, a drifted shape) is still UNKNOWN, below, unchanged: the caps
   # keep binding on a read that is merely illegible, and only a CONFIRMED-ABSENT transport empties
   # the census.
-  tree_err="$dir/.wt-tree-err.$$"
-  tree="$(cmux tree --json 2>"$tree_err")" || tree=""
-  tree_err="$(cat "$tree_err" 2>/dev/null || true)"
-  rm -f "$dir/.wt-tree-err.$$" 2>/dev/null || true
+  # ⛔ THE CAPTURE MUST NOT BE ABLE TO STOP THE PROBE (review round 6 of #2653, P2). A redirect that
+  # cannot be opened makes bash SKIP the command entirely, so on an unwritable (or missing) `$dir`
+  # `cmux tree` would never run: `tree` empty, `tree_err` empty, probe UNKNOWN, and the table loses
+  # every row it derives FROM THE DAEMON — the record-less workers the census exists to keep. That is
+  # the under-count direction (caps stop binding). So the capture is optional: if the file cannot be
+  # created, the probe still runs and its stderr is discarded exactly as before.
+  # ⛔ THREE SEPARATE NAMES, BECAUSE ONE WAS DOING TWO JOBS (review round 7 of #2653): `tree_err` held
+  # the FILE PATH and then the file's CONTENT, so `rm -f "$tree_err"` removed nothing and one capture
+  # file accumulated per controller process (carrying the daemon's stale stderr, and colliding with the
+  # next run's `mkdir`). And a failing `>` redirect prints its own diagnostic on the PRE-COMMAND stderr,
+  # which `2>/dev/null` on that simple command does not silence — the `{ …; } 2>/dev/null` group does,
+  # which matters because on an unwritable `$dir` this runs on EVERY census read and the controller's
+  # log is append-only and never rotated.
+  # ⛔ ONE CAPTURE LOCATION, AND IT IS NOT `$dir` (review round 8 of #2653, P1). Round 6's fallback
+  # captured the streams differently when `$dir` was unwritable, so the SAME bytes could read one way
+  # with a writable dir and another way without it: the writable branch routed only STDERR into
+  # `tree_err` (an unparseable STDOUT left the verdict UNKNOWN), while the fallback merged both — so a
+  # `no server running` line printed on STDOUT became the absent-owner signal in one branch and not in
+  # the other. `dead` frees the caps and lets `wt_close` close a live worker's terminal, so that was
+  # the same P1 class the round-7 rc fix closed on the OTHER axis.
+  # The capture now lives in `$TMPDIR` (always writable for the user running the controller), so there
+  # is exactly ONE branch: stdout → `tree`, stderr → `tree_err`. If even that cannot be created, the
+  # probe still runs with stderr discarded and the absent-owner signal is simply UNOBSERVABLE — the
+  # census stays UNKNOWN and the caps binding, which is the pre-change behaviour and the safe side.
+  tfile="${TMPDIR:-/tmp}/.wt-tree-err.$$"
+  if { : >"$tfile"; } 2>/dev/null; then
+    tree="$(cmux tree --json 2>"$tfile")" || tree=""
+    tree_err="$(cat "$tfile" 2>/dev/null || true)"
+    rm -f "$tfile" 2>/dev/null || true
+  else
+    tree="$(cmux tree --json 2>/dev/null)" || tree=""
+    tree_err=""
+  fi
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
   # header already records that the id shape differs) yields an EMPTY table while `$tree` is
@@ -858,19 +973,129 @@ wt_table() {
     # while a single refusal sample cannot empty the census.
     case "$tree_err" in
       *'Connection refused'*|*'no server running'*)
-        absent_now="$(date +%s 2>/dev/null || echo 0)"
-        absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
-        case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
-        if [ -z "$absent_since" ]; then
-          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null || true
-          absent_since="$absent_now"
+        # ⛔ A FAILED CLOCK MUST NOT BECOME THE LITERAL `0` (review round 12 of #2653, P1): `|| echo 0`
+        # handed a failure STRAIGHT THROUGH the digit guard below, PERSISTED `0` as the stamp, and the
+        # already-elapsed arm then confirmed on ONE real sample with zero elapsed window — the exact P1
+        # the two-sample rule exists to prevent, on the state that survives the process. Capture the
+        # STATUS, so a failure lands in the fail-closed `-z` branch.
+        absent_now="$(date +%s 2>/dev/null)" || absent_now=""
+        # ⛔ A FAILED CLOCK MUST NOT EMPTY THE CENSUS OR POISON THE STAMP (review round 11 of #2653, P2):
+        # a `date` printing a diagnostic makes `$(( 10#… ))` error — `wt_table` aborts before printing,
+        # and an empty table is read as "no workers" — and the failure would then PERSIST the stamp `0`,
+        # which the read arm treats as an already-elapsed window, confirming on ONE real sample. Guard it
+        # and refuse to open a window on an unusable clock: the record stays UNKNOWN (fail-closed).
+        case "$absent_now" in ''|*[!0-9]*) absent_now="" ;; esac
+        if [ -z "$absent_now" ]; then :; else
+        # ⛔ TWO VALUES, BECAUSE ONE COULD NOT TELL "A GAP" FROM "STILL ABSENT" (review round 14 of
+        # #2653, P2). The file used to hold only FIRST-SEEN. With a single value, a CONTINUOUS outage
+        # longer than `WT_ABSENT_STALE_MIN` looked like a gap: the stamp aged past the bound, the
+        # staleness rule re-opened the window, and the rows flipped `dead` → `unknown` for a full
+        # `WT_ABSENT_CONFIRM` before confirming again — so the release was a DUTY CYCLE (measured at the
+        # defaults: ~900s dead, ~60s unknown, repeating), i.e. the 26h stall reduced to one cycle in four
+        # rather than ended. Format: "<first_seen> <last_absent>". A legacy single-value file (an older
+        # harness) reads as first_seen with an empty last_absent → continuity is judged on first_seen (so a
+        # deploy that restarts the controller MID-OUTAGE still releases rather than starting the clock
+        # again), which is the safe reading for a file this build did not write.
+        absent_since=""; absent_last=""
+        if [ -f "$dir/.wt-absent-since" ]; then
+          read -r absent_since absent_last < "$dir/.wt-absent-since" 2>/dev/null || true
         fi
-        # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
-        # what the suites and an operator debugging a box use; the default window needs a second sample.
-        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
+        case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        case "$absent_last"  in ''|*[!0-9]*) absent_last=""  ;; esac
+        # ⛔ AND IT IS `10#`-NORMALISED TOO (review round 15 of #2653, P1): `_cont` is used as a bare
+        # arithmetic VARIABLE, which re-parses its value as an expression — `08` is read as OCTAL, the
+        # expansion errors, and `wt_table` ABORTS BEFORE IT PRINTS. Every later read hits the same field
+        # (nothing repairs the file during an outage), so the census stays EMPTY: `wt_count` 0 (caps stop
+        # binding) and `wt_alive` "not alive", so `wt_close` deletes a record it never looked at. This is
+        # the field BOTH writers emit, so it is the normal case — the guard existed one line away for
+        # field 1 and not for field 2.
+        if [ -n "$absent_last" ]; then absent_last=$(( 10#$absent_last )); fi
+        # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
+        # `$(( … ))` reads a leading zero as OCTAL, `08` is not octal, the expansion errors and the
+        # FUNCTION ABORTS before printing a table — an EMPTY census, which every consumer reads as "the
+        # box has no workers" (caps stop binding, `wt_close` deletes a record it never looked at). The
+        # `10#` normalisation is the same one `floor_norm` uses, and it is also why `is_num` refuses a
+        # leading zero. ⛔ AND IT APPLIES ONLY TO A STAMP THAT EXISTS — normalising an EMPTY stamp would
+        # turn it into `0` (an already-elapsed window) and confirm on the FIRST sample, which is the
+        # single-sample conclusion this whole rule forbids.
+        absent_now=$(( 10#${absent_now:-0} ))
+        # ⛔ NORMALISE A PRESENT STAMP BEFORE ANY ARITHMETIC (see the `08` note below): the stale check
+        # immediately below does subtraction, so an `08` would abort here instead of there.
+        if [ -n "$absent_since" ]; then absent_since=$(( 10#$absent_since )); fi
+        # ⛔ A STALE STAMP IS NOT CONTINUITY (review round 9 of #2653, P1). The stamp records when an
+        # absent owner was FIRST seen; nothing requires it to belong to the CURRENT outage. If the owner
+        # was absent at T0, came back while NOTHING read the census (a deploy restarted the controller, a
+        # cycle froze in a hung probe), and went absent again, the first sample of the later outage found
+        # an ancient stamp and confirmed immediately — a single-sample `dead`, which frees every cap and
+        # lets `wt_close` delete a live worker's record.
+        # ⛔ AND A FUTURE STAMP IS NOT CONTINUITY EITHER (review round 10 of #2653): after an NTP step or
+        # a VM snapshot restore the subtraction is negative, so neither the staleness check nor the
+        # confirm test fires and the release is pinned for the whole skew — the stall this change ends,
+        # in the fail-closed direction. A non-monotonic stamp is discarded like a stale one.
+        # ⛔ AND THE EMPTINESS TEST IS A `case`, NOT `[ … -gt 0 ]` (review round 10): `[` on an empty
+        # value prints its own diagnostic on EVERY window opening — the per-read bash noise silenced
+        # everywhere else in this file. A stamp of literally `0` IS an already-elapsed window, kept.
+        # ⛔ AND A `0` STAMP IS NOT A SPECIAL CASE (review round 12 of #2653): the old `0) : ;;` arm kept
+        # it as an "already-elapsed window", which is exactly what let a failed clock (persisted as 0)
+        # confirm on the next sample. Judged by the ordinary staleness rule a `0` is older than
+        # `WT_ABSENT_STALE_MIN` on any real clock, so it is discarded → first sample → fail-closed, and
+        # epoch-zero / NTP-step inputs are covered by the same rule. (No suite writes a `0` stamp: every
+        # fixture writes `now - N`.)
+        # The continuity datum is `last_absent` when the file carries two values (this build), else
+        # `first_seen` (a legacy stamp). A FUTURE value, or one older than the bound, breaks continuity.
+        _cont="${absent_last:-$absent_since}"
+        case "$_cont" in
+          '') : ;;
+          *)  if [ "$_cont" -gt "$absent_now" ] \
+                 || [ $(( absent_now - _cont )) -gt "$WT_ABSENT_STALE_MIN" ]; then
+                absent_since=""; absent_last=""
+              fi ;;
+        esac
+        if [ -z "$absent_since" ]; then
+          # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
+          # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
+          # ever — exactly the 26h stall this change exists to end, with nothing saying so. `wt_warn`
+          # writes to stderr AND `$LOG`, which is where that stall would have been visible.
+          # ⛔ LATCHED (review round 9 of #2653, P2): the write fails on EVERY attempt, so an unlatched
+          # warning is ~250 B per census read (~12/cycle, ~1 MB/day) into the append-only, never-rotated
+          # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
+          # per process; the state is still visible in stderr and `$LOG`.
+          # A successful write RE-ARMS the warning (the next inability to confirm is a new fact).
+          { printf '%s %s\n' "$absent_now" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
+            && rm -f "${TMPDIR:-/tmp}/.wt-warned-absent-window.$$" 2>/dev/null \
+            || { _wl="${TMPDIR:-/tmp}/.wt-warned-absent-window.$$"
+                 # ⛔ THE LATCH IS A FILE, NOT A VARIABLE (review round 10 of #2653, P2): every consumer
+                 # calls `wt_table` in a COMMAND SUBSTITUTION (`$(wt_table)`, `wt_table | awk`), i.e. in a
+                 # subshell, so an in-process variable was assigned and discarded on every read — the
+                 # warning fired per read, ~12/cycle, ~1 MB/day into the append-only log. `$$` is the
+                 # parent's pid and is stable across those subshells, so this file latches.
+                 [ -e "$_wl" ] || { : >"$_wl" 2>/dev/null || true; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); logged once per process"; }; }
+          absent_since="$absent_now"; absent_last="$absent_now"
+        else
+          # CONTINUOUS absence: refresh ONLY the continuity datum, so the window never ages past the
+          # staleness bound while the outage lasts — and keep `first_seen`, which is what the two-sample
+          # confirmation measures.
+          { printf '%s %s\n' "$absent_since" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null || true
+          absent_last="$absent_now"
+        fi
+        # ONE comparison, always: an ALREADY-ELAPSED stamp confirms on THIS sample — that is how an
+        # operator declares "this outage has lasted", and how the fixtures say it. ⛔ THE KNOB'S `0` DOES
+        # NOT: it is coerced to 60 above (review round 7), because zero would confirm on one sample.
+        # This comment claimed the suites set the knob to 0 — they did exactly the opposite, BECAUSE of
+        # round 7, and a reader looking for that debugging switch would think the knob was broken
+        # (review round 13).
+        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1
+        fi ;;
+      # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
+      # on a READABLE tree, so an answer that proves nothing either way — the
+      # `cannot connect … No such file or directory` wrapper this module deliberately treats as UNKNOWN,
+      # a banner — left an ANCIENT stamp standing; the next absent sample then confirmed immediately, a
+      # single-sample conclusion reached through a recovery path. Closing here means an outage whose
+      # messages alternate restarts the timer: the fail-CLOSED direction (caps bind longer).
+      *) rm -f "$dir/.wt-absent-since" 2>/dev/null || true ;;
     esac
   fi
-  # ANY readable answer closes the absent window: the owner came back (or was always there).
+  # …and a readable census closes it as well (the owner answered).
   [ -n "$tree" ] && rm -f "$dir/.wt-absent-since" 2>/dev/null || true
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
@@ -948,7 +1173,12 @@ EOF
   fi
   WT_TABLE="$(printf '%s\n' "$tbl" | sed '/^$/d' | awk -F'\t' 'NF==2 && !seen[$1]++')"
   WT_TABLE_AT="$now"
-  { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$" 2>/dev/null \
+  # ⛔ THE `2>/dev/null` MUST APPLY TO THE GROUP, NOT SIT AFTER THE `>` (review round 8 of #2653, P2):
+  # a failing `>` open prints bash's own diagnostic on the PRE-COMMAND stderr, which a redirect placed
+  # after it never sees — so an unwritable `$dir` emitted raw bash noise on EVERY census read (~12 per
+  # controller cycle) into an append-only, never-rotated log. Measured: the group form silences it and
+  # keeps the same status.
+  { { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
     && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
   printf '%s\n' "$WT_TABLE"
 }
@@ -1121,7 +1351,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # reason discarded (a permission-broken socket dir answers `directory … has unsafe permissions`)
       # is the one diagnostic that matters most where it was missing.
       spmsg="${spout//$'\n'/ }"
-      wt_warn "tmux could not start $name: ${spmsg:0:300}"
+      wt_warn "REFUSED $name: tmux could not start it: ${spmsg:0:300}"
       return 1 ;;
     terminal) : ;;
     *) wt_warn "REFUSED $name: unreadable launcher '$kind'"; return 1 ;;
@@ -1139,7 +1369,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
     set -- "$@" --cwd "$cwd" --no-open -- /bin/bash "$runf"
     out="$(cmux "$@" 2>&1)" || { wt_warn "REFUSED $name: cmux surface new-terminal failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
     id="$(printf '%s\n' "$out" | grep -oE 'term_[A-Za-z0-9]+|surface:[0-9]+' | head -1)"
-    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
+    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; return 1; }
     ws=""
   else
     # The guest CLI's equivalent (see the header): one terminal surface, the run script typed into it.
@@ -1156,13 +1386,18 @@ PY
     id="$(printf '%s\n' "$out" | sed -n 's/.*"terminal_id": *"\([^"]*\)".*/\1/p' | head -1)"
     ws="$(printf '%s\n' "$out" | sed -n 's/.*"workspace_id": *"\([^"]*\)".*/\1/p' | head -1)"
     [ -n "$id" ] || { wt_warn "REFUSED $name: cmux created the workspace but printed no terminal_id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; \
-      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; wt_forget; return 1; }
+      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; wt_forget; return 1; }
   fi
   mkdir -p "$dir" 2>/dev/null || true
   # ⛔ THE RECORD WRITE IS CHECKED. A spawn that returns 0 without a record is an UNTRACKABLE worker: the
   # census can still see its surface (so the slot is held) but `wt_close` has no `kind`/`id` to close it
   # with — the worker holds a slot forever and the reap can never free it. So a failed write closes the
   # terminal it just created and FAILS the spawn.
+  # ⛔ THE OWNER HAS ANSWERED BY HERE (a terminal id came back), so the absent window is stale whatever
+  # happens to the RECORD WRITE below: a failed `printf > worker-<name>` returns 1 at the check below,
+  # and clearing only on the success tail left the ancient stamp standing — a second route to a
+  # one-sample confirmation (review round 9 of #2653, P2).
+  rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true
   if ! printf 'kind=terminal\nid=%s\nworkspace=%s\ngrammar=%s\ncwd=%s\nrun=%s\ncreated=%s\n' \
     "$id" "${ws:-}" "$grammar" "$cwd" "$runf" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null; then
     wt_warn "REFUSED $name: created terminal '$id' but could not record it in $dir — closing that terminal rather than leaving an untrackable worker behind"
@@ -1172,6 +1407,13 @@ PY
     wt_forget
     return 1
   fi
+  # ⛔ A TERMINAL SPAWN PROVES THE OWNER ANSWERED (review round 6 of #2653, P2), so the absent window
+  # must not survive it: otherwise the window stays ancient across an outage, and the FIRST absent
+  # sample after a restart-and-crash confirms immediately — the single-sample conclusion the two-sample
+  # rule exists to forbid. ⛔ AND IT BELONGS HERE, NOT IN wt_forget: wt_forget also runs for TMUX
+  # spawns, which prove nothing about the cmux owner and are exactly what the controller keeps doing
+  # during an outage — clearing there would restart the timer on every outage spawn and re-create the
+  # 26h stall.
   wt_forget
   return 0
 }
