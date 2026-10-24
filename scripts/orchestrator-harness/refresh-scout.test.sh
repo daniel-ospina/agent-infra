@@ -1925,9 +1925,12 @@ case "$OUT" in
   *) bad "claim-unreachable: no aggregate INCOMPLETE line — output: $OUT" ;;
 esac
 
-# (c) The registry is NOT INSTALLED: the documented FALLBACK. The candidate IS queued (a missing FILE
-#     is not an unreachable registry — refusing here would make the box merge-only), and the box says
-#     so every time. This pins the limit the code comment states, so it cannot go quiet.
+# (c) The registry is NOT INSTALLED: REFUSED (agent-infra#2466, reversing the old fallback).
+#     A missing registry is a registry that cannot answer, and an answer nobody can read is not
+#     evidence of freedom — the old behaviour queued the issue unclaimed, which is exactly the
+#     duplicate dispatch the registry exists to prevent. The cost of the reversal is one command
+#     (`deploy-harness.sh`), named in the refusal; the cost of the old behaviour was two lanes on
+#     one issue, on a box that could neither take the claim nor see a peer's.
 mk_case claim-absent
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
@@ -1938,13 +1941,18 @@ mk_gh_one_issue "$D"
 rm -f "$D/o/claims.sh"
 rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
-  *42*) ok "claim-absent: a candidate is still queued (the fallback is not a false block)" ;;
-  *) bad "claim-absent: nothing was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+  *42*) bad "claim-absent: #42 was QUEUED with no registry — a missing registry is not freedom" ;;
+  *) ok "claim-absent: a candidate is NOT queued when the registry is missing (fail-closed)" ;;
 esac
 case "$OUT" in
-  *"no claim registry at"*"cross-box issue-claim check is OFF"*) ok "claim-absent: the missing registry is ANNOUNCED (never silent)" ;;
-  *) bad "claim-absent: the missing registry is silent — output: $OUT" ;;
+  *"is NOT INSTALLED"*"INCOMPLETE, never CLEAN"*) ok "claim-absent: the refusal NAMES the missing registry and its polarity" ;;
+  *) bad "claim-absent: the refusal does not name the missing registry — output: $OUT" ;;
 esac
+# ⛔ AND THE PASS IS RED, NOT QUIET: an INCOMPLETE that queues nothing must not read as "no work
+# available". This is the aggregate contract the refresh already documents; with the fallback gone it
+# is the ONLY signal that an unprovisioned box has stopped dispatching.
+[ "$RC" -ne 0 ] && ok "claim-absent: the pass EXITS NON-ZERO (an unreadable registry is a red run)" \
+  || bad "claim-absent: the pass exited 0 while refusing every candidate (a silent stop)"
 
 # (f) A REASON MUST BELONG TO THE CANDIDATE IT IS PRINTED FOR (cycle-22 review). `CLAIM_RESULT` is a
 #     shell GLOBAL that the CLEAN arm reads to decide whether to print "queued because its ONLY claim is
@@ -1957,7 +1965,12 @@ esac
 mk_case claim-stale-reason
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"          # the pool holds issue 42
-rm -f "$D/o/claims.sh"
+# ⛔ A REGISTRY THAT ANSWERS CLEAN BUT NEVER RESETS THE GLOBAL (agent-infra#2466). This case used to
+# stage the hazard by REMOVING the registry — the absence used to reach the CLEAN arm and queue. It
+# no longer does (a missing registry is INCOMPLETE, case (c)), so the fixture now stages the same
+# hazard directly: a reader that returns CLEAN and leaves `CLAIM_RESULT` untouched. The walk's own
+# per-candidate reset is what must stop the inherited reason being printed for #42.
+printf 'claim_issue_preflight() { return 0; }\n' > "$D/o/claims.sh"
 rf "$D" refresh "CLAIM_RESULT=the only claim on #9999 is ORPHANED (ghostbox:1: held-by-orphan)"
 case "$OUT" in
   *"ONLY claim is ORPHANED"*) bad "claim-stale-reason: an inherited CLAIM_RESULT was attributed to THIS candidate — output: $OUT" ;;
@@ -2149,6 +2162,29 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
   case "$(cat "$DB4/log" 2>/dev/null)" in
     *rphan*|*eclaim*) ok "orch-loop dispatch: the log line carries the orphan/reclaim token" ;;
     *) bad "orch-loop dispatch: the log line does not name the orphan reason" ;;
+  esac
+
+  # (i-c) NO REGISTRY AT ALL: NOT batched (agent-infra#2466). This arm used to warn and dispatch
+  #       unclaimed — the fail-open that makes a second cell's work invisible to this one. The
+  #       assertion is deliberately NEGATIVE (nothing batched, nothing in dispatched.txt) plus a log
+  #       line that NAMES the cause, because the failure it prevents is silent by construction.
+  DB5="$T/db-noregistry"; mkdir -p "$DB5/o/state" "$DB5/repo"
+  git init -q --bare "$DB5/origin.git"; git init -q "$DB5/repo"
+  git -C "$DB5/repo" remote add origin "$DB5/origin.git"
+  # deliberately NO cp of claims.sh into $DB5/o
+  printf '42\n' > "$DB5/o/candidates.txt"; : > "$DB5/o/dispatched.txt"
+  db "$DB5"
+  case "$(tr '\n' ' ' < "$DB5/o/.batch" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: #42 was batched with NO claim registry (an absent registry is not freedom)" ;;
+    *) ok "orch-loop dispatch: with no registry the issue is NOT batched (fail-closed)" ;;
+  esac
+  case "$(tr '\n' ' ' < "$DB5/o/dispatched.txt" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: #42 reached dispatched.txt with no claim registry" ;;
+    *) ok "orch-loop dispatch: with no registry dispatched.txt is untouched (the candidate stays retryable)" ;;
+  esac
+  case "$(cat "$DB5/log" 2>/dev/null)" in
+    *"claim-unreadable"*"no registry at"*) ok "orch-loop dispatch: the refusal names claim-unreadable and the missing path" ;;
+    *) bad "orch-loop dispatch: the refusal does not name the cause — log: $(cat "$DB5/log" 2>/dev/null)" ;;
   esac
 
   # (ii) a PEER already holds it: NOT batched, NOT in dispatched.txt (so the issue stays in

@@ -777,17 +777,15 @@ gh_env_verdict() {
 # being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
 # on two boxes.
 #
-# ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
-# through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
-# seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
-# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
-# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
-# remedy it prints is now this same helper), so a deployed cell has it; a
-# box without it cannot take the claim either, and refusing to queue on a missing FILE would make
-# every such box merge-only — a bigger, less reversible failure than the state being removed.
-# Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
-# provisioning failure (rc=3 below), because that one is local, permanent, and fixable in seconds.
+# MISSING IS REFUSED TOO — agent-infra#2466 REVERSED THE OLD "loud fallthrough" (2026-10-23). The old
+# rule let a box with NO registry file keep dispatching, unclaimed, on the argument that making a
+# missing file refuse would turn such a box merge-only. Two things changed that: (a) the PR path now
+# abstains on an unreadable registry as well, so the cell is not "merge-only" — it is silent, and this
+# change makes the silence announced with the one-line remedy; and (b) the fallthrough was not loud in
+# the place that matters: `issue_claim_verdict` ALREADY returned INCOMPLETE for a missing file, and the
+# call site simply did not ask it. So missing, unreadable and PRESENT-BUT-STALE are one polarity
+# (refuse), and `--check` refuses them up front. The migration cost is one command, named in the log
+# line and in `--check`'s output; the cost of the old behaviour was two lanes on one issue.
 # ⛔ THE REGISTRY PATH IS NOT READ FROM THE ENVIRONMENT (2026-10-16 review). `CLAIMS_SH` was a
 # regression-test seam, but three production callers had begun to honour it, which let an ambient
 # value resolve a DIFFERENT registry in each of them — a gate half-disabled by the environment, the
@@ -984,9 +982,15 @@ cmd_check() {
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
   else
-    # NOT a failure: the documented loud fallthrough (issue_claim_verdict's STATED LIMIT). The box
-    # dispatches, without the cross-box gate, and says so — the same verdict the refresh reaches.
-    echo "[refresh] check: claim registry=$O/claims.sh absent — the refresh will WARN per issue and dispatch without a cross-box claim"
+    # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
+    # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
+    # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
+    # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
+    # same one-line remedy.
+    echo "[refresh] check: FAIL $O/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
+    echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
+    return "$EXIT_NOT_PROVISIONABLE"
   fi
   # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
   # worktree, but the venv it reads must be the one the run will find there. Reading
@@ -3407,16 +3411,15 @@ while read -r N; do
         # the block's own rule is that neither line may claim an action this script did not take. The
         # reset makes the guarantee local: an empty reason can only come from THIS candidate.
         CLAIM_RESULT=''
-        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
-        # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
-        # keeps dispatching. It is NOT a verdict: the branch below announces it every time.
-        if [ -f "$O/claims.sh" ]; then
-          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
-          # condition's status surviving into the else branch.
-          issue_claim_verdict "$N"; ICR=$?
-        else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
-        fi
+        # ⛔ A MISSING REGISTRY IS `ICR=2` (INCOMPLETE, never CLEAN) — agent-infra#2466. This call used
+        # to sit behind `if [ -f "$O/claims.sh" ]`, so an UNPROVISIONED box left `ICR=0` and QUEUED the
+        # issue: the one case the old note called a "documented loud fallthrough" was in fact a silent
+        # fail-open in the only place this block declares it never fails open, and it is the shape a
+        # second cell hits when it was never provisioned — the exact duplicate dispatch the issue claim
+        # exists for. `issue_claim_verdict` already answers 2 for a missing file, so the fix is to ASK
+        # it rather than to decide for it: one verdict, no second path. The cost is that an
+        # unprovisioned box queues nothing until the one-line remedy in `--check` is run.
+        issue_claim_verdict "$N"; ICR=$?
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
         # registry might return — as CLEAN and queued the issue: fail-OPEN, in the one place this
