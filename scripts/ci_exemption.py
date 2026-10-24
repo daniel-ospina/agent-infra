@@ -1421,9 +1421,27 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: never buy an exemption — it converts an unreadable refusal into a named,
 #: attributable block. The slug charset is exactly `_slug`'s, so the key stays
 #: whitespace-free for the `uniq -c | awk` rate table.
+#:
+#: `bash-shard::<slug>` (#2643) is a bash SHARD's own identity, and
+#: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and BOTH CARRY
+#: SIGNATURES, so they are admitted on a nodeid's terms — the §4.6 overlap still
+#: has to hold before either buys anything. Their slug charset is `_slug`'s too.
+#:
+#: ⛔ EVERY PRODUCER IN THIS MODULE MUST APPEAR HERE, and omitting one is the
+#: #6798 failure mode, not a formatting bug: an id PRODUCED by a parser and
+#: REJECTED here is dropped by `parse_failure_rows` — so `decide` sees an EMPTY
+#: PR set and reports `CLEAN blocked=0` — and dropped by `parse_rates`, so main's
+#: row vanishes too. Measured in review of #2648: `bash-shard::…` was produced,
+#: printed by the CLI, and then silently discarded one layer down, which would
+#: have converted this change from a truthful refusal into a false PASS. The same
+#: measurement showed `runner::…` had been in exactly that state since it was
+#: introduced, because the vector below enumerated only two of the three families
+#: that existed when it was written. The pytest vector for this predicate now
+#: enumerates ALL of them, so the next producer reddens instead of vanishing.
 _NON_NODEID_KEY_RE = re.compile(
     r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
-    r"|job-unreadable::[A-Za-z0-9_.\-]+)$"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_.\-]+"
+    r"|runner::[A-Za-z0-9_.\-]+)$"
 )
 
 
@@ -1650,6 +1668,8 @@ _RUNNER_AGG_SIG = "runner-aggregate"
 #: PR's failing set until nothing could ever certify). File-coarse for the same reason the runner
 #: aggregate above is: the shard's internal case names are not stable.
 _BASH_SHARD_RE = re.compile(r"^(?:❌|✗)\s*\*{0,2}\s*failed shard:\s*(?P<label>\S.*?)\s*$")
+#: Matched against ``line.replace("**", "")`` for the same reason `_RUNNER_AGG_RE` is
+#: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
 
@@ -1667,7 +1687,14 @@ def bash_shard_failures(
     ids: list[str] = []
     signatures: dict[str, frozenset[str]] = {}
     for line in _log_lines(text):
-        m = _BASH_SHARD_RE.match(line)
+        # ⛔ THE SAME RENDERING RULE AS `runner_aggregate_failures` — strip the bold pairs
+        # wholesale, then match. A pattern that tolerates ONE optional `**` pair does NOT
+        # match the measured bold shape (`❌** **failed shard: …`, where each pair is its
+        # own token): it would match the plain form this runner prints today and match
+        # NOTHING against the capture it exists for, i.e. break silently the day the line
+        # is bolded — the #2643 refusal returning with no diagnostic. The two `❌`-keyed
+        # parsers must not disagree about what a bullet looks like.
+        m = _BASH_SHARD_RE.match(line.replace("**", ""))
         if m is None:
             continue
         key = f"{_BASH_SHARD_KEY_PREFIX}{_slug(m.group('label'))}"

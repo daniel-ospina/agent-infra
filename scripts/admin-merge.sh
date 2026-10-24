@@ -5094,16 +5094,17 @@ reproduce_residual_on_base() {
   [ -s "$residual" ] || return 1
   # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
   # P2). The parser's other non-nodeid identities — `collect-error::<file>`
-  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) — are
-  # real residual rows but they name no pytest nodeid. Handed to the runner as
-  # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
-  # directory not found`), so a residual that mixes a collection error with real
-  # nodeids aborted the whole base run and cleared nothing — the false block this
-  # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
-  # already filters them from the candidate set; this is the function's own
-  # guard, so the contract holds for any caller.)
+  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131),
+  # `bash-shard::<path>` (#2643) and `runner::<job>` — are real residual rows but
+  # they name no pytest nodeid. Handed to the runner as ARGV, ONE of them makes
+  # pytest EXIT 4 having run NOTHING (`ERROR: file or directory not found`), so a
+  # residual that mixes a collection error with real nodeids aborted the whole
+  # base run and cleared nothing — the false block this repair exists to remove,
+  # with no diagnostic naming the cause. (`repro_scope` already filters them from
+  # the candidate set; this is the function's own guard, so the contract holds for
+  # any caller.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^bash-shard::' -e '^runner::' "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -5315,7 +5316,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^bash-shard::/d; /^runner::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -5323,6 +5324,13 @@ main_baseline_units() {
     # above is suppressed for the family and a main baseline red on a DIFFERENT
     # job would read as pre-existing in this one.
     sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
+    # #2643/#6798: the file-coarse aggregates — the unit is the SHARD PATH / the
+    # JOB SLUG, exactly as `failure_file_key` derives it. Without these arms the
+    # generic `s/::.*//` above is suppressed for the family, every shard collapses
+    # onto the literal `bash-shard`, and a main baseline red in ONE shard reads as
+    # pre-existing in a DIFFERENT one.
+    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n 's/^runner::\(.*\)$/\1/p' "$mainfails"
   } | sort -u
 }
 
@@ -5344,6 +5352,13 @@ failure_file_key() {
     # pre-existing failure in this one. Without this arm the generic default
     # would collapse every job onto the literal `job-unreadable`.
     job-unreadable::*) printf '%s\n' "${1#job-unreadable::}" ;;
+    # #2643/#6798: the file-coarse aggregates group by the PATH / JOB SLUG they
+    # name — the same unit `main_baseline_units` derives. The generic default
+    # would collapse every shard onto the literal `bash-shard` (and every JS
+    # aggregate onto `runner`), so a main baseline red in one shard would be
+    # reported as "measured on this lane" for a DIFFERENT shard's failure.
+    bash-shard::*) printf '%s\n' "${1#bash-shard::}" ;;
+    runner::*) printf '%s\n' "${1#runner::}" ;;
     *) printf '%s\n' "${1%%::*}" ;;
   esac
 }
@@ -5370,7 +5385,8 @@ intersect_sets() {
 #   * a guard-step identity has no local pytest runner, so it cannot be
 #     reproduced and must always remain in the residual.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
-#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131) also name no
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `bash-shard::<path>` #2643, `runner::<job>`) also name no
 #     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
 #     NOTHING, so they are not candidates either — they are units the rail can
 #     NAME, never measurements a local run can clear (#3715 review, P2).
@@ -5387,6 +5403,7 @@ repro_scope() {
     [ -n "$nid" ] || continue
     case "$nid" in
       guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      bash-shard::*|runner::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
   done < "$scratch"

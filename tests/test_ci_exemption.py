@@ -2436,27 +2436,10 @@ def test_6798_a_KILL_does_not_excuse_a_NAMED_test_failure():
 # dicts by hand and never exercise the row parsers. Hence these.
 
 
-def test_6798_the_row_door_admits_the_non_nodeid_families():
-    """F5: the predicates that gate the row/rate doors must admit them."""
-    for key in ("watchdog-kill::pytest", "collect-error::tests/test_a.py"):
-        assert is_failure_key(key), f"parse_rates would DROP main's row for {key}"
-        assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
 
 
-def test_6798_the_row_door_still_rejects_junk():
-    """FAIL-CLOSED: the widened predicate must not become a wildcard.
 
-    `is_failure_key` gates MAIN's rate table — the exemption allowlist. Admitting
-    a loose string there is a false-exemption vector, not a formatting nicety.
-    """
-    for junk in (
-        "random-string",
-        "watchdog-kill::OTHER",          # not the one identity we emit
-        "collect-error::notapyfile",     # must be a .py path
-        "collect-error::",               # empty path
-        "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
-    ):
-        assert not is_failure_key_loose(junk), f"{junk!r} must NOT buy a failure key"
+
 
 
 def test_6798_a_kill_only_PR_row_is_NOT_silently_dropped():
@@ -2479,13 +2462,28 @@ def test_6798_a_kill_only_PR_row_is_NOT_silently_dropped():
 
 
 def test_6798_main_rates_admit_the_non_nodeid_families():
-    """F6: main's rate row must survive, or main reads empty and always BLOCKS."""
-    parsed = parse_rates("watchdog-kill::pytest\t1\t3\n")
+    """F6: main's rate row must survive, or main reads empty and always BLOCKS.
 
-    assert "watchdog-kill::pytest" in parsed.rates, (
-        f"main's rate row was dropped (rejected={parsed.rejected}) — with main "
-        f"empty, the COMPARISON half cannot work in either direction"
+    ⛔ AND EVERY PRODUCED FAMILY IS COVERED (#2648 review). `runner::` and `bash-shard::`
+    were both produced by this module and rejected here, so main's row vanished and the PR
+    read uniquely red — measured on the real CLI, for a shape this vector already existed
+    for.
+    """
+    parsed = parse_rates(
+        "watchdog-kill::pytest\t1\t3\n"
+        "runner::python-ci\t3\t8\n"
+        "bash-shard::scripts-a.test.sh\t2\t8\n"
     )
+
+    for key in (
+        "watchdog-kill::pytest",
+        "runner::python-ci",
+        "bash-shard::scripts-a.test.sh",
+    ):
+        assert key in parsed.rates, (
+            f"main's rate row was dropped for {key!r} (rejected={parsed.rejected}) — with "
+            f"main empty, the COMPARISON half cannot work in either direction"
+        )
     assert parsed.rejected == []
 
 
@@ -2499,11 +2497,17 @@ def test_6798_a_collection_error_rate_row_survives_main_side():
 
 def test_6798_main_signature_rows_admit_the_non_nodeid_families():
     """The main-side signature table is a separate door and needs it too."""
-    sigs = parse_signature_rows("watchdog-kill::pytest\twatchdog-kill\n")
+    sigs = parse_signature_rows(
+        "watchdog-kill::pytest\twatchdog-kill\n"
+        "runner::python-ci\trunner-aggregate\n"
+        "bash-shard::scripts-a.test.sh\tbash-shard\n"
+    )
 
     assert sigs.get("watchdog-kill::pytest") == frozenset({"watchdog-kill"}), (
         "a dropped main signature fails `_signatures_overlap` closed"
     )
+    assert sigs.get("runner::python-ci") == frozenset({"runner-aggregate"}), sigs
+    assert sigs.get("bash-shard::scripts-a.test.sh") == frozenset({"bash-shard"}), sigs
 
 
 # ==========================================================================
@@ -2656,6 +2660,121 @@ def test_bash_shard_identity_never_contains_the_slice_or_a_count():
     a, _ = ci_exemption.bash_shard_failures(sliced)
     b, _ = ci_exemption.bash_shard_failures(unsharded)
     assert a == b and len(a) == 1
+
+
+def test_bash_shard_bold_rendering_matches_its_sibling_parser():
+    """⛔ THE RENDERING RULE IS SHARED, and a divergence is silent.
+
+    The measured Actions capture bolds the bullet as ``❌ ** **label**: …`` — each ``**`` pair its
+    own token — so `runner_aggregate_failures` strips the pairs WHOLESALE and then matches. This
+    parser originally tolerated ONE optional pair, which matches the plain form the runner prints
+    today and matches NOTHING against the bold form: the identity would vanish the day the line is
+    bolded, and #2643's refusal would come back with no diagnostic. Both `❌`-keyed parsers must
+    agree about what a bullet looks like.
+
+    (Latent when written — `run-bash-shards.sh` uses `printf`, not markdown source — which is
+    exactly why it needs a vector rather than a comment.)
+    """
+    bold = "❌** **failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+    plain_ids, _ = ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+    )
+    assert ci_exemption.bash_shard_failures(bold)[0] == plain_ids, (
+        "the bold rendering stopped matching — the two ❌-keyed parsers now disagree"
+    )
+    # …and the sibling still agrees with itself on the same capture.
+    assert ci_exemption.runner_aggregate_failures(
+        "❌** **test-discard-gate**: 470 passed, 1 failed"
+    )[0] == ["runner::test-discard-gate"]
+
+
+# ── THE ROW DOOR, DERIVED FROM THE PRODUCERS (#6798, raised in #2648 review) ─
+#
+# `_NON_NODEID_KEY_RE` is hand-enumerated, and that enumeration went stale TWICE in the
+# same way: `runner::` was produced by `runner_aggregate_failures` and rejected by the row
+# door, and `bash-shard::` was about to repeat it. The failure mode is NOT a formatting
+# bug — a produced-and-rejected id is dropped by `parse_failure_rows` (so `decide` sees an
+# EMPTY PR set and reports `CLEAN blocked=0`) and by `parse_rates` (so main's row
+# vanishes). Review of #2648 measured both, on the real CLI.
+#
+# Hand-listing the families in a vector reproduces the bug, because the list is what went
+# stale. So the vector DERIVES the set from the module's own producers: every
+# `*_KEY_PREFIX` / `_KEY_PREFIX` constant must be admitted. A new producer without an
+# admitted key reddens here instead of disappearing one layer down.
+
+
+def test_6798_the_row_door_admits_the_non_nodeid_families():
+    """F5: the predicates that gate the row/rate doors must admit them."""
+    for key in ("watchdog-kill::pytest", "collect-error::tests/test_a.py"):
+        assert is_failure_key(key), f"parse_rates would DROP main's row for {key}"
+        assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
+
+
+
+
+def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
+    """Every family this module PRODUCES must be a key the row/rate doors ACCEPT.
+
+    Derived from the module's own `*_KEY_PREFIX` constants, so adding a parser without
+    admitting its key reddens HERE rather than silently converting a red PR into
+    `VERDICT CLEAN blocked=0` (measured in #2648 review for `bash-shard::`, and live for
+    `runner::` before it).
+
+    Each prefix's KEY SHAPE is declared, not guessed: `guard-step::` carries TWO parts and a
+    one-part key is correctly rejected, so the map is asserted to cover the producer set
+    EXACTLY — a new family must state its shape here, which is the point.
+    """
+    shapes = {
+        "guard-step::": "guard-step::tests-a.py::test-x",
+        "runner::": "runner::tests-a.test.sh",
+        "bash-shard::": "bash-shard::tests-a.test.sh",
+    }
+    producers = {
+        v for k, v in vars(ci_exemption).items()
+        if k.endswith("_KEY_PREFIX") and isinstance(v, str) and v
+    }
+    assert producers == set(shapes), (
+        "the producer set and this vector disagree — a family was added or renamed without "
+        f"admitting its key: only-in-module={sorted(producers - set(shapes))}, "
+        f"only-in-vector={sorted(set(shapes) - producers)}"
+    )
+    for prefix, key in sorted(shapes.items()):
+        assert is_failure_key(key), (
+            f"`parse_rates` DROPS main's row for {key!r} ({prefix}): main would look green "
+            "for a family this module produces, so every such PR failure reads as PR-unique"
+        )
+        assert is_failure_key_loose(key), (
+            f"`parse_failure_rows` DROPS the PR's own row for {key!r} ({prefix}): `decide` "
+            "then sees an EMPTY PR set and emits `CLEAN blocked=0` for a RED PR — the #6798 "
+            "false PASS"
+        )
+    # The enumerated families that are not `*_KEY_PREFIX` constants, kept explicit.
+    for key in (
+        "watchdog-kill::pytest",
+        "collect-error::tests/test_a.py",
+        "job-unreadable::bash-suites-1",
+    ):
+        assert is_failure_key(key) and is_failure_key_loose(key), key
+
+
+def test_6798_the_row_door_still_rejects_junk():
+    """FAIL-CLOSED: the widened predicate must not become a wildcard.
+
+    `is_failure_key` gates MAIN's rate table — the exemption allowlist. Admitting
+    a loose string there is a false-exemption vector, not a formatting nicety.
+    """
+    for junk in (
+        "random-string",
+        "watchdog-kill::OTHER",          # not the one identity we emit
+        "collect-error::notapyfile",     # must be a .py path
+        "collect-error::",               # empty path
+        "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
+        "bash-shard::",                  # empty shard path
+        "bash-shard::a b",               # whitespace defeats the rate table's uniq|awk
+        "runner::",                      # empty job slug
+        "bash-shard::x::y",              # a nodeid is not a shard key
+    ):
+        assert not is_failure_key_loose(junk), f"{junk!r} must NOT buy a failure key"
 
 
 # ── #9331 · a MEASURED value is not a different failure ───────────────────
