@@ -276,5 +276,185 @@ case "$NOCARRY" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=0;; *) rc=1;; esac
 [ "$rc" -ne 0 ]; ck $? "the CARRY assertion FIRES when the clause is stripped from the line (#2343)"
 
 echo
+echo "§F landing artifacts — the brief must make a PR PASSABLE, not just reviewed (#2325)"
+# THE DEFECT (agent-infra#2325, measured 2026-10-25 on agent-infra). `pipeline-compliance` blocked 36
+# of 40 open agent-infra PRs and the count GREW faster than lanes could be rescued from it (33 -> 36
+# in one hour). The brief told a lane to READ `issue-workflow` / `issue-scoping` and never to PRODUCE
+# the artifacts those skills exist to create, so every lane finished real work, opened a PR, and was
+# refused — its evidence retro-fitted by a human or a drain lane afterwards. These checks read the
+# ARTIFACTS a lane receives (the composed brief + the template block), and §F.4 drives the GATE'S OWN
+# PARSERS over the shapes this text prescribes — a shape that stops being accepted there goes red here.
+LANDING_SELF="$(landing_artifacts_brief_section self)"
+LANDING_HARNESS="$(landing_artifacts_brief_section harness)"
+landing_artifacts_brief_section SCOPE=banana >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "an unknown role is refused (never the wrong audience's record duty)"
+[ -n "$LANDING_SELF" ] && [ -n "$LANDING_HARNESS" ]; ck $? "the helper renders the section for both roles"
+case "$LANDING_SELF" in *"$LANDING_ARTIFACTS_HEADING"*) rc=0;; *) rc=1;; esac
+ck $rc "the section carries its findable heading (the check this exists for is named in it)"
+
+# ONE predicate per requirement, used by BOTH the composed-brief check and the non-vacuity control —
+# so the control exercises the SAME pattern it claims to validate (a control that strips a DIFFERENT,
+# weaker token proves nothing; the #2148 suite's own §E lesson).
+has_req_a()  { case "$1" in *"[a] the issue reference must BEGIN A LINE"*) return 0;; *) return 1;; esac; }
+has_req_b()  { case "$1" in *"FIRST CONTENT LINE"*"<!-- issue-scoping:"*) return 0;; *) return 1;; esac; }
+has_req_c()  { case "$1" in *"CURRENT head"*"$LANDING_HEAD_BINDING"*"~/.pi/agent/scripts/record-review.sh"*) return 0;; *) return 1;; esac; }
+has_req_d()  { case "$1" in *"[d] plan evidence"*) ;; *) return 1;; esac
+                case "$1" in *'`## Wiring`'*) ;; *) return 1;; esac
+                case "$1" in *"docs/plans/*.md"*) return 0;; *) return 1;; esac; }
+has_req_e()  { case "$1" in *"[e] test evidence"*"*.test.ts"*) return 0;; *) return 1;; esac; }
+has_mech_1() { case "$1" in *'`git commit -F <message-file>`'*) return 0;; *) return 1;; esac; }
+has_mech_2() { case "$1" in *'never `git add -A`'*) return 0;; *) return 1;; esac; }
+has_honesty() { case "$1" in *"never write a scoping comment for a plan you did not follow"*"fabricated one MERGES"*) return 0;; *) return 1;; esac; }
+
+echo
+echo "§F.1 the composed brief a lane.sh lane RECEIVES (the same dry-run artifact §C asserts on)"
+[ -f "$BRIEF_FILE" ]; ck $? "the composed brief exists"
+COMPOSED="$(cat "$BRIEF_FILE" 2>/dev/null || true)"
+has_req_a "$COMPOSED"; ck $? "[a] the issue ref must BEGIN A LINE (a mid-sentence ref does not count)"
+has_req_b "$COMPOSED"; ck $? "[b] the scoping marker is the comment's FIRST CONTENT LINE at column 0"
+has_req_c "$COMPOSED"; ck $? "[c] the record is bound to the CURRENT head, with the recorder command"
+has_req_d "$COMPOSED"; ck $? "[d] plan evidence: docs/plans/*.md or a ## Wiring section"
+has_req_e "$COMPOSED"; ck $? "[e] test evidence for runtime code"
+has_mech_1 "$COMPOSED"; ck $? "mechanic: git commit -F <message-file> (never -m)"
+has_mech_2 "$COMPOSED"; ck $? "mechanic: never git add -A"
+has_honesty "$COMPOSED"; ck $? "⛔ the brief forbids FABRICATION (evidence describes work actually done; else BLOCKED)"
+case "$COMPOSED" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
+ck $rc "the HEAD-BINDING rule is stated: a moved head invalidates the record, so it is re-recorded"
+# The five artifacts must not have displaced what the brief already said (an insertion that drops a
+# line is invisible to every check above).
+grep -q '## Reviewer step' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the reviewer step SURVIVES the insertion"
+grep -q '## Deliverable' "$BRIEF_FILE" 2>/dev/null; ck $? "…as does the Deliverable section"
+grep -q 'never search the filesystem for an interpreter' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the no-search bound"
+
+echo
+echo "§F.2 role-correct on [c] only — who mints the record differs, what is owed does not"
+case "$LANDING_SELF" in *"Record AFTER your last push, then RE-RECORD if the head moves"*) rc=0;; *) rc=1;; esac
+ck $rc "self: the LANE records (after the last push) and re-records when the head moves"
+case "$LANDING_SELF" in *'`merge-one.sh` mints'*) rc=1;; *) rc=0;; esac
+ck $rc "…and is not told merge-one.sh mints it (the two roles cannot collapse)"
+case "$LANDING_HARNESS" in *'`merge-one.sh` mints'*) rc=0;; *) rc=1;; esac
+ck $rc "harness: merge-one.sh mints the record for this lane"
+case "$LANDING_HARNESS" in *"Record AFTER your last push"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and is NOT told to record it (this lane has no reviewer to point --evidence at)"
+case "$LANDING_HARNESS" in *"do NOT amend, rebase or push again"*) rc=0;; *) rc=1;; esac
+ck $rc "…its duty is the head: no amend/rebase/push once the record exists"
+for L in "$LANDING_SELF" "$LANDING_HARNESS"; do has_honesty "$L"; ck $? "each role carries the no-fabrication paragraph (neither can be the honest one by accident)"; done
+has_mech_1 "$LANDING_HARNESS" && has_mech_2 "$LANDING_HARNESS"; ck $? "both commit mechanics are in the harness section lane.sh splices"
+
+echo
+echo "§F.3 the controller brief template mirrors the section BYTE FOR BYTE (drift-pinned block)"
+BLOCK="$(awk '/^<!-- BEGIN landing-artifacts/{f=1;next} /^<!-- END landing-artifacts -->$/{exit} f' "$TEMPLATE")"
+[ -n "$BLOCK" ]; ck $? "templates/LANE-BRIEF.md carries a landing-artifacts block"
+if [ "$BLOCK" = "$LANDING_SELF" ]; then rc=0; else rc=1; fi
+ck $rc "the block EQUALS the helper's rendered self section (one home: edit the helper, not the template)"
+if grep -qF 'BEGIN landing-artifacts' "$TEMPLATE"; then rc=0; else rc=1; fi
+ck $rc "…under named markers, so the pin cannot silently drift to a stale block"
+grep -q 'edit THERE, not here' "$TEMPLATE" 2>/dev/null; ck $? "…and the marker says where the text actually lives"
+
+echo
+echo "§F.4 GATE PARITY — the shapes this text prescribes are the shapes the CHECK accepts"
+# The section is only worth anything if its samples pass the real gate, and its warnings are true.
+# Neither script sources cleanly (check-pipeline-compliance.sh is a top-level program), so its
+# functions and constants are EXTRACTED and driven here — the same technique selftest.sh uses to
+# drive the required-check derivation. A parser rename/removal makes this go red rather than quietly
+# turning the assertions below into prose checks.
+GATE="$(cd "$HERE/../.." && pwd)/scripts/check-pipeline-compliance.sh"
+[ -f "$GATE" ]; ck $? "the gate scripts/check-pipeline-compliance.sh is present beside the harness"
+extract_fn() { awk -v n="$1" '$0 == n"() {"{f=1} f{print} f&&/^}$/{exit}' "$GATE"; }
+gate_const() { grep -E "^$1=" "$GATE" | head -1; }
+eval "$(extract_fn has_scoping_marker)" 2>/dev/null
+eval "$(extract_fn has_review_record)" 2>/dev/null
+eval "$(extract_fn parse_issue_ref)" 2>/dev/null
+# parse_trace_ref is a ONE-LINER in the gate (`parse_trace_ref() { parse_issue_ref …; }`), so the
+# brace-terminated extractor above cannot lift it; lift the line itself, verbatim (a reword goes red
+# in the `declare -f` guard below rather than silently degrading to a prose check).
+eval "$(grep -E '^parse_trace_ref\(\) \{' "$GATE" | head -1)" 2>/dev/null
+eval "$(gate_const REVIEW_RECORD_MARKER_RE)" 2>/dev/null
+eval "$(gate_const REFCTX)" 2>/dev/null
+eval "$(gate_const CLOSING_KW)" 2>/dev/null
+eval "$(gate_const TRACE_KW)" 2>/dev/null
+GH_REPO='daniel-ospina/agent-infra'
+if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ]; then rc=0; else rc=1; fi
+ck $rc "the gate's own parsers + patterns were EXTRACTED (a rename would make this section vacuous)"
+
+# [a] — the shape the brief prescribes passes; the shape it warns about does not.
+GH_REPO='daniel-ospina/agent-infra'
+[ "$(parse_issue_ref $'Stuff.\n\nCloses #2325\n')" = "daniel-ospina/agent-infra#2325" ]; ck $? "[a] 'Closes #2325' at line start IS a reference"
+[ "$(parse_issue_ref '- Closes #2325')" = "daniel-ospina/agent-infra#2325" ]; ck $? "…including after a bullet (the brief says so)"
+[ "$(parse_issue_ref 'This (fixes #2325) inline.')" = "" ]; ck $? "⛔ …while a MID-SENTENCE '(fixes #N)' is NOT (the brief says so)"
+[ "$(parse_trace_ref 'Refs #2325')" != "" ]; ck $? "…and 'Refs #N' on its own line satisfies [a] (traceability form, which the gate resolves second)"
+
+# [b] — first content line at column 0 passes; the three mention shapes the brief warns about fail.
+SC_BRIEF='<!-- issue-scoping: 2026-10-25 (standard) -->
+
+## Scope
+boundaries, alternatives, wiring table.'
+has_scoping_marker "$SC_BRIEF"; ck $? "[b] the brief's shape (marker = FIRST content line, column 0) PASSES the gate"
+has_scoping_marker 'Discussed first.
+
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a BLANK-LINE-SEPARATED FOOTER is ACCEPTED too (the check's ONE alternative — an earlier draft of this test claimed the marker must be first, and THIS gate falsified the claim)"
+has_scoping_marker 'Discussed first.
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …while a marker CROWDED under a preamble (no blank line) FAILS (that is the mention shape)"
+has_scoping_marker '    <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …an INDENTED marker FAILS (a code block is a mention — column 0 is the contract)"
+has_scoping_marker 'The artifact looks like `<!-- issue-scoping: 2026-10-25 (standard) -->` in a table.'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …a quoted marker FAILS (a mention is not an artifact)"
+
+# [c] — a record in the brief's shape binds at the current head and is STALE at an older one.
+H40='0123456789abcdef0123456789abcdef01234567'
+O40='89abcdef0123456789abcdef0123456789abcdef'
+MARK="review recorded: reviews/2325.json verdict=clean @ $H40 (daniel-ospina/agent-infra)"
+has_review_record "$MARK" 2325 daniel-ospina/agent-infra "$H40"; ck $? "[c] the brief's marker shape binds at the CURRENT head"
+has_review_record "$MARK" 2325 daniel-ospina/agent-infra "$O40"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and is REFUSED once the head moves (why the brief says re-record)"
+has_review_record 'code-review done, reviewer approved' 2325 daniel-ospina/agent-infra "$H40"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and no phrase satisfies [c] (only the recorder's line does)"
+
+# [e] — the evidence markers the brief tells a lane to report.
+eval "$(gate_const TEST_EVIDENCE_RE)" 2>/dev/null
+if declare -f has_test_evidence >/dev/null; then :; else
+  has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
+fi
+has_test_evidence 'pytest: 412 passed, 0 failed'; ck $? "[e] 'pytest … N passed' is accepted as test evidence"
+has_test_evidence 'VGATE PASS'; ck $? "…and 'VGATE PASS'"
+
+echo
+echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the assertions fire"
+# ⛔ THIS IS THE ONE THAT MATTERS. §F.1 greps text; if the composer could lose a requirement while
+# the greps still passed, the whole section would be a test that cannot fail. So a COPY of the
+# harness is built with ONE bullet deleted from the helper and lane.sh run against it, forbidding any
+# stub of the real files: the failure must be OBSERVED in the composed brief.
+STRIP="$TMP/strip"; mkdir -p "$STRIP"
+cp "$HERE/spawn-gate.sh" "$STRIP/spawn-gate.sh"
+cp "$LANE" "$STRIP/lane.sh"
+sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
+[ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
+(
+  cd "$TMP" || exit 1
+  O="$TMP/o3" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIP/lane.sh" 2325 fix/strip acme/widget
+) >/dev/null 2>&1
+STRIPPED="$(cat "$TMP/o3/logs/prompt-2325.txt" 2>/dev/null || true)"
+has_req_d "$STRIPPED"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous)"
+has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requirements still pass (the control is targeted, not a broken fixture)"
+# …and the same control for the HEAD-BINDING sentence, which is the rule a lane most needs.
+STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
+cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
+sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
+(
+  cd "$TMP" || exit 1
+  O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
+) >/dev/null 2>&1
+STRIPPED2="$(cat "$TMP/o4/logs/prompt-2325.txt" 2>/dev/null || true)"
+case "$STRIPPED2" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL"
+
+echo
+
+echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

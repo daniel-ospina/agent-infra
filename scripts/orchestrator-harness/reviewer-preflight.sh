@@ -178,12 +178,109 @@ BRIEF
   esac
 }
 
+# ── Landing artifacts (#2325) ───────────────────────────────────────────────────────────────────
+# WHY (agent-infra#2325, measured 2026-10-25 on agent-infra): `pipeline-compliance` blocked 36 of the
+# 40 open agent-infra PRs, and the count GREW faster than lanes could be rescued from it (33 → 36 in
+# one hour). The cause is not per-PR. The dispatched brief told a lane to READ `issue-workflow` /
+# `issue-scoping` and never to PRODUCE the artifacts those skills exist to create — so every lane did
+# real work, opened a PR, was refused, and had its evidence retro-fitted by a human or a drain lane.
+#
+# ⛔ ONE HOME, AND IT IS NOT THIS FILE'S OPINION. The letters [a]-[e] are
+# `scripts/check-pipeline-compliance.sh`'s OWN, and the shapes below are the shapes ITS parsers
+# accept — the suite (`reviewer-preflight.test.sh` §F) extracts those parsers and drives them over
+# this text's samples, so a shape that stops being accepted there goes red here. Do not restate the
+# gate's rules; name them and give the shape.
+#
+# ⛔ EVIDENCE, NOT PAPERWORK (this is the whole guard against the obvious shortcut). A brief that
+# asks for these artifacts and stays silent about honesty teaches lanes to fabricate: a lane that
+# cannot earn a clean verdict must say so and stop, because a missing artifact is REFUSED by the
+# gate while a fabricated one MERGES. Both roles carry that paragraph verbatim.
+#
+# ⛔ NO TYPESCRIPT TWIN, deliberately. `extensions/shared/reviewer-preflight.ts` is the pi-side
+# disclosure and has no path that renders this checklist; a second copy with no consumer would be a
+# copy that drifts unobserved. If the pi side ever prints it, add the twin AND extend the drift pin
+# in `extensions/shared/reviewer-preflight.test.ts` in the same change.
+LANDING_ARTIFACTS_HEADING='## Landing artifacts — what makes this PR pass `pipeline-compliance` (agent-infra#2325)'
+# The one sentence both roles share, so "a moved head" cannot be stated in one place and forgotten in
+# the other. It is the rule that turns a finished record into a stale one (check (c)).
+LANDING_HEAD_BINDING='a record bound to an older head is STALE, so a moved head must be RE-RECORDED at the new head'
+LANDING_HONESTY='**EVIDENCE, NOT PAPERWORK — write only what you did.** The scoping comment and the review record must describe the work actually done and the code actually read. If you cannot earn a clean verdict, say so in the PR and report `BLOCKED`; never write a scoping comment for a plan you did not follow, nor record a verdict for a review nobody ran. A missing artifact is REFUSED by the gate; a fabricated one MERGES.'
+
+# landing_artifacts_brief_section [self|harness] — the brief section, role-correct on [c] only.
+# The artifacts a lane OWES are identical across roles; who mints the review record is not.
+landing_artifacts_brief_section() {
+  local role="${1:-self}" record
+  case "$role" in
+    self)
+      record="**Record AFTER your last push, then RE-RECORD if the head moves** — ${LANDING_HEAD_BINDING}: an
+  older-head record certifies a revision that is no longer the PR, and the check refuses it. The
+  recorder appends that line; its \`--evidence\` artifact is the PR comment carrying the reviewer's
+  verdict (see the reviewer step below):
+  \`~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>\`"
+      ;;
+    harness)
+      record="**\`merge-one.sh\` mints this record when it reviews the pushed PR** — your duty is the head: push
+  the head you mean to land, then do NOT amend, rebase or push again, because ${LANDING_HEAD_BINDING}
+  (and the review is paid for a second time). For reference, the command it runs is
+  \`~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>\`"
+      ;;
+    *)
+      printf 'reviewer-preflight.sh: unknown role "%s" (expected self|harness)\n' "$role" >&2
+      return 2
+      ;;
+  esac
+  cat <<BRIEF
+${LANDING_ARTIFACTS_HEADING}
+
+That required check reads five things from the PR and its linked issue ([a]-[e] ARE the check's own
+letters — \`scripts/check-pipeline-compliance.sh\` prints each failure with the skill that produces
+it). Four of them are only producible while you work, so produce them as you go.
+
+⛔ ${LANDING_HONESTY}
+
+- **[a] the issue reference must BEGIN A LINE.** On its own line — optionally after a bullet, an
+  ordered-list marker, \`>\`, a heading or a \`- [ ]\` checkbox — write \`Closes #<ISSUE>\` (or
+  \`Refs #<ISSUE>\` when something genuinely stays open). A mid-sentence \`(fixes #N)\` does NOT
+  count, and an unintended closing keyword can auto-close an issue on merge.
+- **[b] the scoping comment, whose FIRST CONTENT LINE is the marker at column 0:**
+
+      <!-- issue-scoping: <YYYY-MM-DD> (<tier>) -->
+
+  …then the scoping content (boundaries, alternatives considered, the wiring table). POSITION is the
+  contract: column 0 on the first line with content, or — the ONLY alternative the check accepts —
+  the last line with content, set off by a blank line as a footer block. An indented marker renders
+  as a code block, and a marker quoted in a table, fence or discussion counts nowhere: those are
+  mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
+  extend it — do not post a second one, the check needs ONE comment carrying the marker. Otherwise
+  post it with \`gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>\`.
+- **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
+  the PR body or a commit message, naming THIS PR, THIS repo and THIS head:
+  \`review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @ <40-hex head sha> (<owner/repo>)\`.
+  ${record}
+- **[d] plan evidence** (\`complexity:standard\` / \`complexity:complex\` only): the PR changes a file
+  under \`docs/plans/*.md\`, OR the scoping comment carries a \`## Wiring\` section (the wiring-check
+  table). A \`complexity:micro\` issue is exempt from [b]-[e].
+- **[e] test evidence** when the PR touches runtime code (\`extensions/**\`, \`bin/*.js\`): new or
+  updated \`*.test.ts\` / \`*.test.js\` files in the diff, OR the run reported in the PR body — the
+  exact command and its counts (\`<N> passed\`, \`pytest …\`, \`npm test\`, \`VGATE PASS\`, \`<N>/<N>\`).
+  Evidence from a run taken BEFORE your last edit describes a tree you never pushed: re-run after the
+  final change and report THAT run.
+
+Two commit mechanics that fail SILENTLY (they are also in the Rules above, repeated because each has
+cost a lane a whole PR): \`git commit -F <message-file>\` — never \`-m\`, where the shell executes
+backticks and \`\$(…)\` and the message is mangled with no error — and never \`git add -A\`; stage the
+specific files you changed.
+BRIEF
+}
+
 # CLI, for tests and for a human who wants the exact text:
 #   bash reviewer-preflight.sh --line [self|harness|reviewer] | --brief [self|harness]
+#                                  | --landing-brief [self|harness]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --line)  shift; reviewer_preflight_line "${1:-self}" ;;
     --brief) shift; reviewer_brief_section "${1:-self}" ;;
-    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness]\n' "$0" >&2; exit 2 ;;
+    --landing-brief) shift; landing_artifacts_brief_section "${1:-self}" ;;
+    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness]\n' "$0" >&2; exit 2 ;;
   esac
 fi
