@@ -1200,7 +1200,7 @@ classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
     local head_ts tree_ts witness wname age_s young age_floor aged_note
-    local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor
+    local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\trule=P proof=worktree-list bare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
@@ -1458,16 +1458,26 @@ classify_one() {
         # The window is the FLOOR IN FORCE, not always 7d: a lane scratch dir past
         # its 1-day cap, or a patch-equivalent head past the merged floor, is out of
         # the window and falls through to the aged removal below.
+        # ⛔ A MERGED PR FOR OTHER WORK IS NOT "NO PR" (#2756 review cycle 2). This
+        # arm used to be an `elif` on the same condition, so once `pr_state` was
+        # cleared the marker below was unreachable and a REMOVE row told the operator
+        # "gh found no PR for this branch" while gh had returned a MERGED PR for it.
+        # The proof now states which of the two it is, on BOTH rows.
+        if [ -n "$pr_other" ]; then
+            no_pr_proof="gh-state:$pr_other-state=MERGED-head=other"
+        else
+            no_pr_proof="gh-state:no-PR-matches-this-head($subj)"
+        fi
         if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-            printf 'preserve\tno-pr\t\trule=6 proof=gh-state:no-PR-for %s (no PR — cannot prove it is landed) refs=%s age=%sm\n' "$subj" "$refs" "$((age_s / 60))"
+            printf 'preserve\tno-pr\t\trule=6 proof=%s (no PR matches this head — cannot prove it is landed)%s refs=%s age=%sm\n' \
+                "$no_pr_proof" "${pr_other:+ pr-merged-other-head=$pr_other}" "$refs" "$((age_s / 60))"
             return 0
         fi
-        aged_note=" no-pr=gh-state(no PR for $subj)"
-    elif [ -n "$pr_other" ]; then
-        # A merged PR exists but names DIFFERENT work (a reused branch name). Say so:
-        # the row is decided by the rule above, and the operator must not read
-        # "a merged PR exists" as "this head landed".
-        aged_note=" pr-merged-other-head=$pr_other"
+        if [ -n "$pr_other" ]; then
+            aged_note=" pr-merged-other-head=$pr_other"
+        else
+            aged_note=" no-pr=gh-state(no PR matches this head: $subj)"
+        fi
     fi
 
     # ── rule=P: the commit is on no ref at all ─────────────────────────────

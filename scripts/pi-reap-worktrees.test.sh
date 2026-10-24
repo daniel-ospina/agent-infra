@@ -834,7 +834,7 @@ WT_NOPR="$(add_named_wt "$REPO" "$ENV-nopr" feat/g14-nopr)"
 commit_in_wt "$WT_NOPR" "$RECENT_DATE" nopr              # 2d old: inside the 7d floor
 OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_NOPR")" "reason=no-pr" "G14d no PR => preserve, reason=no-pr"
-assert_contains "$(row_for "$OUT" "$WT_NOPR")" "no PR — cannot prove it is landed" \
+assert_contains "$(row_for "$OUT" "$WT_NOPR")" "cannot prove it is landed" \
     "G14d the row says WHY it cannot be proven"
 assert_contains "$(row_for "$OUT" "$WT_NOPR")" "rule=6" "G14d the row names rule 6"
 assert_dir "$WT_NOPR" "G14d --apply kept it"
@@ -854,6 +854,13 @@ assert_absent "$(row_for "$OUT" "$WT_REUSE")" "rule=4" \
     "G14f rule 4 requires headRefOid == HEAD, not just the branch name"
 assert_contains "$(row_for "$OUT" "$WT_REUSE")" "reason=no-pr" \
     "G14f the row falls through to no-pr (the PR it found is other work)"
+# ⛔ AND IT MUST SAY SO. Cycle 2 of the review found this marker was DEAD CODE: the
+# no-PR arm won every time `pr_state` was cleared, so the row told the operator "gh
+# found no PR for this branch" while gh had returned a MERGED PR for it. Assert the
+# marker on both rows (preserve here, aged-removal below), because "reason=no-pr"
+# alone is satisfied by the lie.
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "pr-merged-other-head=head-ref feat/g14-reuse" \
+    "G14f the row names the MERGED-other-head PR instead of claiming gh found none"
 run_reaper $ENV --dry-run --repo "$REPO" >/dev/null
 OUT="$(FAKE_GH_PRS="$(printf 'feat/g14-reuse\t%s\tMERGED\t4246' "$SQ_SHA")" \
     run_reaper $ENV --apply --repo "$REPO")"
@@ -900,7 +907,23 @@ OUT="$(FAKE_GH_PRS="" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "reason=reclaimable" \
     "G14i an aged no-PR checkout is still reclaimed by the #1095 aged rule"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "rule=P" "G14i the REMOVAL row is attributed to rule=P"
-assert_contains "$(row_for "$OUT" "$WT_AGED")" "no-pr=gh-state" "G14i the no-PR evidence travels with it"
+assert_contains "$(row_for "$OUT" "$WT_AGED")" "no-pr=gh-state(no PR matches this head" \
+    "G14i the no-PR evidence travels with it"
+# the aged-removal twin of G14f's marker: a reused branch name with an old MERGED PR
+# must NOT be reported as "no PR" on the removal row either.
+ENV=G14j; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_AGED2="$(add_named_wt "$REPO" "$ENV-aged2" feat/g14j-aged)"
+commit_in_wt "$WT_AGED2" "$OLD_DATE" aged2
+OTHER_SHA="$("$REAL_GIT" -C "$REPO" rev-parse main)"   # main's tip: NOT this worktree's HEAD
+OUT="$(FAKE_GH_PRS="$(printf 'feat/g14j-aged\t%s\tMERGED\t4249' "$OTHER_SHA")" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_AGED2")" "reason=reclaimable" \
+    "G14j (precondition) the aged row is still a removal"
+assert_contains "$(row_for "$OUT" "$WT_AGED2")" "pr-merged-other-head=" \
+    "G14j the REMOVAL row carries the merged-other-head marker"
+assert_absent "$(row_for "$OUT" "$WT_AGED2")" "no-pr=gh-state(no PR matches this head" \
+    "G14j ... and never claims gh reported no PR"
 assert_absent "$(row_for "$OUT" "$WT_AGED")" "rule=6" \
     "G14i a removal is never attributed to rule 6 (a KEEP rule in the table)"
 
