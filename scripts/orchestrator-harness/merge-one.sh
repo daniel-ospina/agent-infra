@@ -1127,8 +1127,19 @@ case "$LAST" in
 
     gate_verdict=""; gate_line=""; gate_try=0; gate_absent=0; gate_unread=0; gate_last=""; gate_lastkind=""
     gate_wait=$(( GATE_POLL_TRIES * GATE_POLL_SECS ))
+    # ⛔ THE FALLBACK IS NOT `/dev/null` (review P2-2). It was, and the cleanup below then ran
+    # `rm -f /dev/null` on the boxes where `mktemp` can fail AND the worker is root (a cloud cell with a
+    # full/unwritable TMPDIR) — unlinking the device node, after which every later `>/dev/null` in the
+    # fleet CREATES a regular file in devtmpfs and the harness runs on a corrupted /dev. A capture that
+    # cannot be made is also not "no stderr": the verdict says so instead of claiming gh was silent.
     gate_errf="$(mktemp "${TMPDIR:-/tmp}/merge-$PR-gate.XXXXXX" 2>/dev/null || true)"
-    [ -n "$gate_errf" ] || gate_errf="/dev/null"
+    gate_capture=1
+    if [ -z "$gate_errf" ]; then
+      # One non-mktemp fallback (a pid-suffixed path is unique per worker process); if THAT cannot be
+      # written the capture is DEGRADED, and the verdict says so instead of claiming gh was silent.
+      gate_errf="${TMPDIR:-/tmp}/merge-$PR-gate.$$"
+      if ! : > "$gate_errf" 2>/dev/null; then gate_capture=0; gate_errf="/dev/null"; fi
+    fi
     while [ "$gate_try" -lt "$GATE_POLL_TRIES" ]; do
       gate_try=$(( gate_try + 1 ))
       : > "$gate_errf" 2>/dev/null || true
@@ -1154,7 +1165,14 @@ try:
 except Exception as e:
     print("UNREADABLE the payload is not JSON (%s)" % str(e).replace("\n", " ")[:120])
     raise SystemExit(0)
-rows = d if isinstance(d, list) else (d.get("check_runs") if isinstance(d, dict) else [])
+rows = d if isinstance(d, list) else (d.get("check_runs") if isinstance(d, dict) else None)
+if rows is None:
+    # ⛔ A SCALAR PAYLOAD IS NOT AN EMPTY CHECK SET (review P2-1). `null` is what any jq-based
+    # wrapper prints for a missing key, and a hand-rolled gh shim is exactly the chain #2320 measured —
+    # classifying it as ABSENT reported condition (a) as condition (b) and told the operator to fix
+    # the gate NAME, against the wrong bound.
+    print("UNREADABLE the payload is not a check list (JSON %s)" % type(d).__name__)
+    raise SystemExit(0)
 if not isinstance(rows, list):
     print("UNREADABLE the payload carries no check list")
     raise SystemExit(0)
@@ -1169,10 +1187,17 @@ if hit is None:
     print("ABSENT want=%s saw=%s" % (want, saw))
     raise SystemExit(0)
 st = str(hit.get("state") or "").strip().upper()
+# ⛔ NAMED POLARITY, NOT A DENY-LIST (review P2-3). A non-green state is not automatically a
+# FAILURE: `scripts/objective.py` records `NON_RED = {"cancelled", "stale"}` ("not green, but not
+# evidence of failure") and neutral/skipped are non-red by the same allow-list rule. Labelling a
+# CANCELLED gate "RED" sends an operator hunting a failing test for a superseded run. BOTH buckets
+# still refuse — the distinction here is the WORDING of the verdict, never the abort.
 if st == "SUCCESS":
     print("SUCCESS")
 elif st in ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED"):
     print("PENDING state=%s" % st)
+elif st in ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED"):
+    print("NOTGREEN state=%s" % st)
 elif not st:
     print("UNREADABLE the matching row carries no state field")
 else:
@@ -1182,22 +1207,35 @@ else:
       # line only: the refusal this carries is `gh-core-floor remaining=<n> …` / `gh-core-exhausted
       # resets_in=<Nm>`, which is a single line, and a stack trace here would bury it.
       gate_errline="$(head -n 1 "$gate_errf" 2>/dev/null | tr -d '\r' | cut -c1-200)"
-      [ -n "$gate_errline" ] || gate_errline="<no stderr>"
+      if [ -n "$gate_errline" ]; then :
+      elif [ "${gate_capture:-1}" = 1 ]; then gate_errline="<no stderr>"
+      else gate_errline="<capture unavailable: no temp file could be created, so gh's stderr was NOT recorded>"
+      fi
       case "$gate" in
         SUCCESS)
           gate_verdict=SUCCESS; gate_line="gate=SUCCESS (try $gate_try)"; break ;;
-        RED\ state=*)
-          # ⛔ RED DOES NOT ABORT EARLY, DELIBERATELY. The pre-#2596 loop waited the whole window on
-          # a red gate, and that wait is not pointless: a re-run (a peer lane, `fix-one.sh`, the CI
-          # daemon) can flip the same row green mid-window, and aborting on the first sighting would
-          # turn that into a re-paid review next cycle. So the observation is RECORDED (and logged
-          # once, as a TRANSITION line that says polling continues) while the poll window is
+        RED\ state=*|NOTGREEN\ state=*)
+          # ⛔ NOT GREEN DOES NOT ABORT EARLY, DELIBERATELY. The pre-#2596 loop waited the whole window
+          # on a non-green gate, and that wait is not pointless: a re-run (a peer lane, `fix-one.sh`,
+          # the CI daemon) can flip the same row green mid-window, and aborting on the first sighting
+          # would turn that into a re-paid review next cycle. So the observation is RECORDED (and
+          # logged once, as a TRANSITION line that says polling continues) while the poll window is
           # unchanged; the terminal verdict is emitted once, after the loop, only if the row never
           # turns green. The abort DIRECTION is identical to the pre-#2596 code.
-          gate_verdict=RED; gate_line="gate=${gate#RED state=} (RED, last seen at try $gate_try/$GATE_POLL_TRIES) — the gate is not green after the wait; refusing (a red gate does not turn green by being polled longer)"
-          if [ "$gate_last" != "$gate" ]; then
-            echo "[merge $PR] gate=${gate#RED state=} (RED at try $gate_try) — still polling: a re-run can flip this row, so the window is unchanged; the abort is taken when it expires" >> "$L.log"
-            gate_last="$gate"; gate_lastkind=RED
+          # ⛔ THE WORDING CARRIES THE POLARITY (review P2-3): `RED` only for a conclusion the repo's
+          # own allow-list calls red; a CANCELLED/STALE/NEUTRAL/SKIPPED row is NON-RED and not
+          # evidence of a failing test, so it says NOT GREEN instead of sending an operator hunting one.
+          case "$gate" in
+            RED\ state=*)      gate_kind=RED ;;
+            *)                  gate_kind=NOTGREEN ;;
+          esac
+          case "$gate_kind" in
+            RED)      gate_verdict=RED;      gate_line="gate=${gate#RED state=} (RED, last seen at try $gate_try/$GATE_POLL_TRIES) — the gate is not green after the wait; refusing (a red gate does not turn green by being polled longer)" ;;
+            NOTGREEN) gate_verdict=NOTGREEN; gate_line="gate=${gate#NOTGREEN state=} (NOT GREEN — a NON-RED conclusion that is not evidence of review, last seen at try $gate_try/$GATE_POLL_TRIES) — refusing after the wait; re-run the check rather than hunting a failure" ;;
+          esac
+          if [ "$gate_last" != "$gate_kind-$gate" ]; then
+            echo "[merge $PR] gate=${gate#* state=} (${gate_kind} at try $gate_try) — still polling: a re-run can flip this row, so the window is unchanged; the abort is taken when it expires" >> "$L.log"
+            gate_last="$gate_kind-$gate"; gate_lastkind="$gate_kind"
           fi
           gate_unread=0; gate_absent=0 ;;
         ABSENT\ want=*)
@@ -1254,7 +1292,7 @@ else:
     # (`NOT YET CREATED` / `PENDING` / `UNREADABLE` / the RED transition), so the terminal verdict is
     # emitted here once and only once.
     echo "[merge $PR] $gate_line" >> "$L.log"
-    rm -f "$gate_errf" 2>/dev/null || true
+    [ -n "${gate_errf:-}" ] && [ "$gate_errf" != "/dev/null" ] && rm -f "$gate_errf" 2>/dev/null
     # ⛔ NOT parked, deliberately (verified by reading the controller, not assumed): the signed
     # marker IS in the PR body by here (the check above proved it, rather than trusting rc=0), so
     # this head can still merge. A park would make the loop's

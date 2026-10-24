@@ -26,6 +26,9 @@
 #                          number of times (it does not spend the CI window).
 #   §1b the read returned NOTHING AT ALL (no payload, rc 1 — the degraded-shim shape) → the same
 #                          verdict, saying the read produced no payload.
+#   §1e a capture that cannot be created at all → the verdict REPORTS the degraded capture (never
+#                          "gh printed nothing"), and the cleanup never names /dev/null (an `rm -f
+#                          /dev/null` on a root worker unlinks the device node).
 #   §2  `<caller> / <job>` → `gate=SUCCESS (try 1)` and MERGED: the name is matched verbatim or after
 #                          stripping the `<caller> / ` prefix — the normalisation admin-merge.sh
 #                          already applies to job names.
@@ -34,6 +37,12 @@
 #   §3  an EMPTY surface → `gate=NO-SUCH-CHECK want=… saw=<none>`, after the ABSENT bound (not the CI
 #                          window), with the wait reason logged ONCE.
 #   §4  a QUEUED gate    → `gate=NOT YET KNOWN want=…` at the poll bound, with the observed state.
+#   §1c the same failed read with the retry bound at 1 → the TERMINAL line itself carries stderr=
+#                          (anchored, so a verdict that drops the stderr cannot pass on the progress line).
+#   §1d a SCALAR payload (`null`, what a jq-based wrapper prints for a missing key) → UNAVAILABLE,
+#                          never "no such check" (a scalar is not an empty check set).
+#   §4c a CANCELLED gate  → NOT GREEN, not "RED": the wording carries the repo's own polarity
+#                          (objective.py NON_RED = {cancelled, stale}) so nobody hunts a failing test.
 #   §4b a RED gate       → still refused (exit 4), still waited out (a re-run can flip it), nothing
 #                          parked, and exactly ONE terminal verdict line + one transition line.
 #   §5  the row APPEARS after one poll → `gate=SUCCESS (try 2)`: a not-yet-created check is a WAIT.
@@ -127,6 +136,8 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     empty)     printf '[]\n' ;;
     queued)    printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n' ;;
     red)       printf '[{"name":"ai-review-gate","state":"FAILURE"}]\n' ;;
+    cancelled) printf '[{"name":"ai-review-gate","state":"CANCELLED"}]\n' ;;
+    scalar)    printf 'null\n' ;;
     appears)   if [ "$(wc -l < "$MRG/checks.log")" -le 1 ]; then
                  printf '[{"name":"ci / lint","state":"SUCCESS"}]\n'
                else
@@ -155,14 +166,15 @@ run_merge() { # run_merge [env assignments…] — drives the SHIPPED worker; lo
       esac
     }
     git() { return 0; }
-    export -f pi gh git
+    rm() { printf 'rm %s\n' "$*" >> "${RM_LOG:-/dev/null}"; command rm "$@"; }
+    export -f pi gh git rm
     # The worker's OWN defaults are the production path, so §0 drives it with NO tunables at all
     # (`WORKER_DEFAULTS=1`); every other arm pins a zero-second poll so the suite never waits.
     gate_env="GATE_POLL_SECS=${GATE_POLL_SECS:-0} GATE_POLL_TRIES=${GATE_POLL_TRIES:-3} GATE_ABSENT_TRIES=${GATE_ABSENT_TRIES:-2} GATE_READ_TRIES=${GATE_READ_TRIES:-3}"
     for _a in "$@"; do [ "$_a" = "WORKER_DEFAULTS=1" ] && gate_env=""; done
     env PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
       MRG="$MRG" FAKE_HEAD="$HEAD" FAKE_REQ="${FAKE_REQ:-ai-review-gate}" \
-      PRCHECKS_MODE="${PRCHECKS_MODE:-success}" \
+      PRCHECKS_MODE="${PRCHECKS_MODE:-success}" RM_LOG="$MRG/rm.log" \
       REVIEW_GATE="${REVIEW_GATE:-ai-review-gate}" \
       $gate_env \
       "$@" \
@@ -206,6 +218,9 @@ nq 'stderr=<no stderr>' <<<"$log" && ok "§1 read failed: stderr is not reported
                                   || bad "§1 read failed: stderr read as empty although gh wrote a refusal"
 grep -qE 'gate= \(try' <<<"$log" && bad "§1 read failed: an EMPTY 'gate= (try N)' line was printed" \
                                  || ok "§1 read failed: no empty 'gate=' line anywhere (the collapse is gone)"
+q 'merge-7-gate\.' "$(cat "$MRG/rm.log" 2>/dev/null)" \
+  && ok "§1 read failed: the capture temp file is REMOVED on the refusal path (no leak per PR)" \
+  || bad "§1 read failed: no removal of the capture temp file was attempted — it leaks on every refused merge"
 n="$(polls)"
 [ "$n" -eq 2 ] && ok "§1 read failed: the retry is BOUNDED (2 polls = GATE_READ_TRIES, not the CI window)" \
                || bad "§1 read failed: $n polls (want 2) — an unreadable read is not bounded by its own budget"
@@ -220,6 +235,29 @@ qF "read='the read produced no payload at all" <<<"$log" \
   || bad "§1b empty read: the verdict does not say why; log=$(tr '\n' ' ' <<<"$log")"
 qF 'gate=UNAVAILABLE rc=1' <<<"$log" && ok "§1b empty read: UNAVAILABLE, with the rc" \
                                     || bad "§1b empty read: no UNAVAILABLE verdict"
+
+# ── §1e a capture that CANNOT be created: no /dev/null fallback, and the degradation is REPORTED ──
+# (review P2-2) The old fallback was `/dev/null` itself, so the cleanup's `rm -f` would UNLINK the
+# device node on a root worker — after which every later `>/dev/null` on that box creates a regular
+# file in devtmpfs. TMPDIR is pointed at a path that cannot exist, so neither mktemp nor the pid
+# fallback can be written.
+mkmrg
+out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1 TMPDIR=/dev/null/definitely-not-a-dir/merge-gate)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1e no capture: the worker still refuses legibly (exit 4)" \
+                || bad "§1e no capture: rc=$rc; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+qF 'capture unavailable' <<<"$log" && ok "§1e no capture: the verdict REPORTS the degraded capture (never 'gh printed nothing')" \
+                                   || bad "§1e no capture: the degraded capture was reported as silence; log=$(tr '\n' ' ' <<<"$log")"
+if q '/dev/null' "$(cat "$MRG/rm.log" 2>/dev/null)"; then
+  bad "§1e no capture: the cleanup ATTEMPTED to remove /dev/null (rm log: $(tr '\n' ';' < "$MRG/rm.log")) — on a root worker that unlinks the device node"
+else
+  ok "§1e no capture: the cleanup never names /dev/null, even when that is the only sink available"
+fi
+if [ -s "$MRG/rm.log" ]; then
+  ok "§1e no capture: the rm probe is LIVE (it recorded $(wc -l < "$MRG/rm.log") removal(s) on this run), so the assertion above is not vacuous"
+else
+  bad "§1e no capture: the rm probe recorded nothing — the /dev/null assertion is vacuous"
+fi
 
 # ── §2 a `<workflow> / <job>` row IS the gate: matched after the caller prefix ───────────────────
 mkmrg
@@ -276,6 +314,39 @@ q 'gate=PENDING state=QUEUED (try 1)' <<<"$log" && ok "§4 queued gate: the firs
 n="$(polls)"
 [ "$n" -eq 3 ] && ok "§4 queued gate: bounded by GATE_POLL_TRIES (3 polls)" \
                || bad "§4 queued gate: $n polls (want 3)"
+
+# ── §1c the TERMINAL line itself carries the stderr (anchored; the progress line must not stand in) ──
+mkmrg
+out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1c bound=1: refused (exit 4)" || bad "§1c bound=1: rc=$rc; log=$(tr '\n' ' ' <<<"$log")"
+term="$(grep '] gate=UNAVAILABLE' <<<"$log")"
+qF 'stderr=gh-core-floor remaining=120 floor=800 resets_in=4m' <<<"$term" \
+  && ok "§1c bound=1: the UNAVAILABLE verdict CARRIES the read's stderr (a verdict that drops it goes red here)" \
+  || bad "§1c bound=1: the verdict dropped the stderr; terminal line=[${term:-<none>}]"
+nq 'gate=UNREADABLE' <<<"$log" && ok "§1c bound=1: no progress line exists at this bound, so the assertion above is anchored to the verdict" \
+                             || bad "§1c bound=1: a progress line is present — the anchor is not exclusive"
+
+# ── §1d a SCALAR payload is UNREADABLE, not "no such check" (a scalar is not an empty check set) ──
+mkmrg
+out="$(run_merge PRCHECKS_MODE=scalar GATE_READ_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1d scalar payload: refused (exit 4)" || bad "§1d scalar payload: rc=$rc"
+qF 'gate=UNAVAILABLE rc=0' <<<"$log" && ok "§1d scalar payload: reported as UNAVAILABLE (a read that returned \`null\` never observed the repo)" \
+                                     || bad "§1d scalar payload: not reported as unreadable; log=$(tr '\n' ' ' <<<"$log")"
+nq 'NO-SUCH-CHECK' <<<"$log" && ok "§1d scalar payload: NOT reported as a missing check (that would send the operator to fix the gate NAME)" \
+                             || bad "§1d scalar payload: classified as NO-SUCH-CHECK — condition (a) reported as condition (b)"
+
+# ── §4c a CANCELLED gate is NOT GREEN, not RED (the repo's own polarity) ──────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=cancelled GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§4c cancelled gate: still refused (exit 4) — non-red is not green" \
+                || bad "§4c cancelled gate: rc=$rc"
+qF 'gate=CANCELLED (NOT GREEN' <<<"$log" && ok "§4c cancelled gate: the verdict says NOT GREEN and names the state" \
+                                         || bad "§4c cancelled gate: the polarity wording is wrong; log=$(tr '\n' ' ' <<<"$log")"
+nq 'CANCELLED (RED' <<<"$log" && ok "§4c cancelled gate: never called RED (objective.py NON_RED = {cancelled, stale})" \
+                               || bad "§4c cancelled gate: a non-red conclusion was labelled RED — an operator hunts a failing test"
 
 # ── §4b a RED gate: still refuses, still waits the window (a re-run can flip it), ONE terminal line ──
 mkmrg
