@@ -66,7 +66,7 @@ done
 # `git -C <candidate>` below read ANOTHER repo's index — measured (round-6 review): with
 # `GIT_DIR=<harness>/.git`, a NON-harness checkout was returned as the harness repo, because the index entry
 # it was asked about belonged to the harness. Cleared once, here, so no later read can be hijacked.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 
 sha12() { printf '%s' "${1:0:12}"; }
 is_sha() { case "${1:-}" in ''|*[!0-9a-fA-F]*) return 1 ;; esac; [ "${#1}" -ge 7 ]; }

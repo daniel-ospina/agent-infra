@@ -220,7 +220,8 @@ def run(cmd, timeout=60, cwd=None, env=None):
     """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout.
 
     ⛔ EVERY `git` INVOCATION IS SANITISED HERE, IN ONE PLACE (round-8 review, measured). Eight of twelve
-    git reads still inherited the ambient environment, and `GIT_DIR=<a foreign repo>/.git` made
+    git reads still inherited the ambient environment (8 of the 11 call sites), and
+    `GIT_DIR=<a foreign repo>/.git` made
     `claim_state()` report a holder that existed only in THAT repo, `repo_slug()` answer a foreign slug,
     `github_origin()` — the checkout-vs-flag MISMATCH GUARD — return "" (fail open), and `git_dir()` name
     another repository. A defaulted `env` here closes the whole class, including calls added later; a
@@ -2726,13 +2727,15 @@ def harness_repo_of(o: Path) -> Path | None:
 
 
 # ⛔ NO INHERITED GIT ENVIRONMENT, FOR ANY READ (round-7 review note, then measured). `GIT_DIR`,
-# `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` all
+# `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` and
+# `GIT_COMMON_DIR` (measured in round 8: with THAT one set, `repo_slug()`/`github_origin()` answered a
+# FOREIGN slug for an agent-infra-origin repo, so the mismatch guard failed open again) all
 # redirect `git -C <path>` at ANOTHER repository, so a cycle launched from a shell that exports one would
 # read a foreign main/index/repo and print it as this repo's — the #2679/#2680 false-reading class,
 # reached through the environment rather than through a path. Every git invocation this file makes goes
 # through this env; a probe describes the directory it was POINTED AT, never the caller's.
 GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR")
 
 
 def git_env() -> dict:

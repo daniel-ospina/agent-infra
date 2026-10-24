@@ -2896,6 +2896,20 @@ out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_P
 ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
    "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'has NO INDEX ENTRY' <<<"$out" && grep -q 'pointer makes the PATH exist' <<<"$out" && echo 0 || echo 1)"
 
+# ⛔ `GIT_COMMON_DIR` IS OBSERVABLE ONLY ON AN **ACCEPTED** CANDIDATE (round-9 review, measured): on a repo the
+# marker test already refuses it changes nothing, so a pin there is vacuous. The read it corrupts is the
+# RELATION — git takes OBJECTS from the inherited common dir, so a pin that is not an object in THIS repo is
+# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history. Asserted
+# against `$HERE_TOP`, which IS the harness repo.
+# The pin is a commit that EXISTS in the FOREIGN repo and NOT in this one: an inherited common dir makes
+# `cat-file -e` succeed for it, which is what turns `[unknown]` into `[diverged]`. A synthetic zero sha would
+# be absent from both repos and the case would pass for the wrong reason.
+git -C "$PLAIN" rev-parse HEAD > "$TMP/pin-foreign"
+out="$(env REPO= HARNESS_PIN="$TMP/pin-foreign" GIT_COMMON_DIR="$PLAIN/.git" HOME="$TMP/home" FIXTURE="$FX" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$HERE_TOP" 2>&1)"
+ck "§27b box-status is not hijacked by an inherited GIT_COMMON_DIR (an absent pin stays [unknown])" \
+   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" && echo 0 || echo 1)"
+
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
 # ships no harness bytes was accepted and its own `origin/main` became the value goal 2 measured against).
@@ -2977,9 +2991,17 @@ ck "§27b harness_repo_of REFUSES the same gitlink shape" \
 # exactly how the `GIT_DIR` pin died here). And each variable is given a path that EXISTS in this checkout:
 # `$HERE_TOP/.git` is a 47-byte gitdir FILE in a linked worktree, so `…/.git/index` is not a file there and
 # the pin would be vacuous in the very lane the suite runs in.
-HARNESS_INDEX="$(git -C "$HERE_TOP" rev-parse --git-path index)"
-ck "§27b the pin fixtures are real paths (gitdir may be a FILE in a worktree)" \
-   "$([ -e "$HERE_TOP/.git" ] && [ -e "$HARNESS_INDEX" ] && echo 0 || echo 1)"
+# ⛔ AN ABSOLUTE INDEX PATH, OR THE PIN IS VACUOUS IN CI (round-8 review, BLOCKING). `--git-path index`
+# answers a CWD-RELATIVE `.git/index` in a MAIN worktree (absolute only in a linked one), and a relative
+# `GIT_INDEX_FILE` does not hijack at all — git resolves it against the candidate after `-C`. CI runs this
+# shard from a main worktree with no `cd`, so the pin was green there while the reader it pins was broken.
+HARNESS_GITDIR="$(git -C "$HERE_TOP" rev-parse --absolute-git-dir)"
+HARNESS_INDEX="$HARNESS_GITDIR/index"
+ck "§27b the pin fixtures are real ABSOLUTE paths (a relative index path cannot hijack, so a pin on one is vacuous)" \
+   "$(case "$HARNESS_INDEX" in /*) [ -e "$HARNESS_INDEX" ] && echo 0 || echo 1 ;; *) echo 1 ;; esac)"
+# ⛔ THREE VARIABLES, THREE CASES: `GIT_DIR` (whole repository), `GIT_INDEX_FILE` (the index read) and
+# `GIT_COMMON_DIR` (measured in round 8: with it set, `repo_slug()`/`github_origin()` answered a FOREIGN slug
+# for an agent-infra-origin repo, so the checkout-vs-flag mismatch guard failed open again).
 for hijack in GIT_DIR GIT_INDEX_FILE; do
   case "$hijack" in
     GIT_DIR)         hval="$HERE_TOP/.git" ;;
@@ -3026,16 +3048,24 @@ PYMOD
 # enforced once, in `run()`; this case pins it there rather than at each call site, so a call added later is
 # covered the day it is written.
 # `$HERE_TOP` (not the fixture repo): `github_origin` answers "" for a non-github origin BY DESIGN, so the
-# fixture would make this case vacuous for the wrong reason.
-out_all="$(env GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
-   PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
-   python3 - "$SUT" "$HERE_TOP" <<'PYMOD'
+# fixture would make this case vacuous for the wrong reason. Both relocating variables are exercised here,
+# because THIS is where they are observable — `repo_slug()`/`github_origin()` read the checkout's own
+# origin, and a foreign `GIT_DIR` or `GIT_COMMON_DIR` made them answer the FOREIGN repo's slug, i.e. the
+# checkout-vs-flag mismatch guard failed OPEN.
+for hijack in GIT_DIR GIT_COMMON_DIR; do
+  case "$hijack" in
+    GIT_DIR)        hval="$FX/plainrepo/.git" ;;
+    GIT_COMMON_DIR) hval="$FX/plainrepo/.git" ;;
+  esac
+  out_all="$(env "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" \
+     PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+     python3 - "$SUT" "$HERE_TOP" <<'PYMOD'
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 repo = Path(sys.argv[2])
-slug = m.github_origin(repo)          # the mismatch guard: must NOT fail open under a foreign GIT_DIR
+slug = m.github_origin(repo)          # the mismatch guard: must NOT fail open under a foreign git dir
 gdir = m.git_dir(repo)
 truth_gdir = m.run(["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
                    env=m.git_env())[1].strip()
@@ -3043,18 +3073,19 @@ ok = (slug != "" and truth_gdir and gdir.strip() == truth_gdir)
 print(0 if ok else 1)
 PYMOD
 )"
-ck "§27b every git read is sanitised (github_origin does not fail open under a foreign GIT_DIR)" \
-   "$(grep -qx 0 <<<"$out_all" && echo 0 || echo 1)"
+  ck "§27b every git read is sanitised (github_origin does not fail open under a foreign $hijack)" \
+     "$(grep -qx 0 <<<"$out_all" && echo 0 || echo 1)"
+done
+
 
 ck "§27b main_sha ignores an inherited GIT_DIR (it reads the repo it was pointed at)" \
    "$(grep -qx 0 <<<"$out_main" && echo 0 || echo 1)"
 
-ck "§27b harness_repo_of is not hijacked by an inherited GIT_DIR either" \
-   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
-for hijack in GIT_DIR GIT_INDEX_FILE; do
+for hijack in GIT_DIR GIT_INDEX_FILE GIT_COMMON_DIR; do
   case "$hijack" in
     GIT_DIR)         hval="$HERE_TOP/.git" ;;
     GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
+    GIT_COMMON_DIR)  hval="$PLAIN/.git" ;;
   esac
   out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
      "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" \
