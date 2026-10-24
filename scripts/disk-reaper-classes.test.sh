@@ -850,9 +850,23 @@ case_o() {
                "O a '=' INSIDE a component still yields a relarg row (the whole token, not only the value)"
     case_check "$(grep -qF "$(printf 'relarg\t11\tA=b=c/wt-o')" <<<"$rows" && echo 0 || echo 1)" \
                "O a TWO-'=' attached token yields the WHOLE token as well as the value (arms agree)"
+    # ⛔ THE VALUE HALF TOO. The assertion above only greps the whole token, so "as well as the value"
+    # was unasserted and no mutation could turn it red — which is how the arms stayed disagreeing for a
+    # two-`=` token: /proc emitted `b=c/wt-o`, the ps arm emitted only the whole token.
+    case_check "$(grep -qF "$(printf 'relarg\t11\tb=c/wt-o')" <<<"$rows" && echo 0 || echo 1)" \
+               "O and the value after the FIRST = as well (b=c/wt-o)"
     ( . "$lib"; lp_path_named "$d/live-paths.tsv" "$wt" && printf 'named=1 why=%s\n' "$LP_NAME_WHY" || printf 'named=0\n' ) >"$base/res1" 2>&1
     case_check "$(grep -q 'named=1' "$base/res1" && echo 0 || echo 1)" \
                "O and the tree it names is NAMED (so the pass can keep it)"
+    # A BARE token names a tree with no `/` at all (`git -C wt-x`, `tar -C wt-x`): refusing those rows
+    # left that spelling invisible to every witness, so the tree was reaped while the holder was alive.
+    mkdir -p "$base/scratch/wt-bare"
+    printf 'bash\0-c\0sleep 300; :\0git\0-C\0wt-bare\0' >"$base/proc/11/cmdline"
+    d="$base/cen1b"
+    ( . "$lib"; LP_PROC_ROOT="$base/proc" LP_LSOF_PROBE="$base/no-lsof" LP_PS_PROBE="$base/no-ps" lp_census "$d" ) >/dev/null 2>&1
+    ( . "$lib"; lp_path_named "$d/live-paths.tsv" "$base/scratch/wt-bare" && printf 'named=1\n' || printf 'named=0\n' ) >"$base/res1b" 2>&1
+    case_check "$(grep -q 'named=1' "$base/res1b" && echo 0 || echo 1)" \
+               "O a BARE non-flag token (git -C wt-bare) names the tree"
     # A symlinked relative prefix belongs to the SYMLINK arm, not the lexical one: `rel-link` → the tree.
     ln -sfn "$wt" "$base/scratch/rel-link"
     mkdir -p "$base/proc/12"
@@ -870,7 +884,7 @@ case_o() {
 expect_pass "O the census emits the spelling a live holder used (whole token, value, symlink)" case_o "$LIVE_LIB"
 # Mutation: dropping the WHOLE-TOKEN emission for an attached form (the exact cycle-9 regression) must
 # turn O red — otherwise the `=`-in-a-component arm is covered by a case that cannot fail.
-MUT_O='s/case "\$_tok" in \*\/\*)/case "$_tok" in *\/__never__)/'
+MUT_O='s|^ *\*\/\*) printf .relarg.*$|        */*) : ;;|' 
 if apply_mutation "$LIVE_LIB" "$T/mut-o/live-paths.sh" "$MUT_O"; then
     expect_fail "O mutation: dropping the whole-token relarg makes the '='-component arm RED" case_o "$T/mut-o/live-paths.sh"
 else

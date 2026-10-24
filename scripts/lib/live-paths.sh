@@ -42,7 +42,8 @@
 # real box permanently inert — the inert-enforcer shape this family exists to remove.
 #
 # READ-ONLY. This file deletes nothing and writes only inside the caller's census directory.
-# Bounded: one `ls` over /proc (or one `lsof`), no per-pid fork, no recursion. The caller owns the
+# Bounded: one `ls` over /proc (or one `lsof`), one BUILTIN read per pid's cmdline (no `tr` fork),
+# no recursion. Rows: cwd/exe per pid plus one row per path-like or bare non-flag argv token.. The caller owns the
 # watchdog — every invocation here is a handful of bulk reads.
 
 # ── integer helper (no octal surprises: leading zeros parse as OCTAL inside $(( ))) ──────────────
@@ -53,6 +54,25 @@ lp_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 #   LP_CENSUS_PIDS  distinct pids seen (readable cwd OR exe OR argv)
 # Returns 0 on a real census (including a partial one), 1 when it could not be read at all.
 LP_CENSUS_ROWS=0; LP_CENSUS_PIDS=0; LP_CENSUS_MECH=""
+# _lp_emit_relarg <pid> <token> — one row saying "this token is resolved against this pid's own cwd".
+# `relarg` = the token contains a `/`; `relbare` = a bare, non-flag token (`git -C wt-x` names a tree
+# with no `/` at all, so refusing those rows left that spelling invisible to every witness — measured).
+# A bare token is only ~183 rows on a busy box, so this costs rows, never forks.
+_lp_emit_relarg() {
+    local _pid="$1" _tok="$2"
+    # ⛔ A token can contain TAB or NEWLINE (an argv argument holding a script, measured: the table came
+    # back as 200 rows of Python source). The table is TSV, so a raw token corrupts the parse for every
+    # row after it — flatten the separators, and drop anything pathologically long (a path is not 4 KB).
+    _tok="${_tok//$'\t'/ }"; _tok="${_tok//$'\n'/ }"; _tok="${_tok//$'\r'/ }"
+    [ "${#_tok}" -le 1024 ] || return 0
+    case "$_tok" in
+        ''|-*) return 0 ;;
+        */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;;
+        *)   printf 'relbare\t%s\t%s\n' "$_pid" "$_tok" ;;
+    esac
+    return 0
+}
+
 lp_census() { # <dir>
     local dir="${1:-}" out probe proc="${LP_PROC_ROOT:-/proc}" rows pids
     [ -n "$dir" ] || return 1
@@ -91,7 +111,10 @@ lp_census() { # <dir>
                 [ -r "$_f" ] || continue
                 _pid="${_f#"$proc"/}"; _pid="${_pid%/cmdline}"
                 lp_num "$_pid" || continue
-                tr '\0' '\n' <"$_f" 2>/dev/null | while IFS= read -r _tok; do
+                # ⛔ BUILTIN SPLIT. `tr '\0' '\n' | while …` forked once per pid — and the header
+                # promises no per-pid fork; `toctou_preserve` runs a FULL census per candidate, so that
+                # made a pass O(candidates x pids) forks.
+                while IFS= read -r -d '' _tok; do
                     # ⛔ ABSOLUTE TOKENS ONLY — and an absolute path can arrive ATTACHED: a holder that
                     # names the tree as `--repo=/abs/tree` or `WORKTREE=/abs/tree` matched no `/*` case, so
                     # it did not protect the tree it named (measured: the tree was reaped while a live
@@ -114,16 +137,16 @@ lp_census() { # <dir>
                                  # became invisible and the tree was reaped — a regression this very fix
                                  # introduced. The value covers `K=v/path`; the whole token covers
                                  # `path/with=sign`; each is emitted only when path-like.
-                                 *)  case "${_tok#*=}" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;; esac
-                                     case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
+                                 *)  _lp_emit_relarg "$_pid" "${_tok#*=}"
+                                     _lp_emit_relarg "$_pid" "$_tok" ;;
                              esac ;;
                         # ⛔ PATH-LIKE ONLY. Emitting every token exploded the table 100x on a real box
                         # (32,686 rows over 127 pids, measured) because a bare word (`sleep`, `--flag`,
                         # a java classpath element) can never name a tree — and the matcher requires a
                         # `/` anyway. A token without one is not a candidate spelling.
-                        *) case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
+                        *) _lp_emit_relarg "$_pid" "$_tok" ;;
                     esac
-                done
+                done <"$_f" 2>/dev/null
             done
         } >>"$out" 2>/dev/null
     else
@@ -161,8 +184,15 @@ lp_census() { # <dir>
                         # disagree again for `A=b=c/d` (the /proc arm emits the value, this arm emitted the
                         # whole token), which is the invariant this file exists to hold.
                         if (n >= 2) {
-                            if (kv[2] ~ /\//) printf "relarg\t%s\t%s\n", pid, kv[2]
+                            # ⛔ the value is everything after the FIRST `=`. `kv[2]` is only the span
+                            # between the first and second, so for `A=b=c/wt-o` this arm emitted just
+                            # the whole token while /proc emitted `b=c/wt-o` — still disagreeing, and
+                            # this is the ONLY arm on macOS.
+                            rest = $i; sub(/^[^=]*=/, "", rest)
+                            if (rest ~ /\//) printf "relarg\t%s\t%s\n", pid, rest
+                            else if (rest != "" && rest !~ /^-/) printf "relbare\t%s\t%s\n", pid, rest
                             if ($i ~ /\//) printf "relarg\t%s\t%s\n", pid, $i
+                        else if ($i != "" && $i !~ /^-/) printf "relbare\t%s\t%s\n", pid, $i
                             continue
                         }
                         if ($i ~ /\//) printf "relarg\t%s\t%s\n", pid, $i
@@ -310,33 +340,44 @@ lp_path_named() { # <census> <canonical-path>
             return r
         }
         $1 == "cwd" { cwd[$2] = $3; next }
-        $1 == "relarg" {
+        ($1 == "relarg" || $1 == "relbare") {
             if (!($2 in cwd)) next
             tok = $3
-            if (tok !~ /\//) next
+            if (tok == "") next
             full = norm(cwd[$2] "/" tok)
+            # ⛔ A BARE token must resolve EXACTLY to the candidate. Prefix semantics are right for a
+            # path-like token (naming something under the tree implies using it) but wrong for a bare
+            # one: a holder whose cwd IS the tree and whose argv is `sleep 180` resolved to
+            # `<tree>/180` and reported `reason=argv-named`, stealing the reason from the cwd arm that
+            # actually proved it (measured). A bare name can only name the tree by being it.
+            if ($1 == "relbare") { if (full == cand) { print $2; exit 0 } ; next }
             if (full == cand || index(full, cand "/") == 1) { print $2; exit 0 }
         }
         END { exit 1 }' "$f" 2>/dev/null)"
     if [ -z "$_relpid" ]; then
         # A second chance for a SYMLINKED relative prefix (`rel-link/f.txt`, `rel-link` → the tree).
-        # ⛔ NO ROW CAP BEFORE THE CHEAP FILTER: capping the raw rows at 200 meant one chatty pid (a test
-        # runner with 200 paths) starved every later holder, and the arm failed open exactly where it
-        # was added to fail closed. Every row now gets ONE builtin `-L` stat (cheap), and only the rows
-        # that are actually symlinks spend a fork — capped at 50 so a pathological box cannot turn this
-        # into thousands of subprocesses.
+        # ⛔ NO ROW CAP BEFORE THE CHEAP FILTER, AND NO FORK PER ROW. The first form of this pass capped
+        # the raw rows at 200 — one chatty pid starved every later holder, failing OPEN where the pass
+        # exists to fail closed — and looked each row's cwd up with its own `awk` (measured: a dry-run
+        # over 37 candidates took 3m18s, rows 1,161). ONE awk emits (pid, cwd, component, rest); the
+        # shell then does a builtin `-L` per row and forks only a real symlink (capped at 50).
         _rfork=0
-        _relpid="$(awk -F'\t' '$1 == "relarg" && $3 ~ /\// { print $2 "\t" $3 }' "$f" 2>/dev/null | while IFS="$(printf '\t')" read -r _rpid _rtok; do
+        _relpid="$(awk -F'\t' '
+            $1 == "cwd" { cwd[$2] = $3; next }
+            ($1 == "relarg" || $1 == "relbare") && $3 ~ /\// {
+                if (!($2 in cwd)) next
+                id = $3
+                i = index(id, "/")
+                printf "%s\t%s\t%s\t%s\n", $2, cwd[$2], substr(id, 1, i - 1), substr(id, i + 1)
+            }' "$f" 2>/dev/null | while IFS="$(printf '\t')" read -r _rpid _rcwd _rcomp _rrest; do
             [ -n "${_rpid:-}" ] || continue
-            _rcwd="$(awk -F'\t' -v p="$_rpid" '$1=="cwd" && $2==p {print $3; exit}' "$f" 2>/dev/null)"
-            [ -n "$_rcwd" ] || continue
-            _rcomp="${_rtok%%/*}"
-            case "$_rtok" in "$_rcwd"/*) continue ;; esac
-            [ -L "$_rcwd/$_rcomp" ] || [ -d "$_rcwd/$_rcomp" ] || continue
+            [ -n "${_rcomp:-}" ] || continue
+            # ONLY a symlinked (or just-created) first component can resolve somewhere the lexical join
+            # could not reach; a plain directory is exactly what the join already tested.
+            [ -L "$_rcwd/$_rcomp" ] || continue
             _rcanon="$(lp_canon "$_rcwd/$_rcomp" 2>/dev/null)" || continue
             [ -n "$_rcanon" ] || continue
-            _rfull="${_rcanon%/}/${_rtok#*/}"
-            if _lp_rel "$_rfull" "$path"; then printf '%s' "$_rpid"; exit 0; fi
+            if _lp_rel "${_rcanon%/}${_rrest:+/$_rrest}" "$path"; then printf '%s' "$_rpid"; exit 0; fi
             _rfork=$((_rfork + 1))
             [ "$_rfork" -ge 50 ] && exit 1
         done)"
