@@ -214,8 +214,13 @@ case_b() { # <owner-script> <entry-point>
     # pass moved the same counter by 4,160 MB in one measured run. What the case pins is that the
     # reclaim is expressed as a df DELTA at all (a `du` sum would be a different label entirely) and
     # that the record's value is a measured number — not `unmeasured`.
-    case_check "$([ -n "$n" ] && [ "$n" -ge 1 ] && echo 0 || echo 1)" \
-               "and the reclaim is visible in df (freed_df=${n:-?}MB; magnitude not asserted on a shared box)"
+    # ⛔ AND NOT `-ge 1` EITHER. `df` granularity is 1 MB and this is a shared box: a lane allocating
+    # during the window cancels a 64 MB reclaim (measured 0 MB on a run that DID reap the fixture), so a
+    # magnitude floor is a flake, not a check. What this case pins is the ACCOUNTING SHAPE — a numeric
+    # `freed_df` in a `(df delta)` report, and a measured (not `unmeasured`) record. The magnitude is
+    # evidenced by the real-cell run in the PR body, where nothing else was writing.
+    case_check "$([ -n "$n" ] && [ "$n" -ge 0 ] && echo 0 || echo 1)" \
+               "and the reclaim is expressed as a numeric df delta (freed_df=${n:-?}MB, magnitude not asserted)"
     return $((CASE_FAIL > 0))
 }
 
@@ -241,8 +246,13 @@ case_c() { # <owner-script>
     # the refusal could not reach it.
     out_seam="$(REAP_AW_PROC_ROOT="$base/no-such-proc" REAP_AW_ROOTS="$base/scratch-x" \
                 bash "$owner" --dry-run 2>&1)"
+    # ⛔ THE CAUSE, NOT ONLY THE OUTCOME. `census=unreadable` is reachable on a host with no `lsof` even
+    # with the seam arm removed (the fall-back fails by itself), so an outcome-only assertion lets the
+    # mutant survive on a slim image. The NOTE is printed by the arm itself and by nothing else.
+    case_check "$(grep -qF 'is not a process table' <<<"$out_seam" && echo 0 || echo 1)" \
+               "an explicit REAP_AW_PROC_ROOT naming a MISSING table is REFUSED, and said so by cause"
     case_check "$(grep -qF 'census=unreadable' <<<"$out_seam" && echo 0 || echo 1)" \
-               "an explicit REAP_AW_PROC_ROOT naming a MISSING table forces the fail-closed arm"
+               "… and the pass then reports the fail-closed census"
     out_seam="$(REAP_AW_PROC_ROOT="$base/empty-proc" REAP_AW_ROOTS="$base/scratch-x" \
                 bash "$owner" --dry-run 2>&1)"
     case_check "$(grep -qF 'census=unreadable' <<<"$out_seam" && echo 0 || echo 1)" \
@@ -489,7 +499,7 @@ case_k() { # <entry-point>
 # controller pointed at a tree through a symlink named `/tmp/link/wt/f` while the candidate's canonical
 # path was `/tmp/real/wt` — no prefix matched and the tree the live controller was working in was reaped.
 case_l() { # <owner-script>
-    local owner="$1" base root repo wt out pid
+    local owner="$1" base root repo wt wt2 wt3 out pid pid2 pid3
     base="$(newbase l)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" wt1 feat/l-argv)"
@@ -500,14 +510,33 @@ case_l() { # <owner-script>
     # census read it — the case measured nothing and the tree was reaped in the fixture too.
     bash -c 'sleep 300; :' "$base/link/wt1/some-file.txt" &
     pid=$!; SLEEPERS="$SLEEPERS $pid"
-    sleep 0.5
-    out="$(REAP_AW_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" REAP_AW_PROC_ROOT=/proc bash "$owner" --apply 2>&1)"
+    # the token IS an alias for another candidate (the simplest symlink spelling: no sub-path)
+    wt2="$(mk_linked_wt "$repo" "$root" wt2 feat/l-alias)"
+    age_path "$wt2" 400
+    ln -s "$wt2" "$base/alias-wt2"
+    bash -c 'sleep 300; :' "$base/alias-wt2" &
+    pid2=$!; SLEEPERS="$SLEEPERS $pid2"
+    # and the ATTACHED spelling: `--repo=<abs>`
+    wt3="$(mk_linked_wt "$repo" "$root" wt3 feat/l-attached)"
+    age_path "$wt3" 400
+    bash -c 'sleep 300; :' "--repo=$wt3" &
+    pid3=$!; SLEEPERS="$SLEEPERS $pid3"
+    sleep 0.6
+    # ⛔ NO SEAM HERE: hardcoding `/proc` made the case RED for the WRONG reason on a host without one
+    # (macOS — the very platform whose `/tmp`→`/private/tmp` spelling this case is about), because the
+    # owner then refused the census and the "tree kept" assertion passed only because nothing ran. The
+    # owner picks its own mechanism.
+    out="$(REAP_AW_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" bash "$owner" --apply 2>&1)"
     [ -n "${DRC_DEBUG:-}" ] && printf 'L\n%s\n' "$out" >&2
     case_check "$([ -d "$wt" ] && echo 0 || echo 1)" \
                "a tree a live process names through a SYMLINK is KEPT (argv spellings are canonicalised)"
     case_check "$(grep -qF 'reason=argv-named' <<<"$out" && echo 0 || echo 1)" \
                "and it is KEPT BY NAME with reason=argv-named"
-    kill "$pid" 2>/dev/null
+    case_check "$([ -d "$wt2" ] && echo 0 || echo 1)" \
+               "a token that IS a SYMLINK to the tree protects it too (no sub-path to match on)"
+    case_check "$([ -d "$wt3" ] && echo 0 || echo 1)" \
+               "and so does the ATTACHED spelling (--repo=<abs>)"
+    kill "$pid" "$pid2" "$pid3" 2>/dev/null
     return $((CASE_FAIL > 0))
 }
 
@@ -525,7 +554,7 @@ MUT_D2='s/^        PIN_PATHS="\$_pc"$/        :/'
 MUT_J='s/kill -0/false/'
 MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
 MUT_L='s/_lp_rel "\$_cand" "\$path"/_lp_rel "" "$path"/'
-MUT_C='s/^    LP_CENSUS_UNAVAILABLE=1$/    :/'
+MUT_C2='s/^if \[ -n "\${REAP_AW_PROC_ROOT:-}" \] && /if false \&\& /'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
 
@@ -639,7 +668,7 @@ else
     chmod +x "$T/mut-l/reap-abandoned-worktrees.sh"
     expect_fail "L mutation: dropping the argv canonicalisation turns the case RED" case_l "$T/mut-l/reap-abandoned-worktrees.sh"
 fi
-if apply_mutation "$AW_OWNER" "$T/mut-c2/reap-abandoned-worktrees.sh" "$MUT_C"; then
+if apply_mutation "$AW_OWNER" "$T/mut-c2/reap-abandoned-worktrees.sh" "$MUT_C2"; then
     ln -sfn "$HERE/lib" "$T/mut-c2/lib"
     expect_fail "C mutation: dropping the seam refusal turns the seam assertions RED" case_c "$T/mut-c2/reap-abandoned-worktrees.sh"
 else
