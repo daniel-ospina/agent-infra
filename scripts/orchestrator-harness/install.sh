@@ -184,6 +184,18 @@ if [ "$ACTION" = uninstall ]; then
   # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
   # the domain until the label is no longer LOADED, and fail loudly if it still is.
   lc_bootout "$LABEL" "$PLIST" || exit 1
+  # ⛔ BOOTOUT NO LONGER STOPS THE CONTROLLER, SO UNINSTALL MUST (2026-10-18, review round 1, measured).
+  # The job used to BE orch-loop.sh, so removing it stopped the fleet. It now runs launchd-controller.sh,
+  # which keeps the controller in a tmux session that is NOT in the job's process group (the pane's
+  # parent is the tmux server, ppid-1 lineage), so `launchctl bootout` kills only the supervisor and
+  # leaves a full controller dispatching, merging and unsupervised — with a ✅ printed over it. That is
+  # the exact inversion of the guard below: it used to be launchd resurrecting the controller; now it
+  # is tmux preserving it. The session name is the job's own (`CONTROLLER_SESSION`, default
+  # `orch-controller`), so this can only ever stop the controller this job started.
+  CTRL_SESS="${CONTROLLER_SESSION:-orch-controller}"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$CTRL_SESS" 2>/dev/null; then
+    tmux kill-session -t "=$CTRL_SESS" 2>/dev/null || true
+  fi
   # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
   # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
   # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
@@ -221,6 +233,34 @@ if [ "$ACTION" = uninstall ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
     # inspect), so destroying it here would leave the job loaded with nothing to retry against.
     die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
+  # ⛔ AND THE CONTROLLER MUST BE GONE BEFORE ✅ (review round 1). `kill-session` is a SIGNAL, not a
+  # proof — a pane that refuses to die, or a controller started by some other path, leaves a box that
+  # still dispatches while this command says Removed. The controller records its own pid in
+  # $O/.orch.lock, so that is the read that answers the question; give the SIGHUP a moment first, and
+  # keep the plist on failure so the retry has something to act on.
+  _cp=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # ⛔ THE READ MUST BE GUARDED — a non-regular lock (a FIFO, a wedged network mount) makes `cat`
+    # BLOCK ON OPEN, and this runs AFTER the bootout, so the wait would hang for ever with the fleet
+    # already stopped, the plist never removed and no message (review round 2, measured: a FIFO lock
+    # still blocked the exact expression after 2s). `lc_foreign_controller` already documents and
+    # guards this same read; do not re-do it unguarded.
+    # ⛔ AND "CANNOT READ IT" IS NOT "NO CONTROLLER" (review round 3, measured: a FIFO lock was
+    # byte-identical to an ABSENT lock and printed ✅). An absent lock means no controller holds it; a
+    # PRESENT but non-regular one means the controller's state CANNOT BE VERIFIED, and this block's
+    # whole job is to refuse that — the shape `lc_probe`'s `unread=2` already models ten lines above.
+    if [ ! -e "$O/.orch.lock" ]; then _cp=0; break; fi
+    if [ ! -f "$O/.orch.lock" ]; then
+      die "$O/.orch.lock is not a regular file (a FIFO, or a wedged mount), so whether the controller is still running cannot be VERIFIED — NOT removed, and the plist is kept at $PLIST. Next: ls -l '$O/.orch.lock'; if no controller is running, rm -f it, then re-run --uninstall"
+    fi
+    _cp="$(cat "$O/.orch.lock" 2>/dev/null || echo 0)"
+    case "$_cp" in ''|*[!0-9]*) _cp=0 ;; esac
+    [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null; then
+    die "the controller is STILL running (pid $_cp, recorded in $O/.orch.lock) after removing $LABEL — NOT removed, and the plist is kept at $PLIST. Next: tmux kill-session -t =${CONTROLLER_SESSION:-orch-controller} (or kill $_cp), then re-run --uninstall"
   fi
   rm -f "$PLIST"
   rm -f "$O/state/launchd-loaded.sha256"
@@ -512,6 +552,15 @@ done
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
     || die "gh-limit.py does not parse"
 }
+# The merge reminder (#2603) is a TIMER'S ENTRY POINT, and a syntax error in it is a cycle that dies
+# with a traceback in a log nobody reads — the same class as a broken gh-limit.py, so it takes the
+# same parse gate. `box-status.sh` is a `*.sh` and is already covered by the sweep above.
+# ⛔ UNGUARDED, like its neighbour: a `[ -f ]` guard made a MISSING file pass this gate, so a
+# checkout without merge-reminder.py was reported as parsing fine while the timer had no script.
+command -v python3 >/dev/null 2>&1 \
+  || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
+  || die "merge-reminder.py is missing or does not parse"
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -804,10 +853,15 @@ DRIFTED=""
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
+# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
+# its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
+# that is not in this list is the drift the list exists to catch.
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1029,6 +1083,16 @@ SELF="bash $(shq "$HERE/install.sh")"
 # cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
 # than read from a global: the library must not depend on an unstated variable.
 LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
+# ⛔ THE PLIST NOW EXECUTES A SCRIPT THE INSTALLER NEVER COPIES, SO ITS ABSENCE IS FATAL, NOT DRIFT.
+# This installer deliberately copies nothing ($O is operator-synced) and the DRIFT block above WARNS —
+# correctly for the general list. But the entrypoint is different in kind: on an un-synced box
+# `/bin/bash $O/launchd-controller.sh` exits 127 on every run, so a `--start` would bootstrap a job
+# that crash-loops under KeepAlive, grows launchd.err, and leaves the fleet with NO controller while
+# the command reports success. It is one `-f` test away from being knowable, so it is refused here.
+case "$ACTION" in
+  start|restart)
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: cp '$HERE'/*.sh '$O'/"; ;;
+esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
   restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
