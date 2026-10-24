@@ -1900,9 +1900,9 @@ run_loop() {
       return 0
     fi
     now="$(date +%s)"
-    if [ $(( now - last_d )) -ge "$DOCTOR_INTERVAL" ]; then run_role_pass doctor; last_d=$now; fi
-    if [ $(( now - last_m )) -ge "$MERGE_INTERVAL" ]; then run_role_pass merge; last_m=$now; fi
-    if [ $(( now - last_h )) -ge "$HYGIENE_INTERVAL" ]; then run_role_pass hygiene; last_h=$now; fi
+    if [ $(( now - last_d )) -ge "$DOCTOR_INTERVAL" ]; then run_role_pass doctor ""; last_d=$now; fi
+    if [ $(( now - last_m )) -ge "$MERGE_INTERVAL" ]; then run_role_pass merge ""; last_m=$now; fi
+    if [ $(( now - last_h )) -ge "$HYGIENE_INTERVAL" ]; then run_role_pass hygiene ""; last_h=$now; fi
     # `sleep & wait`: bash runs a trap only after the foreground command returns, and a foreground
     # `sleep 600` would defer `stop` for its whole duration (orch-loop.sh's measured note).
     "$SLEEP_BIN" "$LOOP_TICK" & wait $! || true
