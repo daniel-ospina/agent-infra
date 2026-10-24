@@ -623,6 +623,36 @@ fi
 mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.dir.$RANDOM" 2>/dev/null || true
 clear_store; clear_parked
 
+# (j) REPORT-ONLY OUTRANKS AT-HEAD (review round 4, P2). REPORT-ONLY sat AFTER the store check, so on a
+# report-only box a head that already carried a CLEAN record took the AT-HEAD path — where `1 >= 0` is
+# true — and PARKED on the first refusal as `REVIEW-AT-HEAD-STUCK 1/0`: a PR removed from the sweep with
+# a reason naming a budget the box never had, contradicting "REPORT-ONLY: nothing dispatched, NOTHING
+# parked". The sibling red-fixer role's rule is "REPORT-ONLY IS DECIDED BEFORE THE COUNTER IS READ".
+clear_parked; clear_revdisp
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 0
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'REPORT-ONLY' "$TMP/d.log" \
+   && ! grep -q 'REVIEW-AT-HEAD-STUCK' "$TMP/d.log"; then
+  ok "(j) MAX_REVIEW_TRIES=0 outranks AT-HEAD: a recorded review is NOT parked on a report-only box"
+else
+  bad "(j) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+clear_store; clear_parked
+
+# (k) a PARK THAT DID NOT LAND is reported as what it is (review round 4, P2). The park IS the
+# terminator: an unwritable `parked-<PR>` means the PR re-enters the arm every cycle while the log says
+# PARKED. Same hazard class as (h)/(i), one level up — the one place rounds 2-3 did not look.
+clear_store; seed_revdisp abc1234 3; clear_parked
+mkdir -p "$TMP/O/state/parked-4242"          # a DIRECTORY of that name: the park cannot land
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'PARK DID NOT LAND' "$TMP/d.log" && ! grep -q 'PARKED (an unfixable head' "$TMP/d.log"; then
+  ok "(k) an unwritable PARK is named (PARK DID NOT LAND), never reported as PARKED"
+else
+  bad "(k) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/parked-4242" "$TMP/parked.dir.$RANDOM" 2>/dev/null || true
+clear_revdisp
+
 # (d) the review-LANE cap still binds, and the refusal NAMES its holders and their age
 clear_store; clear_revdisp
 drive 'FAILED:ai-review-gate' rail 9 1

@@ -55,7 +55,14 @@
 # the concurrency caps must keep BINDING and a reaper must never kill what it cannot see. The other
 # direction — "we could not read it, so it is dead" — silently frees every slot and lets the box
 # spawn without limit exactly when the daemon is in trouble. `dead` is only ever concluded from a
-# POSITIVE read (the workspace is gone; the session name is absent).
+# POSITIVE read: (1) the workspace is gone, (2) the session name is absent, or (3) — added
+# deliberately with agent-infra#2653, see the `wt_table` absent-owner arm — the session OWNER is
+# confirmed ABSENT (`Connection refused` from an empty `cmux tree`, i.e. a socket nobody is listening
+# on, or the CLI's own `no server running`), because a durable terminal lives INSIDE the owner: no
+# owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is deliberately narrow —
+# the errno-agnostic `cannot connect to session socket <path>: <reason>` wrapper does NOT qualify
+# (ENOENT / EACCES / EAGAIN are reachable with the daemon and its terminals ALIVE), so a merely
+# illegible or unreachable answer still leaves its workers UNKNOWN and the caps binding.
 #
 # ⛔ WHAT THIS FILE DELIBERATELY DOES NOT DO. No SILENT anything: a box with no surface at all is
 # refused out loud, and a tmux spawn that cannot be given an environment with a credential is refused
