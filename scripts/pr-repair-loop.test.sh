@@ -536,9 +536,14 @@ echo "── the farm declares what the unit execs ──"
 # `case` pattern cannot use `[[:space:](]` (a bracket expression inside a pattern is a syntax error).
 farm_declares() { # <script basename> <setup.sh path> -> 0 declares / 1 does not
     local f="$1" file="$2" line
-    line="$(grep -E '^fleet_srcs=\(' "$file" 2>/dev/null || true)"
+    line="$(grep -E '^[[:space:]]*fleet_srcs=\(' "$file" 2>/dev/null || true)"
+    # ⛔ EVERY LEGAL POSITION, INCLUDING THE TWO A SPACE-ONLY SET MISSES (review of this PR): a
+    # single-element array `($f)` has no space on either side, and a TAB-separated first position has no
+    # space before the name. Both are legal declarations, so a space-only set reports a true declaration
+    # as absent — the false-red direction this helper exists to avoid.
+    line="${line//$'\t'/ }"
     case "$line" in
-        *"($f "*|*" $f "*|*" $f)"*) return 0 ;;
+        *"($f)"*|*"($f "*|*" $f "*|*" $f)"*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -557,6 +562,12 @@ farm_declares pr-repair-loop.sh "$TMP/farm-first.sh" && ok "the declaration chec
     || bad "the declaration check misses first position (a legal, still-declared array)"
 farm_declares pr-repair-loop.sh "$TMP/farm-last.sh" && ok "the declaration check finds LAST position" \
     || bad "the declaration check misses last position"
+printf 'fleet_srcs=(%s)\n' pr-repair-loop.sh >"$TMP/farm-only.sh"
+farm_declares pr-repair-loop.sh "$TMP/farm-only.sh" && ok "the declaration check finds a ONE-ELEMENT array" \
+    || bad "the declaration check misses a one-element array (no space on either side)"
+printf 'fleet_srcs=(%s\tother.sh)\n' pr-repair-loop.sh >"$TMP/farm-tab.sh"
+farm_declares pr-repair-loop.sh "$TMP/farm-tab.sh" && ok "the declaration check finds a TAB-separated first position" \
+    || bad "the declaration check misses a tab-separated first position"
 farm_declares pr-repair-loop.sh "$TMP/farm-absent.sh" \
     && bad "the declaration check PASSES on an array that does not list the script" \
     || ok "the declaration check refutes an array that does not list the script"
