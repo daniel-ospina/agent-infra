@@ -228,10 +228,14 @@ case "${1:-}" in
   # `lanes=1/2 zombie=0`, deleting the `count` call would still leave the census assertion green —
   # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
   # DOCTOR_TEST_REAP_CENSUS=unreadable models the abstention the DOCTOR must escalate on: the reaper
-  # could not take the read, so it prints `?` and exits 3. Without this seam the doctor's own
-  # `lanes=?/?` → rc=3 arms (cloud-cell-doctor.sh:926-933) were untested — delete either and an
-  # unreadable census rendered as a clean pass (#2163 review P2, cycle 6).
-  count) if [ "${DOCTOR_TEST_REAP_CENSUS:-}" = "unreadable" ]; then printf 'lanes=?/? zombie=?\n'; exit 3; fi
+  # could not take the read, so it prints `?` and exits 3. DOCTOR_TEST_REAP_CENSUS=garble models the
+  # OTHER classifier arm (`*)` in cloud-cell-doctor.sh:928): output that does not parse as a census at
+  # all — what an unexecutable tool or the `bounded 60` SIGKILL actually produce. Both arms were
+  # untested before #2163 review cycle 6/7 (cycle 7 found the catch-all still unpinned).
+  count) case "${DOCTOR_TEST_REAP_CENSUS:-}" in
+           unreadable) printf 'lanes=?/? zombie=?\n'; exit 3 ;;
+           garble)     printf 'cannot read the lane census\n'; exit 0 ;;
+         esac
          printf 'lanes=3/7 zombie=2\n' ;;
   # DOCTOR_TEST_REAP_ABSTAIN models a pass that could not JUDGE every tree: the reaper's own
   # `abstained=` counter is the only token that distinguishes it from an idle one.
@@ -338,6 +342,21 @@ DOCTOR_TEST_REAP_CENSUS=unreadable doc reap
 [ "$RC" -eq 3 ] && ok "census-abstain: rc=3 (the census could not be read)" || bad "census-abstain: rc=$RC — an unreadable census read as a clean pass — $OUT"
 result_has "lanes=?/?" && ok "census-abstain: the pass line says ?/? rather than a fabricated 0" || bad "census-abstain: the census is not reported as unknown — $OUT"
 grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "census-abstain: the census was actually READ (the leg is not vacuous)" || bad "census-abstain: no count call — this arm cannot have fired"
+
+# …and the OTHER classifier arm: output that is not a census AT ALL (an unexecutable tool, the
+# `bounded 60` SIGKILL) must take the `*)` catch-all to the same rc=3 — #2163 review cycle 7 found
+# that arm still unpinned. ⛔ WHAT THIS LEG DOES AND DOES NOT PIN (measured, cycle 7): it pins the
+# OPERATOR-VISIBLE outcome (garbled read ⇒ rc=3, `lanes=?/?`, `count` really called). Mutating the
+# catch-all's own `pass_rc=3` to nothing does NOT turn it red, so that assignment is redundant with
+# the arm's `unverifiable` increment rather than load-bearing; the residual (which assignment is the
+# effective one) is left open here deliberately instead of being claimed as covered.
+say_case "a GARBLED census read is cannot-verify (rc=3), not a clean pass"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_CENSUS=garble doc reap
+[ "$RC" -eq 3 ] && ok "census-garble: rc=3 (the read did not parse)" || bad "census-garble: rc=$RC — a garbled read read as a clean pass — $OUT"
+result_has "lanes=?/?" && ok "census-garble: the pass line says ?/? rather than a fabricated 0" || bad "census-garble: the census is not reported as unknown — $OUT"
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "census-garble: the census was actually READ (the leg is not vacuous)" || bad "census-garble: no count call — this arm cannot have fired"
 
 # ── 1a3) a process pass that judged NOTHING is unverifiable, not a health record ──────────────
 # ⛔ THE CELL SHAPE (#2163 review r3, P2). On a cell every lane is `ancestry-unknown`, so the armed
