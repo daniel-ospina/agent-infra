@@ -176,6 +176,15 @@ assert_eq "$RS_RC" "3" "§5 push diverges too (same timestamp, still different b
 assert_contains "$(git -C "$STORE" show "refs/reviews/$KEY:record.json")" "$HEAD_A" \
   "§5 ...and the divergence did not reach the shared store either"
 
+# ── §5b: `union` runs pull AND push, so ONE divergent record is detected twice. The count is what an
+# operator reads in one log line and what a scheduler trends, so it must name DISTINCT records —
+# measured before the fix: `conflicts=2` for one key, listed twice, exit 3.
+echo "── §5b union counts a divergent record ONCE, not once per direction"
+rs_rc "$BOX1" union
+assert_eq "$RS_RC" "3" "§5b union still exits 3 on divergence"
+assert_contains "$RS_LAST" "conflicts=1 " "§5b ...and counts the ONE divergent record once (conflicts=1, not 2)"
+assert_contains "$RS_LAST" "1 record(s) DIVERGE" "§5b ...and the message names one record, not two"
+
 echo "── §6 two repos' legacy <pr>.json files are never collapsed"
 # clear §5's deliberate divergence first, so this section's summaries are unambiguous
 mint "$BOX1" "$KEY" "2026-10-23T10:00:00Z" "$HEAD_A"
@@ -890,6 +899,43 @@ RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30c a legacy-named mirror that denies its key is NOT converged (exit 4)"
 assert_contains "$RS_LAST" "unreadable=5" "§30c ...and it is COUNTED with the other four, never reported same"
 assert_contains "$RS_LAST" "NOT this key" "§30c ...naming the key the record denies"
+
+# ── §30d: WHITESPACE. `{"pr": 441, …}` is ordinary valid JSON (json.load, the rail's read_record and
+# the fast path all accept it) but the field reader's sed had no `[[:space:]]*` after the colon, so it
+# read `" 441"` / `" 2026-12-31T00:00:00Z"`. Two consequences, both measured before the fix: (a) the
+# same bytes were `same`/exit 0 on a box holding a mirror and `unreadable`/exit 4 on a box without
+# one, and (b) a LEADING SPACE sorts below any digit-leading stamp, so an OLDER peer record won the
+# ordering compare and REPLACED a NEWER local one with `older_refused=0`, `conflicts=0`, exit 0 —
+# rule 1 inert. Reachable by any record that went through another serializer or a hand repair.
+echo "── §30d a whitespace-shaped record is read the same way the fast path reads it"
+ORIGIN9="$T/origin9.git"; STORE9="$T/store9"; BOX12="$T/box12"
+git init -q --bare "$ORIGIN9"; mkdir -p "$STORE9" "$BOX12"
+git -C "$STORE9" init -q; git -C "$STORE9" remote add origin "$ORIGIN9"
+git -C "$STORE9" config user.email sync@test.invalid; git -C "$STORE9" config user.name sync-test
+git -C "$STORE9" commit -q --allow-empty -m seed; git -C "$STORE9" push -q origin HEAD:refs/heads/main
+K_WS="daniel-ospina-agent-infra-2007"
+seed_payload "$STORE9" "$K_WS" "{\"pr\": 2007, \"head_sha\": \"$HEAD_A\", \"verdict\": \"clean\", \"repo\": \"daniel-ospina/agent-infra\", \"reviewed_at\": \"2026-11-13T10:00:00Z\"}"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d a pretty-printed peer record materialises (exit 0, not refused as unreadable)"
+assert_contains "$RS_LAST" "wrote=1" "§30d ...and it is WRITTEN, not skipped"
+assert_contains "$RS_LAST" "unreadable=0" "§30d ...with nothing counted unreadable"
+# and the file the box got is the peer's bytes, readable by the rail's own field expectations
+assert_eq "$(grep -c '"pr": 2007' "$BOX12/$K_WS.json")" "1" "§30d ...and the materialised file carries the peer's own bytes"
+
+# rule 1 against a whitespace-stamped local record: NEWER local must survive an OLDER peer
+K_WS2="daniel-ospina-agent-infra-2008"
+seed_payload "$STORE9" "$K_WS2" "{\"pr\":2008,\"head_sha\":\"$HEAD_A\",\"verdict\":\"not-clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{"pr": 2008, "head_sha": "%s", "verdict": "clean", "repo": "daniel-ospina/agent-infra", "reviewed_at": "2026-12-31T00:00:00Z"}' "$HEAD_B" > "$BOX12/$K_WS2.json"
+cp "$BOX12/$K_WS2.json" "$T/ws2.before"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d an older peer never costs the run its exit status"
+assert_contains "$RS_LAST" "older_refused=1" "§30d ...an OLDER peer record is REFUSED against a newer whitespace-stamped local one"
+assert_contains "$RS_LAST" "wrote=0" "§30d ...and nothing is written"
+if cmp -s "$BOX12/$K_WS2.json" "$T/ws2.before"; then
+  ok "§30d ...and the newer local record is left BYTE-IDENTICAL (rule 1 holds for whitespace JSON)"
+else
+  bad "§30d the newer local record was REWRITTEN — the ordering compare read a whitespace-prefixed stamp as older"
+fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do

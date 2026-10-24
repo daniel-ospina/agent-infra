@@ -256,7 +256,17 @@ g_hash_paths()    { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 hash-ob
 # its own fields back the same way, so a second JSON parser here would be a second definition of
 # the record's shape (the same reason that script's record_identity() is an exact-string compare).
 field() { # <file> <name>
-  sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | command head -1
+  # ⛔ WHITESPACE AFTER THE COLON IS VALID JSON. Without `[[:space:]]*` this sed returned
+  # ` 441` for `{"pr": 441, …}` and ` 2026-12-31T00:00:00Z` for a pretty-printed stamp, while the
+  # fast path (json.load) read `441`/the stamp correctly — so ONE record shape was "same" where a
+  # mirror existed and "unreadable"/exit 4 where it did not (measured), and a LEADING SPACE on a
+  # stamp sorts below any digit-leading stamp, which made the ordering compare decide "peer is
+  # newer" for an OLDER peer and overwrite a newer local record with no conflict and exit 0
+  # (measured: local `" 2026-12-31…"` clean was replaced by peer `2026-01-01…` not-clean). The
+  # `"name" : value` (space BEFORE the colon, also valid JSON) has the same shape. The trailing trim
+  # covers `{"pr":441 , …}`. A record field never legitimately carries outer spaces.
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null \
+    | command head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # ── what the CONSUMER can actually use ───────────────────────────────────────────────────
@@ -1073,8 +1083,17 @@ do_status() {
 }
 
 summary() { # <verb>
+  # ⛔ conflicts= counts DISTINCT RECORDS, not decisions. `union` runs pull and then push, so ONE
+  # divergent record is detected in both directions: the counter read conflicts=2 and the message
+  # listed the same key twice (measured), sending an operator to look for a second record that does
+  # not exist and doubling the number a scheduler trends.
+  local ccount="$CONFLICT" ckeys="$CONFLICT_KEYS"
+  if [ -n "$CONFLICT_KEYS" ]; then
+    ccount="$(printf '%s\n' $CONFLICT_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+    ckeys=" $(printf '%s\n' $CONFLICT_KEYS | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ *$//')"
+  fi
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
-    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$CONFLICT" "$UNKEYED" "$UNREADABLE" "$FAILED"
+    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$UNREADABLE" "$FAILED"
   # THE CONVERGENCE LINE (#2577). Printed LAST so a caller that greps `^<verb>:` for the tail (the
   # rail and the cell bring-up both do) reports the numbers a stalled sync makes visible, instead of
   # a breakdown that reads identical whether the 3,000 fleet records arrived or none did.
@@ -1092,8 +1111,8 @@ summary() { # <verb>
     fi
     return 1
   fi
-  if [ "$CONFLICT" -gt 0 ]; then
-    warn "registry-sync.sh: $CONFLICT record(s) DIVERGE at the same reviewed_at:$CONFLICT_KEYS"
+  if [ "$ccount" -gt 0 ]; then
+    warn "registry-sync.sh: $ccount record(s) DIVERGE at the same reviewed_at:$ckeys"
     return 3
   fi
   if [ "$UNREADABLE" -gt 0 ]; then
