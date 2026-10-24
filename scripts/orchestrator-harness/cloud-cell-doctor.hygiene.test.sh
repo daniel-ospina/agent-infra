@@ -207,6 +207,20 @@ mk_tmpdir() { # <name> <age: touch -t form> -> path
   printf '%s' "$d"
 }
 
+# ⛔ RELATIVE AGES BY EPOCH, NOT BY A WALL-CLOCK ROUND TRIP (review round 6, P2). `touch -t` parses an
+# `[[CC]YY]MMDDhhmm` stamp in the HOST zone, and a stamp that lands inside a DST-REPEATED hour resolves
+# to whichever offset libc picks — measured under Europe/Madrid: a `now − 600 s` stamp resolved 3600 s
+# into the future, so the doctor computed a NEGATIVE age and the "10 minutes ago" fixture behaved as
+# "in the future". `os.utime` sets the instant directly, so no zone, offset or fold can move it.
+mk_tmpdir_ago() { # <name> <seconds-ago> -> path
+  local d="$T/tmp/$1"
+  mkdir -p "$d"; printf 'x\n' > "$d/f"
+  python3 -c 'import os,sys,time
+t = time.time() - float(sys.argv[1])
+for p in sys.argv[2:]: os.utime(p, (t, t))' "$2" "$d" "$d/f"
+  printf '%s' "$d"
+}
+
 # ── the worktree fixture: real git, real gates ──────────────────────────────────────────────────
 mk_repo() {
   mkdir -p "$T/repo"
@@ -294,7 +308,7 @@ LIVE="$$"                                   # this suite's own pid: alive for th
 mk_tmpdir "cloud-cell-${LIVE}.BBBB" "$ANCIENT" >/dev/null      # alive pid, ancient mtime
 mk_tmpdir "cloud-cell-test.CCCC"    "$ANCIENT" >/dev/null      # no pid in the name
 DEAD2="$(dead_pid)"
-mk_tmpdir "cloud-cell-${DEAD2}.DDDD" "$(date +%Y%m%d%H%M)" >/dev/null   # dead pid, but FRESH
+mk_tmpdir_ago "cloud-cell-${DEAD2}.DDDD" 0 >/dev/null                   # dead pid, but FRESH
 printf '1\n' > "$T/docker/info_rc"
 printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' \
   > "$T/docker/info_err"
@@ -492,18 +506,16 @@ say_case "the temp idle floor is honoured at the value the operator set (HYGIENE
 # registry cites for HYGIENE_TMP_MIN_AGE_S (extensions/shared/heartbeat-progress-edges.ts).
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
 DEAD7="$(dead_pid)"
-# ⛔ LOCAL time, not UTC (review round 5): `touch -t` reads its stamp in the HOST'S zone, so a UTC
-# stamp is off by the offset — 10 minutes ago in UTC is 1 h 10 min in the future under CEST, and under
-# a negative offset it is hours old, flipping the two assertions below in opposite directions. Measured:
-# TZ=Europe/Madrid → FAIL=1, TZ=America/New_York → FAIL=1, TZ=UTC → 77/0. `fromtimestamp` (local) is
-# the zone `touch` will use.
-TEN_MIN_AGO="$(python3 -c 'import datetime,time;print(datetime.datetime.fromtimestamp(time.time()-600).strftime("%Y%m%d%H%M"))')"
-mk_tmpdir "cloud-cell-${DEAD7}.LLLL" "$TEN_MIN_AGO" >/dev/null
+# ⛔ The stamp is set by EPOCH (`mk_tmpdir_ago`), not by a wall-clock round trip: round 5 fixed a UTC
+# stamp that `touch -t` read as local, and round 6 found the residual — a `now − 600 s` stamp can land
+# inside a DST-REPEATED hour and resolve to the other offset (measured: +3600 s, so a "10 minutes ago"
+# dir read as being 3000 s in the FUTURE). Epoch arithmetic has no zone to get wrong.
+mk_tmpdir_ago "cloud-cell-${DEAD7}.LLLL" 600 >/dev/null
 HYGIENE_TMP_MIN_AGE_S=60 doc hygiene
 [ -e "$T/tmp/cloud-cell-${DEAD7}.LLLL" ] \
   && bad "temp: a dir 10 min old survived a 60 s floor (the floor is not read from HYGIENE_TMP_MIN_AGE_S)" \
   || ok "temp: under a 60 s floor the 10-min-old dir is reclaimed (the floor is read from the environment)"
-mk_tmpdir "cloud-cell-${DEAD7}.NNNN" "$TEN_MIN_AGO" >/dev/null
+mk_tmpdir_ago "cloud-cell-${DEAD7}.NNNN" 600 >/dev/null
 HYGIENE_TMP_MIN_AGE_S=3600 doc hygiene
 [ -e "$T/tmp/cloud-cell-${DEAD7}.NNNN" ] \
   && ok "temp: under a 3600 s floor the SAME age is KEPT (the floor is a real gate, not decoration)" \
