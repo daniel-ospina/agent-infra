@@ -165,7 +165,6 @@ run() { # <verb> [extra argv…]
           BRINGUP_LOG="$BRINGUP_LOG" REFRESH_LOG="$REFRESH_LOG" \
           REFRESH_RELATION="${REFRESH_RELATION:-current}" BRINGUP_START_RC="${BRINGUP_START_RC:-0}" \
           HU_FORK_LIMITS_FILE="${FORKFILE:-$TMP/fork-generous}" \
-          CAP_FORK_LIMITS_FILE="${CAPFORK:-$TMP/fork-generous}" \
           HU_LANE_SILENT="${LANESILENT:-2400}" HU_NEXT_STALE="${NEXTSTALE:-900}" \
           bash "$SCRIPTS/harness-up" "$_v" --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" "$@" 2>&1 )"
   RC=$?
@@ -207,6 +206,26 @@ ck "(A) a generous fork limit does not bind (binding is load/disk, not fork)" \
    "$(! has "$cap_row" 'binding=fork' && { has "$cap_row" 'binding=load' || has "$cap_row" 'binding=disk'; } && echo 0 || echo 1)"
 ck "(A) …and fork headroom is still printed with its number (reported, never omitted)" \
    "$(has "$cap_row" 'fork headroom=3397 (' && echo 0 || echo 1)"
+
+# ⛔ `unbounded` IS A READING, NOT A ZERO. `procs_max=0` means NO CEILING WAS FOUND, and the row must
+# say so: `by fork=0` would tell an operator that the box with no process limit can place zero lanes —
+# a fabricated number in the one place this file forbids them. It must also NOT bind.
+cat > "$HARNESS/capacity.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  probe) printf 'host=fixture ncpu=4 load1=400 lpc=100 lanes=0 disk_free_mb=90000 mem_free_mb=4000 procs=400 procs_max=0 fork=0 at=%s\n' "$(date +%s)" ;;
+  fork)  printf 'procs=400 procs_max=0 fork=0 src=unbounded headroom=unbounded min_fork_headroom=200\n' ;;
+  *)     exit 2 ;;
+esac
+SH
+chmod +x "$HARNESS/capacity.sh"
+run status
+cap_row="$(row capacity)"
+ck "(A) an UNBOUNDED fork ceiling prints unbounded, never 0 (a ceiling that does not exist cannot bind)" \
+   "$(has "$cap_row" 'by fork=unbounded' && lacks "$cap_row" 'by fork=0' && echo 0 || echo 1)"
+ck "(A) …and it does not bind (binding is load/disk, not fork)" \
+   "$(lacks "$cap_row" 'binding=fork' && echo 0 || echo 1)"
+rm -f "$HARNESS/capacity.sh"
 
 # ⛔ UNMEASURABLE IS NOT UNLIMITED: neither the record nor the shim can answer → REFUSED.
 OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \

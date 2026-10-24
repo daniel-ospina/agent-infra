@@ -21,9 +21,10 @@
 #          and then the launcher's OWN checkout; a candidate that is not a checkout ROOT is skipped.
 #          An unusable `--repo` REFUSES, naming the value; an unusable inherited candidate is skipped.
 #   Capacity knobs (all MEASUREMENTS, none a cap), in the order they bind:
-#     fork headroom  HU_FORK_RESERVE (800 tasks kept free) and HU_FORK_PER_LANE (40 tasks a lane's
-#                    process tree holds) — read FIRST because a box can fork nothing at 0.32x load
-#                    (#2293) while load and disk both read healthy;
+#     fork headroom  HU_FORK_RESERVE (default: the instrument's own `min_fork_headroom` — 200 today)
+#                    and HU_FORK_PER_LANE (40 tasks a lane's process tree holds) — read FIRST, before
+#                    any probe that must fork, because a box can fork nothing at 0.32x load (#2293)
+#                    while load and disk both read healthy;
 #     disk           HU_DISK_PER_LANE_MB (1100), HU_DISK_FLOOR_MB (500);
 #     load           HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to capacity.sh's
 #                    CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units).
@@ -1412,7 +1413,29 @@ hu_capacity() {
   local load1="" ncpu="" dfree="" probe="shim" rec="" capsh="$SELF_PATH/orchestrator-harness/capacity.sh"
   local ceil percpu perlanes loadlanes dpath diskfloor diskcost avail disklen lanes now fixed="none"
   local forkhead="" forksrc="" forkreserve="" forklane="" forkavail="" forklanes="" forkbound=1 binding="" fr=""
-  local fmin="" frh="" frc=0
+  local fmin="" frh="" frc=0 forklanes_txt=""
+  # ── FORK HEADROOM IS READ **FIRST**, BEFORE ANY PROBE THAT MUST FORK TO ANSWER ────────────────
+  # (#2293, and the same ordering lesson `capacity.sh:477-481` records for itself.) This dimension is
+  # the one whose failure is TOTAL — a box at 0.32x load, or one whose cgroup pids ceiling is 4x
+  # tighter than RLIMIT_NPROC, can fork nothing while load and disk both read comfortable. So it is
+  # measured before `capacity.sh probe` and before `hp_load1_c`/`hp_ncpu`, because EVERY one of those
+  # forks: on a box that cannot fork they fail too, and the earlier refusals would then report
+  # `load_unreadable` — naming the loadavg and pointing the operator at the wrong fault — before the
+  # fork read was ever attempted. The true answer on such a box is "this box cannot fork".
+  # ⛔ capacity.sh IS THE ONE INSTRUMENT, AND ITS `fork` VERB IS THE READING ALONE. The #2552 batch
+  # landed the fork read on main while this branch was in review, under a DIFFERENT record schema
+  # (`procs=`/`procs_max=`/`fork=`/`src=`) than this branch had invented (`fork_headroom=`). A branch
+  # cannot win that: two publishers under one `refs/boxes` namespace is the defect, not the field name,
+  # so the RECORD is main's and this launcher CONSUMES it. Deriving `procs_max − procs` here would be a
+  # second implementation of `cap_h_for`'s arithmetic, so the verb answers with `headroom=` already
+  # computed there — and `min_fork_headroom=` carries the fleet's declared margin, so this file cannot
+  # invent a second one either.
+  if [ -f "$capsh" ]; then
+    fr="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" fork 2>/dev/null)"; frc=$?
+    # 254 is capacity.sh's own "THE READ COULD NOT FORK" (bash terminates on a failed fork): the box
+    # is out of pids, which is the TOTAL failure this dimension exists for. Name it, do not retry.
+    [ "$frc" -eq 254 ] && { printf 'capacity_refused reason=fork_exhausted probe=capacity.sh\n'; return 3; }
+  fi
   # ── the reading: capacity.sh's record first, the shim probes as the fallback ────────────────────
   if [ -f "$capsh" ]; then
     # ⛔ BOUNDED, and a FAILED probe is not a reading: a `capacity.sh` that cannot answer leaves the
@@ -1438,26 +1461,10 @@ hu_capacity() {
   [ -n "$load1" ] || { printf 'capacity_refused reason=load_unreadable probe=%s\n' "$probe"; return 3; }
   [ -n "$ncpu" ]  || { printf 'capacity_refused reason=ncpu_unreadable probe=%s\n' "$probe"; return 3; }
   # ── fork headroom: THE FIRST DIMENSION, because it is the one whose failure is TOTAL ───────────
-  # measured on this box 2026-10-22: cgroup pids 1295/4692 (3397 spare) against RLIMIT_NPROC 15641 and
-  # threads-max 31282 — the cgroup was 4x tighter than the kernel's limit and would have bound
-  # silently, since load (2.52 on 8 cpu) and disk (82 GB free) both read comfortable. #2293 is the
-  # same shape at 0.32x load. The record's own field is consumed first (one instrument: capacity.sh),
-  # and the shim is the fallback for a box with no capacity.sh beside the launcher — the record names
-  # which answered, so a fallback can never pass as the fleet instrument.
-  # ⛔ capacity.sh IS THE ONE INSTRUMENT, AND ITS `fork` VERB IS THE READING ALONE. The #2552 batch
-  # landed the fork read on main while this branch was in review, under a DIFFERENT record schema
-  # (`procs=`/`procs_max=`/`fork=`/`src=`) than this branch had invented (`fork_headroom=`). A branch
-  # cannot win that: two publishers under one `refs/boxes` namespace is the defect, not the field name,
-  # so the RECORD is main's and this launcher CONSUMES it. Deriving `procs_max − procs` here would be a
-  # second implementation of `cap_h_for`'s arithmetic, so the verb answers with `headroom=` already
-  # computed there — and `min_fork_headroom=` carries the fleet's declared margin, so this file cannot
-  # invent a second one either.
-  if [ -f "$capsh" ]; then
-    fr="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" fork 2>/dev/null)"; frc=$?
-    # 254 is capacity.sh's own "THE READ COULD NOT FORK" (bash terminates on a failed fork): the box
-    # is out of pids, which is the TOTAL failure this dimension exists for. Name it, do not retry.
-    [ "$frc" -eq 254 ] && { printf 'capacity_refused reason=fork_exhausted probe=capacity.sh\n'; return 3; }
-  fi
+  # (READ ABOVE, before the load/ncpu/disk probes: those fork to answer, so their refusals would
+  # otherwise fire first on the very box this dimension exists for.) The shim is the fallback for a
+  # box with no capacity.sh beside the launcher — the record names which answered, so a fallback can
+  # never pass as the fleet instrument.
   case "$fr" in
     *[[:space:]]headroom=*)
       frh="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]headroom=\([^ ]*\).*/\1/p' | head -1)"
@@ -1515,9 +1522,8 @@ hu_capacity() {
   # A lane's process tree, and the tasks a box must keep for itself. 40 is a MEASUREMENT-shaped
   # default, not a round number: one `pi` holds 11 threads on this Linux box (`ps -eo comm,nlwp`), and
   # a lane adds its shell, the worker terminal, `gh`/`git` calls and — for a test lane — a pytest or
-  # `uv sync` tree. 800 kept free is ~20 idle lanes' worth, and is the cushion a fork storm eats first
-  # (#2304: 3.4k processes from one recursion). Both are knobs because both are measurements of a
-  # WORKLOAD, not caps.
+  # `uv sync` tree. Both are knobs because both are measurements of a WORKLOAD, not caps — but only
+  # `HU_FORK_PER_LANE` is a workload number here: the reserve is the fleet's declared margin (below).
   # ⛔ THE RESERVE IS THE FLEET'S DECLARED MARGIN, NOT A SECOND ONE. `min_fork_headroom` IS
   # `CAP_MIN_FORK_HEADROOM` in capacity.sh (200) — the number the fleet's own placement gate refuses
   # on. This launcher defaulting to its own 800 would mean two readers disagree about one reading, so
@@ -1530,10 +1536,14 @@ hu_capacity() {
   if [ "$forkhead" = unbounded ]; then
     # No ceiling found => this dimension cannot bind. `forkbound=0` is what the derivation reads; the
     # numbers are left at 0 and are NEVER compared, so an unbounded box cannot read as "0 lanes".
-    forkbound=0; forkavail=0; forklanes=0
+    # ⛔ AND THE ROW MUST NOT PRINT THAT 0 EITHER: `lanes_by_fork=0` renders as `by fork=0`, which to a
+    # reader says the box with NO process ceiling can place zero lanes — a fabricated number in the
+    # one place this file forbids them. The word rides in its own field so the reader can tell "not a
+    # constraint" from "a constraint with no room".
+    forkbound=0; forkavail=0; forklanes=0; forklanes_txt="unbounded"
   else
     forkavail=$(( 10#$forkhead > 10#$forkreserve ? 10#$forkhead - 10#$forkreserve : 0 ))
-    forklanes=$(( forkavail / 10#$forklane ))
+    forklanes=$(( forkavail / 10#$forklane )); forklanes_txt="$forklanes"
   fi
   # ── the derivation, IN THE ORDER THE DIMENSIONS FAIL: fork (total), disk (total, and the one that
   # breaks a box first in practice), load (soft). `binding=` names WHICH one produced the number, so a
@@ -1548,7 +1558,7 @@ hu_capacity() {
     "$(uname -n 2>/dev/null || printf 'unknown')" \
     "$(awk -v c="$load1" 'BEGIN{printf "%.2f", c/100}')" "$ncpu" \
     "$(awk -v c="$ceil" 'BEGIN{printf "%.2f", c/100}')" \
-    "$dfree" "$loadlanes" "$disklen" "$forklanes" "$forkhead" "${forksrc:-unknown}" "$binding" "$lanes" "$fixed" "$probe" "${now:-0}"
+    "$dfree" "$loadlanes" "$disklen" "$forklanes_txt" "$forkhead" "${forksrc:-unknown}" "$binding" "$lanes" "$fixed" "$probe" "${now:-0}"
   return 0
 }
 
@@ -1575,7 +1585,9 @@ hu_row_capacity() {
   binding="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]binding=\([a-z]*\).*/\1/p' | head -1)"
   lb_load="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_load=\([0-9]*\).*/\1/p' | head -1)"
   lb_disk="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_disk=\([0-9]*\).*/\1/p' | head -1)"
-  lb_fork="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_fork=\([0-9]*\).*/\1/p' | head -1)"
+  # `[^ ]*`, not `[0-9]*`: `unbounded` is a legitimate reading and must print as itself — the same
+  # rule the `fork_headroom=` parse beside it already follows.
+  lb_fork="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_fork=\([^ ]*\).*/\1/p' | head -1)"
   case "$lanes" in ''|*[!0-9]*) hu_row capacity - - "UNKNOWN (the decision ran but its lane count cannot be parsed: $rec)"; return 2 ;; esac
   # The reading rides IN THE ROW: a lane count with no fork/disk/load beside it is the tidy display
   # this rule forbids, and a reader could not tell a measured 12 from a pinned 8. The dimensions are
@@ -1597,6 +1609,7 @@ hu_row_capacity() {
 # that names a probe, not a remedy; the sentence says what is missing and that a cap is not the answer.
 hu_cap_reason_txt() {
   case "${1:-}" in
+    fork_exhausted) printf 'this box COULD NOT FORK AT ALL (capacity.sh answered 254 — EAGAIN) — the remedy is EXTERNAL: restart or drain it; nothing inside it can be cleaned up, and a fixed lane cap is not a measurement' ;;
     fork_unreadable) printf 'the fork/task headroom could not be measured (ulimit -u, /proc/sys/kernel/threads-max, cgroup pids.max, kern.maxproc all unreadable) — a box that cannot prove it can fork must not be given lanes, and a fixed lane cap is not a measurement' ;;
     load_unreadable) printf 'the 1-min load average could not be read (/proc/loadavg and sysctl vm.loadavg both failed) — a fixed lane cap is not a measurement' ;;
     ncpu_unreadable) printf 'the CPU count could not be read (nproc, sysctl hw.ncpu and getconf all failed) — a fixed lane cap is not a measurement' ;;
@@ -1739,13 +1752,13 @@ hu_row_selftest() {
 # operator's deliberate `harness-down` then `harness-up`, never a side effect of asking for status).
 HU_HEAL_NOTE=""
 hu_heal() {
-  local st rel
+  local st rel started=0
   st="$(hu_row_state loop)"
   case "$st" in
     MISSING*)
       say "heal: the controller is NOT running — starting it (nothing live is interrupted; lanes are separate workers)"
       if hu_start_loop; then HU_HEAL_NOTE="$HU_HEAL_NOTE
-HEAL: started a controller that was not running"
+HEAL: started a controller that was not running"; started=1
       else HU_HEAL_NOTE="$HU_HEAL_NOTE
 HEAL FAILED: the controller still is not running (see above)"; fi ;;
     DUPLICATE*)
@@ -1773,8 +1786,15 @@ HEAL FAILED: the pin is still behind (see above)"; fi ;;
       case "$(hu_row_state loop)" in
         OK*) HU_HEAL_NOTE="$HU_HEAL_NOTE
 NOT HEALED: the pin is AHEAD of the running tree (restart-pending) — closing it requires dropping the running controller; run 'harness-down' then 'harness-up', deliberately" ;;
-        *)   HU_HEAL_NOTE="$HU_HEAL_NOTE
-STALE RECORD: relation=restart-pending describes the LAST controller, and no controller is running now — the loop row is the live answer" ;;
+        # ⛔ THE ROWS ARE THE PRE-HEAL SET, so "nothing is running" may already be false BY THIS PASS's
+        # OWN ACTION: if the MISSING arm above started a controller, the pending restart was closed by
+        # that start, and repeating "no controller is running now" would contradict the note printed a
+        # few lines earlier — the "a recorded relation is not a live state" inversion this block exists
+        # to close, re-introduced by reading a stale row set.
+        *)   if [ "$started" -eq 1 ]; then HU_HEAL_NOTE="$HU_HEAL_NOTE
+STALE RECORD CLEARED: relation=restart-pending described the controller that had STOPPED; this pass started one, so the pending restart is closed by that start (re-read the table above for the live row)"
+             else HU_HEAL_NOTE="$HU_HEAL_NOTE
+STALE RECORD: relation=restart-pending describes the LAST controller, and no controller is running now — the loop row is the live answer"; fi ;;
       esac ;;
   esac
   HU_HEAL_NOTE="$(printf '%s' "$HU_HEAL_NOTE" | sed '/^$/d')"
@@ -1785,6 +1805,7 @@ STALE RECORD: relation=restart-pending describes the LAST controller, and no con
 hu_row_state() { printf '%s' "$HU_ROWS" | awk -F'|' -v n="${1:-}" '$1==n {print $4; exit}'; }
 
 
+# The divergence row delegates to the ONE instrument that owns that question (agent-infra#1745's
 # check-deployed-drift.sh). This file never grows a second copy of it.
 hu_row_drift() {
   local rc log="$HU_TMP/drift.log"

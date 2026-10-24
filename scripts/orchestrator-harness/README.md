@@ -1518,10 +1518,16 @@ of a previous run:
 load — #2293 — while load and disk read healthy), then disk (what breaks a box first in practice),
 then load. `lanes_by_fork` / `lanes_by_disk` / `lanes_by_load` are all computed and the smallest wins;
 `binding=` names which one did, so "the box could not fork" and "the box is busy" stop printing as one
-lane count. `capacity.sh` (the fleet instrument) supplies `fork_headroom`/`fork_source` when it is
-beside the launcher; the shim in `harness-up` is the documented fallback and the row names which one
-answered (`via=`). An **unmeasurable** fork limit refuses the start — "I could not look" is never
-spent as "there is room".
+lane count. `capacity.sh` (the fleet instrument) answers the `fork` verb with `headroom=` and
+`min_fork_headroom=` (plus `src=` naming the limit that bounded it: `uid`/`cgroup`/`unbounded`), and
+those are the only fork names it publishes; `harness-up` re-labels them `fork_headroom`/
+`fork_source` in its OWN decision record, which is a launcher field, not a capacity one. A box where
+no ceiling could be found reads `unbounded`, which prints as `unbounded` — never as `0`, which would
+say no ceiling permits no lanes. The shim in `harness-up` is the documented fallback when
+`capacity.sh` is not beside the launcher, and the row names which one answered (`via=`). An
+**unmeasurable** fork limit refuses the start — "I could not look" is never spent as "there is room"
+— and a box that could not fork at all is refused by name (`fork_exhausted`), because its remedy is
+external to it.
 
 **Status heals**, by default (`--no-heal` for a pure read), and only the two repairs that are safe
 while lanes work: a controller that is **not running** is started (nothing live is interrupted), and a
