@@ -1301,19 +1301,52 @@ for shape in unparseable-pid no-identity-record; do
 done
 reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
 
-# ── 19) THE LOOP SURVIVES ITS FIRST TICK, AND AN ABSENT MODE IS A LIVE PASS (agent-infra#2424) ────
-# ⛔ THE BUG THIS CASE EXISTS FOR: `run_loop` dispatches `run_role_pass doctor` with NO mode
-# argument, so `"$@"` expanded to nothing and every role's `local dry="$1"` read an UNBOUND `$1`
-# under `set -u` — the loop DIED on its first tick, every tick, on every cell, and nothing recorded
-# it (`doctor` is first in the tick, so it crashed; `reap`/`merge`/`hygiene` carried the same latent
-# bug). The `.desired`-absent fixture above could NOT see it: that loop exits BEFORE its first
-# dispatch, which is exactly why the crash survived three recorded instances on cell-4.
-# ⛔ A SUBCOMMAND-DRIVING test is VACUOUS here: the CLI always binds `$1` (to ""), so only driving
-# `loop` exercises the ABSENT-argument shape. And "it did not crash" is not the criterion either —
-# a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE pass.
-say_case "loop: the first tick dispatches, and an absent mode is a LIVE pass (#2424)"
+say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick and every role's DIRECT entry (#2135/#2424)"
+# ⛔ THE BUG THESE CASES EXIST FOR. `run_loop` USED TO dispatch `run_role_pass doctor|merge|hygiene`
+# with NO mode argument; `run_role_pass` forwards `"$@"`, so each role's `local dry="$1"` read an
+# UNBOUND `$1` under `set -u` and the loop DIED on its first tick — every tick, on every cell
+# (`cloud-cell-doctor.sh: line 1385: $1: unbound variable`). Doctor is first, so it crashed; reap,
+# merge and hygiene carried the identical latent crash. The suite above never saw it because its loop
+# fixture has no `.desired` and quenches BEFORE the first dispatch, and because every CLI verb binds
+# `$1` (to "") — so only the absent-mode call shape the scheduler used was fatal.
+# ⛔ THE LOOP IS NO LONGER THE DISCRIMINATOR, AND THIS SUITE MUST NOT PRETEND IT IS. #2424 shipped
+# TWICE: this branch defaults the mode in each role (`local dry="${1:-}"`), while #2555 landed
+# separately and made the loop bind it explicitly (`run_role_pass doctor ""`). Both fixes are in the
+# merged tree, so Arm A below can no longer drive an unbound `$1` on its own — Arms B and D, which
+# call the roles DIRECTLY with no argument, are what pin the absent shape now; Arm C pins it in the
+# SOURCE (it classifies `local` reads, it never calls a role). Arm A still earns its place: it pins
+# that every derived role records a LIVE pass on the loop's real tick.
+#
+# ⛔ THE ROLE SET IS DERIVED FROM THE DISPATCHER, NEVER SPELLED HERE. A hardcoded list covers the four
+# roles that exist today and silently ignores the fifth: a new role added to `run_role_pass` with a
+# bare `"$1"` (or with a non-empty default such as `"${1:---dry-run}"`) would crash — or, worse,
+# rehearse while the fleet believes the work was attempted — with this suite still green.
+ROLES="$(awk '/^run_role_pass\(\) \{/,/^\}/' "$DOCTOR" \
+         | sed -nE 's/^[[:space:]]*([A-Za-z][A-Za-z0-9_-]*)\)[[:space:]]*run_([A-Za-z0-9_]+).*/\1 \2/p')"
+ROLE_N="$(printf '%s\n' "$ROLES" | grep -c . || true)"
+if [ "${ROLE_N:-0}" -ge 4 ]; then
+  ok "roles: derived $ROLE_N dispatched role(s) from run_role_pass: $(printf '%s' "$ROLES" | awk '{printf "%s ", $1}')"
+else
+  bad "roles: found ${ROLE_N:-0} role arm(s) in run_role_pass — the derivation is broken, so every arm below is vacuous"
+fi
+# The derived name must BE the function the dispatcher calls, or the arms below would exercise a
+# function that is not wired to the role at all.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  if grep -qE "^[[:space:]]*run_${_f}\(\)([[:space:]]*\{|[[:space:]]*$)" "$DOCTOR"; then
+    ok "roles: '${_r}' dispatches run_${_f}, which the script defines"
+  else
+    bad "roles: '${_r}' dispatches run_${_f}, which the script does NOT define — the derivation is wrong"
+  fi
+done <<<"$ROLES"
+
+# Arm A — the loop on a STARTED cell: no abort, and EVERY derived role records a pass.
+# ⛔ It owns its fixture. Measured false red without this: a `rail/sleep` left by an earlier case
+# (case 5 sets one to 2s) truncates the tick inside the 6s bound and this arm then reports the two
+# #2424 strings — "role 'merge' recorded NO pass" — for a doctor that is completely correct.
 reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
-: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not exit
+rm -f "$T"/gh/* "$T"/rail/* "$T"/sup/* "$T"/uv/* "$T"/wt/* 2>/dev/null || true
+: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not quench
 : > "$T/tmux/sessions"
 OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
        timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
@@ -1321,20 +1354,501 @@ case "$OUT" in
   *"unbound variable"*) bad "loop: DIED on its first tick (the #2424 abort) — $OUT" ;;
   *)                    ok "loop: the first tick dispatches with no unbound-variable abort" ;;
 esac
-for r in reap doctor merge hygiene; do
-  st="$T/o/state/roles/$r.state"
-  if [ ! -f "$st" ]; then bad "loop: role '$r' recorded NO pass (its state file is missing)"; continue; fi
+result_has "loop started" && ok "loop: it recorded the tick ('loop started')" \
+  || bad "loop: no 'loop started' line — $OUT"
+# "The loop survived" is NOT the acceptance: a loop that schedules nothing has fixed nothing.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  st="$T/o/state/roles/${_r}.state"
+  if [ ! -f "$st" ]; then bad "loop: role '${_r}' recorded NO pass (its state file is missing)"; continue; fi
   p="$(sed -n 's/^passes=//p' "$st")"
-  res="$(sed -n 's/^last_result=//p' "$st")"
-  { [ -n "$p" ] && [ "$p" -ge 1 ]; } \
-    && ok "loop: role '$r' recorded a pass (passes=$p)" \
-    || bad "loop: role '$r' recorded passes='${p}' — it never completed a pass"
-  case "$res" in
-    *"a rehearsal"*) bad "loop: role '$r' ran as a REHEARSAL (dry-run branch) with no flag — $res" ;;
-    *)               ok "loop: role '$r' ran LIVE (absent mode ≠ --dry-run)" ;;
+  { [ -n "$p" ] && [ "$p" -ge 1 ]; } && ok "loop: role '${_r}' recorded a pass (passes=$p)" \
+    || bad "loop: role '${_r}' recorded passes='${p}' — it never completed a pass"
+  # What this READS is exactly what it says: the record is not MARKED as a rehearsal. It is not the
+  # only guard — a rehearsal that exits on cannot-verify writes an UNMARKED record, so "empty means
+  # live" is pinned by the VALUE rule in arm C and proven behaviourally in arm D, not by this string.
+  case "$(sed -n 's/^last_result=//p' "$st")" in
+    *"a rehearsal"*) bad "loop: role '${_r}' recorded a REHEARSAL with no flag — empty must mean LIVE" ;;
+    *)               ok "loop: role '${_r}' did not record a rehearsal (the record is not marked as one)" ;;
+  esac
+done <<<"$ROLES"
+
+# Arm B — every role entry point called with NO ARGUMENT AT ALL, sourced from the script's own
+# define-only prelude so `set -u` is the FILE's, not the suite's. Arm A can only reach the roles the
+# tick dispatches, and every CLI verb binds `$1`, so the absent shape has to be driven directly —
+# this arm does it for every derived role, and Arm D does it for one (`bash -u -c … run_reap`).
+PRELUDE="$T/doctor-funcs.sh"
+CASELINE="$(grep -n '^case "${1:-status}" in$' "$DOCTOR" | head -1 | cut -d: -f1)"
+if [ -n "$CASELINE" ] && [ "$CASELINE" -gt 100 ]; then
+  head -n "$((CASELINE - 1))" "$DOCTOR" > "$PRELUDE"
+  ok "bare-entry: the define-only prelude was extracted ($((CASELINE - 1)) lines of the doctor, everything before the CLI dispatch at $CASELINE)"
+else
+  bad "bare-entry: could not find the CLI dispatch line — this arm cannot run (head=-n '${CASELINE}')"
+fi
+# ⛔ NON-VACUITY: an empty or truncated prelude would make every call below "command not found" (rc
+# 127) and read as a pass. Prove each function exists before trusting any result.
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  if [ -s "$PRELUDE" ] && bash -c "source '$PRELUDE'; declare -F run_${_f} >/dev/null" 2>/dev/null; then
+    ok "bare-entry: run_${_f} is defined by the extracted prelude"
+  else
+    bad "bare-entry: run_${_f} is NOT defined by the prelude — the arm below would be vacuous"
+  fi
+done <<<"$ROLES"
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+  # No `.desired`: the doctor arm then takes its "cell is not started" path instead of starting a
+  # controller. The abort being pinned happens on the FIRST line of each role, before any of that.
+  OUT="$(bash -u -c "source '$PRELUDE'; run_${_f}" 2>&1)"; RC=$?
+  case "$OUT" in
+    *"unbound variable"*) bad "bare-entry: run_${_f} with NO argument DIED on an unbound variable — $OUT" ;;
+    *) ok "bare-entry: run_${_f} with NO argument returns (rc=$RC) instead of dying on \${1}" ;;
+  esac
+done <<<"$ROLES"
+
+# Arm C — the CLASS, not the four lines. Every `local` assignment that READS a positional must be
+# classified, and the classification is by VALUE:
+#   * `"${N:-}"`      → DEFAULTED to the empty string: absent means the caller's empty value;
+#   * `"${N:-<any>}"` → REJECTED: a default here would invent a mode (a rehearsal would arm itself);
+#   * bare `$N`       → permitted only when the (ENCLOSING FUNCTION, bound name) pair is one of the
+#                       REQUIRED reads the audit block documents (an empty role/pid/head is never a
+#                       safe value).
+# ⛔ THE KEY IS `function:name`, NEVER THE NAME ALONE (review P1). A name-keyed allowlist grandfathers
+# the next `local s="$1"` ANYWHERE in the file: `s`, `rc`, `d` and `role` are the commonest locals
+# here and are already reused across helpers, so a brand-new function reusing one of those names
+# passed the walk with a ✅ and no decision was ever made — the exact false PASS this case exists to
+# prevent. The suite pins the negative direction (`function:s` under a function not on the list).
+# ⛔ THE CLASSIFIER IS A FUNCTION so the scanner itself can be tested: a shape-whitelist that cannot
+# see `local dry="${1}"` (or `local x="$1/$2"`) reports "clean" over the exact crash, which is the
+# fail-open shape this case exists to prevent. Both were measured blind in an earlier revision.
+# ⛔ THE VERDICT COMES FROM THE READ, NOT FROM WHAT SURROUNDS IT (review P2). The bucket used to be
+# decided by whether the value was EXACTLY the positional, so `local dry="$1 "` and `local x="$1$2"`
+# were filed `derived` — ungraded ✅ notes — even though both are bare reads that die on an absent
+# argument. `derived` is now an ANNOTATION printed under the verdict (the value embeds the positional
+# in a path or a concatenation), never a bucket that suppresses grading.
+# ⛔ THE COMMENT STRIP IS QUOTE-AWARE, AND QUOTE TRACKING MUST MODEL `$( )` (review P1, twice).
+# Stripping at the first whitespace-plus-`#` truncated a value that CONTAINS that sequence
+# (`local what="reap #$1 lane"`): the read vanished from the SCAN and from the COUNT in one stroke, so
+# no record and no `unparsed` — PASS identical to baseline over a binding that dies under `set -u`.
+# A simple quote TOGGLE then failed the same way one level down: in
+# `local ok="$(printf %s " #pad")" n="$1"` the inner quote closes the toggle, but bash re-quotes
+# INSIDE `$( )`, so the strip fired and the line produced no record at all. This is therefore a state
+# machine with a DEPTH STACK: entering `$( )` saves the quoting state and starts unquoted, and the
+# matching `)` restores it. A `#` is a comment only at depth 0, unquoted, preceded by whitespace.
+# The program is written once to a file because it needs both quote characters, which cannot be nested
+# inside the shell's own quoting without becoming unreadable.
+STRIP_AWK="$T/strip-comment.awk"
+cat > "$STRIP_AWK" <<'AWK'
+{
+  out = ""; q = ""; depth = 0; n = length($0); i = 1
+  while (i <= n) {
+    c = substr($0, i, 1)
+    if (q == "'") { out = out c; if (c == "'") q = ""; i++; continue }
+    if (c == "\\" && q != "'") { out = out c substr($0, i + 1, 1); i += 2; continue }
+    if (q == "\"") {
+      if (c == "\"") { q = ""; out = out c; i++; continue }
+      if (c == "$" && substr($0, i + 1, 1) == "(") { stk[depth] = q; depth++; q = ""; out = out "$("; i += 2; continue }
+      out = out c; i++; continue
+    }
+    if (q == "`") { out = out c; if (c == "`") q = ""; i++; continue }
+    if (c == "\"") { q = "\""; out = out c; i++; continue }
+    if (c == "'") { q = "'"; out = out c; i++; continue }
+    if (c == "`") { q = "`"; out = out c; i++; continue }
+    if (c == "$" && substr($0, i + 1, 1) == "(") { stk[depth] = q; depth++; out = out "$("; i += 2; continue }
+    if (c == ")" && depth > 0) { depth--; q = stk[depth]; out = out c; i++; continue }
+    if (c == "#" && i > 1 && substr($0, i - 1, 1) ~ /[ \t]/ && depth == 0) break
+    out = out c; i++
+  }
+  print out
+}
+AWK
+strip_comment() { printf '%s\n' "$1" | awk -f "$STRIP_AWK"; }
+# ⛔ ONE PATTERN, ONE VARIABLE (this class has now cost three rounds). The guard, the per-value
+# scan and the fail-closed counter each carried their own copy of the read pattern, and every round
+# found them out of step: `${#1}`/`${!1}` were in none of them, then `${01}` was in none of them.
+# `POSRE` is the single definition; a read shape added here is added everywhere by construction.
+# ⛔ AND THE BARE FORM DOES NOT ACCEPT LEADING ZEROS, while the braced form does. Bash reads `${01}`,
+# `${010}`, `${#01}`, `${!01}` and `${0123}` as positional reads (they die with `01: unbound
+# variable`), but unbraced `$01` is `$0` followed by `1`, not a read of arg 1 — so `0*` belongs only
+# inside `\${…}`. Reproduced (review P1): a `${01}` binding left the suite at PASS=235 with no record
+# and no `unparsed`. The `.` guard used to be a `case` with four hand-written arms; with five shapes
+# that is five places to forget, so it is a grep against this one pattern.
+POSRE='\$\{[#!]?0*[1-9][0-9]*[^}]*\}|\$[1-9][0-9]*'
+audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
+  local body="$1" assign var val rd seen=0 alln=0
+  # ⛔ ONE STRING FOR BOTH THE SCAN AND THE COUNT (review P1). The count used to strip a trailing
+  # `# …` comment while the assignment scan read the RAW line, so a comment that looks like an
+  # assignment contributed a phantom "seen" read: `seen == alln`, no `unparsed` was emitted, and the
+  # fail-closed counter went silent on exactly the shape it exists for. Stripping ONCE, here, before
+  # either use, makes the two compare the same string.
+  body="$(strip_comment "$body")"
+  while read -r assign; do
+    [ -n "$assign" ] || continue
+    var="${assign%%=*}"; val="${assign#*=}"
+    grep -qE "$POSRE" <<<"$val" || continue
+    while read -r rd; do
+      [ -n "$rd" ] || continue
+      seen=$((seen + 1))
+      # ⛔ THE DEFAULTED FORM IS ANCHORED, NOT A CONTAINS-MATCH (review P1, reproduced). The arm used
+      # to be the glob `${` + digit + `*` + `:-}`, which grades ANY expansion whose TEXT happens to
+      # contain `:-}` as safe-to-be-empty: `${1#*:-}` (strip a prefix), `${1%:-}`, `${1/foo/:-}` and
+      # the folded `${1:-${2#*:-}}` all became `defaulted` — and every one of them dies with
+      # `1: unbound variable` when the argument is absent. It is now exactly `${<digits>:-}`, which is
+      # the only spelling that means "absent → empty". A non-empty default stays `invented` (loud),
+      # and everything else is `bare`.
+      if grep -qE '[$][{][0-9]+:-[}]$' <<<"$rd"; then
+        printf 'defaulted %s %s\n' "$var" "$rd"
+      elif grep -qE '[$][{][0-9]+:-.+' <<<"$rd"; then
+        printf 'invented %s %s\n' "$var" "$rd"
+      else
+        printf 'bare %s %s\n' "$var" "$rd"
+      fi
+      # The ANNOTATION, printed UNDER the verdict so it can never suppress it (`head -1` still
+      # reads the verdict). A value that embeds the positional in a path/concatenation inherits its
+      # function's contract — which is exactly why it must be graded, not excused.
+      case "$val" in
+        "$rd"|"\"$rd\"") ;;
+        *) printf 'derived %s %s\n' "$var" "$rd" ;;
+      esac
+    done < <(grep -oE "$POSRE" <<<"$val")
+  done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
+  # ⛔ A POSITIONAL READ THE ASSIGNMENT SCAN CANNOT ATTRIBUTE IS A HARD FAIL, NOT A SILENCE
+  # (review P2). The assignment pattern cannot see through a nested quote: for
+  # `local n="$(printf %s "$1")"` the outer `="[^"]*"` stops at the inner quote, so the read was
+  # never graded — although it dies on an absent argument exactly like `local x="$1"`, and it IS
+  # inside this audit's declared scope ("every `local` binding of a positional"). The line's reads are
+  # therefore COUNTED and compared with the ones the parse produced; the difference is reported as
+  # `unparsed` (fail-closed) rather than dropped. Trailing ` # …` comments are stripped first so a
+  # comment that mentions `$1` cannot invent an unparsed read (`="#ff"` is unaffected: the strip
+  # needs WHITESPACE before the `#`).
+  # ⛔ `[#!]?` IS REQUIRED: `${#1}` (length) and `${!1}` (indirect) are REAL positional reads that die
+  # under `set -u` exactly as `$1` does, and with a bare `[1-9]` after `${` BOTH halves of this audit
+  # were blind to them — the assignment scan did not see the read, so it was never graded, AND the
+  # `alln` counter below did not count it, so the fail-closed `unparsed` net could not fire either.
+  # Reproduced (review P1): `local n="${#1}"` in a new function left the suite at FAIL=0 and the
+  # counters untouched. `POSRE` above is the one definition all three use.
+  alln="$(grep -oE "$POSRE" <<<"$body" | wc -l)"
+  while [ "$seen" -lt "$alln" ]; do
+    seen=$((seen + 1))
+    printf 'unparsed ? ?\n'
+  done
+}
+# The scanner's own contract on the shapes that matter, INCLUDING the ones earlier revisions missed.
+# ⛔ A BARE READ STAYS BARE THOUGH THE VALUE EMBEDS IT. `local d="$ROLES_DIR/.$1.lock"`,
+# `local dry="$1 "` and `local x="$1$2"` were filed `derived` (ungraded ✅) before the review, and
+# all of them die on an absent argument exactly like `local x="$1"`.
+# ⛔ NOTHING INSIDE THE HEREDOC MAY BE A COMMENT: that block is DATA, and a `#` line is read as a
+# record whose `want` is the prose — the failure mode is three ❌ in the self-test, not a silent pass.
+while IFS='|' read -r want text; do
+  [ -n "${want:-}" ] || continue
+  got="$(audit_line "$text" | cut -d' ' -f1 | head -1)"
+  [ "$got" = "$want" ] && ok "audit[self-test]: '$text' is classified '$want'" \
+    || bad "audit[self-test]: '$text' classified '${got:-<nothing>}' (want '$want') — the scanner is blind to a shape that crashes the scheduler"
+done <<'EOF'
+defaulted|local dry="${1:-}" s log
+defaulted|local dry="${4:-}" s log
+defaulted|local dry="${12:-}" s log
+invented|local dry="${1:---dry-run}" s log
+invented|local dry="${1:-0}" s log
+invented|local dry="${4:---dry-run}" s log
+bare|local dry="${1}" s log
+bare|local dry="$1" s log
+bare|local x=$1
+bare|local d="$ROLES_DIR/.$1.lock"
+bare|local tmp="$1/.own.tmp.$$"
+bare|local dry="$1 "
+bare|local x="$1$2"
+bare|local n="${#1}"
+bare|local n="${!1}"
+bare|local what="reap #$1 lane"
+bare|local ok="$(printf %s " #pad")" n="$1"
+bare|local n="${01}"
+bare|local n="${#01}"
+bare|local n="${!010}"
+bare|local s="${1#*:-}"
+bare|local s="${1%:-}"
+bare|local s="${1/foo/:-}"
+invented|local s="${1:-${2#*:-}}"
+bare|local d="$1" tmp="$1/.own.tmp.$$"
+EOF
+# …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
+# not skipped. `local n="$(printf %s "$1")"` is the measured case.
+_unp="$(audit_line 'local n="$(printf %s "$1")"' | tr '\n' '|')"
+case "$_unp" in
+  *unparsed*) ok "audit[self-test]: a positional inside a nested substitution is reported UNPARSED (fail-closed), not silently skipped" ;;
+  *)          bad "audit[self-test]: a nested-substitution read produced '${_unp:-<nothing>}' — an unattributable read is being skipped, which is the silence this arm exists to prevent" ;;
+esac
+# …then the real file. The allowlist is (FUNCTION, NAME) pairs — see the P1 note above.
+REQUIRED_READS=" state_write:role state_write:rc state_write_rehearsal:role state_write_rehearsal:own \
+ lock_claim:d lock_claim:tmp reclaim_lock:d role_lock:role role_unlock:d bounded:s run_bounded:s \
+ pid_ident:pid human_above:pid attestation_clean:pr attestation_clean:head \
+ controller_heartbeat_verdict:who role_row:role role_row:bound run_role_pass:role "
+# ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
+# grandfathering this list was re-keyed to remove, and it would do it silently. The pattern is
+# `*:*` (HAS a colon) — the first version tested `*:*:*`, i.e. TWO colons, which no real entry has,
+# so the assertion passed on any input at all: a vacuous check inside the gate against vacuous checks.
+BADENTRY=0; _n=0
+for _e in $REQUIRED_READS; do
+  _n=$((_n + 1))
+  case "$_e" in *:*) ;; *) BADENTRY=1 ;; esac
+done
+[ "$BADENTRY" -eq 0 ] && [ "$_n" -ge 15 ] \
+  && ok "audit: every REQUIRED_READS entry is a function:name pair ($_n entries)" \
+  || bad "audit: REQUIRED_READS has $_n entries and BADENTRY=$BADENTRY — an entry without a function:name key, or a collapsed list, grandfathers the next bare read"
+# The enclosing function of a line, so a bare read is judged where it actually lives.
+func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empty before the first)
+  local file="$1" want="$2" ln best=0
+  # ⛔ HEADER FORMS ACCEPTED, AND ALL MAY BE INDENTED: `name() {`, `name () {` (space before the
+  # parens), `name()` with the brace on the NEXT line, `function name() {`, and the keyword form
+  # `function name {`. Matching only
+  # `name() {` at column 0 attributed a next-line-brace function, or a NESTED helper (this file has
+  # `note()` in run_reap and `claim_take()` in run_merge), to the PRECEDING/OUTER function — where
+  # that function's allowlisted name covered the read and it passed with no decision (review P1/P2,
+  # both reproduced).
+  # ⛔ NO `$` AFTER THE BRACE ARM: a trailing comment (`state_write_rehearsal() { # <role> …`) is
+  # normal in this file, and anchoring there silently dropped 22 of the 48 headers — which made a
+  # line resolve to the PRECEDING function, i.e. exactly the misattribution this fixes.
+  # ⛔ AND A TRAILING COMMENT BEFORE A NEXT-LINE BRACE (review P1, reproduced): `ZzFutureHelper()  #
+  # note` + `{` on the following line is bash-legal, and an EOL-anchored next-line arm missed it, so
+  # the read resolved to the PRECEDING function and PASS went 230→231 with the mutant's read ✅ under
+  # `run_bounded`. Both arms therefore accept an optional trailing comment — and the comment arm is
+  # `#.*`, not `#[^"]*`: a comment containing a quote (`# it says "hi"`) is still a comment, and with
+  # the narrower class that header was invisible too (review P1). The parens are `\([[:space:]]*\)`
+  # because `name( ) {` is bash-legal as well.
+  # ⛔ AND A LINE-CONTINUED HEADER (review P1, reproduced): `ZzContHeader() \` and `{` on the next
+  # line is bash-legal, and missing it attributed the read to the PRECEDING function, where an
+  # allowlisted pair for the same NAME graded it REQUIRED (PASS 235→236). Hence the `\\[[:space:]]*$`
+  # arm, which accepts a trailing backslash as well as a trailing comment.
+  # ⛔ AND THE BODY MAY OPEN ON THE HEADER LINE WITH ANY COMPOUND OPENER (review P1, reproduced):
+  # `ZzNew() (` , `ZzNew() if true; then`, `while`, `until`, `for`, `select`, `case`, `[[`, `((` are all
+  # bash-legal one-line headers, and missing them attributed the body's read to the PRECEDING function,
+  # where an allowlisted pair for the same name graded it REQUIRED (PASS 239→240). The `name()` form
+  # always has EMPTY parens, so an awk `function secs(t, n, …)` is still not a header.
+  # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
+  # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
+  # nested helpers both sit after their function's only positional binding, so nothing is
+  # misattributed; a future one that does not would be reported under the helper's name, which is
+  # LOUD (that pair is not on REQUIRED_READS) rather than silently allowed.
+  # ⛔ THE NAME CHARSET IS NOT `[a-z_]` (review P1, reproduced). Bash accepts `ZzFutureHelper ()`,
+  # `zz-future-helper()`, `ZzFutureHelper(){` and a dotted/colon name; with a lowercase-only class
+  # those headers were INVISIBLE, so the mutant's `local s="$1"` resolved to the preceding function —
+  # whose allowlisted pair covered it — and the suite stayed green. The class below is therefore
+  # every non-dash non-paren token character, and the extraction `s/[[:space:]]*(...//` strips an
+  # optional `()`/`{` suffix.
+  # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
+  # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
+  # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1); do
+    [ "$ln" -le "$want" ] || break
+    best="$ln"
+  done
+  [ "${best:-0}" -gt 0 ] || return 0
+  sed -n "${best}p" "$file" | sed -nE 's/^[[:space:]]*(function[[:space:]]+)?([^[:space:](){;]+).*/\2/p'
+}
+# ⛔ THE RESOLVER IS TESTED ON THE SPELLINGS THEMSELVES, NOT ON A HEURISTIC. A broad
+# "looks definition-shaped" counter was tried first and it FALSE-RED on line 616 — `function secs(t,
+# n,a,i,…)`, an AWK function inside a single-quoted awk program, which the shell never defines. A
+# count that cannot tell bash from awk is a gate that refuses correct code, so the fail-closed duty is
+# carried here instead: every bash-legal header form must resolve to its own name, verified by driving
+# func_for over a fixture built for exactly that. Each of these was INVISIBLE before the charset was
+# widened (`[a-z_]` only) and silently attributed the read to the PRECEDING function — whose
+# allowlisted pair then covered it (review P1, reproduced: `ZzFutureHelper() { local s="$1"; }` after
+# `bounded()` left the suite at FAIL=0 and both `bounded:s` lines ✅).
+{
+  printf 'outer_fn() {\n  :\n}\n'
+  printf 'ZzFutureHelper() {\n  local s="$1"\n}\n'
+  printf 'ZzSpacedHelper () {\n  local s="$1"\n}\n'
+  printf 'ZzTightHelper(){\n  local s="$1"\n}\n'
+  printf 'function ZzKeyword {\n  local s="$1"\n}\n'
+  printf 'zz-dashed-name() {\n  local s="$1"\n}\n'
+  printf 'ZzNextLine()\n{\n  local s="$1"\n}\n'
+  printf 'ZzCommentBrace()  # a note\n{\n  local s="$1"\n}\n'
+  printf 'ZzSpacedParen( ) {\n  local s="$1"\n}\n'
+  printf 'ZzQuotedComment()  # it says "hi"\n{\n  local s="$1"\n}\n'
+  printf 'ZzContHeader() \\\n{\n  local s="$1"\n}\n'
+  printf 'ZzSubshell() (\n  local s="$1"\n)\n'
+  printf 'ZzIfBody() if true; then\n  local s="$1"\nfi\n'
+  printf 'ZzCaseBody() case x in\n  local s="$1"\n  ;;\nesac\n'
+} > "$T/hdr.sh"
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment ZzContHeader ZzSubshell ZzIfBody ZzCaseBody; do
+  _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
+  [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
+    || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
+done
+unset _want _got
+
+# Walk one file and PRINT one record per positional read: "<verdict> <line> <function> <name> <read>".
+# ⛔ A FUNCTION, so the walk can be run over a SYNTHETIC file the suite controls (the non-vacuity arm
+# further down). While it was inline, the only thing tested was that it ran over the shipped file —
+# which is precisely the shape that lets a name-keyed allowlist stay green.
+audit_scan() { # <file>
+  local file="$1" line ln body fn
+  while IFS= read -r line; do
+    ln="${line%%:*}"; body="${line#*:}"
+    fn="$(func_for "$file" "$ln")"
+    while read -r verdict var rd; do
+      [ -n "${verdict:-}" ] || continue
+      printf '%s %s %s %s %s\n' "$verdict" "$ln" "${fn:-?}" "$var" "$rd"
+    done < <(audit_line "$body")
+  done < <(grep -nE '^[[:space:]]*local[[:space:]]' "$file")
+}
+# Grade one file's reads against REQUIRED_READS. Counts land in AUDIT_*; the RETURN is the number of
+# ungraded/fatal pairs, so a caller can assert on it without re-deriving the decision.
+audit_grade() { # <file> <emit 1|0>
+  local file="$1" emit="$2" verdict ln fn var rd bad_n=0 graded=0
+  AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0; AUDIT_MATCHED=""
+  while read -r verdict ln fn var rd; do
+    graded=$((graded + 1))
+    case "$verdict" in
+      defaulted) AUDIT_DEF=$((AUDIT_DEF + 1))
+                 [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
+      invented)  bad_n=$((bad_n + 1))
+                 [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
+      unparsed)  bad_n=$((bad_n + 1))
+                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — the read sits outside the quoted value it is looked for in (a split value like \"\$D\"/\"\$1.x\", a literal in single quotes, or an arithmetic). Rewrite it as one \"…\$N…\" token so it can be judged; an unattributed read is ungraded" ;;
+      derived)   AUDIT_DER=$((AUDIT_DER + 1))
+                 [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) EMBEDS $rd in a larger value — a note; it is graded above, not excused" ;;
+      *)         AUDIT_BARE=$((AUDIT_BARE + 1))
+                 case "$REQUIRED_READS" in
+                   *" $fn:$var "*) AUDIT_REQ=$((AUDIT_REQ + 1))
+                       AUDIT_MATCHED="$AUDIT_MATCHED $fn:$var"
+                       [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) REQUIRED — reads $rd bare; a caller bug is the right outcome" ;;
+                   *) bad_n=$((bad_n + 1))
+                       [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) reads $rd BARE and is not on the REQUIRED list — decide it, do not imitate its neighbour" ;;
+                 esac ;;
+    esac
+  done < <(audit_scan "$file")
+  # ⛔ NO VERDICT WITHOUT AN OBSERVATION (agent-infra#2096/#2121 — and the tree-wide
+  # `scripts/check-false-pass-shapes.sh` gate is the authority, not this comment). A loop over a
+  # substitution can iterate ZERO times, so a function that only counts failures reports PASS over
+  # an empty read — here that would be a file with no `local` bindings at all, i.e. a scan that
+  # observed nothing. `graded` is the observation count and a zero-observation grade REFUSES.
+  [ "$graded" -gt 0 ] || return 1
+  return "$bad_n"
+}
+# ⛔ THE NON-VACUITY ARM FOR THE (function, name) KEY. A synthetic file with one allowlisted read and
+# one NEW helper that reuses TWO names that ARE on the list under other functions (`s` from
+# `bounded:s`, `who` from `controller_heartbeat_verdict:who`). Under the FUNCTION key both are
+# ungraded→bad (2); under the old NAME key both would pass (0). So this arm fails the moment somebody
+# re-keys the list by name, which is the P1 regression it exists to catch.
+cat > "$T/audit-mutant.sh" <<'SH'
+state_write() {
+  local role="$1" rc="$2"
+}
+future_helper() {
+  local s="$1" who="$2"
+}
+SH
+MT_BAD=0
+# `emit 0` keeps the mutant's own failures out of the summary counters: every ok()/bad() call site in
+# audit_grade is guarded by `[ "$emit" = 1 ] &&`, so with emit=0 neither is ever invoked.
+audit_grade "$T/audit-mutant.sh" 0; MT_BAD=$?
+[ "$MT_BAD" -eq 2 ] && ok "audit[self-test]: a NEW helper reusing allowlisted NAMES is graded BAD twice (the key is function:name)" \
+  || bad "audit[self-test]: the mutant graded $MT_BAD bad pair(s), want 2 — the allowlist is name-keyed again (or the walk lost the function)"
+# …and the allowlisted pair on the SAME mutant is graded OK, so the arm above is not vacuous either.
+_allow="$(audit_scan "$T/audit-mutant.sh" | awk '$1 == "bare" && $3 == "state_write" && $4 == "role"')"
+case "$_allow" in
+  *"state_write role"*) ok "audit[self-test]: the same mutant's allowlisted state_write:role IS seen (the walk found both functions)" ;;
+  *) bad "audit[self-test]: the mutant's state_write:role was not seen (got '${_allow:-<nothing>}') — the two-bad arm could be passing for the wrong reason" ;;
+esac
+AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0
+BADSUM=0
+audit_grade "$DOCTOR" 1; BADSUM=$?
+[ "$BADSUM" -eq 0 ] && ok "audit: every bare read in the shipped file is a declared function:name pair" \
+  || bad "audit: $BADSUM bare/invented read(s) in the shipped file are undeclared — see the ❌ lines above"
+[ "$((AUDIT_DEF + AUDIT_BARE))" -ge 15 ] && [ "$AUDIT_DEF" -ge 4 ] \
+  && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_REQ required) plus $AUDIT_DER embedding note(s)" \
+  || bad "audit: classified only $((AUDIT_DEF + AUDIT_BARE)) reads ($AUDIT_DEF defaulted) — the scan is broken, so this arm proves nothing"
+# ⛔ EVERY LISTED PAIR MUST BE MATCHED — twice over, because each check misses what the other
+# catches. The COUNT catches a listed pair matched TWICE while another is matched ZERO times;
+# the MEMBERSHIP check catches a listed pair the walk never saw at all. `AUDIT_REQ` alone was a
+# count, so on a copy of the doctor carrying `bounded`'s `$1` weakened to `${1:-}` PLUS a nested
+# `local s="$1"` (whose read the broken resolver attributed to `bounded`) the count still read
+# 19 == 19 and the suite stayed green (review P2, reproduced).
+_DISTINCT_MATCHED="$(printf '%s\n' $AUDIT_MATCHED | sort -u | wc -l)"
+_DISTINCT_LISTED="$(printf '%s\n' $REQUIRED_READS | sort -u | wc -l)"
+[ "$_DISTINCT_MATCHED" -eq "$_DISTINCT_LISTED" ] \
+  && ok "audit: $_DISTINCT_MATCHED distinct pair(s) matched, one for each of the $_DISTINCT_LISTED listed" \
+  || bad "audit: $_DISTINCT_MATCHED distinct pair(s) matched for $_DISTINCT_LISTED listed — a listed read is missing and another is standing in for it twice"
+UNMATCHED=0
+for _pair in $REQUIRED_READS; do
+  case " $AUDIT_MATCHED " in
+    *" $_pair "*) ;;
+    *) UNMATCHED=$((UNMATCHED + 1))
+       bad "audit: REQUIRED_READS lists $_pair but the walk never matched it — that read is no longer bare, so its coverage was silently lost" ;;
   esac
 done
-reset_state; rm -f "$T/o/state/roles/.desired"
+[ "$UNMATCHED" -eq 0 ] && ok "audit: every listed pair was matched by name (no pair is covered only through a same-named neighbour)" \
+  || bad "audit: $UNMATCHED listed pair(s) were never matched"
+# …and each dispatched role's mode read must BE the empty-defaulted one (the derived list again).
+while read -r _r _f; do
+  [ -n "${_r:-}" ] || continue
+  # ⛔ NO PIPE INTO `grep -q` (#841): under the suite's `pipefail` a quiet grep exits at its first
+  # match, awk takes SIGPIPE, and the pipeline status makes this `if` take the ELSE branch — the
+  # measured flake was one role failing while the other three passed on the SAME file.
+  if grep -q 'local dry="\${1:-}"' < <(awk "/^run_${_f}\\(\\) \\{/,/^\\}/" "$DOCTOR"); then
+    ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (it survives the absent/empty mode the scheduler passes)"
+  else
+    bad "audit: run_${_f} does NOT read its mode as \"\${1:-}\" — a bare dispatch would kill or rehearse the scheduler"
+  fi
+done <<<"$ROLES"
+
+# Arm D — THE DIRECTION THAT MATTERS, behaviourally: with no flag a destructive verb ACTS, with
+# `--dry-run` it does not. Arm C pins the source value; this pins what the value DOES, so "empty
+# means live" cannot be satisfied by a comment.
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+mk_lane lane-42 4242
+doc reap --dry-run
+killed lane-42 && bad "rehearsal: 'reap --dry-run' KILLED the lane (a rehearsal took the destructive path)" \
+  || ok "rehearsal: 'reap --dry-run' killed nothing (the opt-in rehearsal still rehearses)"
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+mk_lane lane-42 4242
+OUT="$(bash -u -c "source '${PRELUDE:-/dev/null}'; run_reap" 2>&1)"; RC=$?
+killed lane-42 && ok "live: run_reap with NO argument REAPED the lane (empty mode = a live pass, rc=$RC)" \
+  || bad "live: run_reap with NO argument did NOT reap — an absent mode took the rehearsal path, rc=$RC — $OUT"
+
+# Arm E — the SAME rule the reap arm above proves, for the OTHER thing a live loop now really does:
+# a real-sized queue read must not GRIND. `run_merge` used to ask "is the answer empty?" with
+# `[ -z "${prs//[[:space:]]/}" ]`, which is SUPERLINEAR: it is quadratic in the payload, so a real
+# queue answer already costs many seconds of PURE CPU inside that one builtin —
+# no syscalls, merge lock held, so MERGE_BUDGET_S could not bound it and the whole sequential loop
+# (doctor, reap, hygiene) stalled behind it on the first tick. cleanup-stale-branches.sh:694
+# documents the identical hole and its fix: a `case` glob, same set, O(n).
+# ⛔ TWO DIFFERENT NUMBERS, MEASURED SEPARATELY, AND NEITHER IS DERIVED FROM THE OTHER (review P2).
+# On this box, bash 5.2.21, the old empty-check inside one builtin: 322 KiB (330,246 B) → 14.5 s and
+# 843 KiB (the 862,802 B fixture below) → 99.8 s (2.6x bytes, 6.9x time — quadratic); the `case` glob
+# → 9 ms and 26 ms on the same two payloads. The fixture is deliberately larger than a real queue
+# answer so the PRE-FIX code cannot finish it inside the 30 s bound — the bound is what DISCRIMINATES,
+# so the fixture has to sit comfortably on the wrong side of it. (An earlier revision of this comment
+# quoted "349 KB → 84 s" as if it were this box's measurement; it is not reproducible here — 330 KB
+# costs 14.5 s — so it is gone rather than reconciled.)
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+python3 - "$T/gh/prs.json" <<'PYJSON'
+import json, sys
+# 1200 entries, pretty-printed: the whitespace-heavy shape a real answer has. Drafts, so every one is
+# skipped cheaply and the ONLY cost measured is the empty-check itself.
+# A real PR carries a title and a body; the SIZE is what this arm needs, and the iteration count is
+# what keeps the FIXED path fast, so the size comes from the text, not from more candidates.
+body = ("this pull request touches the harness and explains, at length, why the change is safe; " * 6)
+rows = [{"number": 1000 + i, "head": {"sha": "%040d" % i}, "draft": True,
+         "title": "fix(harness): a title of ordinary length", "body": body} for i in range(1200)]
+open(sys.argv[1], "w").write(json.dumps(rows, indent=2))
+PYJSON
+PAYLOAD_BYTES="$(wc -c < "$T/gh/prs.json")"
+[ "${PAYLOAD_BYTES:-0}" -gt 300000 ] && ok "merge: the fixture is a real-sized payload (${PAYLOAD_BYTES} bytes)" \
+  || bad "merge: the fixture is only ${PAYLOAD_BYTES:-0} bytes — too small to discriminate"
+START_S="$(date +%s)"
+OUT="$(timeout 30 bash "$DOCTOR" merge --dry-run 2>&1)"; RC=$?
+ELAPSED_S=$(( $(date +%s) - START_S ))
+[ "$RC" -ne 124 ] && ok "merge: a ${PAYLOAD_BYTES}-byte queue read COMPLETES (rc=$RC in ${ELAPSED_S}s, not killed at 30s)" \
+  || bad "merge: the pass was KILLED at 30s on a real-sized payload (rc=$RC) — the empty-check is superlinear again"
+# …and it must still reach a verdict, not merely survive: the record says what it did with the queue.
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state" 2>/dev/null)" in
+  '') bad "merge: no verdict recorded after the big-payload pass" ;;
+  *)  ok "merge: it recorded a verdict on the big payload — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state" | cut -c1-80)" ;;
+esac
+rm -f "$T/gh/prs.json"
 
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo
