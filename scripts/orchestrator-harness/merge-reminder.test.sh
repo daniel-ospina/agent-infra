@@ -1861,7 +1861,9 @@ ck "§27 the goals block precedes the landing table in the report" \
    "$(awk '/## Where the goals stand this run/{g=NR} /## 1. Closest to landing/{p=NR} END{exit !(g && p && g<p)}' \
         "$O/MERGE-REMINDER.md" && echo 0 || echo 1)"
 ck "§27 the goal reads never spend the landing arm's CORE bound" \
-   "$([ "$(wc -l < "$FX/calls.txt")" -le 8 ] && echo 0 || echo 1)"
+   "$([ "$(wc -l < "$FX/calls.txt")" -eq 5 ] && echo 0 || echo 1)"
+ck "§27 ...and no SEARCH read is counted in the core bucket at all" \
+   "$(nq 'search/' "$(cat "$FX/calls.txt")" && echo 0 || echo 1)"
 
 # A count that could not be READ is NOT-MEASURED — never 0. "0 open P0" is a claim (the goal is
 # met), and it is exactly the claim this block exists to refuse to invent.
@@ -1892,21 +1894,59 @@ chmod +x "$TMP/box-cur.sh" "$TMP/box-behind.sh"
 printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-behind.sh" > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
-ck "§27 a drifted cell BREAKS goal 2's marker" \
+ck "§28 a drifted cell BREAKS goal 2's marker" \
    "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
-ck "§27 ...and the drifted box is NAMED with its reading" \
+ck "§28 ...and the drifted box is NAMED with its reading" \
    "$(qF "cell-2=${OTHER:0:12} [behind]" "$MDF" && echo 0 || echo 1)"
-ck "§27 ...and the count says 1/2 current, not 'autonomous'" \
-   "$(qF '1/2 current' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+ck "§28 ...and the count says 1/2 on main, not 'autonomous'" \
+   "$(qF '1/2 on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
 # All boxes current: the marker HOLDS, and the report says what that is worth (not proof).
 write_no_landing; reset_o
 printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 every box on the pin ⇒ MARKERS-HOLD" \
-   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '2/2 current' "$MDF" && echo 0 || echo 1)"
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '2/2 on this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and it says the marker is not proof of autonomy" \
    "$(qF 'That is the marker, not proof' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ `[current]` IS NOT "ON MAIN". `box-status.sh` compares against ITS OWN checkout's `origin/main`,
+# so a box can answer `[current]` while running a different commit — and a `source=stamp` identity
+# records what was SEEDED, not what is RUNNING. Counting either as "the same version everywhere" is
+# the fail-open this case exists for (measured: MARKERS-HOLD printed for two `deadbeef` boxes against
+# main=848ba4b1 while the deploy arm reported drift for both).
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "${OTHER:0:12}" > "$FX/box.offpin.txt"
+cat > "$TMP/box-offpin.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.offpin.txt"
+STUB
+chmod +x "$TMP/box-offpin.sh"
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-offpin.sh" \
+  > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a box answering [current] at ANOTHER commit BREAKS the marker" \
+   "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the line says it is a different commit from this cycle's main" \
+   "$(qF 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and only 1 of 2 counts as on main" \
+   "$(qF '1/2 on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+# A stamp identity is a SEED RECORD, not a running process: it cannot hold the marker either.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=stamp\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.stamp.txt"
+cat > "$TMP/box-stamp.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.stamp.txt"
+STUB
+chmod +x "$TMP/box-stamp.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-stamp.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a source=stamp box cannot hold the marker (seeded ≠ running)" \
+   "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && qF 'source=stamp(seeded, not running)' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
@@ -1943,6 +1983,13 @@ out="$(run_sut)"; rc=$?
 ck "§28 a full page exits 3 (a truncated read is not an empty queue)" "$([ "$rc" -eq 3 ] && echo 0 || echo 1)"
 ck "§28 ...and names the truncation" "$(qF 'the listing filled its 100-row page' "$out" && echo 0 || echo 1)"
 ck "§28 NOTHING was dispatched from a truncated listing" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+# ⛔ `--max-prs > 100` would disable that guard: the API caps `per_page` at 100, so `len(rows) >=
+# 200` can never be true while the read is still truncated — the defect reachable by following the
+# tool's own remedy. It is a USAGE error, not a bigger bound.
+out="$(run_sut --max-prs 200 2>&1)"; rc=$?
+ck "§28 --max-prs 200 is refused as usage (rc=$rc)" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+ck "§28 ...and says why (the API's per_page cap disables the guard)" \
+   "$(qF "disables the truncation" "$out" && echo 0 || echo 1)"
 
 echo "-- §28 the deploy bound is keyed on the TARGET, not on a from the action changes"
 # A box that creeps forward without arriving (diverged -> behind, a partial apply) changes its `from`

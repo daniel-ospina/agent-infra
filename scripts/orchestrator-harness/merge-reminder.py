@@ -1543,8 +1543,9 @@ def read_prs(budget: Budget, slug: str, max_prs: int) -> list[dict]:
         # were INVISIBLE — the rank denominators undercounted and an attested+quiet PR below the cut
         # could never be dispatched. This file already refuses a full statuses page and a
         # page-truncated check surface for the same reason; the listing was the one read that did not.
-        raise Skipped(f"UNREADABLE pulls — the listing filled its {max_prs}-row page, so the queue "
-                      f"may be truncated (raise --max-prs, or page the listing)")
+        raise Skipped(f"UNREADABLE pulls — the listing filled its {max_prs}-row page "
+                      f"({len(rows)} row(s) read), so the queue may be truncated — page the listing "
+                      f"(`--max-prs` cannot exceed the API's own 100-row cap)")
     prs = []
     for r in rows:
         if not isinstance(r, dict):
@@ -1726,6 +1727,16 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
     This makes NO REST call — it reads artifacts on the boxes (`$O/state/boxes.tsv`, and
     `box-status.sh` beside this script for the local box) — which is exactly why it can go first.
 
+    ⛔ `[current]` IS NOT "ON MAIN", AND THIS FUNCTION MUST NOT LET IT READ AS ONE. `box-status.sh`
+    computes `relation` against ITS OWN checkout's `origin/main` (its `REF=origin/main`), which is not
+    necessarily the checkout `repo_path_of` picked — so a box can answer `[current]` while running a
+    different commit from the `main_sha` this cycle read, and a `source=stamp` identity records what
+    was SEEDED, not what is RUNNING (`harness-refresh.sh`; the deploy arm refuses to license anything
+    on it for exactly that reason). A goal line that counted `relation == "current"` as "the same
+    version everywhere" was a fail-open: measured, it printed `MARKERS-HOLD` for two boxes whose
+    harness was `deadbeef` against `main=848ba4b1`, while `deploy_arm` on the same inventory and the
+    same main reported drift for both. Hence `on_pin`, which carries every term the deploy arm uses.
+
     It NEVER raises: an unreadable inventory or a failed probe becomes a row that SAYS SO, because a
     goal line silently missing the drifted cell reads like the cell is fine.
     """
@@ -1733,12 +1744,23 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         boxes = read_inventory(o)
     except Skipped as e:
         return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
-                 "note": str(e)}]
+                 "on_pin": False, "note": str(e)}]
     rows: list[dict] = []
     for name, status_cmd, _activate in boxes:
-        d = probe_box(name, status_cmd)
+        # ⛔ A SUMMARY READ, BOUNDED SHORT: this probe runs BEFORE the landing decision, so an
+        # unreachable box must not put `timeout`-seconds of dead time in front of a dispatch (the
+        # timer is 600 s and `--rail-wait-s` already overlaps it by design). The deploy arm keeps its
+        # OWN moment-of-action probe — that reading gates an activation, and a cached one would be
+        # evidence from minutes ago — which is why the two can disagree within one report: the deploy
+        # table is the later, authoritative read.
+        d = probe_box(name, status_cmd, timeout=15)
+        on_pin = bool(d["readable"] and d["relation"] == "current"
+                      and d.get("source") != "stamp"
+                      and main_sha and d["harness"][:12] == main_sha[:12])
         rows.append({"box": name, "harness": d["harness"][:12], "relation": d["relation"],
-                     "readable": bool(d["readable"]), "note": ""})
+                     "source": d.get("source", ""), "controller": d["controller"],
+                     "roles": d["roles"], "readable": bool(d["readable"]),
+                     "on_pin": on_pin, "note": ""})
     return rows
 
 
@@ -1750,12 +1772,17 @@ def _drift_text(rows: list[dict]) -> str:
         if not r["readable"]:
             parts.append(f"{r['box']}=UNREADABLE")
         else:
-            parts.append(f"{r['box']}={r['harness'] or '<none>'} [{r['relation'] or '?'}]")
+            tag = f"{r['harness'] or '<none>'} [{r['relation'] or '?'}]"
+            if r.get("source") == "stamp":
+                tag += " source=stamp(seeded, not running)"
+            elif r["relation"] == "current" and not r.get("on_pin"):
+                tag += " (a different commit from this cycle's main)"
+            parts.append(f"{r['box']}={tag}")
     return " · ".join(parts)
 
 
 def goal_progress(drift: list[dict], budget: Budget, slug: str,
-                  skipped: str = "") -> tuple[list[str], list[str]]:
+                  skipped: str = "", main_sha: str = "") -> tuple[list[str], list[str]]:
     """Measure BOTH goals. -> (the readings as markdown lines, what to do IN GOAL ORDER).
 
     ⛔ A COUNT THAT COULD NOT BE READ IS `NOT-MEASURED`, NEVER `0`. Zero is a claim ("there are
@@ -1802,9 +1829,11 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     else:
         goal1 = "OPEN"
 
-    currents = [r for r in drift if r["readable"] and r["relation"] == "current"]
-    boxes_bad = [r for r in drift if not r["readable"] or r["relation"] != "current"]
-    if not drift or qo_why or qm_why:
+    currents = [r for r in drift if r.get("on_pin")]
+    boxes_bad = [r for r in drift if not r.get("on_pin")]
+    if not drift or qo_why or qm_why or not main_sha:
+        # ⛔ WITHOUT `origin/main` THERE IS NO "SAME VERSION EVERYWHERE" TO ASSERT: every row could be
+        # `[current]` against its own ref and the goal would still read like a fleet on one pin.
         goal2 = "NOT-MEASURED"
     elif boxes_bad:
         goal2 = "MARKERS-BROKEN"
@@ -1816,9 +1845,12 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"  {GOAL_REPO}: open P0={p0} · open P1={p1} · closed today P0={c0} · P1={c1} · "
         f"PRs merged today={dm}",
         f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
-        f"  harness: {_drift_text(drift)} ({len(currents)}/{len(drift)} current)",
+        f"  harness: {_drift_text(drift)} ({len(currents)}/{len(drift)} on this cycle's main)",
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
+    if not main_sha:
+        lines.append("  ⚠️ harness: `origin/main` could not be read, so 'the same version everywhere' "
+                     "cannot be asserted at all")
     for name, why in unreadable:
         lines.append(f"  ⚠️ {name}: {why}")
     for why in (qo_why, qm_why):
@@ -2253,6 +2285,14 @@ def main(argv=None) -> int:
         print(f"--candidates must be 1..{MAX_CANDIDATES} (the REST budget: 1 + 4*candidates <= {REST_BUDGET})",
               file=sys.stderr)
         return 2
+    if args.max_prs < 1 or args.max_prs > 100:
+        # ⛔ THE API CAPS `per_page` AT 100. Accepting --max-prs 200 would return at most 100 rows
+        # while the full-page guard compares `len(rows) >= 200`, which can never be true: the guard
+        # would go silently inert and the listing would truncate — the exact defect it was added for,
+        # reachable by following the tool's own remedy.
+        print("--max-prs must be 1..100 (the API's per_page cap; a larger value disables the truncation "
+              "guard instead of raising the bound)", file=sys.stderr)
+        return 2
 
     md = o / STATE_MD
     skipped = ""
@@ -2294,7 +2334,7 @@ def main(argv=None) -> int:
         # LOCAL artifact read (no REST), the goals spend the SEARCH quota (a different bucket), so
         # neither can starve the landing arm's documented `REST_BUDGET`.
         drift = drift_rows(o, main)
-        goal_lines, goal_actions = goal_progress(drift, budget, slug)
+        goal_lines, goal_actions = goal_progress(drift, budget, slug, main_sha=main)
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
@@ -2313,7 +2353,7 @@ def main(argv=None) -> int:
         # whole file exists to prevent.
         goal_lines, goal_actions = goal_progress(
             drift, budget, slug,
-            skipped=skipped or "the cycle did not reach the goal read")
+            skipped=skipped or "the cycle did not reach the goal read", main_sha=main)
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.
