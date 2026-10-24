@@ -2587,7 +2587,7 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
         f"runner={len(parsed.runner)} "
-        f"bash-shard={len(parsed.bash_shard)}",
+        f"bash-shard={len(parsed.bash_shard)} "
         f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )
@@ -2664,7 +2664,7 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
         f"runner={len(parsed.runner)} "
-        f"bash-shard={len(parsed.bash_shard)}",
+        f"bash-shard={len(parsed.bash_shard)} "
         f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )

@@ -106,7 +106,6 @@ shard_slowest=""
 #
 # It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
 # self-check sentinels below, which deliberately fail, cannot print a bogus name.
-shard_err_before=0
 
 # The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
 # BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
@@ -529,6 +528,15 @@ if [ "$shard_errors" -gt 0 ]; then
   # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
+    # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
+    # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
+    # this runner exists to close. Completeness is compared from what was COUNTED (`shard_errors`)
+    # against what was NAMED, never inferred from the list being non-empty.
+    recap_named=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named" -lt "$shard_errors" ]; then
+      echo "❌ …and $((shard_errors - recap_named)) of the counted failure(s) could NOT be named — the naming arm did not run for them. This is a defect in scripts/run-bash-shards.sh, not in the failing file."
+    fi
     # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
     # syntax sweeps; the list above names them together. Printing "2 failed" beside one name reads as a
     # missing name — and the missing half is exactly what the recap exists to stop hunting for.
