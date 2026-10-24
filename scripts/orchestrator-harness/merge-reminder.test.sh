@@ -2135,6 +2135,38 @@ ck "§27 ...and the unanswered box is not given a COMPARISON as its reason" \
    "$(nq 'cell-2 (a different commit' "$MDF" \
       && echo 0 || echo 1)"
 
+# ⛔ "NOT all: <none>" IS A VERDICT WITH NO DATUM - and the case that produces it (one unreachable
+# cell, the rest on the pin) is the COMMON degradation.
+write_no_landing; reset_o
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-dead.sh" \
+  > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a mixed fleet with every PROBED box on the pin says so, not 'NOT all: <none>'" \
+   "$(qF 'every PROBED box is on the pin' "$MDF" && nq 'NOT all: <none>' "$MDF" \
+      && qF '1 box(es) gave no answer' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the READINGS state the partial count, not 'not compared'" \
+   "$(qF '(1 of 2 box(es) gave no answer)' "$MDF" && nq 'not compared' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ AND THE ARM'S OWN FAILED ACTIVATION IS NAMED, not excused as an operator's stop: the ledger
+# holds the attempt at this pin, so "it cannot tell" was a false limitation.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: STOPPED\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.stopped2.txt"
+cat > "$TMP/box-stopped2.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.stopped2.txt"
+STUB
+chmod +x "$TMP/box-stopped2.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-stopped2.sh" > "$O/state/boxes.tsv"
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED\n' "${OTHER:0:12}" "${MAIN12}" "$(date +%s)" \
+  > "$O/state/merge-reminder.deploys"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an at-pin STOPPED box with a recorded attempt names OUR failed activation" \
+   "$(qF 'deployed-but-NOT-activated' "$MDF" && qF 'OUR last activation of this box did not verify' "$MDF" \
+      && echo 0 || echo 1)"
+
 # ⛔ A NON-UTF-8 LEDGER IS A READING TOO. `UnicodeDecodeError` is a `ValueError`, so it escaped every
 # `except OSError` in this file: traceback, exit 1, no report, previous cycle's file left on disk.
 write_no_landing; reset_o
@@ -2162,6 +2194,11 @@ write_no_landing; reset_o
 : > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+# ⛔ ONCE: the readings parenthetical and the ⚠️ line said the same sentence twice, and nothing
+# pinned it - restoring the pre-fix line left the suite green.
+ck "§27 ...and says it ONCE (the readings, not the readings and the warning)" \
+   "$([ "$(printf '%s\n' "$MDF" | grep -oF 'the inventory exists and lists NO boxes' | wc -l)" -eq 1 ] \
+      && qF 'no box was probed this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 an EMPTY inventory says it lists no boxes (not 'absent', and no fraction)" \
    "$(qF 'the inventory exists and lists NO boxes' "$MDF" && qF 'boxes.tsv=NO-ROWS' "$MDF" \
       && nq 'on this cycle' "$MDF" \
@@ -2218,6 +2255,11 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a local probe with no pin is UNREADABLE, and that states no fraction" \
    "$(qF 'local=UNREADABLE' "$MDF" && nq 'on this cycle' "$MDF" \
       && qF 'the probe returned nothing' "$MDF" && echo 0 || echo 1)"
+# ⛔ ...AND THE ROW IS NOT GIVEN A COMPARISON IT NEVER MADE, in the branch that renders its reasons
+# (the mixed case renders only rows that ANSWERED, so the earlier assertion could not see this).
+ck "§27 ...and the unanswered box is given no invented comparison" \
+   "$(qF 'local (the probe did not answer)' "$MDF" && nq 'a different commit from this cycle' "$MDF" \
+      && echo 0 || echo 1)"
 ck "§27 ...and LOCAL ONLY is printed as a reading, whichever branch the action takes" \
    "$(qF 'LOCAL ONLY — the inventory is absent' "$MDF" && echo 0 || echo 1)"
 # ⛔ ONCE, AND NOT IN THE ACTION: appended per-action it appeared twice in the pre-fix shape, and

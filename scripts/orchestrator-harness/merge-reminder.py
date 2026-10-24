@@ -1102,11 +1102,21 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                     # is the #1872/#1714 defect, and it is also why the "our last activation did not
                     # verify" attribution below was unreachable for the exact failure it describes (a
                     # `stop -> apply -> start` whose apply succeeded and whose start did not).
-                    entry["verdict"] = (f"deployed-but-NOT-activated — harness {d['harness'][:12]} "
-                                        f"[current] is the pin; controller="
-                                        f"{d['controller'] or '<unread>'} is not RUNNING (this arm does "
-                                        f"not start it: it cannot tell an operator's stop from its own "
-                                        f"failed activation)")
+                    # ⛔ AND IT CAN SAY WHICH: the ledger holds exactly this fact for an at-pin box, so
+                    # "cannot tell an operator's stop from its own failed activation" was a FALSE
+                    # limitation — it kept the arm's OWN damage (a `stop -> apply -> start` whose apply
+                    # advanced the pin and whose start failed) reading as an operator's intent, which is
+                    # the one case a human most needs named.
+                    n_dep, _last_dep = deploy_attempts(o, name, d["harness"], main_sha)
+                    entry["verdict"] = (
+                        f"deployed-but-NOT-activated — harness {d['harness'][:12]} [current] is the "
+                        f"pin; controller={d['controller'] or '<unread>'} is not RUNNING. "
+                        + (f"OUR last activation of this box did not verify ({n_dep} attempt(s) "
+                           f"recorded); a human must confirm the box state before this arm touches it "
+                           f"again"
+                           if n_dep else
+                           "no activation of this box is recorded at this pin, so this arm cannot tell "
+                           "an operator's stop from its own failed activation and does not start it"))
                 else:
                     entry["verdict"] = "current"
                 results.append(entry)
@@ -1949,6 +1959,9 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     # excluding it made the DEFAULT fleet path (no `state/boxes.tsv`) print "not compared" beside the
     # box it had just compared, with the remediation aimed at a read that never failed.
     placeholder = [r for r in drift if r.get("inventory") in PLACEHOLDER]
+    # The boxes that ANSWERED — used by the readings (a partial count) and by the action (a mixed
+    # fleet is not an unmeasured one), so both say the same thing about the same rows.
+    measured = [r for r in drift if r.get("readable") and r.get("inventory") not in PLACEHOLDER]
     compared = (bool(drift) and not placeholder and bool(main_sha)
                 and all(r.get("readable") for r in drift))
     why_not_compared = (
@@ -1984,9 +1997,15 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"  {GOAL_REPO}: open P0={p0} · open P1={p1} · closed today P0={c0} · P1={c1} · "
         f"PRs merged today={dm}",
         f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
+        # ⛔ THE READINGS MUST AGREE WITH THE ACTION. In a mixed fleet `compared` is False, so this
+        # said "not compared — the probe returned nothing" two lines above an action stating the
+        # measured fraction — the two-readers defect (#1872/#1714) inside one block, with the same
+        # reason then printed twice. The mixed case states the PARTIAL count instead.
         "  harness: " + _drift_text(drift) +
         ("" if not drift else
          f" ({len(currents)}/{len(drift)} on this cycle's main)" if compared else
+         f" ({len(drift) - len(measured)} of {len(drift)} box(es) gave no answer)"
+         if (main_sha and measured) else
          f" (not compared — {why_not_compared})"),
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
@@ -2051,13 +2070,18 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # unanswered box used to void the measured verdicts in the paragraph the owner acts on
         # ("Nothing here is a verdict on a box" over a box that had just been measured off-pin) and to
         # defer a real repair behind "repair that read first".
-        measured = [r for r in drift if r.get("readable") and r.get("inventory") not in PLACEHOLDER]
         measured_bad = [r for r in measured if not r.get("on_pin")]
         mixed = (not compared) and bool(main_sha) and bool(measured)
         bad_names = ", ".join(f"{r['box']} ({'; '.join(r.get('reasons') or ['not verified'])})"
                               for r in measured_bad) or "<none>"
+        # ⛔ "NOT all: <none>" IS A VERDICT WITH NO DATUM, contradicted by its own complete fraction —
+        # and one unreachable cell with the rest on the pin is the COMMON degradation, so that clause is
+        # the one the owner reads most often.
+        bad_clause = (f" — NOT all: {bad_names}. " if measured_bad
+                      else " — every PROBED box is on the pin. ")
         head = (f"**Goal 2 (harness autonomy):** {len(currents)}/{len(measured)} PROBED box(es) run "
-                f"this cycle's main, deployed AND activated — NOT all: {bad_names}. "
+                f"this cycle's main, deployed and activated."
+                f"{bad_clause}"
                 # \u26d4 THE COUNT IS IN THE SENTENCE, SO THE REASON IS THE FACT AND NOT A SECOND COUNT.
                 # "1 box(es) did not answer (1 box(es) did not answer)" was the duplication this
                 # sentence shipped with for one round.
@@ -2085,9 +2109,11 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
             f"main, deployed AND activated; {queue_note}. That is the marker, not proof: keep the "
             f"queue moving and keep every cell on the pin.")
     else:
+        # ⛔ NO REASON HERE: the readings line and its ⚠️ already state it, and repeating the sentence
+        # in the action is the duplication that has now been removed from three places.
         actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — no box was probed "
-                       f"({why_not_compared}), so nothing about the fleet's version is asserted. Repair "
-                       f"the read instead of assuming the fleet is fine.")
+                       "(see the ⚠️ line), so nothing about the fleet's version is asserted. Repair "
+                       "that read instead of assuming the fleet is fine.")
     actions.append("**Then, and only then, the PR table below:** it is the VEHICLE for the goals, not "
                    "the objective. A PR that moves neither goal is work, not progress.")
     return lines, actions
