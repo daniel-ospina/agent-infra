@@ -1197,8 +1197,14 @@ BDS_RC=0; BDS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system.control CON
 # directories the readers DO search stay installable, and so does a hermetic temp dir (every other arm).
 _gd="$(arm_root 'gd-ok')"; mk_systemctl "$_gd/bin" "$_gd/state" "$_gd/sc.log"
 GDO_RC=0; GDO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system" inst 'gd-ok' --dry-run 2>&1)" || GDO_RC=$?
-[ "$GDO_RC" -eq 0 ] && ok 'SYSTEMD_UNIT_DIR=/etc/systemd/system (a directory the readers search) is ALLOWED' \
-                    || bad "the guard refused the canonical system unit dir — $GDO_OUT"
+# ⛔ ASSERT THE *GUARD'S* VERDICT, NOT `rc 0` (review round 5, #2666). On a box where the cell's own unit is
+# already installed — which #2433 makes the normal state, and which is TRUE on this cell — `--dry-run` fails
+# LATER, at the "a unit already supervises another state dir" guard. That is correct behaviour and not this
+# guard's business, so the arm must not depend on the host: it asserts that THIS guard did not fire.
+case "$GDO_OUT" in
+  *'REFUSING SYSTEMD_UNIT_DIR'*) bad "the guard refused the canonical system unit dir — $GDO_OUT" ;;
+  *) ok 'SYSTEMD_UNIT_DIR=/etc/systemd/system (a directory the readers search) is NOT refused by this guard' ;;
+esac
 # ⛔ THE LIST IS NOT HAND-MAINTAINED, AND AN ALIAS IS NOT A DIFFERENT DIRECTORY (re-review P1, #2666). Two
 # escapes of the first form, both measured: `/run/systemd/system.control` — which `systemd-analyze unit-paths`
 # prints — was ADMITTED (`would install …`, rc 0), and `ln -s /usr/lib/systemd/system <tmp>/alias` was
@@ -1224,8 +1230,10 @@ esac
 _ra="$(arm_root 'rd-alias-ok')"; mk_systemctl "$_ra/bin" "$_ra/state" "$_ra/sc.log"
 mkdir -p "$_ra/tree"; ln -sfn /etc/systemd/system "$_ra/tree/ok"
 RA_RC=0; RA_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ra/tree/ok" inst 'rd-alias-ok' --dry-run 2>&1)" || RA_RC=$?
-[ "$RA_RC" -eq 0 ] && ok 'a symlink to the canonical system unit dir is ALLOWED (resolved, then graded)' \
-                   || bad "a symlink to /etc/systemd/system was refused — $RA_OUT"
+case "$RA_OUT" in
+  *'REFUSING SYSTEMD_UNIT_DIR'*) bad "a symlink to /etc/systemd/system was refused by this guard — $RA_OUT" ;;
+  *) ok 'a symlink to the canonical system unit dir is NOT refused (resolved, then graded)' ;;
+esac
 # ⛔ ONE DIRECTORY, ONE COPY, HOWEVER IT IS SPELLED (re-review P2, #2666). The same directory reached as
 # `CONTROLLER_USER_UNIT_DIR` WITH A TRAILING SLASH and as the target itself was counted twice, so the
 # "already installed" guard printed one file as two copies and refused a healthy idempotent re-install with
@@ -1364,6 +1372,39 @@ _UPOK="$DD2/missing/x/../../units"
 UPO_RC=0; UPO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_UPOK" inst dd2 --dry-run 2>&1)" || UPO_RC=$?
 [ "$UPO_RC" -eq 0 ] && ok 'a .. chain that stays inside the fixture is still ALLOWED (the rule is the resolved path)' \
                     || bad "a fixture path with interior .. was refused — $UPO_OUT"
+# ⛔ A `..` THAT POPS A **MISSING** COMPONENT AND LANDS ON A SYMLINK (review P1 round 5, #2666). Lexical
+# collapsing is WRONG here: `<tmp>/tree/new/../link/system.control` has a missing `new`, so a lexical pop skips
+# it and then reads `link` as a plain name — while `mkdir -p` CREATES `new`, steps back, and FOLLOWS `link` into
+# /etc/systemd. The resolver now uses `mkdir -p` semantics (`realpath -m`), so the graded path is the write
+# path. The inside-the-fixture twin must stay allowed, or the arm would pass by refusing everything.
+say_case 'a .. that pops a MISSING component and then hits a symlink is graded by where the write lands'
+LK="$(arm_root lk)"; mk_systemctl "$LK/bin" "$LK/state" "$LK/sc.log"
+mkdir -p "$LK/tree" "$LK/inside"
+ln -sfn /etc/systemd "$LK/tree/link"
+ln -sfn "$LK/inside" "$LK/tree/lnk"
+LK_RC=0; LK_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$LK/tree/new/../link/system.control" inst lk --dry-run 2>&1)" || LK_RC=$?
+[ "$LK_RC" -ne 0 ] && ok 'missing-component + symlink into a systemd dir is REFUSED (mkdir -p would follow it)' \
+                   || bad "a .. over a MISSING component followed a symlink into /etc/systemd and was admitted — $LK_OUT"
+case "$LK_OUT" in
+  *'resolves to /etc/systemd/system.control'*) ok 'and the refusal names the path the resolver walked to' ;;
+  *) bad "the symlink-through-missing-component refusal does not name the resolved path — $LK_OUT" ;;
+esac
+LK2_RC=0; LK2_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$LK/tree/new/../lnk/x" inst lk --dry-run 2>&1)" || LK2_RC=$?
+[ "$LK2_RC" -eq 0 ] && ok 'the same shape resolving INSIDE the fixture is still ALLOWED (no blanket refusal)' \
+                    || bad "a missing-component + inside-fixture symlink was refused — $LK2_OUT"
+# ⛔ AND WHEN THE BOX CANNOT RESOLVE, THE GUARD REFUSES INSTEAD OF GRADING A GUESS (review P1 round 5, #2666).
+# Every earlier round graded the raw spelling when the tool was absent, and every one of them failed OPEN.
+say_case 'a directory that cannot be resolved is REFUSED, not guessed'
+UR="$(arm_root ur)"; mk_systemctl "$UR/bin" "$UR/state" "$UR/sc.log"
+printf '#!/bin/bash\nexit 1\n' > "$UR/bin/realpath"; chmod +x "$UR/bin/realpath"
+printf '#!/bin/bash\nexit 1\n' > "$UR/bin/readlink"; chmod +x "$UR/bin/readlink"
+UR_RC=0; UR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$UR/units/not-yet-there" inst ur --dry-run 2>&1)" || UR_RC=$?
+[ "$UR_RC" -ne 0 ] && ok 'an unresolvable unit dir is REFUSED (fail-closed, never graded as a literal)' \
+                   || bad "an unresolvable unit dir was graded from its literal spelling — $UR_OUT"
+case "$UR_OUT" in
+  *'cannot be resolved to a physical path'*) ok 'and the refusal says it could not resolve, and names the fix' ;;
+  *) bad "the unresolvable refusal does not say what was wrong — $UR_OUT" ;;
+esac
 # ⛔ AND THE PHYSICAL SPELLING OF A NOT-YET-EXISTING USER ROOT (re-review P2, #2666): with `$HOME` a symlink and
 # `~/.local/share/systemd` absent, the `$HOME` spelling was refused while its PHYSICAL spelling was admitted —
 # same directory, two verdicts. Both must resolve to the same root now.
