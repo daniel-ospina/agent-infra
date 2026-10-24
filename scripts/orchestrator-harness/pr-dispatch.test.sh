@@ -834,12 +834,12 @@ if [ -s "$TMP/issue.sh" ]; then
     cat "$TMP/i.log"
   }
   _o="$(issueref 1 1 3)"
-  printf '%s' "$_o" | grep -q '⛔ 3 spawn(s) REFUSED' \
+  grep -q '⛔ 3 spawn(s) REFUSED' <<<"$_o" \
     && ok "1 PR-phase + 3 issue-path refusals: the issue line reports 3, not the cumulative 4" \
     || bad "the issue line over-reported: $(printf '%s' "$_o" | tr '\n' ' ')"
   # ⛔ THE REASON'S IDENTITY IS THE CLAIM (review, cycle 4): a count alone stays green while the line
   # attributes the PR phase's reason to issue-path refusals. The fixture writes two distinct reasons.
-  printf '%s' "$_o" | grep -q 'ISSUE phase' && ! printf '%s' "$_o" | grep -q 'PR phase' \
+  grep -q 'ISSUE phase' <<<"$_o" && ! grep -q 'PR phase' <<<"$_o" \
     && ok "…and the reason is the first NEW row's (issue phase), never the PR phase's" \
     || bad "the issue line attributes the wrong phase's reason: $(printf '%s' "$_o" | tr '\n' ' ')"
   _o="$(issueref 1 4 0)"
@@ -850,7 +850,7 @@ if [ -s "$TMP/issue.sh" ]; then
   # issue path with nothing to add — and the writer refuses further rows, so "no delta" would read as
   # "nothing was refused" when in fact nothing could be RECORDED.
   _o="$(issueref 1 200 0)"
-  printf '%s' "$_o" | grep -q 'at its 200-row cap' && printf '%s' "$_o" | grep -q 'UNMEASURED' \
+  grep -q 'at its 200-row cap' <<<"$_o" && grep -q 'UNMEASURED' <<<"$_o" \
     && ok "a record the PR phase saturated says the ISSUE path is UNMEASURED (never a silent zero)" \
     || bad "a saturated record left the issue path silent: $(printf '%s' "$_o" | tr '\n' ' ')"
 else
