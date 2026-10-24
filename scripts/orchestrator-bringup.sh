@@ -159,6 +159,28 @@ if [ "$PLATFORM" = "cell" ]; then
 else
   ENV_FILE="${ENV_FILE:-$HOME/.config/orchestrator/bringup.env}"
   O="${O:-$HOME/orchestrator}"
+  # ── THE MAC'S PIN RECORDS (agent-infra#2231, mac pin parity) ────────────────────────────────────
+  # These were CELL-ONLY, and that is the whole divergence this closes: `harness_ctl_path()` below
+  # prefers `HARNESS_PIN_FILE` when it is set, so on a Mac it always fell back to
+  # `$HARNESS_BRINGUP` — the checkout the operator happened to run this from — and `deploy_harness`
+  # seeded `$O` from THAT. So the Mac had no pin record to read, reported `harness: <checkout>` in
+  # `status`, and answered "which commit is this box on?" differently from every cell.
+  # The same three spellings the cells use, under the Mac's own home: `~/.pi/agent/state/HARNESS-PIN`
+  # (sha), `~/.harness-path` (the dir the controller execs) and `~/harness` (the per-commit worktrees).
+  # ⛔ `~/harness`, NOT a path under `~/Documents`: launchd's bash is TCC-blocked from reading
+  # ~/Documents (the recorded reason setup.sh COPIES instead of symlinking, #427), so a pin root there
+  # would be unreadable by the very job that must exec it.
+  HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$HOME/harness}"
+  HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}"
+  # What `deploy_harness` seeds `$O` FROM. A pin that exists and can be read wins, because the
+  # controller execs THAT tree and the two surfaces must be one commit. An absent or unreadable record
+  # is NOT a rebind: `deploy_harness` then falls back to `$HARNESS_BRINGUP` exactly as before, so a
+  # box that has not been pinned yet still starts (and install.sh is what creates the pin).
+  HARNESS_SEED=""
+  if [ -f "$HARNESS_PIN_FILE" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    _seed_pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+    if [ -n "$_seed_pin" ] && [ -d "$_seed_pin" ]; then HARNESS_SEED="$_seed_pin"; fi
+  fi
   SUPERVISOR=""
 fi
 # Which harness directory to consult. Defaults to the sibling `orchestrator-harness/` of this
@@ -638,14 +660,21 @@ RESOLVERS
 # performed, the resolver set is kept, and this returns non-zero naming what it refused to delete.
 # Returns 1 only in that state — a plain deploy (or one with nothing to remove) returns 0.
 deploy_harness() {
-  [ -d "$HARNESS_BRINGUP" ] || unknown "no harness at $HARNESS_BRINGUP — nothing to deploy into $O"
+  # ⛔ SEED FROM THE PINNED TREE, NOT FROM THE CHECKOUT THIS WAS RUN FROM (agent-infra#2231). The
+  # controller execs the pinned harness; the workers exec `$O`. Seeding `$O` from the operator's
+  # checkout made those two DIFFERENT COMMITS on the Mac — the same version skew `--pin-only` exists
+  # to avoid on a cell (`cloud-cell-supervisor.sh`'s `seed_and_stamp` seeds from `$HARNESS`, the pin).
+  # `HARNESS_SEED` is set on the Mac branch of the platform block above; on a cell it stays empty and
+  # this function is not the seeder at all (the supervisor's `seed_and_stamp` is).
+  local SRC_HARNESS="${HARNESS_SEED:-$HARNESS_BRINGUP}"
+  [ -d "$SRC_HARNESS" ] || unknown "no harness at $SRC_HARNESS — nothing to deploy into $O"
   mkdir -p "$O/logs" "$O/state" "$O/wip" || refuse "cannot create the state dir $O"
   local src f b tmp n=0 changed="" stale="" keep="" why conflict=0
   # ── THE PLAN, before anything is written ────────────────────────────────────────────────────────
   # Two halves, because they are two different risks: a shipped file whose bytes DIFFER is about to be
   # overwritten (a hand edit in $O is lost), and a file $O carries and the checkout does not is what
   # the mirror used to delete. An operator reading a plan can stop it; nobody reads an `rm` in a loop.
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     b="$(basename "$src")"
     [ -f "$O/$b" ] || continue
@@ -655,11 +684,11 @@ deploy_harness() {
   for f in "$O"/*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
-    [ -f "$HARNESS_BRINGUP/$b" ] && continue
+    [ -f "$SRC_HARNESS/$b" ] && continue
     why="$(resolver_reason "$b")"
     if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
   done
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
     cp -p "$src" "$tmp" || { rm -f "$tmp"; refuse "cannot stage $f into $O — check free space"; }
@@ -684,13 +713,13 @@ deploy_harness() {
       warn "deploy: CONFLICT — --prune asked for a mirror, and a mirror would delete the resolver set named above; that removal was NOT performed. Retire one of those files by changing the resolver that names it, not by pruning $O"
     fi
   fi
-  if [ -f "$HARNESS_BRINGUP/gh-rest/gh" ]; then
+  if [ -f "$SRC_HARNESS/gh-rest/gh" ]; then
     mkdir -p "$O/gh-rest" || refuse "cannot create $O/gh-rest"
     tmp="$O/gh-rest/.gh.$$"
-    cp -p "$HARNESS_BRINGUP/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
+    cp -p "$SRC_HARNESS/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
       || { rm -f "$tmp"; refuse "cannot install $O/gh-rest/gh"; }
   fi
-  ok "deployed $n harness script(s) into $O from $HARNESS_BRINGUP"
+  ok "deployed $n harness script(s) into $O from $SRC_HARNESS"
   return "$conflict"
 }
 
@@ -903,7 +932,12 @@ start_cell() {
     # and the real cause (apply failed) is never stated. Measured by review of #1856.
     refuse "the harness could not be pinned to ${HARNESS_REF:-the configured ref} in ${HARNESS_REPO:-this checkout} (see the apply output above) — no controller was started"
   fi
-  if ! bash "$SUPERVISOR" start; then
+  # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THIS CALLER IS NOT THE SERVICE MANAGER (review P1 round 18,
+  # #2402). The unit exports `ORCH_FOREGROUND=1`, and a bring-up run from a lane shell inherits it through the
+  # tmux server the controller created; without this pin the exec branch fires and `exec`s the loop INSIDE
+  # this process — outside the unit's cgroup, so `systemctl stop` cannot end it, and the registry entry below
+  # is never recorded because the process was replaced. `harness-up` carries the same fence.
+  if ! env ORCH_FOREGROUND=0 bash "$SUPERVISOR" start; then
     refuse "cloud-cell-supervisor.sh start failed (see its output above) — no registry entry was recorded"
   fi
   STARTED_PID="$(await_pid roster_pid_from_status)"
@@ -962,15 +996,42 @@ launchd_job_for_state_dir() {
     args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
     # The LAST <string> of the array is the program: every job in this fleet is `/bin/bash <script>`,
     # and a job with no ProgramArguments is not one of ours.
-    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p')"
-    case "$prog" in "$O"/*) ;; *) continue ;; esac
+    # ⛔ THE FIRST non-interpreter token (agent-infra#2231 follow-up): the program is now
+    # `<pin>/<entry>`, which is NOT under $O, so a `case "$prog" in "$O"/*)` filter made the installer's
+    # own job INVISIBLE to this scan — and the two-jobs ambiguity refusal below then never fired, so
+    # `start` adopted the stack job and left the pin-programmed loop job loaded (a second controller).
+    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p' \
+      | awk 'BEGIN{FS=OFS=" "} {for(i=1;i<=NF;i++){ if ($i ~ /^-/) continue; if ($i ~ /(^|\/)(ba|z|k)?sh$/ || $i ~ /\/env$/) continue; print $i; exit }}')"
+    # The ownership question is asked FIRST: a job that DECLARES this state dir (`O`) is this state
+    # dir's job wherever its program lives. A job that merely lives under $O is not (the stack
+    # supervisor, heartbeat, nightwatch, pr-doctor all do) — see the comment below.
+    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    # ⛔ AN AUXILIARY IS NEVER THIS STATE DIR'S CONTROLLER, WHATEVER IT DECLARES. The shipped watchdog
+    # template declares EXACTLY this state dir (`templates/launchd/com.eldato.controller-watchdog.plist`
+    # `O` = `{{HOME}}/orchestrator`, which IS the Mac's `$O`) while its program lives under
+    # AGENT_INFRA_PATH — outside `$O`. So before this line, the `O` question alone counted the WATCHDOG
+    # as a controller, and on a box where the documented activation path had installed it
+    # (`install-launchd.sh`, ACTIVATION-MATRIX row 8) the scan returned TWO jobs and `start` refused
+    # "TWO launchd jobs" — `harness-up up` could not run on the very box this pin work exists for, and
+    # a watchdog is not a second controller (#2231 review).
+    # ⛔ AND IT IS AN EXCLUSION LIST, NOT AN ALLOW-LIST OF CONTROLLER NAMES: the box's controller shapes
+    # are open-ended — the stack supervisor (`$O/supervisor.sh`), an operator's renamed loop — and an
+    # allow-list makes them stop owning their OWN state dir, which silently turns a duplicate-controller
+    # refusal (#1761) into an adoption. The marker still has to be read from the DECLARATION (that is
+    # what makes a PIN-programmed loop visible at all, #2231), so what this narrows is which PROGRAMS
+    # may claim it.
+    case "$(basename "${prog:-}")" in
+      watchdog-loop.sh|orchestrator-heartbeat.sh|heartbeat-loop.sh|nightwatch.sh|pr-doctor.py) continue ;;
+    esac
+    if [ "$job_o" != "$O" ]; then
+      case "$prog" in "$O"/*) ;; *) continue ;; esac
+    fi
     # ⛔ A JOB THAT MERELY LIVES IN $O IS NOT THIS STATE DIR'S CONTROLLER JOB. On this box FOUR plists
     # run a program under $O — the stack supervisor, the heartbeat, `bg/nightwatch.sh`, pr-doctor — and
     # counting them all as owners made `start` refuse for ambiguity on the one box it has to work on
     # (measured 2026-10-21; the first version of this function did exactly that). The ownership marker
     # is the one the controller's own templates write: the job DECLARES this state dir (`O`), or it runs
     # the loop itself. An auxiliary installed under $O declares neither.
-    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ "$job_o" = "$O" ] || [ "$prog" = "$O/orch-loop.sh" ] || continue
     label="$(printf '%s' "$flat" | sed -n 's:.*<key>Label</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ -n "$label" ] || continue
