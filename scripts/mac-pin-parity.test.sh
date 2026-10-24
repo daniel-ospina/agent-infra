@@ -80,9 +80,16 @@ FX_SHA="$(git -C "$FX" rev-parse HEAD 2>/dev/null)"
 STAGE="$T/stage"; mkdir -p "$STAGE"
 cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" "$STAGE/" 2>/dev/null
 BIN="$T/bin"; mkdir -p "$BIN"
-# install.sh probes the real binaries (gh/network, tmux, pi) and lints the plist with plutil. All four
-# are stubbed: the assertions below are about the RENDERED PROGRAM, not about the host's toolchain.
-for b in gh tmux plutil; do printf '#!/bin/sh\nexit 0\n' > "$BIN/$b"; chmod +x "$BIN/$b"; done
+# install.sh probes the real binaries (gh/network, tmux, pi, jq) and lints the plist with plutil. ALL of
+# them are stubbed IN $BIN: the assertions below are about the RENDERED PROGRAM, not the host's toolchain.
+# ⛔ `pi` AND `jq` BELONG IN THIS LOOP, NOT ONLY IN $SHOME (the arms' Linux-CI red, 2026-10-24). `RUN()`
+# prepends $SHOME/…/pi-node/current/bin, but most arms invoke the installer directly with
+# `PATH="$BIN:$PATH"`, so a `pi` that existed ONLY under $SHOME left those arms reading the HOST's
+# toolchain: green on a dev Mac (where `pi` is on the ambient PATH), and ~20 arms RED on the runner with
+# `✓ gh ❌ pi not on PATH` — install.sh's hard-dependency probe (tmux gh pi jq) died before the arm's own
+# assertion could run. jq is in that same probe (#1962) and is used by install.sh ONLY to test presence,
+# so a no-op stub is faithful. Stub the DEPENDENCY; never the host.
+for b in gh tmux plutil pi jq; do printf '#!/bin/sh\nexit 0\n' > "$BIN/$b"; chmod +x "$BIN/$b"; done
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SHOME/.local/share/pi-node/current/bin/pi"
 chmod +x "$SHOME/.local/share/pi-node/current/bin/pi"
