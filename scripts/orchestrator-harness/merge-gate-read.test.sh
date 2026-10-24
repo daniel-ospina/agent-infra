@@ -929,7 +929,12 @@ s = s.replace('          gate_kind=CLASSIFIERFAIL', '          gate_kind=UNREADA
 open(dst, "w").write(s)
 EOP
 if qF '          gate=""' "$(cat "$MUT11")"; then
-  b_out="$(
+  # ⛔ THE STUBS LIVE IN A FUNCTION, NOT INLINE IN THE CAPTURE. A `name() { … }` header
+  # written directly inside "$( … )" is a HIDDEN brace to the false-PASS scanner: it sees the
+  # header, cannot see the brace, and leaves a phantom function body open to EOF — so it
+  # reports a PARTIAL scan of this whole file and refuses to certify anything in it (#2096).
+  # The capture still runs in a subshell, so the stubs stay scoped exactly as before.
+  _s15_classifierfail() {
     L="$TMP/block"; PR=7; OR=acme/widget; REVIEW_GATE=ai-review-gate
     GATE_POLL_SECS=0; GATE_POLL_TRIES=2; GATE_ABSENT_TRIES=2; GATE_READ_TRIES=3
     export L PR OR REVIEW_GATE GATE_POLL_SECS GATE_POLL_TRIES GATE_ABSENT_TRIES GATE_READ_TRIES
@@ -942,7 +947,8 @@ if qF '          gate=""' "$(cat "$MUT11")"; then
     : > "$L.log"
     . "$MUT11" >/dev/null 2>&1
     cat "$L.log"
-  )"
+  }
+  b_out="$(_s15_classifierfail)"
   # The pre-round-8 shape LOSES the classifier verdict entirely (measured: it degrades to the catch-all
   # `last='<nothing>'`), which is what §17 asserts against — a lost verdict, not a legible one.
   nq 'the check surface was READ but the classifier produced no verdict' <<<"$b_out" \
