@@ -2786,6 +2786,12 @@ if true; then
     # bash prints `Killed` for it, so "the first diagnostic in the log" would point at a fixture doing
     # its job. awk keeps the LAST match and needs no pipe (a `grep | tail -1` would SIGPIPE).
     diag="$(awk '/syntax error|unbound variable|command not found|Terminated|Killed/{d=$0} END{if (d != "") print d}' "$MUT/$name.log" 2>/dev/null)"
+    # ⛔ …AND A LOG WITH NONE OF THOSE PATTERNS IS STILL EVIDENCE. The code this replaced always
+    # appended `tail -1`; keeping only the pattern match narrowed the abort path, so `No space left on
+    # device`, `Bad substitution` and a plain scenario `❌ expected rc 0, got 1` all produced an abort
+    # with NO log evidence at all — measurably weaker than what it replaced, on the one path whose
+    # whole job is attribution (#1185).
+    [ -n "$diag" ] || diag="$(tail -1 "$MUT/$name.log" 2>/dev/null)"
     if [ "$present" = 1 ]; then
       fail "mutation $name produced an UNREADABLE verdict artifact (<failures> <checks> expected), rc=$rc$sig — its generated run did not report a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
     else
@@ -2841,15 +2847,31 @@ if true; then
     # ⛔ A WAIT THAT SUCCEEDS MUST CHARGE NOTHING. (Review finding 1 on #2623: charging every waited
     # second let ordinary slowness exhaust the budget, after which every remaining child was aborted
     # unpolled — the same false red, reintroduced by the fix for it.) Called DIRECTLY, not through
-    # `$( )`: the budget lives in this shell, and a subshell would make the assertion vacuous.
+    # `$( )`: the budget lives in this shell, and a subshell would make the assertion vacuous. Its own
+    # verdict line is NOT suppressed — a hidden `pass`/`fail` would still move `checks`/`failures` and
+    # produce a count with no matching line (review finding 3 on #2623).
     ( sleep 2; printf '5 290\n' >"$_sv/late2.verdict" ) &
     _vpid=$!
     _b0="$MUTATION_VERDICT_BUDGET"
-    MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late2 1 >/dev/null 2>&1
+    MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late2 1
     wait "$_vpid" 2>/dev/null
     [ "$MUTATION_VERDICT_BUDGET" -eq "$_b0" ] \
       && pass "verdict arm: a wait that SUCCEEDS charges nothing to the drain budget (benign lateness cannot starve later children)" \
       || fail "verdict arm: a successful wait spent the drain budget ($_b0 -> $MUTATION_VERDICT_BUDGET) — enough benign lateness would false-abort every later child"
+    # ⛔ NOR IS A ZERO-BYTE ARTIFACT A VERDICT (review finding 2 on #2623): the writer OPENS the file a
+    # few syscalls before the write lands, so "exists" is not "has a verdict". Pinned because a
+    # rewrite from `[ -s ]` back to `[ -f ]` leaves EVERY OTHER ARM GREEN, while turning a live
+    # child's mid-write window into "produced an UNREADABLE verdict artifact" — a false abort with no
+    # assertion firing.
+    : >"$_sv/midwrite.verdict"
+    ( sleep 2; printf '9 290\n' >"$_sv/midwrite.verdict" ) &
+    _vpid=$!
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict midwrite 1 2>&1)"
+    wait "$_vpid" 2>/dev/null
+    case "$_o" in
+      *"class covered"*"9 of 290"*) pass "verdict arm: a ZERO-BYTE artifact is not 'arrived' — the decision waits for content (a live child is not aborted mid-write)" ;;
+      *) fail "verdict arm: a zero-byte artifact was read as the verdict (got: $_o)" ;;
+    esac
     # ⛔ AND AN EXHAUSTED BUDGET MUST SAY SO, not report "in 0s … never reached a verdict" as if the
     # child were at fault. Forced here by charging the budget down first.
     _b1="$MUTATION_VERDICT_BUDGET"
