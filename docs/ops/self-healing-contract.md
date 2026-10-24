@@ -453,9 +453,13 @@ The measured freeze that this pins: a refresh ABORTed mid-pass leaving a **parti
 of 42 entries — and `42` is not `< 6`, so the old backlog trigger never fired again and the queue froze
 for **six hours**. `refresh-candidates.sh` REFUSES with the pre-flight's OWN rc and carries its command
 and stderr line (#2659) — a failed refresh is never a silent success — while `harness-refresh.sh` reports its own
-outcomes by code — `0` current (nothing re-deployed), `10` advanced, `11` pin mended, `23` usage, `25`
-behind with no materialiser, `26` refuses without `--force` — each naming itself and touching nothing it
-cannot verify.
+outcomes by code, in its own words — `0` current (no-op), `10` repinned (the materialiser ran and recorded
+whether the pin advanced or `$O` was re-seeded), `11` mended (the pin was empty/absent/not-a-commit),
+`20` REFUSED dirty, `21` REFUSED ahead, `22` REFUSED diverged, **`23` REFUSED unknown** (the ref/repo/running
+commit cannot be resolved — *cannot-verify is not a pass* — or the materialiser failed), `25` behind with
+NO materialiser, `26` REFUSED blocked (a `--re-seed` would change the code under a running controller).
+⛔ `23` is **not** a usage code: reading it as one would let an operator dismiss a cannot-verify refusal as
+their own typo.
 
 **What repairs it.** A frozen pool → `refresh-candidates.sh` by hand and read the funnel; a pin that
 cannot advance → `cloud-cell-supervisor.sh apply`.
@@ -493,7 +497,10 @@ blob sha of every shipped `*.sh`), **and refuse to answer "fine" when it cannot 
 
 **ALIVE vs REFUSING vs IDLE.** The exit code IS the contract: **0 OK · 1 DRIFT · 2 UNKNOWN**
 (*"AN ABSENT, UNREADABLE OR UNKNOWN IDENTITY IS `UNKNOWN`, AND CANNOT-VERIFY IS NEVER A PASS"*). A
-failed fetch says so rather than comparing a stale ref. `--surface` extends it to *every* place a
+failed fetch prints a `WARNING` and then compares the **LOCAL** ref, *"which may be stale"* — so an `OK`
+on that path is NOT proof the box is current, and the script's header says exactly that: it refuses to
+compare silently, not to compare. (An earlier draft of this document dropped the word "silently" and
+thereby turned a warned-but-stale comparison into a guarantee it does not give.) `--surface` extends it to *every* place a
 harness script lives on the box (the running controller's dir, `$O`, the pin, every pinned snapshot,
 `$HOME/orchestrator`), because #1790 measured up to **four** `orch-loop.sh` trees on one cell.
 Pinned in CI by `selftest.sh` (its 15 `check-deployed-drift:` assertions — §5.1) plus a small delta suite
@@ -557,6 +564,7 @@ is what §3.10's placement is for.
 | `❌*` | **provably absent fleet-wide from provenance or transport, not from a per-box read** — the artifact does not exist anywhere (no source in any repo) or the channel cannot carry it (a per-repo namespace). It is `❌` on every box *because of that*, never because each box was read |
 | `NC` | **no channel** — the box could not be read at all (§1.1), so its state is UNKNOWN here |
 | `REC` | **recorded, not re-measured** — a prior measurement or a plist/label, carried as a record |
+| `INF` | **inferred** from that box's OWN published artifact (a capacity record it wrote), not read from the box |
 | `REC ✅` | a RECORD that says present/working — the box was **not** re-read in this pass; §1.1 is why |
 | `REC ⚠️` | a record that also carries a known defect (named in the cell) |
 | `REC (label only)` | a record whose only evidence is a plist/label on one machine — closer to a name than to a measurement |
@@ -565,7 +573,7 @@ is what §3.10's placement is for.
 
 | capability | cell-4 | cell-3 | cell-1 | Mac |
 |---|---|---|---|---|
-| controller cycling | ✅ `HEALTHY age=180`, 355 cycles | ✅ inferred from its 14:47:40Z capacity record | NC | REC ✅ |
+| controller cycling | ✅ `HEALTHY age=180`, 355 cycles | INF from its 14:47:40Z capacity record | NC | REC ✅ |
 | one supervisor, one controller | ⚠️ two supervisors / one controller (§3.2) | NC | NC | REC ✅ (tmux entrypoint) |
 | `eldato-orchestrator` unit | ⚠️ active **and waiting for a foreign pid** — it does not own the controller (§3.2) | NC | NC | n/a (launchd) |
 | merge rail present | ✅ | NC | NC | REC ✅ |
@@ -576,13 +584,14 @@ is what §3.10's placement is for.
 | `nonblocking-dispatch` takes `prfix` | ✅ | NC | NC | NC |
 | `auto-rail` actuator | ❌* no source in any repo | ❌* | ❌* | REC (label only) |
 | precedence rule (merge before new work) | ✅ in code + observed in the cycle record | NC | NC | NC |
-| placement seam present | ✅ | ✅ (publishes) | NC | ✅ (publishes) |
+| placement seam present | ✅ | INF (publishes) | NC | REC ✅ (publishes) |
 | **placement sees more than one box** | ❌ (§3.10) | ❌* | ❌* | ❌* |
 | `check-deployed-drift` | ✅ present; pin ≠ running (§1.3) | NC | NC | REC ⚠️ (remedy destroys — baseline §3.1) |
 | disk above floor | ✅ (4649 MB ≈ 97 % used) | NC | NC | NC |
 
-**What the ❌s mean, read column by column** (the table above already distinguishes a measured
-absence from an unreadable machine, so this summary must not flatten it again):
+**What the ❌s mean, read column by column** (the table above distinguishes a MEASURED cell from one
+INFERRED from the box's own published record and from one RECORDED off-box, so this summary must not
+flatten them again — and neither should a reader who quotes only this list):
 
 - **Landing attribution: `❌` on cell-4, `❌*` on the other three** — no record anywhere names the box
   that landed a PR (the land path has no host field at all, which is what `❌*` means).
@@ -685,7 +694,7 @@ invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
 | **C3** | **#2707** — the fleet view: a per-box identity + a transport that is not partitioned by work repo (and a `cap_place` that refuses to decide on a fleet of one) | C1 | needs a design decision with a measured basis; §3.10 carries the evidence |
 | **C4** | merge precedence — **already shipped** (#2099 / #2126 / #2203), observable, and pinned by `test-gates.sh` | — | **no child filed**: it exists. The epic's "threshold" phrasing is superseded by the #2099 ruling (§6) |
 | **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass |
-| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) and `check-deployed-drift.sh` compares the RUNNING dir to `$REF`, never to the PIN (§3.14) |
+| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) `check-deployed-drift.sh` compares the RUNNING dir to `$REF`, never to the PIN, and a FAILED FETCH still compares a possibly-stale LOCAL ref (warned, and an `OK` on that path proves less than it looks) (§3.14) |
 
 Every child carries the same research mandate as the epic: **read
 `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` → run the contradiction test → read the artifacts named
