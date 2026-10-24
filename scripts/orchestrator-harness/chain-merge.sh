@@ -106,7 +106,7 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 82 key / 83 harness-skew), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
@@ -134,6 +134,11 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
     disk) printf 'disk' ;;
     fork) printf 'fork' ;;
     land) printf 'land' ;;
+    # ⛔ `mem` IS THE SPAWN GATE'S MEMORY REFUSAL (#2387), and it MUST be mapped, not left to the
+    # default: `lane.sh` writes it, and falling through to `load` would name the load gate in the
+    # chain's log and exit 75 — sending the operator to watch a 1-min average that will never move
+    # while the OOM killer takes lanes, i.e. the exact wrong-cause class this field exists to remove.
+    mem) printf 'mem' ;;
     capability) printf 'capability' ;;
     skew) printf 'skew' ;;
     # ⛔ `key` IS THE MODEL-CREDENTIAL REFUSAL (agent-infra#3331), and it belongs HERE for the same reason
@@ -282,6 +287,10 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
+      # 81 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
+      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
+      # DIFFERENT reading, so it exits with its own code rather than reporting 75.
+      mem)  _cap_rc="${AGENT_MEM_REFUSED:-81}" ;;
       # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
       # and either rejected its own arguments (a usage/version skew between the caller and the deployed
       # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader

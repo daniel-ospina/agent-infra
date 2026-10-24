@@ -1042,6 +1042,21 @@ ck "§LB …and does NOT report it as a load refusal (the two remedies are mutua
 KEY_GATE_REFUSED_DECL="$(sed -n 's/^KEY_GATE_REFUSED=//p' "$HERE/key-gate.sh" | head -1)"
 [ "${KEY_GATE_REFUSED_DECL:-}" = "82" ]; rc=$?
 ck "§LB …and the code the chain reports is the gate's OWN declared constant (key-gate.sh KEY_GATE_REFUSED='${KEY_GATE_REFUSED_DECL:-<none>}')" $rc
+# …and a `mem` record (the SPAWN gate's memory refusal, agent-infra#2387) maps to ITS code — 81, not
+# 75. This is the arm that catches a `mem` falling through the default: the classification is right
+# either way (a memory refusal IS a capacity transfer, unlike `land`), but a `load` label sends the
+# operator to watch a 1-min average that will never move while lanes are OOM-killed — the exact
+# wrong-cause class the `disk`/`land` arms above exist to remove.
+acquire_claim 107
+NOW3="$(date +%s)"; EP3=$(( NOW3 - 1 ))
+printf '%s\t%s\t%s\n' "$EP3" "$(( EP3 + 900 ))" "mem" > "$O/state/capacity-refused-107"
+run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+  CHAIN_CLAIM_COMMIT="$(chain_gen 107)" \
+  bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 107 feat/107-tm
+{ [ "$BOUNDED_RC" -eq 81 ]; }; rc=$?
+ck "§LB chain-merge.sh maps a 'mem' record to exit 81 (got $BOUNDED_RC) — not 75, not the load remedy" $rc
+grep -q 'refused at the mem gate' "$O/logs/chain-107.log"; rc=$?
+ck "§LB …and NAMES the memory gate, not the load one (the load wording is not universal)" $rc
 
 # ── the derivation, driven directly, so the SIZING RULE is a measurement and not a slogan ──
 # Little's law in practice: L_max = λW. 40 landings/24h with a 24h lead budget allows 40 open; with a

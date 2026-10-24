@@ -899,7 +899,8 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83)
+# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83),
+# AGENT_MEM_REFUSED (81)
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
@@ -916,6 +917,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_BRIEF_REFUSED:-80}")        lane_outcome refused "brief-gate" ;;
     "${AGENT_LOAD_REFUSED:-75}")         lane_outcome refused "load-gate" ;;
     "${AGENT_FORK_REFUSED:-73}")         lane_outcome refused "fork-gate" ;;
+    # ⛔ THE MEMORY GATE'S OWN OUTCOME NAME (#2387), for the reason the comment above gives: an
+    # operator told "refused" still cannot tell a fork-exhausted box (73) from one whose memory floor
+    # is gone (81), and the remedies are mutually exclusive — a fork needs an external restart, a
+    # memory floor clears when resident lanes finish.
+    "${AGENT_MEM_REFUSED:-81}")          lane_outcome refused "mem-gate" ;;
     "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
     "${AGENT_HARNESS_SKEW_REFUSED:-83}") lane_outcome refused "harness-skew" ;;
