@@ -211,7 +211,7 @@ gb() { if command -v timeout >/dev/null 2>&1; then timeout "$GIT_TIMEOUT" "$@"; 
 # we cannot create is a refusal (3), never a pass.
 LOCK_HELD=0
 acquire_lock() {
-    local owner started
+    local owner started _lmt _lage
     mkdir -p "$STATE_DIR" 2>/dev/null
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
@@ -229,11 +229,22 @@ acquire_lock() {
         say "SKIP reason=lock-held pid=$owner"
         return 3
     fi
-    if num "$started" && [ $(( $(now) - started )) -le "$LOCK_STALE_SECONDS" ] && [ -f "$LOCK_DIR/token" ]; then
-        # A token we cannot attribute is NOT broken: a live sweep may be between creating the lock
-        # and writing its token. Refuse rather than race (fail closed, benign, retried next tick).
-        say "SKIP reason=lock-tokenless age=$(( $(now) - started ))s"
-        return 3
+    # ⛔ ONLY AN UNATTRIBUTABLE LOCK IS "TOKENLESS", AND ONLY WHILE IT IS YOUNG. The old test fired on a
+    # token it COULD attribute (pid parsed, `kill -0` says the owner is gone): a SIGKILLed sweep then
+    # refused every contender for the whole stale window for no reason, and a `started` in the FUTURE
+    # (clock step-back, a token from another box) made `age` negative — `-le stale` always true — so the
+    # lock was unreclaimable for the entire skew (measured: `age=-500000s`). A lock whose owner is
+    # provably gone is STALE; a future timestamp is stale; an unattributable lock is refused only while
+    # it is younger than the window, because a live sweep may be between `mkdir` and its token write.
+    if ! num "$owner"; then
+        if [ -f "$LOCK_DIR/token" ]; then _lmt="$(file_mtime "$LOCK_DIR/token")"; else _lmt="$(file_mtime "$LOCK_DIR")"; fi
+        if num "$_lmt"; then
+            _lage=$(( $(now) - _lmt )); [ "$_lage" -lt 0 ] && _lage=0
+            if [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then
+                say "SKIP reason=lock-tokenless age=${_lage}s"
+                return 3
+            fi
+        fi
     fi
     say "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
     rm -rf "$LOCK_DIR" 2>/dev/null
@@ -513,6 +524,17 @@ CENSUS="$CENSUSDIR/live-paths.tsv"
 
 MODE_TEXT=dry-run; [ "$DRY_RUN" = 1 ] || MODE_TEXT=apply
 say "reap-abandoned-worktrees: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
+# ⛔ THE DOCUMENTED SEAM MUST REACH THE LIBRARY. `REAP_AW_PROC_ROOT` drives the fail-closed arm in the
+# docs and in this suite, but the census reads `LP_PROC_ROOT`; unmapped, the documented way to simulate
+# an unreadable table silently read the REAL one and reported green (`census=ok`).
+# An EXPLICIT seam that does not name a readable process table forces the fail-closed arm: the seam
+# says WHICH table to read, so falling through to `lsof` would silently read a different one and
+# report green — the exact "the documented way to test the refusal cannot reach it" defect.
+if [ -n "${REAP_AW_PROC_ROOT:-}" ] && [ ! -d "${REAP_AW_PROC_ROOT}" ]; then
+    say "note: REAP_AW_PROC_ROOT=$REAP_AW_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
+    LP_CENSUS_UNAVAILABLE=1
+fi
+export LP_PROC_ROOT="${LP_PROC_ROOT:-${REAP_AW_PROC_ROOT:-/proc}}"
 if ! lp_census "$CENSUSDIR"; then
     # ⛔ THE FAIL-CLOSED ARM, SAID OUT LOUD. Nothing is reaped, and the reason names the probe. The
     # caller turns this into a red class: a reaper that cannot prove idleness must never read green.

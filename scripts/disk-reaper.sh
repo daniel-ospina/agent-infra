@@ -1378,11 +1378,14 @@ reap_venv() {
 # sweep; `pinned()` / `lp_path_named()` inside it say what it will not touch). This function only
 # accounts: per root, a `df` reading before and after, never a `du` sum.
 reap_abandoned_arm() {
-    local roots root b a d out rc _r
+    local roots root b a d out rc _r _root_rem
     AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""; AW_REAPED=0; AW_SETUP_FAIL=0
     if [ -z "$ABANDONED_WT_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree arm=abandoned FAIL-CLOSED — reap-abandoned-worktrees.sh not found (looked at \$ABANDONED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         AW_NOTE="abandoned-worktree owner missing"
+        # ⛔ SET, or the `misconfigured` verdict this arm exists for never happens (the guard read a
+        # variable nothing assigned and the record still said `fail-closed` — "the delegate RAN").
+        AW_SETUP_FAIL=1
         RC_WT="$(worst_rc "$RC_WT" 3)"
         MISCONFIG="${MISCONFIG}${MISCONFIG:+, }abandoned-worktree-delegate-missing"
         return 0
@@ -1398,8 +1401,18 @@ reap_abandoned_arm() {
                   --aged-minutes "${DISK_REAPER_ABANDONED_MINUTES:-180}"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$root")"
+        # ⛔ PER ROOT. The "removed nothing ⇒ not our delta" rule used to be applied to the SUM across
+        # roots, so a root whose delegate reaped nothing had its foreign delta credited as long as any
+        # OTHER root reaped something (measured: a stub reporting reaped=1 for r1 and 0 for r2 gave
+        # `freed_df=63MB detail=ok` for a pass that removed nothing in r2). A delta belongs to the root
+        # that produced it, and only when THAT root's own ledger says it removed something.
+        _root_rem="$(sed -n 's/.* reaped=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | head -1)"
+        case "${_root_rem:-}" in ''|*[!0-9]*) _root_rem=0 ;; esac
         if [ -n "$b" ] && [ -n "$a" ]; then
-            d=$(( (a - b) / 1024 )); AW_RAW=$((AW_RAW + d)); [ "$d" -lt 0 ] && d=0; AW_FREED=$((AW_FREED + d))
+            d=$(( (a - b) / 1024 )); AW_RAW=$((AW_RAW + d))
+            if [ "$_root_rem" -gt 0 ]; then
+                [ "$d" -lt 0 ] && d=0; AW_FREED=$((AW_FREED + d))
+            fi
         else
             AW_MEASURED=0
         fi
@@ -1595,7 +1608,7 @@ reap_worktree() {
 # keeps the newest, never empties a family, and keeps-and-names every copy it cannot prove. This
 # entry point adds nothing to that: it accounts, per root, with a `df` delta.
 reap_dup() {
-    local roots root b a d out rc freed=0 raw=0 MEASURED=1 rows="" cands="" all_c=0 line path size why _dn reaped=0 _r
+    local roots root b a d out rc freed=0 raw=0 MEASURED=1 rows="" cands="" all_c=0 line path size why _dn reaped=0 _r _root_rem
     local sweep_end swept
     if [ -z "$DUP_INSTALL_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
@@ -1611,8 +1624,13 @@ reap_dup() {
         run_class bash "$DUP_INSTALL_REAPER_PATH" "$(mode_flag)" --root "$root"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$root")"
+        _root_rem="$(sed -n 's/.* reaped=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | head -1)"
+        case "${_root_rem:-}" in ''|*[!0-9]*) _root_rem=0 ;; esac
         if [ -n "$b" ] && [ -n "$a" ]; then
-            d=$(( (a - b) / 1024 )); raw=$((raw + d)); [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+            d=$(( (a - b) / 1024 )); raw=$((raw + d))
+            if [ "$_root_rem" -gt 0 ]; then
+                [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+            fi
         else
             MEASURED=0
         fi
@@ -1646,9 +1664,11 @@ reap_dup() {
             path="${line#remove}"
             path="${path#"${path%%[![:space:]]*}"}"
             path="${path%"${path##*[![:space:]]}"}"
-            # The owner's row is `remove <path> (duplicate of <marker>; newest kept is <path>)` — the
-            # path is the FIRST token, and it must be absolute or the `du` would measure our cwd.
-            path="${path%% *}"
+            # ⛔ THE ROW IS `remove <path>` AND THE PATH IS THE REST OF THE LINE. Truncating at the first
+            # space measured a DIFFERENT directory: a copy under `"/tmp/sp test/root/fam/b"` was sized as
+            # `/tmp/sp`, and the class reported a byte figure that was not its work (measured: 200MB per
+            # row for candidates holding 12MB).
+            path="${path%"${path##*[![:space:]]}"}"
             [[ "$path" == /* ]] || continue
             why="du could not read it (already gone, or unreadable)"
             if [ "$(now)" -ge "$sweep_end" ]; then size="?"; why="du budget exhausted"
