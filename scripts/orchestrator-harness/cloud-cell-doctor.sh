@@ -2616,7 +2616,8 @@ run_status() {
 #   `${N##*/}`, and the operators `${#N}` (length) and `${!N}` (indirect) — the last two were blind
 #   spots until review found that `local n="${#1}"` died on an absent argument while the scan saw no
 #   read at all and the fail-closed counter had nothing to compare against.
-# ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local `, so a binding
+# ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local[[:space:]]` (any
+#   whitespace, so `local<TAB>` is found), so a binding
 #   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either, and
 #   neither is the continuation half of a binding split over lines (`local s="$1" \` + `tmp="$2"`)
 #   — only the first line is seen (review P2). Neither exists in this file today (one binding per
