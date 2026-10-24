@@ -1,0 +1,59 @@
+[Unit]
+# eldato harness apply — put this box's harness on origin/main, on a clock (#2416).
+#
+# WHY THIS IS SCHEDULED AND NOT A LINE IN THE BRING-UP. `cloud-cell-supervisor.sh apply` already
+# fetches agent-infra main and pins the cell's harness to it (#1745), and `start` runs it before every
+# launch — but NOTHING SCHEDULED IT, so a cell ran whatever code it had when it was last started and
+# `main` moved away underneath it. A harness fix that merged but is not live on a cell has fixed
+# nothing. This unit is the clock; `scripts/harness-apply-pass.sh` is what it runs, and that pass calls
+# the existing verbs (it re-implements no activation) behind the safety predicates its header states:
+# refuse a box that is AHEAD of main, preserve dirty files BY NAME before moving a tree, never signal a
+# running lane, and report the readings it decided from.
+Description=eldato harness apply — converge this box's harness on origin/main
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/harness-apply.md
+# It fetches. This ordering only avoids a guaranteed first-fetch failure on a box that boots
+# disconnected. ⛔ A FAILED FETCH IS NOT A PASS: the pass refuses with `cannot-verify` (exit 23) rather
+# than comparing against the stale remote-tracking ref, so a disconnected boot goes RED and heals on the
+# next tick. Being wrong about drift is the defect this whole feature removes.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+# The state dir the pass writes its record and preservation dir into. Exported so the scheduled pass
+# and an operator's `--status` read ONE record, not two paths that happen to look alike.
+Environment=HARNESS_APPLY_STATE_DIR={{STATE_DIR}}
+# ⛔ THE CHECKOUT IS PINNED, not left to a login shell: a unit that resolved the repo from the service's
+# own environment would converge a different tree than the one the operator means, and say so nowhere.
+Environment=HARNESS_APPLY_REPO={{PASS_REPO}}
+Environment=HARNESS_APPLY_REF={{PASS_REF}}
+# An EMPTY value is meaningful: the pass decides pin-vs-sync from the box's own posture (a pin record
+# present => pin, else the checkout's ./sync.sh => sync). The installer renders the POSITION rather
+# than hard-coding one, so a cell and a Mac can share one artifact.
+Environment=HARNESS_APPLY_MODE={{PASS_MODE}}
+# A background convergence, never a deadline: it must not compete with a lane for CPU or I/O.
+Nice=10
+IOSchedulingClass=idle
+# It is a fetch, a worktree add and (when a dirty tree must be preserved) a copy. Ten minutes is ample;
+# the bound exists so a wedged `git` cannot leave the oneshot "activating" for ever with the next tick
+# queued behind it.
+TimeoutStartSec=600
+# ⛔ NO `-` PREFIX ON ExecStart: a pass that cannot run must go RED, not be swallowed. The unit's
+# colour is the only surface that reaches an operator who is not tailing a log.
+ExecStart=/bin/bash {{PASS}}
+# ⛔ WHICH CODES ARE GREEN IS THE PASS'S OWN VOCABULARY (it adopts harness-refresh.sh's, because both
+# answer the same question and two vocabularies for one fact is the defect this repo keeps deleting):
+#   0  current    the pin already names the ref tip — the cadence no-op
+#   10 advanced   the materialiser ran and moved the pin (or repaired a lying pin record to the tree)
+#   11 mended     the pin was missing; what the box actually runs was recorded
+# and EVERYTHING ELSE IS RED, deliberately — including 21 (REFUSED ahead) and 25 (behind but nothing
+# here can advance it). Those are not "the box is busy": they are states a HUMAN must resolve, and an
+# ahead box in particular carries commits that may exist nowhere else (c4 lost three on 2026-10-22).
+# Greening them would hide the one condition this whole change exists to surface.
+SuccessExitStatus=0 10 11
+# Auditability: the pass writes $HARNESS_APPLY_STATE_DIR/harness-apply.status (one key=value PER LINE —
+# the shape every reader of this family parses; a single space-separated line parses to ONE key)
+# and appends to harness-apply.log; journald keeps the exit status and the per-pass readings.

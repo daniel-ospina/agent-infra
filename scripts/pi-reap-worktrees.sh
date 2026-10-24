@@ -729,8 +729,8 @@ self_pid_tree_load() {
     done
 }
 
-live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
-    local canon="$1" recorded="$2" pid line
+live_process_for() { # <canon> <recorded> [<exclude-pids>] -> matching pid ("" when none)
+    local canon="$1" recorded="$2" exclude="${3:-}" pid line
     [ -s "$PS_OUT" ] || return 1
     # The match MUST end at a path boundary. A bare substring test lets a
     # SIBLING share the basename prefix (`.../wt-elsewhere` contains
@@ -747,6 +747,7 @@ live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
           if (b != "" && hits(line, b)) { print pid }
         }' "$PS_OUT" 2>/dev/null); do
         case "$SELF_PIDS" in *" $pid "*) continue ;; esac
+        case " $exclude " in *" $pid "*) continue ;; esac
         printf '%s\n' "$pid"
         return 0
     done
@@ -754,6 +755,7 @@ live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
         [ -n "$line" ] || continue
         pid="${line%% *}"
         case "$SELF_PIDS" in *" $pid "*) continue ;; esac
+        case " $exclude " in *" $pid "*) continue ;; esac
         case "$line" in *"/${canon##*/}"*) ;; *) continue ;; esac
         if canonical_token_match "$line" "$canon"; then printf '%s\n' "$pid"; return 0; fi
     done <<<"$(grep -F -- "/${canon##*/}" "$PS_OUT" 2>/dev/null)"
@@ -776,7 +778,7 @@ cwd_probe_load() {
     return 0
 }
 
-live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
+live_cwd_for() { # <canon> <recorded> [<exclude-pids>] -> pid whose cwd is inside ("" when none)
     # ⛔ THE REAPER'S OWN PROCESS TREE IS **NOT** EXEMPT HERE (#2354). The argv probe skips
     # SELF_PIDS because its own command line carries the path it is judging — a string it wrote
     # itself. A CWD is not that: no process can be *made* to sit in a checkout by the reaper's
@@ -785,13 +787,17 @@ live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
     # was reported `unref=no-proc` and offered for removal while the lane was still using it.
     # The self-checkout gate above still protects the reaper's OWN directory (decided by path, not
     # by pid), and it runs FIRST, so dropping the pid filter cannot make a self-reap possible.
-    local canon="$1" recorded="$2" pid="" last=""
+    # `<exclude-pids>` is the #2721 addition and is NOT that filter: it carries only the holders THIS
+    # classification has already DEMOTED as idle shells, so the scan can reach the next holder. It is
+    # per-record and caller-supplied — never the reaper's ancestry — so #2354's rule still holds.
+    local canon="$1" recorded="$2" exclude="${3:-}" pid="" last=""
     [ -s "$CWD_OUT" ] || return 1
     while IFS= read -r line; do
         case "$line" in
             p*) pid="${line#p}" ;;
             n*)
                 last="${line#n}"
+                case " $exclude " in *" $pid "*) continue ;; esac
                 case "$last" in
                     "$canon"|"$canon"/*|"$recorded"|"$recorded"/*)
                         printf '%s\n' "$pid"; return 0 ;;
@@ -805,8 +811,107 @@ live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
     return 1
 }
 
+# ── THE IDLE-SHELL RULE (agent-infra#2721) ─────────────────────────────
+# WHY. `live-process` and `live-cwd` answer "is a process holding this checkout?" — and a shell that
+# `cd`'d in and never exited answers YES for ever. #2721 measured the cost: the reclaim log recorded
+# `KEEP … (a live process has it as cwd)` for nearly every worktree on a wedged cell while 59
+# checkouts at 5-6 GB each accumulated and the box lost its disk. A shell at a prompt is not a lane:
+# the lane's agent is the shell's CHILD, so a shell with no children is a process nobody is using.
+#
+# THE RULE, and it is deliberately narrow:
+#   a cwd / argv holder is LIVE EVIDENCE unless it is a SHELL whose START TIME is before the
+#   worktree's HEAD commit AND which has no child process.
+# "Started before the last commit" is #2721's own phrasing of "never did anything here": a lane
+# between turns still holds its `pi`/test child, so it does not match; a lane that finished and left
+# its `cd` behind does. Every OTHER gate is untouched — dirty / ignored-artifact / open-pr /
+# too-recent / detached-unreachable / remote-only-ref all still PRESERVE — so the blast radius of a
+# wrong reading here is a re-created checkout, never uncommitted or unpushed work (and `clean` +
+# `reachable` are checked before any removal regardless).
+# ⛔ FAIL CLOSED ON EVERY UNKNOWABLE: a pid missing from the ps table, a start time that cannot be
+# read, a HEAD that cannot be dated, or any probe that cannot answer all leave the holder LIVE.
+# ⛔ AND IT IS SWITCHABLE (`REAP_WT_IDLE_SHELL=0`) so an operator can restore the strict reading
+# without editing a shipped script. A demotion is NAMED in the pass log.
+IDLE_SHELL="${REAP_WT_IDLE_SHELL:-1}"
+
+# proc_start_epoch <pid> -> epoch seconds the process started ("" when unreadable).
+# Linux needs no fork: the `/proc/<pid>` DIRECTORY's mtime is set at process creation (measured).
+# Elsewhere `ps -o etimes=` then `ps -o etime=`'s `[[dd-]hh:]mm:ss` form (BSD ps has etime).
+# An unreadable value is "" — never 0, which would compare as "started at the epoch" and make every
+# holder read stale.
+proc_start_epoch() {
+    local pid="${1:-}" v e f1 f2 f3 rest
+    is_pos_int "$pid" || return 1
+    if [ -r "/proc/$pid" ]; then
+        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+        [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    fi
+    v="$("$PS_BIN" -o etimes= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    case "$v" in ''|*[!0-9]*) v="" ;; esac
+    [ -n "$v" ] && { printf '%s\n' "$(( $(now_epoch) - v ))"; return 0; }
+    e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    [ -n "$e" ] || return 1
+    case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    v=0
+    case "$e" in *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;; esac
+    case "$e" in
+        *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
+        *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
+        *)     f1=0; f2=0; f3="$e" ;;
+    esac
+    is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
+    printf '%s\n' "$(( $(now_epoch) - (v + f1 * 3600 + f2 * 60 + f3) ))"
+}
+
+# is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
+is_shell_pid() {
+    local pid="${1:-}" cmd base
+    is_pos_int "$pid" || return 1
+    [ -s "${PS_OUT:-}" ] || return 1
+    cmd="$(awk -v p="$pid" '$1==p { $1=""; $2=""; sub(/^[ \t]+/, ""); print; exit }' "$PS_OUT" 2>/dev/null)"
+    [ -n "$cmd" ] || return 1
+    cmd="${cmd%% *}"
+    base="${cmd##*/}"
+    base="${base#-}"
+    case "$base" in bash|sh|dash|zsh|ksh|ksh93|mksh|ash|fish) return 0 ;; esac
+    return 1
+}
+
+# has_child <pid> — a pid with a live child is DOING something (a prompt has none). The reaper's own
+# process tree is excluded, exactly as every other witness excludes it.
+has_child() {
+    local pid="${1:-}"
+    is_pos_int "$pid" || return 1
+    [ -s "${PS_OUT:-}" ] || return 1
+    awk -v p="$pid" -v self=" ${SELF_PIDS:-} " '
+        $2==p { if (index(self, " " $1 " ") == 0) { found=1; exit } }
+        END { exit !found }' "$PS_OUT" 2>/dev/null
+}
+
+# head_epoch_for <sha> -> epoch of that commit ("" when git cannot date it). Bounded like every other
+# git probe here, and the failure arm is the PRESERVING one.
+head_epoch_for() {
+    local sha="${1:-}" v
+    [ -n "$sha" ] || return 1
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT.ct" "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha" || return 1
+    v="$(head -1 "$GIT_OUT.ct" 2>/dev/null | tr -d ' \t')"
+    is_pos_int "$v" || return 1
+    printf '%s\n' "$v"
+}
+
+# stale_shell_for <pid> <sha> — 0 when this holder is an IDLE SHELL predating the worktree's HEAD.
+stale_shell_for() {
+    local pid="${1:-}" sha="${2:-}" head start
+    [ "$IDLE_SHELL" = 1 ] || return 1
+    is_shell_pid "$pid" || return 1
+    has_child "$pid" && return 1
+    head="$(head_epoch_for "$sha")" || return 1
+    start="$(proc_start_epoch "$pid")" || return 1
+    [ "$start" -lt "$head" ] || return 1
+    return 0
+}
+
 # clean_gate <path> -> "<verdict>\t<payload>"
-# verdict: clean | dirty | ignored-artifact | status-timeout | status-error.
 # For `clean` the payload is the allowlisted-EPHEMERAL entries present (they
 # must be deleted before `git worktree remove`, which refuses on untracked
 # files); otherwise up to 3 offending entries.
@@ -1251,12 +1356,37 @@ classify_one() {
         return 0
     fi
 
-    if detail="$(live_process_for "$canon" "$path")"; then
-        printf 'preserve\tlive-process\t\trule=1 proof=ps-argv pid %s holds the path\n' "$detail"; return 0
-    fi
-    if detail="$(live_cwd_for "$canon" "$path")"; then
-        printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix pid %s has cwd inside the path\n' "$detail"; return 0
-    fi
+    # ── THE HOLDERS, EXAMINED ONE BY ONE (agent-infra#2721) ────────────────────────────────────
+    # ⛔ EVERY holder is examined, not just the first, and that is load-bearing: a worktree routinely
+    # holds an idle shell left over from an earlier lane AND a live lane's own process, so taking the
+    # first hit decides the whole checkout from whichever pid the probe happened to list first
+    # (reproduced while writing this: one stale shell masked a busy lane's shell, and the rule then
+    # demoted the wrong way). A holder that IS an idle shell predating HEAD is NAMED in the log and
+    # the scan moves to the next one; the other gates (clean/reachable/open-pr/age) still decide.
+    local _stale="" _seen=""
+    while detail="$(live_process_for "$canon" "$path" "$_seen")"; do
+        _seen="$_seen $detail"
+        if stale_shell_for "$detail" "$sha"; then
+            _stale="$_stale pid=$detail(argv)"
+            log "STALE-SHELL pid=$detail (argv) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$detail"; return 0
+    done
+    _seen=""
+    while detail="$(live_cwd_for "$canon" "$path" "$_seen")"; do
+        _seen="$_seen $detail"
+        if stale_shell_for "$detail" "$sha"; then
+            _stale="$_stale pid=$detail(cwd)"
+            log "STALE-SHELL pid=$detail (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$detail"; return 0
+    done
+    # A demoted holder is carried into the row, so a reader can see WHY a checkout that looked live
+    # was reclaimed — and can tell a genuine idle-shell demotion from a lane that was still working.
+    local stale_txt=""
+    [ -n "$_stale" ] && stale_txt="stale-shell:$_stale"
 
     crumb="$(clean_gate "$path")"
     cverdict="${crumb%%$'\t'*}"
@@ -1401,8 +1531,8 @@ classify_one() {
             return 0
         fi
         log "CLASSIFY merged-age-floor $path head_age=$((age_s / 86400))d merged_floor=${age_floor}d"
-        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=merge-base --is-ancestor %s %s=0 age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
-            "$eph" "${sha:-?}" "${MAIN_REF:-<no-main-ref>}" "$((age_s / 60))"
+        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=merge-base --is-ancestor %s %s=0 age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
+            "$eph" "${sha:-?}" "${MAIN_REF:-<no-main-ref>}" "$((age_s / 60))" "${stale_txt:-no-proc}"
         return 0
     fi
 
@@ -1429,8 +1559,8 @@ classify_one() {
             printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s) pr-merged %s state=MERGED%s head=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$pr_key" "$prnum_note" "${pr_oid:0:12}"
             return 0
         fi
-        printf 'remove\treclaimable\t%s\trule=4 refs=%s proof=pr-merged %s state=MERGED%s head=%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
-            "$eph" "$refs" "$pr_key" "$prnum_note" "${pr_oid:0:12}" "$((age_s / 60))"
+        printf 'remove\treclaimable\t%s\trule=4 refs=%s proof=pr-merged %s state=MERGED%s head=%s age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
+            "$eph" "$refs" "$pr_key" "$prnum_note" "${pr_oid:0:12}" "$((age_s / 60))" "${stale_txt:-no-proc}"
         return 0
     fi
 
@@ -1499,8 +1629,8 @@ classify_one() {
         return 0
     fi
 
-    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
-        "$eph" "$aged_note" "$refs" "$((age_s / 60))"
+    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
+        "$eph" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}"
     return 0
 }
 
