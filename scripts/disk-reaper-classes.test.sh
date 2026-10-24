@@ -240,7 +240,7 @@ case_b() { # <owner-script> <entry-point>
 
 # ── C: an unreadable process list SKIPS the sweep and says so ───────────────────────────────────
 case_c() { # <owner-script>
-    local owner="$1" base root repo wt out rc out_seam
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err rc out_seam
     base="$(newbase c)"; root="$base/scratch"; mkdir -p "$base/empty-proc"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" old-idle feat/c-idle)"
@@ -561,7 +561,7 @@ case_l() { # <owner-script>
 # live", and reaped against it. Measured: a linked worktree with a live process cwd'd inside it was
 # reaped on that host shape.
 case_m() { # <owner-script>
-    local owner="$1" base root repo wt out rc
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err rc
     base="$(newbase m)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" live-wt feat/m-live)"
@@ -588,7 +588,7 @@ case_m() { # <owner-script>
 # then read `<path> (deleted)`). The witness here is the tree BECOMING dirty between classification and
 # removal: a `git` stand-in answers CLEAN on the first `status` call and DIRTY on the next.
 case_n() { # <owner-script>
-    local owner="$1" base root repo wt out
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err
     base="$(newbase n)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" wt1 feat/n-toctou)"
@@ -610,6 +610,35 @@ STUB
                "a tree that CHANGED during the pass is PRESERVED (the re-probe saw it)"
     case_check "$(grep -qF 'reason=toctou' <<<"$out" && echo 0 || echo 1)" \
                "and it is KEPT BY NAME with reason=toctou"
+    # ⛔ THE CENSUS ARM TOO. A dirty tree was only ONE of the two witnesses: handing the witnesses the
+    # census DIRECTORY instead of its TSV made the live-process half read nothing, always "clean", and
+    # every candidate printed `read error: 0: Is a directory` — and this case still passed, because it
+    # only ever exercised the dirty arm. The intruder below starts INSIDE the candidate after the
+    # pass-start census (the stub holds the first `status` open), so only a working re-probe can see it.
+    base2="$(newbase n2)"; root2="$base2/scratch"
+    repo2="$(mk_repo "$base2")"
+    wt2="$(mk_linked_wt "$repo2" "$root2" wt-entered feat/n-entered)"
+    age_path "$wt2" 400
+    mkdir -p "$base2/bin"
+    cat >"$base2/bin/git" <<SLOW
+#!/usr/bin/env bash
+[ "\$1" = "-C" ] && [ "\$3" = "status" ] && sleep 2
+exec "$REAL_GIT" "\$@"
+SLOW
+    chmod +x "$base2/bin/git"
+    ( sleep 0.8; cd "$wt2" 2>/dev/null || exit 0; exec sleep 6 ) &
+    local intrus=$!; SLEEPERS="$SLEEPERS $intrus"
+    out2="$(PATH="$base2/bin:$PATH" REAL_GIT="$REAL_GIT" REAP_AW_STATE_DIR="$base2/state" \
+            REAP_AW_ROOTS="$root2" bash "$owner" --apply 2>"$base2/err")"
+    err="$(cat "$base2/err" 2>/dev/null)"
+    [ -n "${DRC_DEBUG:-}" ] && printf 'N2\n%s\n--stderr--\n%s\n' "$out2" "$err" >&2
+    case_check "$([ -d "$wt2" ] && echo 0 || echo 1)" \
+               "a tree a lane ENTERS mid-pass is PRESERVED (the re-probe's census is read, not a directory)"
+    case_check "$(grep -qF 'reason=toctou' <<<"$out2" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME with reason=toctou (entered-during-pass)"
+    case_check "$(grep -qF 'Is a directory' <<<"$err" && echo 1 || echo 0)" \
+               "and the witnesses were handed the census FILE, not its directory (no read error)"
+    kill "$intrus" 2>/dev/null
     return $((CASE_FAIL > 0))
 }
 
