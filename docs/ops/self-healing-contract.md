@@ -64,7 +64,8 @@ measurement** — and is marked as such.
 
 | epic table row | measured 2026-10-24 | verdict |
 |---|---|---|
-| cell-4 `eldato-orchestrator` **❌ inactive**, "and it still read as healthy" | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402). Its `MainPID` is `cloud-cell-supervisor.sh start`, whose own log line is: `controller already running (pid 684873…) — this unit supervises the cell now: waiting for it to go, then taking over` | **The row's proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, two live `merge-*` worker sessions). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
+| cell-4 `eldato-orchestrator` **❌ inactive**, "and it still read as healthy" | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402). Its `MainPID` is `cloud-cell-supervisor.sh start`, whose own log line is: `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)`.
+**The doubled pid is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z. | **The row's proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, two live `merge-*` worker sessions). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
 | "precedence rule implemented **nowhere**" ❌❌❌❌ | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §5.1, `OVERRIDES:`). |
 | "universal dispatcher: **one seam does not exist**; two ad-hoc dispatchers with different gates" | `capacity.sh` (759 lines) ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
 | "no machine except the Mac has an actuator that lands anything" | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held two live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
@@ -185,7 +186,9 @@ capability's only honest readout is **which pid the box considers its controller
 match, **and against the snapshot path in that match's argv**. `systemctl is-active` is **not** a
 readout of this capability: measured today, `active` while the unit's own log said
 `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to
-go`. A second supervisor over a foreign controller is `ACTIVE` and doing nothing.
+go, then taking over (a stop or a restart ends this wait)` (quoted verbatim and in full in §1.2, which
+also reads the doubled pid). A second supervisor over a foreign controller is `ACTIVE` and doing
+nothing.
 
 **What repairs it.** Converge to one: stop the stray **by exact pid** (enumerate with `ppid` and
 `cmdline` first — never `pkill -f`), then `install-controller-service.sh` / `install.sh --restart`,
@@ -365,15 +368,17 @@ The fleet channel is `refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>
 on the queue repo's origin, read with one `git ls-remote --refs`.
 
 ⛔ **MEASURED DEFECT (2026-10-24, this box) — the fleet view collapses to ONE box.**
-`cap_host` defaults to `hostname -s`, and **two cloud cells demonstrably share the hostname `cmux`**: cell-4
-measured directly (`$ hostname` → `cmux`), cell-3 proved by a 4-core reading arriving under that same key
-from an 8-core box. Nothing overrides it — no deploy path sets `CAP_HOST`. So both publish under the SAME
+`cap_host` defaults to `hostname -s`, and **two boxes demonstrably share the hostname `cmux`**: cell-4
+measured directly (`$ hostname` → `cmux`), plus a **4-core box** publishing under that same key — cell-3 by
+**elimination, not by a read** (cell-1 and cell-4 are 8-core, and §1.1 says a peer cannot be inventoried
+from a cell; the numbers are `fleet-capacity.md`'s). Nothing overrides it — no deploy path sets
+`CAP_HOST`. So both publish under the SAME
 key, and `cap_publish` prunes
 `refs/boxes/<that host>/*` on every publish — **each box deletes its peers' records**. Evidence, in two
 halves:
 - this box's own probe: `host=cmux ncpu=8 …` — but `refs/boxes/cmux/1792853260-4-336-0-25297-4514-9-4692-1`
-  in **tortoise** carries **`ncpu=4`**, which is not this 8-core box: it was published by cell-3
-  (4 cores), under the same key, 20 s earlier;
+  in **tortoise** carries **`ncpu=4`**, which is not this 8-core box: **another box** published it under
+  the same key 20 s earlier (cell-3 by elimination — inferred, not read, §1.1);
 - `refs/boxes` in **agent-infra** carries two keys, neither of them cell-4's live reading: `Daniels-MacBook-Air`
   (130 records, newest 14:36:29Z) and a `cmux` record **34 h stale** (`ncpu=4`, 2026-10-23 04:50Z). The Mac
   publishes into a different **work repo** — cell-4's `REPO=/tmp/cell-t3` is tortoise — so a box's
@@ -435,15 +440,16 @@ cannot advance → `cloud-cell-supervisor.sh apply`.
 **state.** cell-4: pin/process skew (§1.3) — the pin is truthful with `origin/main`, the **running**
 controller is not. `harness-refresh.sh` moves the pin; nothing moves a running controller.
 
-### 3.13 Liveness / reapers — `lane-status.py`, `lane-watchdog.py`, `pi-reap-*`, `disk-reaper.sh`, `reap-lane-venvs.sh`
+### 3.13 Liveness / reapers — `lane-status.py`, `lane-watchdog.py`, `orphan-reap.py`, `pi-reap-*`, `disk-reaper.sh`, `reap-lane-venvs.sh`
 
 **Promises.** Reap what is provably dead, keep what is working, and never reap a human's session.
 
 **ALIVE vs REFUSING vs IDLE.** `docs/ops/fleet-liveness.md` defines **exactly five** states and always
 names the evidence: `dead | running-quiet | wedged | idle | unknown`, with `unknown` a **named
 abstention** (exit 3) and a reason vocabulary (`ps-unreadable`, `jsonl-age-unknown`, `no-holder-record`,
-`turn-state-unknown`, `tail-after-compaction`, …). The reapers have their own four: `LIVE`,
-`PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`.
+`turn-state-unknown`, `tail-after-compaction`, …). The reapers have their own four —
+`LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE` — declared in `scripts/orphan-reap.py`
+(`POOL_STATES`), which is also where the `UNVERIFIABLE (no-progress-channel:…)` abstention below lives.
 ⛔ **The declared hole a universal dispatcher must not repeat:** a `pi` that leaves no bindable session
 file (a print-mode `task` child, a resumed session keeping its original name-stamp) has **no progress
 channel**, so its PARKED row abstains as `UNVERIFIABLE (no-progress-channel:<binding>)` rather than
