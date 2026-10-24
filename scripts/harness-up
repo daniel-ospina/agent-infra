@@ -276,6 +276,14 @@ hp_fork_headroom() {
     # function exists to enforce. Empty now means UNMEASURED, and no limit is taken from it.
     _count() { # <cmd…> -> a positive integer, or empty
       local v; v="$("$@" 2>/dev/null)" || { printf ''; return 0; }
+      # ⛔ STRIP WHITESPACE FIRST: BSD `wc -l` PADS its count to a column ("     300"), so the digit
+      # test below rejected a perfectly good reading and every Darwin process count came back EMPTY.
+      # On a box whose only working source was `kern.maxproc`, `n_all` empty meant that limit was
+      # never taken, and with no uid count either the probe REFUSED outright — "could not look" on a
+      # Mac that could be measured. Measured 2026-10-24 (bash 3.2.57, macOS): the (G) arm refused with
+      # every one of ulimit/threads-max/cgroup/maxproc reported "unreadable" against a stub table of
+      # 300 processes. `${v//[[:space:]]/}` is bash 3.2-safe and adds no pipe.
+      v="${v//[[:space:]]/}"
       case "$v" in ''|0|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
     }
     case "$(hp_os)" in

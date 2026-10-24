@@ -212,10 +212,26 @@ cap_fork_headroom() {
   else
     local ps_cmd="${CAP_PS:-ps}" n_all="" n_uid="" uid rl tm cg _p _mx _cu _mp _mpu
     uid="$(id -u 2>/dev/null)" || uid=""
+    # ⛔ A FAILED OR EMPTY PROCESS READ IS NOT "ZERO TASKS USED" (fresh review, P1 — #1745/#2293's own
+    # class, re-entering through the SIBLING copy). `wc -l` prints `0` when `ps` fails and awk's
+    # `END{print c+0}` prints `0` when there are no rows, so `used=0` passed every `[ -n ]` guard and
+    # the probe answered `headroom=<the whole limit> rc=0` — "I could not look" spent as "there is
+    # room". `harness-up`'s shim already refuses this; this copy did not, AND `harness-up` PREFERS the
+    # record's number over its own shim, so on a cell this one line defeated the refusal the rest of
+    # the PR is built around (measured 2026-10-24 with a failing `ps`: `fork_headroom=1333
+    # fork_source=rlimit-nproc rc=0` — 1333 ≥ the 800 floor, so a box that could not be measured stayed
+    # ELIGIBLE). Empty now means UNMEASURED and no limit is taken from it.
+    _count() { # <cmd…> -> a positive integer, or empty
+      local v; v="$("$@" 2>/dev/null)" || { printf ''; return 0; }
+      # BSD `wc -l` PADS its count; an untrimmed read fails the digit test below and the limit is
+      # silently dropped (see the twin note in scripts/harness-up — the same defect, same fix).
+      v="${v//[[:space:]]/}"
+      case "$v" in ''|0|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
+    }
     case "$(cap_os)" in
       Darwin)
-        n_all="$($ps_cmd -e -o pid= 2>/dev/null | wc -l | tr -d ' ')"
-        [ -n "$uid" ] && n_uid="$($ps_cmd -e -o uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')"
+        n_all="$(_count sh -c "$ps_cmd -e -o pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -e -o uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")"
         rl="$(ulimit -u 2>/dev/null)"; case "$rl" in ''|*[!0-9]*) rl="" ;; esac
         [ -n "$rl" ] && [ -n "$n_uid" ] && _cap_take rlimit-nproc "$rl" "$n_uid"
         _mp="$(sysctl -n kern.maxproc 2>/dev/null)"; _mpu="$(sysctl -n kern.maxprocperuid 2>/dev/null)"
@@ -225,8 +241,8 @@ cap_fork_headroom() {
         [ -n "$_mpu" ] && [ -n "$n_uid" ] && _cap_take kern-maxprocperuid "$_mpu" "$n_uid" ;;
       *)
         # Linux: RLIMIT_NPROC and threads-max both count TASKS (threads), so the used count is threads.
-        n_all="$($ps_cmd -eLo pid= 2>/dev/null | wc -l | tr -d ' ')"
-        [ -n "$uid" ] && n_uid="$($ps_cmd -eLo uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')"
+        n_all="$(_count sh -c "$ps_cmd -eLo pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -eLo uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")"
         rl="$(ulimit -u 2>/dev/null)"; case "$rl" in ''|*[!0-9]*) rl="" ;; esac
         [ -n "$rl" ] && [ -n "$n_uid" ] && _cap_take rlimit-nproc "$rl" "$n_uid"
         tm="$(cat /proc/sys/kernel/threads-max 2>/dev/null)"

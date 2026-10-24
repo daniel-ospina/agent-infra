@@ -37,6 +37,17 @@ ck() { # <name> <0|1>
   assertions=$((assertions + 1))
   if [ "$2" -eq 0 ]; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); fi
 }
+# ⛔ MATCHING IS DATA, NEVER SYNTAX — AND THIS FILE MUST PARSE ON bash 3.2 (macOS).
+# This suite is added to `scripts/run-bash-shards.sh`, whose list BOTH lanes run, and one of them is
+# a Mac fleet cell where `/bin/bash` is 3.2.57. On 3.2 an UNBALANCED `(` in a `case` PATTERN is a
+# SYNTAX ERROR — `*"OK (heartbeat"*)` made `bash -n scripts/harness-unit.test.sh` fail outright and
+# the run died at that line, so (F)/(G) never executed and `up` would have refused the tree the moment
+# the sweep reached this file (measured 2026-10-24, bash 3.2.57: "syntax error near unexpected token
+# `('" at the first such pattern; CI is ubuntu/bash 5 and cannot see it). A row's parentheses, `*`
+# and `|` are EVIDENCE, not pattern syntax, so every assertion below asks `has`/`lacks` about the row
+# as LITERAL TEXT — `"$2"` is quoted, so its contents never reach the parser.
+has()   { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+lacks() { case "$1" in *"$2"*) return 1 ;; *) return 0 ;; esac; }
 # ⛔ A BSD `mktemp` REQUIRES A TEMPLATE, so the suite passes one — while the launcher's own call is
 # what (G) exercises.
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/harness-unit.XXXXXXXX")"
@@ -137,6 +148,14 @@ printf '1 bash /usr/bin/unrelated.sh\n' > "$TMP/ps-none"
 printf '4242 bash %s/orch-loop.sh\n4243 bash %s/cloud-cell-doctor.sh\n' "$HARNESS" "$HARNESS" > "$TMP/ps-live"
 
 # One status run. Every knob is a seam that exists in the shipped file (nothing here is a mock of it).
+# ⛔ `-o "$CELL/orchestrator"` IS NOT DECORATION (fresh review, P1 — measured 2026-10-24): the launcher
+# resolves its state dir as `O="${A_O:-${O:-}}"`, so an INHERITED `O` BEAT `CELL_HOME` and this suite
+# read the LIVE box's state dir instead of the fixture. Measured on the fleet's own Mac with `O`
+# exported (`O=/Users/home/orchestrator`, which the harness itself exports): the (C) arms read 2,869
+# real logs and 10 assertions failed — and the (F2) arm's stub refresh writes
+# `> "$O/state/harness-refresh"`, so a `relation=behind` run would have OVERWRITTEN THE LIVE CELL'S
+# refresh record with a fabricated `relation=current`. The explicit `-o` (which OUTRANKS an inherited
+# `O`) is what makes this suite hermetic on a box that is itself a controller.
 run() { # <verb> [extra argv…]
   _v="$1"; shift
   OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
@@ -148,7 +167,7 @@ run() { # <verb> [extra argv…]
           HU_FORK_LIMITS_FILE="${FORKFILE:-$TMP/fork-generous}" \
           CAP_FORK_LIMITS_FILE="${CAPFORK:-$TMP/fork-generous}" \
           HU_LANE_SILENT="${LANESILENT:-2400}" HU_NEXT_STALE="${NEXTSTALE:-900}" \
-          bash "$SCRIPTS/harness-up" "$_v" --repo "$REPO" --harness "$HARNESS" --no-fetch "$@" 2>&1 )"
+          bash "$SCRIPTS/harness-up" "$_v" --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" "$@" 2>&1 )"
   RC=$?
 }
 row() { printf '%s\n' "$OUT" | grep -E "^$1 " | head -1; }
@@ -164,38 +183,38 @@ printf 'cgroup-pids 10000 9999\nrlimit-nproc 15641 2009\n' > "$TMP/fork-none"   
 FORKFILE="$TMP/fork-tight" run status
 cap_row="$(row capacity)"
 ck "(A) a tight fork limit BINDS the lane count (1000 spare / 40 per lane = 5 of load's 9) [$cap_row]" \
-   "$(case "$cap_row" in *"lanes=5 "*"binding=fork"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'lanes=5 ' && has "$cap_row" 'binding=fork' && echo 0 || echo 1)"
 ck "(A) …and the row says a fork limit is what bound it, not load or disk" \
-   "$(case "$cap_row" in *"binding=fork"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'binding=fork' && echo 0 || echo 1)"
 ck "(B) the dimensions print in the order they FAIL: fork → disk → load" \
-   "$(printf '%s' "$cap_row" | grep -q 'fork headroom=.*→ disk free=.*→ load=' && echo 0 || echo 1)"
+   "$(grep -q 'fork headroom=.*→ disk free=.*→ load=' <<<"$cap_row" && echo 0 || echo 1)"
 ck "(B) …and the fork number is attributed to the LIMIT that produced it (cgroup≠rlimit here)" \
-   "$(case "$cap_row" in *"fork headroom=1000 (cgroup-pids)"*|*"fork headroom=1000 (shim:cgroup-pids)"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$({ has "$cap_row" 'fork headroom=1000 (cgroup-pids)' || has "$cap_row" 'fork headroom=1000 (shim:cgroup-pids)'; } && echo 0 || echo 1)"
 
 # A box whose fork headroom is one task: no lane may be placed, and the verdict is DEGRADED (not OK).
 FORKFILE="$TMP/fork-none" run status
 cap_row="$(row capacity)"
 ck "(A) 1 task of headroom places ZERO lanes and is DEGRADED, not a healthy lane count" \
-   "$(case "$cap_row" in *"DEGRADED (no room"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'DEGRADED (no room' && echo 0 || echo 1)"
 ck "(A) …and the verdict follows (rc=$RC)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 
 # A generous fork limit must NOT bind — load and disk decide, and fork is still REPORTED.
 FORKFILE="$TMP/fork-generous" run status
 cap_row="$(row capacity)"
 ck "(A) a generous fork limit does not bind (binding is load/disk, not fork)" \
-   "$(case "$cap_row" in *"binding=fork"*) echo 1 ;; *"binding=load"*|*"binding=disk"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(! has "$cap_row" 'binding=fork' && { has "$cap_row" 'binding=load' || has "$cap_row" 'binding=disk'; } && echo 0 || echo 1)"
 ck "(A) …and fork headroom is still printed with its number (reported, never omitted)" \
-   "$(case "$cap_row" in *"fork headroom=3397 ("*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'fork headroom=3397 (' && echo 0 || echo 1)"
 
 # ⛔ UNMEASURABLE IS NOT UNLIMITED: neither the record nor the shim can answer → REFUSED.
 OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/bin/ps" PS_TABLE="$TMP/ps-live" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HARNESS_UP_OS=Linux HU_FORK_LIMITS_FILE="$TMP/does-not-exist" \
-        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch 2>&1 )"; RC=$?
+        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" 2>&1 )"; RC=$?
 cap_row="$(row capacity)"
 ck "(A) an unmeasurable fork limit REFUSES the placement (never a fixed cap, never 0-by-omission)" \
-   "$(case "$cap_row" in *REFUSED*fork/task" headroom"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'REFUSED' && has "$cap_row" 'fork/task headroom' && echo 0 || echo 1)"
 ck "(A) …and cannot-verify is BROKEN (rc=2, got $RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 
 # The record path (capacity.sh, the fleet instrument) is consumed — including its fork fields, which
@@ -231,11 +250,11 @@ touch -t "$old"   "$L/fix-4.log"
 run status
 lanes_row="$(row lanes)"
 ck "(C) lanes are counted from the launcher's live worker RECORDS (4 here) [$lanes_row]" \
-   "$(case "$lanes_row" in *"3/4 live and advancing"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$lanes_row" '3/4 live and advancing' && echo 0 || echo 1)"
 ck "(C) …and a lane SILENT past the controller's own bound is NAMED, with the bound [$lanes_row]" \
-   "$(case "$lanes_row" in *"2400s"*"fix-4"*|*"fix-4"*"2400s"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$lanes_row" '2400s' && has "$lanes_row" 'fix-4' && echo 0 || echo 1)"
 ck "(C) …and a FINISHED lane (a log whose worker record is gone) is IGNORED, not counted silent [$lanes_row]" \
-   "$(case "$lanes_row" in *"1 finished log(s) ignored"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$lanes_row" '1 finished log(s) ignored' && echo 0 || echo 1)"
 ck "(C) …so the row is DEGRADED, and the verdict with it (rc=$RC)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 touch -t "$fresh" "$L/fix-4.log"
 run status
@@ -277,10 +296,10 @@ OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
         HU_PS="$TMP/bin/ps-ppid" P_SCRIPT="$HARNESS" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
-        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch --no-heal 2>&1 )"; RC=$?
+        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch --no-heal -o "$CELL/orchestrator" 2>&1 )"; RC=$?
 loop_row="$(row loop)"
 ck "(C') a controller AND its own refresh child read as ONE controller, not DUPLICATE [$loop_row]" \
-   "$(case "$loop_row" in *DUPLICATE*) echo 1 ;; *"OK (heartbeat"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(lacks "$loop_row" 'DUPLICATE' && has "$loop_row" 'OK (heartbeat' && echo 0 || echo 1)"
 ck "(C') …so the verdict is not BROKEN on a healthy single-controller box (rc=$RC)" \
    "$([ "$RC" -le 1 ] && echo 0 || echo 1)"
 
@@ -315,7 +334,7 @@ PS_TABLE="$TMP/ps-none" run status
 ck "(F1) a missing controller is HEALED (the authority's start ran once)" \
    "$([ "$(grep -c '^start' "$BRINGUP_LOG")" -eq 1 ] && echo 0 || echo 1)"
 ck "(F1) …and the heal is SAID, so an operator can see what moved" \
-   "$(printf '%s' "$OUT" | grep -q 'HEAL: started a controller' && echo 0 || echo 1)"
+   "$(grep -q 'HEAL: started a controller' <<<"$OUT" && echo 0 || echo 1)"
 ck "(F1) …and no stop was issued (a heal never kills what is live)" \
    "$([ "$(grep -c '^stop' "$BRINGUP_LOG")" -eq 0 ] && echo 0 || echo 1)"
 
@@ -334,7 +353,7 @@ printf 'relation=behind running=%s ref=%s pin=%s action=none fetch=ok rc=0 at=%s
 REFRESH_RELATION=behind run status
 ck "(F2) a STALE pin (relation=behind) is re-pinned (refresh ran once)" \
    "$([ "$(wc -l < "$REFRESH_LOG")" -ge 1 ] && echo 0 || echo 1)"
-ck "(F2) …and the heal is said" "$(printf '%s' "$OUT" | grep -q 'HEAL: re-pinned a stale harness' && echo 0 || echo 1)"
+ck "(F2) …and the heal is said" "$(grep -q 'HEAL: re-pinned a stale harness' <<<"$OUT" && echo 0 || echo 1)"
 
 # (F3) restart-pending is REPORTED, never closed by a status verb: closing it means dropping the
 # running controller, which is the operator's own down/up.
@@ -345,7 +364,7 @@ run status
 ck "(F3) restart-pending is NOT healed (no refresh call: closing it would drop the live controller)" \
    "$([ "$(wc -l < "$REFRESH_LOG")" -eq 0 ] && echo 0 || echo 1)"
 ck "(F3) …and the refusal names the deliberate remedy" \
-   "$(printf '%s' "$OUT" | grep -q 'run .harness-down. then .harness-up.' && echo 0 || echo 1)"
+   "$(grep -q 'run .harness-down. then .harness-up.' <<<"$OUT" && echo 0 || echo 1)"
 
 printf 'relation=current running=%s ref=%s pin=%s action=none fetch=ok rc=0 at=%s\n' \
   "$S12" "$S12" "$S12" "$(date +%s)" > "$CELL/orchestrator/state/harness-refresh"
@@ -357,11 +376,25 @@ PS_TABLE="$TMP/ps-dup" run status
 ck "(F4) a DUPLICATE is reported and NEVER killed by status (no start, no stop)" \
    "$([ "$(grep -cE '^(start|stop)' "$BRINGUP_LOG")" -eq 0 ] && echo 0 || echo 1)"
 ck "(F4) …and it says whose decision that is" \
-   "$(printf '%s' "$OUT" | grep -q 'choosing which controller to kill is a human decision' && echo 0 || echo 1)"
+   "$(grep -q 'choosing which controller to kill is a human decision' <<<"$OUT" && echo 0 || echo 1)"
 
 # ══ (G) THE macOS ARM IS EXERCISED ═════════════════════════════════════════════════════════════
 # BSD-shaped stubs: `sysctl -n kern.maxproc/hw.ncpu/vm.loadavg`. The fork probe on Darwin reads
 # kern.maxprocperuid against the uid's process count, so the mac's limit SOURCE is what is asserted.
+# ⛔ `id` IS STUBBED TOO (2026-10-24): `hp_fork_headroom`/`cap_fork_headroom` read the CURRENT uid
+# with `id -u` and compare it to what `ps -o uid=` reports. The ps stub answers with `PS_UID` (1000),
+# so on any host whose real uid is not exactly 1000 the per-uid count matched ZERO rows, `n_uid` came
+# back empty, `kern.maxprocperuid` was skipped, and the arm could never reach the 900 it asserts —
+# it never showed because the suite died at the `case` parse error above before reaching (G). A stub
+# that answers one half of a two-sided comparison has to answer the other half.
+cat > "$TMP/bin/id" <<'SH'
+#!/bin/sh
+case "$*" in
+  "-u") echo "${PS_UID:-1000}" ;;
+  *)     exec /usr/bin/id "$@" ;;
+esac
+SH
+chmod +x "$TMP/bin/id"
 cat > "$TMP/bin/sysctl" <<'SH'
 #!/bin/sh
 case "$*" in
@@ -383,14 +416,14 @@ OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HU_PS="$TMP/bin/ps" PS_TABLE="$TMP/ps-mac" PS_UID=1000 \
         HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 HARNESS_UP_OS=Darwin \
         HU_LANE_SILENT=2400 HU_NEXT_STALE=900 \
-        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch 2>&1 )"; RC=$?
+        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" 2>&1 )"; RC=$?
 cap_row="$(row capacity)"
 ck "(G) the Darwin arm measures fork headroom from kern.maxprocperuid, not a Linux path [$cap_row]" \
-   "$(case "$cap_row" in *"fork headroom=900 ("*"kern-maxprocperuid"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(has "$cap_row" 'fork headroom=900 (' && has "$cap_row" 'kern-maxprocperuid' && echo 0 || echo 1)"
 ck "(G) …and a macOS status run reaches a verdict (a BSD mktemp/stat death would end it earlier)" \
-   "$(printf '%s' "$OUT" | grep -q '^VERDICT: ' && echo 0 || echo 1)"
+   "$(grep -q '^VERDICT: ' <<<"$OUT" && echo 0 || echo 1)"
 ck "(G) …with the mac's launchd row present (not the cell arm)" \
-   "$(printf '%s\n' "$OUT" | grep -q '^launchd ' && echo 0 || echo 1)"
+   "$(grep -q '^launchd ' <<<"$OUT" && echo 0 || echo 1)"
 
 # ── the suite's own non-vacuity floor (the #1890 class) ────────────────────────────────────────
 ck "non-vacuity: at least 20 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 20 ] && echo 0 || echo 1)"

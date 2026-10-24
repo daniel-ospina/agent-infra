@@ -1268,6 +1268,14 @@ scripts/harness-status             # one line per component + ONE verdict; exit 
 scripts/harness-down               # stop it via the platform authority (never a bare pkill)
 ```
 
+⛔ `harness-status` IS A READ; `harness-up status` HEALS. The launcher repairs by default (`--no-heal`
+for a pure read): it starts a controller that is not running and re-pins a pin that is behind. The thin
+`harness-status` name keeps the read-only contract it has always documented and passes `--no-heal`, so
+`harness-down` followed by a status read (or a monitoring poll) cannot silently restart a stack an
+operator deliberately stopped; ask for the repairs with `harness-status --heal` or `harness-up status`.
+Neither verb kills a duplicate or cycles a live-but-late controller — those are labelled
+`NOT HEALED` with whose decision they are.
+
 **What `harness-status` answers, row by row** — and what each row READS, because a health check that
 only passes by remembering is a defect. Every row below is a live read of an artefact, never a record
 of a previous run:
