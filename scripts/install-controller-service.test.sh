@@ -350,7 +350,7 @@ UU_RC=0
 UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
-          ELDATO_PLATFORM=Linux bash "$INST" --install 2>&1)" || UU_RC=$?
+          ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UU_RC=$?
 [ "$UU_RC" -eq 0 ] && ok 'user scope: install rc=0' || bad "user scope: rc=$UU_RC — $UU_OUT"
 UUNIT="$US/home/.config/systemd/user/eldato-orchestrator.service"
 if [ -f "$UUNIT" ]; then
@@ -398,7 +398,7 @@ rm -f "$UUNIT"
 UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
-          ELDATO_PLATFORM=Linux bash "$INST" --install 2>&1)" || UL_RC=$?
+          ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UL_RC=$?
 [ "$UL_RC" -ne 0 ] && ok 'user scope: linger OFF is refused, never a green install over a supervisor that dies at logout' \
                    || bad 'user scope: reported success with linger off'
 
@@ -906,7 +906,7 @@ mkdir -p "$G/nobin"; ln -sf "$G/bin/systemctl-fail" "$G/nobin/systemctl"
 GN_RC=0
 GN_OUT="$(bnd env SUDO=false SYSTEMCTL="$G/bin/systemctl-fail" ORCH_SUPERVISOR="$SUP" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$G/home" CELL_HOME="$G/home" \
-          ELDATO_PLATFORM=Linux PATH="$G/nobin:/usr/bin:/bin" bash "$INST" --install 2>&1)" || GN_RC=$?
+          ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 PATH="$G/nobin:/usr/bin:/bin" bash "$INST" --install 2>&1)" || GN_RC=$?
 [ "$GN_RC" -ne 0 ] && ok 'install: refuses when NO service manager is available (never a silent no-op)' \
                    || bad 'install: reported success with no service manager'
 case "$GN_OUT" in
@@ -930,7 +930,7 @@ mv -f "$G/tpl/mutant.tmp" "$G/tpl/eldato-orchestrator.service"
 GT_RC=0
 GT_OUT="$(bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$G/bin/systemctl" SYSTEMD_UNIT_DIR="$G/units" \
           TEMPLATES_DIR="$G/tpl" HOME="$G/home" CELL_HOME="$G/home" PATH="$G/bin:/usr/bin:/bin" \
-          ELDATO_PLATFORM=Linux bash "$INST" --install 2>&1)" || GT_RC=$?
+          ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || GT_RC=$?
 [ "$GT_RC" -ne 0 ] && ok 'install: refuses a template with an unresolved token' \
                    || bad "install: installed a unit carrying {{NOPE}} — $GT_OUT"
 case "$GT_OUT" in

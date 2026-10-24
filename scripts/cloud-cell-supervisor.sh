@@ -312,7 +312,7 @@ keyfile_has_key() {
 # while the unit sat in the operator's own home: `status` printed `supervision: NONE` over an ENABLED unit
 # and `stop` never issued the `systemctl stop` — the "reported stopped, still running" shape, one layer in.
 # Writer and readers must agree on ONE directory, so the pre-re-point value is kept deliberately.
-CONTROLLER_INVOKER_HOME="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"
+CONTROLLER_INVOKER_HOME_IN="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"
 export HOME="$CELL_HOME"
 
 # Publish WORKER_ENV_NAMES into the tmux server's `update-environment`, APPENDING to whatever is
@@ -430,6 +430,11 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 [ -z "$CONTROLLER_ORPHAN_TIMEOUT_IN" ]   || CONTROLLER_ORPHAN_TIMEOUT="$CONTROLLER_ORPHAN_TIMEOUT_IN"
 [ -z "$CONTROLLER_HANDOVER_TIMEOUT_IN" ] || CONTROLLER_HANDOVER_TIMEOUT="$CONTROLLER_HANDOVER_TIMEOUT_IN"
 [ -z "$CONTROLLER_UNIT_IN" ]             || CONTROLLER_UNIT="$CONTROLLER_UNIT_IN"
+# ⛔ AND THE INVOKER'S HOME CARRIES THE SAME OVERRIDE FENCE AS THE FOUR ABOVE (review P2 round 17, #2402):
+# `set -a; . "$ENV_FILE"` would otherwise let a pushed `CONTROLLER_INVOKER_HOME=` re-point the USER unit
+# directory every reader uses — reproducing the exact "reported stopped, still running" defect the capture
+# exists to prevent, now reachable from keys.env instead of from the caller's shell.
+[ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -723,7 +728,11 @@ env_file_owner_o() { # <envf> <unit_cell_home> <rendered_o> [<unit_home>] -> res
   # caller HOME=/home/cellA -> /home/cellA/orchestrator — so cell B read cell A's unit as its OWN and
   # `stop`/`--status`/`--uninstall` acted on another state dir's dispatcher. Set it from the unit, exactly
   # like CELL_HOME/O above; an empty value means "the unit states no HOME", which keeps the caller's.
-  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE -u HOME bash -c '
+  # ⛔ `-u HOME` MUST NOT BE ADDED (review P2 round 17, #2402): unsetting it made the documented fallback
+  # impossible — with no `Environment=HOME=` in the unit, `O=$HOME/o` resolved to `/o` (an empty-variable
+  # expansion), a path no cell has, and `unit_owner_dir` fed that to every "supervises <dir>" answer. The
+  # inherited value IS the caller's HOME, which is the documented fallback.
+  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
       [ -z "$4" ] || HOME="$4"
       CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
       set -a; . "$1" >/dev/null 2>&1

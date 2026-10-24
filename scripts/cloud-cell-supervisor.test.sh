@@ -2391,6 +2391,93 @@ grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
 kill -9 "$S3MP" 2>/dev/null || true
 S3MC="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3MC" ] && kill -9 "$S3MC"; } 2>/dev/null || true
 rm -f "$S3/units/eldato-orchestrator.service"
+# ── §(l-n) THE UNIT'S OWN `HOME`, AND THE INVOKER'S HOME, DECIDE WHICH UNIT A VERB ADDRESSES ──
+# ⛔ TWO DEFECTS MEASURED ON THE ROUND-16 HEAD (review P2 round 17, #2402), both of which this suite was
+# BLIND to (mutations that reverted either fix left it at 455/0), and both of which present as the
+# "reported stopped, still running" false pass:
+#  (1) `env_file_owner_o` evaluated `keys.env` with the CALLER's HOME, so `O=$HOME/o` named the caller's home
+#      and a foreign cell's unit read as this cell's own (or this cell's as foreign);
+#  (2) the USER unit directory was derived from the RE-POINTED `HOME` (= $CELL_HOME), while the installer
+#      writes to the INVOKER's `$HOME/.config/systemd/user` — so with CELL_HOME != HOME every verb looked in a
+#      directory no installer writes and reported `supervision: NONE` over an ENABLED unit.
+say_case "a unit's keys.env resolving \$HOME uses the UNIT's home, and the user unit dir is the INVOKER's"
+S5="$T/svc5"; rm -rf "$S5"; mkdir -p "$S5/units" "$S5/o" "$S5/home" "$S5/uh" "$S5/repo" "$S5/bin" "$S5/invokerhome/.config/systemd/user"
+printf 'O=$HOME/o\n' > "$S5/uh/keys.env"
+cat > "$S5/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S5/uh
+Environment=CELL_HOME=$S5/home
+Environment=ENV_FILE=$S5/uh/keys.env
+Environment=O=$S5/installer-orchestrator
+Restart=always
+SH
+cat > "$S5/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S5/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S5/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S5/o/orch-loop.sh"
+svc5_sup() { # <verb> [extra env…]
+  PATH="$S5/bin:$PATH" SYSTEMCTL="$S5/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S5/units" \
+    HOME="$S5/invokerhome" CELL_HOME="$S5/home" ENV_FILE="$S5/home/keys.env" \
+    SESSION="svc2402c-$$" O="$S5/o" REPO="$S5/repo" OR="daniel-ospina/agent-infra" \
+    SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 "$@" 2>&1
+}
+# (1) the resolution must follow the UNIT's HOME. `status` names the dir a foreign unit supervises.
+S5_OUT="$(svc5_sup bash "$SUP" status)"
+case "$S5_OUT" in
+  *"$S5/uh/o"*) ok "unit HOME: a keys.env spelling O=\$HOME/o resolves against the UNIT's Environment=HOME=" ;;
+  *) bad "unit HOME: the resolution did not use the unit's HOME — a foreign cell's unit reads as this cell's (or this cell's as foreign): $S5_OUT" ;;
+esac
+case "$S5_OUT" in
+  *"$S5/invokerhome/o"*) bad "unit HOME: the resolution used the CALLER's HOME — ONE unit file, two owners depending on who runs the verb: $S5_OUT" ;;
+  *) ok "unit HOME: and it does NOT use the caller's HOME" ;;
+esac
+# (2) with CELL_HOME != HOME and NO CONTROLLER_USER_UNIT_DIR, the USER copy must still be FOUND — the installer
+# writes it under the INVOKER's home, so a reader deriving it from $CELL_HOME is reading a directory that never
+# exists. The unit there is OURS (it renders this state dir), so `status` must not answer `supervision: NONE`.
+# ⛔ ITS OWN FIXTURE: arm (1) deliberately leaves a FOREIGN copy in the SYSTEM dir above, and that copy is the
+# resolved one — reusing this root would test the system-dir walk, not the invoker-home reader.
+S6="$T/svc6"; rm -rf "$S6"; mkdir -p "$S6/system" "$S6/o" "$S6/home" "$S6/repo" "$S6/bin" "$S6/invokerhome/.config/systemd/user"
+cat > "$S6/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S6/sc.log"
+case "\${1:-}" in
+  is-enabled) [ -f "$S6/user-enabled" ] && { printf 'enabled\n'; exit 0; }; printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S6/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S6/o/orch-loop.sh"; touch "$S6/user-enabled"
+cat > "$S6/invokerhome/.config/systemd/user/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S6/invokerhome
+Environment=CELL_HOME=$S6/home
+Environment=ENV_FILE=$S6/home/keys.env
+Environment=O=$S6/o
+Restart=always
+SH
+S6_OUT="$(env -u CONTROLLER_USER_UNIT_DIR PATH="$S6/bin:$PATH" SYSTEMCTL="$S6/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$S6/system" \
+          HOME="$S6/invokerhome" CELL_HOME="$S6/home" ENV_FILE="$S6/home/keys.env" \
+          SESSION="svc2402d-$$" O="$S6/o" REPO="$S6/repo" OR="daniel-ospina/agent-infra" \
+          SCOPE=own HARNESS="" bash "$SUP" status 2>&1)"
+# ⛔ MATCH THE SUPERVISION ROW, NOT A SUBSTRING OF THE WHOLE REPORT: `status` also prints "gh: not installed"
+# and "NO RECORD" lines, and a loose match graded an unrelated answer as this arm's verdict.
+if printf '%s\n' "$S6_OUT" | grep -q 'supervision:.*NONE'; then
+  bad "invoker HOME: the USER unit at the INVOKER's \$HOME/.config/systemd/user was not found (CELL_HOME != HOME) — status claims nothing supervises an ENABLED unit: $S6_OUT"
+elif printf '%s\n' "$S6_OUT" | grep -q 'supervision:.*ACTIVE'; then
+  ok "invoker HOME: the USER unit is found through the INVOKER's HOME, not the re-pointed \$CELL_HOME"
+else
+  bad "invoker HOME: status gave no supervision verdict at all for an enabled USER unit: $S6_OUT"
+fi
+
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is

@@ -811,7 +811,10 @@ do_install() {
         say "  ordering: ⚠️  After=/Wants=network-online.target does NOT bind in this (USER) scope — a per-user"
         say "            manager ships no network-online.target, so systemd drops the dependency. A boot whose"
         say "            network is not up yet can fill StartLimitBurst and converge to 'failed' with no unattended"
-        say "            recovery: re-arm with 'bash $0 --install' or 'bash $SUPERVISOR start'. The SYSTEM scope has it."
+        say "            recovery: re-arm with 'bash $0 --install' or 'ORCH_FOREGROUND=0 bash $SUPERVISOR start'."
+        say "            The SYSTEM scope has the ordering. (The pin matters: a lane shell inside a service-managed"
+        say "            controller's tree inherits ORCH_FOREGROUND=1, and an unpinned start would re-parent the"
+        say "            controller into that shell while the unit stays enabled.)"
     fi
     say "  exec:    /bin/bash $SUPERVISOR start   (ORCH_FOREGROUND=1 — the controller is the unit's main process)"
     say "  state:   $O   (env: $ENV_FILE)"
@@ -1058,7 +1061,11 @@ env_file_owner_o() { # <envf> <unit_cell_home> <rendered_o> [<unit_home>] -> res
     # to two different state dirs depending on who ran the verb — so account B read account A's unit as its
     # OWN and `--status`/`--uninstall` acted on a foreign dispatcher. Keep this body identical to the
     # supervisor's copy; an empty value keeps the caller's HOME.
-    out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE -u HOME bash -c '
+    # ⛔ `-u HOME` MUST NOT BE ADDED (review P2 round 17, #2402): unsetting it made the documented fallback
+    # impossible — with no `Environment=HOME=` in the unit, `O=$HOME/o` resolved to `/o`, a path no cell has.
+    # The inherited value IS the caller's HOME, which is the documented fallback. Keep this body identical to
+    # the supervisor's copy.
+    out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
         [ -z "$4" ] || HOME="$4"
         CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
         set -a; . "$1" >/dev/null 2>&1

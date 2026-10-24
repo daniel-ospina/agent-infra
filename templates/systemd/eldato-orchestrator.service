@@ -99,13 +99,18 @@ TimeoutStopSec=30
 #                                which is what makes the burst fill and the unit converge to `failed`. At one
 #                                start per `orphan + RestartSec`, "below the interval" is NOT enough — the
 #                                installer enforces the arithmetic for exactly that reason.
-#                                ⛔ AND AN ATTEMPT COSTS MORE THAN THE CEILING (review P2 round 16, #2402): the
-#                                supervisor polls in 5 s steps, so a T-second ceiling can cost T+5 s, and every
-#                                attempt also pays the supervisor's startup and `cmd_check` reads (another
-#                                ~5 s). The installer subtracts BOTH, so the ORPHAN CEILING it accepts is
-#                                `(interval-1)/burst - RestartSec - 5 - 5` — 74 s at these defaults, not the
-#                                84 s the plain relation suggests. Both allowances are named once, in
-#                                scripts/install-controller-service.sh.
+#                                ⛔ AND THE INSTALLER RESERVES SLACK INSIDE THAT RELATION (review P2 round 16,
+#                                #2402): it subtracts the 5 s poll quantum and 5 s of supervisor startup, so
+#                                the ORPHAN CEILING it accepts is `(interval-1)/burst - RestartSec - 5 - 5` —
+#                                74 s at these defaults, not the 84 s the plain relation suggests. (The
+#                                quantum is a reserve, not an overrun: `foreground_handover` tests the NEXT
+#                                step. Both allowances are owned by scripts/install-controller-service.sh.)
+#                                ⛔ AND THE WINDOW IS NECESSARY, NOT SUFFICIENT (review P1 round 17, #2402): a
+#                                CONFIGURATION fault does not wait on the orphan ceiling — it dies in
+#                                `cmd_check`/`harness_apply`, whose cost NOTHING bounds (no `timeout` wraps the
+#                                pre-flight, so a hung credential or network read can outlast this window). A
+#                                slow-enough pre-flight therefore restarts for ever while `--status` reads
+#                                supervised. Bounding that phase is a separate change; it is not claimed here.
 # `TimeoutStartSec=` is kept as the systemd-side counterpart of the orphan bound — it keeps the pair true if
 # this unit ever changes `Type=` — but it is not what enforces either bound today.
 TimeoutStartSec={{START_TIMEOUT_SEC}}
