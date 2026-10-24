@@ -561,6 +561,18 @@ command -v python3 >/dev/null 2>&1 \
   || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
 python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
   || die "merge-reminder.py is missing or does not parse"
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification, so they take the SAME parse gate: a syntax error in either one installs clean (the
+# files exist, so the loop's startup check does not fire), `python3 $O/check-class.py` exits 1 with
+# stderr discarded, and EVERY PR classifies `V=""` — no merge, no fixer, no reviewer — with no signal.
+# UNGUARDED, like their neighbours: a `[ -f ]` guard made a MISSING file pass a gate that exists to
+# catch a broken one.
+for _py in check-class.py nochk-resolve.py; do
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the NOCHECKS arm ($_py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/$_py" 2>/dev/null \
+    || die "$_py is missing or does not parse — the controller cannot classify a single PR without it"
+done
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────

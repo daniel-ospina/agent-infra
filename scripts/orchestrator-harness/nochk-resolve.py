@@ -488,7 +488,9 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
     # so a head WITH a surface read as absent). The read above answered for the PR's CURRENT head —
     # whatever `--head` says — so that is the sha every following question must be asked about. The
     # observed head is only a FALLBACK, and a divergence is DISCLOSED on the verdict rather than
-    # silently resolved in either direction.
+    # silently resolved in either direction. ⛔ EXCEPT ON `RECOVERED`: that token IS the class and the
+    # sweep acts on it, so a suffix would corrupt it — the class describes the LIVE head, which is the
+    # head the rail will read, so the polarity is safe. Every other verdict carries the disclosure.
     live = head_sha(repo, pr)
     sha = live or args.head
     if not sha:
@@ -504,7 +506,8 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
     if total > 0:
         if len(arows) != total:
             # A TRUNCATED surface is not a class (#2704): never classify from part of the evidence.
-            return f"READ-FAILED:authority truncated at {sha[:12]} ({len(arows)} of {total} runs)"
+            return (f"READ-FAILED:authority truncated at {sha[:12]} "
+                    f"({len(arows)} of {total} runs){moved}")
         # The controller's read is blind, the authority is not: use the working read.
         label = classify(arows, req, rgate)
         if not graded(label):
