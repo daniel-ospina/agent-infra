@@ -2405,10 +2405,13 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   # that took either side alone would drop one arm, and the parts would print SHORT of `listed`
   # beside `reconciled=1` — the measured listed=20/parts=17 shape. 3 landed + 40 collided + 4 judged
   # leaves 176 against a pool of 223, so this fixture ONLY renders cleanly when BOTH arms exist.
-  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  # ⛔ `stop=limit` IS PART OF THIS FIXTURE TOO, for the same reason the writer fixtures set it: the
+  # reader's #2183 cause map has no bare `(limit)` arm at all, so a record without `stop=` renders
+  # `(cause not recorded)` and this decomposition assertion would fail on a green writer.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 stop=limit at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
   case "$out" in
-    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (limit)"*)
+    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (slot limit: 24 slot(s) filled)"*)
       echo "  ok the reader keeps BOTH skip buckets, so a merged record decomposes in full"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record carrying both skip buckets did not decompose: $out"; FAIL=$((FAIL+1)) ;; esac
 else

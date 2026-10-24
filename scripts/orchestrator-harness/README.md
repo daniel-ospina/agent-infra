@@ -1466,7 +1466,7 @@ reads one of:
 
 and the line then appends `— failing surface: <surface>:<n>`. That field is **fixed-point logged, never
 guessed**: the names come from the pre-flight's own `INCOMPLETE SURFACES` block where it printed one, and
-from this script's own verdict arms where the unanswerable surface is local — `claim-registry` (the claim
+from this script's own verdict arms where the unanswerable surface is local — `issue-claim-registry` (the claim
 registry could not answer), `unrecognised-verdict` (a `VERDICT:` line this reader does not know), and
 `unknown:<n>` (the producer printed no block at all, so a parse failure is never "no surface"). The line also
 appends `— K released from checked` (or `— released from checked: UNKNOWN (the count was not recorded — see the

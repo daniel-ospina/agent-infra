@@ -2093,7 +2093,19 @@ print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d re
 # ⛔ FAIL CLOSED PER ENTRY: an entry whose state cannot be read is KEPT — a failed read never drops a
 # suppression that may still be owed. Named in the log, so it is never silent.
 lp = os.path.join(O, "landed.txt")
-landed_entries = [l for l in lines("landed.txt") if l]
+# ⛔ UNREADABLE IS NOT EMPTY, AND IT MUST NOT ABORT THE PASS. `lines()` returns `None` for
+# UNREADABLE (see its own contract), and this caller was the one site the merge left unguarded: a
+# single stray byte — or `landed.txt` being a directory, the shape `read_soft` documents — raised
+# `TypeError: 'NoneType' object is not iterable`, the reap exited non-zero, and the caller refused the
+# whole pass TRANSIENTLY every cycle: the permanent no-dispatch loop this change exists to remove.
+# `or []` reads as "nothing to settle this pass", which leaves landed.txt UNTOUCHED — every entry is
+# kept, i.e. fail-closed per entry, the same polarity as the per-entry `landed_issue_state` rule below.
+_landed_rows = lines("landed.txt")
+if _landed_rows is None:
+    print("[reap] SKIPPED (landed.txt unreadable) — no landed entry is settled or released this pass; "
+          "an unreadable file is not an empty one")
+    _landed_rows = []
+landed_entries = [l for l in _landed_rows if l]
 
 def landed_issue_state(n):
     """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure
@@ -2979,7 +2991,14 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
   block="$(printf '%s\n' "$out" | awk '
     function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
     /^INCOMPLETE SURFACES/ { inblk=1; next }
-    inblk && /^[A-Z][A-Z ]+ — / { inblk=0 }
+    # ⛔ A NEW SECTION ENDS THE BLOCK. Any COLUMN-0 line is a heading — the block own rows are
+    # indented `[surface] …` — and the previous rule stopped only on a heading followed by an em
+    # dash, so an `ADVISORY SURFACES` heading was consumed as a FAILURE surface. Measured once the
+    # funnel record was comma-joined (a space-join had been discarding the second token and hiding
+    # it): `unusable=issue-assignee-holder:1,open-PRs:1`, an ADVISORY surface counted as a failing
+    # one, which is a false accusation against the producer.
+    # NOTE: no apostrophes in here — this is a SINGLE-QUOTED awk program, so one would close it.
+    inblk && /^[^[:space:]]/ { inblk=0 }
     inblk && /^ *\[/ {
       line=$0
       s=line; sub(/^ *\[/, "", s); sub(/\].*$/, "", s)
@@ -3566,7 +3585,13 @@ if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
   # pass-record's `unusable=` are all reads of the same log. Building this field from a SECOND list let
   # the two disagree — `claim-registry` in one and `issue-claim-registry` in the other for the same
   # failure. The slug is canonical from the recorder, so no case-folding is needed here.
-  UNUSABLE_FIELD="$(unusable_summary)"
+  # ⛔ COMMA-JOINED, because `FUNNEL_LINE` is a SPACE-delimited `key=value` record that orch-loop.sh
+  # parses with `for kv in ${f:-}`. `unusable_summary` joins its `<slug>:<n>` pairs with a SPACE (the
+  # right framing for a log line), so using it verbatim here would split the value across tokens: the
+  # reader keeps `unusable=<first>` and silently DISCARDS every later surface. Multi-surface passes are
+  # ordinary — the walk records a producer surface and `issue-claim-registry` in the same pass — so that
+  # is exactly the "names one fact and hides the rest" reading this change exists to end.
+  UNUSABLE_FIELD="$(unusable_summary | tr ' ' ',')"
   [ -n "$UNUSABLE_FIELD" ] || UNUSABLE_FIELD="unknown:$V_UNJUDGED"
 fi
 # ── WHAT THE REAPER/CLAIM FILTER RELEASED (agent-infra#2183) ────────────────────────────────────
