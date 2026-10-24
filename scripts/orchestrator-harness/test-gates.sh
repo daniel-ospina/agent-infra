@@ -1199,8 +1199,13 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   _live() { printf '%s\n' "$@" > "$LO_LIVE"; }
   # A REGISTRY THAT ANSWERED AND HOLDS NOTHING (agent-infra#2466). Every case below that expects
   # "unowned" needs this file to exist: a MISSING snapshot is `claim-unreadable` (the registry never
-  # answered), which owns the PR on purpose. Cases that want a claim overwrite it; the missing/failed/
-  # stale classes are pinned explicitly further down.
+  # answered). Cases that want a claim overwrite it; the missing/failed/stale classes are pinned
+  # explicitly further down.
+  # ⛔ AND `claim-unreadable` DOES **NOT** OWN THE PR (review, P1 — this comment used to say it did,
+  # and the code was written to match). `unowned_scan` computes `n - owned`, so an "owned" answer for
+  # a registry nobody could read drives the un-owned count to 0 and OPENS the issue path — the
+  # fail-open that function's own rule forbids. The sweep needs no protection from this predicate: it
+  # gates on `claim_selection_verdict` directly, where rc 2 acts on nothing.
   : > "$O/state/claims-snapshot"
 
   # (1) THE LIVE ARM. One row per holding process; the branch is the primary signal.
@@ -1290,14 +1295,25 @@ FAKE
   eqv "an EMPTY but fresh snapshot is a registry that answered: the PR is unowned" \
       "unowned" "$(_owned 12 ddd000000000)"
   rm -f "$O/state/claims-snapshot"
-  eqv "a MISSING snapshot is claim-UNREADABLE: the PR reads owned (nothing is spawned on an absent answer)" \
-      "owned" "$(_owned 12 ddd000000000)"
+  # ⛔ THE POLARITY IS THE POINT (review, P1). An unreadable registry is NOT FREEDOM — the sweep
+  # acts on nothing — but it is NOT "OWNED" either: `unowned_scan` computes `n - owned`, so an
+  # "owned" answer empties the count and OPENS the issue path on a registry nobody read, which is
+  # the fail-open its own rule forbids. All three unreadable shapes below therefore read UNOWNED.
+  eqv "a MISSING snapshot is claim-UNREADABLE: the PR is NOT owned (the sweep still acts on nothing)" \
+      "unowned" "$(_owned 12 ddd000000000)"
   printf '#claim-snapshot\t%d\tfailed\t0\n' "$(date +%s)" > "$O/state/claims-snapshot"
-  eqv "a snapshot written from a FAILED fetch also reads owned (its entries are a stale read)" \
-      "owned" "$(_owned 12 ddd000000000)"
+  eqv "a snapshot written from a FAILED fetch is NOT ownership either (its entries are a stale read)" \
+      "unowned" "$(_owned 12 ddd000000000)"
   printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
-  eqv "a snapshot OLDER than the age bound reads owned too (a claim published since would be invisible)" \
-      "owned" "$(_owned 12 ddd000000000)"
+  eqv "a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)" \
+      "unowned" "$(_owned 12 ddd000000000)"
+  # ⛔ AND THE GATE DIRECTION, not just the word. This is the assertion that catches the flip:
+  # with the old `*) return 0` arm every unreadable shape counted as owned, the un-owned count went
+  # to 0, and the drain gate opened with the whole PR queue invisible.
+  printf '12:ddd000000000:fix/12-b\n' > "$O/state/last-open-prs"
+  rm -f "$O/state/claims-snapshot"
+  eqv "…so an unreadable registry leaves the PR counted UN-OWNED and the issue path STAYS SHUT" \
+      "1" "$(_own 1)"
   : > "$O/state/claims-snapshot"
 
   # (4) THE COUNT over a real listing, through the SHIPPED unowned_pr_count. Rows are

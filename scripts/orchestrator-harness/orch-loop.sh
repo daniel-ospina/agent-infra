@@ -2826,13 +2826,26 @@ claim_selection_verdict() {
 # "may I work this?", which is the conservative question; this answers "is someone already working
 # it?", which is the selection question. Two questions, two predicates, deliberately.
 claim_foreign_live() {
-  # ⛔ rc 2 (claim-unreadable) IS NOT FREEDOM HERE EITHER (agent-infra#2466). `*` rather than
-  # `1)` on purpose: any code a future reader invents also blocks, and a MISSING reader (127) blocks
-  # too. A predicate that ANSWERS "owned" for an unreadable registry over-counts the in-flight set —
-  # the safe direction for this rule (take on MORE PR work, never less) — and it is what keeps
-  # `unowned_pr_count` from opening the issue path on a registry nobody read.
+  # ⛔ rc 2 (claim-unreadable) IS NOT FREEDOM — BUT IT IS NOT "OWNED" EITHER (review, P1). Only
+  # rc 1 (claim-held: a live lease on this head, held by another box) is OWNERSHIP. rc 0 (free, or
+  # this box's own claim), rc 2 (unreadable), and any code a future reader invents — including a
+  # MISSING reader (127) — are NOT owned.
+  #
+  # WHY THE POLARITY IS THIS WAY ROUND. The consumers disagree about which answer is conservative:
+  #   * `unowned_scan` computes `u = n - owned`. OVER-counting `owned` drives `u` to 0, and a zero
+  #     un-owned count is what OPENS the issue path — see that function's own rule: "assuming they
+  #     were owned would OPEN the issue path on a listing we could not read — the fail-open this
+  #     file's is_limit discipline exists to prevent". A predicate that answers "owned" for an
+  #     unreadable registry therefore causes exactly the fail-open it is documented to prevent
+  #     (measured: stale / failed-fetch / absent registry all yielded unowned=0 and the gate opened
+  #     with every open PR invisible).
+  #   * The SWEEP does not read this predicate. Its spawn is gated on `claim_selection_verdict`
+  #     directly (see the `case` at the sweep below), where rc 2 acts on NOTHING. So a permissive
+  #     answer here buys no spawn-side safety and costs the drain gate.
+  # Both directions therefore fail CLOSED: the sweep acts on nothing, and the count keeps the issue
+  # path shut because the PRs it could not classify are still counted as un-owned work.
   claim_selection_verdict "${1:-}" "${2:-}" >/dev/null
-  case $? in 0) return 1 ;; *) return 0 ;; esac
+  case $? in 1) return 0 ;; *) return 1 ;; esac
 }
 # ⛔ THE FLEET-WIDE `box` SENTINEL IS NOT AN IDENTITY HERE EITHER (cycle-21 review). Falling back to
 # the literal `box` made a probe-blind box read EVERY peer's `box:<pid>` claim as its OWN, so

@@ -140,13 +140,18 @@ esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
 
 # ── HOW OLD MAY A SNAPSHOT BE AND STILL BE BELIEVED? (agent-infra#2466) ─────────────────────────
-# `claim_snapshot` is refreshed once per controller cycle (~120 s), and every PR/issue SELECTION
+# `claim_snapshot` is refreshed once per controller cycle, and every PR/issue SELECTION
 # reads it instead of paying a network round trip per key. Before this bound there was no age at
 # ALL: a snapshot written before a peer's claim still read as current, so a claim published since
 # the last successful fetch was invisible — the exact duplicate the registry exists to prevent, and
-# indistinguishable from "nobody holds it". 900 s is ~7 cycles: long enough that a slow cycle, a
-# suspended laptop or a long dispatch never FALSE-BLOCKS selection, short enough that a wedged or
-# dead refresh cannot hide a peer's claim for anywhere near its lease (CLAIM_TTL 1800 s).
+# indistinguishable from "nobody holds it".
+# ⛔ THE CYCLE IS 240 s, NOT 120 s (review, P2): `CYC="${CYC:-240}"` in `orch-loop.sh` and in
+# `install.sh`, and README §"the loop" states the floor. So 900 s is ≈3.75 cycles, ~1 cycle of a
+# suspended laptop — NOT the ~7 this line used to claim. The corrected margin is the point: a cycle
+# whose body overruns 15 min goes stale WITHIN the cycle, and the sweep then acts on nothing for the
+# remainder. Long enough that an ordinary slow cycle or a long dispatch never FALSE-BLOCKS selection,
+# short enough that a wedged or dead refresh cannot hide a peer's claim for anywhere near its lease
+# (CLAIM_TTL 1800 s).
 # The same digit clamp as every other tunable here: an unparseable bound is worse than the default.
 CLAIM_SNAPSHOT_MAX_AGE="${CLAIM_SNAPSHOT_MAX_AGE:-900}"
 case "${CLAIM_SNAPSHOT_MAX_AGE:-}" in
@@ -1348,9 +1353,20 @@ claim_snapshot() {
   case "${now:-}" in ''|*[!0-9]*) now=0 ;; esac
   # A read instant of 0 is NOT a fresh read: the reader treats it as unreadable (0 is in the past by
   # every clock), which is the fail-closed direction on a box whose `date` cannot answer.
-  { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp"
-  rm -f "$body" 2>/dev/null || true
-  mv -f "$tmp" "$out" 2>/dev/null || true
+  # ⛔ A FAILED WRITE MUST NOT PUBLISH AN EMPTY SNAPSHOT (review, P2). The brace below used to
+  # discard its own exit status and the `mv` was `|| true`, so a failed write (ENOSPC/EIO under
+  # `$O/state`) still created `$tmp` and replaced the last GOOD read with a 0-byte file — and a
+  # header-less snapshot falls back to a fresh mtime, so every key then read `claim-absent` (FREE)
+  # while the cycle log printed `read=ok refs=0`. That is the "an empty one reads UNOWNED" state
+  # this header exists to refuse, reached from the write side. Fail closed instead: publish nothing,
+  # keep the previous (age-guarded) snapshot, and report the fetch as failed.
+  if { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$out" 2>/dev/null; then
+    rm -f "$body" 2>/dev/null || true
+  else
+    fetch=failed; n=0
+    rm -f "$tmp" "$body" 2>/dev/null || true
+  fi
   CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"
   return 0
 }
