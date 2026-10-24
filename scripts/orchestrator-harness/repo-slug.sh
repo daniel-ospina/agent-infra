@@ -92,19 +92,27 @@ repo_slug_from_remote() {
   # passes a slash-count test and yields `acme/widget?tab=1`, which every `--repo` call then receives;
   # cloud-cell-supervisor.sh's own parser rejects it, so the two derivations disagreed on a shape an
   # operator can produce by copy-paste. Only the characters an owner/repo name can contain are
-  # accepted, in BOTH segments.
-  case "$slug" in
+  # accepted, in BOTH segments. The rule itself lives in `repo_slug_valid` (one owner).
+  repo_slug_valid "$slug" || return 1
+  printf '%s\n' "$slug"
+}
+
+# repo_slug_valid <owner/name> — the ONE shape rule for a slug. Used by repo_slug_from_remote and
+# derive_or below, and delegated to by orchestrator-harness/repo-target.sh (#2724 review, P2): a
+# second hand-copy of this rule drifted from the parser and could report `slug-mismatch` (the wrong
+# repo) for what is really a malformed target. GitHub slugs are CASE-INSENSITIVE; this validator
+# accepts both cases and the comparer folds them.
+repo_slug_valid() {
+  case "${1:-}" in
     ''|*/*/*|/*|*:*) return 1 ;;
     */*) : ;;
     *) return 1 ;;
   esac
-  case "${slug%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  case "${slug#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  printf '%s\n' "$slug"
+  case "${1%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${1#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  return 0
 }
 
-# derive_or <repo-path> [<explicit-or>] -> prints the `owner/name` to use; rc 1 when nothing could
-# be derived (the caller prints its own warning — silence here is what hid the original defect).
 derive_or() {
   local repo="${1:-}" explicit="${2:-}" url slug
   if [ -n "$explicit" ]; then
@@ -115,10 +123,7 @@ derive_or() {
     # nobody asked for, which is #2040 itself — while the warning quoted a perfectly parseable origin
     # as the thing it could not parse. rc 2 = "the operator's pin is wrong", which the callers refuse
     # by name; rc 1 = "no pin, and the origin does not name a repo", which may fall back loudly.
-    case "$explicit" in ''|*/*/*|*:*) return 2 ;; esac
-    case "$explicit" in */*) : ;; *) return 2 ;; esac
-    case "${explicit%%/*}" in ''|*[!A-Za-z0-9._-]*) return 2 ;; esac
-    case "${explicit#*/}"  in ''|*[!A-Za-z0-9._-]*) return 2 ;; esac
+    repo_slug_valid "$explicit" || return 2
     printf '%s\n' "$explicit"; return 0
   fi
   [ -n "$repo" ] && [ -d "$repo" ] || return 1

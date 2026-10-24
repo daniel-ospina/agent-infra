@@ -106,7 +106,7 @@ fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
-echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+echo "[lane $N] cwd=$(pwd) branch=$(repo_target_head_branch "$PWD") $(date)" >> "$O/logs/lane-$N.log"
 # ── THE POST-BUILD ASSERTION, BEFORE ANY LANE ARTIFACT (agent-infra#2724/#2694) ─────────────────
 # The worktree exists (it is cwd). Read WHAT IT IS and refuse when it is not the target. The line is
 # written to the lane log AND echoed, so it is the one grep that answers "which repo did this lane
@@ -118,11 +118,26 @@ if [ "$REPO_ASSERT_RC" -ne 0 ]; then
   echo "[lane $N] NOT started: repo-target REFUSED (exit $REPO_ASSERT_RC) — no agent, no PR, nothing measured in the wrong repository" >> "$O/logs/lane-$N.log"
   exit "$REPO_ASSERT_RC"
 fi
+# ⛔ A `--repo-dir`-ONLY CALL MUST NOT LEAVE `$OR` EMPTY (#2762 review, P1). The module supports
+# naming ONLY a directory, and it derives the target slug internally — but `$OR` is what the brief's
+# `gh issue view … --repo $OR` and the branch assertion use. Left empty, the lane STARTS and writes a
+# brief whose `--repo` argument is empty: `gh` then falls back to ambient `GH_REPO` (the #2235
+# wrong-repo fail-open this change exists to close) or errors. The dir assertion has just PROVED this
+# worktree is the target, so deriving the slug from it is not a guess; if it still cannot be read,
+# refuse rather than start.
+if [ -z "$OR" ]; then
+  OR="$(repo_target_slug "$PWD" 2>/dev/null || true)"
+  if [ -z "$OR" ]; then
+    echo "[repo-target] lane $N result=REFUSED repo=UNREADABLE worktree=$PWD target=<none> target_dir=${LANE_REPO_DIR:-} reason=target-underivable — REFUSED: the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls" | tee -a "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: no target slug could be derived from the asserted worktree" >> "$O/logs/lane-$N.log"
+    exit "$REPO_TARGET_REFUSED"
+  fi
+fi
 # The branch half: a worktree of the right repo checked out on a DIFFERENT named branch is the
 # `prfixup` shape. A DETACHED HEAD is deliberately allowed — the cell template creates `worktree add
 # --detach` and the lane creates its branch at push time — so the branch assertion applies only when
 # HEAD is attached to a named branch.
-HEAD_BRANCH="$(git -C "$PWD" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+HEAD_BRANCH="$(repo_target_head_branch "$PWD")"
 if [ -n "${BR:-}" ] && [ -n "$HEAD_BRANCH" ]; then
   BRANCH_ASSERT_LINE="$(repo_target_branch_assert "lane $N" "$PWD" "$BR" "$OR")"; BRANCH_ASSERT_RC=$?
   printf '%s\n' "$BRANCH_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"

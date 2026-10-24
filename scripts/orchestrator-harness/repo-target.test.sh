@@ -12,19 +12,25 @@
 # WHAT IS PINNED — behaviour, not prose:
 #   A  the shared identity assertion: target+worktree agree; mismatch refuses naming BOTH slugs; no
 #      target refuses with a named reason; two checkouts of the SAME slug are distinguished by
-#      directory; an unreadable origin is a refusal, never a pass; the branch-level assertion.
+#      directory; an unreadable origin is a refusal, never a pass; the branch-level assertion; ambient
+#      GIT_DIR cannot forge it; case-insensitive slugs pass; a self-referential target dir refuses; a
+#      malformed target refuses.
 #   B  lane.sh (the start gate inside the worktree): matching target starts; tortoise worktree with an
 #      agent-infra target REFUSES (72) with both slugs in the message and writes NO brief; no target
 #      refuses; a flag/positional contradiction refuses; a worktree checked out on another branch
-#      refuses; and the lane log carries the per-dispatch `[repo-target]` line.
+#      refuses; the per-dispatch `[repo-target]` line is present; a 4th positional refuses; and a
+#      `--repo-dir`-ONLY call starts with a NON-EMPTY `$OR` in the brief.
 #   C  fix-one.sh (the PR-lane builder): a checkout/target mismatch refuses BEFORE any work; a branch
 #      that is not in the target repo refuses BY NAME, never as `could not materialise`; a matching
 #      target materialises and passes both assertions.
 #   D  dispatch-merge.sh (the issue-lane builder): a checkout that is not the target refuses the whole
 #      batch (both slugs named); no target refuses.
+#   F  the module is REQUIRED: absent or stale -> exit 78 in EVERY caller (lane, fix-one, dispatch-merge).
 #
-# HERMETIC: every repo is a throwaway `git init` under a temp dir, with a LOCAL bare repo wired via
-# `url.<path>.insteadOf` so the GitHub slug stays readable for the parser while no network is used.
+# HERMETIC: every repo is a throwaway `git init` under a temp dir, and `http.proxy` points at a closed
+# local port so the one fetch under test fails instantly without network while `git remote get-url`
+# keeps answering the GitHub slug (do NOT rewire origin with `url.<path>.insteadOf`: it rewrites
+# `get-url` too and makes every fixture unreadable).
 # Run: bash repo-target.test.sh            (and `--nonvacuity <rev>` to re-measure the pre-fix tree)
 set -u
 
@@ -123,6 +129,26 @@ A6="$(repo_target_branch_assert "unit" "$TWT" "feat/not-there" "daniel-ospina/to
 { [ "$a6" -eq 72 ] && grep -q 'feat/not-there' <<<"$A6" && grep -q 'daniel-ospina/tortoise' <<<"$A6" \
     && grep -q 'reason=branch-missing' <<<"$A6"; }; ck "A6 branch not in the target repo -> REFUSED naming the branch AND the repo" $?
 
+# ⛔ AMBIENT GIT ENV MUST NOT FORGE THE IDENTITY (#2762 review, P1). With GIT_DIR pointed at the
+# TARGET repo, the pre-scrub reads answered "tortoise" for an agent-infra worktree and the gate said
+# OK. The gate must read the worktree path it was GIVEN.
+A7="$(GIT_DIR="$AI/.git" repo_target_assert "unit" "$TWT" "daniel-ospina/agent-infra" "" 2>/dev/null)"; a7=$?
+{ [ "$a7" -eq 72 ] && grep -q 'repo=daniel-ospina/tortoise' <<<"$A7" \
+    && grep -q 'reason=slug-mismatch' <<<"$A7"; }; ck "A7 ambient GIT_DIR pointing at the target does NOT forge the worktree's identity (72)" $?
+
+# GitHub slugs are CASE-INSENSITIVE; the cell supervisor folds case (#1745), so refusing here would
+# certify the cell healthy and then block every dispatch on it (#2762 review, P1).
+A8="$(repo_target_assert "unit" "$TWT" "Daniel-Ospina/Tortoise" "")"; a8=$?
+{ [ "$a8" -eq 0 ] && grep -q 'result=OK' <<<"$A8"; }; ck "A8 same slug in a different case -> OK (GitHub slugs are case-insensitive)" $?
+
+A9="$(repo_target_assert "unit" "$TWT" "" "$TWT")"; a9=$?
+{ [ "$a9" -eq 72 ] && grep -q 'reason=target-self' <<<"$A9"; }; ck "A9 target dir IS the worktree under test -> REFUSED (a tautology can never refuse)" $?
+
+A10="$(repo_target_assert "unit" "$TWT" "tortoise" "")"; a10=$?
+A10b="$(repo_target_assert "unit" "$TWT" "/tmp/not-a-slug" "")"; a10b=$?
+{ [ "$a10" -eq 72 ] && grep -q 'reason=target-invalid' <<<"$A10" \
+    && [ "$a10b" -eq 72 ] && grep -q 'reason=target-invalid' <<<"$A10b"; }; ck "A10 malformed target ('tortoise', a path) -> REFUSED reason=target-invalid, not a wrong-repo claim" $?
+
 # ═══ B. lane.sh — the start gate ══════════════════════════════════════════════════════════════
 echo
 echo "── B. lane.sh: the post-build assertion before any lane artifact ──────────────────────────"
@@ -155,6 +181,16 @@ nline="$(grep -c '^\[repo-target\]' "$B6LOG" 2>/dev/null || true)"
 # A malformed dispatch must not be silently truncated to its first three words.
 lane_drive "$TWT" 3006 feat/3006-extra --repo daniel-ospina/tortoise extra1 extra2
 { [ "$LR" -eq 78 ] && grep -q 'too many positional' <<<"$RLOUT"; }; ck "B7 a 4th positional -> REFUSED (78) instead of silently dropped" $?
+
+# ⛔ A `--repo-dir`-ONLY CALL MUST NAME THE REPO (#2762 review, P1). The module supports naming only a
+# directory; `$OR` must then be derived from the ASSERTED worktree, or the written brief carries an
+# EMPTY `--repo` and `gh` falls back to ambient GH_REPO (the #2235 fail-open).
+B8WT="$(mk_wt "$TT" wt-b8 feat/3007-dironly)" || { echo "❌ worktree fixture"; exit 2; }
+lane_drive "$B8WT" 3007 feat/3007-dironly --repo-dir "$TT"
+{ [ "$LR" -eq 0 ] && [ -f "$LR_DIR/logs/prompt-3007.txt" ] \
+    && grep -q -- '--repo daniel-ospina/tortoise' "$LR_DIR/logs/prompt-3007.txt" \
+    && ! grep -q -- '--repo  ' "$LR_DIR/logs/prompt-3007.txt" \
+    && grep -q 'branch=feat/3007-dironly result=OK repo=daniel-ospina/tortoise' "$LRLOG" 2>/dev/null; }; ck "B8 --repo-dir only -> STARTS, brief names the repo, branch line is not UNREADABLE (rc=$LR)" $?
 
 # ═══ C. fix-one.sh — the PR-lane builder (#2694) ═══════════════════════════════════════════════
 echo
@@ -202,6 +238,48 @@ d1=$?
 O="$DMO" bash "$DM" "$TT" > "$T/dm2.out" 2>&1
 d2=$?
 { [ "$d2" -eq 72 ] && grep -q 'no-target' "$T/dm2.out"; }; ck "D2 no target -> REFUSED (72) with a named reason, before any worktree" $?
+
+# ⛔ A REFUSAL MUST ALSO DROP THE BLACKLIST ROW (#2762 review, P1). The controller appends the id to
+# `dispatched.txt` BEFORE calling this script; a refusal that leaves the row makes this box skip a FREE
+# issue until the reaper prunes it — the same shape the CI-queue deferral already remedies.
+DMO3="$T/o-dm3"; mkdir -p "$DMO3/logs" "$DMO3/state"; printf '5007\n' > "$DMO3/dispatched.txt"
+O="$DMO3" bash "$DM" "$TT" daniel-ospina/agent-infra 5007 > "$T/dm3.out" 2>&1
+d3=$?
+{ [ "$d3" -eq 72 ] && [ -f "$DMO3/dispatched.txt" ] && ! grep -qx '5007' "$DMO3/dispatched.txt"; }; ck "D3 repo refusal drops the batch's dispatched.txt row (no phantom 'dispatched' work)" $?
+DMO4="$T/o-dm4"; mkdir -p "$DMO4/logs" "$DMO4/state"; printf '5008\n' > "$DMO4/dispatched.txt"
+O="$DMO4" bash "$DM" "$TT" "" 5008 > "$T/dm4.out" 2>&1
+d4=$?
+{ [ "$d4" -eq 72 ] && [ -f "$DMO4/dispatched.txt" ] && ! grep -qx '5008' "$DMO4/dispatched.txt"; }; ck "D4 no-target refusal drops the row too" $?
+
+# ═══ F. the module is REQUIRED in every caller (T9) ═════════════════════════════════════════════
+echo
+echo "── F. a deployed box without repo-target.sh must REFUSE (exit 78), never silently skip ──"
+# Copy the whole harness, then remove/replace the module, so the ONLY difference is the gate itself.
+RIG_MISS="$T/rig-missing"; mkdir -p "$RIG_MISS"
+cp "$HERE"/*.sh "$RIG_MISS/"
+rm -f "$RIG_MISS/repo-target.sh"
+( cd "$TWT" && O="$RIG_MISS/o-lane" LANE_DRY_RUN=1 bash "$RIG_MISS/lane.sh" --repo daniel-ospina/tortoise 5001 feat/5001 ) > "$T/f-lane.out" 2>&1
+f1=$?
+{ [ "$f1" -eq 78 ] && grep -q 'repo-target.sh missing' "$T/f-lane.out"; }; ck "F1 lane.sh without the module -> FATAL 78 (rc=$f1)" $?
+( cd "$TT" && O="$RIG_MISS/o-fix" bash "$RIG_MISS/fix-one.sh" "$TT" daniel-ospina/tortoise 5002 work ) > "$T/f-fix.out" 2>&1
+f2=$?
+{ [ "$f2" -eq 78 ] && grep -q 'repo-target.sh missing' "$T/f-fix.out"; }; ck "F2 fix-one.sh without the module -> FATAL 78 (rc=$f2)" $?
+( cd "$TT" && O="$RIG_MISS/o-dm" bash "$RIG_MISS/dispatch-merge.sh" "$TT" daniel-ospina/tortoise 5003 ) > "$T/f-dm.out" 2>&1
+f3=$?
+{ [ "$f3" -eq 78 ] && grep -q 'repo-target.sh missing' "$T/f-dm.out"; }; ck "F3 dispatch-merge.sh without the module -> FATAL 78 (rc=$f3)" $?
+
+RIG_STALE="$T/rig-stale"; mkdir -p "$RIG_STALE"
+cp "$HERE"/*.sh "$RIG_STALE/"
+printf '#!/usr/bin/env bash\nREPO_TARGET_REFUSED=72\n' > "$RIG_STALE/repo-target.sh"
+( cd "$TWT" && O="$RIG_STALE/o-lane" LANE_DRY_RUN=1 bash "$RIG_STALE/lane.sh" --repo daniel-ospina/tortoise 5004 feat/5004 ) > "$T/f-lane2.out" 2>&1
+f4=$?
+{ [ "$f4" -eq 78 ] && grep -q 'is stale' "$T/f-lane2.out"; }; ck "F4 lane.sh with a STALE module (no functions) -> FATAL 78 (rc=$f4)" $?
+( cd "$TT" && O="$RIG_STALE/o-fix" bash "$RIG_STALE/fix-one.sh" "$TT" daniel-ospina/tortoise 5005 work ) > "$T/f-fix2.out" 2>&1
+f5=$?
+{ [ "$f5" -eq 78 ] && grep -q 'is stale' "$T/f-fix2.out"; }; ck "F5 fix-one.sh with a STALE module -> FATAL 78 (rc=$f5)" $?
+( cd "$TT" && O="$RIG_STALE/o-dm" bash "$RIG_STALE/dispatch-merge.sh" "$TT" daniel-ospina/tortoise 5006 ) > "$T/f-dm2.out" 2>&1
+f6=$?
+{ [ "$f6" -eq 78 ] && grep -q 'is stale' "$T/f-dm2.out"; }; ck "F6 dispatch-merge.sh with a STALE module -> FATAL 78 (rc=$f6)" $?
 
 # ═══ E. the pre-fix tree does NOT refuse (the non-vacuity proof) ══════════════════════════════
 # Optional because the baseline must be a commit BEFORE this change: run it manually with
