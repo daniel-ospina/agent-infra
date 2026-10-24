@@ -613,11 +613,167 @@ tmux_witness_for() {
 }
 
 # live_witness <canon> — "<witness>\t<evidence>" when a live holder exists, nothing when none.
+#
+# ── THE IDLE-SHELL RULE (agent-infra#2721) ───────────────────────────────────────────────────
+# WHY. The cwd and tmux-pane witnesses answer "is a process sitting in this worktree?" — and a shell
+# that `cd`'d in and never exited answers YES for ever. That is not a hypothetical: the reclaim logs
+# quoted in #2721 recorded `KEEP … (a live process has it as cwd)` for nearly every worktree on a
+# wedged cell while 59 checkouts carrying a lane env each (5-6 GB `du`) accumulated and the box lost
+# its disk. A shell at a prompt is not a lane: the lane's agent is the shell's CHILD, so a shell with
+# no children is a process nobody is using.
+#
+# THE RULE, and it is deliberately narrow:
+#   a cwd / tmux-pane holder is LIVE EVIDENCE unless it is a SHELL whose START TIME is before the
+#   worktree's HEAD commit AND which has no child process.
+# "Started before the last commit" is the brief's own phrasing of "never did anything here": a lane
+# between turns still holds its `pi`/test child, so it does not match; a lane that finished and left
+# its pane or its `cd` behind does. Every OTHER gate is untouched — `dirty`/`ignored-artifact`/`open-pr`/
+# `too-recent`/`detached-unreachable` and the shared-store rule all still KEEP — so the blast radius of
+# a wrong reading here is a re-created environment, never uncommitted or unpushed work.
+# ⛔ FAIL CLOSED ON EVERY UNKNOWABLE: a pid missing from the process table, a start time that cannot be
+# read, a HEAD that cannot be dated, or any probe that cannot answer all leave the witness LIVE.
+# ⛔ AND IT IS SWITCHABLE (`REAP_VENV_IDLE_SHELL=0`) so an operator can restore the strict reading
+# without editing a shipped script; when it demotes a holder it NAMES it in the pass log.
+IDLE_SHELL="${REAP_VENV_IDLE_SHELL:-1}"
+
+# proc_start_epoch <pid> -> epoch seconds the process started ("" when unreadable).
+# Linux needs no fork: the `/proc/<pid>` DIRECTORY's mtime is set at process creation (measured).
+# Elsewhere fall back to `ps -o etimes=` (elapsed seconds) and then to `ps -o etime=`'s
+# `[[dd-]hh:]mm:ss` form, which BSD ps has. An unreadable value is "" — never 0, which would compare
+# as "started at the epoch" and mis-classify every holder as stale.
+proc_start_epoch() {
+    local pid="${1:-}" v e rest
+    [ -n "$pid" ] && is_pos_int "$pid" || return 1
+    if [ -r "/proc/$pid" ]; then
+        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+        [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    fi
+    v="$("$PS_BIN" -o etimes= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    case "$v" in ''|*[!0-9]*) v="" ;; esac
+    [ -n "$v" ] && { printf '%s\n' "$(( $(now_epoch) - v ))"; return 0; }
+    e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    [ -n "$e" ] || return 1
+    case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    v=0
+    case "$e" in
+        *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;;
+    esac
+    local f1 f2 f3 rest
+    case "$e" in
+        *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
+        *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
+        *)     f1=0; f2=0; f3="$e" ;;
+    esac
+    is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
+    v=$(( v + f1 * 3600 + f2 * 60 + f3 ))
+    printf '%s\n' "$(( $(now_epoch) - v ))"
+}
+
+# is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
+is_shell_pid() {
+    local pid="${1:-}" cmd base
+    [ -n "$pid" ] && [ -s "${PS_TABLE:-}" ] || return 1
+    cmd="$(awk -v p="$pid" '$1==p { $1=""; $2=""; sub(/^[ \t]+/, ""); print; exit }' "$PS_TABLE" 2>/dev/null)"
+    [ -n "$cmd" ] || return 1
+    cmd="${cmd%% *}"
+    base="${cmd##*/}"
+    base="${base#-}"
+    case "$base" in bash|sh|dash|zsh|ksh|ksh93|mksh|ash|fish) return 0 ;; esac
+    return 1
+}
+
+# has_child <pid> — a pid with a live child in the table is DOING something (a prompt has none).
+# The reaper's own probe tree is excluded, the same way every other witness excludes it: the reaper
+# forks from the shell it is called by, and that shell's cwd may well be the worktree it is reaping.
+has_child() {
+    local pid="${1:-}"
+    [ -n "$pid" ] && [ -s "${PS_TABLE:-}" ] || return 1
+    awk -v p="$pid" -v self=" ${SELF_PIDS:-} " '
+        $2==p { if (index(self, " " $1 " ") == 0) { found=1; exit } }
+        END { exit !found }' "$PS_TABLE" 2>/dev/null
+}
+
+# head_epoch_for <worktree> -> epoch of the worktree's HEAD commit ("" when git cannot date it).
+# Bounded like every other git call in this script, and cached per pass: the same worktree is probed
+# at classification and again at removal.
+HEAD_EPOCH_CACHE=""
+head_epoch_for() {
+    local wt="${1:-}" out rc v k
+    [ -n "$wt" ] || return 1
+    while IFS="$TAB" read -r k v; do
+        [ "$k" = "$wt" ] && [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    done <<<"$HEAD_EPOCH_CACHE"
+    out="$(bound_file headep)" || return 1
+    run_bounded "$REAP_VENV_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$wt" log -1 --format=%ct
+    rc=$?
+    v="$(head -1 "$out" 2>/dev/null | tr -d ' \t')"
+    rm -f "$out"
+    [ "$rc" = 0 ] || return 1
+    is_pos_int "$v" || return 1
+    HEAD_EPOCH_CACHE="$HEAD_EPOCH_CACHE$wt$TAB$v"$'\n'
+    printf '%s\n' "$v"
+}
+
+# stale_shell_holder <pid> <worktree-canon> — 0 when this holder is an IDLE SHELL predating HEAD.
+# Fail-closed in every branch: anything we cannot prove leaves the holder LIVE.
+stale_shell_holder() {
+    local pid="${1:-}" canon="${2:-}" head start
+    [ "$IDLE_SHELL" = 1 ] || return 1
+    [ -n "$pid" ] && is_pos_int "$pid" || return 1
+    is_shell_pid "$pid" || return 1
+    has_child "$pid" && return 1
+    head="$(head_epoch_for "$canon")" || return 1
+    start="$(proc_start_epoch "$pid")" || return 1
+    [ "$start" -lt "$head" ] || return 1
+    return 0
+}
+
+# demote_row <table-var-name> <pid> — drop that holder's row from a probe TABLE FILE, so the witness
+# scan moves on to the NEXT holder instead of stopping at the first one. It mutates the shared file on
+# purpose: the witness readers run inside `$( )` subshells, so a shell variable holding "already
+# demoted pids" could not cross that boundary, while the file can (measured: without this, ONE idle
+# shell + one busy lane in the same worktree demoted the idle shell and then never looked at the busy
+# one — the env was reaped under a live lane, which is the exact failure this reaper exists to avoid).
+demote_row() { # demote_row <table-var-name> <pid>
+    local var="${1:-}" pid="${2:-}" f
+    [ -n "$var" ] && [ -n "$pid" ] && is_pos_int "$pid" || return 0
+    f="${!var:-}"
+    [ -n "$f" ] && [ -s "$f" ] || return 0
+    awk -v p="$pid" -F"$TAB" '$1 != p' "$f" >"$f.demoted" 2>/dev/null && mv -f "$f.demoted" "$f" 2>/dev/null
+    return 0
+}
+
 live_witness() {
-    local canon="$1" hit
-    if hit="$(tmux_witness_for "$canon")"; then printf 'live-tmux-pane\t%s\n' "$hit"; return 0; fi
-    if hit="$(cwd_witness_for "$canon")"; then printf 'live-cwd\t%s\n' "$hit"; return 0; fi
+    local canon="$1" hit pid note=""
+    # EVERY holder is examined, not just the first (see demote_row): a worktree routinely holds an idle
+    # shell left over from an earlier lane AND a live lane's own shell, and taking the first hit would
+    # decide the verdict for the whole worktree from whichever pid the probe happened to list first.
+    while hit="$(tmux_witness_for "$canon")"; do
+        pid="$(printf '%s' "$hit" | sed -n 's/^pane_pid=\([0-9][0-9]*\).*/\1/p')"
+        if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
+            note="$note pid=$pid(tmux-pane)"
+            demote_row TMUX_TABLE "$pid"
+        else
+            printf 'live-tmux-pane\t%s\n' "$hit"; return 0
+        fi
+    done
+    while hit="$(cwd_witness_for "$canon")"; do
+        pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
+        if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
+            note="$note pid=$pid(cwd)"
+            demote_row CWD_TABLE "$pid"
+        else
+            printf 'live-cwd\t%s\n' "$hit"; return 0
+        fi
+    done
     if hit="$(argv_witness_for "$canon")"; then printf 'live-argv\t%s\n' "$hit"; return 0; fi
+    # A DEMOTED HOLDER IS NAMED, never silent: the pass log is where an operator decides whether a
+    # stale-cwd reading was right, and a demotion nobody can see is the same defect as a KEEP nobody
+    # can explain (#2721).
+    if [ -n "$note" ]; then
+        log "stale-shell:$note — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
+    fi
     return 1
 }
 
