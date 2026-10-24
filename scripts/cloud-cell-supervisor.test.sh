@@ -3471,6 +3471,44 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
 
+# ── the scheduled layer's PLACEMENT (agent-infra#1864) ───────────────────────────────────────
+# ⛔ POSITION, NOT PRESENCE. `scheduler_ensure` must run inside cmd_start and BEFORE the
+# already-running early return: `start` is the cell's own "the cell is now alive" signal, and the
+# common start-after-stop path hits that return — so a loop that died while the controller lived is
+# revived ONLY because this call sits above it. Putting the call back below the return (the shape
+# this PR's own header warns about) would leave every assertion above green, which is why the
+# invariant is pinned here by line position rather than left to the reader of a comment.
+# It must also come AFTER assert_queue_target: --start clears the OFF switch, so running it before
+# the queue-target gate meant a start that then REFUSED had already un-stopped a deliberate --stop.
+say_case "start revives the scheduled layer, from the right place in cmd_start (#1864)"
+START_BODY="$(sed -n '/^cmd_start()/,/^}/p' "$SUP")"
+[ -n "$START_BODY" ] && ok "cmd_start was found in the supervisor" \
+  || bad "could not locate cmd_start in $SUP — this case would otherwise pass vacuously"
+# Line numbers WITHIN cmd_start's own body, so nothing outside the function can satisfy them.
+sched_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  scheduler_ensure$' | head -1 | cut -d: -f1)"
+return_ln="$(printf '%s\n' "$START_BODY" | grep -n 'if tmux has-session -t "\$SESSION"' | head -1 | cut -d: -f1)"
+queue_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  assert_queue_target$' | head -1 | cut -d: -f1)"
+[ -n "$sched_ln" ] && ok "start calls scheduler_ensure" \
+  || bad "cmd_start never calls scheduler_ensure — nothing revives the schedule on a running cell"
+[ -n "$return_ln" ] && ok "the already-running early return is still in cmd_start" \
+  || bad "the early return this case is about is gone from cmd_start — re-derive this assertion"
+# ⛔ ITS OWN PRESENCE GUARD, like the other two. Without it a cmd_start that no longer contains
+# `assert_queue_target` made the ordering block below skip BOTH its ok and its bad — no assertion
+# ran, and the case still reported success. A gate whose anchor can vanish silently is not a gate.
+[ -n "$queue_ln" ] && ok "cmd_start still gates on the queue target before it starts anything" \
+  || bad "assert_queue_target is gone from cmd_start — the ordering assertion below would skip vacuously"
+if [ -n "$sched_ln" ] && [ -n "$return_ln" ]; then
+  [ "$sched_ln" -lt "$return_ln" ] \
+    && ok "scheduler_ensure runs BEFORE the already-running early return (a dead loop is revived by start)" \
+    || bad "scheduler_ensure is BELOW the already-running early return (line $sched_ln vs $return_ln) — a cell whose loop died while the controller lived would stay dead"
+fi
+if [ -n "$sched_ln" ] && [ -n "$queue_ln" ]; then
+  [ "$queue_ln" -lt "$sched_ln" ] \
+    && ok "scheduler_ensure runs AFTER assert_queue_target (a refused start cannot un-stop the schedule)" \
+    || bad "scheduler_ensure runs BEFORE assert_queue_target (line $sched_ln vs $queue_ln) — a start that then refuses would already have cleared a deliberate --stop"
+fi
+
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
