@@ -211,6 +211,11 @@ OWNERSHIP_NOTE = ""
 # in for a repo nobody named. An empty REPO therefore means "not resolved yet", never "tortoise".
 REPO = ""            # owner/name, set by resolve_repo()
 REPO_DIR = ""        # the checkout that repo is graded from ("" = read-only, no spawning)
+# What this PROCESS inherited in `GH_REPO`, captured on the first pin and never re-read: `apply_repo`
+# overwrites that variable itself, so the live value stops describing the ambient once pinned (see
+# the #2280-review note in `apply_repo`). None = "not captured yet", which keeps the comparison
+# honest in a test that sets the variable after import.
+_INHERITED_GH_REPO = None
 # Why the checkout could not be found, when it could not. Named on the pass line rather than
 # silently degrading: a pass with no checkout can still grade the QUEUE, but it can place nothing.
 REPO_DIR_ERROR = ""
@@ -536,7 +541,7 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
     force belongs to `slug`, the answer is logged, and `dispatch()` refuses when it does not.
     """
     global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT, STATE, STATUS, LOG, LOG_BASENAME
-    global _WORKER_TAG
+    global _WORKER_TAG, _INHERITED_GH_REPO
     REPO = slug
     REPO_DIR = checkout or ""
     WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees") if REPO_DIR else ""
@@ -565,7 +570,15 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
     # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
     # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
     # what stops a worker this pass spawns from having its own rail answer about another repo.
-    ambient = (os.environ.get("GH_REPO") or "").strip()
+    # ⛔ COMPARED AGAINST WHAT THE PROCESS INHERITED, NOT WHAT THIS PROCESS PINNED (#2280 review,
+    # P2). The pin below writes `GH_REPO`, so comparing against the live value made every repo
+    # after the first in an `--all-repos` set log "GH_REPO=… (ambient) is NOT the repo this pass
+    # grades" about the repo this same process pinned one iteration earlier -- the line that exists
+    # to expose a real #2235 leak, manufacturing one.
+    global _INHERITED_GH_REPO
+    if _INHERITED_GH_REPO is None:
+        _INHERITED_GH_REPO = (os.environ.get("GH_REPO") or "").strip()
+    ambient = _INHERITED_GH_REPO
     if ambient and ambient.lower() != slug.lower():
         log("GH_REPO='%s' (ambient) is NOT the repo this pass grades -- pinning GH_REPO=%s for "
             "every call and every child" % (ambient, slug))
@@ -2133,6 +2146,27 @@ def _num_tokens(slug: str) -> set:
     return {int(t) for t in re.findall(r"(?<![A-Za-z0-9])0*([0-9]+)(?![0-9])", slug or "")}
 
 
+def _under_repo_dir(path: str) -> bool:
+    """Is `path` inside THIS pass's checkout? The only worktree-NAME evidence that PROVES anything.
+
+    ⛔ A WORKTREE NAME IS ONLY EVIDENCE ABOUT THE REPO IT SITS IN (#2280 review, P2). The fleet's
+    own naming makes two repos' worktrees collide: `.worktrees/prd-42` is the shape pr-doctor
+    creates, and `_num_tokens` reads `42` out of it -- so with `--all-repos` grading A and B, B's
+    live `prd-42` was attributed to A's PR #42. The pass then sorted A's real work BEHIND owned
+    PRs, spent its class budget on the wrong ones, and printed "every one of N open PR(s) has a
+    live holder" while an un-owned PR sat in the queue. With no checkout at all (`REPO_DIR == ""`)
+    nothing on the box can be placed in this repo, so the arm is disabled rather than guessing --
+    the function's own doctrine is that ownership is PROVED, never inferred.
+    """
+    if not REPO_DIR:
+        return False
+    try:
+        root, real = os.path.realpath(REPO_DIR), os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    return real == root or real.startswith(root + os.sep)
+
+
 def live_owners(prs: list) -> tuple[dict, str]:
     """{pr_number: "<evidence>"} for PRs a LIVE process is working, plus WHY the read failed.
 
@@ -2161,6 +2195,10 @@ def live_owners(prs: list) -> tuple[dict, str]:
         OWNERSHIP_NOTE = ("branch map unavailable (%s) -- %s"
                           % (werr[:100],
                              "matching worktree paths and numbers only" if cwds else "no probe"))
+    if not REPO_DIR:
+        _no_ck = ("no checkout for this repo, so a worktree NAME on this box proves nothing about "
+                  "it -- the NUMBER arm is disabled")
+        OWNERSHIP_NOTE = _no_ck if not OWNERSHIP_NOTE else OWNERSHIP_NOTE + "; " + _no_ck
     by_path = {path: br for path, br in wts}
     owners = {}
     for p in prs:
@@ -2177,9 +2215,11 @@ def live_owners(prs: list) -> tuple[dict, str]:
                         break
             if n in owners:
                 break
-            # (b) the worktree's NAME matches the branch slug, or carries the PR number
+            # (b) the worktree's NAME matches the branch slug, or carries the PR number -- and
+            # ONLY for a worktree inside THIS repo's checkout (see `_under_repo_dir()`: the same
+            # `prd-<n>` name exists in every repo, so a bare name is another repo's work).
             slug = _worktree_slug(cwd)
-            if not slug:
+            if not slug or not _under_repo_dir(cwd):
                 continue
             if head and (slug in heads or slug == head.replace("/", "-")):
                 owners[n] = "worktree %s matches head branch %s (live pid %s)" % (slug, head, pid)
@@ -3072,8 +3112,38 @@ class _UsageParser(argparse.ArgumentParser):
         except Exception:
             rc = EXIT_USAGE
         raise SystemExit(rc)
+def _per_repo_records() -> list[str]:
+    """The per-repo STATE records beside the canonical one -- and NOT the other two file kinds.
+
+    ⛔ THREE SHAPES SHARE THIS PREFIX, AND ONLY ONE HOLDS COOLDOWN ROWS (#2280 review, P2): the
+    canonical `pr-doctor.json` (which the first version of this helper counted as a "per-repo
+    record"), one `pr-doctor.<tag>.json` row file per repo, and a `pr-doctor.<tag>.status.json`
+    VERDICT sidecar per repo (plus the canonical `pr-doctor.status.json`). Counting the sidecars
+    made the note report 2.5x the real number and name files `--status` cannot read rows out of.
+    """
+    try:
+        names = sorted(os.listdir(STATE_DIR))
+    except OSError:
+        return []
+    canonical = os.path.basename(STATE)
+    return [n for n in names
+            if n.startswith("pr-doctor.") and n.endswith(".json")
+            and n != canonical and not n.endswith(".status.json")]
+
+
+def _per_repo_pointer() -> str:
+    """What this machine-wide view is NOT showing, or "" when there is nothing to point at."""
+    per_repo = _per_repo_records()
+    if not per_repo:
+        return ""
+    return ("; %d per-repo record(s) exist beside it (%s%s) and are NOT shown here, because "
+            "`--all-repos` writes those and their rows are the current ones -- run "
+            "`--status --all-repos`" % (len(per_repo), ", ".join(per_repo[:3]),
+                                        "..." if len(per_repo) > 3 else ""))
+
+
 def _status_age_note() -> str:
-    """What the machine-wide `--status` view is, and how old -- ONE line, or "" if unknowable.
+    """What the machine-wide `--status` view is, and how old -- ONE line.
 
     ⛔ BECAUSE A ROW WITH NO REPO AND NO DATE IS A CLAIM ABOUT NOW THAT NOTHING CHECKED (#2280
     review, P2). `--all-repos` redirects `STATE` per repo (`apply_repo(multi=True)`) and restores
@@ -3082,34 +3152,25 @@ def _status_age_note() -> str:
     for a repo the set may no longer contain. Its rows carry no repo field, which is why the
     per-repo printer refuses to substitute this file under a repo's header -- and the same reason
     applies here, to the file presented as "the machine-wide view". Printed rather than guessed:
-    the age of the record, and whether per-repo records exist that this view cannot show.
+    the age of the record, and whether per-repo records exist that this view cannot show. The
+    POINTER is computed before the age probe so the MISSING-file branch carries it too: that branch
+    is exactly the set-only box, where the per-repo rows are the only state there is.
     """
+    pointer = _per_repo_pointer()
     try:
         age_s = max(0.0, time.time() - os.path.getmtime(STATE))
     except OSError:
         return ("pr-doctor: NO canonical state file at %s -- no single-repo pass has recorded "
-                "anything here. Nothing is listed below, which is NOT the same as \"nothing is "
-                "in cooldown\"." % STATE)
+                "anything here, so nothing is listed below. That is NOT the same as \"nothing is "
+                "in cooldown\"%s." % (STATE, pointer))
     if age_s < 3600:
         age = "%dm" % int(age_s // 60)
     elif age_s < 86400:
         age = "%dh" % int(age_s // 3600)
     else:
         age = "%dd" % int(age_s // 86400)
-    try:
-        per_repo = [n for n in sorted(os.listdir(STATE_DIR))
-                    if n.startswith("pr-doctor.") and n.endswith(".json")
-                    and n != "pr-doctor.status.json"]
-    except OSError:
-        per_repo = []
-    tail = ""
-    if per_repo:
-        tail = ("; %d per-repo record(s) exist beside it (%s%s) and are NOT shown here, because "
-                "`--all-repos` writes those and their rows are the current ones -- run "
-                "`--status --all-repos`" % (len(per_repo), ", ".join(per_repo[:3]),
-                                            "..." if len(per_repo) > 3 else ""))
     return ("pr-doctor: canonical (machine-wide) state %s, last written %s ago; its rows carry no "
-            "repo field%s." % (STATE, age, tail))
+            "repo field%s." % (STATE, age, pointer))
 
 
 def _print_state(path: str, label: str = "") -> None:
@@ -3301,7 +3362,13 @@ def run_all_repos(args, explicit) -> int:
                 % (slug, ckwhy))
         try:
             rc = run_pass(args, set_note)
-        except BaseException as e:                 # one repo's crash must not end the SET
+        except Exception as e:                # one repo's crash must not end the SET
+            # ⛔ `Exception`, NOT `BaseException` (#2280 review, P2). The reason to catch here is
+            # "a crash grading repo A says nothing about repo B's queue", and that is a statement
+            # about CRASHES. `BaseException` also swallowed the operator's Ctrl-C: it became repo
+            # A's `verdict=CRASH rc=4` and the loop CARRIED ON grading -- and spawning -- the rest
+            # of the set, with every further Ctrl-C eaten by the next iteration, so the only way
+            # out was SIGKILL. An interrupt is not a per-repo fact; it propagates.
             # ⛔ THE SET IS THE POINT: a crash grading repo A says nothing about repo B's queue, so
             # it is CAUGHT here, reported as this repo's rc=4 and the loop CARRIES ON. Letting it
             # propagate would end the invocation with the remaining repos ungraded (and, before

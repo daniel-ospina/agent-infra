@@ -125,6 +125,11 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
+    # ⛔ `_INHERITED_GH_REPO` IS THE PROCESS'S INHERITANCE, captured on the first pin. One test
+    # process runs many "processes", so it is reset here for the same reason every other global is:
+    # an earlier test's env would become this one's inheritance (measured: the ambient-GH_REPO test
+    # went red for exactly that reason).
+    monkeypatch.setattr(pr, "_INHERITED_GH_REPO", None, raising=False)
     # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
     # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
     # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
@@ -3918,6 +3923,7 @@ def test_ownership_requires_a_live_process_in_the_pr_branch(monkeypatch):
 def test_ownership_by_worktree_path_is_a_TOKEN_match_not_a_substring(monkeypatch):
     """#7 must not be "owned" by a worktree checked out for #17 (the prefix-collision class)."""
     monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "REPO_DIR", "/r", raising=False)   # the checkout that OWNS those worktrees
     monkeypatch.setattr(pr, "_cwd_probe", lambda: ({"11": "/r/.worktrees/fix-17"}, ""))
     monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([("/r/.worktrees/fix-17", "x")], ""))
     owners, err = pr.live_owners([{"number": 7, "headRefName": "y"},
@@ -3942,6 +3948,7 @@ def test_the_ownership_predicate_still_answers_when_GIT_is_unreadable(monkeypatc
     `fix/pr-doctor-exit2`.
     """
     monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "REPO_DIR", "/r", raising=False)   # the checkout that OWNS those worktrees
     monkeypatch.setattr(pr, "_cwd_probe", lambda: (
         {"7": "/r/.worktrees/pr-doctor-exit2/src", "8": "/r/.worktrees/fix-42"}, ""))
     monkeypatch.setattr(pr, "_repo_worktrees", lambda: (
@@ -5218,3 +5225,95 @@ def test_the_machine_wide_status_view_NAMES_its_own_age_and_the_per_repo_records
     # AN ABSENT FILE IS NOT "NOTHING IN COOLDOWN": the rows are missing, the fact is not.
     monkeypatch.setattr(pr, "STATE", str(tmp_path / "absent.json"))
     assert "NOT the same" in pr._status_age_note()
+
+
+def test_another_repos_worktree_name_does_not_OWN_this_repos_PR(monkeypatch):
+    """`prd-<n>` is the fleet's name for a pr-doctor worktree in EVERY repo (#2280 review, P2).
+
+    With `--all-repos` grading A and B, B's live `.worktrees/prd-42` used to be attributed to A's
+    PR #42: A's real work was sorted behind "owned" PRs, its class budget went to the wrong ones,
+    and the pass printed "every one of N open PR(s) has a live holder" while an un-owned PR sat in
+    the queue. A worktree NAME is evidence only about the repo it sits in.
+    """
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "REPO_DIR", "/repoA", raising=False)   # grading A
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: (
+        {"31": "/repoB/.worktrees/prd-42", "32": "/repoA/.worktrees/prd-43"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([], "git worktree list failed: rc=128"))
+    owners, err = pr.live_owners([{"number": 42, "headRefName": "fix/a"},
+                                  {"number": 43, "headRefName": "fix/b"}])
+    assert err == "", err
+    assert list(owners) == [43], owners          # B's prd-42 must NOT own A's #42
+    # AND WITH NO CHECKOUT THE ARM IS OFF, NOT GUESSING -- the note says which arm went dark.
+    monkeypatch.setattr(pr, "REPO_DIR", "", raising=False)
+    owners, err = pr.live_owners([{"number": 42, "headRefName": "fix/a"}])
+    assert owners == {}, owners
+    assert "NUMBER arm is disabled" in pr.OWNERSHIP_NOTE, pr.OWNERSHIP_NOTE
+
+
+def test_a_set_pins_GH_REPO_WITHOUT_manufacturing_an_ambient_warning(tmp_path, monkeypatch):
+    """One warning about the INHERITED value, not K-1 about this process's own pin (#2280 review)."""
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("GH_REPO", "o/inherited")          # what the box actually exported
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "run_pass", lambda args, note="", *_r, **_k: 0)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == 0, logs
+    ambient = [m for m in logs if "(ambient)" in m]
+    # EVERY such line names the value the PROCESS INHERITED -- never the slug this process pinned
+    # one repo earlier (the measured defect: "GH_REPO='daniel-ospina/agent-infra' (ambient) is NOT
+    # the repo this pass grades" while grading tortoise).
+    assert ambient, logs
+    assert all("o/inherited" in m for m in ambient), ambient
+    assert not any("GH_REPO='daniel-ospina/" in m for m in ambient), ambient
+
+
+def test_an_INTERRUPT_ends_the_set_instead_of_becoming_a_per_repo_crash(tmp_path, monkeypatch):
+    """Ctrl-C is not "repo A crashed": the loop must stop, not grade (and spawn) the rest."""
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    graded = []
+
+    def _rp(args, note="", *_r, **_k):
+        graded.append(pr.REPO)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pr, "run_pass", _rp)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    with pytest.raises(KeyboardInterrupt):
+        pr.main()
+    assert graded == [_REPO_A], graded          # the second repo was never entered
+
+
+def test_the_status_pointer_excludes_the_canonical_file_and_the_verdict_sidecars(tmp_path,
+                                                                                monkeypatch):
+    """The pointer must count ROW files, and it must appear in the missing-file branch too."""
+    monkeypatch.setattr(pr, "STATE", str(tmp_path / "pr-doctor.json"))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    (tmp_path / "pr-doctor.json").write_text("{}")                                    # canonical
+    (tmp_path / "pr-doctor.status.json").write_text("{}")                             # canonical verdict
+    (tmp_path / "pr-doctor.daniel-ospina-agent-infra.json").write_text("{}")          # rows
+    (tmp_path / "pr-doctor.daniel-ospina-agent-infra.status.json").write_text("{}")   # verdict
+    (tmp_path / "pr-doctor.daniel-ospina-tortoise.json").write_text("{}")             # rows
+    assert pr._per_repo_records() == ["pr-doctor.daniel-ospina-agent-infra.json",
+                                     "pr-doctor.daniel-ospina-tortoise.json"]
+    note = pr._status_age_note()
+    assert "2 per-repo record(s)" in note, note
+    assert ".status.json" not in note, note
+    # THE SET-ONLY BOX: no canonical file at all -- the per-repo rows are the ONLY state, so the
+    # pointer must be in THAT branch (the one the finding measured as dropping it).
+    monkeypatch.setattr(pr, "STATE", str(tmp_path / "pr-doctor-absent.json"))
+    missing = pr._status_age_note()
+    assert "NO canonical state file" in missing, missing
+    assert "pr-doctor.daniel-ospina-tortoise.json" in missing, missing
+    assert "--status --all-repos" in missing, missing
