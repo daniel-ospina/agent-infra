@@ -153,7 +153,7 @@ file_mtime() {
 # ── lock (same model as every other owner in this family) ──────────────────────────────────────
 LOCK_HELD=0
 acquire_lock() {
-    local owner started
+    local owner started _lmt _lage
     mkdir -p "$STATE_DIR" 2>/dev/null
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
@@ -168,8 +168,13 @@ acquire_lock() {
     owner="$(sed -n 's/^.*pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     if num "$owner" && kill -0 "$owner" 2>/dev/null; then say "SKIP reason=lock-held pid=$owner"; return 3; fi
-    if num "$started" && [ -f "$LOCK_DIR/token" ] && [ $(( $(now) - started )) -le "$LOCK_STALE_SECONDS" ]; then
-        say "SKIP reason=lock-tokenless age=$(( $(now) - started ))s"; return 3
+    # See the abandoned-worktree owner: only an UNATTRIBUTABLE lock is tokenless, and only while young.
+    if ! num "$owner"; then
+        if [ -f "$LOCK_DIR/token" ]; then _lmt="$(file_mtime "$LOCK_DIR/token")"; else _lmt="$(file_mtime "$LOCK_DIR")"; fi
+        if num "$_lmt"; then
+            _lage=$(( $(now) - _lmt )); [ "$_lage" -lt 0 ] && _lage=0
+            if [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then say "SKIP reason=lock-tokenless age=${_lage}s"; return 3; fi
+        fi
     fi
     say "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
     rm -rf "$LOCK_DIR" 2>/dev/null
@@ -304,6 +309,14 @@ CENSUS="$CENSUSDIR/live-paths.tsv"
 MODE_TEXT=dry-run; [ "$DRY_RUN" = 1 ] || MODE_TEXT=apply
 DEADLINE=$(( $(now) + BUDGET ))
 say "reap-duplicate-installs: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') markers=$(printf '%s' "$MARKERS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
+# An EXPLICIT seam that does not name a readable process table forces the fail-closed arm: the seam
+# says WHICH table to read, so falling through to `lsof` would silently read a different one and
+# report green — the exact "the documented way to test the refusal cannot reach it" defect.
+if [ -n "${REAP_DI_PROC_ROOT:-}" ] && [ ! -d "${REAP_DI_PROC_ROOT}" ]; then
+    say "note: REAP_DI_PROC_ROOT=$REAP_DI_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
+    LP_CENSUS_UNAVAILABLE=1
+fi
+export LP_PROC_ROOT="${LP_PROC_ROOT:-${REAP_DI_PROC_ROOT:-/proc}}"
 if ! lp_census "$CENSUSDIR"; then
     say "SKIP reason=census-unreadable mechanism=${LP_CENSUS_MECH:-none} — the process list could not be read, so NO copy can be proven idle; nothing was reaped (fail closed)"
     say "SUMMARY class=duplicate-install mode=$MODE_TEXT families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"
