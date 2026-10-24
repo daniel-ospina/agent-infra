@@ -859,15 +859,20 @@ proc_start_epoch() {
     e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
     [ -n "$e" ] || return 1
     case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    # ⛔ EVERY FIELD IS FORCED TO BASE 10 (review round 1, P2): `ps -o etime` prints zero-padded
+    # components, so an ordinary `1:08:30` reaches the arithmetic as `08` and bash rejects it as a bad
+    # OCTAL constant — the error left `v` short by the hours component, which reads as a process that
+    # started EARLIER than it did, i.e. it biased the rule toward demoting a LIVE holder. `10#` makes
+    # the parse literal decimal.
     v=0
-    case "$e" in *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;; esac
+    case "$e" in *-*) v=$(( 10#${e%%-*} * 86400 )); e="${e#*-}" ;; esac
     case "$e" in
         *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
         *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
         *)     f1=0; f2=0; f3="$e" ;;
     esac
     is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
-    printf '%s\n' "$(( $(now_epoch) - (v + f1 * 3600 + f2 * 60 + f3) ))"
+    printf '%s\n' "$(( $(now_epoch) - (v + 10#$f1 * 3600 + 10#$f2 * 60 + 10#$f3) ))"
 }
 
 # is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
@@ -1308,6 +1313,45 @@ patch_equivalent() { # <sha> -> 0 when every commit it adds has a patch-id twin 
 # Emits one row: "<verdict>\t<reason>\t<ephemeral>\t<detail>" (ephemeral is
 # third so the free-text detail, which may embed a path containing a tab, is
 # absorbed by cut -f4-).
+# holders_live <canon> <recorded-path> <sha> -> 0 when a holder that is NOT a demoted idle shell
+# exists (HL_VERDICT/HL_DETAIL name it), 1 when every holder was demoted (HL_STALE lists them) or
+# there was none.
+#
+# ⛔ EVERY HOLDER IS EXAMINED, NOT JUST THE FIRST (agent-infra#2721): a worktree routinely holds an
+# idle shell left over from an earlier lane AND a live lane's own process, so taking the first hit
+# decides the whole checkout from whichever pid the probe happened to list first (reproduced while
+# writing this: one stale shell masked a busy lane's shell). The scan carries a per-record EXCLUDE
+# LIST rather than rewriting the probe output, so one verdict cannot change the evidence the next
+# one sees, and the cap makes a probe that keeps returning the same pid terminate instead of spin.
+holders_live() {
+    local canon="$1" recorded="$2" sha="$3" pid seen="" n=0 cap
+    HL_VERDICT=""; HL_DETAIL=""; HL_STALE=""
+    cap=$(( $(wc -l <"${PS_OUT:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${CWD_OUT:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
+    [ "$cap" -ge 4 ] || cap=4
+    while pid="$(live_process_for "$canon" "$recorded" "$seen")"; do
+        n=$((n + 1)); [ "$n" -le "$cap" ] || break
+        seen="$seen $pid"
+        if stale_shell_for "$pid" "$sha"; then
+            HL_STALE="$HL_STALE pid=$pid(argv)"
+            log "STALE-SHELL pid=$pid (argv) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        HL_VERDICT="live-process"; HL_DETAIL="$pid"; return 0
+    done
+    seen=""; n=0
+    while pid="$(live_cwd_for "$canon" "$recorded" "$seen")"; do
+        n=$((n + 1)); [ "$n" -le "$cap" ] || break
+        seen="$seen $pid"
+        if stale_shell_for "$pid" "$sha"; then
+            HL_STALE="$HL_STALE pid=$pid(cwd)"
+            log "STALE-SHELL pid=$pid (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
+        HL_VERDICT="live-cwd"; HL_DETAIL="$pid"; return 0
+    done
+    return 1
+}
+
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
@@ -1370,30 +1414,19 @@ classify_one() {
     # (reproduced while writing this: one stale shell masked a busy lane's shell, and the rule then
     # demoted the wrong way). A holder that IS an idle shell predating HEAD is NAMED in the log and
     # the scan moves to the next one; the other gates (clean/reachable/open-pr/age) still decide.
-    local _stale="" _seen=""
-    while detail="$(live_process_for "$canon" "$path" "$_seen")"; do
-        _seen="$_seen $detail"
-        if stale_shell_for "$detail" "$sha"; then
-            _stale="$_stale pid=$detail(argv)"
-            log "STALE-SHELL pid=$detail (argv) — an idle shell predating HEAD is not a live lane (#2721)"
-            continue
-        fi
-        printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$detail"; return 0
-    done
-    _seen=""
-    while detail="$(live_cwd_for "$canon" "$path" "$_seen")"; do
-        _seen="$_seen $detail"
-        if stale_shell_for "$detail" "$sha"; then
-            _stale="$_stale pid=$detail(cwd)"
-            log "STALE-SHELL pid=$detail (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
-            continue
-        fi
-        printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$detail"; return 0
-    done
-    # A demoted holder is carried into the row, so a reader can see WHY a checkout that looked live
-    # was reclaimed — and can tell a genuine idle-shell demotion from a lane that was still working.
+    # ⛔ THE SAME EVIDENCE IS CONSULTED AT REMOVAL TIME (review round 1, P3). `classify_one` decides
+    # from holders that existed minutes ago on a big box, so a demoted shell that got a child in the
+    # meantime — i.e. started working again — must be able to STOP the removal, not just have been
+    # right once. `holders_live` is shared by both call sites for exactly that reason.
     local stale_txt=""
-    [ -n "$_stale" ] && stale_txt="stale-shell:$_stale"
+    if holders_live "$canon" "$path" "$sha"; then
+        case "$HL_VERDICT" in
+            live-process) printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$HL_DETAIL"; return 0 ;;
+            live-cwd)     printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$HL_DETAIL"; return 0 ;;
+            *)            printf 'preserve\t%s\t\trule=1 proof=holder:pid=%s holds the path\n' "$HL_VERDICT" "$HL_DETAIL"; return 0 ;;
+        esac
+    fi
+    [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
 
     crumb="$(clean_gate "$path")"
     cverdict="${crumb%%$'\t'*}"
@@ -1642,7 +1675,7 @@ classify_one() {
 }
 
 # ── removal ────────────────────────────────────────────────────────────
-# remove_one <path>
+# remove_one <path> <sha>
 # Never --force. Deletes the declared-ephemeral ROOT names first, whether
 # UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
 # root branch collects both, so both are pre-deleted here. NESTED ignored
@@ -1676,8 +1709,31 @@ classify_one() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local path="$1" eph entry target out rc crumb cverdict cpay
+    local path="$1" sha="$2" eph entry target out rc crumb cverdict cpay rcanon
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
+
+    # Re-check #0 — THE HOLDER RULE, AGAIN, RIGHT BEFORE THE DELETE (review round 1): the
+    # classification ran minutes ago, and a shell it demoted as idle can have picked up a child since,
+    # which is exactly what "started working again" looks like. Return 2 (the same "preserved, nothing
+    # removed" path the clean re-check uses) so the caller reports a PRESERVE, not a failure.
+    # ⛔ THE PROBE TABLES ARE RE-READ HERE, not reused (review round 1): PS_OUT/CWD_OUT are ONE snapshot
+    # taken at the top of the pass, so re-running the RULE over them would see the same holder set and
+    # the same child set — a re-probe that cannot observe a change is an inert gate, and an inert gate
+    # is worse than none because the log would claim a check that never happened. A failed re-read is
+    # fail-CLOSED (preserve), matching the removal-time posture of the sibling venv reaper.
+    rcanon="$(canonicalize "$path")"
+    if ! ps_load; then
+        REMOVE_SKIP_VERDICT="live-probe-unavailable"
+        log "REMOVE-SKIP $path the live-holder re-probe could not read the process table — nothing removed, preserved (fail-closed)"
+        rm -f "$out"; return 2
+    fi
+    self_pid_tree_load
+    cwd_probe_load
+    if holders_live "$rcanon" "$path" "$sha"; then
+        REMOVE_SKIP_VERDICT="live-refound"
+        log "REMOVE-SKIP $path a holder is live AGAIN (${HL_VERDICT} pid=${HL_DETAIL}) since classification — nothing removed, preserved"
+        rm -f "$out"; return 2
+    fi
 
     # Re-check #1 — before ANY deletion. Without this, a checkout that grew an
     # ignored artifact since classification would lose its ephemerals to the
@@ -1982,7 +2038,7 @@ run() {
                     say "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
                 else
-                    remove_one "$p"; rc=$?
+                    remove_one "$p" "$h"; rc=$?
                     case "$rc" in
                         0)
                             say "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
@@ -1997,7 +2053,7 @@ run() {
                             # `ignored-artifact` mean the checkout changed,
                             # while `status-*` means the probe could not be
                             # evaluated — different operator actions.
-                            say "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
+                            say "         PRESERVED — removal-time re-check kept it (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
                             log "PRESERVED-LATE $p" ;;
                         *)
