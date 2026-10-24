@@ -28,7 +28,8 @@
 #   (c) a STALE scout (an orphaned lock) is REPAIRED and the report names the lock by PATH;
 #   (d) NON-VACUITY: with the cause-recording reverted, (a) goes red — the record says "no cause".
 #   (a2) an index.lock whose AGE cannot be read is REFUSED, never repaired (#2688 review, P1).
-#   (a3) an UNEVALUABLE SCOUT_LOCK_STALE_SECS is refused, and a fresh lock survives it.
+#   (a3) an UNEVALUABLE SCOUT_LOCK_STALE_SECS is refused, and a fresh lock survives it — including
+#        the zero-equivalent (`00`, `000`) and out-of-range spellings a digits-only test admits.
 #   (a4) a DANGLING SYMLINK at index.lock is refused and named, not mistaken for "no lock".
 #   (a5) a DIRTY scout records WHY it refused — not the "no recorded reason" fallback.
 #
@@ -105,6 +106,7 @@ OUT=""; RC=0
 rp() {
   local dir="$1" script="${2:-$REFRESH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+          -u SCOUT_LOCK_STALE_SECS \
           HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
           bash "$script" 6 2>&1)"
   RC=$?
@@ -191,7 +193,7 @@ ck "(a2) the cause says the AGE is unknown, not that the lock is orphaned" "$r"
 # an operator's non-numeric SCOUT_LOCK_STALE_SECS skipped the live-writer arm and reached the `rm -f` —
 # deleting a 0-second-old LIVE lock while printing a `REPAIR:` line (#2688 review cycle 2, P1).
 BOUNDN=0
-for bad in 5m abc 0 '300 '; do
+for bad in 5m abc 0 '300 ' 00 000 9223372036854775808; do
   BOUNDN=$((BOUNDN+1))
   mk_case "bound-$BOUNDN"
   LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
@@ -217,11 +219,16 @@ mk_case dangling-lock
 LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
 ln -s "$D/does-not-exist" "$LOCK"
 rp "$D"
-ck "(a4) a dangling index.lock symlink refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+# ⛔ rc=3 + NON-REGULAR, not merely "non-zero and names the path" (review cycle 3, P2): WITHOUT the
+# `[ -L ]` fix git's own `fatal: Unable to create '…/index.lock': File exists` refusal ALSO exits
+# non-zero and ALSO names $LOCK, so the weaker assertions passed on the un-fixed code.
+ck "(a4) a dangling index.lock symlink hits the NON-REGULAR arm (rc=$RC, want 3)" "$([ "$RC" -eq 3 ]; echo $?)"
 ck "(a4) the symlink was NOT deleted (still present)" "$([ -L "$LOCK" ]; echo $?)"
 WHY="$(rec why)"
 case "$WHY" in *"$LOCK"*) r=0 ;; *) r=1 ;; esac
 ck "(a4) the cause NAMES the lock path (why=${WHY:0:120})" "$r"
+case "$WHY" in *"NON-REGULAR"*) r=0 ;; *) r=1 ;; esac
+ck "(a4) the cause says NON-REGULAR — the arm the fix created, not git's later refusal" "$r"
 
 # ── (a5) A DIRTY SCOUT RECORDS *WHY* IT REFUSED, NOT "refused without a recorded reason" ─────────────
 # The two `scout_sync` refusal arms set the rc and printed their own lines but never `SCOUT_REFUSE_WHY`,
