@@ -138,36 +138,61 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # the defect this installer removes, one layer down. Resolved here beside the scope so the two cannot
 # disagree, and the rendered line is asserted below.
 # ⛔ A UNIT DIRECTORY SYSTEMD READS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1,
-# #2402). `SYSTEMD_UNIT_DIR` is the installer's WRITE override, but the supervisor discovers a unit only
-# under the system dir (`CONTROLLER_SYSTEM_UNIT_DIR`, default `/etc/systemd/system`) and the user dirs it
-# enumerates (`cloud-cell-supervisor.sh::controller_unit_copies`). systemd additionally loads units from
-# `/etc/systemd/system.control`, `/etc/systemd/system.attached`, `/usr/lib/systemd/system`,
-# `/usr/local/lib/systemd/system`, the user managers' `/etc/systemd/user`, `/etc/xdg/systemd/user` and
-# `~/.local/share/systemd/user`. A unit written into one of those is ENABLED and BOOT-ARMED while
+# #2402; re-review P1). `SYSTEMD_UNIT_DIR` is the installer's WRITE override, but the supervisor discovers a
+# unit only under the system dir (`CONTROLLER_SYSTEM_UNIT_DIR`, default `/etc/systemd/system`) and the user
+# dirs it enumerates (`cloud-cell-supervisor.sh::controller_unit_copies`). systemd additionally loads units
+# from `/etc/systemd/system.control`, `/etc/systemd/system.attached`, `/run/systemd/system.control`,
+# `/run/systemd/system.attached`, `/run/systemd/generator*`, `/usr/lib/systemd/system`,
+# `/usr/local/lib/systemd/system`, and the user managers' `/etc/systemd/user`, `/etc/xdg/systemd/user`,
+# `~/.local/share/systemd/user`. A unit written into any of those is ENABLED and BOOT-ARMED while
 # `start`/`stop`/`status` cannot see it at all: when it dies the doctor finds no unit, launches a tmux
 # controller, and `Restart=always` revives the unit — TWO dispatchers on one queue (#1761), the exact
-# duplicate this feature exists to prevent. Verified on the unguarded form:
-# `SYSTEMD_UNIT_DIR=/etc/systemd/system.control` → rc 0, `would install … and enable it`.
-# The ALLOWED set is the two directories the readers search BY DEFAULT, compared LITERALLY and not
-# through a seam: re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at `/etc/systemd/system.control` would
-# otherwise make the guard agree with itself and admit the directory. A directory systemd does NOT read
-# (a hermetic test fixture under `$TMPDIR`) is always allowed — nothing boots it.
-unit_dir_systemd_reads() { # <dir> — a real systemd search path
-    case "${1%/}" in
-        /etc/systemd/system.control|/etc/systemd/system.attached) return 0 ;;
-        /usr/lib/systemd/system|/usr/lib/systemd/user|/lib/systemd/system) return 0 ;;
-        /usr/local/lib/systemd/system|/usr/local/lib/systemd/user) return 0 ;;
-        /etc/systemd/user|/etc/xdg/systemd/user) return 0 ;;
-        /run/systemd/system|/run/systemd/transient) return 0 ;;
-        */.local/share/systemd/user) return 0 ;;
-        *) return 1 ;;
-    esac
+# duplicate this feature exists to prevent.
+#
+# ⛔ NOT A HAND-MAINTAINED LIST OF DIRECTORIES, AND NOT A LITERAL COMPARISON (re-review P1, #2666). Two
+# measured escapes of the first form: an UNLISTED systemd path (`/run/systemd/system.control` — which
+# `systemd-analyze unit-paths` prints on this host — was admitted and dry-ran `would install …`), and any
+# SYMLINKED spelling of a refused directory (`ln -s /etc/systemd/system.control $T/alias &&
+# SYSTEMD_UNIT_DIR=$T/alias` was admitted), because a literal match cannot see through an alias. So the
+# decision is taken on the RESOLVED path, and the test is the systemd TREE (every directory under a
+# manager's unit root), not one filename per revision of systemd. The only members of those trees that
+# stay allowed are the two directories the cooperating verbs read BY DEFAULT — compared after resolution,
+# so re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at a refused directory cannot make the guard agree with
+# itself. A directory OUTSIDE every systemd tree (a hermetic test fixture under `$TMPDIR`) is always
+# allowed: nothing boots it.
+canon_dir() { # <dir> — the resolved spelling (symlinks, `//`, and trailing slashes collapsed)
+    local d="${1:-}"
+    [ -n "$d" ] || return 0
+    # `readlink -f` is GNU/busybox: it resolves every component that exists and returns the canonical path
+    # with a not-yet-created leaf kept as-is. Where it is absent, `pwd -P` answers the same question for a
+    # directory that exists; a path that does not exist at all degrades to its slash-stripped spelling.
+    if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then
+        readlink -f -- "$d"; return 0
+    fi
+    ( cd "$d" 2>/dev/null && pwd -P ) || printf '%s\n' "${d%/}"
 }
-unit_dir_is_read_by_default() { # <dir> — searched by the supervisor with NO override in play
+unit_dir_in_systemd_tree() { # <resolved dir> — a tree one of systemd's managers loads units from
+    local d="${1%/}" h
+    case "$d" in
+        /etc/systemd|/etc/systemd/*) return 0 ;;
+        /run/systemd|/run/systemd/*) return 0 ;;
+        /run/user/*/systemd|/run/user/*/systemd/*) return 0 ;;
+        /usr/lib/systemd|/usr/lib/systemd/*) return 0 ;;
+        /usr/local/lib/systemd|/usr/local/lib/systemd/*) return 0 ;;
+        /lib/systemd|/lib/systemd/*) return 0 ;;
+        /etc/xdg/systemd|/etc/xdg/systemd/*) return 0 ;;
+    esac
+    for h in "${HOME:-}" "$(passwd_home "$(id -u)" 2>/dev/null || true)" "$(passwd_home "${SUDO_USER:-}" 2>/dev/null || true)"; do
+        [ -n "$h" ] || continue
+        case "$d" in "${h%/}"/.local/share/systemd|"${h%/}"/.local/share/systemd/*) return 0 ;; esac
+    done
+    return 1
+}
+unit_dir_is_read_by_default() { # <resolved dir> — searched by the supervisor with NO override in play
     local d="${1%/}" h
     [ "$d" = "/etc/systemd/system" ] && return 0
     for h in "${HOME:-}" "$(passwd_home "$(id -u)" 2>/dev/null || true)" "$(passwd_home "${SUDO_USER:-}" 2>/dev/null || true)"; do
-        [ -n "$h" ] && [ "$d" = "${h%/}/.config/systemd/user" ] && return 0
+        [ -n "$h" ] && [ "$d" = "$(canon_dir "${h%/}/.config/systemd/user")" ] && return 0
     done
     return 1
 }
@@ -186,15 +211,18 @@ choose_target() {
         return 1
     fi
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
-        if unit_dir_systemd_reads "$SYSTEMD_UNIT_DIR" && ! unit_dir_is_read_by_default "$SYSTEMD_UNIT_DIR"; then
-            err "REFUSING SYSTEMD_UNIT_DIR=$SYSTEMD_UNIT_DIR: systemd loads units from there, but every cooperating"
-            err "  verb (start/stop/status) discovers a unit only under /etc/systemd/system or"
-            err "  \$HOME/.config/systemd/user — so this would install an ENABLED, BOOT-ARMED unit that nothing here"
-            err "  can see. When it dies the doctor launches a tmux controller and Restart=always revives the unit:"
-            err "  TWO dispatchers on one queue (#1761), the duplicate this feature exists to prevent."
+        _unit_dir_resolved="$(canon_dir "$SYSTEMD_UNIT_DIR")"
+        if [ -n "$_unit_dir_resolved" ] && unit_dir_in_systemd_tree "$_unit_dir_resolved" \
+           && ! unit_dir_is_read_by_default "$_unit_dir_resolved"; then
+            err "REFUSING SYSTEMD_UNIT_DIR=$SYSTEMD_UNIT_DIR (resolves to $_unit_dir_resolved): systemd loads units"
+            err "  from there, but every cooperating verb (start/stop/status) discovers a unit only under"
+            err "  /etc/systemd/system or \$HOME/.config/systemd/user — so this would install an ENABLED, BOOT-ARMED"
+            err "  unit that nothing here can see. When it dies the doctor launches a tmux controller and"
+            err "  Restart=always revives the unit: TWO dispatchers on one queue (#1761), the duplicate this"
+            err "  feature exists to prevent."
             err "  Fix: install into the system or the user unit dir — or point SYSTEMD_UNIT_DIR at a directory"
-            err "  systemd does NOT read (a hermetic test dir); only the directories systemd loads and this"
-            err "  fleet's readers do not search are refused."
+            err "  systemd does NOT load from (a hermetic test dir). The decision is taken on the RESOLVED path,"
+            err "  so a symlink to a systemd directory is refused too."
             return 1
         fi
         TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
@@ -619,8 +647,12 @@ do_install() {
     # box that installed a USER unit and later gained passwordless sudo would get a SYSTEM unit too — both
     # enabled, both started at boot, and the loser parked in the adopt-wait forever. The bring-up re-runs
     # --install on every --check, so this is not exotic: it is the next bring-up.
-    local other; other="$(installed_units)"
-    if [ -n "$other" ] && [ "$other" != "$UNIT_DIR/$UNIT_NAME" ]; then
+    local other target_resolved; other="$(installed_units)"
+    # ⛔ COMPARE RESOLVED PATHS, NOT SPELLINGS (re-review P2, #2666): `installed_unit_copies` prints resolved
+    # paths, so the target must be resolved too — otherwise a symlinked or slash-suffixed `UNIT_DIR` reads as
+    # a DIFFERENT copy and this guard refuses a healthy idempotent re-install.
+    target_resolved="$(canon_dir "$UNIT_DIR")/$UNIT_NAME"
+    if [ -n "$other" ] && [ "$other" != "$target_resolved" ]; then
         err "REFUSING: a unit is already installed at $other, and this run targets $UNIT_DIR/$UNIT_NAME."
         err "  Two ENABLED units are two supervisors for one queue (#1761). Remove the other one first:"
         err "    bash $0 --uninstall   # resolves the INSTALLED copy, then re-run --install"
@@ -836,7 +868,7 @@ do_install() {
         esac
     fi
     controller_proof "$proof_since" "$proof_o" || {
-        err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${proof_budget}s (${proof_budget_src}):"
+        err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s of ${proof_budget}s (${proof_budget_src}):"
         err "  expected the harness's lock ($O/.orch.lock$([ -n "$proof_o" ] && [ "${proof_o%/}" != "${O%/}" ] && printf ' or %s/.orch.lock' "${proof_o%/}")) held by a live orch-loop.sh, or a heartbeat in the same state dir."
         err "  An active unit whose start is about to die (no key, a foreign controller, a bad pin) converges to"
         err "  'failed' at StartLimitBurst — the #2402 defect, with a green install on top of it. Read:"
@@ -1227,7 +1259,17 @@ installed_unit_copies() { # every copy of OUR unit this box can find: system sco
     # left TWO copies for one state dir, no refusal. Two ENABLED units are two supervisors for one queue:
     # `stop` addresses one while the other revives the controller (#1761). The guard now shares the
     # read-back verbs' enumeration, so the two can never disagree about what is installed.
+    # ⛔ AND A DIRECTORY IS COUNTED ONCE — BY ITS RESOLVED SPELLING (review P2, #2402; re-review P2, #2666).
+    # The seams it unions (`SYSTEMD_UNIT_DIR`, `CONTROLLER_SYSTEM_UNIT_DIR`, `CONTROLLER_USER_UNIT_DIR`, the
+    # caller's `$HOME`, the passwd homes) are spelled independently, so the SAME directory arrives twice with
+    # a trailing slash or through a symlinked home and a literal `$seen` let both through: the "already
+    # installed" guard then printed ONE file twice as two copies and refused a healthy idempotent re-install
+    # with `--uninstall` (destructive) as its remedy. `cloud-cell-bringup.sh --check` re-runs `--install`
+    # every time and the shape this PR targets is exactly HOME != passwd home, so that refusal was permanent
+    # rather than an edge. Resolved once, used for the dedupe, the printed path, and the guard's comparison.
     for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
@@ -1236,6 +1278,8 @@ installed_unit_copies() { # every copy of OUR unit this box can find: system sco
         printf '%s\n' "$d/$UNIT_NAME"
     done
     while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
