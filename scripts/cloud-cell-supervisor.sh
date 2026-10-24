@@ -424,6 +424,16 @@ CONTROLLER_HANDOVER_TIMEOUT_IN="${CONTROLLER_HANDOVER_TIMEOUT:-}"
 # `is-enabled other.service` → `not-found` → "a real DISABLED answer" → launched a TMUX controller beside the
 # ENABLED unit (#1761). Snapshotted before the source and put back after it, like its three siblings.
 CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
+# ⛔ AND THE THREE THAT DECIDE WHERE THE UNIT IS LOOKED FOR, AND WITH WHAT (review P1 round 18, #2402).
+# `SYSTEMCTL` and the two unit DIRECTORIES are read AFTER `source_env_file` and were the last unfenced
+# siblings of the family above, so a `keys.env` line still reached the same measured pair of false passes:
+# `CONTROLLER_USER_UNIT_DIR=/nowhere` made the installed unit invisible (`status` → "nothing supervises
+# this cell"; `stop` → zero systemctl calls while `Restart=always` re-created the controller seconds
+# later), and `SYSTEMCTL=/bin/true` let `stop` print "controller stopped (systemd …)" and exit 0 without
+# issuing the verb. Snapshotted before the source, put back after it.
+SYSTEMCTL_IN="${SYSTEMCTL:-}"
+CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
+CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -435,6 +445,9 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # directory every reader uses — reproducing the exact "reported stopped, still running" defect the capture
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
+SYSTEMCTL="$SYSTEMCTL_IN"
+[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -630,11 +643,40 @@ CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
 # NOT ACTIVE — nothing will restart a dead controller". The rendered unit CARRIES its owner
 # (`Environment=O=`), so ownership is a READ, not a guess.
 controller_unit_copies() { # every copy on the box, system then user
-  local d
-  for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
-           "${CONTROLLER_USER_UNIT_DIR:-${CONTROLLER_INVOKER_HOME:-$HOME}/.config/systemd/user}"; do
+  local d seen=" "
+  for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
     [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
   done
+  # ⛔ THE USER UNIT'S DIRECTORY HAS NO RECORDED OWNER, SO THE READ TRIES EVERY HONEST CANDIDATE (review P1
+  # round 18, #2402). `$HOME` at read time is the INVOKER's, and the invoker is deliberately NOT the
+  # installer: the doctor's session string forces `HOME=$CELL_HOME`, while the operator's standalone
+  # `install-controller-service.sh --install` wrote the unit under the OPERATOR's home. With
+  # `CELL_HOME != $HOME` — the shape this file's own round-16 note names — the doctor looked in
+  # `$CELL_HOME/.config/systemd/user`, found nothing, skipped the ENTIRE service branch (the NOT-ACTIVE
+  # fence included) and launched a tmux controller BESIDE the enabled unit: #1761's duplicate dispatcher,
+  # which is the invariant this PR exists to close. The passwd home is what `systemctl --user` itself
+  # resolves (the user manager takes HOME from the database, not from our environment), so it is the
+  # authoritative candidate; the invoker's HOME stays because the bring-up installs under it. Widening the
+  # SEARCH cannot make a foreign unit look ours — every copy is still ownership-checked by `unit_owner_dir`.
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$seen" in *" $d "*) continue ;; esac
+    seen="$seen$d "
+    [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
+  done < <(controller_user_unit_dirs)
+  return 0
+}
+# The home the passwd database names for a user — NEVER `$HOME`, which the caller re-points.
+passwd_home() {
+  [ -n "${1:-}" ] || return 0
+  getent passwd "$1" 2>/dev/null | cut -d: -f6
+}
+controller_user_unit_dirs() {
+  local h
+  [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
+  h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
 }
 # The state dir a rendered unit ACTUALLY supervises, and the one it CLAIMS.
@@ -832,7 +874,9 @@ controller_unit_path() {
 sup_systemctl() { # <systemctl verb…>
   local sc user_scope=0
   if [ -n "${_UNIT_PATH:-}" ]; then
-    [ "$(dirname "$_UNIT_PATH")" = "${CONTROLLER_USER_UNIT_DIR:-${CONTROLLER_INVOKER_HOME:-$HOME}/.config/systemd/user}" ] && user_scope=1
+    # Where the RESOLVED copy lives decides the manager, for ANY candidate user directory — not just the
+    # one this invocation would have guessed (see `controller_user_unit_dirs`).
+    [ "$(dirname "$_UNIT_PATH")" != "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" ] && user_scope=1
   elif [ ! -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then
     user_scope=1
   fi

@@ -1120,6 +1120,25 @@ foreign_units() {
 # WOULD this go on THIS box now", which is not "where IS it": a box that installed a USER unit and later
 # gained passwordless sudo would resolve to the SYSTEM scope, print `not installed: /etc/systemd/system/…`
 # and exit 0 while the user unit stayed installed, enabled and running. The installed file is the evidence.
+# The home the passwd database names for a user — NEVER `$HOME`, which the caller re-points (or which
+# `sudo` rewrites to /root). This is the directory `systemctl --user` itself resolves.
+passwd_home() {
+    [ -n "${1:-}" ] || return 0
+    getent passwd "$1" 2>/dev/null | cut -d: -f6
+}
+# ⛔ A USER-SCOPE UNIT HAS NO RECORDED OWNER, SO EVERY HONEST CANDIDATE IS READ (review P2 round 18, #2402).
+# The search below used `$HOME/.config/systemd/user` — the CALLER's home. `sudo bash $0 --status` rewrites
+# HOME to /root, so a healthy enabled unit became "not-enabled / not-active" and `--status` exited 1 over it,
+# while the doc promises the verb resolves the INSTALLED copy first. The operator's own home is what the
+# user manager actually reads, so it is tried before the caller's.
+installed_user_unit_dirs() {
+    local h
+    [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
+    h="${HOME:-}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+    h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+    h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+    return 0
+}
 find_installed_unit() {
     local d seen=" "
     # ⛔ `CONTROLLER_SYSTEM_UNIT_DIR` is the READ side of the system scope (the supervisor's own seam name);
@@ -1130,7 +1149,7 @@ find_installed_unit() {
     # the host. Without this dedupe that configuration reported the SAME file twice, and `installed_units`'
     # "two copies installed" arm then fired on a single unit: install re-runs exited 1 with `changed=1`
     # (`install: re-run rc differs (0 then 1)`, reproduced).
-    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
@@ -1138,6 +1157,14 @@ find_installed_unit() {
         unit_is_ours "$d/$UNIT_NAME" || continue
         printf '%s\n' "$d/$UNIT_NAME"; return 0
     done
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || continue
+        printf '%s\n' "$d/$UNIT_NAME"; return 0
+    done < <(installed_user_unit_dirs)
     return 1
 }
 # every installed copy, in the order the scopes are tried. ONE is the normal case; two is an operator who

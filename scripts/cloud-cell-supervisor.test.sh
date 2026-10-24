@@ -3739,7 +3739,8 @@ grep -q '^source_env_file' <<<"$_src_block" \
 # CONTROLLER_UNIT is the fourth member: the template renders the name, so a keys.env line must not re-point it
 # (review P1 round 14, #2402 — `stop` printed success with no systemctl call while the enabled unit kept the
 # controller alive, and `start` launched a tmux controller beside it).
-for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT; do
+for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT \
+          SYSTEMCTL CONTROLLER_SYSTEM_UNIT_DIR CONTROLLER_USER_UNIT_DIR; do
   grep -q "^${_v}_IN=" <<<"$_src_block" \
     && ok "env-file override: $_v is SNAPSHOTTED before the source" \
     || bad "env-file override: $_v is not snapshotted — a keys.env line would silently replace the value the installer validated"
@@ -3747,6 +3748,36 @@ for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTR
     && ok "env-file override: $_v is re-asserted AFTER the source" \
     || bad "env-file override: $_v is not restored after source_env_file — keys.env can still win"
 done
+# ⛔ CONTROLLER_INVOKER_HOME IS THE FOURTH OF THAT FAMILY BUT SITS OUTSIDE THE BLOCK ABOVE (it is captured
+# at :315, before ORCH_FOREGROUND_IN, so the awk range cannot see it). Pinned directly, or its fence can be
+# deleted with every arm above still green. RED on revert: the `$CONTROLLER_INVOKER_HOME_IN` assignment goes.
+grep -q 'CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"' "$SUP" \
+  && ok 'env-file override: CONTROLLER_INVOKER_HOME is re-asserted after the source' \
+  || bad 'env-file override: CONTROLLER_INVOKER_HOME is not restored after source_env_file — keys.env can re-point the directory every unit reader uses'
+
+# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18, #2402).
+# `$HOME` at read time is the INVOKER's; the doctor's session forces `HOME=$CELL_HOME`, while an operator's
+# standalone install wrote the unit under the OPERATOR's home. With `CELL_HOME != $HOME` the doctor found
+# nothing, skipped the service branch and launched a tmux controller BESIDE the enabled unit (#1761).
+grep -q 'controller_user_unit_dirs' "$SUP" && grep -q '^passwd_home()' "$SUP" \
+  && ok 'unit lookup: the user-scope search carries the passwd-home candidates, not only the invoker HOME' \
+  || bad 'unit lookup: the user-scope unit is resolved from a single HOME guess again — a CELL_HOME != HOME cell loses its unit (and its NOT-ACTIVE fence)'
+grep -q 'getent passwd "\$1"' "$SUP" \
+  && ok 'unit lookup: passwd_home reads the database, so neither `export HOME=$CELL_HOME` nor sudo can re-point it' \
+  || bad 'unit lookup: passwd_home does not read the passwd database — the caller environment decides again'
+grep -q 'dirname "\$_UNIT_PATH")" != ' "$SUP" \
+  && ok 'unit lookup: the manager scope is taken from the resolved copy (any user dir), not one guessed path' \
+  || bad 'unit lookup: the scope is decided by comparing against one guessed user directory — a unit found in another candidate would be addressed on the SYSTEM manager'
+# ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THESE CALLERS ARE NOT THE SERVICE MANAGER (review P1 round 18,
+# #2402). The unit exports =1 and every lane shell inherits it through the tmux server it created, so an
+# unpinned `start` either parks against the handover bound and reports a false failure (`harness up`) or
+# `exec`s the loop outside the unit's cgroup (`orchestrator-bringup.sh`).
+grep -q 'ORCH_FOREGROUND=0 hu_run' "$HERE/harness-up" \
+  && ok 'caller pin: harness-up starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: harness-up starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin'
+grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-bringup.sh" \
+  && ok 'caller pin: orchestrator-bringup.sh starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: orchestrator-bringup.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 execs the loop outside the unit cgroup'
 # ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
 # sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
 # it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.
