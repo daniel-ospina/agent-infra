@@ -425,6 +425,51 @@ grep -q 'LANE SCRATCH' "$TMP/lanescratch.out" \
     && ok "the refusal names the #2697 hazard" \
     || bad "the refusal does not name the lane-scratch hazard"
 
+# ⛔ THE LINGER REFUSAL MUST BE CONTRADICTIBLE (review of this PR, round 6): it was the one fix with
+# no arm, so deleting it restored the exact false PASS this capability removes — a user-scope unit that
+# dies with the last login, reported as activation. Hermetic: every binary the installer calls is a stub
+# in $TMP/userbin, `sudo -n true` fails (forcing the USER scope), and HOME points at a fixture.
+mkdir -p "$TMP/userbin" "$TMP/fakehome" "$TMP/farmfull"
+for f in pr-repair-loop.sh pi-reap-worktrees.sh; do
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/farmfull/$f"; chmod +x "$TMP/farmfull/$f"
+done
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farmfull/pr-doctor.py"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/userbin/sudo"
+cat >"$TMP/userbin/loginctl" <<'STUB'
+#!/usr/bin/env bash
+echo "Linger=${STUB_LINGER:-no}"
+STUB
+cat >"$TMP/userbin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    *show-environment*) exit 0 ;;
+    *is-active*) echo active ;;
+    *is-enabled*) echo enabled ;;
+    *"show -p KillMode --value"*) echo process ;;
+    *"show -p ExecStart --value"*) echo "argv[]=/bin/bash ${PR_REPAIR_SCRIPTS}/pr-repair-loop.sh --loop" ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/userbin/sudo" "$TMP/userbin/loginctl" "$TMP/userbin/systemctl"
+
+env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
+    PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=no \
+    "$INSTALLER" --install >"$TMP/linger-no.out" 2>&1
+check "a user-scope install without linger is REFUSED (rc≠0)" 1 "$?"
+if grep -q 'loginctl enable-linger' "$TMP/linger-no.out" \
+    && ! find "$TMP/fakehome" -name '*.service' 2>/dev/null | grep -q .; then
+    ok "the linger refusal names the remedy and installs NOTHING"
+else
+    bad "the linger refusal is not discriminating (out: $(tr -d '\n' <"$TMP/linger-no.out" | cut -c1-220))"
+fi
+env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
+    PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=yes \
+    "$INSTALLER" --install >"$TMP/linger-yes.out" 2>&1
+check "the same install with linger=yes succeeds (rc=0)" 0 "$?"
+find "$TMP/fakehome" -name 'eldato-pr-repair.service' 2>/dev/null | grep -q . \
+    && ok "the unit was written into the user scope" \
+    || bad "the unit was not written into the user scope"
+
 echo "── the farm declares what the unit execs ──"
 for f in pr-repair-loop.sh install-repair-service.sh; do
     if grep -qE "^fleet_srcs=\(.*[[:space:](]$f[[:space:])]" "$ROOT/pi-bootstrap/setup.sh" 2>/dev/null \
