@@ -2058,9 +2058,9 @@ counts the same five):
 **Costs, and how a skipped run is never an empty one.** `GET /rate_limit` FIRST (it is unmetered),
 then at most `REST_BUDGET = 9` metered core calls: one open-PR listing, then per candidate three
 surface reads (workflow runs, `check-runs?filter=all`, legacy statuses) plus one **single-PR read for
-mergeability** — the LIST endpoint never computes it (every open PR answers `null`: measured 10/10 on
-agent-infra, 2026-10-24), and reading that `null` as `REFUSE(mergeable=unknown)` made the whole arm
-INERT. A single-PR read that the budget cannot afford says `NOT-READ`, never an inherited value. The
+mergeability** — the LIST endpoint never computes it (every one of agent-infra's ten open PRs answered
+`null` in a 2026-10-24 reading), and reading that `null` as `REFUSE(mergeable=unknown)` made the whole
+arm INERT. A single-PR read that the budget cannot afford says `NOT-READ`, never an inherited value. The
 listing itself is one page of 100 and a FULL page is UNREADABLE by name, because it carries no
 `total_count` to prove it was not truncated (70 open PRs against a 30-row page hid 40 of them).
 The goal readings spend the SEARCH quota instead (`GOAL_SEARCH_BUDGET = 8`, counted in
