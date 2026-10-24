@@ -28,8 +28,10 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -213,6 +215,251 @@ def test_a_stale_dispatch_stops_consuming_budget():
 def test_max_override_is_a_hard_ceiling():
     b = pr.pass_budgets({}, {"max_fix": 16, "max_review": 12}, total_override=8)
     assert b["total"] == 8
+
+
+# ── 2b. a SLOT belongs to a PROCESS, not to a record (agent-infra#2700 C5) ──────────────
+
+def _a_dead_pid() -> int:
+    """A pid that is PROVABLY gone -- and that can never be recycled into existence.
+
+    ⛔ NOT A REAPED CHILD (#2746 review round 3). This helper used to return a child's pid after
+    measuring it dead once; the pid is then written into a pid file and re-measured LATER, inside
+    `pass_budgets` -- and a pid recycled in that window reads `alive` BY DESIGN, so the assertion
+    would fail on a green tree with a message that blames the fix. On a box running forty lanes that
+    is the flake class this suite cannot afford.
+
+    `2**31 - 1` is above every platform's `pid_max` (Linux defaults to 4194304 and is capped below
+    2**22; macOS's is smaller), so no process can ever hold it and `kill` answers ESRCH for ever.
+    The probe is the assertion: if some platform ever did hand it out, this fails HERE, naming the
+    helper, instead of inside a test about budgets.
+    """
+    sentinel = 2 ** 31 - 1
+    try:
+        os.kill(sentinel, 0)
+    except ProcessLookupError:
+        return sentinel
+    pytest.fail("pid %d exists on this box -- it cannot be used as a provably-dead pid" % sentinel)
+
+
+def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch):
+    """A register full of finished workers must not read as a full machine.
+
+    MEASURED 2026-10-24 19:26-19:31Z on the Mac: 60 `bg/prd-*.pid` files, ZERO of their pids alive,
+    and `pass_budgets()` charged every fresh row to MAX_FIX -- `inflight=16, budget fix=0`,
+    `dispatched 0 of 44 queued`, on every pass for hours. PRE-FIX the FIRST assertion below reads 0:
+    three ghost rows hold all three fix slots on the strength of the row alone.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 3, "max_review": 12}
+    st = {}
+    for n in (11, 12, 13):
+        (bg / ("prd-%d.pid" % n)).write_text("%d\n" % dead)
+        st[str(n)] = {"action": "fix-ci", "worker": "prd-%d" % n, "head": "a" * 40,
+                      "at": "2026-01-01T00:00:00Z", "at_epoch": now}
+
+    # (1) three PROVABLY DEAD workers must not hold the ceiling, and the self-report must say so.
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 3, "three dead workers still hold the whole fix ceiling: %r" % (b,)
+    assert b["used"] == 0
+    assert (b["inflight"], b["alive"], b["unknown"]) == (3, 0, 0), \
+        "the pass line must be able to say `inflight=3 (alive=0 unknown=0)`: %r" % (b,)
+    assert b["used"] == b["alive"] + b["unknown"], "used is alive + unknown, always"
+
+    # (2) a LIVE worker consumes exactly one slot (`os.getpid()` is this test process).
+    (bg / "prd-14.pid").write_text("%d\n" % os.getpid())
+    st["14"] = {"action": "fix-ci", "worker": "prd-14", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 2, "a live worker must cost exactly one slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (4, 1, 0)
+
+    # (3) NO pid file at all => UNKNOWN => still consumes one slot. This is the FAIL-CLOSED
+    # direction and it is deliberate: freeing a slot we cannot disprove is a duplicate dispatch
+    # onto a live PR -- invisible, and how one conflict gets resolved twice.
+    st["15"] = {"action": "fix-ci", "worker": "prd-15", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 1, "an unreadable liveness must NOT free a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (5, 1, 1), \
+        "an unproven row is `unknown`, NOT `alive` -- merging them is how the self-report lies: %r" % (b,)
+
+    # (4) the arithmetic is PER CLASS: a ghost REVIEW row frees the review budget and touches
+    # nothing in the fix budget (the ceiling it holds is decided by ACTION_CLASS, not by the pass).
+    (bg / "prd-16.pid").write_text("%d\n" % dead)
+    st["16"] = {"action": "record-review", "worker": "prd-16", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["review"]) == (1, 12), \
+        "a dead review worker must free a REVIEW slot only: %r" % (b,)
+
+
+def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monkeypatch):
+    """THE TRAP, and the whole trick of this fix.
+
+    The state row stores the SHORT worker name (`prd-2035`) while the launcher writes a REPO-SCOPED
+    pid file (`prd-agent-infra-2035.pid`), the partitioning that stopped two doctors sharing one
+    register (#2700/#2725). An exact-name lookup finds NOTHING, and "nothing found => assume alive"
+    (the safe direction) then keeps every ghost alive -- which is why the first version of this fix
+    changed nothing at all. The trailing NUMBER is matched too.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
+        "a repo-scoped pid file proves the short-named row's worker gone"
+
+    # …and the same file, LIVE, holds the slot: over-matching must never free a running worker.
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
+
+    # A PREFIX is a different PR: 20350's dead worker must not free 2035's slot.
+    (bg / "prd-agent-infra-2035.pid").unlink()
+    (bg / "prd-20350.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0, \
+        "'-20350.pid' answers for PR 20350, never for PR 2035"
+
+
+def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
+    """Only a pid file that is READABLE may drop a slot; garbage is not evidence of absence.
+
+    Every entry here is a real path to a real defect, not padding:
+      * `9999999999` / `2147483648` -- `os.kill` raises `OverflowError` (NOT OSError) outside the
+        platform's pid range, so a ten-digit pid file ABORTED the whole pass from inside the
+        counter until `_read_pid` range-checked it (#2746 review);
+      * `99999` -- an UNTERMINATED number is a mid-write prefix of `999999`, i.e. a different pid;
+        the launcher's `echo` always terminates, so an unterminated file is not a verdict;
+      * the non-UTF8 byte -- a strict text read raises `UnicodeDecodeError` (a ValueError, NOT an
+        OSError), which escaped every handler and crashed the pass (#2746 review).
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"21": {"action": "fix-ci", "worker": "prd-21", "at_epoch": now}}
+    for junk in ("", "not-a-pid\n", "0\n", "9999999999\n", "2147483648\n", "99999",
+                 "4242\n5678\n"):
+        (bg / "prd-21.pid").write_text(junk)
+        b = pr.pass_budgets(st, cap, now_epoch=now)
+        assert b["fix"] == 0, "pid file %r freed a slot it could not disprove: %r" % (junk, b)
+        assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+    (bg / "prd-21.pid").write_bytes(b"\xff\xfe not a pid\n")
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 0, "a non-UTF8 pid file crashed or freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+
+def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path, monkeypatch):
+    """An artifact of the wrong TYPE is unknown, not gone -- and not a hang either.
+
+    `_worker_pid_files` filters on `isfile`, which excludes a directory AND keeps a FIFO from
+    blocking `open()` forever with no writer. Both are asserted: the FIFO case is the one a
+    regression to `os.path.exists` would turn into a HUNG pass (worse than the crash this round-1
+    review already fixed), and it would otherwise pass this suite green.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    (bg / "prd-31.pid").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    st = {"31": {"action": "fix-ci", "worker": "prd-31", "at_epoch": now}}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
+    assert b["fix"] == 0, "a directory at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+    fifo = bg / "prd-32.pid"
+    os.mkfifo(fifo)                       # POSIX only; this suite does not run on Windows
+    st["32"] = {"action": "fix-ci", "worker": "prd-32", "at_epoch": now}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)   # must not hang
+    assert b["fix"] == 0, "a FIFO at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (2, 0, 2)
+
+
+def test_the_pass_line_reports_inflight_alive_and_unknown(monkeypatch, tmp_path):
+    """The self-report must be ON THE LINE, not merely in the dict (#2746 review round 2).
+
+    The three-state split is the whole operator-facing point of the change -- `inflight=16 (alive=0
+    unknown=0)` is what makes "sixteen records and nothing running" visible -- and nothing asserted
+    that the line carries it, so a later edit could drop `alive`/`unknown` from the message with the
+    whole suite green.
+    """
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    (bg / "prd-1.pid").write_text("%d\n" % dead)     # provably gone: frees its slot
+    (bg / "prd-2.pid").write_text("not-a-pid\n")     # unknown: holds it, and is reported as such
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(3)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inflight=2 (alive=0 unknown=1)" in joined, joined
+
+
+def test_a_zero_budget_held_by_unproven_rows_does_not_claim_saturation(monkeypatch, tmp_path):
+    """`no capacity budget` must not say "all in flight" over rows no process backs.
+
+    #2746 review round 2 measured the contradiction: `inflight=2 (alive=0 unknown=2)` on the pass
+    line and then "all of MAX_FIX+MAX_REVIEW is in flight" as the verdict -- the same
+    internally-consistent-and-false story the change exists to remove, one line lower.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    for n in (1, 2):
+        (bg / ("prd-%d.pid" % n)).write_text("not-a-pid\n")        # unknown, twice
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 2, "max_review": 0})
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inhight=2" not in joined, joined          # guard against a typo'd field name
+    assert "inflight=2 (alive=0 unknown=2)" in joined, joined
+    assert "no capacity budget (inflight=2: alive=0 unproven=2)" in joined, joined
+    assert "is in flight" not in joined, joined
+
+
+def test_one_live_candidate_holds_the_slot_even_when_a_sibling_pid_file_is_dead(tmp_path, monkeypatch):
+    """MIXED CANDIDATES: the fail-closed loop must look at ALL of them (#2746 review).
+
+    A regression that made the loop "first candidate wins" would free a slot while the short-named
+    file's live pid is still running -- the duplicate-dispatch direction. Both orders are asserted,
+    because the exact-name file sorts first in `_worker_pid_files` either way.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-2035.pid").write_text("%d\n" % dead)                  # exact name: dead
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())  # scoped: LIVE
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "a LIVE sibling pid file must hold the slot even though the exact-named one is dead: %r" % (b,)
+
+    (bg / "prd-2035.pid").write_text("%d\n" % os.getpid())            # exact name: LIVE
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)       # scoped: dead
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "…and in the other order: %r" % (b,)
+
+    # One unreadable sibling is NOT a free slot either: it could name the live worker.
+    (bg / "prd-2035.pid").write_text("not-a-pid\n")
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"], b["unknown"]) == (0, 0, 1), \
+        "unreadable + dead must hold the slot as UNKNOWN, never drop it: %r" % (b,)
 
 
 # ── 3. the dispatch path is the BACKGROUND one, and it is LOAD-GATED ──────────────────────
@@ -1212,6 +1459,87 @@ def test_lane_table_feeding_is_gone_from_the_source():
     assert not any("cmux_dispatch" in s for s in literals)
 
 
+def test_the_action_for_a_free_workspace_is_a_BACKGROUND_SPAWN_not_a_workspace_send(
+        monkeypatch, tmp_path):
+    """the CHOSEN ACTION for a PR the job can work on: a background spawn, never a cmux send.
+
+    ⛔ SCOPE STATED (review round 3, P3). This stubs `materialise_worktree`, so it does NOT test
+    ownership -- whatever the identity rules are, `argv[3]` is the path the stub returned, and
+    `_owns_worktree_root(WORKTREE_ROOT)` is TRUE by construction because that constant always ends
+    in `.worktrees`. Ownership is pinned by
+    `test_adoption_is_refused_into_a_directory_the_job_did_not_create` and
+    `test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call`; what THIS test
+    pins is the shape of the action (the measured third requirement: the PR doctor must spawn
+    rather than type into a workspace), which is worth keeping separate and honest.
+    """
+    fleet_wt = str(tmp_path / "tortoise" / ".worktrees" / "prd-9")
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "tortoise" / ".worktrees"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (fleet_wt, ""))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    statuses = iter(["lost", "lost", "running"])
+    monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
+    calls = []
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda argv, timeout=180, cwd=None, env=None, capture=True:
+                        (calls.append(argv), ("", "", 0))[1])
+
+    ok, detail, _ = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
+    assert ok is True, detail
+    assert calls, "nothing was dispatched"
+    argv = calls[-1]
+    # (1) the action is the BACKGROUND SPAWN, never a workspace send
+    assert argv[1] == "/opt/orch/nonblocking-dispatch.sh"
+    assert "cmux" not in " ".join(argv[:2])
+    for verb in ("workspace-select", "workspace select", "safe-send", "send"):
+        assert verb not in " ".join(argv), (verb, argv)
+    # (2) the target is the worktree THIS JOB created, not any pre-existing workspace
+    assert argv[3] == fleet_wt
+    assert pr._owns_worktree_root(pr.WORKTREE_ROOT) is True
+    assert pr._owns_worktree_root("/Users/owner/Documents/Personal website") is False
+
+
+def test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call(
+        monkeypatch, tmp_path):
+    """⛔ THE SAME DEFECT ONE LAYER DOWN. A misconfigured `WORKTREE_ROOT` (the checkout itself, or a
+    directory in the owner's own project) would create and dispatch `prd-<n>` inside work that is
+    not ours. It must refuse BEFORE any git operation, not fail halfway through.
+    """
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "Personal website"))
+
+    def boom(*a, **k):
+        raise AssertionError("a git probe ran against a root this job does not own")
+
+    monkeypatch.setattr(pr, "_worktrees", boom)
+    wt, err = pr.materialise_worktree(_prb(1, "a" * 40, "feat/x"))
+    assert wt == "" and "not a fleet worktree root" in err, (wt, err)
+    assert not (tmp_path / "Personal website" / "prd-1").exists()
+    # the refusal is a verdict about the INSTALL, not about this PR: recording it would cool down
+    # every open PR for one misconfiguration (the same polarity as a missing dispatcher)
+    assert getattr(err, "persistent", False) is False
+    # non-vacuity: the shipped shape is accepted
+    ok_root = tmp_path / "tortoise" / ".worktrees"
+    ok_root.mkdir(parents=True)
+    assert pr._owns_worktree_root(str(ok_root)) is True
+    assert pr._owns_worktree_root(str(ok_root / "wt-12")) is True
+    # ⛔ AND THE SLUG SHAPE (review round 6, P3): the fleet's own lane shape is `wt-<slug>`, so a
+    # digit-only test here silently disabled `_is_spawn_target` (and with it the ADOPT arm) for a
+    # slug-shaped root instead of refusing one root.
+    assert pr._owns_worktree_root(str(tmp_path / "wt-tortoise")) is True
+    assert pr._owns_worktree_root(str(tmp_path / "wt-")) is False
+    # ⛔ AND A SYMLINKED ROOT IS STILL A ROOT (review round 7, P2, MEASURED). Resolving the root
+    # before reading its shape made `<repo>/.worktrees`-as-a-symlink resolve away its own last
+    # segment, so EVERY PR was refused at the first statement and the adopt arm was disabled -- a
+    # box that had only moved its worktrees to another volume looked like a misconfigured install.
+    link_root = tmp_path / "repo2" / ".worktrees"
+    link_root.parent.mkdir(parents=True)
+    link_root.symlink_to(tmp_path / "bigdisk" / "worktrees", target_is_directory=True)
+    assert pr._owns_worktree_root(str(link_root)) is True, "a symlinked worktree root is owned"
+
+
 # ── 5. the end-to-end dispatch cap is the configured one, not 4 ───────────────────────────
 
 def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
@@ -1479,6 +1807,158 @@ def test_adopting_an_unsafe_lane_worktree_refuses_AND_records_a_row(monkeypatch,
     assert "uncommitted" in detail and str(lane) in detail, detail
     assert (lane / "f.txt").read_text() == "a lane's uncommitted work\n", \
         "the lane's work must never be reset (c1=%s)" % c1[:7]
+
+
+def test_adoption_is_refused_into_a_directory_the_job_did_not_create(monkeypatch, tmp_path):
+    """⛔ REVIEW ROUND 1 (P2): adoption was the ONE arm that reached a directory outside
+    WORKTREE_ROOT, and `dispatch()` then spawned a worker into it (with `_ensure_head` free to
+    `reset --hard`). "pr-doctor must never send work into a workspace it did not create" does not
+    stop applying because the PR's branch happens to be checked out there: an owner-created
+    scratch worktree must be refused, not adopted."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    scratch = tmp_path / "scratch" / "tortoise-wip"       # NOT `.worktrees/...`, NOT `$HOME/wt-*`
+    scratch.parent.mkdir(parents=True)
+    g("worktree", "add", str(scratch), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(42, head, "fix/abc"))
+    assert wt == "", "a worktree this job does not own must not be adopted: %r" % (wt,)
+    assert "did not create" in err and str(scratch) in err, err
+    # non-vacuity: the same branch in a FLEET-shaped worktree IS adopted (the deadlock stays fixed)
+    assert pr._is_spawn_target(str(repo / ".worktrees" / "fix-1")) is True
+    assert pr._is_spawn_target(str(scratch)) is False
+
+
+def test_the_adopt_arm_shares_the_documented_owner_worktree_boundary(monkeypatch, tmp_path):
+    """⛔ THE BOUNDARY, PINNED FROM THIS SIDE TOO (review round 5, P2, MEASURED).
+
+    `_owns_worktree_root`'s docstring once claimed an owner's `~/Personal website/.worktrees` was
+    "caught by the ADOPT arm". It is not: `.worktrees` + a REAL linked worktree is exactly what the
+    adopt arm accepts, so a PR whose branch is checked out there is adopted, spawned into, and
+    `_ensure_head` may `reset --hard` it. That is the SAME accepted boundary as the classifier's
+    (agent-infra#2213 -- neither can tell which repos the fleet owns without a provenance record),
+    and this test exists so closing #2213 has a test to flip instead of a docstring to argue with.
+    """
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    owner_wt = tmp_path / "Personal website" / ".worktrees" / "preview"
+    owner_wt.parent.mkdir(parents=True)
+    g("worktree", "add", str(owner_wt), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    assert pr._is_spawn_target(str(owner_wt)) is True, (
+        "the boundary moved -- update the docstring, docs/ops/fleet-liveness.md §2a and #2213")
+    wt, err = pr.materialise_worktree(_prb(77, head, "fix/abc"))
+    assert wt == str(owner_wt) and err == "", (
+        "the adopt arm refused a shape it is documented to accept: %r %r" % (wt, err))
+    # non-vacuity, the other direction: the SAME shape WITHOUT a git artifact is refused
+    plain = tmp_path / "Personal website" / ".worktrees" / "not-a-worktree"
+    plain.mkdir()
+    assert pr._is_spawn_target(str(plain)) is False
+
+
+def test_is_spawn_target_accepts_only_fleet_shaped_worktrees(monkeypatch, tmp_path):
+    root = tmp_path / "repo" / ".worktrees"
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(root))
+    # under this job's own root: ours by construction, even before git has made anything there
+    assert pr._is_spawn_target(str(root / "prd-3")) is True
+    # ⛔ A LANE'S OWN worktree must be a REAL linked worktree (`.git` as a FILE), not a directory
+    # that merely spells `.worktrees` -- otherwise the adopt arm hands `dispatch()` (and its
+    # `reset --hard`) a directory nobody's git created (review round 2, P2)
+    lane_wt = tmp_path / "GitHub" / "tortoise" / ".worktrees" / "fix-1529"
+    lane_wt.mkdir(parents=True)
+    assert pr._is_spawn_target(str(lane_wt)) is False, "a bare `.worktrees` directory is not a lane"
+    (lane_wt / ".git").write_text("gitdir: /x/.git/worktrees/fix-1529\n")
+    assert pr._is_spawn_target(str(lane_wt)) is True
+    assert pr._is_spawn_target("/Users/owner/Documents/Personal website") is False
+    assert pr._is_spawn_target(str(tmp_path / "scratch" / "checkout")) is False
+    # a poisoned path is unreadable evidence, never a spawn target
+    assert pr._is_spawn_target(str(root / "prd-4") + "\x00x") is False
+
+
+def test_is_spawn_target_refuses_a_git_FILE_that_is_not_a_worktree_pointer(monkeypatch, tmp_path):
+    """⛔ REVIEW ROUND 9 (P2), MEASURED: the pr-doctor copy of the pointer rule was pinned by nothing.
+    Replacing it with "any `.git` FILE is proof" left the whole suite green -- the agreement test's
+    paths contain no NON-worktree `.git` file. That copy is what guards `reset --hard` inside the
+    ADOPT arm, so it is driven here through the same shapes `lane-actions` refuses: a submodule's
+    `.../.git/modules/<name>`, a `--separate-git-dir` custom dir, and junk."""
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "repo" / ".worktrees"))
+    base = tmp_path / "someone" / ".worktrees" / "adopt-me"
+    base.mkdir(parents=True)
+    for pointer in ("gitdir: ../.git/modules/sub\n", "gitdir: /x/custom-gitdir\n", "not a pointer\n"):
+        (base / ".git").write_text(pointer)
+        assert pr._is_spawn_target(str(base)) is False, pointer
+    (base / ".git").write_text("gitdir: /x/.git/worktrees/adopt-me\n")
+    assert pr._is_spawn_target(str(base)) is True
+
+
+def test_the_temp_root_is_a_spawn_root_without_citing_this_box(monkeypatch):
+    """⛔ REVIEW ROUND 9 (P2), MEASURED: pr-doctor's temp-root arm was covered only by two paths that
+    exist on ONE machine (`/tmp/wt-9204`, `/tmp/cell-home/wt-lane-identity`), so on a CI runner the
+    assertion passed whatever `_fleet_roots()` contained -- and the regression it hides is the
+    round-3 P1: without the temp root, every real `/tmp/wt-<slug>` lane is refused by the ADOPT arm,
+    a PERMANENT block for a base-repo PR whose branch is already checked out. This builds the shape
+    instead of citing it."""
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", "/tmp/repo/.worktrees")   # the shipped shape
+    d = tempfile.mkdtemp(prefix="wt-", dir=tempfile.gettempdir())
+    try:
+        with open(os.path.join(d, ".git"), "w") as fh:
+            fh.write("gitdir: /x/.git/worktrees/%s\n" % os.path.basename(d))
+        assert pr._is_spawn_target(d) is True, (
+            "the temp root dropped out of pr-doctor's fleet roots: every /tmp/wt-* lane is now "
+            "refused by the ADOPT arm")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_two_fleet_worktree_predicates_agree(monkeypatch, tmp_path):
+    """⛔ ONE QUESTION, ONE ANSWER (review round 2, P3). pr-doctor keeps its own copy of the
+    identity predicate (importing the classifier would resurrect the lane-table coupling `#1874`
+    removed), and the two had already DRIFTED: the classifier accepted `/tmp/cell-home/wt-*` while
+    pr-doctor accepted only `$HOME/wt-*`, so the same path was a lane to one and not to the other.
+    The copies may differ ONLY by pr-doctor's extra "is it under my own root" arm."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("lane_actions", os.path.join(here, "lane-actions.py"))
+    LA = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(LA)
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "repo" / ".worktrees"))
+    wt = tmp_path / "GitHub" / "tortoise" / ".worktrees" / "prd-12"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /x/.git/worktrees/prd-12\n")
+    plain = tmp_path / "not-a-checkout" / ".worktrees" / "b"
+    plain.mkdir(parents=True)
+    main_co = tmp_path / "checkout"
+    (main_co / ".git").mkdir(parents=True)
+    # ⛔ BUILT, NEVER CITED: a `wt-` directory is only a lane when it is a real linked worktree
+    # (review round 4, P2), so the shapes below are created here rather than named from this box --
+    # an earlier version cited `/tmp/wt-9204`, which exists on exactly one machine.
+    wt_root = tmp_path / "cell-home"
+    wt_root.mkdir()
+    num_wt = wt_root / "wt-9204"
+    num_wt.mkdir()
+    (num_wt / ".git").write_text("gitdir: /x/.git/worktrees/wt-9204\n")
+    bare_wt = wt_root / "wt-bare"
+    bare_wt.mkdir()                                    # the name, and nothing else
+    # BOTH modules get the same extra root, or the test compares two different rules and calls the
+    # fixture a disagreement (it did, first time round: pr-doctor read the real root list).
+    monkeypatch.setattr(LA, "FLEET_ROOTS", tuple(LA.FLEET_ROOTS) + (str(wt_root),))
+    _roots = pr._fleet_roots()
+    monkeypatch.setattr(pr, "_fleet_roots", lambda: tuple(_roots) + (str(wt_root),))
+    for p in (str(wt), str(wt / "scripts"), str(plain), str(main_co),
+              str(num_wt), str(num_wt / "scripts"), str(bare_wt),
+              "/tmp/cell-home/wt-lane-identity", "/tmp/wt-9204", "/tmp/cell-ai",
+              "/Users/owner/Documents/Personal website", "/Users/owner/repo/wt-1-final-draft",
+              "repo/wt-1", ""):
+        if p in ("/tmp/cell-home/wt-lane-identity", "/tmp/wt-9204"):
+            # real worktrees on THIS box only: the pair is still required to agree, whatever the
+            # machine says (on a runner both answer False)
+            assert pr._is_spawn_target(p) == LA._is_fleet_worktree(p), p
+            continue
+        assert pr._is_spawn_target(p) == LA._is_fleet_worktree(p), (
+            "the two predicates disagree about %r (pr-doctor=%r, classifier=%r)"
+            % (p, pr._is_spawn_target(p), LA._is_fleet_worktree(p)))
 
 
 def test_an_adopted_lane_worktree_at_the_pr_head_is_dispatched(monkeypatch, tmp_path):
