@@ -50,6 +50,12 @@
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (nothing started) ·
 #       3 REFUSED — a guard verdict or an install that is not configured. Nothing changed.
+#       4 STARTED BUT UNPROVEN — the listeners came up and no job arrived, or the queue was empty, so
+#         capacity is NOT claimed. Kept distinct from 2 on purpose: 2 means "I changed nothing", 4
+#         means "I changed something and could not prove it helped" — collapsing them would tell a
+#         caller its box was untouched after it started two runners.
+#   VERIFY_WAIT_S (and its "busy within" message) is ONE variable, so the window the script prints is
+#   the window it waits: it used to print CI_RUNNER_SETTLE_S and then wait a hard-coded 30 s.
 set -uo pipefail
 
 REPO="${CI_RUNNER_REPO:-daniel-ospina/agent-infra}"
@@ -63,6 +69,7 @@ MEM_MIN_MB="${CI_RUNNER_MEM_MIN_MB:-3584}"    # ci_runner_pool.sh's floor, reuse
 DISK_MIN_GB="${CI_RUNNER_DISK_MIN_GB:-4}"     # a job's checkout+venv peaked at ~0.5-2G here; below 4G
                                               # the next ENOSPC is a matter of which job lands first
 SETTLE_S="${CI_RUNNER_SETTLE_S:-20}"
+VERIFY_WAIT_S="${CI_RUNNER_VERIFY_WAIT_S:-30}"   # the "busy within" bound — printed AND waited
 COUNT=2; DRY=0; MODE=run; AWK_CHECK=1
 
 while [ $# -gt 0 ]; do
@@ -79,7 +86,8 @@ done
 case "$COUNT" in ''|*[!0-9]*) echo "usage: --count must be a positive integer (got '$COUNT')" >&2; exit 1 ;; esac
 [ "$COUNT" -ge 1 ] || { echo "usage: --count must be >= 1 (got $COUNT)" >&2; exit 1; }
 
-say() { printf '%s\n' "$*" >&2; }
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || { say "cannot-act why=missing-tool tool=$1"; exit 2; }; }
 
 dir_for() { printf '%s/%s-%s' "$ROOT" "$NAME_PREFIX" "$1"; }
@@ -93,7 +101,7 @@ mem_avail_mb() { awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev
 
 # ── status: the artifact view only ────────────────────────────────────────────
 # Read-only in every mode: this is the report a caller branches on, and it never starts anything.
-remote_rows() { gh api "repos/$REPO/actions/runners?per_page=100" \
+remote_rows() { gh api --paginate "repos/$REPO/actions/runners?per_page=100" \
   --jq '.runners[] | "\(.id)\t\(.name)\t\(.status)\tbusy=\(.busy)\t\([.labels[].name]|join(","))"'; }
 
 if [ "$MODE" = status ]; then
@@ -111,6 +119,9 @@ fi
 # ── preflight: the readings this script will act on, printed BEFORE it acts ────
 need gh
 need nohup
+# `setsid` detaches the listener from this caller's session. Without it present, the start below
+# fails into the same place a dead run.sh does, so it is a hard requirement, not an optimisation.
+need setsid
 mem_mb="$(mem_avail_mb)"; disk_gb="$(disk_free_gb)"
 case "${mem_mb:-}" in ''|*[!0-9]*) say "cannot-measure why=mem-unreadable (orchestrator-harness/capacity.sh is the owner of that read; this script refuses rather than guess)"; exit 2 ;; esac
 case "${disk_gb:-}" in ''|*[!0-9]*) say "cannot-measure why=disk-unreadable root=$ROOT"; exit 2 ;; esac
@@ -135,19 +146,37 @@ if [ "$AWK_CHECK" = 1 ]; then
     *) say "REFUSED why=awk-not-gawk awk='${awk_pin}' — hosted CI runs GNU awk, and mawk 1.3.4 panics on the interval-expression regexes in tests/materialize-agents (job 120770477498, 'awk rc 100'). Fix: sudo apt-get install -y gawk, then re-run; --skip-awk-check overrides."
        exit 3 ;;
   esac
+else
+  # An escape hatch that leaves no trace is a silent policy change: say so, with the reading.
+  say "WARNING why=awk-check-skipped awk='${awk_pin}' — a job that runs an interval-expression regex may go false-red (#2637)"
 fi
 
 queued_before="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)"
 say "queued_before=${queued_before:-UNREADABLE}"
 
 rc=0
+# WHICH RUNNERS THIS RUN OWNS. The verification below must judge these EXACT names: counting every
+# runner whose name starts with the prefix let a PEER that was already busy satisfy the proof, so a
+# start that died reported `OK` — the #2589 failure this script exists to catch, on the box where a
+# busy peer is the normal state. `started_names` is the subset this run actually started.
+our_names=" "; started_names=" "
 for i in $(seq 1 "$COUNT"); do
   d="$(dir_for "$i")"; name="$NAME_PREFIX-$i"
   if [ ! -f "$d/.runner" ]; then
     say "REFUSED name=$name why=not-configured dir=$d (no .runner) — register it, this script only starts what exists"
     rc=3; continue
   fi
-  id="$(gh api "repos/$REPO/actions/runners?per_page=100" --jq ".runners[]|select(.name==\"$name\")|.id" 2>/dev/null | head -1)"
+  # ⛔ `.runner` IS NOT JUST AN EXISTENCE FLAG. It carries the repo the install is registered to, and
+  # an install belonging to ANOTHER repo would be labelled here and started as if it were this cell's
+  # — serving that other repo's jobs while this report calls it capacity. Names repeat across repos.
+  runner_url="$(sed -n 's/.*"gitHubUrl": "\([^"]*\)".*/\1/p' "$d/.runner" 2>/dev/null | head -1)"
+  case "$runner_url" in
+    "https://github.com/$REPO") : ;;
+    '') say "REFUSED name=$name why=runner-file-unreadable dir=$d (no gitHubUrl in .runner) — refusing to act on an install whose repo cannot be read"; rc=3; continue ;;
+    *) say "REFUSED name=$name why=wrong-repo dir=$d gitHubUrl=$runner_url — this install is registered to another repo; starting it here would report another repo's jobs as this cell's capacity"; rc=3; continue ;;
+  esac
+  our_names="$our_names$name "
+  id="$(gh api --paginate "repos/$REPO/actions/runners?per_page=100" --jq ".runners[]|select(.name==\"$name\")|.id" 2>/dev/null | head -1)"
   case "${id:-}" in ''|*[!0-9]*) say "cannot-act name=$name why=no-registration (GitHub does not list it; a local .runner alone serves nothing)"; rc=2; continue ;; esac
 
   body="$(printf '{"labels":["%s"]}' "$(printf '%s' "$LABELS" | sed 's/,/","/g')")"
@@ -158,7 +187,12 @@ for i in $(seq 1 "$COUNT"); do
 
   # Labels first: a listener that starts on a label set no job matches is the "online and never
   # busy" failure this script exists to prevent (#2589).
-  if got="$(printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - --jq '[.labels[].name]|join(",")' 2>&1)"; then
+  # ⛔ NO `printf … | gh … --input -` PIPE. Under `set -o pipefail`, a `gh` that answers before it
+  # drains stdin closes the pipe, `printf` dies of SIGPIPE (141), the pipeline reports 141 even though
+  # the PUT SUCCEEDED — and the refusal branch below then reports `label-write-failed` for a label set
+  # that was in fact written. Measured: 3-4 of every 40-60 runs, on a stub that ignores stdin, i.e. an
+  # intermittent false refusal. A here-string is a file, so the writer cannot be killed.
+  if got="$(gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - --jq '[.labels[].name]|join(",")' <<<"$body" 2>&1)"; then
     say "labelled name=$name id=$id labels=$got"
   else
     say "cannot-act name=$name why=label-write-failed detail=$got"; rc=2; continue
@@ -171,19 +205,28 @@ for i in $(seq 1 "$COUNT"); do
   fi
 
   # Detached, no tmux ON PURPOSE: a tmux server death once took eight lanes with it.
+  #
+  # ⛔ A LOG THAT ALREADY EXISTED IS NOT EVIDENCE OF THIS START. `ls -t … | head -1` alone re-read the
+  # PREVIOUS run's `Listening for Jobs`, so a `run.sh` that died instantly (ENOSPC — the exact way
+  # these two listeners died at 15:22:51Z) reported `started` on the previous run's log and suppressed
+  # the runner.log tail that showed the real error. The proof is a log that did not exist before AND a
+  # live pid for THIS install.
+  before="$(ls -t "$d"/_diag/Runner_*.log 2>/dev/null | head -1)"
   ( cd "$d" && setsid nohup ./run.sh >> runner.log 2>&1 < /dev/null & )
   started=0
   for _ in $(seq 1 "$SETTLE_S"); do
     sleep 1
     f="$(ls -t "$d"/_diag/Runner_*.log 2>/dev/null | head -1)"
+    pid="$(listen_pid "$d")"
     # "Listening for Jobs" is the artifact; the Conflict retry loop (#2502) never prints it.
-    if [ -n "$f" ] && grep -q "Listening for Jobs" "$f" 2>/dev/null; then started=1; break; fi
+    if [ -n "$pid" ] && [ -n "$f" ] && [ "$f" != "$before" ] && grep -q "Listening for Jobs" "$f" 2>/dev/null; then started=1; break; fi
   done
   if [ "$started" = 1 ]; then
-    say "started name=$name pid=$(listen_pid "$d") _diag=Listening-for-Jobs"
+    started_names="$started_names$name "
+    say "started name=$name pid=$pid _diag=Listening-for-Jobs"
   else
-    say "cannot-act name=$name why=no-listening-line-in-_diag (last lines below)"
-    tail -3 "$d/runner.log" 2>/dev/null | sed 's/^/    /' >&2
+    say "cannot-act name=$name why=no-new-listening-log (a log that predates this start is not evidence; last lines below)"
+    tail -3 "$d/runner.log" 2>/dev/null | sed 's/^/    /' | warn
     rc=2
   fi
 done
@@ -199,24 +242,37 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 # ── verify BY ARTIFACT: online is necessary, busy is the proof ────────────────
-# A runner that is `online` and never `busy` is exactly what this lane exists to fix, so the
-# script prints both and exits non-zero when no runner it started has taken a job.
-say "── verifying (online is necessary; busy within ${SETTLE_S}s of a queued run is the proof)"
-online=0; busy=0
-for _ in $(seq 1 6); do
+# A runner that is `online` and never `busy` is exactly what this lane exists to fix, so the script
+# prints both and refuses to call it success. Two things it must NOT do:
+#   · count a runner it does not own — `our_names` is the set built above and nothing else matches;
+#   · diagnose the label defect (#2589) when the queue was EMPTY. An empty queue proves nothing, and
+#     reporting it as the defect this lane exists to fix is a false red in the opposite direction.
+say "── verifying (online is necessary; busy within ${VERIFY_WAIT_S}s is the proof)"
+# ⛔ A MEASURED `0` IS NOT A KNOWN QUEUE EITHER. `0` used to fall through to the "known" arm, so an
+# empty queue was reported as the #2589 label defect — a false red in the opposite direction, and the
+# exact thing this branch exists to prevent. Only a positive count is evidence that a job was waiting.
+case "${queued_before:-}" in ''|UNREADABLE|0) queued_known=0 ;; *) queued_known=1 ;; esac
+online=0; busy=0; busy_started=0
+tries=$(( VERIFY_WAIT_S / 5 )); [ "$tries" -ge 1 ] || tries=1
+for _ in $(seq 1 "$tries"); do
   rows="$(remote_rows 2>/dev/null)" || { say "cannot-measure why=runner-list-unreadable"; exit 2; }
-  online="$(printf '%s\n' "$rows" | awk -F'\t' -v p="$NAME_PREFIX" '$2 ~ ("^" p "-") && $3=="online"' | wc -l | tr -d ' ')"
-  busy="$(printf '%s\n' "$rows" | awk -F'\t' -v p="$NAME_PREFIX" '$2 ~ ("^" p "-") && $0 ~ /busy=true/' | wc -l | tr -d ' ')"
-  say "  $(date -u +%T) online=$online busy=$busy"
+  online="$(printf '%s\n' "$rows" | awk -F'\t' -v ours="$our_names" 'index(ours, " " $2 " ") && $3=="online"' | wc -l | tr -d ' ')"
+  busy="$(printf '%s\n' "$rows" | awk -F'\t' -v ours="$our_names" 'index(ours, " " $2 " ") && $0 ~ /busy=true/' | wc -l | tr -d ' ')"
+  busy_started="$(printf '%s\n' "$rows" | awk -F'\t' -v ours="$started_names" 'index(ours, " " $2 " ") && $0 ~ /busy=true/' | wc -l | tr -d ' ')"
+  say "  $(date -u +%T) online=$online busy=$busy busy_started=$busy_started"
   [ "$busy" -ge 1 ] && break
   sleep 5
 done
-printf '%s\n' "$rows" | awk -F'\t' -v p="$NAME_PREFIX" '$2 ~ ("^" p "-") {printf "  %s\t%s\t%s\t%s\n",$2,$3,$4,$5}' >&2
+printf '%s\n' "$rows" | awk -F'\t' -v ours="$our_names" 'index(ours, " " $2 " ") {printf "  %s\t%s\t%s\t%s\n",$2,$3,$4,$5}' | warn
 queued_after="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)"
 say "queued_before=${queued_before:-UNREADABLE} queued_after=${queued_after:-UNREADABLE}"
 if [ "$online" -ge 1 ] && [ "$busy" -ge 1 ]; then
   say "OK online=$online busy=$busy"
-  exit "$rc"
+  exit 0
 fi
-say "NOT-OK online=$online busy=$busy — online without busy is the #2589 failure this script exists to prevent"
-exit 2
+if [ "$online" -ge 1 ] && [ "$queued_known" = 0 ]; then
+  say "UNPROVEN online=$online busy=$busy why=no-queued-job — nothing was waiting for these runners, so 'online' is all that can be claimed. Not the #2589 defect: an empty queue proves nothing either way."
+  exit 4
+fi
+say "UNPROVEN online=$online busy=$busy — online without busy with ${queued_before} run(s) queued is the #2589 failure this script exists to prevent (label set, or a job that needs a tool this box lacks — see #2637 for the awk class)"
+exit 4
