@@ -156,7 +156,8 @@ without a human in the loop:
   mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
   worker gate's own refusal, whatever it bound on (that gate binds on **load, memory, disk or land**
   — the last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap terms
-  belong to the controller's separate gate, which refuses before any claim is taken), because load is a
+  — and the controller's OWN memory arm, a DIFFERENT floor (`MIN_MEM_FREE_MB`, §7 below: two
+  populations, one probe) — belong to the controller's separate gate, which refuses before any claim is taken), because load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
@@ -982,7 +983,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 
 ⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `MERGE_STALL_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries **24** placeholders (counted, not incremented: `grep -o '__[A-Z_]*__' launchd.plist.template | sort -u | wc -l`) — the eighteen limits rendered above them, plus `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+carries **24** placeholders (counted, not incremented: `grep -o '__[A-Z_]*__' launchd.plist.template | sort -u | wc -l`) — the eighteen rendered limits (four of which are named HERE rather than in the table above, because they have no row of their own: `MAX_RED_FIX`, `MAX_RED_FIX_TRIES`, `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`), plus `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
@@ -2554,7 +2555,8 @@ already holding):
   is a symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is
   also why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
   can carry: the WORKER gate binds on **load, memory, disk or land** (`spawn-gate.sh`), so those are
-  the four values field 3 can ever hold (`mem` is #2387's memory refusal); the lanes/swap terms belong to the CONTROLLER's own gate, which
+  the four values field 3 can ever hold (`mem` is #2387's memory refusal); the lanes/swap terms — and the CONTROLLER's own memory
+  arm, which compares `mem_avail` against `MIN_MEM_FREE_MB`, a different floor for a different population (§7) — belong to the CONTROLLER's own gate, which
   refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
   predates #2409 and knows only two values must treat `land` as `load` (it is non-numeric for its
   purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal".
@@ -3231,7 +3233,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
 | `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
-| `spawn-gate.sh` | the load, memory and disk gate (`disk_free_mb`/`disk_ok` `:200-243`, `mem_avail_mb` `:334`, `mem_gate_verdict` `:366`, `can_spawn` `:440`) plus the ONE `run_agent()` (`:781`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⚠️ Line numbers drift — search the function names, not the numbers. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
+| `spawn-gate.sh` | the load, memory, disk and land gate (`disk_free_mb`/`disk_ok` `:200-243`, `mem_avail_mb` `:334`, `mem_gate_verdict` `:366`, `can_spawn` `:440`) plus the ONE `run_agent()` (`:781`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⚠️ Line numbers drift — search the function names, not the numbers. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail |
 | `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
