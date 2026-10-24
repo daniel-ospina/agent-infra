@@ -2000,8 +2000,18 @@ run_hygiene() {
         # log instead of reading as a silent, permanent LOCAL-ONLY box. Cheap: it only reads source.
         rs_out="$(run_bounded "$DOCTOR_REGISTRY_NET_TIMEOUT" bash "$rsync" surface-check 2>&1)"; rc=$?
         if [ "$rc" -ne 0 ]; then
-          log "[hygiene] WARN review-registry union NOT RUN — the checkout-guard would withhold this script's git surface (#2520, surface-check rc=$rc), so the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
-          result="${result}${result:+; }registry union REFUSED by the checkout-guard"
+          # ⛔ rc=3 IS NOT A REFUSAL. surface-check answers 0 classify / 5 would-refuse / 3
+          # could-not-check, and collapsing 3 into "the guard withheld it" reports a refusal that
+          # never happened — a box missing `awk`, or carrying an unreadable script, would log it for
+          # ever and never rediscover the real cause. The union still does not run (fail closed);
+          # only the STATEMENT differs, and it names the cause it actually has.
+          if [ "$rc" -eq 3 ]; then
+            log "[hygiene] WARN review-registry union NOT RUN — could not VERIFY the script's git surface (surface-check rc=3, NOT VERIFIED): the registry is UNCHANGED, not converged, and the cause is NOT a guard refusal: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union NOT RUN — git surface could not be verified"
+          else
+            log "[hygiene] WARN review-registry union NOT RUN — the checkout-guard would withhold this script's git surface (#2520, surface-check rc=$rc), so the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union REFUSED by the checkout-guard"
+          fi
         else
         # --dir is EXPLICIT: the registry the cell's LANES read is this HOME's, and a step that
         # certified a registry nobody reads would be the same false green as no count at all.

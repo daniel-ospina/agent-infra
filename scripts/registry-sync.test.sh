@@ -741,6 +741,16 @@ printf '\nbad_two() { git -C "$STORE" %s -- .; }\n' "chec"'kout' >> "$WT"
 OUT="$(bash "$WT" surface-check 2>&1)"; RC=$?
 assert_eq "$RC" "5" "§28 a working-tree verb is REFUSED (exit 5) — a registry sync only moves refs and blobs"
 assert_contains "$OUT" "working-tree verb" "§28 ...and it says which class of verb it found"
+# ⛔ THE ALLOWLIST IS CLOSED, and this case is why. surface-check used to enumerate the FORBIDDEN
+# verbs, which under-refuses by construction: a fixture that re-added `merge`, `rebase`, `stash`,
+# `cherry-pick`, `revert`, `am` or `pull` printed OK and exited 0, because none of them was listed.
+# The verb below is assembled from fragments for the same guard reason as the fixtures above.
+WT2="$T/registry-sync-wt2.sh"
+cp "$SYNC" "$WT2"
+printf '\nbad_three() { git -C "%s" %s push -u; }\n' "$STORE" "sta"'sh' >> "$WT2"
+OUT="$(bash "$WT2" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 an UNLISTED working-tree verb (stash) is REFUSED — the allowlist is closed, not a blocklist"
+assert_contains "$OUT" "working-tree verb" "§28 ...and it names the class, so the fix is obvious"
 # "I could not check" is not a pass either.
 mkdir -p "$T/nopath"
 OUT="$(env PATH="$T/nopath" "$BASH" "$SYNC" surface-check 2>&1)"; RC=$?
@@ -832,6 +842,24 @@ assert_contains "$RS_LAST" "unreadable=2" "§30 ...and BOTH defects are counted 
 assert_contains "$RS_LAST" "skipped=2" "§30 ...and the convergence line reports them as skipped"
 assert_contains "$RS_LAST" "no readable reviewed_at" "§30 ...naming the unstamped record"
 assert_contains "$RS_LAST" "NOT this key" "§30 ...and naming the mis-keyed one"
+
+# ── §30b: the TWO shapes where the fast path and `pull_one` disagreed (§30 pinned only the two
+# the author thought of). Both are MIRRORED byte-for-byte, so the fast path is the only thing that
+# could answer them — and it used to answer `same`/exit 0 while `pull_one` refuses both.
+#  1. a NEGATIVE pr: `fast_ok` accepted any int, `pull_one` requires `^[0-9]+$`.
+#  2. a DUPLICATED key: `field()` is a greedy sed (takes the LAST match), json.load takes the last
+#     duplicate KEY — a nested `"reviewed_at":""` reads empty to one and non-empty to the other.
+echo "── §30b the fast path never answers \`same\` where the full comparison says unreadable"
+K_NEG_PR="daniel-ospina-agent-infra--2003"
+K_DUP_STAMP="daniel-ospina-agent-infra-2004"
+seed_payload "$STORE8" "$K_NEG_PR" "{\"pr\":-2003,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+seed_payload "$STORE8" "$K_DUP_STAMP" "{\"pr\":2004,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"evidence\":{\"reviewed_at\":\"\"}}"
+mirror "$K_NEG_PR"; mirror "$K_DUP_STAMP"
+RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30b a mirrored NEGATIVE-pr / duplicated-key record is NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=4" "§30b ...and all FOUR defects are counted, none reported same"
+assert_contains "$RS_LAST" "no usable pr field" "§30b ...naming the negative-pr record"
+assert_contains "$RS_LAST" "no readable reviewed_at" "§30b ...and the duplicated-key record (the greedy reader's empty stamp)"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do

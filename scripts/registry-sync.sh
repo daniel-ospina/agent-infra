@@ -309,6 +309,25 @@ def usable(p):
     if not (isinstance(v, str) and v.strip()):
         return False
     return True
+def dupkeys(p):
+    # A COMPARED KEY THAT APPEARS MORE THAN ONCE, ANYWHERE, IS AMBIGUOUS. `field()` (a greedy sed)
+    # reads the LAST occurrence in the TEXT; json.load keeps the last DUPLICATE KEY of an OBJECT.
+    # The two disagree the moment a compared key is repeated, so such a record takes the slow path.
+    # ⛔ NO APOSTROPHE APPEARS IN THIS FILE, ON PURPOSE: the whole program is a single-quoted
+    # shell assignment, so one apostrophe (a raw-string prefix, or quoted %s) terminates it
+    # mid-line — measured as `r"%s"\s*:` arriving at python as `r%ss*:` and every record reading
+    # as unusable.
+    seen = []
+    def hook(pairs):
+        for k, _v in pairs:
+            if k in ("reviewed_at", "pr", "verdict", "head_sha", "repo"):
+                seen.append(k)
+        return dict(pairs)
+    try:
+        json.loads(open(p, encoding="utf-8", errors="replace").read(), object_pairs_hook=hook)
+    except Exception:
+        return True
+    return len(seen) != len(set(seen))
 def fast_ok(p):
     # ⛔ THE FAST PATH ASKS A STRICTER QUESTION THAN THE INSTALL GATE, because it answers
     # "is this record already what the full comparison would call SAME?" — and the full
@@ -323,9 +342,21 @@ def fast_ok(p):
     if not isinstance(d.get("reviewed_at"), str) or not d.get("reviewed_at").strip():
         return False
     pr, repo = d.get("pr"), d.get("repo", "")
-    if not isinstance(pr, int) or isinstance(pr, bool):
+    # ⛔ `pull_one` REQUIRES `^[0-9]+$` ON THE TEXT IT READ, so a NEGATIVE integer is unreadable
+    # there and must never read as `same` here (reproduced: `"pr":-5` under the key
+    # `…-agent-infra--5` satisfied the identity check as `%s-%s-%d` and the fast path reported
+    # converged/exit 0 over a record the slow path refuses with "no usable pr field"/exit 4).
+    if not isinstance(pr, int) or isinstance(pr, bool) or pr < 0:
         return False
     if not (isinstance(repo, str) and "/" in repo):
+        return False
+    # ⛔ TWO READERS READ THIS FILE, AND THEY READ DUPLICATES DIFFERENTLY. `field()` is a greedy
+    # sed: it takes the LAST `"name":` anywhere in the text, while json.load keeps only the last
+    # DUPLICATE KEY of an object. A nested `"evidence":{"reviewed_at":""}` therefore reads EMPTY
+    # to `field` and NON-EMPTY to json — reproduced as `same`/exit 0 over a record `pull_one`
+    # refuses with "carries no readable reviewed_at"/exit 4. Any compared key that appears more
+    # than once ANYWHERE is AMBIGUOUS: it takes the slow path, which is authoritative.
+    if dupkeys(p):
         return False
     stem = p.rsplit("/", 1)[-1][:-5] if p.endswith(".json") else ""
     if re.fullmatch(r"[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-[0-9]+", stem):
@@ -748,6 +779,12 @@ push_one() { # <key> <source-file>
     # against what is actually there now — never re-push the comparison this attempt just lost.
     if [ "$attempt" -ge 2 ]; then break; fi
     fetch_refs >/dev/null 2>&1
+    # ⛔ THE FETCH RESET THE BATCHED MAP (`reset_store_blobs`), AND NOTHING ELSE REBUILDS IT. Without
+    # this line every key AFTER a refused push falls back to two git processes per key — the ~15 min
+    # cost this PR exists to delete — inside a step the doctor bounds at 300 s, so the one failure a
+    # contended store produces (a peer moved the ref) is exactly the one that makes the bound inert.
+    # The listing just changed, so the map must be rebuilt from it: one batched call.
+    build_store_blobs || :
   done
   warn "  ⚠️ FAILED $key — the push was refused twice (a peer moved the ref, or this box cannot push to $REMOTE). The record stays LOCAL and is not lost; re-run to retry."
   FAILED=$((FAILED + 1)); PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
@@ -1078,10 +1115,31 @@ summary() { # <verb>
 surface_check() {
   local hits rc
   hits="$(awk '
-    # Every token after a `git` command word, minus the options that consume an argument, is the
+    # Every token after a `git` COMMAND WORD, minus the options that consume an argument, is the
     # VERB. `-C`/`-c` and friends take a value, so their value must not be mistaken for a verb.
+    #
+    # ⛔ PROSE IS NOT A COMMAND. This file talks ABOUT git in its warnings ("a git invocation
+    # whose verb …"), so a quote-blind scan reads the next English word as a verb and refuses the
+    # script for its own help text (measured: `unlisted verb invocation`, `unlisted verb surface`).
+    # Every double-quoted span is therefore replaced by ONE placeholder token — `Q` for prose,
+    # `DYN` when it carries `$` (a quoted expansion in the verb position, `"$@"`, is exactly the
+    # shape this check exists to catch). ONE token, not whitespace: `-C "$STORE"` must keep its
+    # value in the value slot, or the verb slides into it and the scan reads the option instead
+    # (measured: a fixture `git -C "<path>" stash push -u` reported OK because `stash` had moved
+    # into the value slot of `-C`).
+    function strip_prose(line,   out, pre, seg) {
+      out = ""
+      while (match(line, /"[^"]*"/)) {
+        pre = substr(line, 1, RSTART - 1)
+        seg = substr(line, RSTART, RLENGTH)
+        out = out pre (index(seg, "$") ? " DYN " : " Q ")
+        line = substr(line, RSTART + RLENGTH)
+      }
+      return out line
+    }
+    /^[ \t]*#/ { next }                       # a comment is prose; the guard reads COMMANDS
     {
-      n = split($0, t, /[ \t]+/)
+      n = split(strip_prose($0), t, /[ \t]+/)
       for (i = 1; i <= n; i++) {
         if (t[i] != "git") continue
         j = i + 1
@@ -1093,9 +1151,19 @@ surface_check() {
         }
         if (j > n) continue                      # a bare `git` runs nothing
         v = t[j]
-        if (v ~ /[$`]/) { printf "%d: dynamic verb %s\n", NR, v; continue }
-        fam = " checkout checkout-index restore switch reset clean read-tree apply rm "
-        if (index(fam, " " v " ") > 0) printf "%d: working-tree verb %s\n", NR, v
+        sub(/[;)},]+$/, "", v)                  # `mktree;` / `push)` — the separator is not the verb
+        if (v ~ /[$`]/ || v == "DYN") { printf "%d: dynamic verb %s\n", NR, v; continue }
+        # ⛔ AN ALLOWLIST, NOT A BLOCKLIST. Enumerating the FORBIDDEN verbs under-refuses by
+        # construction: `merge`, `rebase`, `stash`, `cherry-pick`, `revert`, `am`, `mv` and `pull`
+        # all rewrite a working tree and none of them was listed, so a regression that re-added one
+        # of them read back as runnable (surface-check OK, exit 0). Only the verbs the header of this
+        # file declares are accepted; anything else is REFUSED, so an under-refusal is impossible
+        # and a genuinely new verb has to be justified in the header before it can pass.
+        allowed = " ls-remote fetch remote rev-parse cat-file hash-object mktree commit-tree push update-ref "
+        if (index(allowed, " " v " ") > 0) continue
+        wt = " checkout checkout-index restore switch reset clean read-tree apply merge rebase stash cherry-pick revert am pull rm "
+        if (index(wt, " " v " ") > 0) printf "%d: working-tree verb %s\n", NR, v
+        else printf "%d: unlisted verb %s\n", NR, v
       }
     }' "${BASH_SOURCE[0]}" 2>/dev/null)"
   rc=$?
