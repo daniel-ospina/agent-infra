@@ -80,6 +80,14 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
+# ⛔ THE SCRATCH-ROOT ARMS MUST BE SCOPED TO THE FIXTURE (#2542). The abandoned-worktree arm and the
+# duplicate-install class sweep a SCRATCH ROOT (`/tmp` by default) rather than a repo, so without this
+# a `--apply` assertion anywhere in this suite would reap the machine's own `/tmp` worktrees — it did,
+# once, on this very box (four clean abandoned checkouts). A test suite that can delete outside its
+# fixture is not a test suite. Every case that needs a synthetic root sets its own.
+REAP_AW_ROOTS="$T/scratch/absent"
+REAP_DI_ROOTS="$T/scratch/absent"
+export REAP_AW_ROOTS REAP_DI_ROOTS
 SLEEPERS=""
 cleanup() {
     local p

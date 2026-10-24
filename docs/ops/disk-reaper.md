@@ -1,5 +1,5 @@
 ---
-title: "Disk reaper — one scheduled pass over the three disk sinks (#2032)"
+title: "Disk reaper — one scheduled pass over every disk sink that stops a cell (#2032, #2542)"
 type: engineering
 domain: operations
 doc_status: live
@@ -12,14 +12,16 @@ aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, workt
 # Disk reaper (#2032)
 
 One entry point — `scripts/disk-reaper.sh` — that runs, accounts for and reports
-the three sinks that exhaust a cell's disk. It **owns no deletion rule**. Each
-class has one owner, and the owners are the only code that deletes:
+the sinks that exhaust a cell's disk. It **owns no deletion rule**. Each class has
+one owner (one class has two, for the two shapes of one sink), and the owners are the
+only code that deletes:
 
 | class | owner (policy) | reclaims |
 |---|---|---|
 | `uv` | `scripts/pi-cache-reap.sh` (#1987) | machine-global uv/npm/pip caches, bounded **by size** (`CACHE_REAP_MAX_MB`, default 2048 per cache), prune-then-escalate |
 | `venv` | `scripts/reap-lane-venvs.sh` (#1932 / #1949) | per-worktree `.venv`s whose lane is gone, proven by three liveness witnesses; fail-closed |
-| `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) | clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor |
+| `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) **+** `scripts/reap-abandoned-worktrees.sh` (#2542) | the first arm: clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor. The second arm: abandoned LINKED worktree directories under a scratch root — age > 180 min **and** no live process's cwd/exe inside (see *The two classes that were missing* below) |
+| `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 
 ## Why one entry point
 
@@ -81,6 +83,13 @@ A live holder is **never** selected. The witnesses are mechanical and fail close
   `bash -c 'cd <wt> && pytest'`, whose argv never names the path);
 * `live-argv` — any process whose command line names the path.
 
+⛔ **ONE IMPLEMENTATION.** The census the two #2542 classes use is `scripts/lib/live-paths.sh`
+(`lp_census` / `lp_path_held` / `lp_path_named`): one bulk `ls -l /proc/<pid>/{cwd,exe}` plus argv,
+the same probe the merged #2594 hygiene pass makes its per-root exclusion from, and the same
+`(deleted)`-stripping and path-boundary rules. A second copy of this predicate is how two deletion
+policies drift, and the drift is silent in the dangerous direction — the copy that forgets one arm
+deletes live work.
+
 A probe that cannot be evaluated is a refusal (`exit 3` **from the owner**), not a pass. Through the
 entry point that refusal arrives as exit **6** with `ok=0` in the pass record and
 `verdict=<class>=refused` — the unit stays green because the box is busy, and the RECORD is what
@@ -121,6 +130,96 @@ deletion), and not an open-PR head.
 `disk-reaper.test.sh` T2 is the load-bearing test: a real process cwd'd into a real
 linked worktree is kept by both the worktree and venv classes, and the *same*
 fixture is reclaimed once the holder is gone.
+
+## The two classes that were missing (#2542)
+
+Measured 2026-10-24, all three cells. The guard fired on a nearly-full box and reclaimed **4 MB per
+cycle**:
+
+```
+cell-1: LOW free=6618MB use=95% floor=8000MB — reclaiming   →  reclaimed: 6618MB -> 6614MB
+        (six cycles in 25 minutes; its classes uv, venv, worktree matched nothing)
+```
+
+Two consumers were in **none** of the classes, and they are the ones that fill a cell:
+
+| sink | measured | what it is |
+|---|---|---|
+| abandoned `/tmp` worktree directories | **12.3 GB, 133 directories** across c4/c1/c3 (`df` deltas +5,595 / +3,001 / +3,738 MB); oldest 4,801 min, newest three 5 GB each | linked worktrees of lanes that finished or died. Their HEAD is young and their tree is dirty, so `pi-reap-worktrees.sh`'s clean/aged/reachable policy never lets go |
+| duplicate tool installs | **11.3 GB** — eight identical `actions-runner` installs on an 8-core cell | copies of one tool where one would serve |
+
+### `class=worktree`, second arm — abandoned scratch worktrees
+
+`scripts/reap-abandoned-worktrees.sh` owns the rule. **Two dials, both required:**
+
+1. **AGE** — the directory's mtime older than `--aged-minutes` (default **180**;
+   `DISK_REAPER_ABANDONED_MINUTES` / `REAP_AW_AGED_MINUTES`).
+2. **LIVE-CWD** — no live process's cwd *or* exe resolves inside it, enumerated by reading
+   `/proc/<pid>/cwd` (plus `exe` and argv) for **every** pid — never `pgrep -f`, which self-matches the
+   shell running the check and shows the nesting stack rather than the population.
+
+Dial 2 is what makes it safe, and it earned its place on the first run: it **kept** five directories
+whose age alone would have condemned them — `cell-wt-tmainred70` (226 m), `cell-wt-zombiepi` (742 m),
+`cell-wt-trebase6` (823 m), `cell-wt-venvlink` (1,080 m), `wt-pinfix` (2,200 m) — each with a live
+process inside it. A reaper without that arm deletes live work, which is worse than a full disk.
+
+**What is a candidate, exactly** — a directory immediately under a scratch root (`--root`, default
+`/tmp`) whose `.git` is a **file**, i.e. a *linked* worktree. That one test is what keeps this from
+being a reaper for the machine: a primary checkout's `.git` is a *directory*, so `/tmp/cell-ai` (the
+hub) and `/tmp/cell-t3` (the cell's repo) cannot be reached by an age or liveness accident; depth 1
+means `/tmp/cell-home/...` (state, harness pins) is not swept; and a directory that is not a checkout
+at all is never touched.
+
+**The rest of the contract is kept verbatim (#2542 / #2594):**
+
+* the sha pinned in `.agent-infra-stamp.json` is **never** reaped — by path (`harness`, `scripts`, …)
+  or by name (a directory named after the commit);
+* a path a **live** process's `/proc/<pid>/args` names is never reaped (a controller can be started
+  elsewhere and still hold the tree it was pointed at);
+* a live lane's worktree is never reaped — that is dial 2;
+* when the process list cannot be read **at all**, the sweep is *skipped* and says so
+  (`SKIP reason=census-unreadable`, exit 3) — "could not enumerate" is never read as "nothing is live".
+  A **partial** read (another uid's `/proc` entries are unreadable) is a real census and is reported
+  with its population size; refusing on a partial read would make the sweep inert on every real box,
+  which is the inert-enforcer shape this family exists to remove;
+* the report is a **`df` delta** taken by the entry point, never a `du` sum.
+
+**The third dial, `--dirty keep|reap` (default `keep`).** A candidate whose `git status --porcelain`
+is non-empty is KEPT and named (`reason=dirty(<n>)`). `git worktree remove` never deletes a branch,
+the commits live in the shared object store, and a detached sha is still findable with
+`git fsck --unreachable` — so the one thing removal genuinely destroys is **uncommitted work**
+(measured on the same box: a 33-hour-old abandoned checkout holding 212 dirty entries). `--dirty reap`
+restores exactly the six-cycle measurement's two-dial predicate. Both settings are reported, so the
+choice is never implicit: on this box the default kept 26 dirty directories and reaped 43;
+`--dirty reap` made 69 candidates.
+
+> **OVERRIDES:** the #1095 worktree policy's *clean* gate and 7-day HEAD floor, for **scratch-root
+> linked worktrees only** — the owner ruled (2026-10-24, #2542) that an abandoned `/tmp` checkout is
+> reclaimable at age > 180 min with no live cwd inside it, because the debris is a dead lane's
+> checkout and the repo-layout gates kept 12.3 GB of it forever while the cells filled to 95%. The
+> uncommitted-work dial above is the guard that makes that ruling safe by default.
+
+### `class=duplicate-install` — surplus copies of the same tool install
+
+`scripts/reap-duplicate-installs.sh` owns the rule. A **family** is a directory whose children each
+carry the same install **marker** (default `bin/Runner.Listener` — a file only a GitHub Actions runner
+install has; markers are a table, never inferred from a directory name). Then:
+
+* the **newest copy is never a candidate** — it is the survivor;
+* a copy with a live process's cwd/exe inside it is KEPT (`reason=live-listener`), as is one a live
+  process was started from (`reason=argv-named`) and one a systemd/launchd **unit file names**
+  (`reason=unit-referenced` — a configured-but-stopped runner is not idle in intent);
+* a copy younger than `--aged-minutes` (default 180) is KEPT (`reason=young`);
+* if the number of copies, or which is newest, cannot be established, **the family is untouched**;
+* if the process list cannot be read, the pass **fails closed** and removes nothing.
+
+⛔ **The asymmetry is the policy.** A duplicate left on disk costs disk; a duplicate reaped while live
+costs **work** — a runner killed mid-job is a lost job and the run goes unserved (#2542: a runner died
+mid-`packaging-smoke` on ENOSPC). Every uncertain case therefore takes the keep arm, and every keep is
+named with its reason.
+
+Both owners need no `--repo`: they run on a cell whose repo list is empty, which is the #2443 failure
+mode (the repo-scoped classes fail closed there while the disk keeps filling).
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -453,6 +552,26 @@ when the last run has never happened, and when the pass record's own `rc` is one
 (3/4) or is STALE — a stale record is an alarm even when its `rc` was benign.
 
 ## Tests
+
+`scripts/disk-reaper-classes.test.sh` covers the two #2542 classes and is **mutation-checked**: each
+case runs twice, once against the real owner (must pass) and once against a mutant of the same file
+with that case's arm neutered (must fail), so a case that has stopped checking anything says so.
+
+| case | proves | mutant that must turn it red |
+|---|---|---|
+| A | an old directory with a **live cwd** inside is KEPT and named, while an identical old directory in the same run is reaped | `if lp_path_held …` → `if false` |
+| B | an old directory with **no** live cwd is reaped **and the entry point reports a `df` delta** (not a `du` sum) | `if remove_one …` → `if false` |
+| C | with the process list **unreadable** the sweep is skipped and reports the skip (exit 3, nothing removed) | `if ! lp_census …` → `if false` |
+| D | the **pinned sha** is never reaped, by name and by path, while a sibling candidate in the same run is | `if pinned …` → `if false` |
+| E | duplicate-install **keeps the last copy**: newest never a candidate, live-hosted copy kept, only the provably-idle surplus removed | `[ "$c" = "$newest" ]` → `[ "$c" = "__never__" ]` |
+| F | with **no resolvable repo** the abandoned arm still runs (the #2443 shape: the registered arm fails closed as `misconfigured`, the arm that needs no repo does not) | `REPO_ARM_OK=0; REPOS=""` → `return 3` |
+| G | a class that removed **nothing** reports `freed=0` and names the un-attributed `df` change in the pass record, instead of claiming another process' free space as its own | `if [ "$reaped" = 0 ] && ! is_dry` → `if false` |
+| H | a **symlink** in the scratch root is never followed out of it: the link is kept and named, the target outside the root is untouched | `if [ -L "$d" ]` → `if false` |
+| I | a tree **git cannot read** is not a clean tree: `dirty=?` KEEPS it (`reason=clean-unknown`), so uncommitted work survives a dangling `.git` | `dirty="?"` → `dirty="0"` |
+
+The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
+own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
+(it did once, on this box, before the scoping was added).
 
 `scripts/disk-reaper.test.sh` — 375 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
