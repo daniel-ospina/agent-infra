@@ -470,21 +470,40 @@ do_install() {
     # burst*(t+RestartSec) < interval  ⇔  t <= (interval-1)/burst - RestartSec — and the bound is computed
     # ONCE so the refusal can only quote the number the test enforced. (It used to print `300/3-15` = 85 s
     # while the test required at most 84: a remedy the guard then refused.)
-    sl_maxtime=$(( (sl_iv - 1) / sl_burst - RESTART_SEC ))
-    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY (review P2 round 9, #2402): when the template's own RestartSec
-    # alone exceeds the window there is no value to recommend, and the old sentence still printed one
-    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."). Name the real cause instead.
-    sl_min_iv=$(( sl_burst * (RESTART_SEC + 1) + 1 ))
-    sl_max_rs=$(( (sl_iv - 1) / sl_burst - 1 ))
-    # ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB, AND MUST NOT NAME A KNOB THIS
-    # INSTALLER REFUSES (review P2 round 11, #2402). The refusal used to say "Fix the template
-    # (StartLimitIntervalSec= needs to exceed …)" while `verify_unit` PINS `StartLimitIntervalSec=300` on the
-    # rendered artifact — so following the advice made every install refuse — and it blamed the TEMPLATE even
-    # when the operator's own `ORCH_RESTART_SEC` was what overran the window. A sibling revision offered
-    # `ORCH_RESTART_SEC <= 98` (the bound for a 1 s ceiling) while the ceiling still defaulted to 60 s, so
-    # following THAT met a second refusal naming a variable it never mentioned. The bound is now derived from
-    # the ceiling ACTUALLY IN FORCE, so one edit satisfies both guards.
-    sl_max_rs_at_ceiling=$(( (sl_iv - 1) / sl_burst - START_TIMEOUT_SEC ))
+    # ⛔ THE CEILING IS NOT THE WHOLE COST OF AN ATTEMPT (review P1 round 12, #2402). The supervisor polls in
+    # 5 s steps, so a T-second ceiling can cost T+5 s of wall time, and every attempt also pays the
+    # supervisor's own startup and `cmd_check` reads. With the shipped 300/3 window and the maximum the
+    # earlier bound allowed, `3 × (84 + 15) = 297 < 300` left 3 s of slack for BOTH — attempts landed far
+    # enough apart that the oldest aged out before the burst was exceeded, the unit restarted for ever, and
+    # `--status` read it supervised: reachable by following this guard's own printed remedy. The supervisor
+    # no longer overruns its bound (it tests the NEXT 5 s step), and both allowances are named here once,
+    # subtracted from the ceiling, and quoted in the refusal.
+    WAIT_QUANTUM_SEC=5
+    ATTEMPT_OVERHEAD_SEC=5
+    sl_maxtime=$(( (sl_iv - 1) / sl_burst - RESTART_SEC - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC ))
+    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY, AND THE CAUSE MUST BE NAMED CORRECTLY (review P2 rounds 9 and 10,
+    # #2402). Two defects lived here: the sentence printed the negative bound as advice
+    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."), and it blamed the TEMPLATE even when the operator's own
+    # `ORCH_RESTART_SEC` was what pushed the window out of reach — an operator who followed it (raising
+    # StartLimitIntervalSec above `RestartSec × burst`) was then refused by `verify_unit`, which pins the
+    # rendered window. The true minimum is `burst × (RestartSec + 1) + 1` (one whole second of orphan ceiling
+    # for the LAST attempt, plus one so the burst can be EXCEEDED inside the window), and it is computed ONCE
+    # so the message can only quote what the guard enforces.
+    sl_min_iv=$(( sl_burst * (RESTART_SEC + WAIT_QUANTUM_SEC + ATTEMPT_OVERHEAD_SEC + 1) + 1 ))
+    sl_max_rs=$(( (sl_iv - 1) / sl_burst - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC - 1 ))
+    # ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB (review P2 round 10, #2402). The
+    # refusal used to offer `ORCH_RESTART_SEC <= 98` — the bound that fits a 1 s orphan ceiling — while the
+    # ceiling still defaulted to 60 s, so an operator who followed it met a SECOND refusal naming a variable
+    # the message never mentioned (`ORCH_START_TIMEOUT_SEC <= 1s`). The bound is now derived from the ceiling
+    # ACTUALLY IN FORCE, so one edit satisfies both guards; the 1 s-ceiling shape is still named, as an
+    # explicit second knob.
+    # ⛔ AND IT NO LONGER ADVISES RAISING StartLimitIntervalSec (review P2 round 10, #2402): `verify_unit`
+    # PINS the rendered window, so that advice was refused by this same installer's own artifact check. A
+    # remedy that cannot be followed is the defect class this PR exists to remove, not a nicety.
+    # ...and it subtracts the SAME allowances as the ceiling itself (review P1 round 12, #2402): a bound
+    # derived without them is a bound this guard then refuses (measured: 39 s at the 60 s default failed the
+    # very next check, because 3 × (60 + 39 + 10) = 327 > 300).
+    sl_max_rs_at_ceiling=$(( (sl_iv - 1) / sl_burst - START_TIMEOUT_SEC - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC ))
     if [ "$sl_maxtime" -lt 1 ]; then
         err "REFUSING: no orphan ceiling fits this start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave nothing for RestartSec=${RESTART_SEC}s plus a >= 1s ceiling (the minimum window is ${sl_min_iv}s), so NO configuration would converge to failed."
         if [ "$sl_max_rs_at_ceiling" -ge 1 ]; then

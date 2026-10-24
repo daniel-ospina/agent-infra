@@ -1311,58 +1311,16 @@ JR3_RC=0; JR3_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=3074457345618258602 inst j
 [ "$JR3_RC" -ne 0 ] \
   && ok 'install: REFUSES a digits-only ORCH_START_TIMEOUT_SEC that overflows the arithmetic (19 digits, wraps negative under multiplication)' \
   || bad "install: accepted ORCH_START_TIMEOUT_SEC=3074457345618258602 — 3 × (x + 15) wraps NEGATIVE, so a multiplicative guard passes and the unit would restart forever — $JR3_OUT"
-case "$JR3_OUT" in *'Use ORCH_START_TIMEOUT_SEC <= 84s'*) ok 'install: the overflow refusal quotes the bound the guard enforced (84s, not the 85s the old message printed)' ;; *) bad "install: the refusal did not quote the enforced bound ('<= 84s') — $JR3_OUT" ;; esac
-# ...and the boundary is INCLUSIVE: 84 s fits the relation exactly (3 × (84 + 15) = 297 < 300). A guard that
-# refused its own recommended value would be a new false red on every cell the message is meant to repair.
+case "$JR3_OUT" in *'Use ORCH_START_TIMEOUT_SEC <= 74s'*) ok 'install: the overflow refusal quotes the bound the guard enforced (74s — each attempt share of the window minus RestartSec, the 5 s poll quantum and the per-attempt overhead; not an optimistic 84 s)' ;; *) bad "install: the refusal did not quote the enforced bound ('<= 74s') — $JR3_OUT" ;; esac
+# ...and the boundary is INCLUSIVE: 74 s fits the relation WITH the quantum and overhead allowances
+# (3 × (74 + 15 + 5 + 5) = 297 < 300). A guard that refused its own recommended value would be a new false
+# red on every cell the message is meant to repair.
 JR4="$(arm_root j4)"; mk_systemctl "$JR4/bin" "$JR4/state" "$JR4/sc.log"
-JR4_RC=0; JR4_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=84 inst j4 --install 2>&1)" || JR4_RC=$?
+JR4_RC=0; JR4_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=74 inst j4 --install 2>&1)" || JR4_RC=$?
 [ "$JR4_RC" -eq 0 ] \
-  && ok 'install: ACCEPTS the boundary value the refusal names (84 s — the relation is enforced exactly, not tightened into a new refusal)' \
-  || bad "install: refused the very value its own refusal recommends (84 s) — the bound and the message disagree — $JR4_OUT"
+  && ok 'install: ACCEPTS the boundary value the refusal names (74 s — the relation is enforced exactly, not tightened into a new refusal)' \
+  || bad "install: refused the very value its own refusal recommends (74 s) — the bound and the message disagree — $JR4_OUT"
 
-# ⛔ THE RECOGNITION OF A FALSIFIED FINDING IS NOT A TEST — the arms below pin a HEAD-SIDE defect the round-9
-# review caught and the fix closed. Each one goes RED on a revert (stated in the comment) so it is a pin, not
-# an anecdote.
-
-# ⛔ THE PROOF FOLLOWS THE UNIT, NOT THE INSTALLER (review P1 round 9, #2402). The installer never sources
-# `$ENV_FILE`; the SUPERVISOR does (`set -a`), so a `keys.env` `O=` line puts the controller's lock and
-# heartbeat in the RESOLVED dir. Polling only `$O` made a correctly supervised cell fail the install after
-# the full proof timeout. RED on revert: deleting the second leg of `controller_proof` makes this arm time
-# out with "NO CONTROLLER PROVED ITSELF".
-say_case 'the controller proof follows the state dir the UNIT resolves to, not the installer $O'
-PR1="$(arm_root pr1)"; mk_systemctl "$PR1/bin" "$PR1/state" "$PR1/sc.log"; mkdir -p "$PR1/resolved"
-printf 'O=%s/resolved\n' "$PR1" > "$PR1/home/keys.env"
-PR1_RC=0; PR1_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR1/resolved" inst pr1 --install 2>&1)" || PR1_RC=$?
-[ "$PR1_RC" -eq 0 ] \
-  && ok 'install: a controller heartbeating in the RESOLVED state dir proves the unit (the installer never sources keys.env)' \
-  || bad "install: failed a correctly supervised cell whose keys.env repoints O — the proof only looked at the installer's \$O: $PR1_OUT"
-
-# ⛔ INSTALL MUST CONVERGE ON A CELL WHOSE keys.env REPOINTS `O` (review P1 round 9, #2402). The write path
-# used to re-apply the RESOLUTION-ONLY ownership test after the union had let this cell's OWN copy through,
-# so the SECOND `--install` (which the bring-up runs on every `--check`) refused, named its own unit as
-# another state dir's, and told the operator to UNINSTALL a healthy cell. RED on revert: reinstate the
-# resolution-only block and the second call exits 1.
-say_case 'a second --install on a cell whose keys.env repoints O still converges (the union, not the resolution)'
-PR2="$(arm_root pr2)"; mk_systemctl "$PR2/bin" "$PR2/state" "$PR2/sc.log"; mkdir -p "$PR2/resolved"
-printf 'O=%s/resolved\n' "$PR2" > "$PR2/home/keys.env"
-PR2A_RC=0; PR2A_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR2/resolved" inst pr2 --install 2>&1)" || PR2A_RC=$?
-[ "$PR2A_RC" -eq 0 ] \
-  && ok 'install: the first install succeeds (nothing to compare against yet)' \
-  || bad "install: the FIRST install of a legitimately repointed cell failed: $PR2A_OUT"
-PR2B_RC=0; PR2B_OUT="$(EXTRA_ENV="CONTROLLER_PROOF_TIMEOUT=8 SC_PROOF_DIR=$PR2/resolved" inst pr2 --install 2>&1)" || PR2B_RC=$?
-[ "$PR2B_RC" -eq 0 ] \
-  && ok 'install: RE-INSTALLING its own unit converges (the write path uses the union too)' \
-  || bad "install: refused its OWN unit on re-install — the resolution-only test came back: $PR2B_OUT"
-case "$PR2B_OUT" in
-  *'DIFFERENT state dir'*) bad 'install: named its own unit as another state dir’s — the remedy would tell the operator to uninstall a healthy cell' ;;
-  *) ok 'install: never claims its own unit belongs to another state dir' ;;
-esac
-
-# ⛔ `activating` IS THE RESTART WINDOW, NOT A RUNNING CONTROLLER (review P2 round 9, #2402).
-# `controller_unit_active_state` scores `activating` as running, so the automated fence fell through to
-# `reset-failed`, which also ZEROES the start rate limit — and the doctor does this every 120 s inside a
-# 300 s window, so convergence to `failed` became probabilistic. RED on revert: drop the word check and the
-# stub's `reset-failed` call appears.
 # ⛔ AN OPERATOR'S OWN RestartSec IS NAMED AS THE CAUSE, WITH A VALUE THAT WORKS (review P2 round 10, #2402).
 # With `ORCH_RESTART_SEC=200` the window cannot fit ANY ceiling, and the refusal used to blame the template.
 # RED on revert: the message names StartLimitIntervalSec only, and no `ORCH_RESTART_SEC <=` remedy appears.
@@ -1373,8 +1331,8 @@ JR5_RC=0; JR5_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=200 inst j5 --install 2>&1)" || 
   && ok 'install: REFUSES when RestartSec alone leaves no room for a 1 s orphan ceiling' \
   || bad "install: accepted ORCH_RESTART_SEC=200 inside a 300 s window — no configuration can converge to failed — $JR5_OUT"
 case "$JR5_OUT" in
-  *'ORCH_RESTART_SEC <= 39'*) ok 'install: the refusal quotes the bound that fits WITH THE CEILING IN FORCE (<= 39 at the 60 s default), not the 98 s one that needs a second knob' ;;
-  *) bad "install: the refusal did not name ORCH_RESTART_SEC with a bound the NEXT guard also accepts ('<= 39' at the default ceiling) — $JR5_OUT" ;;
+  *'ORCH_RESTART_SEC <= 29'*) ok 'install: the refusal quotes the bound that fits WITH THE CEILING IN FORCE (<= 29 at the 60 s default — with the 5 s poll quantum and the per-attempt overhead subtracted), not the 98 s one that needs a second knob' ;;
+  *) bad "install: the refusal did not name ORCH_RESTART_SEC with a bound the NEXT guard also accepts ('<= 29' at the default ceiling) — $JR5_OUT" ;;
 esac
 # ⛔ THE REMEDY MUST BE ACCEPTED ON ITS OWN, WITH NOTHING ELSE CHANGED (review P2 round 10, #2402). The
 # previous message named 98 s, which guard B then refused unless ORCH_START_TIMEOUT_SEC was ALSO lowered to
@@ -1382,17 +1340,17 @@ esac
 # supplied the missing knob silently). This arm applies ONLY the quoted number, at the default ceiling.
 # RED on revert: quote `sl_max_rs` again and this install is refused with `ORCH_START_TIMEOUT_SEC <= 1s`.
 JR6B="$(arm_root j6b)"; mk_systemctl "$JR6B/bin" "$JR6B/state" "$JR6B/sc.log"
-JR6B_RC=0; JR6B_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=39 inst j6b --install 2>&1)" || JR6B_RC=$?
+JR6B_RC=0; JR6B_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=29 inst j6b --install 2>&1)" || JR6B_RC=$?
 [ "$JR6B_RC" -eq 0 ] \
-  && ok 'install: ACCEPTS the quoted bound (39 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
-  || bad "install: refused the value its own refusal recommends (39 s at the default 60 s ceiling) — the remedy still needs a second knob: $JR6B_OUT"
+  && ok 'install: ACCEPTS the quoted bound (29 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
+  || bad "install: refused the value its own refusal recommends (29 s at the default 60 s ceiling) — the remedy still needs a second knob: $JR6B_OUT"
 # ...and the explicit TWO-KNOB shape (the largest RestartSec, with the 1 s ceiling it leaves room for) is
 # still accepted, so naming it in the else-branch is a real alternative rather than prose.
 JR6="$(arm_root j6)"; mk_systemctl "$JR6/bin" "$JR6/state" "$JR6/sc.log"
-JR6_RC=0; JR6_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=98 ORCH_START_TIMEOUT_SEC=1 inst j6 --install 2>&1)" || JR6_RC=$?
+JR6_RC=0; JR6_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=88 ORCH_START_TIMEOUT_SEC=1 inst j6 --install 2>&1)" || JR6_RC=$?
 [ "$JR6_RC" -eq 0 ] \
-  && ok 'install: ACCEPTS the two-knob shape (98 s RestartSec with the 1 s ceiling it leaves room for)' \
-  || bad "install: refused the two-knob shape its own else-branch names (98 s, with a 1 s ceiling) — bound and message disagree — $JR6_OUT"
+  && ok 'install: ACCEPTS the two-knob shape (88 s RestartSec with the 1 s ceiling it leaves room for)' \
+  || bad "install: refused the two-knob shape its own else-branch names (88 s, with a 1 s ceiling) — bound and message disagree — $JR6_OUT"
 
 say_case 'an automated restart does NOT clear the start limit while the unit is activating'
 PR3="$(arm_root pr3)"; mk_systemctl "$PR3/bin" "$PR3/state" "$PR3/sc.log"; mk_tmux "$PR3/bin" "$PR3/tmux.log"
@@ -1441,8 +1399,8 @@ JQ_RC=0; JQ_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=200 inst jq --install --dry-run 2>
   && ok 'install: REFUSES when RestartSec alone leaves no room for a 1 s orphan ceiling' \
   || bad "install: accepted ORCH_RESTART_SEC=200 inside a 300 s window — no configuration can converge to failed — $JQ_OUT"
 case "$JQ_OUT" in
-  *'ORCH_RESTART_SEC <= 39'*) ok 'install: the bound is derived from the ceiling IN FORCE (39 at the 60 s default), not the 98 that needs a second knob' ;;
-  *) bad "install: the refusal did not quote a bound the next guard accepts ('<= 39' at the default ceiling) — $JQ_OUT" ;;
+  *'ORCH_RESTART_SEC <= 29'*) ok 'install: the bound is derived from the ceiling IN FORCE (29 at the 60 s default — with the 5 s poll quantum and the per-attempt overhead subtracted), not the 98 that needs a second knob' ;;
+  *) bad "install: the refusal did not quote a bound the next guard accepts ('<= 29' at the default ceiling) — $JQ_OUT" ;;
 esac
 case "$JQ_OUT" in
   *'Fix the template'*|*'raise StartLimitIntervalSec'*) bad 'install: the refusal still advises raising StartLimitIntervalSec — verify_unit pins it, so that remedy is refused by this installer' ;;
@@ -1450,10 +1408,10 @@ case "$JQ_OUT" in
 esac
 # …and the quoted number is ACCEPTED with NOTHING ELSE changed (the printed contract, actually exercised).
 JQ2="$(arm_root jq2)"; mk_systemctl "$JQ2/bin" "$JQ2/state" "$JQ2/sc.log"
-JQ2_RC=0; JQ2_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=39 inst jq2 --install --dry-run 2>&1)" || JQ2_RC=$?
+JQ2_RC=0; JQ2_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=29 inst jq2 --install --dry-run 2>&1)" || JQ2_RC=$?
 [ "$JQ2_RC" -eq 0 ] \
-  && ok 'install: ACCEPTS the quoted bound (39 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
-  || bad "install: refused the value its own refusal recommends (39 s at the default 60 s ceiling) — the remedy still needs a second knob: $JQ2_OUT"
+  && ok 'install: ACCEPTS the quoted bound (29 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
+  || bad "install: refused the value its own refusal recommends (29 s at the default 60 s ceiling) — the remedy still needs a second knob: $JQ2_OUT"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)

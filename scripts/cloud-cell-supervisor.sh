@@ -2125,7 +2125,12 @@ cmd_start() {
       # is non-empty, so the two halves below concatenated — "pid 15562491556249", a pid `ps -p` cannot
       # resolve, handed to the operator inside the FATAL that tells them what to wait for.
       if [ -n "$_own" ]; then _who="pid $(_pids_join "$_own")"; else _who="tmux session '$SESSION'"; fi
-      [ "$_waited" -lt "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for $_who — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
+      # ⛔ THE BOUND IS A CEILING ON THE WHOLE ATTEMPT, AND THE SLEEP IS 5 s GRANULAR (review P1 round 12,
+      # #2402). Testing BEFORE the sleep let a bound of T cost T+5 s of wall time, and the installer's
+      # start-limit arithmetic (`burst × (ceiling + RestartSec) < window`) assumed the ceiling was the cost:
+      # at the accepted maximum the burst could never fill, so `Restart=always` restarted for ever while
+      # `--status` read the unit supervised. Check the NEXT step, not the last one.
+      [ "$((_waited + 5))" -le "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for $_who — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
       [ "$_saidd" = 1 ] || say "controller already running ($_who) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
       _saidd=1
       sleep 5; _waited=$((_waited + 5))
@@ -2213,7 +2218,14 @@ cmd_start() {
       return 0
       fi
     fi
-    die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
+    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+      # The handover waits on the SESSION too, so a completed one means $seen0 is stale: re-read before
+      # deciding, and never die on the pid list the wait just outlived (review P2 round 12, #2402).
+      foreground_handover || return 1
+      seen0="$(seen_controller_pids)" \
+        || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+    fi
+    [ -z "$seen0" ] || die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
   fi
   # A controller can be running OUTSIDE the session (a leftover harness copy, or one whose lock a
   # launcher removed). Refuse, naming it: a second controller either exits on the lock (leaving a
@@ -2224,15 +2236,20 @@ cmd_start() {
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
-  if [ -n "$own" ]; then
-    # ⛔ THE THIRD "already running" EXIT HANDS OVER TOO (review P2 round 10, #2402). Its two siblings have
-    # this guard; without it, a controller that appears between the handover at the top of this function and
-    # this read (the window spans `assert_queue_target`'s git/network reads) reaches this branch, returns 0
-    # — and under `Restart=always` three orderly exits inside the start window leave the unit `failed`,
-    # which is the loop the handover exists to remove, on the one path the PR's own comment claims is closed.
-    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
-      foreground_handover || return 1
-    else
+  # ⛔ A COMPLETED HANDOVER INVALIDATES THESE READS (review P2 round 12, #2402). They are taken BEFORE it,
+  # and the handover waits for exactly the controller they name — so falling through with them intact sent
+  # control into the `die` below ("a controller runs from this machine's shared harness path … refusing")
+  # on a controller that had just exited: a FATAL after a successful wait, burning a start against
+  # `StartLimitBurst`. In service mode the handover is the answer; the facts are re-read after it, and the
+  # non-foreground tail (which must still answer "already running") is fenced to the operator path.
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ] && { [ -n "$own" ] || [ -n "$live" ]; }; then
+    foreground_handover || return 1
+    own="$(owned_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+    live="$(seen_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+  fi
+  if [ -n "$own" ] && [ "${ORCH_FOREGROUND:-0}" != 1 ]; then
     say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
@@ -2241,7 +2258,6 @@ cmd_start() {
     superseded && return 1
     [ "$drc" -eq 0 ] || return 1
     return 0
-    fi
   fi
   if [ -n "$live" ]; then
     # ⛔ NOT "already running", and NOT rc=0. This state dir started NOTHING: the pid runs the harness

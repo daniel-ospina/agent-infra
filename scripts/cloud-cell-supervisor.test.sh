@@ -3685,8 +3685,10 @@ _ar_bad="$(awk '
       if (line[i] !~ /say "already running/) continue
       found = 0
       for (j = i - 1; j >= 1 && j >= i - 9; j--) {
+        # The answer is correct if it sits in the NON-foreground arm, which this file spells two ways: an
+        # `else` after a foreground test, or a branch whose own condition requires `ORCH_FOREGROUND != 1`.
         if (line[j] ~ /^[[:space:]]*else[[:space:]]*$/) { found = 1; break }
-        if (line[j] ~ /ORCH_FOREGROUND/ && line[j] ~ /!= 1|== 1/) { break }
+        if (line[j] ~ /ORCH_FOREGROUND/ && line[j] ~ /!= 1/) { found = 1; break }
       }
       if (!found) printf "%d ", i
     }
