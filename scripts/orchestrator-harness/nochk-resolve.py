@@ -502,7 +502,7 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
     # ── 2. THE AUTHORITY TELLS "EMPTY" FROM "BLIND" ──────────────────────────────────────────────
     arows, total, areason = authority(repo, sha)
     if arows is None:
-        return f"READ-FAILED:authority unreadable at {sha[:12]} ({areason})"
+        return f"READ-FAILED:authority unreadable at {sha[:12]} ({areason}){moved}"
     if total > 0:
         if len(arows) != total:
             # A TRUNCATED surface is not a class (#2704): never classify from part of the evidence.
@@ -517,7 +517,7 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
     # ── 3. THE SURFACE IS GENUINELY ABSENT AT THIS HEAD ──────────────────────────────────────────
     runs, rreason = runs_at(repo, sha)
     if runs is None:
-        return f"READ-FAILED:runs unreadable at {sha[:12]} ({rreason})"
+        return f"READ-FAILED:runs unreadable at {sha[:12]} ({rreason}){moved}"
     owner = args.repair_owner if args.repair_owner is not None else repair_owner(args.repo_dir)
     if not owner:
         owner_text = "this repo declares no repair for it"

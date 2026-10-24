@@ -314,16 +314,24 @@ _CK_PY="$O/check-class.py"; [ -f "$_CK_PY" ] || _CK_PY="$_HERE_RS/check-class.py
 _NCHK_PY="$O/nochk-resolve.py"; [ -f "$_NCHK_PY" ] || _NCHK_PY="$_HERE_RS/nochk-resolve.py"
 [ -f "$_CK_PY" ] || _CK_PY=""
 [ -f "$_NCHK_PY" ] || _NCHK_PY=""
-if [ -z "$_CK_PY" ]; then
-  _nock_fatal="FATAL check-class.py not found (looked in $O and ${_HERE_RS:-<unresolved>}) — every PR's classification would be EMPTY (no merge, no fixer, no reviewer), so the controller refuses to start; re-seed it: bash $O/deploy-harness.sh --src <harness checkout> --o $O"
-  echo "orch-loop: $_nock_fatal" >&2
-  printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_nock_fatal" >> "$O/logs/orch-loop.log" 2>/dev/null || true
-  exit 78
-fi
-if [ -z "$_NCHK_PY" ]; then
-  printf '%s [startup] ⚠️ NOCHECKS ARM ABSENT: nochk-resolve.py was not found in %s or %s — a NOCHECKS PR is NAMED as "the arm produced no verdict" and re-read next cycle (never silently, never spun); re-seed the harness (deploy-harness.sh)\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$O" "${_HERE_RS:-<unresolved>}" >> "$O/logs/orch-loop.log" 2>/dev/null || true
-fi
+# ⛔ A FUNCTION, NOT AN INLINE BLOCK (review P1, agent-infra#2719): an inline guard is run by nothing —
+# downgrading this `exit 78` to `:` left every suite green — and this repo's convention is to extract
+# and DRIVE its startup guards. `nochk-resolve.test.sh` extracts this function and runs it.
+nochk_require_classifier() { # <check-class.py|""> <nochk-resolve.py|""> <O> <harness-dir>; exits 78
+  _ck="$1"; _nchk="$2"; _o="$3"; _hd="${4:-<unresolved>}"
+  if [ -z "$_ck" ]; then
+    _fatal_nock="FATAL check-class.py not found (looked in $_o and $_hd) — every PR's classification would be EMPTY (no merge, no fixer, no reviewer), so the controller refuses to start; re-seed it: bash $_o/deploy-harness.sh --src <harness checkout> --o $_o"
+    echo "orch-loop: $_fatal_nock" >&2
+    printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_fatal_nock" >> "$_o/logs/orch-loop.log" 2>/dev/null || true
+    exit 78
+  fi
+  if [ -z "$_nchk" ]; then
+    printf '%s [startup] ⚠️ NOCHECKS ARM ABSENT: nochk-resolve.py was not found in %s or %s — a NOCHECKS PR is NAMED as "the arm produced no verdict" and re-read next cycle (never silently, never spun); re-seed the harness (deploy-harness.sh)\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_o" "$_hd" >> "$_o/logs/orch-loop.log" 2>/dev/null || true
+  fi
+  return 0
+}
+nochk_require_classifier "$_CK_PY" "$_NCHK_PY" "$O" "$_HERE_RS"
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
