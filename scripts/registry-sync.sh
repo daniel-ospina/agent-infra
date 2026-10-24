@@ -6,25 +6,26 @@
 #   registry-sync.sh union   …   # pull, then push — the converging verb
 #   registry-sync.sh status  …   # counts, plus the records another box has and this one does not
 #   registry-sync.sh surface-check [--repo <path>]
-#                                # 0 when the checkout-guard can CLASSIFY this script's git
-#                                # surface, 5 when it would refuse it, 3 when that cannot be
-#                                # checked here. Run it after editing this file (see below).
+#                                # 0 when this script's git surface is INTACT (no unbounded verb,
+#                                # no working-tree verb), 5 when it is DEFECTIVE, 3 when that
+#                                # cannot be checked here. ⛔ 0 is NOT a promise that the guard will
+#                                # RUN it: a hub-rooted session is still withheld by the guard's
+#                                # #1484/#1485 content walk (agent-infra#2621).
 #
 # Exit: 0 converged (nothing left to do), 2 usage, 1 cannot run (no store / no remote /
 # unwritable registry / a record that could not be moved), 3 CONVERGED WITH DIVERGENCE — at
 # least one pair of records shares a `reviewed_at` but disagrees on content, so neither side was
 # overwritten (rule 4 below), 4 records were SKIPPED because they could not be read or ordered
 # (an unreadable peer ref or stamp, a mis-keyed record) — an unreadable store is not a converged
-# one, and 0 must never be reported over records this box could not use, 5 REFUSED — the
-# invocation never ran at all because the checkout-guard withheld it (see "THE GIT SURFACE IS
-# LITERAL" below).
+# one, and 0 must never be reported over records this box could not use.
 #
-# ⛔ 5 CANNOT BE EMITTED BY A RUN OF THIS SCRIPT. A guard refusal happens BEFORE the first line
-# of this file executes, so the caller sees NO exit status at all — and "no exit status" has been
-# read as success, which is the whole of #2520. `surface-check` is the verb that turns that silence
-# into a value (0 = the guard will let this run, 5 = it would refuse it, 3 = the check could not
-# read its own source, which is NOT a pass). Any wrapper that sees the invocation withheld must map
-# it onto 5 rather than onto 0.
+# `surface-check` has its OWN status: 0 surface intact / 5 surface DEFECTIVE / 3 not verified.
+# ⛔ A RUN OF THIS SCRIPT NEVER RETURNS 5. A guard refusal happens BEFORE the first line of this
+# file executes, so the caller sees NO exit status at all — and "no exit status" has been read as
+# success, which is the whole of #2520. `surface-check` is the verb that turns that silence into a
+# value. A wrapper that sees the invocation withheld must map it onto 5 rather than onto 0 — and
+# must NOT read a 5 from `surface-check` as "the guard refused it": 5 there means this file's own
+# surface is defective, which is why the guard WOULD refuse it, not that it did.
 #
 # ── WHY THIS EXISTS ───────────────────────────────────────────────────────────────────────
 # `record-review.sh` writes ~/.pi/agent/reviews/<owner>-<repo>-<pr>.json and NOTHING replicated
@@ -137,8 +138,8 @@
 # `g_cat_blob`, `g_cat_batch_check`, `g_hash_object`, `g_hash_paths`, `g_mktree`, `g_commit_tree`,
 # `g_push`/`g_push_create` and `g_update_ref` below — network reads, object/blob reads, object/blob
 # writes, one ref update, and one push. `is_repo`'s own check is literal for the same reason. If
-# this file is edited, run `registry-sync.sh surface-check` (exit 0 = the guard classifies it, 5 = the guard would refuse
-# it) — the shipped test suite runs the same check, and pins it against a fixture that
+# this file is edited, run `registry-sync.sh surface-check` (exit 0 = surface intact, 5 = surface
+# defective) — the shipped test suite runs the same check, and pins it against a fixture that
 # reintroduces the wrapper.
 #
 # ── WHAT THIS DOES NOT DO ────────────────────────────────────────────────────────────────
@@ -358,11 +359,16 @@ def fast_ok(p):
     # than once ANYWHERE is AMBIGUOUS: it takes the slow path, which is authoritative.
     if dupkeys(p):
         return False
+    # ⛔ UNCONDITIONAL. This used to run only when the file name LOOKED like a qualified key, so a
+    # legacy `<pr>.json` (`441.json`) skipped the test entirely — and `local_record_for_key` returns
+    # that legacy file for the key derived from the repo field, so a legacy record whose `pr` DENIED
+    # the key it sits under reached the fast path and answered `same`/exit 0, while the slow path
+    # refuses it as NOT this key/exit 4 (reproduced). A name that does not derive from the record
+    # own fields is never fast-eligible: it takes the authoritative slow path.
     stem = p.rsplit("/", 1)[-1][:-5] if p.endswith(".json") else ""
-    if re.fullmatch(r"[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-[0-9]+", stem):
-        owner, _, name = repo.partition("/")
-        if "%s-%s-%d" % (owner, name, pr) != stem:
-            return False
+    owner, _, name = repo.partition("/")
+    if "%s-%s-%d" % (owner, name, pr) != stem:
+        return False
     return True
 if sys.argv[1] == "--one":
     sys.exit(0 if usable(sys.argv[2]) else 1)

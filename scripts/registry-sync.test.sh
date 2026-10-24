@@ -877,6 +877,20 @@ assert_contains "$RS_LAST" "unreadable=4" "§30b ...and all FOUR defects are cou
 assert_contains "$RS_LAST" "no usable pr field" "§30b ...naming the negative-pr record"
 assert_contains "$RS_LAST" "no readable reviewed_at" "§30b ...and the duplicated-key record (the greedy reader's empty stamp)"
 
+# ── §30c: the LEGACY name. A `<pr>.json` file does not derive from the record's own fields, and
+# `local_record_for_key` will still hand it to the key its `repo` implies — so a legacy record whose
+# own `pr` DENIES the key it sits under must never be fast-eligible (measured: it answered
+# `same`/exit 0 while the slow path says "NOT this key"/exit 4).
+echo "── §30c a LEGACY-named mirror is never `same` when it denies the key it sits under"
+K_LEGACY="daniel-ospina-agent-infra-2005"
+seed_payload "$STORE8" "$K_LEGACY" "{\"pr\":2006,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+LEGACY_BLOB="$(git -C "$STORE8" rev-parse --verify "refs/reviews/$K_LEGACY:record.json")"
+git -C "$STORE8" cat-file blob "$LEGACY_BLOB" > "$BOX11/2005.json"
+RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30c a legacy-named mirror that denies its key is NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=5" "§30c ...and it is COUNTED with the other four, never reported same"
+assert_contains "$RS_LAST" "NOT this key" "§30c ...naming the key the record denies"
+
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
   b="${pair%%:*}"; f="${pair##*:}"
