@@ -166,20 +166,20 @@ if [ "$PLATFORM" != "Linux" ]; then
    which is the installer that owns that platform. (ELDATO_PLATFORM exists so tests can exercise
    this refusal anywhere.)"
 fi
-[ -f "$TEMPLATE" ] || die "missing unit template: $TEMPLATE"
-[ -n "$PYTHON_BIN" ] || die "no python3 on PATH — the unit's ExecStart would name an empty interpreter"
-TRIGGER="$(find_trigger)" || die "pr-doctor-trigger.py not found (looked beside this script, in this
-   repo's scripts/, and in \$HOME/.pi/agent/scripts). Install the farm first: pi-bootstrap/setup.sh"
-[ -f "$TRIGGER" ] || die "the trigger resolves to a non-file: $TRIGGER"
 
-# ── render-time gates: they apply to the verbs that PRODUCE the artifact ──────────────────────
-# ⛔ `--status` AND `--uninstall` ARE READING/REMOVAL VERBS AND MUST NEVER INHERIT A RENDER
-# CONSTRAINT (review cycle 2, F5). Both gates used to run before the action switch, so
-# `REPAIR_RESTART_SEC=100 --status` refused to REPORT on an installed unit and a
-# `REPAIR_REPO=... --uninstall` refused to remove one — the operator's only way out of a bad render
-# was refused by the render's own rules.
 case "$ACTION" in
   --install|--dry-run)
+    # ⛔ THESE PREFLIGHTS ARE RENDER PREFLIGHTS AND BELONG HERE, NOT ABOVE (review cycle 3). They used
+    # to run before the action switch, so `--status` and `--uninstall` inherited them — and the copy
+    # that actually LANDS on a box is `deploy-harness.sh`'s farm of `scripts/orchestrator-harness/*`
+    # into `$O`, where `ROOT/templates/systemd` DOES NOT EXIST (templates are deliberately not
+    # farmed). On that copy both verbs died with `missing unit template`, i.e. the operator could not
+    # REPORT on or REMOVE a bad unit from the only place the installer is deployed.
+    [ -f "$TEMPLATE" ] || die "missing unit template: $TEMPLATE"
+    [ -n "$PYTHON_BIN" ] || die "no python3 on PATH — the unit's ExecStart would name an empty interpreter"
+    TRIGGER="$(find_trigger)" || die "pr-doctor-trigger.py not found (looked beside this script, in
+   this repo's scripts/, and in \$HOME/.pi/agent/scripts). Install the farm first: pi-bootstrap/setup.sh"
+    [ -f "$TRIGGER" ] || die "the trigger resolves to a non-file: $TRIGGER"
     # The repo the unit watches, and the ONE thing it cannot be today. `scripts/pr-doctor.py`
     # hardcodes both `REPO = "daniel-ospina/tortoise"` (:167) and `REPO_DIR` (:168), while its
     # CLASSIFIER (`scripts/objective.py:83`) reads `OBJECTIVE_REPO` at exec time. So on any repo but
@@ -211,10 +211,13 @@ case "$ACTION" in
     # The checkout the doctor is *supposed* to use. It is inert until the OBJECTIVE_REPO port lands
     # (see the env-seam note above), so a missing path is a WARNING with its reason — not a refusal,
     # and never silence.
+    # ⚠️ ON STDERR: this is an ADVISORY, and `--dry-run`'s stdout IS the unit (a bare advisory line
+    # before `[Unit]` makes the file systemd cannot parse — review cycle 3).
+    warn() { printf '⚠️  %s\n' "$*" >&2; }
     if [ ! -d "$REPO_DIR" ]; then
-      say "⚠️  PR_DOCTOR_REPO_DIR=$REPO_DIR does not exist on this box. The trigger exports it, but"
-      say "    scripts/pr-doctor.py still hardcodes its own REPO_DIR, so this is a NAMED residual, not"
-      say "    a working redirect — see the required follow-up on the PR."
+      warn "PR_DOCTOR_REPO_DIR=$REPO_DIR does not exist on this box. The trigger exports it, but"
+      warn "  scripts/pr-doctor.py still hardcodes its own REPO_DIR, so this is a NAMED residual, not"
+      warn "  a working redirect — see the required follow-up on the PR."
     fi
     ;;
 esac
@@ -249,17 +252,21 @@ case "$ACTION" in
     say "unit:     $UNIT_PATH ($SCOPE scope)"
     say "enabled:  $($SYSTEMCTL is-enabled "$UNIT_NAME" 2>&1)"
     say "active:   $($SYSTEMCTL is-active "$UNIT_NAME" 2>&1)"
-    # Read the ARTIFACT, not the send: the installed ExecStart must be the TRIGGER. ⛔ THE CHECK IS
-    # ON WHAT THE UNIT NAMES, NOT ON WHAT THIS INVOCATION WOULD HAVE RENDERED (review cycle 2): the
-    # strict `grep -qF "$TRIGGER"` made `--status` exit 4 unless the caller re-supplied the same
-    # `PR_DOCTOR_TRIGGER` the install used — a REPORT that depends on the report's own env is not a
-    # report, and the installed path is printed anyway. `--install` still pins the exact path, because
-    # there it is known.
-    if grep -qF 'pr-doctor-trigger.py' "$UNIT_PATH" && grep -qF -- "--backstop 1800" "$UNIT_PATH"; then
+    # Read the ARTIFACT, not the send: the installed ExecStart must BE the trigger. ⛔ BOTH NEEDLES ARE
+    # PINNED TO THE ExecStart LINE (review cycle 3). Matching the whole FILE made this a false PASS:
+    # `Documentation=…/scripts/pr-doctor-trigger.py` and the template's own commented rationale also
+    # contain `pr-doctor-trigger.py` and `--backstop 1800`, so a unit whose ExecStart was `/bin/false`
+    # passed this check and exited 0. The check exists to answer "what will the manager RUN", and the
+    # only line that answers it is ExecStart.
+    exec_line="$(grep -m1 '^ExecStart=' "$UNIT_PATH")"
+    if [ -n "$exec_line" ] && grep -qF 'pr-doctor-trigger.py' <<<"$exec_line" \
+       && grep -qF -- '--backstop 1800' <<<"$exec_line"; then
       ok "the installed ExecStart runs the trigger with the 1800 s backstop"
-      say "exec: $(grep -m1 '^ExecStart=' "$UNIT_PATH" | cut -c1-160)"
+      say "exec: $(printf '%s' "$exec_line" | cut -c1-160)"
     else
-      say "⛔ the installed unit does not carry the trigger + backstop — re-run --install"; exit 4
+      say "⛔ the installed ExecStart is not the trigger with the 1800 s backstop — re-run --install"
+      say "   ExecStart: ${exec_line:-<absent>}"
+      exit 4
     fi
     exit 0
     ;;

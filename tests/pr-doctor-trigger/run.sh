@@ -368,7 +368,7 @@ assert_contains "$darwin" "install-launchd.sh" "and it names the installer that 
 # ── G2. the INSTALL path, driven through a fake systemctl (review cycle 2, F2/F5) ─────────────
 FAKE_UNIT_DIR="$TMP/units"; mkdir -p "$FAKE_UNIT_DIR"
 SC_LOG="$TMP/systemctl.log"; : >"$SC_LOG"
-SC_STATE="$TMP/sc-state"; printf 'active\n' >"$SC_STATE"
+SC_STATE="$TMP/sc-state"; printf 'inactive\n' >"$SC_STATE"   # a down box: the install must START it
 cat >"$TMP/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 # a systemctl that logs every verb and tracks an ACTIVE state the suite can seed and read back.
@@ -395,12 +395,17 @@ inst 15 >"$TMP/g-install.log" 2>&1
 assert_eq "$?" "0" "--install succeeds against a service manager (fake systemctl)"
 [ -f "$FAKE_UNIT_DIR/eldato-pr-doctor-trigger.service" ] \
   && pass "the unit file is written to the resolved unit dir" || fail "no unit file after --install"
+# ⛔ THE POSITIVE CONTROL FOR THE NEXT ASSERTION (review cycle 3, F4). Without it the arm was vacuous
+# in the direction that matters: with the `restart` deleted from the installer entirely, the counter
+# was 0 before and 0 after and the suite still reported ALL PASSED. A CHANGED install MUST restart.
+assert_eq "$(grep -c '^restart' "$SC_LOG")" "1" "a CHANGED install restarts the unit exactly once"
 n_before="$(grep -c '^restart' "$SC_LOG")"
 printf 'active\n' >"$SC_STATE"
 inst 15 >"$TMP/g-reinstall.log" 2>&1
 assert_eq "$?" "0" "a second --install over identical bytes exits 0"
 assert_eq "$(grep -c '^restart' "$SC_LOG")" "$n_before" \
-  "it does NOT restart an unchanged unit (a gratuitous restart orphans the doctor)"
+  "and an UNCHANGED one does NOT restart it (a gratuitous restart orphans the doctor)"
+assert_eq "$n_before" "1" "(the unchanged arm compares against a real restart, not against zero)"
 # ⛔ THE REGRESSION THIS ARM EXISTS FOR (review cycle 2, F2): a re-install is the operator's natural
 # recovery action for a trigger that is DOWN, and "unchanged bytes" must not mean "nothing to do".
 printf 'inactive\n' >"$SC_STATE"
@@ -417,6 +422,23 @@ assert_contains "$(cat "$TMP/g-badrestart.log")" "StartLimitBurst" "and the refu
 REPAIR_RESTART_SEC=100 ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
   bash "$INSTALLER" --status >"$TMP/g-status.log" 2>&1; strc=$?
 assert_eq "$strc" "0" "--status still answers with the same bad render value (reading verbs are not gated)"
+# ⛔ THE READING/REMOVAL VERBS MUST NOT NEED THE TEMPLATE (review cycle 3). The copy that lands on a
+# box is the farmed `scripts/orchestrator-harness/*` into $O, where `ROOT/templates/systemd` does NOT
+# exist (templates are deliberately not farmed) — so a preflight that lived above the action switch
+# made `--status` and `--uninstall` impossible from the only place the installer is deployed.
+noT="$TMP/notemplates"
+st2="$(ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
+        TEMPLATES_DIR="$noT" bash "$INSTALLER" --status 2>&1)"; st2rc=$?
+assert_eq "$st2rc" "0" "--status works with NO template dir (the farmed layout)"
+printf 'ExecStart=/bin/false\n# pr-doctor-trigger.py --backstop 1800 (prose in a comment)\n' >"$TMP/units/bogus.service"
+bogus="$(REPAIR_UNIT_NAME=bogus.service ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" \
+          SYSTEMCTL=systemctl TEMPLATES_DIR="$noT" bash "$INSTALLER" --status 2>&1)"; brc2=$?
+# ⛔ A FALSE PASS, CAUGHT (review cycle 3): the check used to grep the whole FILE, so the
+# `Documentation=` URL and the template's own prose satisfied it and an ExecStart of `/bin/false`
+# reported ✅ with rc 0.
+[ "$brc2" -ne 0 ] && pass "--status REFUSES a unit whose ExecStart is not the trigger (rc=$brc2)" \
+  || fail "--status reported ✅ over ExecStart=/bin/false — a false PASS"
+assert_contains "$bogus" "ExecStart: ExecStart=/bin/false" "and it prints the ExecStart it actually read"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── H. a trigger with NO doctor is DOCTOR-MISSING, never a clean pass"
