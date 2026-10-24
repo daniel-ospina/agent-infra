@@ -267,6 +267,96 @@ function advanceCheckpoint(skill: SkillState): void {
 let sequenceTimeout: ReturnType<typeof setTimeout> | null = null;
 const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 
+// ── #1770: a park is BOUNDED and NAMED ──────────────
+// MEASURED 2026-10-24: a baseline lane logged twelve identical
+// `Sequence timeout — parking "…/commit-workflow/SKILL.md" at step 0` lines over
+// one hour with 0 commits and 0 dirty files, and sat forever with no verdict.
+// The fleet audit log holds 195 `timeout_park` rows; **188 are at step 0**, and
+// both parked skills' step 0 is `gate: auto` (commit-workflow: 150 parks,
+// code-review: 45; one session parked 45× across 8h40m).
+//
+// WHY A STEP-0 PARK IS A NO-OP, PROVABLY: `getExpectedToolsForStep` returns
+// `{allow: [], block: []}` for `gate: auto`, and `wouldBlockUnderGate` is false
+// for every tool name — so in warn, gate AND strict an `auto` step blocks
+// nothing. Parking it therefore "preserves" a state that no gate reads, and the
+// ONLY artifact the park can ever produce is the log line. That is the whole
+// difference between a lane working and a lane stuck: twelve busy-looking lines.
+//
+// So two rules, and neither one relaxes any gate:
+//   1. an UNGATED step parks nothing — no line, no audit row, timer re-armed;
+//   2. a GATED step that parks is bounded: the first park names WHY the step
+//      cannot advance and WHAT to do, repeats are coalesced (no line), and at
+//      the cap the lane EXITS carrying `SEQUENCE-GATE-UNSATISFIABLE` — one line
+//      a monitor can grep — instead of parking forever with no `.rc`.
+// Park interval stays the fixed 10-minute sequence timer (no backoff to tune:
+// repeats cost nothing once coalesced, and the cap ends the stall).
+export const SEQUENCE_PARK_CAP = 3;
+const parkStreak = new Map<string, number>();
+// Keys that already reached the cap in this session. After the verdict the lane
+// is ENDING, so a stray second timer (or a direct call) must not re-park, re-log
+// or re-verdict it — one stall, one verdict.
+const unsatisfiableKeys = new Set<string>();
+// The timer has no ctx of its own; the last event's ctx is where `shutdown`
+// lives (loop-enforcer uses the same ctx.shutdown to end a session).
+let lastEventCtx: { shutdown?: () => void } | null = null;
+
+/**
+ * Why THIS step can never advance by waiting, and what actually moves it.
+ * Derived from the step's own gate — never a generic timeout string (#1770.3).
+ */
+export function parkDiagnosis(step: Step, mode: Mode): { cause: string; remedy: string } {
+  const gate = step.gate || "auto";
+  if (gate === "verifier" || gate === "ai_review") {
+    return {
+      cause: `a "${gate}" step advances ONLY on a terminal reviewer result — a returned \`task\`/\`subagent\` dispatch or a terminal \`task_collect\`. Idling, and reading any skill, never advances it`,
+      remedy: "dispatch the reviewer with `task`, then poll `task_status` and reap it with `task_collect`; a child that died before its first message can never produce a result, so the dispatch alone cannot advance this step",
+    };
+  }
+  if (gate === "checkpoint") {
+    // Normally unreachable (the checkpoint branch above parks first), kept so a
+    // checkpoint step that ever reaches here still names a CLEAR-able remedy.
+    return {
+      cause: `a "checkpoint" step advances ONLY on a fresh \`parallel_work_check\` PASS token for phase "${step.token_phase || "(missing token_phase — unpassable)"}"`,
+      remedy: gateGuidance(step, mode).replace(/^→ /, ""),
+    };
+  }
+  if (gate === "human_approval" || gate === "human_review") {
+    return {
+      cause: `a "${gate}" step waits for a HUMAN decision, which no tool call can produce`,
+      remedy: "record the decision, then advance the turn — an idle wait cannot satisfy a human gate",
+    };
+  }
+  if (!step.gate) {
+    // No gate keyword at all: NOT the same as `auto`. `getExpectedToolsForStep`
+    // treats it as the standard work phase (blocks git/destructive calls), and
+    // the auto-advance loop is keyed on `gate === "auto"` — so it can never
+    // advance on its own. Named separately so the verdict never calls it "auto".
+    return {
+      cause: "this step declares NO gate, so it is enforced as the standard work phase — it blocks every git/destructive call and has NO auto-advance trigger (only reading the next SKILL.md with the read tool moves it)",
+      remedy: "read the next skill in the sequence with the read tool, or have the operator fix the skill's frontmatter (`gate: auto` for a work phase, or the gate it meant)",
+    };
+  }
+  return {
+    cause: `the "${gate}" gate has no advance trigger in this session`,
+    remedy: "drive the step with the tool its gate advertises, or have the operator clear it",
+  };
+}
+
+/**
+ * End the lane instead of parking it forever: the verdict line + the audit row
+ * are the greppable artifact, and `process.exitCode` / `ctx.shutdown()` make the
+ * absence of a `.rc` impossible — a stalled gate is now a TERMINAL state.
+ */
+function endUnsatisfiableLane(): void {
+  try { process.exitCode = 3; } catch { /* exitCode is advisory; the marker line is the contract */ }
+  const ctx = lastEventCtx;
+  if (ctx && typeof ctx.shutdown === "function") {
+    // Deferred off the timer stack (mirrors loop-enforcer's /end): shutting down
+    // inside pi's timer callback would tear down the session mid-callback.
+    setTimeout(() => { try { ctx.shutdown!(); } catch { /* best-effort */ } }, 100);
+  }
+}
+
 // #201: on 10-min idle, print-mode PARKS the skill (state preserved, timer
 // re-armed) instead of popping. Previously blocked-spam workers never timed
 // out at all (every blocked call re-armed the timer before validation) and a
@@ -302,12 +392,69 @@ export function handleSequenceTimeout(
   // #357 (Task 4): park predicate is argv-aware — bare-shell `pi -p` (no
   // PI_MODE env) parks too; the audited mode uses the same (env, argv) seam so
   // it matches the parked behavior under test.
+  const topStep = top.steps[top.stepIndex];
   if (isPrintMode(env, argv)) {
-    console.log(`[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} (10min no tool calls) — state preserved`);
-    auditLog({ ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex, mode: resolveMode(env, MODE_FILE, argv) });
-    // park: keep stack/stepIndex/reviewers intact, re-arm the timer
-    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-    return;
+    const mode = resolveMode(env, MODE_FILE, argv);
+    // #1770 rule 1 — an UNGATED step parks NOTHING. `gate: auto` blocks no tool
+    // in any mode (see the SEQUENCE_PARK_CAP rationale above), so a park here
+    // preserves a state no gate reads and emits a line that reads exactly like a
+    // lane doing work. Re-arm silently: there is no gate at this step to stall.
+    // ⛔ ONLY an explicit `auto`. A step with an EMPTY gate is NOT ungated —
+    // `getExpectedToolsForStep` routes it to the standard work phase, which
+    // blocks every git/destructive call, and it has no auto-advance trigger
+    // (that loop is keyed on `gate === "auto"`). Such a step stalls for real and
+    // must still park, be named and be bounded (pg review of this change).
+    if (!topStep || topStep.gate === "auto") {
+      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+      return;
+    }
+    // #1770 rule 2 — a GATED step's park is bounded, coalesced and NAMED.
+    const key = checkpointKey(top);
+    if (unsatisfiableKeys.has(key)) return; // verdict already emitted — never re-arm, never repeat
+    const parks = (parkStreak.get(key) ?? 0) + 1;
+    parkStreak.set(key, parks);
+    const { cause, remedy } = parkDiagnosis(topStep, mode);
+    if (parks === 1) {
+      console.log(
+        `[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} "${topStep.name}" (gate: ${topStep.gate || "none"}) — 10 min with no tool call. ` +
+        `WHY IT CANNOT ADVANCE BY WAITING: ${cause}. REMEDY: ${remedy}. ` +
+        `(park 1/${SEQUENCE_PARK_CAP} — repeats are coalesced; the next line is the verdict)`,
+      );
+      auditLog({
+        ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex,
+        step_name: topStep.name, gate: topStep.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, cause, remedy,
+      });
+    }
+    if (parks < SEQUENCE_PARK_CAP) {
+      // park: keep stack/stepIndex/reviewers intact, re-arm the timer (silently —
+      // the first park already named the cause, and a repeat adds no information).
+      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+      return;
+    }
+    // CAP REACHED — the gate is UNSATISFIABLE by waiting. Say so, and exit.
+    unsatisfiableKeys.add(key);
+    parkStreak.delete(key);
+    const idleMin = Math.round((parks * SEQUENCE_TIMEOUT_MS) / 60_000);
+    console.log(
+      `[sequence-enforcer] ⛔ SEQUENCE-GATE-UNSATISFIABLE — "${top.path}" parked ${parks}× at step ${top.stepIndex} "${topStep.name}" (gate: ${topStep.gate || "none"}), no advance in ${idleMin} min.`,
+    );
+    // A warn session cannot be BLOCKED by this step, so say why ending it is
+    // still right: warn is audit-only, not a waiver — the sequence cannot advance
+    // either, and 30 min with no tool call is not a working lane.
+    const warnNote = mode === "warn"
+      ? " (warn mode: this step does not BLOCK, but it still cannot advance by waiting — a warn pass is audit-only, not a waiver of the sequence)"
+      : "";
+    console.log(`[sequence-enforcer]    WHY: ${cause}.${warnNote}`);
+    console.log(`[sequence-enforcer]    REMEDY: ${remedy}.`);
+    console.log(
+      `[sequence-enforcer]    ENDING THIS LANE (exit 3) — waiting cannot satisfy this gate; the ⛔ line above is the verdict a monitor greps.`,
+    );
+    auditLog({
+      ts: new Date().toISOString(), event: "sequence_gate_unsatisfiable", skill: top.path, step: top.stepIndex,
+      step_name: topStep.name, gate: topStep.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, idle_min: idleMin, cause, remedy,
+    });
+    endUnsatisfiableLane();
+    return; // NEVER re-arm: no further parks, no further lines
   }
   console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
   // ponytail: pop only the stale skill, preserve parent (#7276)
@@ -452,6 +599,11 @@ let sessionIdWarned = false;
 // override wins so direct helper/timer audit paths are deterministic. Never
 // throws (resolveSessionId swallows; override path is pure assignment).
 function captureAuditSession(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): void {
+  // #1770: the timer-driven verdict ends the session, and a timer carries no
+  // ctx — keep the last event's (every handler boundary refreshes it). A ctx
+  // without `shutdown` never REPLACES one that has it.
+  const eventCtx = ctx as { shutdown?: () => void } | undefined;
+  if (eventCtx && typeof eventCtx.shutdown === "function") lastEventCtx = eventCtx;
   if (process.env.NODE_ENV === "test" && auditSessionOverride.active) {
     auditSessionId = auditSessionOverride.id;
     return;
@@ -1691,6 +1843,14 @@ export function _resetStateForTest(): void {
   // the captured id is dropped so the next session_start/ctx re-resolves).
   auditSessionOverride = { active: false, id: null };
   auditSessionId = null;
+  // #1770: the park streak is per-session state too — a prior test's parks must
+  // not pre-park (or prematurely cap) the next one.
+  parkStreak.clear();
+  unsatisfiableKeys.clear();
+  lastEventCtx = null;
+  // #1770: `endUnsatisfiableLane` sets a non-zero exit code; a test that drives
+  // the cap must not leave the suite exiting 3.
+  process.exitCode = 0;
   if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
 }
 
@@ -1714,6 +1874,11 @@ export default function (pi: ExtensionAPI) {
     parkedCheckpoints.clear();
     checkpointBlockStreak = null;
     auditCoalesce.clear();
+    // #1770: a new session's parks start at zero (same per-session rule as the
+    // checkpoint one-shot above — a cap consumed by a PREVIOUS session must not
+    // end this one on its first park).
+    parkStreak.clear();
+    unsatisfiableKeys.clear();
     if (sequenceTimeout) {
       clearTimeout(sequenceTimeout); sequenceTimeout = null; // cycle 2: a stale timer must never fire into a new session
     }
@@ -1787,6 +1952,9 @@ export default function (pi: ExtensionAPI) {
     parkedCheckpoints.clear();
     checkpointBlockStreak = null;
     auditCoalesce.clear();
+    parkStreak.clear(); // #1770: same per-session hygiene on shutdown
+    unsatisfiableKeys.clear();
+    lastEventCtx = null;
     if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
     clearBridgeState();
   });
