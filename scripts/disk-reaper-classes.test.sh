@@ -178,7 +178,7 @@ case_a() { # <owner-script>
 
 # ── B: an old directory with no live cwd is REAPED, and the pass reports a df DELTA ─────────────
 case_b() { # <owner-script> <entry-point>
-    local owner="$1" pass="$2" base root repo wt out rc status n
+    local owner="$1" pass="$2" base root repo wt out out2 rc status n n2
     base="$(newbase b)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" old-idle feat/b-idle)"
@@ -219,8 +219,15 @@ case_b() { # <owner-script> <entry-point>
     # magnitude floor is a flake, not a check. What this case pins is the ACCOUNTING SHAPE — a numeric
     # `freed_df` in a `(df delta)` report, and a measured (not `unmeasured`) record. The magnitude is
     # evidenced by the real-cell run in the PR body, where nothing else was writing.
-    case_check "$([ -n "$n" ] && [ "$n" -ge 0 ] && echo 0 || echo 1)" \
-               "and the reclaim is expressed as a numeric df delta (freed_df=${n:-?}MB, magnitude not asserted)"
+    # ⛔ AND A FALSIFIABLE ONE. `[ "$n" -ge 0 ]` cannot be false ($n is captured by `[0-9][0-9]*`), so it
+    # re-asserted the line above. The invariant that CAN fail: run the pass again with nothing left to
+    # reap — a class that claims a delta it did not cause reports a non-zero `freed_df` here.
+    out2="$(DISK_REAPER_STATE_DIR="$base/state2" REAP_AW_ROOTS="$root" REAP_DI_ROOTS="$base/no-dups" \
+            WORKTREE_REAPER="$base/bin/pi-reap-worktrees.sh" ABANDONED_WT_REAPER="$owner" \
+            bash "$pass" --apply --only worktree --repo "$repo" 2>&1)"
+    n2="$(printf '%s' "$out2" | sed -n 's/.*class=worktree .*freed_df=\([0-9][0-9]*\)MB.*/\1/p' | head -1)"
+    case_check "$([ "${n2:-x}" = 0 ] && echo 0 || echo 1)" \
+               "a second pass, with nothing left to reap, reports freed_df=0MB (got '${n2:-none}') — no delta is claimed that the class did not cause"
     return $((CASE_FAIL > 0))
 }
 
@@ -540,6 +547,34 @@ case_l() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── M: an EMPTY census on the lsof/ps arm is a REFUSAL, not "nothing is live" ────────────────────
+# The `ps` block sat inside the `{ … } >>"$out"` brace group, so a host with `lsof` but no `ps` (the CI
+# runner's own container — this arm's declared target) RETURNED from the whole census before the
+# counters and the empty-table gate ran: an empty census returned 0, the owner read it as "nothing is
+# live", and reaped against it. Measured: a linked worktree with a live process cwd'd inside it was
+# reaped on that host shape.
+case_m() { # <owner-script>
+    local owner="$1" base root repo wt out rc
+    base="$(newbase m)"; root="$base/scratch"
+    repo="$(mk_repo "$base")"
+    wt="$(mk_linked_wt "$repo" "$root" live-wt feat/m-live)"
+    age_path "$wt" 400
+    mkdir -p "$base/bin"
+    # a lsof stand-in that answers with a PROCESS HEADER and no cwd row, plus no ps: non-empty therefore
+    # "lsof worked", but it yields ZERO rows — the exact shape that sailed through the early `return 0`
+    # and left an empty census looking like "nothing is live".
+    printf '#!/usr/bin/env bash\nprintf "p999999\\n"\nexit 0\n' >"$base/bin/lsof-stub"
+    chmod +x "$base/bin/lsof-stub"
+    out="$(LP_PROC_ROOT="$base/no-proc" LP_LSOF_PROBE="$base/bin/lsof-stub" LP_PS_PROBE="$base/no-ps" \
+           REAP_AW_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'M rc=%s\n%s\n' "$rc" "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "an EMPTY census FAILS CLOSED (rc=$rc, expected 3)"
+    case_check "$(grep -qF 'census=unreadable' <<<"$out" && echo 0 || echo 1)" \
+               "and it says the census was unreadable rather than reporting a clean sweep"
+    case_check "$([ -d "$wt" ] && echo 0 || echo 1)" "nothing was reaped against a table it could not read"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 MUT_A='s/if lp_path_held "\$CENSUS" "\$canon"; then/if false; then/'
 MUT_B='s/if remove_one "\$canon" "\$repo"; then/if false; then/'
@@ -555,6 +590,7 @@ MUT_J='s/kill -0/false/'
 MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
 MUT_L='s/_lp_rel "\$_cand" "\$path"/_lp_rel "" "$path"/'
 MUT_C2='s/^if \[ -n "\${REAP_AW_PROC_ROOT:-}" \] && /if false \&\& /'
+MUT_M='s/if command -v "\$_lp_ps_probe" >\/dev\/null 2>\&1; then/command -v "$_lp_ps_probe" >\/dev\/null 2>\&1 || return 0; if true; then/'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
 
@@ -673,6 +709,18 @@ if apply_mutation "$AW_OWNER" "$T/mut-c2/reap-abandoned-worktrees.sh" "$MUT_C2";
     expect_fail "C mutation: dropping the seam refusal turns the seam assertions RED" case_c "$T/mut-c2/reap-abandoned-worktrees.sh"
 else
     bad "C seam mutation could not be applied — the seam assertions are not checking it"
+fi
+
+expect_pass "M an EMPTY census is a refusal, never 'nothing is live'" case_m "$AW_OWNER"
+# the arm lives in the LIBRARY, so the mutant is a mutant library beside a COPY of the owner
+mkdir -p "$T/mut-m/lib"
+cp "$HERE/reap-abandoned-worktrees.sh" "$T/mut-m/reap-abandoned-worktrees.sh"
+sed "$MUT_M" "$HERE/lib/live-paths.sh" >"$T/mut-m/lib/live-paths.sh" 2>/dev/null
+if cmp -s "$HERE/lib/live-paths.sh" "$T/mut-m/lib/live-paths.sh" || ! bash -n "$T/mut-m/lib/live-paths.sh" 2>/dev/null; then
+    bad "M mutation could not be applied to lib/live-paths.sh (the empty-table gate moved) — the case is not checking it any more"
+else
+    chmod +x "$T/mut-m/reap-abandoned-worktrees.sh"
+    expect_fail "M mutation: dropping the empty-table gate turns the case RED" case_m "$T/mut-m/reap-abandoned-worktrees.sh"
 fi
 
 echo
