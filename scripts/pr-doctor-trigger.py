@@ -34,11 +34,20 @@ PROPERTIES THIS DELIBERATELY HAS
   events, or a wave of check completions, produces ONE pass.
 * **Fail visible.** A doctor exit that is neither 0 nor 2 (2 = "refused with a reason")
   is logged as `DOCTOR-FAILED` and does not consume the backstop window, so a later tick
-  retries instead of waiting half an hour on a crash.
+  retries instead of waiting half an hour on a crash. A doctor that is not there at all is
+  `DOCTOR-MISSING` — never a clean window (CPython exits 2 for "can't open file", and 2 is
+  the code this file treats as clean).
 * **AN UNREADABLE SURFACE IS NOT A QUIET ONE.** A failed `gh pr list` is never folded into
   "no PRs need work" (#2271: an empty check surface read as green). It is logged as
   `PR-SURFACE-UNREADABLE`, the previous fingerprint is KEPT (so the surface cannot read as
-  "changed" by going blind), and it is never treated as evidence of anything.
+  "changed" by going blind), and it is never treated as evidence of anything. The same holds
+  for an answer that ARRIVES but is not a PR list — empty stdout, `{}`, `null`, `[1,2]` are
+  `PR-SURFACE-UNPARSEABLE`, and the ONLY spelling of a genuinely empty surface is `[]`.
+  Under `--once` a degraded read exits 2 rather than reporting "nothing to do".
+* **A PENDING CHANGE SURVIVES A RESTART.** The debounce timestamp is persisted with the
+  fingerprint and cleared only when a pass completes, so a `Restart=always` restart inside the
+  coalescing window resumes the change instead of comparing the new surface against a fingerprint
+  already saved and concluding "no change" (which silently dropped it).
 
 WHY A RETRY FLOOR AND NOT "RETRY NEXT TICK"
 -------------------------------------------
@@ -84,27 +93,73 @@ def fingerprint(repo: str) -> tuple[str, int] | None:
 
     ONE call, no per-PR data: `statusCheckRollup` would make this O(PRs) requests and defeat
     the point of a 60 s poll. `updatedAt` moves on push/review/label, which is what we need.
+
+    ⛔ AN UNUSABLE ANSWER IS NEVER AN EMPTY ONE (#2271, review cycle 1). `gh` can exit 0 and still
+    hand back something that is not a PR list — empty stdout, `{}`, `null`, `{"data": []}`, `[1,2]`.
+    Every one of those is a FAILED READ, and the measured consequence of conflating them with `[]`
+    is the exact failure class this file exists to avoid: an unusable surface read as "no PRs need
+    work". Two of them (`{}` and empty stdout) did exactly that before this was fixed — `{}
+    iterates its KEYS, so it produced zero rows and a legitimate-looking empty fingerprint, and
+    `r.stdout or "[]"` MANUFACTURED the empty list out of nothing. Three others (`null`, a dict,
+    a list of scalars) raised, which under `Restart=always` is a restart loop converging to
+    `failed`. So: a real empty surface is the JSON list `[]` and NOTHING ELSE.
     """
-    r = subprocess.run(
-        ["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
-         "--json", "number,mergeStateStatus,updatedAt,isDraft"],
-        capture_output=True, text=True, timeout=180,
-    )
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
+             "--json", "number,mergeStateStatus,updatedAt,isDraft"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        log("PR-SURFACE-UNREADABLE timeout=180 -- gh did not answer; not treating that as quiet")
+        return None
+    except OSError as e:
+        # A MISSING gh BINARY IS A BROKEN READ, NOT A QUIET QUEUE. Raising here killed the trigger
+        # with a traceback (invisible in a journal unless someone reads it) instead of naming it.
+        log("PR-SURFACE-UNREADABLE gh is not runnable (%s) -- not treating that as quiet" % e)
+        return None
     if r.returncode != 0:
         log("PR-SURFACE-UNREADABLE rc=%d stderr=%s -- not treating an unreadable surface as quiet"
             % (r.returncode, (r.stderr or "").strip()[:200]))
         return None
+    raw = (r.stdout or "").strip()
+    if not raw:
+        log("PR-SURFACE-UNPARSEABLE empty stdout with rc=0 -- a real empty surface prints `[]`")
+        return None
     try:
-        prs = json.loads(r.stdout or "[]")
+        prs = json.loads(raw)
     except json.JSONDecodeError as e:
         log("PR-SURFACE-UNPARSEABLE %s" % e)
+        return None
+    if not isinstance(prs, list):
+        log("PR-SURFACE-UNPARSEABLE the payload is %s, not a list of PRs" % type(prs).__name__)
+        return None
+    if any(not isinstance(p, dict) for p in prs):
+        log("PR-SURFACE-UNPARSEABLE the payload carries a non-object element -- not a PR list")
         return None
     rows = sorted((p.get("number"), p.get("mergeStateStatus"), p.get("updatedAt"), bool(p.get("isDraft")))
                   for p in prs)
     return ("|".join("%s:%s:%s:%s" % t for t in rows), len(rows))
 
 
+# `run_doctor` returns this when there is no doctor to run. It is deliberately NOT 2: `pr-doctor`
+# reserves 2 for "I could not read the world, or could not deliver" and the pass DID NOT RUN here,
+# so the two must not share a code path. Distinct value + its own log line = a distinguishable
+# verdict rather than a second meaning for an existing one.
+DOCTOR_MISSING = 127
+
+
 def run_doctor(repo: str, repo_dir: str, max_n: int) -> int:
+    # ⛔ THE DOCTOR MUST EXIST BEFORE IT IS COUNTED AS A PASS (review cycle 1, reproducced). CPython
+    # exits **2** for "can't open file", and 2 is the code this trigger treats as a CLEAN window —
+    # so a trigger whose doctor was never farmed (or was deleted) reported `DOCTOR-END rc=2`, saved
+    # `last_pass = now`, consumed the whole 1800 s backstop window and exited 0 under `--once`.
+    # That is byte for byte the state `pi-bootstrap/setup.sh`'s farm order exists to prevent ("a
+    # trigger with no doctor ... would look like a running repair service and start nothing"), and
+    # the farm order cannot prevent it outside the farm (a hand copy, a deleted file).
+    if not os.path.isfile(DOCTOR):
+        log("DOCTOR-MISSING %s -- nothing was attempted; NOT a clean window" % DOCTOR)
+        return DOCTOR_MISSING
     env = dict(os.environ)
     env["GH_REPO"] = repo
     env["PR_DOCTOR_REPO"] = repo
@@ -190,7 +245,16 @@ def main() -> int:
     # `updatedAt` moves and a wave of check completions fires several more, and each is a real
     # surface change. In `--once` mode there is no later tick to coalesce with, so the change runs
     # immediately — a supervisor restart must not add 90 s of sleep before the first pass.
-    changed_at: float | None = None
+    # ⛔ THE PENDING CHANGE IS PERSISTED, NOT JUST REMEMBERED (review cycle 1, reproduced). It lived
+    # only in this process while the FINGERPRINT was written to disk immediately, so a restart
+    # inside the debounce window compared the new surface against the already-saved fingerprint,
+    # found "no change", and the change was NEVER RUN — silently, forever. With `Restart=always`
+    # and `RestartSec=15` a restart inside the window is ordinary (deploy, `systemctl restart`, OOM,
+    # a crash between the save and the pass). `pending_since` is cleared only when a pass completes.
+    changed_at: float | None = float(st["pending_since"]) if st.get("pending_since") else None
+    if changed_at is not None:
+        log("RESUMING a pending change from %s (a restart inside the debounce window)"
+            % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(changed_at)))
 
     while True:
         res = fingerprint(a.repo)
@@ -206,6 +270,7 @@ def main() -> int:
             else:
                 change_seen = True
                 changed_at = now
+                st["pending_since"] = now
             st["fingerprint"] = fp
             save_state(state_path, st)
             if change_seen:
@@ -249,6 +314,14 @@ def main() -> int:
 
         if not run:
             if a.once:
+                if fp is None:
+                    # ⛔ THE "UNREADABLE IS NOT QUIET" RULE HOLDS IN `--once` TOO (review cycle 1).
+                    # This branch said `no change ... nothing to do` over a FAILED read, so a
+                    # supervisor running `--once` reported a clean no-op on a surface it could not
+                    # read — the #2271 conflation, in the one mode the unit's ExecStart uses.
+                    log("SURFACE-DEGRADED -- unreadable; NOTHING attempted (this is not a quiet "
+                        "surface)")
+                    return 2
                 log("no change prs=%d reason=%s -- nothing to do" % (count, why))
                 return 0
             if fp is None:
@@ -264,6 +337,7 @@ def main() -> int:
         now = time.time()
         st["last_attempt"] = now
         changed_at = None
+        st.pop("pending_since", None)      # the change has been ACTED on; nothing is pending
         if rc in (0, 2):
             st["last_pass"] = now
         else:

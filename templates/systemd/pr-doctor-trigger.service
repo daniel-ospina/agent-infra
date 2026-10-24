@@ -63,6 +63,12 @@ Restart=always
 RestartSec={{RESTART_SEC}}
 # `process`, not `mixed`: the doctor's workers are spawned through tmux and must NOT be SIGKILLed by
 # this unit's cgroup when the trigger is restarted. Those workers are lanes in their own right.
+# ⚠️ NAMED RESIDUAL, not a claim of mutual exclusion: `KillMode=process` signals only the main
+# process, so a doctor that is mid-pass when the unit is restarted CAN outlive it (the trigger's
+# flock dies with the trigger), and the next start may run a doctor of its own beside the old one.
+# The mitigations are outside this unit: the doctor re-reads its per-PR state before acting, so a
+# duplicate pass does not duplicate a worker, and the trigger's lock still prevents two TRIGGERS.
+# "`mixed` would close it and is refused because it would SIGKILL every tmux lane on the box (#2402).
 KillMode=process
 TimeoutStopSec=30
 # A trigger must never be quiet: journald keeps every `no change`, `throttled`, `DOCTOR-FAILED` and
