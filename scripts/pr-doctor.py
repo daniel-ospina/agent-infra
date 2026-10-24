@@ -60,11 +60,43 @@ THE FIVE HARD RULES (each one earned the hard way today):
   4. IDEMPOTENT AND RESUMABLE. State lives on disk; a restart does not re-dispatch everything.
   5. LOG WHAT IT DID. The point is that work was DISPATCHED, not that a count was printed.
 
+WHICH REPO IT GRADES — resolved by EVIDENCE, and never a default (2026-10-21).
+
+The job used to carry `REPO = "daniel-ospina/tortoise"` as a module constant, so every pass spoke
+for ONE repo no matter which repo it had been started for. MEASURED: it printed a clean `nothing to
+do` while `daniel-ospina/agent-infra` held 52 open PRs (the 9 tortoise PRs were all in cooldown),
+and it is installed as a machine-global `com.tortoise.pr-doctor`. A clean verdict that names no
+repo is a statement about a repo nobody asked it to look at.
+
+`resolve_repo()` decides the target from an ALLOW-LIST of evidence, in order:
+
+    1. `--repo owner/name` (explicit, per invocation);
+    2. `OR` — the slug THE LAUNCHER resolved for this invocation and passed in (`orch-loop.sh`,
+       the cell supervisor's session strings and the harness plist all carry it);
+    3. the `origin` remote of the checkout the launcher named in `REPO`;
+    4. the `origin` remote of the cwd, when it is a checkout;
+    5. REFUSE, loudly, exit 2 — naming every source it looked at.
+
+`OR`/`REPO` are per-invocation state the launcher already resolved, which is why they outrank a
+bare ambient variable. `GH_REPO` and `TORTOISE_REPO` are deliberately NOT consulted: both are
+GLOBAL on a fleet box (a pushed `keys.env` exported `GH_REPO=daniel-ospina/tortoise` and `gh`
+honoured it for every command; the ambient `TORTOISE_REPO` outranked a launchd entry point's own
+directory -- #2235, #9388), so inheriting either is how this job would grade a repo nobody named.
+Once the target IS resolved by evidence, `GH_REPO` is PINNED to it for every child, so a polluted
+ambient value cannot make a spawned worker's rail answer about another repo.
+
+`--all-repos` grades a SET — the `PR_DOCTOR_REPOS` list (`owner/name` or `owner/name=/checkout`,
+comma or space separated) or repeated `--repo` — and prints ONE LINE PER REPO (repo, open PRs,
+items it could not place, verdict). The overall exit is non-clean when ANY repo is, so a single
+machine-wide beat line can no longer hide a 52-PR queue behind another repo's quiet pass.
+
 Usage:
-    pr-doctor.py                 # one pass
+    pr-doctor.py                 # one pass, for the repo the launcher named
     pr-doctor.py --dry-run       # show what it WOULD dispatch, send nothing
     pr-doctor.py --max 3         # cap concurrent dispatches this pass
     pr-doctor.py --status        # show state
+    pr-doctor.py --repo OWNER/NAME        # grade ONE named repo (repeatable)
+    pr-doctor.py --all-repos              # one line per repo in PR_DOCTOR_REPOS
 """
 from __future__ import annotations
 
@@ -97,6 +129,11 @@ STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 # ⛔ THE IMPORT-TIME SNAPSHOT ONLY -- DO NOT USE FOR I/O (see `_log_path()`): a writer that reads
 # this constant writes the REAL log no matter what `STATE_DIR` was redirected to.
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
+# ⛔ THE NAME `log()` ACTUALLY WRITES IS THIS ONE, AND IT IS LATE-BOUND ON PURPOSE. `_log_path()`
+# joins `STATE_DIR` with it AT CALL TIME, so a per-repo pass can write its own file without
+# freezing a directory -- which is the measured defect `_log_path()`'s docstring records. It is a
+# NAME, not a path, so redirecting `STATE_DIR` still redirects the write.
+LOG_BASENAME = "pr-doctor.log"
 # ⛔ THE PASS VERDICT, WHERE A READER THAT IS NOT launchd CAN SEE IT (2026-10-18).
 # `com.tortoise.pr-doctor` exits non-zero on every refusal, and that code is recorded by launchd,
 # but NOTHING in the fleet reads it: the two launchers are a detached heartbeat child (whose own
@@ -164,8 +201,405 @@ OWNERSHIP_NOTE = ""
 # and `SNAPSHOT`/`SNAPSHOT_MAX_AGE_S` its published roster. This file spawns load-gated workers
 # instead and reads no roster at all, so the constants went with the path that used them -- a
 # constant nobody reads is how a retired path still looks alive.
-REPO = "daniel-ospina/tortoise"
-REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
+#
+# ── WHICH REPO: state, not a default ──────────────────────────────────────────────────────────
+# ⛔ THESE ARE **EMPTY ON PURPOSE**, AND THAT IS THE FIX (2026-10-21). They used to be the literals
+# `"daniel-ospina/tortoise"` and `$HOME/Documents/GitHub/tortoise`, which made every pass a
+# statement about that one repo whichever repo it was started for -- the measured "nothing to do"
+# over agent-infra's 52 open PRs. `resolve_repo()` fills them from evidence before ANY read, and
+# refuses (exit 2) when the evidence does not answer, so there is no path on which a default stands
+# in for a repo nobody named. An empty REPO therefore means "not resolved yet", never "tortoise".
+REPO = ""            # owner/name, set by resolve_repo()
+REPO_DIR = ""        # the checkout that repo is graded from ("" = read-only, no spawning)
+# What this PROCESS inherited in `GH_REPO`, captured on the first pin and never re-read: `apply_repo`
+# overwrites that variable itself, so the live value stops describing the ambient once pinned (see
+# the #2280-review note in `apply_repo`). None = "not captured yet", which keeps the comparison
+# honest in a test that sets the variable after import.
+_INHERITED_GH_REPO = None
+# Why the checkout could not be found, when it could not. Named on the pass line rather than
+# silently degrading: a pass with no checkout can still grade the QUEUE, but it can place nothing.
+REPO_DIR_ERROR = ""
+# What the last pass did, for the per-repo line in `--all-repos` mode. `record_exit` is the ONE
+# exit path, so it is the one place that can publish it without a second copy of the verdict.
+LAST_PASS: dict = {}
+
+# The canonical (single-repo) state paths, captured before `apply_repo()` can replace them, so the
+# beat's existing readers keep reading exactly the file they read today when ONE repo is graded.
+_CANONICAL = (STATE, STATUS, LOG)
+# Non-empty only in `--all-repos` mode: prefixes the per-repo worker name so two repos' PR #42
+# cannot share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer).
+_WORKER_TAG = ""
+
+
+class RepoUnresolved(Exception):
+    """No repo could be resolved from evidence.
+
+    ⛔ IT IS RAISED, NEVER CAUGHT INTO A DEFAULT. Every caller either refuses the pass loudly
+    (exit 2) or records that ONE repo as refused and carries on with the others; nothing on either
+    path can substitute a repo the launcher did not name, which is the defect this whole block
+    removes (a hardcoded tortoise default answering a clean pass while agent-infra held 52 PRs).
+    """
+
+
+# `owner/name`, and nothing else. Deliberately strict: gh also accepts `[HOST/]OWNER/REPO`, but a
+# host prefix is dropped by `_normalize_slug` below rather than kept, because this pass grades
+# `api.github.com` (see `_gh_token`) and a host it cannot attest is not a repo it can grade.
+_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+")
+
+
+def _normalize_slug(value: str) -> str:
+    """`owner/name` (with `.git`, a host prefix or a URL accepted and stripped), or ""."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if "://" in v or "@" in v.split("/", 1)[0] or ":" in v.split("/", 1)[0]:
+        v = _slug_from_remote(v)
+    if v.endswith(".git"):
+        v = v[:-4]
+    v = v.strip("/")
+    parts = [p for p in v.split("/") if p]
+    if len(parts) == 3:            # [HOST/]OWNER/REPO -- accepted only when the host is GitHub's
+        if not _names_github(parts[0]):
+            return ""
+        parts = parts[1:]
+    if len(parts) != 2:
+        return ""
+    slug = "%s/%s" % (parts[0], parts[1])
+    return slug if _SLUG_RE.fullmatch(slug) else ""
+
+
+def _names_github(host: str) -> bool:
+    """Does this remote's HOST name the GitHub instance every read of this pass targets?
+
+    ⛔ THE HOST IS ATTESTED, NOT DISCARDED. Every read here is `api.github.com` and every write is a
+    push to the checkout, so an origin on ANOTHER host (`gitlab.com`, `bitbucket.org`, a mirror)
+    proving `owner/name` would let a checkout certify a GitHub repo it has no relation to -- the
+    silent-wrong-repo class this whole resolver removes, one layer down. A host it cannot attest is
+    not a repo it can grade, so the answer is "proves nothing" and the pass falls back to a
+    read-only grade of the evidence it DOES have.
+    """
+    h = (host or "").strip().lower()
+    h = h.split("@")[-1].split(":")[0]         # strip any userinfo / port
+    return h in ("github.com", "www.github.com")
+
+
+def _slug_from_remote(url: str) -> str:
+    """The `owner/name` a git remote URL names, or "" when it names no repository we can grade.
+
+    ⛔ A LOCAL PATH NAMES NO REPOSITORY. `git remote get-url origin` on a checkout of a mirror or a
+    bare directory returns a filesystem path, which identifies no repo on GitHub -- answering "this
+    is owner/name" from it would be an inference, and this resolution exists to be evidence.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" in u:
+        # ⛔ A SCHEME ALLOW-LIST, NOT "anything with ://". `file:///home/user/tortoise` has a path
+        # that looks exactly like `owner/name`, so the general branch answered `user/tortoise` for
+        # a checkout of a LOCAL DIRECTORY -- a checkout "proving" a GitHub repo it has no relation
+        # to. Only a network transport names a repository this pass can grade.
+        scheme = u.split("://", 1)[0].strip().lower()
+        if scheme not in ("http", "https", "ssh", "git", "git+ssh", "ssh+git"):
+            return ""
+        rest = u.split("://", 1)[1]
+        head, _, tail = rest.partition("/")
+        if not tail or not _names_github(head):
+            return ""
+        path = tail
+    elif re.match(r"^[^/]+@[^/:]+:", u):        # scp-like: git@github.com:owner/name.git
+        host = u.split("@", 1)[1].split(":", 1)[0]
+        if not _names_github(host):
+            return ""
+        path = u.split(":", 1)[1]
+    else:
+        return ""                              # a filesystem path (or a bare option): no repo named
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    slug = "%s/%s" % (parts[-2], parts[-1])
+    return slug if _SLUG_RE.fullmatch(slug) else ""
+
+
+def _origin_slug(checkout: str) -> tuple[str, str]:
+    """The `owner/name` a checkout PROVES it is, or ("", why it proves nothing)."""
+    if not checkout:
+        return "", "no checkout was named"
+    if not os.path.isdir(checkout):
+        return "", "%s is not a directory" % checkout
+    out, err, rc = sh_err(["git", "-C", checkout, "remote", "get-url", "origin"], timeout=30)
+    if rc != 0:
+        return "", "%s has no readable 'origin' remote (%s)" % (
+            checkout, (err or "").strip()[:120] or "rc=%s" % rc)
+    slug = _slug_from_remote(out)
+    if not slug:
+        return "", "%s's 'origin' remote (%s) names no GitHub repository" % (
+            checkout, (out or "").strip()[:120] or "empty")
+    return slug, ""
+
+
+def _checkout_that_proves(slug: str, env: dict) -> tuple[str, str]:
+    """The checkout that PROVES it is <slug>, or ("", why none does).
+
+    ⛔ A DISAGREEING CHECKOUT IS NOT ADOPTED. `REPO` and the cwd are candidates, and each is used
+    ONLY when its own `origin` names the repo already decided -- so a pass launched for repo A from
+    repo B's checkout (or with a stale `REPO=B`) can never read B's worktrees, branches or remote.
+    """
+    notes = []
+    for cand, src in (((env.get("REPO") or "").strip(), "REPO"), (os.getcwd(), "cwd")):
+        if not cand:
+            if src == "REPO":
+                notes.append("REPO is not set")
+            continue
+        got, why = _origin_slug(cand)
+        if got and got.lower() == slug.lower():
+            return cand, ""
+        notes.append("%s=%s is %s" % (src, cand, "a checkout of %s" % got if got else why))
+    return "", "; ".join(notes)
+
+
+def resolve_repo(explicit: str | None = None, env: dict | None = None,
+                 checkout_hint: str = "") -> tuple[str, str, str, str]:
+    """Which repo this pass grades: (slug, checkout, source, why-no-checkout).
+
+    THE ORDER IS THE DESIGN, and each rank is evidence the launcher ALREADY resolved:
+
+      1. `--repo`            the operator's explicit word for THIS invocation;
+      2. `OR`                the slug the launcher resolved and passed (`orch-loop.sh`, the cell
+                             session strings and `harness`/`install.sh`'s rendered plist all
+                             carry `OR` + `REPO` + `O` as per-invocation state);
+      3. `REPO`'s `origin`   the checkout the launcher named, read for what it PROVES it is;
+      4. the cwd's `origin`  the weakest evidence: whatever checkout the process happens to be in;
+      5. refuse              exit 2, naming every source it looked at.
+
+    ⛔ WHY NOT `GH_REPO` / `TORTOISE_REPO`. Both are GLOBAL on a fleet box, so either would make
+    this job grade a repo nobody named -- the exact failure that already graded tortoise while an
+    agent-infra rail ran (#2235: a pushed `keys.env` exported `GH_REPO=daniel-ospina/tortoise`), and
+    the failure #9388 had to fix in reverse (an ambient `TORTOISE_REPO` outranking a launchd entry
+    point's own directory). `OR`/`REPO` outrank them because they are resolved PER INVOCATION by
+    the thing that started this pass; `GH_REPO` is instead PINNED to the resolved slug (see
+    `apply_repo`) so an ambient value cannot leak the other way, into a spawned worker.
+
+    Raises `RepoUnresolved` when no evidence answers. Never returns a default.
+    """
+    env = os.environ if env is None else env
+    explicit_given = explicit is not None
+    explicit = (explicit or "").strip()
+    or_env = (env.get("OR") or "").strip()
+    repo_env = (env.get("REPO") or "").strip()
+
+    # ⛔ AN EXPLICIT FLAG WITH NO REPO IN IT IS A REFUSAL, NOT A FALLBACK. A lone `--repo
+    # "=<checkout>"` (or `--repo ""`) used to slide through as "no explicit repo given" and resolve
+    # from `OR`/`REPO`/cwd -- i.e. the operator's word was DISCARDED and the pass graded a repo they
+    # did not name, which is the fail-open this whole resolver removes, one input shape over. The
+    # checkout half of the entry does not make the repo half optional.
+    if (explicit_given and not explicit) or (checkout_hint and not explicit):
+        raise RepoUnresolved(
+            "--repo %r names no repository (expected `owner/name` or `owner/name=<checkout>`) -- "
+            "refusing to fall back to another source"
+            % (explicit or checkout_hint))
+
+    if explicit:
+        slug = _normalize_slug(explicit)
+        if not slug:
+            raise RepoUnresolved("--repo %r is not an owner/name slug" % explicit)
+        if checkout_hint:
+            got, why = _origin_slug(checkout_hint)
+            if got and got.lower() == slug.lower():
+                return slug, checkout_hint, "--repo+checkout", ""
+            # ⛔ A PROVEN DISAGREEMENT IS REFUSED FOR THAT ENTRY -- adopting it would grade the other
+            # repo (the whole defect), and ignoring it silently would hide a launcher
+            # misconfiguration. An UNREADABLE checkout is not a proven disagreement: it is the same
+            # TCC/launchd shape as the `OR`+`REPO` branch (`~/Documents` has no Full Disk Access), and
+            # every `owner/name=/checkout` entry on a multi-repo machine points there -- refusing
+            # would report `open_prs=?` for exactly the queues this mode exists to measure. Grade the
+            # queue read-only instead, and say which checkout could not be used.
+            if got:
+                raise RepoUnresolved(
+                    "%s was given as the checkout of %s but it is a checkout of %s -- refusing to "
+                    "grade a repo the checkout does not prove" % (checkout_hint, slug, got))
+            ck, why2 = _checkout_that_proves(slug, env)
+            return slug, ck, "--repo", "%s does not prove a repo (%s)%s" % (
+                checkout_hint, why, ("; " + why2) if why2 else "")
+        ck, why = _checkout_that_proves(slug, env)
+        return slug, ck, "--repo", why
+
+    if or_env:
+        slug = _normalize_slug(or_env)
+        if not slug:
+            raise RepoUnresolved("OR=%r is not an owner/name slug" % or_env)
+        if repo_env:
+            # ⛔ A PROVEN DISAGREEMENT IS A REFUSAL; AN UNREADABLE CHECKOUT IS NOT EVIDENCE OF ONE.
+            # `REPO` is the checkout and `OR` the slug the same launcher resolved, so when their
+            # `origin` names DIFFERENT repos one of them is stale and either choice is a guess --
+            # refuse and print both (the check `orchestrator-bringup.sh` makes of its own pair).
+            # But a checkout whose remote cannot be read (launchd has no Full Disk Access under
+            # `~/Documents` -- the TCC limitation `_repo_worktrees` documents) proves NOTHING, and
+            # `OR` is still the launcher's own word: grade that repo's queue read-only rather than
+            # refuse the pass, or the fix would re-create the "queue not graded" failure in reverse.
+            got, why = _origin_slug(repo_env)
+            if got and got.lower() == slug.lower():
+                return slug, repo_env, "OR+REPO", ""
+            if got:
+                raise RepoUnresolved(
+                    "the launcher named two different repos: OR=%s but REPO=%s is a checkout of "
+                    "%s -- refusing to pick one (set OR to the checkout's repo, or REPO to a '%s' "
+                    "checkout)" % (slug, repo_env, got, slug))
+            ck, why2 = _checkout_that_proves(slug, env)
+            return slug, ck, "OR", "REPO=%s does not prove a repo (%s)%s" % (
+                repo_env, why, ("; " + why2) if why2 else "")
+        ck, why = _checkout_that_proves(slug, env)
+        return slug, ck, "OR", why
+
+    if repo_env:
+        got, why = _origin_slug(repo_env)
+        if got:
+            return got, repo_env, "REPO", ""
+        raise RepoUnresolved(
+            "REPO=%s does not name a repository: %s -- refusing to guess which repo this pass "
+            "grades (set OR=owner/name, or point REPO at a checkout whose origin names it)"
+            % (repo_env, why))
+
+    got, why = _origin_slug(os.getcwd())
+    if got:
+        return got, os.getcwd(), "cwd", ""
+    raise RepoUnresolved(
+        "no repository could be resolved for this pass: --repo was not given, OR is not set, "
+        "REPO is not set, and the cwd (%s) is not a checkout with a GitHub 'origin' (%s). "
+        "GH_REPO and TORTOISE_REPO are deliberately NOT consulted -- both are global on a fleet "
+        "box, so inheriting one grades a repo nobody named (#2235). Fix: pass --repo OWNER/NAME, "
+        "or set REPO=<checkout> (its origin proves the repo), or OR=OWNER/NAME"
+        % (os.getcwd(), why))
+
+
+def split_repo_entry(entry: str) -> tuple[str, str]:
+    """`owner/name[=<checkout>]` -> (owner/name, checkout-or-"").
+
+    ONE parser for both ways an entry arrives — a lone `--repo`, a repeated `--repo`, and a
+    `PR_DOCTOR_REPOS` item — because a form that works in one and not the other is the
+    two-authorities defect this file keeps removing: `--repo owner/name=/checkout` refused as
+    "not an owner/name slug" on the single-repo path while the identical string worked beside a
+    second `--repo`.
+    """
+    slug, _, hint = (entry or "").partition("=")
+    return slug.strip(), hint.strip()
+
+
+def configured_repos(explicit=(), env: dict | None = None) -> list[str]:
+    """The SET a per-repo run grades: `--repo` flags plus `PR_DOCTOR_REPOS`, and no default.
+
+    Each entry is `owner/name`, or `owner/name=<checkout>` when the checkout is not the one `REPO`
+    names (the multi-repo machine's case: one state dir, several repos). ⛔ AN EMPTY SET IS A
+    REFUSAL, not "grade everything" -- there is no discovery step here, deliberately: a scan of
+    the filesystem would answer with whatever checkouts happen to exist, which is a default by
+    another name. ⛔ AND EXPLICIT FLAGS REPLACE the `PR_DOCTOR_REPOS` default rather than joining it
+    (see below): a named pair is an instruction, the variable is a machine default.
+    """
+    env = os.environ if env is None else env
+    # ⛔ AN EMPTY ENTRY IS KEPT AND REFUSED LATER, NOT FILTERED AWAY. Dropping it discarded an
+    # operator's explicit-but-empty flag with no row and no refusal whenever one valid repo sat
+    # beside it in the set -- a silently shorter set is exactly the "which repos did this grade?"
+    # gap this mode exists to close. `resolve_repo()` refuses it per entry (`REFUSING rc=2`), and the
+    # rest of the set still runs.
+    items = [s.strip() for s in explicit]
+    # ⛔ THE FLAGS ARE THE SET WHEN THEY ARE GIVEN. `PR_DOCTOR_REPOS` is the launcher's configured
+    # set, and merging it into an explicit pair meant two `--repo` flags graded the WHOLE machine
+    # while one flag graded exactly one repo: on a box that exports the variable, an operator could
+    # not name two repos without also dispatching on repos this invocation never mentioned. An
+    # explicit list is a narrower instruction than a machine default, so it wins outright.
+    if not items:
+        raw = (env.get("PR_DOCTOR_REPOS") or "").strip()
+        if raw:
+            items = [s.strip() for s in re.split(r"[,\s]+", raw)]
+    out, seen = [], set()
+    for it in items:
+        key = it.split("=", 1)[0].strip().lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
+
+def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str = "?",
+               rubric_note: str = "") -> None:
+    """Point every read and every write of this pass at ONE repo, and say so.
+
+    Three globals move together and they MUST: `REPO` (the slug every gh/REST read is made
+    against), `REPO_DIR`/`WORKTREE_ROOT` (the checkout those reads act on), and the classifier's
+    own `REPO` -- `objective.py` builds its check-run and attestation paths from its module global,
+    so a doctor scoped without it would read repo A's queue and repo B's checks, i.e. every head
+    would be a 404 and every PR would classify blind. The state paths move too when more than one
+    repo is graded in one process, so two repos' PR #42 cannot share a cooldown row.
+
+    ⛔ AND THE RUBRIC IS A SECOND FACT ABOUT A REPO, WHICH THIS FUNCTION CANNOT INVENT (see the
+    block comment on `_RUBRIC_REPO`). `objective.py`'s `REQUIRED` / `GATED_CHECKS` /
+    `SURFACE_PATHS` are that repo's declaration; moving `REPO` without them made a pass for repo B
+    judge B's queue by tortoise's declaration. So the rubric is NOT moved here -- an invented one
+    would be the same defect mirrored -- `contract_note()` decides OUT LOUD whether the rubric in
+    force belongs to `slug`, the answer is logged, and `dispatch()` refuses when it does not.
+    """
+    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT, STATE, STATUS, LOG, LOG_BASENAME
+    global _WORKER_TAG, _INHERITED_GH_REPO
+    REPO = slug
+    REPO_DIR = checkout or ""
+    WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees") if REPO_DIR else ""
+    try:
+        CLASSIFIER.REPO = slug
+    except Exception:                     # an older sibling without the attribute is still usable
+        pass
+    if multi:
+        tag = repo_tag(slug)
+        STATE = os.path.join(STATE_DIR, "pr-doctor.%s.json" % tag)
+        STATUS = os.path.join(STATE_DIR, "pr-doctor.%s.status.json" % tag)
+        LOG = os.path.join(STATE_DIR, "pr-doctor.%s.log" % tag)
+        # ⛔ THE LOG'S NAME MOVES THROUGH `LOG_BASENAME`, because `LOG` above is the import-time
+        # snapshot this file's own comment says must not be used for I/O: `log()` never read it,
+        # so every repo in a set appended to the ONE canonical file while the README promised a
+        # per-repo one.
+        LOG_BASENAME = "pr-doctor.%s.log" % tag
+        _WORKER_TAG = tag + "-"
+    else:
+        # ⛔ A SINGLE-REPO PASS TOUCHES NO PATH. Its state/status/log ARE the canonical files, so
+        # re-deriving them here would overwrite a caller's seam (`STATE_DIR`, `STATUS`) with a
+        # second opinion about where they live -- the same "two authorities for one path" defect
+        # `--status` was just given a single reader for.
+        LOG_BASENAME = "pr-doctor.log"
+        _WORKER_TAG = ""
+    # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
+    # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
+    # what stops a worker this pass spawns from having its own rail answer about another repo.
+    # ⛔ COMPARED AGAINST WHAT THE PROCESS INHERITED, NOT WHAT THIS PROCESS PINNED (#2280 review,
+    # P2). The pin below writes `GH_REPO`, so comparing against the live value made every repo
+    # after the first in an `--all-repos` set log "GH_REPO=… (ambient) is NOT the repo this pass
+    # grades" about the repo this same process pinned one iteration earlier -- the line that exists
+    # to expose a real #2235 leak, manufacturing one.
+    global _INHERITED_GH_REPO
+    if _INHERITED_GH_REPO is None:
+        _INHERITED_GH_REPO = (os.environ.get("GH_REPO") or "").strip()
+    ambient = _INHERITED_GH_REPO
+    if ambient and ambient.lower() != slug.lower():
+        log("GH_REPO='%s' (ambient) is NOT the repo this pass grades -- pinning GH_REPO=%s for "
+            "every call and every child" % (ambient, slug))
+    os.environ["GH_REPO"] = slug
+    log("repo: %s (from %s; checkout %s)" % (slug, source, REPO_DIR or
+                                              "NONE -- queue only, nothing can be spawned"))
+    # The rubric gets its own line: "which repo" and "judged by whose declaration" are two facts,
+    # and a pass that reports only the first cannot be audited for the second.
+    log(rubric_report(rubric_note))
+
+
+def worker_name(number) -> str:
+    """The worker's name for a PR, qualified by the repo only when more than one is in scope.
+
+    Two repos can both have a PR #42, and the worker name keys `$O/bg/<name>.*` (liveness, `.rc`,
+    the log). A single-repo pass keeps the historical `prd-<n>` -- the fleet's readers and
+    `--status` rows are pinned to it -- while a multi-repo pass prefixes the repo so one repo's
+    live worker cannot be read as the other's.
+    """
+    return "prd-%s%s" % (_WORKER_TAG, number)
+
 
 # ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872, merged as #1930). `objective.py` owns the class
 # vocabulary, the check-run read, the attestation read and the predicate; this file owns the
@@ -238,6 +672,101 @@ GH = getattr(CLASSIFIER, "GH_BIN", "") or shutil.which("gh") or "gh"
 # calling that binary and still gets serialisation and the documented backoff.
 GH_LAYER_ENV = dict(getattr(CLASSIFIER, "GH_LAYER_ENV", {}) or {})
 
+# ⛔ THE REPO'S RUBRIC IS A SECOND FACT, AND THIS FILE MAY NOT ASSUME IT (review P1). `apply_repo()`
+# moves `REPO` on both sides, but `objective.py` ALSO holds the rubric every PR is judged by:
+# `REQUIRED` (its `REQUIRED_DEFAULT` -- seven TORTOISE contexts), `GATED_CHECKS` (= REQUIRED minus
+# `ai-review-gate`) and `SURFACE_PATHS` (tortoise's human-gated files). Moving only `REPO` means a
+# pass for another repo reads ITS queue and judges it by ANOTHER repo's declaration. MEASURED on
+# this tree with `apply_repo("daniel-ospina/agent-infra")` and an all-green, clean-attested check
+# list: `classify_pr` -> `rerun-checks`, i.e. the doctor dispatches a *re-trigger* at a fully green
+# PR (the six tortoise names are always `gated_absent`), `call-rail`/`record-review` are unreachable
+# for that repo at all, and `touches_surface()` is always False -- so a diff on the human-gated
+# surface is handed to the automated lander instead of to the owner.
+#
+# ⛔ SO THE RUBRIC'S SCOPE IS DECIDED PER PASS, OUT LOUD, AND THE ANSWER IS A NOTE, NOT A GUESS.
+# The seam that supplies a repo's own rubric already exists and is `objective.py`'s:
+# `OBJECTIVE_REQUIRED` (comma-separated contexts) and `OBJECTIVE_SURFACE` (comma-separated paths).
+# When they are supplied, the rubric IS the operator's declaration for any slug and nothing is
+# refused. When they are not, the built-ins are in force, and they describe exactly ONE repo -- the
+# one `objective.py`'s `REQUIRED_DEFAULT` comment names -- so ANY OTHER repo gets a note
+# (`contract_note()`, DERIVED from the resolved slug, never stored) and this file REFUSES TO
+# DISPATCH for it (`dispatch()`), instead of dispatching a wrong order it cannot check. The queue is still graded: that measurement is the one the fleet keeps losing,
+# and "I graded it and placed nothing, because I do not know its rubric" is a report.
+#
+# ⛔ WHY NOT READ BRANCH PROTECTION HERE. That read has ONE owner in this tree --
+# `scripts/orchestrator-harness/repo-authority.sh` -- and `objective.py` already consumes its answer
+# through the seam above. A second reader in this file could disagree with the merge rail about what
+# a repo requires, which is the #1764 defect that file exists for. Wiring the per-repo declaration
+# is agent-infra#2518; one doctor instance per repo is #2281.
+# ⚠️ DECLARED RESIDUAL: the seams are MACHINE-wide, so one `--all-repos` set cannot describe two
+# repos at once -- a set grading a repo whose rubric was not supplied is read-only by design.
+_RUBRIC_REPO = "daniel-ospina/tortoise"      # the repo `REQUIRED_DEFAULT` describes, NOT a target
+
+
+def _rubric_supplied() -> bool:
+    """True when the operator supplied a rubric through `objective.py`'s own seams.
+
+    Same rule as `objective._required_from_env()`: an EMPTY or whitespace-only value is "not
+    supplied", never "this repo requires nothing" -- the latter would make every PR
+    `call-rail`-eligible.
+    """
+    return bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip()) and bool(
+        (os.environ.get("OBJECTIVE_SURFACE") or "").strip())
+
+
+def contract_note(slug: str) -> str:
+    """Why the rubric this process holds is NOT `slug`'s ("" when it is, or when nothing is graded).
+
+    ⛔ IT IS DERIVED FROM THE RESOLVED SLUG, NEVER STORED. A module flag would be a second copy of
+    "which repo is this pass about", and the class of defect this file keeps removing is two
+    authorities for one fact: a leftover flag refuses (or worse, ALLOWS) the NEXT repo's dispatch
+    for a reason about a different repo -- measured here, it took 13 dispatch tests red before the
+    derivation replaced it.
+
+    The failure this prevents is a confident verdict about a declaration nobody read: without it,
+    `apply_repo('daniel-ospina/agent-infra')` classifies every PR by tortoise's seven required
+    contexts (`rerun-checks` at a fully green PR) and `touches_surface()` is always False.
+    """
+    if not slug:
+        return ""                       # nothing is being graded: no rubric to be wrong about
+    if _rubric_supplied():
+        # ⛔ "THE OPERATOR DECLARED IT" IS ONLY AN ANSWER FOR A REPO THE DECLARATION CAN NAME.
+        # The seams are MACHINE-wide (`OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` carry values, not a
+        # slug), so one declaration can describe exactly one repo -- and it says nothing about
+        # WHICH. In a set grading several repos the attribution is therefore UNKNOWABLE, and the
+        # honest answer is the refusal, not a guess: guessed, it re-creates the failure measured
+        # here (`rerun-checks` at a green PR, and a surface-touching diff handed to the automated
+        # lander) for every repo in the set but one. `set_rubric_note()` supplies that refusal per
+        # pass; this branch stays the answer for a single-repo pass, where the declaration is
+        # attributable by construction.
+        return ""
+    if slug.strip().lower() == _RUBRIC_REPO:
+        return ""                       # the built-ins ARE this repo's rubrics by construction
+    return ("the required-check set and human-gated surface paths %s is judged by are NOT supplied "
+            "to the classifier, and inheriting %s's would grade every PR by a declaration nobody "
+            "read (every green PR would classify `rerun-checks`, and `touches_surface()` would be "
+            "always False, so a surface-touching diff would go to the automated lander). Nothing "
+            "is dispatched for %s; its queue is still graded. Fix: supply "
+            "OBJECTIVE_REQUIRED='<ctx>,<ctx>' and OBJECTIVE_SURFACE='<path>,<path>'. "
+            "Tracked: agent-infra#2518" % (slug, _RUBRIC_REPO, slug))
+
+
+def rubric_report(note: str = "") -> str:
+    """The one line a pass logs about the rubric it is judging by -- and whose it is.
+
+    `note` is an ATTRIBUTION THE CALLER ALREADY DECIDED (`--all-repos`, see `set_rubric_note()`).
+    It is passed in rather than re-derived so the line a pass PRINTS and the refusal `dispatch()`
+    APPLIES are the same answer: a report saying "the operator declared it" while the dispatcher
+    refused (or the reverse) would be the two-authorities defect this file keeps removing.
+    """
+    note = note or contract_note(REPO)
+    if note:
+        return "rubric: REFUSING TO DISPATCH -- %s" % note
+    return ("rubric: required=%s surface=%s (from %s)"
+            % (",".join(getattr(CLASSIFIER, "REQUIRED", ()) or ()) or "none",
+               ",".join(getattr(CLASSIFIER, "SURFACE_PATHS", ()) or ()) or "none",
+               "the OBJECTIVE_* seams" if _rubric_supplied() else "objective.py built-ins"))
+
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
@@ -268,7 +797,10 @@ DEFAULT_MAX_REVIEW = 4
 # and spawn-gate.test.sh's invoker census exists to refuse exactly that.
 ORCH_DIR = os.environ.get("O") or os.path.join(HOME, "orchestrator")
 NONBLOCKING_DISPATCH = os.path.join(ORCH_DIR, "nonblocking-dispatch.sh")
-WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees")
+# Derived from REPO_DIR by resolve_repo() (empty until then -- see the note on REPO above), so the
+# PR worktrees a pass creates can only ever be worktrees OF THE REPO BEING GRADED. A fixed root
+# made an agent-infra pass `git -C` tortoise's checkout and add tortoise worktrees for it.
+WORKTREE_ROOT = ""
 SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
 # ⛔ THE SPAWN CALL MUST NOT WAIT FOR THE WORKER -- AND A CAPTURED CALL DOES. `subprocess.run`
 # blocks until EOF on the capture PIPE, not until the child exits; `nonblocking-dispatch.sh`
@@ -435,7 +967,13 @@ def _log_path() -> str:
     live job was being written by a test suite, and nothing in it said so. `STATUS` is NOT affected:
     tests patch it directly, so `record_exit` keeps honouring that seam.
     """
-    return os.path.join(STATE_DIR, "pr-doctor.log")
+    # ⛔ AND THE NAME IS RESOLVED HERE, FROM `LOG_BASENAME`, FOR THE SAME REASON ONE FIELD OVER.
+    # `apply_repo(multi=True)` used to assign a per-repo `LOG` that NOTHING read (`log()` went
+    # straight through this function), so every repo in an `--all-repos` set appended to the ONE
+    # canonical file while the README told an operator to look in
+    # `pr-doctor.<owner>-<name>.log`. Late-binding the NAME fixes that without reintroducing a
+    # frozen path: the directory is still read from `STATE_DIR` at call time.
+    return os.path.join(STATE_DIR, LOG_BASENAME)
 
 
 def log(msg: str) -> None:
@@ -498,6 +1036,12 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
                "pid": os.getpid(), "repo": REPO, "rest_recovered": REST_RECOVERED}
     payload.update(extra)
+    # ⛔ THE PER-REPO LINE READS THIS, so it is stowed HERE -- the one exit path -- rather than
+    # rebuilt from a second copy of each exit's counts (which is how two readers of one verdict
+    # start disagreeing). It is stowed even when the pass is not recorded: a `--dry-run` in
+    # `--all-repos` mode still has to print a truthful line per repo.
+    LAST_PASS.clear()
+    LAST_PASS.update(payload)
     if NOT_A_FLEET_READING or payload.get("dry_run"):
         # ⛔ A DRY RUN MUST NOT STAMP THE FLEET'S VERDICT (2026-10-18, review). `dispatch()` returns
         # True under `--dry`, so a lane reproducing an issue with `--dry-run` would write
@@ -1030,6 +1574,15 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     fetching, checking out or resetting anything -- `--dry-run` used to return before this call and
     so reported "would spawn" precisely when the worktree was what would block.
     """
+    # ⛔ NO CHECKOUT IS NOT "THE CHECKOUT IN $HOME". Every git call below runs `-C REPO_DIR`, so an
+    # empty one made this function read the CALLER's cwd (`git -C ""` behaves like no `-C`): a pass
+    # with no checkout would then add worktrees of whatever repo it happened to be launched from,
+    # for PRs of the repo it was told to grade. Refused by name instead -- and it is a verdict
+    # about THIS pass's inputs (not about the PR), so it is retryable, never a cooldown row.
+    if not REPO_DIR:
+        return "", ("no checkout of %s on this machine, so no worktree can be materialised for "
+                    "#%s -- pass REPO=<checkout> (or <owner/name>=<checkout> in PR_DOCTOR_REPOS)"
+                    % (REPO or "the target repo", pr.get("number")))
     branch = pr["headRefName"]
     head = pr["headRefOid"]
     # A fork PR's headRefName can COLLIDE with a base-repo branch (e.g. a fork of `main`), so branch
@@ -1538,7 +2091,14 @@ def _repo_worktrees() -> tuple[list, str]:
     schedule that actually runs the dispatcher, while the same probe succeeded from an interactive
     shell. So the branch map sharpens the answer when it can be read, and the caller falls back to
     the worktree PATH (which lsof reports from kernel data, unaffected by TCC) when it cannot.
+
+    ⛔ AND WITH NO CHECKOUT THERE IS NOTHING TO ASK. `git -C ""` behaves like no `-C` at all, so the
+    probe would `worktree list` whatever repo the process's cwd happens to be in (`_ownership_git`
+    pins `cwd=HOME`) and hand back ANOTHER repo's branch map as this repo's ownership -- the same
+    wrong-repo read `materialise_worktree()` refuses by name.
     """
+    if not REPO_DIR:
+        return [], "no checkout on this machine -- the branch map is unavailable"
     out, err = _ownership_git(["worktree", "list", "--porcelain"])
     if err or not out.strip():
         return [], "git worktree list failed: %s" % (err or "empty output")
@@ -1586,6 +2146,27 @@ def _num_tokens(slug: str) -> set:
     return {int(t) for t in re.findall(r"(?<![A-Za-z0-9])0*([0-9]+)(?![0-9])", slug or "")}
 
 
+def _under_repo_dir(path: str) -> bool:
+    """Is `path` inside THIS pass's checkout? The only worktree-NAME evidence that PROVES anything.
+
+    ⛔ A WORKTREE NAME IS ONLY EVIDENCE ABOUT THE REPO IT SITS IN (#2280 review, P2). The fleet's
+    own naming makes two repos' worktrees collide: `.worktrees/prd-42` is the shape pr-doctor
+    creates, and `_num_tokens` reads `42` out of it -- so with `--all-repos` grading A and B, B's
+    live `prd-42` was attributed to A's PR #42. The pass then sorted A's real work BEHIND owned
+    PRs, spent its class budget on the wrong ones, and printed "every one of N open PR(s) has a
+    live holder" while an un-owned PR sat in the queue. With no checkout at all (`REPO_DIR == ""`)
+    nothing on the box can be placed in this repo, so the arm is disabled rather than guessing --
+    the function's own doctrine is that ownership is PROVED, never inferred.
+    """
+    if not REPO_DIR:
+        return False
+    try:
+        root, real = os.path.realpath(REPO_DIR), os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    return real == root or real.startswith(root + os.sep)
+
+
 def live_owners(prs: list) -> tuple[dict, str]:
     """{pr_number: "<evidence>"} for PRs a LIVE process is working, plus WHY the read failed.
 
@@ -1614,6 +2195,10 @@ def live_owners(prs: list) -> tuple[dict, str]:
         OWNERSHIP_NOTE = ("branch map unavailable (%s) -- %s"
                           % (werr[:100],
                              "matching worktree paths and numbers only" if cwds else "no probe"))
+    if not REPO_DIR:
+        _no_ck = ("no checkout for this repo, so a worktree NAME on this box proves nothing about "
+                  "it -- the NUMBER arm is disabled")
+        OWNERSHIP_NOTE = _no_ck if not OWNERSHIP_NOTE else OWNERSHIP_NOTE + "; " + _no_ck
     by_path = {path: br for path, br in wts}
     owners = {}
     for p in prs:
@@ -1630,9 +2215,11 @@ def live_owners(prs: list) -> tuple[dict, str]:
                         break
             if n in owners:
                 break
-            # (b) the worktree's NAME matches the branch slug, or carries the PR number
+            # (b) the worktree's NAME matches the branch slug, or carries the PR number -- and
+            # ONLY for a worktree inside THIS repo's checkout (see `_under_repo_dir()`: the same
+            # `prd-<n>` name exists in every repo, so a bare name is another repo's work).
             slug = _worktree_slug(cwd)
-            if not slug:
+            if not slug or not _under_repo_dir(cwd):
                 continue
             if head and (slug in heads or slug == head.replace("/", "-")):
                 owners[n] = "worktree %s matches head branch %s (live pid %s)" % (slug, head, pid)
@@ -1831,7 +2418,7 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 2. Get it REVIEWED in a fresh context: dispatch a `task` sub-agent (NEVER review your own work).
    Only a verbatim `NO ISSUES FOUND` is clean. Issues found -> fix -> RE-REVIEW.
 3. RECORD at the CURRENT head:
-   `scripts/record-review.sh {n} <HEAD_SHA> clean daniel-ospina/tortoise --evidence comment:<ID>`
+   `scripts/record-review.sh {n} <HEAD_SHA> clean {repo} --evidence comment:<ID>`
 4. MERGE it: `scripts/admin-merge.sh {n}`
 
 ⛔ Recording a review is NOT merging. Stopping between step 3 and 4 is what left PRs sitting for
@@ -1841,7 +2428,7 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 ⛔ If a check fails AFTER your fix: fix it again and continue. **Fixing is the normal path, not a blocker.**
 ⛔ `ai-review-gate=failure` is EXPECTED on a fresh PR and clears only by recording.
    `BLOCKED` / `UNSTABLE` merge states on a ready PR are NORMAL and are not reasons to hold.
-{push}""".format(n=n, push=push)
+{push}""".format(n=n, push=push, repo=REPO)
 
     if action == "call-rail":
         return """# MERGE #{n} — nothing else is needed
@@ -2189,7 +2776,106 @@ def _confirm(name: str) -> tuple[str, str]:
     return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
 
 
-def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bool]:
+def set_rubric_note(entries: list[str]) -> str:
+    """Why a SET cannot be judged by the operator's machine-wide rubric ("" when it can).
+
+    ⛔ A DECLARATION THAT NAMES NO REPO CANNOT DESCRIBE TWO. `OBJECTIVE_REQUIRED` /
+    `OBJECTIVE_SURFACE` carry a required-check set and a surface-path list, and NOTHING in them
+    says which repo wrote them -- `objective.py` binds them once, process-wide. In a single-repo
+    pass that is unambiguous (the operator is grading the repo they declared). In a SET it is a
+    coin flip per repo, and the losing side gets exactly the verdict this change exists to stop:
+    every green PR `rerun-checks` (staling its attestation), `call-rail`/`record-review`
+    unreachable, and `touches_surface()` always False so a surface-touching diff reaches the
+    automated lander. So the set REFUSES TO DISPATCH and still measures both queues -- the loud,
+    fixable report the rest of this mode already uses.
+
+    ⛔ IT IS NOT A FLAG. It is computed from the SET and passed down the call chain to the two
+    places that decide (`rubric_report()` and `dispatch()`), because a module flag would be a
+    second authority on "which repo is this pass about" -- the defect `contract_note()` exists to
+    remove, one input over (`--all-repos` switching it mid-process is what a flag gets wrong).
+
+    A set of ONE is attributable and does not refuse: `--all-repos` with a single entry grades one
+    repo, and the operator's declaration is that repo's by construction.
+    """
+    if not _rubric_supplied():
+        return ""                       # nothing declared: `contract_note()` decides per slug
+    slugs = set()
+    for entry in entries or ():
+        slug = _normalize_slug(split_repo_entry(entry)[0])
+        if slug:
+            slugs.add(slug.lower())
+    if len(slugs) <= 1:
+        return ""                       # one repo in the set: the declaration can only be its own
+    return ("this pass grades %d repos (%s) and the operator's rubric declaration is MACHINE-wide "
+            "-- OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE carry no repo, so which of these it describes "
+            "is unknowable, and grading any of them by it would hand a surface-touching diff to "
+            "the automated lander while classifying every green PR `rerun-checks`. Nothing is "
+            "dispatched for this set; both queues are still graded. Fix: grade one repo per pass "
+            "(no `--all-repos`), or wire the rubric per repo (agent-infra#2518)."
+            % (len(slugs), ",".join(sorted(slugs))))
+
+
+def worker_live_for(number) -> object:
+    """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
+
+    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is MODE-QUALIFIED
+    (`prd-<tag>-42` in a set) while the worktree is `prd-42` in BOTH modes, so a single-repo pass and
+    an `--all-repos` pass over the SAME repo can look at one directory while calling it two things.
+    Probing only this mode's name reports a live worker as ABSENT; the pass then adopts that
+    worktree and spawns a second agent into it -- two agents, one git index, one branch. So the
+    question for a PR is asked of every name that resolves to its worktree, and an UNANSWERABLE
+    reading (`None`) wins over a negative one: the safe direction is not to spawn.
+    """
+    names = [worker_name(number)]
+    plain = "prd-%s" % number
+    if plain not in names:
+        names.append(plain)              # the single-repo pass's name for the SAME worktree
+    for nm in names:
+        live = worker_live(nm)
+        if live is None:                  # unanswerable: do not spawn
+            return None
+        if live is not False:             # running under THIS name
+            return True
+    return False
+
+
+def repo_tag(slug: str) -> str:
+    """The one spelling of a repo's file/worker tag (`owner/name` -> `owner-name`).
+
+    ONE HOME for the derivation: `apply_repo`, `--status`, and the collision guard must agree, and
+    three independent `.replace()` calls are how two of them drift apart.
+    """
+    return (slug or "").replace("/", "-")
+
+
+def set_tag_collisions(entries: list[str]) -> str:
+    """Why two repos in a SET cannot be told apart by their state files, or "" when they can.
+
+    ⛔ A LOSSY TAG IS A MIS-ATTRIBUTION, WHICH IS THE DEFECT THIS WHOLE MODE EXISTS TO PREVENT
+    (#2280 review cycle 3, P2). `owner-name` is not injective: `acme/tools-api` and `acme-tools/api`
+    both become `acme-tools-api`, so one repo's cooldown rows consume the other's budget slots, a
+    live `prd-acme-tools-api-42` suppresses the OTHER repo's #42, and `--status --repo acme-tools/api`
+    prints the shared file under its own header. Refusing the set is the only answer that keeps the
+    per-repo records honest without renaming every existing one: the operator grades them in two
+    passes, which #2281 makes the normal shape anyway.
+    """
+    seen = {}
+    for entry in entries or ():
+        slug = _normalize_slug(split_repo_entry(entry)[0])
+        if not slug:
+            continue
+        seen.setdefault(repo_tag(slug).lower(), set()).add(slug.lower())
+    clash = {t: s for t, s in seen.items() if len(s) > 1}
+    if not clash:
+        return ""
+    return ("; ".join("tag %s is shared by %s" % (t, " and ".join(sorted(s)))
+                      for t, s in sorted(clash.items())) +
+            " -- their state files, worker names and cooldowns would be one record. Grade each repo "
+            "in its own pass, or rename one of them (agent-infra#2281 removes this mode).")
+
+
+def dispatch(pr: dict, action: str, text: str, dry: bool,
+             rubric_note: str = "") -> tuple[bool, str, bool]:
     """Spawn a background worker for one PR. Returns (launched, detail, record).
 
     ⛔ THIS IS THE ONLY DISPATCH PATH. The lane-table path (`idle_lanes()` + a cmux send to a
@@ -2217,7 +2903,18 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     naming the dispatcher's own stderr is what says so.
     """
     n = pr["number"]
-    name = "prd-%d" % n
+    name = worker_name(n)
+    # ⛔ AN UNKNOWN RUBRIC IS A REFUSAL, NOT A GUESS (see `contract_note()`). Every action this pass
+    # could order is DERIVED from a classification made against `REQUIRED`/`SURFACE_PATHS`, so if
+    # those describe another repo then every order in this pass is wrong in the same direction --
+    # `rerun-checks` at a green PR, and a surface-touching diff handed to the automated lander.
+    # This is a GATE-class refusal (`record=False`): it consumes nothing, records no cooldown row,
+    # and a pass that then places nothing reports EXIT_UNDELIVERABLE -- a loud, fixable verdict
+    # rather than a confident wrong order. Placed BEFORE the dry-run branch so `--dry-run` says the
+    # same thing a real pass would do.
+    note = rubric_note or contract_note(REPO)
+    if note:
+        return False, note, False
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
@@ -2226,7 +2923,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
         if not wt:
             log("DRY-RUN %s would NOT spawn: %s" % (name, werr[:160]))
             return False, werr, False
-        live = worker_live(name)
+        live = worker_live_for(n)
         if live is not False:
             log("DRY-RUN %s would NOT spawn: %s"
                 % (name, "worker still running" if live else "worker liveness unreadable"))
@@ -2242,7 +2939,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
-    live = worker_live(name)
+    # ⛔ BOTH NAMES: the worktree is `prd-<n>` in EVERY mode, so a live worker started by the OTHER
+    # mode owns the same directory (see `worker_live_for()`).
+    live = worker_live_for(n)
     if live:
         return False, "worker %s is still running -- one worker per PR" % name, False
     if live is None:
@@ -2362,7 +3061,7 @@ class _QuietParser(argparse.ArgumentParser):
 
 
 def _add_reading_flags(p) -> None:
-    """The three flags that decide `NOT_A_FLEET_READING` -- DECLARED ONCE, used by BOTH parsers.
+    """The flags that decide `NOT_A_FLEET_READING` -- DECLARED ONCE, used by BOTH parsers.
 
     ⛔ A SECOND COPY OF THESE DECLARATIONS IS A SECOND ANSWER WAITING TO HAPPEN (2026-10-22, review):
     the RULE is one expression (`_not_a_fleet_reason`), but if the flag SPECS were written twice, a
@@ -2376,6 +3075,14 @@ def _add_reading_flags(p) -> None:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--only", type=int, default=0, help="limit to one PR number")
     p.add_argument("--status", action="store_true")
+    # ⛔ `--repo` IS A READING FLAG TOO (2026-10-23, rebase of the repo-resolution change): it
+    # selects WHICH repo this reading is about, and its empty spelling (`--repo ""`) is a REFUSAL
+    # answered by `resolve_repo()`, never by argparse. Declared HERE for the same reason as the
+    # three above -- the pre-parse and `main()` must describe it identically, or a `--repo ""`
+    # invocation is classified by one reader and parsed by another.
+    p.add_argument("--repo", action="append", default=[], metavar="OWNER/NAME",
+                   help="the repo THIS pass grades. Repeat it (or pass --all-repos) to grade a "
+                        "set and get one line per repo")
 
 
 def _reading_scanner():
@@ -2466,6 +3173,310 @@ class _UsageParser(argparse.ArgumentParser):
         except Exception:
             rc = EXIT_USAGE
         raise SystemExit(rc)
+def _per_repo_records() -> list[str]:
+    """The per-repo STATE records beside the canonical one -- and NOT the other two file kinds.
+
+    ⛔ THREE SHAPES SHARE THIS PREFIX, AND ONLY ONE HOLDS COOLDOWN ROWS (#2280 review, P2): the
+    canonical `pr-doctor.json` (which the first version of this helper counted as a "per-repo
+    record"), one `pr-doctor.<tag>.json` row file per repo, and a `pr-doctor.<tag>.status.json`
+    VERDICT sidecar per repo (plus the canonical `pr-doctor.status.json`). Counting the sidecars
+    made the note report 2.5x the real number and name files `--status` cannot read rows out of.
+    """
+    try:
+        names = sorted(os.listdir(STATE_DIR))
+    except OSError:
+        return []
+    canonical = os.path.basename(STATE)
+    return [n for n in names
+            if n.startswith("pr-doctor.") and n.endswith(".json")
+            and n != canonical and not n.endswith(".status.json")]
+
+
+def _per_repo_pointer() -> str:
+    """What this machine-wide view is NOT showing, or "" when there is nothing to point at."""
+    per_repo = _per_repo_records()
+    if not per_repo:
+        return ""
+    return ("; %d per-repo record(s) exist beside it (%s%s) and are NOT shown here, because "
+            "`--all-repos` writes those and their rows are the current ones -- run "
+            "`--status --all-repos`" % (len(per_repo), ", ".join(per_repo[:3]),
+                                        "..." if len(per_repo) > 3 else ""))
+
+
+def _status_age_note() -> str:
+    """What the machine-wide `--status` view is, and how old -- ONE line.
+
+    ⛔ BECAUSE A ROW WITH NO REPO AND NO DATE IS A CLAIM ABOUT NOW THAT NOTHING CHECKED (#2280
+    review, P2). `--all-repos` redirects `STATE` per repo (`apply_repo(multi=True)`) and restores
+    only the PATH at the end, so a set-only box never writes the canonical `pr-doctor.json`: the
+    unlabelled view is then frozen at whatever the last SINGLE-repo pass left, possibly days old,
+    for a repo the set may no longer contain. Its rows carry no repo field, which is why the
+    per-repo printer refuses to substitute this file under a repo's header -- and the same reason
+    applies here, to the file presented as "the machine-wide view". Printed rather than guessed:
+    the age of the record, and whether per-repo records exist that this view cannot show. The
+    POINTER is computed before the age probe so the MISSING-file branch carries it too: that branch
+    is exactly the set-only box, where the per-repo rows are the only state there is.
+    """
+    pointer = _per_repo_pointer()
+    try:
+        age_s = max(0.0, time.time() - os.path.getmtime(STATE))
+    except OSError:
+        return ("pr-doctor: NO canonical state file at %s -- no single-repo pass has recorded "
+                "anything here, so nothing is listed below. That is NOT the same as \"nothing is "
+                "in cooldown\"%s." % (STATE, pointer))
+    if age_s < 3600:
+        age = "%dm" % int(age_s // 60)
+    elif age_s < 86400:
+        age = "%dh" % int(age_s // 3600)
+    else:
+        age = "%dd" % int(age_s // 86400)
+    return ("pr-doctor: canonical (machine-wide) state %s, last written %s ago; its rows carry no "
+            "repo field%s." % (STATE, age, pointer))
+
+
+def _print_state(path: str, label: str = "") -> None:
+    """One state file's rows, printed exactly as `--status` always printed them.
+
+    The canonical file is read through `load_state()` -- the same reader every other path uses, so a
+    corrupt or missing record degrades to "no rows" in ONE place instead of two disagreeing ones.
+    A per-repo file (`--all-repos`) has no such seam and is read directly.
+    """
+    if label:
+        print("== %s ==" % label)
+    # ⛔ AN EMPTY `path` IS A REFUSAL TO PRINT, NOT AN EMPTY RECORD. `_status_paths()` hands one
+    # through when the operator named a repo that has NO per-repo record; falling back to the
+    # canonical file here would print ANOTHER repo's rows under this repo's header -- the
+    # mis-attribution the two-record split exists to prevent.
+    if not path:
+        print("pr-doctor: NO per-repo record exists for the repo named above. The canonical "
+              "`pr-doctor.json` is NOT shown under its header: its rows carry no repo field, so "
+              "they could be ANOTHER repo's cooldowns, and printing them here would read as this "
+              "repo's state. Run `pr-doctor.py --status` with no `--repo` for the machine-wide "
+              "view, or wait for a pass that grades this repo (`--all-repos`).")
+        return
+    if path == STATE:
+        st = load_state()
+        note = _status_age_note()
+        if note:
+            print(note)
+    else:
+        try:
+            with open(path) as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+    for k, v in sorted(st.items()):
+        if k.startswith("_"):
+            continue
+        # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
+        # it always did -- and a row that exists because the PR was REFUSED can no longer be
+        # read as "a worker was dispatched for this".
+        kind = v.get("kind") or "spawn"
+        print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
+                                                (v.get("worker") or v.get("lane") or "?")[:12],
+                                                v.get("at"),
+                                                "" if kind == "spawn" else "  kind=" + kind))
+
+
+def _status_paths(args) -> list[tuple[str, str]]:
+    """[(label, state path)] for `--status`: the canonical file, or one per named repo.
+
+    ⛔ THE LABEL NAMES THE FILE THE ROWS CAME FROM, because there are now two records and picking
+    one silently is how an operator reads repo A's rows as repo B's. A SET reads each repo's own
+    file; one explicit `--repo` reads that repo's own file when an `--all-repos` run wrote it --
+    and when it does not exist, NOTHING is printed for it (see `_print_state`): the previous
+    version substituted the CANONICAL file and headed its rows with the named repo's slug, which is
+    a printed lie whenever those rows belong to another repo (a single-repo pass, a hand-armed
+    `com.tortoise.pr-doctor`), and the canonical file has no repo field to filter on.
+    """
+    # ⛔ ONE PARSER FOR BOTH WAYS AN ENTRY ARRIVES (#2518 review, P2). This branch used
+    # `_normalize_slug(explicit[0])` while the pass path used `split_repo_entry`, so
+    # `--status --repo owner/name=<checkout>` 
+    # refused as "not an owner/name slug" while the identical string worked everywhere else.
+    # NO EMPTY-FLAG FILTER HERE EITHER. `if s and s.strip()` discarded `--status --repo ""` and
+    # silently read the canonical file instead -- the operator's word dropped and a default adopted,
+    # the same shape the pass path refuses. A flag that was GIVEN is examined, empty or not.
+    explicit = [s.strip() for s in args.repo]
+    if not args.all_repos and len(explicit) <= 1:
+        if not explicit:
+            return [("", STATE)]      # ONE machine-wide view: the file the beat's readers read
+        slug_in, _hint = split_repo_entry(explicit[0])
+        slug = _normalize_slug(slug_in)
+        if not slug:
+            raise RepoUnresolved("--repo %r is not an owner/name slug" % explicit[0])
+        per = os.path.join(STATE_DIR, "pr-doctor.%s.json" % repo_tag(slug))
+        if os.path.exists(per):
+            return [("%s (%s)" % (slug, os.path.basename(per)), per)]
+        return [("%s (no per-repo record)" % slug, "")]
+    entries = configured_repos(explicit)
+    if not entries:
+        raise RepoUnresolved("--all-repos with no PR_DOCTOR_REPOS names no repo to read")
+    out = []
+    for entry in entries:
+        slug = _normalize_slug(split_repo_entry(entry)[0])
+        if not slug:
+            # NAMED, not skipped: a silently dropped entry makes the list look complete while one
+            # repo's record is missing from a read the operator asked for.
+            print("pr-doctor: --status: %r names no repository -- its record was NOT read" % entry)
+            continue
+        out.append((slug, os.path.join(STATE_DIR, "pr-doctor.%s.json" % repo_tag(slug))))
+    return out
+
+
+def _unplaced(p: dict):
+    """How much legible work a per-repo pass could NOT place: the count the row reports.
+
+    It is the same blindness axis `_finish` refuses on -- unreadable checks, an unusable
+    changed-file list, an order no worker accepted -- summed into ONE number, because the question
+    a per-repo row answers is "did this repo's queue get worked", not "which read failed".
+    """
+    if "dispatched" not in p:
+        return None                    # the pass never got as far as counting (a blind queue read)
+    return sum(p.get(k) or 0 for k in ("unreadable", "surface_unreadable", "surface_partial",
+                                       "surface_abandoned", "undeliverable"))
+
+
+def repo_row(slug: str, rc: int, p: dict) -> str:
+    """ONE line for one repo: repo, open PRs, items it could not place, verdict, rc.
+
+    ⛔ THE DENOMINATOR IS THE POINT. A machine-wide beat printed `PR-DOCTOR ok rc=0` while
+    agent-infra held 52 open PRs, because the pass it reported on was tortoise's. A row that always
+    carries `open_prs` and `unplaced` cannot say "healthy" about a repo whose queue it never read,
+    and a non-clean row is visible beside a clean one instead of replacing it.
+    """
+    op = p.get("open_prs")
+    un = _unplaced(p)
+    # ⛔ 2 AND 3 ARE DIFFERENT FACTS, SO THE WORD DIFFERS TOO: 2 = "I could not read the world",
+    # 3 = "I read it, I placed the work, and NO WORKER TOOK IT". Re-collapsing them under one word
+    # is what `_finish`'s exit-code split exists to prevent, and an operator scanning a per-repo
+    # table would be sent after a broken read instead of a broken transport.
+    verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH"}.get(rc, "RED")
+    return ("repo=%-34s open_prs=%-5s unplaced=%-5s dispatched=%-5s verdict=%s rc=%s"
+            % (slug, "?" if op is None else op, "?" if un is None else un,
+               p.get("dispatched", "?"), verdict, rc))
+
+
+def _worst_rc(rcs: list[int]) -> int:
+    """The overall exit for a set of passes: crash > could-not-read > nobody-took-it > clean."""
+    for code in (4, 2, 3):
+        if code in rcs:
+            return code
+    return next((c for c in rcs if c), 0)
+
+
+def canonical_paths() -> None:
+    """Point the state paths back at the files the fleet's readers read (ONE-repo layout)."""
+    global STATE, STATUS, LOG, LOG_BASENAME, _WORKER_TAG
+    STATE, STATUS, LOG = _CANONICAL
+    LOG_BASENAME = "pr-doctor.log"
+    _WORKER_TAG = ""
+
+
+def clear_repo_target() -> None:
+    """Forget the previous target before resolving a new one.
+
+    ⛔ THIS IS WHY A REFUSAL IS A REFUSAL IN ONE PROCESS TOO. `--all-repos` grades several repos
+    in sequence, and a repo whose evidence does not answer must not inherit the PREVIOUS repo's
+    slug, checkout or worktree root -- that would grade the wrong repo while reporting a refusal.
+    A fresh process starts here by construction; this makes an in-process pass say the same.
+    """
+    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT
+    REPO = REPO_DIR = REPO_DIR_ERROR = WORKTREE_ROOT = ""
+
+
+def run_all_repos(args, explicit) -> int:
+    """Grade a SET of repos in one invocation, one line per repo, non-clean if ANY repo is."""
+    entries = configured_repos(explicit)
+    if not entries:
+        msg = ("--all-repos (or repeated --repo) needs a SET of repos and PR_DOCTOR_REPOS is "
+               "empty: pass PR_DOCTOR_REPOS='owner/name[=checkout],...' or repeat --repo. There "
+               "is deliberately no default set -- a machine that names no repo is not a machine "
+               "with one repo")
+        log("REFUSING: %s" % msg)
+        return record_exit(EXIT_REFUSING, msg, repo="")
+    results, rows = [], []
+    # ⛔ TWO REPOS THAT SHARE A TAG WOULD SHARE ONE RECORD -- refused before anything is read (see
+    # `set_tag_collisions()`); the alternative is one repo's cooldowns deciding the other's budget.
+    clash = set_tag_collisions(entries)
+    if clash:
+        log("REFUSING: %s" % clash)
+        return record_exit(EXIT_REFUSING, clash, repo="")
+    # ⛔ COMPUTED ONCE, FROM THE SET, AND PASSED DOWN -- never stored (see `set_rubric_note()`).
+    set_note = set_rubric_note(entries)
+    if set_note:
+        log("rubric: REFUSING TO DISPATCH -- %s" % set_note)
+    for entry in entries:
+        slug_in, hint = split_repo_entry(entry)
+        try:
+            slug, checkout, source, ckwhy = resolve_repo(explicit=slug_in, checkout_hint=hint)
+        except RepoUnresolved as e:
+            # ⛔ A BROKEN ENTRY DOES NOT STOP THE SET, and it does not become a clean row either:
+            # it is REPORTED (with `?` where the counts would be, because nothing was read) and it
+            # makes the overall verdict non-clean. Stopping here would hide the other repos' queues
+            # behind one misconfiguration; grading on regardless without saying so would hide this
+            # one.
+            log("repo=%s: REFUSED -- %s" % (slug_in or entry, e))
+            row = repo_row(slug_in or entry, 2, {})
+            rows.append(row)
+            print(row, flush=True)
+            log(row)
+            results.append({"repo": slug_in or entry, "rc": 2, "reason": str(e),
+                            "open_prs": None, "unplaced": None})
+            continue
+        apply_repo(slug, checkout, multi=True, source=source, rubric_note=set_note)
+        if ckwhy:
+            log("checkout: NONE for %s (%s) -- the queue is graded and NOTHING will be spawned"
+                % (slug, ckwhy))
+        try:
+            rc = run_pass(args, set_note)
+        except Exception as e:                # one repo's crash must not end the SET
+            # ⛔ `Exception`, NOT `BaseException` (#2280 review, P2). The reason to catch here is
+            # "a crash grading repo A says nothing about repo B's queue", and that is a statement
+            # about CRASHES. `BaseException` also swallowed the operator's Ctrl-C: it became repo
+            # A's `verdict=CRASH rc=4` and the loop CARRIED ON grading -- and spawning -- the rest
+            # of the set, with every further Ctrl-C eaten by the next iteration, so the only way
+            # out was SIGKILL. An interrupt is not a per-repo fact; it propagates.
+            # ⛔ THE SET IS THE POINT: a crash grading repo A says nothing about repo B's queue, so
+            # it is CAUGHT here, reported as this repo's rc=4 and the loop CARRIES ON. Letting it
+            # propagate would end the invocation with the remaining repos ungraded (and, before
+            # this, with `STATUS` still pointing at the last repo -- so the crash reached a
+            # per-repo file while the beat read a stale canonical one).
+            import traceback
+            traceback.print_exc()
+            log("repo=%s: CRASHED (%s: %s) -- the rest of the set is still graded"
+                % (slug, type(e).__name__, str(e)[:160]))
+            row = repo_row(slug, 4, {})
+            rows.append(row)
+            print(row, flush=True)
+            log(row)
+            results.append({"repo": slug, "rc": 4, "open_prs": None, "unplaced": None,
+                            "reason": "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:160])})
+            continue
+        row = repo_row(slug, rc, LAST_PASS)
+        rows.append(row)
+        print(row, flush=True)
+        log(row)
+        results.append({"repo": slug, "rc": rc, "reason": LAST_PASS.get("reason", ""),
+                        "open_prs": LAST_PASS.get("open_prs"),
+                        "unplaced": _unplaced(LAST_PASS)})
+    # The AGGREGATE record belongs in the canonical file: each repo's own pass already wrote its
+    # per-repo record, and leaving STATUS on the last repo would publish that repo's verdict as the
+    # machine's. `repos` carries the per-repo rows so a reader can see WHICH one is red.
+    canonical_paths()
+    rc = _worst_rc([r["rc"] for r in results])
+    dirty = [r["repo"] for r in results if r["rc"]]
+    # ⛔ THE NON-CLEAN REPOS GO FIRST IN `reason`, BECAUSE THE BEAT CUTS IT. `objective.py` renders
+    # the field at `[:110]` and `heartbeat-loop.sh` at `[:180]`; a summary in grading order would put
+    # the quiet repo first and let the cut sever exactly the repo an operator has to act on.
+    ordered = [r for r in results if r["rc"]] + [r for r in results if not r["rc"]]
+    summary = "; ".join("%s rc=%s%s" % (r["repo"], r["rc"],
+                                        "" if not r["rc"] else " (%s)" % (r["reason"] or "")[:90])
+                       for r in ordered)
+    log("all-repos: %d repo(s) graded, %d non-clean%s -- %s"
+        % (len(results), len(dirty), (" (%s)" % ",".join(dirty)) if dirty else "", summary[:400]))
+    return record_exit(rc, "all-repos: %d of %d repo(s) non-clean -- %s"
+                       % (len(dirty), len(results), summary),
+                       repo=",".join(r["repo"] for r in ordered), repos=results)
 
 
 def dispatcher_kind_support() -> str:
@@ -2514,29 +3525,77 @@ def main() -> int:
     ap.add_argument("--max", type=int, default=None,
                     help="hard ceiling on dispatches this pass; default is the machine's "
                          "MAX_FIX+MAX_REVIEW (see capacity())")
+    ap.add_argument("--all-repos", action="store_true",
+                    help="grade every repo named in PR_DOCTOR_REPOS and print one line per repo")
     args = ap.parse_args()
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
+    # ⛔ ONE EXPRESSION. `_not_a_fleet_reason()` is the fleet's only copy of this rule (the prescan
+    # uses it too); the branch's second copy (`reading_kind`) is gone, exactly as #2310 requires.
+    # It is assigned BEFORE every exit path below, so a repo-resolution refusal (which never
+    # reaches a pass) still cannot let `--dry-run` stamp the fleet's record.
     NOT_A_FLEET_READING = _not_a_fleet_reason(args)
 
+    # ⛔ THE FILTER KEEPS AN EMPTY FLAG. Dropping `--repo ""` here read it as "no flag was given",
+    # so the pass fell back to `OR`/`REPO`/cwd and graded a repo the operator had explicitly not
+    # named -- the exact fail-open this change removes, at the one input spelling that survived the
+    # guard inside `resolve_repo()`. A flag that was GIVEN is preserved, empty or not.
+    explicit = [s.strip() for s in args.repo]
+    # ⛔ NOTHING CARRIES OVER FROM AN EARLIER PASS IN THIS PROCESS. See `clear_repo_target`.
+    clear_repo_target()
+
+    if args.status:
+        try:
+            for label, path in _status_paths(args):
+                _print_state(path, label)
+        except RepoUnresolved as e:
+            log("REFUSING: %s" % e)
+            return record_exit(EXIT_REFUSING, str(e), read="status")
+        return EXIT_CLEAN
+
+    if args.all_repos or len(explicit) > 1:
+        return run_all_repos(args, explicit)
+
+    try:
+        # `--repo owner/name=<checkout>` is the same entry form a set accepts (see
+        # `split_repo_entry`), so a lone flag parses it too rather than refusing it as a bad slug.
+        slug_in, hint = split_repo_entry(explicit[0]) if explicit else ("", "")
+        slug, checkout, source, ckwhy = resolve_repo(
+            explicit=(slug_in if explicit else None), checkout_hint=hint)
+    except RepoUnresolved as e:
+        # ⛔ THE REFUSAL, NOT A DEFAULT, AND IT HAPPENS BEFORE ANY READ. The old module constant
+        # made an unresolvable repo silently BECOME tortoise, so the pass then reported a clean
+        # verdict about a repo nobody had asked it to look at (52 agent-infra PRs, "nothing to do").
+        # A refusal that has already called gh is not a refusal, so nothing is read first; the exit
+        # is EXIT_REFUSING -- the fleet's own "I could not read the world" -- and the reason names
+        # every source it looked at, so an operator is never sent hunting for a line that set a
+        # hidden default.
+        log("REFUSING: %s" % e)
+        return record_exit(EXIT_REFUSING, str(e), repo="")
+    apply_repo(slug, checkout, source=source)
+    if ckwhy:
+        # DECLARED, not silent: the queue is still graded (that is the measurement the fleet keeps
+        # losing), but with no checkout there is no worktree to put a worker in, so nothing can be
+        # placed -- and `materialise_worktree()` says exactly that instead of `git -C ""` in the
+        # caller's cwd.
+        log("checkout: NONE for %s (%s) -- the queue is graded and NOTHING will be spawned"
+            % (slug, ckwhy))
+    return run_pass(args)
+
+
+def run_pass(args, rubric_note: str = "") -> int:
     # ⛔ `--status` IS ANSWERED BEFORE THE SEAM GATE (2026-10-22, review round 4). It prints
     # `load_state()` rows and reads no world, so it needs NO classifier symbol. Gating it behind
     # SEAM_ERROR removed the only in-process state listing on exactly the box where the farm drifted
     # -- i.e. where an operator needs it most. The gate below protects every path that READS.
     st = load_state()
-    if args.status:
-        for k, v in sorted(st.items()):
-            if k.startswith("_"):
-                continue
-            # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
-            # it always did -- and a row that exists because the PR was REFUSED can no longer be
-            # read as "a worker was dispatched for this".
-            kind = v.get("kind") or "spawn"
-            print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
-                                                    (v.get("worker") or v.get("lane") or "?")[:12],
-                                                    v.get("at"),
-                                                    "" if kind == "spawn" else "  kind=" + kind))
-        return EXIT_CLEAN
+    # ⛔ `--status` WAS ANSWERED IN `main()` BEFORE THIS FUNCTION WAS ENTERED, through
+    # `_status_paths()`/`_print_state()` -- the branch's extraction of exactly the inline printer
+    # that used to live here, unchanged for the canonical file and extended to one file per repo.
+    # Keeping this copy too would be two printers for one flag (the two-readers defect this file
+    # keeps removing), and it is unreachable: `main()` returns on `args.status` before `run_pass()`.
+    # The property main stated here is preserved, and earlier: `--status` still reads no world, so
+    # it is still answered BEFORE the seam gate below.
 
     # ⛔ THE SEAM IS A RECORDED REFUSAL, NOT A BARE EXIT (2026-10-22, review round 3). See
     # SEAM_ERROR above: raising at import time exited 1 and left the previous pass's `ok` in place.
@@ -2593,6 +3652,11 @@ def main() -> int:
         return record_exit(EXIT_REFUSING, "the open-PR read FAILED (%s) -- nothing dispatched"
                            % OPEN_PRS_ERROR[:160], read="open_prs")
     prs = [p for p in prs if not p.get("isDraft")]
+    # ⛔ THE QUEUE'S OWN DENOMINATOR, TAKEN BEFORE `--only` NARROWS THE UNIVERSE. A per-repo row
+    # that reported `open_prs=1` because the operator was debugging one PR would answer "how big is
+    # this repo's queue" with the size of the debug view -- the same denominator failure the
+    # `dispatched 0 of 0` line was fixed for.
+    queue_n = len(prs)
     if args.only:
         prs = [p for p in prs if p["number"] == args.only]
     if not prs:
@@ -2600,8 +3664,11 @@ def main() -> int:
         # ⛔ THE EMPTY QUEUE IS A CLEAN PASS, AND IT SAYS WHICH CLEAN PASS IT IS (2026-10-18).
         # `dispatched 0` with no denominator is the line this job printed for days while it was
         # actually refusing; "0 of 0 queued -- queue is empty" cannot be mistaken for that.
+        # ⛔ `queue_n`, NOT a literal 0: `--only N` can narrow a NON-EMPTY queue to empty, and the
+        # per-repo row must not then claim this repo has no open PRs (the denominator this change
+        # exists to publish). `queue_n` is 0 in the genuine-empty case, which is the common one.
         return record_exit(EXIT_CLEAN, "queue is empty: no open non-draft PRs",
-                           queued=0, dispatched=0)
+                           queued=0, dispatched=0, open_prs=queue_n)
 
     # classify everything first, then dispatch highest-value first
     classified = []
@@ -2774,7 +3841,11 @@ def main() -> int:
             % len(prs))
         return record_exit(EXIT_REFUSING, "not ONE of the %d open PR(s) had readable checks -- nothing "
                            "dispatched" % len(prs), queued=len(prs), dispatched=0,
-                           read="pr_checks")
+                           open_prs=queue_n,
+                           # ⛔ `unreadable` IS WHAT `_unplaced()` SUMS. Omitting it made this
+                           # exit's per-repo row report `unplaced=0` for a pass that could not read
+                           # ONE of its PRs -- the same fact `_finish` reports as `unplaced=N`.
+                           unreadable=len(prs), read="pr_checks")
 
     # Cheapest-and-highest-payoff FIRST: a landable PR costs one rail call, a repair costs lane-
     # hours. ⛔ THIS IS THIS FILE'S OWN POLICY, NOT `objective.CLASS_ORDER` -- the two differ
@@ -2966,6 +4037,7 @@ def main() -> int:
         elif not dispatched and undeliv:
             code = EXIT_UNDELIVERED
         return record_exit(code, why, queued=queued, dispatched=dispatched, prs=delivered,
+                           open_prs=queue_n,
                            dry_run=bool(args.dry_run),
                            issue_work=issue_work,
                            un_owned=len(un_owned), owned=len(owners),
@@ -2994,13 +4066,13 @@ def main() -> int:
         # while it is still running; the worker name and the worktree are deterministic, so the
         # second spawn lands on top of the live one and destroys its log/.rc/.pid (see dispatch()).
         # This is checked even with NO state row, because a lost state file is not a dead worker.
-        live = worker_live("prd-%s" % key)
+        live = worker_live_for(key)
         if live:
             # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
             # nothing to do" is a false clean when the truth is "three PRs already have a worker".
             stalled["worker-running"] = stalled.get("worker-running", 0) + 1
-            log("#%s (%s): worker prd-%s is still running -- not spawning a second one"
-                % (key, action, key))
+            log("#%s (%s): worker %s is still running -- not spawning a second one"
+                % (key, action, worker_name(key)))
             continue
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as
@@ -3025,8 +4097,8 @@ def main() -> int:
             # nothing to do, and it will land without another pass.
             undeliverable += 1
             stalled["live-unreadable"] = stalled.get("live-unreadable", 0) + 1
-            log("#%s (%s): worker prd-%s liveness could not be read -- skipping rather than "
-                "spawning blind over a possibly live worker" % (key, action, key))
+            log("#%s (%s): worker %s liveness could not be read -- skipping rather than "
+                "spawning blind over a possibly live worker" % (key, action, worker_name(key)))
             continue
         text = brief(p, action, why, cr)
         if not text:
@@ -3035,7 +4107,7 @@ def main() -> int:
             stalled["brief"] += 1
             undeliverable += 1
             continue
-        ok, detail, record = dispatch(p, action, text, args.dry_run)
+        ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
             if record and not args.dry_run:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in
@@ -3043,7 +4115,7 @@ def main() -> int:
                 # the pass logs the same line for ever and the PR is never dispatched and never
                 # visible in `--status`. NOTE the row consumes the class slot on the NEXT pass via
                 # pass_budgets(), so it must not also be charged to this pass's `spent`.
-                st[key] = {"action": action, "worker": "prd-%s" % key, "kind": "refused",
+                st[key] = {"action": action, "worker": worker_name(key), "kind": "refused",
                            "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
                 # COUNTED for the same reason as the two liveness skips above: a pass whose only
                 # outcome was refusals must not summarize itself as "nothing to do". The row makes
@@ -3058,7 +4130,7 @@ def main() -> int:
                 undeliverable += 1
             continue
         if not args.dry_run:
-            st[key] = {"action": action, "worker": "prd-%s" % key, "kind": "spawn",
+            st[key] = {"action": action, "worker": worker_name(key), "kind": "spawn",
                        "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
         spent[cls] += 1
         dispatched += 1
@@ -3083,6 +4155,12 @@ if __name__ == "__main__":
     except BaseException as e:
         import traceback
         traceback.print_exc()
+        # ⛔ THE RECORD GOES TO THE CANONICAL FILE, WHATEVER THE PASS LAST POINTED AT. A crash in
+        # `--all-repos` mode propagates out with `STATUS` on the LAST repo's per-repo file, so
+        # recording here without restoring would put the crash where no reader looks (the beat and
+        # `objective.py` read `pr-doctor.status.json`) and leave a stale `ok` standing as the
+        # machine's verdict. `canonical_paths()` is a no-op for a single-repo pass.
+        canonical_paths()
         record_exit(EXIT_CRASH, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
         # ⛔ `raise SystemExit(4)`, NOT a bare re-raise (2026-10-18, review): CPython exits 1 for an
         # uncaught exception, so the sidecar said rc=4 while launchd said 1 -- the two readers this

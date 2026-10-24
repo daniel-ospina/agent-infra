@@ -1806,7 +1806,91 @@ agent-infra#2129 and called from `orch-loop.sh` by that same commit (NOT by #189
 either, which is what makes the field PUBLISHED AND UNREAD rather than merely re-homed. The orphan is
 disclosed in `scripts/heartbeat-loop.sh` and in the retirement note at the foot of this file.
 
-agent-infra#1774, #1788.
+### WHICH REPO A PASS GRADES — evidence, never a default (2026-10-21)
+
+`pr-doctor.py` used to carry `REPO = "daniel-ospina/tortoise"` and `REPO_DIR =
+$HOME/Documents/GitHub/tortoise` as module constants, so every pass spoke for ONE repo whichever
+repo it had been started for. MEASURED: the installed `com.tortoise.pr-doctor` printed a clean
+`nothing to do` while `daniel-ospina/agent-infra` held 52 open PRs (the 9 tortoise PRs were all in
+cooldown). The verdict was true about tortoise and false about the machine, and nothing in the line
+said which repo it was about.
+
+`resolve_repo()` now decides the target from evidence, highest first, and REFUSES (exit 2) rather
+than defaulting:
+
+| rank | source | why it ranks there |
+|---|---|---|
+| 1 | `--repo OWNER/NAME` | the operator's explicit word for THIS invocation |
+| 2 | `OR` | the slug the LAUNCHER resolved and passed — `orch-loop.sh`, the cell session strings and `install.sh`'s rendered plist all carry `OR` + `REPO` + `O` as per-invocation state |
+| 3 | `REPO`'s `origin` remote | the checkout the launcher named, read for what it PROVES it is |
+| 4 | the cwd's `origin` remote | the weakest evidence: whatever checkout the process happens to be in |
+| 5 | REFUSE | exit 2, naming every source it looked at |
+
+`GH_REPO` and `TORTOISE_REPO` are deliberately NOT sources: both are global on a fleet box (a
+pushed `keys.env` exported `GH_REPO=daniel-ospina/tortoise` and `gh` honoured it for every command
+— #2235; an ambient `TORTOISE_REPO` outranked a launchd entry point's own directory — #9388), so
+inheriting one grades a repo nobody named. Once the target is resolved, `GH_REPO` is PINNED to it,
+so a worker this pass spawns cannot have its own rail answer about another repo.
+
+The checkout is used only when its `origin` proves the resolved repo: a pass launched for A from
+B's checkout grades A, reads B's checkout only for the identity probe, and cannot `git -C` B, add
+B's worktrees, or read B's branches. A launcher that names two repos (`OR=A` with a `REPO` checkout
+of B) is refused, naming both. With no checkout the queue is still graded and the pass says
+`checkout: NONE … NOTHING will be spawned` — deliberately, because a 52-PR queue must not go
+unreported just because this box has no worktree for it.
+
+`--all-repos` (set from `PR_DOCTOR_REPOS='owner/name[=checkout],…'` or repeated `--repo`) grades
+the whole set and prints ONE ROW PER REPO:
+
+```text
+repo=daniel-ospina/agent-infra          open_prs=52    unplaced=52    dispatched=0     verdict=REFUSING rc=2
+repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched=0     verdict=clean rc=0
+```
+
+The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
+(`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
+`CRASH` (`4`). Each entry is `owner/name`, or `owner/name=<checkout>` when the checkout is not the one
+`REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
+flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
+instruction), and a checkout is only used when its `origin` proves the resolved repo — a remote on
+another host, a local path or a `file://` URL proves nothing.
+
+The aggregate exit is non-clean when ANY repo is (precedence `4` crash > `2` could-not-read > `3`
+nobody-took-it), the canonical `pr-doctor.status.json` names every repo and carries a `repos` list,
+and each repo also writes its own `pr-doctor.<owner>-<name>.{json,status.json,log}` — so the beat's
+single line can no longer launder a stuck repo behind a quiet one. There is deliberately no default
+set: `--all-repos` with no `PR_DOCTOR_REPOS` refuses, because a filesystem scan would answer with
+whatever checkouts happen to exist, which is a default by another name.
+
+### WHICH CONTRACT A PASS JUDGES BY — resolved, or refused (agent-infra#2518)
+
+Resolving the repo is not the whole decision: `objective.py` also holds the **contract** a PR is
+judged by — the REQUIRED check contexts (minus `ai-review-gate` for the gated set) and the
+human-gated SURFACE paths. Those are `objective.py`'s built-ins, and they describe exactly one repo.
+A pass for any other repo reads ITS queue and would judge it by a declaration nobody wrote for it:
+**measured** on `daniel-ospina/agent-infra` with an all-green, clean-attested check list, that
+classifies `rerun-checks` (every green PR re-triggered, its attestation staled) and
+`touches_surface()` is always `False` (a surface-touching diff handed to the automated lander).
+
+So the contract's scope is decided per pass and **fails closed**:
+
+* The contract is the repo's own when the operator supplied it through `objective.py`'s existing
+  seams — `OBJECTIVE_REQUIRED='<ctx>,<ctx>'` and `OBJECTIVE_SURFACE='<path>,<path>'`. Both must be
+  non-empty: an empty value is "not supplied", never "this repo requires nothing".
+* It is also the repo's own for the **one** repo the built-ins describe (`REQUIRED_DEFAULT`) —
+  refusing that one would kill the shipped single-repo doctor.
+* Otherwise the pass **refuses to dispatch** and says so in its log. It still grades the queue and
+  prints the row — `open_prs`/`unplaced` are the measurement the fleet keeps losing — but an
+  unplaceable queue reports `UNPLACED` (`3`), not a confident order derived from another repo.
+
+⛔ The refusal is DERIVED from the resolved slug on every call, never stored: a module flag left over
+from the previous repo in an `--all-repos` set would refuse (or, worse, allow) the next one's
+dispatch for a reason about a different repo. ⚠️ **Declared residual:** the seams are machine-wide,
+so one `--all-repos` set cannot describe two repos at once — a set grading a repo whose contract was
+not supplied is read-only by design. Per-repo contract wiring is **agent-infra#2518**, and one doctor
+instance per repo is **#2281**.
+
+agent-infra#1774, #1788, #2281, #2518.
 
 ### 6.5.3 Ancestry is the safety rail
 
