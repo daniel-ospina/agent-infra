@@ -413,7 +413,7 @@ consumer reusing this file via `workflow_call`. With the variable unset the job 
 does today; the reservation is one command to engage and the same one to release.
 
 That 24 h cancel is **not a safe place to wait**, which is the second half of the same argument: a
-`cancelled` check is in `NON_RED_CONC` (`scripts/admin-merge.sh:4379`), so a reservation that was
+`cancelled` check is in the rail's `NON_RED_CONC` allow-list (`scripts/admin-merge.sh`), so a reservation that was
 engaged but never labelled would end as a **non-red** required check instead of a visibly `queued`
 one — the rail's own fail-open class (#2474). Hence §9.3's release deadline.
 
@@ -429,7 +429,7 @@ Do this **before** engaging the variable, then verify. `<id>` is a runner id fro
 1. List the runners and pick the slots to reserve:
 
 ```bash
-gh api repos/daniel-ospina/agent-infra/actions/runners \
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
   --jq '.runners[] | {id, name, status, busy, labels: [.labels[].name]}'
 ```
 
@@ -462,7 +462,7 @@ strands a registered-but-jobless runner (#2373).
 3. Verify the reservation is visible to the scheduler (THE ARTIFACT, not the send):
 
 ```bash
-gh api repos/daniel-ospina/agent-infra/actions/runners \
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
   --jq '.runners[] | select([.labels[].name] | index("required-check")) | "\(.id) \(.name) status=\(.status) labels=\([.labels[].name]|join(","))"'
 ```
 
@@ -489,7 +489,7 @@ is neither `queued` nor `cancelled` on the head before trusting the rail.
 
 ### 9.4 Residuals, stated because they are not fixed here
 
-- **A `cancelled` REQUIRED check is non-red in the rail** (`NON_RED_CONC`, `scripts/admin-merge.sh:4379`,
+- **A `cancelled` REQUIRED check is non-red in the rail** (`NON_RED_CONC` allow-list in `scripts/admin-merge.sh`,
   `{success, neutral, skipped, cancelled, stale}`). This is pre-existing and is the same class as
   #2474 (a cancelled guard leg satisfying a completeness check with no verdict); the reservation
   makes it *reachable* via the 24 h queue cancel, which is why §9.3 carries a deadline. The rail

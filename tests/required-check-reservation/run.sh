@@ -28,6 +28,9 @@
 #      sequence there sees only `ubuntu-latest` while YAML puts the job on the reservation.
 #      This is the regression found in review round 2 (a false PASS).
 #   9. UNREADABLE workflow                                                → rc 2, never a pass.
+#   9. MUTANT: a multi-line FLOW sequence on the reservation        → must FAIL (T2).
+#   9b. CONTROL: a multi-line FLOW sequence of an unchanged routing  → must stay GREEN (0).
+#   9c. CONTROL: a job id with a trailing comment                    → must stay GREEN (0).
 #  10. CONTROL: a quoted/annotated spelling of an UNCHANGED routing       → must stay GREEN (0).
 #  10b. CONTROL: a one-line flow sequence WITH a trailing comment          → must stay GREEN (0).
 #  11. MUTANT: a one-line FLOW sequence on the reservation                → must FAIL (T2).
@@ -199,6 +202,31 @@ run_expect 1 "8 MUTANT a comment-interrupted block sequence is REFUSED" "$TMP/wf
 # ── 10. CONTROLS: equivalent spellings must not red a clean job, and must not hide a reserved one ─
 # The reader asserts the resolved VALUE, not the source spelling. Round 3 found it reddened a CLEAN
 # job for a trailing comment, quotes, or a one-element flow sequence; round 4 pins both directions.
+# 9 — a FLOW sequence that WRAPS onto the next line. `runs-on: [a,` / `  b]` is valid YAML; reading
+# only the first line reported just the labels before the break, so a second job on the reservation
+# passed GREEN (review round 4, P1).
+if mutate "$WF" "$TMP/wf-mlflow.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest,
+              required-check]'; then
+  run_expect 1 "9 MUTANT a multi-line FLOW sequence on the reservation is REFUSED" "$TMP/wf-mlflow.yml" "$DOC"
+else
+  fail "9 MUTATION-NOT-APPLIED (no plain runs-on to convert)"
+fi
+
+if mutate "$WF" "$TMP/wf-mlflow-clean.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest,
+              ]'; then
+  run_expect 0 "9b CONTROL a multi-line FLOW sequence of an unchanged routing stays GREEN" "$TMP/wf-mlflow-clean.yml" "$DOC"
+else
+  fail "9b MUTATION-NOT-APPLIED (no plain runs-on to convert)"
+fi
+
+# 9c — a JOB ID with a trailing comment. Not recognising it appended that job's lines to the
+# previous job and overwrote its routing, reddening a clean tree and blaming the wrong job.
+if mutate "$WF" "$TMP/wf-jobcomment.yml" '  workflow-drift:' '  workflow-drift: # drift guard'; then
+  run_expect 0 "9c CONTROL a job id with a trailing comment stays GREEN" "$TMP/wf-jobcomment.yml" "$DOC"
+else
+  fail "9c MUTATION-NOT-APPLIED (no plain job id to annotate)"
+fi
+
 if mutate "$WF" "$TMP/wf-quoted.yml" '    runs-on: ubuntu-latest' '    runs-on: "ubuntu-latest"  # default hosted'; then
   run_expect 0 "10 CONTROL a quoted/annotated unchanged routing stays GREEN" "$TMP/wf-quoted.yml" "$DOC"
 else

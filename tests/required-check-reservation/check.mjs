@@ -133,7 +133,10 @@ function parseJobs(file) {
       current = null;
       continue;
     }
-    const job = /^  ([A-Za-z0-9_-]+):\s*$/.exec(line);
+    // A job id with an optional trailing comment (`  workflow-drift: # drift guard`) is still a
+    // job start. Without this, that job's lines were appended to the PREVIOUS job, overwriting its
+    // routing — a clean tree then reddened with T1/T3 blaming the wrong job (review round 4).
+    const job = /^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(line);
     if (job) {
       current = {
         block: [line],
@@ -142,6 +145,7 @@ function parseJobs(file) {
         runsOnSeq: null,
         runsOnOpaque: false,
         pendingBare: false,
+        pendingFlow: null,
         timeout: null,
         uses: false,
       };
@@ -150,6 +154,27 @@ function parseJobs(file) {
     }
     if (!current) continue;
     current.block.push(line);
+    // A FLOW sequence that wraps onto following lines: `runs-on: [a,` / `  b]`. Reading only the
+    // first line dropped the continuation and reported only the labels before the break — a FALSE
+    // PASS while YAML had a second job on the reservation (review round 4, P1). Accumulate until
+    // the `]`; the job stays OPAQUE (exit 2) for as long as it is unresolved.
+    if (current.pendingFlow !== null) {
+      const buf = current.pendingFlow + " " + line.trim();
+      const close = buf.indexOf("]");
+      if (close >= 0) {
+        current.runsOnLabels = buf
+          .slice(0, close)
+          .split(",")
+          .map((s) => normLabel(s))
+          .filter((s) => s.length > 0);
+        current.runsOn = current.runsOnLabels.join(",");
+        current.runsOnOpaque = false;
+        current.pendingFlow = null;
+      } else {
+        current.pendingFlow = buf;
+      }
+      continue;
+    }
     // A single-line `runs-on: <value>` — inline scalar or one-line FLOW sequence.
     const roInline = /^    runs-on:\s*(\S.*?)\s*$/.exec(line);
     if (roInline) {
@@ -160,11 +185,20 @@ function parseJobs(file) {
       // label. Round 4's VGATE caught `[ubuntu-latest]  # hosted` being read as `[ubuntu-latest]`.
       if (/^\[/.test(raw)) {
         const close = raw.lastIndexOf("]");
-        const inner = close > 0 ? raw.slice(1, close) : raw.slice(1);
-        current.runsOnLabels = inner
-          .split(",")
-          .map((s) => normLabel(s))
-          .filter((s) => s.length > 0);
+        if (close > 0) {
+          current.runsOnLabels = raw
+            .slice(1, close)
+            .split(",")
+            .map((s) => normLabel(s))
+            .filter((s) => s.length > 0);
+        } else {
+          // Opened but not closed on this line: keep accumulating.
+          current.pendingFlow = raw.slice(1);
+          current.runsOnLabels = [];
+          current.runsOn = "";
+          current.runsOnOpaque = true;
+          continue;
+        }
       } else {
         current.runsOnLabels = [normLabel(raw)];
       }
