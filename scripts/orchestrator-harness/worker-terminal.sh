@@ -736,7 +736,7 @@ case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
 [ "$WT_ABSENT_CONFIRM" -gt 0 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err tfile trc absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -779,32 +779,25 @@ wt_table() {
   # which `2>/dev/null` on that simple command does not silence — the `{ …; } 2>/dev/null` group does,
   # which matters because on an unwritable `$dir` this runs on EVERY census read and the controller's
   # log is append-only and never rotated.
-  tfile="$dir/.wt-tree-err.$$"
+  # ⛔ ONE CAPTURE LOCATION, AND IT IS NOT `$dir` (review round 8 of #2653, P1). Round 6's fallback
+  # captured the streams differently when `$dir` was unwritable, so the SAME bytes could read one way
+  # with a writable dir and another way without it: the writable branch routed only STDERR into
+  # `tree_err` (an unparseable STDOUT left the verdict UNKNOWN), while the fallback merged both — so a
+  # `no server running` line printed on STDOUT became the absent-owner signal in one branch and not in
+  # the other. `dead` frees the caps and lets `wt_close` close a live worker's terminal, so that was
+  # the same P1 class the round-7 rc fix closed on the OTHER axis.
+  # The capture now lives in `$TMPDIR` (always writable for the user running the controller), so there
+  # is exactly ONE branch: stdout → `tree`, stderr → `tree_err`. If even that cannot be created, the
+  # probe still runs with stderr discarded and the absent-owner signal is simply UNOBSERVABLE — the
+  # census stays UNKNOWN and the caps binding, which is the pre-change behaviour and the safe side.
+  tfile="${TMPDIR:-/tmp}/.wt-tree-err.$$"
   if { : >"$tfile"; } 2>/dev/null; then
     tree="$(cmux tree --json 2>"$tfile")" || tree=""
     tree_err="$(cat "$tfile" 2>/dev/null || true)"
     rm -f "$tfile" 2>/dev/null || true
   else
-    # No capture file: merge the streams, then SPLIT them on RC FIRST and shape second.
-    # ⛔ RC FIRST IS THE FAIL-OPEN FIX (review round 7 of #2653, P1). The writable branch DISCARDS the
-    # reply when the read exits non-zero (`|| tree=""`), so accepting a parseable answer with a
-    # non-zero exit HERE made the two branches disagree about the same bytes: measured, one terminal
-    # record read `unknown`/count=1 with the capture writable and `dead`/count=0 with it unopenable —
-    # i.e. ONE sample emptied the census on exactly the degraded box this fallback exists for (caps
-    # stop binding, `wt_alive` says DEAD so the controller re-spawns, `wt_close` deletes a live
-    # worker's record). A non-zero exit is never a reading, in either branch.
-    # ⛔ AND THE TEXT MUST SURVIVE THAT EXIT: the absent-owner sentence arrives on stderr WITH rc=3, so
-    # clearing it would re-hide the one state this fallback preserves. It becomes the DIAGNOSTIC
-    # (`tree_err`), never the census.
-    tree="$(cmux tree --json 2>&1)"; trc=$?
-    if [ "$trc" -eq 0 ]; then
-      case "$tree" in
-        *'{'*) tree_err="" ;;              # JSON-shaped: let the parser judge it (a banner → UNKNOWN)
-        *)     tree_err="$tree"; tree="" ;; # nothing JSON-shaped: the text IS the diagnostic
-      esac
-    else
-      tree_err="$tree"; tree=""
-    fi
+    tree="$(cmux tree --json 2>/dev/null)" || tree=""
+    tree_err=""
   fi
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
@@ -842,6 +835,15 @@ wt_table() {
         absent_now="$(date +%s 2>/dev/null || echo 0)"
         absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
         case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
+        # `$(( … ))` reads a leading zero as OCTAL, `08` is not octal, the expansion errors and the
+        # FUNCTION ABORTS before printing a table — an EMPTY census, which every consumer reads as "the
+        # box has no workers" (caps stop binding, `wt_close` deletes a record it never looked at). The
+        # `10#` normalisation is the same one `floor_norm` uses, and it is also why `is_num` refuses a
+        # leading zero. ⛔ AND IT APPLIES ONLY TO A STAMP THAT EXISTS — normalising an EMPTY stamp would
+        # turn it into `0` (an already-elapsed window) and confirm on the FIRST sample, which is the
+        # single-sample conclusion this whole rule forbids.
+        absent_now=$(( 10#${absent_now:-0} ))
         if [ -z "$absent_since" ]; then
           # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
           # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
@@ -853,10 +855,18 @@ wt_table() {
         fi
         # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
         # what the suites and an operator debugging a box use; the default window needs a second sample.
+        absent_since=$(( 10#${absent_since:-0} ))
         [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
+      # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
+      # on a READABLE tree, so an answer that proves nothing either way — the
+      # `cannot connect … No such file or directory` wrapper this module deliberately treats as UNKNOWN,
+      # a banner — left an ANCIENT stamp standing; the next absent sample then confirmed immediately, a
+      # single-sample conclusion reached through a recovery path. Closing here means an outage whose
+      # messages alternate restarts the timer: the fail-CLOSED direction (caps bind longer).
+      *) rm -f "$dir/.wt-absent-since" 2>/dev/null || true ;;
     esac
   fi
-  # ANY readable answer closes the absent window: the owner came back (or was always there).
+  # …and a readable census closes it as well (the owner answered).
   [ -n "$tree" ] && rm -f "$dir/.wt-absent-since" 2>/dev/null || true
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
@@ -934,7 +944,12 @@ EOF
   fi
   WT_TABLE="$(printf '%s\n' "$tbl" | sed '/^$/d' | awk -F'\t' 'NF==2 && !seen[$1]++')"
   WT_TABLE_AT="$now"
-  { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$" 2>/dev/null \
+  # ⛔ THE `2>/dev/null` MUST APPLY TO THE GROUP, NOT SIT AFTER THE `>` (review round 8 of #2653, P2):
+  # a failing `>` open prints bash's own diagnostic on the PRE-COMMAND stderr, which a redirect placed
+  # after it never sees — so an unwritable `$dir` emitted raw bash noise on EVERY census read (~12 per
+  # controller cycle) into an append-only, never-rotated log. Measured: the group form silences it and
+  # keeps the same status.
+  { { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
     && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
   printf '%s\n' "$WT_TABLE"
 }

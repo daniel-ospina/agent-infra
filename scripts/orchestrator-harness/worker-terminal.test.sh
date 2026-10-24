@@ -1634,10 +1634,11 @@ out="$(bash "$TMP/q7.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O24" 2>&1)"
 case "$out" in *"UNWRITABLE"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "an unwritable absent-window is NAMED (an inert release cannot pass as a bounded one)" $rc
 
-# ⛔ AN RC!=0 REPLY IS NEVER THE CENSUS — IN EITHER BRANCH (review round 7 of #2653, P1). The writable
-# capture path discards it (`|| tree=""`); the merged fallback used to trust a JSON-shaped answer
-# regardless of rc, so the SAME bytes read `unknown`/count=1 with a writable dir and `dead`/count=0
-# without one — one sample emptying the census on exactly the degraded box the fallback exists for.
+# ⛔ AN RC!=0 REPLY IS NEVER THE CENSUS (review rounds 7-8 of #2653, P1). The probe discards it
+# (`|| tree=""`). Round 6 had a second, merged-stream branch for an unwritable `$dir` that trusted a
+# JSON-shaped answer regardless of rc — so the SAME bytes read `unknown`/count=1 with a writable dir and
+# `dead`/count=0 without one. Round 8 removed that branch entirely (the capture moved to `$TMPDIR`), so
+# this arm now pins the remaining rule: on a read-only state dir the reply is still discarded.
 cat > "$TMP/q10.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; mkdir -p "$O/state"
@@ -1667,6 +1668,47 @@ SH
 out="$(bash "$TMP/q11.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O28" 2>&1)"
 case "$out" in *"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "WT_ABSENT_CONFIRM=0 cannot disable the two-sample rule (an export is not a gate)" $rc
+
+# ⛔ `08` PASSES A DIGIT GUARD AND ABORTS `$(( ))` (review round 8 of #2653, P2). The expansion error
+# kills `wt_table` BEFORE it prints, and an empty census is indistinguishable from "this box has no
+# workers": the caps stop binding and `wt_close` deletes a record it never looked at. The `10#`
+# normalisation is what keeps a hand-edited stamp harmless.
+cat > "$TMP/q12.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_oct\nworkspace=ws_oct\n' > "$WT_DIR/worker-merge-94"
+printf '08\n' > "$WT_DIR/.wt-absent-since"          # a leading-zero stamp: NOT octal
+export CMUX_TREE_ABSENT=1
+. "$1"
+# ⛔ A ROW, NOT A COUNT: an `08` stamp is EPOCH 8, so it legitimately reads as an elapsed window and
+# its record as dead — what must NOT happen is the arithmetic aborting the function before it prints.
+echo "rows=$(wt_table | wc -l | tr -d ' ')"
+SH
+out="$(bash "$TMP/q12.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O29" 2>&1)"
+case "$out" in *"rows=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a leading-zero stamp (\`08\`) cannot abort the census into an EMPTY table" $rc
+
+# ⛔ ONLY THE ABSENT ANSWER MAY LEAVE THE WINDOW STANDING (review round 8 of #2653, P2). An answer that
+# proves nothing either way (the ENOENT wrapper this module deliberately treats as UNKNOWN, a banner)
+# used to leave an ancient stamp, so the NEXT absent sample confirmed immediately — a single-sample
+# conclusion reached through a recovery path.
+cat > "$TMP/q13.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=60; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_rec\nworkspace=ws_rec\n' > "$WT_DIR/worker-merge-93b"
+. "$1"
+export CMUX_TREE_ABSENT=1
+wt_table >/dev/null 2>&1 || true                     # opens the window
+echo "window-open=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+unset CMUX_TREE_ABSENT
+export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG='cannot connect to session socket /tmp/x.sock: No such file or directory (os error 2)'
+WT_TABLE_TTL=0;     # a non-absent, non-readable answer
+wt_table >/dev/null 2>&1 || true
+echo "window-after-other=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+SH
+out="$(bash "$TMP/q13.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O30" 2>&1)"
+case "$out" in *"window-open=open"*"window-after-other=closed"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an answer that is neither readable nor absent CLOSES the window (no single-sample confirmation later)" $rc
 
 # ⛔ THE SPAWN-CLEAR NEEDS A PIN, OR A REFACTOR THAT FOLDS IT INTO wt_forget STAYS GREEN (review
 # round 7 of #2653). A terminal spawn PROVES the cmux owner answered, so it must close the absent
