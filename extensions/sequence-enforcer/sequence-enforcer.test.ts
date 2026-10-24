@@ -3906,7 +3906,8 @@ await test("#1770.12 an unanswered long call keeps ONE clock — a second call n
       equal(blocked?.block, true, "pre-state: the bash call is REFUSED by the gate");
       equal(_inFlightForTest().length, 1, "a refused call leaves no state of its own — the sibling task is still outstanding");
     });
-    ok(parkSuppressedByInFlight(1, Number.POSITIVE_INFINITY), "the deferral does not expire on an enforcer-side clock — the tool layer owns tool liveness");
+    ok(parkSuppressedByInFlight(1, 0, 60_000), "an outstanding call suppresses while it is young");
+    ok(!parkSuppressedByInFlight(1, 7 * 60 * 60 * 1000), "and a phantom entry older than the fleet's 6 h task hard cap stops suppressing — a leak can never be permanent");
   } finally { /* nothing to release */ }
 });
 
@@ -4147,6 +4148,35 @@ await test("#1770.20 the verdict really EXITS 3 with the marker on stdout — pr
   ok(out.includes("SEQUENCE-GATE-UNSATISFIABLE"), "with the greppable marker on stdout");
   ok(out.includes("ENDING THIS LANE NOW (exit 3)"), "and the explicit ending line");
   ok(!out.includes("STILL ALIVE"), "the deferred fallback never fired");
+});
+
+await test("#1770.21 a call blocked by ANOTHER extension (no tool_result ever) cannot disarm the bound — tool_execution_end clears it (final review, blocker)", async () => {
+  _resetStateForTest();
+  auditCapture();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  try {
+    _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
+      // a long call is recorded as in flight…
+      await handlers.tool_call!({ toolName: "bash", toolCallId: "peer-blocked", input: { command: "scripts/slow-thing.sh" } });
+      equal(_inFlightForTest().length, 1, "pre-state: recorded");
+      // …then a LATER extension (skill-enforcer, verification-gate) refuses it, so
+      // no tool_result for THIS extension ever arrives. pi still emits
+      // tool_execution_end for the call that did not run.
+      await handlers.tool_execution_end!({ toolCallId: "peer-blocked", toolName: "bash", isError: true });
+      deepEqual(_inFlightForTest(), [], "the phantom entry is GONE — the bound is not disarmed");
+      captureStart();
+      try { for (let i = 0; i < 3; i++) handleSequenceTimeout(); } finally { captureStop(); }
+      equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 1, "and the stall is still bounded after the peer block");
+      deepEqual(_exitRequestsForTest(), [3]);
+      // per-id: a sibling's end must not clear another call
+      await handlers.tool_execution_start!({ toolCallId: "A", toolName: "task" });
+      await handlers.tool_execution_start!({ toolCallId: "B", toolName: "task" });
+      await handlers.tool_execution_end!({ toolCallId: "B", toolName: "task", isError: false });
+      deepEqual(_inFlightForTest().map((x) => x.id), ["A"], "a sibling's end clears only its own id");
+    });
+  } finally { auditRelease(); }
 });
 
 // ── cleanup + summary ────────────────────────────────

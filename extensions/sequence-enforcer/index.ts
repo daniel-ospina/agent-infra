@@ -345,7 +345,12 @@ export const SEQUENCE_PARK_CAP = 3;
 // DEFERS: the tool layer owns tool liveness (a silent child is killed at
 // DEFAULT_STREAM_STALL_MS = 20 min, a wedged one at the 6 h cap), and a completed
 // call clears the state. Nothing here suppresses a lane whose tools have returned.
-export const SEQUENCE_INFLIGHT_MAX_MS = Number.POSITIVE_INFINITY;
+// The ceiling exists ONLY so a leak cannot be permanent: `tool_execution_end` is
+// the authoritative clear (pi emits it even for a call that never ran, e.g. a
+// sibling extension's block), but if an entry ever survives that, an entry older
+// than the fleet's own task HARD CAP cannot correspond to a running tool. Same
+// number as DEFAULT_HARD_CAP_MS, so no legitimate call can be cut by it.
+export const SEQUENCE_INFLIGHT_MAX_MS = 6 * 60 * 60 * 1000;
 // ⛔ WHAT THIS BOUNDS: SILENCE, NOT BUSYNESS (review cycle 4, finding 1).
 // A "window" only elapses when NO tool event has happened for 10 minutes — every
 // tool call/result re-arms the timer. So the enforcer can honestly bound one
@@ -376,6 +381,16 @@ let lastEventCtx: { shutdown?: () => void } | null = null;
 // A — still working — was parked and killed. Every event now touches only its
 // own id.
 const inFlight = new Map<string, number>(); // toolCallId -> startedAt
+
+/** Oldest outstanding call's age (0 when nothing is outstanding). */
+function inFlightAgeMs(now = Date.now()): number {
+  let oldest = now;
+  for (const startedAt of inFlight.values()) if (startedAt < oldest) oldest = startedAt;
+  return now - oldest;
+}
+function suppressForInFlight(): boolean {
+  return parkSuppressedByInFlight(inFlight.size, inFlightAgeMs());
+}
 // Last tool activity — the MEASURED basis of the verdict's idle window.
 let lastToolActivityAt = Date.now();
 // Test seam: the exit request is recorded instead of ending the test process.
@@ -404,12 +419,14 @@ function isLongRunningTool(name: string): boolean {
  * Is the idle clock suppressed because a tool call is in flight?
  * Exported pure (test seam) — the timestamps are the whole rule.
  */
-export function parkSuppressedByInFlight(outstanding: number, maxMs: number = SEQUENCE_INFLIGHT_MAX_MS): boolean {
+/** Suppress the idle clock while a long call is outstanding and still young. */
+export function parkSuppressedByInFlight(
+  outstanding: number,
+  ageMs = 0,
+  maxMs: number = SEQUENCE_INFLIGHT_MAX_MS,
+): boolean {
   if (outstanding <= 0) return false;
-  // No enforcer-side ceiling: the tool layer owns tool liveness (20-min silent
-  // child bound, 6 h hard cap). `maxMs` stays as a seam so a future caller can
-  // bound it deliberately; the default never expires.
-  return Number.isFinite(maxMs) ? true : true;
+  return ageMs < maxMs;
 }
 
 /**
@@ -665,7 +682,7 @@ export function handleSequenceTimeout(
     // reviewer dispatch this very step prescribes) can run for tens of minutes
     // with no events at all. Re-arm silently until it outlives the fleet's own
     // bounds, so a working lane is never failed and a hung one still is.
-    if (parkSuppressedByInFlight(inFlight.size)) {
+    if (suppressForInFlight()) {
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
@@ -2652,6 +2669,28 @@ function tokenStateLabel(reason: string): string {
   if (reason.includes("none found")) return "none";
   return "other";
 }
+
+// ── tool_execution_start / end: the AUTHORITATIVE in-flight signal ──
+  // A call that another extension blocks, or that is never executed (aborted turn,
+  // unknown tool, invalid args), produces NO `tool_result` — so a leaf that only
+  // listened to tool_call/tool_result would hold a phantom "in flight" entry and
+  // disarm the whole bound for the session (final review of cycle 5, blocker).
+  // pi emits `tool_execution_end` on every path, including the blocked one (the
+  // bundle's `emitToolExecutionEnd(finalized, emit)` runs for the `immediate`
+  // preparation whose result IS the block error), so it is the reliable clear.
+  pi.on("tool_execution_start", async (event) => {
+    const id = String((event as any).toolCallId ?? "");
+    const name = String((event as any).toolName ?? "");
+    if (!id || !isLongRunningTool(name)) return;
+    if (!inFlight.has(id)) inFlight.set(id, Date.now());
+    return undefined;
+  });
+  pi.on("tool_execution_end", async (event) => {
+    const id = String((event as any).toolCallId ?? "");
+    if (!id) return;
+    inFlight.delete(id);
+    return undefined;
+  });
 
 // ── tool_result: advance step on gate fulfillment ──
   pi.on("tool_result", async (event, _ctx) => {
