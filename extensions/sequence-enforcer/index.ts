@@ -370,8 +370,12 @@ const unsatisfiableKeys = new Set<string>();
 // The timer has no ctx of its own; the last event's ctx is where `shutdown`
 // lives (loop-enforcer uses the same ctx.shutdown to end a session).
 let lastEventCtx: { shutdown?: () => void } | null = null;
-// The most recent tool call with no matching tool_result yet.
-let inFlight: { id: string; startedAt: number } | null = null;
+// Outstanding LONG-RUNNING tool calls, by toolCallId. ⛔ A single slot was a
+// blocker (final review of cycle 4): pi runs sibling calls from one assistant
+// message IN PARALLEL, so reviewer-B's result cleared reviewer-A's liveness and
+// A — still working — was parked and killed. Every event now touches only its
+// own id.
+const inFlight = new Map<string, number>(); // toolCallId -> startedAt
 // Last tool activity — the MEASURED basis of the verdict's idle window.
 let lastToolActivityAt = Date.now();
 // Test seam: the exit request is recorded instead of ending the test process.
@@ -380,27 +384,32 @@ export function _exitRequestsForTest(): number[] {
   return process.env.NODE_ENV === "test" ? testExitRequests : [];
 }
 /** Test seam: the outstanding in-flight call (or null) — proves it is never renewed. */
-export function _inFlightForTest(): { id: string; startedAt: number } | null {
-  return process.env.NODE_ENV === "test" ? inFlight : null;
+export function _inFlightForTest(): Array<{ id: string; startedAt: number }> {
+  return process.env.NODE_ENV === "test"
+    ? [...inFlight.entries()].map(([id, startedAt]) => ({ id, startedAt }))
+    : [];
 }
 
 // Only these can legitimately produce NO events for tens of minutes. A `read`
 // or an `edit` is instantaneous, so it must never mask a stall (the pre-existing
 // timeout tests drive `read` and expect the park immediately).
-const LONG_RUNNING_TOOLS = new Set(["bash", "task", "subagent", "task_collect", "task_status", "web_fetch", "loop_enforcer"]);
+const LONG_RUNNING_TOOLS = new Set(["bash", "task", "subagent", "task_collect", "task_status", "web_fetch", "web_search", "loop_enforcer"]);
+// MCP tools cannot be enumerated by hand (and one of them can run for many
+// minutes), so the `mcp__` namespace is long-running BY CONSTRUCTION.
+function isLongRunningTool(name: string): boolean {
+  return LONG_RUNNING_TOOLS.has(name) || name.startsWith("mcp__");
+}
 
 /**
  * Is the idle clock suppressed because a tool call is in flight?
  * Exported pure (test seam) — the timestamps are the whole rule.
  */
-export function parkSuppressedByInFlight(
-  now: number,
-  flight: { startedAt: number } | null,
-  maxMs: number = SEQUENCE_INFLIGHT_MAX_MS,
-): boolean {
-  if (!flight) return false;
-  if (!Number.isFinite(maxMs)) return true; // defer to the tool layer's own watchdogs
-  return now - flight.startedAt < maxMs;
+export function parkSuppressedByInFlight(outstanding: number, maxMs: number = SEQUENCE_INFLIGHT_MAX_MS): boolean {
+  if (outstanding <= 0) return false;
+  // No enforcer-side ceiling: the tool layer owns tool liveness (20-min silent
+  // child bound, 6 h hard cap). `maxMs` stays as a seam so a future caller can
+  // bound it deliberately; the default never expires.
+  return Number.isFinite(maxMs) ? true : true;
 }
 
 /**
@@ -463,8 +472,8 @@ function endUnsatisfiableLane(): void {
  * idle clock — so a refused `bash` would otherwise look like a working one
  * (review cycle 2 finding 1, cycle 3 finding 3's root).
  */
-function blockedResult(reason: string): { block: true; reason: string } {
-  inFlight = null;
+function blockedResult(reason: string, toolCallId = ""): { block: true; reason: string } {
+  inFlight.delete(toolCallId); // a refused call produces no tool_result
   return { block: true, reason };
 }
 
@@ -530,18 +539,29 @@ function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: M
  * outright would leave the measured class invisible; review cycle 1, finding 5).
  * Coalesced: the line and its row are written once per idle episode.
  */
-function noteNotGatedIdle(skill: SkillState, step: Step | undefined, mode: Mode, why: string): void {
+function noteNotGatedIdle(
+  skill: SkillState, step: Step | undefined, mode: Mode, why: string,
+  // A HUMAN gate is NOT the "no gate applied" class: it blocks every tool except
+  // read/web/loop_enforcer, so it gets its own event and its own sentence (final
+  // review of cycle 4, finding 3 — an operator filtering `timeout_idle_ungated`
+  // for "nothing is blocking" must not get human-owned stalls).
+  humanOwned = false,
+): void {
   const key = stallKey(skill);
   if (idleEpisodeSeen.has(key)) return;
   idleEpisodeSeen.add(key);
   const idleMin = Math.max(0, Math.round((Date.now() - lastToolActivityAt) / 60_000));
   console.log(
     `[sequence-enforcer] 💤 Idle — "${skill.path}" at step ${skill.stepIndex} "${step?.name ?? "?"}" (gate: ${step?.gate || "auto"}), no tool call for ${idleMin} min. ` +
-    `${why} So this is NOT a gate stall — further idle windows in this episode are coalesced, and there is no verdict to give. ` +
-    `A lane that never wakes is the lane reaper's call (fleet_state), not the sequence gate's.`,
+    // ⛔ the PARENTHESES matter: `a + b ? c : d` parses as `(a + b) ? c : d`, which
+    // printed the branch text and dropped the whole "💤 Idle — …" prefix.
+    (humanOwned
+      ? `${why} Further idle windows in this episode are coalesced and there is no verdict to give — the bound applies to machine gates.`
+      : `${why} So this is NOT a gate stall — further idle windows in this episode are coalesced, and there is no verdict to give. ` +
+        `A lane that never wakes is the lane reaper's call (fleet_state), not the sequence gate's.`),
   );
   auditLog({
-    ts: new Date().toISOString(), event: "timeout_idle_ungated", skill: skill.path, step: skill.stepIndex,
+    ts: new Date().toISOString(), event: humanOwned ? "timeout_idle_human" : "timeout_idle_ungated", skill: skill.path, step: skill.stepIndex,
     step_name: step?.name ?? null, gate: step?.gate || "auto", mode, idle_min: idleMin,
   });
 }
@@ -645,7 +665,7 @@ export function handleSequenceTimeout(
     // reviewer dispatch this very step prescribes) can run for tens of minutes
     // with no events at all. Re-arm silently until it outlives the fleet's own
     // bounds, so a working lane is never failed and a hung one still is.
-    if (parkSuppressedByInFlight(Date.now(), inFlight)) {
+    if (parkSuppressedByInFlight(inFlight.size)) {
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
@@ -669,7 +689,7 @@ export function handleSequenceTimeout(
       // A human gate on top is reported with ITS OWN reason (never "declares NO
       // gate" — it blocks everything except read/web/loop_enforcer), and never
       // bounded: a person is the owner.
-      noteNotGatedIdle(stall.skill, stall.step, mode, HUMAN_GATE);
+      noteNotGatedIdle(stall.skill, stall.step, mode, HUMAN_GATE, true);
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
@@ -733,9 +753,9 @@ function noteToolActivity(kind: "call" | "result", toolCallId: string, toolName 
     // parked, logged or ended — the pre-#1770 symptom, silently. The clock starts
     // at the FIRST unanswered call and the tool layer's watchdogs bound it; a
     // completed call (tool_result) clears it, so the next one starts fresh.
-    if (!inFlight) inFlight = LONG_RUNNING_TOOLS.has(toolName) ? { id: toolCallId, startedAt: lastToolActivityAt } : null;
+    if (isLongRunningTool(toolName) && !inFlight.has(toolCallId)) inFlight.set(toolCallId, lastToolActivityAt);
   } else {
-    inFlight = null;
+    inFlight.delete(toolCallId); // only THIS call's liveness — never a sibling's
   }
   // Only the ungated-idle EPISODE restarts on activity. The park count deliberately
   // does NOT (review cycle 2, finding 3): a lane that keeps making calls which do
@@ -2130,7 +2150,7 @@ export function _resetStateForTest(): void {
   idleEpisodeSeen.clear();
   unsatisfiableKeys.clear();
   lastEventCtx = null;
-  inFlight = null;
+  inFlight.clear();
   lastToolActivityAt = Date.now();
   testExitRequests.length = 0;
   // #1770: `endUnsatisfiableLane` sets a non-zero exit code; a test that drives
@@ -2166,7 +2186,7 @@ export default function (pi: ExtensionAPI) {
     parkAnnounced.clear();
     idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
-    inFlight = null;
+    inFlight.clear();
     lastToolActivityAt = Date.now();
     if (sequenceTimeout) {
       clearTimeout(sequenceTimeout); sequenceTimeout = null; // cycle 2: a stale timer must never fire into a new session
@@ -2246,7 +2266,7 @@ export default function (pi: ExtensionAPI) {
     idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
     lastEventCtx = null;
-    inFlight = null;
+    inFlight.clear();
     if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
     clearBridgeState();
   });
@@ -2523,7 +2543,7 @@ export default function (pi: ExtensionAPI) {
           // A blocked call is not in flight (VGATE review of cycle 4 found this
           // one block return still leaving the state set). The shape is kept
           // verbatim — the freshTokenBlock marker is a separate contract.
-          inFlight = null;
+          inFlight.delete(toolCallId);
           return {
             block: true,
             reason: `${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`,
@@ -2556,7 +2576,7 @@ export default function (pi: ExtensionAPI) {
         if (!shouldCoalesceBlocked(key)) {
           auditLog({ ts: new Date().toISOString(), event: "blocked", skill: target.path, step: ownerStep.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(ownerStep).allow, hint: guidance });
         }
-        return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`);
+        return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`, toolCallId);
       }
       // allowed escape call → resets the consecutive-block streak (mixed spam).
       checkpointBlockStreak = null;
@@ -2576,7 +2596,11 @@ export default function (pi: ExtensionAPI) {
       // #357 (Task 5): handler owns the single blocked audit entry
       // (#201: enriched with allowed/hint gate context).
       auditLog({ ts: new Date().toISOString(), event: "blocked", skill: top.path, step: step.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(step).allow, hint: guidance });
-      return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`);
+      // ⛔ NOT `toolCallId` here: that const is declared far below in this handler
+      // (checkpoint branch), so reading it here was a TDZ ReferenceError — which
+      // the handler's fail-open catch swallowed, silently skipping the block for
+      // every non-checkpoint refusal. Read the id from the event.
+      return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`, String((event as any).toolCallId ?? ""));
     }
 
     // #357 (Task 5): warn-mode would-block — ONE warn_blocked entry, and skip

@@ -3735,9 +3735,9 @@ await test("#1770.7 a tool call IN FLIGHT is not idle — a 30-min reviewer disp
   sequenceEnforcer(pi as any);
   try {
     // the pure rule: suppressed while a call is younger than the bound, resumed after
-    ok(parkSuppressedByInFlight(1_000, { startedAt: 0 }), "a call in flight suppresses the idle clock");
-    ok(parkSuppressedByInFlight(6 * 60 * 60 * 1000, { startedAt: 0 }), "for as long as it is in flight — the enforcer has NO ceiling (the tool layer's 20-min silence bound / 6 h cap owns tool liveness; review cycle 4 finding 2)");
-    ok(!parkSuppressedByInFlight(1_000, null), "no call in flight → not suppressed");
+    ok(parkSuppressedByInFlight(1), "an outstanding call suppresses the idle clock");
+    ok(parkSuppressedByInFlight(3), "…and so do three of them (a parallel dispatch counts once per call)");
+    ok(!parkSuppressedByInFlight(0), "no call outstanding → not suppressed");
 
     _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
     await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
@@ -3893,19 +3893,20 @@ await test("#1770.12 an unanswered long call keeps ONE clock — a second call n
       // second must NOT restart the clock: renewal is how a retry loop hid a stall.
       await handlers.tool_call!({ toolName: "task", toolCallId: "task-1", input: { prompt: "review" } });
       const first = _inFlightForTest();
-      ok(first, "an unanswered long call is tracked");
+      equal(first.length, 1, "an unanswered long call is tracked");
       await handlers.tool_call!({ toolName: "task", toolCallId: "task-2", input: { prompt: "review again" } });
       const second = _inFlightForTest();
-      equal(second!.id, "task-1", "the FIRST unanswered call is the one being timed (a renewal would name task-2)");
-      equal(second!.startedAt, first!.startedAt, "and its clock was not restarted");
+      equal(second.length, 2, "BOTH dispatches are outstanding (pi runs sibling calls in parallel)");
+      const a = second.find((x) => x.id === "task-1")!;
+      equal(a.startedAt, first[0]!.startedAt, "and the FIRST call's clock was not restarted");
       // a BLOCKED long call is not in flight at all (cycle 3 finding 3's root)
       await handlers.tool_result!({ toolName: "task", toolCallId: "task-1", content: [] } as any);
-      equal(_inFlightForTest(), null, "a completed call clears the clock");
+      deepEqual(_inFlightForTest().map((x) => x.id), ["task-2"], "a completed call clears ONLY its own slot, never a sibling\'s");
       const blocked: any = await handlers.tool_call!({ toolName: "bash", toolCallId: "blocked-1", input: { command: "rm -rf /" } });
       equal(blocked?.block, true, "pre-state: the bash call is REFUSED by the gate");
-      equal(_inFlightForTest(), null, "a refused call leaves NO in-flight state — it can never suppress the idle clock");
+      equal(_inFlightForTest().length, 1, "a refused call leaves no state of its own — the sibling task is still outstanding");
     });
-    ok(parkSuppressedByInFlight(Date.now() + SEQUENCE_INFLIGHT_MAX_MS, { startedAt: 0 }), "the deferral does not expire on an enforcer-side clock — the tool layer owns tool liveness");
+    ok(parkSuppressedByInFlight(1, Number.POSITIVE_INFINITY), "the deferral does not expire on an enforcer-side clock — the tool layer owns tool liveness");
   } finally { /* nothing to release */ }
 });
 
@@ -3932,7 +3933,7 @@ await test("#1770.13 a BACKGROUND reviewer + polls (the verdict's own remedy) is
     });
     equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "no verdict while the lane is polling a running reviewer (cycle 3 finding 1)");
     equal(_exitRequestsForTest().length, 0, "and the lane is not ended");
-    equal(_inFlightForTest(), null, "a background dispatch is not 'in flight' — the poll streak is what protects it");
+    deepEqual(_inFlightForTest(), [], "a background dispatch is not 'in flight' — the poll streak is what protects it");
   } finally { auditRelease(); }
 });
 
@@ -3972,7 +3973,7 @@ await test("#1770.15 a long call cannot be in flight at a current CHECKPOINT —
       // in flight, because the checkpoint blocks every non-escape tool.
       const res: any = await handlers.tool_call!({ toolName: "task", toolCallId: "reviewer-blocking", input: { prompt: "review" } });
       equal(res?.block, true, "the reviewer dispatch is BLOCKED by the checkpoint — it never becomes in-flight");
-      equal(_inFlightForTest(), null, "so no in-flight state exists to suppress the idle clock");
+      deepEqual(_inFlightForTest(), [], "so no in-flight state exists to suppress the idle clock");
       captureStart();
       try { for (let i = 0; i < 3; i++) handleSequenceTimeout(); } finally { captureStop(); }
     });
@@ -4063,6 +4064,8 @@ await test("#1770.18 a HUMAN gate is reported with its own reason and NEVER boun
     equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "a lane waiting on a PERSON is never ended");
     equal(_exitRequestsForTest().length, 0, "and no exit request");
     equal(logs.filter((l) => l.includes("💤 Idle")).length, 1, "it is reported once per episode instead");
+    equal(auditEntries.filter((e) => e.event === "timeout_idle_human").length, 1, "under its OWN event — not timeout_idle_ungated, whose meaning is 'no gate is applied'");
+    equal(auditEntries.filter((e) => e.event === "timeout_idle_ungated").length, 0);
     ok(/HUMAN decision/.test(logs.join("\n")), "with the human reason");
     ok(!/declares NO gate/.test(logs.join("\n")), "and NOT the false 'declares NO gate' text — a human gate blocks everything except read/web/loop_enforcer");
 
@@ -4078,6 +4081,72 @@ await test("#1770.18 a HUMAN gate is reported with its own reason and NEVER boun
     ok(/HUMAN decision/.test(logs.join("\n")), "the human reason is emitted for the sole-gated case too");
     equal(_exitRequestsForTest().length, 0);
   } finally { auditRelease(); }
+});
+
+await test("#1770.19 PARALLEL sibling calls: a returning sibling never clears a still-running call's liveness (final review, blocker)", async () => {
+  _resetStateForTest();
+  auditCapture();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  try {
+    _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
+      // two reviewers dispatched from one assistant message (pi runs them in PARALLEL)
+      await handlers.tool_call!({ toolName: "task", toolCallId: "reviewer-A", input: { prompt: "A" } });
+      await handlers.tool_call!({ toolName: "task", toolCallId: "reviewer-B", input: { prompt: "B" } });
+      equal(_inFlightForTest().length, 2, "both dispatches are outstanding");
+      // B returns while A is still working
+      await handlers.tool_result!({ toolName: "task", toolCallId: "reviewer-B", content: [] } as any);
+      deepEqual(_inFlightForTest().map((x) => x.id), ["reviewer-A"], "B's result cleared ONLY B — A is still working");
+      captureStart();
+      try { for (let i = 0; i < 3; i++) handleSequenceTimeout(); } finally { captureStop(); }
+      equal(logs.filter((l) => l.includes("parking")).length, 0, "no park while a sibling reviewer is still running");
+      equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "and no verdict — the lane is WORKING");
+      equal(_exitRequestsForTest().length, 0, "and it is never ended");
+      // a long MCP tool is in-flight by construction (it cannot be enumerated)
+      await handlers.tool_call!({ toolName: "mcp__seo-intelligence__perplexity_research", toolCallId: "mcp-1", input: {} });
+      equal(_inFlightForTest().length, 2, "an mcp__* call counts as in flight too");
+    });
+  } finally { auditRelease(); }
+});
+
+await test("#1770.20 the verdict really EXITS 3 with the marker on stdout — proven in a child PROCESS, not the test seam", async () => {
+  const dir = tmpDir("exit-e2e");
+  const home = join(dir, "home");
+  mkdirSync(home, { recursive: true });
+  const skill = join(dir, "SKILL.md");
+  writeFileSync(skill, "---\nname: exitfixture\nsteps:\n  - name: dispatch_reviewers\n    type: skill\n    gate: verifier\n---\nbody\n");
+  const driver = join(dir, "driver.mts");
+  writeFileSync(
+    driver,
+    [
+      `process.env.HOME = ${JSON.stringify(home)};`,
+      `process.env.PI_MODE = "print";`,
+      `process.env.AGENT_SEQUENCE_MODE = "warn";`,
+      `delete process.env.NODE_ENV;`, // the test seam must NOT be active
+      `const mod = await import(${JSON.stringify(join(REPO_ROOT, "extensions/sequence-enforcer/index.ts"))});`,
+      `const handlers = {};`,
+      `const pi = { on: (ev, h) => { (handlers[ev] ??= []).push(h); } };`,
+      `mod.default(pi);`,
+      `const ctx = { cwd: process.cwd() };`,
+      `for (const h of handlers.session_start ?? []) await h({}, ctx);`,
+      `for (const h of handlers.tool_call ?? []) await h({ type: "tool_call", toolName: "read", toolCallId: "r1", input: { path: ${JSON.stringify(skill)} } }, ctx);`,
+      `for (const h of handlers.tool_result ?? []) await h({ type: "tool_result", toolName: "read", toolCallId: "r1", content: [] }, ctx);`,
+      `for (let i = 0; i < 3; i++) mod.handleSequenceTimeout({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, ["pi"]);`,
+      `setTimeout(() => { console.log("[driver] STILL ALIVE — the verdict did not end the lane"); process.exit(0); }, 1500);`,
+    ].join("\n"),
+  );
+  let status = 0, out = "";
+  try {
+    out = execFileSync("npx", ["-y", "tsx@4", driver], { cwd: REPO_ROOT, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e: any) {
+    status = typeof e.status === "number" ? e.status : -1;
+    out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+  }
+  equal(status, 3, "the process EXITED 3 (a real exit, not a recorded request)");
+  ok(out.includes("SEQUENCE-GATE-UNSATISFIABLE"), "with the greppable marker on stdout");
+  ok(out.includes("ENDING THIS LANE NOW (exit 3)"), "and the explicit ending line");
+  ok(!out.includes("STILL ALIVE"), "the deferred fallback never fired");
 });
 
 // ── cleanup + summary ────────────────────────────────
