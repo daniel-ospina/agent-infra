@@ -1322,7 +1322,7 @@ say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick 
 # bare `"$1"` (or with a non-empty default such as `"${1:---dry-run}"`) would crash — or, worse,
 # rehearse while the fleet believes the work was attempted — with this suite still green.
 ROLES="$(awk '/^run_role_pass\(\) \{/,/^\}/' "$DOCTOR" \
-         | sed -nE 's/^[[:space:]]*([a-z][a-z_]*)\)[[:space:]]+run_([a-z_]+).*/\1 \2/p')"
+         | sed -nE 's/^[[:space:]]*([A-Za-z][A-Za-z0-9_-]*)\)[[:space:]]*run_([A-Za-z0-9_]+).*/\1 \2/p')"
 ROLE_N="$(printf '%s\n' "$ROLES" | grep -c . || true)"
 if [ "${ROLE_N:-0}" -ge 4 ]; then
   ok "roles: derived $ROLE_N dispatched role(s) from run_role_pass: $(printf '%s' "$ROLES" | awk '{printf "%s ", $1}')"
@@ -1439,7 +1439,7 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
   while read -r assign; do
     [ -n "$assign" ] || continue
     var="${assign%%=*}"; val="${assign#*=}"
-    case "$val" in *'$'[1-9]*|*'${'[1-9]*) ;; *) continue ;; esac
+    case "$val" in *'$'[1-9]*|*'${'[1-9]*|*'${#'[1-9]*|*'${!'[1-9]*) ;; *) continue ;; esac
     while read -r rd; do
       [ -n "$rd" ] || continue
       seen=$((seen + 1))
@@ -1455,7 +1455,7 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
         "$rd"|"\"$rd\"") ;;
         *) printf 'derived %s %s\n' "$var" "$rd" ;;
       esac
-    done < <(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"$val")
+    done < <(grep -oE '\$\{[#!]?[1-9][^}]*\}|\$[1-9]' <<<"$val")
   done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
   # ⛔ A POSITIONAL READ THE ASSIGNMENT SCAN CANNOT ATTRIBUTE IS A HARD FAIL, NOT A SILENCE
   # (review P2). The assignment pattern cannot see through a nested quote: for
@@ -1466,7 +1466,13 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
   # `unparsed` (fail-closed) rather than dropped. Trailing ` # …` comments are stripped first so a
   # comment that mentions `$1` cannot invent an unparsed read (`="#ff"` is unaffected: the strip
   # needs WHITESPACE before the `#`).
-  alln="$(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"$body" | wc -l)"
+  # ⛔ `[#!]?` IS REQUIRED: `${#1}` (length) and `${!1}` (indirect) are REAL positional reads that die
+  # under `set -u` exactly as `$1` does, and with a bare `[1-9]` after `${` BOTH halves of this audit
+  # were blind to them — the assignment scan did not see the read, so it was never graded, AND the
+  # `alln` counter below did not count it, so the fail-closed `unparsed` net could not fire either.
+  # Reproduced (review P1): `local n="${#1}"` in a new function left the suite at FAIL=0 and the
+  # counters untouched. The two regexes below MUST stay identical for that net to mean anything.
+  alln="$(grep -oE '\$\{[#!]?[1-9][^}]*\}|\$[1-9]' <<<"$body" | wc -l)"
   while [ "$seen" -lt "$alln" ]; do
     seen=$((seen + 1))
     printf 'unparsed ? ?\n'
@@ -1497,6 +1503,8 @@ bare|local d="$ROLES_DIR/.$1.lock"
 bare|local tmp="$1/.own.tmp.$$"
 bare|local dry="$1 "
 bare|local x="$1$2"
+bare|local n="${#1}"
+bare|local n="${!1}"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
 # …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
@@ -1526,8 +1534,9 @@ done
 # The enclosing function of a line, so a bare read is judged where it actually lives.
 func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empty before the first)
   local file="$1" want="$2" ln best=0
-  # ⛔ HEADER FORMS ACCEPTED, AND ALL MAY BE INDENTED: `name() {`, `name()` with the brace on the
-  # NEXT line, `function name() {`, and the keyword form `function name {`. Matching only
+  # ⛔ HEADER FORMS ACCEPTED, AND ALL MAY BE INDENTED: `name() {`, `name () {` (space before the
+  # parens), `name()` with the brace on the NEXT line, `function name() {`, and the keyword form
+  # `function name {`. Matching only
   # `name() {` at column 0 attributed a next-line-brace function, or a NESTED helper (this file has
   # `note()` in run_reap and `claim_take()` in run_merge), to the PRECEDING/OUTER function — where
   # that function's allowlisted name covered the read and it passed with no decision (review P1/P2,
@@ -1540,13 +1549,47 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # nested helpers both sit after their function's only positional binding, so nothing is
   # misattributed; a future one that does not would be reported under the helper's name, which is
   # LOUD (that pair is not on REQUIRED_READS) rather than silently allowed.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[a-z_][a-z0-9_]*\(\)([[:space:]]*\{|[[:space:]]*$)|^[[:space:]]*function[[:space:]]+[a-z_][a-z0-9_]*([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
+  # ⛔ THE NAME CHARSET IS NOT `[a-z_]` (review P1, reproduced). Bash accepts `ZzFutureHelper ()`,
+  # `zz-future-helper()`, `ZzFutureHelper(){` and a dotted/colon name; with a lowercase-only class
+  # those headers were INVISIBLE, so the mutant's `local s="$1"` resolved to the preceding function —
+  # whose allowlisted pair covered it — and the suite stayed green. The class below is therefore
+  # every non-dash non-paren token character, and the extraction `s/[[:space:]]*(...//` strips an
+  # optional `()`/`{` suffix.
+  # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
+  # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
+  # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\(\)([[:space:]]*\{|[[:space:]]*$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
   [ "${best:-0}" -gt 0 ] || return 0
-  sed -n "${best}p" "$file" | sed -nE 's/^[[:space:]]*(function[[:space:]]+)?([a-z_][a-z0-9_]*).*/\2/p'
+  sed -n "${best}p" "$file" | sed -nE 's/^[[:space:]]*(function[[:space:]]+)?([^[:space:](){;]+).*/\2/p'
 }
+# ⛔ THE RESOLVER IS TESTED ON THE SPELLINGS THEMSELVES, NOT ON A HEURISTIC. A broad
+# "looks definition-shaped" counter was tried first and it FALSE-RED on line 616 — `function secs(t,
+# n,a,i,…)`, an AWK function inside a single-quoted awk program, which the shell never defines. A
+# count that cannot tell bash from awk is a gate that refuses correct code, so the fail-closed duty is
+# carried here instead: every bash-legal header form must resolve to its own name, verified by driving
+# func_for over a fixture built for exactly that. Each of these was INVISIBLE before the charset was
+# widened (`[a-z_]` only) and silently attributed the read to the PRECEDING function — whose
+# allowlisted pair then covered it (review P1, reproduced: `ZzFutureHelper() { local s="$1"; }` after
+# `bounded()` left the suite at FAIL=0 and both `bounded:s` lines ✅).
+{
+  printf 'outer_fn() {\n  :\n}\n'
+  printf 'ZzFutureHelper() {\n  local s="$1"\n}\n'
+  printf 'ZzSpacedHelper () {\n  local s="$1"\n}\n'
+  printf 'ZzTightHelper(){\n  local s="$1"\n}\n'
+  printf 'function ZzKeyword {\n  local s="$1"\n}\n'
+  printf 'zz-dashed-name() {\n  local s="$1"\n}\n'
+  printf 'zz_next_line()\n{\n  local s="$1"\n}\n'
+} > "$T/hdr.sh"
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name zz_next_line; do
+  _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
+  [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
+    || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
+done
+unset _want _got
+
 # Walk one file and PRINT one record per positional read: "<verdict> <line> <function> <name> <read>".
 # ⛔ A FUNCTION, so the walk can be run over a SYNTHETIC file the suite controls (the non-vacuity arm
 # further down). While it was inline, the only thing tested was that it ran over the shipped file —
