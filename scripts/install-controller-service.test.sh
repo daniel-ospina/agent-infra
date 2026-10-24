@@ -1265,7 +1265,10 @@ SH_RC=0; SH_OUT="$(EXTRA_ENV="HOME=$SH/home-link SYSTEMD_UNIT_DIR=$SH/home-link/
                    || bad "a symlinked \$HOME admitted a real user-manager unit root — $SH_OUT"
 # ⛔ AND THE XDG ROOTS ARE USER-MANAGER UNIT ROOTS TOO (re-review P2, #2666): `systemd.unit(5)` lists
 # `$XDG_CONFIG_HOME/systemd/user` and `$XDG_DATA_HOME/systemd/user`, and neither was covered.
-for _xdg in XDG_CONFIG_HOME XDG_DATA_HOME; do
+# ⛔ ALL THREE XDG ROOTS, NOT TWO (review P2 cycle 2, #2666): `$XDG_RUNTIME_DIR/systemd` is a user-manager
+# unit root too, and with no arm its line in the tree list was deletable with the suite green — the same rule
+# this file applies to `/run/user/*/systemd`.
+for _xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_RUNTIME_DIR; do
   _ax="$(arm_root "xdg-$(printf '%s' "$_xdg" | tr 'A-Z' 'a-z')")"; mk_systemctl "$_ax/bin" "$_ax/state" "$_ax/sc.log"
   mkdir -p "$_ax/xdg/systemd/user"
   _AX_RC=0; _AX_OUT="$(EXTRA_ENV="$_xdg=$_ax/xdg SYSTEMD_UNIT_DIR=$_ax/xdg/systemd/user" inst "$(basename "$_ax")" --dry-run 2>&1)" || _AX_RC=$?
@@ -1448,6 +1451,14 @@ RUR="$(arm_root rur)"; mk_systemctl "$RUR/bin" "$RUR/state" "$RUR/sc.log"
 RUR_RC=0; RUR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/run/user/$(id -u)/systemd/user" inst rur --dry-run 2>&1)" || RUR_RC=$?
 [ "$RUR_RC" -ne 0 ] && ok '/run/user/<uid>/systemd/user is REFUSED (a user-manager unit root nothing here reads)' \
                    || bad "/run/user/<uid>/systemd/user was ADMITTED — the pattern is deletable — $RUR_OUT"
+# …and the same for the other declared root that had no arm: `/usr/local/lib/systemd/system` (review P2 cycle 2,
+# #2666). `/lib/systemd/*` needs no arm of its own — `realpath` folds it onto `/usr/lib/systemd/*`, which is
+# armed — but `/usr/local/lib/systemd/*` folds nowhere.
+UL="$(arm_root ul)"; mk_systemctl "$UL/bin" "$UL/state" "$UL/sc.log"
+UL_RC=0; UL_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/usr/local/lib/systemd/system" inst ul --dry-run 2>&1)" || UL_RC=$?
+[ "$UL_RC" -ne 0 ] && ok '/usr/local/lib/systemd/system is REFUSED (its pattern is not deletable)' \
+                   || bad '/usr/local/lib/systemd/system was ADMITTED — a declared tree root with no arm — $UL_OUT'
+
 # ⛔ AND THE UNIT NAME IS NOT A PATH (review residual round 6, #2666). `$UNIT_DIR/$UNIT_NAME` is the write path;
 # a name carrying `/` or `..` would leave the directory that was graded.
 say_case 'CONTROLLER_UNIT must be a bare unit name, never a path'
