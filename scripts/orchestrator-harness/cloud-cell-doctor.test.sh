@@ -1585,7 +1585,11 @@ fi
 # function that is not wired to the role at all.
 while read -r _r _f; do
   [ -n "${_r:-}" ] || continue
-  if grep -qE "^[[:space:]]*run_${_f}\(\)([[:space:]]*\{|[[:space:]]*$)" "$DOCTOR"; then
+  # ⛔ ANY BASH-LEGAL HEADER FORM, NOT JUST `run_x() {` AT COLUMN 0 (review P2, reproduced): a
+  # whitespace-identical reformat (`run_reap()` + next-line brace, `run_reap () {`, `run_reap(){`, an
+  # indented header) failed this arm while every behavioural arm passed. func_for already accepts all
+  # of them, so this check uses the same shape instead of a second, stricter spelling.
+  if grep -qE "^[[:space:]]*(function[[:space:]]+)?run_${_f}[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\\\[[:space:]]*|#.*)?)$" "$DOCTOR"; then
     ok "roles: '${_r}' dispatches run_${_f}, which the script defines"
   else
     bad "roles: '${_r}' dispatches run_${_f}, which the script does NOT define — the derivation is wrong"
@@ -1746,10 +1750,15 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
       # to be the glob `${` + digit + `*` + `:-}`, which grades ANY expansion whose TEXT happens to
       # contain `:-}` as safe-to-be-empty: `${1#*:-}` (strip a prefix), `${1%:-}`, `${1/foo/:-}` and
       # the folded `${1:-${2#*:-}}` all became `defaulted` — and every one of them dies with
-      # `1: unbound variable` when the argument is absent. It is now exactly `${<digits>:-}`, which is
-      # the only spelling that means "absent → empty". A non-empty default stays `invented` (loud),
-      # and everything else is `bare`.
-      if grep -qE '[$][{][0-9]+:-[}]$' <<<"$rd"; then
+      # `1: unbound variable` when the argument is absent. It is now exactly `${<digits>:-}` or
+      # `${<digits>-}`, which are the two spellings that mean "absent → empty" (`:-` also replaces an
+      # empty value, `-` does not; neither can die on an absent argument). A non-empty default stays
+      # `invented` (loud), and everything else is `bare`.
+      # ⛔ `${N+x}` / `${N:+x}` ARE DELIBERATELY NOT MODELLED: they cannot die on an absent argument
+      # either, but they IGNORE the caller's value (they yield `x` when it is SET), so a role written
+      # that way would look defaulted while discarding the mode — graded `bare`/`unparsed` so it needs
+      # a human decision instead of being waved through (review P3, declared).
+      if grep -qE '^\$\{[0-9]+(:-|-)\}$' <<<"$rd"; then
         printf 'defaulted %s %s\n' "$var" "$rd"
       elif grep -qE '[$][{][0-9]+:-.+' <<<"$rd"; then
         printf 'invented %s %s\n' "$var" "$rd"
@@ -1800,6 +1809,8 @@ while IFS='|' read -r want text; do
 done <<'EOF'
 defaulted|local dry="${1:-}" s log
 defaulted|local dry="${4:-}" s log
+defaulted|local dry="${1-}" s log
+bare|local dry="${1+x}" s log
 defaulted|local dry="${12:-}" s log
 invented|local dry="${1:---dry-run}" s log
 invented|local dry="${1:-0}" s log
@@ -1891,7 +1902,7 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1); do
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\([[:space:]]*\).*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -2039,7 +2050,11 @@ while read -r _r _f; do
   # ⛔ NO PIPE INTO `grep -q` (#841): under the suite's `pipefail` a quiet grep exits at its first
   # match, awk takes SIGPIPE, and the pipeline status makes this `if` take the ELSE branch — the
   # measured flake was one role failing while the other three passed on the SAME file.
-  if grep -q 'local dry="\${1:-}"' < <(awk "/^run_${_f}\\(\\) \\{/,/^\\}/" "$DOCTOR"); then
+  # ⛔ THE RANGE START IS A HEADER FORM TOO (review P2, reproduced): `awk "/^run_${_f}\\(\\) \\{/"` only
+  # matched `run_x() {` at column 0, so a role whose header is reformatted (next-line brace, `( )`,
+  # indented) yielded an EMPTY range and the arm then reported "does NOT read its mode as ${1:-}" over
+  # a file that reads it correctly. The start pattern now accepts the forms func_for accepts.
+  if grep -q 'local dry="\${1:-}"' < <(awk "/^[[:space:]]*(function[[:space:]]+)?run_${_f}[[:space:]]*\\([[:space:]]*\\)([[:space:]]*\\{.*|[[:space:]]*$)/,/^\\}/" "$DOCTOR"); then
     ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (it survives the absent/empty mode the scheduler passes)"
   else
     bad "audit: run_${_f} does NOT read its mode as \"\${1:-}\" — a bare dispatch would kill or rehearse the scheduler"

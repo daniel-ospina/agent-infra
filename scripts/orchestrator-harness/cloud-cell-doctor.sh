@@ -2630,6 +2630,14 @@ run_status() {
 #   helpers and a name-keyed list grandfathers the next `local s="$1"` anywhere in the file — and a
 #   role added to `run_role_pass` tomorrow is graded on the day it is added, not only the four that
 #   exist today.
+# ⛔ THE KEY IS (FUNCTION, NAME) AND DELIBERATELY NOT THE INDEX (declared residual, review P2). One
+#   listed pair therefore covers every read of that name inside that function: `local pid="$1$2"` in
+#   `human_above` (whose only caller passes one argument) inherits `human_above:pid`'s REQUIRED verdict
+#   and its `$2` read is not separately decided. It is caught BEHAVIOURALLY — the suite's reap arm runs
+#   the function and the unbound `$2` fails it — so it is not a silent pass, but the static audit alone
+#   would allow it. Keying by index was rejected for now because it multiplies the list by every
+#   read position and the index is not what makes a read safe (the FUNCTION's contract is); if this
+#   ever needs closing, key the list by `function:name:index` and re-derive it mechanically.
 run_role_pass() { # <role> [--dry-run]
   local role="$1" rc; shift
   if ! role_lock "$role"; then
