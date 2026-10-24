@@ -97,6 +97,10 @@ mkstubs() { # mkstubs <dir> — the real interpreter, the real signer, and nothi
   # python3 is the REAL interpreter: repo-authority's normaliser and the gate classifier are python.
   # An exit-0 stub makes the classifier print nothing and every arm pass for the wrong reason (the
   # fixture defect cloud-cell-record-dep.test.sh records at its mkmrg).
+  # ⛔ THE STUB DIR DOES NOT WIN FOR python3: merge-one.sh prepends /opt/homebrew/bin:/usr/local/bin to
+  # PATH before it classifies, so a `python3` here is SHADOWED by the real interpreter (measured). The
+  # symlink stays because other helpers resolve python3 from the stub dir; a pathological python3 is
+  # injected as a shell FUNCTION in the sliced-block arms (§17) instead — the only place it can bite.
   p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$d/python3"
   # openssl is REAL and SYMLINKED: the worker VERIFIES the marker's HMAC before step 3 (#784), so a
   # stub emitting a matching digest would make the fixture unfaithful.
@@ -159,6 +163,8 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
                      printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n'
                    fi ;;
     # §14: two failed reads, then a green gate — the transient clears INSIDE the window.
+    # §18: a shim that writes ANSI escapes to stderr — `cat`ting that log would erase the line above.
+    ansistderr) printf '\033[1A\033[2Kwatch out\n' >&2; return 1 ;;
     failthenok) if [ "$(wc -l < "$MRG/checks.log")" -le 2 ]; then
                   printf 'gh-core-floor remaining=120 floor=800 resets_in=4m\n' >&2; return 1
                 else
@@ -506,6 +512,21 @@ q 'gate=SUCCESS (try 3)' <<<"$log" && ok "§14 transient read: green on the thir
                                   || bad "§14 transient read: no SUCCESS at poll 3; log=$(tr '\n' ' ' <<<"$log")"
 q 'MERGED' <<<"$log" && ok "§14 transient read: the PR is actually merged" || bad "§14 transient read: no MERGED line"
 
+
+# ── §18 gh's STDERR is transport-controlled: an ANSI escape in it must not be able to erase the log
+#         line above when the log is read (round 8 P2-2) ─────────────────────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=ansistderr GATE_POLL_TRIES=1)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§18 ANSI stderr: refused (exit 4)" || bad "§18 ANSI stderr: rc=$rc"
+if [ "$(printf '%s' "$log" | tr -d '\000-\010\013-\037\177')" = "$log" ]; then
+  ok "§18 ANSI stderr: the log carries NO control characters, so no escape can rewrite it under cat"
+else
+  bad "§18 ANSI stderr: control characters reached the log (an escape can erase the line above it under cat)"
+fi
+q 'watch out' <<<"$log" && ok "§18 ANSI stderr: the readable text of the stderr survives the strip" \
+                              || bad "§18 ANSI stderr: the stderr text was lost; log=$(tr '\n' ' ' <<<"$log")"
+
 # ── §1c the TERMINAL line itself carries the stderr (anchored; the progress line must not stand in) ──
 mkmrg
 out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1)"; rc=$?
@@ -732,6 +753,41 @@ if [ -s "$SLICE" ] && qF 'gate=UNAVAILABLE' "$(cat "$SLICE")"; then
 else
   bad "§7 the gate block could not be sliced out of merge-one.sh — the mutation controls cannot run"
 fi
+
+# ── §17 the CLASSIFIER dies while the READ succeeds: the verdict must say so, carry pyrc=, and never
+#         print an empty read= (round 8 P2-1). Driven through the SHIPPED block, because the worker
+#         prepends /usr/local/bin to PATH (`merge-one.sh:49`), so a stub `python3` in the fixture is
+#         shadowed by the real interpreter — the failure has to be injected as a shell FUNCTION here.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+if [ -s "$SLICE" ]; then
+  b_out="$(
+    BLOCK_MODE=success; L="$TMP/block"; PR=7; OR=acme/widget; REVIEW_GATE=ai-review-gate
+    GATE_POLL_SECS=0; GATE_POLL_TRIES=2; GATE_ABSENT_TRIES=2; GATE_READ_TRIES=3
+    export BLOCK_MODE L PR OR REVIEW_GATE GATE_POLL_SECS GATE_POLL_TRIES GATE_ABSENT_TRIES GATE_READ_TRIES
+    gh() { case "$*" in *"pr checks"*) printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;; *) return 0 ;; esac; }
+    # ⛔ the classifier itself dies, AFTER a successful read — nothing about the repo was observed.
+    python3() { printf 'boom: MemoryError\n' >&2; return 1; }
+    sleep() { :; }
+    export -f gh python3 sleep
+    is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+    is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+    : > "$L.log"
+    . "$SLICE" >/dev/null 2>&1
+    cat "$L.log"
+  )"
+  q 'pyrc=1' <<<"$b_out" && ok "§17 classifier death: the verdict carries pyrc= (the datum that names the fault)" \
+                          || bad "§17 classifier death: pyrc is missing; block=$(tr '\n' ' ' <<<"$b_out")"
+  nq "read=''" <<<"$b_out" && ok "§17 classifier death: no empty read= field anywhere (the #2596 class, one field over)" \
+                           || bad "§17 classifier death: an empty read= reached the log"
+  q 'the check surface was READ but the classifier produced no verdict' <<<"$b_out" \
+    && ok "§17 classifier death: it says the READ succeeded and the CLASSIFIER died (not 'transport')" \
+    || bad "§17 classifier death: the verdict blames the wrong layer; block=$(tr '\n' ' ' <<<"$b_out")"
+  q 'TOOLING failure' <<<"$b_out" && ok "§17 classifier death: named as a tooling failure, so the operator does not go hunting a rate limit" \
+                                  || bad "§17 classifier death: the fault class is not named"
+else
+  bad "§17 classifier death: the block could not be sliced — the arm cannot run"
+fi
+
 run_block() { # run_block <block-file> <mode> [gate-name] — the sliced block against the same world
   (
     BLOCK_MODE="$2"; BLOCK_GATE="${3:-ai-review-gate}"; L="$TMP/block"; PR=7; OR=acme/widget
@@ -859,6 +915,41 @@ if qF '_gw=$(( ${GATE_POLL_TRIES:-30} * ${GATE_POLL_SECS:-30} )) ;;' "$(cat "$MU
                                                 || bad "§14 mutation: the accepting guard did not reproduce the octal abort — §16's 08 arm is vacuous ($m)"
 else
   bad "§14 mutation: the case-guard mutation did not apply — inconclusive"
+fi
+MUT11="$TMP/block-classifierfail.sh"
+python3 - "$SLICE" "$MUT11" <<'EOP'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+# the pre-round-8 shape, restored verbatim: an EMPTY token + the UNREADABLE kind, so the terminal line
+# is built from an empty `$gate` and prints `read=''` while the read had actually succeeded.
+s = s.replace('          gate="CLASSIFIERFAIL pyrc=$gate_pyrc rc=$gate_rc stderr=$gate_errline"',
+              '          gate=""', 1)
+s = s.replace('          gate_kind=CLASSIFIERFAIL', '          gate_kind=UNREADABLE', 1)
+open(dst, "w").write(s)
+EOP
+if qF '          gate=""' "$(cat "$MUT11")"; then
+  b_out="$(
+    L="$TMP/block"; PR=7; OR=acme/widget; REVIEW_GATE=ai-review-gate
+    GATE_POLL_SECS=0; GATE_POLL_TRIES=2; GATE_ABSENT_TRIES=2; GATE_READ_TRIES=3
+    export L PR OR REVIEW_GATE GATE_POLL_SECS GATE_POLL_TRIES GATE_ABSENT_TRIES GATE_READ_TRIES
+    gh() { case "$*" in *"pr checks"*) printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;; *) return 0 ;; esac; }
+    python3() { printf 'boom: MemoryError\n' >&2; return 1; }
+    sleep() { :; }
+    export -f gh python3 sleep
+    is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+    is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+    : > "$L.log"
+    . "$MUT11" >/dev/null 2>&1
+    cat "$L.log"
+  )"
+  # The pre-round-8 shape LOSES the classifier verdict entirely (measured: it degrades to the catch-all
+  # `last='<nothing>'`), which is what §17 asserts against — a lost verdict, not a legible one.
+  nq 'the check surface was READ but the classifier produced no verdict' <<<"$b_out" \
+    && ok "§15 mutation: with the pre-round-8 shape (empty token) the classifier verdict is LOST, so §17 goes RED" \
+    || bad "§15 mutation: the empty-token mutant still produced the correct verdict — §17 is vacuous"
+else
+  bad "§15 mutation: the token mutation did not apply — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"

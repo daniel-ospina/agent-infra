@@ -1306,7 +1306,11 @@ else:
       # The read's own words, for the one call whose silence is being interpreted (#2448). First
       # line only: the refusal this carries is `gh-core-floor remaining=<n> …` / `gh-core-exhausted
       # resets_in=<Nm>`, which is a single line, and a stack trace here would bury it.
-      gate_errline="$(head -n 1 "$gate_errf" 2>/dev/null | tr -d '\r' | cut -c1-200)"
+      # ⛔ THE STDERR FIELD IS TRANSPORT-CONTROLLED TOO (review round 8 P2-2). Only `\r` used to be
+      # dropped, so a shim writing ANSI escapes put `ESC[1A ESC[2K` into the log — `cat`ting it then
+      # ERASES the line above and renders `[merge 7] gate=SUCCESS` for a refused merge. Same rule as
+      # `clean()` on the payload: strip control characters at the boundary, not at each print site.
+      gate_errline="$(head -n 1 "$gate_errf" 2>/dev/null | tr -d '\000-\010\013-\037\177' | tr -d '\r' | cut -c1-200)"
       if [ -n "$gate_errline" ]; then :
       elif [ "${gate_capture:-1}" = 1 ]; then gate_errline="<no stderr>"
       else gate_errline="<capture unavailable: no temp file could be created, so gh's stderr was NOT recorded>"
@@ -1361,7 +1365,7 @@ else:
             echo "[merge $PR] gate=NOT YET CREATED want=$REVIEW_GATE (the check surface is EMPTY at try $gate_try) — CI has created no check row for this head yet; a not-yet-created check is a WAIT, not a failure, so the full $GATE_POLL_TRIES poll(s) / ${gate_wait}s window applies" >> "$L.log"
             gate_last="$gate"; gate_lastkind=EMPTY
           fi ;;
-        PENDING\ state=*|UNREADABLE*|ROWUNREADABLE*)
+        PENDING\ state=*|UNREADABLE*|ROWUNREADABLE*|CLASSIFIERFAIL*)
           # An unparseable/absent payload counts against its OWN bound; a check that is merely
           # still running counts against the poll bound (it IS the CI wait this loop exists for).
           # Both counters are CONSECUTIVE: a parsed verdict proves the transport works, so a blip
@@ -1393,11 +1397,19 @@ else:
           # The classifier itself produced nothing (python3 missing/killed). That is a transport
           # failure, and it must never read as `gate=` — say which one it was.
           gate_unread=$(( gate_unread + 1 )); gate_absent=0
+          # ⛔ ITS OWN TOKEN (review round 8 P2-1). This arm used to leave `$gate` EMPTY while setting
+          # `gate_lastkind=UNREADABLE`, so the terminal line — built from `$gate` — printed `read=''`
+          # (an empty datum in the verdict #2596 exists to make legible) AND described the last
+          # observation as a failed READ although the read had SUCCEEDED (rc=0, well-formed payload)
+          # and it was the CLASSIFIER that died — dropping `pyrc=`, the only datum that names the
+          # fault. The token carries both, so the terminal wording (below) can name the classifier.
+          gate="CLASSIFIERFAIL pyrc=$gate_pyrc rc=$gate_rc stderr=$gate_errline"
+          gate_kind=CLASSIFIERFAIL
           # Same as the read arm: no early break — a window that expires while the classifier cannot
           # run ends in UNAVAILABLE (below), but a classifier that recovers mid-window still wins.
-          if [ "$gate_last" != "<no-classifier-verdict>" ]; then
-            echo "[merge $PR] gate=UNREADABLE pyrc=$gate_pyrc rc=$gate_rc read='the classifier produced no verdict' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — the watcher itself failed; retrying" >> "$L.log"
-            gate_last="<no-classifier-verdict>"; gate_lastkind=UNREADABLE
+          if [ "$gate_last" != "$gate" ]; then
+            echo "[merge $PR] gate=UNREADABLE pyrc=$gate_pyrc rc=$gate_rc read='the classifier produced no verdict' stderr=$gate_errline (try $gate_try) — the watcher itself failed; retrying" >> "$L.log"
+            gate_last="$gate"; gate_lastkind=CLASSIFIERFAIL
           fi ;;
       esac
       [ "$gate_try" -lt "$GATE_POLL_TRIES" ] || break
@@ -1420,6 +1432,10 @@ else:
           fi ;;
         ABSENT)
           gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (the poll window expired while the surface carried checks and none was named this gate) — want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)" ;;
+        CLASSIFIERFAIL)
+          # The read SUCCEEDED; the CLASSIFIER died. Say that, and carry pyrc= — the datum that names it.
+          gate_verdict=UNAVAILABLE
+          gate_line="gate=UNAVAILABLE ${gate#CLASSIFIERFAIL } (still failing at the end of the $gate_try-poll window) — the check surface was READ but the classifier produced no verdict, so this is a TOOLING failure (python3), not a state of the repo and not transport; nothing about the gate has been observed" ;;
         UNREADABLE|ROWUNREADABLE)
           gate_verdict=UNAVAILABLE
           case "$gate" in
@@ -1436,6 +1452,7 @@ else:
           gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window" ;;
       esac
       [ -n "$gate_verdict" ] || gate_verdict=UNKNOWN
+      [ -n "$gate_line" ] || gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) — unclassified last observation (kind=${gate_lastkind:-none}); this is a gap in the verdict builder, never a pass"
     fi
 
     # ⛔ EXACTLY ONE terminal `gate=` line per run: every progress line above is a DIFFERENT kind
