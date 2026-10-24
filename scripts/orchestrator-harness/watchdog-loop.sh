@@ -315,7 +315,13 @@ restart_stack() {
       [ -n "$sup" ] || { [ -f "$O/cloud-cell-supervisor.sh" ] && sup="$O/cloud-cell-supervisor.sh"; }
       [ -n "$sup" ] || { [ -f "$SELF_DIR/../cloud-cell-supervisor.sh" ] && sup="$SELF_DIR/../cloud-cell-supervisor.sh"; }
       if [ -n "$sup" ] && [ -f "$sup" ]; then
-        bash "$sup" start >>"$LOG" 2>&1 || rc=$?
+        # ⛔ PIN `ORCH_FOREGROUND=0` (review P2, #2402). A watchdog that itself runs INSIDE a service-managed
+        # controller's environment inherits `Environment=ORCH_FOREGROUND=1` from the unit (it is exported into
+        # the whole controller tree, and a tmux server started by that controller carries it to every lane
+        # shell). Inherited, `start` takes the FOREGROUND branch: it parks inside the handover wait for up to
+        # CONTROLLER_HANDOVER_TIMEOUT instead of delegating to the unit — the same inheritance the doctor pins
+        # against, at a call site the doctor's pin cannot reach.
+        ORCH_FOREGROUND=0 bash "$sup" start >>"$LOG" 2>&1 || rc=$?
       else
         rc=127
         say "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
