@@ -891,14 +891,23 @@ wt_table() {
         # `WT_ABSENT_CONFIRM` before confirming again — so the release was a DUTY CYCLE (measured at the
         # defaults: ~900s dead, ~60s unknown, repeating), i.e. the 26h stall reduced to one cycle in four
         # rather than ended. Format: "<first_seen> <last_absent>". A legacy single-value file (an older
-        # harness) reads as first_seen with an empty last_absent → treated as a gap → first sample, which
-        # is the safe reading for a file this build did not write.
+        # harness) reads as first_seen with an empty last_absent → continuity is judged on first_seen (so a
+        # deploy that restarts the controller MID-OUTAGE still releases rather than starting the clock
+        # again), which is the safe reading for a file this build did not write.
         absent_since=""; absent_last=""
         if [ -f "$dir/.wt-absent-since" ]; then
           read -r absent_since absent_last < "$dir/.wt-absent-since" 2>/dev/null || true
         fi
         case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
         case "$absent_last"  in ''|*[!0-9]*) absent_last=""  ;; esac
+        # ⛔ AND IT IS `10#`-NORMALISED TOO (review round 15 of #2653, P1): `_cont` is used as a bare
+        # arithmetic VARIABLE, which re-parses its value as an expression — `08` is read as OCTAL, the
+        # expansion errors, and `wt_table` ABORTS BEFORE IT PRINTS. Every later read hits the same field
+        # (nothing repairs the file during an outage), so the census stays EMPTY: `wt_count` 0 (caps stop
+        # binding) and `wt_alive` "not alive", so `wt_close` deletes a record it never looked at. This is
+        # the field BOTH writers emit, so it is the normal case — the guard existed one line away for
+        # field 1 and not for field 2.
+        if [ -n "$absent_last" ]; then absent_last=$(( 10#$absent_last )); fi
         # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
         # `$(( … ))` reads a leading zero as OCTAL, `08` is not octal, the expansion errors and the
         # FUNCTION ABORTS before printing a table — an EMPTY census, which every consumer reads as "the

@@ -1815,6 +1815,24 @@ _n=$(printf '%s\n' "$out" | sed -n 's/^count=//p')
 _fl=$(printf '%s\n' "$out" | sed -n 's/^last=//p')
 if [ "${_n:-1}" = "0" ] && [ -n "${_fl:-}" ]; then rc=0; else rc=1; echo "      $out"; fi
 ck "a CONTINUOUS outage stays confirmed (first_seen kept, last_absent refreshed — no duty cycle)" $rc
+# ⛔ AND THE REFRESH ITSELF IS PINNED (review round 15 of #2653, residual 2): the seeded `last` is
+# already fresh, so dropping the refresh write left the arm above green — the other half of the
+# duty-cycle fix. A sample whose `last` is 800s old (inside the bound) must come back ~now.
+cat > "$TMP/q22b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_ref\nworkspace=ws_ref\n' > "$WT_DIR/worker-merge-84"
+now=$(date +%s)
+printf '%s %s\n' "$(( now - 5000 ))" "$(( now - 800 ))" > "$WT_DIR/.wt-absent-since"
+export CMUX_TREE_ABSENT=1
+. "$1"
+wt_table >/dev/null 2>&1 || true
+echo "last_age=$(( $(date +%s) - $(awk '{print $2}' "$WT_DIR/.wt-absent-since") ))"
+SH
+out="$(bash "$TMP/q22b.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O39b" 2>&1)"
+_la=$(printf '%s\n' "$out" | sed -n 's/^last_age=//p')
+if [ -n "${_la:-}" ] && [ "${_la#-}" -lt 60 ] 2>/dev/null; then rc=0; else rc=1; echo "      $out"; fi
+ck "…and the continuity datum is REFRESHED on every absent sample (not just at window open)" $rc
 
 # ⛔ A STALE STAMP CONFIRMS NOTHING (review round 9 of #2653, P1): the stamp records when an absent
 # owner was FIRST seen, and nothing requires it to belong to the current outage — after an up-period in
@@ -1868,6 +1886,23 @@ SH
 out="$(bash "$TMP/q12.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O29" 2>&1)"
 case "$out" in *"rows=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a leading-zero stamp (\`08\`) cannot abort the census into an EMPTY table" $rc
+# ⛔ …AND THE SAME FOR THE SECOND FIELD (review round 15 of #2653, P1). Both writers emit
+# "<first_seen> <last_absent>", and `_cont` reads the SECOND — so a leading-zero `last_absent` is the
+# NORMAL-case operand, and it was class-checked but never `10#`-normalised: `08` re-parsed as octal,
+# `wt_table` aborted before printing, and the empty table made `wt_close` delete a record it never
+# looked at. q12's single-field seed cannot catch this.
+cat > "$TMP/q12b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_oct2\nworkspace=ws_oct2\n' > "$WT_DIR/worker-merge-85"
+printf '%s 08\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"   # field 2 is `08`
+export CMUX_TREE_ABSENT=1
+. "$1"
+echo "rows=$(wt_table | wc -l | tr -d ' ')"
+SH
+out="$(bash "$TMP/q12b.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O29b" 2>&1)"
+case "$out" in *"rows=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a leading-zero LAST_ABSENT cannot abort the census either (the field the arithmetic reads)" $rc
 
 # ⛔ ONLY THE ABSENT ANSWER MAY LEAVE THE WINDOW STANDING (review round 8 of #2653, P2). An answer that
 # proves nothing either way (the ENOENT wrapper this module deliberately treats as UNKNOWN, a banner)
