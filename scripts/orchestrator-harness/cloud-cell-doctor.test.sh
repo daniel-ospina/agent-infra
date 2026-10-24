@@ -1411,12 +1411,23 @@ done <<<"$ROLES"
 # classified, and the classification is by VALUE:
 #   * `"${N:-}"`      → DEFAULTED to the empty string: absent means the caller's empty value;
 #   * `"${N:-<any>}"` → REJECTED: a default here would invent a mode (a rehearsal would arm itself);
-#   * bare `$N`       → permitted only when the bound name is one of the REQUIRED reads the audit
-#                       block documents (an empty role/pid/head is never a safe value).
-# ⛔ The classifier is a FUNCTION so the scanner itself can be tested: a shape-whitelist that cannot
-# see `local dry="${1}"` (or `local x="$1/derived"`) reports "clean" over the exact crash, which is
-# the fail-open shape this case exists to prevent. Both were measured blind in an earlier revision.
-audit_line() { # <text> -> "<verdict> <name> <read>" per positional read
+#   * bare `$N`       → permitted only when the (ENCLOSING FUNCTION, bound name) pair is one of the
+#                       REQUIRED reads the audit block documents (an empty role/pid/head is never a
+#                       safe value).
+# ⛔ THE KEY IS `function:name`, NEVER THE NAME ALONE (review P1). A name-keyed allowlist grandfathers
+# the next `local s="$1"` ANYWHERE in the file: `s`, `rc`, `d` and `role` are the commonest locals
+# here and are already reused across helpers, so a brand-new function reusing one of those names
+# passed the walk with a ✅ and no decision was ever made — the exact false PASS this case exists to
+# prevent. The suite pins the negative direction (`function:s` under a function not on the list).
+# ⛔ THE CLASSIFIER IS A FUNCTION so the scanner itself can be tested: a shape-whitelist that cannot
+# see `local dry="${1}"` (or `local x="$1/$2"`) reports "clean" over the exact crash, which is the
+# fail-open shape this case exists to prevent. Both were measured blind in an earlier revision.
+# ⛔ THE VERDICT COMES FROM THE READ, NOT FROM WHAT SURROUNDS IT (review P2). The bucket used to be
+# decided by whether the value was EXACTLY the positional, so `local dry="$1 "` and `local x="$1$2"`
+# were filed `derived` — ungraded ✅ notes — even though both are bare reads that die on an absent
+# argument. `derived` is now an ANNOTATION printed under the verdict (the value embeds the positional
+# in a path or a concatenation), never a bucket that suppresses grading.
+audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
   local body="$1" assign var val rd
   while read -r assign; do
     [ -n "$assign" ] || continue
@@ -1424,22 +1435,27 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read
     case "$val" in *'$'[1-9]*|*'${'[1-9]*) ;; *) continue ;; esac
     while read -r rd; do
       [ -n "$rd" ] || continue
-      # A value that is ONLY the positional is a BINDING of it — the shape that must declare how it
-      # treats an absent argument. A value that merely USES the positional (`"$1/x"`) is derived: it
-      # cannot carry a default and inherits its function's contract, so it is REPORTED, not graded.
+      case "$rd" in
+        '${'[1-9]*':-}') printf 'defaulted %s %s\n' "$var" "$rd" ;;
+        '${'*':-'*)      printf 'invented %s %s\n' "$var" "$rd" ;;
+        *)               printf 'bare %s %s\n' "$var" "$rd" ;;
+      esac
+      # The ANNOTATION, printed UNDER the verdict so it can never suppress it (`head -1` still
+      # reads the verdict). A value that embeds the positional in a path/concatenation inherits its
+      # function's contract — which is exactly why it must be graded, not excused.
       case "$val" in
         "$rd"|"\"$rd\"") ;;
-        *) printf 'derived %s %s\n' "$var" "$rd"; continue ;;
-      esac
-      case "$rd" in
-        '${1:-}'|'${2:-}'|'${3:-}') printf 'defaulted %s %s\n' "$var" "$rd" ;;
-        '${'*':-'*)                 printf 'invented %s %s\n' "$var" "$rd" ;;
-        *)                          printf 'bare %s %s\n' "$var" "$rd" ;;
+        *) printf 'derived %s %s\n' "$var" "$rd" ;;
       esac
     done < <(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"$val")
   done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
 }
-# The scanner's own contract on the shapes that matter, INCLUDING the two the whitelist missed.
+# The scanner's own contract on the shapes that matter, INCLUDING the ones earlier revisions missed.
+# ⛔ A BARE READ STAYS BARE THOUGH THE VALUE EMBEDS IT. `local d="$ROLES_DIR/.$1.lock"`,
+# `local dry="$1 "` and `local x="$1$2"` were filed `derived` (ungraded ✅) before the review, and
+# all of them die on an absent argument exactly like `local x="$1"`.
+# ⛔ NOTHING INSIDE THE HEREDOC MAY BE A COMMENT: that block is DATA, and a `#` line is read as a
+# record whose `want` is the prose — the failure mode is three ❌ in the self-test, not a silent pass.
 while IFS='|' read -r want text; do
   [ -n "${want:-}" ] || continue
   got="$(audit_line "$text" | cut -d' ' -f1 | head -1)"
@@ -1447,38 +1463,122 @@ while IFS='|' read -r want text; do
     || bad "audit[self-test]: '$text' classified '${got:-<nothing>}' (want '$want') — the scanner is blind to a shape that crashes the scheduler"
 done <<'EOF'
 defaulted|local dry="${1:-}" s log
+defaulted|local dry="${4:-}" s log
+defaulted|local dry="${12:-}" s log
 invented|local dry="${1:---dry-run}" s log
 invented|local dry="${1:-0}" s log
+invented|local dry="${4:---dry-run}" s log
 bare|local dry="${1}" s log
 bare|local dry="$1" s log
 bare|local x=$1
-derived|local d="$ROLES_DIR/.$1.lock"
-derived|local tmp="$1/.own.tmp.$$"
+bare|local d="$ROLES_DIR/.$1.lock"
+bare|local tmp="$1/.own.tmp.$$"
+bare|local dry="$1 "
+bare|local x="$1$2"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
-# …then the real file.
-REQUIRED_LOCALS=" role rc own d s pid pr head bound "
-AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0
-while IFS= read -r line; do
-  ln="${line%%:*}"; body="${line#*:}"
-  while read -r verdict var rd; do
-    [ -n "${verdict:-}" ] || continue
+# …then the real file. The allowlist is (FUNCTION, NAME) pairs — see the P1 note above.
+REQUIRED_READS=" state_write:role state_write:rc state_write_rehearsal:role state_write_rehearsal:own \
+ lock_claim:d lock_claim:tmp reclaim_lock:d role_lock:role role_unlock:d bounded:s run_bounded:s \
+ pid_ident:pid human_above:pid attestation_clean:pr attestation_clean:head \
+ controller_heartbeat_verdict:who role_row:role role_row:bound run_role_pass:role "
+# ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
+# grandfathering this list was re-keyed to remove, and it would do it silently.
+BADENTRY=0
+# ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
+# grandfathering this list was re-keyed to remove, and it would do it silently. The pattern is
+# `*:*` (HAS a colon) — the first version tested `*:*:*`, i.e. TWO colons, which no real entry has,
+# so the assertion passed on any input at all: a vacuous check inside the gate against vacuous checks.
+BADENTRY=0; _n=0
+for _e in $REQUIRED_READS; do
+  _n=$((_n + 1))
+  case "$_e" in *:*) ;; *) BADENTRY=1 ;; esac
+done
+[ "$BADENTRY" -eq 0 ] && [ "$_n" -ge 15 ] \
+  && ok "audit: every REQUIRED_READS entry is a function:name pair ($_n entries)" \
+  || bad "audit: REQUIRED_READS has $_n entries and BADENTRY=$BADENTRY — an entry without a function:name key, or a collapsed list, grandfathers the next bare read"
+# The enclosing function of a line, so a bare read is judged where it actually lives.
+func_for() { # <file> <line-number> -> the enclosing function's name (empty before the first one)
+  local file="$1" want="$2" ln best=0
+  for ln in $(grep -nE '^[a-z_][a-z0-9_]*\(\) *\{' "$file" | cut -d: -f1); do
+    [ "$ln" -le "$want" ] || break
+    best="$ln"
+  done
+  [ "${best:-0}" -gt 0 ] || return 0
+  sed -n "${best}p" "$file" | sed -nE 's/^([a-z_][a-z0-9_]*)\(\).*/\1/p'
+}
+# Walk one file and PRINT one record per positional read: "<verdict> <line> <function> <name> <read>".
+# ⛔ A FUNCTION, so the walk can be run over a SYNTHETIC file the suite controls (the non-vacuity arm
+# further down). While it was inline, the only thing tested was that it ran over the shipped file —
+# which is precisely the shape that lets a name-keyed allowlist stay green.
+audit_scan() { # <file>
+  local file="$1" line ln body fn
+  while IFS= read -r line; do
+    ln="${line%%:*}"; body="${line#*:}"
+    fn="$(func_for "$file" "$ln")"
+    while read -r verdict var rd; do
+      [ -n "${verdict:-}" ] || continue
+      printf '%s %s %s %s %s\n' "$verdict" "$ln" "${fn:-?}" "$var" "$rd"
+    done < <(audit_line "$body")
+  done < <(grep -nE '^[[:space:]]*local ' "$file")
+}
+# Grade one file's reads against REQUIRED_READS. Counts land in AUDIT_*; the RETURN is the number of
+# ungraded/fatal pairs, so a caller can assert on it without re-deriving the decision.
+audit_grade() { # <file> <emit 1|0>
+  local file="$1" emit="$2" verdict ln fn var rd bad_n=0
+  AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0
+  while read -r verdict ln fn var rd; do
     case "$verdict" in
       defaulted) AUDIT_DEF=$((AUDIT_DEF + 1))
-                 ok "audit: $var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
-      invented)  bad "audit: $var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
+                 [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
+      invented)  bad_n=$((bad_n + 1))
+                 [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
       derived)   AUDIT_DER=$((AUDIT_DER + 1))
-                 ok "audit: $var (line $ln) DERIVES from $rd — reported, not graded: a derived value cannot carry a default" ;;
+                 [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) EMBEDS $rd in a larger value — a note; it is graded above, not excused" ;;
       *)         AUDIT_BARE=$((AUDIT_BARE + 1))
-                 case "$REQUIRED_LOCALS" in
-                   *" $var "*) ok "audit: $var (line $ln) REQUIRED — reads $rd bare; a caller bug is the right outcome" ;;
-                   *)          bad "audit: $var (line $ln) reads $rd BARE and is not on the REQUIRED list — decide it, do not imitate its neighbour" ;;
+                 case "$REQUIRED_READS" in
+                   *" $fn:$var "*) AUDIT_REQ=$((AUDIT_REQ + 1))
+                       [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) REQUIRED — reads $rd bare; a caller bug is the right outcome" ;;
+                   *) bad_n=$((bad_n + 1))
+                       [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) reads $rd BARE and is not on the REQUIRED list — decide it, do not imitate its neighbour" ;;
                  esac ;;
     esac
-  done < <(audit_line "$body")
-done < <(grep -nE '^[[:space:]]*local ' "$DOCTOR")
+  done < <(audit_scan "$file")
+  return "$bad_n"
+}
+# ⛔ THE NON-VACUITY ARM FOR THE (function, name) KEY. A synthetic file with one allowlisted read and
+# one NEW helper that reuses TWO names that ARE on the list under other functions (`s` from
+# `bounded:s`, `who` from `controller_heartbeat_verdict:who`). Under the FUNCTION key both are
+# ungraded→bad (2); under the old NAME key both would pass (0). So this arm fails the moment somebody
+# re-keys the list by name, which is the P1 regression it exists to catch.
+cat > "$T/audit-mutant.sh" <<'SH'
+state_write() {
+  local role="$1" rc="$2"
+}
+future_helper() {
+  local s="$1" who="$2"
+}
+SH
+_emit_off() { :; }
+MT_BAD=0
+# `emit 0` is enough to keep the mutant's own failures out of the summary counters: every ok()/bad()
+# call site in audit_grade is guarded by `[ "$emit" = 1 ] &&`, so with emit=0 neither is ever invoked.
+audit_grade "$T/audit-mutant.sh" 0; MT_BAD=$?
+[ "$MT_BAD" -eq 2 ] && ok "audit[self-test]: a NEW helper reusing allowlisted NAMES is graded BAD twice (the key is function:name)" \
+  || bad "audit[self-test]: the mutant graded $MT_BAD bad pair(s), want 2 — the allowlist is name-keyed again (or the walk lost the function)"
+# …and the allowlisted pair on the SAME mutant is graded OK, so the arm above is not vacuous either.
+_allow="$(audit_scan "$T/audit-mutant.sh" | awk '$1 == "bare" && $3 == "state_write" && $4 == "role"')"
+case "$_allow" in
+  *"state_write role"*) ok "audit[self-test]: the same mutant's allowlisted state_write:role IS seen (the walk found both functions)" ;;
+  *) bad "audit[self-test]: the mutant's state_write:role was not seen (got '${_allow:-<nothing>}') — the two-bad arm could be passing for the wrong reason" ;;
+esac
+AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0
+BADSUM=0
+audit_grade "$DOCTOR" 1; BADSUM=$?
+[ "$BADSUM" -eq 0 ] && ok "audit: every bare read in the shipped file is a declared function:name pair" \
+  || bad "audit: $BADSUM bare/invented read(s) in the shipped file are undeclared — see the ❌ lines above"
 [ "$((AUDIT_DEF + AUDIT_BARE + AUDIT_DER))" -ge 15 ] && [ "$AUDIT_DEF" -ge 4 ] \
-  && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_BARE required, $AUDIT_DER derived)" \
+  && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_REQ required, $AUDIT_DER embedding)" \
   || bad "audit: classified only $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) reads ($AUDIT_DEF defaulted) — the scan is broken, so this arm proves nothing"
 # …and each dispatched role's mode read must BE the empty-defaulted one (the derived list again).
 while read -r _r _f; do
@@ -1514,8 +1614,11 @@ killed lane-42 && ok "live: run_reap with NO argument REAPED the lane (empty mod
 # no syscalls, merge lock held, so MERGE_BUDGET_S could not bound it and the whole sequential loop
 # (doctor, reap, hygiene) stalled behind it on the first tick. cleanup-stale-branches.sh:694
 # documents the identical hole and its fix: a `case` glob, same set, O(n).
-# ⛔ The fixture is a REAL-SHAPED payload of ~500 KB, and the bound is what DISCRIMINATES: the
-# pre-fix code cannot finish it inside 30s, the fixed code finishes in well under a second.
+# ⛔ TWO DIFFERENT NUMBERS, DELIBERATELY, AND THEY ARE NOT INTERCHANGEABLE (review P2): 349 KB / 84 s
+# is the measurement of the REAL queue answer; the fixture below is a SYNTHETIC 843 KiB (862,802
+# bytes, asserted below) and costs ~104 s in the same builtin. The fixture is deliberately larger
+# than the real payload so the pre-fix code cannot finish it inside the 30 s bound — the bound is
+# what DISCRIMINATES, so the fixture has to sit comfortably on the wrong side of it.
 reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
 python3 - "$T/gh/prs.json" <<'PYJSON'
 import json, sys
