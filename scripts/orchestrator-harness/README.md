@@ -1937,7 +1937,7 @@ these were read at the moment of action:
 |---|---|---|
 | open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | `mergeable: null` is GitHub saying "not computed yet" — `REFUSE(mergeable=unknown)` |
 | a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
-| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592) |
+| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592). The combined commit-status `state` is cross-checked against the entries READ — but `pending` with **zero** statuses is GitHub's EMPTY state for a check-run-only head, not truncation, and treating it as truncation made every real head UNREADABLE |
 | no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
 | a surface that was actually READ | `reds=0 in-flight=0` | a surface of ZERO groups is `REFUSE(surface=empty)`: a head pushed moments ago has no check runs and no commit statuses, and a review record can precede CI — **absence of evidence is not evidence of green** |
 | no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` naming the PR — re-read AT THE MOMENT OF ACTION, not only from the pre-REST snapshot |
@@ -1984,7 +1984,9 @@ pid that is NEW relative to the pre-activation read**, re-probed until `--verify
 else `deploy=<box>:UNVERIFIED` with the readings. The new pid is load-bearing: `stop → apply → start`
 is one shell chain whose exit code is never read, so a controller that survived a failed stop would
 otherwise satisfy "RUNNING" while executing the old tree — and a `source=stamp` identity is rewritten
-by `apply` BEFORE `start`. The boxes are an
+by `apply` BEFORE `start`. When the BEFORE read carries no pid at all (a box one deploy behind with an
+older status command), a restart cannot be proven and the deploy is `UNVERIFIED` — never a fallback
+to "any pid", which would accept exactly the pre-existing controller the rule excludes. The boxes are an
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
 whatever remote path that box already uses — no new control surface is invented here.
 

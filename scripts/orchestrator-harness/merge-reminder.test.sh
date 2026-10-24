@@ -49,6 +49,8 @@
 #   §23 the DEPLOY arm's own bound: an unattainable target is attempted, RECORDED, then a WAIT, then
 #       a REFUSE by count — never a restart every cycle — and a box our own failed activation left
 #       STOPPED is reported as our damage;
+#   §25 the serialisation: SIX concurrent reapers produce exactly ONE winner (the `.reap` mutex), and a
+#       rail that appears only in the SECOND process-table read still refuses the dispatch;
 #   §24 evidence details: `box-status.sh` reads a RIGHT-PADDED ps line (the pid-parse defect that
 #       reported a live controller as STOPPED), the systemd unit's ExecStart starts with the
 #       interpreter exactly once, uninstall spares an operator line that merely mentions the tag,
@@ -182,7 +184,11 @@ JSON
   cat > "$FX/runs.json" <<JSON
 {"workflow_runs":[{"id":9001,"name":"python-ci","path":".github/workflows/ci.yml"}]}
 JSON
-  : > "$FX/status.json" && echo '{"state":"success","statuses":[]}' > "$FX/status.json"
+  # ⛔ THE REAL SHAPE: GitHub answers `state: "pending"` with ZERO statuses for a commit whose CI is
+  # check-runs only (measured on five consecutive origin/main commits, and documented in
+  # admin-merge.sh). The old fixture said `success` with an empty list — a body the API never
+  # returns, which is how a cross-check that refused EVERY real head stayed green here.
+  : > "$FX/status.json" && echo '{"state":"pending","statuses":[]}' > "$FX/status.json"
 }
 write_baseline() {
   : > "$FX/calls.txt"; : > "$FX/ps.txt"; rm -f "$FX/rail-argv.txt" "$FX/activate.txt"
@@ -869,6 +875,45 @@ printf '%s\n' "${out:-1 ps}"
 STUB
 chmod +x "$BIN/ps"
 
+# A pending combined state with ZERO statuses is the EMPTY state, not a truncated page: the check-run
+# surface is what decides, and a green one must still GO. (Reverting the cycle-3 fix makes this
+# UNREADABLE, so the assertion discriminates it.)
+write_baseline; reset_o
+printf '{"state":"pending","statuses":[],"total_count":0}\n' > "$FX/status.json"
+out="$(run_sut)"; rc=$?
+ck "§22g a check-run-only head (pending, 0 statuses) still GOes" \
+   "$(qF 'GO dispatched' "$out" && echo 0 || echo 1)"
+# ...but a pending state CONTRADICTED by entries that are not in flight IS a partial page.
+write_baseline; reset_o
+cat > "$FX/status.json" <<JSON
+{"state":"pending","statuses":[
+ {"context":"vercel/deploy","state":"failure","created_at":"2026-10-23T05:00:00Z",
+  "updated_at":"2026-10-23T05:00:00Z"}]}
+JSON
+out="$(run_sut --json)"; rc=$?
+ck "§22h pending contradicted by a failing entry is UNREADABLE" \
+   "$(qF 'combined commit-status state is' "$out" && qF 'REFUSE(UNREADABLE)' "$out" && echo 0 || echo 1)"
+
+# ⛔ THE CLAIM IS READ FROM A PRIVATE REF, NOT FETCH_HEAD. One FETCH_HEAD per .git is rewritten by ANY
+# concurrent fetch, and reading it made a LIVE claim eligible to be reported as EXPIRED. Here the
+# remote claim is EXPIRED while FETCH_HEAD names a ZERO-lease (LIVE) commit: a reader of FETCH_HEAD
+# refuses, a reader of the private ref dispatches.
+write_baseline; reset_o
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+printf 'claim owner=cell-2 lease_until=0 nonce=decoy\n' > "$TMP/claimmsg-decoy"
+DECOY_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-decoy")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+printf 'claim owner=cell-9 lease_until=1577836800 nonce=real\n' > "$TMP/claimmsg-real"
+REAL_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-real")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+git -C "$REPO_SRC" push --quiet origin "$REAL_SHA:refs/claims/pr-42" 2>/dev/null
+printf '%s\t\tbranch refs/claims/pr-42 of origin\n' "$DECOY_SHA" > "$REPO_SRC/.git/FETCH_HEAD"
+out="$(run_sut)"; rc=$?
+ck "§22i an EXPIRED claim is read from its own ref, not a decoy FETCH_HEAD" \
+   "$(qF 'GO dispatched' "$out" && echo 0 || echo 1)"
+ck "§22i and no temporary claim ref is left behind" \
+   "$([ -z "$(git -C "$REPO_SRC" for-each-ref --format='%(refname)' refs/reminder 2>/dev/null)" ] && echo 0 || echo 1)"
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+rm -f "$REPO_SRC/.git/FETCH_HEAD"
+
 # ═══ §23 the DEPLOY arm's own bound: an unattainable target must not restart forever ═══════════
 echo "-- §23 deploy attempts are recorded and bounded"
 write_no_landing; reset_o
@@ -885,7 +930,7 @@ out="$(run_sut --verify-deploy-s 1)"; rc=$?
 ck "§23a an activation that does not reach main is UNVERIFIED, never assumed" \
    "$(qF 'UNVERIFIED' "$out" && echo 0 || echo 1)"
 ck "§23a the attempt was RECORDED (so the next cycle can read it)" \
-   "$(grep -q '^local ' "$O/state/merge-reminder.deploys" 2>/dev/null && echo 0 || echo 1)"
+   "$([ -s "$O/state/merge-reminder.deploys" ] && grep -q '^local' "$O/state/merge-reminder.deploys" && echo 0 || echo 1)"
 # ...and a second cycle inside --retry-s does not try again blindly.
 rm -f "$FX/activate.txt"
 out="$(run_sut --verify-deploy-s 1)"; rc=$?
@@ -895,7 +940,8 @@ ck "§23b and nothing was activated" "$([ ! -e "$FX/activate.txt" ] && echo 0 ||
 # With the pair already tried DEPLOY_MAX_ATTEMPTS times, the arm STOPS and says a human must look.
 : > "$O/state/merge-reminder.deploys"
 for n in 1 2 3; do
-  printf 'local ffffffffffff %s %s unverified\n' "${MAIN12}" "$(( $(date +%s) - 1000 ))" \
+  # TAB-separated, the ledger's real shape (a box name may contain a space)
+  printf 'local\tffffffffffff\t%s\t%s\tunverified\n' "${MAIN12}" "$(( $(date +%s) - 1000 ))" \
     >> "$O/state/merge-reminder.deploys"
 done
 rm -f "$FX/activate.txt"
@@ -911,6 +957,46 @@ ck "§23d a STOPPED box after OUR unverified attempt is reported as OUR damage" 
    "$(qF 'our last activation of this box did not verify' "$out" && echo 0 || echo 1)"
 ck "§23d and it still does not start it behind an operator's back" \
    "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+
+# ⛔ A NEW PID IS REQUIRED. The activation runs, the box becomes `current`, and the SAME controller
+# pid is still answering: that is a controller which survived a failed `stop`, and it must not read
+# as VERIFIED (deleting the `and fresh:` conjunct left the whole suite green before this case).
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 7)\nroles: idle\n' > "$FX/box.txt"
+cat > "$TMP/box-samepid.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "activate-ran" >> "$FIXTURE/activate.txt"
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 7)\nroles: idle\n' \
+  "$(sed -n 's/^harness: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" > "$FIXTURE/box.txt"
+exit 0
+STUB
+chmod +x "$TMP/box-samepid.sh"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-samepid.sh" > "$O/state/boxes.tsv"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§23e the SAME controller pid after activation is UNVERIFIED (a new process is required)" \
+   "$(qF 'UNVERIFIED' "$out" && qF 'a NEW pid is required' "$out" && echo 0 || echo 1)"
+ck "§23e (and it says which pid was there before)" "$(qF 'pids=7 before' "$out" || qF '7 before' "$out" && echo 0 || echo 1)"
+
+# ⛔ NO "BEFORE" PID MEANS A NEW PROCESS CANNOT BE PROVEN. A box one deploy behind may run an older
+# status command that prints `controller: RUNNING` with no pid; falling back to "any pid at all" then
+# accepts the PRE-EXISTING controller, which is exactly what the new-pid rule excludes.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING\nroles: idle\n' > "$FX/box.txt"
+cat > "$TMP/box-newpid.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "activate-ran" >> "$FIXTURE/activate.txt"
+H="$(sed -n 's/^harness: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")"
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 99)\nroles: idle\n' \
+  "$H" "$H" "$H" > "$FIXTURE/box.txt"
+exit 0
+STUB
+chmod +x "$TMP/box-newpid.sh"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-newpid.sh" > "$O/state/boxes.tsv"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§23f a pre-read with NO pid cannot prove a restart, so the deploy is UNVERIFIED" \
+   "$(qF 'UNVERIFIED' "$out" && qF 'a NEW pid is required' "$out" && echo 0 || echo 1)"
 
 # ═══ §24 box-status.sh's controller pid, and the timer arms' rendered shape ═════════════════════
 echo "-- §24 evidence details"
@@ -943,18 +1029,29 @@ ck "§24b and it names this script exactly once" \
 
 # A crontab line that merely MENTIONS our tag is not ours to delete.
 : > "$FX/crontab.txt"
-printf '%s\n' '*/5 * * * * /usr/bin/true # paused tortoise-merge-reminder during freeze' > "$FX/crontab.txt"
+# ⛔ THE FIXTURE MUST CARRY THE LITERAL TAG. "# paused tortoise-merge-reminder during freeze" does
+# NOT contain "# tortoise-merge-reminder", so the old bare-tag predicate never touched it and the
+# assertion passed on a line that was never at risk.
+printf '%s\n' '*/5 * * * * /usr/bin/true # tortoise-merge-reminder paused during freeze' > "$FX/crontab.txt"
 env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
   --uninstall-timer >/dev/null 2>&1
 ck "§24c an operator line that only MENTIONS the tag survives uninstall" \
-   "$(grep -q 'paused tortoise-merge-reminder during freeze' "$FX/crontab.txt" && echo 0 || echo 1)"
+   "$(grep -q 'paused during freeze' "$FX/crontab.txt" && echo 0 || echo 1)"
 
 # ...and the darwin plist has the same argv-shape risk, driven hermetically (the repo already drives
 # a launchd installer this way in install-launchd-durability.test.sh).
 D="$TMP/darwinbin"; DH="$TMP/home5"; mkdir -p "$D" "$DH"
 cat > "$D/launchctl" <<'STUB'
 #!/usr/bin/env bash
+# STATEFUL, like install-launchd-durability.test.sh's shim: `bootout` marks the job unloaded,
+# `bootstrap` marks it loaded, and `print` answers from that state. A stateless stub that succeeds
+# `print` after `bootout` made a REFUSED removal look like a successful one.
 printf '%s\n' "$*" >> "$FIXTURE/launchctl.txt"
+case "${1:-}" in
+  bootout)   : > "$FIXTURE/launchctl.loaded"; rm -f "$FIXTURE/launchctl.loaded" ;;
+  bootstrap) : > "$FIXTURE/launchctl.loaded" ;;
+  print)     [ -e "$FIXTURE/launchctl.loaded" ] && exit 0 || exit 1 ;;
+esac
 exit 0
 STUB
 cat > "$D/plutil" <<'STUB'
@@ -979,6 +1076,12 @@ ck "§24d darwin: the plist was rendered and loaded (rc suffix: $(tail -1 <<<"$o
    "$([ -s "$PL" ] && q 'rc=0' "$outd" && echo 0 || echo 1)"
 ck "§24d darwin: ProgramArguments names the script ONCE and carries the interval" \
    "$([ "$(grep -o 'merge-reminder\.py' "$PL" 2>/dev/null | wc -l)" -eq 1 ] && grep -q '<key>StartInterval</key>' "$PL" && echo 0 || echo 1)"
+# The same class as the systemd `ExecStart` defect: a duplicated interpreter still names the script
+# once, so the assertion above cannot see it. Count the ARRAY's entries (interpreter, script, --o, $O)
+# rather than any 'python' substring in the file (a PATH value can contain one).
+parg="$(sed -n 's/.*<key>ProgramArguments<\/key><array>\(.*\)<\/array>.*/\1/p' "$PL" 2>/dev/null)"
+ck "§24d darwin: ProgramArguments carries exactly FOUR strings (no duplicated argv[0])" \
+   "$([ "$(grep -o '<string>' <<<"$parg" | wc -l)" -eq 4 ] && echo 0 || echo 1)"
 ck "§24d darwin: the job is booted out BEFORE it is bootstrapped (launchd requires it)" \
    "$(awk '/bootout/{b=NR} /bootstrap/{s=NR} END{exit !(b && s && b<s)}' "$FX/launchctl.txt" && echo 0 || echo 1)"
 env HOME="$DH" FIXTURE="$FX" PATH="$D:/usr/bin:/bin" "$PY3" -c '
@@ -988,7 +1091,89 @@ spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 sys.exit(m.install_timer(pathlib.Path(sys.argv[2]), 600, True))
 ' "$SUT" "$O" >/dev/null 2>&1
-ck "§24e darwin: --uninstall-timer removes the plist" "$([ ! -e "$PL" ] && echo 0 || echo 1)"
+ck "§24e darwin: --uninstall-timer removes the plist AND its loaded job" \
+   "$([ ! -e "$PL" ] && [ ! -e "$FX/launchctl.loaded" ] && echo 0 || echo 1)"
+
+# ⛔ CRON EATS `%` BEFORE THE SHELL SEES IT, so an `$O` carrying one must be escaped — and the
+# post-write verification must recognise the ESCAPED line as ours, or install reports failure for an
+# entry it just wrote (and uninstall leaves it behind).
+OP="$TMP/o%pct"
+: > "$FX/crontab.txt"
+outp="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$OP" \
+        --install-timer --interval 600 2>&1)"; prc=$?
+ck "§24f install with '%' in \$O succeeds and verifies (rc=$prc)" \
+   "$([ "$prc" -eq 0 ] && grep -q '\\%' "$FX/crontab.txt" && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$OP" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§24f ...and --uninstall-timer removes that escaped entry" \
+   "$(grep -q 'o\\%pct' "$FX/crontab.txt" && echo 1 || echo 0)"
+
+# ⛔ ANOTHER REMINDER IS NOT A RAIL. `--rail <path>/admin-merge.sh` puts the rail's NAME in a
+# reminder's own argv; counting that as "a landing attempt is live" made the arm refuse itself.
+write_baseline; reset_o
+printf '%s python3 /x/merge-reminder.py --rail /x/admin-merge.sh --o /x\n' 616 > "$FX/ps.txt"
+out="$(run_sut)"; rc=$?
+ck "§25c a PEER reminder whose argv names the rail is not a rail" \
+   "$(qF 'GO dispatched' "$out" && echo 0 || echo 1)"
+
+# ═══ §25 the serialisation that cycle 3 pinned: exactly one reap winner, and a fresh ps read ═══
+echo "-- §25 reap mutex and the moment-of-action read"
+# ⛔ TWO REAPERS MUST NOT BOTH WIN. `unlink` + `O_EXCL`-create is not atomic; without the `.reap`
+# mutex each can return "taken" and two rails run for one PR (the very defect the lock prevents).
+RPD="$TMP/reap"; mkdir -p "$RPD/state"
+printf '99999999\n' > "$RPD/state/mergeclaim-42.lock"
+rout="$(python3 - "$SUT" "$RPD/state/mergeclaim-42.lock" <<'PYMOD'
+import importlib.util, multiprocessing as mp, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+lock = Path(sys.argv[2])
+
+import time
+barrier = None
+
+def worker(q):
+    barrier.wait()                      # maximise simultaneity
+    got, _ = m._take_pid_lock(lock)
+    q.put(got)
+    if got:
+        time.sleep(1.5)                 # HOLD the lock while the others try, as a real lander does
+                                        # (a winner that exits at once leaves a dead pid, which the
+                                        # next racer would legitimately reap — that is correct
+                                        # behaviour, not a second winner)
+
+if __name__ == "__main__":
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    barrier = ctx.Barrier(6)
+    ps = [ctx.Process(target=worker, args=(q,)) for _ in range(6)]
+    for p in ps: p.start()
+    for p in ps: p.join(15)
+    wins = sum(1 for _ in ps if q.get())
+    print("winners=%d" % wins)
+PYMOD
+)"
+ck "§25a exactly ONE of six concurrent reapers wins the lock" \
+   "$(grep -qx 'winners=1' <<<"$rout" && echo 0 || echo 1)"
+ck "§25a (the sidecar mutex was cleaned up)"    "$([ ! -e "$RPD/state/mergeclaim-42.lock.reap" ] && echo 0 || echo 1)"
+
+# ⛔ THE PROCESS TABLE IS RE-READ AT THE MOMENT OF ACTION. A rail that appears only in the SECOND
+# read (after the gates and this cycle's REST calls) must still refuse the dispatch.
+write_baseline; reset_o
+mkdir -p "$TMP/twops"; : > "$FX/ps-calls.txt"
+cat > "$TMP/twops/ps" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(wc -l < "$FIXTURE/ps-calls.txt") + 1 ))
+printf 'x\n' >> "$FIXTURE/ps-calls.txt"
+if [ "$n" -le 1 ]; then printf '1 ps\n'; else cat "$FIXTURE/ps2.txt" 2>/dev/null || printf '1 ps\n'; fi
+STUB
+chmod +x "$TMP/twops/ps"
+printf '%s bash /tmp/h/admin-merge.sh 42 --repo %s\n' 888 "$SLUG" > "$FX/ps2.txt"
+out="$(env -u OR -u O FIXTURE="$FX" REPO="$REPO_SRC"        PATH="$TMP/twops:$BIN:/usr/bin:/bin:/usr/local/bin"        python3 "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh"        --rail-wait-s 5 --retry-s 900)"; rc2=$?
+ck "§25b a rail that appears in the SECOND table read still refuses the dispatch" \
+   "$(qF 'REFUSE(rail=running' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+ck "§25b (and the two reads really happened: $(wc -l < "$FX/ps-calls.txt") ps call(s))" \
+   "$([ "$(wc -l < "$FX/ps-calls.txt")" -ge 2 ] && echo 0 || echo 1)"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

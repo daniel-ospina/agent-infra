@@ -429,7 +429,13 @@ def check_surface(budget: Budget, slug: str, head: str) -> dict:
             v["verdict"] == "red" for v in status_groups):
         problem = ("the combined commit-status state is `failure` but no failing status was read "
                    "— the page is incomplete, so its absences prove nothing")
-    if not problem and combined == "pending" and not any(
+    # ⛔ `pending` IS THE EMPTY STATE, NOT EVIDENCE OF A DROPPED ENTRY. GitHub reports
+    # `state: "pending"` for a body carrying ZERO legacy statuses — the normal shape of any head whose
+    # CI is check-runs only (`admin-merge.sh` documents the same fact twice) — so treating it as
+    # truncation made EVERY real head UNREADABLE and the actuator dead (2026-10-23, measured on five
+    # consecutive origin/main commits: `state=pending statuses=0 total_count=0`). Only a pending
+    # state that the READ ENTRIES contradict is suspicious.
+    if not problem and combined == "pending" and statuses and not any(
             v["verdict"] == "in_flight" for v in status_groups):
         problem = ("the combined commit-status state is `pending` but no in-flight status was read "
                    "— the page is incomplete, so its absences prove nothing")
@@ -692,7 +698,8 @@ def _is_our_cron_line(line: str, tag: str) -> bool:
     tortoise-merge-reminder during freeze` entry) and reported that as removing our arm (#2603
     review). Install and uninstall now share this one predicate.
     """
-    return tag in line and shell_quote(str(Path(__file__).resolve())) in line
+    quoted = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
+    return tag in line and quoted in line
 
 
 def local_activate(o: Path, platform: str | None = None) -> str:
@@ -745,6 +752,9 @@ def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
 
 
 DEPLOYS = "merge-reminder.deploys"
+# How long a `<lock>.reap` sidecar is believed to be a live reaper. The reap itself is a few
+# syscalls, so anything older is an orphan whose pid may have been reused.
+REAP_STALE_S = 300
 DEPLOY_MAX_ATTEMPTS = 3
 
 
@@ -765,7 +775,10 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
     n, last = 0, 0
     frm12, to12 = frm[:12], to[:12]
     for line in text.splitlines():
-        parts = line.split()
+        # ⛔ TAB, NOT SPACE: a box name is human-authored (`name<TAB>status<TAB>activate`) and may
+        # contain a space, which a whitespace split turns into a DIFFERENT key — so the bound would
+        # never bind for that box and it would be restarted every cycle.
+        parts = line.split("\t")
         if len(parts) >= 4 and parts[0] == box and parts[1] == frm12 and parts[2] == to12:
             n += 1
             try:
@@ -775,18 +788,26 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
     return n, last
 
 
-def record_deploy(o: Path, box: str, frm: str, to: str, verdict: str) -> None:
+def record_deploy(o: Path, box: str, frm: str, to: str, verdict: str) -> bool:
+    """-> True when the attempt is on disk. ⛔ THE CALLER MUST REPORT A FALSE.
+
+    An unwritable ledger (read-only `$O`, full disk) makes `deploy_attempts` return `(0, 0)` — so the
+    bound would report itself satisfied while bounding nothing, an inert enforcer. Recording the
+    failure in the verdict is what keeps "no attempts recorded" from meaning two different things.
+    """
     p = o / "state" / DEPLOYS
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a") as fh:
-            fh.write(f"{box} {frm[:12]} {to[:12]} {int(time.time())} {' '.join(verdict.split())}\n")
+            fh.write(f"{box}\t{frm[:12]}\t{to[:12]}\t{int(time.time())}\t"
+                     f"{' '.join(verdict.split())}\n")
         lines = p.read_text().splitlines()[-400:]
         tmp = p.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
         os.replace(tmp, p)
+        return True
     except OSError:
-        pass          # a ledger that cannot be written must not turn a refusal into an action
+        return False          # a ledger write must not turn a refusal into an action — but it is said
 
 
 def _controller_pids(d: dict) -> list[str]:
@@ -961,7 +982,11 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 time.sleep(min(15, max(1, verify_s // 6)))
                 last = probe_box(name, status_cmd)
                 post_pids = set(_controller_pids(last))
-                fresh = bool(post_pids - pre_pids) if pre_pids else bool(post_pids)
+                # ⛔ NO "BEFORE" PID MEANS A NEW PROCESS CANNOT BE PROVEN. Falling back to "any pid
+                # at all" is exactly wrong here: the pre-read that carries no pid is a box one deploy
+                # BEHIND (an older status command, which is the state this arm exists to fix), and the
+                # pid it then finds is the pre-existing controller the check was added to exclude.
+                fresh = bool(pre_pids) and bool(post_pids - pre_pids)
                 if last["readable"] and last["harness"][:12] == main_sha[:12] \
                         and last["relation"] == "current" and last["controller"] == "RUNNING" \
                         and fresh:
@@ -977,7 +1002,9 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                                 f"pids={(','.join(_controller_pids(last or {})) or '<none>')} "
                                 f"(a NEW pid is required: {','.join(sorted(pre_pids)) or '<none>'} "
                                 f"before)")
-            record_deploy(o, name, d["harness"], main_sha, entry["verdict"])
+            if not record_deploy(o, name, d["harness"], main_sha, entry["verdict"]):
+                entry["verdict"] += (" [⚠️ the deploy ledger could NOT be written — the attempt "
+                                     "bound is inert until $O/state is writable]")
             results.append(entry)
     finally:
         if held_deploy_lock:
@@ -1141,22 +1168,27 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
             rfd = os.open(str(reap), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             break
         except FileExistsError:
+            # The mutex carries `<pid> <epoch>`: `kill -0` alone cannot tell a live reaper from a
+            # REUSED pid, and a reused pid would fence the reap for as long as that unrelated process
+            # lives. The reap window is milliseconds, so an old entry is stale by age.
             try:
-                rpid = reap.read_text().strip()
-            except OSError:
-                rpid = "?"
-            if _pid_alive(rpid):
+                fields = reap.read_text().split()
+                rpid = fields[0] if fields else "?"
+                rage = int(fields[1]) if len(fields) > 1 else 0
+            except (OSError, ValueError):
+                rpid, rage = "?", 0
+            if _pid_alive(rpid) and rage and (time.time() - rage) < REAP_STALE_S:
                 return False, f"running (a reap is in progress pid={rpid})"
             try:
-                reap.unlink()          # a dead reaper is the same stale flag, one level down
+                reap.unlink()          # a dead OR aged reaper is the same stale flag, one level down
             except OSError:
                 return False, f"stale-lock pid={pid} (the reap mutex could not be cleared)"
         except OSError as e:
             return False, f"stale-lock pid={pid} ({type(e).__name__}: could not serialise the reap)"
     if rfd is None:
-        return False, f"running (a reap is in progress)"
+        return False, "running (a reap is in progress)"
     try:
-        os.write(rfd, str(os.getpid()).encode())
+        os.write(rfd, f"{os.getpid()} {int(time.time())}".encode())
         os.close(rfd)
         try:
             pid2 = path.read_text().strip()
@@ -1196,7 +1228,14 @@ def any_rail_live(o: Path, ps_rows) -> str:
             return f"{lock.name} pid={pid}"
     if ps_rows is None:
         return UNREADABLE
+    me = {str(os.getpid()), str(os.getppid())}
     for pid, cmd in ps_rows:
+        # ⛔ NOT OUR OWN INVOCATION: `--rail <path>/admin-merge.sh` puts the rail's NAME in this
+        # process's own argv, and without this the arm refused itself on every cycle ("a landing
+        # attempt is live: admin-merge.sh pid=<self>") — a self-refusal that blames a rail that does
+        # not exist. A process running THIS script is never the rail it is about to dispatch.
+        if pid in me or "merge-reminder.py" in cmd:
+            continue
         m = re.search(r"(\S*(?:admin-merge|merge-one)\.sh)\b", cmd)
         if m:
             return f"{m.group(1).rsplit('/', 1)[-1]} pid={pid}"
