@@ -945,8 +945,8 @@ nothing refused, logged or counted, and the box went to load 258 against its own
 refusal is loud (1-min load, ceiling, the item, and the calling process), counted in
 `~/.pi/agent/state/spawn-gate.tsv` (allowed runs too; bounded by a one-generation rotation at 5 MiB,
 because this is the highest-volume sink in the tree and a device that fills silently is #1765's
-defect), and exits 76, which `run_agent` translates to
-the callers' usual `AGENT_LOAD_REFUSED`/`AGENT_STARTED=0`. Its stated limits are in the file's header:
+defect), and exits 76 (a LOAD refusal) or 72 (a MEMORY refusal, #2387), which `run_agent` translates to
+the callers' usual `AGENT_LOAD_REFUSED` / `AGENT_MEM_REFUSED` with `AGENT_STARTED=0`. Its stated limits are in the file's header:
 the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately — that is the
 operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
@@ -2573,7 +2573,7 @@ already holding):
   corrupt byte. Past that, each consumes the fields it needs and no others:
   - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
     this chain's start minus the ordering slack, and not older than the record's own yield window).
-    It reports **field 3** as the exit code (75 load / 77 disk / 74 land) and maps an unrecognised value
+    It reports **field 3** as the exit code (75 load / 73 memory / 77 disk / 74 land) and maps an unrecognised value
     to `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
     one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
     yield window must not make a proven refusal unreadable.
@@ -3133,8 +3133,9 @@ were deleted.
   `tmux new-session -d -s <name> "… pi -p …"`, no `lane.sh`, so `MAX_LOAD` was never read — on a box
   at load 258 on 10 cores against its own ceiling of 100. **✔ FIXED** — `spawn-gate.sh` is also an
   executable installed as `$HOME/.pi/agent/bin/pi` (first on PATH), so every `pi` resolves the gate; a
-  refusal names the reading/ceiling/item/caller, is counted in `~/.pi/agent/state/spawn-gate.tsv`,
-  and exits 76 (translated to the callers' 75). Named residuals: an invocation that bypasses PATH
+  refusal names the reading/ceiling/item/caller (or, for memory, the reading/floor/item/caller — #2387), is
+  counted in `~/.pi/agent/state/spawn-gate.tsv`, and exits 76 for load or 72 for memory (translated to the
+  callers' 75 / 73). Named residuals: an invocation that bypasses PATH
   (absolute path, `env -i`, a `PATH` reset) is not gated — that is the operator's documented rescue,
   and `MAX_LOAD` stays the operator's own tunable — and the **`task`/sub-agent dispatch does not pass
   through PATH at all** (`getPiInvocation` spawns `process.execPath` + the entry script so a truncated

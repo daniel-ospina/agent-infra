@@ -125,7 +125,12 @@ MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 # move either factor and keep the arithmetic auditable, which is what the gate's own line promises.
 MEM_LANE_RESERVE_MB="${MEM_LANE_RESERVE_MB:-1024}"
 MEM_SPAWN_RESERVE_LANES="${MEM_SPAWN_RESERVE_LANES:-2}"
-MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-$(( ${MEM_LANE_RESERVE_MB:-1024} * ${MEM_SPAWN_RESERVE_LANES:-2} ))}"
+# ⛔ `10#` ON THE DERIVATION, NOT JUST IN THE GATE (review P3). A bare `$(( ))` parses base 0, so
+# `MEM_LANE_RESERVE_MB=08` aborted the installer HERE ("value too great for base") before the loop's
+# leading-zero arm could name the real problem — the same shell rule this file documents further down
+# and `spawn-gate.sh` already respects. Fail-safe (nothing renders, exit is non-zero), but the operator
+# got a shell error instead of ours.
+MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))}"
 BATCH="${BATCH:-2}"
 # The product work floor (agent-infra#2054): how many slots of each batch are filled from
 # `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through

@@ -1119,6 +1119,16 @@ reap_lane_venv() {
 #     install.sh renders it into the plist, and `orch-loop.sh`/`install.sh` derive it the same way.
 #     A process that sets it has stated a ceiling of its own. MAX_LOAD=0 keeps its documented
 #     meaning: spawn nothing, for ever (`[ 0 -lt 0 ]` is false, so every reading is refused).
+#     ⛔ THE SAME IS TRUE OF THE MEMORY FLOOR (#2387 review), and this file used to deny it: the
+#     bullet below says the memory gate "needs nothing from the caller", which is true of the
+#     READING and false of the FLOOR. `MEM_MIN_AVAIL_MB` (and the two factors behind it:
+#     `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`) is read from the environment at source time
+#     exactly like MAX_LOAD, so a caller that exports `MEM_MIN_AVAIL_MB=1` has stated a floor of its
+#     own and is not gated on memory — that is the documented lever, and it is also the disarm. The
+#     harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a memory-tight
+#     box does not answer a load arm with 73; the four values an operator sets deliberately are
+#     stated in README §7 and rendered by install.sh into the plist, so no caller can claim it did
+#     not know.
 #   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim
 #     about print mode, and parsing argv to exempt "interactive" would create a SECOND definition of
 #     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
@@ -1131,9 +1141,12 @@ reap_lane_venv() {
 #     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
 #     its own gates rather than deferring to this one.
 #   * The MEMORY gate (#2387) IS here, and its STATE is read from the box's own probe (/proc/meminfo
-#     or vm_stat), so it needs nothing from the caller — which is exactly why it can be enforced at
-#     this layer while the disk gate cannot. Its floor is per-BOX (not per-volume), so unlike the disk
-#     reading there is nothing a caller knows that this layer does not.
+#     or vm_stat), so it needs no ARGUMENT from the caller — a caller could not know the box's free
+#     memory even in principle, which is exactly why it can be enforced at this layer while the disk
+#     gate cannot. Its floor is per-BOX (not per-volume), so unlike the disk reading there is nothing
+#     per-spawn a caller knows that this layer does not. ⚠️ The FLOOR is still caller-settable — see
+#     the MAX_LOAD bullet above, which states that limit for both gates rather than pretending this
+#     one is exempt.
 #   * `pi` invocations that never leave the current process — none exist today (there is no in-process
 #     API use of the harness's model calls), and if one appeared it would be outside every PATH gate.
 #   * ⛔ THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT, AND IT DOES NOT PASS THROUGH PATH.
