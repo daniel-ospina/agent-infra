@@ -1087,25 +1087,76 @@ class TestActionVocabulary:
                         "details_url": self.DU})
         return out
 
-    def _pr(self, ms="BLOCKED", files=None):
-        return {"number": 1, "isDraft": False, "mergeStateStatus": ms,
-                "headRefOid": "a" * 40, "files": files or []}
+    def _pr(self, ms="BLOCKED", files=None, mergeable=None):
+        out = {"number": 1, "isDraft": False, "mergeStateStatus": ms,
+               "headRefOid": "a" * 40, "files": files or []}
+        if mergeable is not None:
+            out["mergeable"] = mergeable
+        return out
 
     def test_ai_review_gate_only_red_is_record_review_not_fix_ci(self):
         assert self.o.classify_pr(self._pr(), self._cr(red=["ai-review-gate"]), False) \
             == "record-review"
 
     def test_dirty_is_resolve_conflict(self):
-        """A conflicted PR whose checks are not all green -- the normal case."""
+        """A conflicted PR whose checks are not all green -- the normal case, and it stays
+        `resolve-conflict` rather than being read as CI work: the rebase re-runs them anyway."""
         cr = self._cr(red=["python-ci-gate"])
         assert self.o.classify_pr(self._pr(ms="DIRTY"), cr, False) == "resolve-conflict"
+        assert self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(absent=self.REQ), False) \
+            == "resolve-conflict"
 
-    def test_knows_the_one_edge_the_strict_order_creates(self):
-        """PINNED, NOT ENDORSED: `call-rail` is FIRST in CLASS_ORDER, so a PR that is BOTH
-        fully green+attested AND `DIRTY` classifies `call-rail` -- which the rail would then
-        REFUSE on the conflict. The spec fixes the order, so the order is implemented exactly
-        as written; this test exists so the edge is visible rather than discovered in the field."""
-        assert self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(), True) == "call-rail"
+    def test_dirty_green_and_attested_is_resolve_conflict_never_call_rail(self):
+        """⛔ THE DIRECT SHAPE OF #1936, AND `call-rail` MEANS THE RAIL WILL ACCEPT IT.
+
+        Fully green + CURRENTLY attested + `mergeStateStatus=DIRTY` -- an attested green PR
+        whose base moved without touching its head. This is a NORMAL live shape, and it used
+        to classify `call-rail`: a class whose brief tells a lane "MERGE #N -- nothing else is
+        needed" while `scripts/admin-merge.sh` refuses that very PR (`CONFLICTED`), so NO lane
+        was ever told to rebase and the PR sat. `rail_block_reason` reads checks only and
+        returns None here, so the mergeability term has to enter the DECISION, which is why
+        the conflict arm (arm 1) sits above `call-rail` (arm 2).
+
+        `resolve-conflict`, not `blocked-by-rail`: no rail GATE is proven non-green (the
+        `why` a `blocked-by-rail` token carries would be empty), and the work is a rebase --
+        which is exactly what `scripts/pr-loop.py::decide` says for this class."""
+        k = self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(), True)
+        assert k != "call-rail", k
+        assert k == "resolve-conflict", k
+
+    def test_a_CONFLICTING_mergeable_is_a_conflict_even_while_the_state_is_UNREAD(self):
+        """⛔ `mergeable=CONFLICTING` IS AN ANSWER; `mergeStateStatus=UNKNOWN` IS AN ABSENCE.
+
+        The two fields settle at DIFFERENT times: `mergeable` is computed on demand and can be
+        settled at CONFLICTING while `mergeStateStatus` is still recomputing, which is the one
+        window in which the two disagree -- and reading only the state word made that window
+        `call-rail` on a head GitHub says it cannot merge. The queue read ALREADY requests both
+        fields (`objective.queue()`), so the answer was fetched and ignored.
+
+        The guard direction is pinned beside it: the field's OWN unread value (`UNKNOWN`) and an
+        absent field are still not evidence, so a PR GitHub has not answered for is NEVER pushed
+        into a needless rebase (a rebase stales its attestation)."""
+        k = self.o.classify_pr(self._pr(ms="UNKNOWN", mergeable="CONFLICTING"),
+                               self._cr(), True)
+        assert k != "call-rail", k
+        assert k == "resolve-conflict", k
+        # ...and the settle order can also be the reverse: DIRTY state, `mergeable` not yet read.
+        assert self.o.classify_pr(self._pr(ms="DIRTY", mergeable="UNKNOWN"), self._cr(), True) \
+            == "resolve-conflict"
+        # The over-fire guards: an unread or absent `mergeable` is never a conflict.
+        assert self.o.classify_pr(self._pr(ms="UNKNOWN", mergeable="UNKNOWN"),
+                                  self._cr(), True) == "call-rail"
+        assert self.o.classify_pr(self._pr(ms="CLEAN", mergeable="MERGEABLE"),
+                                  self._cr(), True) == "call-rail"
+
+    def test_an_unread_merge_state_is_never_a_conflict(self):
+        """`mergeStateStatus` is computed LAZILY and reads UNKNOWN fleet-wide while GitHub
+        recomputes (measured 2026-10-01: 75 of 82 non-draft PRs). Only a POSITIVE answer may
+        move a PR into `resolve-conflict` -- a literal `DIRTY` state, or `mergeable=CONFLICTING`
+        (#1936). An UNREAD state is NOT a positive answer: treating one as a conflict would send
+        every PR on the board to a needless rebase, and a rebase stales its attestation."""
+        assert self.o.classify_pr(self._pr(ms="UNKNOWN"), self._cr(), True) == "call-rail"
+        assert self.o.classify_pr(self._pr(ms=""), self._cr(), True) == "call-rail"
 
     def test_non_required_reds_change_nothing(self):
         """`drive`/`sigpipe-guard` are red on main BY DESIGN -- never a bucket."""
@@ -1117,14 +1168,21 @@ class TestActionVocabulary:
             == "rerun-checks"
 
     def test_NOTHING_reported_yet_while_checks_RUN_is_running_not_rerun(self):
-        """⛔ ARM 2 MUST CONCEDE TO ARM 4 (#1872 review -- a real defect found in review).
+        """⛔ THE NOT-YET-REPORTED `rerun-checks` ARM (arm 3) MUST CONCEDE TO `running` (arm 4)
+        (#1872 review -- a real defect found in review).
+
+        ⚠️ ARM NUMBERS MOVE WITH EVERY INSERTION ABOVE THEM (#1936, then the WEDGED re-trigger), so
+        the NAMES are authoritative and the numbers are only a reading aid: `resolve-conflict` is
+        arm 1 and the WEDGED re-trigger is arm 0, which puts `running` at arm 4 and `record-review`
+        at arm 5. This sentence has now been renumbered twice; cite the classes, not the ordinals.
 
         A fresh head where NO required context has reported yet while other checks are already
         in flight is the NORMAL first state of a push (`python-ci-gate`, `docs` and `legal-e2e`
         are created seconds after the children). `not req_seen` cannot tell "not reported yet"
         from "never ran", and the two need OPPOSITE actions: wait, versus START the workflow.
 
-        Before the fix arm 2 fired first and this shape read `rerun-checks`; the dispatcher's
+        Before the fix the not-yet-reported `rerun-checks` arm fired first and this shape read
+        `rerun-checks`; the dispatcher's
         brief for that class asserts "(Nothing is in flight ...)" and tells the lane to push an
         empty commit -- so a 20-second-old head was churned, wasting runner capacity and staling
         every attestation.
