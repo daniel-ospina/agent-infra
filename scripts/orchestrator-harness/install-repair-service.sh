@@ -94,7 +94,18 @@ ACTION=--install
 for arg in "$@"; do
   case "$arg" in
     --install|--uninstall|--status|--dry-run) ACTION="$arg" ;;
-    --help|-h) sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # ⛔ THE RANGE IS DERIVED, NEVER A CONSTANT. It was `sed -n '2,50p'` while the header had grown
+    # past line 80, so `--help` silently dropped 13 documented seams (`REPAIR_POLL_SEC`,
+    # `REPAIR_RESTART_SEC`, `SYSTEMCTL`, `SUDO`, `ELDATO_PLATFORM`, the exit codes …) with no sign
+    # anything was cut — the same defect `scripts/install-disk-reaper-timer.sh:113-126` records for
+    # its own header. No constant fallback: if the derivation fails (invoked from a pipe) say so
+    # rather than reinstating the truncation.
+    --help|-h)
+      n="$(grep -n '^set -uo pipefail' "${BASH_SOURCE[0]}" 2>/dev/null | head -1 | cut -d: -f1)"
+      if [ -z "$n" ]; then
+        echo "${0##*/}: cannot derive the help range (invoke this FILE, not a pipe)" >&2; exit 2
+      fi
+      sed -n "2,$(( n - 1 ))p" "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done

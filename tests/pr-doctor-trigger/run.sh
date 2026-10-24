@@ -338,10 +338,19 @@ stop_loop "$mpid"
 echo "── G. the SERVICE wiring: ExecStart runs the TRIGGER, Restart=always, backstop 1800"
 INSTALLER="$ROOT/scripts/orchestrator-harness/install-repair-service.sh"
 [ -f "$INSTALLER" ] && pass "the repair-service installer ships" || fail "no $INSTALLER"
-unit="$(ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
+unit="$(PR_DOCTOR_REPO_DIR="$TMP/no-such-checkout" ELDATO_PLATFORM=Linux \
+        PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
         TEMPLATES_DIR="$ROOT/templates/systemd" \
-        bash "$INSTALLER" --dry-run 2>/dev/null)"; irc=$?
+        bash "$INSTALLER" --dry-run 2>"$TMP/dryrun.err")"; irc=$?
 assert_eq "$irc" "0" "--dry-run renders without touching the service manager"
+# ⛔ STDOUT IS THE UNIT AND NOTHING ELSE (review cycle 4). `--dry-run > x.service` is how the verb is
+# used, and an advisory printed with `say` put three bare lines above `[Unit]`, which systemd cannot
+# parse. The advisory is made to fire DETERMINISTICALLY here (a path that cannot exist), so the arm
+# cannot pass by this box happening not to have the checkout.
+assert_eq "$(head -1 <<<"$unit")" "[Unit]" "--dry-run's FIRST stdout line is [Unit] (installs cleanly)"
+assert_not_contains "$unit" "does not exist on this box" "no advisory leaks into the rendered unit"
+assert_contains "$(cat "$TMP/dryrun.err")" "PR_DOCTOR_REPO_DIR" \
+  "and the advisory still fires — on stderr, where it cannot corrupt the unit"
 exec_line="$(grep -m1 '^ExecStart=' <<<"$unit")"
 assert_contains "$exec_line" "pr-doctor-trigger.py" "ExecStart runs the TRIGGER"
 assert_not_contains "$exec_line" "pr-doctor-loop.sh" "ExecStart is not a shell loop"
@@ -484,8 +493,12 @@ stop_loop "$pid"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # Tripwire for section loss: a whole case was once deleted from a suite of this shape and it still
-# reported ALL PASSED. This cannot guard its own deletion; the floor is the honest limit.
-assert_eq "$([ "$PASS" -ge 30 ] && echo ok || echo short)" "ok" "assertion floor (≥30 fired, got $PASS)"
+# reported ALL PASSED. ⛔ THE FLOOR IS PINNED JUST BELOW THE CURRENT POPULATION (review cycle 4): at
+# `-ge 30` this guard tolerated losing 55 assertions, and EVERY single section is smaller than that
+# (section A3 alone is 12), so any one case could be deleted while the floor printed `ok` — a
+# tripwire blind to the exact event it names. Deleting the smallest arm now trips it. Bump it when
+# you add arms; never lower it to make a failing run pass.
+assert_eq "$([ "$PASS" -ge 88 ] && echo ok || echo short)" "ok" "assertion floor (≥88 fired, got $PASS)"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
