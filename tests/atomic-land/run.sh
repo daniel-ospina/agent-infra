@@ -2680,6 +2680,15 @@ if true; then
   MUTATION_JOBS="${ATOMIC_LAND_MUTATION_JOBS:-4}"
   case "$MUTATION_JOBS" in ''|*[!0-9]*) MUTATION_JOBS=4 ;; esac
   [ "$MUTATION_JOBS" -ge 1 ] 2>/dev/null || MUTATION_JOBS=4
+  # How long to wait for a child's verdict ARTIFACT once `wait` has reaped a pid (#2622: the reaped
+  # pid is not always the process still writing, so the artifact can land a few seconds later) — and
+  # a TOTAL budget for those waits across the whole drain, because a systemic breakage (the child
+  # never writes one) must not add `WAIT x 65` to a sharded step whose own bound is 70 min: the
+  # slots are BOUNDED, so a real abort stays RED with its cause named instead of eating the clock.
+  MUTATION_VERDICT_WAIT="${ATOMIC_LAND_VERDICT_WAIT:-20}"
+  case "$MUTATION_VERDICT_WAIT" in ''|*[!0-9]*) MUTATION_VERDICT_WAIT=20 ;; esac
+  MUTATION_VERDICT_BUDGET="${ATOMIC_LAND_VERDICT_BUDGET:-120}"
+  case "$MUTATION_VERDICT_BUDGET" in ''|*[!0-9]*) MUTATION_VERDICT_BUDGET=120 ;; esac
   MUT_QUEUE=()          # "<name>\t<mutated rail>" per queued mutation, in call order
   mut_reported=0
   # The declared population. Two guards read it, and they catch DIFFERENT things (below): the
@@ -2697,34 +2706,122 @@ if true; then
       pids=(); names=(); n=0
       while [ "$i" -lt "$total" ] && [ "$n" -lt "$MUTATION_JOBS" ]; do
         IFS=$'\t' read -r name src <<< "${MUT_QUEUE[$i]}"
+        # The verdict is an ARTIFACT, not a line of prose in the log (see the drain note below): the
+        # child writes "<failures> <checks>" to this path as its last act.
         ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" \
+          ATOMIC_LAND_VERDICT="$MUT/$name.verdict" \
           bash "$0" >"$MUT/$name.log" 2>&1 &
         pids+=("$!"); names+=("$name")
         i=$((i + 1)); n=$((n + 1))
       done
       k=0
       while [ "$k" -lt "${#pids[@]}" ]; do
+        n="${names[$k]}"
         rc=0; wait "${pids[$k]}" || rc=$?
         mut_reported=$((mut_reported + 1))
-        # ⛔ A NON-ZERO EXIT IS NOT A VERDICT BY ITSELF. The child is a WHOLE suite run, and a child
-        # that died for a reason unrelated to the mutation — OOM-killed (137), a full /tmp (1), a
-        # watchdog bound lost to contention (124) — exits non-zero exactly like a caught mutation.
-        # Serial execution made that rare; concurrent children widen it, and reading it as "class
-        # covered" is a FALSE PASS over an unchecked class. So require the child's OWN summary line:
-        # the suite prints "❌ N of M atomic-land test(s) failed" on every failing path, including a
-        # crash-free run of a mutated rail, and prints nothing of the sort when it dies mid-run.
-        if [ "$rc" -ne 0 ] \
-           && grep -qE '^❌ [0-9]+ of [0-9]+ atomic-land test\(s\) failed$' "$MUT/$name.log"; then
-          pass "mutation ${names[$k]} reddens the suite (class covered)"
-        elif [ "$rc" -ne 0 ]; then
-          fail "mutation ${names[$k]} exited $rc with NO failure verdict — it did not run to a verdict, so it covers nothing: $(tail -1 "$MUT/$name.log" 2>/dev/null)"
-        else
-          fail "mutation ${names[$k]} did NOT redden the suite (class NOT covered)"
-        fi
+        # The `wait` above REAPS; it never decides (see `mutation_verdict`).
+        mutation_verdict "$n" "$rc"
         k=$((k + 1))
       done
     done
   }
+  # mutation_verdict <name> <rc> — THE ONE PLACE a child's coverage is decided (#2622).
+  #
+  # ⛔ THE VERDICT IS AN ARTIFACT, NOT A LOG SCRAPE — AND NOT AN EXIT STATUS.
+  # This used to grep the child's stdout for its summary line. That reads a file whose WRITER MAY
+  # STILL BE RUNNING: on a loaded box (CI runs these children 4-up) the pid the drain's `wait` reaps
+  # is gone while the child is still live and still appending — measured on origin/main (848ba4b1):
+  # `ps -p <waited>` empty, and the log 933 bytes longer 3 s later, ENDING WITH THE CHILD'S OWN
+  # "❌ 14 of 290 atomic-land test(s) failed". The grep read a PARTIAL log, matched nothing, and a
+  # mutation whose coverage is real was reported as an unattributed abort — a false red that took
+  # `main` down (11 and 14 "failed" of 361 on the same tree, two consecutive runs).
+  # So the child publishes the verdict where a reader cannot race it, and this function requires the
+  # ARTIFACT: "<failures> <checks>".
+  #
+  # ⛔ A NON-ZERO EXIT IS NOT A VERDICT BY ITSELF EITHER. A child that died for a reason unrelated to
+  # the mutation — OOM-killed (137), a full /tmp, a watchdog bound lost to contention (124) — exits
+  # non-zero exactly like a caught mutation; reading that as "class covered" is a FALSE PASS over an
+  # unchecked class. `rc` is therefore REPORTED, never trusted: only `failures > 0` is coverage.
+  # And when there is no artifact, the report NAMES THE CAUSE — rc, the signal, the log path and the
+  # first diagnostic in it — because "did not run to a verdict" with a section header as its only
+  # evidence is the unattributable-failure class (#1185) that made this shard impossible to triage.
+  mutation_verdict() { # <name> <rc>
+    local name="$1" rc="$2" verdict="$MUT/$1.verdict" waited=0 f c signame diag sig
+    while [ ! -f "$verdict" ] && [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ] \
+          && [ "$MUTATION_VERDICT_BUDGET" -gt 0 ]; do
+      sleep 1; waited=$((waited + 1)); MUTATION_VERDICT_BUDGET=$((MUTATION_VERDICT_BUDGET - 1))
+    done
+    f=""; c=""
+    [ -f "$verdict" ] && read -r f c <"$verdict"
+    # An artifact that does not parse is not a verdict: treat it as absent (fail-closed).
+    case "$f" in ''|*[!0-9]*) f=""; c="" ;; esac
+    if [ -n "$f" ] && [ "$f" -gt 0 ]; then
+      pass "mutation $name reddens the suite (class covered) — $f of $c test(s) failed"
+      return 0
+    fi
+    if [ -n "$f" ]; then
+      fail "mutation $name did NOT redden the suite (class NOT covered) — its verdict artifact reports 0 of ${c:-?} test(s) failed"
+      return 0
+    fi
+    sig=""
+    if [ "$rc" -gt 128 ]; then
+      signame=""
+      signame="$(kill -l $((rc - 128)) 2>/dev/null)"
+      sig=" (killed by SIG${signame:-$((rc - 128))})"
+    fi
+    # The diagnostic NEAREST the death, not the first: a scenario legitimately kills a rail (7d) and
+    # bash prints `Killed` for it, so "the first diagnostic in the log" would point at a fixture doing
+    # its job. awk keeps the LAST match and needs no pipe (a `grep | tail -1` would SIGPIPE).
+    diag="$(awk '/syntax error|unbound variable|command not found|Terminated|Killed/{d=$0} END{if (d != "") print d}' "$MUT/$name.log" 2>/dev/null)"
+    fail "mutation $name produced NO verdict artifact in ${waited}s (rc=$rc$sig) — its generated run never reached a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    return 0
+  }
+  # ⛔ THE DECISION ITSELF, PINNED WITHOUT RUNNING 65 CHILDREN (#2622). `mutation_verdict` is the ONE
+  # place a child's coverage is decided, so it is exercised directly here: a reddening artifact, a
+  # kept-green artifact, an ABSENT artifact (must name rc + the nearest diagnostic — the #1185 class),
+  # a kill (must name the SIGNAL), and the RACE this fix exists for (the artifact lands AFTER the
+  # drain's `wait` has already returned). Without these arms a rewrite of `mutation_verdict` back to
+  # "grep the log" would leave every mutation still reporting something, and no assertion would
+  # notice that the something had stopped being attributable.
+  # Gated like the population guards below: a CHILD run is a measurement of a mutated rail, and these
+  # arms must not change its assertion count.
+  if [ "$RUN_MUTATIONS" != "0" ]; then
+    _sv="$TMP/selftest-verdicts"; mkdir -p "$_sv"
+    printf '3 290\n' >"$_sv/red.verdict"
+    _o="$(MUT="$_sv" mutation_verdict red 1 2>&1)"
+    case "$_o" in
+      *"class covered"*"3 of 290"*) pass "verdict arm: an artifact reporting failures is COVERAGE (a reddening child is not re-run)" ;;
+      *) fail "verdict arm: a reddening child did not read as coverage (got: $_o)" ;;
+    esac
+    printf '0 290\n' >"$_sv/green.verdict"
+    _o="$(MUT="$_sv" mutation_verdict green 0 2>&1)"
+    case "$_o" in
+      *"did NOT redden"*) pass "verdict arm: an artifact reporting 0 failures is class NOT covered — not an abort, and not coverage" ;;
+      *) fail "verdict arm: a kept-green child did not read as a coverage gap (got: $_o)" ;;
+    esac
+    printf 'mutated rail: line 9: syntax error near unexpected token\n' >"$_sv/dead.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict dead 1 2>&1)"
+    case "$_o" in
+      *"NO verdict artifact"*"rc=1"*"syntax error"*) pass "verdict arm: an absent artifact ABORTS with rc and the diagnostic named (the failure is attributable)" ;;
+      *) fail "verdict arm: an aborted child was not attributed (got: $_o)" ;;
+    esac
+    printf 'Terminated\n' >"$_sv/killed.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict killed 137 2>&1)"
+    case "$_o" in
+      *"SIGKILL"*) pass "verdict arm: a signalled child names the SIGNAL, not a bare 137" ;;
+      *) fail "verdict arm: a signalled child did not name its signal (got: $_o)" ;;
+    esac
+    # THE RACE (the measured false red): nothing on disk when the decision starts, the artifact
+    # arrives 2 s later. A log-scraping decision read the partial log and reported an abort here.
+    ( sleep 2; printf '4 290\n' >"$_sv/late.verdict" ) &
+    _vpid=$!
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late 1 2>&1)"
+    wait "$_vpid" 2>/dev/null
+    case "$_o" in
+      *"class covered"*"4 of 290"*) pass "verdict arm: an artifact that lands AFTER the reaping wait is still read as coverage (the #2622 race)" ;;
+      *) fail "verdict arm: the late-artifact race was read as an abort (got: $_o)" ;;
+    esac
+  fi
   # Two perl traps have cost this harness real coverage (all four instances fixed
   # here, found by a fresh review of this file): (1) `$` is NOT literal in a perl
   # REPLACEMENT — `"$GH"` becomes `""` unless it is spelled `\044GH`, silently
@@ -2757,8 +2854,14 @@ if true; then
     # result must still PARSE. This catches the `||`-in-a-pattern trap only; it
     # does NOT catch an emptied-`$` replacement, which still parses and still
     # reddens for the wrong reason (see the traps note above).
-    if ! bash -n "$src" 2>/dev/null; then
-      fail "mutation $name produced a file that does not PARSE — corrupt mutation, not coverage"
+    # ⛔ NAME THE GENERATED PROGRAM, NOT JUST THE VERDICT ABOUT IT. The diagnostic used to be
+    # discarded (`2>/dev/null`) and the message said only "does not PARSE", so a generator that
+    # emitted invalid shell — e.g. a perl replacement that emptied a condition and produced the
+    # literal `if then` — reported a corrupt mutation with no file and no line to look at. `bash -n`
+    # already prints `<file>: line N: <message>`; keep the first line of it.
+    if ! _parse="$(bash -n "$src" 2>&1)"; then
+      _parse="${_parse%%$'\n'*}"
+      fail "mutation $name: generated rail is not valid shell (${_parse:-bash -n gave no diagnostic}) — corrupt mutation, not coverage"
       return
     fi
     if [ "$RUN_MUTATIONS" = "0" ]; then
@@ -3117,6 +3220,13 @@ if true; then
   fi
 fi
 
+# The verdict ARTIFACT (#2622): a child launched by `mutation_drain` is asked for its result where
+# a reader cannot race it, instead of leaving the parent to scrape this log. Written on BOTH paths,
+# because the parent must be able to tell "0 failures" (class NOT covered) from "never finished"
+# (an abort, with its cause reported).
+if [ -n "${ATOMIC_LAND_VERDICT:-}" ]; then
+  printf '%s %s\n' "$failures" "$checks" >"$ATOMIC_LAND_VERDICT"
+fi
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks atomic-land test(s) failed"
   exit 1
