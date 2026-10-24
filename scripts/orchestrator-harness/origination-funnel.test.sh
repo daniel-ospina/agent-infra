@@ -124,6 +124,12 @@ drive_gate() {
 # to run unscrubbed). `env -i` plus an explicit allowlist, so a knob this repo adds tomorrow cannot
 # leak a cell's real configuration into the sandbox, and an operator's exported SCOUT_*/GH_* cannot
 # turn a suite failure into a mystery.
+#
+# ⛔ THE CHECKOUT'S `origin` IS A URL, AND THE BARE REPO IS A SEPARATE REMOTE (agent-infra#1935).
+# `resolve_repo` in the shipped script refuses a DECLARED queue target whose checkout can only prove a
+# LOCAL-PATH `origin` (a bare `$D/origin.git`), because a path cannot be shown to be that repo — and
+# this suite wants `$OR` declared, because arms below assert that `GH_REPO` is derived from it. A URL
+# origin satisfies the resolver without changing what any arm measures: nothing here fetches.
 run_env() {
   local dir="$1"; shift
   env -i \
@@ -140,7 +146,9 @@ mk_case() {
   mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools" "$D/tmp"
   git init -q --bare "$D/origin.git"
   git init -q "$D/repo"
-  git -C "$D/repo" remote add origin "$D/origin.git"
+  # A URL `origin`: `resolve_repo` must be able to PROVE the checkout is the declared $OR, and a
+  # local path cannot prove it (#1935). The bare repo below stays for the write-scope arm.
+  git -C "$D/repo" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
   # A REAL BOX HAS A REFRESH SCRIPT. "No refresh script at all" is its OWN state (rc=1, tested in
   # section 10); a fixture without one would be a box that cannot originate, and the gate would
@@ -218,6 +226,19 @@ esac
 SH
   chmod +x "$d/bin/gh.body"
 }
+# ⛔ TWO unreadable surfaces, and that is load-bearing (agent-infra#1935). The holder surface ALONE is
+# no longer a failure on the merged tree: `refresh-candidates.sh` re-routes a HOLDER-ONLY `INCOMPLETE`
+# to the cross-box claim registry (a live claim refuses, an empty one is CLEAN), so a one-surface
+# fixture made every "the failed refresh is NAMED" arm below green on a pass that now SUCCEEDS.
+# These arms grade the failure path, so the fixture must fail for a reason the harness cannot
+# re-route: with a second unreadable surface the re-route is correctly refused (only the holder-SOLE
+# case is substituted). #1935's own selftest arms cover the re-route.
+# ⛔ …AND EVERY FIXTURE BELOW THAT MUST REACH THE FAILURE PATH CARRIES THE SAME TWO-SURFACE SHAPE (see
+# `mk_tool_mixed`, `mk_tool_stderr_report`, `mk_tool_stderr_chatty`, `mk_tool_silent_then_surface`,
+# `mk_tool_degraded_then_hard`). Holding this shape in ONE fixture was not enough: the others stayed
+# holder-SOLE and every arm that grades `the failed refresh is NAMED` went red on a pass that had
+# become CLEAN — which is the re-route WORKING, caught only because those arms assert the failure
+# datum rather than the verdict. A new failure-path fixture needs the second surface too.
 # mk_tool_incomplete <dir> [block|table] — the pre-flight answer that broke the fleet: a bare
 # INCOMPLETE whose failing surface is the fleet board's lane registry. `block` (default) prints the
 # canonical INCOMPLETE SURFACES block; `table` prints ONLY the SURFACE table (the shapes the producer
@@ -241,7 +262,9 @@ if shape == "block":
     print("INCOMPLETE SURFACES")
     print("  [issue assignee/holder] " + why)
     print("")
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -284,7 +307,8 @@ if n == $fail_n:
     print("issue assignee/holder           INCOMPLETE  0     " + why)
     print("INCOMPLETE SURFACES")
     print("  [issue assignee/holder] " + why)
-    print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+    print("  [open PRs] gh: could not reach api.github.com")
+    print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
     sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")
     sys.exit(2)
 # THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
@@ -318,7 +342,8 @@ out.write("FLEET BOARD: probing the live-session store\n")
 out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
 out.write("INCOMPLETE SURFACES\n")
 out.write("  [issue assignee/holder] " + why + "\n")
-out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -338,7 +363,8 @@ out = sys.stderr
 out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
 out.write("INCOMPLETE SURFACES\n")
 out.write("  [issue assignee/holder] " + why + "\n")
-out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
 for i in range(60):
     out.write("noise line %d\n" % i)
 sys.exit(2)
@@ -361,7 +387,8 @@ why = ("claim gate: the FLEET BOARD could not answer — the board's lane regist
 print("issue assignee/holder           INCOMPLETE  0     " + why)
 print("INCOMPLETE SURFACES")
 print("  [issue assignee/holder] " + why)
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -406,7 +433,8 @@ if n == $deg_n:
 print("issue assignee/holder           INCOMPLETE  0     " + why)
 print("INCOMPLETE SURFACES")
 print("  [issue assignee/holder] " + why)
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\n")
 sys.exit(2)
 PY
