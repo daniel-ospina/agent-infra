@@ -1152,8 +1152,9 @@ run_merge() {
   rc=$?
   # ⛔ NEVER `[ -z "${prs//[[:space:]]/}" ]` HERE (the same hole `cleanup-stale-branches.sh:694`
   # documents). The pattern substitution is SUPERLINEAR, and a real open-PR answer is large: measured
-  # on this cell's bash 5.2.21, a 349 KB payload — this repo's actual `pulls?state=open` size — took
-  # 84 s of PURE CPU (no syscalls at all), with the merge lock held the whole time. `MERGE_BUDGET_S`
+  # on this cell's bash 5.2.21, THIS repo's real `pulls?state=open` answer (349 KB) took 84 s of PURE
+  # CPU (no syscalls at all), with the merge lock held the whole time — and the suite's synthetic
+  # 843 KiB fixture (862,802 bytes) takes 104 s in the same builtin. `MERGE_BUDGET_S`
   # cannot bound it: the cost sits inside one builtin, so the whole sequential loop (doctor, then
   # reap, then hygiene) stalls behind it on the first tick of every cell. The `case` glob answers "empty
   # or whitespace-only" in O(n) and matches exactly the same set (POSIX `[:space:]`); a NUL cannot
@@ -2567,9 +2568,15 @@ run_status() {
 #     (`--dry-run`), and the suite pins BOTH directions so the distinction cannot drift.
 #
 #   REQUIRED — deliberately bare `"$1"`/`"$2"`, NO default; absent stays fatal:
-#     state_write(role, rc), state_write_rehearsal(role, own), lock_claim(d), reclaim_lock(d),
+#     state_write(role, rc), state_write_rehearsal(role, own), lock_claim(d, tmp), reclaim_lock(d),
 #     role_lock(role), role_unlock(role), bounded(s), run_bounded(s), pid_ident(pid),
-#     human_above(pid), attestation_clean(pr, head), role_row(role, bound), run_role_pass(role).
+#     human_above(pid), attestation_clean(pr, head), role_row(role, bound), run_role_pass(role),
+#     controller_heartbeat_verdict(who).
+#     * who (controller_heartbeat_verdict) — it NAMES what is up (`tmux '<session>'`, `the
+#       controller (service-managed)`) in the line the operator reads. An empty default would print a
+#       diagnosis that names nobody — `⛔ CONTROLLER STALE:  is up but …` — so the read stays fatal
+#       and the caller that omitted it is the bug. Added by the #2402 merge: `${1:-}` arrived after
+#       this audit was written, and the suite's exhaustive walk is what caught it — the audit working.
 #     * role/rc/own/bound — an empty ROLE records a pass nowhere, and an empty BOUND makes
 #       `[ "" -ge N ]` an arithmetic error: the caller is wrong and saying so beats a silent write
 #       to nowhere.
@@ -2582,13 +2589,29 @@ run_status() {
 #       so this read must never acquire a default.
 #     * run_role_pass's role — "" would fall to the `*)` arm's `unknown role ""`; not bare-dispatched
 #       anywhere, so it stays fatal.
-#   DERIVED (reported, not graded): a value that only USES the positional — `tmp="$1/.own.tmp.$$"`,
-#   `d="$ROLES_DIR/.$1.lock"`. These cannot carry a default and inherit their function's contract,
-#   so they are counted and printed by the suite instead of being forced onto the list above.
-# ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE and over a DERIVED role list:
-#   `"${N:-}"` passes, `"${N:-<anything>}"` FAILS (a non-empty default would let an absent argument
-#   arm a mode by itself), a bare `$N` must be a name above, and a role added to `run_role_pass`
-#   tomorrow is graded on the day it is added — not only the four that exist today.
+#   EMBEDDING — an ANNOTATION, never an exemption (review P2): a value that embeds the positional —
+#   `tmp="$1/.own.tmp.$$"`, `d="$ROLES_DIR/.$1.lock"` — is GRADED on the read (`bare` above, hence
+#   `lock_claim`'s `tmp` and `role_unlock`'s `d` are on the REQUIRED list) and merely ANNOTATED as
+#   embedding.
+#   It used to be a separate ungraded bucket, and that bucket swallowed `local dry="$1 "` and
+#   `local x="$1$2"` — both read an absent argument exactly like `local x="$1"` and both died the
+#   #2424 death — while printing a ✅ "reported, not graded". A bucket that reports instead of grading
+#   is how a fail-open classifier looks.
+# ⛔ SCOPE — WHAT THIS AUDIT DOES NOT COVER (review P2). It walks `local` BINDINGS, i.e. lines matching
+#   `^[[:space:]]*local `. A positional read that is not bound by `local` — `state_get`'s direct `$1`/
+#   `$2` in `"$ROLES_DIR/$1.state"`, `row_rc_merge`'s `case "${1:-0}"`, the `attempt_*` helpers — is
+#   NOT graded by it, and `${1:-0}` there is the non-empty-default shape the audit rejects for a
+#   binding. Named here rather than silently implied: every such read today is on a function whose
+#   every caller binds, so none is live, but a NEW one would be graded by neither this block nor the
+#   suite's walk. Extending the walk to function bodies is the fix if one appears; until then, read
+#   this list as "every `local` binding of a positional", not "every positional read in the file".
+# ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE, keyed by (FUNCTION, NAME) and over a
+#   DERIVED role list: `"${N:-}"` passes at any index, `"${N:-<anything>}"` FAILS (a non-empty default
+#   would let an absent argument arm a mode by itself), a bare `$N` must be a `function:name` pair on
+#   the list above — the NAME ALONE is not enough, because `s`/`rc`/`d`/`role` are reused across
+#   helpers and a name-keyed list grandfathers the next `local s="$1"` anywhere in the file — and a
+#   role added to `run_role_pass` tomorrow is graded on the day it is added, not only the four that
+#   exist today.
 run_role_pass() { # <role> [--dry-run]
   local role="$1" rc; shift
   if ! role_lock "$role"; then
