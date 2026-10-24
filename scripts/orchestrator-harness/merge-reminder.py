@@ -735,43 +735,55 @@ _O_TOKEN = re.compile(r"O='([^']*)'|O=(\S+)")
 
 
 def _same_o_key(p: str) -> str:
-    """One spelling per `$O`: `--o` takes what the operator typed (symlink, relative, `~`)."""
+    """One spelling per `$O`: `--o` takes what the operator typed (symlink, relative, `~`).
+
+    ⛔ NEVER RAISES. This runs on text READ FROM A CRONTAB, and `expanduser()` raises RuntimeError for
+    an unknown account (`~nosuchuser`) while `resolve()` raises it for a symlink loop — either one
+    escaped `--install-timer`/`--uninstall-timer` as a traceback, i.e. an installer that refused
+    nothing and removed nothing. An empty token is not a path at all: it stays empty rather than
+    silently becoming the reader's own cwd.
+    """
+    if not p:
+        return ""
     try:
         return str(Path(p).expanduser().resolve())
-    except OSError:
+    except (OSError, RuntimeError):
         return p
 
 
 def _is_our_cron_line(line: str, tag: str, o: Path | None = None) -> bool:
-    """True only for a line THIS file wrote: the tag AND this script's path.
+    """True only for a line THIS file wrote: the tag, AND our command, AND our `$O` — or, for an entry
+    written before the `$O` token existed, the tag and this script's path.
 
     ⛔ A bare tag match deleted an operator's own line that merely mentioned it (e.g. a `# paused
     tortoise-merge-reminder during freeze` entry) and reported that as removing our arm (#2603
-    review). Install and uninstall now share this one predicate.
+    review). Install and uninstall share this one predicate.
     """
-    quoted = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
     if tag not in line:
         return False
-    # ⛔ THE ENTRY NAMES THE COPY THAT INSTALLED IT *AND* THE `$O` IT SERVES. `deploy-harness.sh` seeds
-    # `$O/<script>` and `install.sh` treats that as the same script as the checkout copy, so keying on
-    # the SCRIPT alone made a cross-copy uninstall match nothing (it printed "nothing to remove",
-    # exited 0, and left the arm firing — measured) — while keying on the script NAME made one `$O`'s
-    # uninstall delete a PEER `$O`'s arm and an operator line that merely mentioned the script.
-    # The `$O` token is what both copies render identically, and what distinguishes two reminders.
+    name = Path(__file__).name
+    quoted = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
+    # ⛔ NO SINGLE TEXT KEY IDENTIFIES OUR ENTRY. `$O/<script>` and the checkout copy are the same
+    # script to `install.sh`, so keying on the script PATH made a cross-copy uninstall match nothing
+    # ("nothing to remove", exit 0, arm firing). Keying on the script NAME made one `$O`'s uninstall
+    # delete a peer's arm. Keying on the `O=` token ALONE deleted an operator line that merely
+    # MENTIONED our `$O` — the token can sit in a comment — so a token only ever counts together with
+    # our command. And the token is compared LITERALLY first: `shell_quote` can emit quotes a regex
+    # cannot parse back (`--o /tmp/o'brien` renders `O='/tmp/o'\''brien'`), and a parsed-only match
+    # made our OWN line unrecognisable — install then wrote the entry, reported it missing, and each
+    # retry appended another live dispatcher.
     if o is not None:
-        # ⛔ THE SAME `$O` REACHED BY A DIFFERENT SPELLING IS THE SAME `$O`. The token is the literal
-        # `--o` argument, so `--o /real/O` and `--o /symlink/to/O` (or `--o .`) rendered different
-        # tokens: install appended a SECOND arm for the same directory, and an uninstall from the
-        # other spelling matched nothing — "nothing to remove", exit 0, arm still firing (measured).
-        # Compare RESOLVED paths, parsing the token out of the line instead of matching its text.
+        if ("O=" + shell_quote(str(o)).replace("%", "\\%")) in line and name in line:
+            return True
         want = _same_o_key(str(o))
-        for m in _O_TOKEN.finditer(line):
-            val = m.group(1) if m.group(1) is not None else m.group(2)
-            if _same_o_key(val.replace("\\%", "%")) == want:
-                return True
+        if want:
+            for m in _O_TOKEN.finditer(line):
+                val = m.group(1) if m.group(1) is not None else m.group(2)
+                if _same_o_key(val.replace("\\%", "%")) == want and name in line:
+                    return True
         if _O_TOKEN.search(line):
-            return False              # a different `$O`'s entry (or an operator line naming one)
-    # An entry written before the `O=` token existed carries only the script path.
+            return False              # a different `$O`, or a line that only mentions ours
+    # An entry written before the `O=` token existed carries only the script's path.
     return quoted in line
 
 

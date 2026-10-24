@@ -1683,6 +1683,52 @@ ck "§26p a red group that WAS read is still reported beside an unread candidate
    "$(qF 'ci / build' "$skout" && echo 0 || echo 1)"
 ck "§26p ...and only the all-unread case abstains" \
    "$(qF 'could not be read' "$skout" && qF 'No PR in this cycle carries a red group' "$skout" && echo 0 || echo 1)"
+
+# ⛔ A LINE THAT ONLY *MENTIONS* OUR `$O` IS NOT OUR LINE. The token can sit in a comment, so a tag plus
+# a token is not proof: the command must be ours too, or install/uninstall deletes an operator's job
+# and reports it as "removed crontab entry".
+: > "$FX/crontab.txt"
+printf '30 4 * * * /usr/local/bin/pause-arm.sh --go  # tortoise-merge-reminder, see O=%s\n' "'$O'" \
+  > "$FX/crontab.txt"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+  --install-timer --interval 600 >/dev/null 2>&1
+ck "§26q an operator job that merely MENTIONS our \$O survives an install" \
+   "$(qF 'pause-arm.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§26q ...and survives an uninstall (it is not ours to remove)" \
+   "$(qF 'pause-arm.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+: > "$FX/crontab.txt"
+
+# ⛔ A `$O` CONTAINING A QUOTE IS STILL OUR `$O`. Matching the token only through a regex truncated it at
+# the first quote, so our OWN entry became unrecognisable: install wrote it, reported it missing, and
+# each retry appended another live dispatcher; uninstall said "nothing to remove".
+QP="$TMP/o'brien"; mkdir -p "$QP"; : > "$FX/crontab.txt"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$QP" \
+        --install-timer --interval 600 2>&1)"; rc3=$?
+ck "§26r a \$O containing a QUOTE installs and VERIFIES (rc=$rc3)" \
+   "$([ "$rc3" -eq 0 ] && [ "$(grep -c 'tortoise-merge-reminder' "$FX/crontab.txt")" -eq 1 ] && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$QP" \
+  --install-timer --interval 600 >/dev/null 2>&1
+ck "§26r ...and re-installing does not append a second arm" \
+   "$([ "$(grep -c 'tortoise-merge-reminder' "$FX/crontab.txt")" -eq 1 ] && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$QP" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§26r ...and uninstall removes it (not 'nothing to remove')" \
+   "$(grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+: > "$FX/crontab.txt"
+
+# ⛔ A PATH TOKEN READ FROM THE CRONTAB MUST NOT BE ABLE TO CRASH THE INSTALLER: `~nosuchuser` raises
+# RuntimeError in expanduser(), and a symlink loop raises it in resolve() — neither is an OSError.
+printf '30 4 * * * O=%s /usr/local/bin/x.sh  # tortoise-merge-reminder\n' "'~nosuchuser/x'" \
+  > "$FX/crontab.txt"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+        --install-timer --interval 600 2>&1)"; rc3=$?
+ck "§26s a '~nosuchuser' token in the spool does not crash the install (rc=$rc3)" \
+   "$(nq 'Traceback' "$out3" && [ "$rc3" -le 3 ] && echo 0 || echo 1)"
+ck "§26s ...and the operator's line survived" \
+   "$(qF 'x.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+: > "$FX/crontab.txt"
 : > "$FX/crontab.txt"
 : > "$FX/crontab.txt"
 
