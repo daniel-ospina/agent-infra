@@ -247,13 +247,19 @@ class _SameOriginOnly(urllib.request.HTTPRedirectHandler):
     except `content-length`/`content-type` to the redirect target, so a 30x naming another
     host would hand `Authorization: bearer <tok>` to that host. GitHub's API does not redirect
     `/pulls` cross-origin today, so this is defence in depth rather than a live leak: the
-    property bought is that the token cannot leave the origin that was asked. Returning None
+    property bought is that the token cannot leave the ORIGIN that was asked. Returning None
     makes urllib raise HTTPError, which the caller already turns into None (UNKNOWN, never
     empty). Same-origin redirects are untouched.
+
+    ⛔ AN ORIGIN IS (scheme, host, port), NOT netloc. `netloc` alone would follow a same-host
+    `https:` -> `http:` downgrade and re-send the PAT IN CLEARTEXT; the stdlib's own check in
+    `HTTPRedirectHandler.http_error_302` only asserts the scheme is one it knows, never that it
+    did not change. So compare the pair.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+        new, cur = urllib.parse.urlsplit(newurl), urllib.parse.urlsplit(req.full_url)
+        if (new.scheme, new.netloc) != (cur.scheme, cur.netloc):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
