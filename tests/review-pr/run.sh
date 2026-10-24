@@ -2515,7 +2515,15 @@ for _cl in \
   '**Verdict:** CLEAN — both fixes leave 2 blocking defects unresolved.' \
   '**Verdict:** CLEAN — I confirm the fix leaves 2 blocking defects unresolved.' \
   '**Verdict:** CLEAN — we note the removed guard leaves 1 blocking issue open.' \
-  '**Verdict:** CLEAN — we fixed the nit, 2 blocking defects remain.'
+  '**Verdict:** CLEAN — we fixed the nit, 2 blocking defects remain.' \
+  '**Verdict:** CLEAN — P1 × two remain.' \
+  '**Verdict:** CLEAN — two × P1 blocking findings.' \
+  '**Verdict:** CLEAN — P1s: two.' \
+  '**Verdict:** CLEAN — fixed the guard that leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — addressed the issue which leaves 2 blocking defects open.' \
+  '**Verdict:** CLEAN — Fixes to the retry path leave 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — Removed the old guard so 2 blocking defects remain.' \
+  '**Verdict:** CLEAN — blocking defects that remain unresolved: 2'
 do
   reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
   run "$SRC" 2284
@@ -2788,6 +2796,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 809 ]; ck $? "assertion-count pin: >= 809 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 825 ]; ck $? "assertion-count pin: >= 825 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

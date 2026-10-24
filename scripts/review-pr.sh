@@ -1756,7 +1756,11 @@ function clause_before(pre,   parts, n) {
   # `.`, `(`, `though`, `whereas`, so `fixed the P3 nit though 2 blocking defects remain` and
   # `fixed the P3 nit (2 blocking defects remain)` recorded a SIGNED clean record — the same leak round
   # seven fixed for `but`, one connector over). A full stop ends a clause as surely as a semicolon does.
-  n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though)([[:space:]]|$)/)
+  # ⛔ RELATIVE AND ADVERBIAL CLAUSES ARE CLAUSES (P0, adversarial review of #2288 — MEASURED: a repair
+  # verb opening the clause exempted a live count inside a relative clause — `fixed the guard that leaves 2
+  # blocking defects unresolved` recorded a signed clean record — and the same leak sat behind `so` and
+  # `because`, which the reviewer named as an out-of-scope residual. Both are the same boundary defect.)
+  n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though|that|which|who|whose|where|when|if|so|because|since)([[:space:]]|$)/)
   return parts[n]
 }
 function repair_led(cl,   n, w, i, low) {
@@ -1781,6 +1785,16 @@ function repair_led(cl,   n, w, i, low) {
     if (low ~ /^verdict[[:space:]]*[:.]?[[:space:]]*/) { sub(/^verdict[[:space:]]*[:.]?[[:space:]]*/, "", low); continue }
     if (low ~ /^clean([^[:alnum:]]|$)/) { sub(/^clean[^[:alnum:]]*/, "", low); continue }
   }
+  # ⛔ `fixes to …` IS A NOUN PHRASE, NOT A VERB (P0, adversarial review of #2288 — MEASURED:
+  # `Fixes to the retry path leave 2 blocking defects unresolved.` opened with a repair word, so the
+  # determiner-free noun escaped the closed subject list and recorded a signed clean record. A repair verb
+  # is not followed by a preposition; a repair noun is.)
+  if (low ~ ("^(" repair ")[[:space:]]+(to|of|for|in|on|at|by|with)([^[:alnum:]]|$)")) return 0
+  # ⛔ …AND A CLAUSE-INITIAL NOUN IS NOT A VERB WHEN THE NEXT WORD IS A COUNT PREDICATE (P0, adversarial
+  # review of #2288 — MEASURED: making `that` a clause boundary made `that fix leaves 2 blocking defects`
+  # clause-initial `fix`, which arm 1 then read as a repair verb. `Fixed the 3 issues` keeps its object
+  # determiner; a NOUN is followed by the predicate that reports the blockers.)
+  if (low ~ ("^(" repair ")[[:space:]]+(leaves?|remains?|stays?|stall|stalls|blocks?|is|are|was|were|has|have)([^[:alnum:]]|$)")) return 0
   if (low ~ ("^(" repair ")([^[:alnum:]]|$)")) return 1
   # ⛔ THE BRIDGE IS A CLOSED AUXILIARY VOCABULARY, AND `that|both|all` ARE NOT SUBJECTS (P0, eleventh
   # fresh review of #2288 — MEASURED: they are DETERMINERS, so `that fix leaves 2 blocking defects` and
@@ -1812,12 +1826,20 @@ BEGIN {
   # one optional alphabetic word, used for the subject-phrase bridge (see repair_led)
   AUX = "(have|has|had|also|now|already|just|finally|then|both)[[:space:]]+"
   pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
+  PN = "(" pnum ")"
   fwd = "(^|[^[:alnum:]])(" pnum ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
-  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"
+  # ⛔ THE MIRROR ARM GETS THE SAME BRIDGE WIDTH AS THE FORWARD ARM (P1, adversarial review of #2288 —
+  # MEASURED: it capped the noun→numeral bridge at TWO words while the forward arm allowed THREE, so
+  # `blocking defects that remain unresolved: 2` was a count to one arm and not the other, and recorded a
+  # signed clean record. Two arms over one numeral class must share one bridge.)
+  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"
   # (the severity token is folded too: the line is lowercased above, so `P[0-3]` would never match)
   # (a PLURAL severity with a count is a count too: `P1s: 2` — P2, ninth fresh review of #2288, which
   # recorded a signed clean record because neither reader knew the plural form)
-  mul = "(^|[^[:alnum:]])(([0-9]+)[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3])|(p[0-3])[[:space:]]*(×|x|\\*|times)[[:space:]]*([0-9]+)|p[0-3]s[[:space:]]*[:=][[:space:]]*[0-9]+)"
+  # ⛔ THE MULTIPLIER SLOTS TAKE THE SHARED NUMERAL CLASS, SPELLED NUMERALS INCLUDED (P0, adversarial
+  # review of #2288 — MEASURED: the slots were `[0-9]+`, so `P1 × two remain` and `P1s: two` were not
+  # counts at all and recorded signed clean records, while `P1 × 2` refused)
+  mul = "(^|[^[:alnum:]])((" PN ")[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3]s?)|(p[0-3]s?)[[:space:]]*(×|x|\\*|times)[[:space:]]*(" PN ")|p[0-3]s[[:space:]]*[:=][[:space:]]*(" PN "))"
 }
 {
   # ⛔ CASE-FOLDED, because awk match() honours no -i (P0, seventh fresh review of #2288 — MEASURED:
