@@ -98,8 +98,10 @@ lp_census() { # <dir>
                     # process had it in argv). Emit the part after `=`; a relative value still emits
                     # nothing, so the "absolute only" rule is unchanged.
                     case "$_tok" in
-                        /*)   printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;;
-                        *=/*) printf 'arg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;;
+                        /*) printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;;
+                        *=*) case "${_tok#*=}" in
+                                 /*) printf 'arg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;;
+                             esac ;;
                     esac
                 done
             done
@@ -119,11 +121,24 @@ lp_census() { # <dir>
                 /^p/ { pid = substr($0, 2); next }
                 /^n/ { p = substr($0, 2); sub(/ \(deleted\)$/, "", p)
                        if (pid ~ /^[0-9]+$/ && p ~ /^\//) printf "cwd\t%s\t%s\n", pid, p }'
+            # ⛔ NOT `|| return 0`. This block is inside a `{ … } >>"$out"` group, so a `return` here
+            # returned from the WHOLE census: the counters below never ran and BOTH fail-closed gates
+            # (`rows -eq 0`, `no cwd/exe`) were skipped, so on a host with `lsof` but no `ps` (the CI
+            # runner's own container — this arm's declared target) an EMPTY census returned 0 and the
+            # owner read it as "nothing is live" and reaped against it. Measured: a linked worktree with
+            # a live process cwd'd inside it was REAPED on that host shape.
             _lp_ps_probe="${LP_PS_PROBE:-ps}"
-            command -v "$_lp_ps_probe" >/dev/null 2>&1 || return 0
-            "$_lp_ps_probe" -axo pid=,args= 2>/dev/null | awk '
-                { pid = $1; if (pid !~ /^[0-9]+$/) next
-                  for (i = 2; i <= NF; i++) if ($i ~ /^\//) printf "arg\t%s\t%s\n", pid, $i }'
+            if command -v "$_lp_ps_probe" >/dev/null 2>&1; then
+                "$_lp_ps_probe" -axo pid=,args= 2>/dev/null | awk '
+                    { pid = $1; if (pid !~ /^[0-9]+$/) next
+                      for (i = 2; i <= NF; i++) {
+                        if ($i ~ /^\//) { printf "arg\t%s\t%s\n", pid, $i; continue }
+                        # the ATTACHED spelling (`--repo=/abs`, `VAR=/abs`) — the /proc arm emits it,
+                        # and leaving it out made the two arms disagree about what a holder "named"
+                        n = split($i, kv, "=")
+                        if (n == 2 && kv[2] ~ /^\//) printf "arg\t%s\t%s\n", pid, kv[2]
+                      } }'
+            fi
         } >>"$out" 2>/dev/null
     fi
 
@@ -221,7 +236,17 @@ lp_path_named() { # <census> <canonical-path>
                     # last component is the ALIAS's name), so the arm was blind to the simplest symlink
                     # spelling of all and the tree was reaped while that process was alive. A stat is
                     # cheap; only a token that exists earns the `lp_canon` call.
-                    *) if [ -d "$p" ] || [ -L "$p" ]; then _cand="$(lp_canon "$p")" || _cand=""; fi ;;
+                    # ⛔ A FILE UNDER AN ALIASED SPELLING still named nothing: `alias-wt/somefile.txt`
+                    # is not a directory, so the stat arm skipped it, while `real-wt/somefile.txt` matched
+                    # through the basename case. Canonicalise its DIRECTORY: that covers file, directory
+                    # and symlinked-prefix spellings uniformly, and it still cannot reach an ancestor
+                    # (`dirname /tmp/alias-root` is `/tmp`, which is not the candidate).
+                    *) if [ -d "$p" ] || [ -L "$p" ]; then
+                           _cand="$(lp_canon "$p")" || _cand=""
+                       else
+                           _pp="$(lp_canon "$(dirname "$p")")" || _pp=""
+                           _cand="${_pp:+$_pp/}${p##*/}"
+                       fi ;;
                 esac
                 if [ -n "${_cand:-}" ] && _lp_rel "$_cand" "$path"; then
                     LP_NAME_WHY="argv pid $pid (canonicalised)"; return 0
