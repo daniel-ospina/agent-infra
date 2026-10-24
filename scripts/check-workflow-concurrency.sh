@@ -225,7 +225,7 @@ function addtrigger(v,   t) {
 # value after `:`, so each entry is cut at its first colon; the outer brackets are stripped first.
 function addflow(v,   n, i, parts, t) {
   gsub(/^[\[{]/, "", v); gsub(/[\]}]$/, "", v)
-  n = split(v, parts, /,[ \t]*/)
+  n = splitqv(v, parts)
   for (i = 1; i <= n; i++) { t = parts[i]; sub(/:.*/, "", t); addtrigger(t) }
 }
 # parseconc() — a FLOW-mapping `concurrency: {group: …, cancel-in-progress: true}`. Without this the
@@ -234,46 +234,111 @@ function addflow(v,   n, i, parts, t) {
 # enforce-skills.yml with its own two-line block rewritten as a flow mapping).
 function parseconc(v,   n, i, parts, t, k) {
   gsub(/^[\[{]/, "", v); gsub(/[\]}]$/, "", v)
-  n = split(v, parts, /,[ \t]*/)
+  n = splitqv(v, parts)
   for (i = 1; i <= n; i++) {
     t = parts[i]
     k = t; sub(/:.*/, "", k); k = unq(trim(k))
     if (k == "group") { group = unq(trim(substr(t, index(t, ":") + 1))) }
-    else if (k == "cancel-in-progress") { cancel = unq(trim(substr(t, index(t, ":") + 1))) }
+    else if (k == "cancel-in-progress") { cancel = tolower(unq(trim(substr(t, index(t, ":") + 1)))) }
   }
 }
 function opens(v)  { return gsub(/[\[{]/, "", v) }
-# stripcomment(s) — remove a trailing `#` comment, leftmost first, in LINEAR time. The regex form
-# (`sub(/[ \t]+#.*$/,"")`) re-scans the whitespace run from every start position, so one line of
-# 100 000 spaces cost 16 s: a gate that can be made to hang by a whitespace run is a gate an author
-# can stall. split() is linear, and a `#` with no whitespace before it is NOT a comment.
-function stripcomment(s,   n, seg, res, k, hit) {
-  n = split(s, seg, "#")
-  if (n < 2) return s
-  res = seg[1]; hit = 0
-  for (k = 2; k <= n; k++) {
-    if (seg[k-1] == "" || seg[k-1] ~ /[ \t]$/) { hit = 1; break }
-    res = res "#" seg[k]
+# stripcomment(s) — remove a trailing YAML comment in LINEAR time and QUOTE-AWARE. Two independent
+# defects lived here: the regex form re-scanned a whitespace run from every start position (one line
+# of 100 000 spaces cost 16 s), and neither form knew about quotes, so a `#` INSIDE a value truncated
+# it — a refusal then quoted text that is not the value, and a correct workflow was refused.
+function stripcomment(s,   out, i, n, c, q, nx) {
+  out = ""; n = length(s); q = ""
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (q != "") {
+      out = out c
+      if (q == DQ && c == "\\") { out = out substr(s, i + 1, 1); i++; continue }
+      if (c == q) {
+        nx = substr(s, i + 1, 1)
+        if (nx == q) { out = out nx; i++; continue }
+        q = ""
+      }
+      continue
+    }
+    if (c == DQ || c == SQ) { q = c; out = out c; continue }
+    if (c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t]/)) {
+      sub(/[ \t]+$/, "", out)
+      return out
+    }
+    out = out c
   }
-  if (!hit) return s
-  sub(/[ \t]+$/, "", res)
-  return res
+  return out
+}
+# mask_quoted(s) — the text with the CONTENTS of quoted VALUES blanked, for matching that must not
+# fire on a string literal (a `run:` value containing JSON). A quoted scalar followed by `:` is a
+# KEY, not a value — it stays visible, or `'concurrency': {…}` would hide the very block being looked
+# for (round 8, P1).
+function mask_quoted(s,   out, i, n, c, q, nx, start, seg, j) {
+  out = ""; n = length(s); q = ""; start = 0
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (q != "") {
+      if (q == DQ && c == "\\") { i++; continue }
+      if (c == q) {
+        nx = substr(s, i + 1, 1)
+        if (nx == q) { i++; continue }
+        seg = substr(s, start, i - start + 1)
+        j = i + 1
+        while (j <= n && substr(s, j, 1) ~ /[ \t]/) j++
+        if (substr(s, j, 1) == ":") { out = out seg }
+        else { out = out substr(seg, 1, 1); for (j = 2; j < length(seg); j++) out = out "x"; out = out substr(seg, length(seg), 1) }
+        q = ""
+      }
+      continue
+    }
+    if (c == DQ || c == SQ) { q = c; start = i; continue }
+    out = out c
+  }
+  return out
+}
+# splitqv(v, arr) — split a flow mapping on commas that are NOT inside a quoted scalar. Splitting on
+# `,` blindly truncated a quoted group at its first comma, which HID a per-commit variable from R1 and
+# refused correct expressions like format(...) as a fragment.
+function splitqv(v, arr,   n, i, c, q, cur, len, nx) {
+  n = 0; cur = ""; q = ""; len = length(v)
+  for (i = 1; i <= len; i++) {
+    c = substr(v, i, 1)
+    if (q != "") {
+      cur = cur c
+      if (q == DQ && c == "\\") { cur = cur substr(v, i + 1, 1); i++; continue }
+      if (c == q) {
+        nx = substr(v, i + 1, 1)
+        if (nx == q) { cur = cur nx; i++; continue }
+        q = ""
+      }
+      continue
+    }
+    if (c == DQ || c == SQ) { q = c; cur = cur c; continue }
+    if (c == ",") { arr[++n] = cur; cur = ""; continue }
+    cur = cur c
+  }
+  arr[++n] = cur
+  return n
 }
 function closes(v) { return gsub(/[\]}]/, "", v) }
 # flush() — print the record for the file just finished, then clear its state. Called at the first
 # line of the NEXT file (so a previous record never carries content from the next file) and at EOF.
 function flush(   tg, k, n) {
   if (fname == "") return
+  if (pendkey != "") {                    # a value that ran to EOF: still a value
+    if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
+    pendkey = ""; pendval = ""; pendind = -1
+  }
+  # It must run AFTER the pending value is resolved: before, a compliant workflow whose `group` value
+  # sat on a continuation line at the end of the file was refused as unreadable (round 8, P2) —
+  # the guard rejected a value this same function then read.
   # A `concurrency:` block was declared but NOTHING in it could be read (e.g. a YAML merge key, whose
   # group and cancel arrive through `<<:`). "Declared, unreadable" must not be treated as "declared,
   # no cancellation": the absent-key arm of R2 reads that as the non-cancelling default (round 7).
   if (hasconc && group == "" && cancel == "" && concbad == 0 && joblevel == 0) {
     concbad = 1
     concwhy = "a `concurrency:` block is declared but no `group`/`cancel-in-progress` value could be read from it (an unmodelled child, such as a YAML merge key)"
-  }
-  if (pendkey != "") {                    # a value that ran to EOF: still a value
-    if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
-    pendkey = ""; pendval = ""; pendind = -1
   }
   n = 0; tg = ""
   for (k in trig) { n++; tg = tg (n > 1 ? " " : "") k }
@@ -412,6 +477,7 @@ BEGIN {
   if (cur == "on") {
     ind = lineindent
     key = substr(line, ind + 1)
+    if (key ~ /^-[ \t]/) { addtrigger(substr(key, 2)); next }   # `on:` written as a block sequence
     if (match(key, "^" KEYPAT)) {
       if (onindent < 0) { onindent = ind }
       if (ind == onindent) {             # a NESTED key (branches:, types:, inputs:) is not a trigger
@@ -428,7 +494,7 @@ BEGIN {
   if (match(substr(line, lineindent + 1), "^" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
   # A job written as a FLOW mapping (`build: {…, concurrency: {…}}`) hides the key from the line test
   # above, so it is looked for anywhere a flow mapping can put it (round 7, P2).
-  if (line ~ /[\[{,][ \t]*["]?concurrency["]?[ \t]*:/) { joblevel = 1; next }
+  if (match(mask_quoted(line), "[\\[{,][ \t]*" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
 
   if (cur == "concurrency") {
     t = trim(line)
@@ -488,6 +554,14 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
     printf '  %-32s %-46s %s\n' "$fname" "${triggers:-<none>}" "$choice"
   fi
 
+  # R4's bookkeeping records that this file WAS scanned, before any refusal can `continue` past it.
+  # Recorded only in the R4 arm, a guard refused by R0 was additionally reported as "named in
+  # EXEMPT_FILES but no such PR-triggered workflow was scanned" — a false second diagnostic that sends
+  # the author looking for a rename (round 8, P2).
+  if is_exempt "$fname"; then
+    applied_exemptions="$applied_exemptions$fname "
+  fi
+
   # ---- R0: what could not be read is not compliant ----------------------------------------
   if [ "$onparsed" -eq 0 ]; then
     # The specific cause when the reader has one (an alias, a tag): the generic sentence describes
@@ -542,7 +616,6 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
   # ---- R1 / R4: PR entry points ------------------------------------------------------------
   if [ "$is_pr" -eq 1 ]; then
     if is_exempt "$fname"; then
-      applied_exemptions="$applied_exemptions$fname "
       if [ "$hasconc" -eq 1 ]; then
         fail "$fname: is an EXEMPT GUARD (#$EXEMPT_ISSUE) but now declares \`concurrency:\` — if the rail has been fixed, remove it from EXEMPT_FILES in scripts/check-workflow-concurrency.sh in the same change; if not, this re-arms the #$EXEMPT_ISSUE fail-open [R4]"
       fi

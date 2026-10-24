@@ -446,7 +446,9 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-event-number.yml" "$CFIX/pr-target-headref.yml" "$CFIX/pr-eof.yml" \
   "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml" \
   "$CFIX/pr-cancel-continuation-comment.yml" "$CFIX/push-concurrency-flow-child-ok.yml" \
-  "$CFIX/pr-concurrency-flow-child.yml"
+  "$CFIX/pr-concurrency-flow-child.yml" \
+  "$CFIX/pr-flow-format.yml" "$CFIX/pr-flow-capital.yml" "$CFIX/push-flow-false-capital.yml" \
+  "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -486,6 +488,9 @@ for pair in \
   "push-explicit-top-key.yml R0" \
   "push-concurrency-merge-key.yml R0" \
   "push-job-flow-value.yml R0" \
+  "push-job-quoted-key.yml R0" \
+  "pr-flow-group-comma-sha.yml R1" \
+  "push-on-sequence.yml R2" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
