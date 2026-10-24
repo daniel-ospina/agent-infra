@@ -105,8 +105,10 @@ elif [ -n "$stamp_commit" ]; then src="stamp"; id="$stamp_commit"; fi
 # canonical tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts` pointer
 # (see this repo's AGENTS.md, #9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in every such
 # checkout — a mere existence test re-admitted the tortoise repo and #2679 came back for the shape the
-# fleet actually runs. The harness file must therefore be TRACKED by the candidate's own repo:
-# `git ls-files --error-unmatch` follows no pointer and is an offline fact about the tree.
+# fleet actually runs. The harness file must therefore be TRACKED by the candidate's own repo — and the
+# question is asked of the INDEX ENTRY (`git ls-files -s`: the mode AND the exact recorded path), because
+# `--error-unmatch` alone is a PATHSPEC match: it is satisfied by a tracked file BESIDE a directory of that
+# name, and by a mode-120000 symlink (both measured accepted).
 #
 # Same rule as `harness_repo_of()` in merge-reminder.py, so the two readers cannot disagree inside one
 # report (#2680's lesson): a candidate that names a SUBDIRECTORY of a harness checkout is ACCEPTED (the
@@ -125,11 +127,30 @@ harness_missing_reason() { # <path> -> why it is not the harness repo (empty = i
   # that ships no harness bytes was accepted and its own `origin/main` became the value goal 2 measured
   # against). `ls-files -s` prints the MODE, and only a regular blob (100644/100755) is the harness file;
   # 120000 is a link and 160000 a gitlink/submodule.
-  entry="$(git -C "$top" ls-files -s --error-unmatch scripts/orchestrator-harness/box-status.sh 2>/dev/null | head -1)"
-  case "${entry%% *}" in
-    100644|100755) return ;;                 # it IS the harness repo
-  esac
-  printf '%s does not carry the harness: scripts/orchestrator-harness/box-status.sh is not a TRACKED REGULAR FILE there (mode %s; a scripts -> $AGENT_INFRA_PATH/scripts pointer makes the PATH exist in any checkout, and a tracked symlink ships no harness bytes)' "$top" "${entry%% *}"
+  #
+  # ⛔ AND THE PATH MUST MATCH EXACTLY (round-5 review follow-up, measured: with the index holding
+  # `…/box-status.sh/x`, the pathspec matched THAT entry, so a repo whose harness path is a DIRECTORY was
+  # accepted). `ls-files -s` gives `<mode> <object> <stage>\t<path>`, so the RECORDED path is compared —
+  # a prefix is not the file. Each refusal names the reason it actually found.
+  marker=scripts/orchestrator-harness/box-status.sh
+  tab="$(printf '\t')"
+  entry="$(git -C "$top" ls-files -s --error-unmatch -- "$marker" 2>/dev/null | head -1)"
+  mode="${entry%% *}"
+  ipath=""
+  case "$entry" in *"$tab"*) ipath="${entry#*"$tab"}" ;; esac
+  if [ -z "$entry" ]; then
+    printf '%s does not carry the harness: it has NO INDEX ENTRY for %s (a scripts -> $AGENT_INFRA_PATH/scripts pointer makes the PATH exist in any checkout without one)' "$top" "$marker"
+    return
+  fi
+  if [ "$mode" != "100644" ] && [ "$mode" != "100755" ]; then
+    printf '%s does not carry the harness: %s is not a TRACKED REGULAR FILE there (mode %s; a tracked symlink ships no harness bytes)' "$top" "$marker" "$mode"
+    return
+  fi
+  if [ "$ipath" != "$marker" ]; then
+    printf '%s does not carry the harness: the index entry matching %s records %s instead (a directory of that name, or a nested file)' "$top" "$marker" "$ipath"
+    return
+  fi
+  return                                     # it IS the harness repo
 }
 REF_WHY=""
 refused=""

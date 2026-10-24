@@ -2798,7 +2798,7 @@ ck "§27b ...and no whitespace split of a flattened cmdline remains in the reade
 out="$(env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
   bash "$BOX" --o "$O" --repo "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES an explicit --repo that does not carry the harness" \
-   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'not a TRACKED REGULAR FILE there' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
 ck "§27b ...and it says so instead of omitting the ref line (an absent line is not an opinion)" \
    "$(grep -q "does not carry the harness" <<<"$out" && echo 0 || echo 1)"
 # ⛔ EVERY CANDIDATE AT ONCE, including this script's own checkout — which is why the probe runs from a
@@ -2829,7 +2829,7 @@ ck "§27b the flat-copy probe really is outside every checkout (its own checkout
 # one; none of the three may be adopted, and the flat copy's own directory is not a checkout at all. The
 # answer is UNRESOLVED with the reason, never a foreign `origin/main`.
 ck "§27b box-status skips EVERY non-harness candidate (env, \$O, \$HOME/orchestrator) and says why" \
-   "$(! grep -q '^ref: origin/main=' <<<"$out" && grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'not a TRACKED REGULAR FILE there' <<<"$out" && echo 0 || echo 1)"
+   "$(! grep -q '^ref: origin/main=' <<<"$out" && grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A RELATIVE CONTROLLER PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT THE READER's (round-3
 # review follow-up, measured on the real fleet shape: a controller started as `bash ./orch-loop.sh` in
@@ -2894,7 +2894,7 @@ ck "§27b harness_repo_of REFUSES a checkout whose harness path is only the giti
 out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$SHAPED" --repo "$SHAPED" 2>&1)"
 ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
-   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'not a TRACKED REGULAR FILE there' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
@@ -2931,6 +2931,40 @@ PYMOD
 ck "§27b harness_repo_of REFUSES the same tracked-symlink shape" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 
+# ⛔ A DIRECTORY OF THAT NAME IS NOT THE FILE (round-5 review follow-up, measured: with the index holding
+# `…/box-status.sh/x`, the pathspec matched THAT entry, so a repo whose harness path is a directory was
+# accepted). The index entry's RECORDED PATH is compared, not just its mode.
+DIRSHAPE="$FX/dir-shape"
+rm -rf "$DIRSHAPE"
+git init --quiet -b main "$DIRSHAPE" 2>/dev/null
+git -C "$DIRSHAPE" config user.email t@example.invalid
+git -C "$DIRSHAPE" config user.name t
+: > "$DIRSHAPE/README"
+mkdir -p "$DIRSHAPE/scripts/orchestrator-harness/box-status.sh"
+: > "$DIRSHAPE/scripts/orchestrator-harness/box-status.sh/nested"
+git -C "$DIRSHAPE" add -A
+git -C "$DIRSHAPE" commit --quiet -m "a directory where the marker file should be"
+ck "§27b the dir-shape fixture really tracks a file BESIDE the marker path, not at it" \
+   "$(git -C "$DIRSHAPE" ls-files -s --error-unmatch -- scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1 && ! git -C "$DIRSHAPE" ls-files -s --error-unmatch -- scripts/orchestrator-harness/box-status.sh | grep -q "box-status.sh$" && echo 0 || echo 1)"
+out="$(env REPO= HARNESS_REPO="$DIRSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES a DIRECTORY at the marker path (records the nested file it found)" \
+   "$(grep -q 'records scripts/orchestrator-harness/box-status.sh/nested instead' <<<"$out" && echo 0 || echo 1)"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$DIRSHAPE" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+print(0 if (got is None or Path(got).resolve() != shaped) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
 # ⛔ A SUBDIRECTORY CANDIDATE — DRIVEN FROM THE FLAT COPY, BECAUSE THAT IS THE ONLY PLACE THE QUESTION IS
 # VISIBLE (round-3 review, BLOCKING: the first version of this case ran `$BOX`, whose own checkout IS the
 # harness, so candidate 3 printed a `ref:` line and the case passed whether the subdir was accepted or
@@ -2948,7 +2982,7 @@ mkdir -p "$PLAIN/scripts/orchestrator-harness"
 out="$(env REPO= HARNESS_REPO="$PLAIN/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b ...and refuses an EXISTING subdirectory of a checkout that does not track the harness" \
-   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'not a TRACKED REGULAR FILE there' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"

@@ -2632,6 +2632,9 @@ def script_checkout() -> Path | None:
     return ps[2] if len(ps) > 2 else None
 
 
+MANIFEST_MARKER = "scripts/orchestrator-harness/box-status.sh"
+
+
 def harness_repo_of(o: Path) -> Path | None:
     """The checkout the DEPLOYED harness belongs to — the repo goal 2's "same version" means.
 
@@ -2678,9 +2681,11 @@ def harness_repo_of(o: Path) -> Path | None:
     # pointer (this repo's AGENTS.md, #9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in
     # every such checkout through it. Measured on `/tmp/cell-wt-greenmain` (origin = tortoise.git):
     # `is_file()` true, and the resolution returned that repo with a TORTOISE `origin/main`
-    # (`49dca29bb124…`) — #2679 in full, for the shape two of the fleet's cells run. `git ls-files
-    # --error-unmatch` is the right question: it asks the candidate's OWN repo whether it owns the
-    # harness file, and it follows no pointer.
+    # (`49dca29bb124…`) — #2679 in full, for the shape two of the fleet's cells run. The candidate's OWN
+    # repo is asked, and the question is about the INDEX ENTRY: `git ls-files -s` gives `<mode> <object>
+    # <stage>\t<path>`, and only a regular blob recorded at the exact path is the harness file. A
+    # path-existence test follows the pointer; `--error-unmatch` alone is a PATHSPEC match, satisfied by a
+    # mode-120000 symlink and by a tracked file BESIDE a directory of that name (both measured accepted).
     here = script_checkout()
     cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
              str(Path.home() / "orchestrator")]
@@ -2693,11 +2698,14 @@ def harness_repo_of(o: Path) -> Path | None:
             continue
         # A TRACKED SYMLINK IS NOT THE HARNESS: `ls-files --error-unmatch` is satisfied by a mode-120000
         # entry too, so a repo that ships no harness bytes would be taken for the harness repo and its own
-        # main measured against (round-4 review follow-up, measured). `ls-files -s` gives the mode; only a
-        # regular blob is the harness file.
-        rc2, entry, _ = run(["git", "-C", top, "ls-files", "-s", "--error-unmatch",
-                             "scripts/orchestrator-harness/box-status.sh"], timeout=15)
-        if rc2 == 0 and (entry or "").strip().split(" ", 1)[0] in ("100644", "100755"):
+        # main measured against (round-4 review follow-up, measured). And the PATH must match exactly
+        # (round-5 follow-up): a pathspec also matches a tracked file BESIDE a directory of that name.
+        rc2, entry, _ = run(["git", "-C", top, "ls-files", "-s", "--error-unmatch", "--",
+                             MANIFEST_MARKER], timeout=15)
+        line = (entry or "").strip().splitlines()[0] if (entry or "").strip() else ""
+        head, _, ipath = line.partition("\t")          # `<mode> <object> <stage>\t<path>`
+        mode = head.split(" ", 1)[0] if head else ""
+        if rc2 == 0 and mode in ("100644", "100755") and ipath.strip() == MANIFEST_MARKER:
             return Path(top)
     return None
 
