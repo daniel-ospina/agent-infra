@@ -9,12 +9,13 @@
 # worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
 # both platform shapes. (a) remains, and is what this supervisor is for.
 #
-# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
-# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
-# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
-# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
-# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
-# override, because a gate an agent can defeat with an export is not a gate.
+# The lanes were never launchd's, and they belong to neither launcher camp: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL wherever it answers
+# and otherwise uses tmux (the launchd Mac, and a cell whose guest CLI cannot run) **with an explicit
+# HOME + keys.env environment contract**. A tmux worker started without that contract is the measured
+# `~21 log lines` death (agent-infra#2210, reopened: the credential is HOME-bound, so a worker with the
+# wrong HOME has none). Where NO surface exists the launcher REFUSES loudly; there is no env override,
+# because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
@@ -25,7 +26,10 @@
 #           normally not needed by hand — it exists for a cell you want to fix without starting.
 #   prune   reclaim the regenerable disk the lanes leave behind and report the review scratch that
 #           accumulates under /tmp. --scratch[=DAYS] also deletes scratch checkouts older than DAYS.
-#           A full disk is what breaks a cell FIRST.
+#           A full disk is what breaks a cell FIRST. --exclude-root=PATH (repeatable, absolute) skips
+#           the per-worktree cache sweep at PATH — the seam the doctor's hygiene role uses to leave a
+#           worktree a LIVE process is sitting in alone while still reclaiming the idle ones
+#           (agent-infra#2573; the exclusion is reported by path, never applied silently).
 #           ⛔ A per-worktree `.venv` is NOT removed here any more (agent-infra#1932). This sweep used
 #           to `rm -rf` it at every worktree root, with no idea whether the lane using it was alive;
 #           the only guard on the unattended path was a tmux NAME regex (`^(lane|fix|merge)-`) that
@@ -48,8 +52,11 @@
 #   reap    one wedged-session pass, gated (namespace, log, two observations, human ancestry)
 #   merge   land PRs with a clean attestation at head, through `admin-merge.sh`, and record every
 #           refusal with its reason (never an override; never a blind retry at the same head)
-#   hygiene `uv cache prune`, worktree-root caches (only when no worker is live), stale worktrees
-#           via the shipped `pi-reap-worktrees.sh` (armed only under disk pressure by default)
+#   hygiene `uv cache prune`, the `cloud-cell-*` temp dirs (agent-infra#2573), idle docker
+#           images/volumes, worktree-root caches (a root a live process holds is EXCLUDED and named,
+#           never a reason to skip every root), stale worktrees via the shipped
+#           `pi-reap-worktrees.sh` (armed only under disk pressure by default). Every pass reports a
+#           `df` delta and never a `du` sum.
 #
 # The verbs run ONE pass and are idempotent; `start` runs the loop that schedules them. Both write
 # the same `$O/state/roles/<role>.state` records, so "configured" and "ran a pass at HH:MM:SSZ" are
@@ -202,7 +209,12 @@ worker_census() { # stdout: the live worker count; exit 3 when no answer can be 
     # right after "a worker is live" inherited the memo and stood down with no worker running.
     WT_TABLE_TTL=0
     command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
-    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    # ⛔ `chain-` IS COUNTED HERE TOO (review finding on #2210's fix). `dispatch-merge.sh` spawns
+    # `chain-<N>` workers that live up to ~90 min, and the census filter in worker-terminal.sh counts
+    # them — but this list did not, so a chain-only box read "no workers" and `workers_maybe_live()`
+    # (which gates the destructive cache/disk sweep) stood DOWN to "safe to delete" under a live
+    # chain. The population this decision reads and the population the census reports must be one list.
+    _c="$(wt_count lane- fix- merge- chain- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
     case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
     printf '%s\n' "$_c" )
 }
@@ -2061,6 +2073,16 @@ cmd_start() {
   # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # ⛔ AND THE REPO A COMMAND ACTS ON IS PER-INVOCATION STATE, NEVER A GLOBAL EXPORT (measured
+  # 2026-10-21). A pushed `keys.env` on a cell carried `GH_REPO=daniel-ospina/tortoise`; `gh` honours
+  # `GH_REPO` as its default repo for EVERY command, so an agent-infra rail on that box graded the
+  # TORTOISE repo and printed `ALREADY MERGED` for a September tortoise PR — success over zero work, on
+  # the wrong repo, with nothing in the output saying so (the same class #2235 fixes in the rail itself).
+  # The session RE-SOURCES $ENV_FILE, so unsetting it out here would be undone a few characters later;
+  # the `unset` therefore lives INSIDE the command string, immediately after the source, and the same
+  # `unset` is in the doctor's string because that loop can restart the controller.
+  # ⛔ THE SESSION IS SERVED THE TMUX SERVER'S ENV, NOT THIS SHELL'S — so the `unset` cannot be done
+  # here and must be part of the string, exactly like every other value below.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
@@ -2421,8 +2443,11 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
-  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: where the cmux daemon answers a cell's lanes are durable
+  # terminals, so that answered 0 for a busy box. (The `grep -c` form is SIGPIPE-safe — it consumes all
+  # input — but it is still the wrong SOURCE: where the launcher is tmux (#2210) it lists only that
+  # surface, and the census is the one read that is right on both.) An unreadable census prints
+  # UNKNOWN, never 0.
   say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
@@ -2807,14 +2832,58 @@ registered_worktree() {
   return 1
 }
 
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573) — an EXCLUSION list, never an INCLUSION one.
+# The doctor's hygiene role can prove, PER WORKTREE ROOT, whether a live process is sitting in it
+# (the shipped `orchestrator-harness/live-ownership.sh` cwd census), so it excludes exactly the roots
+# a worker is in and lets the rest be swept. An INCLUSION list ("sweep only these") would silently
+# drop every root the caller did not enumerate — including $HARNESS_REPO's, which the doctor does not
+# even know about — so the sweep would lose coverage while still reporting success. Newline-separated
+# (a path can contain spaces), canonicalised at COMPARE time so a symlinked spelling cannot slip
+# past, and matched as a PATH PREFIX in ONE direction only (#2573 review, P1):
+#   * a held root is excluded EXACTLY, and
+#   * every ANCESTOR of it is excluded too — `sweep_root_caches` at an ancestor runs
+#     `find -maxdepth 5 -name __pycache__`, which reaches INTO the held worktree.
+# ⛔ The prefix must NOT run the other way. `case "$root" in "$cand"/*)` would make one held root
+# exclude every SIBLING under it — and on the fleet layout (`<repo>/.worktrees/<lane>`) a single live
+# lane holds `<repo>`, so ALL other lanes' roots would be skipped while the caller reported N roots
+# swept. That is the same self-disable shape #2573 exists to remove, one level down; measured
+# 2026-10-19 on the two-worktree fixture.
+EXCLUDE_ROOTS=""
+root_excluded() { # <root> -> 0 when the caller proved a LIVE process holds it
+  local root cand
+  [ -n "${EXCLUDE_ROOTS:-}" ] || return 1
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 1   # unresolvable: nothing of ours to spare
+  [ "$root" != "/" ] || return 1
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    # A root that no longer exists cannot be held by anything: nothing to exclude (and nothing to
+    # sweep either — `sweep_root_caches` skips a missing root).
+    cand="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
+    [ "$root" = "$cand" ] && return 0
+    # The held path protects itself and the roots whose sweep would recurse INTO it — never its
+    # siblings (see the header).
+    case "$cand" in "$root"/*) return 0 ;; esac
+  done <<< "$EXCLUDE_ROOTS"
+  return 1
+}
+
+exclude_root_add() { # <absolute path>
+  if [ -n "${EXCLUDE_ROOTS:-}" ]; then EXCLUDE_ROOTS="$EXCLUDE_ROOTS"$'\n'"$1"; else EXCLUDE_ROOTS="$1"; fi
+}
+
 cmd_prune() {
   local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
+  EXCLUDE_ROOTS=""
   for a in "$@"; do
     case "$a" in
       --caches) caches_only=1 ;;
+      --exclude-root=*) case "${a#*=}" in
+                          /*) exclude_root_add "${a#*=}" ;;
+                          *) die "prune: --exclude-root needs an ABSOLUTE path (got '${a#*=}'): a relative one would be resolved against whatever directory the caller happened to be in" ;;
+                        esac ;;
       --scratch) do_scratch=1 ;;
       --scratch=*) do_scratch=1; days="${a#*=}" ;;
-      *) die "usage: $0 prune [--caches] [--scratch[=DAYS]]" ;;
+      *) die "usage: $0 prune [--caches] [--exclude-root=PATH]… [--scratch[=DAYS]]" ;;
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
@@ -2904,9 +2973,22 @@ cmd_prune() {
     # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
     # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
     # largest consumer was a 5.6G `.venv` in ONE LINKED worktree, which this loop could never reach.
-    while IFS= read -r root; do sweep_root_caches "$root"; done \
+    while IFS= read -r root; do
+      # ⛔ A HELD ROOT IS NAMED, NOT SILENTLY DROPPED. The caller excluded it because a live process
+      # has a cwd inside it; a skip nobody can see is the same defect as the clamp this replaces
+      # (the doctor declining to reclaim precisely when the box is busiest).
+      if root_excluded "$root"; then
+        say "prune: caches NOT swept at $root — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+        continue
+      fi
+      sweep_root_caches "$root"
+    done \
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
-    sweep_root_caches "$r"
+    if root_excluded "$r"; then
+      say "prune: caches NOT swept at $r — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+    else
+      sweep_root_caches "$r"
+    fi
   done
   reap_global_caches
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }

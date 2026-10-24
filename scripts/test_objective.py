@@ -1438,9 +1438,24 @@ def test_the_wedge_reason_is_BOUNDED_and_says_how_many_it_hid():
     # the same rows WITHOUT the cap exceed the budget this bound exists to protect
     uncapped = ",".join(f"{objective.evidence_name(n)} {st} {a:.0f}m" for n, st, a in rows)
     assert len(uncapped) > 3 * objective.WEDGE_REASON_MAX_CHARS, len(uncapped)
-    # FOUR OR FEWER: nothing is hidden, so nothing is claimed
+    # FOUR SHORT NAMES FIT THE BUDGET: nothing is hidden, so nothing is claimed. The CHAR
+    # budget can still hide names at or below MAX_NAMES -- see the long-name case below.
     four = objective.wedge_reason(rows[:4])
     assert "+0 more" not in four and "more" not in four, four
+    # ⛔ LONG NAMES: the CHAR budget (not the name cap) is what bites -- two long matrix names are
+    # FEWER than MAX_NAMES and still hide one. Its old LENGTH assertion compared the output against
+    # `WEDGE_REASON_MAX_CHARS` -- the very constant a cap raise moves -- so at 10**9 that assertion
+    # passed, and the first failure pytest reported was the `uncapped` assertion above, which also
+    # compares against the moved constant (398 > 3 * 10**9). The arm was not wholly blind: its next
+    # assertion, `budget.endswith(",+1 more")`, is behavioural and does fail at 10**9 (the raised cap
+    # hides nothing, so the suffix disappears) -- it is simply never reached while `uncapped` fails
+    # first. Pinning a LITERAL makes the LENGTH bound itself fail on a cap raise (`144 <= 120` fails;
+    # `144 <= 10**9` passed), independent of `uncapped`.
+    long_names = [("python-ci-gate / validate / pytest (3.12, ubuntu-latest)", "in_progress", 150),
+                  ("legal-e2e / integration suite / cartola (desktop)", "in_progress", 140)]
+    budget = objective.wedge_reason(long_names)
+    assert len(budget) <= 120, budget
+    assert budget.endswith(",+1 more"), budget
     # EMPTY is None, never an empty order
     assert objective.wedge_reason([]) is None
     # ORDER IS DETERMINISTIC: age descending, then name

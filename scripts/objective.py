@@ -1590,8 +1590,12 @@ def classify_one(p):
         # branch, which names the gate that was never created.
         # ⛔ THE NAME IS SANITISED AT THE BOUNDARY (#1948 review): what survives the filter is
         # still an author-published check-run name, and this string becomes an executed order AND
-        # a machine-parsed token downstream. `st` is a conclusion this file chose from a fixed
-        # vocabulary; `n` is whatever the head published.
+        # a machine-parsed token downstream. `st` is GitHub's check-run `status`, read from the
+        # payload (`st = (newest.get("status") or "").lower()`) -- an enum at the API, whose
+        # longest member is `in_progress`, so it carries no `=`/`:`/marker and is bounded in
+        # length. It is NOT chosen here; `n` is whatever the head published.
+        # (An earlier wording said `st` was "chosen by this file from a fixed vocabulary", which
+        # misattributed the guarantee to this module -- fresh review, P3.)
         # ⛔ BOUNDED, not merely joined (#1948 review cycle 5, P2): this string is cut at 900
         # chars downstream, and an unbounded list of author-published names can push the fields
         # behind it off the line. `wedge_reason` keeps the oldest few and says how many it hid.

@@ -945,6 +945,16 @@ case "$PROV_OUT" in
   *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
   *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
 esac
+# ⛔ A `chain-*` WORKER IS A WORKER FOR THIS DECISION TOO (review finding on #2210's fix). The census
+# filter in worker-terminal.sh counts `chain-<N>` (dispatch-merge.sh spawns them; they live ~90 min),
+# but this count listed only lane-/fix-/merge-, so a chain-only box read "no workers" — and
+# `workers_maybe_live()` is what authorises the DESTRUCTIVE cache/disk sweep to run. A census that
+# reports a worker the decision cannot see is a census the decision does not have.
+PROV_TMUX_SESSIONS='chain-9' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a chain-only worker (the census and the destructive gate are one population)" ;;
+  *) bad "status reports 0 for a chain-only census — the sweep would run under a live chain worker — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
 
 # (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
 # The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
@@ -1278,7 +1288,9 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
 # ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
-# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cell is in. The
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cmux-ANSWERING
+# cell is in (a cell whose guest cmux cannot answer runs tmux sessions instead, #2210, which the two
+# PROV_TMUX_ arms above cover). The
 # pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
 # lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
 rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"
@@ -1339,6 +1351,75 @@ rm -rf "$R/repo-wt/.venv"; mkdir -p "$R/repo-wt/.venv"; printf 'x\n' > "$R/repo-
 PRUNE_VENV_MIN_AGE=0 prunesup --caches
 [ -e "$R/repo-wt/.venv" ] && bad "prune --caches did not reclaim a provably-dead lane's .venv (the delegation is dead)" \
                           || ok "prune --caches reclaims a lane .venv once the reaper can prove it is dead"
+
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573). The doctor's hygiene role proves, per worktree
+# root, whether a LIVE process has a cwd inside it, and excludes exactly those so the rest can still be
+# swept on the busiest box. The verb must therefore honour the exclusion — and it must stay an
+# EXCLUSION: every root the caller does NOT name (here the main checkout; in production $HARNESS_REPO's
+# worktrees, which the doctor cannot even enumerate) keeps its coverage. Both directions, one arm.
+mkdir -p "$R/repo-wt/node_modules" "$R/repo/.pytest_cache"
+printf 'x\n' > "$R/repo-wt/node_modules/marker"; printf 'x\n' > "$R/repo/.pytest_cache/marker"
+prunesup --caches --exclude-root="$R/repo-wt"
+[ -e "$R/repo-wt/node_modules" ] && ok "prune --exclude-root: the EXCLUDED root keeps its caches (a live process holds it)" \
+                                 || bad "prune --exclude-root swept a root it was told to spare"
+[ -e "$R/repo/.pytest_cache" ] && bad "prune --exclude-root: a root the caller did NOT exclude was left unswept (an exclusion list must not narrow coverage)" \
+                               || ok "prune --exclude-root: a root the caller did NOT name is still swept (exclusion, never inclusion)"
+case "$PR_OUT" in
+  *"NOT swept at $R/repo-wt"*) ok "prune --exclude-root: the skip is REPORTED by path, never silent" ;;
+  *) bad "prune --exclude-root: the excluded root was skipped without saying so — $PR_OUT" ;;
+esac
+# A ROOT CAN BE THE MAIN CHECKOUT, and the cache loop reaches it through a SECOND call site (the
+# `sweep_root_caches "$r"` line). Excluding only the linked-worktree loop would leave that one armed.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the MAIN checkout root is spared when it is the excluded one" \
+                             || bad "prune --exclude-root: the main checkout's own root was swept despite the exclusion"
+# A path that no longer exists cannot be held by a live process (and `sweep_root_caches` skips a missing
+# root anyway), so a stale exclusion must not silently disable the sweep.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/gone-root"
+[ -e "$R/repo/node_modules" ] && bad "prune --exclude-root: a vanished exclusion path disabled the sweep (it spared a root nothing holds)" \
+                             || ok "prune --exclude-root: an exclusion path that no longer exists does not stop the sweep"
+# ⛔ THE DECISIVE CASE (agent-infra#2573 review, P1): the caller excludes the PARENT root, which is
+# exactly what the doctor does when the cwd census finds a live process anywhere under the repo (the
+# fleet layout: every lane worktree is `<repo>/.worktrees/<lane>`). A prefix match on the DESCENDANT
+# side then skips every worktree under it — all lanes spared, while the caller reports "swept N idle
+# root(s)". Restoring `case "$root" in "$cand"/*` reddens this arm.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneC" HEAD 2>/dev/null || true
+mkdir -p "$R/repo/.worktrees/laneC/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneC/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/.worktrees/laneC/node_modules" ] && bad "prune --exclude-root: an excluded PARENT spared every worktree UNDER it — one live lane disables the sweep (the #2573 clamp, one level down)" \
+                                              || ok "prune --exclude-root: a worktree UNDER an excluded parent is still swept"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the excluded parent's OWN root is still spared" \
+                             || bad "prune --exclude-root: the excluded parent's own caches were swept"
+
+# ⛔ ONE HELD ROOT MUST NOT SPARE ITS SIBLINGS (agent-infra#2573 review, P1). The fleet puts every lane
+# worktree under `<repo>/.worktrees/<lane>`, so a prefix match in the WRONG direction — `case "$root" in
+# "$cand"/*` — made ONE live lane exclude every sibling root, while the caller still reported "swept N
+# idle root(s)": the same self-disable #2573 exists to remove, one level down. Two NESTED registered
+# worktrees are the reproduction; restoring that arm reddens the two `ok`s below.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneA" HEAD
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneB" HEAD
+mkdir -p "$R/repo/.worktrees/laneA/node_modules" "$R/repo/.worktrees/laneB/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneA/node_modules/marker"
+printf 'x\n' > "$R/repo/.worktrees/laneB/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo/.worktrees/laneA"
+[ -e "$R/repo/.worktrees/laneA/node_modules" ] && ok "prune --exclude-root: a NESTED held worktree keeps its caches" \
+                                              || bad "prune --exclude-root: the nested excluded worktree was swept"
+[ -e "$R/repo/.worktrees/laneB/node_modules" ] && bad "prune --exclude-root: one held worktree spared its SIBLING (the clamp is back, one level down)" \
+                                              || ok "prune --exclude-root: a SIBLING of a held worktree is still swept (exclusion is per-root, not per-repo)"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: an ANCESTOR of a held root is spared too (its own find -maxdepth 5 recurses INTO it)" \
+                             || bad "prune --exclude-root: the parent checkout was swept while a held worktree sat inside it"
+# A RELATIVE exclusion would be resolved against whatever directory the caller happened to be in, so it
+# is refused — a silent misresolution is a held root that gets swept.
+prunesup --caches --exclude-root=relative/path
+[ "$PR_RC" -ne 0 ] && case "$PR_OUT" in
+  *"--exclude-root needs an ABSOLUTE path"*) ok "prune --exclude-root: a relative path is REFUSED (it would resolve against the caller's cwd)" ;;
+  *) bad "prune --exclude-root: rc=$PR_RC but the refusal is not explained — $PR_OUT" ;;
+esac || bad "prune --exclude-root: a relative exclusion path was accepted (rc=$PR_RC)"
 # (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
 # checkout is what the flag exists to reclaim.
 git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD
@@ -1940,6 +2021,76 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
+# MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
+# environment, not the caller's, so an ambient export silently vanishes when a server already exists —
+# the loop on one cell died `FATAL REPO is not set`. And a cell's pushed `keys.env` carried
+# `export GH_REPO=daniel-ospina/tortoise`, which gh honours as the DEFAULT repo for every command, so
+# agent-infra rails on that box graded a tortoise PR and printed `ALREADY MERGED` over zero work.
+# Both halves are asserted on the SHIPPED string, executed the way tmux executes it: the recorded
+# command is run under `env -i` (no caller environment at all — the worst-case server) with ONLY the
+# final controller exec replaced by a probe. Nothing else is rewritten, so an `export` moved back out
+# of the string fails here even though the string still mentions the name.
+say_case "the session env lives INSIDE the command string, and GH_REPO is neutralised (#2216 class)"
+printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$Q/keys.env"
+qsup start "$Q/agent-repo" "$Q/st-env"
+[ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO (it is neutralised, not refused)" \
+                  || bad "start refused a cell merely because its keys.env carries GH_REPO: $Q_OUT"
+# ⛔ THE COMMAND UNDER TEST IS THE CONTROLLER'S, NOT THE DOCTOR'S. The stub records a single `cmd`
+# file and the LAST session launched is the doctor (`bash cell-doctor.sh loop`), so reading that file
+# graded the WRONG command string — this check then reported "unproven" rather than red, which is the
+# false-negative shape it exists to avoid. The controller's own argv line is the one naming orch-loop.sh.
+_CTRL_ARGV="$(grep -F 'orch-loop.sh' "$Q/st-env/argv" 2>/dev/null | tail -1)"
+_COMMAND=""
+if [ -n "$_CTRL_ARGV" ]; then
+  _COMMAND="${_CTRL_ARGV#*-c }"   # drop `new-session -d -s <sess> -c `
+  _COMMAND="${_COMMAND#* }"       # drop the -c DIRECTORY (the harness path; it carries no spaces)
+fi
+[ -n "$_COMMAND" ] || bad "could not recover the controller's command string from the stub argv — the env-in-session assertions would grade nothing"
+# (1) STATIC: the unset is inside the string, AFTER the keys.env source (otherwise the source puts it
+# back — the file is re-sourced by the session itself) and BEFORE the controller exec.
+_ranks="$(printf '%s\n' "$_COMMAND" | awk '{ i=index($0,"keys.env"); j=index($0,"unset GH_REPO"); k=index($0,"orch-loop.sh");
+    print (i>0 && j>i && k>0 && j<k) ? "ordered" : "out-of-order" }')"
+case "$_ranks" in
+  ordered) ok "the unset GH_REPO is inside the command string, after the keys.env source and before the controller exec" ;;
+  *) bad "the unset GH_REPO is missing or misplaced in the command string — a session that re-sources keys.env would carry the global repo: $_COMMAND" ;;
+esac
+# (2) RUNTIME: run the SHIPPED string the way tmux does (env -i + the server's environment) with only
+# the controller exec swapped for a probe. This is what proves the values SURVIVE into the session.
+# The prefix is taken by PARAMETER EXPANSION (strip from the single `bash '<harness>/orch-loop.sh'`
+# tail), not by a regex: the string is full of shell metacharacters and a pattern that half-matched
+# would silently build a probe that proves nothing.
+_PROBE="$Q/st-env/probe.sh"
+# ⛔ NO QUOTED GLOB IN THE STRIP: in `${var%pattern}` a quoted `'*'` is a LITERAL asterisk, so
+# `${_COMMAND%bash '*'}` matches nothing and the probe silently fell back to the whole string (measured
+# here — the failed match is why the honest branch below is "could not build" rather than a false pass).
+_PROBE_CMD="$(printf '%s' "$_COMMAND" | sed "s#bash '[^']*/orch-loop[.]sh'.*##")"
+if [ -n "$_PROBE_CMD" ] && [ "$_PROBE_CMD" != "$_COMMAND" ]; then
+  printf '%s\n' "$_PROBE_CMD" > "$_PROBE"
+  printf 'printf "REPO=%%s GH_REPO=%%s OR=%%s\\n" "$REPO" "${GH_REPO:-<unset>}" "$OR" > "%s"\n' \
+    "$Q/st-env/inside" >> "$_PROBE"
+  ( cd / && env -i PATH=/usr/bin:/bin HOME="$Q/home" bash "$_PROBE" >/dev/null 2>&1 )
+  _INSIDE="$(cat "$Q/st-env/inside" 2>/dev/null)"
+  case "$_INSIDE" in
+    *"REPO=$Q/agent-repo"*) ok "the launcher's REPO SURVIVES into the session under env -i (\"$_INSIDE\")" ;;
+    *) bad "REPO did not survive into the session (got '$_INSIDE') — the loop would die FATAL REPO is not set" ;;
+  esac
+  case "$_INSIDE" in
+    *"GH_REPO=<unset>"*) ok "GH_REPO is EMPTY inside the session even though keys.env exported it globally" ;;
+    *GH_REPO=?*) bad "the session inherited a GLOBAL GH_REPO ('$_INSIDE') — every gh call on this box would default to that repo" ;;
+    *) bad "the probe did not report GH_REPO at all ('$_INSIDE') — cannot-verify is not a pass here" ;;
+  esac
+else
+  bad "could not build the runtime probe from the recorded command string — the env-in-session claim is unproven (tail: '${_COMMAND: -160}')"
+fi
+# (3) The bring-up half: it must not WRITE a global GH_REPO, and it must drop one that is pushed.
+grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
+  && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
+  || ok "cloud-cell-bringup.sh writes no global GH_REPO"
+grep -qF 'unset GH_REPO' "$BRINGUP" \
+  && ok "cloud-cell-bringup.sh DROPS a GH_REPO pushed through keys.env (the measured wrong-repo defect)" \
+  || bad "cloud-cell-bringup.sh does not neutralise a pushed GH_REPO"
+
 # ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
 # The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
 # names) and this cell's own orch-loop.sh processes — never from `tmux has-session` alone. Measured

@@ -357,7 +357,16 @@ while :; do
   # be re-added here to "reserve" a slice for a step that is not in this pass; folding the two
   # helpers into one is a mechanical cleanup, not a behaviour change.
   slack() {
-    local r=$(remaining); [ "$r" -lt 20 ] && r=20; echo "$r"
+    # ⛔ NOT `local r=$(remaining)` (agent-infra#2121, discarded-status): the DECLARATION
+    # builtin's status is what `$?` holds afterwards, so a `remaining` that FAILED and one that
+    # returned NOTHING are indistinguishable — and an empty `r` made the test below compare ""
+    # against 20, which is an error, not a floor. A read this loop cannot observe must fall
+    # through to the CONSERVATIVE floor instead.
+    local r
+    r="$(remaining)"
+    case "$r" in ''|*[!0-9]*) r=20 ;; esac
+    [ "$r" -lt 20 ] && r=20
+    echo "$r"
   }
   if [ -f "$STATE/HEARTBEAT-OFF" ]; then
     printf '%s LOOP exiting: kill file present\n' "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
