@@ -329,3 +329,110 @@ are indistinguishable in the log. `mp_reason`'s own comment records the measured
 5. **Do not `pkill -f` with a pattern that could appear in a prompt.** Prompts are passed as argv
    elements (`"$(cat "$prompt")"`), so a pattern matching prompt *text* kills the worker. Kill by
    recorded pid.
+
+---
+
+## 9. The fleet partition — one cell per repo, one BROAD cell per queue
+
+A controller's work queue is **one repo**: `$OR`. The supervisor **derives** it from `$REPO`'s
+`origin` remote (`resolve_queue_target`), and an explicit `OR` that disagrees with that checkout
+**refuses the start** rather than dispatching repo B's PRs out of repo A's tree (agent-infra#1901).
+So the fleet is partitioned by **(cell → checkout)** first, and `SCOPE` decides how much of *that
+repo's* queue a cell touches:
+
+| `SCOPE` at process start | swept set (`headRefName` filter, `BEGIN scope-select`) | when |
+|---|---|---|
+| `auto` (**default**: unset) | BROAD when open PRs `> 10`, else OWN | a one-cell repo, or a cell nobody has decided about |
+| `broad` | every **non-draft** PR except `^design/`, `^scope/`, `^dependabot/` | **the one cell that owns draining this repo's queue** |
+| `own` | only `-tm$` (lane), `-cap$` (capacity), `^fix/` | every *other* cell on the same repo |
+
+⛔ **Drafts are swept only on own-pattern branches.** The listing ANDs `$SEL` to
+`select((.isDraft|not) or (.headRefName|test("-tm$|-cap$|^fix/")))` (`orch-loop.sh`), so a **draft**
+`feat/`, `chore/`, `test/` or `epic/` branch is swept by **neither** mode — `broad` does not reach it.
+That is deliberate for own-pattern drafts (nothing else would ever ready them, #8219/#8085) and it
+means "pin this cell `broad`" is not a way to get a non-lane draft swept or readied.
+
+`SCOPE` is read from the process **environment**, which is fixed when the process starts (the
+`BEGIN scope-select` block re-evaluates every cycle, but it reads that same fixed value). So a
+change takes effect by restarting the cell — never by exporting into a live controller. A
+set-but-empty or unrecognised value is **FATAL** in both `orch-loop.sh` (the `BEGIN scope-select`
+block) and the supervisor (`validate_scope`): a blank entry that silently fell back to `auto` is
+exactly a cell that drains the shared queue.
+
+### 9.1 `own` is a branch-pattern filter — NOT an ownership filter
+
+`own` selects `-tm$|-cap$|^fix/`, which is **the same set on every cell of the same repo**. It
+separates a cell from **non-lane** branches (`feat/`, `chore/`, `test/`, `epic/`); it does **not**
+separate two cells from each other. Two `own`-pinned cells on one repo sweep the same PRs and can
+still both re-record and both auto-arm the same head.
+
+Ownership is also still **inferred from LOCAL branches and worktrees**
+(`tools/collision_preflight.py`), which are invisible across machines — agent-infra#4256.
+**The pin is a MITIGATION, never the fix**; the root is #5052 (an authoritative expiring claim
+registry). Both files carry that caveat in their own comments; this section exists so a future
+reader does not read the partition as a guarantee of non-duplication.
+
+Two operational consequences that are easy to get backwards:
+
+- **Partitioning cells apart is done by repo, not by `own`.** Two cells are separated when they
+  have different checkouts (different `OR`). Two `own` cells on one repo are separated by nothing.
+- **`own` on the only cell of a repo strands that repo's non-lane PRs.** Measured on tortoise
+  2026-10-24T05:07Z: 12 open PRs, of which the `own` filter matched **6**. The other five live
+  branches — `feat/runner-autoscale`, `feat/9675-step1-write-eval`, `feat/3515-store-sync-backstop`,
+  `chore/batch-review-measurement`, `test/9664-capstone-connector-record` — are in the swept set
+  only because that cell is BROAD, and the sixth non-match is a draft `epic/` branch that neither
+  mode sweeps (see the draft rule above). The count
+  moves minute to minute — the controller's 05:00Z cycle printed `open=14` from its sticky
+  last-known after a transient listing failure, the 05:07Z listing was 12 — so re-measure, never
+  quote this one.
+
+### 9.2 The measured partition (2026-10-24T05:00Z)
+
+| cell (`cmux vm ls`) | host name | `REPO` (checkout) | `OR` (queue) | `SCOPE` | what proves it |
+|---|---|---|---|---|---|
+| `pi-cell-3` | `cmux` | `/tmp/cell-t3` | `daniel-ospina/tortoise` | **`broad`** (pinned 05:00:00Z) | `/proc/<pid>/environ`; `[scope] open=14 -> BROAD (pinned SCOPE=broad)`; `[cap] … open=14@daniel-ospina/tortoise`; fresh `refs/boxes/cmux/*` in tortoise |
+| `Daniels-MacBook-Air` (the Mac orchestrator) | `Daniels-MacBook-Air` | an **agent-infra** checkout | `daniel-ospina/agent-infra` | **unverified** — not readable from `pi-cell-3` | fresh `refs/boxes/Daniels-MacBook-Air/*` in agent-infra (newest 04:55:42Z). `cap_publish "$REPO"` pushes to the *checkout's* origin, so those refs prove an agent-infra checkout, not merely an agent-infra queue |
+| `pi-cell-4` | — | — | — | **UNKNOWN** | no `refs/boxes` record in either repo **and** the cmux peer link is down from `pi-cell-3` (`cmux vm exec pi-cell-4` → `no known daemon matches this route; connect with an invitation`). No record is not a measurement of absence |
+| `pi-lane-1` | — | — | — | **UNKNOWN** | same: no capacity ref, same link failure |
+
+⛔ **Do not read the UNKNOWN rows as "no controller".** The cell that cannot be reached is the cell
+that cannot be re-pinned from here, and it must not be written into this table as if it had been.
+
+### 9.3 Applying a partition change
+
+One cell at a time, through the supervisor — never two controllers on one cell (the ownership read in
+`cloud-cell-supervisor.sh`, agent-infra#1761: `$O/.orch.lock` plus a scoped process read, because
+`tmux has-session` cannot see a controller launched outside the `orch` session), and never by editing
+a live controller's environment:
+
+```bash
+CELL_HOME=/tmp/cell-home REPO=<checkout> O=$CELL_HOME/orchestrator \
+OR=<owner/repo> SCOPE=<role> \
+HARNESS_REPO=<agent-infra checkout> HARNESS_REF=origin/main \
+HARNESS_PIN_DIR=$CELL_HOME/harness HARNESS_PIN_FILE=$CELL_HOME/.harness-path \
+bash scripts/cloud-cell-supervisor.sh stop      # then: start, with the same environment
+```
+
+Prove it after the start, in this order:
+
+1. the **new** pid's environment carries the intended pair — `tr '\0' '\n' < /proc/<pid>/environ |
+   grep -E '^(OR|REPO|SCOPE)='`;
+2. `status` prints `controller: RUNNING (pid …) — scope=<SCOPE> repo=<OR>` — it echoes the
+   **configured** value (`scope=auto` on a cell that was never pinned; the *resolved* mode is not in
+   `status`) — and the queue line `[ok — derived from the checkout]` when `OR` was left to derive,
+   or `[ok — OR matches the checkout]` when it was declared;
+3. the pin equals the remote tip — `cat $CELL_HOME/.pi/agent/state/HARNESS-PIN` vs
+   `git ls-remote origin refs/heads/main`;
+4. the controller's own log names the repo and the mode it actually took —
+   `[cap] … open=<n>@<OR>` and `[scope] open=<n> -> <MODE> (<why>)` (this `[scope]` line, not
+   `status`, is where the RESOLVED mode is readable).
+
+If the new configuration refuses to start, restart the **previous** environment and report the cell
+as unchanged — an unattended cell with no controller is worse than an unpinned one.
+
+⚠️ `cloud-cell-supervisor.sh check` prints the `⛔ COLLISION: … an UNPINNED cell drains the SHARED
+queue` advisory **unconditionally** — it is not a verdict about the cell being checked, and it fires
+on a correctly pinned `SCOPE=broad` cell too. Read the role from the controller's `[scope]` line and
+the configured value from `status`'s `scope=`, not from that block, or the advisory becomes
+background noise that the real collision (two BROAD cells, or an unpinned one) no longer cuts
+through.
