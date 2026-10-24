@@ -517,7 +517,8 @@ def configured_repos(explicit=(), env: dict | None = None) -> list[str]:
     return out
 
 
-def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str = "?") -> None:
+def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str = "?",
+               rubric_note: str = "") -> None:
     """Point every read and every write of this pass at ONE repo, and say so.
 
     Three globals move together and they MUST: `REPO` (the slug every gh/REST read is made
@@ -573,7 +574,7 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
                                               "NONE -- queue only, nothing can be spawned"))
     # The rubric gets its own line: "which repo" and "judged by whose declaration" are two facts,
     # and a pass that reports only the first cannot be audited for the second.
-    log(rubric_report())
+    log(rubric_report(rubric_note))
 
 
 def worker_name(number) -> str:
@@ -716,7 +717,16 @@ def contract_note(slug: str) -> str:
     if not slug:
         return ""                       # nothing is being graded: no rubric to be wrong about
     if _rubric_supplied():
-        return ""                       # the operator declared it; it applies to whatever slug
+        # ⛔ "THE OPERATOR DECLARED IT" IS ONLY AN ANSWER FOR A REPO THE DECLARATION CAN NAME.
+        # The seams are MACHINE-wide (`OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` carry values, not a
+        # slug), so one declaration can describe exactly one repo -- and it says nothing about
+        # WHICH. In a set grading several repos the attribution is therefore UNKNOWABLE, and the
+        # honest answer is the refusal, not a guess: guessed, it re-creates the failure measured
+        # here (`rerun-checks` at a green PR, and a surface-touching diff handed to the automated
+        # lander) for every repo in the set but one. `set_rubric_note()` supplies that refusal per
+        # pass; this branch stays the answer for a single-repo pass, where the declaration is
+        # attributable by construction.
+        return ""
     if slug.strip().lower() == _RUBRIC_REPO:
         return ""                       # the built-ins ARE this repo's rubrics by construction
     return ("the required-check set and human-gated surface paths %s is judged by are NOT supplied "
@@ -728,9 +738,15 @@ def contract_note(slug: str) -> str:
             "Tracked: agent-infra#2518" % (slug, _RUBRIC_REPO, slug))
 
 
-def rubric_report() -> str:
-    """The one line a pass logs about the rubric it is judging by -- and whose it is."""
-    note = contract_note(REPO)
+def rubric_report(note: str = "") -> str:
+    """The one line a pass logs about the rubric it is judging by -- and whose it is.
+
+    `note` is an ATTRIBUTION THE CALLER ALREADY DECIDED (`--all-repos`, see `set_rubric_note()`).
+    It is passed in rather than re-derived so the line a pass PRINTS and the refusal `dispatch()`
+    APPLIES are the same answer: a report saying "the operator declared it" while the dispatcher
+    refused (or the reverse) would be the two-authorities defect this file keeps removing.
+    """
+    note = note or contract_note(REPO)
     if note:
         return "rubric: REFUSING TO DISPATCH -- %s" % note
     return ("rubric: required=%s surface=%s (from %s)"
@@ -2720,7 +2736,47 @@ def _confirm(name: str) -> tuple[str, str]:
     return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
 
 
-def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bool]:
+def set_rubric_note(entries: list[str]) -> str:
+    """Why a SET cannot be judged by the operator's machine-wide rubric ("" when it can).
+
+    ⛔ A DECLARATION THAT NAMES NO REPO CANNOT DESCRIBE TWO. `OBJECTIVE_REQUIRED` /
+    `OBJECTIVE_SURFACE` carry a required-check set and a surface-path list, and NOTHING in them
+    says which repo wrote them -- `objective.py` binds them once, process-wide. In a single-repo
+    pass that is unambiguous (the operator is grading the repo they declared). In a SET it is a
+    coin flip per repo, and the losing side gets exactly the verdict this change exists to stop:
+    every green PR `rerun-checks` (staling its attestation), `call-rail`/`record-review`
+    unreachable, and `touches_surface()` always False so a surface-touching diff reaches the
+    automated lander. So the set REFUSES TO DISPATCH and still measures both queues -- the loud,
+    fixable report the rest of this mode already uses.
+
+    ⛔ IT IS NOT A FLAG. It is computed from the SET and passed down the call chain to the two
+    places that decide (`rubric_report()` and `dispatch()`), because a module flag would be a
+    second authority on "which repo is this pass about" -- the defect `contract_note()` exists to
+    remove, one input over (`--all-repos` switching it mid-process is what a flag gets wrong).
+
+    A set of ONE is attributable and does not refuse: `--all-repos` with a single entry grades one
+    repo, and the operator's declaration is that repo's by construction.
+    """
+    if not _rubric_supplied():
+        return ""                       # nothing declared: `contract_note()` decides per slug
+    slugs = set()
+    for entry in entries or ():
+        slug = _normalize_slug(split_repo_entry(entry)[0])
+        if slug:
+            slugs.add(slug.lower())
+    if len(slugs) <= 1:
+        return ""                       # one repo in the set: the declaration can only be its own
+    return ("this pass grades %d repos (%s) and the operator's rubric declaration is MACHINE-wide "
+            "-- OBJECTIVE_REQUIRED/OBJECTIVE_SURFACE carry no repo, so which of these it describes "
+            "is unknowable, and grading any of them by it would hand a surface-touching diff to "
+            "the automated lander while classifying every green PR `rerun-checks`. Nothing is "
+            "dispatched for this set; both queues are still graded. Fix: grade one repo per pass "
+            "(no `--all-repos`), or wire the rubric per repo (agent-infra#2518)."
+            % (len(slugs), ",".join(sorted(slugs))))
+
+
+def dispatch(pr: dict, action: str, text: str, dry: bool,
+             rubric_note: str = "") -> tuple[bool, str, bool]:
     """Spawn a background worker for one PR. Returns (launched, detail, record).
 
     ⛔ THIS IS THE ONLY DISPATCH PATH. The lane-table path (`idle_lanes()` + a cmux send to a
@@ -2757,8 +2813,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     # and a pass that then places nothing reports EXIT_UNDELIVERABLE -- a loud, fixable verdict
     # rather than a confident wrong order. Placed BEFORE the dry-run branch so `--dry-run` says the
     # same thing a real pass would do.
-    if contract_note(REPO):
-        return False, contract_note(REPO), False
+    note = rubric_note or contract_note(REPO)
+    if note:
+        return False, note, False
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
@@ -3015,6 +3072,46 @@ class _UsageParser(argparse.ArgumentParser):
         except Exception:
             rc = EXIT_USAGE
         raise SystemExit(rc)
+def _status_age_note() -> str:
+    """What the machine-wide `--status` view is, and how old -- ONE line, or "" if unknowable.
+
+    ⛔ BECAUSE A ROW WITH NO REPO AND NO DATE IS A CLAIM ABOUT NOW THAT NOTHING CHECKED (#2280
+    review, P2). `--all-repos` redirects `STATE` per repo (`apply_repo(multi=True)`) and restores
+    only the PATH at the end, so a set-only box never writes the canonical `pr-doctor.json`: the
+    unlabelled view is then frozen at whatever the last SINGLE-repo pass left, possibly days old,
+    for a repo the set may no longer contain. Its rows carry no repo field, which is why the
+    per-repo printer refuses to substitute this file under a repo's header -- and the same reason
+    applies here, to the file presented as "the machine-wide view". Printed rather than guessed:
+    the age of the record, and whether per-repo records exist that this view cannot show.
+    """
+    try:
+        age_s = max(0.0, time.time() - os.path.getmtime(STATE))
+    except OSError:
+        return ("pr-doctor: NO canonical state file at %s -- no single-repo pass has recorded "
+                "anything here. Nothing is listed below, which is NOT the same as \"nothing is "
+                "in cooldown\"." % STATE)
+    if age_s < 3600:
+        age = "%dm" % int(age_s // 60)
+    elif age_s < 86400:
+        age = "%dh" % int(age_s // 3600)
+    else:
+        age = "%dd" % int(age_s // 86400)
+    try:
+        per_repo = [n for n in sorted(os.listdir(STATE_DIR))
+                    if n.startswith("pr-doctor.") and n.endswith(".json")
+                    and n != "pr-doctor.status.json"]
+    except OSError:
+        per_repo = []
+    tail = ""
+    if per_repo:
+        tail = ("; %d per-repo record(s) exist beside it (%s%s) and are NOT shown here, because "
+                "`--all-repos` writes those and their rows are the current ones -- run "
+                "`--status --all-repos`" % (len(per_repo), ", ".join(per_repo[:3]),
+                                            "..." if len(per_repo) > 3 else ""))
+    return ("pr-doctor: canonical (machine-wide) state %s, last written %s ago; its rows carry no "
+            "repo field%s." % (STATE, age, tail))
+
+
 def _print_state(path: str, label: str = "") -> None:
     """One state file's rows, printed exactly as `--status` always printed them.
 
@@ -3037,6 +3134,9 @@ def _print_state(path: str, label: str = "") -> None:
         return
     if path == STATE:
         st = load_state()
+        note = _status_age_note()
+        if note:
+            print(note)
     else:
         try:
             with open(path) as f:
@@ -3173,6 +3273,10 @@ def run_all_repos(args, explicit) -> int:
         log("REFUSING: %s" % msg)
         return record_exit(EXIT_REFUSING, msg, repo="")
     results, rows = [], []
+    # ⛔ COMPUTED ONCE, FROM THE SET, AND PASSED DOWN -- never stored (see `set_rubric_note()`).
+    set_note = set_rubric_note(entries)
+    if set_note:
+        log("rubric: REFUSING TO DISPATCH -- %s" % set_note)
     for entry in entries:
         slug_in, hint = split_repo_entry(entry)
         try:
@@ -3191,12 +3295,12 @@ def run_all_repos(args, explicit) -> int:
             results.append({"repo": slug_in or entry, "rc": 2, "reason": str(e),
                             "open_prs": None, "unplaced": None})
             continue
-        apply_repo(slug, checkout, multi=True, source=source)
+        apply_repo(slug, checkout, multi=True, source=source, rubric_note=set_note)
         if ckwhy:
             log("checkout: NONE for %s (%s) -- the queue is graded and NOTHING will be spawned"
                 % (slug, ckwhy))
         try:
-            rc = run_pass(args)
+            rc = run_pass(args, set_note)
         except BaseException as e:                 # one repo's crash must not end the SET
             # ⛔ THE SET IS THE POINT: a crash grading repo A says nothing about repo B's queue, so
             # it is CAUGHT here, reported as this repo's rc=4 and the loop CARRIES ON. Letting it
@@ -3345,7 +3449,7 @@ def main() -> int:
     return run_pass(args)
 
 
-def run_pass(args) -> int:
+def run_pass(args, rubric_note: str = "") -> int:
     # ⛔ `--status` IS ANSWERED BEFORE THE SEAM GATE (2026-10-22, review round 4). It prints
     # `load_state()` rows and reads no world, so it needs NO classifier symbol. Gating it behind
     # SEAM_ERROR removed the only in-process state listing on exactly the box where the farm drifted
@@ -3869,7 +3973,7 @@ def run_pass(args) -> int:
             stalled["brief"] += 1
             undeliverable += 1
             continue
-        ok, detail, record = dispatch(p, action, text, args.dry_run)
+        ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
             if record and not args.dry_run:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in

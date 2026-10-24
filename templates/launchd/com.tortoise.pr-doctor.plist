@@ -53,7 +53,27 @@
          GH: PATH carries the fleet's gh-wrapper dir first (rendered by
          install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
          HOME stays the real home so the doctor's state dir is the fleet's, not
-         launchd's. -->
+         launchd's.
+
+         ⛔ THE REPO IS NAMED BY ARGV (the "repo" flag) AND NOT BY `GH_REPO` (agent-infra#2280).
+         This template used to carry `<key>GH_REPO</key><string>daniel-ospina/tortoise</string>`
+         and nothing else, which worked only because the doctor resolved its target from a
+         MODULE CONSTANT that happened to be the same repo. #2280 removed that constant: the
+         doctor now resolves its target by EVIDENCE (the "repo" flag, then `OR`, then `REPO`'s git
+         origin, then the cwd's origin) and REFUSES (exit 2) when none answers, because `GH_REPO`
+         is a box-GLOBAL selector (a pushed `keys.env` once exported
+         `GH_REPO=daniel-ospina/tortoise` and `gh` obeyed it for every command on the box, #2235).
+         A job armed from this template with only `GH_REPO` set would therefore have exited 2 on
+         every tick and dispatched NOTHING, for ever, while looking armed. That is why the change
+         that removed the constant ships this template fix WITH it. The flag is rank 1 (this job's
+         explicit word for THIS invocation); `REPO` below is rank 3 and is only ADOPTED when its
+         own git `origin` PROVES that slug, so the plist cannot make the doctor read another
+         repo's worktrees, and a box whose `{{TORTOISE_REPO}}` does not resolve grades the queue
+         read-only and says so instead of spawning.
+
+         ⛔ DO NOT RE-ADD `GH_REPO` AS THE SELECTOR. It is not evidence (see above); the doctor
+         pins `GH_REPO` to the repo it resolved, in that direction only, for the children it
+         spawns. -->
     <key>Label</key>
     <string>com.tortoise.pr-doctor</string>
     <key>ProgramArguments</key>
@@ -61,6 +81,9 @@
         <string>/usr/bin/env</string>
         <string>python3</string>
         <string>{{HOME}}/.pi/agent/scripts/pr-doctor.py</string>
+        <!-- The repo this job grades, as argv (rank-1 evidence in resolve_repo()). -->
+        <string>--repo</string>
+        <string>daniel-ospina/tortoise</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -68,8 +91,9 @@
         <string>{{PATH}}</string>
         <key>HOME</key>
         <string>{{HOME}}</string>
-        <key>GH_REPO</key>
-        <string>daniel-ospina/tortoise</string>
+        <!-- The CHECKOUT (not a slug): adopted only if its `origin` proves the repo above. -->
+        <key>REPO</key>
+        <string>{{TORTOISE_REPO}}</string>
     </dict>
     <key>StartInterval</key>
     <integer>1800</integer>
