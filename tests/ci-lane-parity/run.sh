@@ -1252,6 +1252,127 @@ OUT="$(cat "$TMP/badflag.out")"
 if [ "$RC" -eq 2 ]; then pass "an unknown argument exits 2"; else fail "an unknown argument exited $RC (want 2)"; fi
 
 echo ""
+echo "8am. ATTRIBUTION — a failed shard is NAMED in the verdict, not only counted (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR. On 2026-10-24 four shards were red on `main` and FOUR PR slices each
+# printed `❌ 1 bash shard(s) failed`; the merge rail refused the PR with "yielded NO parseable failure
+# identity", and the only way to learn which suite was red was to download an 18,695-line job log and
+# bisect it against this runner's own `▸ <secs> <path>` rows. A count is not an identity, so the
+# verdict now names its shards. Nothing asserted that, and nothing could: every existing arm here
+# asserts COUNTS and SETS (listed==executed, the slice's exact set, the sweep counter), and a red that
+# prints nothing still satisfies all of them.
+#
+# The fixture is the runner with EVERY `run_shard` line pointed at a hermetic stand-in, exactly as
+# arms 8d/8e/8h do — with ONE of them pointed at the failing stand-in, so the run is red for a reason
+# this arm chose. Three assertions, and the second and third are what make the first mean something:
+#   (a) the failing shard's PATH appears in the verdict block;
+#   (b) the PASSING stand-in's path does NOT appear there (a block that names every shard satisfies
+#       (a) while telling a reader nothing);
+#   (c) RED CONTROL — gut the recorder and the run must STILL fail (rc 1, the counter is untouched)
+#       while naming nothing. Without (c), (a) could be satisfied by any future line that happens to
+#       print a path.
+PASS_SHARD="tests/ci-lane-parity/stand-in-shard.sh"
+FAIL_SHARD="tests/ci-lane-parity/stand-in-shard-fail.sh"
+awk -v pass="$PASS_SHARD" -v fails="$FAIL_SHARD" '
+  /^run_shard / && $2 !~ /^\"/ { n++; print "run_shard " (n == 2 ? fails : pass); next }
+  { print }
+' "$RUNNER" >"$TMP/runner-named.sh"
+if cmp -s "$RUNNER" "$TMP/runner-named.sh"; then
+  fail "the attribution fixture rewrote no run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-named.out")"
+  # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
+  # printed mid-run and is NOT what a parser sees at the end, so assert on the block.
+  VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-named.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$VERDICT"; then
+    pass "a failed shard is NAMED in the verdict block (rc 1)"
+  else
+    fail "the verdict did not name the failed shard (rc $RC): $VERDICT"
+  fi
+  if grep -qF "$PASS_SHARD" <<<"$VERDICT"; then
+    fail "the verdict names the PASSING stand-in too — a block naming every shard attributes nothing: $VERDICT"
+  else
+    pass "…and it names only the shard that actually failed"
+  fi
+  # RED CONTROL (c): the recorder's body replaced by `: ` — the failure is still COUNTED, so the run is
+  # still rc 1; only the name is gone. That is the shape that proves (a) is pinning the recorder.
+  # ⛔ ASSERTED ON THE VERDICT SLICE, NEVER ON `$OUT` (review cycle 1). `shard_note` prints a timeline
+  # row — `▸ 0s <path>` — for every listed shard whether it passed or failed, so the WHOLE log always
+  # contains the failing path and `! grep -qF "$FAIL_SHARD" <<<"$OUT"` would fail this arm on every
+  # commit, reddening `bash-suites` for the very reason it exists to attribute.
+  awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+    "$TMP/runner-named.sh" >"$TMP/runner-noname.sh"
+  if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
+    fail "the no-name mutation did not change the fixture"
+  else
+    $FIXTURE_BOUND bash "$TMP/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    RC=$?
+    NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
+    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
+      pass "RED CONTROL: a gutted recorder still fails the run (rc 1) and names nothing in the verdict"
+    else
+      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_VERDICT"
+    fi
+    # …and it must SAY SO rather than end on a bare count: an unnamed failure has to read as unnamed.
+    if grep -q 'could NOT be named' <<<"$NONAME_VERDICT"; then
+      pass "…and an unnamed failure says so, instead of ending as a silent count"
+    else
+      fail "an unnamed failure did not announce that it could not be named: $NONAME_VERDICT"
+    fi
+  fi
+fi
+
+echo ""
+echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no un-named red (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR (#2648 cycle-4 review): the first version named only the shard LOOP, so
+# a MIXED run — one listed shard failing PLUS a `bash -n` failure from the syntax sweep — yielded
+# exactly ONE identity. The rail's step-1c (`examined > extracted`) then PASSED, and the un-named file
+# disappeared from a certificate that named no residual: a truthful refusal turned into a FALSE PASS.
+# Nothing reddened if the sweep-naming half were reverted, which is what this arm closes.
+#
+# The fixture: every `run_shard` points at the PASSING stand-in (so the run is red ONLY because of the
+# sweep), and SWEEP_GLOBS is narrowed to a temp dir holding one file with a syntax error. Assert the
+# broken file is NAMED in the verdict block and that the run does NOT fall back to `could NOT be named`.
+BROKEN_DIR="$TMP/sweep-broken"
+mkdir -p "$BROKEN_DIR"
+printf 'if then\n' >"$BROKEN_DIR/broken.sh"
+awk -v pass="$PASS_SHARD" -v dir="$BROKEN_DIR" '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"" dir "/*.sh\")"; next }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " pass; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-sweepname.sh"
+if cmp -s "$RUNNER" "$TMP/runner-sweepname.sh"; then
+  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor a run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
+  RC=$?
+  SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
+    pass "a bash -n failure is NAMED in the verdict block (rc 1)"
+  else
+    fail "a sweep failure was counted but not named (rc $RC): $SWEEP_VERDICT"
+  fi
+  if grep -q 'could NOT be named' <<<"$SWEEP_VERDICT"; then
+    fail "a sweep failure was left UNNAMED — the rail gets an identity for the other shard and merges: $SWEEP_VERDICT"
+  else
+    pass "…and the verdict has no un-named remainder (the rail sees every failure)"
+  fi
+  # RED CONTROL: gut the recorder that the SWEEP calls, and the same run must go back to the count-only
+  # verdict — proving this arm pins the sweep's naming rather than any other line that prints a path.
+  awk '{ if ($0 ~ /^shard_named_failure\(\) \{/) { print "shard_named_failure() { :; }"; next } print }' \
+    "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepnoname.sh"
+  $FIXTURE_BOUND bash "$TMP/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
+  RC2=$?
+  SWEEP_NONAME="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepnoname.out")"
+  if [ "$RC2" -eq 1 ] && ! grep -qF "broken.sh" <<<"$SWEEP_NONAME" && grep -q 'could NOT be named' <<<"$SWEEP_NONAME"; then
+    pass "RED CONTROL: with the naming helper gutted the sweep failure is un-named again (rc 1)"
+  else
+    fail "the no-name control did not revert to an un-named verdict (rc $RC2): $SWEEP_NONAME"
+  fi
+fi
+
+echo ""
 echo "10. WIRING — a guard (or runner) nothing invokes protects nothing"
 for pair in "PR:$PR" "main:$MAIN"; do
   lane="${pair%%:*}"; wf="${pair#*:}"

@@ -27,14 +27,54 @@
 #                    refs/remotes/* and `revocable-ref` otherwise, and the ref
 #                    is NAMED in both.
 #   * aged         — HEAD commit strictly older than REAP_WT_AGED_DAYS (7),
-#                    EXCEPT when HEAD is MERGED (refs=merged): the merge is
-#                    the proof the work landed, so the age floor has nothing
-#                    left to protect and a merged checkout can be reclaimed
-#                    the same day. REAP_WT_MERGED_AGE_DAYS is the merged
-#                    floor (default 0); set it to the same value as
-#                    REAP_WT_AGED_DAYS to restore the blanket floor.
+#                    EXCEPT when HEAD is MERGED (refs=merged) or
+#                    PATCH-EQUIVALENT: those are the proofs the work landed,
+#                    so the age floor has nothing left to protect and such a
+#                    checkout can be reclaimed the same day.
+#                    REAP_WT_MERGED_AGE_DAYS (0) is the floor for both. A lane
+#                    SCRATCH checkout (`wt-*` / `cell-wt-*`, #2354) has its floor
+#                    CAPPED at REAP_WT_SCRATCH_AGE_DAYS (1) when that is lower: a
+#                    dead lane's scratch dir is not a week's worth of review
+#                    surface. The cap only ever LOWERS — a value above the floor in
+#                    force has no effect (so 14 does not mean "keep longer"), and a
+#                    merged/patch-equivalent scratch row keeps the merged floor.
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
+#
+# ⛔ WHAT "FINISHED" MEANS (the durable rule — #1095, #2354). A worktree is
+# finished ONLY when LOCAL evidence proves it: its tree is CLEAN (no work that
+# exists only here), its head is IN THE BASE (an ancestor of MAIN_REF, OR held by
+# a refs/heads/* ref that survives the removal), NO live process holds the path,
+# and NO open PR names the branch. ⛔ PATCH-ID EQUIVALENCE TO MAIN_REF IS *NOT*
+# A REACHABILITY PROOF and must never be used as one: `git cherry` reports that an
+# equal patch appeared SOMEWHERE in main's history, so a change main has since
+# reverted still shows `-`, patch-id ignores whitespace, and a DETACHED head whose
+# commits all have twins is still on no ref — treating it as "in the base" removes
+# a checkout and orphans that commit. Patch equivalence only lifts the AGE FLOOR
+# (patch_equivalent()); the survival decision stays with ancestry and ref-holding,
+# which is why a squashed lane is reclaimed as `branch-retained:<name>`. The
+# branch is never deleted, so "reachable" is a property of the REF, not of the
+# checkout: `git worktree remove` removes the directory and nothing else.
+# ⛔ TWO THINGS THIS TOOL MUST NEVER DO:
+#   1. touch a PRIMARY checkout — the main worktree, or the reaper's own cwd;
+#      the gate is `main-checkout` / `self-checkout`, decided by git's own
+#      FIRST `worktree list` entry and by canonicalised path containment (a
+#      nested lane worktree must never be mistaken for the hub it sits under);
+#   2. judge "finished" from a BRANCH NAME — a name is not evidence. `merged`
+#      is an ancestor test, never a "looks landed" test, and a branch whose
+#      name says fix/ or chore/ is treated exactly like any other.
+#
+# ⛔ THE OPEN-PR SURFACE IS A VETO — AND AN UNREADABLE VETO IS NOT A PASS (#2354)
+# The veto is a PRECONDITION: a worktree whose branch an open PR names must never
+# be touched, so a pass that CANNOT read the open-PR list must not remove
+# anything it cannot clear. That is why an unreadable `gh` still aborts the class
+# (exit 3, nothing removed) — a wrong reap costs a night, an orphan costs disk.
+# What #2354 changed is the SURFACE, not the rule: the scheduled wrapper hands
+# this script the REAL gh for its read-only query, because routing a bounded
+# hourly sweep through the interactive pacing shim meant a wedged shim (a
+# self-recursive `AGENT_GH_REAL`, fixed in agent-infra #2266/#2295) made every
+# pass reclaim zero while `systemctl` showed it green. A veto that cannot answer
+# is a deployment defect to fix, never a licence to skip the veto.
 #
 # WHY THE MERGED EXEMPTION IS SAFE. The floors protect two different things:
 # `clean` protects uncommitted work, `reachable` protects commits, and the
@@ -222,6 +262,13 @@ REAP_WT_AGED_DAYS="${REAP_WT_AGED_DAYS:-7}"
 # The age floor applied to a MERGED head. 0 = reclaim a merged checkout the same day (see POLICY
 # CONTRACT); set it equal to REAP_WT_AGED_DAYS for the pre-exemption behaviour.
 REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS:-0}"
+# The age floor for a LANE SCRATCH checkout (`wt-*` / `cell-wt-*` at any depth). A dead lane's
+# scratch dir is not the 7-day review surface a named issue branch is: it exists to be thrown away.
+# It still keeps every safety gate (clean / no live holder / no open PR); only the AGE differs.
+REAP_WT_SCRATCH_AGE_DAYS="${REAP_WT_SCRATCH_AGE_DAYS:-1}"
+# Path patterns that mark a lane scratch checkout. Basename match, deliberately narrow: `wt-4212`,
+# `cell-wt-diskhyg2` — NOT `wt` or a repo whose name merely starts with `wt`.
+REAP_WT_SCRATCH_GLOB="${REAP_WT_SCRATCH_GLOB:-wt-*|cell-wt-*}"
 REAP_WT_MAX_DAYS="${REAP_WT_MAX_DAYS:-1000000}"
 REAP_WT_DRY_RUN="${REAP_WT_DRY_RUN:-1}"
 REAP_WT_LIST_TIMEOUT="${REAP_WT_LIST_TIMEOUT:-30}"
@@ -414,6 +461,33 @@ is_regenerable_ignored() {
     return 1
 }
 
+# is_scratch_path <path> — true for a LANE SCRATCH checkout (#2354).
+#
+# A lane's throwaway dir is named `wt-<issue>` (the `wt-` prefix the harness has used for years) or
+# `cell-wt-<slug>` (a cell lane). The match is on the BASENAME and on a HYPHENATED prefix, so `wt`
+# alone, `web-tools/` and a repo directory that merely starts with those letters are NOT scratch: a
+# prefix rule that accepted `wt*` would silently shorten the age floor for a legitimate checkout.
+# This only CHOOSES the age floor — every other gate (clean, live holder, open PR) still decides.
+is_scratch_path() {
+    local base
+    base="${1%/}"; base="${base##*/}"
+    # NOTE: no `local IFS` — a value-less `local` UNSETS it, and `set -u` turns that into a hard
+    # error inside the predicate (if it did not, a mis-set IFS would silently change the split).
+    local pat old_ifs="$IFS"
+    # ⛔ `set -f` AROUND THE SPLIT (review of #2354). `for pat in $REAP_WT_SCRATCH_GLOB` performs
+    # PATHNAME EXPANSION: with `wt-999` in the reaper's cwd the list became the FILE `wt-999` and
+    # the scratch floor silently stopped applying — ambient, cwd-dependent, and silent.
+    set -f
+    IFS='|'
+    for pat in $REAP_WT_SCRATCH_GLOB; do
+        # shellcheck disable=SC2254 — the glob is DELIBERATE (the seam is a pattern list)
+        case "$base" in $pat) IFS="$old_ifs"; set +f; return 0 ;; esac
+    done
+    IFS="$old_ifs"
+    set +f
+    return 1
+}
+
 # ── lock (macOS has no flock) ──────────────────────────────────────────
 LOCK_HELD=0
 lock_release() { [ "$LOCK_HELD" = 1 ] && { rm -rf "$LOCK_DIR"; LOCK_HELD=0; }; return 0; }
@@ -575,6 +649,12 @@ ps_load() {
     return 0
 }
 
+# Exported so a caller (and the harness) can tell WHICH pid this run IS. SELF_PIDS is assembled
+# from `ps` output, so a test can only pin the cwd-vs-argv asymmetry by emitting the ancestor link
+# FOR THIS PID — without it, `SELF_PIDS` holds the reaper alone and an "ancestor holds it" leg is
+# vacuous (the mutant that restores the exemption passes it; review of #2354).
+export REAP_WT_SELF_PID="$$"
+
 self_pid_tree_load() {
     local pid="$$" ppid depth=0
     SELF_PIDS=" $$ "
@@ -586,8 +666,8 @@ self_pid_tree_load() {
     done
 }
 
-live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
-    local canon="$1" recorded="$2" pid line
+live_process_for() { # <canon> <recorded> [<exclude-pids>] -> matching pid ("" when none)
+    local canon="$1" recorded="$2" exclude="${3:-}" pid line
     [ -s "$PS_OUT" ] || return 1
     # The match MUST end at a path boundary. A bare substring test lets a
     # SIBLING share the basename prefix (`.../wt-elsewhere` contains
@@ -604,6 +684,7 @@ live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
           if (b != "" && hits(line, b)) { print pid }
         }' "$PS_OUT" 2>/dev/null); do
         case "$SELF_PIDS" in *" $pid "*) continue ;; esac
+        case " $exclude " in *" $pid "*) continue ;; esac
         printf '%s\n' "$pid"
         return 0
     done
@@ -611,6 +692,7 @@ live_process_for() { # <canon> <recorded> -> matching pid ("" when none)
         [ -n "$line" ] || continue
         pid="${line%% *}"
         case "$SELF_PIDS" in *" $pid "*) continue ;; esac
+        case " $exclude " in *" $pid "*) continue ;; esac
         case "$line" in *"/${canon##*/}"*) ;; *) continue ;; esac
         if canonical_token_match "$line" "$canon"; then printf '%s\n' "$pid"; return 0; fi
     done <<<"$(grep -F -- "/${canon##*/}" "$PS_OUT" 2>/dev/null)"
@@ -633,20 +715,32 @@ cwd_probe_load() {
     return 0
 }
 
-live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
-    local canon="$1" recorded="$2" pid="" last=""
+live_cwd_for() { # <canon> <recorded> [<exclude-pids>] -> pid whose cwd is inside ("" when none)
+    # ⛔ THE REAPER'S OWN PROCESS TREE IS **NOT** EXEMPT HERE (#2354). The argv probe skips
+    # SELF_PIDS because its own command line carries the path it is judging — a string it wrote
+    # itself. A CWD is not that: no process can be *made* to sit in a checkout by the reaper's
+    # arguments. Exempting the tree here reproduced a live-lane reap in the field: a lane ran the
+    # reaper from worktree A while its OWN session (the reaper's ancestor) sat in worktree B, so B
+    # was reported `unref=no-proc` and offered for removal while the lane was still using it.
+    # The self-checkout gate above still protects the reaper's OWN directory (decided by path, not
+    # by pid), and it runs FIRST, so dropping the pid filter cannot make a self-reap possible.
+    # `<exclude-pids>` is the #2721 addition and is NOT that filter: it carries only the holders THIS
+    # classification has already DEMOTED as idle shells, so the scan can reach the next holder. It is
+    # per-record and caller-supplied — never the reaper's ancestry — so #2354's rule still holds.
+    local canon="$1" recorded="$2" exclude="${3:-}" pid="" last=""
     [ -s "$CWD_OUT" ] || return 1
     while IFS= read -r line; do
         case "$line" in
             p*) pid="${line#p}" ;;
             n*)
                 last="${line#n}"
+                case " $exclude " in *" $pid "*) continue ;; esac
                 case "$last" in
                     "$canon"|"$canon"/*|"$recorded"|"$recorded"/*)
-                        case "$SELF_PIDS" in *" $pid "*) ;; *) printf '%s\n' "$pid"; return 0 ;; esac ;;
+                        printf '%s\n' "$pid"; return 0 ;;
                     *"/${canon##*/}"*)
                         if canonical_token_match "$last" "$canon"; then
-                            case "$SELF_PIDS" in *" $pid "*) ;; *) printf '%s\n' "$pid"; return 0 ;; esac
+                            printf '%s\n' "$pid"; return 0
                         fi ;;
                 esac ;;
         esac
@@ -654,8 +748,107 @@ live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
     return 1
 }
 
+# ── THE IDLE-SHELL RULE (agent-infra#2721) ─────────────────────────────
+# WHY. `live-process` and `live-cwd` answer "is a process holding this checkout?" — and a shell that
+# `cd`'d in and never exited answers YES for ever. #2721 measured the cost: the reclaim log recorded
+# `KEEP … (a live process has it as cwd)` for nearly every worktree on a wedged cell while 59
+# checkouts at 5-6 GB each accumulated and the box lost its disk. A shell at a prompt is not a lane:
+# the lane's agent is the shell's CHILD, so a shell with no children is a process nobody is using.
+#
+# THE RULE, and it is deliberately narrow:
+#   a cwd / argv holder is LIVE EVIDENCE unless it is a SHELL whose START TIME is before the
+#   worktree's HEAD commit AND which has no child process.
+# "Started before the last commit" is #2721's own phrasing of "never did anything here": a lane
+# between turns still holds its `pi`/test child, so it does not match; a lane that finished and left
+# its `cd` behind does. Every OTHER gate is untouched — dirty / ignored-artifact / open-pr /
+# too-recent / detached-unreachable / remote-only-ref all still PRESERVE — so the blast radius of a
+# wrong reading here is a re-created checkout, never uncommitted or unpushed work (and `clean` +
+# `reachable` are checked before any removal regardless).
+# ⛔ FAIL CLOSED ON EVERY UNKNOWABLE: a pid missing from the ps table, a start time that cannot be
+# read, a HEAD that cannot be dated, or any probe that cannot answer all leave the holder LIVE.
+# ⛔ AND IT IS SWITCHABLE (`REAP_WT_IDLE_SHELL=0`) so an operator can restore the strict reading
+# without editing a shipped script. A demotion is NAMED in the pass log.
+IDLE_SHELL="${REAP_WT_IDLE_SHELL:-1}"
+
+# proc_start_epoch <pid> -> epoch seconds the process started ("" when unreadable).
+# Linux needs no fork: the `/proc/<pid>` DIRECTORY's mtime is set at process creation (measured).
+# Elsewhere `ps -o etimes=` then `ps -o etime=`'s `[[dd-]hh:]mm:ss` form (BSD ps has etime).
+# An unreadable value is "" — never 0, which would compare as "started at the epoch" and make every
+# holder read stale.
+proc_start_epoch() {
+    local pid="${1:-}" v e f1 f2 f3 rest
+    is_pos_int "$pid" || return 1
+    if [ -r "/proc/$pid" ]; then
+        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+        [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+    fi
+    v="$("$PS_BIN" -o etimes= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    case "$v" in ''|*[!0-9]*) v="" ;; esac
+    [ -n "$v" ] && { printf '%s\n' "$(( $(now_epoch) - v ))"; return 0; }
+    e="$("$PS_BIN" -o etime= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    [ -n "$e" ] || return 1
+    case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
+    v=0
+    case "$e" in *-*) v=$(( ${e%%-*} * 86400 )); e="${e#*-}" ;; esac
+    case "$e" in
+        *:*:*) f1="${e%%:*}"; rest="${e#*:}"; f2="${rest%%:*}"; f3="${rest#*:}" ;;
+        *:*)   f1=0; f2="${e%%:*}"; f3="${e#*:}" ;;
+        *)     f1=0; f2=0; f3="$e" ;;
+    esac
+    is_pos_int "$f1" && is_pos_int "$f2" && is_pos_int "$f3" || return 1
+    printf '%s\n' "$(( $(now_epoch) - (v + f1 * 3600 + f2 * 60 + f3) ))"
+}
+
+# is_shell_pid <pid> — the process's COMMAND WORD is a shell (its argv[0], from the ps table).
+is_shell_pid() {
+    local pid="${1:-}" cmd base
+    is_pos_int "$pid" || return 1
+    [ -s "${PS_OUT:-}" ] || return 1
+    cmd="$(awk -v p="$pid" '$1==p { $1=""; $2=""; sub(/^[ \t]+/, ""); print; exit }' "$PS_OUT" 2>/dev/null)"
+    [ -n "$cmd" ] || return 1
+    cmd="${cmd%% *}"
+    base="${cmd##*/}"
+    base="${base#-}"
+    case "$base" in bash|sh|dash|zsh|ksh|ksh93|mksh|ash|fish) return 0 ;; esac
+    return 1
+}
+
+# has_child <pid> — a pid with a live child is DOING something (a prompt has none). The reaper's own
+# process tree is excluded, exactly as every other witness excludes it.
+has_child() {
+    local pid="${1:-}"
+    is_pos_int "$pid" || return 1
+    [ -s "${PS_OUT:-}" ] || return 1
+    awk -v p="$pid" -v self=" ${SELF_PIDS:-} " '
+        $2==p { if (index(self, " " $1 " ") == 0) { found=1; exit } }
+        END { exit !found }' "$PS_OUT" 2>/dev/null
+}
+
+# head_epoch_for <sha> -> epoch of that commit ("" when git cannot date it). Bounded like every other
+# git probe here, and the failure arm is the PRESERVING one.
+head_epoch_for() {
+    local sha="${1:-}" v
+    [ -n "$sha" ] || return 1
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT.ct" "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha" || return 1
+    v="$(head -1 "$GIT_OUT.ct" 2>/dev/null | tr -d ' \t')"
+    is_pos_int "$v" || return 1
+    printf '%s\n' "$v"
+}
+
+# stale_shell_for <pid> <sha> — 0 when this holder is an IDLE SHELL predating the worktree's HEAD.
+stale_shell_for() {
+    local pid="${1:-}" sha="${2:-}" head start
+    [ "$IDLE_SHELL" = 1 ] || return 1
+    is_shell_pid "$pid" || return 1
+    has_child "$pid" && return 1
+    head="$(head_epoch_for "$sha")" || return 1
+    start="$(proc_start_epoch "$pid")" || return 1
+    [ "$start" -lt "$head" ] || return 1
+    return 0
+}
+
 # clean_gate <path> -> "<verdict>\t<payload>"
-# verdict: clean | dirty | ignored-artifact | status-timeout | status-error.
 # For `clean` the payload is the allowlisted-EPHEMERAL entries present (they
 # must be deleted before `git worktree remove`, which refuses on untracked
 # files); otherwise up to 3 offending entries.
@@ -850,6 +1043,7 @@ commits_survive() {
     fi
     if [ "$merged" = 1 ]; then printf 'merged\n'; return 0; fi
 
+
     if [ "$branch" != "-" ]; then
         # A named branch is a survival mechanism ONLY when the ref RESOLVES.
         # `git worktree list --porcelain` keeps emitting `branch refs/heads/X`
@@ -921,6 +1115,27 @@ commits_survive() {
     return 0
 }
 
+# patch_equivalent <sha> — the SQUASH-MERGE evidence (#2354), and ONLY an age-floor signal.
+#
+# ⛔ THIS IS NOT A SURVIVAL PROOF, and must never be returned by commits_survive (review of
+# #2354). `git cherry <main> <sha>` answers "does an equal patch-id appear in main's HISTORY",
+# which is neither reachability nor present state: measured on a fixture where the squash was
+# later REVERTED, `git cherry` still prints `-` while `main` no longer contains the change; and
+# patch-id is whitespace-insensitive, so a branch adding `x = 1` matches main's `x  =  1`. A
+# detached head on no ref would then be "survives" and be removed, orphaning the commit — the
+# exact P0 `detached-unreachable` exists to prevent. Reachability stays with commits_survive
+# (ancestor, or a refs/heads/* holder); this predicate only shortens the AGE floor, where the
+# branch ref already proves the commit cannot be orphaned.
+patch_equivalent() { # <sha> -> 0 when every commit it adds has a patch-id twin on MAIN_REF
+    local sha="$1"
+    [ -n "$MAIN_REF" ] && [ -n "$sha" ] || return 1
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" cherry "$MAIN_REF" "$sha" || return 1
+    # An EMPTY range is not this class (the head is an ancestor of MAIN_REF).
+    [ -s "$GIT_OUT" ] || return 1
+    ! grep -q '^+' "$GIT_OUT"
+}
+
 # ── classification ─────────────────────────────────────────────────────
 # classify_one <path> <sha> <branch> <flags> <now>
 # Emits one row: "<verdict>\t<reason>\t<ephemeral>\t<detail>" (ephemeral is
@@ -979,12 +1194,37 @@ classify_one() {
         return 0
     fi
 
-    if detail="$(live_process_for "$canon" "$path")"; then
+    # ── THE HOLDERS, EXAMINED ONE BY ONE (agent-infra#2721) ────────────────────────────────────
+    # ⛔ EVERY holder is examined, not just the first, and that is load-bearing: a worktree routinely
+    # holds an idle shell left over from an earlier lane AND a live lane's own process, so taking the
+    # first hit decides the whole checkout from whichever pid the probe happened to list first
+    # (reproduced while writing this: one stale shell masked a busy lane's shell, and the rule then
+    # demoted the wrong way). A holder that IS an idle shell predating HEAD is NAMED in the log and
+    # the scan moves to the next one; the other gates (clean/reachable/open-pr/age) still decide.
+    local _stale="" _seen=""
+    while detail="$(live_process_for "$canon" "$path" "$_seen")"; do
+        _seen="$_seen $detail"
+        if stale_shell_for "$detail" "$sha"; then
+            _stale="$_stale pid=$detail(argv)"
+            log "STALE-SHELL pid=$detail (argv) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
         printf 'preserve\tlive-process\t\tpid %s holds the path\n' "$detail"; return 0
-    fi
-    if detail="$(live_cwd_for "$canon" "$path")"; then
+    done
+    _seen=""
+    while detail="$(live_cwd_for "$canon" "$path" "$_seen")"; do
+        _seen="$_seen $detail"
+        if stale_shell_for "$detail" "$sha"; then
+            _stale="$_stale pid=$detail(cwd)"
+            log "STALE-SHELL pid=$detail (cwd) — an idle shell predating HEAD is not a live lane (#2721)"
+            continue
+        fi
         printf 'preserve\tlive-cwd\t\tpid %s has cwd inside the path\n' "$detail"; return 0
-    fi
+    done
+    # A demoted holder is carried into the row, so a reader can see WHY a checkout that looked live
+    # was reclaimed — and can tell a genuine idle-shell demotion from a lane that was still working.
+    local stale_txt=""
+    [ -n "$_stale" ] && stale_txt="stale-shell:$_stale"
 
     crumb="$(clean_gate "$path")"
     cverdict="${crumb%%$'\t'*}"
@@ -1027,19 +1267,38 @@ classify_one() {
     case "$head_ts" in
         ''|*[!0-9]*) printf 'preserve\tunreadable-head\t\tcannot date HEAD %s\n' "${sha:-?}"; return 0 ;;
     esac
-    # The age floor is a proxy for "work may still be in progress". A MERGED head is
-    # the proof it is not (the branch landed and the tree is clean), so it is exempt
-    # unless an operator pins the blanket floor. Every other refs class keeps the floor.
+    # The age floor is a proxy for "work may still be in progress". A MERGED or
+    # PATCH-EQUIVALENT head is the proof it is not (the change is on main and the
+    # tree is clean), so both are exempt unless an operator pins the blanket floor.
+    # A lane SCRATCH checkout (`wt-*` / `cell-wt-*`) takes its own, shorter floor:
+    # it is a throwaway dir, not a named branch awaiting review (#2354).
     local age_floor="$REAP_WT_AGED_DAYS"
-    [ "$refs" = "merged" ] && age_floor="$REAP_WT_MERGED_AGE_DAYS"
+    case "$refs" in
+        merged) age_floor="$REAP_WT_MERGED_AGE_DAYS" ;;
+        *)
+            # A landed-but-squashed head: the change is on main, so the review floor has nothing
+            # left to protect — same treatment as `merged`, decided by evidence, not by ancestry.
+            if patch_equivalent "$sha"; then
+                age_floor="$REAP_WT_MERGED_AGE_DAYS"
+                log "CLASSIFY patch-equivalent $path head=$sha"
+            fi ;;
+    esac
+    if [ "$REAP_WT_SCRATCH_AGE_DAYS" -lt "$age_floor" ] && is_scratch_path "$path"; then
+        age_floor="$REAP_WT_SCRATCH_AGE_DAYS"
+    fi
     if [ "$((now - head_ts))" -le "$((age_floor * 86400))" ]; then
-        printf 'preserve\ttoo-recent\t\tHEAD age %sd ≤ %sd\n' "$(((now - head_ts) / 86400))" "$age_floor"
+        printf 'preserve\ttoo-recent\t\tHEAD age %sd ≤ %sd (%s)\n' "$(((now - head_ts) / 86400))" "$age_floor" "$refs"
         return 0
     fi
     [ "$refs" = "merged" ] && log "CLASSIFY merged-age-floor $path head_age=$(((now - head_ts) / 86400))d merged_floor=${age_floor}d"
 
-    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=no-proc,no-pr\n' \
-        "$eph" "$refs" "$(((now - head_ts) / 86400))"
+    # `unref=` names WHICH witnesses were consulted and what they said, so the row is readable on its
+    # own: `no-proc` means the ps/lsof probes found nobody; `stale-shell:<pids>` means they found only
+    # shells sitting at a prompt since before HEAD (#2721). Without that, a reader cannot tell a
+    # genuinely dead checkout from one whose holder was demoted by a rule they would want to check.
+    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=%s\n' \
+        "$eph" "$refs" "$(((now - head_ts) / 86400))" \
+        "${stale_txt:-no-proc,no-pr}"
     return 0
 }
 
@@ -1199,7 +1458,9 @@ run() {
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_GIT_TIMEOUT:"$REAP_WT_GIT_TIMEOUT" \
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_BUDGET_SECONDS:"$REAP_WT_BUDGET_SECONDS" \
              REAP_WT_LOCK_STALE_SECONDS:"$REAP_WT_LOCK_STALE_SECONDS" REAP_WT_PR_LIMIT:"$REAP_WT_PR_LIMIT" \
-             REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS"; do
+             REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS" \
+             REAP_WT_MERGED_AGE_DAYS:"$REAP_WT_MERGED_AGE_DAYS" \
+             REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
@@ -1285,8 +1546,10 @@ run() {
             echo "SKIPPED-REPO: skipped=${REPO_CANON:-$REPO} reason=${PR_SKIP_REASON:-unknown}" >&2
             echo "   ${PR_SKIP_REMEDY:-set REAP_WT_REPO_SLUG, or replace the origin remote with a GitHub URL}" >&2
             echo "   NOTHING in this repo was touched: a checkout whose PR state is unknown is never removed (the other repos in the pass are unaffected)" >&2
+            echo "   (#2354: the scheduled pass must use the REAL gh — a wedged interactive shim is a" >&2
+            echo "   deployment defect, not a reason to skip the veto; nothing is removed)" >&2
             log "FAIL-CLOSED abort: open-PR gate unverifiable for ${REPO_CANON:-$REPO} (reason=${PR_SKIP_REASON:-unknown}) with candidates (exit 3)"
-            print_footer "$now"
+        print_footer "$now"
             exit 3
         fi
     else
