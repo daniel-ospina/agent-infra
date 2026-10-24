@@ -1506,18 +1506,22 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      if A's writer silently failed (the vacuity this block exists to close).
 #      424520-424523 is verified unused by every other vector in this file.
 #  (2) The env-prefix assignments: `VAR=val func` is NOT a leak — a prefix
-#      assignment before a FUNCTION call is restored when the call returns
-#      (measured on bash 5.2.21: previously-unset comes back unset, previously-set
-#      at its old value; a PLAIN assignment inside the callee is discarded either
-#      way). The one exception is narrow and measured: a callee that `export`s the
-#      variable while it was previously UNSET leaves that value behind
-#      (`h(){ export W=inside; }; W=p h` → W=inside; with W pre-set it comes back
-#      at its old value). Special builtins keep the value only under
-#      `set -o posix`, which this suite does not use. The exception is exactly why
-#      every runner here does its `export`s INSIDE its own `( … )` subshell:
-#      nothing a runner exports can escape the call (measured: after a
-#      `run_record_diff_with` the four variables come back unset, or at their
-#      pre-set value).
+#      assignment before a FUNCTION call is restored when the call returns, and a
+#      PLAIN assignment inside the callee is discarded too (measured on bash
+#      5.2.21: `g(){ W=inside; }; W=pre; W=pfx g` → W=pre; prev-unset → unset;
+#      `k(){ :; }` → restored either way). What DEFEATS the restore is the callee
+#      EXPORTING that variable, whatever its previous value:
+#      `h(){ export W=inside; }; W=pre; W=pfx h` → W=inside (prev-unset → inside
+#      too), and even a bare `export W` leaves the TEMPORARY value behind
+#      (`j(){ export W; }; W=pre; W=pfx j` → W=pfx). Special builtins keep the
+#      value only under `set -o posix`, which this suite does not use.
+#      That export case is exactly why every runner here does its `export`s
+#      INSIDE its own `( … )` subshell: nothing a runner exports can escape the
+#      call (measured: after a `run_record_diff_with` the four variables come back
+#      unset, or at their pre-set value). NOTE: an earlier revision of this note
+#      restricted the exception to the previously-UNSET case — a probe with the
+#      callee exporting a DIFFERENT variable appeared to confirm it. That was a
+#      buggy probe; the sentence you are reading is the measured one.
 #      The carriers that survive a call are the TOP-LEVEL exports: `export
 #      STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9 / §8.9a / §8.9b / §8.14 /
 #      §8.15 (the five blocks that install a per-issue label map). Each unsets its
