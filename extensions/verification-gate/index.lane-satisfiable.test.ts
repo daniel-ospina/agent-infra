@@ -30,6 +30,15 @@
  *   M5 make bridge recovery store the supplied digest        → the bridge-recovery test (the commit's
  *      verbatim instead of the gate's sha256                    pendingRehash would mask it, so that
  *                                                              test observes the bridge WITHOUT one)
+ *   M6 un-widen the heredoc detector (`<<\EOF`)            → the split unit test
+ *   M7 drop the `$'…'` ANSI-C state                          → the split unit test
+ *
+ * NOT mutation-pinned, and stated rather than implied: bridge recovery now answers "matched?" and
+ * "what to store?" from ONE read (`matchAndStoredDigest`, shared with the merge path) instead of
+ * `hashMatchesDisk` then `storedDigestFor`. That closes a RACE WINDOW — a writer landing between
+ * the two reads — which no test can observe deterministically, so a green run says nothing about
+ * it. It failed closed before and it fails closed now; what changed is that the invariant
+ * `storedDigestFor`'s comment claims is a property of the code rather than of one call site.
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and
  * audit log are HOME-derived), and every repo is a throwaway temp checkout.
@@ -343,6 +352,27 @@ test("unit: splitMutationFromCommit splits at the commit arm, and is null withou
   const afterQuote = mod.splitMutationFromCommit("git add a.txt && git commit -m 'a && b'");
   equal(afterQuote?.mutation, "git add a.txt", "control: a quote AFTER the cut point does not disturb the split");
   equal(afterQuote?.commit, "git commit -m 'a && b'", "control: the commit arm keeps its quoted argument verbatim");
+
+  // ⛔ `$'…'` IS ANSI-C QUOTING — `\'` is ESCAPED there (fresh review round 6, P2). The scan closed
+  // the single-quote state at `\'`, believed it was outside a quote, and cut inside a MENTION:
+  // arm 1 = `printf $'x\'` (bash: "unexpected EOF while looking for matching '"), arm 2 = the rest
+  // of the quoted string plus the real commit. A remedy that cannot run is worse than none.
+  equal(
+    mod.splitMutationFromCommit(String.raw`printf $'x\' && git commit -m y' > m.txt && git add m.txt && git commit -F m.txt`),
+    null,
+    "ANSI-C quoting hides the invocation the same way a plain quote does"
+  );
+  // Control: `$'…'` CLOSED before the commit arm is not a mention, so the split still stands.
+  const afterAnsiC = mod.splitMutationFromCommit(String.raw`printf $'a\'b' > m.txt && git add m.txt && git commit -F m.txt`);
+  equal(afterAnsiC?.mutation, String.raw`printf $'a\'b' > m.txt && git add m.txt`,
+    "control: ANSI-C quoting BEFORE the cut point is preserved and does not close the split");
+
+  // ⛔ `<<\EOF` IS A HEREDOC (fresh review round 6, P2). `['"]?\w` did not match the standard
+  // no-expansion spelling, so a body line containing `git commit` was cut as if it were a command:
+  // arm 1 truncated the heredoc and arm 2 started with the rest of the BODY, i.e. the printed
+  // remedy committed the wrong message.
+  equal(mod.splitMutationFromCommit("cat <<\\EOF > m.txt\nx &&\ngit commit -m y\nEOF\ngit commit -F m.txt"),
+    null, "a backslash-quoted heredoc delimiter is still a heredoc");
 });
 
 // ── runner ────────────────────────────────────────────

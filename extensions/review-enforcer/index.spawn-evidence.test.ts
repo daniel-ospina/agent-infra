@@ -22,9 +22,14 @@
  * `pushd`, attached short-flag values, `fetch -u` — each was a live accept). The path is open
  * only for the op AT THE COMMAND POSITION — `git push origin <this-branch>`, `git push origin HEAD`
  * (HEAD is exactly the commit the record is bound to), or a plain `gh pr create` with no head
- * override — and only when the push's remote is the one the repo slug is read from (`origin`).
- * Anything containing `'"`\$(){}<>|&;`, a backslash or a newline falls back to the ordinary
- * ≥1-dispatch floor. A lane that wants the record path runs the push as its own command.
+ * override — only when the push's remote is the one the repo slug is read from (`origin`), and only
+ * with NO FLAGS (`-f`, `-d`, `-u`, `-o …` all fall back: a flag changes what the op DOES without
+ * moving a positional, and round 5's filter-the-flags-away parse accepted `git push origin main -d`,
+ * i.e. a remote-branch DELETE authorized by a record of HEAD). Anything containing
+ * `'"`\$(){}<>|&;`, a backslash, a newline, or a pathname-expansion character (`*?[]~!`) falls back
+ * to the ordinary ≥1-dispatch floor: an expansion means the TOKENS ARE NOT THE ARGV, which is the
+ * only premise a positional read has. A lane that wants the record path runs the push as its own
+ * command.
  *
  * WHAT IS STILL REFUSED (each pinned below):
  *   • no record at all                        → block + the durable `no_reviewers_dispatch` row
@@ -69,6 +74,17 @@
  *   M12 anchor `isPush`/`isPrCreate` back to free text             → §REFUSE-command-position
  *   M13 drop the `words[0] !== ORIGIN_REMOTE` binding              → §REFUSE-non-origin-remote
  *   M14 refuse `HEAD` again (`words[1] !== branch` only)           → §ALLOW — git push origin HEAD
+ *   M15 drop the push-flag refusal (back to FILTERING `-` tokens) → §REFUSE-push-flag. This is the
+ *                                                                  round-5 shape: filtering kept the
+ *                                                                  positionals intact, so `git push
+ *                                                                  origin main -d` (== --delete)
+ *                                                                  DELETED the remote branch from a
+ *                                                                  record bound to HEAD.
+ *   M16 remove `[*?[\]~!]` from `evidenceCommandIsPlain`            → §REFUSE-pathname-expansion
+ *                                                                  (`git push origin main -*`; with a
+ *                                                                  file named `--tags` in the cwd bash
+ *                                                                  expands the flag slot to it and the
+ *                                                                  push ships every tag)
  *
  * NOT mutation targets — `evidenceCommandIsPlain` closes these BEFORE the named arm can run, so a
  * green run says nothing about the arm. The list is EXHAUSTIVE, because an earlier revision said
@@ -423,6 +439,56 @@ async function main() {
     equal(mod.commandMovesRefs("git fetch . refs/heads/side:refs/heads/main"), true,
       "a fully-qualified refs/heads destination is a ref write");
     equal(mod.commandMovesRefs("git fetch origin"), false, "a plain fetch is not ref-moving");
+  });
+
+  test("§REFUSE — a push FLAG is not the accepted shape, even when the positionals look right", async () => {
+    // ⛔ Fresh review round 6 (P1). Round 5 DROPPED every `-`-prefixed token and then required
+    // exactly `<remote> <ref>` — so the SHORT spellings of the flags the long-form guard refuses
+    // walked in. Measured at the previous head: `git push origin main -d` was ACCEPTED, and git
+    // really acts on it (`! [remote rejected] main (deletion of the current branch prohibited)` on
+    // a protected branch — i.e. it IS a refs/heads delete, and it succeeds on any PR branch).
+    for (const cmd of [
+      "git push origin main -d",
+      "git push -d origin main",
+      "git push origin main -f",
+      "git push -u origin main",
+      "git push --force-with-lease origin main",
+      "git push -o ci.skip origin main",
+      "git push origin main --tags",
+      "git push origin main --delete",
+    ]) {
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null,
+        `a flag can change WHAT the op does without moving a positional: ${cmd}`);
+    }
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git push origin main -d" } }, { cwd: repoDir() });
+    ok(res?.block === true, "a remote-branch DELETE must fall back to the ≥1-dispatch floor");
+    ok(mod.resolveShippedHeads("git push origin main", { cwd: repoDir() }) !== null,
+      "control: the bare shape is still accepted");
+    ok(mod.resolveShippedHeads("git push origin HEAD", { cwd: repoDir() }) !== null,
+      "control: …and so is the bare HEAD form");
+  });
+
+  test("§REFUSE — PATHNAME EXPANSION closes the evidence path: the tokens are then not the argv", async () => {
+    // ⛔ Fresh review round 6 (P1). The whitelist rejected quotes, escapes, substitutions and
+    // operators but not `*?[]~`, so `git push origin main -*` was ACCEPTED — and in a checkout
+    // holding a file named `--tags`, bash expands that flag slot to it, so the push shipped every
+    // tag: the exact long form the guard at the top of the resolver refuses. Measured with real
+    // git: `* [new tag] unreviewed-tag -> unreviewed-tag` alongside the branch.
+    for (const cmd of [
+      "git push origin main -*",
+      "git push origin main ?",
+      "git push origin ma[n]",
+      "git push origin ~",
+      "git push origin main !",
+    ]) {
+      equal(mod.evidenceCommandIsPlain(cmd), false, `expansion characters must close the path: ${cmd}`);
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null, `…and the resolver must refuse: ${cmd}`);
+    }
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git push origin main -*" } }, { cwd: repoDir() });
+    ok(res?.block === true, "a glob in the flag slot must fall back to the ≥1-dispatch floor");
+    // Controls: a refname cannot contain any of these, so nothing legitimate is lost.
+    equal(mod.evidenceCommandIsPlain("git push origin main"), true);
+    equal(mod.evidenceCommandIsPlain("gh pr create --title x --body-file body.md"), true);
   });
 
   test("§unit — headBoundReviewEvidence: exact head, repo-scoped, ambiguity is not evidence", async () => {

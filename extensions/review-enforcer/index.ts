@@ -2748,6 +2748,15 @@ export function evidenceCommandIsPlain(command: string): boolean {
   if (/['"`\\$(){}<>|&;\n\r]/.test(command)) return false;
   // A trailing/bare backslash would be an escape even without a following metacharacter.
   if (/\\/.test(command)) return false;
+  // ⛔ PATHNAME EXPANSION IS ALSO "THE SHELL CHANGES THE TOKENS" (fresh review round 6, P1).
+  // `*`, `?`, `[...]` and `~` are expanded BEFORE the command runs, so a command containing one
+  // is NOT "its tokens are the argv" — which is the only reason a positional read is valid here.
+  // Measured: `git push origin main -*` was ACCEPTED at the previous head, and in a checkout
+  // containing a file named `--tags` bash expands the flag slot to it, so the dropped token
+  // became `--tags` and the push shipped every tag — the exact long form the guard at the top of
+  // `resolveShippedHeads` refuses. No legitimate accepted shape contains any of these: git forbids
+  // `*`, `?`, `[` and `~` in a refname, and `!` is history expansion in an interactive shell.
+  if (/[*?[\]~!]/.test(command)) return false;
   return true;
 }
 
@@ -2842,9 +2851,18 @@ export function resolveShippedHeads(
   if (branch === "" || branch === "HEAD") return null; // detached: no named branch to reason about
 
   if (isPush) {
-    // `git push <flags> <remote> <ref>` — the argv is positional now, so there is no text to slice.
+    // `git push <remote> <ref>` — and NOTHING ELSE. The argv is positional now, so there is no
+    // text to slice and also no flag to reason about.
     const tail = argv.slice(2);
-    const words = tail.filter((w) => !w.startsWith("-"));
+    // ⛔ NO FLAGS AT ALL (fresh review round 6, P1). Round 5 DROPPED every `-`-prefixed token and
+    // then required exactly `<remote> <ref>`, which left the short forms of the flags the long-form
+    // guard refuses: `git push origin main -d` (== `--delete`) was ACCEPTED and DELETES the remote
+    // branch, and `git push --force-with-lease origin main` / `-f` / `-u` were accepted the same
+    // way. A flag can change WHAT the op does without changing its positionals, so this arm accepts
+    // the bare shape only. The cost is a false block on `git push -u origin <b>`: that falls back to
+    // the ≥1-dispatch floor, which is always available and is what the printed remedy already names.
+    if (tail.some((w) => w.startsWith("-"))) return null;
+    const words = tail;
     // ⛔ EXACTLY `<remote> <ref>` (fresh review, P2). A bare `git push` / `git push origin`
     // ships whatever `push.default` or `remote.<remote>.push` selects — possibly refs that are not
     // HEAD — while the record is bound to HEAD.
@@ -5182,7 +5200,7 @@ const BLOCK_MESSAGE = [
   "   → A spawned reviewer PROCESS counts too — FOR THESE EXACT SHAPES ONLY. A review record bound",
   "     to this op's current HEAD (`review-pr.sh <PR>`, or record one with the command below)",
   "     satisfies this floor when the refused command is one of:",
-  "        git push origin <this-branch>",
+  "        git push origin <this-branch>          (NO flags — `-f`, `-d`, `-u`, `-o …` fall back)",
   "        git push origin HEAD",
   "        gh pr create …            (no -H/--head, and no --repo pointing at another repo)",
   "     Any shell syntax closes that path — a pipe, `&&`, a quote, a redirect, `$VAR`, `cd … &&`,",
@@ -5316,7 +5334,7 @@ export const MICRO_BLOCK_MESSAGE = [
   // #2349: same disclosure as the generic message, corrected post-#2287: the floor DOES consult a
   // head-bound record before it refuses, so "reads NO review record" was no longer true.
   "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
-  "     head for this repo on this box, or the command carried shell syntax) — and the reviewer",
+  "     head for this repo on this box, or the command carried shell syntax or a flag) — and the reviewer",
   "     DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE, so a record on",
   "     another box is invisible here. What unlocks this floor is a dispatch NOW.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
