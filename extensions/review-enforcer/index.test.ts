@@ -7926,6 +7926,70 @@ test("#1382 (h): an arithmetic shift is not a heredoc opener", () => {
     "a numeric shift operand does not open a body, so the real push still fires the notice");
 });
 
+// ── cycle-10 fresh review: two measured fail-opens, both REGRESSIONS ─────────────────────
+// Each was measured EXECUTED (a recording `gh` first on PATH received `pr merge 999 --admin`)
+// while `maskHeredocData` blanked the line, and origin/main's gate saw the same text. They are
+// regressions rather than pre-existing holes because this change put `maskHeredocData` UPSTREAM of
+// `isGitOp`: before it, masking only decided how a command was CLASSIFIED; now a masked-out merge
+// does not reach the gate at all, so any masking imperfection DISARMS the gate.
+test("#1382 (i): a KEYWORD compound carries a body to a runner (if/for/while/case)", () => {
+  // The cycle-9 fix counted `(`/`{` depth, so `if … fi`, `for|while|until|select … done` and
+  // `case … esac` were invisible. The `:` line is what beat the old 2-line forward window: it sits
+  // between the terminator and the pipe, so neither the frame nor the forward scan saw the runner.
+  const MERGE = "gh pr merge 999 --admin";
+  const executed: ReadonlyArray<readonly [string, string]> = [
+    ["if/fi + pipe", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["if/fi + store", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["for/done + pipe", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["while/done + pipe", `while true; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["until/done + pipe", `until false; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["case/esac + pipe", `case x in\nx)\ncat <<'EOF'\n${MERGE}\nEOF\n:\n;;\nesac | bash`],
+    ["nested if+for + pipe", `if true; then\nfor x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone\nfi | bash`],
+    ["for/done + store then bash", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone > /tmp/p.sh\nbash /tmp/p.sh`],
+  ];
+  for (const [label, command] of executed) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: a keyword frame carries the body to a runner, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge, not merely a git op`);
+  }
+  // The stack must not turn a `case` ARM terminator into a closed `(`: the arm `x)` in the
+  // `case/esac` case above ends in `)`, and that body is still detected — so the arm terminator
+  // provably does not cancel the `case` frame. (Asserted BEHAVIOURALLY there rather than against
+  // `openConstructDepth`, which is private to the module.)
+  // …and a construct that CLOSES before the opener line stays DATA, the same rule as `{ … }`.
+  ok(!isGitOp(maskHeredocData(`if true; then\ntrue\nfi\ncat <<'EOF'\n${MERGE}\nEOF`)),
+    "an `if` closed before the opener line is not an enclosing construct");
+});
+
+test("#1382 (j): an ESCAPED $( or backtick is not a live substitution", () => {
+  // The substitution scan ignored backslash parity and never checked that the substitution was
+  // still OPEN at the opener, so a quoted `<<WORD` MENTION became a real opener and blanked the
+  // real merge between it and a later line that happened to be the delimiter.
+  const MERGE = "gh pr merge 999 --admin";
+  const executed: ReadonlyArray<readonly [string, string]> = [
+    ["escaped $()", `echo "\\$(cat <<true"\n${MERGE}\ntrue`],
+    ["escaped backtick", `echo "\\\`cat <<:"\n${MERGE}\n:`],
+    ["escaped $( with a body-like word", `echo "\\$(cat <<EOF"\n${MERGE}\nEOF`],
+  ];
+  for (const [label, command] of executed) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: an escaped substitution is TEXT, so the merge stays VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it still classifies as an admin merge`);
+  }
+  // A substitution that already CLOSED on the opener line puts the opener back in quoted text.
+  ok(isGitOp(maskHeredocData(`echo "$(true) \`<<true\`"\n${MERGE}\ntrue`)),
+    "a closed substitution does not hold the opener open");
+  // The UNESCAPED substitution is still a real redirect — this is the legitimate spelling of
+  // `gh pr create --body "$(cat <<'EOF' … EOF)"`, so its body must stay DATA (not an admin merge)
+  // while the command is still recognised as the git op it is.
+  const viaBody = `gh pr create --body "$(cat <<'EOF'\ngh pr merge 111 --admin\nEOF\n)"`;
+  ok(isGitOp(maskHeredocData(viaBody)), "an unescaped $(cat <<'EOF' is still a real substitution");
+  ok(!isAdminMergeCommand(maskHeredocData(viaBody)),
+    "a merge QUOTED in a --body is stdin data, not an admin merge — the #1382 direction");
+});
+
 // (a3) The SIBLING reader: `stripHeredocBodies` now takes its opener from the same helper, so a
 // MENTION of `<<EOF` cannot delimit a phantom body that swallows a real push — which made the
 // #2148 first-push notice go SILENT, the failure direction that helper's own doc calls the worst.

@@ -473,6 +473,44 @@ function lineIndex(command: string): { starts: number[]; mask: boolean[] } {
   return { starts, mask: unquotedMask(command) };
 }
 
+/** Is the character at `at` escaped by an ODD number of preceding backslashes? */
+export function isEscaped(text: string, at: number): boolean {
+  let backslashes = 0;
+  while (at - 1 - backslashes >= 0 && text[at - 1 - backslashes] === "\\") backslashes++;
+  return backslashes % 2 === 1;
+}
+
+/**
+ * Is the substitution opened at `subStart` (`` ` `` when `subOpenLen` is 1, `$(` when 2) still
+ * unclosed at `at`? Conservative in the SAFE direction: when the balance cannot be decided the
+ * answer is `false` ⇒ the opener is treated as quoted text ⇒ nothing is blanked ⇒ the gate still
+ * sees the command.
+ */
+export function substitutionOpenAt(
+  command: string,
+  subStart: number,
+  subOpenLen: number,
+  at: number,
+): boolean {
+  if (subOpenLen === 1) {
+    for (let k = subStart + 1; k < at; k++) {
+      if (command[k] === "`" && !isEscaped(command, k)) return false;
+    }
+    return true;
+  }
+  let depth = 1;
+  for (let k = subStart + 2; k < at; k++) {
+    if (isEscaped(command, k)) continue;
+    const c = command[k];
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return false;
+    }
+  }
+  return depth > 0;
+}
+
 export interface HeredocOpener {
   /** Index of `<<` WITHIN the opener line. */
   indexInLine: number;
@@ -526,7 +564,19 @@ export function realHeredocOpener(
       regionStart = abs;
       while (regionStart > 0 && mask[regionStart - 1] === false) regionStart--;
       if (command[regionStart] !== '"') continue; // '…' and $'…' carry no substitutions: text
+      // ⛔ AN ESCAPED SUBSTITUTION IS STILL TEXT (cycle-10 review, P0, measured executed). The scan
+      // used to read `\$(` and ``\` `` as LIVE substitutions, turning a quoted `<<WORD` MENTION
+      // into a real opener so the body was blanked while bash ran it — the exact fail-open this
+      // change exists to close, re-arranged. `unquotedMask` records no escape information, so the
+      // backslash parity must be checked HERE. Measured, each executing `gh pr merge 999 --admin`
+      // and each REFUSED by origin/main:
+      //     echo "\$(cat <<true"      ⏎ <body> ⏎ true
+      //     echo "\`cat <<:"         ⏎ <body> ⏎ :
+      // It must ALSO still be OPEN at the opener: a `$()` that already closed on this line puts
+      // the opener back in plain quoted text. Both checks bias toward "mention" (⇒ nothing is
+      // blanked ⇒ the gate still sees the command), never toward a blanked body.
       for (let k = regionStart; k < abs; k++) {
+        if (isEscaped(command, k)) continue;
         if (command[k] === "`") {
           subStart = k;
           subOpenLen = 1;
@@ -539,6 +589,7 @@ export function realHeredocOpener(
         }
       }
       if (subStart === -1) continue; // quoted text with no substitution: a mention
+      if (!substitutionOpenAt(command, subStart, subOpenLen, abs)) continue; // already closed: text
     }
     if (!quoted) {
       // An unquoted `#` that starts a word begins a comment; anything after it is prose.
@@ -652,14 +703,108 @@ function readsProgramFromStdin(consumerText: string): boolean {
  */
 function openConstructDepth(command: string, offset: number): number {
   const mask = unquotedMask(command);
-  let depth = 0;
-  for (let i = 0; i < offset; i++) {
-    if (mask[i] !== true) continue; // quoted: not shell syntax
+  const frames = shellFrameStack(command, offset, mask);
+  return frames.length;
+}
+
+/** A construct the shell has opened and not yet closed, before the heredoc opener. */
+type ShellFrame = "paren" | "brace" | "if" | "loop" | "case";
+
+const KEYWORD_FRAME: Record<string, ShellFrame> = {
+  if: "if",
+  for: "loop",
+  while: "loop",
+  until: "loop",
+  select: "loop",
+  case: "case",
+};
+
+const KEYWORD_CLOSES: Record<string, ShellFrame> = {
+  fi: "if",
+  done: "loop",
+  esac: "case",
+};
+
+/** Characters that end a shell WORD — everything else accumulates into one word. */
+const SHELL_WORD_STOP = /[\s;&|(){}<>`"'\\]/;
+
+/**
+ * The stack of constructs OPEN, unclosed, at `offset`. Non-empty ⇒ the heredoc's consumer is not
+ * visible at that offset.
+ *
+ * ⛔ KEYWORD COMPOUNDS WERE INVISIBLE (cycle-10 review, P0, measured executed). This counted only
+ * `(`/`{`, so bash's KEYWORD frames — `if … fi`, `for|while|until|select … done`, `case … esac` —
+ * contributed nothing. A body then piped or stored by a keyword compound was blanked as DATA while
+ * bash ran it, and `origin/main` refused the identical text — a REGRESSION, not a pre-existing
+ * hole, because this change made `maskHeredocData` upstream of `isGitOp`, so a masked-out merge no
+ * longer even reaches the gate. Measured, each executing `gh pr merge 999 --admin`:
+ *     if true; then ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ : ⏎ fi | bash
+ *     for x in 1; do ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ : ⏎ done > /tmp/p.sh ⏎ bash /tmp/p.sh
+ * The `:` line is what beat the old 2-line forward window, so the frame itself must be the signal.
+ *
+ * A STACK, not a count: a `case` ARM ends with `)` (`case x in a) …`), which a bare counter reads as
+ * closing a `(`, and `}` must not pop an `if`. A closer pops the nearest matching frame and is
+ * ignored when no such frame is open, so an unbalanced closer can never HIDE an open construct —
+ * the sign of the error stays on the fail-closed side.
+ */
+function shellFrameStack(command: string, offset: number, mask: boolean[]): ShellFrame[] {
+  const frames: ShellFrame[] = [];
+  const popNearest = (kind: ShellFrame): void => {
+    for (let k = frames.length - 1; k >= 0; k--) {
+      if (frames[k] === kind) {
+        frames.length = k; // everything opened after it is closed with it
+        return;
+      }
+    }
+  };
+  let i = 0;
+  while (i < offset) {
+    if (mask[i] !== true) {
+      i++; // quoted: not shell syntax
+      continue;
+    }
     const c = command[i];
-    if (c === "(" || c === "{") depth++;
-    else if (c === ")" || c === "}") depth--;
+    if (c === "(") {
+      frames.push("paren");
+      i++;
+      continue;
+    }
+    if (c === "{") {
+      frames.push("brace");
+      i++;
+      continue;
+    }
+    if (c === ")") {
+      // A `)` that closes a `case` arm is an arm terminator, NOT a closed `(`.
+      if (frames[frames.length - 1] === "case") {
+        i++;
+        continue;
+      }
+      popNearest("paren");
+      i++;
+      continue;
+    }
+    if (c === "}") {
+      popNearest("brace");
+      i++;
+      continue;
+    }
+    if (SHELL_WORD_STOP.test(c)) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < offset && mask[j] === true && !SHELL_WORD_STOP.test(command[j])) j++;
+    const word = command.slice(i, j);
+    const opens = KEYWORD_FRAME[word];
+    if (opens !== undefined) frames.push(opens);
+    else {
+      const closes = KEYWORD_CLOSES[word];
+      if (closes !== undefined) popNearest(closes);
+    }
+    i = j;
   }
-  return depth;
+  return frames;
 }
 
 /**
