@@ -294,8 +294,13 @@ def _state_file(repo: str) -> str:
     false IDLE this whole job exists to remove. `STATE` is the module's snapshot of this for the repo
     the process was pointed at; the function is the call-time form for anything that moves
     `STATE_DIR` or grades a second repo.
+
+    ⛔ AND THE TAG ITSELF HAS ONE HOME (`repo_tag`, defined below -- resolved at CALL time like every
+    other name this function touches): the collision guard (`set_tag_collisions`) proves two repos
+    cannot share a register by comparing exactly the spelling produced here, so a second
+    `.replace("/", "-")` in this function is how the guard and the file name come to disagree.
     """
-    return os.path.join(STATE_DIR, "pr-doctor-%s.json" % repo.replace("/", "-"))
+    return os.path.join(STATE_DIR, "pr-doctor-%s.json" % repo_tag(repo))
 
 
 def _bind_register(slug: str) -> str:
@@ -704,7 +709,7 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
         # question ("which repo's rows am I printing/streaming") and the canonical pair is what the
         # fleet's bash readers open by name for the machine-wide verdict. Renaming them to the
         # register's spelling would change two reader contracts for a cosmetic consistency.
-        tag = slug.replace("/", "-")
+        tag = repo_tag(slug)
         STATUS = os.path.join(STATE_DIR, "pr-doctor.%s.status.json" % tag)
         LOG = os.path.join(STATE_DIR, "pr-doctor.%s.log" % tag)
         # ⛔ THE LOG'S NAME MOVES THROUGH `LOG_BASENAME`, because `LOG` above is the import-time
@@ -3486,6 +3491,65 @@ def set_rubric_note(entries: list[str]) -> str:
             % (len(slugs), ",".join(sorted(slugs))))
 
 
+def worker_live_for(number) -> object:
+    """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
+
+    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is MODE-QUALIFIED
+    (`prd-<tag>-42` in a set) while the worktree is `prd-42` in BOTH modes, so a single-repo pass and
+    an `--all-repos` pass over the SAME repo can look at one directory while calling it two things.
+    Probing only this mode's name reports a live worker as ABSENT; the pass then adopts that
+    worktree and spawns a second agent into it -- two agents, one git index, one branch. So the
+    question for a PR is asked of every name that resolves to its worktree, and an UNANSWERABLE
+    reading (`None`) wins over a negative one: the safe direction is not to spawn.
+    """
+    names = [worker_name(number)]
+    plain = "prd-%s" % number
+    if plain not in names:
+        names.append(plain)              # the single-repo pass's name for the SAME worktree
+    for nm in names:
+        live = worker_live(nm)
+        if live is None:                  # unanswerable: do not spawn
+            return None
+        if live is not False:             # running under THIS name
+            return True
+    return False
+
+
+def repo_tag(slug: str) -> str:
+    """The one spelling of a repo's file/worker tag (`owner/name` -> `owner-name`).
+
+    ONE HOME for the derivation: `apply_repo`, `--status`, and the collision guard must agree, and
+    three independent `.replace()` calls are how two of them drift apart.
+    """
+    return (slug or "").replace("/", "-")
+
+
+def set_tag_collisions(entries: list[str]) -> str:
+    """Why two repos in a SET cannot be told apart by their state files, or "" when they can.
+
+    ⛔ A LOSSY TAG IS A MIS-ATTRIBUTION, WHICH IS THE DEFECT THIS WHOLE MODE EXISTS TO PREVENT
+    (#2280 review cycle 3, P2). `owner-name` is not injective: `acme/tools-api` and `acme-tools/api`
+    both become `acme-tools-api`, so one repo's cooldown rows consume the other's budget slots, a
+    live `prd-acme-tools-api-42` suppresses the OTHER repo's #42, and `--status --repo acme-tools/api`
+    prints the shared file under its own header. Refusing the set is the only answer that keeps the
+    per-repo records honest without renaming every existing one: the operator grades them in two
+    passes, which #2281 makes the normal shape anyway.
+    """
+    seen = {}
+    for entry in entries or ():
+        slug = _normalize_slug(split_repo_entry(entry)[0])
+        if not slug:
+            continue
+        seen.setdefault(repo_tag(slug).lower(), set()).add(slug.lower())
+    clash = {t: s for t, s in seen.items() if len(s) > 1}
+    if not clash:
+        return ""
+    return ("; ".join("tag %s is shared by %s" % (t, " and ".join(sorted(s)))
+                      for t, s in sorted(clash.items())) +
+            " -- their state files, worker names and cooldowns would be one record. Grade each repo "
+            "in its own pass, or rename one of them (agent-infra#2281 removes this mode).")
+
+
 def dispatch(pr: dict, action: str, text: str, dry: bool,
              rubric_note: str = "") -> tuple[bool, str, bool]:
     """Spawn a background worker for one PR. Returns (launched, detail, record).
@@ -3535,7 +3599,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         if not wt:
             log("DRY-RUN %s would NOT spawn: %s" % (name, werr[:160]))
             return False, werr, False
-        live = worker_live(name)
+        live = worker_live_for(n)
         if live is not False:
             log("DRY-RUN %s would NOT spawn: %s"
                 % (name, "worker still running" if live else "worker liveness unreadable"))
@@ -3551,7 +3615,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
-    live = worker_live(name)
+    # ⛔ BOTH NAMES: the worktree is `prd-<n>` in EVERY mode, so a live worker started by the OTHER
+    # mode owns the same directory (see `worker_live_for()`).
+    live = worker_live_for(n)
     if live:
         return False, "worker %s is still running -- one worker per PR" % name, False
     if live is None:
@@ -4027,6 +4093,12 @@ def run_all_repos(args, explicit) -> int:
         log("REFUSING: %s" % msg)
         return record_exit(EXIT_REFUSING, msg, repo="")
     results, rows = [], []
+    # ⛔ TWO REPOS THAT SHARE A TAG WOULD SHARE ONE RECORD -- refused before anything is read (see
+    # `set_tag_collisions()`); the alternative is one repo's cooldowns deciding the other's budget.
+    clash = set_tag_collisions(entries)
+    if clash:
+        log("REFUSING: %s" % clash)
+        return record_exit(EXIT_REFUSING, clash, repo="")
     # ⛔ COMPUTED ONCE, FROM THE SET, AND PASSED DOWN -- never stored (see `set_rubric_note()`).
     set_note = set_rubric_note(entries)
     if set_note:
@@ -4705,7 +4777,7 @@ def run_pass(args, rubric_note: str = "") -> int:
         # while it is still running; the worker name and the worktree are deterministic, so the
         # second spawn lands on top of the live one and destroys its log/.rc/.pid (see dispatch()).
         # This is checked even with NO state row, because a lost state file is not a dead worker.
-        live = worker_live(worker_name(key))
+        live = worker_live_for(key)
         if live:
             # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
             # nothing to do" is a false clean when the truth is "three PRs already have a worker".

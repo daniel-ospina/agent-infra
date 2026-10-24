@@ -329,6 +329,47 @@ export O="${O:-$HOME/orchestrator}"
 # needed, but never omit this one silently.
 export PATH="/Users/danielospina/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/danielospina/.pi/agent/bin:/Users/danielospina/.pi/agent/shims:/Users/danielospina/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
+
+# ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).
+# The PR-DOCTOR step below launches `pr-doctor.py` with NO ARGUMENTS (deliberately — that pin is
+# what stops an argument turning the pass into a no-op, see test_dispatch_wiring.py), so the child's
+# only repo evidence is what it inherits from HERE. It inherits nothing: this block pins HOME, O and
+# PATH and nothing else, and launchd gives the job no PATH at all — measured. And pr-doctor no longer
+# has a module-level default repo: it resolves its target from evidence (`--repo` > `OR` > `REPO`'s
+# git origin > cwd's origin) and REFUSES (exit 2) when none answers. Unpinned, the beat's only
+# dispatch entry point would therefore refuse on every pass — the same "armed but dispatching
+# nothing, for ever" failure the #2280 change fixed in the launchd template, one launcher over.
+#
+# The box's own declared target is the orchestrator plist `install.sh` renders (`OR` = slug,
+# `REPO` = the checkout whose `origin` proves it). It is EVIDENCE, not a default: it is the
+# per-box declaration the controller itself runs on, it is read only when the variable is unset
+# (an operator pin, or a supervisor-launched cell that already exported OR/REPO, still wins), and
+# when the plist is absent or names nothing this function prints nothing — the pass then refuses
+# LOUDLY, naming every source it looked at, instead of grading a repo nobody named.
+_beat_repo_evidence() {
+  local plist="$1/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  [ -f "$plist" ] || return 0
+  # ONE PHYSICAL LINE on purpose (beyond the usual reason): the wiring tests walk this file's
+  # executable lines as SHELL, and a python line artfully shaped like `for k in (...)` reads to
+  # that walker as an unclosed shell `for` — which moved the launch's enclosing constructs and
+  # reddened three unrelated reachability pins. `|| return 0` covers an unreadable/corrupt plist.
+  /usr/bin/python3 -c 'import plistlib,sys;e=(plistlib.load(open(sys.argv[1],"rb")).get("EnvironmentVariables") or {});print("\n".join(["%s=%s"%(k,(e.get(k) or "").strip()) for k in ("OR","REPO") if (e.get(k) or "").strip()]))' "$plist" 2>/dev/null || return 0
+}
+
+# The wiring the child depends on, split from the reader so each is testable on its own: fill OR and
+# REPO from the box's declaration ONLY when they are not already set (an operator pin, or a
+# supervisor-launched cell that already exported them, still wins).
+_beat_pin_repo_evidence() {
+  if [ -z "${OR:-}" ] || [ -z "${REPO:-}" ]; then
+    local _ev _or _repo
+    _ev="$(_beat_repo_evidence "$HOME" 2>/dev/null || true)"
+    _or="$(printf '%s\n' "$_ev" | sed -n 's/^OR=//p' | head -1)"
+    _repo="$(printf '%s\n' "$_ev" | sed -n 's/^REPO=//p' | head -1)"
+    if [ -z "${OR:-}" ] && [ -n "$_or" ]; then export OR="$_or"; fi
+    if [ -z "${REPO:-}" ] && [ -n "$_repo" ]; then export REPO="$_repo"; fi
+  fi
+}
+_beat_pin_repo_evidence
 cd "$HOME" || exit 0
 
 echo $$ > "$PIDFILE"
