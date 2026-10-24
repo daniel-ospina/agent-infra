@@ -371,13 +371,22 @@ toctou_preserve() { # <worktree> -> 0 = still removable, 1 = PRESERVE (TOCTOU_WH
         TOCTOU_WHY="re-probe-census-unreadable"
         return 1
     fi
-    if lp_path_held "$fresh" "$wt"; then TOCTOU_WHY="entered-during-pass ($LP_HOLD_WHY)"; rm -rf "$fresh"; return 1; fi
-    if lp_path_named "$fresh" "$wt"; then TOCTOU_WHY="argv-named-during-pass ($LP_NAME_WHY)"; rm -rf "$fresh"; return 1; fi
+    # ⛔ THE CENSUS FILE, NOT THE DIRECTORY. `lp_census DIR` writes `DIR/live-paths.tsv`, and the two
+    # witnesses `read` the path they are given — handed a DIRECTORY they read nothing, found no witness,
+    # and returned "clean", so this arm could never preserve anything (and every candidate emitted three
+    # `read: read error: 0: Is a directory` lines). The fresh-census half was dead code.
+    if lp_path_held "$fresh/live-paths.tsv" "$wt"; then TOCTOU_WHY="entered-during-pass ($LP_HOLD_WHY)"; rm -rf "$fresh"; return 1; fi
+    if lp_path_named "$fresh/live-paths.tsv" "$wt"; then TOCTOU_WHY="argv-named-during-pass ($LP_NAME_WHY)"; rm -rf "$fresh"; return 1; fi
     if [ "$DIRTY_MODE" = keep ]; then
         out="$(head_state "$wt")"
         dirty_n="$(printf '%s' "$out" | sed -n 's/.*dirty=\([0-9][0-9]*\).*/\1/p')"
         case "$dirty_n" in
-            0|'') : ;;   # '' = git could not answer; the dial already kept those at classification
+            0) : ;;
+            # ⛔ '' = git did NOT answer. The classifier keeps that case (`reason=clean-unknown`); reading
+            # it as CLEAN here would remove a tree whose state git cannot report — and the justification
+            # "the dial already kept those at classification" reasons about the very snapshot this
+            # re-probe exists because it is stale.
+            '') TOCTOU_WHY="re-probe-state-unreadable"; rm -rf "$fresh"; return 1 ;;
             *) TOCTOU_WHY="became-dirty(dirty_n=$dirty_n)"; rm -rf "$fresh"; return 1 ;;
         esac
     fi
