@@ -4203,6 +4203,61 @@ await test("#1770.21 a call blocked by ANOTHER extension (no tool_result ever) c
   } finally { auditRelease(); }
 });
 
+await test("#1770.22 a retry loop of calls blocked by a PEER extension is ACTIVITY — never a silent stall (final review of cycle 7, blocker)", async () => {
+  _resetStateForTest();
+  auditCapture();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  try {
+    _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
+      captureStart();
+      try {
+        for (let i = 0; i < 12; i++) {
+          // the ONLY events a peer-blocked call produces
+          await handlers.tool_execution_start!({ toolCallId: `pb-${i}`, toolName: "bash" });
+          await handlers.tool_execution_end!({ toolCallId: `pb-${i}`, toolName: "bash", isError: true });
+          handleSequenceTimeout();
+        }
+      } finally { captureStop(); }
+    });
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "a retrying lane is NOT silent — no verdict, however many refusals");
+    equal(_exitRequestsForTest().length, 0, "and it is never ended");
+    // (driven directly here, so one park line is expected; under the real timer it would not fire at all)
+    equal(logs.filter((l) => l.includes("parking")).length, 1, "the park line is announced once, never per refusal");
+  } finally { auditRelease(); }
+});
+
+await test("#1770.23 INTERACTIVE parity with main: pop for every machine gate, park a checkpoint only when not warn and stalled — never bounded", async () => {
+  // main's exact outcomes: pop for non-checkpoint frames; for a checkpoint owner
+  // it re-armed and did NOTHING when warn or not yet stalled, and parked when
+  // gate/stall — so `pop` and `park` are independent expectations.
+  const cases: Array<{ name: string; steps: Step[]; mode?: string; park: boolean; pop: boolean }> = [
+    { name: "auto", steps: [makeStep({ name: "a", gate: "auto" })], park: false, pop: true },
+    { name: "verifier", steps: [makeStep({ name: "v", gate: "verifier" })], park: false, pop: true },
+    { name: "human_approval", steps: [makeStep({ name: "h", gate: "human_approval" })], park: false, pop: true },
+    { name: "empty gate", steps: [makeStep({ name: "e", gate: "" })], park: false, pop: true },
+    { name: "checkpoint (WARN)", steps: [makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" })], mode: "warn", park: false, pop: false },
+    { name: "checkpoint (gate, stalled)", steps: [makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" })], mode: "gate", park: true, pop: false },
+  ];
+  for (const c of cases) {
+    _resetStateForTest();
+    auditCapture();
+    _pushSkillForTest("/repo/skills/i/SKILL.md", c.steps, 0);
+    _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
+    await withEnv({ PI_MODE: undefined, AGENT_SEQUENCE_MODE: c.mode }, () => {
+      captureStart();
+      try { handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    const popped = logs.some((l) => l.includes("popping stale")) && _stackForTest().length === 0;
+    equal(auditEntries.filter((e) => e.event === "checkpoint_block_recovery").length, c.park ? 1 : 0, `${c.name}: park count matches main`);
+    equal(popped, c.pop, `${c.name}: pop matches main`);
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, `${c.name}: interactive is never bounded`);
+    equal(_exitRequestsForTest().length, 0, `${c.name}: never an exit`);
+    auditRelease();
+  }
+});
+
 // ── cleanup + summary ────────────────────────────────
 for (const d of TMP_DIRS) {
   try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }

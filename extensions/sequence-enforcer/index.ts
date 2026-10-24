@@ -418,11 +418,19 @@ export function _inFlightForTest(): Array<{ id: string; startedAt: number }> {
 // Only these can legitimately produce NO events for tens of minutes. A `read`
 // or an `edit` is instantaneous, so it must never mask a stall (the pre-existing
 // timeout tests drive `read` and expect the park immediately).
-const LONG_RUNNING_TOOLS = new Set(["bash", "task", "subagent", "task_collect", "task_status", "web_fetch", "web_search", "loop_enforcer"]);
-// MCP tools cannot be enumerated by hand (and one of them can run for many
-// minutes), so the `mcp__` namespace is long-running BY CONSTRUCTION.
+// ⛔ FAIL-SAFE BY INVERSION (final review of cycle 7, finding 4): an UNKNOWN tool
+// is treated as long-running. The opposite (a list of long ones) is fail-open —
+// this repo's own `design_reviewer`/`carousel_designer` were unlisted, and one
+// long call at a gated step would have been a 30-minute false kill. Only tools
+// that are provably instantaneous are excluded; everything else — including every
+// `mcp__*` — is assumed able to run for minutes, and `tool_execution_end` is the
+// authoritative clear (so an over-inclusive entry costs at most one window).
+const INSTANT_TOOLS = new Set([
+  "read", "write", "edit", "grep", "find", "ls", "todo_write", "todo_read",
+  "loop_enforcer", "task_status", "task_collect", "web_search", "web_fetch",
+]);
 function isLongRunningTool(name: string): boolean {
-  return LONG_RUNNING_TOOLS.has(name) || name.startsWith("mcp__");
+  return !INSTANT_TOOLS.has(name);
 }
 
 /**
@@ -661,39 +669,25 @@ export function handleSequenceTimeout(
   const owner = stall.skill;
   const ownerStep = stall.step;
 
-  if (stall.kind === "human") {
-    // A person owns this stall: reported with its own reason, never bounded.
-    if (print) noteNotGatedIdle(owner, ownerStep, mode, HUMAN_GATE, true);
-    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-    return;
-  }
-  if (stall.kind === "checkpoint" && mode === "warn") {
-    // Warn applies NO checkpoint gate (the first call auto-advances), so nothing
-    // is holding the lane — the same shape as an `auto` step (cycle 2 finding 2).
-    if (print) noteNotGatedIdle(owner, ownerStep, mode, WARN_CHECKPOINT_NO_GATE);
-    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-    return;
-  }
-  // A long call IN FLIGHT is not silence, on EVERY gated kind — including a
-  // checkpoint (final review of cycle 6). `blockedResult` and
-  // `tool_execution_end` clear the entry for a call that was refused or never
-  // ran, so a genuinely blocked lane is still bounded.
-  if (suppressForInFlight()) {
-    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-    return;
-  }
-  // A checkpoint must have STALLED on the wall clock (its pre-existing gate) —
-  // and, like the interactive pop, is never bounded in a host where a human can
-  // run the checker / force-pass.
-  if (stall.kind === "checkpoint") {
-    parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
-    if (!print || Date.now() - owner.stepStartedAt <= WALL_CLOCK_STALL_MS) {
+  // ⛔ INTERACTIVE FIRST (final review of cycle 7, finding 2b): an interactive
+  // session keeps EXACTLY main's behaviour — pop the stale sequence,
+  // except a checkpoint owner, which is parked one-shot and never bounded. Earlier
+  // revisions classified first, which silently stopped interactive sessions from
+  // popping at a human gate (main popped). Docs claim "unchanged"; this makes it
+  // true.
+  if (!print) {
+    if (stall.kind === "checkpoint") {
+      // Exactly main's condition: a checkpoint is parked only when the session is
+      // NOT warn and the step has actually stalled on the wall clock. (A VGATE
+      // reviewer of cycle 8 found this revision parked an interactive WARN
+      // checkpoint, which main did not — a divergence with no gating effect, but
+      // "unchanged" has to mean unchanged.)
+      if (mode !== "warn" && Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS) {
+        parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
+      }
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
-  }
-  if (!print) {
-    // Interactive: the established stale-sequence pop (unchanged behaviour).
     console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
     skillStack.pop();
     const parent = topSkill();
@@ -705,6 +699,36 @@ export function handleSequenceTimeout(
     }
     return;
   }
+  if (stall.kind === "human") {
+    // A person owns this stall: reported with its own reason, never bounded.
+    noteNotGatedIdle(owner, ownerStep, mode, HUMAN_GATE, true);
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  if (stall.kind === "checkpoint" && mode === "warn") {
+    // Warn applies NO checkpoint gate (the first call auto-advances), so nothing
+    // is holding the lane — the same shape as an `auto` step (cycle 2 finding 2).
+    noteNotGatedIdle(owner, ownerStep, mode, WARN_CHECKPOINT_NO_GATE);
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  // A long call IN FLIGHT is not silence, on EVERY gated kind — including a
+  // checkpoint (final review of cycle 6). `blockedResult` and
+  // `tool_execution_end` clear the entry for a call that was refused or never
+  // ran, so a genuinely blocked lane is still bounded.
+  if (suppressForInFlight()) {
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  // A checkpoint in a PRINT lane must additionally have STALLED on the wall clock
+  // (its pre-existing condition), and keeps its one-shot recovery audit.
+  if (stall.kind === "checkpoint") {
+    parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
+    if (Date.now() - owner.stepStartedAt <= WALL_CLOCK_STALL_MS) {
+      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+      return;
+    }
+  }
   // ── print mode, gated owner: bounded, coalesced, NAMED ──
   if (unsatisfiableKeys.has(stallKey(owner))) return; // one verdict per stall — never re-arm, never repeat
   const parks = bumpParkStreak(owner);
@@ -714,7 +738,7 @@ export function handleSequenceTimeout(
     console.log(
       `[sequence-enforcer] ⏰ Sequence timeout — parking "${owner.path}" at step ${owner.stepIndex} "${ownerStep.name}" (gate: ${ownerStep.gate || "none"}) — 10 min with no tool call. ` +
       `WHY IT CANNOT ADVANCE BY WAITING: ${cause}. REMEDY: ${remedy}. ` +
-      `(silent window ${parks}; reported once per step — the next line for this step is a verdict)`,
+      `(silent window ${parks}; this line is reported ONCE per step — if the lane keeps working, that is all you will see)`,
     );
     auditLog({
       ts: new Date().toISOString(), event: "timeout_park", skill: owner.path, step: owner.stepIndex,
@@ -740,12 +764,12 @@ export function handleSequenceTimeout(
  * visible to the timeout path. The TOTAL window count at a step does NOT restart
  * here — only a step advance resets it (bumpParkStreak).
  */
-function noteToolActivity(kind: "call" | "result", toolCallId: string, toolName = ""): void {
+function noteToolActivity(kind: "call" | "result" | "start" | "end", toolCallId: string, toolName = ""): void {
   lastToolActivityAt = Date.now();
   // Activity ends the silent streak: the bound is about SILENCE (see the
   // SEQUENCE_PARK_CAP rationale), so a lane that is calling tools is never parked.
   parkStreak.clear();
-  if (kind === "call") {
+  if (kind === "call" || kind === "start") {
     // ⛔ NEVER RENEW an outstanding call (review cycle 2, finding 1). A call the
     // enforcer BLOCKS emits no tool_result, so a lane retrying a blocked `bash`
     // would otherwise renew the suppression on every retry and could never be
@@ -2660,17 +2684,21 @@ function tokenStateLabel(reason: string): string {
   // pi emits `tool_execution_end` on every path, including the blocked one (the
   // bundle's `emitToolExecutionEnd(finalized, emit)` runs for the `immediate`
   // preparation whose result IS the block error), so it is the reliable clear.
+  // ⛔ These are ACTIVITY, not just bookkeeping (final review of cycle 7,
+  // finding 1). A call that ANOTHER extension blocks, or that never executes,
+  // produces only these two events — no `tool_call`, no `tool_result`. If they did
+  // not count as activity, a lane retrying a blocked call would look SILENT and be
+  // killed: exactly the busy-lane false kill this PR exists to prevent.
   pi.on("tool_execution_start", async (event) => {
     const id = String((event as any).toolCallId ?? "");
-    const name = String((event as any).toolName ?? "");
-    if (!id || !isLongRunningTool(name)) return;
-    if (!inFlight.has(id)) inFlight.set(id, Date.now());
+    if (!id) return;
+    noteToolActivity("start", id, String((event as any).toolName ?? ""));
     return undefined;
   });
   pi.on("tool_execution_end", async (event) => {
     const id = String((event as any).toolCallId ?? "");
     if (!id) return;
-    inFlight.delete(id);
+    noteToolActivity("end", id);
     return undefined;
   });
 
