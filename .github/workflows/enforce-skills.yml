@@ -37,10 +37,9 @@ on:
 # never lost. What IS lost is (a) the per-commit run record — main @ the cancelled head was never
 # observed, and the rail's lane bookkeeping reads run rows — and (b) any drift that existed ONLY on
 # the cancelled head (introduced by A, removed by B): that intermediate tree is never checked, and
-# `!cancelled()` on `auto-file-on-failure` means a cancelled run files nothing at all. And a
-# NON-matching push (a `docs/`-only push, which does not trigger this workflow) cannot re-check
-# anything, so on the window where the nightly is what cancels, the drift signal is simply absent
-# for that commit.
+# `!cancelled()` on `auto-file-on-failure` means a cancelled run files nothing at all. (A push whose
+# diff does NOT match the `paths` filter creates no run at all, so it cancels nothing — that case is
+# not part of the loss.)
 #
 # The group carries `github.event_name` as well as the ref (`schedule` and `push` both evaluate
 # `github.ref` to refs/heads/main, so a ref-only key puts the nightly and the push gate in the same

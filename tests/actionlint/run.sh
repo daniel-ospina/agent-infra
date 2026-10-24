@@ -438,7 +438,8 @@ conc_run() { # conc_run <expected-exit> <label> [args...]
 
 conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml" \
-  "$CFIX/pr-head-ref.yml"
+  "$CFIX/pr-head-ref.yml" "$CFIX/push-group-only.yml" "$CFIX/push-block-scalar.yml" \
+  "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -450,8 +451,12 @@ for pair in \
   "pr-on-four-space.yml R1" \
   "pr-on-flow-map.yml R1" \
   "push-cancel-true.yml R2" \
+  "push-single-quoted.yml R2" \
+  "push-space-colon.yml R2" \
+  "push-multiline-flow.yml R2" \
   "reusable-concurrency.yml R3" \
-  "push-job-level.yml R0"; do
+  "push-job-level.yml R0" \
+  "pr-unreadable-on.yml R0"; do
   name="${pair% *}"; tag="${pair#* }"
   conc_run 1 "$name blocks" "$CFIX/$name"
   if grep -q "\[$tag\]" "$OUT"; then
@@ -546,6 +551,27 @@ conc_run 1 "a tree missing the exempt guards is RED, not silently exempt-free" -
 grep -q 'named in EXEMPT_FILES but no such PR-triggered workflow was scanned' "$OUT" \
   && pass "the missing exemptions are named" \
   || fail "the missing exemptions were not named"
+
+# --- an exempt guard that LOST its #2474 rationale is RED (the arm the exemption rests on) -----
+# Reachable only in --root mode (in FILES mode the rationale file is the repo's own copy), so without
+# this arm a regression that silently accepts an unreasoned exemption would stay green — measured by
+# neutering the arm (round 2, P2).
+mkdir -p "$CASE6_DIR/unreasoned/.github/workflows"
+sed 's/#2474/#0000/g' "$ROOT/.github/workflows/pipeline-compliance.yml" \
+  >"$CASE6_DIR/unreasoned/.github/workflows/pipeline-compliance.yml"
+sed 's/#2474/#0000/g' "$ROOT/.github/workflows/workflow-lock.yml" \
+  >"$CASE6_DIR/unreasoned/.github/workflows/workflow-lock.yml"
+conc_run 1 "an exempt guard without its #2474 rationale is RED" --root "$CASE6_DIR/unreasoned"
+grep -q 'no longer carries its' "$OUT" \
+  && pass "the missing rationale is named" \
+  || { fail "the missing rationale was not named"; sed 's/^/      /' "$OUT"; }
+
+# --- an EMPTY scan set refuses, instead of reporting PASS over nothing -----------------------
+mkdir -p "$CASE6_DIR/emptytree/.github/workflows"
+conc_run 2 "an empty workflow directory refuses to pass (exit 2)" --root "$CASE6_DIR/emptytree"
+grep -q 'no workflow files were scanned' "$OUT" \
+  && pass "the empty-scan refusal is named" \
+  || { fail "the empty-scan refusal was not named"; sed 's/^/      /' "$OUT"; }
 
 echo ""
 if [ "$failures" -gt 0 ]; then

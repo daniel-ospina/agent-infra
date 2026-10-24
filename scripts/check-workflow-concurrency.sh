@@ -26,15 +26,18 @@
 #         - a `group` that carries the workflow's OWN identity — the file stem as a PREFIX
 #           (`<stem>-…`), or `${{ github.workflow }}` — so two workflows on one PR cannot cancel
 #           each other, AND a group no OTHER PR workflow also declares (a copied file that keeps
-#           the old name is caught by the prefix; two files that reuse `github.workflow` are caught
-#           by the duplicate check); and
+#           the old name is caught by the prefix; two files that end up in the same runtime group are
+#           caught by the duplicate check, which RESOLVES `github.workflow` to each file's own
+#           `name:` — so the canonical `${{ github.workflow }}-${{ github.ref }}` idiom is correct
+#           in every file, and only a genuinely shared group is refused); and
 #         - the REF — `${{ github.ref }}` or `${{ github.head_ref }}`, or
 #           `${{ github.event.pull_request.number }}` for `pull_request_target` (there `github.ref`
 #           is the BASE branch, so a ref key collapses every PR into one group); and
 #         - `cancel-in-progress: true` — a superseded head is precisely what should be cancelled.
-#   R2  PUSH — a workflow triggered by `push` MUST NOT cancel: either no `concurrency:` block, or
-#       `cancel-in-progress: false`. A cancelled run on the default branch is a base-tree run that
-#       measured nothing and will not be re-created for that head.
+#   R2  PUSH — a workflow triggered by `push` MUST NOT cancel: no `concurrency:` block, no
+#       `cancel-in-progress` key at all (GitHub's own default is not to cancel), or the literal
+#       `false`. A cancelled run on the default branch is a base-tree run that measured nothing and
+#       will not be re-created for that head.
 #   R3  REUSABLE — a workflow triggered ONLY by `workflow_call` MUST NOT declare `concurrency:`.
 #       The caller owns supersession (it holds the ref and the PR), and a block here would apply
 #       in the callee's context, letting two callers on the same ref cancel each other.
@@ -150,8 +153,13 @@ trap 'rm -f "$TMP_OUT" "$TMP_GROUPS"' EXIT
 # a `#` inside it. CR is stripped too: a CRLF file is valid YAML, and a `false\r` that prints as
 # `false` must not be refused as if it were a different value.
 awk '
+# A KEY is: optional single/double quote, an identifier, optional quote, optional spaces, colon.
+# Both quote styles matter — a formatter that quotes mapping keys emits `'"'"'concurrency'"'"':`, and a
+# spelling the reader cannot see is a rule that silently does not apply (round 2 found exactly that:
+# `'"'"'concurrency'"'"':` + cancel-in-progress true on a push workflow reported GREEN, "push workflows never
+# cancel"). The space-before-colon form (`push :`) is valid YAML too.
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-function unq(s)  { if (s ~ /^".*"$/ ) return substr(s, 2, length(s) - 2)
+function unq(s)  { if (s ~ /^\".*\"$/ ) return substr(s, 2, length(s) - 2)
                    if (substr(s, 1, 1) == SQ && substr(s, length(s), 1) == SQ) return substr(s, 2, length(s) - 2)
                    return s }
 # addtrigger() — accept the shapes a trigger can be written in: a bare word, or a flow-list entry.
@@ -161,22 +169,30 @@ function addtrigger(v,   t) {
   trig[t] = 1
 }
 # addflow() — `on: [push, pull_request]` and `on: {pull_request: {...}}`. A flow MAPPING carries its
-# value after `:`, so each entry is cut at its first colon; braces are stripped first.
+# value after `:`, so each entry is cut at its first colon; the outer brackets are stripped first.
 function addflow(v,   n, i, parts, t) {
   gsub(/^[\[{]/, "", v); gsub(/[\]}]$/, "", v)
   n = split(v, parts, /,[ \t]*/)
   for (i = 1; i <= n; i++) { t = parts[i]; sub(/:.*/, "", t); addtrigger(t) }
 }
+function opens(v)  { return gsub(/[\[{]/, "", v) }
+function closes(v) { return gsub(/[\]}]/, "", v) }
 # flush() — print the record for the file just finished, then clear its state. Called at the first
 # line of the NEXT file (so a previous record never carries content from the next file) and at EOF.
 function flush(   tg, k, n) {
   if (fname == "") return
   n = 0; tg = ""
   for (k in trig) { n++; tg = tg (n > 1 ? " " : "") k }
-  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0)
+  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname
   delete trig; hasconc = 0; group = ""; cancel = ""; joblevel = 0; fname = ""; onindent = -1; cur = ""
+  scalarindent = -1; flowopen = 0; flowbuf = ""; wfname = ""
 }
-BEGIN { cur = ""; SQ = sprintf("%c", 39); hasconc = 0; joblevel = 0; onindent = -1 }
+BEGIN {
+  cur = ""; SQ = sprintf("%c", 39); DQ = "\""
+  QCH = "[" DQ SQ "]"
+  KEYPAT = QCH "?[A-Za-z_][A-Za-z0-9_-]*" QCH "?[ \t]*:"
+  hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; wfname = ""
+}
 {
   if (FNR == 1) {                         # a new file begins: close the previous record FIRST
     flush()
@@ -189,16 +205,44 @@ BEGIN { cur = ""; SQ = sprintf("%c", 39); hasconc = 0; joblevel = 0; onindent = 
   sub(/[ \t]+#[^#]*$/, "", line)          # trailing comment (only when preceded by whitespace)
   if (trim(line) == "") next
 
+  # BLOCK SCALARS: `run: |` bodies are TEXT, not keys. Without this, a `concurrency:` line inside a
+  # shell script or a heredoc reads as a real key (round 2: a `run: |` fragment was refused as "a
+  # JOB-level concurrency" — a false red pointing at a change that does not exist in the file).
+  if (scalarindent >= 0) {
+    lead = 0
+    if (match(line, /^[ \t]+/)) lead = RLENGTH   # match() returns the POSITION, RLENGTH is the width
+    if (lead > scalarindent) next         # still inside the scalar body
+    scalarindent = -1
+  }
+  lineindent = 0                          # 0 for a top-level line
+  if (match(line, /^[ \t]+/)) lineindent = RLENGTH
+  if (line ~ /:[ \t]*[|>][-+0-9]*[ \t]*$/) { scalarindent = lineindent; next }
+
+  # A multi-line flow `on:` (`on: [push,` / `  pull_request]`) is accumulated until the brackets
+  # balance: reading only the first line silently DROPPED the rest, so a push trigger vanished and
+  # R2 was never evaluated (round 2, P1).
+  if (flowopen) {
+    flowbuf = flowbuf " " trim(line)
+    if (opens(flowbuf) <= closes(flowbuf)) { addflow(flowbuf); flowopen = 0; flowbuf = "" }
+    next
+  }
+
   if (line ~ /^[^ \t]/) {                 # a TOP-LEVEL key (column 0)
     cur = "?"
-    if (match(line, /^"?[A-Za-z_][A-Za-z0-9_-]*"?:/)) {
-      cur = substr(line, 1, RLENGTH - 1)
-      gsub(/"/, "", cur)
+    if (match(line, "^" KEYPAT)) {
+      cur = substr(line, 1, RLENGTH)
+      sub(/[ \t]*:$/, "", cur); gsub(QCH, "", cur)
     }
     onindent = -1
+    if (cur == "name") {
+      wfname = unq(trim(substr(line, index(line, ":") + 1)))
+    }
     if (cur == "on") {
       rest = trim(substr(line, index(line, ":") + 1))
-      if (rest != "") addflow(rest)       # `on: push` / `on: [a, b]` / `on: {pull_request: {}}`
+      if (rest != "") {
+        if (opens(rest) > closes(rest)) { flowopen = 1; flowbuf = rest }
+        else { addflow(rest) }            # `on: push` / `on: [a, b]` / `on: {pull_request: {}}`
+      }
     }
     if (cur == "concurrency") { hasconc = 1 }
     next
@@ -207,15 +251,14 @@ BEGIN { cur = ""; SQ = sprintf("%c", 39); hasconc = 0; joblevel = 0; onindent = 
   # Indented content. Under `on:`: a trigger key at the FIRST child indent only (a nested
   # `branches:` under `pull_request:` is not a trigger).
   if (cur == "on") {
-    if (match(line, /^[ \t]+/)) {
-      ind = RLENGTH                     # the child indent (remember: match() resets RSTART/RLENGTH)
-      key = substr(line, ind + 1)
-      if (key ~ /^"?[A-Za-z_][A-Za-z0-9_-]*"?:/) {
-        if (onindent < 0) { onindent = ind }
-        if (ind == onindent) {           # a NESTED key (branches:, types:, inputs:) is not a trigger
-          sub(/:.*$/, "", key); gsub(/"/, "", key)
-          trig[key] = 1
-        }
+    ind = lineindent
+    key = substr(line, ind + 1)
+    if (match(key, "^" KEYPAT)) {
+      if (onindent < 0) { onindent = ind }
+      if (ind == onindent) {             # a NESTED key (branches:, types:, inputs:) is not a trigger
+        k = substr(key, 1, RLENGTH)
+        sub(/[ \t]*:$/, "", k); gsub(QCH, "", k)
+        trig[k] = 1
       }
     }
     next
@@ -223,16 +266,15 @@ BEGIN { cur = ""; SQ = sprintf("%c", 39); hasconc = 0; joblevel = 0; onindent = 
 
   # A JOB-level `concurrency:` (indented while we are NOT in the workflow-level section). GitHub
   # honours it and this check does not model it, so it is refused (R0) rather than ignored.
-  if (line ~ /^[ \t]+"?concurrency"?[ \t]*:/) { joblevel = 1; next }
+  if (match(substr(line, lineindent + 1), "^" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
 
   if (cur == "concurrency") {
     t = trim(line)
-    if (t ~ /^"?group"?[ \t]*:/) { group = unq(trim(substr(t, index(t, ":") + 1))) }
-    else if (t ~ /^"?cancel-in-progress"?[ \t]*:/) { cancel = unq(trim(substr(t, index(t, ":") + 1))) }
+    if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) { group = unq(trim(substr(t, index(t, ":") + 1))) }
+    else if (match(t, "^" QCH "?cancel-in-progress" QCH "?[ \t]*:")) { cancel = unq(trim(substr(t, index(t, ":") + 1))) }
   }
 }
-END { flush() }
-' "${FILES[@]}" >"$TMP_OUT" 2>/dev/null
+END { flush() }' "${FILES[@]}" >"$TMP_OUT" 2>/dev/null
 awk_rc=$?
 if [ "$awk_rc" -ne 0 ]; then
   echo "❌ the workflow reader failed (rc=$awk_rc) — no verdict can be given" >&2
@@ -263,7 +305,7 @@ has_trigger() { # has_trigger <triggers> <name>
   return 1
 }
 
-while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed; do
+while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed wfname; do
   [ -n "${fname:-}" ] || continue
   scanned=$((scanned + 1))
 
@@ -302,8 +344,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed;
         else
           fail "$fname: triggers \`push\`, but \`concurrency.cancel-in-progress: true\` — a cancelled run on the default branch measured nothing and no replacement run is created for that head. Use \`cancel-in-progress: false\` (or drop the block) [R2]"
         fi
-      elif [ "$cancel" != "false" ]; then
-        fail "$fname: triggers \`push\` and declares \`cancel-in-progress: '${cancel:-<absent>}'\` — only the literal \`false\` is accepted on a push-triggered workflow [R2]"
+      elif [ -n "$cancel" ] && [ "$cancel" != "false" ]; then
+        fail "$fname: triggers \`push\` and declares \`cancel-in-progress: '${cancel}'\` — only the literal \`false\` (or an absent key, which is GitHub's own default) is accepted on a push-triggered workflow [R2]"
       fi
     fi
   fi
@@ -327,7 +369,13 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed;
           "$stem"-*|*'github.workflow'*) : ;;
           *) fail "$fname: \`concurrency.group\` ('$group') does not carry this workflow's own identity — expected a '$stem-' PREFIX or \`github.workflow\`; two workflows on one PR would cancel EACH OTHER [R1]" ;;
         esac
-        printf '%s\t%s\n' "$group" "$fname" >>"$TMP_GROUPS"
+        # The group a RUN will see: `github.workflow` is the workflow's NAME, not its file name, so
+        # the comparison must resolve it — otherwise two workflows with different names that share
+        # the canonical `${{ github.workflow }}-${{ github.ref }}` idiom would be false-red as
+        # "they would cancel each other" (round 2 P2), when their runtime groups differ.
+        resolved="${group//'${{ github.workflow }}'/$wfname}"
+        resolved="${resolved//'${{github.workflow}}'/$wfname}"
+        printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
         if has_trigger "$triggers" pull_request_target; then
           case "$group" in
             *'github.event.pull_request.number'*) : ;;
