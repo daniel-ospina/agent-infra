@@ -226,8 +226,20 @@ run_drainer_fg c3
 check "(c3) a live lane-shaped pid counts toward the cap and the pass SKIPS" \
   'grep -q "SKIP: 1 lanes already running (cap 1)" "$ROOT/ai-c3/logs/ai-drainer.log"' \
   "$(cat "$ROOT/ai-c3/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
-check "(c3) the dead pidfile did not inflate the count past the cap message" \
-  'grep -q "SKIP: 1 lanes" "$ROOT/ai-c3/logs/ai-drainer.log"'
+# ⛔ DISCRIMINATING: with the cap at 2, ONE live lane and one DEAD pidfile must report `lanes=1`.
+# At `MAX_LANES=1` the skip message is identical whether the dead pidfile counted or not, so that arm
+# alone cannot prove the dead pidfile was ignored — this one reads the count out of the START line.
+o="$ROOT/o-c3b"; ai="$ROOT/ai-c3b"; mkdir -p "$o/bg" "$ai"
+bash "$ROOT/nonblocking-dispatch.sh" 30 &
+planted2=$!; echo "$planted2" >>"$ROOT/pids"
+printf '%s' "$planted2" >"$o/bg/seed-lane.pid"
+printf '999999' >"$o/bg/dead-lane.pid"
+O="$o" AI="$ai" DISPATCH="$DISPATCH" SEED_REPO="$SEED" SEED_REF="$SEED_REF" SWAP_FREE_MB=9999 \
+  MAX_LANES=2 LANE_TIMEOUT=60 LANE_WAIT_MAX=10 LANE_POLL_S=1 FAKE_LANE_SECS=0 RC_GRACE_S=2 \
+  bash "$DRAINER" >/dev/null 2>&1
+check "(c3b) with cap=2 the count is exactly the ONE live lane (the dead pidfile adds nothing)" \
+  'grep -q "START: .* lanes=1 " "$ai/logs/ai-drainer.log"' \
+  "$(grep "START:" "$ai/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 RUN_MAX_LANES=4
 
 # ── ARM (c4): A NON-NUMERIC LANE_TIMEOUT MUST NOT DISABLE THE HELD LOCK ──────────────────────
@@ -261,7 +273,7 @@ check "(d) pass 3 WRAPS back to offset 0" '[ "$(off "$ROOT/brief-3.md")" = "0" ]
 check "(d) the cursor file advanced past the wrap" \
   '[ "$(cat "$ROOT/ai-d/state/drainer-slice" 2>/dev/null)" = "3" ]'
 check "(d) the tick did not leave its worktree behind" \
-  '! ls -d "$ROOT/ai-d"/wt-drainer-* >/dev/null 2>&1'
+  '[ -z "$(ls -d "$ROOT/ai-d"/wt-drainer-* 2>/dev/null | grep -v "\\.lane-pid$")" ]'
 
 # ── NON-VACUITY: remove the lock and the concurrency arm MUST fail ───────────────────────────
 MUT="$ROOT/ai-drainer-nolock.sh"
@@ -326,6 +338,35 @@ check "(e2) a TERM to the tick leaves a LIVE lane's worktree in place" \
   '[ -n "$wt_e2" ] && [ -d "$wt_e2" ] && [ -n "$lane_pid_e2" ] && kill -0 "$lane_pid_e2" 2>/dev/null \
      && grep -q "leaving worktree" "$ai/logs/ai-drainer.log"' \
   "worktree=${wt_e2:-none} lane=${lane_pid_e2:-none} warns=$(grep -c "leaving worktree" "$ai/logs/ai-drainer.log" 2>/dev/null)"
+
+# ── ARM (f): the LEFTOVER REAPER must not eat a live lane's checkout ────────────────────────
+# The measured defect: a worktree's name carries the TICK's pid, which is dead the moment the tick
+# exits — so on the TIMEOUT path (its lane still running) the NEXT tick reaped a live lane's checkout
+# with its uncommitted work. The reaper keys on the lane pid recorded beside the tree, and leaves an
+# UNKNOWN tree alone.
+o="$ROOT/o-f"; ai="$ROOT/ai-f"; mkdir -p "$o/bg" "$ai"
+FAKE_LANE_SECS=25
+( O="$o" AI="$ai" DISPATCH="$DISPATCH" SEED_REPO="$SEED" SEED_REF="$SEED_REF" SWAP_FREE_MB=9999 \
+  LANE_TIMEOUT=60 LANE_WAIT_MAX=2 LANE_POLL_S=1 FAKE_LANE_SECS=25 RC_GRACE_S=2 \
+  bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids" )
+wait_for_path "$o/bg/ai-drain-"*.pid 80
+i=0; while [ -d "$ai/state/ai-drainer.lock" ] && [ "$i" -lt 60 ]; do sleep 0.25; i=$((i + 1)); done
+wt_f="$(ls -d "$ai"/wt-drainer-* 2>/dev/null | grep -v '\\.lane-pid$' | head -1)"
+lane_f="$(cat "$o"/bg/*.pid 2>/dev/null | tr -dc '0-9')"
+check "(f) the TIMEOUT path left the worktree AND its lane-pid sidecar" \
+  '[ -n "$wt_f" ] && [ -d "$wt_f" ] && [ -f "$wt_f.lane-pid" ]' "worktree=${wt_f:-none}"
+FAKE_LANE_SECS=0
+RUN_SWAP=9999 run_drainer_fg f
+check "(f) the NEXT tick did NOT reap a live lane's worktree" \
+  '[ -d "$wt_f" ] && kill -0 "$lane_f" 2>/dev/null' \
+  "worktree=$([ -d "${wt_f:-/nonexistent}" ] && echo present || echo GONE) reaped=$(grep -c REAPED "$ai/logs/ai-drainer.log" 2>/dev/null)"
+# Once the lane is really gone a later tick DOES reclaim it — the reaper is not inert either way.
+kill "$lane_f" 2>/dev/null; sleep 0.5
+# SAME state dir: the reaper looks in the tick's OWN `$AI`, so a different tag would reap nothing and
+# the arm would pass for the wrong reason.
+RUN_SWAP=9999 run_drainer_fg f
+check "(f) once the lane is gone the leftover IS reclaimed" '! [ -d "$wt_f" ]' "worktree still at ${wt_f:-none}"
+FAKE_LANE_SECS=0
 
 # ── the TIMER INSTALLER's refusals (a false PASS here installs an inert job) ─────────────────
 echo "== install-drainer-timer refusals =="

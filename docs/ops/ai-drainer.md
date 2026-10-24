@@ -59,16 +59,26 @@ operator activates them on a box**, and both are in the fleet inventory so their
 Two more properties are part of the same contract, because each one is a way for a tick to look
 successful while nothing happened:
 
-- **the lane's own exit status is the verdict.** Both dispatchers write `$O/bg/<name>.rc`; a spawn
-  refused by a gate dies in milliseconds, so "the pid is gone" is not "the work happened". No `.rc` →
-  the tick FAILS (refused or lost); `.rc != 0` → the tick FAILS and names the log. The lock is also
-  **not** released on a zero-length wait: an unreadable lane pidfile is a failure, not a free lock.
+- **the lane's exit status is the verdict — where the dispatcher records one.**
+  `nonblocking-dispatch.sh` writes `$O/bg/<name>.rc`, and there a spawn refused by a gate dies in
+  milliseconds, so "the pid is gone" is not "the work happened": no `.rc` after a bounded
+  `RC_GRACE_S` grace → the tick FAILS (refused or lost); `.rc != 0` → it FAILS and names the log.
+  ⛔ **`bg-dispatch.sh` — this script's first preference, and the dispatcher in use on the box
+  tonight — records NO status file at all.** The capability is detected from the dispatcher, and a
+  dispatcher without it gets a `WARN` naming the gap and exit 0: an inert lane under that overlay is
+  NOT red. That is a known gap (the overlay is unversioned), stated here rather than papered over.
+  The lock is also **not** released on a zero-length wait: an unreadable lane pidfile is a failure,
+  not a free lock.
 - **the beat is written by every tick that ran**, including a skip — on a swap-bound box, SKIP is the
   normal steady state, and a beat written only after a dispatch would make a correctly-idle job read
   `LATE` for ever.
-- **the worktree is removed on every exit path** except a timeout (a lane may still be writing in it):
-  a fresh checkout per tick with nothing removing it is ~72/day of disk on a box that has already been
-  disk-bound.
+- **the worktree is removed only when the lane is provably dead.** A signal to the TICK says nothing
+  about the lane (a `bootout`, a reboot, a Ctrl-C on a hand-run copy), and the dispatcher backgrounds
+  the lane before it returns, so a trap can land between the call and the pid read — in both cases the
+  tree is LEFT, and the tick says why. The lane pid is recorded beside the tree (`<wt>.lane-pid`) and a
+  later tick reaps a leftover only when that pid is dead; a tree with no sidecar is UNKNOWN and left
+  alone. A fresh checkout per tick with nothing removing it is ~72/day on a box that has been
+  disk-bound, so the reaper is not optional — and a reaper that guesses is worse than none.
 
 `ai-drainer.test.sh` covers all three guards, both tick verdicts, and the launcher's refusals, and
 asserts the concurrency arm against a **mutation**: the same arm is re-run against a copy with the
