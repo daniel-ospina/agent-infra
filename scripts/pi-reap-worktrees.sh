@@ -335,7 +335,14 @@ REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}"
 REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}"
 REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}"
 REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
-REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-1000}"
+# The bound on ONE batched `gh pr list --state all` read (the whole pass). It must
+# exceed the LARGEST repo's total PR count, or the truncation refusal below fires on
+# every pass and the worktree class becomes a no-op — which is the failure this whole
+# change exists to remove. MEASURED 2026-10-24: daniel-ospina/tortoise has **3,987**
+# PRs across all states, so the old default of 1000 would have refused there forever.
+# `gh` pages past 1000 (`--limit 1200` returned 1200), so the remedy for a bigger repo
+# is this number and not a code change.
+REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-5000}"
 REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF:-}"
 REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}"
 
@@ -1127,7 +1134,7 @@ pr_state_load() {
     if [ "$nrows" -ge "$REAP_WT_PR_LIMIT" ]; then
         rm -f "$out"; GH_OK=0; GH_STATE="truncated"; PR_ROWS=""
         PR_SKIP_REASON="gh-pr-list-truncated(limit=$REAP_WT_PR_LIMIT)"
-        PR_SKIP_REMEDY="this repo has at least ${REAP_WT_PR_LIMIT} PRs across ALL states, so gh returned only the newest and an absence is no longer evidence. Raise REAP_WT_PR_LIMIT above the repo's total PR count (daniel-ospina/tortoise measured 913 on 2026-10-24), or reap the repo by hand"
+        PR_SKIP_REMEDY="this repo has at least ${REAP_WT_PR_LIMIT} PRs across ALL states, so gh returned only the newest and an absence is no longer evidence. Raise REAP_WT_PR_LIMIT above the repo's total PR count (daniel-ospina/tortoise measured 3,987 on 2026-10-24; the default is 5,000), or reap the repo by hand"
         log "GH pr-list TRUNCATED at limit=$REAP_WT_PR_LIMIT for $slug (rows=$nrows) — fail-closed: an absent PR is not evidence"
         return 1
     fi

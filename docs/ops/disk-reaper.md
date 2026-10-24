@@ -220,7 +220,12 @@ merged history can exhaust it; gh then returns the newest N rows and silently dr
 rest. An absent row is NOT "no PR" — inside the floor it is rule 6, past the floor the
 aged rule — so a row count AT `REAP_WT_PR_LIMIT` is a **refusal** (exit 3, nothing
 removed), never a KEEP: a live branch must not be reaped on a list that never
-contained it.
+contained it. The bound therefore has to exceed the largest repo's total PR
+count — **`REAP_WT_PR_LIMIT` defaults to 5000** because `daniel-ospina/tortoise`
+measured **3,987** PRs across all states on 2026-10-24, and a default below that
+would refuse every pass on the very repo with the most worktrees (a reaper that
+reaps nothing is the failure this change exists to remove). `gh` pages past 1000,
+so a bigger repo is a bigger number here, not a code change.
 
 **Rule 7 is the freshness floor, and its witness is two-sided.** A lane dispatched
 minutes ago is detached at `main`, clean and holder-free for exactly the same reason an
