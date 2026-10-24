@@ -2431,6 +2431,47 @@ done
 # — MEASURED: four columns of indent dropped the line from the transcript map, so a normal nested
 # markdown bullet's count never reached the guard). The count channel now reads it; verdict SELECTION
 # still ignores it (a 4-column line is a code quotation).
+# ⛔ A SEVERITY TOKEN BETWEEN THE NUMERAL AND THE NOUN DEFEATED BOTH READERS (P0, eighth fresh review of
+# #2288 — MEASURED, PRE-EXISTING on main: the forward bridge bridged only ALPHABETIC words, so `p1` could
+# never be crossed, and the severity scanner count arm required the digits IMMEDIATELY before the token).
+# Each of these recorded a SIGNED clean record. The count arm now crosses up to three words and shares
+# the numeral class with the classifier.
+for _cl in \
+  '**Verdict:** CLEAN — 2 blocking P1 defects remain in scripts/x.sh.' \
+  '**Verdict:** CLEAN — two P0 defects remain.' \
+  '**Verdict:** CLEAN — one P1 finding remains.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (severity between the count and the noun): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# COUNTER-DIRECTION: the negated / zero severity forms must still record (they do on main, and the arms
+# that already handled them are pinned elsewhere — this keeps the widened bridge from swallowing them).
+for _cl in \
+  '**Verdict:** CLEAN — 0 P1, 0 P2 findings.' \
+  '**No P1**: none.  **P2**: none.\
+**Verdict:** CLEAN'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "records clean (negated/zero severity): $_cl (rc=$(rc_of))"
+done
+# ⛔ A REPAIR STATED FIRST ON A VERDICT LINE IS REACHABLE NOW (P2, eighth fresh review of #2288 — MEASURED:
+# `split` yields a LEADING EMPTY field for a clause that begins with punctuation, so the three-slot window
+# was ["", "verdict", "clean"] and the repair verb was unreachable on every verdict line).
+reset; printf '**Verdict:** CLEAN — fixed the 2 issues from round 1.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…and a repair-first VERDICT line records (rc=$(rc_of))"
+# ⛔ AN INDEFINITE ARTICLE WITH A REPAIR LATER IN THE CLAUSE (P2, eighth fresh review of #2288 — MEASURED
+# over-block: `a` is a numeral here, so widening the nouns to `bugs?` made this refuse).
+reset; printf '**Verdict:** CLEAN — a bug in the retry path was fixed in round 2.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…while 'a bug … was fixed in round 2' records (rc=$(rc_of))"
+reset; printf '**Verdict:** CLEAN — a bug remains in the retry path.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "  ...and 'a bug remains' still refuses (rc=$(rc_of))"
+reset
 reset; printf '**Verdict:** CLEAN\n- Summary\n      - 2 blocking defects remain in scripts/x.sh\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…an indented nested-list count is refused (rc=$(rc_of))"
@@ -2685,6 +2726,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 762 ]; ck $? "assertion-count pin: >= 762 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 773 ]; ck $? "assertion-count pin: >= 773 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

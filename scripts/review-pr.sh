@@ -1340,6 +1340,10 @@ function counts_only(r,   guard, seen) {
 # which is the ratchet this rule exists to stop. The NIT tags below are the same kind of closed
 # list: a label that tags ITSELF as a note is a note, and P3-class notes never block.
 function noun() { return "(findings?|blockers?|issues?|defects?|bugs?|severity|priority|critical|high|major)" }
+# ⛔ ONE NUMERAL CLASS FOR BOTH READERS (P0, eighth fresh review of #2288): the count classifier and the
+# severity scanner count arm must agree on what a count IS, or one of them silently fails open — the
+# class was duplicated and they drifted one spelling over, twice. §BI-2 asserts they stay equal.
+function numwords() { return "(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|dozen|single|sole|lone|several|multiple|many)" }
 function nittag(s) { return (s ~ /^[[:space:]]*[*_`]*(\()?\[(nit|note|optional|informational|suggestion)[)\]][[:space:]]*:/ || s ~ /^[[:space:]]*[*_`]*\((nit|note|optional|informational|suggestion)\)/) }
 function sepafter(s) { return (s ~ /^[[:space:]*_`]*[][):.,;—–-]/) }
 function label(s,   a, b, pre, post, sl) {
@@ -1467,7 +1471,15 @@ function label(s,   a, b, pre, post, sl) {
       # was invisible until the numeral-zero cue below made the sibling form (`0 P1, 2 P2`) reach this
       # token at all: the comma arm used to fire on the FIRST token and block the line for the wrong
       # reason, so the missing arm had no failing case. Non-zero only — `0` is the cue, not a count.
-      if (!negpre && pre ~ /(^|[^[:alnum:]])[1-9][0-9]*[[:space:]]*$/) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      # ⛔ AND THE COUNT MAY BE SEPARATED FROM THE TOKEN (P0, eighth fresh review of #2288 — MEASURED,
+      # pre-existing on main: the count arm required the digits to sit IMMEDIATELY before the token, so
+      # `**Verdict:** CLEAN — 2 blocking P1 defects remain in scripts/x.sh.` produced NO blocking line and
+      # a SIGNED clean record, while `2 P2 findings` blocked. A severity token between the numeral and
+      # the finding noun is ordinary reviewer prose, so the count may now cross up to three words. Word
+      # numerals are included, and the bridge is written as OPTIONAL GROUPS rather than `{0,3}` because
+      # mawk does not support interval expressions (measured: a `{0,3}` here compiles everywhere and
+      # matches nothing under mawk, silently fail-open).
+      if (!negpre && pre ~ ("(^|[^[:alnum:]])(" numwords() "|[1-9][0-9]*)([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "[[:space:]-]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
@@ -1743,13 +1755,24 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[;,]|[[:space:]](and|but|however|yet|while|although)([[:space:]]|$)/)
   return parts[n]
 }
-function repair_led(cl,   n, w) {
+function repair_led(cl,   n, w, i) {
   n = split(cl, w, /[^[:alpha:]-]+/)
-  # up to three words may precede the verb ("The PR fixes", "We have also fixed")
-  for (i = 1; i <= 3 && i <= n; i++) if (w[i] ~ repair_re) return 1
+  # ⛔ SKIP THE EMPTY LEADING FIELD (P2, eighth fresh review of #2288 — MEASURED: a verdict-shaped clause
+  # begins with punctuation, so `split` yields ["", "verdict", "clean", ...] and the three-slot window was
+  # `"", "verdict", "clean"` — the repair verb was UNREACHABLE on every verdict line, so
+  # `**Verdict:** CLEAN — fixed the 2 issues from round 1.` refused while the same sentence on its own
+  # line recorded). Up to three words may precede the verb ("The PR fixes", "We have also fixed").
+  k = 0
+  for (i = 1; i <= n; i++) {
+    if (w[i] == "") continue
+    k++
+    if (w[i] ~ repair_re) return 1
+    if (k >= 3) return 0
+  }
   return 0
 }
 BEGIN {
+  # (the same class the severity scanner uses, so the two readers cannot drift: §BI-2 asserts it)
   num = "[0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many"
   noun = "findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?"
   repair = "(fixed|addressed|resolved|closed|removed|repaired|fix|fixes|fixing|address|addresses|addressing|close|closes|closing|resolve|resolves|resolving|remove|removes|removing|re-review|re-reviewed)"
@@ -1786,8 +1809,17 @@ BEGIN {
       if (dig == "0") continue
       # a repair stated inside the match ("1 finding was fixed") is not a live count
       if (frag ~ ("(" repair ")$")) continue
+      cl = clause_before(pre)
       # …and one stated at the head of THIS clause is not either
-      if (repair_led(clause_before(pre))) continue
+      if (repair_led(cl)) continue
+      # ⛔ AN INDEFINITE ARTICLE NEEDS THE REPAIR ANYWHERE IN THE CLAUSE (P2, eighth fresh review of
+      # #2288 — MEASURED over-block, the direction that costs a PAID run: `a` is a numeral here, so
+      # `**Verdict:** CLEAN — a bug in the retry path was fixed in round 2.` refused once this branch
+      # widened the noun list to `bugs?`). `a`/`an` is not a count unless something else says the
+      # finding is live, and a repair verb in the clause is that something.
+      # (the repair may sit AFTER the match — `a bug in the retry path was fixed in round 2` — so for an
+      # article the whole LINE is searched; `a`/`an` with no repair anywhere still refuses)
+      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && line ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
       print frag
     }
   }
@@ -1891,7 +1923,20 @@ refuse_counted_clean() {
     # The arms are: forward `<numeral> … <noun>`, mirror `<noun> … [:=-] <numeral>`, and the multiplier
     # `<severity> ×|x|*|times <n>` — every spelling as an ALTERNATION, because inside a bracket expression
     # the multi-byte `×` does not match under `LANG=C` (measured).
-    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK" 2>/dev/null || true)"
+    # ⛔ A FAILED CLASSIFIER IS NOT AN EMPTY ONE (P1, eighth fresh review of #2288 — MEASURED: a
+    # classifier that compiles but matches nothing — exactly the mawk `{0,3}` class this branch already
+    # hit — exits 0 and prints nothing, so every pin in this guard goes fail-open and a signed clean
+    # record is minted. `2>/dev/null || true` was swallowing both the status and the reason. The canary
+    # is a string the classifier MUST report: if it does not, the guard cannot be shown to have run and
+    # the run refuses with E_SCAN instead of recording.
+    if [ -z "${COUNT_SCAN_CANARY_OK:-}" ]; then
+      _canary="$(printf '%s\n' '1 blocking defect remains.' | awk "$COUNT_SCAN_AWK" 2>/dev/null)"
+      [ -n "$_canary" ] \
+        || die "$E_SCAN" "the count classifier did not report a canary finding (\"1 blocking defect remains.\") — it compiled but is not working under $(command -v awk), so the contradiction guard cannot be shown to have run. No verdict is recorded (transcript: $TRANSCRIPT)."
+      COUNT_SCAN_CANARY_OK=1
+    fi
+    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK")" \
+      || die "$E_SCAN" "the count classifier FAILED on this transcript line (awk rc=$?) — a failed scan is not an empty scan, so no verdict is recorded (transcript: $TRANSCRIPT)"
     [ -n "$_hit" ] || continue
     CLEAN_COUNT_WORDS="$(printf '%s' "$_hit" | head -1)"; CLEAN_COUNT_LINE="$_vl"; break
   done < "$_src"
