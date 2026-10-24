@@ -215,6 +215,251 @@ def test_max_override_is_a_hard_ceiling():
     assert b["total"] == 8
 
 
+# ── 2b. a SLOT belongs to a PROCESS, not to a record (agent-infra#2700 C5) ──────────────
+
+def _a_dead_pid() -> int:
+    """A pid that is PROVABLY gone -- and that can never be recycled into existence.
+
+    ⛔ NOT A REAPED CHILD (#2746 review round 3). This helper used to return a child's pid after
+    measuring it dead once; the pid is then written into a pid file and re-measured LATER, inside
+    `pass_budgets` -- and a pid recycled in that window reads `alive` BY DESIGN, so the assertion
+    would fail on a green tree with a message that blames the fix. On a box running forty lanes that
+    is the flake class this suite cannot afford.
+
+    `2**31 - 1` is above every platform's `pid_max` (Linux defaults to 4194304 and is capped below
+    2**22; macOS's is smaller), so no process can ever hold it and `kill` answers ESRCH for ever.
+    The probe is the assertion: if some platform ever did hand it out, this fails HERE, naming the
+    helper, instead of inside a test about budgets.
+    """
+    sentinel = 2 ** 31 - 1
+    try:
+        os.kill(sentinel, 0)
+    except ProcessLookupError:
+        return sentinel
+    pytest.fail("pid %d exists on this box -- it cannot be used as a provably-dead pid" % sentinel)
+
+
+def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch):
+    """A register full of finished workers must not read as a full machine.
+
+    MEASURED 2026-10-24 19:26-19:31Z on the Mac: 60 `bg/prd-*.pid` files, ZERO of their pids alive,
+    and `pass_budgets()` charged every fresh row to MAX_FIX -- `inflight=16, budget fix=0`,
+    `dispatched 0 of 44 queued`, on every pass for hours. PRE-FIX the FIRST assertion below reads 0:
+    three ghost rows hold all three fix slots on the strength of the row alone.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 3, "max_review": 12}
+    st = {}
+    for n in (11, 12, 13):
+        (bg / ("prd-%d.pid" % n)).write_text("%d\n" % dead)
+        st[str(n)] = {"action": "fix-ci", "worker": "prd-%d" % n, "head": "a" * 40,
+                      "at": "2026-01-01T00:00:00Z", "at_epoch": now}
+
+    # (1) three PROVABLY DEAD workers must not hold the ceiling, and the self-report must say so.
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 3, "three dead workers still hold the whole fix ceiling: %r" % (b,)
+    assert b["used"] == 0
+    assert (b["inflight"], b["alive"], b["unknown"]) == (3, 0, 0), \
+        "the pass line must be able to say `inflight=3 (alive=0 unknown=0)`: %r" % (b,)
+    assert b["used"] == b["alive"] + b["unknown"], "used is alive + unknown, always"
+
+    # (2) a LIVE worker consumes exactly one slot (`os.getpid()` is this test process).
+    (bg / "prd-14.pid").write_text("%d\n" % os.getpid())
+    st["14"] = {"action": "fix-ci", "worker": "prd-14", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 2, "a live worker must cost exactly one slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (4, 1, 0)
+
+    # (3) NO pid file at all => UNKNOWN => still consumes one slot. This is the FAIL-CLOSED
+    # direction and it is deliberate: freeing a slot we cannot disprove is a duplicate dispatch
+    # onto a live PR -- invisible, and how one conflict gets resolved twice.
+    st["15"] = {"action": "fix-ci", "worker": "prd-15", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 1, "an unreadable liveness must NOT free a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (5, 1, 1), \
+        "an unproven row is `unknown`, NOT `alive` -- merging them is how the self-report lies: %r" % (b,)
+
+    # (4) the arithmetic is PER CLASS: a ghost REVIEW row frees the review budget and touches
+    # nothing in the fix budget (the ceiling it holds is decided by ACTION_CLASS, not by the pass).
+    (bg / "prd-16.pid").write_text("%d\n" % dead)
+    st["16"] = {"action": "record-review", "worker": "prd-16", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["review"]) == (1, 12), \
+        "a dead review worker must free a REVIEW slot only: %r" % (b,)
+
+
+def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monkeypatch):
+    """THE TRAP, and the whole trick of this fix.
+
+    The state row stores the SHORT worker name (`prd-2035`) while the launcher writes a REPO-SCOPED
+    pid file (`prd-agent-infra-2035.pid`), the partitioning that stopped two doctors sharing one
+    register (#2700/#2725). An exact-name lookup finds NOTHING, and "nothing found => assume alive"
+    (the safe direction) then keeps every ghost alive -- which is why the first version of this fix
+    changed nothing at all. The trailing NUMBER is matched too.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
+        "a repo-scoped pid file proves the short-named row's worker gone"
+
+    # …and the same file, LIVE, holds the slot: over-matching must never free a running worker.
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
+
+    # A PREFIX is a different PR: 20350's dead worker must not free 2035's slot.
+    (bg / "prd-agent-infra-2035.pid").unlink()
+    (bg / "prd-20350.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0, \
+        "'-20350.pid' answers for PR 20350, never for PR 2035"
+
+
+def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
+    """Only a pid file that is READABLE may drop a slot; garbage is not evidence of absence.
+
+    Every entry here is a real path to a real defect, not padding:
+      * `9999999999` / `2147483648` -- `os.kill` raises `OverflowError` (NOT OSError) outside the
+        platform's pid range, so a ten-digit pid file ABORTED the whole pass from inside the
+        counter until `_read_pid` range-checked it (#2746 review);
+      * `99999` -- an UNTERMINATED number is a mid-write prefix of `999999`, i.e. a different pid;
+        the launcher's `echo` always terminates, so an unterminated file is not a verdict;
+      * the non-UTF8 byte -- a strict text read raises `UnicodeDecodeError` (a ValueError, NOT an
+        OSError), which escaped every handler and crashed the pass (#2746 review).
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"21": {"action": "fix-ci", "worker": "prd-21", "at_epoch": now}}
+    for junk in ("", "not-a-pid\n", "0\n", "9999999999\n", "2147483648\n", "99999",
+                 "4242\n5678\n"):
+        (bg / "prd-21.pid").write_text(junk)
+        b = pr.pass_budgets(st, cap, now_epoch=now)
+        assert b["fix"] == 0, "pid file %r freed a slot it could not disprove: %r" % (junk, b)
+        assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+    (bg / "prd-21.pid").write_bytes(b"\xff\xfe not a pid\n")
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 0, "a non-UTF8 pid file crashed or freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+
+def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path, monkeypatch):
+    """An artifact of the wrong TYPE is unknown, not gone -- and not a hang either.
+
+    `_worker_pid_files` filters on `isfile`, which excludes a directory AND keeps a FIFO from
+    blocking `open()` forever with no writer. Both are asserted: the FIFO case is the one a
+    regression to `os.path.exists` would turn into a HUNG pass (worse than the crash this round-1
+    review already fixed), and it would otherwise pass this suite green.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    (bg / "prd-31.pid").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    st = {"31": {"action": "fix-ci", "worker": "prd-31", "at_epoch": now}}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
+    assert b["fix"] == 0, "a directory at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+    fifo = bg / "prd-32.pid"
+    os.mkfifo(fifo)                       # POSIX only; this suite does not run on Windows
+    st["32"] = {"action": "fix-ci", "worker": "prd-32", "at_epoch": now}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)   # must not hang
+    assert b["fix"] == 0, "a FIFO at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (2, 0, 2)
+
+
+def test_the_pass_line_reports_inflight_alive_and_unknown(monkeypatch, tmp_path):
+    """The self-report must be ON THE LINE, not merely in the dict (#2746 review round 2).
+
+    The three-state split is the whole operator-facing point of the change -- `inflight=16 (alive=0
+    unknown=0)` is what makes "sixteen records and nothing running" visible -- and nothing asserted
+    that the line carries it, so a later edit could drop `alive`/`unknown` from the message with the
+    whole suite green.
+    """
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    (bg / "prd-1.pid").write_text("%d\n" % dead)     # provably gone: frees its slot
+    (bg / "prd-2.pid").write_text("not-a-pid\n")     # unknown: holds it, and is reported as such
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(3)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inflight=2 (alive=0 unknown=1)" in joined, joined
+
+
+def test_a_zero_budget_held_by_unproven_rows_does_not_claim_saturation(monkeypatch, tmp_path):
+    """`no capacity budget` must not say "all in flight" over rows no process backs.
+
+    #2746 review round 2 measured the contradiction: `inflight=2 (alive=0 unknown=2)` on the pass
+    line and then "all of MAX_FIX+MAX_REVIEW is in flight" as the verdict -- the same
+    internally-consistent-and-false story the change exists to remove, one line lower.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    for n in (1, 2):
+        (bg / ("prd-%d.pid" % n)).write_text("not-a-pid\n")        # unknown, twice
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 2, "max_review": 0})
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inhight=2" not in joined, joined          # guard against a typo'd field name
+    assert "inflight=2 (alive=0 unknown=2)" in joined, joined
+    assert "no capacity budget (inflight=2: alive=0 unproven=2)" in joined, joined
+    assert "is in flight" not in joined, joined
+
+
+def test_one_live_candidate_holds_the_slot_even_when_a_sibling_pid_file_is_dead(tmp_path, monkeypatch):
+    """MIXED CANDIDATES: the fail-closed loop must look at ALL of them (#2746 review).
+
+    A regression that made the loop "first candidate wins" would free a slot while the short-named
+    file's live pid is still running -- the duplicate-dispatch direction. Both orders are asserted,
+    because the exact-name file sorts first in `_worker_pid_files` either way.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-2035.pid").write_text("%d\n" % dead)                  # exact name: dead
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())  # scoped: LIVE
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "a LIVE sibling pid file must hold the slot even though the exact-named one is dead: %r" % (b,)
+
+    (bg / "prd-2035.pid").write_text("%d\n" % os.getpid())            # exact name: LIVE
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)       # scoped: dead
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "…and in the other order: %r" % (b,)
+
+    # One unreadable sibling is NOT a free slot either: it could name the live worker.
+    (bg / "prd-2035.pid").write_text("not-a-pid\n")
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"], b["unknown"]) == (0, 0, 1), \
+        "unreadable + dead must hold the slot as UNKNOWN, never drop it: %r" % (b,)
+
+
 # ── 3. the dispatch path is the BACKGROUND one, and it is LOAD-GATED ──────────────────────
 
 def test_spawn_argv_is_the_background_dispatcher_not_cmux(monkeypatch):
@@ -4295,3 +4540,125 @@ def test_a_sibling_that_cannot_be_EXECUTED_is_also_a_recorded_refusal(tmp_path):
     assert rec["rc"] == 2, rec
     assert rec.get("read") == "seam", rec
     assert "could not be loaded" in rec["reason"], rec
+
+
+# ── THE CLASSIFIER AND THE DISPATCH REGISTER BELONG TO THE REPO THE DOCTOR WORKS ON ───────────
+# ⛔ TWO INDEPENDENT DEFECTS, ONE SHAPE: a module-level default stood in for an input.
+#
+#   1. `objective.py` reads its repo from `OBJECTIVE_REPO` at EXEC time and nothing shipped set it,
+#      so every call fell back to `daniel-ospina/tortoise`. MEASURED 2026-10-24 14:12Z on a doctor
+#      pointed at agent-infra: the classifier asked about tortoise's check-runs using agent-infra
+#      SHAs, GitHub answered `422 No commit found for SHA` for EVERY PR, all 58 read UNREADABLE, and
+#      the pass dispatched nothing -- while a direct `gh api .../commits/<sha>/check-runs` for the
+#      same sha returned 200 and 30 check-runs. The read was fine; the repo was wrong. (agent-infra#1989)
+#   2. `STATE` was one `pr-doctor.json` whose keys are PR NUMBERS, and `pass_budgets()` charges every
+#      row inside `STALE_DISPATCH_S` against a class ceiling. Two doctors therefore shared ONE
+#      register: the tortoise pass reported `inflight=17, budget fix=0` and `dispatched 0 of 4
+#      queued` on every pass for hours, while the in-flight workers were agent-infra's. (agent-infra#2700)
+#
+# Both are silent by construction: a wrong repo is a READ that answers with a refusal, and a shared
+# register is a BUDGET that answers with zero. Neither raises, and both look like the queue.
+
+def test_the_classifier_is_asked_about_the_repo_this_doctor_dispatches_for(monkeypatch):
+    """The classifier's repo is THIS pass's repo -- not a shipped default.
+
+    Drives the seam directly: `_objective()` execs `objective.py`, which reads `OBJECTIVE_REPO` at
+    exec time, so the value must be installed BEFORE the exec. Patching `pr.REPO` is what a doctor
+    pointed at another repo looks like from in here; before the fix the classifier answered
+    `daniel-ospina/tortoise` regardless.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    mod = pr._objective()
+    assert mod.REPO == "daniel-ospina/agent-infra", (
+        "the classifier resolved %r, but this pass dispatches for %r -- every check-run read would "
+        "be answered `422 No commit found for SHA`" % (mod.REPO, pr.REPO))
+
+
+def test_an_ambient_OBJECTIVE_REPO_cannot_outvote_the_repo_this_pass_dispatches_for(monkeypatch):
+    """FORCED, not `setdefault`. A disagreeing ambient value IS the defect, so it must lose.
+
+    A caller's environment is how the wrong repo arrived in the first place; deriving it from the
+    caller means two facts about one pass can silently disagree, and the pass reports a confident
+    verdict about a repo it is not working on.
+    """
+    monkeypatch.setenv("OBJECTIVE_REPO", "daniel-ospina/tortoise")
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+
+
+def test_the_dispatch_state_file_is_named_for_the_repo_and_derived_at_import(tmp_path):
+    """TWO DOCTORS, TWO REPOS, ONE STATE DIR: the register must not be shared.
+
+    Structural on purpose -- it imports the REAL file in a subprocess (the same shape as the
+    sibling-load test above), so it pins the import-time derivation AND the ordering: `STATE` reads
+    `REPO`, so a copy that defines it first dies with `NameError` before it reads anything.
+    """
+    import shutil
+    for name in ("pr-doctor.py", "objective.py"):
+        shutil.copy(pathlib.Path(__file__).with_name(name), tmp_path / name)
+    env = dict(os.environ, HOME=str(tmp_path))
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import importlib.util, pathlib, sys;"
+         "p = pathlib.Path(sys.argv[1]);"
+         "s = importlib.util.spec_from_file_location('pd', str(p));"
+         "m = importlib.util.module_from_spec(s);"
+         "s.loader.exec_module(m);"
+         "print(m.STATE); print(m._state_file(m.REPO)); print(m._state_file('daniel-ospina/tortoise'));"
+         "print(m._state_file('someone-else/tortoise'))", str(tmp_path / "pr-doctor.py")],
+        capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    live, wired, same_owner, other_owner = [pathlib.Path(x).name for x in r.stdout.split()]
+    assert live == "pr-doctor-daniel-ospina-tortoise.json", (
+        "the dispatch register is %r: a single shared `pr-doctor.json` lets ONE repo's in-flight "
+        "rows consume ANOTHER repo's budget, and `pass_budgets()` then reports `budget fix=0` on "
+        "every pass while the workers it counted belong to a different repo (#2700)" % live)
+    # wiring, not a literal: the pass's register IS this function's answer for its own repo
+    assert live == wired
+    # and the name is the WHOLE slug, so another owner's `tortoise` cannot share this register
+    assert same_owner == "pr-doctor-daniel-ospina-tortoise.json"
+    assert other_owner == "pr-doctor-someone-else-tortoise.json" != same_owner
+
+
+def test_one_repos_inflight_rows_cannot_starve_another_repos_pass(tmp_path, monkeypatch):
+    """The measured symptom, as a predicate: a full register in repo A leaves repo B a full budget."""
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    cap = {"max_fix": 4, "max_review": 4}
+    # doctor A (tortoise): four workers in flight, all inside STALE_DISPATCH_S
+    monkeypatch.setattr(pr, "STATE", pr._state_file("daniel-ospina/tortoise"))
+    pr.save_state({str(n): {"action": "fix-ci", "at_epoch": pr.now()} for n in (101, 102, 103, 104)})
+    assert pr.pass_budgets(pr.load_state(), cap)["fix"] == 0, "the fixture did not fill its budget"
+    # doctor B (agent-infra): its own register, so none of A's rows are charged to it
+    monkeypatch.setattr(pr, "STATE", pr._state_file("daniel-ospina/agent-infra"))
+    assert pr.load_state() == {}, "doctor B read doctor A's dispatch register"
+    assert pr.pass_budgets(pr.load_state(), cap)["fix"] == 4
+
+
+def test_loading_the_classifier_does_not_rewrite_the_process_environment(monkeypatch):
+    """The force is for THIS read, not for the process (review, 2026-10-24).
+
+    `_objective()` also runs at IMPORT time, so a bare `os.environ[...] = REPO` leaves the variable
+    rewritten for every later consumer in the same process — and `scripts/pr-loop.py` carries its own
+    `_objective()`, so the two bind the same repo whichever one asked. A fix that installs a global
+    side effect to win a local read is the same class as the bug: one authority answering for
+    another. `objective.py` reads the variable only at exec, so restoring it is free.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+    assert "OBJECTIVE_REPO" not in os.environ, "the classifier load leaked OBJECTIVE_REPO into the process"
+    # an ambient value that was there before is put back, not deleted
+    monkeypatch.setenv("OBJECTIVE_REPO", "some-other/thing")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+    assert os.environ["OBJECTIVE_REPO"] == "some-other/thing"
+
+
+def test_the_seam_asserts_the_classifiers_repo():
+    """The repo is what the whole plan is built on, so the seam must name it (#2518 P1).
+
+    Without the assertion, a sibling older than #1989 simply has no `REPO` to disagree with, and the
+    pass reads one repo's queue against another repo's classifier with no refusal anywhere. A named
+    seam failure is the only outcome that is not a confident verdict about the wrong repo.
+    """
+    assert "REPO" in pr._SEAM, pr._SEAM

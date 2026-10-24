@@ -507,7 +507,7 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:disk-reaper-run.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
@@ -527,6 +527,11 @@ foreign:cmux_dispatch.py"
 # population, not an exemption. Verified against the CODE, not the diff (#1899): the exec site is
 # `templates/systemd/eldato-harness-apply.service` + `templates/launchd/harness-apply/*.plist`, both
 # naming `$HOME/.pi/agent/scripts/harness-apply-pass.sh`.
+# `script:disk-reaper-run.sh` joined on 2026-10-24 (#2354, PR #2361): the scheduled wrapper the
+# timer unit execs, ADDED to `fleet_srcs` in the same landing (a fresh $DEST/scripts otherwise gets
+# `install-disk-reaper-timer.sh` + `disk-reaper.sh` without the entry point the unit calls — the exact
+# #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
+# — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
 #
 # `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
 # the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
