@@ -1196,8 +1196,22 @@ named_unattributable_runs() {
   # fallback is only for grep being unavailable; the default covers the no-match case. The
   # predicate matches the loop's guard exactly, so the header cannot disagree with the body:
   # the loop skips a line with no NON-SPACE character, and so does this count.
-  named_count="$(grep -c '[^[:space:]]' "$unattributed" 2>/dev/null || true)"
-  [ -n "$named_count" ] || named_count=0
+  # ⛔ A COUNT THAT COULD NOT BE MADE IS NOT ZERO (#2610 review, round 5). `|| true` collapsed
+  # grep's exit 2/127 (unreadable / grep broken) into the same empty capture as a legitimate
+  # no-match, so the header could assert `NAMED (0)` while the loop below — whose guard is shell
+  # pattern matching, not grep — still printed runs underneath it. That is the one unmeasurable
+  # arm in this function that answered AFFIRMATIVELY; it now says the count is UNKNOWN.
+  # `$?` is captured BEFORE the case: inside a branch it is the case's own status, not grep's,
+  # and a diagnostic that names the wrong exit code is a claim about the instrument that is false.
+  named_count="$(grep -c '[^[:space:]]' "$unattributed")"
+  local count_rc=$?
+  case "$count_rc" in
+    0) ;;
+    1) named_count=0 ;;
+    *) named_count="?"
+       say_err "   ⚠️  the unattributable list could not be COUNTED (grep exit ${count_rc}) — the"
+       say_err "   count is UNKNOWN, not zero; the runs named below are still real" ;;
+  esac
   # The base's own surface, through the ONE probe (#1261) — never a second reader. A base
   # ref that could NOT be resolved is not a ref to probe: passing '' would have made the
   # reader assert "'X' IS red on ''" about a branch nobody resolved, so the ref is checked
@@ -1215,11 +1229,15 @@ named_unattributable_runs() {
   # THE COUNT IS CROSS-CHECKED, never assumed (#2610 review, P3-5): the refusal above prints
   # `N of M`, and this list is the SUBJECT of that count. A subset that is short of it would
   # otherwise read as a complete account of the unattributable runs.
-  if [ -n "$expected" ] && [ "$named_count" != "$expected" ]; then
+  if [ -n "$expected" ] && [ "$named_count" != "?" ] && [ "$named_count" != "$expected" ]; then
     say_err "   ⚠️  the collector published $named_count unattributable run(s) where the refusal"
     say_err "   counted ${expected} — this list is INCOMPLETE, so read it as a sample, not as the set"
   fi
-  say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
+  if [ "$named_count" = "?" ]; then
+    say_err "   The failing run(s), NAMED — each check below is one whose failed-step"
+  else
+    say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
+  fi
   say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "${line//[[:space:]]/}" ] || continue

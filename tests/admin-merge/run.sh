@@ -13728,7 +13728,7 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
   && fail "(#1185 c) …but the SUPERSEDED run's log was fetched — the identity resurrected a replaced red" \
   || pass "(#1185 c) …and the superseded run's log was never read"
 
-# ── 80. THE REFUSAL NAMES ITS SUBJECT — THE RUN, THE CHECK, AND THE BASE ANSWER (#2610) ─
+# ── 79. THE REFUSAL NAMES ITS SUBJECT — THE RUN, THE CHECK, AND THE BASE ANSWER (#2610) ─
 # A count is not a subject. Measured on agent-infra 2026-10-24: three rails (#2430, #2608,
 # #2623) refused with "N of M failing PR run(s) yielded NO parseable failure identity" for
 # heads whose surface was red on `bash-suites (1)/(5)/(7)`, and the refusal named NOTHING —
