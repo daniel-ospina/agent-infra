@@ -112,6 +112,9 @@ import {
   RECORD_STATE_CARRY_ALLOWED,
   type ReviewRecord,
 } from "./index.js";
+// #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
+// suite green (the review of #2665 caught the hardcoded copy).
+import { SPAWN_UNSPAWNABLE_TOKEN } from "../shared/spawn-capacity.js";
 // The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
 // this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
 import {
@@ -7160,6 +7163,425 @@ test("#2349 review2 P2 — a no-repo SINGLE-candidate corrupt file is named by i
     ) as any).reason as string;
     ok(reason.includes(resolvePath(dir, "a-repo-77.json")), "names the file that actually exists");
     ok(!reason.includes("<owner>-<repo>-77.json"), "must NOT render the path generator as a real file");
+  });
+});
+
+// ── the ≥1-dispatch floor: a FAILED SPAWN is an ATTEMPT, not a dispatch ──────
+//
+// THE DEFECT THESE PIN. The floor counts `tool_result` events for `task`/`subagent`
+// and nothing else, so a reviewer dispatch that produced NO verdict — a pre-spawn
+// refusal, a child cut at its first-message/cut-gap bound, or a retry-exhausted
+// `failed` — incremented the SAME counter a real review does. Two consequences, both
+// measured on a loaded box (cell-3, 4 vCPU, load1 8.46 → ratio 2.17):
+//   (1) FALSE PASS — a reviewer that never reported satisfied the floor, and the lane's
+//       unreviewed `git push` was allowed. A gate that reports OK while the artifact is
+//       unreviewed is the A-class failure (AGENTS.md §Product Over Process).
+//   (2) CAPACITY READ AS COMPLIANCE — the lane that could not spawn a reviewer was told
+//       "no reviewers dispatched", which is the sentence for a lane that never tried.
+//       The two states have different remedies (retry under less load vs dispatch now)
+//       and the old text could not distinguish them.
+//
+// The counts below are asserted through the REGISTERED HOOKS (a synthetic tool_result
+// shaped exactly like builtin-tools' producers: `status: "failed"` from the
+// retry-exhaustion path, `killed: true` from composeAbnormalExit), because the defect
+// is in what the floor READS, not in a string.
+section("#spawngate — a spawn that produced no verdict is an ATTEMPT, not a dispatch");
+
+/** The synthetic results, shaped from builtin-tools' own producers. */
+const SPAWN_FAILED = {
+  model: "deepseek-v4-flash",
+  provider: "deepseek",
+  // FAILED_TASK_STATUS in extensions/builtin-tools — "the `failed` retry-exhaustion result".
+  status: "failed",
+  retryable: false,
+};
+const SPAWN_CUT = {
+  model: "deepseek-v4-flash",
+  provider: "deepseek",
+  // composeAbnormalExit's details: the child was killed by a bound.
+  killed: true,
+  reason: "first-message-stall",
+  heartbeatTimeout: 1_800_000,
+};
+const SPAWN_REFUSED = {
+  model: "m",
+  provider: "p",
+  status: "invalid-cwd",
+  retryable: false,
+  error: "bad cwd",
+};
+/** A pre-spawn provider-latch halt (builtin-tools' haltDispatchResult): the dispatch never ran. */
+const SPAWN_LATCH = {
+  model: "deepseek-v4-flash",
+  provider: "deepseek",
+  failoverHalt: true,
+  haltAttempted: false,
+  haltReason: "halt",
+};
+
+/**
+ * The one-line verdict a monitor greps — imported, NOT re-typed (review of #2665): a hardcoded
+ * copy would keep this suite green through a rename that broke the token monitors grep for.
+ */
+const UNSPAWNABLE_TOKEN = SPAWN_UNSPAWNABLE_TOKEN;
+
+testAsync("#spawngate 1/4 — a retry-exhausted spawn (`status: failed`) does NOT satisfy the floor", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // The child session was created, the box was loaded, the child never produced a
+        // first message; after retry exhaustion the dispatch returns `failed`.
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a spawn that produced no verdict must NOT satisfy the ≥1-dispatch floor");
+
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), `the refusal names the condition a monitor greps (${UNSPAWNABLE_TOKEN})`);
+        // The distinction the lane needs: this is the BOX, not the lane's diligence.
+        ok(/CAPACITY/.test(reason), "says CAPACITY — the pair of states the old sentence collapsed");
+        ok(/attempt/i.test(reason), "counts the ATTEMPT it observed, so the lane can see its own retry");
+        ok(/status=failed|failed/.test(reason), "names the kind of failed spawn it read");
+        // It must NOT claim a compliance failure it did not observe.
+        ok(!reason.includes("No reviewers were dispatched in this session"), "must not report the never-tried verdict");
+
+        // The durable trail, with its OWN reason so the fleet can count capacity refusals.
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks.length, 1, "one gate_block row");
+        equal(blocks[0].reason, "review_gate_unspawnable", "a capacity refusal is NOT filed as no_reviewers_dispatch");
+        equal(blocks[0].spawn_attempts, 1, "the row carries the attempt count");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2/4 — a child CUT by a bound (`killed: true`) is the same class, and the attempts accumulate", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        await fire("tool_result", { toolName: "task", details: SPAWN_CUT });
+
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "two verdict-less spawns still do not satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(/2\b/.test(reason) && /attempt/i.test(reason), "reports BOTH attempts");
+        ok(reason.includes("first-message-stall"), "names the bound that cut the child (the detail it actually read)");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2b — the MICRO tier takes the same capacity verdict (its own branch, its own pin)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      fs.writeFileSync("/tmp/agent-issue-complexity", "micro\n");
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_CUT });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "micro blocks at 0 COUNTED verdicts too");
+        const reason = (r as any).reason as string;
+        // The micro remediation is about WHICH reviewer to dispatch; the capacity fault is
+        // upstream of the tier, so the micro text must not be what the lane gets.
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the capacity verdict wins over the micro remediation");
+        ok(!reason.includes("micro tier"), "the micro-specific sentence is not the diagnosis");
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks[0].reason, "review_gate_unspawnable");
+        equal(blocks[0].tier, "micro", "the row still records the tier it was judged under");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2i — a PROVIDER LATCH is reported as durable state, never as an argument to fix", async () => {
+  // The end-to-end half of the shared suite's F7: a latch halt genuinely produces no verdict, so
+  // it must NOT be counted (same false PASS), but the remedy it renders has to match the cause —
+  // sending the lane to "fix the refused argument (cwd / session id)" for an exhausted provider
+  // family spends the retry budget on an unchanged dispatch (review of #2665, P2).
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_LATCH });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a latch halt does not satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the verdict is greppable");
+        ok(/LATCH OBSERVED/.test(reason), "names the latch it read");
+        ok(!/fix the refused argument/.test(reason), "never renders the argument remedy");
+        ok(!/less loaded moment/.test(reason), "and never blames load for a durable latch");
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks[0].reason, "review_gate_unspawnable", "the same mechanical reason, so monitors are unchanged");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2c — the FORWARDING pin: a real attempt total past the retained window is not understated", async () => {
+  // `SPAWN_ATTEMPT_KEEP` (10) bounds the session's ledger; the verdict's COUNT must come from
+  // the session total, not from the window. Without a case that makes total != attempts.length,
+  // dropping the third argument at either call site is unobservable (review of #2665).
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        for (let i = 0; i < 12; i++) {
+          await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        }
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocked");
+        const reason = (r as any).reason as string;
+        ok(reason.includes("12 sub-agent spawn ATTEMPT(s)"), `the TRUE total, not the window: ${reason.split("\n")[2]}`);
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks[0].spawn_attempts, 12, "the durable row carries the true total too");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2d — a REFUSAL-only ledger reaches the argument remedy through the HOOKS (F4 pin)", async () => {
+  // Review of #2665: the shared suite pinned the renderer's refusal branch, but no INTEGRATION
+  // case ever rendered it from a ledger built by the registered hooks — so a future change to
+  // what the floor feeds the renderer would have been unobservable.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_REFUSED });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a refused spawn does not satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "capacity verdict");
+        ok(reason.includes("REFUSAL OBSERVED (status=invalid-cwd)"), "the evidence it read is carried through");
+        ok(!/less loaded moment/.test(reason), "and the wrong remedy (load) is not printed");
+        // Review of #2665 (F1-residual relocated): the CALLER's header must derive its class from
+        // the same switch the body uses. A refusal-only ledger must not head itself CAPACITY.
+        ok(!/CAPACITY fault/.test(reason), "the header does not claim CAPACITY for a refusal");
+        ok(/SPAWN-SIDE refusal/.test(reason), "the header names the class the ledger supports");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2e — a failed `subagent` dispatch does not satisfy the floor (the micro tier's own path)", async () => {
+  // P1 of the review of #2665: `subagent` reports failure ONLY on its returned result (isError)
+  // and carries no status/killed in details, so a load-order accident made its failures COUNT.
+  // The classifier now reads details.results[] itself, so this holds whatever order the
+  // extensions loaded in.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "subagent",
+          details: {
+            mode: "single",
+            agentScope: "user",
+            projectAgentsDir: null,
+            results: [{ exitCode: 1, stopReason: "error" }],
+          },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a failed subagent reviewer must NOT satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "capacity verdict");
+        ok(/results\[\]/.test(reason), "names the per-result evidence it read");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2f — a REFUSED BACKGROUND spawn is a capacity attempt, not 'no reviewers dispatched'", async () => {
+  // Review of #2665 non-blocking finding: the background early-return preceded classification,
+  // so the #1662 refused-background shape still got the compliance verdict its own test comment
+  // says it should not. The block is unchanged (no false PASS) — the TEXT was wrong.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocked (it never satisfied the floor)");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the REFUSAL is reported as what it is");
+        ok(!/No reviewers were dispatched/.test(reason), "not as the never-tried verdict");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2g — class coverage survives the bounded ledger (a breaker cannot age out)", async () => {
+  // Review of #2665: the trim dropped index 0 when no later attempt shared its class, evicting
+  // exactly the unique-class oldest the rule protects. Measured [breaker, 11×failed] → the
+  // breaker was gone and the verdict flipped to CAPACITY ("retry under less load") — the
+  // wrong-remedy failure this change exists to remove.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // ONE breaker, then enough failures to push it past SPAWN_ATTEMPT_KEEP.
+        await fire("tool_result", {
+          toolName: "task",
+          details: { model: "m", provider: "p", status: "circuit_open", retryable: false },
+        });
+        for (let i = 0; i < 11; i++) {
+          await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        }
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocked");
+        const reason = (r as any).reason as string;
+        ok(reason.includes("BREAKER OBSERVED"), "the breaker survives the window");
+        ok(!/less loaded moment/.test(reason), "so the capacity-only remedy is not printed");
+        equal(
+          readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block")[0].spawn_attempts,
+          12,
+          "the count is still the true total",
+        );
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2h — a terminal collect is classified on the CHILD's nested details too (no-output → attempt)", async () => {
+  // Review of #2665: the collect view reports `background`-run status, and its mapping calls a
+  // no-output `clean-empty` settle `done`. Classifying on the view alone let a background
+  // reviewer that printed nothing satisfy the floor while the FOREGROUND path called the same
+  // shape a `cut`. The nested payload (`view.details`) carries the child's own `exitCode`.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "task_collect",
+          details: {
+            run_id: "RUN-NOOUT",
+            status: "done",
+            terminal: true,
+            exit_code: 0,
+            details: { model: "m", provider: "p", exitCode: 0 },
+          },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a reaped lane with no output must NOT satisfy the floor");
+        ok(/exitCode=0 clean-empty/.test((r as any).reason), "the child's own field decides");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 3/4 — NO over-block: a real reviewer (no failure fields) still satisfies the floor", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // A completed reviewer: no `status`, no `killed`, no error — plus the
+        // details a real composeTaskResult carries.
+        await fire("tool_result", {
+          toolName: "task",
+          details: { model: "deepseek-v4-flash", provider: "deepseek" },
+        });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "a real reviewer dispatch still unlocks the floor");
+        const dispatched = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatched.length, 1, "and it is audited as a dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 4/4 — ZERO attempts is still the lane's fault: the never-tried verdict is unchanged", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // A REFUSED spawn (#1662's shape) is an attempt too — but with none at all, nothing changes.
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocks");
+        const reason = (r as any).reason as string;
+        ok(!reason.includes(UNSPAWNABLE_TOKEN), "a lane that never tried must NOT be told the box is at fault");
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks[0].reason, "no_reviewers_dispatch", "the compliance refusal keeps its reason");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
   });
 });
 
