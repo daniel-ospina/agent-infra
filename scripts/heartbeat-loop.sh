@@ -447,13 +447,27 @@ while :; do
   if [ ! -f "$_obj_file" ] || [ "$_obj_age" -gt 900 ]; then
     # SYNCHRONOUS + BOUNDED (2026-10-10, #7871). A DETACHED refresh only bounds the NEXT read --
     # this pass's readers would still see the stale value, which is exactly the "not bounding it"
-    # that was measured. Synchronous so the write completes BEFORE the pass's readers; bounded at
-    # 90s so a hanging refresh can never stall the loop; TTL-gated at 900s so the measured cost
+    # that was measured. Synchronous so the write completes BEFORE the pass's readers; bounded so
+    # a hanging refresh can never stall the loop; TTL-gated at 900s so the measured cost
     # (~513 `gh api graphql` calls, 12 s) is paid at most once per 900 s of cache age -- never
     # per read, and never by shortening the TTL to buy freshness with `gh` calls.
+    # ⛔ THE BOUND IS SIZED AGAINST THE READ'S OWN CAP, NOT PICKED (#2227). `gh` is serialised per
+    # box (#2005), so ONE `gh pr view` measured 63.0 s at 13 lanes; `objective.py`'s
+    # `QUEUE_READ_MAX_S` is 100 s (1.6x that measurement). At 90 s this bound was BELOW the read
+    # it wraps -- the refresh was killed mid-read and wrote NO line at all, so a merely-late answer
+    # vanished entirely instead of printing `queue_read=SLOW`. 180 s = the 100 s read cap + the
+    # ~12 s of tick work before it + the ~12 s per-PR classify storm after it + ~56 s of headroom.
+    # Changing one without the other makes the read budget INERT; `scripts/test_objective.py::
+    # test_the_caller_bound_leaves_room_for_the_whole_read` fails if they drift apart.
     printf '%s OBJECTIVE refresh START (cache_age=%ss > 900s)\n' \
       "$(date '+%m-%d %H:%M:%S')" "${_obj_age:-absent}" >> "$LOG"
-    run_bounded 90 "objective-refresh" "$LOG" /usr/bin/python3 "$SCRIPTS/objective.py"
+    # ⛔ THE CHILD IS TOLD ITS BOUND, so it can clip its own read to fit (#2227). These two lines
+    # deploy SEPARATELY (`objective.py` is in the fleet farm; this file is a DECLARED, WITHHELD
+    # entry there, #1553), so a box can run a new reader under an old loop. Without the declaration
+    # the reader assumes the conservative 90 s and reads for 66 s; with it, it uses the full cap.
+    # Either way it FINISHES AND PRINTS before the kill, which is the property that matters.
+    OBJECTIVE_CALLER_BOUND_S=180 \
+      run_bounded 180 "objective-refresh" "$LOG" /usr/bin/python3 "$SCRIPTS/objective.py"
     printf '%s OBJECTIVE refresh DONE (cache_age now %ss)\n' \
       "$(date '+%m-%d %H:%M:%S')" \
       "$(( $(date +%s) - $(mtime_of "$_obj_file") ))" >> "$LOG"
