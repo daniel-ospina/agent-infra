@@ -13879,8 +13879,14 @@ printf '%s\n' '#!/bin/sh' \
 chmod +x "$UNC_BIN/grep"
 PATH="$UNC_BIN:$PATH" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(j) an uncountable list still BLOCKS (exit $rc)" \
-  || fail "(j) the rail proceeded with an uncountable list"
+# ⛔ ANCHORED TO THE ARM, NOT TO THE EXIT (#2610 review, round 6): step 1c's `exit 1` fires on
+# `pr_extracted < pr_examined` whether or not the naming arm ran, so an `rc != 0` assertion alone
+# could not redden if the arm regressed. Both halves are required: the refusal AND the unknown
+# header, on the same run.
+[ "$rc" -ne 0 ] && grep -q 'failing PR run(s)' "$SCEN/err" \
+  && grep -q 'The failing run(s), NAMED —' "$SCEN/err" \
+  && pass "(j) an uncountable list still BLOCKS (exit $rc) and still names the runs" \
+  || fail "(j) the refusal or the named header is missing (exit $rc)"
 grep -q "could not be COUNTED" "$SCEN/err" \
   && pass "(j) …and says the count could not be made" \
   || fail "(j) the uncountable arm is silent: $(sed -n '/NAMED/,$p' "$SCEN/err" 2>/dev/null | head -3)"
@@ -13890,9 +13896,9 @@ grep -q "UNKNOWN, not zero" "$SCEN/err" \
 grep -q 'NAMED (0)' "$SCEN/err" \
   && fail "(j) it asserted a count of 0 for a list it could not count" \
   || pass "(j) …and prints NO number it did not measure"
-grep -q 'run 9961' "$SCEN/err" \
+grep -q "run 9961 — check 'bash-suites (5)'" "$SCEN/err" \
   && pass "(j) …while the runs themselves are still named (the lines are real)" \
-  || fail "(j) the runs were dropped along with the count"
+  || fail "(j) the runs were dropped along with the count: $(grep -n '9961' "$SCEN/err" 2>/dev/null | head -3)"
 grep -q 'INCOMPLETE' "$SCEN/err" \
   && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
   || pass "(j) …and no completeness verdict is claimed from an unknown count"
