@@ -408,8 +408,14 @@ ck "(D) …while a log PAST the bound with still no decision line IS cannot-veri
 printf '[select] PR path: 1 acted; issues BLOCKED\n' > "$L/orch-loop.log"
 touch -t "$old" "$L/orch-loop.log"
 NEXTSTALE=abc run status
-ck "(D) a non-numeric next-stale bound falls back to the documented 900 (a 2h-old line is still LATE, never OK) [$(row next)]" \
-   "$(row next | grep -q 'LATE' && ! row next | grep -q 'OK:' && echo 0 || echo 1)"
+# ⛔ CAPTURE, THEN MATCH AS DATA. `row next | grep -q …` is the SIGPIPE false-negative idiom
+# (scripts/check-no-sigpipe-grep.sh, #841/#864): under pipefail a quiet grep exits at its first match
+# while the producer is still writing, the producer takes SIGPIPE, and the PIPELINE status inverts the
+# row's polarity. This file's own rule is that a row's text is EVIDENCE, not pattern syntax — so the
+# row is captured once and asked about with `has`/`lacks`.
+next_stale_row="$(row next)"
+ck "(D) a non-numeric next-stale bound falls back to the documented 900 (a 2h-old line is still LATE, never OK) [$next_stale_row]" \
+   "$(has "$next_stale_row" 'LATE' && lacks "$next_stale_row" 'OK:' && echo 0 || echo 1)"
 ck "(D) …so the verdict stays DEGRADED rather than flipping to HEALTHY on a bad knob (rc=$RC)" \
    "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 touch -t "$fresh" "$L/orch-loop.log"
