@@ -1918,6 +1918,71 @@ running — `$O` and the controller both move at the next `start` (which re-seed
 and until then every spawn line says `restart-pending`. The controller does not restart *itself*
 onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
 
+### 6.5.9 The reminder's actuator arm: a GO is a claim about evidence
+
+**The reminder.** One timer, every 600 s, answering three questions: what is closest to landing,
+what merged but is **not live** on a box, and what is red for the SAME reason across many PRs. It
+writes `$O/MERGE-REMINDER.md` and prints ONE line. Until #2603 that line read
+`#2579 (?) reds=0 [GREEN(wait:21)] :: …` — `(?)` for priority, and `GREEN` for a surface with
+twenty-one checks still in flight. Both read better than reality, so both are gone: every value is
+MEASURED, and an unread value says `UNREADABLE <reason>`.
+
+**The arm.** The owner's ask (2026-10-23) was that the reminder lead to automated dispatch of the
+needed action, on the stated risk: *"we can merge and if it breaks then it's fast to repair, as long
+as it's not a catastrophic break."* So a GO dispatches the repo's own rail
+(`scripts/admin-merge.sh <PR> --repo …`, backgrounded, its own log) when — and only when — ALL of
+these were read at the moment of action:
+
+| gate | reading | what a failure means |
+|---|---|---|
+| open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | `mergeable: null` is GitHub saying "not computed yet" — `REFUSE(mergeable=unknown)` |
+| a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
+| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592) |
+| no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
+| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` naming the PR |
+
+⛔ **The rail is the authority and this file never merges.** `admin-merge.sh` re-reads the surface
+with its own allow-list polarity, binds its evidence to one SHA, refuses a moved head and classifies
+main's reds by event. The reminder's check read is a COST gate — "is it worth spending a rail
+attempt?" — exactly the division of labour the cell doctor's `merge` role documents. A second
+opinion here would be the two-readers defect (#1872/#1714).
+
+⛔ **A stale record is not a record, and a threshold is not a gate.** `merge-one.sh` and the doctor
+take the local landing lock (`$O/state/mergeclaim-<PR>.lock`) before racing a head; the reminder
+takes the SAME lock with `O_EXCL` immediately before the spawn, so the first lander on this box wins
+and the loser refuses `rail=running`. It then WAITS (bounded, default 900 s) for the rail's own exit
+so the cycle reports the rail's rc rather than assuming its spawn was a success; past the bound it
+leaves the lock and says `still-running pid=…`, and the process scan remains the durable detector.
+Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
+`--match-head-commit` keeps that from landing an unanalysed head, and closing it properly means
+minting the cross-box claim — which is `merge-one.sh`'s job, not this timer's.
+
+**The deploy half.** A merged fix that never reached a box has fixed nothing, so drift is
+ACTIONABLE: after the landing decision (never instead of it), a drifted box is restarted with ITS OWN
+verb — on a cell, `cloud-cell-supervisor.sh stop → apply → start` — and only when no role pass is
+mid-flight (a restart inside a reap kills work no later pass re-runs). It is VERIFIED BY ARTIFACT,
+never by the command's exit code: `harness: <sha> [current]` **and** `controller: RUNNING`, re-probed
+until `--verify-deploy-s` expires, else `deploy=<box>:UNVERIFIED` with the readings. The boxes are an
+inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
+whatever remote path that box already uses — no new control surface is invented here.
+
+**Costs, and how a skipped run is never an empty one.** `GET /rate_limit` FIRST (it is unmetered),
+then at most `REST_BUDGET = 8` metered calls: one open-PR listing and three per candidate (workflow
+runs, `check-runs?filter=all`, legacy statuses) for at most TWO candidates. Under
+`REST_RESERVE = 200` core calls the run is SKIPPED and SAYS SO (`skipped=rate-limited core=12/5000`,
+exit 3) — never `nothing to do`. The same exit and the same wording cover an unreadable PR listing.
+
+**Timers.** `merge-reminder.py --install-timer [--interval S]` renders and LOADS the platform's own
+schedule and verifies it: launchd (`com.tortoise.merge-reminder`, `StartInterval`) on macOS, a
+systemd USER timer (`merge-reminder.timer`) on Linux, else a crontab entry — and a box with NONE of
+them exits 3 naming the remedy rather than installing nothing quietly. `--uninstall-timer` removes it.
+
+**Status: IMPLEMENTED and TESTED** (`merge-reminder.test.sh`, a CI shard in both lanes). Residual,
+named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for reminder-only), so a box
+that runs the timer WILL dispatch a rail on complete evidence — that is the feature, and the gate
+list above is what makes it safe; the review-record store it reads is this box's
+`~/.pi/agent/reviews`, so a peer box's verdict reaches it only through `registry-sync.sh`.
+
 ---
 
 ## 7. Gaps: what is fixed, what is not
@@ -3236,6 +3301,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-doctor.hardening.test.sh` | #1989, the HARDENING half (a separate suite, not a fork of the one above): every read the doctor acts on must be classified, so an unreadable session list / client list / ancestry walk / pane read / log mtime / process table / open-PR read / review record is cannot-verify rather than an answer, while a benign non-answer (a fresh box with no server, a lane that ended between reads) is not; an action that did not take (a refused or unverifiable kill, cpu that went DOWN) is never a reap; the rail's rc classifier is a PREDICATE (`124..127`, any `128+N`); and a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says in the record that it was a rehearsal, on every role. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤8 metered REST calls, a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
+| `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table |
+| `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;

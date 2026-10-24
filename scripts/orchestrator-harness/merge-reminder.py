@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+# merge-reminder.py — the fleet's 10-minute merge REMINDER, with a narrow, EVIDENCE-GATED actuator arm.
+#
+#   merge-reminder.py [--repo owner/name] [--o DIR] [--reviews DIR]
+#                     [--act | --no-act] [--dry-run] [--json] [--quiet]
+#                     [--max-prs N] [--candidates N] [--retry-s S] [--rail-wait-s S]
+#                     [--rail PATH] [--verify-deploy-s S]
+#                     [--install-timer [--interval S]] [--uninstall-timer]
+#
+# Exit: 0 = the cycle RAN (a reminder was written; whether it dispatched or not)
+#       3 = the cycle was SKIPPED — named, and never passed off as "nothing to do"
+#           (rate-limited, an unreadable read, a timer it could not install)
+#       2 = usage
+#       1 = internal error
+#
+# ── WHAT THIS IS (and what it deliberately is not) ───────────────────────────────────────────────
+# It answers THREE questions, and spends a bounded REST budget doing it:
+#   1. what is closest to landing (open PRs of the target repo, best-evidenced first);
+#   2. what merged but is NOT LIVE on the boxes (a merged fix that never reached a box has fixed
+#      nothing — the reminder's second half is the DEPLOY arm, #2416's sibling);
+#   3. what is red for the SAME reason across many PRs (one root that unblocks a batch).
+#
+# Since 2026-10-23 it also ACTS — narrowly, and only on complete evidence. The owner's words:
+# *"those commands could lead to automated dispatches for the needed action… we can merge and if it
+# breaks then it's fast to repair, as long as it's not a catastrophic break."*
+#
+# ⛔ THE RAIL IS THE AUTHORITY, NOT THIS FILE. `scripts/admin-merge.sh` decides whether a merge is
+# safe: it re-reads the check surface with its own allow-list polarity (an unrecognised conclusion is
+# RED), binds the evidence marker to one SHA, refuses a moved head, and classifies main's reds by the
+# EVENT that produced them. This file NEVER merges and NEVER emits an override. What it does is
+# decide WHEN spending one rail attempt is worth it — the same division of labour as the cell
+# doctor's `merge` role (`cloud-cell-doctor.sh`: "The pre-filter is a COST gate, never an
+# authorization"). A second opinion here would be the two-readers defect (#1872/#1714).
+#
+# ⛔ IT IS ALSO A REMINDER FIRST. Before this arm existed the emitted line read
+#     `#2579 (?) reds=0 [GREEN(wait:21)] :: fix(rail): …`
+# — `(?)` for priority, and `GREEN` for a surface with TWENTY-ONE checks still in flight. Both read
+# better than reality. Every value on the line is now MEASURED, and a value it could not read says so:
+#     `reds=0 in-flight=0 attested@head=yes claim=none rail=idle`   → GO
+#     `reds=0 in-flight=21 attested@head=no  claim=none rail=idle`  → WAIT  (#2522/#2592: in flight
+#                                                                     is a WAIT, never a stall, and
+#                                                                     never a GO)
+#     `reds=0 in-flight=0  attested@head=stale …`                   → REFUSE(attested=stale)
+# An UNREAD value is `UNREADABLE <reason>` and NOTHING is dispatched. That is the one rule the whole
+# arm rests on: a GO is a claim about evidence, so it can only be derived from evidence it read.
+#
+# ── THE GATES (ALL of them, at the moment of action; a failure NAMES itself) ────────────────────
+#   pr=OPEN draft=no mergeable=MERGEABLE   the PR is open, not a draft, and GitHub says it merges;
+#                                          `mergeable: null` is UNKNOWN (a WAIT), never a GO.
+#   attested@head=yes                      a review record exists whose `head_sha` EQUALS the live
+#                                          head. A record bound to an older head is `stale` — six
+#                                          PRs were caught in exactly that state on 2026-10-22, and a
+#                                          stale record read as "reviewed" is a false GO.
+#   reds=0 in-flight=0                     newest attempt per check group by `id`, grouped by
+#                                          (app.slug, workflow, job name) — #4877's rule, because
+#                                          two workflows can publish the same job name and a newer
+#                                          green of one must never mask a red of the other.
+#   claim=none                             no live claim: `refs/claims/pr-<N>` and
+#                                          `refs/claims/<N>-<head12>` (cross-box) and
+#                                          `$O/state/mergeclaim-<PR>.lock` (this box). Two landers on
+#                                          one PR is the defect #2574/#2576 exist to prevent.
+#   rail=idle                              no rail already running for THIS PR: the local landing lock
+#                                          with a LIVE pid, or a live `admin-merge.sh` whose argv names
+#                                          the PR (a hand-started rail is still a rail). One attempt
+#                                          per PR per cycle.
+#
+# ── THE COST DISCIPLINE (kept, and made explicit) ───────────────────────────────────────────────
+#   * `GET /rate_limit` FIRST — it is UNMETERED on GitHub's primary limit — and if the core budget is
+#     under `REST_RESERVE` the run is SKIPPED and SAYS SO (`skipped=rate-limited core=…/… reset=…`),
+#     never rendered as an empty queue. (gh-limit.py's own doctrine, #1988.)
+#   * at most `REST_BUDGET = 8` metered calls: ONE open-PR listing plus THREE reads per candidate
+#     (workflow runs, check-runs `filter=all`, legacy statuses) for at most `--candidates` (2).
+#   * the deploy arm makes NO REST call at all: it reads artifacts on the boxes.
+#
+# ── THE DEPLOY ARM ─────────────────────────────────────────────────────────────────────────────
+# Question 2 ("merged but not live") is only useful if it can be ACTED on. When a box's deployed
+# harness sha differs from `origin/main`, the action is the box's own activation verb — on a cell,
+# `cloud-cell-supervisor.sh stop → apply → start` — and it is dispatched here ONLY:
+#   * AFTER the landing decision, never instead of it (a landing and a restart in the same cycle
+#     would restart the controller underneath the rail that was just dispatched);
+#   * when NO ROLE PASS IS MID-FLIGHT on that box (the doctor's `reap`/`merge`/`hygiene` roles hold
+#     `$O/state/roles/.<role>.lock`; restarting a cell mid-reap kills work in a way a merge does not
+#     repair), and
+#   * it is VERIFIED BY ARTIFACT (`harness: <sha> [current]`, `controller: RUNNING`), never by the
+#     activate command's exit code. An unverified deploy is REPORTED as `deploy=<box>:UNVERIFIED`,
+#     never assumed.
+# The boxes are an INVENTORY, not a hardcoded host list: `$O/state/boxes.tsv`, one
+# `name<TAB>status-cmd<TAB>activate-cmd` per line (`#` comments). Without the file the arm runs
+# locally only (`box-status.sh` beside this script), which is the correct default: a timer on a box
+# can act on that box without inventing a remote-control surface.
+#
+# ── TIMERS (both platforms; #2416 owns the fleet-wide schedule) ───────────────────────────────
+#   --install-timer     macOS: renders + bootstraps a launchd agent; Linux: a systemd USER timer
+#                       (falling back to crontab) — and VERIFIES the job is loaded. A box with no
+#                       scheduler REFUSES loudly (exit 3) instead of installing nothing quietly.
+#   --uninstall-timer   removes it and says which one it removed.
+#
+# ── THE SCHEDULER CONTRACT ────────────────────────────────────────────────────────────────────
+# A timer's PATH is not a login shell's. `gh` is resolved from PATH, then `$O/gh-rest/gh` (the REST
+# adapter), then `~/.pi/agent/shims/gh`; if none resolves the run is SKIPPED (UNREADABLE), never an
+# empty answer. `git` must be on PATH for the claim gate — an unreadable claim store is
+# `claim=UNREADABLE` and refuses (a GO on an unread claim store is how two landers happen).
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+REST_BUDGET = 8          # metered REST calls per run (rate_limit is exempt); see the header
+REST_RESERVE = 200       # below this core budget the run is SKIPPED, not rendered as "nothing to do"
+DEFAULT_MAX_PRS = 30     # one page of the open-PR listing
+DEFAULT_CANDIDATES = 2   # 1 + 3*2 = 7 <= REST_BUDGET
+MAX_CANDIDATES = 2       # the budget ceiling, enforced (1 + 3*3 = 10 > 8)
+RETRY_S = 900            # a refusal at THIS head is not retried blind inside this window
+RAIL_WAIT_S = 900        # how long the dispatch waits for the rail's own exit, to report its rc
+DEPLOY_VERIFY_S = 180    # how long the deploy arm waits for the artifact to prove the cycle
+STATE_MD = "MERGE-REMINDER.md"
+ATTEMPTS = "merge-reminder.attempts"
+
+# A completed check run is NON-RED only for a conclusion named HERE (allow-list polarity, #1714): an
+# unrecognised token — a vendor's new conclusion, an empty one — is RED, never "neither".
+NONRED_COMPLETED = {"success", "neutral", "skipped", "cancelled", "stale"}
+IN_FLIGHT_STATUS = {"queued", "in_progress", "waiting", "requested", "pending"}
+CLEAN_VERDICTS = {"clean", "clean-micro", "clean-low"}
+
+# One code path for "no", "cannot say" and "yes" on every read this file acts on (the doctor's
+# three-valued discipline, #1989). `None` is a decision, `UNREADABLE` is an abstention.
+GO, WAIT, REFUSE, UNREADABLE = "GO", "WAIT", "REFUSE", "UNREADABLE"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Skipped(Exception):
+    """A cycle that could not be measured. Reported by name; NEVER an empty answer."""
+
+
+def run(cmd, timeout=60, cwd=None):
+    """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s: {' '.join(cmd[:3])}"
+    except FileNotFoundError as e:
+        return 127, "", f"{e}"
+
+
+# ── gh resolution + metered REST ────────────────────────────────────────────────────────────────
+def resolve_gh(o: Path) -> str:
+    """The daemon's gh is the FIRST candidate: on a live box PATH carries the gh-rest adapter and
+    the limit layer. The fallbacks exist for a launchd/systemd timer whose PATH is not a login
+    shell's — the measured failure that makes a scheduled job report "nothing to do" from an
+    unreadable chain rather than from an empty queue."""
+    for c in (shutil.which("gh"), str(o / "gh-rest" / "gh"), str(Path.home() / ".pi/agent/shims/gh")):
+        if c and os.access(c, os.X_OK):
+            return c
+    raise Skipped("UNREADABLE gh — no gh on PATH, $O/gh-rest/gh, or ~/.pi/agent/shims/gh")
+
+
+class Budget:
+    """The metered REST budget. `rate_limit` is read FIRST and is exempt; every other call is
+    counted, and a call that would exceed the budget raises rather than silently degrading the
+    answer (a truncated read is not a smaller answer, it is a wrong one)."""
+
+    def __init__(self, gh: str):
+        self.gh = gh
+        self.calls = 0
+        self.core_remaining = None
+        self.core_limit = None
+        self.reset = None
+
+    def rate_limit(self):
+        rc, out, err = run([self.gh, "api", "rate_limit"], timeout=30)
+        if rc != 0:
+            raise Skipped(f"UNREADABLE rate_limit rc={rc} {one_line(err)}")
+        try:
+            core = json.loads(out)["resources"]["core"]
+            self.core_limit = int(core["limit"])
+            self.core_remaining = int(core["remaining"])
+            self.reset = int(core.get("reset") or 0)
+        except (ValueError, KeyError, TypeError):
+            raise Skipped("UNREADABLE rate_limit — the answer was not a JSON rate object")
+        # The EXEMPT read above is the only call allowed below the reserve: a run with 12 calls left
+        # is a run that must not spend one on a reminder.
+        if self.core_remaining < REST_RESERVE:
+            raise Skipped(
+                "skipped=rate-limited core=%d/%d reset=%s"
+                % (self.core_remaining, self.core_limit, _iso(self.reset))
+            )
+
+    def api(self, path: str, timeout=45):
+        if self.calls >= REST_BUDGET:
+            raise Skipped(f"UNREADABLE budget — the {REST_BUDGET}-call bound is spent before {path}")
+        self.calls += 1
+        rc, out, err = run([self.gh, "api", path], timeout=timeout)
+        return rc, out, err
+
+
+def _iso(epoch) -> str:
+    try:
+        return datetime.fromtimestamp(int(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OSError, TypeError):
+        return "unknown"
+
+
+def one_line(text: str) -> str:
+    return " ".join((text or "").split())[:200]
+
+
+# ── the review record (a stale record is NOT a record) ─────────────────────────────────────────
+def attest(o: Path, reviews: Path, slug: str, pr: int, head: str) -> tuple[str, str]:
+    """-> (state, detail) with state in {yes, stale, none, UNREADABLE}.
+
+    The record is the shipped `record-review.sh` artifact:
+      {"pr":N,"head_sha":"<40hex>","verdict":"clean","repo":"owner/repo","reviewed_at":"…"}
+    `registry-sync.sh` unions these across boxes, and `admin-merge.sh`/`review-enforcer` read the
+    same shape — so this reads the SAME file the rail's own evidence does, never a side channel.
+    ⛔ A record whose `head_sha` is not the LIVE head is `stale`: the verdict was minted for code
+    that is no longer there. That is not a smaller yes, it is a no.
+    """
+    owner, _, repo = slug.partition("/")
+    names = [reviews / f"{owner}-{repo}-{pr}.json", reviews / f"{pr}.json"]
+    if not reviews.is_dir():
+        return "none", f"no review store at {reviews}"
+    tried = []
+    for f in names:
+        if not f.exists():
+            continue
+        tried.append(str(f))
+        if not f.is_file() or not os.access(f, os.R_OK):
+            return "UNREADABLE", f"attestation=<{f}> not readable"
+        try:
+            d = json.loads(f.read_text())
+        except (ValueError, OSError) as e:
+            return "UNREADABLE", f"attestation=<{f}> unparseable ({type(e).__name__})"
+        if not isinstance(d, dict):
+            return "UNREADABLE", f"attestation=<{f}> is not a JSON object"
+        rec_head = str(d.get("head_sha") or "").strip().lower()
+        verdict = str(d.get("verdict") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", rec_head):
+            return "UNREADABLE", f"attestation=<{f}> carries no usable head_sha"
+        if verdict not in CLEAN_VERDICTS:
+            return "stale", f"attestation=<{f}> verdict={verdict or 'none'} (not clean)"
+        if rec_head != head.lower():
+            return "stale", f"attestation=<{f}> head={rec_head[:12]} live={head[:12]}"
+        return "yes", f"attestation=<{f}> head={rec_head[:12]}"
+    return "none", "no attestation for this PR (tried %s)" % (", ".join(
+        str(p.name) for p in names))
+
+
+# ── the check surface: groups, newest attempt, allow-list polarity ─────────────────────────────
+def _workflow_map(budget: Budget, slug: str, head: str) -> dict[str, str]:
+    """run id -> workflow name, for ONE head. This is why the group key can carry the WORKFLOW:
+    `check_run.name` is the JOB name, and two workflows may publish the same job name, so grouping
+    on the name alone lets the newest of one mask the other (#4877's measured conflation)."""
+    rc, out, err = budget.api(f"repos/{slug}/actions/runs?head_sha={head}&per_page=100")
+    if rc != 0:
+        raise Skipped(f"UNREADABLE workflow map rc={rc} {one_line(err)}")
+    try:
+        runs = json.loads(out).get("workflow_runs") or []
+    except (ValueError, AttributeError):
+        raise Skipped("UNREADABLE workflow map — the answer was not a JSON run list")
+    m = {}
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id") or "")
+        if rid:
+            # `name` is the workflow's display name; `path` is its file — name first, path as the
+            # stable fallback (a renamed workflow still has one path).
+            m[rid] = str(r.get("name") or r.get("path") or f"run:{rid}")
+    return m
+
+
+def _run_id_from_url(url: str) -> str:
+    m = re.search(r"/actions/runs/(\d+)", url or "")
+    return m.group(1) if m else ""
+
+
+def check_surface(budget: Budget, slug: str, head: str) -> dict:
+    """-> {reds:[…], in_flight:[…], groups:N, unreadable:None|str}
+
+    Group key: (app.slug, workflow, job name) for check runs; ("status", context) for legacy commit
+    statuses. Newest attempt per group by check-run `id` — the SAME rule the merge rail uses
+    ("the LATEST check run (highest id) per (app, name) decides"), extended with the workflow so a
+    shared job name cannot mask. An entry whose run id cannot be resolved is NEVER dropped: it takes
+    its own per-entry group (its own check-run id), so an unresolvable entry can never be superseded
+    by a neighbour and its red can never vanish.
+    """
+    wf = _workflow_map(budget, slug, head)
+
+    rc, out, err = budget.api(f"repos/{slug}/commits/{head}/check-runs?filter=all&per_page=100")
+    if rc != 0:
+        raise Skipped(f"UNREADABLE check-runs rc={rc} {one_line(err)}")
+    try:
+        payload = json.loads(out)
+        checks = payload.get("check_runs")
+    except (ValueError, AttributeError):
+        raise Skipped("UNREADABLE check-runs — the answer was not a JSON check-run list")
+    if not isinstance(checks, list):
+        raise Skipped("UNREADABLE check-runs — no check_run array in the answer")
+
+    rc, out, err = budget.api(f"repos/{slug}/commits/{head}/status")
+    if rc != 0:
+        raise Skipped(f"UNREADABLE statuses rc={rc} {one_line(err)}")
+    try:
+        statuses = (json.loads(out) or {}).get("statuses") or []
+    except (ValueError, AttributeError):
+        raise Skipped("UNREADABLE statuses — the answer was not a JSON status list")
+
+    groups: dict[tuple, dict] = {}
+
+    def offer(key, order, verdict, label):
+        cur = groups.get(key)
+        if cur is None or order > cur["order"]:
+            groups[key] = {"order": order, "verdict": verdict, "label": label}
+
+    for idx, c in enumerate(checks):
+        if not isinstance(c, dict):
+            # A non-object entry is unreadable, and unreadable is never green: it becomes a RED
+            # placeholder rather than being skipped (nothing is dropped before classification).
+            offer(("?", "unresolved", f"entry:{idx}"), idx, "red",
+                  f"unparseable check entry #{idx}")
+            continue
+        cid = c.get("id")
+        name = str(c.get("name") or "").strip()
+        app = ((c.get("app") or {}) if isinstance(c.get("app"), dict) else {}).get("slug") or "?"
+        rid = _run_id_from_url(c.get("details_url") or c.get("html_url") or "")
+        workflow = wf.get(rid, f"run:{rid}" if rid else f"unresolved:{cid if cid is not None else idx}")
+        # An UNNAMED entry shares the placeholder name with every other unnamed one; keying it by
+        # (app, workflow, name) would let a newer unnamed non-red supersede an older unnamed red.
+        key = (app, workflow, name if name else f"unnamed:{cid if cid is not None else idx}")
+        verdict = _classify_check(c)
+        offer(key, int(cid) if isinstance(cid, int) else idx, verdict, f"{workflow} / {name or '<unnamed>'}")
+
+    # Legacy commit statuses. The rail reads BOTH endpoints; a status surface this file ignored
+    # would be a read that is quieter than the rail's — the wrong direction for a cost gate.
+    for idx, s in enumerate(statuses):
+        if not isinstance(s, dict):
+            offer(("status", "unresolved", f"entry:{idx}"), idx, "red", "unparseable status entry")
+            continue
+        ctx = str(s.get("context") or "").strip()
+        key = ("status", "commit-status", ctx if ctx else f"unnamed:{idx}")
+        state = str(s.get("state") or "").strip().lower()
+        verdict = "nonred" if state == "success" else ("in_flight" if state == "pending" else "red")
+        # No id on a status: order by position (newest last in GitHub's payload) so the LAST entry
+        # for a context decides — the same "newest wins" rule, with position as its identity.
+        offer(key, idx, verdict, f"status / {ctx or '<unnamed>'}")
+
+    reds = sorted({v["label"] for v in groups.values() if v["verdict"] == "red"})
+    inflight = sorted({v["label"] for v in groups.values() if v["verdict"] == "in_flight"})
+    return {"reds": reds, "in_flight": inflight, "groups": len(groups), "unreadable": None}
+
+
+def _classify_check(c: dict) -> str:
+    """Allow-list polarity for ONE check run. `completed` is non-red only for a named conclusion;
+    a named in-flight status is a WAIT; ANY OTHER non-completed status is classified by its
+    conclusion — so `completely_finished`/`Completed`/`` can never be filed as pending and read
+    green (#1353)."""
+    status = str(c.get("status") or "").strip().lower()
+    concl = str(c.get("conclusion") or "").strip().lower()
+    if status == "completed":
+        return "nonred" if concl in NONRED_COMPLETED else "red"
+    if status in IN_FLIGHT_STATUS:
+        return "in_flight"
+    # Unnamed status with a conclusion: classify by the conclusion, under the same allow-list.
+    if concl:
+        return "nonred" if concl in NONRED_COMPLETED else "red"
+    return "red"
+
+
+# ── claims and rails (local + cross-box) ──────────────────────────────────────────────────────
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True       # exists but is not ours: ALIVE is the fail-closed reading
+
+
+def claim_state(o: Path, repo_path: Path, pr: int, head: str) -> tuple[str, str]:
+    """-> (state, detail). state: none | <holder> | UNREADABLE.
+
+    Three surfaces, because they answer three different questions and all three mean "a lander":
+      * `$O/state/mergeclaim-<PR>.lock` — this box (merge-one.sh's noclobber lock; a DEAD pid is a
+        stale lock, which is not a live claim and is reported as such);
+      * `refs/claims/pr-<N>` — the CROSS-BOX landing claim (#1952: keyed on the PR, because two
+        heads of one PR are not two landing events);
+      * `refs/claims/<N>-<head12>` — the per-head review/landing claim.
+    ⛔ An UNREADABLE claim store is an ABSTENTION, never "no claim": a GO minted against a claim we
+    could not read is how two landers end up on one PR (#2574/#2576).
+    """
+    # ⛔ THE LOCAL LOCK IS THE RAIL'S, NOT THE CLAIM GATE'S. `mergeclaim-<PR>.lock` is created by
+    # the thing that is ABOUT TO LAND this PR on this box (merge-one.sh, or this file's own
+    # dispatch) — so a LIVE one is reported by `rail_state` as `rail=running`, which is the action
+    # it forbids. Reading it as a "claim" here would name the same fact twice and refuse with the
+    # wrong word. A DEAD pid is not a live claim and is reported as a stale lock rather than
+    # deleted: this file is read-only about every artifact another component owns.
+    lock = o / "state" / f"mergeclaim-{pr}.lock"
+    stale_note = ""
+    if lock.exists():
+        try:
+            pid = lock.read_text().strip()
+        except OSError:
+            pid = "?"
+        if not _pid_alive(pid):
+            stale_note = f"stale-local-lock=<{lock}> pid={pid} dead"
+
+    heads = head[:12].lower()
+    refs = [f"refs/claims/pr-{pr}", f"refs/claims/{pr}-{heads}"]
+    rc, out, err = run(["git", "-C", str(repo_path), "ls-remote", "--refs", "origin", *refs],
+                       timeout=45)
+    if rc != 0:
+        # `git` missing is 127; a network failure is any other non-zero. Both are abstentions.
+        return "UNREADABLE", f"claim store unreadable (git ls-remote rc={rc} {one_line(err)})"
+    held = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] in refs:
+            held.append((parts[1], parts[0]))
+    if not held:
+        return "none", stale_note
+    ref, sha = held[0]
+    holder = f"{ref}@{sha[:12]}"
+    # The claim's own commit message carries `owner` and `lease_until` (claims.sh). Read it when it
+    # is cheap to do so; a failure to read the LEASE is not a failure to see the CLAIM, so the
+    # refusal stands and the holder just carries less detail.
+    tmp_ref = f"refs/reminder/claim-{pr}-{os.getpid()}"
+    rc, _, _ = run(["git", "-C", str(repo_path), "fetch", "--no-tags", "--depth=1",
+                    "origin", f"{ref}:{tmp_ref}"], timeout=60)
+    if rc == 0:
+        rc2, msg, _ = run(["git", "-C", str(repo_path), "log", "-1", "--format=%B", tmp_ref],
+                          timeout=15)
+        if rc2 == 0:
+            m_owner = re.search(r"^owner=(.+)$", msg or "", re.M)
+            m_lease = re.search(r"^lease_until=(.+)$", msg or "", re.M)
+            extra = []
+            if m_owner:
+                extra.append(f"owner={m_owner.group(1).strip()}")
+            if m_lease:
+                extra.append(f"lease_until={m_lease.group(1).strip()}")
+            if extra:
+                holder = f"{ref}@({', '.join(extra)})"
+        run(["git", "-C", str(repo_path), "update-ref", "-d", tmp_ref], timeout=15)
+    return holder, f"claim={holder}"
+
+
+def _ps_table() -> list[tuple[str, str]] | None:
+    """(pid, cmdline) for every process, or None when the table cannot be read (an abstention)."""
+    rc, out, _ = run(["ps", "-axo", "pid=,command="], timeout=30)
+    if rc != 0:
+        return None
+    rows = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid, _, cmd = line.partition(" ")
+        rows.append((pid.strip(), cmd.strip()))
+    return rows
+
+
+def rail_state(o: Path, pr: int, ps_rows) -> tuple[str, str]:
+    """-> (state, detail). state: idle | running:pid=<n> | UNREADABLE.
+
+    TWO readings, because the lock alone cannot see a rail somebody started by hand:
+      * the local landing lock (`$O/state/mergeclaim-<PR>.lock`) with a LIVE pid;
+      * every live `admin-merge.sh` whose argv names THIS PR (a hand-started rail is still a rail,
+        and a second one would post duplicate head-bound evidence).
+    """
+    lock = o / "state" / f"mergeclaim-{pr}.lock"
+    if lock.exists():
+        try:
+            pid = lock.read_text().strip()
+        except OSError:
+            pid = ""
+        if pid and _pid_alive(pid):
+            return f"running pid={pid}", f"rail=running pid={pid} (the landing lock {lock} is held by a LIVING pid)"
+    if ps_rows is None:
+        # The lock alone cannot see a rail somebody started by hand, and an unread table cannot
+        # rule one out — so an unread table is an ABSTENTION, never "idle".
+        return UNREADABLE, "rail=UNREADABLE (the process table could not be read)"
+    pat = re.compile(r"admin-merge\.sh\b")
+    for pid, cmd in ps_rows:
+        if pat.search(cmd) and re.search(rf"(^|\s){pr}(\s|$)", cmd):
+            return f"running pid={pid}", f"rail=running pid={pid} (a LIVE admin-merge.sh whose argv names {pr})"
+    return "idle", ""
+
+
+# ── the attempts ledger (one attempt per PR per cycle; no blind retry at one head) ────────────
+def last_attempt(o: Path, pr: int, head: str) -> int:
+    p = o / "state" / ATTEMPTS
+    try:
+        text = p.read_text()
+    except OSError:
+        return 0
+    found = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == str(pr) and parts[1] == head[:40]:
+            try:
+                found = max(found, int(parts[2]))
+            except ValueError:
+                continue
+    return found
+
+
+def record_attempt(o: Path, pr: int, head: str, verdict: str) -> None:
+    p = o / "state" / ATTEMPTS
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            fh.write(f"{pr} {head[:40]} {int(time.time())} {verdict}\n")
+        # Bounded history: the file exists to suppress a blind retry, not to become a disk leak.
+        lines = p.read_text().splitlines()[-400:]
+        tmp = p.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, p)
+    except OSError:
+        pass    # a ledger that cannot be written must not turn a refusal into a dispatch
+
+
+# ── deploy arm ────────────────────────────────────────────────────────────────────────────────
+def read_inventory(o: Path) -> list[tuple[str, str, str]]:
+    """`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd` per line. Absent = LOCAL ONLY."""
+    f = o / "state" / "boxes.tsv"
+    rows: list[tuple[str, str, str]] = []
+    if f.is_file():
+        try:
+            for line in f.read_text().splitlines():
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    raise Skipped(f"UNREADABLE boxes.tsv — {f} line is not name<TAB>status<TAB>activate: {line[:80]}")
+                rows.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+        except OSError as e:
+            raise Skipped(f"UNREADABLE boxes.tsv — {e}")
+        return rows
+    probe = Path(__file__).resolve().parent / "box-status.sh"
+    if not probe.is_file():
+        return []
+    return [("local", f"bash {shell_quote(str(probe))} --o {shell_quote(str(o))}",
+             local_activate(o))]
+
+
+def shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def local_activate(o: Path, platform: str | None = None) -> str:
+    """The activation verb for THIS box, resolved the way the doctor resolves the rail: the shipped
+    location first, then `$O`, then the pi agent scripts.
+
+    ⛔ macOS GETS NO VERB HERE, DELIBERATELY. `cloud-cell-supervisor.sh` is the CELL launcher and says
+    so at the top of its own file ("Runs ON the cell (Linux)"); on macOS the controller is launchd's
+    and a `stop -> apply -> start` would either refuse or, worse, be emulated by something invented
+    here. macOS activation is the harness installer's (`install.sh --restart`), scheduled by
+    agent-infra#2416 — so this returns empty, and the deploy arm REPORTS the drift as
+    `activate=none` instead of pretending it acted on it.
+    """
+    platform = platform or sys.platform
+    if platform.startswith("darwin"):
+        return ""
+    for c in (Path(__file__).resolve().parent.parent / "cloud-cell-supervisor.sh",
+              o / "cloud-cell-supervisor.sh",
+              Path.home() / ".pi/agent/scripts/cloud-cell-supervisor.sh"):
+        if c.is_file():
+            q = shell_quote(str(c))
+            return f"bash {q} stop && bash {q} apply && bash {q} start"
+    return ""
+
+
+def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
+    rc, out, err = run(["bash", "-c", status_cmd], timeout=timeout)
+    text = (out or "") + ("\n" + err if err else "")
+    d = {"name": name, "rc": rc, "raw": text, "harness": "", "relation": "",
+         "controller": "", "roles": "", "readable": True}
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"harness:\s*([0-9a-f]{7,40})\s*\[([^\]]+)\]", line)
+        if m:
+            d["harness"], d["relation"] = m.group(1).lower(), m.group(2).strip().lower()
+        m = re.match(r"controller:\s*([A-Za-z_]+)", line)
+        if m:
+            d["controller"] = m.group(1).upper()
+        m = re.match(r"roles:\s*(.*)$", line)
+        if m:
+            d["roles"] = m.group(1).strip()
+    if rc != 0 or not d["harness"]:
+        d["readable"] = False
+    return d
+
+
+def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
+               dry: bool) -> list[dict]:
+    """Question 2 made actionable. Runs AFTER the landing decision by construction (the caller
+    passes `dispatched_landing`, and a dispatch in the same cycle suppresses this arm: restarting a
+    controller under the rail we just started destroys the run we just paid for)."""
+    results: list[dict] = []
+    try:
+        boxes = read_inventory(o)
+    except Skipped as e:
+        # An unreadable inventory is REPORTED as this cycle's deploy reading; it cannot license a
+        # dispatch (there is nothing to dispatch to), and it must not read as "no boxes".
+        return [{"box": "<inventory>", "harness": "", "relation": "", "controller": "",
+                 "roles": "", "drift": True, "verdict": str(e), "log": ""}]
+    if not boxes:
+        return results
+    for name, status_cmd, activate_cmd in boxes:
+        d = probe_box(name, status_cmd)
+        drift = (not d["readable"]) or (d["harness"][:12] != main_sha[:12]) or (d["relation"] != "current")
+        entry = {"box": name, "harness": d["harness"], "relation": d["relation"],
+                 "controller": d["controller"], "roles": d["roles"], "drift": drift,
+                 "verdict": "", "log": ""}
+        if not drift:
+            entry["verdict"] = "current"
+            results.append(entry)
+            continue
+        if not d["readable"]:
+            entry["verdict"] = f"UNREADABLE harness={d['harness'] or '<none>'} rc={d['rc']}"
+            results.append(entry)
+            continue
+        if dispatched_landing:
+            entry["verdict"] = "deferred (a landing was dispatched this cycle)"
+            results.append(entry)
+            continue
+        roles = d["roles"].strip().lower()
+        if not roles:
+            # An ABSENT roles reading is not "idle": a status command that does not answer this
+            # question cannot license a restart.
+            entry["verdict"] = "REFUSE(roles=UNREADABLE)"
+            results.append(entry)
+            continue
+        if not roles.startswith("idle"):
+            # ⛔ A role pass mid-flight is the one state a restart must not enter: the doctor's reap
+            # and merge roles hold their own locks, and killing them mid-pass destroys work that no
+            # merge re-runs.
+            entry["verdict"] = f"REFUSE(roles={roles})"
+            results.append(entry)
+            continue
+        if not activate_cmd:
+            entry["verdict"] = "activate=none (drifted, no activation verb on this box)"
+            results.append(entry)
+            continue
+        if dry:
+            entry["verdict"] = "DRY-RUN would dispatch: " + activate_cmd
+            results.append(entry)
+            continue
+        logdir = o / "logs"
+        logdir.mkdir(parents=True, exist_ok=True)
+        log = logdir / f"merge-reminder-deploy-{name}-{int(time.time())}.log"
+        try:
+            with log.open("w") as fh:
+                fh.write(f"[{now_iso()}] deploy {name}: {activate_cmd}\n")
+                fh.flush()
+                subprocess.Popen(["bash", "-c", activate_cmd], stdout=fh, stderr=fh,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            entry["verdict"] = f"DISPATCH-FAILED {type(e).__name__}"
+            results.append(entry)
+            continue
+        entry["log"] = str(log)
+        # VERIFY BY ARTIFACT, never by the command's exit code: re-probe until the box reports the
+        # main sha as current and a running controller, or the bound expires.
+        deadline = time.time() + verify_s
+        verified = False
+        last = None
+        while True:
+            time.sleep(min(15, max(1, verify_s // 6)))
+            last = probe_box(name, status_cmd)
+            if last["readable"] and last["harness"][:12] == main_sha[:12] \
+                    and last["relation"] == "current" and last["controller"] == "RUNNING":
+                verified = True
+                break
+            if time.time() >= deadline:
+                break
+        entry["verdict"] = (f"VERIFIED harness={last['harness'][:12]} [current] controller=RUNNING"
+                            if verified else
+                            f"UNVERIFIED harness={(last or {}).get('harness', '')[:12] or '<none>'} "
+                            f"relation={(last or {}).get('relation') or '<none>'} "
+                            f"controller={(last or {}).get('controller') or '<none>'}")
+        results.append(entry)
+    return results
+
+
+# ── landing decision ──────────────────────────────────────────────────────────────────────────
+def decide(pr: dict, attest_state: str, attest_detail: str, surface: dict,
+           claim: str, claim_detail: str, rail: str, rail_detail: str,
+           retry_s: int, o: Path) -> dict:
+    """One candidate -> one verdict + the measured reading it came from.
+
+    ORDER IS THE BRIEF'S, AND IT IS THE ORDER A HUMAN WOULD CHECK: is there anything to land (open,
+    not draft, mergeable) → was the CODE ON SCREEN reviewed (head-bound record) → is it quiet →
+    is anybody else on it (claim) → is the rail already running. The FIRST failing gate is the named
+    refusal, so the line says what to look at rather than listing every gate at once.
+    """
+    head = pr["head"]
+    unread = surface.get("unreadable")
+    if unread:
+        # Not measured is NOT quiet: the counts below would read `reds=0 in-flight=0` and be a GO
+        # derived from a read that never happened.
+        readings = (f"pr={pr['state'].upper()} draft={'yes' if pr['draft'] else 'no'} "
+                    f"mergeable={pr['mergeable']} reds=UNREADABLE in-flight=UNREADABLE "
+                    f"attested@head={attest_state} claim={claim} rail={rail}")
+    else:
+        readings = (f"pr={pr['state'].upper()} draft={'yes' if pr['draft'] else 'no'} "
+                    f"mergeable={pr['mergeable']} reds={len(surface['reds'])} "
+                    f"in-flight={len(surface['in_flight'])} attested@head={attest_state} "
+                    f"claim={claim} rail={rail}")
+    out = {"readings": readings, "verdict": "", "detail": "", "dispatch": False,
+           "reds": len(surface["reds"]), "red_labels": surface["reds"][:4]}
+
+    if pr["state"].lower() != "open":
+        out.update(verdict=f"{REFUSE}(pr={pr['state'].lower()})", detail="the PR is not open")
+        return out
+    if pr["draft"]:
+        out.update(verdict=f"{REFUSE}(draft)", detail="a draft PR is not a landing candidate")
+        return out
+    if pr["mergeable"] != "MERGEABLE":
+        # `mergeable: null` is GitHub saying "not computed yet" — UNKNOWN, and unknown is a WAIT.
+        out.update(verdict=f"{REFUSE}(mergeable={pr['mergeable'].lower()})",
+                   detail="GitHub does not report MERGEABLE (null = not computed yet)")
+        return out
+    if attest_state == UNREADABLE:
+        out.update(verdict=f"{REFUSE}(attested=UNREADABLE)", detail=attest_detail)
+        return out
+    if attest_state != "yes":
+        out.update(verdict=f"{REFUSE}(attested={attest_state})",
+                   detail=attest_detail + " — a stale record is not a record")
+        return out
+    if unread:
+        out.update(verdict=f"{REFUSE}(UNREADABLE)", detail=unread)
+        return out
+    if surface["reds"]:
+        out.update(verdict=f"{REFUSE}(reds={len(surface['reds'])})",
+                   detail="newest attempt per group is RED: " + "; ".join(surface["reds"][:4]))
+        return out
+    if surface["in_flight"]:
+        # reds=0 with checks in flight is a WAIT, never a GO (#2522/#2592).
+        out.update(verdict=f"{REFUSE}(in-flight={len(surface['in_flight'])})",
+                   detail="checks still in flight: " + "; ".join(surface["in_flight"][:4]))
+        return out
+    if claim == UNREADABLE:
+        out.update(verdict=f"{REFUSE}(claim=UNREADABLE)", detail=claim_detail)
+        return out
+    if claim != "none":
+        out.update(verdict=f"{REFUSE}(claim={claim})",
+                   detail="another lander holds this PR: " + claim_detail)
+        return out
+    if rail == UNREADABLE:
+        out.update(verdict=f"{REFUSE}(rail=UNREADABLE)", detail=rail_detail)
+        return out
+    if rail != "idle":
+        out.update(verdict=f"{REFUSE}(rail={rail})", detail=rail_detail)
+        return out
+    prev = last_attempt(o, pr["number"], head)
+    if prev and (time.time() - prev) < retry_s:
+        out.update(verdict=f"{WAIT}(retry-after={int(retry_s - (time.time() - prev))}s)",
+                   detail=f"a rail attempt at this head was recorded {int(time.time() - prev)}s ago "
+                          f"— not retried blind; a push moves the head and re-arms it")
+        return out
+    out.update(verdict=GO, detail="every gate passed")
+    return out
+
+
+# ── dispatch ─────────────────────────────────────────────────────────────────────────────────
+def resolve_rail(explicit: str, o: Path) -> str | None:
+    here = Path(__file__).resolve().parent
+    cands = [explicit] if explicit else []
+    cands += [str(o / "admin-merge.sh"), str(here.parent / "admin-merge.sh"),
+              str(here / "admin-merge.sh"),
+              str(Path.home() / ".pi/agent/scripts/admin-merge.sh")]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return str(Path(c).resolve())
+    return None
+
+
+def dispatch_rail(rail: str, pr: int, slug: str, o: Path, wait_s: int) -> tuple[bool, str, str]:
+    """Take the LOCAL landing lock (`mergeclaim-<PR>.lock`, the artifact merge-one.sh honours) and
+    dispatch the rail in the background, its own log, no shell, no override.
+
+    ⛔ The lock is taken with O_EXCL AFTER the gates and IMMEDIATELY before the spawn: the gates are
+    reads, so between "claim=none" and "spawn" another lander on this box could take it. Whoever
+    wins the create is the one attempt for this PR; the loser refuses as `rail=running`.
+    """
+    lock = o / "state" / f"mergeclaim-{pr}.lock"
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        try:
+            pid = lock.read_text().strip()
+        except OSError:
+            pid = "?"
+        if _pid_alive(pid):
+            return False, f"rail=running pid={pid}", ""
+        # A stale lock (dead pid) is merge-one.sh's to reap with the same predicate; taking it over
+        # here would race that reaper. Refuse, name it, and let the next cycle try.
+        return False, f"rail=stale-lock pid={pid}", ""
+    except OSError as e:
+        return False, f"DISPATCH-FAILED lock={type(e).__name__}", ""
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+
+    logdir = o / "logs"
+    logdir.mkdir(parents=True, exist_ok=True)
+    log = logdir / f"merge-reminder-rail-{pr}-{int(time.time())}.log"
+    try:
+        with log.open("w") as fh:
+            fh.write(f"[{now_iso()}] dispatch: {rail} {pr} --repo {slug}\n")
+            fh.flush()
+            child = subprocess.Popen([rail, str(pr), "--repo", slug], stdout=fh, stderr=fh,
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+        return False, f"DISPATCH-FAILED spawn={type(e).__name__}", ""
+    # Wait, bounded, so the lock's pid is a LIVE lander while the rail runs (and so the cycle can
+    # report the rail's OWN exit code instead of assuming the spawn was a success). Past the bound
+    # the lock is left holding our pid, which dies with us — the process scan remains the durable
+    # "a rail is running" reading, so nothing is silently lost.
+    try:
+        rc = child.wait(timeout=wait_s)
+        detail = f"rc={rc}"
+    except subprocess.TimeoutExpired:
+        detail = f"still-running pid={child.pid} after {wait_s}s"
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+    return True, detail, str(log)
+
+
+# ── landing cycle ────────────────────────────────────────────────────────────────────────────
+def read_prs(budget: Budget, slug: str, max_prs: int) -> list[dict]:
+    rc, out, err = budget.api(f"repos/{slug}/pulls?state=open&per_page={max_prs}")
+    if rc != 0:
+        raise Skipped(f"UNREADABLE pulls rc={rc} {one_line(err)}")
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        raise Skipped("UNREADABLE pulls — the answer was not JSON")
+    if not isinstance(rows, list):
+        raise Skipped("UNREADABLE pulls — the answer was not a JSON list")
+    prs = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        head = str(((r.get("head") or {}) if isinstance(r.get("head"), dict) else {}).get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            # A PR whose head cannot be read is NOT a candidate (a head-bound record cannot be
+            # matched to nothing) — but it is still LISTED, so the reminder never silently shrinks.
+            head = ""
+        mergeable = r.get("mergeable")
+        prs.append({
+            "number": int(r.get("number") or 0),
+            "title": one_line(str(r.get("title") or ""))[:120],
+            "head": head,
+            "state": str(r.get("state") or "open"),
+            "draft": bool(r.get("draft")),
+            "mergeable": ("MERGEABLE" if mergeable is True else
+                          "CONFLICTING" if mergeable is False else "UNKNOWN"),
+            "updated": str(r.get("updated_at") or ""),
+        })
+    return [p for p in prs if p["number"]]
+
+
+def rank(prs: list[dict], o: Path, reviews: Path, slug: str) -> list[dict]:
+    """Closest-to-landing FIRST, using evidence that costs NOTHING to read: a record at the live
+    head is the strongest free signal, then not-draft, then mergeable, then the least recently
+    attempted (round-robin fairness across cycles — a queue that always reads the same two heads
+    never reaches the third)."""
+    for p in prs:
+        if p["head"]:
+            st, _ = attest(o, reviews, slug, p["number"], p["head"])
+            p["_attest"] = st
+            p["_attempt"] = last_attempt(o, p["number"], p["head"])
+        else:
+            p["_attest"], p["_attempt"] = "UNREADABLE", 0
+    return sorted(prs, key=lambda p: (
+        0 if p["_attest"] == "yes" else 1,
+        0 if not p["draft"] else 1,
+        0 if p["mergeable"] == "MERGEABLE" else 1,
+        p["_attempt"],
+        p["number"],
+    ))
+
+
+def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
+    prs = read_prs(budget, slug, args.max_prs)
+    if not prs:
+        # A read that SUCCEEDED and listed nothing is a fact; an unreadable one raised above and is
+        # SKIPPED by the caller. The two must never render the same.
+        return [], False
+    ranked = rank(prs, o, Path(args.reviews).expanduser(), slug)
+    ps_rows = _ps_table()
+    surface_for: dict[int, dict | None] = {p["number"]: None for p in ranked}
+    for p in ranked[: args.candidates]:
+        if not p["head"]:
+            surface_for[p["number"]] = {"reds": [], "in_flight": [], "groups": 0,
+                                        "unreadable": "the head sha could not be read from the PR listing"}
+            continue
+        try:
+            surface_for[p["number"]] = check_surface(budget, slug, p["head"])
+        except Skipped as e:
+            # ONE candidate's surface unreadable does not poison the whole cycle — and it must not
+            # shrink to "quiet" either. It is an UNREADABLE reading for THIS PR (no GO from it).
+            surface_for[p["number"]] = {"reds": [], "in_flight": [], "groups": 0,
+                                        "unreadable": str(e)}
+
+    results = []
+    dispatched = False
+    for i, p in enumerate(ranked, start=1):
+        surface = surface_for.get(p["number"])
+        if surface is None:
+            # Not read this cycle (REST budget): reported as NOT MEASURED rather than as quiet.
+            results.append({"pr": p, "rank": i,
+                            "readings": (f"pr={p['state'].upper()} draft={'yes' if p['draft'] else 'no'} "
+                                         f"mergeable={p['mergeable']} reds=NOT-READ "
+                                         f"attested@head={p['_attest']} claim=NOT-READ rail=NOT-READ"),
+                            "verdict": "NOT-MEASURED (outside this cycle's read budget)",
+                            "detail": f"the top {args.candidates} candidates were read",
+                            "dispatch": False, "reds": 0, "red_labels": []})
+            continue
+        st, detail = (attest(o, Path(args.reviews).expanduser(), slug, p["number"], p["head"])
+                      if p["head"] else (UNREADABLE, "the head sha could not be read"))
+        claim, claim_detail = (claim_state(o, repo_path, p["number"], p["head"])
+                               if p["head"] else (UNREADABLE, "no head to key a claim on"))
+        rail, rail_detail = rail_state(o, p["number"], ps_rows)
+        d = decide(p, st, detail, surface, claim, claim_detail, rail, rail_detail,
+                   args.retry_s, o)
+        d.update({"pr": p, "rank": i})
+        if d["verdict"] == GO and not dispatched:
+            if args.dry_run or not args.act:
+                d["verdict"] = "GO (not dispatched: " + ("--dry-run" if args.dry_run else "--no-act") + ")"
+                d["detail"] = "every gate passed"
+            else:
+                rail_bin = resolve_rail(args.rail, o)
+                if not rail_bin:
+                    d["verdict"] = "REFUSE(rail=missing)"
+                    d["detail"] = ("admin-merge.sh was not found (looked at --rail, $O, the shipped "
+                                   "location, ~/.pi/agent/scripts) — the rail is the authority and "
+                                   "there is no substitute for it")
+                else:
+                    ok, info, log = dispatch_rail(rail_bin, p["number"], slug, o, args.rail_wait_s)
+                    if ok:
+                        dispatched = True
+                        d["dispatch"] = True
+                        d["verdict"] = f"GO dispatched ({info})"
+                        d["detail"] = f"{rail_bin} {p['number']} --repo {slug} → {log}"
+                        # Recorded whether the rail then refused or merged: the ledger exists to stop
+                        # a BLIND retry at one head, and a refusal is the strongest reason not to.
+                        record_attempt(o, p["number"], p["head"], f"rail ({info})")
+                    else:
+                        d["verdict"] = f"REFUSE({info})"
+                        d["detail"] = "another lander won the lock at the moment of action"
+        elif d["verdict"] == GO:
+            # A GO that was not the FIRST one this cycle still must not read like a dispatch.
+            d["verdict"] = "GO (held: one dispatch per cycle)"
+        results.append(d)
+    return results, dispatched
+
+
+# ── the written reminder ─────────────────────────────────────────────────────────────────────
+def compose(md: Path, slug: str, main_sha: str, budget: Budget,
+            landing: list[dict], deploy: list[dict], skipped: str, line: str) -> None:
+    rows = []
+    for r in landing:
+        rows.append(f"| {r['rank']} | #{r['pr']['number']} | {r['verdict']} | "
+                    f"{r['readings']} | {r['pr']['title'][:70]} |")
+    dep = []
+    for d in deploy:
+        dep.append(f"| {d['box']} | {d['harness'][:12] or '<none>'} [{d['relation'] or '?'}] | "
+                   f"{d['controller'] or '?'} | {d['roles'] or '?'} | {d['verdict']} |")
+    body = f"""# Merge reminder — {now_iso()}
+
+**Target:** `{slug}` · **origin/main:** `{main_sha[:12] or 'UNREADABLE'}` ·
+**REST:** {budget.calls}/{REST_BUDGET} metered (+1 exempt `rate_limit`) ·
+**core:** {budget.core_remaining}/{budget.core_limit}
+
+{f'⛔ **SKIPPED:** {skipped}' if skipped else '**cycle:** ran'}
+
+## One line
+
+```
+{line}
+```
+
+## 1. Closest to landing
+
+| # | PR | verdict | measured reading | title |
+|---|---|---|---|---|
+{chr(10).join(rows) if rows else '| — | — | no open PRs | — | — |'}
+
+Readings are the values this cycle MEASURED. `in-flight` > 0 with `reds=0` is a **WAIT**, never a
+GO (#2522/#2592); `attested@head=stale` means a record exists but was minted for an older head
+(a stale record is not a record). `NOT-READ` is outside the read budget, not quiet.
+
+## 2. Merged but NOT live (the deploy arm)
+
+| box | harness | controller | roles | verdict |
+|---|---|---|---|---|
+{chr(10).join(dep) if dep else '| — | — | — | — | no box inventory (`$O/state/boxes.tsv`) and no local probe |'}
+
+A merged fix that is not live on a box has fixed nothing. The arm dispatches each box's OWN
+activation verb, never a hand restart, and only after the landing decision — and VERIFIES it by
+artifact (`harness: <sha> [current]`, `controller: RUNNING`), never by the command's exit code.
+
+## 3. One red for many PRs
+
+{_shared_reds(landing)}
+
+---
+*This file is written by `scripts/orchestrator-harness/merge-reminder.py`. It never merges: a landed
+PR is landed by `scripts/admin-merge.sh`, whose refusals are the record.*
+"""
+    try:
+        tmp = md.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(body)
+        os.replace(tmp, md)
+    except OSError as e:
+        print(f"⚠️  could not write {md}: {e}", file=sys.stderr)
+
+
+def _shared_reds(landing: list[dict]) -> str:
+    """Question 3: is one RED GROUP shared across several PRs (one root that unblocks a batch)?
+    Built from the group LABELS this cycle measured — a count alone cannot say "same reason"."""
+    by_label: dict[str, list[int]] = {}
+    for r in landing:
+        for label in r.get("red_labels") or []:
+            by_label.setdefault(label, []).append(r["pr"]["number"])
+    shared = {k: v for k, v in by_label.items() if len(v) > 1}
+    if shared:
+        return "\n".join(f"- `{k}` → {', '.join(f'#{n}' for n in sorted(v))}" for k, v in shared.items())
+    if any(r.get("reds") for r in landing):
+        return ("A red group appears on ONE PR only (not a batch root): " +
+                "; ".join(f"#{r['pr']['number']}: {', '.join(r.get('red_labels') or [])}"
+                          for r in landing if r.get("reds")))
+    return ("No PR in this cycle carries a red group. (A PR whose surface was NOT READ is not "
+            "evidence of a green one.)")
+
+
+# ── timer install (both platforms) ───────────────────────────────────────────────────────────
+def install_timer(o: Path, interval: int, uninstall: bool) -> int:
+    argv = [sys.executable, str(Path(__file__).resolve()), "--o", str(o)]
+    try:
+        (o / "logs").mkdir(parents=True, exist_ok=True)   # the plist/unit point their output here
+    except OSError as e:
+        print(f"⛔ cannot create {o}/logs: {e}", file=sys.stderr)
+        return 3
+    plat = sys.platform
+    if plat == "darwin":
+        label = "com.tortoise.merge-reminder"
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if uninstall:
+            if plist.exists():
+                run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=60)
+                plist.unlink()
+                print(f"removed {plist}")
+            else:
+                print(f"nothing to remove at {plist}")
+            return 0
+        if not shutil.which("launchctl"):
+            print("⛔ no launchctl on this macOS box — cannot install a timer, and will not pretend to", file=sys.stderr)
+            return 3
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        args_xml = "".join(f"<string>{a}</string>" for a in argv)
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key><array>{args_xml}</array>
+  <key>StartInterval</key><integer>{interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{o}/logs/merge-reminder.out</string>
+  <key>StandardErrorPath</key><string>{o}/logs/merge-reminder.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>{os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}</string>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>O</key><string>{o}</string>
+  </dict>
+</dict></plist>
+"""
+        tmp = plist.with_suffix(f".new.{os.getpid()}")
+        tmp.write_text(xml)
+        # Validate BEFORE replacing a live plist: a rejected render must not destroy a working job.
+        rc, _, err = run(["plutil", "-lint", str(tmp)], timeout=30)
+        if rc != 0:
+            tmp.unlink(missing_ok=True)
+            print(f"⛔ rendered plist does not parse ({one_line(err)}) — the installed job was left alone", file=sys.stderr)
+            return 3
+        os.replace(tmp, plist)
+        run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=60)
+        rc, _, err = run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], timeout=60)
+        rc2, out2, _ = run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=30)
+        if rc != 0 or rc2 != 0:
+            print(f"⛔ wrote {plist} but the job is NOT loaded (bootstrap rc={rc}: {one_line(err)}). "
+                  f"Next: launchctl bootstrap gui/{os.getuid()} {plist}", file=sys.stderr)
+            return 3
+        print(f"installed + loaded {label} every {interval}s ({plist})")
+        return 0
+
+    # Linux: a systemd USER timer, else crontab. A box with neither REFUSES by name.
+    unit = "merge-reminder"
+    udir = Path.home() / ".config" / "systemd" / "user"
+    service = udir / f"{unit}.service"
+    timer = udir / f"{unit}.timer"
+    if uninstall:
+        if timer.exists() or service.exists():
+            run(["systemctl", "--user", "disable", "--now", f"{unit}.timer"], timeout=60)
+            for f in (timer, service):
+                f.unlink(missing_ok=True)
+            print(f"removed {unit}.timer/.service")
+        else:
+            print(f"nothing to remove at {timer}")
+        return 0
+    if shutil.which("systemctl"):
+        udir.mkdir(parents=True, exist_ok=True)
+        service.write_text(
+            "[Unit]\nDescription=merge reminder (harness)\n\n[Service]\nType=oneshot\n"
+            f"WorkingDirectory={o}\nEnvironment=O={o}\nEnvironment=HOME={Path.home()}\n"
+            f"Environment=PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}\n"
+            f"ExecStart=/usr/bin/env python3 {' '.join(shell_quote(a) for a in argv)}\n")
+        timer.write_text(
+            "[Unit]\nDescription=merge reminder timer\n\n[Timer]\n"
+            f"OnBootSec=60s\nOnUnitActiveSec={interval}s\nAccuracySec=10s\n\n"
+            "[Install]\nWantedBy=timers.target\n")
+        run(["systemctl", "--user", "daemon-reload"], timeout=60)
+        rc, _, err = run(["systemctl", "--user", "enable", "--now", f"{unit}.timer"], timeout=90)
+        rc2, out2, _ = run(["systemctl", "--user", "is-active", f"{unit}.timer"], timeout=30)
+        if rc != 0 or rc2 != 0 or "active" not in (out2 or ""):
+            print(f"⛔ wrote {timer} but the timer is NOT active (enable rc={rc}: {one_line(err)}). "
+                  f"Next: systemctl --user enable --now {unit}.timer", file=sys.stderr)
+            return 3
+        print(f"installed + started {unit}.timer every {interval}s ({timer})")
+        return 0
+    if shutil.which("crontab"):
+        rc, out, _ = run(["crontab", "-l"], timeout=30)
+        current = out if rc == 0 else ""
+        tag = "# tortoise-merge-reminder"
+        kept = [ln for ln in current.splitlines() if tag not in ln]
+        mins = max(1, interval // 60)
+        kept.append(f"*/{mins} * * * * O={o} /usr/bin/env python3 {Path(__file__).resolve()} --o {o} {tag}")
+        # Feed the crontab through stdin (the `run()` helper cannot); the rc is still checked.
+        try:
+            p = subprocess.run(["crontab", "-"], input="\n".join(kept) + "\n", text=True,
+                               capture_output=True, timeout=30)
+            if p.returncode != 0:
+                raise OSError(p.stderr.strip() or f"crontab rc={p.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"⛔ could not write the crontab: {e}", file=sys.stderr)
+            return 3
+        print(f"installed a crontab entry every {mins}m ({tag})")
+        return 0
+    print("⛔ no scheduler on this box (no systemctl, no crontab) — the reminder is installed as a "
+          "script but NOTHING will run it. Next: install systemd or cron, or run it from the "
+          "harness's own controller cycle.", file=sys.stderr)
+    return 3
+
+
+# ── main ─────────────────────────────────────────────────────────────────────────────────────
+def repo_slug(repo_path: Path, explicit: str) -> str:
+    if explicit:
+        return explicit
+    rc, out, _ = run(["git", "-C", str(repo_path), "remote", "get-url", "origin"], timeout=15)
+    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", (out or "").strip())
+    if rc == 0 and m:
+        return m.group(1)
+    raise Skipped("UNREADABLE repo — pass --repo owner/name (origin could not be read)")
+
+
+def repo_path_of(o: Path) -> Path:
+    explicit = os.environ.get("REPO")
+    cands = [explicit] if explicit else []
+    cands += [str(Path(__file__).resolve().parents[2]), str(Path.home() / "orchestrator")]
+    for c in cands:
+        if c and run(["git", "-C", c, "rev-parse", "--git-dir"], timeout=15)[0] == 0:
+            return Path(c).resolve()
+    return Path.cwd()
+
+
+def main_sha(repo_path: Path) -> str:
+    """`origin/main` read WITHOUT a fetch: the question is "what has merged", and the timer must not
+    spend a network round trip on it. An unreadable ref is returned as "" and REPORTED — never
+    treated as "up to date" (that is the false-green this whole file exists against)."""
+    rc, out, _ = run(["git", "-C", str(repo_path), "rev-parse", "--verify", "origin/main"], timeout=15)
+    if rc != 0:
+        return ""
+    return (out or "").strip()
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(add_help=True, description="merge reminder + evidence-gated actuator")
+    p.add_argument("--repo", default=os.environ.get("OR", ""), help="owner/name (default: git origin)")
+    p.add_argument("--o", default=os.environ.get("O", str(Path.home() / "orchestrator")))
+    p.add_argument("--reviews", default=os.environ.get("MERGE_REMINDER_REVIEWS",
+                                                       str(Path.home() / ".pi/agent/reviews")))
+    # ⛔ THE ARM IS ON BY DEFAULT — that is the whole point of this change (the owner asked for
+    # automated dispatch of the needed action). `--no-act` (or MERGE_REMINDER_ACT=0) is the
+    # reminder-only mode, and it is the mode a human uses to INSPECT before trusting it. What keeps
+    # the default safe is not the flag: it is the gate list, which emits no GO from an unread value.
+    p.add_argument("--act", dest="act", action="store_true",
+                   default=os.environ.get("MERGE_REMINDER_ACT", "1").strip().lower()
+                   not in ("0", "no", "false", "off"),
+                   help="dispatch the rail when every gate passes (default: ON; --no-act disables)")
+    p.add_argument("--no-act", dest="act", action="store_false")
+    p.add_argument("--dry-run", action="store_true", help="measure and report; dispatch nothing")
+    p.add_argument("--json", action="store_true", help="machine-readable output on stdout")
+    p.add_argument("--quiet", action="store_true", help="write the file, print nothing")
+    p.add_argument("--max-prs", type=int, default=DEFAULT_MAX_PRS)
+    p.add_argument("--candidates", type=int, default=DEFAULT_CANDIDATES)
+    p.add_argument("--retry-s", type=int, default=RETRY_S)
+    p.add_argument("--rail-wait-s", type=int, default=RAIL_WAIT_S)
+    p.add_argument("--verify-deploy-s", type=int, default=DEPLOY_VERIFY_S)
+    p.add_argument("--rail", default=os.environ.get("MERGE_REMINDER_RAIL", ""))
+    p.add_argument("--interval", type=int, default=600)
+    p.add_argument("--install-timer", action="store_true")
+    p.add_argument("--uninstall-timer", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    o = Path(args.o).expanduser()
+    try:
+        o.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"⛔ cannot create $O={o}: {e}", file=sys.stderr)
+        return 1
+
+    if args.install_timer or args.uninstall_timer:
+        return install_timer(o, args.interval, args.uninstall_timer)
+
+    if args.candidates < 1 or args.candidates > MAX_CANDIDATES:
+        print(f"--candidates must be 1..{MAX_CANDIDATES} (the REST budget: 1 + 3*candidates <= {REST_BUDGET})",
+              file=sys.stderr)
+        return 2
+
+    repo_path = repo_path_of(o)
+    md = o / STATE_MD
+    skipped = ""
+    landing: list[dict] = []
+    deploy: list[dict] = []
+    budget = Budget("gh")          # replaced once gh resolves; carries the header's numbers
+    dispatched = False
+    main = ""
+    slug = args.repo or "<unresolved>"
+    # ONE try around the READS THAT CAN SKIP THE WHOLE CYCLE (repo identity, gh, the rate-limited
+    # budget, the open-PR listing). A single candidate's surface failing inside landing_cycle is
+    # handled there — it becomes an UNREADABLE reading for that PR, not a skipped cycle.
+    try:
+        slug = repo_slug(repo_path, args.repo)
+        main = main_sha(repo_path)
+        budget = Budget(resolve_gh(o))
+        budget.rate_limit()
+        landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
+    except Skipped as e:
+        skipped = str(e)
+        landing, dispatched = [], False
+    if not skipped:
+        # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
+        # DEFERS it: restarting a controller under the rail we just started destroys that run.
+        deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run)
+
+    if not main:
+        main = main_sha(repo_path)
+    line = one_line_of(landing, deploy, skipped)
+    compose(md, slug, main, budget, landing, deploy, skipped, line)
+
+    if args.json:
+        print(json.dumps({
+            "ts": now_iso(), "repo": slug, "main": main, "skipped": skipped,
+            "rest_calls": budget.calls, "rest_budget": REST_BUDGET,
+            "core": {"remaining": budget.core_remaining, "limit": budget.core_limit},
+            "landing": [{"pr": r["pr"]["number"], "head": r["pr"]["head"], "rank": r["rank"],
+                         "verdict": r["verdict"], "readings": r["readings"],
+                         "detail": r["detail"], "dispatch": r.get("dispatch", False)}
+                        for r in landing],
+            "deploy": deploy, "line": line,
+        }, indent=2))
+    elif not args.quiet:
+        print(line)
+    # A skipped cycle is exit 3: a caller (or the owner reading a log) must be able to tell "nothing
+    # to do" from "I could not look". Everything else ran.
+    return 3 if skipped else 0
+
+
+def one_line_of(landing: list[dict], deploy: list[dict], skipped: str) -> str:
+    if skipped:
+        return f"MERGE-REMINDER SKIPPED — {skipped} (no dispatch)"
+    if not landing:
+        head = "no landing candidates"
+    else:
+        best = landing[0]
+        head = (f"#{best['pr']['number']} rank={best['rank']}/{len(landing)} "
+                f"[{best['readings']}] {best['verdict']} :: {best['pr']['title']}")
+        dispatch = [r for r in landing if r.get("dispatch")]
+        if dispatch:
+            d = dispatch[0]
+            head = (f"#{d['pr']['number']} [{d['readings']}] {d['verdict']} "
+                    f":: {d['pr']['title']} :: {d['detail']}")
+    dep = [f"{d['box']}={d['verdict']}" for d in deploy if d["verdict"] not in ("current",)]
+    if dep:
+        head += " || deploy: " + "; ".join(dep)
+    return head
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Skipped as e:            # a Skipped that escaped main() (should not happen) is still named
+        print(f"MERGE-REMINDER SKIPPED — {e} (no dispatch)", file=sys.stderr)
+        sys.exit(3)
