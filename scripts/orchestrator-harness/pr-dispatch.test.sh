@@ -349,6 +349,82 @@ drive "" rail 0
   && ok "an EMPTY class (unreadable check read) also gets a named wait" \
   || bad "an empty class still falls through (waits=$(waits) spawns=$(spawns))"
 
+# ⛔ THE NAMED VERDICTS (agent-infra#2719). Before the arm, all four causes arrived as the ONE token
+# above and the only thing the cycle could print was "re-read next cycle". Each cause has its own
+# remedy, so each must reach its own row — and NOT ONE of them may spawn: an empty check surface is
+# never a green and never a reason to act on the code.
+for _nm in \
+  "NOCHECKS:READ-FAILED:transport: error connecting to api.github.com" \
+  "NOCHECKS:BUDGET:this box's share of the ACCOUNT's core budget is exhausted (fleet=4)" \
+  "NOCHECKS:WAIT:a run is executing and has produced no check-run yet (Python CI run 77 in_progress)" \
+  "NOCHECKS:DEFERRED-REPAIR:ci-check-repair (scheduled workflow) owns the re-trigger" \
+  "NOCHECKS:RUN-STARTED:a token the resolver never emits (a NEW token must still not spawn)"; do
+  drive "$_nm" rail 0
+  _k="${_nm%%:*}"; _r="$(reason)"
+  [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+    && ok "${_nm%%:*}…: one wait row, NOTHING spawned (the cause is named, not acted on)" \
+    || bad "${_nm}: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+  case "$_r" in *"${_nm#NOCHECKS:}"*) ok "…and the ledger row CARRIES the named cause" ;;
+    *) bad "the ledger row does not carry the cause: '$_r'" ;; esac
+  # ⛔ AND IT MUST HAVE REACHED THE NAMED ARM, NOT THE RESIDUAL `*)` CATCH-ALL (review P3,
+  # agent-infra#2719). Both arms write one `wait` row carrying `$V`, so every other assertion here
+  # passed with the `NOCHECKS:*` arm DELETED — measured. The residual arm's reason text is the
+  # distinguishing fact: it says "unreadable or empty", which is exactly the collapse this change
+  # removes.
+  case "$_r" in *"unreadable or empty"*) bad "'${_nm%%:*}' fell through to the residual catch-all: '$_r'" ;;
+    *) ok "…and it was the NAMED arm that handled it (not the residual catch-all)" ;; esac
+  [ ! -f "$TMP/O/state/parked-4242" ] \
+    && ok "…and a non-terminal cause never parks the head" \
+    || bad "'${_nm%%:*}' PARKED a head that a later cycle can still resolve"
+done
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234)" rail 0
+[ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+  && ok "NOCHECKS:UNRESOLVABLE: one wait row and NOTHING spawned (a dead end is never a fix or a merge)" \
+  || bad "NOCHECKS:UNRESOLVABLE: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "…and it PARKS the head (no further cycle is spent on a named dead end)" \
+  || bad "the unresolvable verdict did not park the head ($(cat "$TMP/O/state/parked-4242" 2>/dev/null))"
+grep -q 'NOCHECKS-UNRESOLVABLE' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…with the verdict as the park REASON (so the next cycle reports why, not 'parked')" \
+  || bad "the park carries no reason ($(cat "$TMP/O/state/parkreason-4242" 2>/dev/null))"
+grep -q 'PARKED — NOCHECKS-UNRESOLVABLE' "$TMP/d.log" \
+  && ok "…and the log line says PARKED with the verdict" \
+  || bad "the log does not report the park"
+# ⛔ A VERDICT THAT NEVER REACHED THE PR MUST NOT PARK (agent-infra#2719 review P2): the arm never
+# re-enters a parked head, so a failed post would be retried never and the PR would be dead-ended with
+# no explanation anywhere a human looks.
+# the earlier drive PARKED this head, and `drive()` does not clear the park files (they are the very
+# state this assertion is about) — so clear them first or the assertion reads the previous drive's park.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed]" rail 0
+[ ! -f "$TMP/O/state/parked-4242" ] \
+  && ok "[post=failed]: the head is NOT parked (the verdict is retried instead of lost)" \
+  || bad "a verdict that could not be posted still parked the head"
+[ "$(waits)" = "1" ] && [ "$(spawns)" = "0" ] \
+  && ok "[post=failed]: still one wait row and nothing spawned" \
+  || bad "[post=failed]: waits=$(waits) spawns=$(spawns)"
+grep -q 'verdict could NOT be posted' "$TMP/d.log" \
+  && ok "…and the log NAMES the failed post" \
+  || bad "the log does not report the failed post"
+# …but a post that has now failed its bounded number of times IS parked, with the failure as the reason.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed-parked]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-parked]: the bounded-retry case DOES park (the token is not terminal for ever)" \
+  || bad "a post that exhausted its attempts was not parked — the retry would loop for ever"
+grep -q 'could not be posted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason records the post failure (a human can see why nothing was published)" \
+  || bad "the park reason does not record the post failure"
+# …and when the post bound itself cannot be COUNTED (state/ unwritable), it is named and parked.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head [post=failed-inert]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-inert]: an UNCOUNTABLE post bound parks too (a named dead end beats a comment loop)" \
+  || bad "an uncountable post bound was left retrying for ever"
+grep -q 'could not be counted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason says the bound was INERT" \
+  || bad "the park reason does not name the inert bound"
+
 echo
 echo "=== T1: a claim has a spawn behind it, and a failed spawn is never silent ==="
 drive GREEN rail 0 1
