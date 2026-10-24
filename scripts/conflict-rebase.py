@@ -412,13 +412,15 @@ def record_state(pr: int, repo: str, new_diff: str) -> str:
             continue
         rec = _record_for_this_repo(f, repo)
         if rec is None:
-            if f.exists():
-                # A record EXISTS here and cannot be parsed: the comment must not claim
-                # "no record existed" while an unparseable attestation sits at the
-                # canonical path the merge gate reads.
+            # ⛔ TWO DIFFERENT ANOMALIES, TWO DIFFERENT ANSWERS (#2698 review, P2). A
+            # record for ANOTHER repo is inert to the merge gate, so this head is NOT
+            # unreviewed and the comment must not say it is. Only an unparseable object
+            # at the canonical path is UNREADABLE. The old `if f.exists()` re-test here
+            # was always true (`:409` already proved it) so the log arm was dead code
+            # and a foreign record produced a comment with two false claims.
+            if not (_json_parses(f) and isinstance(_json_load(f), dict)):
                 return f"UNREADABLE record at {f.name} — parses as no record; treat this head as UNREVIEWED"
-            log(f"#{pr} ignoring {f.name}: not a usable record for this PR "
-                f"({'another repo' if _json_parses(f) and isinstance(_json_load(f), dict) else 'not a record object'})")
+            log(f"#{pr} ignoring {f.name}: a record for another repo, inert to this gate")
             continue
         found = True
         rec_head = str(rec.get("head_sha") or "?")
@@ -540,11 +542,25 @@ def checks_green(pr: dict, required: list[str]) -> bool:
     """
     if not required:
         return False
-    seen: dict[str, set[str]] = {}
+    # ⛔ THE NEWEST ATTEMPT DECIDES, NOT EVERY ATTEMPT (#2698 review, P1). A re-run ADDS
+    # a check-run; it does not clear the red one. Requiring EVERY attempt at a context
+    # to be green makes a PR that was retried once permanently ineligible — which is
+    # precisely the population this arm exists to serve, because a red required context
+    # is WHY a fixer retried it. Measured live on daniel-ospina/agent-infra: three
+    # MERGEABLE+BEHIND PRs carried `pipeline-compliance: CANCELLED, SUCCESS` and were
+    # skipped as "behind but not green", with the census blaming a fixer.
+    # This is the same read the rail makes and AGENTS.md prescribes: newest attempt per
+    # (workflow, job), decided by POLARITY. `statusCheckRollup` carries no app slug, so
+    # two workflows publishing one job name are still conflated — the rail's own stated
+    # residual, named here rather than silently shared.
+    newest: dict[str, tuple[str, str]] = {}
     for c in pr.get("statusCheckRollup") or []:
         name = str(c.get("name") or c.get("context") or "")
-        seen.setdefault(name, set()).add(str(c.get("conclusion") or c.get("state") or "").upper())
-    return all(seen.get(ctx) and seen[ctx] <= GREEN_CONCLUSIONS for ctx in required)
+        conclusion = str(c.get("conclusion") or c.get("state") or "").upper()
+        when = str(c.get("startedAt") or c.get("completedAt") or "")
+        if name not in newest or when >= newest[name][0]:
+            newest[name] = (when, conclusion)
+    return all(newest.get(ctx) and newest[ctx][1] in GREEN_CONCLUSIONS for ctx in required)
 
 
 def clean_record_at_head(pr: int, repo: str, head: str) -> bool:
@@ -725,9 +741,14 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
             # fault (a signing hook, a full disk, an unreadable object) behind a
             # diagnosis the operator never sees. Classify on EVIDENCE: unmerged index
             # entries are a conflict; anything else is a replay FAILURE.
-            unmerged = sorted({ln.split("\t")[-1] for ln in
-                               run(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U"]).stdout.splitlines()
-                               if ln.strip()})
+            # ⛔ A FAILED READ IS NOT "NO CONFLICT" (#2698 review, P2). Without this
+            # check a git failure here reads as an empty unmerged set, so a REAL content
+            # conflict is reported as `rebase-failed`, gets no label and no comment — the
+            # deliverable never fires and the PR re-enters the queue every pass.
+            ev = run(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U"])
+            if ev.returncode != 0:
+                raise Unreadable(f"could not read the unmerged index: {ev.stderr.strip()[:300]}")
+            unmerged = sorted({ln.split("\t")[-1] for ln in ev.stdout.splitlines() if ln.strip()})
             run(["git", "-C", str(wt), "rebase", "--abort"])
             blob = rb.stdout + rb.stderr
             if not unmerged:
@@ -1126,6 +1147,18 @@ def _success_body(n: int, res: dict, before: tuple[str, str], after: tuple[str, 
             "A review record EXISTS at the canonical path and **could not be moved aside**, so this "
             "head must be treated as UNREVIEWED until a human removes or re-records it. The head "
             "above is not what that record attests.",
+        ]
+    elif rec.startswith("superseded-unverified"):
+        # ⛔ `superseded-unverified` MUST be tested BEFORE `superseded` — it starts with
+        # it, so the generic arm claimed the diff CHANGED when the diff was never read.
+        # That is the same "a claim nobody measured" this function's own header forbids,
+        # and it costs a paid re-review of an unchanged diff (#2698 review, P2).
+        lines += [
+            "",
+            "The diff at this head **could not be read**, so the record's relation to it is "
+            "UNKNOWN — not 'different'. The record was moved aside because a record must never "
+            "stand for a head nobody verified. Treat this head as UNREVIEWED and re-record once "
+            "the diff is readable.",
         ]
     elif rec.startswith("superseded"):
         lines += [

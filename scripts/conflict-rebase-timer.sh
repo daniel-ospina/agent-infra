@@ -34,6 +34,21 @@
 #      CONFLICT_REBASE_DRY_RUN     any value => every pass runs --dry-run
 set -uo pipefail
 
+# ⛔ `timeout` IS GNU COREUTILS AND A MAC HAS NONE (#2046, re-broken here — #2698 review,
+# P1). `timeout 1800 python3 …` exited 127 (`command not found`) on every Mac cell while
+# this timer still stamped its beacon, so `status` printed "running" over a bot that had
+# never executed once. The repo already owns the one bounded-execution helper; use it
+# instead of a bare call, and REFUSE to start when the helper itself is missing (a
+# silent unbounded pass is the fail-open shape, not a degraded one).
+BOUNDED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bounded.sh"
+if [ ! -r "$BOUNDED" ]; then
+  echo "conflict-rebase-timer: $BOUNDED is missing — refusing to schedule a pass I cannot bound" >&2
+  exit 2
+fi
+# shellcheck source=lib/bounded.sh
+. "$BOUNDED"
+trap 'tb_watchdogs_reap 2>/dev/null || true' EXIT
+
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"
 STATE="${HOME}/.pi/agent/state/conflict-rebase"
@@ -62,10 +77,20 @@ pass() {
   # The suite and an operator both need to see the queue before trusting it.
   [ -n "${CONFLICT_REBASE_DRY_RUN:-}" ] && args+=(--dry-run)
   printf '%s BEGIN %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG"
-  if ! timeout 1800 python3 "$BOT" "${args[@]}" >>"$LOG" 2>&1; then
-    printf '%s END rc=nonzero\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$LOG"
+  tb_timeout 1800 python3 "$BOT" "${args[@]}" >>"$LOG" 2>&1
+  local rc=$?
+  # ⛔ THE BEACON ALONE IS NOT A HEALTH SIGNAL. It says "the loop turned", not "a pass
+  # ran". Record the pass's own exit status beside it and surface it from `status`, so a
+  # pass that never executes (127), times out (124) or refuses (2) is visible instead of
+  # reading as healthy forever.
+  printf '%s END rc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rc" >>"$LOG"
+  if [ "$rc" -ne 0 ]; then
+    printf '%s rc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rc" >"$STATE/last-failure"
+  else
+    rm -f "$STATE/last-failure"
   fi
   date +%s >"$BEACON"
+  return "$rc"
 }
 
 case "${1:-}" in
@@ -112,6 +137,11 @@ case "${1:-}" in
       echo "last pass: never"
     fi
     [ -f "$STATE/PAUSED" ] && echo "PAUSED (brake file present)" || echo "not paused"
+    if [ -f "$STATE/last-failure" ]; then
+      echo "LAST PASS FAILED: $(cat "$STATE/last-failure")"
+    else
+      echo "last pass: ok (or no pass yet)"
+    fi
     ;;
   stop)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then

@@ -134,3 +134,27 @@ Across the 35 refusals, five files block 29 of the PRs:
 That is contention, not staleness. Splitting `MEMORY.md`, deriving `run-bash-shards.sh`
 (#2609 says the same), and regenerating `workflow-lock.json` mechanically (#1170) removes
 the queue's actual cause. A rebase bot cannot.
+
+## Re-measurement (independent, 2 h later, on a different population)
+
+The decision above rests on one sample, so it was re-taken at 2026-10-24T17:00Z by a
+second lane against `origin/main@c13af5cd`: **26 `CONFLICTING` open PRs, 25 tested
+(`#2517` is a draft), `git merge-tree --write-tree` clean for 0 of 25.** The hotspot
+ranking reproduced (top two still `MEMORY.md` 7 and `orchestrator-harness/README.md` 6).
+
+The queue had fallen 48 → 26 since the first census, which is the drain by hand — not a
+change in the class. **A `CONFLICTING` PR is one whose content disagrees with `main`;
+there is no mechanical population to harvest, at either sample.**
+
+## Residuals (named, not fixed)
+
+- **No per-subprocess timeout.** A hung `gh`/`git` holds the pass's `flock` for its whole
+  life, and every later pass then exits 0 with "another run holds the lock". The timer now
+  bounds the pass (`tb_timeout 1800`) and records the failure in `status`, so the operator
+  *sees* it — the direct-invocation path (`--max 3` by hand) still has no outer bound.
+- **`refs/claims/*` absent reads as "free".** Both lane surfaces that gate are per-cell;
+  a lane on another cell that has not pushed yet is invisible, and the lease only refuses
+  a *concurrent* push. Per the fleet's own doctrine, no-claim is an abstention, not
+  freedom. Closing this needs the cross-cell board, not a change here.
+- **`statusCheckRollup` carries no app slug**, so two workflows publishing the same job
+  name are conflated when picking the newest attempt — the rail's own stated residual.

@@ -432,7 +432,65 @@ OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
 has "$OUT" "behind but not green" "§16a a red BEHIND PR is skipped for being red"
 # 1201 is green + recorded; the ONLY reason to skip it would be the head being fresh,
 # so assert it is the one that WOULD be rebased.
-has "$OUT" '"pr": 1201' "§16b the green+recorded BEHIND PR is considered"
+# ⛔ §16b USED TO BE VACUOUS (#2698 review, P2). `has "$OUT" '"pr": 1201'` matches the
+# `skipped` bucket too (`{"pr": <n>, "why": …}`), so it passed with NO record at the
+# head — it would have survived inverting `clean_record_at_head`. Assert the ACTED
+# bucket: only a `results` row carries a `branch`/`action`, and only the success path
+# emits `would-rebase`.
+has "$OUT" '"action": "would-rebase"' "§16b the green+recorded BEHIND PR is considered"
+has "$OUT" '"branch": "feat/clean"' "§16c …and it is 1201 in the acted bucket, not the skip bucket"
+
+# ═══════════════════════ §18: the newest attempt decides (#2698 review P1) ══════
+# A re-run ADDS a check-run; it does not clear the red one. `checks_green` used to
+# require EVERY attempt green, so a PR retried once was ineligible forever — the exact
+# population the BEHIND arm exists to serve. Fixture: pipeline-compliance has a
+# superseded FAILURE and a newer SUCCESS; the PR must be considered.
+echo "§18 a retried required context is GREEN when its NEWEST attempt is green"
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"name": "pipeline-compliance", "conclusion": "FAILURE", "startedAt": "2026-10-24T10:00:00Z"},
+        {"name": "pipeline-compliance", "conclusion": "SUCCESS", "startedAt": "2026-10-24T11:00:00Z"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"aaaa1111"}\n' "$H_SHA" >"$TMP/reviews/acme-widgets-1301.json"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" '"action": "would-rebase"' "§18a a flake-retried PR is considered, not skipped"
+has "$OUT" '"branch": "feat/clean"' "§18b …and it is the acted bucket, not a 'not green' skip"
+# The inverse: a PR whose NEWEST attempt is red must still be skipped. Without this the
+# assertion above would pass on a `checks_green` that always returns True.
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"name": "pipeline-compliance", "conclusion": "SUCCESS", "startedAt": "2026-10-24T10:00:00Z"},
+        {"name": "pipeline-compliance", "conclusion": "FAILURE", "startedAt": "2026-10-24T11:00:00Z"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" 'behind but not green' "§18c a PR whose NEWEST attempt is red is still skipped (the pair is discriminating)"
+
+# ═══════════════════════ §19: the schedule can actually run (#2698 review P1) ═══
+# `timeout` is GNU coreutils; a Mac has none. A bare `timeout 1800 python3 …` exited 127
+# on every Mac cell while the timer still stamped its beacon, so `status` reported a
+# healthy loop over a bot that never executed. Assert the property, not the wording.
+echo "§19 the timer bounds the pass with the repo's own helper, never a bare timeout"
+TIMER="$(dirname "$BOT")/conflict-rebase-timer.sh"
+ck "$(grep -qE '^[[:space:]]*(if[[:space:]]+!?[[:space:]]*)?timeout[[:space:]]+[0-9]' "$TIMER" && echo bare || echo none)" "none" "§19a the timer never calls a bare timeout"
+has "$(cat "$TIMER")" 'lib/bounded.sh' "§19b …it sources the one bounded-execution helper"
+has "$(cat "$TIMER")" 'tb_timeout 1800' "§19c …and bounds the pass with it"
+has "$(cat "$TIMER")" 'last-failure' "§19d …and a failed pass is visible in status"
 
 # ═══════════════════════ §17: board shapes and an unreadable gate ═══════════
 # Three arms that a mutation left green: the board's BRANCH match, the board's REPO
