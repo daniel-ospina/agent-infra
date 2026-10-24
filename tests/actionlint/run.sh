@@ -436,8 +436,9 @@ conc_run() { # conc_run <expected-exit> <label> [args...]
   fi
 }
 
-conc_run 0 "the four well-formed fixtures pass" \
-  "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml"
+conc_run 0 "the well-formed fixtures pass" \
+  "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml" \
+  "$CFIX/pr-head-ref.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -446,8 +447,11 @@ for pair in \
   "pr-group-sha.yml R1" \
   "pr-target-group-ref.yml R1" \
   "pr-group-no-identity.yml R1" \
+  "pr-on-four-space.yml R1" \
+  "pr-on-flow-map.yml R1" \
   "push-cancel-true.yml R2" \
-  "reusable-concurrency.yml R3"; do
+  "reusable-concurrency.yml R3" \
+  "push-job-level.yml R0"; do
   name="${pair% *}"; tag="${pair#* }"
   conc_run 1 "$name blocks" "$CFIX/$name"
   if grep -q "\[$tag\]" "$OUT"; then
@@ -458,13 +462,49 @@ for pair in \
   fi
 done
 
+# Cross-file rule: two PR workflows that share one group would cancel each other. Neither file is
+# wrong on its own, so this can only be caught by reading the whole set.
+conc_run 1 "two PR workflows sharing one group block" \
+  "$CFIX/pr-shared-group-a.yml" "$CFIX/pr-shared-group-b.yml"
+grep -q 'declared by more than one PR workflow' "$OUT" \
+  && pass "the shared group is named" \
+  || { fail "the shared group was not reported"; sed 's/^/      /' "$OUT"; }
+
 conc_run 0 "the live repo workflows satisfy the invariant"
-if grep -q "11 file(s) scanned" "$OUT"; then
-  pass "all 11 live workflows were scanned (no silent glob hole)"
+# The expected count is DERIVED from the tree, never pinned: a hardcoded number reds the next PR
+# that adds a workflow for a reason unrelated to its change, and equality on a count does not prove
+# the SET anyway — so the set is also pinned by name below.
+live_wf=0
+for f in "$ROOT"/.github/workflows/*.yml "$ROOT"/.github/workflows/*.yaml; do
+  [ -f "$f" ] && live_wf=$((live_wf + 1))
+done
+if grep -q "$live_wf file(s) scanned" "$OUT"; then
+  pass "all $live_wf live workflows were scanned (no silent glob hole)"
 else
-  fail "expected the live scan to cover 11 workflows"
+  fail "expected the live scan to cover $live_wf workflows (counted from .github/workflows)"
   sed 's/^/      /' "$OUT"
 fi
+# ...and by NAME, so a swap (11 files scanned, ci.yml not among them) cannot pass.
+conc_run 0 "--table lists the live set by name" --table
+if grep -q 'ci\.yml' "$OUT" && grep -q 'enforce-skills\.yml' "$OUT"; then
+  pass "--table names ci.yml and enforce-skills.yml"
+else
+  fail "--table did not name the live workflows it scanned"
+  sed 's/^/      /' "$OUT"
+fi
+
+# --- unreadable shapes must never read green --------------------------------------------
+# `*.yaml` is a workflow GitHub runs: a `*.yml`-only glob would be a whole-file escape.
+mkdir -p "$CASE6_DIR/yaml/.github/workflows"
+cp "$ROOT"/.github/workflows/ci.yml "$CASE6_DIR/yaml/.github/workflows/ci.yml"
+printf 'name: yaml-escape\non:\n  pull_request:\n' \
+  >"$CASE6_DIR/yaml/.github/workflows/zz-new.yaml"
+conc_run 1 "a PR workflow added as .yaml is scanned and refused" --root "$CASE6_DIR/yaml"
+grep -q 'zz-new\.yaml' "$OUT" && pass "the .yaml workflow is named" || fail "the .yaml workflow was not named"
+# CRLF is valid YAML: a `false\r` must not be refused as if it were a different value.
+printf 'name: crlf\r\non:\r\n  push:\r\n    branches: [main]\r\nconcurrency:\r\n  group: crlf-${{ github.event_name }}-${{ github.ref }}\r\n  cancel-in-progress: false\r\n' \
+  >"$CASE6_DIR/crlf.yml"
+conc_run 0 "a CRLF push workflow with cancel-in-progress: false passes" "$CASE6_DIR/crlf.yml"
 
 # --- mutations on the LIVE files: the rules must be load-bearing ---------------------------
 # One directory per variant, each keeping the workflow's own BASENAME — the rules read the file
