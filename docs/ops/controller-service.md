@@ -162,13 +162,15 @@ danger is a tmux controller launched beside a unit that may be enabled.
 
 **Those verbs never execute `keys.env` with root's authority.** Resolving the owner means *sourcing* that
 file, and the file belongs to the operator, while `sudo bash … --status` is a documented invocation — so
-when the installer runs as root it evaluates the file as the **invoking operator** (`SUDO_USER`) whenever
-sudo can name one, and otherwise as the account that **owns** it (`runuser -u <owner>`). It refuses to
-evaluate the file at all — falling back to the rendered `O=`, which is cleartext in the unit — in three
-cases: no `runuser`; a file it cannot read, or whose owner it cannot name; and a file **any account but its
-owner can write** (the shape `sudo tee` leaves behind with a shared group, where "the owner" is the wrong
-question — the test is who can *write* it, not who owns it, because an account that can write it can run
-code as root). The fallback costs nothing for ownership, because ownership is the union above.
+when the installer runs as root it evaluates the file as the account that can actually **write** it, which is
+the file's **owner** (`runuser -u <owner>`); `SUDO_USER` is only the non-root stand-in for the one case
+ownership cannot answer — the owner **is root**, and root can write anything, so "owned by root" says nothing
+about who could have written it. It refuses to evaluate the file at all — falling back to the rendered `O=`,
+which is cleartext in the unit — in three cases: no `runuser`; a file it cannot read, or whose owner it
+cannot name; and a file **any account but its owner can write** (the shape `sudo tee` leaves behind with a
+shared group; the mode check rejects group/other *write*, so a `0644` file owned by another account is fine
+only because it then runs as *that* owner, never as the caller). The fallback costs nothing for ownership,
+because ownership is the union above.
 
 ## Tests
 

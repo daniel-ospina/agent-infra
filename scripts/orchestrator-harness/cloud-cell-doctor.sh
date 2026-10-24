@@ -1987,13 +1987,24 @@ run_doctor() {
       if [ "$rc" -eq 0 ]; then
         log "[doctor] controller restarted (supervisor start rc=0)"
         result="$result; controller RESTARTED"
+      elif [ "$rc" -eq 5 ]; then
+        # ⛔ A UNIT THAT CONVERGED TO `failed` IS NOT A CLEAN PASS (review P1 round 11, #2402). The supervisor
+        # now answers rc 5 for a unit the manager has given up on (start limit hit), and keeps rc 4 for the
+        # states a deliberate `systemctl stop` leaves. Scoring both as "not launched, not a failure" let a
+        # STARTED cell (`.desired` present) with NO dispatcher be recorded as a clean pass, with `doctor
+        # status` exiting 0 over it — the false green this whole change exists to remove, one layer in. A
+        # failed unit is exactly what `--status` prints as unsupervised, so this pass must not certify it.
+        log "[doctor] controller restart NOT launched — ${CONTROLLER_UNIT:-the controller unit} has CONVERGED TO FAILED (start limit): this cell has NO dispatcher and only a human re-arm brings it back"
+        result="$result; controller restart not launched (unit FAILED — no dispatcher)"
+        [ "$rrc" -eq 0 ] && rrc=1
       elif [ "$rc" -eq 4 ]; then
         # ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). `start` answers rc 4
         # when an AUTOMATED restart would have to re-arm a unit the manager reports not active — a
         # deliberate `systemctl stop` (`.desired` survives it, so this pass would otherwise undo the
         # operator's stop within one pass) or a start limit that converged to `failed` (clearing it here
         # is what made a keyless cell retry forever with every surface reading supervised). Honouring it is
-        # NOT a failed pass: the stop is the decision, and a failed unit is already what `--status` prints.
+        # NOT a failed pass: the stop is the decision, and a failed unit is handled by the rc-5 arm above —
+        # which is why this message no longer claims "a start limit that converged to failed" as well.
         log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop, or a start limit that converged to failed); a human 'cloud-cell-supervisor.sh start' re-arms it"
         result="$result; controller restart not launched (service-managed, unit not active)"
       else

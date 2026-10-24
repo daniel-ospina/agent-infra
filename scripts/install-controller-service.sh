@@ -474,25 +474,19 @@ do_install() {
     # ONCE so the refusal can only quote the number the test enforced. (It used to print `300/3-15` = 85 s
     # while the test required at most 84: a remedy the guard then refused.)
     sl_maxtime=$(( (sl_iv - 1) / sl_burst - RESTART_SEC ))
-    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY, AND THE CAUSE MUST BE NAMED CORRECTLY (review P2 rounds 9 and 10,
-    # #2402). Two defects lived here: the sentence printed the negative bound as advice
-    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."), and it blamed the TEMPLATE even when the operator's own
-    # `ORCH_RESTART_SEC` was what pushed the window out of reach — an operator who followed it (raising
-    # StartLimitIntervalSec above `RestartSec × burst`) was then refused by `verify_unit`, which pins the
-    # rendered window. The true minimum is `burst × (RestartSec + 1) + 1` (one whole second of orphan ceiling
-    # for the LAST attempt, plus one so the burst can be EXCEEDED inside the window), and it is computed ONCE
-    # so the message can only quote what the guard enforces.
+    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY (review P2 round 9, #2402): when the template's own RestartSec
+    # alone exceeds the window there is no value to recommend, and the old sentence still printed one
+    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."). Name the real cause instead.
     sl_min_iv=$(( sl_burst * (RESTART_SEC + 1) + 1 ))
     sl_max_rs=$(( (sl_iv - 1) / sl_burst - 1 ))
-    # ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB (review P2 round 10, #2402). The
-    # refusal used to offer `ORCH_RESTART_SEC <= 98` — the bound that fits a 1 s orphan ceiling — while the
-    # ceiling still defaulted to 60 s, so an operator who followed it met a SECOND refusal naming a variable
-    # the message never mentioned (`ORCH_START_TIMEOUT_SEC <= 1s`). The bound is now derived from the ceiling
-    # ACTUALLY IN FORCE, so one edit satisfies both guards; the 1 s-ceiling shape is still named, as an
-    # explicit second knob.
-    # ⛔ AND IT NO LONGER ADVISES RAISING StartLimitIntervalSec (review P2 round 10, #2402): `verify_unit`
-    # PINS the rendered window, so that advice was refused by this same installer's own artifact check. A
-    # remedy that cannot be followed is the defect class this PR exists to remove, not a nicety.
+    # ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB, AND MUST NOT NAME A KNOB THIS
+    # INSTALLER REFUSES (review P2 round 11, #2402). The refusal used to say "Fix the template
+    # (StartLimitIntervalSec= needs to exceed …)" while `verify_unit` PINS `StartLimitIntervalSec=300` on the
+    # rendered artifact — so following the advice made every install refuse — and it blamed the TEMPLATE even
+    # when the operator's own `ORCH_RESTART_SEC` was what overran the window. A sibling revision offered
+    # `ORCH_RESTART_SEC <= 98` (the bound for a 1 s ceiling) while the ceiling still defaulted to 60 s, so
+    # following THAT met a second refusal naming a variable it never mentioned. The bound is now derived from
+    # the ceiling ACTUALLY IN FORCE, so one edit satisfies both guards.
     sl_max_rs_at_ceiling=$(( (sl_iv - 1) / sl_burst - START_TIMEOUT_SEC ))
     if [ "$sl_maxtime" -lt 1 ]; then
         err "REFUSING: no orphan ceiling fits this start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave nothing for RestartSec=${RESTART_SEC}s plus a >= 1s ceiling (the minimum window is ${sl_min_iv}s), so NO configuration would converge to failed."
@@ -501,7 +495,7 @@ do_install() {
         elif [ "$sl_max_rs" -ge 1 ]; then
             err "  ORCH_RESTART_SEC=${RESTART_SEC} plus ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} overrun the window together: lower BOTH — e.g. ORCH_RESTART_SEC <= ${sl_max_rs} with ORCH_START_TIMEOUT_SEC=1 — so the ceiling plus RestartSec fits ${sl_burst} attempts inside ${sl_iv}s."
         else
-            err "  The TEMPLATE is too small for ANY value: StartLimitIntervalSec=${sl_iv}s cannot fit StartLimitBurst=${sl_burst} attempts at any RestartSec >= 1 (it needs >= ${sl_burst}×2+1 = $(( sl_burst * 2 + 1 ))s). Raise it in the template."
+            err "  StartLimitIntervalSec=${sl_iv}s cannot fit ${sl_burst} attempts at any RestartSec >= 1 (it needs >= ${sl_min_iv}s): that is a change to the shipped TEMPLATE and to verify_unit's pin, not an operator knob."
         fi
         return 1
     fi
@@ -928,22 +922,36 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
         # missed the shape `sudo tee`/`sudo cp` leaves behind: a `keys.env` OWNED by root and group- or
         # other-WRITABLE (`-rw-rw-r-- root:staff`, umask 002 in a shared group) was used as its own "owner",
         # ran as root, and executed with root's authority — the escalation this guard exists to close, one
-        # permission bit away. Two changes, both fail-closed: evaluate as the INVOKING operator when sudo can
-        # name one (`SUDO_USER` — the account that could have written the file and the account the controller
-        # runs as), and do not evaluate the file AT ALL when any account but its owner can write it, or the
-        # directory that holds it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and
-        # lossless for ownership because ownership is the UNION.
-        local fmode
+        # permission bit away. Two changes, both fail-closed: do not evaluate the file AT ALL when any account
+        # but its owner can write it, so the caller falls back to the RENDERED `O=` — cleartext in the unit,
+        # and lossless for ownership because ownership is the UNION; and derive the RUNNER FROM THE FILE (see
+        # below).
+        local fmode fowner
         fmode="$(stat -c %A -- "$f" 2>/dev/null)" || return 1
         [ -n "${fmode:-}" ] || return 1
         # Group/other WRITE on the file itself. (The directory is deliberately not tested: if another
-        # account can REPLACE the file, the replacement's owner is that account — which the owner/SUDO_USER
-        # rule below already refuses to run as root — so a directory test would only cause false refusals
-        # on shared-group cells without closing anything additional.)
+        # account can REPLACE the file, the replacement's owner is that account — which the runner rule
+        # below covers — so a directory test would only cause false refusals on shared-group cells without
+        # closing anything additional.)
         case "${fmode:5:1}${fmode:8:1}" in *w*) return 1 ;; esac
-        owner="${SUDO_USER:-}"
-        [ -n "${owner:-}" ] || owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
-        [ -n "${owner:-}" ] || return 1
+        # ⛔ THE RUNNER IS DERIVED FROM THE FILE, NEVER FROM THE CALLER (review P1 round 11, #2402). Preferring
+        # `SUDO_USER` ran the file as the INVOKING operator rather than as the account that can write it: a
+        # `keys.env` owned by account A, read through a documented `sudo bash … --status`, executed A's code
+        # with the SUDOER's authority — the same escalation this guard closes for the group-writable shape,
+        # one ownership bit away (the mode test only rejects group/other WRITE, so a `0644` file owned by
+        # another account passes it). The file's OWNER is the account that can write it, so that is who it
+        # runs as; `SUDO_USER` is only the non-root stand-in for the one case ownership cannot answer — the
+        # owner IS root, and root can write anything, so "owned by root" says nothing about who could have
+        # written it. No stand-in ⇒ do not evaluate at all (fall back to the rendered `O=`).
+        fowner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+        [ -n "${fowner:-}" ] || return 1
+        if [ "$fowner" = "root" ]; then
+            owner="${SUDO_USER:-}"
+            [ -n "${owner:-}" ] || return 1
+            [ "$owner" != "root" ] || return 1
+        else
+            owner="$fowner"
+        fi
         if [ "$owner" != "root" ]; then
             command -v runuser >/dev/null 2>&1 || return 1
             runner=(runuser -u "$owner" --)

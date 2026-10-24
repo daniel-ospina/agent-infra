@@ -1405,6 +1405,55 @@ SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup pr3 start > "$T/pr3.out" 2>&1; PR3_
 grep -q 'reset-failed' "$PR3/sc.log" 2>/dev/null \
   && bad 'start: CLEARED the start limit while the unit was still activating — every 120 s doctor pass re-opens the endless retry' \
   || ok 'start: the start limit is left alone while the unit is activating (convergence to failed stays reachable)'
+# ⛔ A UNIT THAT CONVERGED TO `failed` IS NOT AN OPERATOR DECISION (review P1 round 11, #2402). The fence used
+# to fold `inactive`, `deactivating` AND `failed` into rc 4, which the doctor records as a CLEAN pass — so a
+# STARTED cell whose unit hit its start limit (`.desired` present, no dispatcher) was certified clean and
+# `doctor status` exited 0 over it. rc 5 now carries "the manager gave up". RED on revert: folding `failed`
+# back into the rc-4 arm makes this arm read rc=4 (the clean-pass outcome).
+say_case 'a unit that converged to `failed` is reported as a NO-DISPATCHER state, not as a clean non-restart'
+PR4="$(arm_root pr4)"; mk_systemctl "$PR4/bin" "$PR4/state" "$PR4/sc.log"
+: > "$PR4/units/eldato-orchestrator.service"; : > "$PR4/state/enabled"; printf 'failed\n' > "$PR4/state/isactive_word"
+: > "$PR4/sc.log"
+SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup pr4 start > "$T/pr4.out" 2>&1; PR4_RC=$?
+[ "$PR4_RC" -eq 5 ] \
+  && ok 'start: a FAILED unit answers rc=5 (its own outcome, not the rc=4 operator-stop one)' \
+  || bad "start: a FAILED unit answered rc=$PR4_RC — 4 means 'operator decided', which the doctor scores as a clean pass — $(tail -3 "$T/pr4.out")"
+case "$(cat "$T/pr4.out" 2>/dev/null)" in
+  *FAILED*dispatcher*) ok 'start: the output NAMES the failed unit and the missing dispatcher (an operator can act on it)' ;;
+  *) bad "start: the rc=5 outcome does not name the failed unit and the missing dispatcher: $(tail -3 "$T/pr4.out")" ;;
+esac
+grep -q 'reset-failed' "$PR4/sc.log" 2>/dev/null \
+  && bad 'start: cleared the start limit of a unit that had already given up — the burst the arithmetic exists to bound is reset by the very state it produced' \
+  || ok 'start: a FAILED unit is not re-armed and its start limit is not cleared (the human re-arms it)'
+
+# ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB (review P2 round 11, #2402). Two sibling
+# defects lived in this refusal: it advised "Fix the template (StartLimitIntervalSec= …)" while `verify_unit`
+# LINTS the rendered `StartLimitIntervalSec=300` — so following it made every install refuse — and a later
+# revision quoted the RestartSec bound for a 1 s ceiling while the ceiling defaulted to 60 s, so following THAT
+# met a second refusal naming a variable it never mentioned. The quotient is now derived from the ceiling IN
+# FORCE and the two arms below are a closed loop: the number the refusal prints is the number a lone edit
+# (no other knob touched) is accepted with. RED on revert: quoting `sl_max_rs` (98) again fails the second arm
+# with `ORCH_START_TIMEOUT_SEC <= 1s`.
+say_case 'a start-limit refusal quotes a RestartSec bound the NEXT guard also accepts'
+JQ="$(arm_root jq)"; mk_systemctl "$JQ/bin" "$JQ/state" "$JQ/sc.log"
+JQ_RC=0; JQ_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=200 inst jq --install --dry-run 2>&1)" || JQ_RC=$?
+[ "$JQ_RC" -ne 0 ] \
+  && ok 'install: REFUSES when RestartSec alone leaves no room for a 1 s orphan ceiling' \
+  || bad "install: accepted ORCH_RESTART_SEC=200 inside a 300 s window — no configuration can converge to failed — $JQ_OUT"
+case "$JQ_OUT" in
+  *'ORCH_RESTART_SEC <= 39'*) ok 'install: the bound is derived from the ceiling IN FORCE (39 at the 60 s default), not the 98 that needs a second knob' ;;
+  *) bad "install: the refusal did not quote a bound the next guard accepts ('<= 39' at the default ceiling) — $JQ_OUT" ;;
+esac
+case "$JQ_OUT" in
+  *'Fix the template'*|*'raise StartLimitIntervalSec'*) bad 'install: the refusal still advises raising StartLimitIntervalSec — verify_unit pins it, so that remedy is refused by this installer' ;;
+  *) ok 'install: never advises raising the window verify_unit pins' ;;
+esac
+# …and the quoted number is ACCEPTED with NOTHING ELSE changed (the printed contract, actually exercised).
+JQ2="$(arm_root jq2)"; mk_systemctl "$JQ2/bin" "$JQ2/state" "$JQ2/sc.log"
+JQ2_RC=0; JQ2_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=39 inst jq2 --install --dry-run 2>&1)" || JQ2_RC=$?
+[ "$JQ2_RC" -eq 0 ] \
+  && ok 'install: ACCEPTS the quoted bound (39 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
+  || bad "install: refused the value its own refusal recommends (39 s at the default 60 s ceiling) — the remedy still needs a second knob: $JQ2_OUT"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)
@@ -1636,6 +1685,38 @@ OLROOT2_OWNER="$(stat -c %U -- "$OLROOT/home/keys.env")"
 [ -s "$OLROOT/runuser.log" ] && [ -z "$(grep -vxF "$OLROOT2_OWNER" "$OLROOT/runuser.log" 2>/dev/null)" ] \
   && ok 'root: EVERY runner call used the FILE’S OWNER — the file never ran with root authority' \
   || bad "root: the runner was invoked as '$(tr '\n' ' ' < "$OLROOT/runuser.log" 2>/dev/null)' instead of the file's owner ($OLROOT2_OWNER)"
+# ⛔ THE RUNNER IS DERIVED FROM THE FILE, NOT FROM THE CALLER (review P1 round 11, #2402). The arm above passes
+# with `SUDO_USER` UNSET, so it did not pin the rule it claims: preferring `SUDO_USER` ran a file owned by
+# account A as the INVOKING sudoer, i.e. A's code with B's authority — the escalation this guard exists to
+# close, one ownership bit away (a `0644` file owned by another account passes the mode test). This arm sets
+# `SUDO_USER` to a DIFFERENT account and requires the runner to follow the FILE. RED on revert: preferring
+# `SUDO_USER` makes the log show the sudoer, and the assertion names it.
+say_case 'as root, the runner follows the FILE’S owner even when SUDO_USER names a different account'
+OLSU="$(arm_root l9)"; mk_systemctl "$OLSU/bin" "$OLSU/state" "$OLSU/sc.log"
+printf '#!/bin/bash\n[ "${1:-}" = "-u" ] && { printf "0\\n"; exit 0; }\nexec /usr/bin/id "$@"\n' > "$OLSU/bin/id"
+printf '#!/bin/bash\nprintf "%%s\\n" "$2" >> %s/runuser.log\nshift 3\nexec "$@"\n' "$OLSU" > "$OLSU/bin/runuser"
+chmod +x "$OLSU/bin/id" "$OLSU/bin/runuser"
+printf 'O=%s/o\n' "$OLSU" > "$OLSU/home/keys.env"
+cat > "$OLSU/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$OLSU/home
+Environment=ENV_FILE=$OLSU/home/keys.env
+Environment=O=$OLSU/installer-orchestrator
+Restart=always
+SH
+OLSU_OWNER="$(stat -c %U -- "$OLSU/home/keys.env")"
+OLSU_RC=0; OLSU_OUT="$(EXTRA_ENV="PATH=$OLSU/bin:/usr/bin:/bin SUDO_USER=some-other-sudoer" inst l9 --status 2>&1)" || OLSU_RC=$?
+if [ "$OLSU_OWNER" = root ]; then
+  ok 'root: SKIPPED the SUDO_USER arm — the fixture file is owned by root, so ownership cannot answer it (the arm above covers the root-owned shape)'
+else
+  [ -s "$OLSU/runuser.log" ] && [ -z "$(grep -vxF "$OLSU_OWNER" "$OLSU/runuser.log" 2>/dev/null)" ] \
+    && ok "root: the env file ran as ITS OWNER ($OLSU_OWNER), not as the invoking sudoer — a file account A can write never runs with B's authority" \
+    || bad "root: the runner used '$(tr '\n' ' ' < "$OLSU/runuser.log" 2>/dev/null)' — SUDO_USER overrode the file's owner, so account A's file runs with the sudoer's authority"
+  case "$(cat "$OLSU/runuser.log" 2>/dev/null)" in
+    *some-other-sudoer*) bad 'root: the runner was the INVOKING sudoer, not the file owner — the escalation this guard closes' ;;
+    *) ok 'root: SUDO_USER does not override the file owner' ;;
+  esac
+fi
 # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). A `keys.env` OWNED by
 # root but group/other-WRITABLE — the shape `sudo tee`/`sudo cp` leaves with umask 002 in a shared group —
 # passed as its own "owner" and was sourced with root's authority. It must not be evaluated at all now, and

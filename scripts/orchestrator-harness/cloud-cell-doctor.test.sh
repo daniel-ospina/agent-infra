@@ -455,7 +455,7 @@ grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a started cell with no
 reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
 : > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
 printf '4\n' > "$T/sup/rc"
-doc doctor; RC4=$?
+doc doctor; RC4="$RC"
 rm -f "$T/sup/rc"
 grep -q 'start' "$T/sup/calls" 2>/dev/null && ok 'doctor: the restart was attempted through the supervisor' \
   || bad "doctor: never called the supervisor — the rc=4 arm cannot be reached: $OUT"
@@ -470,6 +470,28 @@ esac
 [ "$RC4" -eq 0 ] \
   && ok 'doctor: the pass stays clean when the manager owns a stopped controller (rrc unchanged)' \
   || bad "doctor: a service-managed non-restart reddened the pass (rc=$RC4) — the operator's stop would read as a doctor failure"
+
+# ⛔ A UNIT THAT CONVERGED TO `failed` IS NOT A CLEAN PASS (review P1 round 11, #2402). The supervisor used to
+# answer the SAME rc 4 for a deliberate `systemctl stop` and for a start limit that converged to `failed`, and
+# this pass recorded both as clean — so a STARTED cell whose unit had given up (no dispatcher, `.desired`
+# present) exited 0 and read healthy, which is the false green #2402 removes, one layer in. rc 5 now carries
+# that state and must redden the pass. RED on revert: fold rc 5 into the rc-4 arm and RC5 drops back to 0.
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '5\n' > "$T/sup/rc"
+doc doctor; RC5="$RC"
+rm -f "$T/sup/rc"
+case "$OUT" in
+  *'CONVERGED TO FAILED'*) ok 'doctor: rc=5 is reported as a unit that converged to FAILED (no dispatcher), not as a clean non-restart' ;;
+  *) bad "doctor: rc=5 was not reported as the failed-unit state: $OUT" ;;
+esac
+[ "$RC5" -ne 0 ] \
+  && ok 'doctor: a started cell whose dispatcher is gone because the unit FAILED is NOT a clean pass (rc is non-zero)' \
+  || bad 'doctor: recorded a CLEAN pass over a started cell with NO dispatcher (the unit FAILED) — exactly the false green this change removes'
+case "$OUT" in
+  *'restart FAILED'*) bad 'doctor: borrowed the generic restart-FAILED wording for a unit that never accepted a start' ;;
+  *) ok 'doctor: the failed-unit outcome has its own wording (an operator can tell it from a transient)' ;;
+esac
 
 # ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
 # `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a

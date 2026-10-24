@@ -664,21 +664,35 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
     # the shape `sudo tee`/`sudo cp` leaves behind: a `keys.env` OWNED by root and group- or other-WRITABLE
     # (`-rw-rw-r-- root:staff`, umask 002 in a shared group) was used as its own "owner", ran as root, and
     # executed with root's authority — the escalation this guard exists to close, one permission bit away.
-    # Two changes, both fail-closed: evaluate as the INVOKING operator when sudo can name one (`SUDO_USER`),
-    # and do not evaluate the file AT ALL when any account but its owner can write it, or the directory that
-    # holds it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and lossless for
-    # ownership because ownership is the UNION. Keep this body identical to the installer's.
-    local fmode
+    # Two changes, both fail-closed: do not evaluate the file AT ALL when any account but its owner can write
+    # it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and lossless for ownership
+    # because ownership is the UNION; and derive the RUNNER FROM THE FILE (see below). Keep this body identical
+    # to the installer's.
+    local fmode fowner
     fmode="$(stat -c %A -- "$f" 2>/dev/null)" || return 1
     [ -n "${fmode:-}" ] || return 1
     # Group/other WRITE on the file itself. (The directory is deliberately not tested: if another account
-    # can REPLACE the file, the replacement's owner is that account — which the owner/SUDO_USER rule below
-    # already refuses to run as root — so a directory test would only cause false refusals on shared-group
-    # cells without closing anything additional.)
+    # can REPLACE the file, the replacement's owner is that account — which the runner rule below covers — so
+    # a directory test would only cause false refusals on shared-group cells without closing anything.)
     case "${fmode:5:1}${fmode:8:1}" in *w*) return 1 ;; esac
-    owner="${SUDO_USER:-}"
-    [ -n "${owner:-}" ] || owner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
-    [ -n "${owner:-}" ] || return 1
+    # ⛔ THE RUNNER IS DERIVED FROM THE FILE, NEVER FROM THE CALLER (review P1 round 11, #2402). Preferring
+    # `SUDO_USER` ran the file as the INVOKING operator rather than as the account that can write it: a
+    # `keys.env` owned by account A, read through a documented `sudo bash … --status`, executed A's code with
+    # the SUDOER's authority — the same escalation this guard closes for the group-writable shape, one
+    # ownership bit away (the mode test only rejects group/other WRITE, so a `0644` file owned by another
+    # account passes it). The file's OWNER is the account that can write it, so that is who it runs as;
+    # `SUDO_USER` is only the non-root stand-in for the one case ownership cannot answer — the owner IS root,
+    # and root can write anything, so "owned by root" says nothing about who could have written it. No
+    # stand-in ⇒ do not evaluate at all (fall back to the rendered `O=`).
+    fowner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+    [ -n "${fowner:-}" ] || return 1
+    if [ "$fowner" = "root" ]; then
+      owner="${SUDO_USER:-}"
+      [ -n "${owner:-}" ] || return 1
+      [ "$owner" != "root" ] || return 1
+    else
+      owner="$fowner"
+    fi
     if [ "$owner" != "root" ]; then
       command -v runuser >/dev/null 2>&1 || return 1
       runner=(runuser -u "$owner" --)
@@ -2299,7 +2313,19 @@ cmd_start() {
         # `failed` became probabilistic instead of guaranteed — the endless retry the arithmetic exists to
         # stop. Only a literal `active`/`reloading` (a process that exists) takes the re-arm path.
         if [ "$ast" -eq 1 ] || [ "$_ast_word" = "activating" ]; then
-          say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop, or a start limit that converged to failed, is the operator's decision. Run '$0 start' to re-arm it."
+          # ⛔ A FAILED UNIT IS NOT AN OPERATOR DECISION (review P1 round 11, #2402). This branch folded every
+          # not-active word — `inactive`, `deactivating`, `failed` — into rc 4, which the doctor records as a
+          # CLEAN pass. But `failed` is systemd's own throttle, not a human's decision: a `Restart=always` unit
+          # whose controller keeps exiting converges to `failed` in ~45 s (3 attempts at RestartSec=15) with
+          # `.desired` still present, and folding it into rc 4 made `doctor status` exit 0 over a STARTED cell
+          # with NO dispatcher — the false green this whole change removes, one layer in. The distinction the
+          # word already carries is now reported: rc 4 only for the states a manager stop leaves, and rc 5 for
+          # a unit that has given up, which the doctor scores as a NON-clean pass.
+          if [ "$_ast_word" = "failed" ]; then
+            say "REFUSING: $CONTROLLER_UNIT is FAILED — its start limit converged and this state dir has NO dispatcher. The service manager will not bring it back without a human: run '$0 start' to re-arm it."
+            return 5
+          fi
+          say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop is the operator's decision. Run '$0 start' to re-arm it."
           return 4
         fi
       fi
