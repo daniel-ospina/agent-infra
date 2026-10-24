@@ -1915,6 +1915,64 @@ cmd_check() {
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
+  # ── the RESOLVED LANE MODEL, and whether THIS box's catalog lists it (agent-infra#2208) ─────
+  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` default to `deepseek/deepseek-flash`
+  # (env-overridable). A box's model list is its OWN — `pi-bootstrap/cell-install.sh` deliberately
+  # does not manage `models.json` ("the cell's identity") — so a drifted cell can hand every lane an
+  # id its provider entry does not list, and pi answers that with
+  # `Warning: Model "…" not found … Using custom model id`: a lane that STARTS, spends tokens and
+  # degrades silently. The failure is silent, so a certification command is where it should be
+  # named.
+  #
+  # ⛔ THIS IS AN INSTRUMENT, NOT A GATE, AND THE DISTINCTION IS THE WHOLE DESIGN (review cycle 2).
+  # pi's resolution is a UNION — its built-in catalog, MERGED with the box's `models` array and with
+  # `modelOverrides` — so absence from the box's array does NOT prove the id fails to resolve.
+  # Measured: the shipped catalog lists `deepseek-v4-flash-vision-exp` only under `modelOverrides`,
+  # and it IS a pi built-in, so `PI_LANE_MODEL=` it resolves cleanly while a `die` here would have
+  # refused a healthy cell. A refusal set out of a question this file cannot answer is a false block.
+  # So: "listed" is reported as listed; anything else is reported as NOT VERIFIED, with the reason,
+  # and nothing refuses. (If it must become a gate, ask pi itself — `pi --list-models` — not this
+  # file's guess at pi's merge rules.)
+  #
+  # ⛔ AND THE PAIR MUST BE THE ONE THE SESSIONS WILL SEE (same review). `cmd_check` runs in the
+  # operator's shell, but the controller and doctor sessions are launched with an explicit env
+  # allow-list and re-source `$ENV_FILE` — they do NOT inherit ambient `PI_LANE_*`. So the pair is
+  # resolved the way a session resolves it (from `$ENV_FILE` when it carries one, defaults
+  # otherwise), and an ambient-only value is named as NOT reaching the lanes rather than reported as
+  # if it governed them.
+  local lane_provider lane_model models_json lane_state lane_chan
+  lane_provider="${PI_LANE_PROVIDER:-deepseek}"
+  lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  lane_chan="ambient shell (does NOT reach the tmux sessions — put it in $ENV_FILE)"
+  if [ -f "$ENV_FILE" ]; then
+    local lane_in_file
+    lane_in_file="$(env -u PI_LANE_PROVIDER -u PI_LANE_MODEL bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s\t%s" "${PI_LANE_PROVIDER:-}" "${PI_LANE_MODEL:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
+    if [ -n "$lane_in_file" ]; then
+      lane_provider="${lane_in_file%%	*}"; lane_provider="${lane_provider:-deepseek}"
+      lane_model="${lane_in_file##*	}"; lane_model="${lane_model:-deepseek-flash}"
+      lane_chan="$ENV_FILE (re-sourced by the controller and doctor sessions)"
+    fi
+  fi
+  models_json="$CELL_HOME/.pi/agent/models.json"
+  if ! command -v jq >/dev/null 2>&1; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
+  elif [ ! -f "$models_json" ]; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
+  else
+    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
+        (.providers[$p]) as $pv
+        | if $pv == null then "no-provider"
+          else
+            (($pv.models // {}) | (if type == "array" then ([.[] | .id]) else (keys) end)) as $ids
+            | (($pv.modelOverrides // {}) | keys) as $ovr
+            | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
+          end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
+    case "$lane_state" in
+      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) say "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
+      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+    esac
+  fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
@@ -1959,7 +2017,7 @@ cmd_check() {
   for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
   # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
