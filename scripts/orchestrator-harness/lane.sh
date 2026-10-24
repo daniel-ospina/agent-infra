@@ -404,11 +404,6 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80)
-# or AGENT_DISK_REFUSED (77);
-# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
-# namespace and could exit 75 itself (#1720).
-# A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
 # AGENT_MEM_REFUSED (81), AGENT_BRIEF_REFUSED (80) or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit any of those itself (#1720).
@@ -509,7 +504,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
     # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
     # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
-    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured). This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool. (The reading, the floor and how the floor was derived — a measured reserve, or an operator-set MEM_MIN_AVAIL_MB — are on the [mem-gate] REFUSED line in this log.)" >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
