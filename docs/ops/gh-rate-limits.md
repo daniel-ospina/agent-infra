@@ -104,6 +104,15 @@ follows are the reusable ones:
 
 * **Same source or no metric.** If EITHER GraphQL list fails, BOTH are re-read over REST. A REST
   open-count beside a GraphQL merged-count compares two differently-wrong reads.
+* **`limit` bounds ROWS READ, not rows returned.** The loop advances on the rows it FETCHED, so it
+  spends the same row budget `gh pr list --limit` spent. In the closed window those rows are then
+  filtered to merges, so the merged list holds the merges among the `limit` most-recently-updated
+  **closed** PRs and is SHORTER than `limit` when some were closed without merging (measured:
+  396/400). This is the bound, not a short read — and it is why the REST read is not
+  interchangeable with `gh pr list --state merged --limit 400`. Filling the window with merges
+  instead would cost an UNBOUNDED number of requests against the very bucket this fallback exists
+  because we are rationing, so the row bound is the deliberate trade: `merged_today` stays exact
+  while a day's merges (plus the abandoned rows updated beside them) fit inside it.
 * **`state=closed` is not `state=merged`.** REST's closed window carries PRs closed WITHOUT
   merging; only rows with a non-null `merged_at` may count toward `merged_today`.
 * **The window is paged, `per_page` never shrinks, and a window that MOVED is refused.** REST
@@ -121,7 +130,14 @@ follows are the reusable ones:
   (measured with the shipped loop: #150 bumped after page 1 → `100` repeated, `150` never
   returned; end-to-end, one merge landing mid-read left `merged_today` at 0 where the truth was
   1). Keeping the window would hide the missing row, so a repeat — which can only arise from the
-  list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A reorder that leaves
+  list changing mid-read — abandons that ATTEMPT; the read is retried **once**, and a second
+  repeat REFUSES the whole read (`None` → `unavailable`). The retry exists because on a box
+  running ~17 concurrent `gh` clients most movers are churn that has settled by the time the page
+  set is re-read, so without it the fallback would spend its requests and still lose the line. It
+  is bounded and stated: at most ONE extra page-set (`ceil(limit/100)` requests), spent only on a
+  path that was going to print `unavailable` anyway, out of the SAME shared 30 s budget — and a
+  retry can never turn two DIFFERENT windows into a number, because a repeat on the second attempt
+  refuses. A reorder that leaves
   the identity at every later offset unchanged — a same-second tie-break swap inside one page —
   produces no repeat and costs nothing; anything whose effect crosses a request boundary either
   repeats (an update) or is the removal case below.
