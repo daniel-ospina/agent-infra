@@ -98,6 +98,15 @@ trap 'rm -rf "$TMP"' EXIT
 # blamed the fixture). An inert stand-in cannot move for a reason this file does not name.
 #
 # Keep `CHEAP` pointed at something hermetic: its rc must depend on nothing but itself.
+#
+# ⛔ WHAT THE SUITE COSTS NOW (measured 2026-10-24, after #2529 landed). CI: the whole suite is
+# 6-12 s on `bash-suites-gate` step 5 across 12 PR runs (worst seen 17 s), 6-8 s on ci-main's
+# `script-validate` step 6 across 4 main runs — the ~90 static arms and ONE fixture execution per
+# runtime pin, not the shard list, are the wall. Locally (macOS, loaded box) 67 s for 94
+# assertions. The 38m41s / "38.7 min" figure that still circulates is PR #2412's job
+# 120365087427 (2026-10-23T10:25Z), taken BEFORE #2529 replaced the real list in the fixture with
+# `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
+# nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
 awk -v cheap="$CHEAP" '
   /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
