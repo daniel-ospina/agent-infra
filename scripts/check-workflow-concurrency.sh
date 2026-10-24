@@ -354,7 +354,23 @@ function splitqv(v, arr,   n, i, c, q, cur, len, nx) {
       }
       continue
     }
-    if ((c == DQ || c == SQ) && qopens(v, i)) { q = c; cur = cur c; continue }
+    if ((c == DQ || c == SQ) && at_val_start(v, i)) { q = c; cur = cur c; continue }
+    if (c == ",") { arr[++n] = cur; cur = ""; continue }
+    cur = cur c
+  }
+  if (q != "") return splitqv_simple(v, arr)
+  arr[++n] = cur
+  return n
+}
+# splitqv_simple(v, arr) — split a flow mapping on EVERY comma, used only when a quote never closed
+# (so it was never a scalar). Without this the separator comma stayed inside the phantom string: a
+# flow `concurrency` carrying a group literal with a stray apostrophe before `cancel-in-progress:
+# true` fused into one entry, the cancelling pair was never read, and the R2 absent-key arm took the
+# non-cancelling default — GREEN on a main-branch workflow that cancels (#2660 round 13).
+function splitqv_simple(v, arr,   n, i, c, cur, len) {
+  n = 0; cur = ""; len = length(v)
+  for (i = 1; i <= len; i++) {
+    c = substr(v, i, 1)
     if (c == ",") { arr[++n] = cur; cur = ""; continue }
     cur = cur c
   }
@@ -715,7 +731,7 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # test, not a closed set of spellings: `github.event.pull_request.head.sha` (the canonical
         # per-head key) contains no `github.sha` substring and passed before (round 4, P1).
         case "$group" in
-          *'.sha'*|*'_sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
+          *'.sha'*|*'github.workflow_sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
             fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` / \`github.head_ref\` alone [R1]" ;;
           *)
             if has_trigger "$triggers" pull_request_target; then

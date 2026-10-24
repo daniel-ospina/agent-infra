@@ -453,7 +453,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-on-sequence-mapping.yml" \
   "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml" \
   "$CFIX/push-flow-apostrophe-false.yml" "$CFIX/push-on-flow-apostrophes-false.yml" \
-  "$CFIX/pr-workflow-ref.yml"
+  "$CFIX/pr-workflow-ref.yml" "$CFIX/push-flow-apostrophe-plain-false.yml" \
+  "$CFIX/pr-group-underscore-sha.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -503,6 +504,10 @@ for pair in \
   "push-on-flow-apostrophes.yml R2" \
   "pr-on-flow-apostrophes.yml R1" \
   "pr-workflow-sha.yml R1" \
+  "push-flow-apostrophe-plain.yml R2" \
+  "pr-on-flow-apostrophe-plain.yml R1" \
+  "push-flow-apostrophe-dash.yml R2" \
+  "push-flow-apostrophe-pair.yml R2" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
