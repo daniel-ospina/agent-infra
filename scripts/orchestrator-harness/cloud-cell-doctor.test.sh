@@ -43,7 +43,43 @@ trap cleanup EXIT
 [ -f "$DOCTOR" ] && ok "shipped doctor present: $(basename "$DOCTOR")" || { bad "missing $DOCTOR"; exit 1; }
 [ -f "$SUP" ]    && ok "shipped supervisor present" || { bad "missing $SUP"; exit 1; }
 
-mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps"
+mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps" "$T/tmp"
+# ⛔ $T/repo MUST BE A REAL CHECKOUT (agent-infra#2573). The cache sweep enumerates worktree roots with
+# `git worktree list`, and an EMPTY-enumeration read is cannot-verify (rc=3) by design — so on a plain
+# directory every hygiene arm here would assert against a pass that abstained instead of deciding.
+git init -q "$T/repo" 2>/dev/null || true
+
+# ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
+# stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
+# those seams pointed at the HOST would delete a fixture of the operator's and run a real
+# `docker image prune -af` on every green run. Both decisions are driven, on real fixtures, by
+# `cloud-cell-doctor.hygiene.test.sh`; here they point at throwaway paths so no arm can reach the box.
+export HYGIENE_TMP_DIR="$T/tmp"
+# ⛔ …AND THE CWD CENSUS IS A SINK TOO (review round 7, P2). `live-ownership.sh` reads the RUNNER's real
+# process table, so a fixture that left `LO_CWD_PROBE` pointing at the host would make the hygiene pass
+# cannot-verify (rc=3) on any runner whose process table it cannot read — a false red about the platform
+# that says nothing about the code. The sibling hardening fixture pins it for the same reason; this one
+# previously pinned only the temp root and docker, so it was the one seam left on the host.
+cat > "$T/bin/cwdprobe" <<'SH'
+#!/bin/bash
+emit() { [ -n "$1" ] || return 0; printf '/proc/4242/cwd -> %s\n' "$1"; printf 'p4242\nn%s\n' "$1"; }
+emit "$FAKE_CWD"
+exit 0
+SH
+chmod +x "$T/bin/cwdprobe"
+export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
+cat > "$T/bin/docker-stub" <<'SH'
+#!/bin/bash
+# `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
+# about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
+case "${1:-}" in
+  info)    printf 'Server Version: stub\n'; exit 0 ;;
+  version) printf '29.1.3\n'; exit 0 ;;   # the volume verb is version-gated; a stub must answer it
+esac
+exit 0
+SH
+chmod +x "$T/bin/docker-stub"
+export DOCTOR_DOCKER_BIN="$T/bin/docker-stub"
 
 # ── stubs ────────────────────────────────────────────────────────────────────────────────────────
 # tmux: sessions list, pane pid per session, attached clients per session, and a kill LOG so the
