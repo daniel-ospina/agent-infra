@@ -125,7 +125,7 @@ def test_prefix_truncation_is_unverified(P):
     assert P.screen_has_payload(prefix, LONG) is False
 
 
-def test_tail_split_by_a_line_wrap_is_still_verified(P):
+def test_tail_split_by_a_line_wrap_is_still_a_pane_match(P):
     # A column wrap inserts a break with no visible character; it must not
     # manufacture a false UNVERIFIED.
     wrapped = "Read the brief at /tmp/1187-brief.md and execute it end to end. "
@@ -310,6 +310,64 @@ def test_a_nonzero_payload_send_exit_is_unverified(P):
     assert verdict == P.UNVERIFIED
 
 
+def test_an_unknown_session_id_never_licenses_the_two_mb_window(P, tmp_path, monkeypatch):
+    """⛔ THE P1 THIS FIX ITSELF OPENED (#1881 review, round 3). `resolve_session_file` returned None
+    for THREE different things — cmux errored, the pane printed no id yet, and the id is known but no
+    file exists — and the re-resolution treated all three as "the file did not exist before the
+    send", reopening the search at offset 0. For the first two that window is the last 2 MB of a
+    transcript that may hold DAYS, so a pre-existing message with a matching body certified a send
+    whose tail was never submitted — measured VERIFIED on the fix's own bytes, UNVERIFIED on its
+    parent. Only a KNOWN id with NO file may reopen at 0.
+
+    Fails on the round-2 bytes: the transient pre-send failure still reached VERIFIED."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    # Days-old identical message: the only occurrence in this transcript is NOT this send's.
+    sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    resume_calls = {"n": 0}
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            # The PRE-SEND read fails (transient); every later read works. Nothing established that
+            # a transcript did not exist, so offset 0 is unsound.
+            resume_calls["n"] += 1
+            if resume_calls["n"] == 1:
+                raise RuntimeError("cmux surface resume show: transient failure")
+            return _Proc(f"{sid}\n")
+        if argv[:2] == ["cmux", "send"]:
+            return _Proc("OK")                    # sent, but nothing was appended
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("working...\n")          # the tail is not even on the pane
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict != P.VERIFIED, "an unknown pre-send baseline certified a pre-existing message"
+
+
+def test_a_failed_baseline_stat_on_an_existing_file_never_reaches_verified(P, tmp_path, monkeypatch):
+    """The mirror ambiguity: the FILE resolved but its size could not be read, so the pre-send
+    baseline is unknown while the file is known to hold history. Treating that as offset 0 would
+    search that history, so VERIFIED stays unreachable for this send (the fail-closed direction:
+    a false PANE_ONLY costs a re-read, a false VERIFIED dispatches a fragment)."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(P, "transcript_offset", lambda path: None)
+
+    run = _fake_cmux(f"working...\n{LONG}\n", surface_out=f"{sid}\n")
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.PANE_ONLY
+
+
 def test_a_transcript_created_by_this_send_can_still_verify(P, tmp_path, monkeypatch):
     """⛔ ONE RESOLUTION IS NOT ENOUGH (#1881 review P2). pi creates the session file on the first
     user message, so resolving the path only BEFORE the send made VERIFIED unreachable for a lane
@@ -400,6 +458,10 @@ def test_a_rolled_transcript_fails_closed(P, tmp_path):
 
 
 def test_a_dropped_enter_is_reported_as_submit_failed_not_as_pane_only(P):
+    # ⛔ PIN AGE, STATED (#1881 review, round 3): this pin belongs to the ROUND-1 fix (the raised
+    # Enter), and it passes against those pre-fix bytes' successor — it does NOT discriminate the
+    # round-3 change, whose residual was the missing NON-ZERO-EXIT arm. That arm's pin is
+    # `test_a_nonzero_enter_exit_is_a_dropped_enter` below.
     """⛔ `entered` MUST DECIDE THE VERDICT (#1881 review P2). It was assigned, set to False on a
     dropped Enter, and never READ — a "recorded" flag next to a comment claiming it decides, which is
     how the P0 re-opens the moment someone adds a pane shortcut. A dropped Enter is not the softer

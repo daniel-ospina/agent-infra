@@ -187,10 +187,15 @@ case "$cmux_payload_verdict" in
     exit 0 ;;
   SUBMIT_FAILED)
     rm -f "$_cmux_payload_err"
-    # The terminating Enter ITSELF raised, so submission was never attempted. Do NOT prescribe a
-    # re-send: the payload is already in that pane's composer, and re-sending duplicates the order.
+    # The terminating Enter FAILED (raised, or cmux exited non-zero), so submission was never
+    # attempted. Do NOT prescribe a re-send: the payload is already in that pane's composer, and
+    # re-sending duplicates the order.
+    # ⛔ AND DO NOT ASSERT A TRANSCRIPT READ THAT MAY NOT HAVE RUN (#1881 review P2). No transcript
+    # may have been resolvable at all, in which case "the transcript records no such message" is a
+    # claim about evidence we never read. The remedy is the same either way, so name both branches.
     echo "$LABEL: SENT BUT NOT SUBMITTED — the terminating Enter FAILED, so the payload was typed"
-    echo "$LABEL:   into the pane and never submitted (the transcript records no such message)."
+    echo "$LABEL:   into the pane and never submitted (the transcript records no such message, or no"
+    echo "$LABEL:   transcript could be consulted at all)."
     echo "$LABEL:   Submit it IN THAT PANE, then re-check; do NOT treat this as delivered (#1187)."
     exit 6 ;;
   PANE_ONLY)

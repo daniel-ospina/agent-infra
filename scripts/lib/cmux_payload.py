@@ -36,8 +36,8 @@ That is the composer state (a dropped Enter, or an earlier message with the same
 body). **NOT a delivery verdict.**
   * `UNVERIFIED`  — no tail anywhere: a truncated prefix, an empty payload, or a
 surface we could not read.
-  * `SUBMIT_FAILED` — the terminating Enter itself raised, so submission was
-never attempted; distinct from `PANE_ONLY` because the remedy differs (submit in
+  * `SUBMIT_FAILED` — the terminating Enter FAILED (it raised, or `cmux` exited non-zero), so
+submission was never attempted; distinct from `PANE_ONLY` because the remedy differs (submit in
 that pane; do NOT re-send).
 
 Neither `PANE_ONLY` nor `UNVERIFIED` nor `SUBMIT_FAILED` may ever be reported to a
@@ -141,13 +141,17 @@ def screen_has_payload(screen: str | None, sent_text: str,
     return marker in compact(screen)
 
 
-def resolve_session_file(workspace: str, run) -> str | None:
-    """The recipient lane's live session `.jsonl`, resolved from the PANE.
+def resolve_session_id(workspace: str, run) -> str | None:
+    """The pane's bound session id, or None when the pane does not NAME one.
 
-    Best-effort second source for delivery evidence (the transcript is where a
-    submitted message is durably written). Returns None when the pane has no
-    session binding — never guess a file. Mirrors `ask-owner.py`'s
-    `lane_session_file`.
+    ⛔ SPLIT FROM THE FILE LOOKUP (#1881 review P1). `resolve_session_file` used to answer None for
+    three different things — cmux errored, the pane printed no id YET, and the id is known but no
+    file exists for it — and the send loop treated all three as "the file did not exist when the send
+    began", so it reopened the transcript search at offset 0. For the first two that window is the
+    last 2 MB of a transcript that may hold DAYS of history, so an earlier message with a matching
+    body certified a send whose tail was never submitted: the occurrence-identity false pass,
+    reopened by the fix that closed it. "No id" and "no file for that id" are different facts and
+    only the second one can establish that a file appearing later was written by this send.
     """
     try:
         proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace],
@@ -155,15 +159,23 @@ def resolve_session_file(workspace: str, run) -> str | None:
         out = getattr(proc, "stdout", "") or ""
     except Exception:                                          # noqa: BLE001
         return None
-    sid = None
     for tok in out.replace("'", " ").split():
         if len(tok) == 36 and tok.count("-") == 4:
-            sid = tok
-            break
-    if not sid:
+            return tok
+    return None
+
+
+def session_file_for(session_id: str | None) -> str | None:
+    """The newest transcript for a KNOWN session id, or None when no file exists yet.
+
+    Takes the id rather than the workspace on purpose: the caller resolves the id ONCE, before the
+    send, so a later lookup can only answer "does the file exist now", never "is this a different
+    session".
+    """
+    if not session_id:
         return None
     home = os.path.expanduser("~")
-    hits = glob.glob(f"{home}/.pi/agent/sessions/*/*{sid}*.jsonl")
+    hits = glob.glob(f"{home}/.pi/agent/sessions/*/*{session_id}*.jsonl")
     if not hits:
         return None
     try:
@@ -175,6 +187,17 @@ def resolve_session_file(workspace: str, run) -> str | None:
         return max(hits, key=os.path.getmtime)
     except OSError:
         return None
+
+
+def resolve_session_file(workspace: str, run) -> str | None:
+    """The recipient lane's live session `.jsonl`, resolved from the PANE.
+
+    Best-effort second source for delivery evidence (the transcript is where a
+    submitted message is durably written). Returns None when the pane has no
+    session binding — never guess a file. Mirrors `ask-owner.py`'s
+    `lane_session_file`.
+    """
+    return session_file_for(resolve_session_id(workspace, run))
 
 
 def _decode_escaped(text: str) -> str:
@@ -289,10 +312,12 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
 
     ``VERIFIED`` requires SUBMISSION evidence (the tail marker appended to the lane's transcript after
     the pre-send baseline). ``PANE_ONLY`` means the tail is visible on the surface but nothing proves
-    it was submitted — a pane that still shows an earlier message with the same body. It is NOT a
-    delivery verdict, and a caller that treats it as one re-opens #1187. ``SUBMIT_FAILED`` means the
-    terminating Enter raised: submission was never attempted, and the remedy is to submit in that
-    pane, never to re-send.
+    it was submitted — a pane that still shows an earlier message with the same body, or a transcript
+    that could not be consulted. It is NOT a delivery verdict, and a caller that treats it as one
+    re-opens #1187. ``SUBMIT_FAILED`` means the terminating Enter failed (it raised, or `cmux` exited
+    non-zero): submission was never attempted, and the remedy is to submit in that pane, never to
+    re-send. A non-zero exit from the PAYLOAD send itself folds into ``UNVERIFIED`` — nothing was
+    typed, so there is no submission to reason about.
 
     `run` and `sleep` are seams so the send/verify loop can be exercised without
     a live cmux.
@@ -305,8 +330,16 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # ⛔ THE TRANSCRIPT BASELINE IS TAKEN BEFORE THE SEND (#1881 review P1). Resolving it afterwards
     # would leave the size AFTER the bytes we are trying to attribute, so `since_offset` could only
     # certify nothing. This is the one read that must precede the act it observes.
-    session_file = resolve_session_file(workspace, run)
+    #
+    # ⛔ AND "THE FILE WAS NOT THERE" IS A FACT, NOT AN ABSENCE (#1881 review P1). The id is resolved
+    # ONCE, here; a file that does not exist for a KNOWN id, and appears after the send, was written
+    # by this send (or later) — only that case may reopen the search at offset 0. An id this read
+    # could not obtain says nothing about whether a transcript existed, so it must never license the
+    # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
+    session_id = resolve_session_id(workspace, run)
+    session_file = session_file_for(session_id)
     session_base = transcript_offset(session_file)
+    may_await_new_file = bool(session_id) and session_file is None
 
     try:
         sent = cmux("send", "--workspace", workspace, text)
@@ -338,10 +371,11 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         # the order and the orchestrator recorded it delivered: the exact false pass this module
         # exists to prevent. Record the failure and let it decide the verdict.
         #
-        # ⛔ AND IT MUST ACTUALLY DECIDE SOMETHING (#1881 review P2). This flag was assigned and set
-        # but NEVER READ, so the comment above claimed a guarantee the code did not implement — and
-        # a "recorded" flag sitting next to a future pane shortcut is exactly how the P0 re-opens.
-        # It now selects the final verdict: no Enter ⇒ SUBMIT_FAILED, never the softer PANE_ONLY.
+        # ⛔ AND IT MUST ACTUALLY DECIDE SOMETHING (#1881 review P2). This flag decides the final
+        # verdict — but only THIS arm used to clear it, so a `cmux` that exited non-zero (rather
+        # than raising) left it True. The stale claim that it was "assigned and never read" is
+        # corrected here: the residual defect was the missing non-zero arm above, and the pin in
+        # the suite predates this round (it fails on the FIRST pre-fix bytes, not on round 3).
         entered = False
     sleep(2)
 
@@ -360,11 +394,12 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         # ⛔ A TRANSCRIPT THAT DID NOT EXIST BEFORE THE SEND CAN STILL BE THE ONE THIS SEND WROTE
         # (#1881 review P2). pi creates the session file on the first user message, so resolving the
         # path only BEFORE the send made VERIFIED unreachable for a lane whose transcript this very
-        # send created — a permanent PANE_ONLY whose text claimed a check that never ran. Re-resolve
-        # while unresolved, with baseline 0: the file did not exist when the send began, so every
-        # byte in it was written by, or after, this send.
-        if not session_file:
-            session_file = resolve_session_file(workspace, run)
+        # send created — a permanent PANE_ONLY. Re-open ONLY for the sound case: the pane named a
+        # session id BEFORE the send and that id had no file yet, so every byte in a file that
+        # appears now is this send's or later (baseline 0). The id is NOT re-resolved: a newly
+        # appearing id could be a different session, and offset 0 there would search its history.
+        if may_await_new_file and session_file is None:
+            session_file = session_file_for(session_id)
             if session_file:
                 session_base = 0
         # SUBMISSION EVIDENCE, in order of strength. The transcript is where a submitted message is
