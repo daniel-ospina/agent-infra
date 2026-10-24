@@ -1958,7 +1958,7 @@ run_hygiene() {
   #    is the opposite: this role claimed work it was asked to do and did not do it. So the pass stays
   #    green and the COUNTS are logged, which is what #2577 asks for — a stalled sync is visible in
   #    `refs=` vs `files=` long before it blocks a lane.
-  local rsync="" rs_out="" rs_refs="" rs_why="" store=""
+  local rsync="" rs_out="" rs_refs="" rs_why="" rs_keys="" store=""
   local -a rs_store_args=()
   case "$DOCTOR_REGISTRY_SYNC" in
     off|none|0)
@@ -2056,8 +2056,14 @@ run_hygiene() {
              # script prints that verdict line itself, so the doctor carries it through instead of
              # paraphrasing the state as "0 skipped".
              rs_why="$(printf '%s\n' "$rs_out" | grep -E 'record\(s\) (DIVERGE|were SKIPPED)' | tail -1)"
+             # ⛔ AND THE KEYS TO ACT ON. The script prints `⚠️ skip <key> — …` per defective record, and
+             # the doctor greps only the counts line and the verdict line, so the one datum an operator
+             # needs (WHICH records) was dropped. The verdict line names conflicts, not skips, and a
+             # skip on THIS box's own record is exactly the case the counts cannot express.
+             rs_keys="$(printf '%s\n' "$rs_out" | grep -E 'skip [^ ]+ —' | tail -3 | sed -E 's/.*skip ([^ ]+) —.*/\1/' | tr '\n' ' ' | sed 's/ *$//')"
              [ -n "$rs_why" ] || rs_why="no verdict line from the sync script"
-             log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs; $rs_why): nothing was overwritten, but records the fleet holds are unusable or DIVERGE here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."
+             [ -z "$rs_keys" ] || rs_why="$rs_why [keys: $rs_keys]"
+             log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs; $rs_why): nothing was overwritten, but a record this box cannot USE was skipped (on the store side or this box) or records DIVERGE here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."
              result="${result}${result:+; }registry rc=$rc ${rs_refs#*: } ($rs_why)" ;;
           # ⛔ A BOUND FIRING IS NOT A FAILURE. 124/137 are `timeout(1)`; 143 is the watchdog arm
           # `run_bounded` uses where `timeout` does not exist (stock macOS). Folding all three into

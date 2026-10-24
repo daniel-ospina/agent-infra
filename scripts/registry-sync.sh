@@ -710,7 +710,17 @@ PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED
 # The convergence counters (#2577). `ADDED`/`UPDATED` are PULL-side only — they describe what this
 # box's registry RECEIVED — while `WROTE` counts both directions. `files=` is read after the run.
 ADDED=0 UPDATED=0
-CONFLICT_KEYS=""
+CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS=""
+
+# ⛔ THE COUNTERS COUNT RECORDS, NOT EVENTS. `union` runs pull AND then push, so one defective key
+# is seen by BOTH directions and every increment happened twice: measured, ONE ambiguous local record
+# reported `unreadable=2` / `skipped=2` / "2 record(s) were SKIPPED", and two defective records
+# reported 4 — the same "look for a second record that does not exist, and double the number a
+# scheduler trends" defect fixed for `conflicts=` in review cycle 4. Every key-scoped increment now
+# registers its key, and `summary()` prints DISTINCT keys. (The counts line is what an operator reads
+# and what the doctor logs; a number nobody can act on is worse than no number.)
+unreadable() { UNREADABLE=$((UNREADABLE + 1)); UNREADABLE_KEYS="$UNREADABLE_KEYS $1"; }
+failed()     { FAILED=$((FAILED + 1)); FAILED_KEYS="$FAILED_KEYS $1"; }
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
   CONFLICT=$((CONFLICT + 1))
@@ -817,7 +827,7 @@ push_one() { # <key> <source-file>
   lat="$(field "$f" reviewed_at)"
   if [ -z "$lat" ]; then
     warn "  ⚠️ skip $key — the local record carries no readable reviewed_at, so no ordering rule can be applied to it."
-    UNREADABLE=$((UNREADABLE + 1)); return 0
+    unreadable "$key"; return 0
   fi
   cs="$(field "$f" reviewed_at)"
   # ⛔ THE FAST PATH (both directions share it): identical blob ids are identical bytes, so this
@@ -836,7 +846,7 @@ push_one() { # <key> <source-file>
   # records and a box that is already converged must stay cheap).
   if ! record_usable "$f"; then
     warn "  ⚠️ skip $key — the LOCAL record is not one this box's rail can USE, or its compared fields do not read the same way twice (json vs field); refusing to publish it."
-    UNREADABLE=$((UNREADABLE + 1)); return 0
+    unreadable "$key"; return 0
   fi
   attempt=0
   while :; do
@@ -848,7 +858,7 @@ push_one() { # <key> <source-file>
       same)   [ -n "$DEC_MSG" ] && say "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
       supersede) say "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
       unreadable) warn "  ⚠️ skip $key — $DEC_MSG; refusing to overwrite it (#2374 rule 1)."
-              UNREADABLE=$((UNREADABLE + 1)); return 0 ;;
+              unreadable "$key"; return 0 ;;
       conflict) conflict "$key" "$lat" "$DEC_PEER_AT" "$f"; return 0 ;;
     esac
     # ⛔ NO FETCH HERE. `exp` is the ref value `push_decision` actually compared: re-reading it
@@ -882,7 +892,7 @@ push_one() { # <key> <source-file>
     build_store_blobs || :
   done
   warn "  ⚠️ FAILED $key — the push was refused twice (a peer moved the ref, or this box cannot push to $REMOTE). The record stays LOCAL and is not lost; re-run to retry."
-  FAILED=$((FAILED + 1)); PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
+  failed "$key"; PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
 }
 
 pull_one() { # <key>
@@ -899,7 +909,7 @@ pull_one() { # <key>
     fi
   fi
   lf=""
-  tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { FAILED=$((FAILED + 1)); return 0; }
+  tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { failed "$key"; return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     # The ref exists (it came from remote_refs) but carries no readable record.json: that is a
     # DEFECT in the store, not "nothing to pull". Reported, because `status` would otherwise list
@@ -912,20 +922,20 @@ pull_one() { # <key>
     # is in. The key came from the store's listing, so the store demonstrably has the ref.
     if [ -n "$(store_oid "$key")" ]; then
       warn "  ⚠️ skip $key — the store lists this ref but its record.json is not readable here (the fetch did not bring its objects)."
-      UNREADABLE=$((UNREADABLE + 1))
+      unreadable "$key"
     fi
     rm -f "$tmp"; return 0
   fi
   rat="$(field "$tmp" reviewed_at)"
   if [ -z "$rat" ]; then
     warn "  ⚠️ skip $key — the peer's record carries no readable reviewed_at."
-    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
+    rm -f "$tmp"; unreadable "$key"; return 0
   fi
   # ⛔ USABILITY BEFORE ORDERING. A record the rail cannot read must never win the comparison: it
   # would replace a usable local record with bytes `read_record` refuses (see `record_usable`).
   if ! record_usable "$tmp"; then
     warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, not strict JSON, or its compared fields do not read the same way twice — json vs field); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
-    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
+    rm -f "$tmp"; unreadable "$key"; return 0
   fi
   # ⛔ THE KEY MUST MATCH WHAT THE RECORD SAYS IT IS, on the way IN as well as out. `push` refuses
   # to publish a record whose own repo/pr disagree with its key; without the same test here, a
@@ -942,15 +952,15 @@ pull_one() { # <key>
   rec_pr="$(field "$tmp" pr)"
   if ! [[ "$rec_pr" =~ ^[0-9]+$ ]]; then
     warn "  ⚠️ skip $key — the peer's record carries no usable pr field, so the key it sits under cannot be verified."
-    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+    unreadable "$key"; rm -f "$tmp"; return 0
   fi
   if [ -z "$rec_repo" ]; then
     warn "  ⚠️ skip $key — the peer's record carries no repo field, so the key it sits under cannot be verified (#2374 rule 3)."
-    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+    unreadable "$key"; rm -f "$tmp"; return 0
   fi
   if [ "${rec_repo%/*}-${rec_repo#*/}-$rec_pr" != "$key" ]; then
     warn "  ⚠️ skip $key — the peer's record says ${rec_repo}#${rec_pr}, which is NOT this key; materialising it would transplant another repo's verdict (#2374 rule 3, #426)."
-    UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+    unreadable "$key"; rm -f "$tmp"; return 0
   fi
   lf=""
   if lf="$(local_record_for_key "$key")" && [ -n "$lf" ]; then
@@ -965,8 +975,8 @@ pull_one() { # <key>
     # bytes are NOT installed here, so a box holding a corrupt record stays put until that record is
     # fixed or removed (which the rail cannot use it either way) — never silently downgraded.
     if ! record_usable "$lf"; then
-      warn "  ⚠️ skip $key — this box's LOCAL record is not one the rail can USE, or its compared fields do not read the same way twice (json vs field), so no peer record can be ordered against it (#2374 rule 1). Fix or remove that local file; the peer's bytes can then be pulled."
-      UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+      warn "  ⚠️ skip $key — this box's LOCAL record is not one the rail can USE, or its compared fields do not read the same way twice (json vs field — the rail may still read it), so no peer record can be ordered against it (#2374 rule 1). REPAIR or RE-MINT that file: deleting it makes the next pull install the peer's record, which may be OLDER than this one."
+      unreadable "$key"; rm -f "$tmp"; return 0
     fi
     lat="$(field "$lf" reviewed_at)"
     if [ -n "$lat" ] && [[ "$lat" > "$rat" ]]; then
@@ -975,7 +985,7 @@ pull_one() { # <key>
     fi
     if [ -z "$lat" ]; then
       warn "  ⚠️ skip $key — this box's record carries no readable reviewed_at; refusing to overwrite an unknown-order record (#2374 rule 1)."
-      UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+      unreadable "$key"; rm -f "$tmp"; return 0
     fi
     if [ "$lat" = "$rat" ]; then
       # The peer's record supersedes this box's only when it is a CARRY of it (same mint time, and
@@ -1022,7 +1032,7 @@ pull_one() { # <key>
     if [ -n "$lf" ]; then UPDATED=$((UPDATED + 1)); else ADDED=$((ADDED + 1)); fi
   else
     warn "  ⚠️ FAILED $key — could not write $REG_DIR/$key.json"
-    FAILED=$((FAILED + 1))
+    failed "$key"
   fi
   rm -f "$tmp"; return 0
 }
@@ -1191,22 +1201,34 @@ summary() { # <verb>
     ccount="$(printf '%s\n' $CONFLICT_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
     ckeys=" $(printf '%s\n' $CONFLICT_KEYS | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ *$//')"
   fi
+  # ⛔ THE SAME RULE FOR THE OTHER TWO COUNTERS, and for the same reason: `union` runs BOTH
+  # directions, so a key-scoped defect is counted once per direction. Measured before this: ONE
+  # ambiguous local record read `unreadable=2` / `skipped=2` / "2 record(s) were SKIPPED", and two
+  # defective records read 4. The convergence line's `skipped=` is the number a scheduler trends, so
+  # an inflated one is worse than none.
+  local ucount="$UNREADABLE" fcount="$FAILED"
+  if [ -n "$UNREADABLE_KEYS" ]; then
+    ucount="$(printf '%s\n' $UNREADABLE_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  fi
+  if [ -n "$FAILED_KEYS" ]; then
+    fcount="$(printf '%s\n' $FAILED_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  fi
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
-    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$UNREADABLE" "$FAILED"
+    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$ucount" "$fcount"
   # THE CONVERGENCE LINE (#2577). Printed LAST so a caller that greps `^<verb>:` for the tail (the
   # rail and the cell bring-up both do) reports the numbers a stalled sync makes visible, instead of
   # a breakdown that reads identical whether the 3,000 fleet records arrived or none did.
   printf '%s: refs=%s files=%s added=%s updated=%s skipped=%s\n' \
-    "$1" "$STORE_REF_COUNT" "$(registry_file_count)" "$ADDED" "$UPDATED" "$UNREADABLE"
-  if [ "$FAILED" -gt 0 ]; then
+    "$1" "$STORE_REF_COUNT" "$(registry_file_count)" "$ADDED" "$UPDATED" "$ucount"
+  if [ "$fcount" -gt 0 ]; then
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
     # failed PUSH means the records WERE read and this box could not publish. Naming both as a single
     # records-are-UNKNOWN state sent an operator to re-run a path that fails identically.
-    if [ "$PUSH_FAILED" -gt 0 ] && [ "$FAILED" -eq "$PUSH_FAILED" ]; then
-      warn "registry-sync.sh: $FAILED record(s) could not be PUBLISHED — the pull side succeeded, so this box"
+    if [ "$PUSH_FAILED" -gt 0 ] && [ "$fcount" -eq "$PUSH_FAILED" ]; then
+      warn "registry-sync.sh: $fcount record(s) could not be PUBLISHED — the pull side succeeded, so this box"
       warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
     else
-      warn "registry-sync.sh: $FAILED record(s) could not be moved — re-run to retry (nothing was deleted, and no record was overwritten with an older one)."
+      warn "registry-sync.sh: $fcount record(s) could not be moved — re-run to retry (nothing was deleted, and no record was overwritten with an older one)."
     fi
     return 1
   fi
@@ -1214,8 +1236,8 @@ summary() { # <verb>
     warn "registry-sync.sh: $ccount record(s) DIVERGE at the same reviewed_at:$ckeys"
     return 3
   fi
-  if [ "$UNREADABLE" -gt 0 ]; then
-    warn "registry-sync.sh: $UNREADABLE record(s) were SKIPPED because they could not be read or ordered — this is"
+  if [ "$ucount" -gt 0 ]; then
+    warn "registry-sync.sh: $ucount record(s) were SKIPPED because they could not be read or ordered — this is"
     # ⛔ "the STORE holds records this box cannot use" was wrong on two of the three arms: `push`
     # publishes LOCAL records and `pull` now also refuses to order against an unusable LOCAL record,
     # so the defect can be either side. Name the state, not a side.
