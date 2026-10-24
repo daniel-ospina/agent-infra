@@ -272,8 +272,13 @@ def branch_has_live_lane(pr: dict, worktrees: list[tuple[str, str, str]], claims
             log(f"fleet-state speaks for {board_repo}, not {repo} — board arm ignored")
             fleet = None
     if isinstance(fleet, dict):
-        for lane in fleet.get("lanes") or []:
-            ident = lane.get("identity") or {}
+        lanes = fleet.get("lanes") or []
+        if not isinstance(lanes, list):
+            raise Unreadable("fleet-state lanes is not a list")
+        for lane in lanes:
+            if not isinstance(lane, dict):
+                raise Unreadable("fleet-state carries a non-object lane entry")
+            ident = lane.get("identity") if isinstance(lane.get("identity"), dict) else {}
             lb = str(ident.get("branch") or "")
             ls = str(ident.get("head_sha") or "")
             who = ident.get("lane") or ident.get("workspace") or "?"
@@ -380,6 +385,13 @@ def _record_for_this_repo(f: Path, repo: str) -> dict | None:
     return rec
 
 
+def _json_load(f: Path):
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def _json_parses(f: Path) -> bool:
     try:
         json.loads(f.read_text())
@@ -400,24 +412,35 @@ def record_state(pr: int, repo: str, new_diff: str) -> str:
             continue
         rec = _record_for_this_repo(f, repo)
         if rec is None:
-            if f.exists() and not _json_parses(f):
+            if f.exists():
                 # A record EXISTS here and cannot be parsed: the comment must not claim
                 # "no record existed" while an unparseable attestation sits at the
                 # canonical path the merge gate reads.
                 return f"UNREADABLE record at {f.name} — parses as no record; treat this head as UNREVIEWED"
-            log(f"#{pr} ignoring {f.name}: it names another repo — not this PR's record")
+            log(f"#{pr} ignoring {f.name}: not a usable record for this PR "
+                f"({'another repo' if _json_parses(f) and isinstance(_json_load(f), dict) else 'not a record object'})")
             continue
         found = True
         rec_head = str(rec.get("head_sha") or "?")
         rec_diff = str(rec.get("diff_sha256") or "")
-        if new_diff and rec_diff and new_diff == rec_diff:
+        if not new_diff:
+            # The diff could not be read (head never became visible). Say UNAVAILABLE —
+            # "the record attests a different diff" would be a claim nobody measured.
+            aside = f.with_name(f.name + f".superseded-{rec_head[:12]}")
+            try:
+                f.rename(aside)
+            except OSError as e:  # pragma: no cover
+                raise Unreadable(f"record store ({e})") from e
+            return (f"superseded-unverified: the diff could not be read at this head, so the record "
+                    f"bound to {rec_head[:12]} was moved aside UNVERIFIED")
+        if rec_diff and new_diff == rec_diff:
             kept = f"kept: diff unchanged ({new_diff[:12]}), record at {rec_head[:12]} still attests it"
             continue
         aside = f.with_name(f.name + f".superseded-{rec_head[:12]}")
         try:
             f.rename(aside)
         except OSError as e:  # pragma: no cover - disk state, not logic
-            return f"UNREADABLE record store ({e}) — record left in place, PR must be re-reviewed"
+            raise Unreadable(f"record store ({e}) — the record could not be moved aside") from e
         renamed.append(f"{rec_diff[:12] or '?'} -> {new_diff[:12] or '?'} at {rec_head[:12]}")
     if renamed:
         return f"superseded: diff changed ({'; '.join(renamed)}), record moved aside"
@@ -936,6 +959,8 @@ def main(argv: list[str]) -> int:
                     results[-1]["detail"] += f" | comment failed: {e}"
                 strikes = strikes_get(n) + 1
                 backoff_set(n, min(BACKOFF_REFUSE_BASE * (2 ** (strikes - 1)), BACKOFF_REFUSE_CAP), r.kind, strikes)
+            elif r.kind == "unreadable":
+                unreadable = True
             elif r.kind == "rebase-failed":
                 # Not a content conflict (no label), but a deterministic mechanical
                 # failure will repeat: a SHORT backoff keeps it from re-occupying a cap
@@ -976,7 +1001,15 @@ def main(argv: list[str]) -> int:
         # OLD head would compare the OLD diff with the record and report "kept" over a
         # head it never measured. Wait for the head to equal what we pushed; if it never
         # does, the hash is UNUSABLE and the record is superseded (fail closed).
-        head_ok = wait_head(n, args.repo, res["new_head"])
+        try:
+            head_ok = wait_head(n, args.repo, res["new_head"])
+        except Unreadable as e:
+            # ⛔ THIS READ SITS OUTSIDE THE POST-PUSH try BELOW. When it raised, the pass
+            # died with a traceback AFTER a successful push: no comment, no record
+            # handling, no report, remaining candidates abandoned — exit 1 where the
+            # contract says 2.
+            head_ok = False
+            log(f"#{n} UNREADABLE head read ({e}) — treating the diff as unverified")
         diff_after = diff_hash(n, args.repo) if head_ok else ("unavailable", "")
         if not head_ok:
             unreadable = True
@@ -1025,7 +1058,11 @@ def write_report(path: str, args, prs: list[dict], conflicting: list[int],
     # headline table was always empty (a false negative on the finding that matters).
     for r in results:
         if r.get("kind") == "content-conflict":
-            m = re.search(r"conflicting paths: (.+)$", r.get("detail") or "", re.M)
+            # `detail` can carry a " | label failed: …" suffix appended by the post-push
+            # handler; the hotspot table is the operator's finding surface and must not
+            # absorb it.
+            core = (r.get("detail") or "").split(" | ")[0]
+            m = re.search(r"conflicting paths: ([^|]+)$", core, re.M)
             if m:
                 for pth in m.group(1).split(", "):
                     if pth.strip():

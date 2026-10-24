@@ -153,6 +153,7 @@ PY
   label) : ;;
   api)
     # `gh api repos/<o>/<r>/branches/main/protection --jq …` → the required contexts
+    if [ -n "${FAKE_API_FAIL:-}" ]; then echo "api boom" >&2; exit 1; fi
     printf '["pipeline-compliance"]\n' ;;
   *) : ;;
 esac
@@ -432,6 +433,40 @@ has "$OUT" "behind but not green" "§16a a red BEHIND PR is skipped for being re
 # 1201 is green + recorded; the ONLY reason to skip it would be the head being fresh,
 # so assert it is the one that WOULD be rebased.
 has "$OUT" '"pr": 1201' "§16b the green+recorded BEHIND PR is considered"
+
+# ═══════════════════════ §17: board shapes and an unreadable gate ═══════════
+# Three arms that a mutation left green: the board's BRANCH match, the board's REPO
+# filter, and the required-contexts read under --include-behind.
+echo "§17 the board arm and an unreadable required-contexts read"
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+cat >"$TMP/fleet2.json" <<EOF
+{"repo": "$REPO", "lanes": [{"identity": {"lane": "cell-y", "branch": "feat/clean", "head_sha": "deadbeefdeadbeef"}}]}
+EOF
+export CONFLICT_REBASE_FLEET_STATE="$TMP/fleet2.json"
+write_prs "[$(pr_json 1301 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
+OUT="$(run_bot --dry-run --max 1 --interval-s 0 --json)"
+has "$OUT" 'live lane: fleet-state lane cell-y' "§17a a board lane on the BRANCH is a hold"
+
+# a board for ANOTHER repo must be ignored (and reasoned about), not believed
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+cat >"$TMP/fleet3.json" <<EOF
+{"repo": "someone/other", "lanes": [{"identity": {"lane": "foreign", "branch": "feat/clean", "head_sha": "$H_SHA"}}]}
+EOF
+export CONFLICT_REBASE_FLEET_STATE="$TMP/fleet3.json"
+write_prs "[$(pr_json 1302 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
+OUT="$(run_bot --dry-run --max 1 --interval-s 0 --json)"
+has "$(cat "$TMP/bot.err")" "board arm ignored" "§17b a foreign board is named and ignored"
+has "$OUT" '"action": "would-rebase"' "§17c …and its lanes do not block this repo's PR"
+
+# --include-behind with an unreadable branch protection => exit 2, never a clean pass
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 1303 feat/clean "$H_SHA" MERGEABLE BEHIND '[]' false true)]"
+FAKE_API_FAIL=1 run_bot --dry-run --max 1 --interval-s 0 --include-behind; RC=$?
+ck "$RC" "2" "§17d an unreadable required-contexts read is exit 2"
+has "$(cat "$TMP/bot.err")" "UNREADABLE required contexts" "§17e …and says which surface"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
