@@ -78,7 +78,14 @@ FX_SHA="$(git -C "$FX" rev-parse HEAD 2>/dev/null)"
 # The installer is driven from a STAGE copy, so nothing it does can reach this checkout's neighbours
 # and its own `bash -n` sweep sees only what is under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
-cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" "$STAGE/" 2>/dev/null
+# ⛔ `merge-reminder.py` IS STAGED, NOT STUBBED (main's install.sh gates on it, 2026-10-24). The
+# installer parses `$HERE/merge-reminder.py` with `ast.parse` and DIES when it is absent — deliberately
+# unguarded, because a `[ -f ]` guard once let a MISSING file read as "parses fine" while the timer had
+# no script. Without it in the stage, every arm stops at that gate instead of at its own assertion; the
+# file is a shipped companion of install.sh (see install.sh's own drift list), so the stage carries the
+# REAL one rather than a stub — a stub would pass the parse gate while proving nothing about the ship set.
+cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" \
+   "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
 BIN="$T/bin"; mkdir -p "$BIN"
 # install.sh probes the real binaries (gh/network, tmux, pi, jq) and lints the plist with plutil. ALL of
 # them are stubbed IN $BIN: the assertions below are about the RENDERED PROGRAM, not the host's toolchain.
@@ -538,7 +545,7 @@ ck "$(has "$out" "REFUSED (pin)" && echo 0 || echo 1)" "…and the refusal is th
 # docs/ops/fleet-harness-baseline.md §3.1) would sail through with the suite green (review finding, P2).
 # The mutation below IS that deviant template: one rule rewritten to the pre-change `__O__` program.
 STAGE_OLD="$T/stage-old"; mkdir -p "$STAGE_OLD"
-cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE_OLD/" 2>/dev/null
+cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE/merge-reminder.py" "$STAGE_OLD/" 2>/dev/null
 sed 's|<string>__HARNESS__/__ENTRY__</string>|<string>__O__/orch-loop.sh</string>|' "$TEMPLATE" > "$STAGE_OLD/launchd.plist.template"
 SHOME10="$T/home10"; mkdir -p "$SHOME10/Library/LaunchAgents"
 out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
