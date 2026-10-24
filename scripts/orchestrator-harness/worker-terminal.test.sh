@@ -69,6 +69,45 @@ gh_hosts_fixture() { # <home>
     > "$1/.config/gh/hosts.yml"
 }
 
+# ── 0) HERMETICITY: the BOX's gh-config redirect is not an input to this suite (#2644) ─────────────
+# `wt_gh_hosts` resolves `GH_CONFIG_DIR` → `XDG_CONFIG_HOME` → `$home/.config/gh/hosts.yml`. That order
+# is the shipped contract and is pinned below where it belongs. What it is NOT is a property of this
+# suite's fixtures: every section here builds its OWN HOME with its OWN hosts.yml, so an AMBIENT value
+# silently retargets every credential probe in the file at a directory that belongs to the machine.
+#
+# MEASURED (2026-10-24, `ci-main` run 40049617028, `189 passed, 7 failed`): the GitHub-hosted runner
+# exports `XDG_CONFIG_HOME=/home/runner/.config`, so `wt_spawn` refused a fixture HOME that carried a
+# valid `oauth_token` — its refusal message named `/home/runner/.config/gh/hosts.yml` — and seven
+# assertions thirty sections apart went red for one reason none of them named. A developer box passed
+# only because its shell had no such value (and often has `GH_TOKEN`, which credits several arms
+# through the caller-token branch and never reaches the store probe at all). Reproduced 7/7 locally by
+# exporting the runner's own value; green with it absent.
+#
+# ⛔ TWO HALVES, and the second is why this is not just an `unset`. (1) Scrub, so the suite is a
+# function of its fixtures and of nothing else. (2) ASSERT the scrub took, as ONE named assertion at
+# the top — so a box (or a future edit) that re-introduces a redirect is told WHAT is wrong, instead of
+# an unrelated-looking cascade.
+#
+# ⛔ WHAT THE MUTATION ARM IS, EXACTLY (review cycle 1 — this used to overstate it). Deleting the
+# `unset` reddens this assertion ONLY on a box that carries an ambient redirect; on a clean box the
+# deletion is invisible, because there is nothing to scrub. That is a property of an ABSENCE and cannot
+# be pinned more tightly than "the resolution is correct on the box we are on", so the arm is the
+# RUNNER SHAPE: with `XDG_CONFIG_HOME` exported, the scrub-less copy fails here first and names the
+# values, and the scrubbed copy passes.
+_amb_gh_dir="${GH_CONFIG_DIR:-<unset>}"
+_amb_xdg_home="${XDG_CONFIG_HOME:-<unset>}"
+unset GH_CONFIG_DIR XDG_CONFIG_HOME
+_hermetic_probe="$TMP/hermetic-probe"
+_hermetic_hosts="$( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts "$_hermetic_probe" )"
+if [ "$_hermetic_hosts" = "$_hermetic_probe/.config/gh/hosts.yml" ]; then
+  rc=0
+else
+  rc=1
+  echo "      wt_gh_hosts(\$_hermetic_probe) => '$_hermetic_hosts'"
+  echo "      ambient BEFORE the scrub: GH_CONFIG_DIR='$_amb_gh_dir' XDG_CONFIG_HOME='$_amb_xdg_home'"
+fi
+ck "hermetic: no ambient GH_CONFIG_DIR/XDG_CONFIG_HOME retargets the credential probe" $rc
+
 # ── the fake surface ───────────────────────────────────────────────────────────
 # ONE stub, parameterised by env, installed into each scenario's bin dir. It answers the guest CLI's
 # grammar (`tree`, `layout apply`, `terminal close`, `workspace rm`) and refuses `surface` exactly as
