@@ -793,6 +793,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
   },
   {
+    name: "HYGIENE_TMP_MIN_AGE_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${HYGIENE_TMP_MIN_AGE_S:-3600}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh §temp — a dir whose embedded pid is dead AND whose mtime is past this floor is reaped, while a FRESH one (dead pid, written seconds ago) is KEPT with its reason; the `> 0` bound is refused at load by cloud-cell-doctor.sh's numeric validation, because a zero floor leaves a recycled pid as the only proof a temp dir is idle",
+    note: "#2573 — how long a `cloud-cell-<pid>.<rand>` temp dir must have been untouched before the hygiene role may reclaim it, once its embedded pid is provably gone. The pid is the primary proof; this floor is the SECOND gate that covers pid RECYCLING (the name's pid can be dead now and have belonged to something else by the time the dir was written). A zero floor makes the recycling hole unbounded, which is why the loader refuses it by name rather than silently accepting a vacuous bound.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",
@@ -891,6 +900,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "retention",
     guardedBy: NONE,
     note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
+  },
+  {
+    name: "REAP_WT_SCRATCH_AGE_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_SCRATCH_AGE_DAYS:-1}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#2354 — the age floor for a LANE SCRATCH checkout (`wt-*` / `cell-wt-*` at any depth), 1 day. A dead lane's scratch dir is a throwaway, not the 7-day review surface a named issue branch is; the 7-day blanket floor held it (and its disk) for a week after the lane was gone, which is why the reaper reclaimed zero. It only ever CAPS DOWN (a value above the floor in force has no effect, so 14 cannot mean 'keep longer'), it never replaces a merged/patch-equivalent floor, and it touches AGE ONLY — every survival gate (clean / no live holder / no open PR / ref-holding) is unchanged, so a young-but-finished scratch dir is still reclaimed and an old-but-dirty one is not. Registered rather than exempted because it IS a retention bound in the same family as REAP_WT_AGED_DAYS/REAP_WT_MERGED_AGE_DAYS above, and a reader must be able to see the floor move.",
   },
   {
     name: "REAP_WT_MAX_DAYS",
