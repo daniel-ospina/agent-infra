@@ -297,6 +297,17 @@ function at_val_start(s, i,   j, c) {
   c = substr(s, j, 1)
   return (c == ":" || c == "-" || c == "[" || c == "{" || c == ",")
 }
+# at_val_start_flow(s, i) — the same test WITHOUT the dash, for a flow collection: a dash has no
+# structural meaning between a `{` and its `}`, so a scalar like shard-dash-a there is plain text and a
+# quote after the dash must not open a string (#2660 round 14).
+function at_val_start_flow(s, i,   j, c) {
+  if (i == 1) return 1
+  j = i - 1
+  while (j > 0 && substr(s, j, 1) ~ /[ \t]/) j--
+  if (j == 0) return 1
+  c = substr(s, j, 1)
+  return (c == ":" || c == "[" || c == "{" || c == ",")
+}
 # stripcomment_simple(s) — the pre-quote-aware rule, used only when a quote never closes.
 function stripcomment_simple(s,   i, n) {
   n = length(s)
@@ -354,7 +365,7 @@ function splitqv(v, arr,   n, i, c, q, cur, len, nx) {
       }
       continue
     }
-    if ((c == DQ || c == SQ) && at_val_start(v, i)) { q = c; cur = cur c; continue }
+    if ((c == DQ || c == SQ) && at_val_start_flow(v, i)) { q = c; cur = cur c; continue }
     if (c == ",") { arr[++n] = cur; cur = ""; continue }
     cur = cur c
   }
@@ -747,8 +758,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
               case "$group" in
                 # The PR number is per-PR and stable across heads and `github.event.number` is that
                 # same number — refusing either was a false red (rounds 4 and 5).
-                *'github.ref'*|*'github.head_ref'*|*'github.event.pull_request.number'*|*'github.event.number'*) : ;;
-                *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\`, \`github.head_ref\` or the PR number (\`github.event.pull_request.number\` / \`github.event.number\`) [R1]" ;;
+                *'github.ref'*|*'github.head_ref'*|*'github.workflow_ref'*|*'github.event.pull_request.number'*|*'github.event.number'*) : ;;
+                *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\`, \`github.head_ref\`, \`github.workflow_ref\` or the PR number (\`github.event.pull_request.number\` / \`github.event.number\`) [R1]" ;;
               esac
             fi ;;
         esac
