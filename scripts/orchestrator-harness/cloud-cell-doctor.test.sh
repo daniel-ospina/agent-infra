@@ -1888,6 +1888,15 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # bash-legal one-line headers, and missing them attributed the body's read to the PRECEDING function,
   # where an allowlisted pair for the same name graded it REQUIRED (PASS 239→240). The `name()` form
   # always has EMPTY parens, so an awk `function secs(t, n, …)` is still not a header.
+  # ⛔ A ZERO-PARAMETER AWK FUNCTION IS INDISTINGUISHABLE FROM A BASH HEADER (declared limitation,
+  # review P2): `function ww() { … }` inside a single-quoted awk program is byte-identical to a bash
+  # function header, and awk really does accept the empty parens. Such a line IS treated as a header,
+  # so a `local` that follows it in the SAME bash function is graded under `ww` and fails LOUDLY
+  # (`ww:pid` is not on REQUIRED_READS). That is the fail-closed direction on purpose: the opposite
+  # choice — not treating `function name()` as a header — is a silent misattribution of every bash
+  # function written in the keyword form, which is the fail-open class this whole audit exists for.
+  # A parameterised awk function (`function secs(t, …)`) is excluded, because a bash `name()` header
+  # always has EMPTY parens.
   # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
   # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
   # nested helpers both sit after their function's only positional binding, so nothing is
@@ -1902,7 +1911,13 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\([[:space:]]*\).*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1); do
+  # ⛔ AND THE NAME ITSELF MAY BE CONTINUED: `ZzContName \` + `() {` is bash-legal, and it is NOT the
+  # `local`-continuation residual (that one is about a binding, this is a HEADER). Missing it resolved
+  # the body's read to the preceding allowlisted function (review P1, reproduced: PASS +1, read ✅ under
+  # `bounded`). It needs the NEXT line to open with `()`, which a plain grep cannot see, so the header
+  # list is built once and SORTED — two greps concatenated would break the ascending walk below.
+  for ln in $( { grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\([[:space:]]*\).*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1
+                 awk 'NR > 1 && prev ~ /^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\\[[:space:]]*$/ && $0 ~ /^[[:space:]]*\([[:space:]]*\)/ { print NR - 1 } { prev = $0 }' "$file"; } | sort -n -u); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -2054,7 +2069,7 @@ while read -r _r _f; do
   # matched `run_x() {` at column 0, so a role whose header is reformatted (next-line brace, `( )`,
   # indented) yielded an EMPTY range and the arm then reported "does NOT read its mode as ${1:-}" over
   # a file that reads it correctly. The start pattern now accepts the forms func_for accepts.
-  if grep -q 'local dry="\${1:-}"' < <(awk "/^[[:space:]]*(function[[:space:]]+)?run_${_f}[[:space:]]*\\([[:space:]]*\\)([[:space:]]*\\{.*|[[:space:]]*$)/,/^\\}/" "$DOCTOR"); then
+  if grep -qE 'local dry="\$\{1(:-|-)\}"' < <(awk "/^[[:space:]]*(function[[:space:]]+)?run_${_f}[[:space:]]*\\([[:space:]]*\\)([[:space:]]*\\{.*|[[:space:]]*$)/,/^\\}/" "$DOCTOR"); then
     ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (it survives the absent/empty mode the scheduler passes)"
   else
     bad "audit: run_${_f} does NOT read its mode as \"\${1:-}\" — a bare dispatch would kill or rehearse the scheduler"
