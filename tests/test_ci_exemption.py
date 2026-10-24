@@ -2806,6 +2806,34 @@ def test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path():
     assert ci_exemption.bash_shard_failures(
         "❌ failed shard: scripts/x/y.sh"
     )[0] == ["bash-shard::scripts/x/y.sh"]
+    # ⛔ THE ENCODER'S EXACT OUTPUT, not merely "inside the alphabet" (#2648 cycle-6): the `%`
+    # RE-ESCAPE is what stops a path from FORGING an escape, and it was asserted nowhere — passing
+    # `%` through left the suite green while `scripts/a,b.sh` and `scripts/a%2Cb.sh` collapsed onto
+    # one identity. Both directions are pinned, by exact token.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a%41.sh"
+    )[0] == ["bash-shard::scripts/a%2541.sh"]
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a,b.sh"
+    )[0] == ["bash-shard::scripts/a%2Cb.sh"]
+    # …including `**`, which the bold-stripping must NOT touch when it is part of a path: stripping
+    # it from the whole line (the sibling parser's rule) made `scripts/a**b.sh` and `scripts/ab.sh`
+    # one identity, and a swept filename can carry `**` through `for f in $pattern` literally.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a**b.sh"
+    )[0] == ["bash-shard::scripts/a%2A%2Ab.sh"]
+    for a, b in (
+        ("scripts/a,b.sh", "scripts/a%2Cb.sh"),   # `%` passthrough would fold these
+        ("scripts/a b.sh", "scripts/a-b.sh"),     # a `-` fallback would fold these
+        ("scripts/a**b.sh", "scripts/ab.sh"),     # whole-line `**` stripping would fold these
+    ):
+        ka, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {a}")
+        kb, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {b}")
+        assert ka != kb, f"{a!r} and {b!r} share one identity: {ka!r}"
+    # …and the BOLD rendering still parses, since the pairs are consumed in the bullet position.
+    assert ci_exemption.bash_shard_failures(
+        "❌** **failed shard: scripts/x/y.sh"
+    )[0] == ["bash-shard::scripts/x/y.sh"]
     # The two labels that collided under the cycle-5 per-character fallback (`%%%02X` has no fixed
     # width): they must stay distinct.
     a = ci_exemption.bash_shard_failures("❌ failed shard: \U0001F600")[0]

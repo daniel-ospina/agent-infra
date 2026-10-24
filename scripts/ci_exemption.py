@@ -1422,7 +1422,7 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: attributable block. The slug charset is exactly `_slug`'s, so the key stays
 #: whitespace-free for the `uniq -c | awk` rate table.
 #:
-#: `bash-shard::<slug>` (#2643) is a bash SHARD's own identity, and
+#: `bash-shard::<path>` (#2643) is a bash SHARD's own identity, and
 #: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and both are admitted on a
 #: nodeid's terms — an id buys nothing unless it is in main's rate table.
 #:
@@ -1690,7 +1690,15 @@ _RUNNER_AGG_SIG = "runner-aggregate"
 #: it because every shard carries the same one). A path is already whitespace-free, so the
 #: slug bought nothing here. `test_bash_shard_identity_is_injective_over_the_listed_shards`
 #: pins it against the runner's real 80-shard list.
-_BASH_SHARD_RE = re.compile(r"^(?:❌|✗)\s*\*{0,2}\s*failed shard:\s*(?P<label>\S.*?)\s*$")
+_BASH_SHARD_RE = re.compile(
+    r"^(?:❌|✗)(?:\s*\*\*)*\s*failed shard:\s*(?P<label>\S.*?)\s*$"
+)
+#: ⛔ THE BOLD PAIRS ARE STRIPPED IN THE BULLET POSITION ONLY, never on the whole line
+#: (see :func:`bash_shard_failures`). `line.replace("**", "")` — the sibling's rule — also rewrote
+#: the LABEL, so `scripts/a**b.sh` became `bash-shard::scripts/ab.sh`, identical to `scripts/ab.sh`:
+#: an injectivity break in the very identity this module exists to keep unique (#2648 cycle-6
+#: review). A swept filename CAN carry `**` through `for f in $pattern` literally, which is the only
+#: way it is reachable — narrow, and still a false attribution if it happens.
 #: Matched against ``line.replace("**", "")`` for the same reason `_RUNNER_AGG_RE` is
 #: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
@@ -1748,14 +1756,12 @@ def bash_shard_failures(
     ids: list[str] = []
     signatures: dict[str, frozenset[str]] = {}
     for line in _log_lines(text):
-        # ⛔ THE SAME RENDERING RULE AS `runner_aggregate_failures` — strip the bold pairs
-        # wholesale, then match. A pattern that tolerates ONE optional `**` pair does NOT
-        # match the measured bold shape (`❌** **failed shard: …`, where each pair is its
-        # own token): it would match the plain form this runner prints today and match
-        # NOTHING against the capture it exists for, i.e. break silently the day the line
-        # is bolded — the #2643 refusal returning with no diagnostic. The two `❌`-keyed
-        # parsers must not disagree about what a bullet looks like.
-        m = _BASH_SHARD_RE.match(line.replace("**", ""))
+        # ⛔ MATCHED ON THE RAW LINE, NOT `line.replace("**", "")`. The bold pairs belong to the
+        # BULLET, and `_BASH_SHARD_RE` consumes them there (`(?:\s*\*\*)*`); stripping them from
+        # the whole line would also rewrite a path containing `**` and collapse two shards onto one
+        # identity (#2648 cycle-6). The two `❌`-keyed parsers still agree on the plain rendering,
+        # which is what both emit; this one additionally survives the bold shape.
+        m = _BASH_SHARD_RE.match(line)
         if m is None:
             continue
         key = f"{_BASH_SHARD_KEY_PREFIX}{_shard_token(m.group('label'))}"
