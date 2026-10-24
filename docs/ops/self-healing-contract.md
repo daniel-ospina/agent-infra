@@ -64,14 +64,15 @@ measurement** — and is marked as such.
 
 | epic table row | measured 2026-10-24 | verdict |
 |---|---|---|
-| cell-4 `eldato-orchestrator` **❌ inactive**, "and it still read as healthy" | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402). Its `MainPID` is `cloud-cell-supervisor.sh start`, whose own log line is: `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)`.
-**The doubled pid is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z. | **The row's proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, two live `merge-*` worker sessions). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
+| cell-4 `eldato-orchestrator` **❌ inactive**, "and it still read as healthy" | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402). Its `MainPID` is `cloud-cell-supervisor.sh start`, whose own log line is: `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)` | **The row's proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, two live `merge-*` worker sessions). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
 | "precedence rule implemented **nowhere**" ❌❌❌❌ | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §5.1, `OVERRIDES:`). |
 | "universal dispatcher: **one seam does not exist**; two ad-hoc dispatchers with different gates" | `capacity.sh` (759 lines) ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
 | "no machine except the Mac has an actuator that lands anything" | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held two live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
 | `pr-doctor` **❌ on all cells** | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
 | `auto-rail` actuator | `rg -ni 'auto-rail\|autorail'` over agent-infra's **whole history** → **0 hits**; not in tortoise either | ⛔ **Unattributable capability**: `com.tortoise.auto-rail` exists only as a launchd label on one machine, with **no source in any repo**. It cannot be repaired from a branch and cannot be audited off the Mac. See `C5`. |
 | "bulk dispatch: 16 workers onto a Mac at load 57" | Not present in the repo. The measured instance on record in `spawn-gate.sh`'s comment beginning *"There is no `lane.sh` in that path"* is **three lanes at load 258 on 10 cores** (`MAX_LOAD=100`) via a `tmux new-session` runner that never sourced the gate | ⚠️ **The epic's figure is UNVERIFIED here.** The *mechanism* it describes is real and documented (§3.9). |
+
+**The doubled pid is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z.
 
 ### 1.3 Transcript — cell-4 (verbatim, the commands whose output is quoted above)
 
@@ -546,8 +547,19 @@ not re-measured.
 | `check-deployed-drift` | ✅ present; pin ≠ running (§1.3) | NC | NC | REC ⚠️ (remedy destroys — baseline §3.1) |
 | disk above floor | ✅ (4649 MB ≈ 97 % used) | NC | NC | NC |
 
-**Four rows are ❌ on every machine**: landing attribution, the fleet view, `auto-rail`'s provenance,
-and `pr-doctor`'s activation on a cell. Those are the children (`C3`, `C5`, `C6`).
+**What the ❌s mean, read column by column** (the table above already distinguishes a measured
+absence from an unreadable machine, so this summary must not flatten it again):
+
+- **Landing attribution: `❌` everywhere, the Mac included** — no record anywhere names the box that
+  landed a PR.
+- **`pr-doctor`'s activation and survivability: `❌` on cell-4, `NC` on cell-3 and cell-1 (no read
+  channel), `REC ✅` on the Mac** — the Mac's ✅ is a RECORD, not a re-measurement.
+  Both of those are `C5` (#2709).
+- **❌ on every cell, `REC (label only)` on the Mac**: `auto-rail`'s provenance — it has no source in any
+  repo, so the Mac's label is a RECORD, not a measurement. → `C5` (#2709).
+- **❌ everywhere**: the fleet view (no box can see another). → `C3` (#2707).
+- **`C6`** (#2710) is not one of these rows: it is the *shape* of the answer for all of them — a
+  refusal must carry a name, a reason and a next action, and `UNKNOWN` must never be a pass.
 
 ---
 
@@ -555,7 +567,10 @@ and `pr-doctor`'s activation on a cell. Those are the children (`C3`, `C5`, `C6`
 
 CI means `scripts/run-bash-shards.sh` — **the one list both lanes call**
 (`.github/workflows/ci.yml` job `bash-suites`; `.github/workflows/ci-main.yml` job `script-validate`),
-currently **85 shards**, plus the pytest list in `ci.yml`'s single `python3.12 -m pytest …` step.
+plus the pytest list in `ci.yml`'s single `python3.12 -m pytest …` step. ⛔ **No shard count is
+written down here on purpose** — an earlier draft said "85", which was wrong the moment this PR added
+one, and a live count rots on every subsequent PR exactly as a line number does (§2). Ask the file:
+`bash scripts/run-bash-shards.sh --list | wc -l`.
 
 ### 5.1 Already proven by an effect test (name the shard, not the file)
 
