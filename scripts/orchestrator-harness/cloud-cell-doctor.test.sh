@@ -1312,7 +1312,40 @@ OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-diverge.sh" DOCTOR_WORKTREE_REAPER="$T/bi
 [ "$RC" -eq 0 ] && ok "hygiene: a divergent registry does NOT fail the pass" || bad "hygiene: divergence produced rc=$RC — $OUT"
 case "$OUT" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and the log carries the script's DIVERGE verdict" ;; *) bad "hygiene: the divergence cause is dropped from the log — $OUT" ;; esac
 case "$OUT" in *"agent-infra-3001"*) ok "hygiene: ...naming the keys an operator must reconcile" ;; *) bad "hygiene: the diverging keys are not named — $OUT" ;; esac
+
 case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and it reaches the role RECORD, not just stdout" ;; *) bad "hygiene: state drops the divergence reason — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" ;; esac
+
+say_case "hygiene: an rc=4 registry logs the SKIPPED keys ONCE each (never the same key per direction)"
+reset_state
+# The script prints one `⚠️ skip <key> —` line PER DIRECTION, so one defective record yields two
+# identical keys; a `tail -N` cap over LINES would hide a distinct third key behind a duplicate — the
+# same artefact this head removed from conflicts=/unreadable=. Two keys, each reported twice.
+cat > "$T/bin/rs-skip.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4001 — the LOCAL record is not one the rail can USE (json vs field); refusing to publish it." >&2
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4001 — this box's LOCAL record is not one the rail can USE, so no peer record can be ordered against it." >&2
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4002 — the peer's record is not one this box's rail can USE." >&2
+printf '%s\n' "union: wrote=0 pushed=0 same=0 older_refused=0 conflicts=0 unkeyed=0 unreadable=2 failed=0"
+printf '%s\n' "union: refs=2 files=2 added=0 updated=0 skipped=2"
+printf '%s\n' "registry-sync.sh: 2 record(s) were SKIPPED because they could not be read or ordered — this is"
+printf '%s\n' "  NOT a converged state (a record this box cannot USE was skipped, on the store side or this box). Nothing was overwritten."
+exit 4
+SH
+chmod +x "$T/bin/rs-skip.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-skip.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an rc=4 registry does NOT fail the pass" || bad "hygiene: rc=4 produced rc=$RC — $OUT"
+case "$OUT" in *"4001"*"4002"*) ok "hygiene: ...and BOTH skipped keys reach the log" ;; *) bad "hygiene: the skipped keys are dropped — $OUT" ;; esac
+if [ "$(grep -o '4001' <<<"$OUT" | wc -l | tr -d ' ')" -le 2 ]; then
+  ok "hygiene: ...with no key repeated inside the [keys: …] datum"
+else
+  bad "hygiene: the same key is listed once per direction — $OUT"
+fi
+case "$OUT" in *"NOT a converged state"*) ok "hygiene: ...and the skip verdict is not truncated mid-sentence" ;; *) bad "hygiene: the skip verdict is cut at '— this is' — $OUT" ;; esac
 
 say_case "hygiene: a union killed by the BOUND (rc=143, no timeout(1)) is TIMED OUT, not FAILED-unknown"
 reset_state

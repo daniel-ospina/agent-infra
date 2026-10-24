@@ -2055,12 +2055,18 @@ run_hygiene() {
              # the same reviewed_at: …-3001 …-3002` logged as `registry rc=3 … skipped=0`. The
              # script prints that verdict line itself, so the doctor carries it through instead of
              # paraphrasing the state as "0 skipped".
-             rs_why="$(printf '%s\n' "$rs_out" | grep -E 'record\(s\) (DIVERGE|were SKIPPED)' | tail -1)"
+             # A SKIP VERDICT IS TWO LINES ("… were SKIPPED … — this is" + "NOT a converged state …"),
+             # so take the pair or the sentence dangles; a DIVERGE verdict is one line.
+             rs_why="$(printf '%s\n' "$rs_out" | grep -A1 -E 'record\(s\) (DIVERGE|were SKIPPED)' | tr '\n' ' ' | sed 's/   */ /g; s/ *$//')"
              # ⛔ AND THE KEYS TO ACT ON. The script prints `⚠️ skip <key> — …` per defective record, and
              # the doctor greps only the counts line and the verdict line, so the one datum an operator
              # needs (WHICH records) was dropped. The verdict line names conflicts, not skips, and a
              # skip on THIS box's own record is exactly the case the counts cannot express.
-             rs_keys="$(printf '%s\n' "$rs_out" | grep -E 'skip [^ ]+ —' | tail -3 | sed -E 's/.*skip ([^ ]+) —.*/\1/' | tr '\n' ' ' | sed 's/ *$//')"
+             # ⛔ DEDUPE BEFORE THE CAP: the script prints one `⚠️ skip <key> —` line PER DIRECTION, so
+             # one defective record yields two identical keys and `tail -3` would cap LINES, hiding a
+             # distinct third key behind a duplicate (the same artefact this head removed from
+             # `conflicts=`/`unreadable=`).
+             rs_keys="$(printf '%s\n' "$rs_out" | sed -nE 's/.*skip ([^ ]+) —.*/\1/p' | awk '!seen[$0]++' | head -3 | tr '\n' ' ' | sed 's/ *$//')"
              [ -n "$rs_why" ] || rs_why="no verdict line from the sync script"
              [ -z "$rs_keys" ] || rs_why="$rs_why [keys: $rs_keys]"
              log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs; $rs_why): nothing was overwritten, but a record this box cannot USE was skipped (on the store side or this box) or records DIVERGE here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."

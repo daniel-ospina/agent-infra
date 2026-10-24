@@ -706,11 +706,11 @@ write_local() { # <key> <content-file>
 
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
-PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0
+PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0 PULL_FAILED=0
 # The convergence counters (#2577). `ADDED`/`UPDATED` are PULL-side only — they describe what this
 # box's registry RECEIVED — while `WROTE` counts both directions. `files=` is read after the run.
 ADDED=0 UPDATED=0
-CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS="" PUSH_FAILED_KEYS=""
+CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS="" SAME_KEYS="" PUSH_FAILED_KEYS=""
 
 # ⛔ THE COUNTERS COUNT RECORDS, NOT EVENTS. `union` runs pull AND then push, so one defective key
 # is seen by BOTH directions and every increment happened twice: measured, ONE ambiguous local record
@@ -720,14 +720,27 @@ CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS="" PUSH_FAILED_KEYS=""
 # registers its key, and `summary()` prints DISTINCT keys. (The counts line is what an operator reads
 # and what the doctor logs; a number nobody can act on is worse than no number.)
 unreadable() { UNREADABLE=$((UNREADABLE + 1)); UNREADABLE_KEYS="$UNREADABLE_KEYS $1"; }
+# ⛔ `same=` IS COUNTED PER RECORD TOO. It was incremented by pull AND by push for one converged
+# record, so a steady-state `union` reported `same=2` for `refs=1 files=1` — the number a scheduler
+# trends, doubled in exactly the state #2577 made hourly.
+same_key()   { SAME=$((SAME + 1)); SAME_KEYS="$SAME_KEYS $1"; }
 failed()     { FAILED=$((FAILED + 1)); FAILED_KEYS="$FAILED_KEYS $1"; }
 # ⛔ `push_failed()` REGISTERS ITS KEY TOO, because `summary()` asks whether EVERY failure was on the
 # push side (`[ "$fcount" -eq "$pfcount" ]`). Comparing a DEDUPED total against an EVENT count answers
 # that question wrongly the moment one key fails in both directions: the pull's failure is deduped
 # away, the counts then look equal, and the operator is told "the pull side succeeded" while it did
-# not. (The arm structure makes that unlikely for one key — a pull only fails when it must WRITE, a
-# push only when it must PUBLISH — so this is defence, not a reproduced path; it costs one variable.)
+# not. (An earlier note here claimed the two could not both fail for one key; that is FALSE and was
+# measured — a symlinked registry entry makes the pull write a peer record while `push` still attempts
+# it, so both fail. `PUSH_FAILED_KEYS` stays for the disclosed count.)
 push_failed() { failed "$1"; PUSH_FAILED=$((PUSH_FAILED + 1)); PUSH_FAILED_KEYS="$PUSH_FAILED_KEYS $1"; }
+# ⛔ THE SIDE QUESTION NEEDS A SIDE-SCOPED MARKER, NOT A COUNT. `summary()` prints "could not be
+# PUBLISHED — the pull side succeeded" when every failure was a push, and it used to ask that by
+# comparing a deduped key count against the push-failure count — which answers it wrongly the moment
+# ONE key fails in both directions (measured, and reachable: a registry entry that is a SYMLINK makes
+# the pull WRITE a peer record while `registry_names` still feeds it to `push`, so both directions
+# fail for one key: exit 1 with "the pull side succeeded" printed over a failed pull). The dedupe
+# cannot express "was there any pull failure", so the pull side is counted explicitly here.
+pull_failed() { failed "$1"; PULL_FAILED=$((PULL_FAILED + 1)); }
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
   CONFLICT=$((CONFLICT + 1))
@@ -843,7 +856,7 @@ push_one() { # <key> <source-file>
   local sb
   sb="$(store_blob_of "$key")"
   if [ -n "$sb" ] && [ "$sb" != "-" ] && [ "$(local_blob_of "$f")" = "$sb" ]; then
-    SAME=$((SAME + 1)); return 0
+    same_key "$key"; return 0
   fi
   # ⛔ THE LOCAL SIDE IS GATED TOO, or `push` publishes a record whose own compared fields read one
   # way to `field` and another to json — the shape that makes the ordering comparison decide on bytes
@@ -862,7 +875,7 @@ push_one() { # <key> <source-file>
     case "$DEC" in
       skip)   say "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
               SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); return 0 ;;
-      same)   [ -n "$DEC_MSG" ] && say "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
+      same)   [ -n "$DEC_MSG" ] && say "  · $key — $DEC_MSG"; same_key "$key"; return 0 ;;
       supersede) say "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
       unreadable) warn "  ⚠️ skip $key — $DEC_MSG; refusing to overwrite it (#2374 rule 1)."
               unreadable "$key"; return 0 ;;
@@ -912,11 +925,11 @@ pull_one() { # <key>
   if [ -n "$sb" ] && [ "$sb" != "-" ]; then
     lf="$(local_record_for_key "$key" 2>/dev/null)" || lf=""
     if [ -n "$lf" ] && [ "$(local_blob_of "$lf")" = "$sb" ]; then
-      SAME=$((SAME + 1)); return 0
+      same_key "$key"; return 0
     fi
   fi
   lf=""
-  tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { failed "$key"; return 0; }
+  tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { pull_failed "$key"; return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     # The ref exists (it came from remote_refs) but carries no readable record.json: that is a
     # DEFECT in the store, not "nothing to pull". Reported, because `status` would otherwise list
@@ -971,7 +984,7 @@ pull_one() { # <key>
   fi
   lf=""
   if lf="$(local_record_for_key "$key")" && [ -n "$lf" ]; then
-    same_bytes "$lf" "$tmp" && { SAME=$((SAME + 1)); rm -f "$tmp"; return 0; }
+    same_bytes "$lf" "$tmp" && { same_key "$key"; rm -f "$tmp"; return 0; }
     # ⛔ THE FOURTH SURFACE. The peer is gated above, but every arm below DECIDES by comparing
     # `field` readings of THIS box's record against the peer — so an ambiguous local record decides
     # too. Measured with a nested `evidence.reviewed_at` on an earlier line: `field` read 2020 while
@@ -1021,10 +1034,10 @@ pull_one() { # <key>
              # both rest on — and it is counted as a write, because it is one.
              if [ "$lf" = "$REG_DIR/$key.json" ] && [ "$(command cat "$lf")" = "$(command cat "$tmp")" ] && write_local "$key" "$tmp"; then
                say "  · canon $key — the only difference was trailing newlines; rewrote it to the published bytes"
-               WROTE=$((WROTE + 1)); SAME=$((SAME + 1)); rm -f "$tmp"; return 0
+               WROTE=$((WROTE + 1)); same_key "$key"; rm -f "$tmp"; return 0
              fi
              say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
-             SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
+             same_key "$key"; rm -f "$tmp"; return 0 ;;
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac
       fi
@@ -1039,7 +1052,7 @@ pull_one() { # <key>
     if [ -n "$lf" ]; then UPDATED=$((UPDATED + 1)); else ADDED=$((ADDED + 1)); fi
   else
     warn "  ⚠️ FAILED $key — could not write $REG_DIR/$key.json"
-    failed "$key"
+    pull_failed "$key"
   fi
   rm -f "$tmp"; return 0
 }
@@ -1213,7 +1226,10 @@ summary() { # <verb>
   # ambiguous local record read `unreadable=2` / `skipped=2` / "2 record(s) were SKIPPED", and two
   # defective records read 4. The convergence line's `skipped=` is the number a scheduler trends, so
   # an inflated one is worse than none.
-  local ucount="$UNREADABLE" fcount="$FAILED"
+  local scount="$SAME" ucount="$UNREADABLE" fcount="$FAILED"
+  if [ -n "$SAME_KEYS" ]; then
+    scount="$(printf '%s\n' $SAME_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  fi
   if [ -n "$UNREADABLE_KEYS" ]; then
     ucount="$(printf '%s\n' $UNREADABLE_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   fi
@@ -1225,7 +1241,7 @@ summary() { # <verb>
     pfcount="$(printf '%s\n' $PUSH_FAILED_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   fi
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
-    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$ucount" "$fcount"
+    "$1" "$WROTE" "$PUSHED" "$scount" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$ucount" "$fcount"
   # THE CONVERGENCE LINE (#2577). Printed LAST so a caller that greps `^<verb>:` for the tail (the
   # rail and the cell bring-up both do) reports the numbers a stalled sync makes visible, instead of
   # a breakdown that reads identical whether the 3,000 fleet records arrived or none did.
@@ -1235,7 +1251,7 @@ summary() { # <verb>
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
     # failed PUSH means the records WERE read and this box could not publish. Naming both as a single
     # records-are-UNKNOWN state sent an operator to re-run a path that fails identically.
-    if [ "$pfcount" -gt 0 ] && [ "$fcount" -eq "$pfcount" ]; then
+    if [ "$pfcount" -gt 0 ] && [ "$PULL_FAILED" -eq 0 ]; then
       warn "registry-sync.sh: $fcount record(s) could not be PUBLISHED — the pull side succeeded, so this box"
       warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
     else

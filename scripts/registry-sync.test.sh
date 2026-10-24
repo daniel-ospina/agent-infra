@@ -1002,6 +1002,15 @@ RS_LAST="$(rsx "$STORE10" "$BOX13" push 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30e push refuses an ambiguous LOCAL record (exit 4)"
 assert_contains "$RS_LAST" "not one this box's rail can USE" "§30e ...naming the reason"
 assert_contains "$RS_LAST" "a record this box cannot USE was skipped" "§30e ...and the summary does not blame the store for a LOCAL defect"
+# ⛔ THE ASSERTION THAT ACTUALLY MATTERS HERE, and it was deleted once: a mutant that keeps
+# `unreadable "$key"` but FALLS THROUGH instead of returning publishes the ambiguous record, prints the
+# same `unreadable=1`, exits 4, and passed the whole suite (measured: PASS=208 FAIL=0 with
+# `refs/reviews/…-2102` present on the store). Nothing can clear it afterwards (rule 2 has no delete).
+if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null 2>&1; then
+  bad "§30e the ambiguous LOCAL record was PUBLISHED anyway"
+else
+  ok "§30e ...and nothing reached the store"
+fi
 
 # ── §30f: the FOURTH SURFACE. `pull_one` gates the PEER record, but every arm below decides by
 # comparing `field` readings of THIS box's record against it — so an ambiguous LOCAL record decides
@@ -1067,6 +1076,11 @@ git -C "$STORE12" init -q; git -C "$STORE12" remote add origin "$ORIGIN12"
 git -C "$STORE12" config user.email sync@test.invalid; git -C "$STORE12" config user.name sync-test
 git -C "$STORE12" commit -q --allow-empty -m seed; git -C "$STORE12" push -q origin HEAD:refs/heads/main
 K_CNT="daniel-ospina-agent-infra-2304"
+# ⛔ THE KEY MUST EXIST IN THE STORE, or `pull` never sees it and only `push` runs — the dedupe then
+# has nothing to collapse and the section passes on pre-fix code AND on a dedupe-disabled mutant
+# (measured: PASS=208 FAIL=0 for both). A usable peer record with an OLDER stamp is enough: the local
+# gate fires before any ordering, so the stamp is never compared.
+seed_payload "$STORE12" "$K_CNT" "{\"pr\":2304,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
 printf '{\n  "pr": 2304,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT.json"
 RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30h a defective record makes the union NOT converged (exit 4)"
@@ -1075,11 +1089,41 @@ assert_contains "$RS_LAST" "skipped=1" "§30h ...and the convergence line's skip
 assert_contains "$RS_LAST" "1 record(s) were SKIPPED" "§30h ...and the message names one record, not two"
 # and TWO defective records are still TWO: a dedupe that also collapsed distinct keys would be worse
 K_CNT2="daniel-ospina-agent-infra-2305"
+seed_payload "$STORE12" "$K_CNT2" "{\"pr\":2305,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
 printf '{\n  "pr": 2305,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT2.json"
 RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30h two defective records still exit 4"
 assert_contains "$RS_LAST" "unreadable=2 " "§30h ...and are counted as TWO distinct records (not 4 events)"
 assert_contains "$RS_LAST" "2 record(s) were SKIPPED" "§30h ...and the message says two"
+
+# ── §30h(2): the "every failure was on the push side" sentence. It cannot be decided by comparing
+# deduped counts, because ONE key can fail in BOTH directions: a registry entry that is a SYMLINK is
+# treated as ABSENT by `local_record_for_key` (so the pull must WRITE the peer record) while
+# `registry_names` still feeds it to `push` (so the push must PUBLISH it) — with an unwritable target
+# and a store that refuses pushes, both directions fail for that key. Measured before the fix: exit 1
+# with "could not be PUBLISHED — the pull side succeeded" printed over a FAILED pull.
+echo "── §30h(2) a failure on BOTH sides is never reported as 'the pull side succeeded'"
+ORIGIN13="$T/origin13.git"; STORE13="$T/store13"; BOX16="$T/box16"
+git init -q --bare "$ORIGIN13"; mkdir -p "$STORE13" "$BOX16"
+git -C "$STORE13" init -q; git -C "$STORE13" remote add origin "$ORIGIN13"
+git -C "$STORE13" config user.email sync@test.invalid; git -C "$STORE13" config user.name sync-test
+git -C "$STORE13" commit -q --allow-empty -m seed; git -C "$STORE13" push -q origin HEAD:refs/heads/main
+K_BOTH="daniel-ospina-agent-infra-2306"
+# ⛔ THE PEER MUST BE **OLDER** AND THE LOCAL RECORD **NEWER**, or the push SKIPS (rule 1) instead of
+# publishing and only one side fails. With the peer older: `pull` sees no usable local record (a symlink
+# is deliberately treated as absent) so it MUST WRITE, and `push` reads the symlink's target, finds
+# itself newer, and MUST PUBLISH — both directions fail for ONE key (measured: two FAILED lines,
+# `failed=1`).
+seed_payload "$STORE13" "$K_BOTH" "{\"pr\":2306,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T10:00:00Z\"}"
+# the store refuses every push, so the push side cannot publish
+printf '#!/bin/bash\nexit 1\n' > "$ORIGIN13/hooks/pre-receive"; chmod +x "$ORIGIN13/hooks/pre-receive"
+# the box's record is reachable ONLY through a symlink, so the pull cannot write it (and the push reads it)
+printf '{"pr":2306,"head_sha":"%s","verdict":"not-clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-12-31T10:00:00Z"}' "$HEAD_B" > "$T/symlink-target"
+ln -s "$T/symlink-target" "$BOX16/$K_BOTH.json"
+RS_LAST="$(rsx "$STORE13" "$BOX16" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "1" "§30h(2) a key that fails on both sides exits 1"
+assert_contains "$RS_LAST" "could not be moved" "§30h(2) ...and is reported as NOT moved, not as a push-only failure"
+if grep -q 'pull side succeeded' <<<"$RS_LAST"; then bad "§30h(2) a two-sided failure claims the pull side succeeded"; else ok "§30h(2) ...and never claims the pull side succeeded"; fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
