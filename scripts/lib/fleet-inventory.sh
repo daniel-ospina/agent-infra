@@ -1002,7 +1002,11 @@ fleet_row_second_controller() {
   # its plist as `O`, so an operator who activated it somewhere else would otherwise be judged against
   # a directory the job does not use (a permanent false MISSING, or worse a false OK against the wrong
   # dir). The seam stays as the fallback for a box with no job.
-  declared="$(fleet_plist_value "$label" O)"
+  # ⛔ `EnvironmentVariables.O`, not `O`: the template declares it inside the env dict, and
+  # `fleet_plist_value` extracts a TOP-LEVEL key (plutil -extract). Reading the root key returned
+  # nothing and the row silently fell back to the seam — a healthy controller at a non-default path
+  # read MISSING, which is the false red this line exists to prevent.
+  declared="$(fleet_plist_value "$label" EnvironmentVariables.O)"
   [ -n "$declared" ] && o="$declared"
   local exp="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
   if [ ! -f "$plist" ]; then

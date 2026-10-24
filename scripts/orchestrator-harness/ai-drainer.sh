@@ -46,6 +46,9 @@
 #   LANE_TIMEOUT      the lane's own wall-clock cap (seconds)    default: 3000
 #   LANE_WAIT_MAX     how long the lock waits for the lane (s)   default: LANE_TIMEOUT+100
 #   LANE_POLL_S       poll interval while holding the lock (s)   default: 30
+#   RC_GRACE_S        how long to wait for the lane's exit-status file after its pid dies (s)
+#                     default: 30 — a dispatcher that records the status from a detached watcher
+#                     writes it a moment later, and calling that lane a refusal would be a false red
 #   PR_BUDGET         PRs one lane may process                   default: 6
 #   SLICE_WIDTH       PRs per slice                              default: 10
 #   SLICE_TOTAL       open-list length the slice wraps over       default: 70
@@ -101,7 +104,8 @@ say() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG" 2>/de
 # is a bash error) or a silent skip. A bad value falls back to the shipped default and says so.
 _num() { # <name> <value> <default>
   case "${2:-}" in
-    '' | *[!0-9]*) say "WARN: ${1}='${2:-}' is not a whole number — using ${3}" && printf '%s' "$3" ;;
+    '') printf '%s' "$3" ;;                     # an unset seam is the DEFAULT, not a mistake
+    *[!0-9]*) say "WARN: ${1}='${2}' is not a whole number — using ${3}" && printf '%s' "$3" ;;
     *) printf '%s' "$((10#$2))" ;;
   esac
 }
@@ -134,39 +138,58 @@ fi
 
 # ── GUARD 1: ONE AT A TIME, AND THE LOCK IS THE LANE'S OWN LIFETIME ────────────────────────────
 # ──8<── lock-guard ────────────────────────────────────────────────────────────────────────────
-if ! mkdir "$LOCK" 2>/dev/null; then
+# ⛔ THE LOCK IS CREATED ALREADY LABELLED. `mkdir "$LOCK"` and then writing `$LOCK/pid` leaves a
+# window in which the lock EXISTS AND NAMES NOBODY — and a contender that sees a pid-less lock calls it
+# stale and takes it, which is two lanes (the very defect the atomic reclaim was meant to close).
+# So: stage a labelled directory, then `rename(2)` it into place, then VERIFY the pid inside is ours.
+_lock_claim() {
+  local stage="$AI/state/.ai-drainer.lock.$$" pid_now
+  rm -rf "$stage" 2>/dev/null
+  mkdir -p "$stage" 2>/dev/null || return 1
+  printf '%s' "$$" >"$stage/pid" 2>/dev/null || { rm -rf "$stage"; return 1; }
+  if [ -e "$LOCK" ]; then rm -rf "$stage" 2>/dev/null; return 2; fi
+  # rename is atomic; if a competitor won, our staged dir lands INSIDE theirs, and the ownership check
+  # below sees their pid — we then remove our own staged dir and report the lock as taken.
+  mv "$stage" "$LOCK" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 2; }
+  pid_now="$(cat "$LOCK/pid" 2>/dev/null || printf '')"
+  if [ "$pid_now" = "$$" ]; then return 0; fi
+  rm -rf "$LOCK/$$" 2>/dev/null
+  return 2
+}
+_lock_holder_alive() { # prints the live holder's pid, or nothing
+  local p
+  for p in "$(cat "$LOCK/pid" 2>/dev/null || printf '')" "$(cat "$LOCK/lane-pid" 2>/dev/null || printf '')"; do
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+if ! _lock_claim; then
+  holder="$(_lock_holder_alive)" \
+    && { say "SKIP: drainer already running (pid $holder)"; exit 0; }
   pid="$(cat "$LOCK/pid" 2>/dev/null || printf '')"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    say "SKIP: drainer already running (pid $pid)"; exit 0
-  fi
   # ⛔ RECLAIM IS ATOMIC — `mv`, never `rm -rf` followed by `mkdir`. That pair is a race with a
-  # measured failure: two ticks both fail `mkdir`, both read the dead pid, both log "reclaiming"; A
-  # `rm -rf`s and re-creates the lock, then B's `rm -rf` DELETES A'S FRESH LOCK and B's own `mkdir`
-  # succeeds — two lanes start, and A's exit trap later removes B's lock so a third can start too.
-  # `mv` succeeds for exactly ONE contender (a directory can be renamed once), so the loser re-tests
-  # the live holder instead of claiming it.
+  # measured failure: two ticks both fail to claim, both read the dead pid, both log "reclaiming"; A
+  # re-creates the lock, then B's `rm -rf` DELETES A'S FRESH LOCK and B's own claim succeeds — two
+  # lanes start, and A's exit trap later removes B's lock so a third can start too. `mv` of a
+  # directory succeeds for exactly ONE contender.
   if mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
     say "STALE lock from pid ${pid:-?} — reclaimed atomically"
     rm -rf "$LOCK.stale.$$" 2>/dev/null
   else
-    pid="$(cat "$LOCK/pid" 2>/dev/null || printf '')"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      say "SKIP: drainer already running (pid $pid)"; exit 0
-    fi
-    say "SKIP: another tick at the lock reclaim race — it will dispatch, not this one"; exit 0
+    holder="$(_lock_holder_alive)" \
+      && { say "SKIP: drainer already running (pid $holder)"; exit 0; }
+    say "SKIP: another tick won the lock reclaim — it will dispatch, not this one"; exit 0
   fi
-  mkdir "$LOCK" 2>/dev/null || { say "SKIP: cannot take the lock at $LOCK"; exit 0; }
+  _lock_claim || { say "SKIP: cannot take the lock at $LOCK"; exit 0; }
 fi
 cleanup() { rm -rf "$LOCK" 2>/dev/null; }
-trap cleanup EXIT INT TERM
-# The lock names ITS OWN holder, so a concurrent tick can tell a live drainer from a stale directory.
-printf '%s' "$$" >"$LOCK/pid" 2>/dev/null
+trap cleanup EXIT
+# ──8<── /lock-guard ───────────────────────────────────────────────────────────────────────────
 # ⛔ THE BEAT IS WRITTEN AS SOON AS THE TICK OWNS THE LOCK, BEFORE any guard that can skip. Its
 # inventory row reads this file as the freshness signal, and a skipped tick is the NORMAL steady state
 # on a swap-bound box — written only after a dispatch, every legitimate skip would read LATE for ever.
 beat() { printf '%s\n' "$(date +%s)" >"$AI/state/ai-drainer.beat" 2>/dev/null; }
 beat
-# ──8<── /lock-guard ───────────────────────────────────────────────────────────────────────────
 # ── GUARD 2: CAPACITY — the measured floor, not a guess ────────────────────────────────────────
 # (15 lanes drove swap to 586 MB against the harness's own 600 MB floor.)
 swap_free_mb="${SWAP_FREE_MB:-}"
@@ -195,12 +218,22 @@ lanes=0
 # exists for (a lane storm on a swap-bound box). Count a pidfile whose pid is ALIVE and whose argv
 # names the worker runtime or one of the dispatchers that spawns it; a dead or recycled pid counts 0.
 _counts_as_lane() { # <command-line>
-  local c="$1" w
+  local c="$1" t b
   [ -n "$c" ] || return 1
-  case "$c" in pi | pi\ *) return 0 ;; esac
-  for w in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
+  # The worker runtime is a NODE script: `pi` has a `#!/usr/bin/env node` shebang, so after exec the
+  # process carries `node /opt/homebrew/bin/pi -p …` — argv[0] is `node`, and a `case "$c" in pi*)`
+  # test (and any test for a bare `pi` token) misses it. Match a token whose BASENAME is `pi`, and
+  # only when the token is a PATH: a shell that merely says the word (`bash -c 'echo pi'`) must not
+  # count as a lane.
+  for t in $c; do
+    case "$t" in
+      /*) b="${t##*/}"; [ "$b" = "pi" ] && return 0 ;;
+      pi) return 0 ;;                        # argv[0] literally `pi` (no shebang rewrite)
+    esac
+  done
+  for b in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
            chain-merge.sh dispatch-merge.sh; do
-    case "$c" in *"$w"*) return 0 ;; esac
+    case "$c" in *"$b"*) return 0 ;; esac
   done
   return 1
 }
@@ -255,12 +288,39 @@ wt="$AI/wt-drainer-$(date +%H%M%S)-$$"
 # A TIMEOUT is the one path that leaves it: the lane may still be writing in it, and deleting a live
 # lane's checkout is the P0 this fleet already paid for. Leftovers are pruned one per tick.
 rm_worktree() {
+  # ⛔ NEVER under a live lane. A signal to THIS tick (launchd bootout, a reboot, an operator's
+  # Ctrl-C on a hand-run copy) says nothing about the lane, which may be mid-edit in that checkout —
+  # `git worktree remove --force` there destroys uncommitted work, the P0 this fleet has already paid
+  # for. The pid is the guard, and it is the same guard the timeout branch relies on.
+  if [ -n "${lane_pid:-}" ] && kill -0 "$lane_pid" 2>/dev/null; then
+    say "WARN: lane $lane_pid is still live — leaving worktree $wt in place (a later tick reaps it once the pid is gone)"
+    return 0
+  fi
   git -C "$SEED_REPO" worktree remove --force "$wt" >/dev/null 2>&1 \
-    || say "WARN: could not remove the worktree at $wt — a reaper will; it is named, not silent"
+    || say "WARN: could not remove the worktree at $wt — a later tick reaps it; it is named, not silent"
 }
-trap 'beat 2>/dev/null; rm_worktree; cleanup' EXIT INT TERM
-# Bounded prune of worktrees whose directories are already gone (one per tick, so it always terminates).
-git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
+_on_signal() { beat 2>/dev/null; rm_worktree; cleanup; exit 143; }
+trap 'beat 2>/dev/null; rm_worktree; cleanup' EXIT
+trap _on_signal INT TERM
+# ⛔ `git worktree prune` IS NOT A LEFTOVER REAPER: it only drops administrative entries whose
+# directory is ALREADY GONE, and the one path that leaves a worktree (a TIMEOUT) leaves the directory
+# in place — so an earlier claim that "leftovers are pruned one tick later" was false. Reap them by
+# the pid the removal candidate's own name carries: a `wt-drainer-*` whose suffix pid is dead is
+# reclaimable; a live one is still in use.
+_reap_leftovers() {
+  local w pid_suffix n=0
+  for w in "$AI"/wt-drainer-*; do
+    [ -d "$w" ] || continue
+    pid_suffix="${w##*-}"
+    case "$pid_suffix" in '' | *[!0-9]*) continue ;; esac
+    kill -0 "$pid_suffix" 2>/dev/null && continue
+    git -C "$SEED_REPO" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w" 2>/dev/null
+    n=$((n + 1))
+  done
+  git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
+  [ "$n" -eq 0 ] || say "REAPED: $n leftover worktree(s) whose lane was gone"
+}
+_reap_leftovers
 if ! git -C "$SEED_REPO" worktree add -f "$wt" "$SEED_REF" >/dev/null 2>&1; then
   say "FAIL: cannot create a worktree at $wt from $SEED_REPO ($SEED_REF)"
   exit 1
@@ -271,6 +331,7 @@ fi
 # header names), and the dispatchers TRUNCATE `$O/bg/<name>.log` and `rm -f $O/bg/<name>.rc` on reuse:
 # the running lane's transcript is destroyed and its exit status is lost, so this tick would poll
 # ANOTHER lane's pid. Same shape as the worktree path above.
+lane_pid=""
 NAME="ai-drain-$(date +%H%M%S)-$$"
 say "START: slice=$start swap=${swap_free_mb}MB lanes=$lanes worktree=$wt lane=$NAME dispatcher=$DISPATCH"
 if ! bash "$DISPATCH" "$NAME" "$wt" "$BRIEF" "$LANE_TIMEOUT" >>"$LOG" 2>&1; then
@@ -291,7 +352,12 @@ if [ -z "$lane_pid" ]; then
   say "FAIL: dispatcher returned but $O/bg/$NAME.pid is missing or unreadable — the lock's lifetime cannot be established, so this tick reports failure instead of a false clean"
   exit 1
 fi
-printf '%s' "$lane_pid" >"$LOCK/pid" 2>/dev/null
+# ⛔ THE LOCK KEEPS THE TICK'S OWN PID, and the LANE gets its own record. Overwriting `pid` with the
+# lane's made the lock's "who holds this" answer point at a process that is NOT the drainer: anything
+# signalling the lock killed a lane, and a reader could not tell a stuck tick from a running lane. Both
+# are recorded because both mean "do not start another": a tick that died while its lane still runs
+# must not have a second lane added beside it.
+printf '%s' "$lane_pid" >"$LOCK/lane-pid" 2>/dev/null
 # A BEAT WHILE WE HOLD THE LOCK. A pass can legitimately last `LANE_TIMEOUT` seconds, and the
 # inventory row derives "fresh" from 2×this job's StartInterval — a healthy 50-minute pass would
 # otherwise read LATE against its own 20-minute interval. `beat()` is defined above, together with
@@ -303,9 +369,9 @@ while kill -0 "$lane_pid" 2>/dev/null && [ "$waited" -lt "$LANE_WAIT_MAX" ]; do
   waited=$((waited + LANE_POLL_S))
 done
 if kill -0 "$lane_pid" 2>/dev/null; then
-  # The lane outlived its own cap: leave its worktree (it may still be writing) and release the lock,
-  # because holding it longer would stop every future tick as well.
-  trap 'cleanup' EXIT INT TERM
+  # The lane outlived its own cap: leave its worktree (it may still be writing — `rm_worktree` refuses
+  # to touch a live lane's checkout) and release the lock, because holding it longer would stop every
+  # future tick as well.
   say "TIMEOUT: lane $lane_pid still alive after ${waited}s — releasing the lock; worktree $wt left in place"
   exit 0
 fi
@@ -315,10 +381,31 @@ fi
 # lane: the tick logs DONE, exits 0, and the inventory row reads healthy while nothing was dispatched
 # (the "installed but inert" state this change exists to end).
 rc_file="$O/bg/$NAME.rc"
+# ⛔ THE CONTRACT IS THE DISPATCHER'S, NOT THIS SCRIPT'S. `nonblocking-dispatch.sh` writes
+# `$O/bg/<name>.rc` from the dying worker; the older overlay `bg-dispatch.sh` writes NO status file at
+# all. Demanding one from a dispatcher that never produces it turns EVERY healthy lane on that box
+# into a FAIL — a permanent false red on the one health screen, i.e. the same defect from the other
+# side. So the capability is DETECTED (a dispatcher that names a `.rc` file writes one) and a
+# dispatcher without it gets a WARN naming the gap, not a fabricated verdict.
+if grep -q '\.rc' "$DISPATCH" 2>/dev/null; then RC_CAPABLE=1; else RC_CAPABLE=0; fi
 rc="$(cat "$rc_file" 2>/dev/null || printf '')"
+# A dispatcher that records the status from a DETACHED watcher writes it a moment AFTER the pid dies;
+# read it with a bounded grace so a healthy lane is not called a refusal for being prompt.
+g=0
+while [ -z "$rc" ] && [ "$RC_CAPABLE" = "1" ] && [ "$g" -lt "${RC_GRACE_S:-30}" ]; do
+  "$SLEEP_BIN" 1 2>/dev/null || "$SLEEP_BIN" 1
+  g=$((g + 1))
+  rc="$(cat "$rc_file" 2>/dev/null || printf '')"
+done
 if [ -z "$rc" ]; then
-  say "FAIL: lane $lane_pid vanished with NO exit status at $rc_file — it was refused or lost, not completed (see $O/bg/$NAME.log)"
-  exit 1
+  if [ "$RC_CAPABLE" = "1" ]; then
+    say "FAIL: lane $lane_pid vanished with NO exit status at $rc_file after ${g}s — it was refused or lost, not completed (see $O/bg/$NAME.log)"
+    exit 1
+  fi
+  # Not this tick's failure to report: the DISPATCHER records no status. Say so, every tick, so the
+  # gap is visible in the log rather than being either invented or hidden.
+  say "WARN: lane $lane_pid finished, but $DISPATCH records no exit status ($rc_file absent) — this tick cannot tell a completed lane from a refused spawn; ship a dispatcher that writes .rc"
+  exit 0
 fi
 if [ "$rc" != "0" ]; then
   say "FAIL: lane $lane_pid exited $rc — see $O/bg/$NAME.log"
