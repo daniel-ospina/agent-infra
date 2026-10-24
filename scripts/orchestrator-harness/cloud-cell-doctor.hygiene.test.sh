@@ -492,7 +492,12 @@ say_case "the temp idle floor is honoured at the value the operator set (HYGIENE
 # registry cites for HYGIENE_TMP_MIN_AGE_S (extensions/shared/heartbeat-progress-edges.ts).
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
 DEAD7="$(dead_pid)"
-TEN_MIN_AGO="$(python3 -c 'import datetime,time;print(datetime.datetime.utcfromtimestamp(time.time()-600).strftime("%Y%m%d%H%M"))')"
+# ⛔ LOCAL time, not UTC (review round 5): `touch -t` reads its stamp in the HOST'S zone, so a UTC
+# stamp is off by the offset — 10 minutes ago in UTC is 1 h 10 min in the future under CEST, and under
+# a negative offset it is hours old, flipping the two assertions below in opposite directions. Measured:
+# TZ=Europe/Madrid → FAIL=1, TZ=America/New_York → FAIL=1, TZ=UTC → 77/0. `fromtimestamp` (local) is
+# the zone `touch` will use.
+TEN_MIN_AGO="$(python3 -c 'import datetime,time;print(datetime.datetime.fromtimestamp(time.time()-600).strftime("%Y%m%d%H%M"))')"
 mk_tmpdir "cloud-cell-${DEAD7}.LLLL" "$TEN_MIN_AGO" >/dev/null
 HYGIENE_TMP_MIN_AGE_S=60 doc hygiene
 [ -e "$T/tmp/cloud-cell-${DEAD7}.LLLL" ] \

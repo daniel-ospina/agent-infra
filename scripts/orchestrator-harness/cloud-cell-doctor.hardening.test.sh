@@ -1365,7 +1365,12 @@ OUT="$(MERGE_READ_TIMEOUT=0 bash "$DOCTOR" merge 2>&1)"; RC=$?
 # of EVERY lane — including a LIVE one in a long model call (quiet log, flat CPU) — and that gate is
 # what the header names as the thing separating a wedge from a long call. REAP_MIN_S=0 removes the
 # age floor outright. Both were accepted, so both could kill the lane the reaper exists to spare.
-for _z in REAP_SAMPLE_S REAP_MIN_S; do
+# ⛔ HYGIENE_TMP_MIN_AGE_S belongs in this loop too (#2573): at 0 the age gate disappears and a
+# RECYCLED pid — the name's pid dead now, alive when the dir was written — is the only proof a temp dir
+# is idle, so a live suite's fixture becomes reap-able. The registry entry for the knob cites this
+# refusal as a guard (extensions/shared/heartbeat-progress-edges.ts), so an unpinned refusal is a
+# citation that can go stale silently.
+for _z in REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S; do
   OUT="$(env "$_z=0" bash "$DOCTOR" reap 2>&1)"; RC=$?
   [ "$RC" -eq 2 ] && result_has "must be > 0" \
     && ok "startup: a zero $_z is refused (0 makes the bound it configures vacuous)" \
