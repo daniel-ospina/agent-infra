@@ -409,21 +409,21 @@ function unquotedOnly(command: string): string {
  */
 export function stripHeredocBodies(command: string): string {
   const lines = command.split("\n");
-  const { starts, mask } = lineIndex(command);
   const out: string[] = [];
+  // The SAME carried state `maskHeredocData` uses (#1382 review cycle 1, P2): without it this path
+  // read a `<< n` on an arithmetic continuation line as an opener and dropped a real `git push`
+  // after it — behaviour inherited from the old regex, but it contradicted the "ONE opener reader"
+  // claim in `heredocOpenersIn`, and an invariant the code does not keep is how the next reader
+  // deletes the fix.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
   for (let i = 0; i < lines.length; i++) {
-    // #1382: the opener is decided by `realHeredocOpener` — ONE reader, so a MENTION of `<<EOF`
-    // inside a quoted argument or a comment cannot delimit a phantom body. That mattered here
-    // too: measured on this change's review, `rg 'x <<EOF' f` + a later line `EOF` swallowed a
-    // real `git push` between them, and the #2148 notice went SILENT — the failure direction
-    // this helper's own doc calls the worst one.
-    const open = realHeredocOpener(command, lines[i], starts[i], mask);
-    if (!open) {
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) {
       out.push(lines[i]);
       continue;
     }
-    const stripTabs = open.stripTabs;
-    const word = open.word;
+    const stripTabs = openers[0].stripTabs;
+    const word = openers[0].delim;
     // KEEP THE OPENING LINE WHOLE, drop the body and the terminator. The whole line is bash COMMAND
     // syntax — text after the redirect (`<<'MSG' && git push`) is still the command — so cutting at
     // the token dropped a real push that followed it on the same line, and a quoted `<<EOF` earlier
@@ -458,731 +458,1059 @@ export function isPushOrPrCreateCommand(command: string): boolean {
   return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
 }
 
-/** Line-start offsets + the module's ONE quote model, for a whole multi-line command. */
-function lineIndex(command: string): { starts: number[]; mask: boolean[] } {
-  const lines = command.split("\n");
-  const starts: number[] = [];
-  let at = 0;
-  for (const line of lines) {
-    starts.push(at);
-    at += line.length + 1; // the "\n" the split consumed
-  }
-  // ONE quote model over the WHOLE text, not per line: a quote can open on an earlier line, and
-  // a per-line model reads a mention inside it as a redirect (measured by review: a `--body 'see:`
-  // … `cat <<EOF'` argument blanked a REAL merge that followed it).
-  return { starts, mask: unquotedMask(command) };
-}
-
-/** Is the character at `at` escaped by an ODD number of preceding backslashes? */
-export function isEscaped(text: string, at: number): boolean {
-  let backslashes = 0;
-  while (at - 1 - backslashes >= 0 && text[at - 1 - backslashes] === "\\") backslashes++;
-  return backslashes % 2 === 1;
-}
-
-/**
- * Is the substitution opened at `subStart` (`` ` `` when `subOpenLen` is 1, `$(` when 2) still
- * unclosed at `at`? Conservative in the SAFE direction: when the balance cannot be decided the
- * answer is `false` ⇒ the opener is treated as quoted text ⇒ nothing is blanked ⇒ the gate still
- * sees the command.
- */
-export function substitutionOpenAt(
-  command: string,
-  subStart: number,
-  subOpenLen: number,
-  at: number,
-): boolean {
-  if (subOpenLen === 1) {
-    for (let k = subStart + 1; k < at; k++) {
-      if (command[k] === "`" && !isEscaped(command, k)) return false;
-    }
-    return true;
-  }
-  let depth = 1;
-  for (let k = subStart + 2; k < at; k++) {
-    if (isEscaped(command, k)) continue;
-    const c = command[k];
-    if (c === "(") depth++;
-    else if (c === ")") {
-      depth--;
-      if (depth === 0) return false;
-    }
-  }
-  return depth > 0;
-}
-
+/** One heredoc redirect found on a line. */
 export interface HeredocOpener {
-  /** Index of `<<` WITHIN the opener line. */
-  indexInLine: number;
-  /** Absolute index of the enclosing `"`-region's opening quote, or -1 (unquoted opener). */
-  regionStart: number;
-  /** Absolute index of the enclosing `$(`, `${` or backtick, or -1 for a plain redirect. */
-  subStart: number;
-  /** Absolute index of the `(`, `{` or backtick that OPENS the enclosing substitution. */
-  subOpenLen: number;
+  /** The delimiter word, quotes already removed (`EOF`, `MSG`, `E-O-F`). */
+  delim: string;
+  /** `<<-`: leading TABS are stripped from the body and the terminator. */
   stripTabs: boolean;
-  word: string;
 }
 
 /**
- * The heredoc opener on THIS LINE, or null when the line carries none the shell would honour.
+ * EVERY heredoc opener on one line, read QUOTE-, COMMENT- and ARITHMETIC-aware.
  *
- * A MENTION IS NOT AN OPENER, and guessing is a fail-open:
- *   - `rg 'x <<EOF' file` — the `<<EOF` sits inside quotes, so no body follows. Reading it as an
- *     opener made a later line that happens to be `EOF` close a "body", and every REAL command
- *     between the two was blanked (a measured fail-open, pinned in the #1382 tests).
- *   - `cat f # see <<EOF` — a COMMENT, which the shell ignores for the same reason.
- *   - a quote that opened on an EARLIER line — the mask is computed over the whole command, so
- *     the line-local variant of this bug cannot come back.
- * The one quoted position that IS a real redirect is a command substitution (`$( … )`, a
- * backtick), because the shell runs it: that is how `gh pr create --body "$(cat <<'EOF' … EOF)"`
- * is spelled. `subStart` records where that substitution opened, so the caller can tell whether
- * its consumer was visible on this line.
+ * ONE opener reader for the whole file: `stripHeredocBodies` (the #2148 notice) and
+ * `maskHeredocData` (the admin-merge gate's data model) both take their openers from here, so the
+ * two cannot disagree about which body exists — the drift this file keeps re-learning (two
+ * predicates, two answers). Ported from `extensions/main-worktree-guard/index.ts`
+ * (`_wtMaskHeredocBodies`), where four review rounds closed exactly these shapes; the reasons are
+ * kept with the code because each one was a measured defect, not a hypothetical:
+ *
+ *  - `<<` inside a QUOTED string or after a `#` comment is not a redirection (`echo "a << EOF"`
+ *    must not blank the rest of the command);
+ *  - `$(( 8 << n ))` is a SHIFT, not a heredoc — arithmetic depth is tracked (and, by
+ *    `maskHeredocData`, carried ACROSS lines, because an arithmetic expression may span them);
+ *  - `<<<WORD` is a HERE-STRING: an opener starts at the FIRST `<` of a `<` run, so none of the
+ *    three `<` may be read as a heredoc and no body may be hunted for;
+ *  - the delimiter is a SHELL WORD, so `<<1`, `<<9EOF` and `<<E-O-F` are legal (an
+ *    identifier-only regex never saw them, and their bodies were then scanned as commands);
+ *  - SEVERAL openers on one line (`cat <<A > x <<B`) have their bodies in opener order, so all of
+ *    them are returned; masking only the first left the second body readable.
+ *
+ * A `$`/backtick/backslash delimiter is EXPANDED by the shell at run time, so its terminator cannot
+ * be known statically: those are refused here and the body stays unmasked (fail-closed), exactly as
+ * before.
  */
-export function realHeredocOpener(
-  command: string,
-  line: string,
-  lineStart: number,
-  mask: boolean[],
-): HeredocOpener | null {
-  // ⛔ AN UNQUOTED DELIMITER IS A WHOLE SHELL WORD (cycle-7 review, P0, measured executed):
-  // `cat <<E-OF` … `E-OF` … `touch x` … `E` used to parse the delimiter as `E`, so the body was
-  // taken to end at the `E` and the REAL COMMAND LINE after it (`touch x`) was blanked — a
-  // command hidden from every gate, with no shadowing trick needed. The unquoted arm therefore
-  // accepts every character bash does except whitespace, shell metacharacters and quote/backslash
-  // (which START a quoted delimiter instead); the quoted arms take the quoted text verbatim.
-  const OPEN = /(?<!<)<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([^\s;&|()<>'"`\\]+))/g;
-  let m: RegExpExecArray | null;
-  while ((m = OPEN.exec(line)) !== null) {
-    const abs = lineStart + m.index;
-    const quoted = mask[abs] !== true;
-    let subStart = -1;
-    let subOpenLen = 0;
-    let regionStart = -1;
-    if (quoted) {
-      // Walk back to the first character of this quoted region, then decide what kind it is.
-      regionStart = abs;
-      while (regionStart > 0 && mask[regionStart - 1] === false) regionStart--;
-      if (command[regionStart] !== '"') continue; // '…' and $'…' carry no substitutions: text
-      // ⛔ AN ESCAPED SUBSTITUTION IS STILL TEXT (cycle-10 review, P0, measured executed). The scan
-      // used to read `\$(` and ``\` `` as LIVE substitutions, turning a quoted `<<WORD` MENTION
-      // into a real opener so the body was blanked while bash ran it — the exact fail-open this
-      // change exists to close, re-arranged. `unquotedMask` records no escape information, so the
-      // backslash parity must be checked HERE. Measured, each executing `gh pr merge 999 --admin`
-      // and each REFUSED by origin/main:
-      //     echo "\$(cat <<true"      ⏎ <body> ⏎ true
-      //     echo "\`cat <<:"         ⏎ <body> ⏎ :
-      // It must ALSO still be OPEN at the opener: a `$()` that already closed on this line puts
-      // the opener back in plain quoted text. Both checks bias toward "mention" (⇒ nothing is
-      // blanked ⇒ the gate still sees the command), never toward a blanked body.
-      for (let k = regionStart; k < abs; k++) {
-        if (isEscaped(command, k)) continue;
-        if (command[k] === "`") {
-          subStart = k;
-          subOpenLen = 1;
-          break;
-        }
-        if (command[k] === "$" && command[k + 1] === "(") {
-          subStart = k;
-          subOpenLen = 2;
-          break;
-        }
+export function heredocOpenersIn(line: string, state?: HeredocScanState): HeredocOpener[] {
+  const hits: HeredocOpener[] = [];
+  // ⛔ QUOTE STATE IS CARRIED ACROSS LINES (#1382 review cycle 1, P1 — verified: `echo "start` …
+  // `cat <<'EOF'` … `end"` is a quoted STRING to bash, but a fresh per-line state read the middle
+  // line as an opener and blanked every real command after it). A quoted string may span lines in
+  // bash, so a caller scanning a WHOLE command passes `state`, and this function resumes inside the
+  // string it left open.
+  let quote: string | null = state?.quote ?? null;
+  let atWordStart = true;
+  // Depth of `$(( … ))` / `(( … ))` on THIS line, where `<<` can only be a SHIFT. `state` carries
+  // it across lines for a caller that masks a WHOLE command: an arithmetic expression may span
+  // lines, and a continuation line starting `<< n ))` would otherwise be read as an opener with
+  // delimiter `n` — whose body never ends, blanking the rest of the command (a fail-OPEN, the one
+  // direction this file may not be wrong in).
+  let arith = state?.arith ?? 0;
+  let bare = state?.bare ?? 0;
+  const bareStack: number[] = state?.bareStack ?? [];
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
       }
-      if (subStart === -1) continue; // quoted text with no substitution: a mention
-      if (!substitutionOpenAt(command, subStart, subOpenLen, abs)) continue; // already closed: text
+      if (ch === quote) quote = null;
+      continue;
     }
-    if (!quoted) {
-      // An unquoted `#` that starts a word begins a comment; anything after it is prose.
-      const commentAt = commentStart(line, mask, lineStart);
-      if (commentAt !== -1 && commentAt < m.index) continue;
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      atWordStart = false;
+      continue;
     }
-    // ⛔ A BARE DELIMITER THAT IS PURELY NUMERIC IS NOT A HEREDOC (cycle-9 review, P2). An
-    // ARITHMETIC SHIFT is spelled exactly like an opener — `x=$(( 1 << 2 ))` — and the bare arm
-    // accepts any metacharacter-free run, so the `2` became a delimiter and the next line equal to
-    // `2` closed a PHANTOM body. In `stripHeredocBodies` that SILENCED the #2148 first-push notice
-    // (a once-per-session budget spent on silence — the direction that helper's own doc calls the
-    // worst one). A numeric delimiter is vanishingly rare as a real heredoc; the refusing/no-notice
-    // direction is the one that costs, so both consumers reject it.
-    if (m[4] !== undefined && /^\d+$/.test(m[4])) continue;
-    return {
-      indexInLine: m.index,
-      regionStart: quoted ? regionStart : -1,
-      subStart,
-      subOpenLen,
-      stripTabs: m[1] === "-",
-      // The delimiter is whichever arm of the OPEN alternation matched (quoted single, quoted
-      // double, or the bare word) — the alternation is what lets `<<E-OF`/`<<END.JSON` parse as the
-      // ONE word bash sees, which the previous single-arm pattern truncated at the first non-word
-      // character (cycle-7 review, P0).
-      // ⛔ NO `.trim()` (cycle-9 review, P2). bash takes a QUOTED delimiter VERBATIM, so `<<'  EOF  '`
-      // terminates on the literal line `  EOF  `; trimming made the masker's terminator `EOF`, so it
-      // closed EARLIER than bash, blanked the real `gh pr merge …` line as body, and the gate allowed
-      // it (measured executed; origin/main refused the same text). The bare arm cannot carry
-      // trailing whitespace — its character class excludes it — so nothing else needs trimming.
-      word: m[2] ?? m[3] ?? m[4] ?? "",
-    };
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === "#" && atWordStart) break; // comment: no redirection after it
+    if (ch === "$" && line[c + 1] === "(" && line[c + 2] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c += 2;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "(" && line[c + 1] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === "(") {
+      bare++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === ")") {
+      if (bare === 0 && line[c + 1] === ")") {
+        arith--;
+        bare = bareStack.pop() ?? 0;
+        c++;
+        atWordStart = false;
+        continue;
+      }
+      if (bare > 0) bare--;
+      atWordStart = false;
+      continue;
+    }
+    // An opener is the FIRST `<` of its run, and never a `<<<` here-string.
+    if (arith === 0 && ch === "<" && line[c + 1] === "<" && line[c + 2] !== "<" && line[c - 1] !== "<") {
+      const stripTabs = line[c + 2] === "-";
+      // The delimiter is the WHOLE shell WORD, which bash builds by CONCATENATION: `<<'E''OF'`,
+      // `<<'EOF'x` and `<<E"OF"x` are one word. Reading only the first quoted/unquoted segment (the
+      // first cut of this reader) produced a terminator that is a strict PREFIX of bash's, so the
+      // body search never ended, the mask ran to end of command, and every REAL command after the
+      // shell's true terminator became invisible — a fail-OPEN the reviewer measured (`cat <<'EOF'x`
+      // … `EOFx` … two admin merges → ALLOWED, where the pre-change text BLOCKED).
+      const word = heredocDelimiterWord(line, c + 2 + (stripTabs ? 1 : 0));
+      if (word !== null) hits.push({ delim: word, stripTabs });
+    }
+    atWordStart = /\s/.test(ch);
   }
-  return null;
-}
-
-/** Index of the line's comment start (an unquoted `#` at a word boundary), or -1. */
-function commentStart(line: string, mask: boolean[], lineStart: number): number {
-  for (let k = 0; k < line.length; k++) {
-    if (line[k] !== "#" || mask[lineStart + k] !== true) continue;
-    if (k === 0 || /[\s;&|(){}!]/.test(line[k - 1])) return k;
+  if (state) {
+    state.quote = quote;
+    state.arith = arith;
+    state.bare = bare;
+    state.bareStack = bareStack;
   }
-  return -1;
+  return hits;
 }
 
 /**
- * The ONE spelling-independent reader of a definition, for the shadowing scan in
- * `heredocBodyIsProgram`.
+ * The heredoc DELIMITER as the shell builds it: ONE word, assembled from every quoted and unquoted
+ * segment (`'E''OF'` → `EOF`, `'EOF'x` → `EOFx`, `E"OF"` → `EOF`).
  *
- * ⛔ IT RUNS ON A DEQUOTED COPY OF THE COMMAND, and that is the whole point. bash removes quotes
- * and backslashes from the WHOLE WORD, so every one of these DEFINES `cat`:
- *
- *     alias cat=bash          alias "cat"=bash        alias -- "cat"=bash
- *     alias c\at=bash         alias c"a"t=bash         \alias cat=bash
- *     al"ias" cat=bash        cat() { bash; }         function cat { bash; }
- *
- * Enumerating spellings is how this class kept escaping: the pre-#1382 scan demanded the exact
- * unquoted word, cycle-7 added ONE optional wrapper character (`["'\\]?`) around the NAME, and
- * cycle-8 measured `alias c\at=bash` EXECUTED with the body blanked (a P0 regression) — then the
- * optional `\\?` before the KEYWORD was dropped in the first draft of that fix, and `\alias
- * cat=bash` walked through the same door (caught by VGATE before commit). So the scan normalizes
- * instead of matching: strip `"`, `'` and `\` from the text (they are removal to bash, wherever
- * they sit), then look for the definition shapes in the result. Groups: 2 = `alias [--] NAME=`,
- * 4 = `[function] NAME ( )`, 6 = `function NAME`.
- *
- * Deliberately over-broad: a definition MENTIONED in quoted data (`echo 'alias cat=bash'`), or
- * inside a heredoc body, also matches — and that keeps the body READABLE, i.e. the refusing
- * direction. The dequoting is for a BOOLEAN test only, so no offset in this file depends on it.
+ * Returns null when the word cannot be resolved STATICALLY — it contains a `$` or a backtick (the
+ * shell EXPANDS the delimiter at run time, so the terminator is unknowable) or a backslash escape
+ * (bash removes it, so the literal word is not the delimiter either). Null means "no opener": the
+ * body stays READABLE, which is the fail-closed direction. No opener is recorded rather than a
+ * guessed one, because a guessed delimiter that is a PREFIX of the real one masks to end of command
+ * and hides real commands — the fail-OPEN this reader exists to prevent.
  */
-const DEFINITION_NAME_RE =
-  /(^|[\s;&|(){}])alias\s+(?:--\s+)?([^\s=;&|()]+)\s*=|(^|[\s;&|(){}])(?:function\s+)?([^\s;&|(){}]+?)\s*\(\s*\)|(^|[\s;&|(){}])function\s+([^\s;&|(){}]+)/g;
+function heredocDelimiterWord(line: string, from: number): string | null {
+  let i = from;
+  while (i < line.length && (line[i] === " " || line[i] === "\t")) i++;
+  let word = "";
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "'") {
+      const end = line.indexOf("'", i + 1);
+      if (end === -1) return null;
+      word += line.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      const end = line.indexOf('"', i + 1);
+      if (end === -1) return null;
+      const inner = line.slice(i + 1, end);
+      // A `$`/backtick inside double quotes is still an EXPANSION.
+      if (/[$`]/.test(inner)) return null;
+      // ⛔ A BACKSLASH INSIDE DOUBLE QUOTES MAKES THE WORD UNKNOWABLE (#1382 review cycle 2, P0).
+      // Bash removes it only before ``$\`"\\`` and newline (`<<"E\OF"` keeps `E\OF`); the previous
+      // line removed it before ANY character and produced the delimiter `EOF`, which never matches
+      // bash's terminator — so the mask ran to end of command and hid every real command after it
+      // (measured: two admin merges ALLOWED). Resolving bash's exact rule is possible but pointless:
+      // the body is only ever MASKED as an optimisation, so an escape here returns null (body
+      // readable, fail-closed) instead of risking a second, subtler disagreement with the shell.
+      if (inner.includes("\\")) return null;
+      word += inner;
+      i = end + 1;
+      continue;
+    }
+    if (ch === "\\") return null; // an escape bash removes: the literal word is not the delimiter
+    // ⛔ ONLY blanks and metacharacters END the word — `\r` is a WORD character to bash (#1382
+    // cycle-3 hardening). With `\s` here, a CRLF opener (`… <<'EOF'\r`) read the delimiter as `EOF`
+    // while bash's is `EOF\r`, so the terminator never matched and the mask ran to end of command.
+    if (/[\n \t;&|<>()]/.test(ch)) break;
+    if (ch === "$" || ch === "`") return null; // expanded at run time
+    word += ch;
+    i++;
+  }
+  return word === "" ? null : word;
+}
 
-/** What bash actually parses: quote characters and backslashes are removed, not part of a word. */
-function dequoteWhole(command: string): string {
-  return command.replace(/["'\\]/g, "");
+/** Carried scan state for a caller reading a WHOLE command line by line. */
+export interface HeredocScanState {
+  /** An UNCLOSED quote character carried across lines (a quoted string may span them). */
+  quote: string | null;
+  arith: number;
+  bare: number;
+  bareStack: number[];
 }
 
 /**
- * The readers on `DATA_READER_WORDS` whose ARGUMENT can itself be a program — the one flag that
- * turns a data reader into an interpreter. Kept beside the list rather than folded into it, so the
- * list keeps its stated meaning ("processes stdin without executing it") instead of an implied "…
- * unless a flag says otherwise".
+ * Commands whose STDIN is DATA: they consume a heredoc body without executing it, so the body is
+ * prose (a file's contents, a commit message, a report) and never a command.
+ *
+ * THE LIST IS SHAPED SO ITS FAILURE DIRECTION IS A REFUSAL: a consumer that is not here keeps its
+ * body READABLE (fail-closed, so an unknown command may still be scanned as before), and every
+ * entry must be a program that cannot run its stdin as code. That is why `sed`/`awk`/`ed`/
+ * `python`/`perl`/`node`/`xargs`/`eval`/`source` are ABSENT (each can execute text), and why `git`
+ * is handled separately and narrowly below.
  */
-const FILTER_READER_WORDS = new Set(["jq", "yq"]);
+const HEREDOC_STDIN_DATA_CONSUMERS = new Set([
+  "cat", "tee", "wc", "head", "tail", "grep", "egrep", "fgrep", "sort", "uniq", "cut", "tr",
+  "nl", "rev", "tac", "paste", "fold", "expand", "unexpand", "strings", "od", "xxd", "base64",
+  "md5sum", "sha1sum", "sha256sum", "shasum", "cksum", "file", "column", "comm", "join", "diff",
+  "jq", "less", "more",
+]);
 
 /**
- * Does this consumer read its PROGRAM from stdin — `jq -f -`, `yq --from-file /dev/stdin`?
+ * Commands that can only NAME a file: they neither run it nor hand it to something that can.
  *
- * ⛔ `jq`/`yq` are on the reader list because a filter ARGUMENT is data, and the list's own
- * rationale says "no `-f -`" — but nothing enforced that clause. `-f -` makes the BODY the filter,
- * and a jq filter can run programs (`system("…")`). Measured on this box: jq 1.7 refuses
- * `system/1 is not defined`, so the shape is NOT exploitable here — a build that has `system`
- * (jq 1.7.1+, and some `yq` variants) executes a body the masker had blanked (cycle-8 review, P2
- * latent). `grep -f -` / `rg -f -` are safe (patterns, not a program) and are NOT included; `sed`,
- * `awk` and `gawk` never reach this check at all (`gawk -f -` is why they are off the list).
+ * ⛔ SEPARATE FROM `HEREDOC_STDIN_DATA_CONSUMERS`, which answers a different question (what may
+ * CONSUME a heredoc body). `ls` does not read stdin at all, so listing it there would be a category
+ * error — but `ls *.md` after `cat >> notes.md <<'EOF'` is one of the most common lane sequences
+ * there is, and without it the glob arm reports the write-then-list shape as "written then executed"
+ * and the reported prose refusal comes back (measured in this change's own final probe). Every entry
+ * here can only display, stat or test a name: none of them can run a file's CONTENTS.
  */
-function readsProgramFromStdin(consumerText: string): boolean {
-  // `-f -`, `-f-`, `-f /dev/stdin`, `--from-file=-`, `--from-file /dev/stdin`. The separator may be
-  // an `=`, whitespace, NOTHING (an attached value) — all three are spellings gh's own flag parser
-  // family accepts, and the first version of this read required the `=`-less attached form only.
-  return /(^|[\s;&|(){}])(?:-f|--from-file)(?:[\s]*=[\s]*|[\s]+|)(?:-|\/dev\/stdin)(?=$|[\s;&|(){}])/.test(
-    consumerText,
+const HEREDOC_FILE_NAMING_ONLY = new Set([
+  ...HEREDOC_STDIN_DATA_CONSUMERS,
+  "ls", "stat", "du", "readlink", "realpath", "dirname", "basename", "echo", "printf", "test", "[",
+  // Filesystem MOVERS: they name a file, they never run its contents. Without these, the glob arm's
+  // basename match made the ordinary write-then-clean-up sequence (`cat >> notes.md <<'EOF'` …
+  // `rm *.md`) a "written then executed" refusal — the reported prose false positive returning from
+  // the other side (#1382 cycle 11 review, P2). `chmod` is here too: it cannot run a file, and the
+  // `chmod +x f; ./f` shape is caught by the SECOND segment's command word.
+  "rm", "mv", "cp", "find", "touch", "mkdir", "chmod", "ln",
+]);
+
+/**
+ * Is the reader at `word` SHADOWED anywhere in the command — by an alias, a function, or a `NAME=`
+ * assignment — so that the word no longer names the program we proved it was?
+ *
+ * ⛔ DEQUOTED, not spelled. Measured on the sibling change (#1382 cycle 8): `alias c\at=bash` and
+ * `alias c"a"t=bash` define `cat` as `bash`, and a scan that matched the SPELLING `cat` saw neither
+ * — the body was masked while bash executed it. The text is dequoted first, so every spelling of
+ * the name is considered; over-matching here only costs a refusal (the body stays readable).
+ */
+function heredocReaderIsShadowed(text: string, word: string): boolean {
+  const w = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const dequoted = text.replace(/["'\\]/g, "");
+  const anchored = (body: string) => new RegExp(`(^|[\\s;&|])${body}`);
+  return (
+    anchored(`alias\\s+${w}\\s*=`).test(dequoted) ||
+    anchored(`function\\s+${w}\\b`).test(dequoted) ||
+    anchored(`${w}\\s*\\(\\)`).test(dequoted) ||
+    anchored(`${w}=`).test(dequoted)
   );
 }
 
 /**
- * Net `(`+`{` minus `)`+`}` OUTSIDE quotes, from the START of the command to `offset`.
+ * The FILE PATHS a heredoc-opening line may write its body to: every `>`/`>>` redirect target, and
+ * every non-flag argument of `tee`.
  *
- * A POSITIVE result means `offset` sits inside a construct the shell has not closed yet, so a
- * heredoc opener there is NESTED (`{ … }`, `( … )`, `f() { … }`, `$( … )`) and the body's consumer
- * is decided on a LATER line — beyond what `heredocBodyIsProgram` can see in the opener line.
+ * WHY THIS EXISTS. Masking a body is sound only while the body cannot be EXECUTED. A body written
+ * to a file and run by a LATER line of the SAME command is executable in one more step than the
+ * `cat > x.sh <<'EOF' … EOF && bash x.sh` shape (which rule (1) already refuses) — and there the
+ * file's name appears again as a word, which is the one thing that can be checked statically:
+ *
+ *   cat > /tmp/x.sh <<'EOF'
+ *   gh pr merge 999 --admin
+ *   EOF
+ *   bash /tmp/x.sh
+ *
+ * Before masking, that body was scanned (over-broad, but it caught this). So a target that
+ * reappears on a line that can EXECUTE a file — after an interpreter/runner word, or as that
+ * line's own COMMAND WORD — is treated as unprovable and the body STAYS READABLE. A refusal, the
+ * direction this file is allowed to be wrong in, and narrow on purpose: a target that recurs in a
+ * plain command (`git add CHANGELOG.md` after `cat >> CHANGELOG.md <<'EOF'`, the most common lane
+ * sequence there is) executes nothing, so it must not bring the prose refusal back. The argv layer
+ * (#984) would catch the execution anyway; not relying on that is the point, because the residual
+ * must not be silent.
  */
-function openConstructDepth(command: string, offset: number): number {
-  const mask = unquotedMask(command);
-  const frames = shellFrameStack(command, offset, mask);
-  return frames.length;
-}
-
-/** A construct the shell has opened and not yet closed, before the heredoc opener. */
-type ShellFrame = "paren" | "brace" | "if" | "loop" | "case";
-
-const KEYWORD_FRAME: Record<string, ShellFrame> = {
-  if: "if",
-  for: "loop",
-  while: "loop",
-  until: "loop",
-  select: "loop",
-  case: "case",
-};
-
-const KEYWORD_CLOSES: Record<string, ShellFrame> = {
-  fi: "if",
-  done: "loop",
-  esac: "case",
-};
-
-/** Characters that end a shell WORD — everything else accumulates into one word. */
-const SHELL_WORD_STOP = /[\s;&|(){}<>`"'\\]/;
-
 /**
- * The stack of constructs OPEN, unclosed, at `offset`. Non-empty ⇒ the heredoc's consumer is not
- * visible at that offset.
+ * The COMMAND WORD of a heredoc-opening line — its reader name as bash would resolve it, with the
+ * opener and everything after it cut off and every quote removed (`c"a"t <<'EOF'` → `cat`,
+ * `cat<<'EOF'` → `cat`).
  *
- * ⛔ KEYWORD COMPOUNDS WERE INVISIBLE (cycle-10 review, P0, measured executed). This counted only
- * `(`/`{`, so bash's KEYWORD frames — `if … fi`, `for|while|until|select … done`, `case … esac` —
- * contributed nothing. A body then piped or stored by a keyword compound was blanked as DATA while
- * bash ran it, and `origin/main` refused the identical text — a REGRESSION, not a pre-existing
- * hole, because this change made `maskHeredocData` upstream of `isGitOp`, so a masked-out merge no
- * longer even reaches the gate. Measured, each executing `gh pr merge 999 --admin`:
- *     if true; then ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ : ⏎ fi | bash
- *     for x in 1; do ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ : ⏎ done > /tmp/p.sh ⏎ bash /tmp/p.sh
- * The `:` line is what beat the old 2-line forward window, so the frame itself must be the signal.
- *
- * A STACK, not a count: a `case` ARM ends with `)` (`case x in a) …`), which a bare counter reads as
- * closing a `(`, and `}` must not pop an `if`. A closer pops the nearest matching frame and is
- * ignored when no such frame is open, so an unbalanced closer can never HIDE an open construct —
- * the sign of the error stays on the fail-closed side.
+ * ⛔ FULLY DEQUOTED, edges and interior alike (#1382 review cycle 1, P2): stripping only the edges
+ * left `c"a"t` and `c\at` unrecognised as the data consumer they are, so a two-merge PROSE body
+ * under them was still refused — the exact false positive this change exists to remove.
  */
-function shellFrameStack(command: string, offset: number, mask: boolean[]): ShellFrame[] {
-  const frames: ShellFrame[] = [];
-  const popNearest = (kind: ShellFrame): void => {
-    for (let k = frames.length - 1; k >= 0; k--) {
-      if (frames[k] === kind) {
-        frames.length = k; // everything opened after it is closed with it
-        return;
-      }
-    }
-  };
-  let i = 0;
-  while (i < offset) {
-    if (mask[i] !== true) {
-      i++; // quoted: not shell syntax
-      continue;
-    }
-    const c = command[i];
-    if (c === "(") {
-      frames.push("paren");
-      i++;
-      continue;
-    }
-    if (c === "{") {
-      frames.push("brace");
-      i++;
-      continue;
-    }
-    if (c === ")") {
-      // A `)` that closes a `case` arm is an arm terminator, NOT a closed `(`.
-      if (frames[frames.length - 1] === "case") {
-        i++;
-        continue;
-      }
-      popNearest("paren");
-      i++;
-      continue;
-    }
-    if (c === "}") {
-      popNearest("brace");
-      i++;
-      continue;
-    }
-    if (SHELL_WORD_STOP.test(c)) {
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < offset && mask[j] === true && !SHELL_WORD_STOP.test(command[j])) j++;
-    const word = command.slice(i, j);
-    const opens = KEYWORD_FRAME[word];
-    if (opens !== undefined) frames.push(opens);
-    else {
-      const closes = KEYWORD_CLOSES[word];
-      if (closes !== undefined) popNearest(closes);
-    }
-    i = j;
-  }
-  return frames;
+function heredocCommandWord(line: string): string {
+  const head = line.replace(/<<-?[\s\S]*$/, "");
+  const first = head.trim().split(/\s+/)[0] ?? "";
+  return first.replace(/["'\\]/g, "");
 }
 
 /**
- * Does anything that can reach the heredoc's stdin RUN it? Deliberately over-broad: a false
- * "yes" only keeps a refusal; a false "no" would let a program spell itself into a body.
- *
- * Five shapes were measured as fail-opens BEFORE this version, each executing
- * `gh pr merge 999 --admin` from a body the masker had blanked:
- *
- *   1. `$SHELL <<'EOF'`, `$(which sh) <<'EOF'` — the consumer is UNRESOLVABLE from the text, so
- *      it must be assumed to be a program (any pre-opener word carrying `$`/a backtick).
- *   2. `bash \\` + newline + `<<'EOF'` — bash removes backslash-newline before parsing, so the
- *      runner sits on the PREVIOUS line (`scanTokens` folds continuations for exactly this
- *      reason; the masker now does too, conservatively).
- *   3. `sh -c "$(` + newline + `cat <<'EOF' …` — the enclosing substitution opened on an earlier
- *      line, so its consumer is not visible here ⇒ program.
- *   4. `X=$(cat <<'EOF' … )` + `eval "$X"` — a body CAPTURED into a variable is runnable later,
- *      so an assignment-position substitution is a program.
- *   5. `echo "$(cat <<'EOF' … EOF)" | bash` — the pipe is on the line AFTER the terminator, so
- *      the pipe test covers the terminator line and the one that follows it.
+ * The `git` subcommands that can only NAME a file — never run one. Everything else (`bisect run`,
+ * `rebase --exec`, `submodule foreach`, `-c alias.x=!sh`, …) may EXECUTE the target, so an unknown
+ * subcommand is treated as an executor: the body stays readable, which is the refusal direction.
  */
-export function heredocBodyIsProgram(
-  command: string,
-  lines: string[],
-  openerLine: number,
-  terminatorLine: number,
-  opener: HeredocOpener,
-  lineStart: number,
-): boolean {
-  const line = lines[openerLine];
-  // A line ENDING in an odd number of backslashes continues onto the next PHYSICAL line, so the
-  // shell's logical line — and its consumer — is not the text this function can see:
-  //   `cat <<'EOF' \` + newline + `  | bash`   → the body is piped into bash;
-  //   `cat <<'EOF' \` + newline + `&& gh pr merge 999 --admin` → the folded line is COMMAND
-  //                                              text, not body, and must stay readable.
-  // The body also starts after the folded line, not after the physical one, so returning "program"
-  // is the only fail-closed answer (cycle-2 review, reproduced end-to-end: both executed).
-  if (/(^|[^\\])(\\\\)*\\$/.test(line)) return true;
-  // (3) the enclosing substitution (or the quote that holds it) began on an earlier line: its
-  // consumer is invisible here. TWO shapes, and the first was the mirror the cycle-2 review
-  // caught — the `"` opened earlier while the `$(` sits on the opener line:
-  //     sh -c "            ← the consumer, one line up
-  //     $(cat <<'EOF' …    ← the substitution starts HERE
-  if (opener.subStart !== -1 && opener.subStart < lineStart) return true;
-  if (opener.subStart !== -1 && opener.regionStart !== -1 && opener.regionStart < lineStart) {
-    return true;
+const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
+  "add", "rm", "mv", "status", "diff", "log", "show", "commit", "push", "fetch", "pull",
+  "checkout", "switch", "restore", "stash", "reset", "revert", "cherry-pick", "clone", "apply",
+  "tag", "branch", "remote", "blame", "grep", "ls-files", "rev-parse", "describe", "merge-base",
+  "worktree", "notes", "config", "cat-file", "hash-object",
+]);
+
+/** Would `line` EXECUTE the file named `target`?
+ *
+ * ⛔ SUBSTRING, not whole word, and the FIRST word decides (#1382 review cycle 1, P2 + cycle-2
+ * hardening). Three runner spellings bash ran were missed by a whole-word runner list — `bash x`,
+ * `. /tmp/x.sh` (POSIX dot-source) and `"$SHELL" /tmp/x.sh` — and so was `BASH_ENV=/tmp/x.sh` written
+ * on a LATER line: a list of executor words cannot be complete. So any line that MENTIONS the target
+ * may be running it, except a `git` line whose subcommand can only name a file. The over-refusal cost
+ * is paid only by a command that writes a file and then merely mentions it outside git (`cat >> X` …
+ * `grep X`), which is rare; the ordinary `cat >> CHANGELOG.md` … `git add CHANGELOG.md` sequence
+ * stays masked, which is the case that would otherwise bring the reported false positive back.
+ */
+function heredocLineExecutes(line: string, target: string, scope = line): boolean {
+  // ⛔ A PROCESS SUBSTITUTION RUNS A PROGRAM WITH THE TARGET AS ITS STDIN (#1382 cycle 10 review, P0 —
+  // measured: `cat /tmp/x.sh > >(bash)` executes the file and contains NO `|` at all, so the pipe arm
+  // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
+  // names the target AND carries one is treated as executing it.
+  if (/[<>]\(/.test(line) && heredocNamesTarget(line, target)) return true;
+  // FIND RUNS WHAT IT FINDS, so the target need not be named on the line (#1382 cycle 12 review, P0 —
+  // measured: `find . -execdir bash {}` masked the body, and `find` searches a TREE, so the written
+  // file may never appear by name). A NON-runner exec (`-exec rm {}`) is still naming, which is why
+  // the program word decides rather than the primary alone.
+  {
+    const prog = heredocFindExecProgram(line);
+    if (prog !== null && heredocWordIsProgram(prog)) return true;
   }
-  // (3b) THE OPENER SITS INSIDE A CONSTRUCT THAT OPENED ON AN EARLIER LINE ⇒ the consumer of that
-  // body is not in this line's text ⇒ program. Measured EXECUTED (cycle-9 review, P0):
-  //     f() {              ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ }
-  //     f | bash
-  // The closing `}` carries neither a pipe nor a redirect, so the forward window in (5)/(6) cannot
-  // see where the body goes; `f` prints `cat`'s output into the pipe. The same reasoning covers a
-  // multi-line `{ … }` / `( … )` group. A construct that CLOSES on the opener line stays DATA —
-  // `{ cat; } <<'EOF'` is pinned data — and so does `--body "$(cat <<'EOF'`, whose substitution (and
-  // therefore its consumer `cat`) sits on that same line.
-  if (openConstructDepth(command, lineStart) > 0) return true;
-  // (2) a line continuation hides the runner on the previous line.
-  const prev = lines[openerLine - 1] ?? "";
-  if (/(^|[^\\])(\\\\)*\\$/.test(prev)) return true;
-  // (4) the consumer is not on this line at all: a COMPOUND command spanning lines attaches the
-  // redirect to its closing word —
-  //     (            /  { bash; }   /  if true; then … fi   <<'EOF'
-  //       bash
-  //     ) <<'EOF'
-  // — so the pre-opener text holds only a closer/keyword (or nothing). Unresolvable ⇒ program.
-  // (The pinned data shapes keep a real word before the opener: `cat`, `x=1 cat`, `{ cat; }`,
-  // `--body "$(cat`.)
-  const preWords = line
-    .slice(0, opener.indexInLine)
-    .split(/[\s;&|(){}!]+/)
-    .filter((w) => w.length > 0)
-    .map(dequote)
-    .filter((w) => w.length > 0)
-    // ⛔ A REDIRECTION IS NOT A CONSUMER (cycle-3 review, P1, measured executed). The closer test
-    // below asks "is every word before the opener a closer/keyword?" so that a compound command
-    // spanning lines — `(` ⏎ `bash` ⏎ `) <<'EOF'` — is recognised as a program. A redirect between
-    // the two — `) 2>/dev/null <<'EOF'`, `) >/dev/null <<'EOF'` — used to make the check fail and
-    // the body be blanked, and the body then RAN. Redirections say nothing about what consumes
-    // stdin, so they are dropped before the question is asked.
-    .filter((w) => !REDIRECTION_WORD_RE.test(w));
-  if (preWords.every((w) => /^(?:\)|\}|fi|done|esac|then|else|do|;;|;|&)$/.test(w) || w === "")) {
-    return true;
-  }
-  // Pre-opener text SPLIT at the enclosing substitution: `consumerText` is what the substitution
-  // runs up to the opener (`cat`), `outerText` is everything before it (`sh -c "`, `X=`).
-  const before = line.slice(0, opener.indexInLine);
-  const consumerText =
-    opener.subStart === -1
-      ? before
-      : command.slice(opener.subStart + opener.subOpenLen, lineStart + opener.indexInLine);
-  const outerText = opener.subStart === -1 ? before : command.slice(lineStart, opener.subStart);
-  // (4) an assignment-position capture: the body is stored, and any later line may run it.
-  if (/(^|[\s;&|(){}!])[A-Za-z_][A-Za-z0-9_]*\+?=["']?$/.test(outerText)) return true;
-  // (5)/(6) WHERE THE BODY CAN GO — on the opener line (either side of the opener), and on the
-  // terminator line and the line that follows it. `piped` and the OUTPUT-REDIRECT test are the SAME
-  // question, so they share ONE window.
-  // ⛔ A REDIRECT OFF THE OPENER LINE WAS INVISIBLE (cycle-9 review, P0, measured executed). The
-  // redirect test ran on the OPENER line only, so each of these blanked the body while bash ran it,
-  // and origin/main refused the identical text:
-  //     echo "$(cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ )" > /tmp/p.sh   then   bash /tmp/p.sh
-  //     {                    ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ } > /tmp/p.sh   then   bash /tmp/p.sh
-  //     (                    ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ ) > /tmp/p.sh   then   bash /tmp/p.sh
-  // The store is one line BELOW the terminator in each, inside the same enclosing command.
-  const piped = (t: string): boolean => /(^|[^|])\|([^|]|$)/.test(t);
-  if (piped(before) || piped(line.slice(opener.indexInLine))) return true;
-  for (const t of lines.slice(terminatorLine, terminatorLine + 2)) {
-    if (piped(t)) return true;
-    for (const w of t.split(/[\s;&|(){}!]+/)) if (OUT_REDIRECT_WORD_RE.test(w)) return true;
-  }
-  // (6) A REDIRECTED BODY IS STORED, AND A STORED BODY CAN BE RUN LATER (cycle-3 review, P0,
-  // measured executed): `cat <<'EOF' > /tmp/p.sh` … `bash /tmp/p.sh` executes an admin merge, and
-  // `cat <<'EOF' > >(bash)` hands the body to bash through a process substitution. The old model
-  // tested only for `|`, so a redirect read as "not a pipe" and the body was blanked. Any `>` /
-  // `>>` / `&>` / `N>` after the opener — including the bare `>` a process substitution splits
-  // into — keeps the body readable. (`-` is not a redirect: `--body-file -` stays data.)
-  // ⛔ OUTPUT redirects ONLY. The heredoc's own opener token (`<<'EOF'`) is a redirection too, and
-  // testing it here blanked every ordinary heredoc — the whole `cat -A` / `jq .` / `tee` class
-  // became a false block. What matters is where the BODY can go, and `<`/`<<` only name where
-  // stdin comes FROM.
-  // ⛔ BOTH SIDES OF THE OPENER. A store can sit BEFORE it (`cat > /tmp/f.sh <<'EOF'`), and a
-  // scan of the right side alone let that body be blanked and then run (cycle-4 review, P0,
-  // measured executed — including its `(cat) > f` and `>>` spellings). This runs on the RAW
-  // slice, because the closer test above has already dropped redirection words from `preWords`.
-  const afterOpener = line.slice(opener.indexInLine);
-  for (const t of afterOpener.split(/[\s;&|(){}!]+/)) {
-    if (OUT_REDIRECT_WORD_RE.test(t)) return true;
-  }
-  for (const t of before.split(/[\s;&|(){}!]+/)) {
-    if (OUT_REDIRECT_WORD_RE.test(t)) return true;
-  }
-  // (7) DEFAULT IS PROGRAM (cycle-3 review, P1s measured executed). An UNRECOGNISED consumer is
-  // not evidence of data: `f() { bash; }` then `f <<'EOF'` runs the body, and any future runner
-  // would too. Data is the EXCEPTION and must be a reader whose only effect on stdin is to
-  // process it — so the consumer word must be on `DATA_READER_WORDS`. Everything else (a
-  // function, an alias, an interpreter the vocabulary has not met — `psql`, `gawk -f -`) stays
-  // READABLE, which can only make the gate refuse more.
-  // ⛔ THE CONSUMER IS THE LAST SIMPLE COMMAND, NOT THE FIRST WORD (cycle-5 review, P0, measured
-  // EXECUTED through the real hook and ALLOWED). A heredoc's stdin attaches to the LAST simple
-  // command on its line, so `cat; bash <<'EOF'`, `cat && bash <<'EOF'` and `cat & bash <<'EOF'`
-  // run the body in bash — while the earlier version read the line's FIRST word (`cat`, a
-  // whitelisted reader) as the consumer and blanked the body. The base commit blocked all of
-  // these, so this was a regression the allowlist introduced.
+  // ⛔ EVERY SEGMENT, not the whole line (#1382 review cycle 2, P1): `git status >/dev/null; bash
+  // /tmp/r.sh` starts with `git`, so a whole-line command-word test ruled the LINE a naming command
+  // and the body was masked while bash ran the file. A separator starts a new command, so each
+  // segment is judged on its OWN first word — and a GLOB is a mention too (`. /tmp/g1.*`), which is
+  // why the mention test lives INSIDE the loop rather than before it.
   //
-  // The split is on separators only, and the walk goes BACKWARDS, because a group's closer can be
-  // the last thing on the line while its real command is inside the group: `{ cat; } <<'EOF'` is
-  // DATA (pinned), and the segment `}` is a closer, not a consumer. A segment whose every word is
-  // a closer/keyword is skipped, and the previous segment's command is used.
-  // ⛔ A COMPOUND SHARES STDIN WITH EVERY COMMAND INSIDE IT (cycle-6 review, P0, measured
-  // EXECUTED and ALLOWED — `{ bash; cat; } <<'EOF'`, `(bash; cat) <<'EOF'`,
-  // `for i in 1; do bash; done <<'EOF'`). Reading "the last simple command" as the consumer is
-  // wrong for exactly those: EVERY command word in the compound reads the same stdin. A text
-  // scan cannot enumerate them reliably, so the model stops trying: a body is DATA only when the
-  // pre-opener text is ONE SIMPLE COMMAND whose command word is a pure reader. Any compound — a
-  // separator, a group, a subshell, a loop/keyword — keeps the body READABLE (fail-closed).
-  // This is a deliberate OVER-BLOCK: `{ cat; } <<'EOF'` and `(cat) <<'EOF'` are data and are now
-  // refused, because the same text with `bash` in place of `cat` executes the body and nothing in
-  // the string says which of the two the caller meant.
-  const simplePrefix = consumerText.replace(/^[\s]+/, "");
-  const COMPOUND_RE = /[;&|(){}]|(^|[\s])(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select|function|time)([\s]|$)/;
-  const isCloserWord = (w: string): boolean =>
-    /^(?:\)|\}|fi|done|esac|then|else|elif|do|;;|;|&|\{|\()$/.test(w);
-  const segments = consumerText
-    .split(/[;&\n]+/)
-    .map((seg) =>
-      seg
-        .split(/[\s|(){}!]+/)
-        .filter((w) => w.length > 0)
-        .map(dequote)
-        .filter((w) => w.length > 0)
-        .filter((w) => !REDIRECTION_WORD_RE.test(w)),
-    )
-    .filter((words) => words.length > 0);
-  let consumerWord = "";
-  for (let i = segments.length - 1; i >= 0; i--) {
-    const words = segments[i].filter((w) => !isCloserWord(w));
-    if (words.length === 0) continue;
-    // The command word of this segment: not a `NAME=value` assignment (`x=1 cat <<EOF`) and not a
-    // flag (`cat -A <<EOF`). Taking the LAST word instead made every ordinary flag argument the
-    // consumer (`-A`, `.`) — a fail-CLOSED bug, but a noisy one that refused `cat -A` / `jq .`.
-    consumerWord =
-      words.find((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && !/^-/.test(w)) ?? "";
-    break;
-  }
-  if (!DATA_READER_WORDS.has(consumerWord)) return true;
-  // ⛔ …and the reader's own FLAG can make it an interpreter (see `readsProgramFromStdin`).
-  if (FILTER_READER_WORDS.has(consumerWord) && readsProgramFromStdin(consumerText)) return true;
-  if (COMPOUND_RE.test(simplePrefix)) return true;
-  // ⛔ AND THE NAME IS NOT THE READER (cycle-4 review, P1, measured executed). A function
-  // definition followed by that name as the consumer runs the BODY through the function, not
-  // through the reader: `cat() { bash; }` then `cat <<'EOF'`. A definition anywhere in the text
-  // — `name()`, `function name`, with or without spaces — or a `PATH=` assignment that can put
-  // another program first, makes the name a guess, so the body stays readable. (A function
-  // EXPORTED from the caller's environment is not text-visible; STATED LIMIT, cited in the PR.)
-  // Both definition spellings: `name() { … }` (POSIX) and `function name { … }` / `function name()`
-  // (bash/ksh) — the second has no parentheses, which the first version of this guard missed.
-  // …and so is an ALIAS (cycle-6 review: `shopt -s expand_aliases` + `alias cat=bash` executed the
-  // body, and the definition scan did not look for it).
-  // ⛔ AND THE DEFINITION SPELLING MUST NOT MATTER (cycle-7 review, P1s measured executed):
-  // `alias -- cat=bash`, `alias "cat"=bash`, `\alias cat=bash` and `eval 'cat(){ bash; }'` all
-  // redefined the reader and all slipped a scan that demanded the exact unquoted spelling. The
-  // name may be quoted or backslash-escaped, `alias` may take `--`, and a definition may sit
-  // inside `eval`/`source` text — the characters are still in the command.
-  // ⛔ SO THE NAME IS RESOLVED, NOT MATCHED — ONE OPTIONAL WRAPPER WAS NOT ENOUGH (cycle-8 review,
-  // P0, measured EXECUTED and ALLOWED). bash removes quotes and backslashes from the WHOLE word,
-  // so `alias c\at=bash` and `alias c"a"t=bash` both define `cat`. The previous read allowed ONE
-  // wrapper character around the name (`["'\\]?`), matched neither spelling, blanked the body — and
-  // bash then ran it: measured on this change, `shopt -s expand_aliases` + `alias c\at=bash` +
-  // `cat <<'EOF' … EOF` put `pr merge 999 --admin` on argv (a recording `gh` first on PATH) while the
-  // handler allowed the command with ZERO gate lines; the unquoted `alias cat=bash` control was
-  // refused. The obfuscation class cannot be enumerated (that is how it slipped one round), so the
-  // name is compared AFTER the same quote/backslash removal the shell performs.
-  // The scan runs on a DEQUOTED copy (see `DEFINITION_NAME_RE`): bash's own removal rule, so no
-  // spelling of the keyword or the name has to be enumerated. `\alias cat=bash`, `al"ias"`,
-  // `alias c\at=bash` and `function cat` all reduce to the same text here.
-  const definitionText = dequoteWhole(command);
-  const definedNames = new Set<string>();
-  for (const m of definitionText.matchAll(DEFINITION_NAME_RE)) {
-    const name = m[2] ?? m[4] ?? m[6] ?? "";
-    if (name) definedNames.add(name);
-  }
-  if (definedNames.has(consumerWord)) return true;
-  if (/(^|[\s;&|(){}])PATH=/.test(command.slice(0, lineStart + opener.indexInLine))) return true;
-  // (1) any word that the shell still has to EXPAND (an unresolvable consumer) keeps the body
-  // readable — the consumer may turn out to be a program.
-  for (const text of [consumerText, outerText]) {
-    for (const raw of text.split(/[\s;&|(){}!]+/)) {
-      if (!raw) continue;
-      if (/[$`]/.test(raw)) return true;
-      const w = dequote(raw);
-      if (/[$`]/.test(w)) return true;
-    }
-  }
-  // (1b) a RUNNER vocabulary word in the OUTER text — the part before the substitution, e.g. the
-  // `sh -c "` that WRAPS `$(cat <<EOF …)`, so the substitution's output is piped into a shell.
-  // ⛔ NOT applied to `consumerText`: by the time this runs, (7) has already proved the consumer is
-  // a pure data reader, and its ARGUMENTS must not be read as commands. `jq . <<EOF` — the `.`
-  // that means `source` in COMMAND position is jq's identity filter here — was a false block until
-  // this split (cycle-3 review, P2).
-  // ⛔ ONLY WHEN A SUBSTITUTION EXISTS does `outerText` name anything but the consumer itself —
-  // with no substitution it IS `consumerText`, already decided by (7), and scanning it here made
-  // `jq .` (`.` is the `source` builtin in COMMAND position) a false block again.
-  const wrapperText = opener.subStart === -1 ? "" : outerText;
-  for (const raw of wrapperText.split(/[\s;&|(){}!]+/)) {
-    if (!raw) continue;
-    const w = dequote(raw);
-    if (!w) continue;
-    if (STDIN_PROGRAM_RUNNERS.has(w) || SHELL_PAYLOAD_RUNNERS.has(w) || SHELL_WRAPPER_WORDS.has(w)) {
-      return true;
-    }
-    if (STDIN_PROGRAM_INTERPRETER_RE.test(w)) return true;
-    if (SHELL_LIKE_WORD_RE.test(w) || SCRIPT_STDIN_RUNNER_RE.test(w)) return true;
-  }
-  // (1c) A CONSUMER THIS SAME COMMAND DEFINES (cycle-9 review, P1, measured executed):
-  //     f() { eval "$1"; } ⏎ f "$(cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ )"
-  // The INNER consumer is `cat` (a data reader) and the OUTER word `f` is in no runner vocabulary —
-  // but `f` is DEFINED in this same text and evals its argument, so the body RUNS. A word that
-  // names a function this command defines is not a reader, whatever it is called; the function's
-  // body is not text-visible here, so the rule does not try to read it. The measured data shape
-  // `gh issue create --body "$(cat …)"` stays DATA: `gh` is defined nowhere in the text.
-  for (const raw of wrapperText.split(/[\s;&|(){}!]+/)) {
-    if (!raw) continue;
-    const w = dequote(raw);
-    if (w && definedNames.has(w)) return true;
+  // ⛔ A READER THAT NAMES THE FILE MAY STILL RUN IT, ONE PIPE LATER (#1382 cycle 9 review, P0 —
+  // measured fail-open introduced by the reader exemption below). `heredocSegmentIsNaming` proves
+  // the READER cannot execute its argument, and the first version concluded the LINE could not
+  // either. That is false: the reader's own STDOUT is a handle. `cat > /tmp/x.sh <<'EOF' … EOF`
+  // followed by `cat /tmp/x.sh | bash` (or `| sh`, `| xargs … sh -c {}`) writes the body to a file
+  // and runs it, while the only segment naming the target starts with `cat` — so the body was
+  // masked and main refused the same command. The pipe is judged on the RAW line, before the
+  // separator split, because the split discards exactly the `|` that carries the meaning.
+  const pipedIntoProgram = heredocPipedIntoProgram(line);
+  for (const segment of line.split(/[;|&]+/)) {
+    if (!heredocNamesTarget(segment, target) && !heredocGlobMentions(segment, target)) continue;
+    if (pipedIntoProgram) return true;
+    if (!heredocSegmentIsNaming(segment, scope)) return true;
   }
   return false;
 }
 
-/** A shell spelled by basename or path (`bash`, `/bin/sh`, `fish`, `tcsh`, …). */
-const SHELL_LIKE_WORD_RE =
-  /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|xonsh|elvish)$/;
-/**
- * A program-spelled runner that reads a script from stdin. `osascript` with no file argument and
- * `Rscript -` both execute what they are given; listing them here can only keep a body READABLE.
- * (The fleet's `extensions/main-worktree-guard/classify-git.mjs` carries a wider list for the same
- * question — this is the review-enforcer's own vocabulary, and it errs toward "program".)
- */
-const SCRIPT_STDIN_RUNNER_RE = /(^|\/)(?:osascript|Rscript|perl|ruby|php|lua|tclsh)$/;
-/**
- * A word that MOVES a file descriptor: `>f`, `>>f`, `2>/dev/null`, `&>f`, `>|f`, `N>&M`. Used for
- * two decisions that pull in the same direction (cycle-3 review): a redirect is not a CONSUMER
- * (so it must not defeat the compound-closer test), and a redirect after a heredoc opener STORES
- * the body (`cat <<EOF > /tmp/p.sh`) — so the body can be run later and must stay readable.
- */
-const REDIRECTION_WORD_RE = /^(?:\d+|&)?(?:>>?|<<?|>\|)(?:&(?:\d+|-)|[^&|].*)?$|^(?:\d*)>&(?:\d+|-)$|^&>>?$/;
-/** The OUTPUT half only: a body redirected OUT of the pipeline (`>f`, `>>f`, `2>f`, `&>f`, `>|f`)
- * is STORED, so it can be run later. `<`/`<<` are excluded — they name where stdin comes from,
- * and the heredoc's own opener token is one of them. */
-const OUT_REDIRECT_WORD_RE = /^(?:\d+|&)?(?:>>?|>\|)(?:&(?:\d+|-)|[^&|].*)?$|^(?:\d*)>&(?:\d+|-)$|^&>>?$/;
-/**
- * ⛔ THE ONLY CONSUMERS THAT MAKE A HEREDOC BODY *DATA* (cycle-3 review). Each one processes stdin
- * without executing it: no shell escape, no `system()`, no `-f -`. Everything NOT on this list —
- * a shell, an interpreter, a function (`f() { bash; }` + `f <<EOF`), an alias, a program the
- * vocabulary has never met — is treated as a PROGRAM, so the body stays readable and the gate
- * still refuses. The list is deliberately short: a false entry here is a fail-OPEN (a body that
- * gets executed while the gate reads it as data), while a missing entry only costs a false block
- * on an exotic data sink.
- * ⚠️ `sed`/`awk`/`python`/`perl` are NOT here even though they are usually data filters: `sed`'s
- * `w`/`e` commands write and execute, `awk` has `system()`, and `gawk -f -` reads a PROGRAM from
- * stdin. They are already in `STDIN_PROGRAM_RUNNERS`, so they stay readable.
- */
-const DATA_READER_WORDS = new Set([
-  "cat", "head", "tail", "wc", "cut", "tr", "paste", "join", "comm", "nl", "fold", "expand",
-  "unexpand", "column", "rev", "tac", "grep", "egrep", "fgrep", "rg", "jq", "yq", "json",
-  "diff", "cmp", "od", "hexdump", "base64", "md5sum", "shasum", "sha1sum", "sha256sum",
-  "sha512sum", "cksum", "file", "xxhsum", "tsv2json",
-]);
+/** Does this word name a PROGRAM that can run text handed to it? The ONE vocabulary shared by the
+ *  pipe arm and the `find -exec` arm, so the two cannot disagree. */
+function heredocWordIsProgram(w: string): boolean {
+  if (!w) return false;
+  return (
+    STDIN_PROGRAM_RUNNERS.has(w) ||
+    STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+    /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w)
+  );
+}
 
-/**
- * THE GATE-FACING reader of heredoc bodies: blank out (length-preserving) every body that the
- * shell hands to a program as STDIN — i.e. every body that is DATA rather than code (#1382).
+/** The word after `find`'s exec primaries (`-exec`, `-execdir`, `-ok`, `-okdir`), or null. */
+function heredocFindExecProgram(line: string): string | null {
+  const words = line.trim().split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+  for (let i = 0; i < words.length; i++) {
+    if (/^-(exec|execdir|ok|okdir)$/.test(words[i]) && words[i + 1]) return words[i + 1];
+  }
+  return null;
+}
+
+/** Is any stage AFTER the first of this line's pipeline a PROGRAM RUNNER (`… | bash`,
+ *  `… | sh -s`, `… | python3`, `… | xargs … sh -c {}`)?
  *
- * `stripHeredocBodies` above answers the SAME question for a different consumer (the #2148
- * notice: "is this command a push?"); BOTH now take their opener from `realHeredocOpener`, so the
- * two cannot disagree about which body exists.
+ *  Reuses `STDIN_PROGRAM_RUNNERS` / `STDIN_PROGRAM_INTERPRETER_RE` — the same vocabulary
+ *  `dataCharMask`'s `pipedIntoRunner` uses — so the two cannot disagree about what a program is.
+ *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout.
  *
- * The bug this fixes, measured 2026-10-21 from a real lane log (cell-1, readlat):
- *
- *   [review-enforcer] 🚫 Admin-merge evidence gate blocked
- *   [review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)
- *
- * Both lines came from READ-ONLY commands whose payload merely quoted `gh pr merge --admin` —
- * the tokenizer splits on whitespace regardless of heredoc state, so a report line read exactly
- * like an invocation. Both were reproduced at the fix's base commit with a `cat <<'EOF'` heredoc,
- * which runs `cat`.
- *
- * Direction of error is the REFUSING one: a body is blanked only when its consumer is positively
- * known not to run it (see `heredocBodyIsProgram` for the five shapes that must stay readable),
- * an UNTERMINATED heredoc blanks nothing, and the opener/terminator lines are never blanked —
- * both are command syntax the shell consumes.
- *
- * STATED RESIDUALS (deliberate, fail-closed):
- *   - a body piped into a program that only STORES or PRINTS it (`cat <<EOF | tee f`,
- *     `| jq .`, `| gh pr comment --body-file -`) stays readable, because the pipe is what catches
- *     `| sh` and this layer does not enumerate benign sinks. A lane that pipes its report is
- *     therefore still refused;
- *   - two openers on ONE line (`cat <<'A' > x <<'B'`): only the first is handled (same residual
- *     as `stripHeredocBodies`);
- *   - `<<$X` / `<<\\EOF` (a delimiter the shell expands or escapes) is not treated as a body at
- *     all — the fail-closed reading.
- */
-export function maskHeredocData(command: string): string {
-  if (!command.includes("<<")) return command; // fast path: no heredoc syntax, nothing to mask
-  const lines = command.split("\n");
-  const { starts, mask } = lineIndex(command);
-  const out: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const open = realHeredocOpener(command, line, starts[i], mask);
-    if (!open) {
-      out.push(line);
+ *  ⛔ "THE SAME VOCABULARY" IS NOT "THE SAME PREDICATE" (#1382 cycle 10 review, P2 — corrected):
+ *  `pipedIntoRunner` accepts a WRAPPER word only when the word after it is a `STDIN_PROGRAM_RUNNERS`
+ *  member, while this function also accepts an interpreter or a path-spelled shell one word along
+ *  (`| env python3` is a runner here, data there). Today THIS side is the stricter one, so nothing
+ *  is open — but a reader who "unifies" them by copying `pipedIntoRunner`'s wrapper arm would
+ *  re-open `| env python3` on a body that python then executes. Narrowing this one to match is not
+ *  a simplification; it is a fail-open. */
+function heredocPipedIntoProgram(line: string): boolean {
+  // ⛔ SHELL GROUPING IS NOT PART OF THE PROGRAM NAME (#1382-c9 review, measured): a downstream stage
+  // written `(bash)`, `( bash )` or `{ bash; }` runs bash, and the first version compared the raw word
+  // `(bash)` against the runner sets, missed it, and MASKED the body — a fail-open on the same shape
+  // the pipe rule exists to catch. Leading `(`/`{`/`!` and trailing `)`/`}`/`;` are stripped before
+  // the comparison. Only the FIRST word is de-grouped, not every word: matching any word in the
+  // stage would re-break the ordinary `cat x.md | grep -i "sh"`, which is the false positive this
+  // whole change removes.
+  const deGroup = (w: string) => w.replace(/^[({!]+/, "").replace(/[)};]+$/, "");
+  const isRunner = heredocWordIsProgram;
+  // ⛔ A TOKEN BEFORE THE PROGRAM HIDES IT (#1382 cycle 10 review, P0 — measured: `| FOO=1 bash` and
+  // `| 2>/dev/null bash` both executed the written file while the body stayed masked). An assignment
+  // prefix and a leading redirection are both ordinary spellings, so they are SKIPPED — never the
+  // whole tail of the stage (see the grouping note above: that is what re-breaks `| grep -i "sh"`).
+  const isPrefixToken = (w: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d*[<>]/.test(w) || w === "!";
+  const stages = line.split(/(?<!\|)\|(?!\|)/);
+  for (let i = 1; i < stages.length; i++) {
+    // `|&` is a pipe with stderr folded in — the `&` is not a command word.
+    const words = stages[i].trim().replace(/^&\s*/, "").split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+    let k = 0;
+    while (k < words.length && isPrefixToken(words[k])) k++;
+    const first = deGroup(words[k] ?? "");
+    // `{ bash; }` — the first WORD is nothing but grouping, so the program is the NEXT word. This
+    // second look happens ONLY when the first word de-grouped to nothing; testing every word of a
+    // stage instead would make the ordinary `cat x.md | grep -i "sh"` a program runner and bring
+    // back the false positive this change exists to remove.
+    if (!first) {
+      let n = k + 1;
+      while (n < words.length && isPrefixToken(words[n])) n++;
+      if (isRunner(deGroup(words[n] ?? ""))) return true;
       continue;
     }
-    // The opener line is command syntax, kept whole (same rule and reasoning as
-    // `stripHeredocBodies`: text after the redirect on that line is still the command).
-    out.push(line);
-    let j = i + 1;
-    let closed = false;
-    for (; j < lines.length; j++) {
-      const probe = open.stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
-      if (probe === open.word) {
-        closed = true;
-        break;
+    if (isRunner(first)) return true;
+    // A wrapper word can hide the program one word along (`| env FOO=1 bash`, `| nice -n 5 sh`).
+    if (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(first)) {
+      for (const w of words.slice(k + 1)) {
+        const bare = deGroup(w);
+        if (!bare || isPrefixToken(bare) || bare.startsWith("-")) continue;
+        if (isRunner(bare)) return true;
       }
     }
-    if (!closed) {
-      // Unterminated: nothing is known to be data, so nothing is blanked.
-      for (let k = i + 1; k < lines.length; k++) out.push(lines[k]);
-      return out.join("\n");
+  }
+  return false;
+}
+
+/** A path as WRITTEN, normalized textually: `./a//b/./c` and `a/b/c` are the same file, and this
+ *  function makes them the same STRING. No filesystem access — the shell may not have run yet. */
+function heredocNormalizePath(p: string): string {
+  const abs = p.startsWith("/");
+  const parts: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      parts.pop();
+      continue;
     }
-    if (heredocBodyIsProgram(command, lines, i, j, open, starts[i])) {
-      for (let k = i + 1; k < j; k++) out.push(lines[k]);
-    } else {
-      // Length-preserving, so the caller can use these offsets against the SAME text.
-      for (let k = i + 1; k < j; k++) out.push(" ".repeat(lines[k].length));
+    parts.push(seg);
+  }
+  return (abs ? "/" : "") + parts.join("/");
+}
+
+/** Does any word in `text` NAME `target` the file?
+ *
+ *  ⛔ NORMALIZED, NOT SUBSTRING (#1382 cycle 9 review, P0 — second measured fail-open introduced by
+ *  the first version). Comparing the raw redirect target to the raw later word missed every spelling
+ *  that reaches the SAME file: `cat > ./rq.sh …` then `bash rq.sh`; `cat > /tmp/x.sh …` then
+ *  `cd /tmp; bash x.sh`; `bash /tmp//x.sh`; `bash /tmp/./x.sh`. Each was masked at the fix and
+ *  refused by main. So the BASENAME counts as a form too: a `cd` or a `./` prefix changes the word
+ *  without changing the file. Over-matching only keeps a body readable (a refusal), which is the
+ *  direction this file is allowed to be wrong in. */
+function heredocNamesTarget(text: string, target: string): boolean {
+  // ⛔ THE RAW SUBSTRING IS KEPT, on purpose, and it is not redundant with the word walk below: a
+  // path can hide inside a word that no path normalization reaches — `BASH_ENV=CHANGELOG.md bash -c
+  // true` names the file with an assignment prefix, and the normalized word comparison missed it
+  // (measured: an existing suite case went red within this change). Over-matching only keeps a body
+  // readable, which is a refusal, so the crude arm stays and the normalized arms are added ON TOP.
+  if (text.includes(target)) return true;
+  // ⛔ `~` / `$HOME` ARE THE SAME DIRECTORY, and on this fleet's macOS default the filesystem is
+  // case-INSENSITIVE (#1382 cycle 10 review, P2 — measured ALLOWED: `cat > ~/x.sh … bash $HOME/x.sh`,
+  // and `bash /tmp/X.SH` for `/tmp/x.sh`). Both sides are expanded to a placeholder home and folded
+  // to lower case before comparison; over-matching is a refusal here, the allowed direction.
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of text.split(/\s+/)) {
+    const w = canon(rawWord);
+    if (!w) continue;
+    if (w === norm) return true;
+    if (base && w === base) return true;
+    // An ABSOLUTE spelling whose tail is the target's path from some point (`bash sub/x.sh` for
+    // `./sub/x.sh`) — the `cd` that makes it absolute may sit on an earlier line.
+    if (w.endsWith("/" + norm)) return true;
+  }
+  return false;
+}
+
+/** Could a GLOB word on this line reach `target`? `. /tmp/g1.*` runs a file whose exact name the
+ *  written-target comparison cannot match, so a glob sharing the target's DIRECTORY counts. */
+function heredocGlobMentions(line: string, target: string): boolean {
+  // ⛔ THE GLOB ARM WAS DEAD FOR EVERY `./`, `../`, ROOT AND BARE-NAME TARGET (#1382 cycle 10
+  // review, P1 — a regression this change introduced). Normalizing the target's DIRECTORY turns
+  // `"./"` into `""`, so the `dir.length < 1` guard returned false before any comparison, and the
+  // pre-fix code (which compared the RAW `"./"` prefix) refused those same commands. Measured:
+  // `cat > ./x.sh … bash ./*.sh` and `cat > ../x.sh … bash ../*.sh` went from REFUSED on main to
+  // MASKED here.
+  //
+  // The glob is now expanded to a REGEX and matched against the target itself (normalized, folded to
+  // lower case, `~`/`$HOME` canonicalized), not against a directory prefix — so `./x.sh` vs `*.sh`,
+  // a bare `x.sh` vs `x*.sh`, and `/tmp/e.sh` vs `/tmp/e.s[h]` all match, while a glob naming a
+  // DIFFERENT file in the same directory does not. `[` is a metachar too (`bash /tmp/e.s[h]`).
+  if (!/[?*[]/.test(line)) return false;
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of line.split(/\s+/)) {
+    const w = canon(rawWord);
+    if (!w || !/[?*[]/.test(w)) continue;
+    const re = globToRegExp(w);
+    // ⛔ A GLOB THAT IS NOT A VALID REGEX MUST NOT THROW OUT OF THE GATE (#1382 cycle 11 review, P1 —
+    // measured: `bash f[z-a]` after writing `f.sh` threw `Range out of order in character class`
+    // from `maskHeredocData` inside the `tool_call` handler). It fails CLOSED today because pi blocks
+    // a tool call whose handler throws — but an unhandled exception on ordinary input is one
+    // `try/catch` away from being a fail-open, so an uncompilable glob is treated as MATCHING (the
+    // body stays readable) instead.
+    // `null` means the glob could not be compiled — treat it as MATCHING (the body stays readable).
+    let matched = re === null;
+    if (re !== null) {
+      try {
+        matched = re.test(norm) || (base ? re.test(base) : false);
+      } catch {
+        matched = true;
+      }
     }
-    out.push(lines[j]); // the terminator: command syntax, never blanked
-    i = j;
+    if (matched) return true;
+  }
+  return false;
+}
+
+/** `*`/`?`/`[...]` as a shell glob, anchored. Everything else is literal. */
+function globToRegExp(glob: string): RegExp | null {
+  let re = "^";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else if (ch === "[") {
+      const close = glob.indexOf("]", i + 1);
+      if (close === -1) re += "\\[";
+      else {
+        re += glob.slice(i, close + 1).replace(/\\/g, "\\\\");
+        i = close;
+      }
+    } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  // An invalid character class (`[z-a]`) is a shell glob bash LEAVES LITERAL but a regex compiler
+  // REJECTS. Returning null (rather than throwing) keeps the gate's decision in the gate.
+  try {
+    return new RegExp(re + "$");
+  } catch {
+    return null;
+  }
+}
+
+/** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
+ *  proven text reader (`wc -l file`, `grep x file`, `cat file`)?
+ *
+ * ⛔ THE READER EXEMPTION IS NOT A LOOPHOLE (#1382 cycle 2, and a measured self-inflicted false
+ * positive): without it, `cat >> notes.md <<'EOF' … EOF` followed by `wc -l notes.md` counted as
+ * "written then executed" and the prose refusal came back — writing a file and then CHECKING it is
+ * one of the most common lane sequences there is. A reader's own `exec` surface is what it does
+ * with its STDOUT, so it can only ever DISPLAY a file, never run it; anything outside that set
+ * (`bash`, `python3`, `source`, `chmod`, an unknown word) is still treated as an executor and keeps
+ * the body readable.
+ *
+ * ⛔ THAT SENTENCE WAS FALSE AND IS CORRECTED HERE (#1382 cycle 10 review, P2 — measured): several
+ * members of `HEREDOC_STDIN_DATA_CONSUMERS` carry an OPTION that runs a program — `sort
+ * --compress-program=/tmp/x.sh FILE` (executed on temp spill) and `less` (`LESSOPEN=|cmd`, `!cmd`)
+ * both MASK a body they can execute. The EXEMPTION is still right for the ordinary `grep x f` /
+ * `wc -l f` / `cat f` case, and the pipe/execution arms above bound the rest, but the guarantee is
+ * NOT "a reader can only display". What it really says is: this reader, with the arguments written
+ * here, cannot run the file. So the reason a future reader would give for adding the NEXT "reader"
+ * to that set — display-only — does not exist, and a member with an exec-bearing flag should be
+ * REMOVED from it. Stated rather than fixed: the option-flag class is not covered by this change.
+ * (See the declared residual in the #1382 issue comment; the argv layer (#984) is the layer that
+ * sees the real invocation.)
+ */
+function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
+  // ⛔ A NAMING WORD THAT WRAPS A COMMAND SUBSTITUTION PROVES NOTHING (#1382 cycle 11 review, P0 —
+  // measured ALLOWED: `ls "$(bash x.sh)"` and `echo "$(bash x.sh)"` masked a body they then ran).
+  // The substitution's OUTPUT is the argument, so the reader is not reading the file — something else
+  // is running it. Any `$(`, backtick or process substitution in the segment returns "not naming".
+  if (/\$\(|`|[<>]\(/.test(segment)) return false;
+  const words = segment.trim().split(/\s+/);
+  const commandWord = (words[0] ?? "").replace(/["'\\]/g, "");
+  // ⛔ SHADOWED IS NOT NAMING (#1382 cycle 11 review, P0 — measured ALLOWED: `ls() { bash "$@"; }`
+  // then `ls x.sh` masked a body the function then RAN, and the same for `echo()`/`stat()`/`du()`).
+  // The naming set is a claim about a PROGRAM; a function, alias or assignment of that name in the
+  // command replaces the program. `heredocReaderIsShadowed` is the same test the OPENER's reader gets
+  // — applying it here is what makes the two halves of the proof agree. The scope is the whole
+  // command (over-conservative on ordering), which keeps a body readable, the allowed direction.
+  if (heredocReaderIsShadowed(scope, commandWord)) return false;
+  // ⛔ `find` IS NOT A NAMER WHEN IT EXECUTES (#1382 cycle 12 review, P0 — measured: `find x.sh -exec
+  // bash {} \;` ran the body WHILE IT WAS MASKED, and five spellings that were REFUSED at e4e78a6f
+  // — `-exec`, `-exec bash {} +`, `-name … -exec`, `-execdir`, `-ok` — became masks the moment `find`
+  // joined the naming set wholesale). Its other primaries only name a file, which is why the whole
+  // command was tempting; the exec primaries are the exception, and they are the one that matters.
+  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
+  if (commandWord !== "git") return false;
+  // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
+  if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
+  const sub = words.slice(1).map((w) => w.replace(/["'\\]/g, "")).find((w) => !w.startsWith("-"));
+  return GIT_FILE_NAMING_SUBCOMMANDS.has(sub ?? "");
+}
+function heredocWrittenTargets(line: string): string[] {
+  const out: string[] = [];
+  const dequoteWord = (w: string) => w.replace(/["'\\]/g, "");
+  // `>`/`>>` targets, quote-aware (a `>` inside a quoted delimiter or message is not a redirect).
+  let quote: string | null = null;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === ">") {
+      if (line[c + 1] === ">") c++;
+      if (line[c + 1] === "&") continue; // `>&2` is an FD, not a file
+      const m = /^\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|<>()+]+))/.exec(line.slice(c + 1));
+      const target = m ? (m[1] ?? m[2] ?? m[3] ?? "") : "";
+      if (target && target !== "/dev/null") out.push(dequoteWord(target));
+      continue;
+    }
+  }
+  const words = line.trim().split(/\s+/).map(dequoteWord);
+  const reader = heredocCommandWord(line);
+  if (reader === "tee") {
+    for (const w of words.slice(1)) if (w && !w.startsWith("-") && w !== "-") out.push(w);
+  }
+  // `sort -o FILE` / `sort --output=FILE` writes its stdin to a file too (#1382 review cycle 2, P2:
+  // `sort` is a proven DATA consumer, so its `-o` target was the one writer this list missed).
+  if (reader === "sort") {
+    for (let k = 0; k < words.length; k++) {
+      if (words[k] === "-o" || words[k] === "--output") {
+        if (words[k + 1]) out.push(words[k + 1]);
+      } else if (words[k].startsWith("--output=")) {
+        out.push(words[k].slice("--output=".length));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Can something EARLIER in the command change what the reader resolves to, or capture the body?
+ *
+ * ⛔ THE PROOF MUST COVER THE WHOLE COMMAND, NOT THE OPENER LINE (#1382 review cycle 2, P1 — two
+ * measured bypasses, both of which bash executed while the gate ALLOWED):
+ *
+ *   PATH=/tmp/e:$PATH; export PATH     # /tmp/e/cat is `exec bash`
+ *   cat <<'SH' … SH                    # body masked, then EXECUTED by the fake reader
+ *
+ *   x=$(cat <<'EOF' … EOF              # the `$(` is on an EARLIER line, so the opener line carried
+ *   )                                  # no substitution …
+ *   eval "$x"                          # … and the captured body reached eval
+ *
+ * So the rule is: refuse to mask when the PREFIX (a) assigns a PATH-relevant variable or exports one,
+ * (b) leaves a command substitution OPEN, or (c) assigns a variable whose VALUE is a file this
+ * heredoc writes (the path travels through the variable into `source "$f"`). Over-refusing only
+ * costs a refusal; the ordinary `cat >> file <<'EOF'` prefix is empty and unaffected.
+ */
+function heredocPrefixIsUnprovable(prefix: string, targets: string[]): boolean {
+  if (/(^|[\s;&|()])(?:export\s+)?(PATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH|CDPATH)=/.test(prefix)) {
+    return true;
+  }
+  // ⛔ ANY SUBSTITUTION IN THE PREFIX REFUSES THE MASK. A depth COUNTER was here, and it was a
+  // measured fail-OPEN: it treated a `)` inside a DOUBLE-QUOTED string, a `#` comment, or an escaped
+  // `\)` as closing a substitution, so all four spellings below reached `eval` with the body masked
+  // (fresh review, and re-measured here at the real gate before the fix):
+  //
+  //     x=$(                     # depth 1
+  //     # ) closing note         # the counter reads this `)` and drops to 0 …
+  //     cat <<'EOF'              # … so the body is "proven" DATA and masked …
+  //     gh pr merge 1 --admin
+  //     EOF
+  //     )                        # … while bash is still INSIDE the substitution
+  //     eval "$x"                # … and the captured body executes.
+  //
+  // A correct count is a shell parser — the class this file has already learned it cannot enumerate.
+  // So the boundary moves instead of the parser growing: a prefix with NO `$(` and NO backtick is
+  // provable; anything else is not. The cost is the pre-#1382 refusal for a heredoc written after a
+  // substitution — a refusal this file was already making, never a permission it newly grants.
+  if (prefix.includes("$(") || prefix.includes("`")) return true;
+  for (const t of targets) if (t !== "" && t !== "-" && prefix.includes(t)) return true;
+  return false;
+}
+
+/**
+ * Does this line END IN A LINE CONTINUATION — an ODD number of trailing backslashes (the shell
+ * removes a backslash-newline outright, so `\` + newline joins the next physical line onto this
+ * one)? `\r` is stripped first: a CRLF command is the same command.
+ *
+ * ⛔ WHY THE MASK MUST SEE THIS (fresh review, P0, measured): the proof is LINE-LOCAL, and bash is
+ * not. A trailing `\` hides everything the proof checks for on the NEXT line, so
+ *
+ *     cat <<'X' \
+ *     | bash
+ *     gh pr merge 1 --admin
+ *     X
+ *
+ * read as "one simple command with no pipe" (`cat`, a data consumer) and the body was masked —
+ * while bash joins the lines into `cat <<'X' | bash` and EXECUTES the body. The same continuation
+ * split a redirect target (`cat <<'X' > \` / `/tmp/x.sh`) so the written-target scan saw no target
+ * at all and a later `bash /tmp/x.sh` went unchecked. Both were measured ALLOWING at the real gate.
+ * A command with continuations is therefore never masked: over-refusal is the direction this file
+ * may be wrong in.
+ */
+function endsWithContinuation(line: string): boolean {
+  const t = line.replace(/\r$/, "");
+  let n = 0;
+  for (let i = t.length - 1; i >= 0 && t[i] === "\\"; i--) n++;
+  return n % 2 === 1;
+}
+
+/**
+ * May this heredoc's body be treated as DATA — i.e. blanked before any gate reads the command?
+ *
+ * THE INVARIANT THIS SERVES, stated once: **a gate that fires on prose teaches agents to write
+ * around it, which is how real bypasses hide.** A body under `cat >> file <<'EOF'` is the single
+ * most common way an agent writes a Markdown file or a commit message, and prose ABOUT a merge is
+ * not a merge. The measured cost of getting this wrong is a lane that cannot RECORD a defect it
+ * just measured (#1382, and this lane's own first tool call).
+ *
+ * The proof is a SHAPE, not a guess, and everything it cannot prove keeps the body readable:
+ *
+ *  1. the opener line is ONE SIMPLE COMMAND — no `;`, `&`, `|`, `(`, `)` and no second `<`
+ *     redirect outside quotes, so the heredoc has exactly one consumer and nothing else on the
+ *     line changes what runs. A `>`/`>>` redirect IS allowed: writing the body to a file is the
+ *     archetypal data sink (`cat >> NOTES.md <<'EOF'`), and excluding it was this fix's first bug —
+ *     it left the reported command refused.
+ *  2. no `$(`, backtick or `NAME=value` prefix before the opener: a command substitution puts the
+ *     body's text back in COMMAND position (`$(cat <<'EOF' … EOF)`), and an assignment can shadow
+ *     `PATH`.
+ *  3. the command word is a proven DATA consumer (see the set above), or `git commit|tag` (whose
+ *     `-F -` stdin is a message).
+ *  4. that word is not shadowed by an alias/function/assignment anywhere in the command
+ *     (`heredocReaderIsShadowed`).
+ *
+ * What this does NOT cover, stated rather than implied: a body written to a FILE that a LATER
+ * command executes (`cat > x.sh <<'EOF' … EOF && bash x.sh` — the `&&` in (1) already keeps that
+ * body readable). The argv layer (#984) is the answer for execution, which is why the caller only
+ * masks while that layer is enforcing.
+ *
+ * ⛔ AND IT IS THE HEREDOC CLASS ONLY. A construct inside a QUOTED ARGUMENT (`echo 'the `gh pr`
+ * guard refused merge-2235'`) still counts as a candidate and is still refused for carrying no
+ * resolvable PR number. That over-block is KEPT, not fixed: #1425 records that four narrowing
+ * attempts at the candidate rule each regressed a real bypass, and #1776's boundary test pins the
+ * ACCEPTED OVER-BLOCK. A heredoc body is different in kind — it is not part of the command's words
+ * at all — which is why it can be masked and a quoted argument cannot.
+ */
+function heredocBodyIsData(line: string): boolean {
+  // (2) a substitution can put the body back in command position; an assignment can shadow PATH.
+  if (/\$\(|`/.test(line)) return false;
+  // (1) one simple command, quote-aware. `>`/`>>` allowed; a second `<` (e.g. another heredoc
+  // opener, or `<file` input redirection) is not provable, so it is refused.
+  let quote: string | null = null;
+  let openerSeen = 0;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (/[;&|()]/.test(ch)) return false;
+    if (ch === "<") {
+      if (line[c + 1] === "<") {
+        openerSeen++;
+        c++; // the opener pair itself
+        if (line[c + 1] === "-") c++;
+        continue;
+      }
+      return false; // `<file` input redirection
+    }
+  }
+  if (openerSeen === 0) return false;
+  // (3) the command word, read the SAME way `maskHeredocData` reads it (`heredocCommandWord`): the
+  // opener and everything after it cut off, every quote removed — so `cat<<'EOF'` and `c"a"t <<'EOF'`
+  // are the data consumers they are, instead of two more spellings that keep the prose refusal.
+  const words = line.trim().split(/\s+/);
+  const first = words[0] ?? "";
+  if (first === "" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(first)) return false;
+  const cmd = heredocCommandWord(line);
+  if (cmd === "git") {
+    // Only the subcommands whose stdin is a MESSAGE (`git commit -F -`, `git tag -F -`). A global
+    // flag can move the subcommand or re-point git's config, so any `-c`/`--config*`/`--exec-path`
+    // before it refuses the mask.
+    const rest = words.slice(1).map((w) => w.replace(/["'\\]/g, ""));
+    const sub = rest.find((w) => !w.startsWith("-"));
+    if (sub !== "commit" && sub !== "tag") return false;
+    if (rest.some((w) => /^-(c|C)$/.test(w) || /^--(config|config-env|exec-path)/.test(w))) return false;
+    return true;
+  }
+  return HEREDOC_STDIN_DATA_CONSUMERS.has(cmd);
+}
+
+/**
+ * #1382 — THE COMPOUND FRAME a heredoc opener sits INSIDE, if any.
+ *
+ * `heredocBodyIsData` proves the body is stdin DATA for the opener's OWN consumer, and for a LONE
+ * simple command that is the whole story. A COMPOUND changes what happens to that consumer's
+ * STDOUT, and the masker did not model it. Measured at the landed head of this file (run through a
+ * real `bash`, each printing its marker — EXECUTIONS, not mentions):
+ *
+ *     if true; then             for x in 1; do              case x in
+ *     cat <<'EOF'               cat <<'EOF'                 x) cat <<'EOF'
+ *     gh pr merge 999 --admin   gh pr merge 999 --admin    gh pr merge 999 --admin
+ *     EOF                       EOF                        EOF
+ *     :                         done | bash                :;;
+ *     fi | bash                                            esac | bash
+ *
+ * In each, `| bash` receives the COMPOUND's stdout, so the body executes while the gate — reading the
+ * masked text — sees no `gh` word at all and returns before any check. Measured before this fix:
+ * `isGitOp(raw)` true, `isGitOp(maskHeredocData(raw))` false. That is a FAIL-OPEN in the one gate
+ * that guards every merge, and it is why the proof below is scoped: it holds for a lone command,
+ * not for a body whose stdout still has somewhere to go.
+ *
+ * A STACK, not a depth counter: a `case` ARM ends in `)` (`case x in x) …`), which a bare counter
+ * reads as closing a `(`, while a stack whose top is `case` ignores it. An unmatched closer is
+ * IGNORED rather than decrementing, so the error stays on the fail-CLOSED side — an unmatched `fi`
+ * can never make a deeper frame read as shallower.
+ *
+ * Conservative by construction: quoted text and `#` comments cannot open or close a frame, and
+ * anything the scan cannot read leaves frames OPEN, i.e. "no mask" — a refusal, the direction this
+ * file is allowed to be wrong in.
+ */
+type HeredocFrame = "if" | "loop" | "case" | "paren" | "brace";
+
+/** The words of one line that can open or close a shell frame, quotes and comments removed. */
+function heredocFrameTokens(line: string): string[] {
+  let quote: string | null = null;
+  let buf = "";
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += " ";
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      buf += " ";
+      continue;
+    }
+    if (ch === "#" && (buf === "" || /\s$/.test(buf))) break; // comment: no frame after it
+    buf += ch;
+  }
+  return buf
+    .replace(/([(){}])/g, " $1 ")
+    .split(/[\s;&|]+/)
+    .filter((t) => t !== "");
+}
+
+/** Apply one line's frame openers/closers to the carried stack. */
+function heredocFramesAdvance(line: string, stack: HeredocFrame[]): void {
+  const top = () => stack[stack.length - 1];
+  for (const w of heredocFrameTokens(line)) {
+    if (w === "if") stack.push("if");
+    else if (w === "for" || w === "while" || w === "until" || w === "select") stack.push("loop");
+    else if (w === "case") stack.push("case");
+    else if (w === "(") stack.push("paren");
+    else if (w === "{") stack.push("brace");
+    else if (w === "fi") { if (top() === "if") stack.pop(); }
+    else if (w === "done") { if (top() === "loop") stack.pop(); }
+    else if (w === "esac") { if (top() === "case") stack.pop(); }
+    else if (w === ")") { if (top() === "paren") stack.pop(); }
+    else if (w === "}") { if (top() === "brace") stack.pop(); }
+  }
+}
+
+/**
+ * Is the heredoc opened on `openerIndex` inside a frame that is still OPEN there?
+ *
+ * The opener line's own PREFIX counts too (`{ cat <<'EOF'`): the `<<` is what delimits it.
+ */
+function heredocOpenerIsInsideFrame(lines: string[], openerIndex: number): boolean {
+  const stack: HeredocFrame[] = [];
+  for (let n = 0; n < openerIndex; n++) heredocFramesAdvance(lines[n], stack);
+  const at = lines[openerIndex].indexOf("<<");
+  heredocFramesAdvance(at >= 0 ? lines[openerIndex].slice(0, at) : "", stack);
+  return stack.length > 0;
+}
+
+/**
+ * Can this command hand a heredoc's BODY to a program by a route other than its own consumer?
+ *
+ * Two routes, both measured above: the body's stdout is PIPED into a program runner (which is how a
+ * `| bash` on a frame's closing line reaches it), or the compound's stdout is REDIRECTED to a file
+ * that a later line executes (`fi > /tmp/p.sh` then `bash /tmp/p.sh`).
+ *
+ * Scoped to lines at and after the opener: an earlier pipe belongs to a different command.
+ */
+function heredocCompoundSinksToRunner(lines: string[], openerIndex: number): boolean {
+  const scope = lines.join("\n");
+  for (let n = openerIndex; n < lines.length; n++) {
+    if (heredocPipedIntoProgram(lines[n])) return true;
+    for (const t of heredocWrittenTargets(lines[n])) {
+      if (t === "" || t === "-") continue;
+      if (lines.slice(n + 1).some((l) => heredocLineExecutes(l, t, scope))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
+ * every offset a later reader holds stays valid.
+ *
+ * This is the admin-merge gate's data model, applied ONCE at the `tool_call` entry so every gate
+ * reads the same text: the candidate test, `hasLiteralAdminFlag`, `mergeVerbInText`,
+ * `countMergeVerbs`, `extractPrNumber` and the merge registry. The AUDIT record keeps the caller's
+ * raw text, and the shell is given the caller's raw command — masking is a READING of the command,
+ * never a rewrite of it.
+ *
+ * Deliberately conservative in the only direction this file is allowed to be wrong in: a body under
+ * a consumer that is not proven data, an unterminated body, a compound opener line, a command with a
+ * LINE CONTINUATION (bash joins those lines, so a line-local proof reads a fragment), a substitution
+ * anywhere in the prefix, or a shadowed reader keeps its body READABLE, so the gate refuses exactly
+ * as it did before. Those shapes are the safety argument, and they are why the mask is applied
+ * UNCONDITIONALLY rather than only while the argv layer (#984) enforces: what it blanks is proven
+ * DATA, i.e. text this command cannot execute, so there is no invocation for a downstream reader to
+ * catch. See the gate entry for the measured reason the old condition kept the false positive alive
+ * on this fleet.
+ *
+ * ⛔ STATED RESIDUAL — AN OPEN GAP, NOT A SAFE ASSUMPTION. The proof is scoped to THIS command. A
+ * body written to a file (`cat > /tmp/x.sh <<'EOF'`) is DATA to the writer, and nothing here follows
+ * that file into a LATER tool call, where `bash /tmp/x.sh` carries no `gh` word for any text gate
+ * to read. The argv-level shim (#984) is the layer that saw that execution, and
+ * `docs/ops/ACTIVATION-MATRIX.md` row 1 records it as ABSENT on this fleet — the load-time #984
+ * warning names the gap. Pinned by `#1382 (e)` in the suite so no lane reads this as covered. (The
+ * same outcome was always reachable through surfaces this gate never inspected — the `write` tool, a
+ * `python3 -c` payload — so this is a boundary of the INSTRUMENT, declared, not a control removed.)
+ */
+export function maskHeredocData(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  const blank = (s: string) => " ".repeat(s.length);
+  // Carried ACROSS lines: an arithmetic expression can span them (a `<<` on a continuation line is a
+  // SHIFT, not an opener), and so can a QUOTED STRING (an opener inside one is text). A false opener
+  // masks to EOF — a fail-open.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) continue;
+    // ⛔ NO LINE CONTINUATIONS, ANYWHERE (fresh review, P0 — measured fail-OPEN). The proof below is
+    // LINE-LOCAL; bash removes a backslash-newline and joins the next physical line onto this one.
+    // So `cat <<'X' \` / `| bash` read as "one simple command, no pipe" and the body was masked
+    // while bash piped it into `bash`; `cat <<'X' > \` / `/tmp/x.sh` hid the redirect target from
+    // `heredocWrittenTargets`, so a later `bash /tmp/x.sh` was never checked either. A continuation
+    // in the opener line OR in the prefix that feeds it makes every rule here a reading of a
+    // FRAGMENT, which is not a proof — so nothing is masked. Over-refusal is the direction this
+    // file may be wrong in.
+    if (endsWithContinuation(lines[i])) continue;
+    if (lines.slice(0, i).some(endsWithContinuation)) continue;
+    // ⛔ A COMPOUND FRAME CAN HAND THE BODY TO A PROGRAM (#1382 — measured fail-OPEN in every
+    // keyword and bracket frame; see `HeredocFrame`). `if … cat <<'EOF' … EOF … fi | bash` pipes the
+    // COMPOUND's stdout into bash, so the body EXECUTES while every rule below proves DATA for the
+    // WRONG consumer and the gate, reading masked text, returns before any check. Checked only when
+    // the opener really is inside an open frame, so the reported false positive — a lone
+    // `cat >> notes.md <<'EOF'` — is untouched.
+    if (heredocOpenerIsInsideFrame(lines, i) && heredocCompoundSinksToRunner(lines, i)) continue;
+    if (!heredocBodyIsData(lines[i])) continue;
+    const reader = heredocCommandWord(lines[i]);
+    // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
+    // WHOLE command, body included, so a report that QUOTED `cat() { bash; }` — an evidence file about
+    // this very gate — disarmed the mask and brought the reported false positive back. An alias or a
+    // function must be defined BEFORE the line that uses it, so the prefix is the sound scope (and a
+    // later definition cannot retroactively change what an earlier line ran).
+    if (heredocReaderIsShadowed(lines.slice(0, i + 1).join("\n"), reader)) continue;
+    // A body written to a FILE that this same command can EXECUTE by a later line — unprovable, so
+    // keep it readable (see `heredocLineExecutes`).
+    const targets = heredocWrittenTargets(lines[i]);
+    // ⛔ A REDIRECT TARGET THE SHELL WILL EXPAND IS NOT A NAME WE CAN COMPARE (#1382 cycle 10 review).
+    // Measured: `cat > $HOME/x.sh <<'EOF' … EOF` + `bash ~/x.sh` was MASKED — the written-target
+    // reader does not carry `$HOME` through as one word, so no comparison could see that the runner
+    // reaches the same file. `$VAR` cannot be resolved here at all, so a `$`/backtick in any target
+    // keeps the whole body READABLE (a refusal) instead of guessing. `~` is left maskable: it expands
+    // to one known directory, and `heredocNamesTarget` canonicalizes it.
+    if (targets.some((t) => /[$`]/.test(t))) continue;
+    // The LATER lines are read with continuations resolved, for the same reason as the opener: a
+    // runner spelled `bash \` / `/tmp/x.sh` executes the body just as plainly as `bash /tmp/x.sh`,
+    // and a line-by-line scan saw neither half.
+    const otherLines = lines
+      .filter((_, n) => n !== i)
+      .join("\n")
+      .replace(/\\\r?\n/g, " ")
+      // ⛔ A LINENBREAK AFTER `|` CONTINUES THE PIPELINE (POSIX). Only `\`-continuations were joined,
+      // so `cat /tmp/x.sh |` <newline> `bash` read as two unrelated commands and the body was masked
+      // while bash ran it (#1382 cycle 10 review, P0 — measured ALLOWED).
+      .replace(/\|[ \t]*\r?\n/g, "| ")
+      .split("\n");
+    // The scope passed to the naming test is the WHOLE command (a function/alias/assignment may be
+    // defined on any line), so a shadowed reader keeps the body readable from any direction.
+    const scope = lines.join("\n");
+    if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t, scope)))) continue;
+    // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or
+    // hold the written path in a variable.
+    if (heredocPrefixIsUnprovable(lines.slice(0, i).join("\n"), targets)) continue;
+    for (const opener of openers) {
+      let closed = false;
+      for (i++; i < lines.length; i++) {
+        const probe = opener.stripTabs ? lines[i].replace(/^\t+/, "") : lines[i];
+        out.push(blank(lines[i]));
+        if (probe === opener.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // An UNTERMINATED heredoc is NOT a bash syntax error — measured: `printf 'cat <<EOF\nhi\n' > /tmp/u.sh;
+      // bash /tmp/u.sh` WARNS ("here-document at line 1 delimited by end-of-file") and then EXECUTES the
+      // command with the remainder as the body, exit 0 (#1382 cycle 9 review, P2 — the first version of
+      // this comment asserted the opposite, and a later widening to a non-proven consumer would have
+      // leaned on it). Masking the remainder is still sound HERE and for a narrower reason: the opener
+      // passed `heredocBodyIsData`, so whatever follows is the body of a consumer this file proved
+      // cannot execute its stdin, and nothing follows the body. If that proof ever widens, this branch
+      // must stop masking — it is the proof, not the "syntax error", that carries the safety.
+      if (!closed) break;
+    }
   }
   return out.join("\n");
 }
@@ -1726,23 +2054,6 @@ function dataCharMask(scan: ScanTokens): boolean[] {
       (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(next) &&
         STDIN_PROGRAM_RUNNERS.has(shellWord(scan.tokens[end + 2] ?? "")));
   };
-  // ── #1382: HEREDOC BODIES ARE STDIN DATA, NOT COMMAND LINES ─────────────
-  // The tokenizer splits on whitespace and separators REGARDLESS of heredoc state, so a body
-  // line reads exactly like a command: `cat <<'EOF'` … `gh pr merge 111 --admin; gh pr merge
-  // 999 --admin` … `EOF` is two merge invocations to every consumer of this mask. Measured
-  // 2026-10-21 in a lane: a read-only `bash` call whose heredoc payload merely DESCRIBED two
-  // merges was refused as a "compound merge" (countMergeVerbs > 1), and the same shape with
-  // ONE mention fell through to the evidence gate — two refusals for a command that runs
-  // `cat`. ONE definition of "which bodies are data" lives in `maskHeredocData` (next to
-  // `stripHeredocBodies`, its notice-facing sibling) and is shared here by DIFF: a character
-  // the helper blanked is a character no invocation can be read from.
-  {
-    const masked = maskHeredocData(joined);
-    for (let k = 0; k < masked.length && k < data.length; k++) {
-      if (masked[k] !== joined[k]) data[k] = true;
-    }
-  }
-
   let i = 0;
   while (i < mask.length) {
     if (mask[i]) { i++; continue; }
@@ -1971,24 +2282,6 @@ const VALUE_POSITION_FLAGS = new Set([
 const REDIRECTION_TOKEN = /^(?:\d+)?(?:>>?|<<?)(?:&\d+-?|&-|&|\d+|[\w./~+=:@%-]+)?$|^&>>?(?:[\w./~+=:@%-]+)?$/;
 
 /**
- * A HEREDOC OPENER with a PLAIN (or plain-quoted) delimiter: `<<EOF`, `<<-EOF`, `<<'EOF'`,
- * `<<"EOF"`, and the bare `<<` / `<<-` when the delimiter is its own word (`cat << EOF`).
- *
- * It is a REDIRECTION, not a construct that can hide a program: the shell consumes it and its
- * body before argv exists, so a `$`-bearing token test that reads it as "a word assembled at
- * runtime" hands every heredoc command to the evidence gate. Measured 2026-10-21 (#1382):
- * `gh pr create --body "$(cat <<'EOF' … EOF)"` failed the positive read at the opener alone,
- * which kept the mention-only refusal alive even after the body became DATA.
- *
- * NARROW ON PURPOSE — the delimiter must be a plain word (optionally quoted), so `<<$X`
- * (delimiter expanded at runtime) and `<<<"$(cmd)"` (a here-string whose word RUNS a
- * substitution) do NOT match, and keep their fail-closed reading. Same delimiting rule as
- * `maskHeredocData`, so the two cannot disagree about which body exists.
- */
-const HEREDOC_OPENER_TOKEN =
-  /^(?:\d+)?<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|"[A-Za-z_][A-Za-z0-9_]*"|[A-Za-z_][A-Za-z0-9_]*)?$/;
-
-/**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
  * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
  * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
@@ -2042,8 +2335,6 @@ export function readsNonMergeGhCall(command: string): boolean {
     // target is itself unresolvable (`>$OUT`) does NOT match this shape and keeps
     // the fail-closed reading.
     if (REDIRECTION_TOKEN.test(tok)) continue;
-    // A heredoc opener is a redirect too (see HEREDOC_OPENER_TOKEN).
-    if (HEREDOC_OPENER_TOKEN.test(tok)) continue;
     const prevWord = shellWord(scan.tokens[i - 1] ?? "");
     // `prevWord.includes("=")` covers the `--flag=value` spelling, where the VALUE's opening
     // word carries the `=` (`--title="admin $(x)"`). The TOKEN itself carrying `=` is NOT an
@@ -2051,15 +2342,8 @@ export function readsNonMergeGhCall(command: string): boolean {
     // And a value position must not be a COMMAND position: an assignment prefix (`Z=ok $R`)
     // puts the next word in command position while carrying `=`, which let a runner word be
     // exempted as a value (adversarial review, shape 18, second half).
-    // #1382: `--body="$(` puts the `=` and the construct in ONE token, so `prevWord` carries no
-    // `=`. A `-`-prefixed NAME before `=` makes the rest of the token the flag's VALUE, and
-    // gh/pflag parses `--body=<v>` as ONE flag whose value can never be an executable word —
-    // the same invariant the `prevWord.includes("=")` arm relies on, for the attached spelling.
-    // (A bare NAME before `=` is an ASSIGNMENT, whose value runs: `X=$(date) gh issue comment 5`
-    // stays fail-closed, pinned below.)
-    const attachedFlagValue = /^--?[A-Za-z][\w-]*=/.test(tok);
     const inValuePosition =
-      (VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=") || attachedFlagValue) &&
+      (VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=")) &&
       !isCommandPositionAt(scan, i);
     if (!inValuePosition) return false; // a `$`-bearing token where a value does not belong
   }
@@ -3858,12 +4142,7 @@ export function hasAdminMergeFlag(command: string): boolean {
   //    the gate's own recommended route in a loop or beside another `gh` call.
   //    `normalizeForFlagScan` neutralizes too (idempotent), so the probe and the raw
   //    reads below cannot disagree about the same command.
-  // #1382: a heredoc body fed to a program that stores/prints it is STDIN data. It cannot be
-  // an argv word, so neither the construct that could assemble a flag nor the word `admin`
-  // can come from it. This is NOT the #1421 adjacency narrowing (that one had to reason about
-  // raw TEXT and was measured unsound for zero-width separators `$V""admin=true`); a body is
-  // not a word at all, so that question never arises here.
-  const cmd = maskHeredocData(withoutMandatedRailPath(command));
+  const cmd = withoutMandatedRailPath(command);
   const probe = normalizeForFlagScan(cmd);
   // 2. Fail CLOSED on what we cannot resolve. Guessing here is what produced
   //    seven rounds of fail-opens, so the rule is "unresolvable ⇒ admin merge".
@@ -3911,10 +4190,7 @@ export function hasAdminMergeFlag(command: string): boolean {
  * `admin_merge_override`. It is narrower than the guess it replaced.
  */
 export function hasLiteralAdminFlag(command: string): boolean {
-  // #1382: a heredoc body is STDIN, not argv — gh's parser never sees it, so it cannot be
-  // an `--admin` of this command. Blanked BEFORE the splice normalizer, so a body's own
-  // quoting cannot look like a flag either.
-  return literalAdminFlagIn(normalizeForFlagScan(maskHeredocData(command)));
+  return literalAdminFlagIn(normalizeForFlagScan(command));
 }
 
 /** The literal flag inside an already-normalized probe (see `hasAdminMergeFlag`). */
@@ -4497,10 +4773,7 @@ export type AdminMergeGateResult =
   // #2349: `reasonTag` names WHICH of the four block states fired, so the console
   // line can print the state instead of one sentence covering all of them. It is
   // added to the result and read ONLY for that line — the decision is the `status`.
-  // #1382: `line` is the ONE-LINE input+remedy rendering. It is a DIFFERENT fact from
-  // `reasonTag` (which state fired): it names the CONCRETE input that failed, so the
-  // operator log, the block reason and the audit row's `failing_input` all name it.
-  | { status: "block"; reason: string; line: string; reasonTag?: AdminMergeBlockTag }
+  | { status: "block"; reason: string; reasonTag?: AdminMergeBlockTag }
   | { status: "allow"; message: string };
 
 /** #2349 — the four distinct ways the admin-merge evidence gate blocks. */
@@ -4509,46 +4782,6 @@ export type AdminMergeBlockTag =
   | "admin_head_unreadable"
   | "admin_comments_unreadable"
   | "admin_no_evidence";
-
-/**
- * THE ONE LINE A REFUSAL MUST CARRY: the failing INPUT, and the REMEDY — the command a lane can
- * run, not a paragraph (#1382).
- *
- * Why it is a function rather than a sentence per branch: `admin-merge.sh` refusals were measured
- * reaching a lane as a bare `🚫 Admin-merge evidence gate blocked` console line (2026-10-21,
- * cell-1 lane log) with no PR, no head and no next step, so the lane's only reading of the block
- * was "the rail refused me". Each branch below names a DIFFERENT failing input with its own
- * diagnostic (the remedy command is the same rail for the four evidence branches; the compound
- * branch cannot be a single PR). ONE place, so a branch cannot be added without stating both.
- *
- * `merges` is only read by the `compound` cause: the count is part of the failing input (a bare
- * "more than one" told a lane nothing about what the gate actually saw, and a report whose payload
- * mentioned two merges was refused under that wording).
- */
-export function adminMergeRefusalLine(
-  cause: "pr" | "head" | "comments" | "evidence" | "compound",
-  pr: number | null,
-  head: string | null,
-  merges = 0,
-): string {
-  const rail = pr === null ? "scripts/admin-merge.sh <PR>" : `scripts/admin-merge.sh ${pr}`;
-  const where = pr === null
-    ? "input: the merge command names no PR"
-    : `input: PR #${pr}${head === null ? "" : ` @ head ${head.slice(0, 12)}`}`;
-  if (cause === "compound") {
-    return `input: ${merges} \`gh pr merge\` invocations in one call → remedy: run ONE PR per call, \`bash scripts/admin-merge.sh <PR>\``;
-  }
-  switch (cause) {
-    case "pr":
-      return `${where} → remedy: \`bash ${rail}\``;
-    case "head":
-      return `${where}, head unreadable (\`gh pr view ${pr} --json headRefOid\`) → remedy: \`bash ${rail}\``;
-    case "comments":
-      return `${where}, comments unreadable (\`gh pr view ${pr} --json comments\`) → remedy: \`bash ${rail}\``;
-    case "evidence":
-      return `${where} carries no \`admin-merge-safety\` marker bound to that head → remedy: \`bash ${rail}\``;
-  }
-}
 
 /**
  * Pure decision for the admin-merge evidence gate.
@@ -4580,46 +4813,37 @@ export function evaluateAdminMergeGate(
     "     alias) and restart (audited as admin_merge_override).",
   ];
   if (pr === null) {
-    const line = adminMergeRefusalLine("pr", null, null);
     return {
       status: "block",
       reasonTag: "admin_no_pr",
-      line,
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
         "❌ STATE: no resolvable PR number — the command carries no readable admin merge selector, so no",
         "   head-bound evidence can be checked. (A mention of the admin-merge form inside a heredoc, a jq",
         "   filter, a PR/issue body or a grep pattern is DATA, not a merge: the text scanner cannot tell",
         "   those apart, and the argv-level gh shim decides them when it is installed.)",
-        `❌ ${line}`,
         ...remediation,
       ].join("\n"),
     };
   }
   if (currentHead === null) {
-    const line = adminMergeRefusalLine("head", pr, null);
     return {
       status: "block",
       reasonTag: "admin_head_unreadable",
-      line,
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
         `❌ STATE: PR #${pr} resolved, but its CURRENT head could not be READ (gh/API failure) — an admin merge cannot be bound to evidence without it.`,
-        `❌ ${line}`,
         ...remediation,
       ].join("\n"),
     };
   }
   if (comments === null) {
-    const line = adminMergeRefusalLine("comments", pr, currentHead);
     return {
       status: "block",
       reasonTag: "admin_comments_unreadable",
-      line,
       reason: [
         "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
         `❌ STATE: PR #${pr}'s head (${currentHead.slice(0, 12)}) is known, but its COMMENTS could not be READ — failing CLOSED for a bypass (a failed fetch is not "no evidence").`,
-        `❌ ${line}`,
         ...remediation,
       ].join("\n"),
     };
@@ -4646,15 +4870,12 @@ export function evaluateAdminMergeGate(
       }
     }
   }
-  const line = adminMergeRefusalLine("evidence", pr, currentHead);
   return {
     status: "block",
     reasonTag: "admin_no_evidence",
-    line,
     reason: [
       "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
       `❌ STATE: evidence missing — PR #${pr}'s comments were READ and none carries head-bound admin-merge evidence at the CURRENT head (${currentHead.slice(0, 12)}).`,
-      `❌ ${line}`,
       "   Evidence is head-bound: every push to the PR invalidates it, so a stale marker is refused.",
       "   A marker alone is also refused — the evidence body must carry the comparison counts.",
       ...remediation,
@@ -5138,27 +5359,37 @@ export default function (pi: ExtensionAPI) {
         ghShimAbsenceWarned = true;
         console.log(
           "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
-            "is active, so bash token splicing can still hide an admin merge. " +
+            "is active, so bash token splicing can still hide an admin merge, and a heredoc body " +
+            "written to a script file and run by a LATER command is not followed by any text gate. " +
             "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
         );
       }
       const shimmed = withGhShim(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
 
-      // ── #1382: THE GATES' OWN INPUT IS THE COMMAND, NOT THE HEREDOC PAYLOAD ──────────
-      // A heredoc body fed to a program that stores or prints it is STDIN DATA, and the shell
-      // never turns it into an argv word. The tokenizer cannot know that (it splits on
-      // whitespace), so the data mask is applied ONCE, here, and every reader below — the
-      // admin-merge gate, the merge registry, `extractPrNumber`, the cd/repo resolution —
-      // decides about the same text. Measured 2026-10-21 in a lane: a read-only command whose
-      // heredoc report quoted two merges was refused first as a "compound merge" and then by
-      // the evidence gate; the same class also reached the merge-REGISTRY gate, which is why
-      // the mask belongs here rather than inside one gate.
+      // #1382: THE GATE READS A DATA MODEL, NOT THE BYTES THE USER TYPED. A heredoc body is stdin
+      // DATA, not command lines: `cat >> evidence.md <<'EOF' … a log line that MENTIONS a merge …
+      // EOF` writes a file and runs nothing, and refusing it is an INSTRUMENT FALSE POSITIVE — the
+      // measured cost is an agent that cannot RECORD a defect it just found (this lane's own first
+      // tool call, and #1382 before it). INVARIANT: a gate that fires on prose teaches agents to
+      // write around it, which is how real bypasses hide.
       //
-      // WHAT IS **NOT** MASKED is what makes this safe: `maskHeredocData` leaves a body
-      // READABLE whenever anything on its opener's line can RUN it (`bash <<'EOF'`,
-      // `eval "$(cat <<EOF …)"`, a pipeline), and leaves unterminated/ambiguous bodies alone.
-      // The audit trail keeps the CALLER'S text (`rawCommand`), so a decision is replayable.
+      // ⛔ UNCONDITIONAL, AND THAT IS THE POINT — masking is NOT a deferral. The first cut of this
+      // fix applied the mask only while the argv layer (#984) enforced, on #1485's rule that "a
+      // deferral is sound only while what it defers TO is installed". That rule is about standing a
+      // DECISION down for text the scanner cannot read (the `merges === 0 && readsNonMergeGhCall`
+      // path below, which stays shim-conditioned). Masking a body that `heredocBodyIsData` has
+      // PROVEN is data is not that: such a body is never executed by this command (a proven stdin
+      // consumer cannot run its stdin; a target it writes is refused when a later line can execute
+      // it; a shadowed reader, a pipe, a substitution or an assignment prefix leaves the body
+      // readable), so the mask cannot hide an invocation — it corrects a mis-read of one.
+      //
+      // THE CONDITION WAS WORSE THAN USELESS, it was the bug: this fleet runs with the argv layer
+      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — nothing installs `scripts/gh-shim`, and the
+      // resolver returns null: measured on this cell), so tying the mask to it left the reported
+      // defect refusing the reporter — a harmless `cat >> notes.md <<'EOF'` — in the only
+      // environment where anybody hit it. Verified, not assumed: with the shim absent the
+      // shim-conditioned build still refuses that command verbatim.
       const command = maskHeredocData(rawCommand);
       if (!isGitOp(command)) return undefined;
 
@@ -5204,25 +5435,19 @@ export default function (pi: ExtensionAPI) {
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
         if (merges > 1) {
-          // #1382: the OPERATOR LOG must carry the count AND the remedy — a bare "blocked
-          // (compound merge)" was measured reaching a lane with neither. The block REASON uses the
-          // helper's one-line rendering (`compoundLine`); this console line is its own sentence and
-          // states the same count, because #1382 (d) pins a log line a lane can act on. They are
-          // deliberately two sentences over ONE count, not one string reused twice.
-          const compoundLine = adminMergeRefusalLine("compound", null, null, merges);
-          // #2349: name the count the gate actually READ, not "more than one"; #1382 additionally
-          // names the runnable REMEDY in the same line, which main's STATE phrasing omitted here.
+          // #2349: name the count the gate actually read. "more than one merge" told a lane
+          // nothing about WHAT it read; the number does, and the refused command is in the audit row.
           console.log(
-            `[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge: ${merges} invocations) — ` +
-              "run ONE PR per call: `bash scripts/admin-merge.sh <PR>`"
+            `[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge) — STATE: ${merges} ` +
+              "`gh pr merge` invocations read in this one command; the gate certifies ONE PR per call"
           );
-          logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command", merges });
+          logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command" });
           return {
             block: true,
             reason:
               "This command contains more than one `gh pr merge`. The admin-merge evidence " +
               "gate can only certify ONE PR per call, so it cannot prove the others are " +
-              `evidenced.\n❌ ${compoundLine}`,
+              "evidenced. Run them as separate commands.",
           };
         }
         // #1485: ZERO merge invocations, and the argv scan POSITIVELY read every
@@ -5258,21 +5483,16 @@ export default function (pi: ExtensionAPI) {
           if (adminResult.status === "block") {
             // #2349: four different states used to print this one sentence. The tag comes
             // from the gate itself, so the console line and the reason cannot disagree.
-            // #1382: the log must ALSO carry the failing input and the remedy — measured
-            // 2026-10-21, a lane's log held `🚫 Admin-merge evidence gate blocked` and nothing
-            // else, so the lane could not tell which input failed without re-deriving the gate.
-            // ONE line: the state, then the concrete input that failed.
             console.log(
               `[review-enforcer] 🚫 Admin-merge evidence gate blocked — STATE: ${adminMergeStateText(
                 adminResult.reasonTag,
                 adminPr,
                 adminHead,
-              )} — ${adminResult.line}`
+              )}`
             );
             logGateEvent("merge_gate_block", {
               pr: adminPr,
               reason: "admin_merge_no_evidence",
-              failing_input: adminResult.line, // #1382: the input, auditably
               command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
             });
             return { block: true, reason: adminResult.reason };
@@ -5441,8 +5661,8 @@ export default function (pi: ExtensionAPI) {
             tier: "micro",
             spawn_attempts: spawnAttemptsTotal,
             spawn_outcomes: spawnAttempts.map((a) => a.outcome),
-            // #1492/#1382: the REFUSED INPUT, unmasked. `command` is maskHeredocData(rawCommand),
-            // so auditing it would blank the very heredoc that caused the refusal.
+            // #1382: audit the caller's command. `command` is the heredoc-masked READING the
+            // gates use, and masking blanks proven DATA — recording it would erase evidence.
             command: auditCommand(rawCommand),
           });
           return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
@@ -5456,10 +5676,9 @@ export default function (pi: ExtensionAPI) {
           // #2349: WHAT the floor read about the registry, so the fleet can count
           // "no record on this box" refusals instead of hand-measuring them.
           record_state: floor.recordState,
-          // #1492/#1382: the REFUSED INPUT, not the analysed text. `command` is
-          // `maskHeredocData(rawCommand)`, so auditing it would blank the very heredoc that
-          // caused the refusal and destroy the audit trail it exists to provide.
-          command: auditCommand(rawCommand),
+          // #1382: the audit row records the command the CALLER wrote. `command` is the
+          // heredoc-masked READING used by the gates; masking is never a rewrite of the record.
+          command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
@@ -5478,8 +5697,7 @@ export default function (pi: ExtensionAPI) {
           tier: tier === "" ? "unlabeled" : tier,
           spawn_attempts: spawnAttemptsTotal,
           spawn_outcomes: spawnAttempts.map((a) => a.outcome),
-          // #1492/#1382: the REFUSED INPUT, unmasked — see the micro-tier row above.
-          command: auditCommand(rawCommand),
+          command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         });
         return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
       }
@@ -5491,8 +5709,8 @@ export default function (pi: ExtensionAPI) {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
         record_state: floor.recordState, // #2349
-        // #1492/#1382: the REFUSED INPUT, unmasked — see the micro-tier row above.
-        command: auditCommand(rawCommand),
+        // #1382: audit the caller's command, not the masked reading (see the micro arm above).
+        command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
       }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
