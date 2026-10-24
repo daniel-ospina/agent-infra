@@ -3560,15 +3560,19 @@ while true; do
     claim_snapshot "$O/state/claims-snapshot" 2>>"$LOG"
     # ⛔ THE READ'S OWN VERDICT IS PUBLISHED EVERY CYCLE (agent-infra#2466). Without this line the
     # only way to learn that selection is standing down is to notice that nothing happened — the
-    # `backlog empty queue=READ(192)` shape, one surface over. `read=failed` means the snapshot on
-    # disk is the LAST GOOD read (the writer keeps it rather than replacing it with a stale-cache
-    # body), so the entries are real but UNDATED relative to this cycle: `claim_snapshot_verdict`
-    # answers from them only while they are inside CLAIM_SNAPSHOT_MAX_AGE, and answers
-    # `claim-unreadable` once they are not.
-    if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
+    # `backlog empty queue=READ(192)` shape, one surface over.
+    # ⛔ AND A FAILED FETCH IS NOT A FAILED PUBLISH (review, P2). Both used to print the same
+    # "the fetch did NOT answer … no PR is spawned or armed" line, which was FALSE for a write
+    # failure: the fetch answered, nothing was published, and the PREVIOUS snapshot keeps its own
+    # `ok` header and is still believed until it ages out. Two causes with opposite consequences
+    # must not share one sentence — an auditor was being pointed at the network when the cause was
+    # the disk.
+    if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
       echo "[claims] snapshot read=ok refs=${CLAIM_SNAPSHOT_REFS:-?} max_age=${CLAIM_SNAPSHOT_MAX_AGE:-?}s" >> "$LOG"
+    elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
+      echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place and is believed until it is older than ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, after which every selection answer is claim-unreadable. This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
     else
-      echo "[claims] ⛔ claim-unreadable risk: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?}) — selection answers from the PREVIOUS snapshot only until it exceeds ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and then every PR reads claim-unreadable (nothing is spawned or armed on the assumption that silence means freedom); cause is on the line above" >> "$LOG"
+      echo "[claims] ⛔ claim-unreadable: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?}) — the snapshot just published says so in its header, so EVERY selection answer this cycle is claim-unreadable: no PR is spawned or armed and no issue dispatched on the assumption that silence means freedom; the cause is on the line above" >> "$LOG"
     fi
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then

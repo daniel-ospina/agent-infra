@@ -1423,43 +1423,53 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
 # controller would pay two network round trips per PR per cycle (24 PRs x 2 = 48 calls).
 # ⛔ `CLAIM_SNAPSHOT_FETCH` / `CLAIM_SNAPSHOT_REFS` are set for the CALLER (the controller prints
 # them on its cycle line): globals because `$(claim_snapshot …)` would run it in a subshell.
-CLAIM_SNAPSHOT_FETCH=""; CLAIM_SNAPSHOT_REFS=""
+# `CLAIM_SNAPSHOT_WRITE` is a THIRD, separate answer: whether the snapshot could be PUBLISHED. A failed
+# FETCH and a failed PUBLISH have different consequences (the first publishes a header that says so;
+# the second publishes nothing, leaving the previous still-believed read in place), so a caller that
+# collapses them logs the wrong cause AND the wrong consequence (review, P2).
+CLAIM_SNAPSHOT_FETCH=""; CLAIM_SNAPSHOT_REFS=""; CLAIM_SNAPSHOT_WRITE=""
 claim_snapshot() {
   # `$1` is OPTIONAL and `set -u` is on, so the temp name must NOT be built from it directly:
   # `local out="${1:-…}" tmp="$1.$$"` dereferences the unset `$1` and aborts the whole fetch with
   # "unbound variable" (exit 127) instead of falling back to the default (P2, 2026-10-14 export
   # review). Derive the temp name from the RESOLVED output path.
   local out="${1:-$HOME/orchestrator/state/claims-snapshot}"
-  local tmp="$out.$$"
-  : > "$tmp"
-  # ⛔ A FAILED FETCH MUST NOT REPLACE A GOOD SNAPSHOT WITH AN EMPTY ONE, AND MUST SAY SO (review
-  # catch, 2026-10-18). The old shape was `fetch … || true` and then an unconditional `mv`, so ANY
+  local tmp="$out.$$" body="$out.body.$$" fetch now n write
+  # ⛔ A FAILED FETCH MUST NOT LEAVE AN EMPTY, UNDATED SNAPSHOT BEHIND (review catch, 2026-10-18;
+  # agent-infra#2466). The old shape was `fetch … || true` and then an unconditional `mv`, so ANY
   # fetch failure — a 30 s network blip, or the unreadable cwd of the 2026-10-18 incident — wrote an
   # EMPTY file over the last good one, and `claim_live()` reads "absent from the snapshot" as "free".
   # Measured: 3 claims on origin, 0 snapshot lines, nothing logged anywhere, while ARCHITECTURE said
-  # this path "fail-open on an unreachable store (logs it)". The prior snapshot is now KEPT (its
-  # leases are self-dating, so a stale one can only make the sweep abstain, never grant a claim), and
-  # the reason is written where the operator reads it.
-  local body="$out.body.$$" fetch now n
+  # this path "fail-open on an unreachable store (logs it)". The empty-and-undated file is gone: the
+  # fetch's own answer is recorded IN the header below, so a failed read is published as
+  # `claim-unreadable` rather than as "no claims", and the reason goes where the operator reads it.
   : > "$body"
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
   # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
   # under CLAIM_CACHE_NS — a snapshot must not delete a concurrent lease read (P2).
-  # ⛔ TWO POLARITIES, ONE WRITER (agent-infra#2466 + the 2026-10-18 review catch). ACQUISITION fails
-  # open: a blip must not refuse a merge, so the PREVIOUS snapshot is KEPT rather than replaced by a
-  # body built from a stale cache. SELECTION fails closed, and it can only do that when the read is
-  # DATED — so a SUCCESSFUL fetch stamps the header below, while a failed one leaves the old header
-  # (or no file at all) for `claim_snapshot_verdict` to age out into `claim-unreadable`. The failure
-  # is reported to the operator here and published to the caller through `CLAIM_SNAPSHOT_FETCH`.
-  if ! _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
-    rm -f "$tmp" "$body" 2>/dev/null || true
-    CLAIM_SNAPSHOT_FETCH="failed"; CLAIM_SNAPSHOT_REFS="0"
+  # ⛔ TWO POLARITIES, ONE WRITER (agent-infra#2466). ACQUISITION fails open — a blip must not refuse
+  # a merge — while SELECTION fails CLOSED, and it can only do that when the read is DATED: the header
+  # below carries the read instant and the fetch's own answer, so the same file serves both readers
+  # without either one guessing. `CLAIM_SNAPSHOT_FETCH` / `_WRITE` / `_REFS` publish what happened to
+  # the CALLER, because the controller's cycle line is the only place an operator sees it.
+  if _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
+    fetch=ok
+  else
+    # ⛔ A FAILED FETCH IS RECORDED, NOT SWALLOWED AND NOT FATAL (agent-infra#2466). Two shapes were
+    # wrong. `|| true` + unconditional `mv` published an EMPTY, undated file that every reader
+    # answered "not owned" — freedom out of a network blip. Returning early (keeping the previous
+    # file) left the header of a PREVIOUS cycle on disk, so the outcome depended on how old that
+    # header was: a 2-second-old one kept answering `claim-free` and the sweep ACTED, which is the
+    # same fail-open one cycle later. The actionable state is neither: the body still holds the rows
+    # of the last successful fetch (they are not lost), and the header published below says
+    # `failed`, which `claim_snapshot_verdict` answers as `claim-unreadable` — refuse, immediately,
+    # on the only cross-box signal there is. The reason is logged where the operator reads it
+    # (this job's stderr reaches no file at all — see orch-loop.sh's call site).
+    fetch=failed
     local why; why="$(_claim_repo_problem)"
-    printf 'claim_snapshot: registry refresh FAILED — %s (previous snapshot kept: %s)\n' \
-      "${why:-git fetch exited non-zero}" "$out" >&2
-    return 1
+    printf 'claim_snapshot: registry refresh FAILED — %s (publishing it in the snapshot header: every reader answers claim-unreadable this cycle)\n' \
+      "${why:-git fetch exited non-zero}" >&2
   fi
-  fetch=ok
   _git for-each-ref --format='%(refname)' "$CLAIM_CACHE_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
     local lease owner until
@@ -1484,12 +1494,19 @@ claim_snapshot() {
   # keep the previous (age-guarded) snapshot, and report the fetch as failed.
   if { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp" 2>/dev/null \
      && mv -f "$tmp" "$out" 2>/dev/null; then
+    write=ok
     rm -f "$body" 2>/dev/null || true
   else
-    fetch=failed; n=0
+    # ⛔ A FAILED PUBLISH IS NOT A FAILED FETCH (review, P2). `fetch` keeps the FETCH's own answer;
+    # `write` records this failure. On a failed FETCH the published header itself says `failed`, so
+    # the reader refuses it; on a failed PUBLISH nothing is published, the PREVIOUS snapshot survives
+    # with its own `ok` header, and it is still believed until it ages out at
+    # CLAIM_SNAPSHOT_MAX_AGE. Collapsing the two made the cycle log assert a stand-down that did not
+    # happen, and pointed an auditor at the network when the cause was the disk.
+    write=failed; n=0
     rm -f "$tmp" "$body" 2>/dev/null || true
   fi
-  CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"
+  CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"; CLAIM_SNAPSHOT_WRITE="$write"
   return 0
 }
 
