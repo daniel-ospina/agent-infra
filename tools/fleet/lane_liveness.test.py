@@ -39,8 +39,8 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 ALSO a filed issue body (#1272)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Nine mutations, each run against the leg
-that must catch it (seven mutate the report; two mutate the CLASSIFIER it
+suite is only a pin if it can FAIL. Ten mutations, each run against the leg
+that must catch it (eight mutate the report; two mutate the CLASSIFIER it
 consumes, which is the seam #1254 actually broke):
   * escalate every state        → CLEAN must go red
   * escalate nothing            → TRIP must go red
@@ -51,6 +51,7 @@ consumes, which is the seam #1254 actually broke):
   * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
   * policy text names one reason for a state several paths reach → TURN-BOUNDARY must go red
   * drop the markdown-cell escape → MD-ESCAPE must go red
+  * drop the population-gap declaration → DISCLOSURE must go red (#1777)
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -69,6 +70,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -793,11 +795,75 @@ def leg_md_escape(module=None):
         fx.close()
 
 
+# The needle is the assertion's anchor: it is the sentence that makes the gap
+# DECLARED rather than implied. If the paragraph is dropped, silence reads as a
+# verdict again — which is the whole defect (#1777).
+GAP_NEEDLE = "ABSENT FROM THIS POPULATION BY CONSTRUCTION"
+
+
+def leg_disclosure(module=None):
+    print("── DISCLOSURE — the population gap is declared, and no git/network call is made (#1777) ──")
+    fx = Fixture([live_lane()], ps_rows=[ps_row(PID_ALIVE)])
+    shim = tempfile.mkdtemp(prefix="lane-liv-gitshim-")
+    calls = os.path.join(shim, "git-calls")
+    try:
+        # A `git` on PATH that records its own invocation and fails. The scheduled
+        # job must not reach for the registry: it runs behind launchd's TCC wall,
+        # where a network read is not available every pass, and the claim axis
+        # belongs to liveness.evaluate's caller (claim_lanes.py), not here.
+        path = os.path.join(shim, "git")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env bash\nprintf '%%s\\n' \"$*\" >> %s\nexit 1\n" % calls)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        env = {"PATH": shim + os.pathsep + os.environ.get("PATH", "")}
+
+        rc, out, gh = run_report(fx, module=module, env_extra=env)
+        assert_eq(rc, 0, "the gap declaration does not change the verdict (a clean fleet still exits 0)")
+        assert_contains(out, GAP_NEEDLE, "the report DECLARES the population it cannot see")
+        assert_contains(out, "Coverage gaps", "the declaration is labelled as a gap, not prose")
+        assert_contains(out, "pi -p --no-session", "it names WHY the lanes are absent")
+        assert_contains(out, "claim_lanes.py", "it names the reader that covers them")
+        if os.path.exists(calls):
+            with open(calls, "r", encoding="utf-8") as fh:
+                bad("the scheduled report called git: %r" % fh.read())
+        else:
+            ok("no git invocation (the report makes no registry/network read)")
+        if gh:
+            bad("a clean fleet called gh: %s" % gh)
+        else:
+            ok("no gh call on a clean fleet")
+
+        # …and the same declaration is machine-readable, so a consumer of --json
+        # (an orchestrator, a dashboard) cannot miss it.
+        rc2, out2, _gh2 = run_report(fx, "--json", module=module, env_extra=env, dry_run=True)
+        assert_eq(rc2, 0, "--dry-run on a clean fleet exits 0")
+        payload = None
+        for line in out2.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                payload = json.loads(line)
+                break
+        if payload is None:
+            bad("no JSON object in the output")
+            return
+        gaps = payload.get("coverage_gaps")
+        assert_eq(isinstance(gaps, list) and len(gaps) >= 3, True,
+                  "--json carries the declared gaps: %r" % (gaps,))
+        assert_eq(any(GAP_NEEDLE in g for g in gaps), True,
+                  "the JSON carries the same declaration as the body")
+        assert_eq(payload.get("counts", {}).get("running-quiet"), 1,
+                  "the verdict counts are unchanged by the declaration")
+    finally:
+        fx.close()
+        shutil.rmtree(shim, ignore_errors=True)
+
+
 LEGS = [("CLEAN", leg_clean), ("TRIP", leg_trip), ("DEDUP", leg_dedup),
         ("DRY-RUN", leg_dry_run), ("ENV-ERROR", leg_env_error),
         ("STALE-DEAD", leg_stale_dead), ("CLOSED-WORKSPACE", leg_closed_workspace),
         ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary),
-        ("COMPACTION", leg_compaction), ("MD-ESCAPE", leg_md_escape)]
+        ("COMPACTION", leg_compaction), ("MD-ESCAPE", leg_md_escape),
+        ("DISCLOSURE", leg_disclosure)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -887,6 +953,14 @@ MUTATIONS = [
         '    return out\n',
         leg_md_escape, 1,
         "a transcript-derived value is interpolated unescaped, so a `|`/backtick/newline can forge the table, the code span or a heading (#1272)",
+        target="report",
+    ),
+    Mutation(
+        "undeclare-the-population-gap",
+        'COVERAGE_GAPS = (',
+        'COVERAGE_GAPS = ()\n_UNUSED_GAPS = (',
+        leg_disclosure, 0,
+        "the population gap stops being declared, so the report's silence reads as a verdict again (#1777)",
         target="report",
     ),
 ]
