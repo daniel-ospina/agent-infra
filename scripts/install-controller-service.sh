@@ -137,6 +137,40 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # does not exist in a per-user manager, so a user unit enabled against it would never be brought back —
 # the defect this installer removes, one layer down. Resolved here beside the scope so the two cannot
 # disagree, and the rendered line is asserted below.
+# ⛔ A UNIT DIRECTORY SYSTEMD READS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1,
+# #2402). `SYSTEMD_UNIT_DIR` is the installer's WRITE override, but the supervisor discovers a unit only
+# under the system dir (`CONTROLLER_SYSTEM_UNIT_DIR`, default `/etc/systemd/system`) and the user dirs it
+# enumerates (`cloud-cell-supervisor.sh::controller_unit_copies`). systemd additionally loads units from
+# `/etc/systemd/system.control`, `/etc/systemd/system.attached`, `/usr/lib/systemd/system`,
+# `/usr/local/lib/systemd/system`, the user managers' `/etc/systemd/user`, `/etc/xdg/systemd/user` and
+# `~/.local/share/systemd/user`. A unit written into one of those is ENABLED and BOOT-ARMED while
+# `start`/`stop`/`status` cannot see it at all: when it dies the doctor finds no unit, launches a tmux
+# controller, and `Restart=always` revives the unit — TWO dispatchers on one queue (#1761), the exact
+# duplicate this feature exists to prevent. Verified on the unguarded form:
+# `SYSTEMD_UNIT_DIR=/etc/systemd/system.control` → rc 0, `would install … and enable it`.
+# The ALLOWED set is the two directories the readers search BY DEFAULT, compared LITERALLY and not
+# through a seam: re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at `/etc/systemd/system.control` would
+# otherwise make the guard agree with itself and admit the directory. A directory systemd does NOT read
+# (a hermetic test fixture under `$TMPDIR`) is always allowed — nothing boots it.
+unit_dir_systemd_reads() { # <dir> — a real systemd search path
+    case "${1%/}" in
+        /etc/systemd/system.control|/etc/systemd/system.attached) return 0 ;;
+        /usr/lib/systemd/system|/usr/lib/systemd/user|/lib/systemd/system) return 0 ;;
+        /usr/local/lib/systemd/system|/usr/local/lib/systemd/user) return 0 ;;
+        /etc/systemd/user|/etc/xdg/systemd/user) return 0 ;;
+        /run/systemd/system|/run/systemd/transient) return 0 ;;
+        */.local/share/systemd/user) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+unit_dir_is_read_by_default() { # <dir> — searched by the supervisor with NO override in play
+    local d="${1%/}" h
+    [ "$d" = "/etc/systemd/system" ] && return 0
+    for h in "${HOME:-}" "$(passwd_home "$(id -u)" 2>/dev/null || true)" "$(passwd_home "${SUDO_USER:-}" 2>/dev/null || true)"; do
+        [ -n "$h" ] && [ "$d" = "${h%/}/.config/systemd/user" ] && return 0
+    done
+    return 1
+}
 wanted_by() {
     case "$1" in
         user) printf 'default.target\n' ;;
@@ -152,6 +186,17 @@ choose_target() {
         return 1
     fi
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
+        if unit_dir_systemd_reads "$SYSTEMD_UNIT_DIR" && ! unit_dir_is_read_by_default "$SYSTEMD_UNIT_DIR"; then
+            err "REFUSING SYSTEMD_UNIT_DIR=$SYSTEMD_UNIT_DIR: systemd loads units from there, but every cooperating"
+            err "  verb (start/stop/status) discovers a unit only under /etc/systemd/system or"
+            err "  \$HOME/.config/systemd/user — so this would install an ENABLED, BOOT-ARMED unit that nothing here"
+            err "  can see. When it dies the doctor launches a tmux controller and Restart=always revives the unit:"
+            err "  TWO dispatchers on one queue (#1761), the duplicate this feature exists to prevent."
+            err "  Fix: install into the system or the user unit dir — or point SYSTEMD_UNIT_DIR at a directory"
+            err "  systemd does NOT read (a hermetic test dir); only the directories systemd loads and this"
+            err "  fleet's readers do not search are refused."
+            return 1
+        fi
         TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
         WANTED_BY="$(wanted_by override)"
         return 0
@@ -736,12 +781,36 @@ do_install() {
     fi
     pid="$(unit_main_pid)" || { err "cannot read $UNIT_NAME's MainPID — the unit answers is-active but nothing here can say a controller is running"; return 1; }
     [ "${pid:-0}" != "0" ] || { err "$UNIT_NAME is active with MainPID 0 — no controller process; read: journalctl -u $UNIT_NAME -n 40"; return 1; }
-    local waited=0
+    local waited=0 proof_budget proof_budget_src _hb_bound
     # ⛔ THE PROOF POLLS THE STATE DIR THE UNIT RESOLVES TO, as well as this installer's `$O` (review P1
     # round 9, #2402): the supervisor sources `$ENV_FILE` (`set -a`), so a `keys.env` `O=` line moves the
     # controller's lock and heartbeat there while this installer never sources the file. Resolved from the
     # INSTALLED copy, so the proof asks about the same unit the manager is running.
-    while [ "$waited" -lt "${CONTROLLER_PROOF_TIMEOUT:-240}" ]; do
+    # ⛔ AND IT MUST OUTWAIT THE PHASE IT WATCHES (review P1, #2402). `systemctl start` forks
+    # (`Type=simple`) and returns BEFORE `ExecStart`'s `start` has run `harness_apply` + `cmd_check` and
+    # `exec`ed the loop — the phase the supervisor already budgets 600 s for
+    # (`CONTROLLER_SERVICE_START_TIMEOUT`/`CONTROLLER_START_TIMEOUT`), raised from 60 s because 60 s
+    # produced a false FATAL on a real cell. This poll defaulted to 240 s AND its own predicate accepts a
+    # heartbeat up to `2 × CYC` (480 s), so a controller whose first witness landed between 240 s and
+    # 480 s was ACCEPTED by the predicate and never observed by the poll: `--install` printed "NO
+    # CONTROLLER PROVED ITSELF in 240s", `cloud-cell-bringup.sh` died on that rc, and `CELL READY` was
+    # refused on a cell that was supervised and about to dispatch. The default is the start budget's own
+    # 600 s, widened only when the heartbeat bound below is larger than it.
+    proof_budget="${CONTROLLER_PROOF_TIMEOUT:-600}"
+    proof_budget_src="CONTROLLER_PROOF_TIMEOUT"
+    if [ -z "${CONTROLLER_PROOF_TIMEOUT:-}" ]; then
+        # ⛔ THE MESSAGE NAMES THE KNOB THAT SET THE BUDGET (review P2, #2402): quoting
+        # `CONTROLLER_PROOF_TIMEOUT` over a value the HEARTBEAT BOUND widened would send the operator to an
+        # unset variable — the same "the sentence must be the rule the guard enforces" class this PR keeps
+        # closing (round 15 did it for the start-limit window).
+        proof_budget_src="the start budget"
+        _hb_bound=$(( ${CYC:-240} * 2 ))
+        if [ "$_hb_bound" -gt "$proof_budget" ]; then
+            proof_budget="$_hb_bound"
+            proof_budget_src="the heartbeat bound, 2 x CYC"
+        fi
+    fi
+    while [ "$waited" -lt "$proof_budget" ]; do
         controller_proof "$proof_since" "$proof_o" && break
         # a unit that has already converged to `failed` will not produce a controller — stop waiting
         case "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" in failed) break ;; esac
@@ -767,7 +836,7 @@ do_install() {
         esac
     fi
     controller_proof "$proof_since" "$proof_o" || {
-        err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s:"
+        err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${proof_budget}s (${proof_budget_src}):"
         err "  expected the harness's lock ($O/.orch.lock$([ -n "$proof_o" ] && [ "${proof_o%/}" != "${O%/}" ] && printf ' or %s/.orch.lock' "${proof_o%/}")) held by a live orch-loop.sh, or a heartbeat in the same state dir."
         err "  An active unit whose start is about to die (no key, a foreign controller, a bad pin) converges to"
         err "  'failed' at StartLimitBurst — the #2402 defect, with a green install on top of it. Read:"
@@ -1139,40 +1208,26 @@ installed_user_unit_dirs() {
     h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
     return 0
 }
-find_installed_unit() {
+installed_unit_copies() { # every copy of OUR unit this box can find: system scope, then every honest user dir
     local d seen=" "
     # ⛔ `CONTROLLER_SYSTEM_UNIT_DIR` is the READ side of the system scope (the supervisor's own seam name);
     # `SYSTEMD_UNIT_DIR` stays the WRITE override. Conflating them is how a write-path override decided
     # which installed copy a read-back reported on.
     # ⛔ AND A DIRECTORY IS COUNTED ONCE (review P2, #2402). The two seams are independent, so a caller
     # may point both at one directory — the hermetic suite does exactly that to keep its read-backs off
-    # the host. Without this dedupe that configuration reported the SAME file twice, and `installed_units`'
+    # the host. Without this dedupe that configuration reported the SAME file twice, and the
     # "two copies installed" arm then fired on a single unit: install re-runs exited 1 with `changed=1`
     # (`install: re-run rc differs (0 then 1)`, reproduced).
+    # ⛔ ONE ENUMERATION, NOT TWO (review P2, #2402). `installed_units` used to hard-code
+    # `$HOME/.config/systemd/user` alone while this reader also tried `CONTROLLER_USER_UNIT_DIR` and the
+    # PASSWD homes, so the "never arm a second supervisor in the other scope" guard could not see an
+    # operator-installed user unit whenever $HOME was not the operator's — and `cloud-cell-bringup.sh`
+    # forces HOME=$CELL_HOME before running the installer. Reproduced at the previous head: with our own
+    # user unit in the passwd home and HOME=$CELL_HOME, `--install` printed `installed: … changed=1` and
+    # left TWO copies for one state dir, no refusal. Two ENABLED units are two supervisors for one queue:
+    # `stop` addresses one while the other revives the controller (#1761). The guard now shares the
+    # read-back verbs' enumeration, so the two can never disagree about what is installed.
     for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
-        [ -n "$d" ] || continue
-        case "$seen" in *" $d "*) continue ;; esac
-        seen="$seen$d "
-        [ -f "$d/$UNIT_NAME" ] || continue
-        unit_is_ours "$d/$UNIT_NAME" || continue
-        printf '%s\n' "$d/$UNIT_NAME"; return 0
-    done
-    while IFS= read -r d; do
-        [ -n "$d" ] || continue
-        case "$seen" in *" $d "*) continue ;; esac
-        seen="$seen$d "
-        [ -f "$d/$UNIT_NAME" ] || continue
-        unit_is_ours "$d/$UNIT_NAME" || continue
-        printf '%s\n' "$d/$UNIT_NAME"; return 0
-    done < <(installed_user_unit_dirs)
-    return 1
-}
-# every installed copy, in the order the scopes are tried. ONE is the normal case; two is an operator who
-# installed both, and the second is why `--uninstall` must not report "no longer supervised" over a copy
-# it did not remove.
-installed_units() {
-    local d seen=" "
-    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
@@ -1180,7 +1235,30 @@ installed_units() {
         unit_is_ours "$d/$UNIT_NAME" || continue
         printf '%s\n' "$d/$UNIT_NAME"
     done
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || continue
+        printf '%s\n' "$d/$UNIT_NAME"
+    done < <(installed_user_unit_dirs)
     return 0
+}
+find_installed_unit() { # the first copy, in scope order (the installed file is the evidence)
+    local p
+    # NOT `| head -1`: under `set -euo pipefail` a writer SIGPIPE'd by `head` fails the whole pipeline
+    # (#836 class — a present value reported as missing).
+    p="$(installed_unit_copies)"
+    [ -n "$p" ] || return 1
+    printf '%s\n' "${p%%$'\n'*}"
+    return 0
+}
+# every installed copy, in the order the scopes are tried. ONE is the normal case; two is an operator who
+# installed both, and the second is why `--uninstall` must not report "no longer supervised" over a copy
+# it did not remove.
+installed_units() {
+    installed_unit_copies
 }
 do_uninstall() {
     local p left _f
@@ -1193,10 +1271,20 @@ do_uninstall() {
     # describes root's world: find_installed_unit found nothing, the verb printed "not installed" and
     # returned 0 while the operator's user unit stayed installed, enabled and restarting the controller —
     # the exact false pass --uninstall exists to refuse.
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        err "REFUSING to uninstall as root (SUDO_USER=$SUDO_USER): HOME=/root hides the operator's user unit,"
+    # ⛔ AND IT IS THE UID, NOT `SUDO_USER` (review P1, #2402). The guard below used to test
+    # `id -u = 0 AND SUDO_USER set`, which refused the ONE spelling that carries a stand-in and ADMITTED
+    # every other root run — `su -`, a direct root login, any root-run provision. Those have HOME=/root and
+    # no SUDO_USER, so the same blind read reported "not installed" (rc 0) over an operator-home unit that
+    # was still enabled and restarting the controller. This is the same weak test the INSTALL guard was
+    # rewritten to remove, and its own comment (:427 above) names the defect; the two halves had drifted.
+    # `CONTROLLER_ALLOW_ROOT=1` is the one opt-in, shared with `--install`, so a root-only container is a
+    # decision the operator states rather than a state the verb guesses.
+    if [ "$(id -u)" = "0" ] && [ "${CONTROLLER_ALLOW_ROOT:-0}" != "1" ]; then
+        err "REFUSING to uninstall as root (uid 0${SUDO_USER:+, SUDO_USER=$SUDO_USER}): HOME=/root hides the operator's user unit,"
         err "  so this verb would report 'not installed' over a supervisor that is still enabled. Re-run as"
-        err "  the operator: sudo -u $SUDO_USER -H bash $0 --uninstall"
+        err "  the operator: ${SUDO_USER:+sudo -u $SUDO_USER -H }bash $0 --uninstall"
+        err "  (on a root-only box, the documented escape is the same one --install uses:"
+        err "    CONTROLLER_ALLOW_ROOT=1 bash $0 --uninstall)"
         return 1
     fi
     if [ -z "$SC" ]; then choose_target >/dev/null 2>&1 || true; fi

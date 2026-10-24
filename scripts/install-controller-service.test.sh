@@ -1122,6 +1122,78 @@ HS_RC=0; HS_OUT="$(SC_PROOF=stale CONTROLLER_PROOF_TIMEOUT=4 inst hs --install 2
 [ "$HS_RC" -ne 0 ] && ok 'install: a PRE-START heartbeat does not certify the install' \
                    || bad "install: certified a unit from a heartbeat that predates its start — $HS_OUT"
 
+# ⛔ THE PROOF POLL MUST OUTWAIT THE PHASE IT WATCHES (review P1, #2402). `systemctl start` forks
+# (`Type=simple`), so the poll begins BEFORE `ExecStart`'s `start` has run `harness_apply` + `cmd_check` and
+# `exec`ed the loop — the phase the supervisor budgets 600 s for. The poll defaulted to 240 s while its own
+# predicate accepts a heartbeat up to `2 × CYC` (480 s): a controller whose first witness landed between
+# 240 s and 480 s was ACCEPTED by the predicate and never observed, so `--install` printed "NO CONTROLLER
+# PROVED ITSELF in 240s", `cloud-cell-bringup.sh` died on that rc, and CELL READY was refused on a healthy
+# cell. Pinned two ways: the default is asserted from the shipping source (an arm cannot wait 600 s), and
+# the refusal names the RESOLVED budget, so the message can never again contradict the wait.
+say_case 'the controller-proof poll budgets at least the start phase it observes'
+case "$(grep -c 'CONTROLLER_PROOF_TIMEOUT:-600' "$INST" 2>/dev/null || true)" in
+  0) bad 'the proof poll default is not 600 s — it cannot observe the 600 s start phase the supervisor budgets' ;;
+  *) ok 'the proof poll default is the start budget (600 s), not 240 s' ;;
+esac
+grep -q 'CONTROLLER_PROOF_TIMEOUT:-240' "$INST" 2>/dev/null \
+  && bad 'the 240 s default is still in the source — the poll would abandon the phase it observes' \
+  || ok 'the 240 s default is gone'
+HPT="$(arm_root hpt)"; mk_systemctl "$HPT/bin" "$HPT/state" "$HPT/sc.log"
+HPT_RC=0; HPT_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst hpt --install 2>&1)" || HPT_RC=$?
+[ "$HPT_RC" -ne 0 ] && ok 'proof budget: the no-proof refusal still fires under the override' \
+                    || bad "proof budget: certified an install with no proof under a 4 s budget — $HPT_OUT"
+case "$HPT_OUT" in
+  *'in 4s (CONTROLLER_PROOF_TIMEOUT)'*) ok 'proof budget: the refusal names the RESOLVED budget, not a stale constant' ;;
+  *) bad "proof budget: the refusal does not name the budget it waited — $HPT_OUT" ;;
+esac
+
+# ⛔ A WRITE TARGET systemd LOADS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1, #2402).
+# `SYSTEMD_UNIT_DIR=/etc/systemd/system.control` installed an ENABLED, BOOT-ARMED unit that `start`/`stop`/
+# `status` cannot discover: when it died the doctor launched a tmux controller while `Restart=always` revived
+# the unit (#1761). A hermetic temp dir must stay allowed (every other arm above installs into one), so the
+# rule refuses only the directories systemd reads and these readers do not search.
+# ⛔ THE PROBE IS A DRY RUN, AND THAT IS THE HERMETIC CHOICE (review P2, #2402). The guard lives in
+# `choose_target`, which `--dry-run` reaches before any file operation, so this arm exercises the PRODUCTION
+# decision with nothing written. A real `--install` into these paths would have been a fixture that can
+# reach the host — under a regressed guard the arm itself would have written an enabled unit into
+# `/usr/lib/systemd/system`. (Verified by mutation: with the guard deleted, a dry run prints
+# `dry-run: would install … and enable it` and exits 0, so every assertion below goes red.)
+say_case 'SYSTEMD_UNIT_DIR refuses a directory systemd loads but the cooperating verbs cannot see'
+for _bad_dir in /etc/systemd/system.control /etc/systemd/system.attached /usr/lib/systemd/system /etc/systemd/user /etc/xdg/systemd/user; do
+  _bd="$(arm_root "bd-$(printf '%s' "$_bad_dir" | tr '/' '_')")"; mk_systemctl "$_bd/bin" "$_bd/state" "$_bd/sc.log"
+  _BD_RC=0; _BD_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_bad_dir" inst "$(basename "$_bd")" --dry-run 2>&1)" || _BD_RC=$?
+  [ "$_BD_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_bad_dir is REFUSED" \
+                      || bad "SYSTEMD_UNIT_DIR=$_bad_dir would install an enabled, boot-armed unit nothing here can see — $_BD_OUT"
+  case "$_BD_OUT" in
+    *'dry-run: would install'*) bad "SYSTEMD_UNIT_DIR=$_bad_dir: the dry run planned the install (the guard did not fire)" ;;
+    *) ok "SYSTEMD_UNIT_DIR=$_bad_dir: no install was planned" ;;
+  esac
+done
+BDR="$(arm_root 'bd-reason')"; mk_systemctl "$BDR/bin" "$BDR/state" "$BDR/sc.log"
+BDR_RC=0; BDR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system.control" inst 'bd-reason' --dry-run 2>&1)" || BDR_RC=$?
+[ "$BDR_RC" -ne 0 ] && ok 'a dry run into /etc/systemd/system.control is REFUSED' \
+                    || bad "the dry run planned an install into /etc/systemd/system.control — $BDR_OUT"
+case "$BDR_OUT" in
+  *'REFUSING SYSTEMD_UNIT_DIR'*) ok 'the refusal names the offending override' ;;
+  *) bad "the refusal does not name SYSTEMD_UNIT_DIR — $BDR_OUT" ;;
+esac
+case "$BDR_OUT" in
+  *'#1761'*) ok 'the refusal names the consequence (two dispatchers on one queue)' ;;
+  *) bad "the refusal does not name the #1761 consequence — $BDR_OUT" ;;
+esac
+# ⛔ AND THE READ SEAM CANNOT DEFEAT IT: re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at the same directory used
+# to make the guard agree with itself. The allowed set is the literal default, not the seam.
+_bd="$(arm_root 'bd-seam')"; mk_systemctl "$_bd/bin" "$_bd/state" "$_bd/sc.log"
+BDS_RC=0; BDS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system.control CONTROLLER_SYSTEM_UNIT_DIR=/etc/systemd/system.control" inst 'bd-seam' --dry-run 2>&1)" || BDS_RC=$?
+[ "$BDS_RC" -ne 0 ] && ok 're-pointing CONTROLLER_SYSTEM_UNIT_DIR at the same directory does NOT defeat the guard' \
+                    || bad "re-pointing the read seam defeated the SYSTEMD_UNIT_DIR guard — $BDS_OUT"
+# …and the ALLOWED side of the same rule, so the guard is a boundary and not a blanket refusal: the two
+# directories the readers DO search stay installable, and so does a hermetic temp dir (every other arm).
+_gd="$(arm_root 'gd-ok')"; mk_systemctl "$_gd/bin" "$_gd/state" "$_gd/sc.log"
+GDO_RC=0; GDO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system" inst 'gd-ok' --dry-run 2>&1)" || GDO_RC=$?
+[ "$GDO_RC" -eq 0 ] && ok 'SYSTEMD_UNIT_DIR=/etc/systemd/system (a directory the readers search) is ALLOWED' \
+                    || bad "the guard refused the canonical system unit dir — $GDO_OUT"
+
 # ⛔ MainPID 0 WITH A *FRESH* HEARTBEAT IS STILL NOT A CONTROLLER (review P1, #2402). `is-active` reports
 # `activating` during a RestartSec wait, and a loop that ticked 10 s ago then died leaves a readable fresh
 # heartbeat; `--status` returned 0 and printed main_pid=0 — the state the doc says it refuses.
@@ -1152,6 +1224,24 @@ case "$HO_OUT" in
 esac
 [ -f "$HO/units/eldato-orchestrator.service" ] && bad 'install: wrote the second unit anyway' \
                                                || ok 'install: wrote nothing beside the existing unit'
+# ⛔ AND THE GUARD MUST SEE EVERY COPY THE READ-BACK VERBS CAN FIND (review P2, #2402). The guard read a
+# NARROWER list than `find_installed_unit`: only `$HOME/.config/systemd/user`, never the passwd homes or
+# `CONTROLLER_USER_UNIT_DIR`. `cloud-cell-bringup.sh` forces HOME=$CELL_HOME before running the installer,
+# so an OPERATOR-installed user unit was invisible: `--install` printed `changed=1` and left TWO copies for
+# one state dir — two enabled units, `stop` addresses one, the other revives the controller (#1761). This
+# arm puts our copy in a user-unit dir that is not $HOME, the shape the bring-up actually produces.
+HO2="$(arm_root ho2)"; mk_systemctl "$HO2/bin" "$HO2/state" "$HO2/sc.log"
+mkdir -p "$HO2/op/.config/systemd/user"
+: > "$HO2/op/.config/systemd/user/eldato-orchestrator.service"
+HO2_RC=0; HO2_OUT="$(EXTRA_ENV="HOME=$HO2/home CONTROLLER_USER_UNIT_DIR=$HO2/op/.config/systemd/user" inst ho2 --install 2>&1)" || HO2_RC=$?
+[ "$HO2_RC" -ne 0 ] && ok 'install: a copy in the OPERATOR home (not $HOME) is REFUSED too (the bring-up shape)' \
+                    || bad "install: armed a second unit because the guard could not see the operator-home copy — $HO2_OUT"
+case "$HO2_OUT" in
+  *'already installed at'*) ok 'install: and that refusal names the copy it found' ;;
+  *) bad "install: the operator-home refusal is unnamed — $HO2_OUT" ;;
+esac
+[ -f "$HO2/units/eldato-orchestrator.service" ] && bad 'install: wrote a second unit beside the operator-home copy' \
+                                                 || ok 'install: wrote nothing beside the operator-home copy'
 
 # ── an ELEVATED uninstall is refused (review P2, #2402) ──────────────────────────────────────────
 # HOME=/root hides the operator's user unit, so `--uninstall` under sudo printed "not installed" (rc 0)
@@ -1160,13 +1250,36 @@ say_case 'uninstall refuses an elevated (sudo) invocation'
 HU2="$(arm_root hu2)"; mk_systemctl "$HU2/bin" "$HU2/state" "$HU2/sc.log"
 printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU2/bin/id"
 chmod +x "$HU2/bin/id"
-HU2_RC=0; HU2_OUT="$(EXTRA_ENV=SUDO_USER=operator inst hu2 --uninstall 2>&1)" || HU2_RC=$?
+HU2_RC=0; HU2_OUT="$(EXTRA_ENV="SUDO_USER=operator CONTROLLER_ALLOW_ROOT=0" inst hu2 --uninstall 2>&1)" || HU2_RC=$?
 [ "$HU2_RC" -ne 0 ] && ok 'uninstall: an ELEVATED invocation is REFUSED' \
                    || bad "uninstall: reported success under sudo, where HOME hides the operator's unit — $HU2_OUT"
 case "$HU2_OUT" in
   *'REFUSING to uninstall as root'*) ok 'uninstall: the refusal names the reason and the operator re-run' ;;
   *) bad "uninstall: refused without naming the root cause — $HU2_OUT" ;;
 esac
+# ⛔ AND THE OTHER SPELLINGS OF "root" (review P1, #2402). The guard used to need `SUDO_USER`, so `su -`, a
+# direct root login or any root-run provision fell THROUGH it: HOME=/root hid the operator's user unit, the
+# verb printed "not installed" and returned 0 over a unit that was still enabled and restarting the
+# controller — the false pass this verb exists to refuse, still live on the spelling the install guard had
+# already been fixed for. Since the guard is now the uid, this arm carries no `SUDO_USER` at all: on the
+# pre-fix code it returns 0, on the fixed code it refuses.
+HU3="$(arm_root hu3)"; mk_systemctl "$HU3/bin" "$HU3/state" "$HU3/sc.log"
+printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU3/bin/id"
+chmod +x "$HU3/bin/id"
+mkdir -p "$HU3/home/.config/systemd/user"
+: > "$HU3/home/.config/systemd/user/eldato-orchestrator.service"
+HU3_RC=0; HU3_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=0" inst hu3 --uninstall 2>&1)" || HU3_RC=$?
+[ "$HU3_RC" -ne 0 ] && ok 'uninstall: a root run with NO SUDO_USER (su -, root login) is REFUSED too' \
+                   || bad "uninstall: a uid-0 run with no SUDO_USER reported 'not installed' over a still-enabled unit — $HU3_OUT"
+case "$HU3_OUT" in
+  *'REFUSING to uninstall as root'*) ok 'uninstall: and that refusal names the reason' ;;
+  *) bad "uninstall: the no-SUDO_USER refusal is unnamed — $HU3_OUT" ;;
+esac
+# ⛔ THE SAME OPT-IN AS `--install`, so a root-only container can still ask (and so the refusal above is the
+# opt-in, not a blanket "root is broken").
+HU4_RC=0; HU4_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=1" inst hu4 --uninstall 2>&1)" || HU4_RC=$?
+[ "$HU4_RC" -eq 0 ] && ok 'uninstall: CONTROLLER_ALLOW_ROOT=1 is the documented escape and it proceeds' \
+                    || bad "uninstall: the documented CONTROLLER_ALLOW_ROOT=1 was refused — $HU4_OUT"
 
 # ── a service-mode start does not wait forever on a session that is not ours (review P2, #2402) ──
 # `$SESSION` is machine-scoped, so a peer repo's controller holds the same name. An unbounded wait parks
