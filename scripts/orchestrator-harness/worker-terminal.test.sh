@@ -264,6 +264,14 @@ scenario cmux; scenario absent; scenario darwin; scenario host
 # the scenario dir ALONE (no `:$PATH`), or the real /usr/bin/tmux a developer box carries would be
 # found and the case could never be driven.
 scenario bare; rm -f "$TMP/bin-bare/tmux"
+# ⛔ THE STUBS ARE `#!/usr/bin/env bash`, so a scenario whose PATH is this dir ALONE still needs the
+# interpreter and the utilities the module actually calls — symlinked in (the `storenogh` pattern
+# below) — or every stub dies 127 and the box looks surface-less for the WRONG reason. `tmux` stays
+# ABSENT deliberately: this box's whole purpose is the no-surface state, and the real /usr/bin/tmux a
+# dev box carries must not be reachable.
+for _u in bash env tr cut sed cat grep date mkdir rm ln; do
+  [ -e "$TMP/bin-bare/$_u" ] || { _p="$(command -v "$_u" 2>/dev/null)" && ln -sf "$_p" "$TMP/bin-bare/$_u"; }
+done
 # A box whose `gh` cannot answer (absent, or a broken install): `scenario` copies the cmux/tmux/uname
 # stubs so only `gh` differs. The credential-contract pins below need it — a hosts.yml credit is only
 # usable if the worker's OWN `gh` can read the store, and that is the arm a session-start cannot see.
@@ -1089,35 +1097,57 @@ printf 'export GH_TOKEN=ghp_keysonly\n' > "$TMP/home-keysonly/keys.env"
 out="$(bash "$TMP/c4.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4e2" "$TMP/home-keysonly" 2>&1)"
 case "$out" in *"home_plain=$TMP/home-keysonly"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and a HOME whose own keys.env carries the token is chosen too (selection and acceptance agree)" $rc
-[ -s "$TMP/tmux4.log" ] && rc=1 || rc=0
-ck "…WITHOUT falling back to tmux (the launcher that kills lanes) — tmux was never called" $rc
-grep -q 'REFUSED lane-8' "$TMP/O4/test.log" && rc=0 || rc=1
+# ⛔ A BOX WITH NO SURFACE AT ALL is now the ONLY state in which the launcher answers `none`: main
+# made tmux a real Linux surface (#2210 — with the HOME+keys.env contract), so `$TMP/O4` above IS a
+# tmux surface and correctly produces NO refusal. The #2366 assertions therefore get their own
+# no-surface run, on `bin-bare` (no cmux answer AND no tmux binary, PATH narrowed so a dev box's real
+# /usr/bin/tmux cannot be found). Without this they read a TMUX run's artifacts and pass vacuously —
+# the "yesterday's fixture" failure a rebase manufactures.
+rm -rf "$TMP/O4n"; mkdir -p "$TMP/O4n"
+cat > "$TMP/c1n.sh" <<'SH'
+set -u
+O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; LOG="$O/test.log"
+mkdir -p "$WT_DIR"
+PATH="$2"
+export CMUX_ABSENT=1 CMUX_LOG="$O/cmux-calls.log"; : > "$CMUX_LOG"
+. "$1"
+wt_startup_banner > "$O/banner.txt" 2>/dev/null
+wt_spawn "lane-8" "/tmp" 'bash /tmp/lane.sh 8 b o/r'; echo "rc=$?"
+SH
+out="$(FAKE_UNAME=Linux bash "$TMP/c1n.sh" "$LIB" "$TMP/bin-bare" "$TMP/O4n" 2>&1)"
+case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…WITHOUT falling back to tmux (no surface at all) — the spawn is REFUSED" $rc
+grep -q 'REFUSED lane-8' "$TMP/O4n/test.log" && rc=0 || rc=1
 ck "…and the refusal reaches the controller's log, not just stderr" $rc
 # ⛔ THE PROBE COST IS A PINNED FACT, not a sentence in a comment (the comment said "one probe" while
-# the banner cost three, then two, as the code changed under it). `none` = the launcher's read + the
-# reason's read on the banner, plus the same two on the refused spawn.
-n_mux="$(grep -c '^CMUX ' "$TMP/O4/cmux-calls.log" 2>/dev/null || echo 0)"
-[ "$n_mux" = "4" ] && rc=0 || rc=1
-printf '      cmux calls for one banner + one refused spawn: %s (want 4)\n' "$n_mux"
+# the banner cost three, then two, as the code changed under it). The MERGED cost is FIVE, and the
+# arithmetic is the union of both sides: the banner's own read + the reason's read (2), then the same
+# two on the refused spawn (2), PLUS main's own re-measurement of `cmux tree` rc on the refusal line
+# (1) — main adds that probe deliberately, because a presence test sent the operator to the wrong
+# fault (#2210). A rebase that left this at 4 would be pinning the pre-merge probe count.
+n_mux="$(grep -c '^CMUX ' "$TMP/O4n/cmux-calls.log" 2>/dev/null || echo 0)"
+[ "$n_mux" = "5" ] && rc=0 || rc=1
+printf '      cmux calls for one banner + one refused spawn: %s (want 5)\n' "$n_mux"
 ck "…and the whole refusal costs FOUR probes (2 banner + 2 spawn), not creeping further" $rc
 # ⛔ THE PROBE'S OWN ANSWER MUST REACH THE OPERATOR (agent-infra#2366). `cmux tree --json >/dev/null
 # 2>&1` keeps the decision and discards the reason, so a launcher-less box prints `launcher=none
 # (cmux=yes, uname=Linux)` — a verdict with no cause, indistinguishable from a tty gate, a TERM gate,
 # a drifted output shape, or a daemon that is not there. The assertion is on the BANNER FILE ALONE,
 # and on the stub's own error string — a fact only the surface can supply.
-grep -q '^\[startup\] worker launcher=none (cmux=yes, uname=Linux) — cmux tree --json failed (rc=1): cmux: no daemon from the surface-stub$' "$TMP/O4/banner.txt" && rc=0 || { rc=1; cat "$TMP/O4/banner.txt" 2>/dev/null; }
+grep -q '^\[startup\] worker launcher=none (cmux=yes, uname=Linux) — cmux tree --json failed (rc=1): cmux: no daemon from the surface-stub$' "$TMP/O4n/banner.txt" && rc=0 || { rc=1; cat "$TMP/O4n/banner.txt" 2>/dev/null; }
 ck "the startup banner carries the PROBE'S own reason, not just the verdict" $rc
-grep -q 'why: cmux tree --json failed (rc=1): cmux: no daemon from the surface-stub' "$TMP/O4/test.log" && rc=0 || { rc=1; cat "$TMP/O4/test.log"; }
+grep -q 'why: cmux tree --json failed (rc=1): cmux: no daemon from the surface-stub' "$TMP/O4n/test.log" && rc=0 || { rc=1; cat "$TMP/O4n/test.log"; }
 ck "…and so does the per-spawn REFUSAL line" $rc
 # An EMPTY-stderr failure must still be diagnosable (a daemon that dies silently is the case where a
 # bare verdict is least useful), and the rc must be the probe's own.
 cat > "$TMP/c1e.sh" <<'SH'
 set -u
-PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+PATH="$2"
 . "$1"
 wt_startup_banner
 SH
-out="$(FAKE_UNAME=Linux CMUX_TREE_SILENT=1 bash "$TMP/c1e.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4e" 2>&1)"
+out="$(FAKE_UNAME=Linux CMUX_TREE_SILENT=1 bash "$TMP/c1e.sh" "$LIB" "$TMP/bin-bare" "$TMP/O4e" 2>&1)"
 case "$out" in *"failed (rc=7): no stderr, exit status only"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "…and a silent failure still names the exit status instead of an empty cause" $rc
 # Control: a HEALTHY terminal surface appends NO reason, and a healthy launchd Mac (`tmux`, which is
@@ -1146,11 +1176,12 @@ ck "orch-loop.sh emits the module's banner (the wiring, not just the function)" 
 # stale cause. Driven here or it is a branch nothing proves.
 cat > "$TMP/c1f.sh" <<'SH'
 set -u
-PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+PATH="$2"
 . "$1"
 wt_startup_banner
 SH
-out="$(FAKE_UNAME=Linux CMUX_FAIL_ONCE="$TMP/flip.marker" bash "$TMP/c1f.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4f" 2>&1)"
+out="$(FAKE_UNAME=Linux CMUX_FAIL_ONCE="$TMP/flip.marker" bash "$TMP/c1f.sh" "$LIB" "$TMP/bin-bare" "$TMP/O4f" 2>&1)"
 case "$out" in *"answered on re-probe (it failed on the launcher read): a probe flip"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
 ck "a probe flip reports the flip, not a cause it cannot know" $rc
 
