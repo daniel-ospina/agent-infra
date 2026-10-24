@@ -1591,6 +1591,41 @@ out="$(bash "$TMP/q5.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O22" 2>&1)"
 case "$out" in *"window=open"*"after-read=closed"*"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a READABLE census closes the absent window (a returning daemon is not judged by a stale one)" $rc
 
+# ⛔ THE CAPTURE MUST NOT BE ABLE TO STOP THE PROBE (review round 6 of #2653). A redirect that cannot be
+# opened makes bash SKIP the command, so an unwritable census dir would hide every row derived FROM THE
+# DAEMON — the record-less workers the census exists to keep — and the caps would stop binding.
+cat > "$TMP/q6.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; mkdir -p "$O"
+WT_DIR="$O/readonly/state"                     # the dir does NOT exist and cannot be created
+export CMUX_TREE_JSON='{"workspaces":[{"id":"ws_r1","name":"wt-lane-31"}],"screens":[{"id":"s1","workspace_id":"ws_r1","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_r1"}],"terminals":[{"id":"term_r1","running":true}]}'
+WT_TABLE_TTL=0
+. "$1"
+echo "count=$(wt_count lane-)"
+SH
+out="$(bash "$TMP/q6.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O23" 2>&1)"
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an UNWRITABLE census dir still READS the daemon (the capture cannot skip the probe)" $rc
+
+# …and an unwritable absent-window is NAMED, because an inert release is the 26h stall again.
+cat > "$TMP/q7.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; mkdir -p "$O/state"
+printf 'kind=terminal
+id=term_w1
+workspace=ws_w1
+' > "$O/state/worker-merge-99"
+chmod 500 "$O/state"
+WT_DIR="$O/state"; WT_TABLE_TTL=0; export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
+. "$1"
+wt_table >/dev/null 2>"$O/err.txt" || true
+chmod 700 "$O/state"
+echo "--- err:"; cat "$O/err.txt"
+SH
+out="$(bash "$TMP/q7.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O24" 2>&1)"
+case "$out" in *"UNWRITABLE"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an unwritable absent-window is NAMED (an inert release cannot pass as a bounded one)" $rc
+
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"
 # The SHIPPED helpers, extracted from orch-loop.sh — not a copy. `is_num` comes with them because the

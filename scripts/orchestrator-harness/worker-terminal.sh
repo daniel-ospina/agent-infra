@@ -58,8 +58,11 @@
 # POSITIVE read: (1) the workspace is gone, (2) the session name is absent, or (3) — added
 # deliberately with agent-infra#2653, see the `wt_table` absent-owner arm — the session OWNER is
 # confirmed ABSENT (`Connection refused` from an empty `cmux tree`, i.e. a socket nobody is listening
-# on, or the CLI's own `no server running`), because a durable terminal lives INSIDE the owner: no
-# owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is deliberately narrow —
+# on, or the CLI's own `no server running`) and CONFIRMED BY TWO SAMPLES at least `WT_ABSENT_CONFIRM`
+# (default 60s) apart — a single refusal only opens the window and keeps the caps binding, because a
+# hard-killed owner leaves pty children behind. A terminal spawn proves the owner answered and closes
+# the window. No owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is
+# deliberately narrow —
 # the errno-agnostic `cannot connect to session socket <path>: <reason>` wrapper does NOT qualify
 # (ENOENT / EACCES / EAGAIN are reachable with the daemon and its terminals ALIVE), so a merely
 # illegible or unreachable answer still leaves its workers UNKNOWN and the caps binding.
@@ -758,10 +761,31 @@ wt_table() {
   # something undecodable (a banner, a drifted shape) is still UNKNOWN, below, unchanged: the caps
   # keep binding on a read that is merely illegible, and only a CONFIRMED-ABSENT transport empties
   # the census.
+  # ⛔ THE CAPTURE MUST NOT BE ABLE TO STOP THE PROBE (review round 6 of #2653, P2). A redirect that
+  # cannot be opened makes bash SKIP the command entirely, so on an unwritable (or missing) `$dir`
+  # `cmux tree` would never run: `tree` empty, `tree_err` empty, probe UNKNOWN, and the table loses
+  # every row it derives FROM THE DAEMON — the record-less workers the census exists to keep. That is
+  # the under-count direction (caps stop binding). So the capture is optional: if the file cannot be
+  # created, the probe still runs and its stderr is discarded exactly as before.
   tree_err="$dir/.wt-tree-err.$$"
-  tree="$(cmux tree --json 2>"$tree_err")" || tree=""
-  tree_err="$(cat "$tree_err" 2>/dev/null || true)"
-  rm -f "$dir/.wt-tree-err.$$" 2>/dev/null || true
+  if : >"$tree_err" 2>/dev/null; then
+    tree="$(cmux tree --json 2>"$tree_err")" || tree=""
+    tree_err="$(cat "$tree_err" 2>/dev/null || true)"
+    rm -f "$tree_err" 2>/dev/null || true
+  else
+    # No capture file: merge the streams, then SPLIT them on "is there JSON in here at all". The
+    # absent-owner signature lives on stderr, so simply discarding it (the pre-change behaviour) would
+    # make an unwritable `$dir` un-fixable: the census could never conclude an absent owner and the
+    # caps would pin for ever — the 26h stall again, from the other side.
+    # ⛔ DO NOT CLEAR ON A NON-ZERO EXIT HERE: the merged text IS the diagnostic (the absent-owner
+    # sentence arrives on stderr with rc=3), so `|| tree=""` would throw it away and re-hide the exact
+    # state this fallback exists to preserve. The `case` below is what decides.
+    tree="$(cmux tree --json 2>&1)" || true
+    case "$tree" in
+      *'{'*) tree_err="" ;;            # something JSON-shaped: let the parser judge it (a banner → UNKNOWN)
+      *)     tree_err="$tree"; tree="" ;;  # nothing JSON-shaped: the text IS the diagnostic
+    esac
+  fi
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
   # header already records that the id shape differs) yields an EMPTY table while `$tree` is
@@ -799,7 +823,12 @@ wt_table() {
         absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
         case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
         if [ -z "$absent_since" ]; then
-          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null || true
+          # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
+          # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
+          # ever — exactly the 26h stall this change exists to end, with nothing saying so. `wt_warn`
+          # writes to stderr AND `$LOG`, which is where that stall would have been visible.
+          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null \
+            || wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED)"
           absent_since="$absent_now"
         fi
         # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
@@ -1109,6 +1138,14 @@ PY
     wt_forget
     return 1
   fi
+  # ⛔ A TERMINAL SPAWN PROVES THE OWNER ANSWERED (review round 6 of #2653, P2), so the absent window
+  # must not survive it: otherwise the window stays ancient across an outage, and the FIRST absent
+  # sample after a restart-and-crash confirms immediately — the single-sample conclusion the two-sample
+  # rule exists to forbid. ⛔ AND IT BELONGS HERE, NOT IN wt_forget: wt_forget also runs for TMUX
+  # spawns, which prove nothing about the cmux owner and are exactly what the controller keeps doing
+  # during an outage — clearing there would restart the timer on every outage spawn and re-create the
+  # 26h stall.
+  case "${kind:-}" in terminal|surface) rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true ;; esac
   wt_forget
   return 0
 }
