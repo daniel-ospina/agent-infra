@@ -491,8 +491,6 @@ OUT="$(drive_glue)"
 [ "$OUT" = "GREEN" ] && ok "glue: a REAL class still reaches the arms unchanged" \
   || bad "glue: a real class became '$OUT'"
 # ⛔ THE INVOCATION IS DRIVEN TOO: a dropped `--post` would silently stop the arm reaching the PR.
-grep -q -- '--post' "$S/argv" || true
-case "$(grep '^python3\|nochk' "$TMP/glue.log" 2>/dev/null)" in *) : ;; esac
 ( PYSPY="$TMP/pyspy"; : > "$PYSPY"
   PR=4242; HEAD_N=abc1234def5678; OR=daniel-ospina/tortoise; REPO=/nonexistent
   O="$TMP/O"; LOG="$TMP/glue.log"; mkdir -p "$O/state"

@@ -296,11 +296,15 @@ if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real ||
 # leaves `$O` one file behind for one cycle, and a harness that can only find its own arm in one of the
 # two places would fail exactly then. ⛔ An ABSOLUTE path, resolved ONCE, because the sweep is a
 # pipeline subshell and a relative path resolved inside it would follow the subshell's cwd.
-# ⛔ MISSING IS LOUD AND NAMED, NEVER SILENT: without `check-class.py` every PR would classify
-# NOCHECKS (the pipeline's `2>/dev/null` turns a missing file into an empty answer), and without
-# `nochk-resolve.py` the arm would have nothing to say. Both are reported here, once, and the loop
-# keeps running — a harness that refuses to start because one arm is absent would be a worse failure
-# than the arm being absent.
+# ⛔ `check-class.py` IS NOT "ONE ARM" — IT IS EVERY PR'S CLASSIFICATION, SO ITS ABSENCE FAILS CLOSED
+# (review P2, agent-infra#2719). Measured: with the file missing, `python3 <missing>` writes to stderr
+# and prints nothing, so `V=""` for EVERY PR — no merge arm, no fixer arm, no reviewer — and the sweep
+# falls to the residual `*)` wait arm, re-reading each PR for ever with class `""`. That is a total,
+# indefinite stop of the controller's work, so it takes the `exit 78` treatment `repo-authority.sh`
+# already gets a few lines above, NOT a warning: a warning on a box whose classification has stopped
+# is the "one startup line nobody reads" failure.
+# `nochk-resolve.py` is genuinely ONE ARM: without it a NOCHECKS PR is named `READ-FAILED: the arm
+# produced no verdict` and re-read next cycle — degraded, honest, not fatal — so that one only warns.
 # ⛔ THE LOG DIRECTORY IS MADE FIRST (review P3, agent-infra#2719): this message fires exactly on a
 # fresh or partially re-seeded `$O`, which is exactly when `$O/logs` may not exist yet — writing the
 # warning before the `mkdir -p` below meant the ONE case it exists for was the one where the redirect
@@ -310,9 +314,15 @@ _CK_PY="$O/check-class.py"; [ -f "$_CK_PY" ] || _CK_PY="$_HERE_RS/check-class.py
 _NCHK_PY="$O/nochk-resolve.py"; [ -f "$_NCHK_PY" ] || _NCHK_PY="$_HERE_RS/nochk-resolve.py"
 [ -f "$_CK_PY" ] || _CK_PY=""
 [ -f "$_NCHK_PY" ] || _NCHK_PY=""
-if [ -z "$_CK_PY" ] || [ -z "$_NCHK_PY" ]; then
-  printf '%s [startup] ⚠️ NOCHECKS ARM INCOMPLETE: check-class.py=%s nochk-resolve.py=%s — a check surface that cannot be read will classify NOCHECKS and be NAMED as unreadable rather than silently re-read; re-seed the harness (deploy-harness.sh)\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${_CK_PY:-MISSING}" "${_NCHK_PY:-MISSING}" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+if [ -z "$_CK_PY" ]; then
+  _nock_fatal="FATAL check-class.py not found (looked in $O and ${_HERE_RS:-<unresolved>}) — every PR's classification would be EMPTY (no merge, no fixer, no reviewer), so the controller refuses to start; re-seed it: bash $O/deploy-harness.sh --src <harness checkout> --o $O"
+  echo "orch-loop: $_nock_fatal" >&2
+  printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_nock_fatal" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+  exit 78
+fi
+if [ -z "$_NCHK_PY" ]; then
+  printf '%s [startup] ⚠️ NOCHECKS ARM ABSENT: nochk-resolve.py was not found in %s or %s — a NOCHECKS PR is NAMED as "the arm produced no verdict" and re-read next cycle (never silently, never spun); re-seed the harness (deploy-harness.sh)\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$O" "${_HERE_RS:-<unresolved>}" >> "$O/logs/orch-loop.log" 2>/dev/null || true
 fi
 
 mkdir -p "$O/logs" "$O/state"
