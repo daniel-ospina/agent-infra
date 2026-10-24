@@ -215,6 +215,120 @@ def test_max_override_is_a_hard_ceiling():
     assert b["total"] == 8
 
 
+# ── 2b. a SLOT belongs to a PROCESS, not to a record (agent-infra#2700 C5) ──────────────
+
+def _a_dead_pid() -> int:
+    """A pid that is PROVABLY gone: a reaped child of ours that has not been recycled.
+
+    Measured at the moment of use (`os.kill(pid, 0)` raising ProcessLookupError), never assumed:
+    the pid space is shared, so a reaped pid can in principle be handed to an unrelated process
+    between the wait and the assertion. The retry loop makes that a non-event instead of a flake.
+    """
+    for _ in range(20):
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        try:
+            os.kill(p.pid, 0)
+        except ProcessLookupError:
+            return p.pid
+    pytest.fail("could not obtain a dead pid: every reaped child's pid was recycled")
+
+
+def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch):
+    """A register full of finished workers must not read as a full machine.
+
+    MEASURED 2026-10-24 19:26-19:31Z on the Mac: 60 `bg/prd-*.pid` files, ZERO of their pids alive,
+    and `pass_budgets()` charged every fresh row to MAX_FIX -- `inflight=16, budget fix=0`,
+    `dispatched 0 of 44 queued`, on every pass for hours. PRE-FIX the FIRST assertion below reads 0:
+    three ghost rows hold all three fix slots on the strength of the row alone.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 3, "max_review": 12}
+    st = {}
+    for n in (11, 12, 13):
+        (bg / ("prd-%d.pid" % n)).write_text("%d\n" % dead)
+        st[str(n)] = {"action": "fix-ci", "worker": "prd-%d" % n, "head": "a" * 40,
+                      "at": "2026-01-01T00:00:00Z", "at_epoch": now}
+
+    # (1) three PROVABLY DEAD workers must not hold the ceiling, and the self-report must say so.
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 3, "three dead workers still hold the whole fix ceiling: %r" % (b,)
+    assert b["used"] == 0
+    assert (b["inflight"], b["alive"]) == (3, 0), \
+        "the pass line must be able to say `inflight=3 (alive=0)`: %r" % (b,)
+
+    # (2) a LIVE worker consumes exactly one slot (`os.getpid()` is this test process).
+    (bg / "prd-14.pid").write_text("%d\n" % os.getpid())
+    st["14"] = {"action": "fix-ci", "worker": "prd-14", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 2, "a live worker must cost exactly one slot: %r" % (b,)
+    assert (b["inflight"], b["alive"]) == (4, 1)
+
+    # (3) NO pid file at all => UNKNOWN => still consumes one slot. This is the FAIL-CLOSED
+    # direction and it is deliberate: freeing a slot we cannot disprove is a duplicate dispatch
+    # onto a live PR -- invisible, and how one conflict gets resolved twice.
+    st["15"] = {"action": "fix-ci", "worker": "prd-15", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 1, "an unreadable liveness must NOT free a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"]) == (5, 2)
+
+
+def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monkeypatch):
+    """THE TRAP, and the whole trick of this fix.
+
+    The state row stores the SHORT worker name (`prd-2035`) while the launcher writes a REPO-SCOPED
+    pid file (`prd-agent-infra-2035.pid`), the partitioning that stopped two doctors sharing one
+    register (#2700/#2725). An exact-name lookup finds NOTHING, and "nothing found => assume alive"
+    (the safe direction) then keeps every ghost alive -- which is why the first version of this fix
+    changed nothing at all. The trailing NUMBER is matched too.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1, \
+        "a repo-scoped pid file proves the short-named row's worker gone"
+
+    # …and the same file, LIVE, holds the slot: over-matching must never free a running worker.
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
+
+    # A PREFIX is a different PR: 20350's dead worker must not free 2035's slot.
+    (bg / "prd-agent-infra-2035.pid").unlink()
+    (bg / "prd-20350.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0, \
+        "'-20350.pid' answers for PR 20350, never for PR 2035"
+
+
+def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
+    """Only a pid file that is READABLE may drop a slot; garbage is not evidence of absence.
+
+    The last two entries are not padding: `os.kill` raises `OverflowError` (NOT OSError) outside the
+    platform's pid range, so a pid file holding a ten-digit number would abort the whole pass from
+    inside the counter. Unknown-and-alive is the only safe reading there, too.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"21": {"action": "fix-ci", "worker": "prd-21", "at_epoch": now}}
+    for junk in ("", "not-a-pid\n", "0\n", "9999999999\n", "2147483648\n"):
+        (bg / "prd-21.pid").write_text(junk)
+        b = pr.pass_budgets(st, cap, now_epoch=now)
+        assert b["fix"] == 0, "pid file %r freed a slot it could not disprove: %r" % (junk, b)
+        assert (b["inflight"], b["alive"]) == (1, 1)
+
+
 # ── 3. the dispatch path is the BACKGROUND one, and it is LOAD-GATED ──────────────────────
 
 def test_spawn_argv_is_the_background_dispatcher_not_cmux(monkeypatch):
