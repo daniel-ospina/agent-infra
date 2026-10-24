@@ -6219,9 +6219,11 @@ main() {
   fi
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
-    say_err "   yielded NO parseable failure identity (neither a 'FAILED <nodeid>' line nor an"
-    say_err "   attributable guard-step '::error::' annotation), so their failures are NOT in the"
-    say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
+    say_err "   yielded NO parseable failure identity (no 'FAILED <nodeid>' line, no attributable"
+    say_err "   guard-step '::error::' annotation, and none of the other families the parser knows:"
+    say_err "   collect-error::, watchdog-kill::, job-unreadable::, bash-shard::, runner::), so their"
+    say_err "   failures are NOT in the set and 'blocked by the decision: 0' would be a false"
+    say_err "   certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
     # NAME the dropped tokens here too: when a run's failures were ENTIRELY

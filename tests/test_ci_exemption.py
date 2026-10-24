@@ -2763,7 +2763,7 @@ def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
 
 
 def test_bash_shard_identity_is_injective_over_the_listed_shards():
-    """⛔ TWO DIFFERENT SHARDS MUST NOT SHARE ONE IDENTITY (#2648 second review).
+    """⛔ TWO DIFFERENT SHARDS MUST NOT SHARE ONE IDENTITY (#2648 reviews 2 and 3).
 
     An identity is what the rail compares against main's baseline, so a collision lets a shard
     nobody has ever run be exempted on the strength of an unrelated shard's history — measured:
@@ -2771,9 +2771,10 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     `bash-shard::scripts-a-b.test.sh`, and `decide` returned `exempt` for the colliding key.
     The constant `bash-shard` signature cannot save it, because EVERY shard carries it.
 
-    Read the real list rather than a fixture: this must hold for the shards that actually run,
-    and it is the assertion that fails when a directory is reorganised into a sibling whose
-    slug collides.
+    Reads the REAL list (not a fixture), and asserts the token IS the path verbatim — the
+    earlier version of this vector fed `path` + its trailing `# comment` (every listed line has
+    one), so all 80 took the old slug fallback and the vector stayed green while asserting a
+    token nobody would ever compare. Caught in #2648 review cycle 3.
     """
     src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
     listed = []
@@ -2781,10 +2782,13 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
         line = line.strip()
         if not line.startswith("run_shard "):
             continue
-        arg = line.split(None, 1)[1].strip().strip('"').strip("'")
-        if arg.startswith("$") or not arg:
+        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
+        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
+        # part of the path this vector tests.
+        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
+        if m is None or m.group(1).startswith("$"):
             continue  # an interpolated or sentinel call, not a listed path
-        listed.append(arg)
+        listed.append(m.group(1))
     assert len(listed) >= 60, (
         f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
         "would pass vacuously"
@@ -2793,6 +2797,13 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     for path in listed:
         got, _sigs = ci_exemption.bash_shard_failures(f"❌ failed shard: {path}")
         assert len(got) == 1, f"{path!r} produced {got!r}"
+        # ⛔ THE ASSERTION THAT MAKES THIS VECTOR LOAD-BEARING: for a listed path the identity
+        # is the PATH, not a transformation of it. It fails the moment a slug (or any lossy
+        # fold) is re-introduced.
+        assert got[0] == "bash-shard::" + path, (
+            f"the identity is not the path verbatim for {path!r}: {got[0]!r} — a lossy token "
+            "can fold two shards onto one identity"
+        )
         ids.setdefault(got[0], []).append(path)
         # …and the key must carry no whitespace (the rate table is `uniq -c | awk`).
         assert re.search(r"\s", got[0]) is None, got[0]
@@ -2800,17 +2811,26 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     assert not collisions, f"distinct shards share one identity: {collisions}"
     assert len(ids) == len(set(listed)), "the count drifted from the list"
 
-    # ⛔ AND THE HARD PART: the pair that DOES collide under a slug. The scan above is
-    # future-proofing — today's 80 paths happen to slug injectively — so on its own it
-    # passes with the pre-fix code. This pair is one directory move apart (`scripts/a-b`
-    # vs `scripts/a/b`) and is what a re-introduced `_slug` breaks.
-    dash, _ = ci_exemption.bash_shard_failures("❌ failed shard: scripts/a-b.test.sh")
-    slash, _ = ci_exemption.bash_shard_failures("❌ failed shard: scripts/a/b.test.sh")
-    assert dash != slash, (
-        f"two different shards collapsed onto one identity ({dash!r}): the path was slugged, "
-        "so a shard main never ran can be exempted on an unrelated shard's baseline"
-    )
-    assert dash == ["bash-shard::scripts/a-b.test.sh"], dash
+    # ⛔ AND THE PAIRS THAT DO COLLIDE under a lossy token — the reason injectivity is a
+    # REQUIREMENT, not a nicety. Each pair is one character apart; a slug, a whitespace fold,
+    # or any `_slug`-style fallback collapses one of them.
+    for a, b in (
+        ("scripts/a-b.test.sh", "scripts/a/b.test.sh"),      # `/` and `-` under `_slug`
+        ("scripts/a b.test.sh", "scripts/a_b.test.sh"),      # whitespace fold
+        ("scripts/a@b/c.test.sh", "scripts/a-b@c.test.sh"),  # `_slug` charset fold
+    ):
+        ka, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {a}")
+        kb, _ = ci_exemption.bash_shard_failures(f"❌ failed shard: {b}")
+        assert ka != kb, (
+            f"two different shards collapsed onto one identity ({ka!r}): the token is lossy, "
+            "so a shard main never ran can be exempted on an unrelated shard's baseline"
+        )
+        assert ci_exemption.is_failure_key(ka[0]), (
+            f"{ka[0]!r} is not in the row door's universe — the identity would be dropped"
+        )
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/a-b.test.sh"
+    )[0] == ["bash-shard::scripts/a-b.test.sh"]
 
 
 def test_6798_the_row_door_still_rejects_junk():

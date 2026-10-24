@@ -178,7 +178,16 @@ slice_skips() {
 # order to prove the name is not being printed by something else. That mutation replaces THIS ONE
 # LINE, so the body must stay on it (a multi-line body would be left dangling at top level and the
 # fixture would fail for a reason it did not choose).
-shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; failed_shards="${failed_shards}${failed_shards:+$'\n'}$1"; printf '❌ failed shard: %s\n' "$1"; }
+#
+# ⛔ TWO RECORDERS, TWO GATES (#2643 review cycle 3). `shard_record_failure` gates on the path being a
+# LISTED shard, so the self-check sentinels (a mktemp `exit 1` file) cannot print a bogus name. The
+# syntax sweep has no such gate and must not need one: its path is real, and it is a failure the rail
+# has to be able to attribute. Naming only the shard LOOP left a MIXED run — one listed shard plus a
+# `bash -n` failure — yielding exactly ONE identity, so the rail's step-1c `examined > extracted`
+# check passed and the un-named file vanished from a certificate that then named no residual. A red
+# file the rail cannot name is the class this whole file exists to refuse.
+shard_named_failure() { failed_shards="${failed_shards}${failed_shards:+$'\n'}$1"; printf '❌ failed shard: %s\n' "$1"; }
+shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; shard_named_failure "$1"; }
 
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
 # from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
@@ -204,7 +213,7 @@ run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
 # checking no syntax at all. `swept` is asserted below, so the sweep loops must have done work.
 swept=0
-sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
+sweep_file() { swept=$((swept + 1)); bash -n "$1" || { shard_errors=$((shard_errors + 1)); [ "${sweep_name:-1}" = 1 ] && shard_named_failure "$1"; return 0; }; }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -404,13 +413,17 @@ fi
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
+before_failed_shards="$failed_shards"
+sweep_name=0          # the sentinel is a mktemp path, not a shard — it must not print a name
 sweep_file "$sentinel_sweep"
+sweep_name=1
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
   exit 1
 fi
 shard_errors=$before_sweep_err
+failed_shards=$before_failed_shards
 swept=$((swept - 1))
 
 # Runtime self-check 3: the FAILURE-RECORDING arm must still be wired. Without this, a rewrite
@@ -452,7 +465,7 @@ if [ "$shard_errors" -gt 0 ]; then
     printf '%s\n' "$failed_shards" | sed 's/^/❌   /'
   fi
   if [ "$named" -ne "$shard_errors" ]; then
-    echo "❌ $((shard_errors - named)) of these failure(s) could NOT be named — counted with no listed shard recorded (the syntax sweep, or an unlisted path, raised them)"
+    echo "❌ $((shard_errors - named)) of these failure(s) could NOT be named — a counting path with no path of its own raised them (a backstop: the shard loop AND the syntax sweep both name themselves)"
   fi
   exit 1
 fi

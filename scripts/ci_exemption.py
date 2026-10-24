@@ -123,6 +123,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 # --------------------------------------------------------------------------
 # Strict parsing — the union is an allowlist, so junk must not enter it
@@ -1423,9 +1424,21 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: whitespace-free for the `uniq -c | awk` rate table.
 #:
 #: `bash-shard::<slug>` (#2643) is a bash SHARD's own identity, and
-#: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and BOTH CARRY
-#: SIGNATURES, so they are admitted on a nodeid's terms — the §4.6 overlap still
-#: has to hold before either buys anything. Their slug charset is `_slug`'s too.
+#: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and both are admitted on a
+#: nodeid's terms — an id buys nothing unless it is in main's rate table.
+#:
+#: ⛔ DECLARED RESIDUAL — THE SIGNATURE GATE CANNOT DISCRIMINATE FOR THESE TWO FAMILIES.
+#: `_BASH_SHARD_SIG = "bash-shard"` (and `runner-aggregate`) is ONE CONSTANT for every member,
+#: so `_signatures_overlap` reduces to "both sides carry this id" and adds nothing over the
+#: rate row. What that means in production: `k_pr = max(row.runs)` is 1 for a PR head, so the
+#: `1 <= k_pr < min_runs` attribution-only branch is the NORM, and a NEW breakage inside shard S
+#: — a bash-level assertion, a missing command, a timeout, i.e. exactly the failures that carry
+#: no pytest nodeid — is exempted whenever main also failed S once in its window. That is the
+#: price of FILE granularity, and it is the SAME trade `runner::` already carries; it is stated
+#: here rather than left implicit because this family is new and a reader comparing it to a
+#: nodeid would otherwise assume a discriminating signature. Per-`case` (or per-test-name)
+#: identities would restore the discrimination at the cost of the instability file granularity
+#: exists to avoid; that trade is the owner's to reopen, not a lane's to reverse.
 #:
 #: ⛔ EVERY PRODUCER IN THIS MODULE MUST APPEAR HERE, and omitting one is the
 #: #6798 failure mode, not a formatting bug: an id PRODUCED by a parser and
@@ -1440,7 +1453,7 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: enumerates ALL of them, so the next producer reddens instead of vanishing.
 _NON_NODEID_KEY_RE = re.compile(
     r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
-    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_./\-]+"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_./%\-]+"
     r"|runner::[A-Za-z0-9_.\-]+)$"
 )
 
@@ -1684,25 +1697,27 @@ _BASH_SHARD_RE = re.compile(r"^(?:❌|✗)\s*\*{0,2}\s*failed shard:\s*(?P<label
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
 
-#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — a PATH, plus `.`/`-`/`_`.
-#: `/` is admissible because the rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`),
-#: not slash-free.
-_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
+#: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
+#: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free. Everything else is
+#: percent-encoded, and THAT is what makes the token injective.
+_SHARD_TOKEN_SAFE = "/._-"
+#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key: the safe set plus `%`.
+_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./%\-]+$")
 
 
 def _shard_token(label: str) -> str:
-    """A whitespace-free, INJECTIVE token for a shard path.
+    """A whitespace-free, INJECTIVE token for a shard path — percent-encoded, never slugged.
 
-    The path is kept verbatim (see `_BASH_SHARD_RE` for why a slug is not injective). Only
-    whitespace is folded — every one of the runner's 80 listed shards is already
-    `[A-Za-z0-9_./-]+`, so this is a guard rather than a transformation. If a path ever
-    carries a character outside that set, `_slug` is the DECLARED coarsening fallback: it
-    keeps an identity instead of dropping the attribution, and the injectivity assertion in
-    `tests/test_ci_exemption.py` fails for that path, so the coarsening cannot arrive
-    silently.
+    See `_BASH_SHARD_RE` for why a slug is not injective. INJECTIVITY IS BY CONSTRUCTION: every
+    byte outside the allow-list becomes `%XX`, so two different paths cannot produce one token.
+    There is no fallback branch that could be non-injective, and so nothing to assert about a
+    "declared coarsening" — a previous version folded whitespace and then fell back to `_slug`,
+    which re-created the collision for `scripts/a b.test.sh` vs `scripts/a_b.test.sh`, and its
+    docstring's claim that the injectivity vector would catch it was false (that vector only
+    ever fed it the 80 listed paths, all of which are already inside the allow-list). Measured
+    in #2648 review cycle 3. For the runner's real list the token IS the path, verbatim.
     """
-    token = re.sub(r"\s+", "_", label.strip())
-    return token if _SHARD_TOKEN_RE.match(token) else _slug(token)
+    return quote(label.strip(), safe=_SHARD_TOKEN_SAFE)
 
 
 def bash_shard_failures(

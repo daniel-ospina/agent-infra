@@ -2936,6 +2936,53 @@ grep -q "no failure in scripts/zz-pr.test.sh" "$TMP/err" && pass "(h) …the SHA
 grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-unique bash shard" \
   || pass "(h) no merge attempted"
 
+# ── (i) the THIRD reader: `main_baseline_units` (raised in #2648 review cycle 3) ──
+# Scenario (h) only ever pins `failure_file_key` — with `main_baseline_units` still collapsing
+# `bash-shard::…` to the literal `bash-shard`, main's unit never matches and the rail prints the
+# PR's path anyway, so (h) stays green with that arm reverted. The arm is only observable where
+# it is used: main red on the SAME shard, so the id IS the residual and `attribute_residual`
+# compares it against main's units — and there the collapse makes the rail say "main carries no
+# failure in <shard>", the exact opposite of the truth. Drive the derivation directly: the
+# scenario fixtures cannot reach that comparison without a three-run rate table.
+(
+  # shellcheck disable=SC1090
+  eval "$(sed -n '/^main_baseline_units() {/,/^}/p' "$ADM")"
+  eval "$(sed -n '/^main_measured_files() {/,/^}/p' "$ADM")"
+  eval "$(sed -n '/^failure_file_key() {/,/^}/p' "$ADM")"
+  printf '%s\n' 'bash-shard::scripts/aa-main.test.sh' 'runner::python-ci' \
+                 'job-unreadable::test-d' 'collect-error::tests/x.py' \
+                 'tests/test_x.py::test_y' > "$TMP/units-in"
+  main_baseline_units "$TMP/units-in" > "$TMP/units-out"
+  main_measured_files "$TMP/units-in" > "$TMP/measured-out"
+  # The SHARD PATH is the unit — never the bare family literal — or a main baseline red in one
+  # shard reads as pre-existing in a different one (the #7131 false conclusion, one family over).
+  if grep -qx 'scripts/aa-main.test.sh' "$TMP/units-out"; then
+    pass "(i) main_baseline_units keys bash-shard:: by SHARD PATH"
+  else
+    fail "(i) main_baseline_units collapsed bash-shard:: to '$(grep -m1 '^bash-shard' "$TMP/units-out" || echo '<none>')" 
+  fi
+  grep -qx 'bash-shard' "$TMP/units-out" \
+    && fail "(i) the bare literal 'bash-shard' is still a unit" \
+    || pass "(i) …never the bare 'bash-shard' literal"
+  grep -qx 'python-ci' "$TMP/units-out" \
+    && pass "(i) main_baseline_units keys runner:: by JOB SLUG" \
+    || fail "(i) main_baseline_units collapsed runner:: to a literal"
+  # …and the FILE reader agrees for the one aggregate that names a file, and only that one.
+  grep -qx 'scripts/aa-main.test.sh' "$TMP/measured-out" \
+    && pass "(i) main_measured_files counts the shard PATH as a measured file" \
+    || fail "(i) main_measured_files did not count the shard path as measured"
+  if grep -qx 'python-ci' "$TMP/measured-out" || grep -qx 'test-d' "$TMP/measured-out" \
+     || grep -qx 'tests/x.py' "$TMP/measured-out"; then
+    fail "(i) main_measured_files invented a measurement for an aggregate that names no file"
+  else
+    pass "(i) …and does not invent one for runner:: / job-unreadable:: / collect-error::"
+  fi
+  # `failure_file_key` must derive the SAME unit, or the rail's words and its clearance drift.
+  [ "$(failure_file_key 'bash-shard::scripts/aa-main.test.sh')" = 'scripts/aa-main.test.sh' ] \
+    && pass "(i) failure_file_key derives the same unit (words and clearance cannot drift)" \
+    || fail "(i) failure_file_key and main_baseline_units disagree about the unit"
+)
+
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
