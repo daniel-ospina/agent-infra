@@ -8,13 +8,16 @@
 #   behind the custom label `required-check` and routes ONLY that job at them.
 #
 # WHAT THIS SUITE PINS (the assertions live in check.mjs; this file drives them and, critically,
-# proves each assertion is LIVE by mutating the artifact):
+# proves the load-bearing ones are LIVE by mutating the artifact — not literally every internal
+# branch, which is why the arms are enumerated rather than summarised):
 #   0. LIVE — the real tree passes.
 #   1. MUTANT: the reservation value stops naming `required-check`        → must FAIL (T1).
 #   2. MUTANT: ONE MORE JOB is moved onto the reservation                 → must FAIL (T2).
 #   3. MUTANT: the `ubuntu-latest` FALLBACK arm is deleted                → must FAIL (T3).
 #   4. MUTANT: `timeout-minutes` is deleted                               → must FAIL (T4).
-#   5. MUTANT: the documented PUT /labels call is broken                  → must FAIL (T5).
+#   5. MUTANT: the documented runner-labels call is broken                → must FAIL (T5).
+#   5b. MUTANT: only the `DELETE …/labels/ubuntu-latest` removal is broken → must FAIL (T5).
+#   5c. MUTANT: the `runs-on` expression stops consuming the variable      → must FAIL (T1).
 #   6. MUTANT: the doc's reservation value disagrees with the workflow    → must FAIL (T5).
 #   7. MUTANT: a second job hidden in a BLOCK-SEQUENCE `runs-on:`         → must FAIL (T2).
 #      A multi-line `runs-on:` parses to null in a naive reader, and a null routing looks exactly
@@ -25,6 +28,9 @@
 #      sequence there sees only `ubuntu-latest` while YAML puts the job on the reservation.
 #      This is the regression found in review round 2 (a false PASS).
 #   9. UNREADABLE workflow                                                → rc 2, never a pass.
+#  10. CONTROL: a quoted/annotated spelling of an UNCHANGED routing       → must stay GREEN (0).
+#  10b. CONTROL: a one-line flow sequence WITH a trailing comment          → must stay GREEN (0).
+#  11. MUTANT: a one-line FLOW sequence on the reservation                → must FAIL (T2).
 #
 # ON T2's STRICTNESS (deliberate): T2 pins EVERY other job in the tree to exactly `ubuntu-latest`,
 # not merely "must not join the reservation". That is intentional — the reservation's value is that
@@ -120,11 +126,26 @@ else
   fail "4 MUTATION-NOT-APPLIED (no '    timeout-minutes: 20' to delete)"
 fi
 
-# ── 5. the documented PUT /labels call broken ─────────────────────────────────────────────────
-if mutate "$DOC" "$TMP/doc-bad-put.md" "/actions/runners/ID/labels" "/actions/runners/ID/nope"; then
-  run_expect 1 "5 MUTANT a broken documented label call is REFUSED" "$WF" "$TMP/doc-bad-put.md"
+# ── 5. the documented runner-labels call broken ─────────────────────────────────────────────
+if mutate "$DOC" "$TMP/doc-bad-labels.md" "/actions/runners/ID/labels" "/actions/runners/ID/nope"; then
+  run_expect 1 "5 MUTANT a broken documented label call is REFUSED" "$WF" "$TMP/doc-bad-labels.md"
 else
-  fail "5 MUTATION-NOT-APPLIED (the documented PUT /labels path was not found)"
+  fail "5 MUTATION-NOT-APPLIED (no /actions/runners/<id>/labels path was found in the doc)"
+fi
+
+# 5b — ONLY the DELETE-based removal of `ubuntu-latest` is broken. Arm 5 breaks the POST and the
+# DELETE together, so on its own it cannot show the DELETE requirement is live.
+if mutate "$DOC" "$TMP/doc-bad-delete.md" "/labels/ubuntu-latest" "/labels/other"; then
+  run_expect 1 "5b MUTANT a doc that stops documenting the ubuntu-latest removal is REFUSED" "$WF" "$TMP/doc-bad-delete.md"
+else
+  fail "5b MUTATION-NOT-APPLIED (no '/labels/ubuntu-latest' removal was found in the doc)"
+fi
+
+# 5c — the routing stops consuming the variable (i.e. someone hardcodes a label list).
+if mutate "$WF" "$TMP/wf-novar.yml" 'vars.PIPELINE_COMPLIANCE_RUNS_ON || ' ""; then
+  run_expect 1 "5c MUTANT a runs-on that ignores the release variable is REFUSED" "$TMP/wf-novar.yml" "$DOC"
+else
+  fail "5c MUTATION-NOT-APPLIED (the variable reference was not found in the runs-on expression)"
 fi
 
 # ── 6. doc and workflow disagree on the reservation value ─────────────────────────────────────
@@ -175,7 +196,30 @@ node -e '
 ' "$WF" "$TMP/wf-commentseq.yml"
 run_expect 1 "8 MUTANT a comment-interrupted block sequence is REFUSED" "$TMP/wf-commentseq.yml" "$DOC"
 
-run_expect 2 "9 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
+# ── 10. CONTROLS: equivalent spellings must not red a clean job, and must not hide a reserved one ─
+# The reader asserts the resolved VALUE, not the source spelling. Round 3 found it reddened a CLEAN
+# job for a trailing comment, quotes, or a one-element flow sequence; round 4 pins both directions.
+if mutate "$WF" "$TMP/wf-quoted.yml" '    runs-on: ubuntu-latest' '    runs-on: "ubuntu-latest"  # default hosted'; then
+  run_expect 0 "10 CONTROL a quoted/annotated unchanged routing stays GREEN" "$TMP/wf-quoted.yml" "$DOC"
+else
+  fail "10 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# 10b — the COMBINATION VGATE round 4 found: a one-line flow sequence WITH a trailing comment.
+# The bracket is located before comment-stripping, so the comment cannot swallow the label list.
+if mutate "$WF" "$TMP/wf-flowcomment.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest]  # default hosted'; then
+  run_expect 0 "10b CONTROL a flow sequence with a trailing comment stays GREEN" "$TMP/wf-flowcomment.yml" "$DOC"
+else
+  fail "10b MUTATION-NOT-APPLIED (no plain runs-on to convert)"
+fi
+
+if mutate "$WF" "$TMP/wf-flow.yml" '    runs-on: ubuntu-latest' '    runs-on: [ubuntu-latest, required-check]'; then
+  run_expect 1 "11 MUTANT a one-line FLOW sequence on the reservation is REFUSED" "$TMP/wf-flow.yml" "$DOC"
+else
+  fail "11 MUTATION-NOT-APPLIED (no plain runs-on to convert to a flow sequence)"
+fi
+
+run_expect 2 "12 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
 
 echo
 if [ "$fails" -ne 0 ]; then

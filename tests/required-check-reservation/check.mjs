@@ -20,9 +20,11 @@
 //       `runs-on` labels and never falls back), which is strictly worse than the queue.
 //   T4  The job carries `timeout-minutes` (#2055) — a hung step on a reserved slot is a silent
 //       outage of the only required check.
-//   T5  The REPRODUCIBLE operational call is documented: the `PUT /actions/runners/<id>/labels`
-//       invocation names `required-check`, and the doc carries the same reservation value the
-//       workflow does. A reservation that exists only in prose is folklore.
+//   T5  The REPRODUCIBLE operational call is documented with the NON-DESTRUCTIVE pair: a
+//       `POST /actions/runners/<id>/labels` naming `labels[]=required-check`, plus a
+//       `DELETE …/labels/ubuntu-latest` for the leak. A PUT-only doc is REFUSED — `PUT` replaces
+//       every custom label — and the doc must carry the same reservation value the workflow does.
+//       A reservation that exists only in prose is folklore.
 //
 // EXIT: 0 clean · 1 violation · 2 could-not-measure (an unreadable input is NEVER a pass)
 //
@@ -71,11 +73,51 @@ function readOrDie(file, what) {
 // subset parser private. Only two things are needed here, and both are structural:
 //   * the set of job ids (and the text of each job block, for the declared reservation value);
 //   * each job's `runs-on` / `timeout-minutes` value.
+// normLabel — resolve a `runs-on:` label to its VALUE, not its spelling. YAML admits several
+// equivalent spellings of the same label: a trailing `# comment`, single or double quotes around
+// the scalar, an item wrapped by a one-line flow sequence. Grading the RAW text made the suite red
+// a CLEAN job for any of those (review round 3), which also falsified this module's own header
+// claim that it asserts values. Strip the spelling, keep the value.
+function normLabel(raw) {
+  const s0 = String(raw).trim();
+  // A QUOTED scalar: the value ends at its matching quote, so a `# comment` after it is not part
+  // of the label. (Round 4's control arm caught `"ubuntu-latest"  # default hosted` being graded as
+  // one long string — the shapes that red a clean job are exactly what a control arm is for.)
+  if (s0.length >= 2 && (s0[0] === '"' || s0[0] === "'")) {
+    const q = s0[0];
+    let out = "";
+    let i = 1;
+    while (i < s0.length) {
+      if (q === '"' && s0[i] === "\\") {
+        out += s0[i + 1] === undefined ? "" : s0[i + 1];
+        i += 2;
+        continue;
+      }
+      if (s0[i] === q) {
+        if (q === "'" && s0[i + 1] === "'") {
+          out += "'";
+          i += 2;
+          continue;
+        }
+        break;
+      }
+      out += s0[i];
+      i += 1;
+    }
+    return out.trim();
+  }
+  // An UNQUOTED scalar: a ` #` starts a comment.
+  let s = s0;
+  const hash = s.search(/\s#/);
+  if (hash >= 0) s = s.slice(0, hash).trim();
+  return s.trim();
+}
+
 // A job id is a 2-space key directly under `jobs:`; a job's keys are at 4 spaces.
 function parseJobs(file) {
   const text = readOrDie(file, "workflow");
   const lines = text.split("\n");
-  const jobs = new Map(); // id -> {block: [lines], runsOn, timeout}
+  const jobs = new Map(); // id -> {block, runsOn, runsOnLabels, timeout, uses, runsOnOpaque}
   let inJobs = false;
   let current = null;
   for (const line of lines) {
@@ -93,17 +135,40 @@ function parseJobs(file) {
     }
     const job = /^  ([A-Za-z0-9_-]+):\s*$/.exec(line);
     if (job) {
-      current = { block: [line], runsOn: null, runsOnSeq: null, timeout: null, uses: false };
+      current = {
+        block: [line],
+        runsOn: null,
+        runsOnLabels: null,
+        runsOnSeq: null,
+        runsOnOpaque: false,
+        pendingBare: false,
+        timeout: null,
+        uses: false,
+      };
       jobs.set(job[1], current);
       continue;
     }
     if (!current) continue;
     current.block.push(line);
-    // A single-line `runs-on: <value>`.
+    // A single-line `runs-on: <value>` — inline scalar or one-line FLOW sequence.
     const roInline = /^    runs-on:\s*(\S.*?)\s*$/.exec(line);
     if (roInline) {
-      current.runsOn = roInline[1];
+      const raw = roInline[1].trim();
       current.runsOnSeq = null;
+      // A one-line FLOW sequence. The closing `]` is located FIRST, so a trailing `# comment` after
+      // the bracket (and inner spaces between items) cannot turn the whole span into one bogus
+      // label. Round 4's VGATE caught `[ubuntu-latest]  # hosted` being read as `[ubuntu-latest]`.
+      if (/^\[/.test(raw)) {
+        const close = raw.lastIndexOf("]");
+        const inner = close > 0 ? raw.slice(1, close) : raw.slice(1);
+        current.runsOnLabels = inner
+          .split(",")
+          .map((s) => normLabel(s))
+          .filter((s) => s.length > 0);
+      } else {
+        current.runsOnLabels = [normLabel(raw)];
+      }
+      current.runsOn = current.runsOnLabels.join(",");
       continue;
     }
     // A BLOCK-SEQUENCE `runs-on:` (value on the following `- ` lines). Without this arm such a job
@@ -113,7 +178,9 @@ function parseJobs(file) {
     if (/^    runs-on:\s*$/.test(line)) {
       current.runsOn = "";
       current.runsOnSeq = [];
+      current.runsOnLabels = [];
       current.runsOnOpaque = false;
+      current.pendingBare = false;
       continue;
     }
     if (current.runsOnSeq) {
@@ -122,16 +189,36 @@ function parseJobs(file) {
       // `- required-check` then parsed as just `ubuntu-latest`, and T2 saw a job that had NOT
       // changed while YAML said it was on the reservation (reproduced in review round 2).
       if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-      const item = /^\s+- +(.+?)\s*$/.exec(line);
-      if (item) {
-        current.runsOnSeq.push(item[1]);
-        current.runsOn = current.runsOnSeq.join(",");
+      // A bare `-` whose value sits on the FOLLOWING indented line is ordinary YAML and is
+      // resolvable: take the next non-blank line as that item's scalar. Refusing it outright
+      // reddened a CLEAN job (review round 3), so it is read rather than declared unreadable.
+      if (current.pendingBare) {
+        current.pendingBare = false;
+        if (/^\s*-/.test(line) || /^\s*\S[^:]*:\s*$/.test(line) || /:\s+/.test(line)) {
+          current.runsOnOpaque = true; // a nested sequence/mapping item — not a plain label
+          continue;
+        }
+        current.runsOnLabels.push(normLabel(line));
+        current.runsOn = current.runsOnLabels.join(",");
         continue;
       }
-      // A bare `-` (value on its own following lines) or an indented continuation of one: this
-      // reader cannot say what the label set IS, so the job is marked OPAQUE and fails closed
-      // rather than being read as "whatever prefix I managed to parse".
-      if (/^\s*-\s*$/.test(line) || /^\s{5,}\S/.test(line)) {
+      if (/^\s*-\s*$/.test(line)) {
+        current.pendingBare = true;
+        continue;
+      }
+      const item = /^\s+- +(.+?)\s*$/.exec(line);
+      if (item) {
+        // An item that is a MAPPING (`- name: x`) is not a label list we can resolve.
+        if (/^\s*\S+\s*:/.test(item[1])) {
+          current.runsOnOpaque = true;
+          continue;
+        }
+        current.runsOnLabels.push(normLabel(item[1]));
+        current.runsOn = current.runsOnLabels.join(",");
+        continue;
+      }
+      // An indented continuation of something this reader did not model: fail closed.
+      if (/^\s{5,}\S/.test(line)) {
         current.runsOnOpaque = true;
         continue;
       }
@@ -203,14 +290,22 @@ if (!blockText.includes(RESERVATION)) {
   if (!declMatch) {
     fail(`T1 the declaration in ${JOB_ID}'s block does not read as a JSON label list`);
   } else {
-    let declared;
+    // The assertion with teeth: the literal READ OUT OF THE FILE must parse to EXACTLY the
+    // reservation value. Round 3 caught the earlier form asserting the module constant against
+    // itself (both branches unreachable).
+    let parsedValue;
     try {
-      declared = JSON.parse(declMatch[1]);
+      parsedValue = JSON.stringify(JSON.parse(declMatch[1]));
     } catch {
       cannot(`the declared reservation value is not JSON: ${declMatch[1]}`);
     }
-    if (!Array.isArray(declared) || !declared.includes(RESERVED_LABEL)) {
-      fail(`T1 the declared reservation value does not name '${RESERVED_LABEL}': ${declMatch[1]}`);
+    const canonical = JSON.stringify(JSON.parse(RESERVATION));
+    if (parsedValue !== canonical) {
+      fail(
+        `T1 the declaration read out of ${JOB_ID}'s block is ${declMatch[1]}, which is not the ` +
+          `reservation value ${RESERVATION} — the documented engage command would differ from ` +
+          `the one the workflow names`
+      );
     }
   }
 }
@@ -248,7 +343,8 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
   const isRequiredFile = path.resolve(abs) === wfAbs;
   const parsed = parseJobs(abs);
   for (const [id, j] of parsed.jobs) {
-    const r = j.runsOn;
+    const labels = Array.isArray(j.runsOnLabels) ? j.runsOnLabels : null;
+    const r = labels ? labels.join(",") : null;
     // An unreadable label set is `cannot-measure`, never an exemption.
     if (j.runsOnOpaque) {
       cannot(
@@ -267,7 +363,9 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
           `treat an unparsed routing as exempt (an unparsed arm is how a second reservation hides)`
       );
     }
-    const isReserved = r.includes(RESERVED_LABEL) || r.includes(VAR_NAME) || /fromJSON\(/.test(r);
+    const isReserved = labels.some(
+      (l) => l.includes(RESERVED_LABEL) || l.includes(VAR_NAME) || /fromJSON\(/.test(l)
+    );
     if (isReserved) {
       reservedJobs++;
       const isTheOneJob = isRequiredFile && id === JOB_ID;
@@ -280,10 +378,9 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
       }
       continue;
     }
-    if (r !== "ubuntu-latest") {
-      fail(
-        `T2 ${path.basename(abs)} job '${id}' changed its routing: expected exactly 'ubuntu-latest', ` +
-          `got ${r} — this change may not touch any other job's routing`
+    if (!(labels.length === 1 && labels[0] === "ubuntu-latest")) {
+      fail(        `T2 ${path.basename(abs)} job '${id}' changed its routing: expected exactly 'ubuntu-latest', ` +
+          `got [${labels.join(", ")}] — this change may not touch any other job's routing`
       );
     }
     advisoryJobs++;
@@ -303,10 +400,10 @@ if (reservedJobs !== 1) {
 
 // ── T5: the reproducible operational call ────────────────────────────────────────────────────
 const doc = readOrDie(DOC_FILE, "docs file");
-// The reservation label must be set by a DOCUMENTED runner-labels invocation (`POST` adds a custom
-// label; `PUT` replaces the whole custom set). Either is acceptable, but the call must be there and
-// it must name the reserved label on the same invocation site — a doc that merely mentions runner
-// labels is folklore.
+// The reservation label must be set by a DOCUMENTED ADDITIVE call (`POST …/labels`). `PUT …/labels`
+// REPLACES every custom label on the runner, so a PUT-only doc is refused rather than accepted —
+// and the removal of the leaking `ubuntu-latest` must be documented as a targeted DELETE. A doc
+// that merely mentions runner labels is folklore.
 const POST_CALL = /POST\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels/;
 const DELETE_CALL = /DELETE\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels\/ubuntu-latest/;
 // The ADD must be a `POST`: `PUT …/labels` REPLACES every custom label on the runner, so a doc whose

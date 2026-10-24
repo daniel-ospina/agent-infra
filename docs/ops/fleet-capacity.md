@@ -449,9 +449,10 @@ gh api -X DELETE repos/daniel-ospina/agent-infra/actions/runners/ID/labels/ubunt
 ```
 
 If you do use `PUT` (e.g. to rebuild a mislabelled runner in one call), you must pass the
-**complete** surviving label set — include every custom label from step 1's listing, plus
-`self-hosted`/`Linux`/`X64`/`self-hosted-x64`/`required-check`. `self-hosted`, `Linux` and `X64`
-are automatic labels GitHub stamps from the host.
+**complete surviving CUSTOM label set** — every custom label from step 1's listing plus
+`self-hosted-x64` and `required-check`. Do **not** list `self-hosted`/`Linux`/`X64`: those are
+AUTOMATIC labels GitHub stamps from the host, they are not part of the custom set `PUT` replaces,
+and `scripts/ci_runner_gate.sh` excludes them from its own body for exactly that reason.
 
 Removing `ubuntu-latest` is part of the reservation, not a detail: a reserved runner that still
 carries `ubuntu-latest` keeps accepting advisory jobs, so the reservation is advisory too. Keep
