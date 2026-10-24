@@ -1873,8 +1873,19 @@ BEGIN {
       # participle inside the counted NP exempted it, so `the 2 blocking defects fixed in round 1 still
       # remain` recorded a signed clean record. `fixed` there is a reduced relative, not a predicated
       # repair, and the live cue that follows is what says so.)
-      _after0 = substr(line, off + RSTART + RLENGTH)
-      if (frag ~ ("(" repair ")$") && _after0 !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/) continue
+      # ⛔ THE WINDOW STARTS AT THE MATCH END — `off` IS ALREADY THERE (P0, fifth adversarial pass of
+      # #2288 — MEASURED: `RSTART`/`RLENGTH` still held the leftover `match(bare, /[0-9]+/)` from the digit
+      # test, so the window began 3 characters Late for a digit count and one character Early for a spelled
+      # one: `the 2 blocking defects fixed left in the code path` recorded clean while its spelled twin
+      # refused, and `2 blocking defects fixed; the P3 nits are left as-is` refused across the `;` boundary
+      # the tool otherwise respects. Both directions, one line.)
+      _after0 = substr(line, abs_end + 1)
+      # (`left unchanged|as-is|alone|intact|untouched` describes SOMETHING ELSE, not a defect left over:
+      # blanked before the cue test, or `2 blocking defects fixed and the parser left unchanged` — a clean
+      # verdict — refused. A false refusal costs a paid re-run.)
+      _cue = _after0
+      gsub(/left[[:space:]-]+(unchanged|as-is|alone|intact|untouched|behind)/, " ", _cue)
+      if (frag ~ ("(" repair ")$") && _cue !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/) continue
       # ⛔ AN OPENING PAREN STARTS A NEW CLAUSE (P1, ninth fresh review of #2288 — MEASURED:
       # `fixed the P3 nit (2 blocking defects remain)` recorded clean because the parenthesis belongs to
       # the MATCH, so the prefix still held the repair and the clause split never saw the boundary).
@@ -1894,7 +1905,12 @@ BEGIN {
       # remains.`)
       _aftcl = _after0
       sub(/[.;:,!?()].*$/, "", _aftcl)
-      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && (cl " " _aftcl) ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
+      # ⛔ THE ARTICLE ARM NEEDS THE SAME LIVENESS GATE AS THE NUMERAL ARM (P0, fifth adversarial pass of
+      # #2288 — MEASURED: an UNPREDICATED repair lexeme in the same clause exempted it — `a blocking defect
+      # remains after the fix to the retry path`, `after the fix a blocking defect remains`, `a blocking
+      # defect remains and needs a fix`, `a blocking defect that round 1 fixed still remains` all recorded a
+      # signed clean record, while their numeral twins refused.)
+      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && _cue !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/ && (cl " " _aftcl) ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
       print frag
     }
   }
