@@ -545,6 +545,14 @@ export function realHeredocOpener(
       const commentAt = commentStart(line, mask, lineStart);
       if (commentAt !== -1 && commentAt < m.index) continue;
     }
+    // ⛔ A BARE DELIMITER THAT IS PURELY NUMERIC IS NOT A HEREDOC (cycle-9 review, P2). An
+    // ARITHMETIC SHIFT is spelled exactly like an opener — `x=$(( 1 << 2 ))` — and the bare arm
+    // accepts any metacharacter-free run, so the `2` became a delimiter and the next line equal to
+    // `2` closed a PHANTOM body. In `stripHeredocBodies` that SILENCED the #2148 first-push notice
+    // (a once-per-session budget spent on silence — the direction that helper's own doc calls the
+    // worst one). A numeric delimiter is vanishingly rare as a real heredoc; the refusing/no-notice
+    // direction is the one that costs, so both consumers reject it.
+    if (m[4] !== undefined && /^\d+$/.test(m[4])) continue;
     return {
       indexInLine: m.index,
       regionStart: quoted ? regionStart : -1,
@@ -555,7 +563,12 @@ export function realHeredocOpener(
       // double, or the bare word) — the alternation is what lets `<<E-OF`/`<<END.JSON` parse as the
       // ONE word bash sees, which the previous single-arm pattern truncated at the first non-word
       // character (cycle-7 review, P0).
-      word: (m[2] ?? m[3] ?? m[4] ?? "").trim(),
+      // ⛔ NO `.trim()` (cycle-9 review, P2). bash takes a QUOTED delimiter VERBATIM, so `<<'  EOF  '`
+      // terminates on the literal line `  EOF  `; trimming made the masker's terminator `EOF`, so it
+      // closed EARLIER than bash, blanked the real `gh pr merge …` line as body, and the gate allowed
+      // it (measured executed; origin/main refused the same text). The bare arm cannot carry
+      // trailing whitespace — its character class excludes it — so nothing else needs trimming.
+      word: m[2] ?? m[3] ?? m[4] ?? "",
     };
   }
   return null;
@@ -631,6 +644,25 @@ function readsProgramFromStdin(consumerText: string): boolean {
 }
 
 /**
+ * Net `(`+`{` minus `)`+`}` OUTSIDE quotes, from the START of the command to `offset`.
+ *
+ * A POSITIVE result means `offset` sits inside a construct the shell has not closed yet, so a
+ * heredoc opener there is NESTED (`{ … }`, `( … )`, `f() { … }`, `$( … )`) and the body's consumer
+ * is decided on a LATER line — beyond what `heredocBodyIsProgram` can see in the opener line.
+ */
+function openConstructDepth(command: string, offset: number): number {
+  const mask = unquotedMask(command);
+  let depth = 0;
+  for (let i = 0; i < offset; i++) {
+    if (mask[i] !== true) continue; // quoted: not shell syntax
+    const c = command[i];
+    if (c === "(" || c === "{") depth++;
+    else if (c === ")" || c === "}") depth--;
+  }
+  return depth;
+}
+
+/**
  * Does anything that can reach the heredoc's stdin RUN it? Deliberately over-broad: a false
  * "yes" only keeps a refusal; a false "no" would let a program spell itself into a body.
  *
@@ -675,6 +707,16 @@ export function heredocBodyIsProgram(
   if (opener.subStart !== -1 && opener.regionStart !== -1 && opener.regionStart < lineStart) {
     return true;
   }
+  // (3b) THE OPENER SITS INSIDE A CONSTRUCT THAT OPENED ON AN EARLIER LINE ⇒ the consumer of that
+  // body is not in this line's text ⇒ program. Measured EXECUTED (cycle-9 review, P0):
+  //     f() {              ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ }
+  //     f | bash
+  // The closing `}` carries neither a pipe nor a redirect, so the forward window in (5)/(6) cannot
+  // see where the body goes; `f` prints `cat`'s output into the pipe. The same reasoning covers a
+  // multi-line `{ … }` / `( … )` group. A construct that CLOSES on the opener line stays DATA —
+  // `{ cat; } <<'EOF'` is pinned data — and so does `--body "$(cat <<'EOF'`, whose substitution (and
+  // therefore its consumer `cat`) sits on that same line.
+  if (openConstructDepth(command, lineStart) > 0) return true;
   // (2) a line continuation hides the runner on the previous line.
   const prev = lines[openerLine - 1] ?? "";
   if (/(^|[^\\])(\\\\)*\\$/.test(prev)) return true;
@@ -712,11 +754,22 @@ export function heredocBodyIsProgram(
   const outerText = opener.subStart === -1 ? before : command.slice(lineStart, opener.subStart);
   // (4) an assignment-position capture: the body is stored, and any later line may run it.
   if (/(^|[\s;&|(){}!])[A-Za-z_][A-Za-z0-9_]*\+?=["']?$/.test(outerText)) return true;
-  // (5) pipes: on the opener line (either side of the opener), or on the terminator line and the
-  // line that follows it — where `echo "$(cat <<EOF … EOF)" | bash` puts its pipe.
+  // (5)/(6) WHERE THE BODY CAN GO — on the opener line (either side of the opener), and on the
+  // terminator line and the line that follows it. `piped` and the OUTPUT-REDIRECT test are the SAME
+  // question, so they share ONE window.
+  // ⛔ A REDIRECT OFF THE OPENER LINE WAS INVISIBLE (cycle-9 review, P0, measured executed). The
+  // redirect test ran on the OPENER line only, so each of these blanked the body while bash ran it,
+  // and origin/main refused the identical text:
+  //     echo "$(cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ )" > /tmp/p.sh   then   bash /tmp/p.sh
+  //     {                    ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ } > /tmp/p.sh   then   bash /tmp/p.sh
+  //     (                    ⏎ cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ ) > /tmp/p.sh   then   bash /tmp/p.sh
+  // The store is one line BELOW the terminator in each, inside the same enclosing command.
   const piped = (t: string): boolean => /(^|[^|])\|([^|]|$)/.test(t);
   if (piped(before) || piped(line.slice(opener.indexInLine))) return true;
-  for (const t of lines.slice(terminatorLine, terminatorLine + 2)) if (piped(t)) return true;
+  for (const t of lines.slice(terminatorLine, terminatorLine + 2)) {
+    if (piped(t)) return true;
+    for (const w of t.split(/[\s;&|(){}!]+/)) if (OUT_REDIRECT_WORD_RE.test(w)) return true;
+  }
   // (6) A REDIRECTED BODY IS STORED, AND A STORED BODY CAN BE RUN LATER (cycle-3 review, P0,
   // measured executed): `cat <<'EOF' > /tmp/p.sh` … `bash /tmp/p.sh` executes an admin merge, and
   // `cat <<'EOF' > >(bash)` hands the body to bash through a process substitution. The old model
@@ -823,9 +876,12 @@ export function heredocBodyIsProgram(
   // spelling of the keyword or the name has to be enumerated. `\alias cat=bash`, `al"ias"`,
   // `alias c\at=bash` and `function cat` all reduce to the same text here.
   const definitionText = dequoteWhole(command);
+  const definedNames = new Set<string>();
   for (const m of definitionText.matchAll(DEFINITION_NAME_RE)) {
-    if ((m[2] ?? m[4] ?? m[6] ?? "") === consumerWord) return true;
+    const name = m[2] ?? m[4] ?? m[6] ?? "";
+    if (name) definedNames.add(name);
   }
+  if (definedNames.has(consumerWord)) return true;
   if (/(^|[\s;&|(){}])PATH=/.test(command.slice(0, lineStart + opener.indexInLine))) return true;
   // (1) any word that the shell still has to EXPAND (an unresolvable consumer) keeps the body
   // readable — the consumer may turn out to be a program.
@@ -856,6 +912,18 @@ export function heredocBodyIsProgram(
     }
     if (STDIN_PROGRAM_INTERPRETER_RE.test(w)) return true;
     if (SHELL_LIKE_WORD_RE.test(w) || SCRIPT_STDIN_RUNNER_RE.test(w)) return true;
+  }
+  // (1c) A CONSUMER THIS SAME COMMAND DEFINES (cycle-9 review, P1, measured executed):
+  //     f() { eval "$1"; } ⏎ f "$(cat <<'EOF' ⏎ <body> ⏎ EOF ⏎ )"
+  // The INNER consumer is `cat` (a data reader) and the OUTER word `f` is in no runner vocabulary —
+  // but `f` is DEFINED in this same text and evals its argument, so the body RUNS. A word that
+  // names a function this command defines is not a reader, whatever it is called; the function's
+  // body is not text-visible here, so the rule does not try to read it. The measured data shape
+  // `gh issue create --body "$(cat …)"` stays DATA: `gh` is defined nowhere in the text.
+  for (const raw of wrapperText.split(/[\s;&|(){}!]+/)) {
+    if (!raw) continue;
+    const w = dequote(raw);
+    if (w && definedNames.has(w)) return true;
   }
   return false;
 }
@@ -4991,9 +5059,11 @@ export default function (pi: ExtensionAPI) {
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
         if (merges > 1) {
-          // #1382: the OPERATOR LOG must carry the input and the remedy — a bare
-          // "blocked (compound merge)" was measured reaching a lane with neither.
-          // ONE spelling of the line (the helper), so the log and the reason cannot drift.
+          // #1382: the OPERATOR LOG must carry the count AND the remedy — a bare "blocked
+          // (compound merge)" was measured reaching a lane with neither. The block REASON uses the
+          // helper's one-line rendering (`compoundLine`); this console line is its own sentence and
+          // states the same count, because #1382 (d) pins a log line a lane can act on. They are
+          // deliberately two sentences over ONE count, not one string reused twice.
           const compoundLine = adminMergeRefusalLine("compound", null, null, merges);
           // #2349: name the count the gate actually READ, not "more than one"; #1382 additionally
           // names the runnable REMEDY in the same line, which main's STATE phrasing omitted here.
@@ -5226,7 +5296,9 @@ export default function (pi: ExtensionAPI) {
             tier: "micro",
             spawn_attempts: spawnAttemptsTotal,
             spawn_outcomes: spawnAttempts.map((a) => a.outcome),
-            command: auditCommand(command),
+            // #1492/#1382: the REFUSED INPUT, unmasked. `command` is maskHeredocData(rawCommand),
+            // so auditing it would blank the very heredoc that caused the refusal.
+            command: auditCommand(rawCommand),
           });
           return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
         }
@@ -5261,7 +5333,8 @@ export default function (pi: ExtensionAPI) {
           tier: tier === "" ? "unlabeled" : tier,
           spawn_attempts: spawnAttemptsTotal,
           spawn_outcomes: spawnAttempts.map((a) => a.outcome),
-          command: auditCommand(command), // #1492: the refused command, not just the reason
+          // #1492/#1382: the REFUSED INPUT, unmasked — see the micro-tier row above.
+          command: auditCommand(rawCommand),
         });
         return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
       }

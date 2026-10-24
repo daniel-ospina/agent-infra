@@ -7884,6 +7884,48 @@ test("#1382: a real merge on a CONTINUED opener line is still a git op after mas
   ok(!isGitOp(maskHeredocData("cat <<'EOF'\ngit push origin HEAD\nEOF")), "a data body's push is not");
 });
 
+// ── cycle-9 fresh review: five measured fail-opens and two parser mis-reads ───────────────
+// The first five were EACH measured EXECUTED while the mask blanked the body (a recording `gh`
+// first on PATH received `pr merge 999 --admin`), and origin/main REFUSED the identical text — so
+// each was a regression the carve-out introduced. They are pinned here because the opener-line
+// scan cannot see a store or a pipe that sits on the enclosing command's closing line.
+test("#1382 (f): a body STORED or PIPED below the terminator is still code", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const executed: ReadonlyArray<readonly [string, string]> = [
+    ["substitution + store", `echo "$(cat <<'EOF'\n${MERGE}\nEOF\n)" > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["brace group + store", `{\ncat <<'EOF'\n${MERGE}\nEOF\n} > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["subshell + store", `(\ncat <<'EOF'\n${MERGE}\nEOF\n) > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["function body + pipe", `f() {\ncat <<'EOF'\n${MERGE}\nEOF\n}\nf | bash`],
+    ["function that evals its argument", `f() { eval "$1"; }\nf "$(cat <<'EOF'\n${MERGE}\nEOF\n)"`],
+  ];
+  for (const [label, command] of executed) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: the body reaches a runner, so the merge must stay VISIBLE`);
+  }
+  // ⛔ NOT asserted here: the `--body="$(cat …)"` data shapes. `isGitOp` answers a BROADER
+  // question than "was the body blanked" (it also fails closed on shapes it cannot parse), so the
+  // data direction is pinned by the mask test at the top of this section and END-TO-END by the
+  // `--body` cases above. (The cycle-9 review listed `{ cat; } <<'EOF'` as a data shape; it is a
+  // deliberate OVER-BLOCK, pinned at ~7665.)
+});
+
+test("#1382 (g): the delimiter is EXACTLY the word bash sees", () => {
+  // bash takes a QUOTED delimiter VERBATIM, so `<<'  EOF  '` ends on the literal padded line.
+  // Trimming made the masker close EARLIER than bash and blank a REAL command line as body.
+  ok(isGitOp(maskHeredocData("cat <<'  EOF  '\n  EOF  \ngh pr merge 999 --admin")),
+    "a padded quoted delimiter ends the body where bash ends it, so the merge is seen");
+  ok(!isGitOp(maskHeredocData("cat <<'EOF'\ngh pr merge 999 --admin\nEOF")),
+    "the ordinary delimiter is still a data body");
+});
+
+test("#1382 (h): an arithmetic shift is not a heredoc opener", () => {
+  // `x=$(( 1 << 2 ))` is a SHIFT. Reading `2` as a delimiter closed a PHANTOM body at the next
+  // `2` line — and in stripHeredocBodies that SILENCED the #2148 first-push notice, spending a
+  // once-per-session budget on silence.
+  ok(isPushOrPrCreateCommand("x=$(( 1 << 2 ))\ngit push origin HEAD\n2"),
+    "a numeric shift operand does not open a body, so the real push still fires the notice");
+});
+
 // (a3) The SIBLING reader: `stripHeredocBodies` now takes its opener from the same helper, so a
 // MENTION of `<<EOF` cannot delimit a phantom body that swallows a real push — which made the
 // #2148 first-push notice go SILENT, the failure direction that helper's own doc calls the worst.
