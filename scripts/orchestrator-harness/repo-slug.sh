@@ -127,13 +127,14 @@ derive_or() {
     printf '%s\n' "$explicit"; return 0
   fi
   [ -n "$repo" ] && [ -d "$repo" ] || return 1
-  # ⛔ RAW CONFIGURED VALUE, NOT `remote get-url` (#2762 review, P1). `get-url` applies
-  # `url.<base>.insteadOf` rewrites, so an ambient `GIT_CONFIG_GLOBAL` could re-point the ORIGIN this
-  # derivation reads (and a legitimate mirror rewrite would make it unreadable). `config --get` returns
-  # what the checkout was cloned from; the git env is scrubbed here too, so `GIT_DIR` cannot redirect
-  # the read — the same class repo-target.sh's `_repo_target_git` closes for the identity assertion.
+  # ⛔ THE REPO'S OWN FILE, NOT THE MERGED CONFIG STACK (#2762 review, P1). `remote get-url` applies
+  # `url.*.insteadOf` rewrites, and `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject config at COMMAND
+  # scope that OUTRANKS the real origin — so an ambient environment could re-point the ORIGIN this
+  # derivation reads (and a legitimate mirror rewrite would make it unreadable). `--local` returns what
+  # the checkout was cloned from; the git env is scrubbed here too, so `GIT_DIR` cannot redirect the
+  # read — the same class repo-target.sh's `_repo_target_git` closes for the identity assertion.
   url="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-    git -C "$repo" config --get remote.origin.url 2>/dev/null || true)"
+    git -C "$repo" config --local --get remote.origin.url 2>/dev/null || true)"
   [ -n "$url" ] || return 1
   slug="$(repo_slug_from_remote "$url")" || return 1
   printf '%s\n' "$slug"

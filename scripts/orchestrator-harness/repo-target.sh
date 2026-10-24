@@ -63,14 +63,19 @@ repo_target_slug() {
   local p="${1:-}" url
   [ -n "$p" ] && [ -d "$p" ] || return 1
   command -v repo_slug_from_remote >/dev/null 2>&1 || return 1
-  # ⛔ READ THE CONFIGURED VALUE, NOT `remote get-url` (#2762 review, P1). `get-url` APPLIES
-  # `url.<base>.insteadOf` rewrites, and an ambient `GIT_CONFIG_GLOBAL` carrying a cross-repo rewrite
-  # made a tortoise worktree answer the agent-infra slug — through the scrub, `result=OK`, lane and
-  # chain spawned in the wrong repo (measured). `config --get remote.origin.url` returns what the repo
-  # was cloned from and is immune to that rewrite; a legitimate MIRROR rewrite (which `get-url` would
-  # turn into a local path, refusing every correct dispatch as `worktree-origin-unreadable`) also
-  # keeps its GitHub slug here.
-  url="$(_repo_target_git -C "$p" config --get remote.origin.url 2>/dev/null)" || return 1
+  # ⛔ READ THE REPO'S OWN FILE, NOT THE MERGED CONFIG STACK (#2762 review, P1). Three vectors, all
+  # closed by `--local` and none by a plain `config --get`:
+  #   * `remote get-url` APPLIES `url.<base>.insteadOf`, so an ambient `GIT_CONFIG_GLOBAL` with a
+  #     cross-repo rewrite made a tortoise worktree answer the agent-infra slug (`result=OK`, lane and
+  #     chain spawned in the wrong repo — measured).
+  #   * `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` and `GIT_CONFIG_PARAMETERS` inject
+  #     config at COMMAND scope, which OUTRANKS the repo's real origin — the same forge with no file
+  #     and no rewrite (`git config --get` answers the injected value).
+  #   * `GIT_CONFIG_GLOBAL` can SUPPLY an origin to a repo that has none, turning the unreadable-origin
+  #     refusal into a pass.
+  # `--local` reads the checkout's own config (the shared config in a linked worktree), so a legitimate
+  # MIRROR rewrite still returns the GitHub slug instead of refusing a correct dispatch.
+  url="$(_repo_target_git -C "$p" config --local --get remote.origin.url 2>/dev/null)" || return 1
   [ -n "$url" ] || return 1
   repo_slug_from_remote "$url" 2>/dev/null
 }

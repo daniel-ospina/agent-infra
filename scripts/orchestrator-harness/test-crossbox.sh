@@ -16,7 +16,12 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MERGE_ONE="$HERE/merge-one.sh"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
+# ⛔ THE FIXTURE'S ORIGIN MUST BE READ THE WAY THE GATE READS IT (#2762 review, P2). `remote get-url`
+# applies `url.*.insteadOf`, so on a box that rewrites the harness origin this suite derived a slug the
+# gate then refused (or exited 2) — a false RED in a suite that is outside the shard list, so nothing
+# else would show it. Read the repo's own file first, and keep `get-url` only as a last resort.
+ORIGIN_URL="$(git -C "$REPO_ROOT" config --local --get remote.origin.url 2>/dev/null || true)"
+[ -n "$ORIGIN_URL" ] || ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
 # ⛔ DERIVE THE TARGET FROM THE FIXTURE, NEVER HARDCODE IT (#2762 review, P2). fix-one.sh now
 # asserts its checkout against the target repo; a literal `daniel-ospina/tortoise` made every gated
 # arm exit 72 with "the fixer ran UNCLAIMED" when this suite ran from any other repo, while it sat

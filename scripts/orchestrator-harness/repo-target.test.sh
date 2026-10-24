@@ -171,6 +171,20 @@ printf '[url "/srv/mirror/tortoise.git"]\n\tinsteadOf = https://github.com/danie
 A12="$(GIT_CONFIG_GLOBAL="$MIRROR_CFG" repo_target_assert "unit" "$TWT" "daniel-ospina/tortoise" "")"; a12=$?
 { [ "$a12" -eq 0 ] && grep -q 'result=OK' <<<"$A12"; }; ck "A12 a benign MIRROR rewrite does not refuse a correct pair (raw config, not the rewritten URL)" $?
 
+# ⛔ APPEND-SCOPE CONFIG INJECTION (#2762 review, P1): `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/...
+# OUTRANK a repo's real local origin, so `config --get` answered the injected value and the gate said
+# OK for the wrong repo (measured with plain git). `--local` reads the checkout's own file.
+A14="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url \
+  GIT_CONFIG_VALUE_0=https://github.com/daniel-ospina/agent-infra.git \
+  repo_target_assert "unit" "$TWT" "daniel-ospina/agent-infra" "")"; a14=$?
+{ [ "$a14" -eq 72 ] && grep -q 'repo=daniel-ospina/tortoise' <<<"$A14" \
+    && grep -q 'reason=slug-mismatch' <<<"$A14"; }; ck "A14 GIT_CONFIG_COUNT injection does not override a REAL local origin (72)" $?
+# ...and the other injection shape: a global config must not SUPPLY an origin to a repo that has none.
+NOREM_CFG="$T/gc-supply"
+printf '[remote "origin"]\n\turl = https://github.com/daniel-ospina/agent-infra.git\n' > "$NOREM_CFG"
+A15="$(GIT_CONFIG_GLOBAL="$NOREM_CFG" repo_target_assert "unit" "$NOREMWT" "daniel-ospina/agent-infra" "")"; a15=$?
+{ [ "$a15" -eq 72 ] && grep -q 'reason=worktree-origin-unreadable' <<<"$A15"; }; ck "A15 a global config cannot SUPPLY an origin to an origin-less repo (still a refusal)" $?
+
 # ONE OWNER FOR THE SHAPE RULE, MEASURED (#2762 review, P2): a hand-copy that agrees on the two shapes
 # A10 pins and diverges elsewhere would pass A10. Drive all three through one table.
 shape_bad=0
@@ -250,15 +264,19 @@ c2=$?
     && grep -q 'daniel-ospina/agent-infra' "$FO/logs/fix-4002.log" 2>/dev/null \
     && ! grep -q 'could not materialise' "$FO/logs/fix-4002.log" 2>/dev/null; }; ck "C2 branch absent from the target repo -> REFUSED naming branch+repo, NOT 'could not materialise'" $?
 
+# ⛔ THE EXIT CODE IS NOT EVIDENCE HERE (#2762 review, P3). MAX_LOAD=0 stops the SPAWN POINT from
+# starting an agent on purpose (a test must not run a model), so fix-one.sh reaches its `gh` stub, the
+# CI-queue gate defers (rc 2 "unreadable" -> DEFER, fail closed) and fix-one exits 0 — an unrelated
+# mechanism. The three `[repo-target]` assertions below are what prove the gate passed, and the built
+# worktree proves the work happened after them.
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
 REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
 c3=$?
-{ [ "$c3" -eq 0 ] \
-    && grep -q 'fixer #4003 target result=OK repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
+{ grep -q 'fixer #4003 target result=OK repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
     && grep -q 'fixer #4003 result=OK repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
     && grep -q 'fixer #4003 branch=work result=OK' "$FO/logs/fix-4003.log" 2>/dev/null \
-    && [ -d "$AI/.worktrees/fix-4003" ]; }; ck "C3 matching target -> ALL THREE assertions pass (log survives the start truncation) and the worktree is built (rc=$c3)" $?
+    && [ -d "$AI/.worktrees/fix-4003" ]; }; ck "C3 matching target -> ALL THREE assertions pass (log survives the start truncation) and the worktree is built (rc=$c3, asserted by the lines not by rc)" $?
 
 # ═══ D. dispatch-merge.sh — the issue-lane batch ═══════════════════════════════════════════════
 echo
