@@ -310,6 +310,46 @@ def rec(p):
     except Exception:
         return None
     return d if isinstance(d, dict) else None
+# ⛔ TWO READERS READ EVERY RECORD: json (this program, and the rail) and `field()` (a greedy sed).
+# They are the SAME reader only when they agree on the value of every COMPARED key. The slow path
+# decides with `field`, so a record where json and `field` disagree made the slow path report `same`
+# or `conflict` on a value json never saw (measured: a nested "evidence":{"head_sha":...} on an
+# EARLIER line made `field` read the nested head while json read the top-level one, so a genuine
+# rule-4 divergence was reported as same/exit 0; a verdict of "a}b" read as "a"). A record whose
+# compared keys are not unambiguous in BOTH readings is UNREADABLE (exit 4) — never guessed at.
+AGREED_KEYS = ("reviewed_at", "pr", "verdict", "head_sha", "repo", "mint", "carried_from", "merge_base_sha", "supersedes")
+FIELD_TAIL = re.compile("([^\",}]*)\"?")
+def field_text(text, name):
+    # A faithful replication of `field()`: first LINE that matches, LAST match on that line (the sed
+    # prefix is greedy), capture up to the first quote/comma/brace, then trim. Any divergence between
+    # this and the shell sed is a bug in one of them, so the agreement test is what pins them.
+    pat = re.compile("\"" + re.escape(name) + "\"[ \\t]*:[ \\t]*\"?")
+    for line in text.splitlines():
+        last = None
+        for m in pat.finditer(line):
+            last = m
+        if last is None:
+            continue
+        tail = FIELD_TAIL.match(line, last.end())
+        return (tail.group(1) if tail else "").strip()
+    return ""
+def agrees(p):
+    text = open(p, encoding="utf-8", errors="replace").read()
+    d = rec(p)
+    if d is None:
+        return False
+    for k in AGREED_KEYS:
+        jv = d.get(k)
+        tv = field_text(text, k)
+        if jv is None:
+            if tv != "":
+                return False
+            continue
+        if isinstance(jv, bool) or not isinstance(jv, (str, int)):
+            return False
+        if str(jv) != tv:
+            return False
+    return True
 def usable(p):
     d = rec(p)
     if d is None:
@@ -318,6 +358,8 @@ def usable(p):
     if not (isinstance(h, str) and RE.fullmatch(h)):
         return False
     if not (isinstance(v, str) and v.strip()):
+        return False
+    if not agrees(p):
         return False
     return True
 def dupkeys(p):
@@ -685,6 +727,16 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
     DEC="unreadable"; DEC_MSG="the peer's ref carries no readable record.json"
     return 0
   fi
+  # ⛔ THE SLOW PATH DECIDES WITH `field`; THE RAIL DECIDES WITH json. They are the same reader only
+  # where they agree, so a peer record whose compared keys read differently is UNREADABLE (exit 4)
+  # rather than guessed at — measured: a nested `evidence:{"head_sha":…}` on an earlier line made
+  # `field` read the nested head, so a genuine rule-4 divergence at a shared stamp was reported
+  # `same`/exit 0 (`wrote=0 conflicts=0`). `record_usable` is that one check.
+  if ! record_usable "$tmp"; then
+    rm -f "$tmp"
+    DEC="unreadable"; DEC_MSG="the peer's record is not one this box's rail can USE, or its compared fields do not read the same way twice (json vs field); refusing to order against it"
+    return 0
+  fi
   rat="$(field "$tmp" reviewed_at)"
   DEC_PEER_AT="$rat"
   if [ -z "$rat" ]; then
@@ -758,6 +810,16 @@ push_one() { # <key> <source-file>
   sb="$(store_blob_of "$key")"
   if [ -n "$sb" ] && [ "$sb" != "-" ] && [ "$(local_blob_of "$f")" = "$sb" ]; then
     SAME=$((SAME + 1)); return 0
+  fi
+  # ⛔ THE LOCAL SIDE IS GATED TOO, or `push` publishes a record whose own compared fields read one
+  # way to `field` and another to json — the shape that makes the ordering comparison decide on bytes
+  # the rail never saw. It sits AFTER the fast path ON PURPOSE: an identical blob id means the bytes
+  # are ALREADY published, so refusing to re-publish them would change nothing while costing a
+  # python3 process per record on every converged run (measured: the store holds thousands of
+  # records and a box that is already converged must stay cheap).
+  if ! record_usable "$f"; then
+    warn "  ⚠️ skip $key — the LOCAL record is not one this box's rail can USE, or its compared fields do not read the same way twice (json vs field); refusing to publish it."
+    UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
   attempt=0
   while :; do
@@ -1052,12 +1114,19 @@ registry_hash() {
 # store" (an error, exit 1 from fetch_refs). Conflating the two made exit 1 mean both.
 do_status() {
   fetch_refs || return 1
-  local key name at list lnew="" rnew="" local_n=0 remote_n=0 missing=0
+  local key name at list lnew="" rnew="" local_n=0 remote_n=0 missing=0 at_tmp
   list="$(mktemp "${TMPDIR:-/tmp}/registry-sync-status.XXXXXX")" || return 1
+  at_tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-status-at.XXXXXX")" || return 1
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     remote_n=$((remote_n + 1))
-    at="$(remote_record "$key" 2>/dev/null | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' | command head -1)"
+    # ⛔ THE ONE READER. This was a bare sed pinned to the COMPACT spelling, so the origin side read
+    # `none` for a record the local side (through `field`) read correctly — measured: the same bytes
+    # gave `origin newest_reviewed_at=none` next to `local newest_reviewed_at=2026-11-30T10:00:00Z`,
+    # and on a mixed store it silently reported an older compact stamp while a newer pretty-printed
+    # one was invisible. `status` is the verb the header tells an operator to run FIRST.
+    at=""
+    if remote_record "$key" > "$at_tmp" 2>/dev/null; then at="$(field "$at_tmp" reviewed_at)"; fi
     if [ -n "$at" ] && { [ -z "$rnew" ] || [[ "$at" > "$rnew" ]]; }; then rnew="$at"; fi
     # "Missing here" means the READER would find nothing — the qualified file OR the legacy
     # `<pr>.json` it falls back to. Counting only the qualified name reported a record as absent
@@ -1075,7 +1144,7 @@ do_status() {
     at="$(field "$REG_DIR/$name" reviewed_at)"
     if [ -n "$at" ] && { [ -z "$lnew" ] || [[ "$at" > "$lnew" ]]; }; then lnew="$at"; fi
   done < "$list"
-  rm -f "$list"
+  rm -f "$list" "$at_tmp"
   printf 'local  records=%s newest_reviewed_at=%s hash=%s\n' "$local_n" "${lnew:-none}" "$(registry_hash)"
   printf 'origin records=%s newest_reviewed_at=%s\n' "$remote_n" "${rnew:-none}"
   printf 'missing_here=%s\n' "$missing"

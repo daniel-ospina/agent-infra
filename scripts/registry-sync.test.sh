@@ -937,6 +937,72 @@ else
   bad "§30d the newer local record was REWRITTEN — the ordering compare read a whitespace-prefixed stamp as older"
 fi
 
+# ── §30d(2): the OTHER two whitespace halves. `"name" : value` (space BEFORE the colon) and
+# `{"pr":441 , …}` (space before the comma) are both valid JSON and both needed a separate piece of
+# the fix; a fence that only exercised `": "` would stay green if either half were deleted, and the
+# record would regress to `unreadable`/exit 4 exactly as `{"pr": 441}` did.
+K_WS3="daniel-ospina-agent-infra-2009"
+seed_payload "$STORE9" "$K_WS3" "{\"pr\" : 2009, \"head_sha\" : \"$HEAD_A\", \"verdict\" : \"clean\", \"repo\" : \"daniel-ospina/agent-infra\", \"reviewed_at\" : \"2026-11-13T10:00:00Z\"}"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d(2) a record written {\"pr\" : 441, …} materialises (space BEFORE the colon)"
+assert_contains "$RS_LAST" "added=1" "§30d(2) ...and it is written, not skipped as unreadable"
+K_WS4="daniel-ospina-agent-infra-2010"
+seed_payload "$STORE9" "$K_WS4" "{\"pr\":2010 , \"head_sha\":\"$HEAD_A\" , \"verdict\":\"not-clean\" , \"repo\":\"daniel-ospina/agent-infra\" , \"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{"pr":2010 , "head_sha":"%s" , "verdict":"clean" , "repo":"daniel-ospina/agent-infra" , "reviewed_at":"2026-12-31T00:00:00Z"}' "$HEAD_B" > "$BOX12/$K_WS4.json"
+cp "$BOX12/$K_WS4.json" "$T/ws4.before"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_contains "$RS_LAST" "older_refused=1" "§30d(2) a stamp with a space before the comma still ORDERS (space before the comma is trimmed)"
+if cmp -s "$BOX12/$K_WS4.json" "$T/ws4.before"; then
+  ok "§30d(2) ...and the newer local record survives byte-identically"
+else
+  bad "§30d(2) the newer local record was rewritten — the trailing trim is missing from the field reader"
+fi
+
+# ── §30e: THE TWO READERS. json (the rail, and the fast path) and `field` (the slow path) must read
+# the SAME value for every COMPARED key, or the slow path decides on a value json never saw. Measured
+# before the fix: a nested `evidence:{"head_sha":…}` on an EARLIER line made `field` read the nested
+# head, so a genuine divergence at a shared stamp was reported `same`/exit 0 — the false convergence
+# the header forbids. Such a record is now UNREADABLE (exit 4), on `pull` AND on `push`.
+echo "── §30e a record json and field read DIFFERENTLY is unreadable, never guessed at"
+ORIGIN10="$T/origin10.git"; STORE10="$T/store10"; BOX13="$T/box13"
+git init -q --bare "$ORIGIN10"; mkdir -p "$STORE10" "$BOX13"
+git -C "$STORE10" init -q; git -C "$STORE10" remote add origin "$ORIGIN10"
+git -C "$STORE10" config user.email sync@test.invalid; git -C "$STORE10" config user.name sync-test
+git -C "$STORE10" commit -q --allow-empty -m seed; git -C "$STORE10" push -q origin HEAD:refs/heads/main
+K_AMBIG="daniel-ospina-agent-infra-2101"
+# The peer says head aaaa at the top level and carries a NESTED head bbbb on an earlier line; this box
+# holds a clean record at the SAME stamp for head bbbb — i.e. the two records DISAGREE on the head.
+seed_payload "$STORE10" "$K_AMBIG" "{
+  \"pr\": 2101,
+  \"evidence\": {\"head_sha\": \"$HEAD_B\"},
+  \"head_sha\": \"$HEAD_A\",
+  \"verdict\": \"clean\",
+  \"repo\": \"daniel-ospina/agent-infra\",
+  \"reviewed_at\": \"2026-11-01T10:00:00Z\"
+}"
+printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T10:00:00Z"}' "$HEAD_B" > "$BOX13/$K_AMBIG.json"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30e an ambiguous peer record is NOT converged (exit 4), not reported same"
+assert_contains "$RS_LAST" "unreadable=1" "§30e ...and it is COUNTED unreadable"
+if printf '%s' "$RS_LAST" | grep -q 'same=1'; then bad "§30e the divergence was still reported same"; else ok "§30e ...and never reported same over two records that disagree"; fi
+if cmp -s "$BOX13/$K_AMBIG.json" <(printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T10:00:00Z"}' "$HEAD_B"); then
+  ok "§30e ...and the local record was not touched"
+else
+  bad "§30e the local record was rewritten from an unreadable peer"
+fi
+# the same record as THIS BOX'S OWN must not be PUBLISHED either — under a key the store does NOT
+# already hold, so "not published" is decidable (the K_AMBIG ref above exists on the store side).
+K_AMBIG_LOCAL="daniel-ospina-agent-infra-2102"
+printf '{\n  "pr": 2102,\n  "evidence": {"head_sha": "%s"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-01T10:00:00Z"\n}\n' "$HEAD_B" "$HEAD_A" > "$BOX13/$K_AMBIG_LOCAL.json"
+RS_LAST="$(rsx "$STORE10" "$BOX13" push 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30e push refuses an ambiguous LOCAL record (exit 4)"
+assert_contains "$RS_LAST" "not one this box's rail can USE" "§30e ...naming the reason"
+if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null; then
+  bad "§30e the ambiguous record was PUBLISHED anyway"
+else
+  ok "§30e ...and nothing reached the store"
+fi
+
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
   b="${pair%%:*}"; f="${pair##*:}"

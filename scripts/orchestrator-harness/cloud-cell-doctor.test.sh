@@ -1290,6 +1290,50 @@ result_has "did NOT converge" && ok "hygiene: ...and says what it means for a pe
   || bad "hygiene: the log does not say the registry did not converge — $OUT"
 case "$OUT" in *"rc=3"*) bad "hygiene: the sync made the pass cannot-verify (it must not)" ;; *) ok "hygiene: ...and it does not turn the pass green-to-red on the merge role's behalf" ;; esac
 
+say_case "hygiene: a DIVERGENT registry logs WHY (conflicts + the keys), not just skipped=0"
+reset_state
+# `skipped=` is the unreadable class only, so a divergence is invisible in the counts line. Before
+# this case the step held `conflicts=2` and the keys in $rs_out and logged `skipped=0` beside
+# "NOT a converged state" — the one datum an operator needs (WHICH records diverge) was dropped.
+cat > "$T/bin/rs-diverge.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+printf '%s\n' "union: wrote=2 pushed=0 same=2 older_refused=0 conflicts=2 unkeyed=0 unreadable=0 failed=0"
+printf '%s\n' "union: refs=4 files=4 added=2 updated=0 skipped=0"
+printf '%s\n' "registry-sync.sh: 2 record(s) DIVERGE at the same reviewed_at: daniel-ospina-agent-infra-3001 daniel-ospina-agent-infra-3002"
+exit 3
+SH
+chmod +x "$T/bin/rs-diverge.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-diverge.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: a divergent registry does NOT fail the pass" || bad "hygiene: divergence produced rc=$RC — $OUT"
+case "$OUT" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and the log carries the script's DIVERGE verdict" ;; *) bad "hygiene: the divergence cause is dropped from the log — $OUT" ;; esac
+case "$OUT" in *"agent-infra-3001"*) ok "hygiene: ...naming the keys an operator must reconcile" ;; *) bad "hygiene: the diverging keys are not named — $OUT" ;; esac
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and it reaches the role RECORD, not just stdout" ;; *) bad "hygiene: state drops the divergence reason — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" ;; esac
+
+say_case "hygiene: a union killed by the BOUND (rc=143, no timeout(1)) is TIMED OUT, not FAILED-unknown"
+reset_state
+# `run_bounded` uses `timeout(1)` when present (124) and its own watchdog otherwise (143). Stock
+# macOS has no `timeout`, and 143 was not in the timeout arm, so a bound-killed union on the box the
+# harness documents as the messy one logged FAILED/cause-UNKNOWN.
+cat > "$T/bin/rs-143.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+exit 143
+SH
+chmod +x "$T/bin/rs-143.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-143.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       DOCTOR_REGISTRY_SYNC_TIMEOUT=120 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+case "$OUT" in *"TIMED OUT after 120s"*) ok "hygiene: rc=143 is reported as the BOUND firing (watchdog arm)" ;; *) bad "hygiene: rc=143 is not recognised as a timeout — $OUT" ;; esac
+case "$OUT" in *"union TIMED OUT rc=143"*) ok "hygiene: ...and it gets its own arm (raise the bound), not the FAILED one" ;; *) bad "hygiene: rc=143 has no TIMED OUT arm — $OUT" ;; esac
+case "$OUT" in *"union FAILED rc=143"*) bad "hygiene: rc=143 still masquerades as a push failure — $OUT" ;; *) ok "hygiene: ...and is never reported as a push failure" ;; esac
+
 # ⛔ #2520 IS THE ARM THAT CANNOT BE SEEN FROM AN EXIT STATUS. A withheld invocation never runs, so
 # the sync's rc says nothing at all; the step therefore asks `surface-check` FIRST. Without this
 # case the pre-check could be deleted and the suite would stay green — and a box whose farmed copy
