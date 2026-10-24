@@ -921,7 +921,30 @@ result_has "registry union REFUSED by the checkout-guard" && ok "hygiene: ...and
 case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran despite the refusal — the pre-check is not gating" ;; *) ok "hygiene: ...and the union is NOT run when the guard would withhold it" ;; esac
 case "$OUT" in *"checkout-guard"*) ok "hygiene: ...and the log names the GUARD, so the next agent need not rediscover #2520" ;; *) bad "hygiene: the log does not name the guard — $OUT" ;; esac
 
-say_case "hygiene: the registry step is SKIPPED when the seam says off, and the skip is visible"
+# ⛔ rc=3 IS NOT A REFUSAL, and the doctor must not say it is. surface-check answers 0 classify /
+# 5 would-refuse / 3 could-not-check; a box without `awk` is the third, and reporting it as "the
+# guard withheld it" names a cause that never existed — leaving the real one unfixed for ever.
+say_case "hygiene: surface-check rc=3 is reported as NOT VERIFIED, never as a guard refusal"
+reset_state
+cat > "$T/bin/rs-unverifiable.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check)
+    echo "surface-check: could not read the source (awk rc=127) — exit 3 = NOT VERIFIED, never a pass." >&2
+    exit 3 ;;
+  union) echo "UNION-RAN-ANYWAY" >&2; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/rs-unverifiable.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-unverifiable.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an unverifiable surface does NOT fail the pass" || bad "hygiene: rc=3 made rc=$RC — $OUT"
+result_has "registry union NOT RUN — git surface could not be verified" && ok "hygiene: ...and the record says the surface could not be VERIFIED" \
+  || bad "hygiene: the rc=3 cause is not named in the role record — $OUT"
+case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran although its surface could not be verified" ;; *) ok "hygiene: ...and the union still does not run (fail closed)" ;; esac
+case "$OUT" in *"cause is NOT a guard refusal"*) ok "hygiene: ...and the log says the cause is NOT a guard refusal (no false attribution)" ;; *) bad "hygiene: rc=3 is reported as a guard refusal — $OUT" ;; esac
 
 say_case "hygiene: the registry step is SKIPPED when the seam says off, and the skip is visible"
 reset_state
