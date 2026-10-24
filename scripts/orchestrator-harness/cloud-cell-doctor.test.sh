@@ -1771,20 +1771,22 @@ done
 # The enclosing function of a line, so a bare read is judged where it actually lives.
 func_for() { # <file> <line-number> -> the enclosing function's name (empty before the first one)
   local file="$1" want="$2" ln best=0
-  # ⛔ TWO ACCEPTED HEADER FORMS. Matching only `name() {` attributes a function whose brace sits on
-  # the NEXT line to the PRECEDING function — so its `local s="$1"` was graded against the
-  # predecessor's allowlist entry and passed with no decision (review P1, reproduced: `future_two()`,
-  # newline, `{`, `local s="$1"` → the suite stayed green). The header is the `name()` line; the
-  # brace may be on it or on the next one, and the name is read from the header either way.
+  # ⛔ TWO ACCEPTED HEADER FORMS, AND BOTH MAY BE INDENTED. Matching only `name() {` attributes a
+  # function whose brace sits on the NEXT line to the PRECEDING function — so its `local s="$1"` was
+  # graded against the predecessor's allowlist entry and passed with no decision (review P1,
+  # reproduced: `future_two()`, newline, `{`, `local s="$1"` → the suite stayed green). And an
+  # INDENTED header is a NESTED function, which this file really has (`note()` in run_reap,
+  # `claim_take()` in run_merge): anchoring at column 0 attributed a nested helper's reads to the
+  # OUTER function, where the outer one's allowlisted name covered them (review P2, reproduced).
   # ⛔ NO `$` AFTER THE BRACE ARM: a trailing comment (`state_write_rehearsal() { # <role> …`) is
   # normal in this file, and anchoring there silently dropped 22 of the 48 headers — which made a
-  # line resolve to the PRECEDING function, i.e. exactly the misattribution this fix removes.
-  for ln in $(grep -nE '^[a-z_][a-z0-9_]*\(\)([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
+  # line resolve to the PRECEDING function, i.e. exactly the misattribution this fixes.
+  for ln in $(grep -nE '^[[:space:]]*[a-z_][a-z0-9_]*\(\)([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
   [ "${best:-0}" -gt 0 ] || return 0
-  sed -n "${best}p" "$file" | sed -nE 's/^([a-z_][a-z0-9_]*)\(\).*/\1/p'
+  sed -n "${best}p" "$file" | sed -nE 's/^[[:space:]]*([a-z_][a-z0-9_]*)\(\).*/\1/p'
 }
 # Walk one file and PRINT one record per positional read: "<verdict> <line> <function> <name> <read>".
 # ⛔ A FUNCTION, so the walk can be run over a SYNTHETIC file the suite controls (the non-vacuity arm
@@ -1804,27 +1806,35 @@ audit_scan() { # <file>
 # Grade one file's reads against REQUIRED_READS. Counts land in AUDIT_*; the RETURN is the number of
 # ungraded/fatal pairs, so a caller can assert on it without re-deriving the decision.
 audit_grade() { # <file> <emit 1|0>
-  local file="$1" emit="$2" verdict ln fn var rd bad_n=0
-  AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0
+  local file="$1" emit="$2" verdict ln fn var rd bad_n=0 graded=0
+  AUDIT_DEF=0; AUDIT_BARE=0; AUDIT_DER=0; AUDIT_REQ=0; AUDIT_MATCHED=""
   while read -r verdict ln fn var rd; do
+    graded=$((graded + 1))
     case "$verdict" in
       defaulted) AUDIT_DEF=$((AUDIT_DEF + 1))
                  [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
       invented)  bad_n=$((bad_n + 1))
                  [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
       unparsed)  bad_n=$((bad_n + 1))
-                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — bind it on its own line so it can be judged; an unattributed read is ungraded" ;;
+                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — the read sits outside the quoted value it is looked for in (a split value like \"$D\"/\"$1.x\", a literal in single quotes, or an arithmetic). Rewrite it as one \"…$N…\" token so it can be judged; an unattributed read is ungraded" ;;
       derived)   AUDIT_DER=$((AUDIT_DER + 1))
                  [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) EMBEDS $rd in a larger value — a note; it is graded above, not excused" ;;
       *)         AUDIT_BARE=$((AUDIT_BARE + 1))
                  case "$REQUIRED_READS" in
                    *" $fn:$var "*) AUDIT_REQ=$((AUDIT_REQ + 1))
+                       AUDIT_MATCHED="$AUDIT_MATCHED $fn:$var"
                        [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) REQUIRED — reads $rd bare; a caller bug is the right outcome" ;;
                    *) bad_n=$((bad_n + 1))
                        [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) reads $rd BARE and is not on the REQUIRED list — decide it, do not imitate its neighbour" ;;
                  esac ;;
     esac
   done < <(audit_scan "$file")
+  # ⛔ NO VERDICT WITHOUT AN OBSERVATION (agent-infra#2096/#2121 — and the tree-wide
+  # `scripts/check-false-pass-shapes.sh` gate is the authority, not this comment). A loop over a
+  # substitution can iterate ZERO times, so a function that only counts failures reports PASS over
+  # an empty read — here that would be a file with no `local` bindings at all, i.e. a scan that
+  # observed nothing. `graded` is the observation count and a zero-observation grade REFUSES.
+  [ "$graded" -gt 0 ] || return 1
   return "$bad_n"
 }
 # ⛔ THE NON-VACUITY ARM FOR THE (function, name) KEY. A synthetic file with one allowlisted read and
@@ -1860,11 +1870,24 @@ audit_grade "$DOCTOR" 1; BADSUM=$?
 [ "$((AUDIT_DEF + AUDIT_BARE + AUDIT_DER))" -ge 15 ] && [ "$AUDIT_DEF" -ge 4 ] \
   && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_REQ required, $AUDIT_DER embedding)" \
   || bad "audit: classified only $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) reads ($AUDIT_DEF defaulted) — the scan is broken, so this arm proves nothing"
-# ⛔ EVERY LISTED PAIR MUST BE MATCHED. `AUDIT_REQ` was computed and only PRINTED, so a REQUIRED_READS
-# entry whose read later became `${1:-}` (or whose function was renamed) silently shrank coverage while
-# the suite stayed green — and a pair that never matches is a dead exemption (review P1).
-[ "$AUDIT_REQ" -eq "$_n" ] && ok "audit: all $_n REQUIRED_READS pairs are actually matched in the file (no stale or dead entry)" \
-  || bad "audit: AUDIT_REQ=$AUDIT_REQ but REQUIRED_READS lists $_n pair(s) — a listed read is no longer bare (coverage silently shrank) or is unreachable"
+# ⛔ EVERY LISTED PAIR MUST BE MATCHED — twice over, because each check misses what the other
+# catches. The COUNT catches a listed pair matched TWICE while another is matched ZERO times;
+# the MEMBERSHIP check catches a listed pair the walk never saw at all. `AUDIT_REQ` alone was a
+# count, so on a copy of the doctor carrying `bounded`'s `$1` weakened to `${1:-}` PLUS a nested
+# `local s="$1"` (whose read the broken resolver attributed to `bounded`) the count still read
+# 19 == 19 and the suite stayed green (review P2, reproduced).
+[ "$AUDIT_REQ" -eq "$_n" ] && ok "audit: REQUIRED_READS matched $_n time(s), one per listed pair" \
+  || bad "audit: $AUDIT_REQ match(es) for $_n listed pair(s) — a pair is matched twice (so another is missing) or the list is stale"
+UNMATCHED=0
+for _pair in $REQUIRED_READS; do
+  case " $AUDIT_MATCHED " in
+    *" $_pair "*) ;;
+    *) UNMATCHED=$((UNMATCHED + 1))
+       bad "audit: REQUIRED_READS lists $_pair but the walk never matched it — that read is no longer bare, so its coverage was silently lost" ;;
+  esac
+done
+[ "$UNMATCHED" -eq 0 ] && ok "audit: every listed pair was matched by name (no pair is covered only through a same-named neighbour)" \
+  || bad "audit: $UNMATCHED listed pair(s) were never matched"
 # …and each dispatched role's mode read must BE the empty-defaulted one (the derived list again).
 while read -r _r _f; do
   [ -n "${_r:-}" ] || continue
