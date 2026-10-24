@@ -139,17 +139,24 @@ shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
 trap 'rm -f "$shard_ran_log"' EXIT
 
 # ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
-# The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so the reader — and
-# the merge rail, which compares a PR's reds against main's by FAILURE IDENTITY — cannot tell WHICH
-# body of work is red. Measured cost (2026-10-24): main and every PR carried the same four red
-# shards for hours, `bash-suites` red on every PR head, and the rail could not subtract a base red it
-# could not name, so the whole queue froze on a 5-minute fix. The names were in the log all along,
-# tens of thousands of lines above the summary.
+# The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so nobody reading
+# the job — human or agent — can tell WHICH body of work is red without walking tens of thousands of
+# lines up the log. Measured cost (2026-10-24): main and every PR carried the same four red shards
+# for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
+# hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# Two prints, on purpose:
-#   * at the moment of failure — so the name sits NEXT TO its own output (a sharded job's log is
-#     sliced per job, and the recap below may be in a different job's log than the body);
-#   * as a recap at the end — so a reader who greps the summary does not have to walk the log.
+# ⛔ WHAT THIS DOES *NOT* DO: it does not give the merge rail a failure IDENTITY. The rail derives
+# that set from `scripts/ci_exemption.py ids`, which recognises a nodeid, a guard-step annotation or
+# ONE runner aggregate shape (`❌ <label>: <N> passed, <M> failed`) — measured against the exact lines
+# this block prints, it returns `ids=0`. A red `bash-suites` step is therefore still identified only
+# by its JOB name, an identity that does not change when a shard does, so a base red cannot be
+# subtracted by shard. That is #2643's remaining half, and it needs a line the parser RECOGNISES —
+# not a better sentence. Do not read this block as "the rail is fixed".
+#
+# Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
+# END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
+# this checkout`, `slice executed a DIFFERENT SET of shards`, and the two sentinels). On any of those
+# the per-failure line is the only name the log will ever carry.
 # LISTED shards only: the runtime sentinel at the end of this file deliberately runs a failing stub,
 # and a green run must never print a FAILED SHARD line for it (`shard_is_listed` is 0 there).
 shard_failed_list=""
@@ -443,6 +450,14 @@ if [ "$shard_errors" -gt 0 ]; then
   # dangling label, and never let an empty list read as "no failing shard".
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT (#2643 review, 2026-10-24). `shard_errors` counts BOTH
+    # failing shards and failing syntax sweeps; the list above names only the former. Printing "2
+    # failed" beside one name reads as a missing name — and the missing half is exactly what the recap
+    # exists to stop hunting for. Counted from the list itself, not a second counter that could drift.
+    shard_named=$(printf '%s' "$shard_failed_list" | tr ',' '\n' | grep -c .)
+    if [ "$shard_errors" -gt "$shard_named" ]; then
+      echo "❌ …and $((shard_errors - shard_named)) of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+    fi
   else
     echo "❌ no shard is named here — every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
   fi

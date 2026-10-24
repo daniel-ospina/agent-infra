@@ -735,6 +735,7 @@ fi
 
 echo ""
 echo "8z. A BACKSLASH-CONTINUED SWALLOW → rc 2 (the tail is not only the first physical line)"
+
 awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: |"; print "          bash scripts/run-bash-shards.sh > /dev/null \\"; print "            || true"; next } print }' \
   "$PR" >"$TMP/ci-pr-cont-swallow.yml"
 if cmp -s "$PR" "$TMP/ci-pr-cont-swallow.yml"; then
@@ -755,6 +756,49 @@ if [ "$RC" -eq 2 ]; then
   pass "a continued pipe exits 2 (no pipefail in the default shell)"
 else
   fail "a continued pipe returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
+echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm RED (#2643)"
+# The runner now prints `❌ FAILED SHARD: <path>` at the point of failure and a recap
+# (`❌ failing shard(s): <path,…>`). BOTH are asserted here, because a reader-facing line nobody
+# asserts is a line the next refactor deletes with every gate green — and the runner's own runtime
+# sentinels CANNOT pin it (the sentinel is deliberately not a listed shard, so a name would be a
+# false report on a green run). Non-vacuity is built in: the same fixture with `shard_fail` deleted
+# must print NO name, and still exit 1.
+NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
+awk -v cheap="$CHEAP" -v failing="$NAMED_FAIL" '
+  /^run_shard / && $2 !~ /^\"/ { n++; if (n == 1) { print "run_shard " failing; next } }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-onefail.sh"
+$FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-onefail.out")"
+if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
+  pass "a failing shard is NAMED at the point of failure ($NAMED_FAIL), and the run still fails (rc 1)"
+else
+  fail "a failing shard was not named at the point of failure (rc $RC): $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+fi
+if grep -qE '^❌ failing shard\(s\): .*stand-in-fail\.sh' <<<"$OUT"; then
+  pass "the RECAP names it too (so grepping the summary does not require walking the log)"
+else
+  fail "the recap did not name the failing shard: $(grep -F 'failing shard' <<<"$OUT" | head -3)"
+fi
+# NON-VACUITY: same fixture, the naming call deleted. The run must STILL fail (the counter is
+# untouched) and must print NO name — so an arm that passed on any failing run would be caught.
+sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$TMP/runner-onefail.sh" >"$TMP/runner-onefail-noname.sh"
+if cmp -s "$TMP/runner-onefail.sh" "$TMP/runner-onefail-noname.sh"; then
+  fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-onefail-noname.out")"
+  if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
+    pass "with the naming deleted the run still fails and prints NO name — this arm measures the naming, not the count"
+  else
+    fail "the no-name mutation returned rc $RC and printed: $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+  fi
 fi
 
 echo ""
