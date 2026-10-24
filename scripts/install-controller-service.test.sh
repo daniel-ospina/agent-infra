@@ -1958,6 +1958,27 @@ kill "$FB_LATE" 2>/dev/null || true
 [ "$FB_RC" -ne 0 ] && ok 'install: a FUTURE-dated heartbeat is not a fresh one (the stale one still refuses)' \
                    || bad "install: a future-dated heartbeat certified the install — every MainPID reads as 'began before it': $(cat "$T/fb.out")"
 
+# The 60 s skew band belongs to the AGE read only. As a START-PROOF value, an instant in the future makes
+# every process look older than it, which is how a clock a few seconds fast certified a start that produced
+# nothing (review P1, #2402). `now+60` is exactly the boundary the launchd twin pins.
+say_case "a heartbeat at the skew boundary is not a start proof (the band is for AGE reads only)"
+BD="$(arm_root bd)"; mk_systemctl "$BD/bin" "$BD/state" "$BD/sc.log"
+printf 'active\n' > "$BD/state/isactive_word"; : > "$BD/state/active"
+printf '%s\n' "$(( $(date +%s) + 60 ))" > "$BD/o/heartbeat"          # exactly the boundary, in $O
+sleep 60 & BD_LATE=$!; printf '%s\n' "$BD_LATE" > "$BD/state/mainpid"
+BD_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst bd --install > "$T/bd.out" 2>&1 || BD_RC=$?
+kill "$BD_LATE" 2>/dev/null || true
+[ "$BD_RC" -ne 0 ] && ok 'install: a FUTURE heartbeat (now+60) is not a start proof — the install refuses' \
+                   || bad "install: a heartbeat 60s in the FUTURE certified the start — every MainPID reads as 'began before it': $(cat "$T/bd.out")"
+# …and the AGE read still tolerates the same skew: a 30s-fast clock must not make `--status` blind.
+FE="$(arm_root fe)"; mk_systemctl "$FE/bin" "$FE/state" "$FE/sc.log"
+: > "$FE/state/enabled"; : > "$FE/state/active"; printf '4242\n' > "$FE/state/mainpid"
+printf '%s\n' "$(( $(date +%s) + 30 ))" > "$FE/o/heartbeat"
+inst fe --status > "$T/fe.out" 2>&1 || true
+grep -qE '^heartbeat_age_s=[0-9]+' "$T/fe.out" \
+  && ok 'status: a heartbeat up to 60s ahead is still READ as an age (the band survives where it belongs)' \
+  || bad "status: a 30s-fast clock made the age UNREADABLE — the band was removed from the wrong reader: $(grep -E 'heartbeat' "$T/fe.out" | head -2)"
+
 # ── a copy that supervises ANOTHER state dir is not ours to replace (review P2, #2402) ──────────────
 # `installed_units` lists only OURS, so a foreign unit at the target path was invisible to the write
 # guard and the render silently replaced it: that cell's supervisor was repointed here and its

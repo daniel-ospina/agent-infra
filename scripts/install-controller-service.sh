@@ -275,14 +275,20 @@ unit_main_pid() {
 #   * a very long run overflows `$(( ))`.
 # So: force decimal, bound the length, require a plausible epoch instant, tolerate <=60s of skew, and clamp
 # the age at 0 (an age is seconds SINCE the write; it can never be negative).
-# ⛔ A HEARTBEAT INSTANT IS VALIDATED BEFORE ANY AGE RULE USES IT (review P1, #2402). `heartbeat_age` and
-# `_controller_proof_dir` both reject over-long, pre-epoch and FUTURE instants, because a heartbeat dated in
-# the future makes `now - t` negative and a DEAD controller reads as FRESH for ever. The `pre_active` gate
-# cannot skip that check: a corrupt or future-dated instant in the RESOLVED dir made `_proc_began_after`
-# answer "the MainPID began before it", which cleared the `since` binding and certified an install over a
-# start that produced no controller — the same false PASS, one input wider. Same four guards, one place.
-_heartbeat_epoch() { # <state dir> -> the plausible instant it records; nothing when absent or implausible
-    local hb="${1%/}/heartbeat" t now
+# ⛔ ONE PARSER, AND THE SKEW BAND IS EXPLICIT (review P1/P2, #2402). A heartbeat instant has two
+# consumers with different tolerances:
+#   * an AGE read (`--status`, `--install`'s report) may accept a value up to 60 s in the FUTURE, because a
+#     clock a few seconds fast is not a dead controller — and the age is clamped at 0;
+#   * a START-PROOF value (`pre_active`, `_controller_proof_dir`) may NOT: `_proc_began_after` answers
+#     "the MainPID began before it" for EVERY process when the instant is in the future, so a heartbeat one
+#     second ahead cleared the `since` binding and certified an install over a start that produced no
+#     controller — the #2402 false PASS, narrowed to a 60-second band by the earlier fix and still there.
+# The repo already settled this asymmetry (`launchd-cycle.sh::lc_hb_value`, "THE 60s SKEW BAND BELONGS TO THE
+# AGE READ ONLY"); this is that rule, with the band as a parameter so there is ONE parser and no drift.
+#   _heartbeat_epoch <state dir> [<band seconds>]   (band defaults to 0: the strict, start-proof reading)
+_heartbeat_epoch() { # <state dir> [<band>] -> the instant it records; nothing when absent or implausible
+    local hb="${1%/}/heartbeat" band="${2:-0}" t now
+    case "$band" in ''|*[!0-9]*) band=0 ;; esac
     [ -f "$hb" ] || return 1
     t="$(tr -dc '0-9' < "$hb" 2>/dev/null)" || return 1
     case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -290,18 +296,12 @@ _heartbeat_epoch() { # <state dir> -> the plausible instant it records; nothing 
     t=$(( 10#$t ))
     [ "$t" -ge 1000000000 ] 2>/dev/null || return 1
     now="$(date +%s)"
-    [ "$t" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
+    [ "$t" -le "$(( now + band ))" ] 2>/dev/null || return 1
     printf '%s\n' "$t"
 }
-heartbeat_age() {    local dir="${1:-$O}" hb="${1:-$O}/heartbeat" t now age
-    [ -f "$hb" ] || return 1
-    t="$(tr -dc '0-9' <"$hb" 2>/dev/null)" || return 1
-    case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
-    [ "${#t}" -le 12 ] || return 1
-    t=$(( 10#$t ))
-    [ "$t" -ge 1000000000 ] 2>/dev/null || return 1
+heartbeat_age() {    local dir="${1:-$O}" t now age
+    t="$(_heartbeat_epoch "$dir" 60)" || return 1
     now="$(date +%s)"
-    [ "$t" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
     age=$(( now - t ))
     [ "$age" -ge 0 ] || age=0
     printf '%s\n' "$age"
@@ -395,14 +395,11 @@ _controller_proof_dir() { # <state dir> <not_before_epoch>
         _proc_began_after "$pid" "${lt:-}"; rc=$?
         [ "$rc" -eq 1 ] && return 0
     fi
-    hb=""
-    [ ! -f "$o/heartbeat" ] || hb="$(tr -dc '0-9' <"$o/heartbeat" 2>/dev/null || true)"
-    case "${hb:-}" in ''|*[!0-9]*) return 1 ;; esac
-    [ "${#hb}" -le 12 ] || return 1
-    hb=$(( 10#$hb ))
-    [ "$hb" -ge 1000000000 ] 2>/dev/null || return 1
+    # ⛔ THE BAND IS ZERO HERE (review P1, #2402): this is a START-PROOF value, so an instant in the future
+    # is not "a clock a few seconds fast" — it makes the value look older than every process on the box,
+    # which is what let a fast clock certify a start that produced nothing. One parser, two tolerances.
+    hb="$(_heartbeat_epoch "$o")" || return 1
     now="$(date +%s)"
-    [ "$hb" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
     # ⛔ A HEARTBEAT FROM BEFORE THIS START IS NOT A CONTROLLER THIS START PRODUCED (review P1, #2402).
     # `start` is a NO-OP when the unit is already running, so a DEAD controller's leftover heartbeat —
     # up to 2·CYC old, the bound below — certified a unit whose start produced nothing, and the verdict
