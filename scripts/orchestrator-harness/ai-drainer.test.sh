@@ -76,10 +76,13 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "MAX_LANES=${RUN_MAX_LANES:-4}" \
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "LANE_WAIT_MAX=${RUN_WAIT_MAX:-30}" "LANE_POLL_S=1" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
-    "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}"
-  # SWAP_FREE_MB is passed only when the arm sets it: an absent value is what makes the script read
-  # the box's own probe, which is the path the unreadable-swap arm exercises.
-  [ -z "${RUN_SWAP:-}" ] || printf 'SWAP_FREE_MB=%s\n' "$RUN_SWAP"
+    "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
+    "RC_GRACE_S=${RUN_RC_GRACE:-2}"
+  # ⛔ ALWAYS PASSED. An arm that left it unset read the HOST's swap, so on a swap-bound box (the box
+  # this drainer exists for) every dispatch arm skipped and five assertions went red for a reason that
+  # is not a defect. Arm (c2) passes the literal `unreadable`, which is the non-numeric value that
+  # drives the fail-closed branch.
+  printf 'SWAP_FREE_MB=%s\n' "${RUN_SWAP:-9999}"
   return 0
 }
 run_drainer_bg() { # <tag>
@@ -140,8 +143,16 @@ check "(a2) three ticks racing over ONE stale lock start exactly ONE lane" \
   '[ "${astarts:-0}" -eq 1 ]' "starts=$astarts — log: $(grep -E 'START:|reclaim|SKIP' "$ai/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
 
 # ── ARM (b): THE LOCK IS RELEASED ONLY WHEN THE LANE PID DIES (the 2-tick overlap) ───────────
-# Reuse arm (a)'s live tick: it holds the lock, and its lane is still alive.
-o="$ROOT/o-a1"; ai="$ROOT/ai-a1"
+# ⛔ ITS OWN state dir and its own long-lived lane. Borrowing arm (a)'s tick made this arm's
+# precondition depend on how long arm (a2) spent racing, so on a loaded box the borrowed lane was
+# already gone and the failures pointed at the product instead of the fixture.
+o="$ROOT/o-b"; ai="$ROOT/ai-b"; mkdir -p "$o/bg" "$ai"
+FAKE_LANE_SECS=20
+( O="$o" AI="$ai" DISPATCH="$DISPATCH" SEED_REPO="$SEED" SEED_REF="$SEED_REF" SWAP_FREE_MB=9999 \
+  LANE_TIMEOUT=60 LANE_WAIT_MAX=30 LANE_POLL_S=1 FAKE_LANE_SECS=20 RC_GRACE_S=2 \
+  bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids" )
+wait_for_path "$ai/state/ai-drainer.lock" 60 || bad "(b) the tick never took the lock"
+sleep 1
 lock_pid="$(cat "$ai/state/ai-drainer.lock/pid" 2>/dev/null)"
 check "(b) the lock names a LIVE holder while the lane lives" \
   '[ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null' "lock pid=${lock_pid:-none}"
@@ -149,7 +160,9 @@ beat_age=$(( $(date +%s) - $(cat "$ai/state/ai-drainer.beat" 2>/dev/null || echo
 check "(b) a held lock writes a FRESH beat while waiting" '[ "$beat_age" -le 5 ]' "beat age ${beat_age}s"
 lane_pid="$(tr -dc '0-9' 2>/dev/null <"$o/bg/"*.pid 2>/dev/null | head -c 12)"
 [ -n "$lane_pid" ] && kill "$lane_pid" 2>/dev/null
-i=0; while [ -d "$ai/state/ai-drainer.lock" ] && [ "$i" -lt 60 ]; do sleep 0.25; i=$((i + 1)); done
+# The tick holds the lock through the exit-status GRACE (RC_GRACE_S=2 here) before it can report the
+# lane's death, so the wait is sized for the grace, not for a bare pid poll.
+i=0; while [ -d "$ai/state/ai-drainer.lock" ] && [ "$i" -lt 120 ]; do sleep 0.25; i=$((i + 1)); done
 check "(b) the lock is RELEASED once the lane pid dies" '[ ! -d "$ai/state/ai-drainer.lock" ]' \
   "still held after $((i / 4))s"
 # A lane that was SIGNALLED has no exit status — and the tick must say so rather than claim success.
@@ -270,6 +283,87 @@ mstarts="$(grep -c 'START:' "$mai/logs/ai-drainer.log" 2>/dev/null || true)"
 # This is the assertion that gives arm (a) its meaning: WITHOUT the lock, two lanes start.
 check "non-vacuity: without the lock TWO lanes start (so arm (a) can fail)" \
   '[ "${mstarts:-0}" -ge 2 ]' "starts=$mstarts (the lock, not the harness, is what makes (a) pass)"
+
+# ── ARM (e): a dispatcher that records NO exit status is a WARN, not a fabricated verdict ────
+# The older overlay `bg-dispatch.sh` writes `<name>.pid` and `<name>.log` and no `.rc` at all, and it is
+# this script's FIRST preference. Demanding a status file from it turned every healthy lane into FAIL
+# (a permanent false red). The contract is the DISPATCHER's, so the tick must name the gap and exit 0.
+NORC="$ROOT/dispatch-norc.sh"
+cat >"$NORC" <<'NORC_EOF'
+#!/usr/bin/env bash
+set -u
+NAME="$1"; O="${O:?}"; D="$O/bg"; mkdir -p "$D"
+( sleep 0 ) &
+echo "$!" > "$D/$NAME.pid"
+exit 0
+NORC_EOF
+chmod +x "$NORC"
+o="$ROOT/o-e"; ai="$ROOT/ai-e"; mkdir -p "$o/bg" "$ai"
+O="$o" AI="$ai" DISPATCH="$NORC" SEED_REPO="$SEED" SEED_REF="$SEED_REF" SWAP_FREE_MB=9999 \
+  LANE_TIMEOUT=60 LANE_WAIT_MAX=10 LANE_POLL_S=1 RC_GRACE_S=2 bash "$DRAINER" >/dev/null 2>&1; rc=$?
+check "(e) a dispatcher with no status file: the tick exits 0 and NAMES the gap" \
+  '[ "$rc" -eq 0 ] && grep -q "records no exit status" "$ai/logs/ai-drainer.log"' "rc=$rc"
+check "(e) …and it does not claim DONE for it" \
+  '! grep -q "DONE: lane" "$ai/logs/ai-drainer.log"'
+
+# ── ARM (e2): a LIVE lane's worktree is never removed, even on a signal ──────────────────────
+# The P0 this arm exists for: an EXIT/TERM trap that removes the checkout takes the lane's
+# UNCOMMITTED work with it. The pid is the only precondition that matters.
+o="$ROOT/o-e2"; ai="$ROOT/ai-e2"; mkdir -p "$o/bg" "$ai"
+FAKE_LANE_SECS=20
+( O="$o" AI="$ai" DISPATCH="$DISPATCH" SEED_REPO="$SEED" SEED_REF="$SEED_REF" SWAP_FREE_MB=9999 \
+  LANE_TIMEOUT=60 LANE_WAIT_MAX=30 LANE_POLL_S=1 FAKE_LANE_SECS=20 RC_GRACE_S=2 \
+  bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids" )
+wait_for_path "$ai/state/ai-drainer.lock" 60
+wait_for_path "$o/bg/ai-drain-"*.pid 80
+sleep 1
+wt_e2="$(ls -d "$ai"/wt-drainer-* 2>/dev/null | head -1)"
+tick_pid="$(cat "$ai/state/ai-drainer.lock/pid" 2>/dev/null)"
+lane_pid_e2="$(cat "$o"/bg/*.pid 2>/dev/null | tr -dc '0-9')"
+kill -TERM "$tick_pid" 2>/dev/null
+sleep 2
+check "(e2) a TERM to the tick leaves a LIVE lane's worktree in place" \
+  '[ -n "$wt_e2" ] && [ -d "$wt_e2" ] && [ -n "$lane_pid_e2" ] && kill -0 "$lane_pid_e2" 2>/dev/null \
+     && grep -q "leaving worktree" "$ai/logs/ai-drainer.log"' \
+  "worktree=${wt_e2:-none} lane=${lane_pid_e2:-none} warns=$(grep -c "leaving worktree" "$ai/logs/ai-drainer.log" 2>/dev/null)"
+
+# ── the TIMER INSTALLER's refusals (a false PASS here installs an inert job) ─────────────────
+echo "== install-drainer-timer refusals =="
+INSTALLER="$HERE/install-drainer-timer.sh"
+if [ -f "$INSTALLER" ]; then
+  T="$ROOT/inst"; mkdir -p "$T/bin" "$T/units"
+  cat >"$T/bin/systemctl" <<'SC_EOF'
+#!/bin/sh
+case "$*" in
+  *is-active*) echo active ;;
+esac
+exit 0
+SC_EOF
+  chmod +x "$T/bin/systemctl"
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T/units" DRAINER=/nonexistent \
+        DRAINER_STATE="$T/state" bash "$INSTALLER" 2>&1)"; rc=$?
+  check "installer: a missing DRAINER ABORTS instead of installing a dead unit" \
+    '[ "$rc" -ne 0 ] && [ -z "$(ls -A "$T/units" 2>/dev/null)" ]' "rc=$rc units=$(ls "$T/units" | tr '\n' ' ')"
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T/state" DRAINER_REPO_SLUG='a|b' bash "$INSTALLER" 2>&1)"; rc=$?
+  check "installer: a value that breaks the render ABORTS (no zero-byte unit, no success line)" \
+    '[ "$rc" -ne 0 ] && ! printf "%s" "$out" | grep -q "scheduled"' \
+    "rc=$rc · $(printf "%s" "$out" | tail -1)"
+  T3="$ROOT/inst3"; mkdir -p "$T3"
+  PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T3/units" DRAINER="$DRAINER" DRAINER_STATE="$T3/state" \
+    DRAINER_O="$T3" bash "$INSTALLER" --dry-run >/dev/null 2>&1
+  check "installer: --dry-run creates nothing (not even the state dir)" \
+    '[ ! -d "$T3/state" ] && [ ! -d "$T3/units" ]'
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T/state" DRAINER_O="$T" bash "$INSTALLER" 2>&1)"; rc=$?
+  check "installer: a good install writes BOTH units and reports the timer active" \
+    '[ "$rc" -eq 0 ] && [ -s "$T/units/eldato-ai-drainer.service" ] && [ -s "$T/units/eldato-ai-drainer.timer" ] \
+      && printf "%s" "$out" | grep -q "active"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
+  check "installer: the installed service carries an ExecStart" \
+    'grep -q "^ExecStart=" "$T/units/eldato-ai-drainer.service"'
+else
+  bad "installer missing at $INSTALLER"
+fi
 
 # ── the LAUNCHER's refusals (the silent-sharing failures, by name) ───────────────────────────
 echo "== multi-repo-controller refusals =="
