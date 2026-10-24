@@ -332,8 +332,14 @@ repo's* queue a cell touches:
 | `SCOPE` at process start | swept set (`headRefName` filter, `BEGIN scope-select`) | when |
 |---|---|---|
 | `auto` (**default**: unset) | BROAD when open PRs `> 10`, else OWN | a one-cell repo, or a cell nobody has decided about |
-| `broad` | every PR except `^design/`, `^scope/`, `^dependabot/` | **the one cell that owns draining this repo's queue** |
+| `broad` | every **non-draft** PR except `^design/`, `^scope/`, `^dependabot/` | **the one cell that owns draining this repo's queue** |
 | `own` | only `-tm$` (lane), `-cap$` (capacity), `^fix/` | every *other* cell on the same repo |
+
+⛔ **Drafts are swept only on own-pattern branches.** The listing ANDs `$SEL` to
+`select((.isDraft|not) or (.headRefName|test("-tm$|-cap$|^fix/")))` (`orch-loop.sh`), so a **draft**
+`feat/`, `chore/`, `test/` or `epic/` branch is swept by **neither** mode — `broad` does not reach it.
+That is deliberate for own-pattern drafts (nothing else would ever ready them, #8219/#8085) and it
+means "pin this cell `broad`" is not a way to get a non-lane draft swept or readied.
 
 `SCOPE` is read from the process **environment**, which is fixed when the process starts (the
 `BEGIN scope-select` block re-evaluates every cycle, but it reads that same fixed value). So a
@@ -363,7 +369,8 @@ Two operational consequences that are easy to get backwards:
   2026-10-24T05:07Z: 12 open PRs, of which the `own` filter matched **6**. The other five live
   branches — `feat/runner-autoscale`, `feat/9675-step1-write-eval`, `feat/3515-store-sync-backstop`,
   `chore/batch-review-measurement`, `test/9664-capstone-connector-record` — are in the swept set
-  only because that cell is BROAD (an open `epic/` **draft** is swept by neither mode). The count
+  only because that cell is BROAD, and the sixth non-match is a draft `epic/` branch that neither
+  mode sweeps (see the draft rule above). The count
   moves minute to minute — the controller's 05:00Z cycle printed `open=14` from its sticky
   last-known after a transient listing failure, the 05:07Z listing was 12 — so re-measure, never
   quote this one.
@@ -382,8 +389,10 @@ that cannot be re-pinned from here, and it must not be written into this table a
 
 ### 9.3 Applying a partition change
 
-One cell at a time, through the supervisor — never two controllers on one cell (#2607), and never
-by editing a live controller's environment:
+One cell at a time, through the supervisor — never two controllers on one cell (the ownership read in
+`cloud-cell-supervisor.sh`, agent-infra#1761: `$O/.orch.lock` plus a scoped process read, because
+`tmux has-session` cannot see a controller launched outside the `orch` session), and never by editing
+a live controller's environment:
 
 ```bash
 CELL_HOME=/tmp/cell-home REPO=<checkout> O=$CELL_HOME/orchestrator \
