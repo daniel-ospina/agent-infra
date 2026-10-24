@@ -145,6 +145,14 @@ REST_RESERVE = 200       # below this core budget the run is SKIPPED, not render
 GOAL_SEARCH_BUDGET = 8   # SEARCH-quota calls per run for the goal readings. ⛔ A DIFFERENT BUCKET to
 #                          `core`: the search API has its own limit (30/min), so measuring the goals
 #                          never spends a call the landing arm needed. See `_count`.
+# ⛔ A RETRY IS A GAP IN TIME, NOT A SECOND CALL. Two `git rev-parse` calls issued back to back run
+# microseconds apart and fail together on the same transient, so a "retry" of that shape recovers
+# nothing — and the retry that DID recover (a third read after the goals) is how one report came to
+# print the recovered sha in its header while the goals block called the same sha unreadable and
+# accused a box sitting on it. ONE value, read once with a real backoff, used by every consumer.
+MAIN_READ_ATTEMPTS = 3
+MAIN_READ_BACKOFF_S = 0.5
+
 DEFAULT_MAX_PRS = 100    # one page of the open-PR listing — the API's own page size, not a slice of
 #                          it: the listing has no `total_count`, so a FULL page is UNREADABLE (below).
 DEFAULT_CANDIDATES = 2   # 1 + 4*2 = 9 <= REST_BUDGET
@@ -1766,6 +1774,10 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         # evidence from minutes ago — which is why the two can disagree within one report: the deploy
         # table is the later, authoritative read.
         d = probe_box(name, status_cmd, timeout=15)
+        # ⛔ `read_inventory` SYNTHESISES a one-row "local" fleet when `boxes.tsv` is absent, so
+        # MARKERS-HOLD could be printed over a ONE-BOX read while goal 2 says "the local box AND all
+        # three cmux cells" — and nothing distinguished "a one-box fleet" from "the inventory is
+        # gone". The row carries which one it was.
         # ⛔ `on_pin` CARRIES EVERY TERM, INCLUDING THE ACTIVATION. Goal 2 is "the SAME harness
         # version DEPLOYED **AND ACTIVATED**": a box whose pin is main but whose controller is
         # STOPPED has deployed the version and is not running it — and that is exactly the row this
@@ -1787,6 +1799,7 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
                      "source": d.get("source", ""), "controller": d["controller"],
                      "roles": d["roles"], "readable": bool(d["readable"]),
                      "on_pin": bool(d["readable"] and not reasons), "reasons": reasons,
+                     "inventory": "file" if (o / "state" / "boxes.tsv").is_file() else "absent",
                      "note": ""})
     return rows
 
@@ -1857,6 +1870,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     else:
         goal1 = "OPEN"
 
+    # Only THIS box was probed, because the inventory is missing — the cells were never read.
+    local_only = bool(drift) and all(r.get("inventory") == "absent" for r in drift)
     currents = [r for r in drift if r.get("on_pin")]
     boxes_bad = [r for r in drift if not r.get("on_pin")]
     # ⛔ THE STANDING IS DECIDED BY THE DRIFT ALONE. A queue count that did not come back is its OWN
@@ -1870,16 +1885,27 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         goal2 = "MARKERS-HOLD"
 
     lines = [
-        f"- **{GOALS[0][0]}** — `STANDING={goal1}`",
+        # ⛔ WHAT `DONE` MEASURES: the OPEN counts. The goal's second half ("and MERGED") is a
+        # per-ISSUE property this block never reads — a P0 closed `not planned` counts as closed — so
+        # the qualifier travels BESIDE the word (prose) instead of inside it: the word is what a
+        # consumer parses, and a word with a parenthetical in it is not a word.
+        f"- **{GOALS[0][0]}** — `STANDING={goal1}`"
+        + (" — no open P0/P1; 'and MERGED' is the merged-today count, not a per-issue read"
+           if goal1 == "DONE" else ""),
         f"  {GOAL_REPO}: open P0={p0} · open P1={p1} · closed today P0={c0} · P1={c1} · "
         f"PRs merged today={dm}",
         f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
-        f"  harness: {_drift_text(drift)} ({len(currents)}/{len(drift)} on this cycle's main)",
+        "  harness: " + _drift_text(drift) +
+        (f" ({len(currents)}/{len(drift)} on this cycle's main)" if main_sha else
+         " (not compared — `origin/main` was unreadable)"),
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
     if not main_sha:
         lines.append("  ⚠️ harness: `origin/main` could not be read, so 'the same version everywhere' "
                      "cannot be asserted at all")
+    if local_only:
+        lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
+                     "never read, so this is not 'the fleet is on the pin'")
     for name, why in unreadable:
         lines.append(f"  ⚠️ {name}: {why}")
     if qo_why or qm_why:
@@ -1900,8 +1926,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
             f"{c0}+{c1} were closed today and {dm} PR(s) merged today. A fix without a MERGED PR is "
             f"not done — land those PRs before starting new work on the goal.")
     elif goal1 == "DONE":
-        actions.append(f"**Goal 1 ({GOAL_REPO} P0+P1):** DONE — no open P0/P1. Hold it: a new P0/P1 "
-                       f"issue re-opens the goal, and {dm} PR(s) merged today.")
+        actions.append(f"**Goal 1 ({GOAL_REPO} P0+P1):** DONE — no open P0/P1, and {dm} PR(s) merged "
+                       f"today. That is the OPEN side measured; 'every fix is MERGED' is not read "
+                       f"per-issue here (a P0 closed `not planned` counts as closed). Hold it: a new "
+                       f"P0/P1 issue re-opens the goal.")
     else:
         actions.append(f"**Goal 1 ({GOAL_REPO} P0+P1):** UNMEASURED this cycle — the counts did not "
                        f"come back (see the ⚠️ lines). Repair the read; do not assume the goal holds.")
@@ -1913,7 +1941,9 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # this cycle's main" is a measured claim; with the ref unreadable it is an invented one, and it
         # is printed in the paragraph the owner acts on.
         head = (f"**Goal 2 (harness autonomy):** the boxes could not be compared to `origin/main` "
-                f"(the ref was unreadable) — repair the read first; then "
+                f"(the ref was unreadable) — repair the read first. Nothing here is a verdict on a "
+                f"box, and these rows may ALSO be stopped or unreadable for their own reasons: "
+                f"{drift_names}. "
                 if not main_sha else
                 f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
                 f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
@@ -1929,8 +1959,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                       "queue NOT read this cycle (see the ⚠️ line)")
         actions.append(
             f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) run this cycle's "
-            f"main, deployed AND activated; {queue_note}. That is the marker, not proof: keep the "
-            f"queue moving and keep every cell on the pin.")
+            f"main, deployed AND activated; {queue_note}."
+            + (" ⛔ LOCAL ONLY — the inventory is absent, so nothing is known about the cells."
+               if local_only else "")
+            + " That is the marker, not proof: keep the queue moving and keep every cell on the pin.")
     else:
         actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — the boxes did not "
                        "answer (no inventory and no local probe), so nothing about the fleet's version "
@@ -2283,6 +2315,21 @@ def main_sha(repo_path: Path) -> str:
     return (out or "").strip()
 
 
+def origin_main(repo_path: Path) -> str:
+    """This cycle's `origin/main`, retried with a REAL backoff (see `MAIN_READ_ATTEMPTS`).
+
+    Returns "" only after every attempt failed — and then EVERY consumer (drift, goals, deploy table,
+    header, `--json`) sees the same "", which is what makes one report internally consistent.
+    """
+    for attempt in range(MAIN_READ_ATTEMPTS):
+        sha = main_sha(repo_path)
+        if sha:
+            return sha
+        if attempt + 1 < MAIN_READ_ATTEMPTS:
+            time.sleep(MAIN_READ_BACKOFF_S)
+    return ""
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(add_help=True, description="merge reminder + evidence-gated actuator")
     p.add_argument("--repo", default=os.environ.get("OR", ""), help="owner/name (default: git origin)")
@@ -2368,13 +2415,9 @@ def main(argv=None) -> int:
                 f"MISMATCHED repo — the target is {slug} but this checkout's origin is {own}, so the "
                 f"claim refs and origin/main would be read from the WRONG repo (a live cross-box "
                 f"claim would read as claim=none). Run this from {slug}'s checkout")
-        main = main_sha(repo_path)
-        if not main:
-            # ⛔ RE-READ IT HERE, NOT AFTER THE DEPLOY ARM. A transient `rev-parse` failure used to
-            # leave the goal block comparing every box against "" while `compose` printed the RECOVERED
-            # sha in the header — one report showing the sha and calling it unreadable, and accusing a
-            # box that was sitting on exactly that sha. The late retry below stays for the OSError path.
-            main = main_sha(repo_path)
+        # ⛔ ONE READ, BEFORE ANYTHING THAT COMPARES AGAINST IT. The goal block, the deploy table,
+        # the header and `--json` all consume THIS value; there is no later read to diverge from it.
+        main = origin_main(repo_path)
         budget = Budget(resolve_gh(o))
         budget.rate_limit()
         # ⛔ ORDER: DRIFT → THE TWO GOALS → THE PR READS (owner's ask, 2026-10-24).
@@ -2418,18 +2461,10 @@ def main(argv=None) -> int:
                        "controller": "", "roles": "", "source": "",
                        "readings": "", "verdict": f"SKIPPED({e})"}]
 
-    if not main and repo_path is not None:
-        # ⛔ INSIDE A GUARD, AND ONLY WHEN THERE IS A PATH: this retry re-runs `git` after the cycle's
-        # try block, so on the very environment the try block was meant to describe it was the one
-        # call that could still crash — and when the repo probe itself raised, there is no path to
-        # retry against (`repo_path is None`), which must not become an UnboundLocalError.
-        try:
-            main = main_sha(repo_path)
-        except OSError as e:
-            main = ""
-            if "UNREADABLE environment" not in skipped:      # one sentence, not two
-                skipped = (skipped + "; " if skipped else "") + \
-                    f"UNREADABLE environment — {type(e).__name__}: {e}"
+    # ⛔ NO THIRD READ. The late retry that used to live here was justified as "for the OSError path",
+    # but `run()` turns every OSError into rc 126, so `main_sha` cannot raise and the block had no
+    # legitimate caller left: its only effect was to give `compose()` a sha that the goals block had
+    # never compared against (round-4 review, proved with a stub that fails the first reads only).
     line = one_line_of(landing, deploy, skipped, dispatched)
     err = compose(md, slug, main, budget, landing, deploy, skipped, line,
                   goal_lines, goal_actions)
@@ -2454,7 +2489,8 @@ def main(argv=None) -> int:
             "drift": [{"box": r["box"], "harness": r["harness"],
                        "relation": r["relation"], "readable": r["readable"],
                        "source": r.get("source", ""), "controller": r.get("controller", ""),
-                       "on_pin": bool(r.get("on_pin")), "reasons": list(r.get("reasons") or [])}
+                       "on_pin": bool(r.get("on_pin")), "reasons": list(r.get("reasons") or []),
+                       "inventory": r.get("inventory", "")}
                       for r in drift],
             "landing": [{"pr": r["pr"]["number"], "head": r["pr"]["head"], "rank": r["rank"],
                          "verdict": r["verdict"], "readings": r["readings"],

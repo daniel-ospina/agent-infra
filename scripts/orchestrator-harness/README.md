@@ -1942,7 +1942,7 @@ PRs and forgot what the PRs are for. Drift is a LOCAL artifact read (no REST) an
 SEARCH quota, so this order cannot starve the landing arm.
 
 ⛔ **A count that does not come back is `NOT-MEASURED`, never `0`** — zero is the claim that the goal
-is met. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
+is met. ⛔ The cycle's main is read ONCE, with a REAL backoff retry (`MAIN_READ_ATTEMPTS` / `MAIN_READ_BACKOFF_S` — two calls issued back to back fail together, and a later read gave the header a sha the goals had never compared against), and every consumer uses that one value. ⛔ A MISSING `state/boxes.tsv` is announced (only THIS box was probed) — the local-only fallback otherwise printed a fleet marker over a one-box read. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
 ONE PAGE, so a local `len()` counts the page and not the population. Measured on tortoise: a slice
 said `P0=4 · P1=5` while the label query answered **7 and 20** (>300 open issues). `_count` therefore
 asks `search/issues` for `total_count`, with the filter already applied by the server.
@@ -2074,7 +2074,7 @@ is still matched by its script path, and that legacy fallback is the only place 
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
 **Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
-242 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+250 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the

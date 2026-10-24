@@ -1875,6 +1875,12 @@ ck "§27 an unreadable goal count is NOT-MEASURED, never 0" \
    "$(qF 'STANDING=NOT-MEASURED' "$MDF" && nq 'open P0=0' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and the reason it could not be read is printed" \
    "$(qF 'no total_count' "$MDF" && echo 0 || echo 1)"
+# ⛔ MARKERS-HOLD IS REACHABLE WITH AN UNREAD QUEUE (the standing is drift-only), so its action may
+# not say "queue read". Reverting that branch left the suite green - the sentence is only wrong in the
+# state the standing rule deliberately allows.
+ck "§27 ...and a MARKERS-HOLD action does not claim an unread queue" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF 'queue NOT read this cycle' "$MDF" \
+      && nq 'queue read (NOT-MEASURED' "$MDF" && echo 0 || echo 1)"
 # GitHub can flag its OWN answer incomplete; `total_count: 0` with `incomplete_results: true` would
 # otherwise render `open P0=0`, i.e. STANDING=DONE, on the one rule this file is built on.
 write_baseline; reset_o
@@ -1975,10 +1981,77 @@ ck "§27 ...and the action NAMES the box and its reason (not the old \`[current]
 # ...and the MACHINE surface must agree with the report: a consumer that re-derives the marker from
 # `relation` alone reproduces the fail-open this case exists for (the field was dropped once already).
 jout="$(run_sut --json 2>/dev/null)"; rc=$?
-jpin="$(printf '%s' "$jout" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(r["on_pin"], ";".join(r["reasons"]))' 2>/dev/null)"
+jpin="$(printf '%s' "$jout" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(r["on_pin"], r["source"], r["controller"], ";".join(r["reasons"]))' 2>/dev/null)"
 ck "§27 --json's drift[] carries on_pin=False for the STOPPED box" \
    "$(qF 'False' "$jpin" && echo 0 || echo 1)"
 ck "§27 ...and names the reason there too" "$(qF 'controller=STOPPED' "$jpin" && echo 0 || echo 1)"
+# The consumer needs the TERMS, not just the verdict: `source` and `controller` are what a re-derivation
+# from `relation` alone would have to invent (deleting either from the record left the suite green).
+ck "§27 ...and publishes the terms themselves (source=pin, controller=STOPPED)" \
+   "$(qF 'pin STOPPED' "$jpin" && echo 0 || echo 1)"
+
+# ⛔ A RETRY IS A GAP IN TIME, NOT A SECOND CALL. Two `git rev-parse` calls microseconds apart fail
+# together, and the third read (after the goals) was the only one that could recover - which is how a
+# report came to print the recovered sha in its header while the goals called the same sha unreadable.
+write_no_landing; reset_o
+rm -f "$O/state/boxes.tsv"
+REALGIT="$(command -v git)"
+cat > "$BIN/git" <<STUB
+#!/usr/bin/env bash
+if [ "\${3:-}" = "rev-parse" ] && [ "\${4:-}" = "--verify" ] && [ "\${5:-}" = "origin/main" ]; then
+  n=\$(cat "\$FIXTURE/mainreads" 2>/dev/null || echo 0); n=\$((n+1))
+  printf '%s' "\$n" > "\$FIXTURE/mainreads"
+  [ "\$n" -le 2 ] && exit 128
+fi
+exec "$REALGIT" "\$@"
+STUB
+chmod +x "$BIN/git"
+printf 'cell-1	bash %s	
+' "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
+rm -f "$FX/mainreads"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a TRANSIENT unreadable origin/main is retried WITH BACKOFF (3 reads: \$(cat "$FX/mainreads"))" \
+   "$([ "$(cat "$FX/mainreads" 2>/dev/null)" = "3" ] && echo 0 || echo 1)"
+ck "§27 ...so the goals judge the boxes against the sha the header prints" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF "$MAIN12" "$MDF" && nq 'UNREADABLE (not compared)' "$MDF" && echo 0 || echo 1)"
+
+# ...and when EVERY read fails, no count is stated anywhere: "0/1 on this cycle's main" is a
+# measurement, and nothing was measured.
+write_no_landing; reset_o
+cat > "$BIN/git" <<STUB
+#!/usr/bin/env bash
+if [ "\${3:-}" = "rev-parse" ] && [ "\${4:-}" = "--verify" ] && [ "\${5:-}" = "origin/main" ]; then exit 128; fi
+exec "$REALGIT" "\$@"
+STUB
+chmod +x "$BIN/git"
+printf 'cell-1	bash %s	
+' "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an unreadable origin/main states NO comparison (\`not compared\`), never 0/N" \
+   "$(qF 'not compared — `origin/main` was unreadable' "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and its action says so IN FULL and still NAMES the boxes" \
+   "$(qF 'repair the read first.' "$MDF" && qF 'cell-1 (main=UNREADABLE' "$MDF" \
+      && nq 'boxes run this cycle' "$MDF" && echo 0 || echo 1)"
+rm -f "$BIN/git"
+
+# ⛔ AN ABSENT INVENTORY IS NOT A ONE-BOX FLEET. goal 2 is "the local box AND all three cmux cells";
+# `read_inventory` synthesises a single local row when boxes.tsv is gone, so MARKERS-* was printed over
+# a one-box read with nothing saying the cells were never probed.
+write_no_landing; reset_o
+rm -f "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a missing boxes.tsv is ANNOUNCED (only this box was probed)" \
+   "$(qF 'no `state/boxes.tsv` — only THIS box was probed' "$MDF" && echo 0 || echo 1)"
+write_no_landing; reset_o
+printf 'cell-1	bash %s	
+' "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 ...and is NOT announced when the inventory is there" \
+   "$(nq 'only THIS box was probed' "$MDF" && nq 'LOCAL ONLY' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
