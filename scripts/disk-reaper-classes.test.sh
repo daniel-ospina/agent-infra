@@ -827,6 +827,56 @@ else
     expect_fail "M mutation: dropping the empty-table gate turns the case RED" case_m "$T/mut-m/reap-abandoned-worktrees.sh"
 fi
 
+# ═══ O: what the CENSUS EMITS (a synthetic /proc, no processes, no hand-written rows) ═══════════
+# The cycle-9 finding was a PRODUCER defect: emitting only the value after `=` dropped the whole token
+# when the `=` sits inside a path component, so no row existed for a live holder to be matched on. A
+# case that hand-writes the row it expects tests the matcher and nothing else — it survived the
+# mutation that deletes the emission (measured). This one builds a fake /proc and reads what comes out.
+case_o() {
+    local lib="$1" base d wt rows
+    base="$(newbase o)"; wt="$base/scratch/wt-o"; mkdir -p "$wt" "$base/proc/11"
+    ln -s "$base/scratch" "$base/proc/11/cwd"
+    ln -s "$(command -v bash)" "$base/proc/11/exe"
+    # the /proc arm is selected by `[ -e "$proc/self/cwd" ]`; without it the census falls through to the
+    # REAL lsof and the case would pass while scanning this box (measured: 387 rows of real pids).
+    mkdir -p "$base/proc/self"; ln -sfn "$base/scratch" "$base/proc/self/cwd"
+    # `=` INSIDE a path component (whole token must be emitted) and a TWO-`=` attached token (both the
+    # value and the whole token, matching the ps arm) in one cmdline.
+    printf 'bash\0-c\0sleep 300; :\0wt-o/f=1.txt\0A=b=c/wt-o\0' >"$base/proc/11/cmdline"
+    d="$base/cen"
+    ( . "$lib"; LP_PROC_ROOT="$base/proc" LP_LSOF_PROBE="$base/no-lsof" LP_PS_PROBE="$base/no-ps" lp_census "$d" ) >/dev/null 2>&1
+    rows="$(cat "$d/live-paths.tsv" 2>/dev/null)"
+    case_check "$(grep -qF "$(printf 'relarg\t11\twt-o/f=1.txt')" <<<"$rows" && echo 0 || echo 1)" \
+               "O a '=' INSIDE a component still yields a relarg row (the whole token, not only the value)"
+    case_check "$(grep -qF "$(printf 'relarg\t11\tA=b=c/wt-o')" <<<"$rows" && echo 0 || echo 1)" \
+               "O a TWO-'=' attached token yields the WHOLE token as well as the value (arms agree)"
+    ( . "$lib"; lp_path_named "$d/live-paths.tsv" "$wt" && printf 'named=1 why=%s\n' "$LP_NAME_WHY" || printf 'named=0\n' ) >"$base/res1" 2>&1
+    case_check "$(grep -q 'named=1' "$base/res1" && echo 0 || echo 1)" \
+               "O and the tree it names is NAMED (so the pass can keep it)"
+    # A symlinked relative prefix belongs to the SYMLINK arm, not the lexical one: `rel-link` → the tree.
+    ln -sfn "$wt" "$base/scratch/rel-link"
+    mkdir -p "$base/proc/12"
+    ln -s "$base/scratch" "$base/proc/12/cwd"
+    ln -s "$(command -v bash)" "$base/proc/12/exe"
+    { printf 'bash\0-c\0:'; for i in $(seq 1 300); do printf '\0gen/f%d.txt' "$i"; done; printf '\0rel-link/file.txt\0'; } >"$base/proc/12/cmdline"
+    d="$base/cen2"
+    ( . "$lib"; LP_PROC_ROOT="$base/proc" LP_LSOF_PROBE="$base/no-lsof" LP_PS_PROBE="$base/no-ps" lp_census "$d" ) >/dev/null 2>&1
+    ( . "$lib"; lp_path_named "$d/live-paths.tsv" "$wt" && printf 'named=1 why=%s\n' "$LP_NAME_WHY" || printf 'named=0\n' ) >"$base/res2" 2>&1
+    case_check "$(grep -q 'named=1' "$base/res2" && echo 0 || echo 1)" \
+               "O a symlinked relative prefix past row 200 still names the tree (no cap before the cheap filter)"
+    return $((CASE_FAIL > 0))
+}
+
+expect_pass "O the census emits the spelling a live holder used (whole token, value, symlink)" case_o "$LIVE_LIB"
+# Mutation: dropping the WHOLE-TOKEN emission for an attached form (the exact cycle-9 regression) must
+# turn O red — otherwise the `=`-in-a-component arm is covered by a case that cannot fail.
+MUT_O='s/case "\$_tok" in \*\/\*)/case "$_tok" in *\/__never__)/'
+if apply_mutation "$LIVE_LIB" "$T/mut-o/live-paths.sh" "$MUT_O"; then
+    expect_fail "O mutation: dropping the whole-token relarg makes the '='-component arm RED" case_o "$T/mut-o/live-paths.sh"
+else
+    bad "O mutation could not be applied — the '='-component arm is not checking it"
+fi
+
 expect_pass "N a tree that CHANGES during the pass is preserved (re-probe before removal)" case_n "$AW_OWNER"
 if apply_mutation "$AW_OWNER" "$T/mut-n/reap-abandoned-worktrees.sh" "$MUT_N"; then
     ln -sfn "$HERE/lib" "$T/mut-n/lib"
