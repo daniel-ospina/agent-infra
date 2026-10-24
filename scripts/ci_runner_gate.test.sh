@@ -61,7 +61,10 @@ CMUX_LOG="$T/cmux.log"
 #   GH_QUEUED      queue probe .total_count (default 5)
 #   GH_MODE        queued-null | queued-empty | enum-fail | enum-garbage | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
-#   GH_POOL_IDS    the ids the enumeration returns
+#   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
+#   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
+#                  #2327 mixed-arch fixtures. When unset, each id in GH_POOL_IDS is emitted with
+#                  the live ARM64 pool's label set, so every pre-#2327 case keeps its meaning.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:?}"
@@ -72,7 +75,18 @@ printf '%s\n' "$*" >> "${GH_LOG:?}"
 # Whether it fires depends on scheduling, so the suite was INTERMITTENTLY red — 3 of 10 local
 # runs, on legs as unrelated as the healthy control and the cmux leg. Draining the pipe removes
 # the race; it does not weaken an assertion, and a stalled writer still fails as it did before.
-case "$*" in *"--input -"*) cat >/dev/null 2>&1 || true ;; esac
+#
+# The drained body is RECORDED, keyed by runner id: `PUT <id> BODY <json>` in GH_LOG. That is the
+# artifact #2327 needs — "which labels did the API receive for WHICH runner" — and it is what the
+# per-arch assertions read. A pool-wide stamp cannot satisfy them, which is the point.
+if [[ "$*" == *"--input -"* ]]; then
+  put_body="$(cat)"
+  put_id=""
+  for a in "$@"; do
+    case "$a" in */runners/*/labels) put_id="${a#*/runners/}"; put_id="${put_id%%/*}" ;; esac
+  done
+  printf 'PUT %s BODY %s\n' "${put_id:-?}" "$put_body" >> "$GH_LOG"
+fi
 case "$*" in
   *"-X PUT"*)
     # GH_PUT_FAIL_ID lets a case fail ONE runner's PUT, which is how a PARTIAL relabel is built.
@@ -86,7 +100,8 @@ case "$*" in
     esac
     exit 0 ;;
   *"--paginate"*)
-    # current_mode asks for a COUNT (a --jq expression with `select(`); runner_ids asks for the ids.
+    # current_mode asks for a COUNT (a --jq expression with `select(`); runner_rows asks for the
+    # `<id>TAB<label>` pairs. Anything else is the pre-#2327 ids-only read.
     if [[ "$*" == *"select("* ]]; then
       printf '%s\n' "${GH_FALLBACK_N:-0}"
       exit 0
@@ -94,9 +109,20 @@ case "$*" in
     case "${GH_MODE:-ok}" in
       enum-fail)    printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
       enum-garbage) printf 'null\n' ;;
+      # a row with NO TAB: the id is then the whole line, so it cannot be read as `<id>TAB<label>`
+      enum-badtab)  printf '101 self-hosted\n' ;;
       # `-` not `:-`: the empty-pool case below sets GH_POOL_IDS to the EMPTY string on purpose,
       # and `:-` would swallow that into the default, making the case vacuous.
-      *)            printf '%s\n' "${GH_POOL_IDS-101 102}" ;;
+      *)
+        if [ -n "${GH_RUNNER_ROWS_FILE:-}" ]; then
+          cat "$GH_RUNNER_ROWS_FILE"
+        else
+          for _id in ${GH_POOL_IDS-101 102}; do
+            for _l in self-hosted Linux ARM64 self-hosted-arm64 ubuntu-latest; do
+              printf '%s\t%s\n' "$_id" "$_l"
+            done
+          done
+        fi ;;
     esac
     exit 0 ;;
 esac
@@ -132,6 +158,12 @@ RC=0
 OUT=""
 STATE_DIR=""
 KEEP_STATE=0
+# The gate under test is `$GATE` unless a case overrides it (the #2327 mutation runs a generated
+# mutant). Seeded here, empty, so the name is ASSIGNED before it is ever used: a `bash "${VAR:-$GATE}"`
+# whose variable is painted on for the first time further down reads to a static analyzer (the
+# worktree guard's script-indirection arm) as an unresolvable script path, and it refuses to run
+# this suite at all. Same idiom as scripts/disk-reaper.test.sh (`VENV_REAPER="${VENV_REAPER:-}"`).
+GATE_UNDER_TEST="${GATE_UNDER_TEST:-}"
 GH_THRESHOLD_DEFAULT=60
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
@@ -172,11 +204,30 @@ run_gate() {
     else
       export CURL_STATUS_FILE="$T/status-default.json"
     fi
-    bash "$GATE" "$@"
+    bash "${GATE_UNDER_TEST:-$GATE}" "$@"
   ) > "$T/out-$name" 2>&1
   RC=$?
   OUT="$(cat "$T/out-$name")"
 }
+
+# put_body_for <id> — the label body the API actually received for THAT runner in the last run.
+# The artifact, not the gate's own account of itself: a pool-wide stamp cannot produce two
+# different bodies, so these assertions cannot be satisfied by one.
+put_body_for() { sed -n "s|^PUT $1 BODY ||p" "$GH_LOG" | tail -1; }
+
+# matches <label-set> <required label>… — the scheduler's rule, in miniature: a runner takes a job
+# only when its label set is a SUPERSET of everything the job asks for. Used to prove that an
+# arch-specific `runs-on:` still resolves to the right architecture after the gate acts.
+matches() {
+  local have=" $1 "; shift; local need
+  for need in "$@"; do
+    case "$have" in *" $need "*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# json_labels '<{"labels":["a","b"]}>' — the body's labels as a space-padded set for `matches`.
+json_labels() { printf ' %s ' "$(printf '%s' "$1" | sed -e 's/.*\[//' -e 's/\]}//' -e 's/","/ /g' -e 's/"//g')"; }
 
 echo "── control: a numeric queue + a readable pool takes the normal path ──"
 : > "$CMUX_LOG"   # ONE truncation for the whole suite — see run_gate
@@ -319,6 +370,15 @@ assert_eq "$RC" "2" "a non-numeric enumeration payload → exit 2 (never iterate
 assert_contains "$OUT" "runner enumeration unreadable" "a non-numeric enumeration payload is named"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a non-numeric enumeration payload relabels nothing"
 
+# The #2327 read is `<id>TAB<label>` rows, so a row WITHOUT a tab has no readable runner id: the
+# split yields the whole line as the id and an EMPTY label. Without the row shape check that empty
+# label would fall through the old `*[!0-9[:space:]]*` id check (the line starts with digits) and
+# the runner would be relabelled from a field that was never read.
+run_gate enum-badtab GH_MODE=enum-badtab GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "2" "a row with no TAB → exit 2 (no readable runner id)"
+assert_contains "$OUT" "runner enumeration unreadable" "a tabless row names the read failure"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a tabless row relabels nothing"
+
 echo "── control: a readable enumeration still relabels (the fix is not 'always fail') ──"
 run_gate relabel GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="101 102" CI_GATE_QUEUE_THRESHOLD=1 --
 assert_eq "$RC" "0" "successful relabel exits 0"
@@ -358,6 +418,156 @@ assert_eq "$RC" "0" "the retry pass exits 0"
 assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the WHOLE pool"
 assert_contains "$OUT" "TRANSITION unknown -> local" "the retry pass records the transition once it converged"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the retry pass records mode=local"
+
+echo "── #2327: a runner's labels describe THAT runner, not the pool it joined first ──"
+# The live pool, read from `gh api repos/daniel-ospina/tortoise/actions/runners` on 2026-10-22:
+#   30/31 pi-runner-vm-*   self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest   ← serving the queue
+#   33/34 pi-runner-x64-*  self-hosted,Linux,X64,  self-hosted-x64,  ubuntu-latest   ← tonight's capacity
+# `ARM64` / `X64` are HOST-derived by GitHub at registration: the only per-runner statement of arch
+# this gate can branch on. The two ARM64 runners are the ones the queue is being served by, so a
+# change to THEIR bodies is the regression these byte-comparisons exist to catch.
+MIXED="$T/rows-mixed.tsv"
+printf '30\tself-hosted\n30\tLinux\n30\tARM64\n30\tself-hosted-arm64\n30\tubuntu-latest\n33\tself-hosted\n33\tLinux\n33\tX64\n33\tself-hosted-x64\n33\tubuntu-latest\n' > "$MIXED"
+
+# want=local ⇒ the fallback label is added to every managed runner.
+run_gate mixed-on GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$MIXED" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "mixed pool: engaging the fallback exits 0"
+assert_eq "$(put_body_for 30)" '{"labels":["self-hosted-arm64","ubuntu-latest"]}' \
+  "(b) the ARM64 runner's body is BYTE-IDENTICAL to today's fallback_on body"
+assert_eq "$(put_body_for 33)" '{"labels":["self-hosted-x64","ubuntu-latest"]}' \
+  "(a) the x86_64 runner gets ITS OWN arch label, from its host label — not the pool's"
+assert_not_contains "$(put_body_for 33)" "self-hosted-arm64" \
+  "(a) and the ARM64 body is NOT stamped onto the x86 runner"
+# The summary line no longer claims one body for the whole pool: it reports the engagement, and the
+# per-runner bodies are logged individually — otherwise one `body=` could describe every runner.
+assert_contains "$OUT" "set_labels ok=2 fail=0 engagement=on" "the summary reports the engagement, not a pool-wide body"
+assert_contains "$OUT" "set_labels runner=33 body={\"labels\":[\"self-hosted-x64\",\"ubuntu-latest\"]}" \
+  "the body written to EACH runner is in the log, attributable to that runner"
+
+# want=github ⇒ the fallback label comes off; each runner KEEPS the marker for its own arch, so an
+# x86 runner leaves the queue's view rather than silently leaving the pool.
+run_gate mixed-off GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$MIXED" --
+assert_eq "$RC" "0" "mixed pool: disengaging the fallback exits 0"
+assert_eq "$(put_body_for 30)" '{"labels":["self-hosted-arm64"]}' \
+  "(b) the ARM64 runner's body is BYTE-IDENTICAL to today's fallback_off body"
+assert_eq "$(put_body_for 33)" '{"labels":["self-hosted-x64"]}' \
+  "(a) the x86_64 runner KEEPS self-hosted-x64 when the fallback is disengaged"
+
+# (c) An arch-specific job must still resolve to the right architecture. Model the scheduler's own
+# rule (a runner takes a job only when its labels are a SUPERSET of `runs-on:`) over the label set
+# each runner actually ends up with: the host labels it was registered with, plus the body the gate
+# PUT (this endpoint REPLACES the custom set; host labels are not custom and cannot be removed).
+ARM_SET=" self-hosted Linux ARM64 $(json_labels "$(put_body_for 30)")"
+X64_SET=" self-hosted Linux X64 $(json_labels "$(put_body_for 33)")"
+if matches "$ARM_SET" self-hosted self-hosted-arm64; then
+  ok "(c) runs-on [self-hosted, self-hosted-arm64] MATCHES the ARM64 runner"
+else
+  bad "(c) runs-on [self-hosted, self-hosted-arm64] no longer matches the ARM64 runner — the queue's own pool is stranded"
+fi
+if matches "$X64_SET" self-hosted self-hosted-arm64; then
+  bad "(c) runs-on [self-hosted, self-hosted-arm64] matches the x86 runner — ARM-only work would be routed to x86"
+else
+  ok "(c) runs-on [self-hosted, self-hosted-arm64] does NOT match the x86 runner"
+fi
+if matches "$X64_SET" self-hosted self-hosted-x64; then
+  ok "(c) runs-on [self-hosted, self-hosted-x64] matches the x86 runner"
+else
+  bad "(c) runs-on [self-hosted, self-hosted-x64] does not match the x86 runner — x86-only work has no runner"
+fi
+if matches "$ARM_SET" self-hosted self-hosted-x64; then
+  bad "(c) runs-on [self-hosted, self-hosted-x64] matches the ARM64 runner — x86-only work would be routed to ARM"
+else
+  ok "(c) runs-on [self-hosted, self-hosted-x64] does NOT match the ARM64 runner"
+fi
+
+# Two doors the derivation must keep shut, each a way the gate could still touch a runner it does
+# not own or guess an architecture it cannot read.
+#
+# (i) A runner that is NOT in this pool (no marker) is not the gate's to relabel. Enumerating every
+#     runner in the repo and putting a body to it was half of #2327; a stranger's labels must survive
+#     a gate tick untouched.
+STRANGER="$T/rows-stranger.tsv"
+printf '30\tself-hosted\n30\tLinux\n30\tARM64\n30\tself-hosted-arm64\n30\tubuntu-latest\n99\tself-hosted\n99\tLinux\n99\tX64\n99\tubuntu-latest\n' > "$STRANGER"
+run_gate mixed-stranger GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$STRANGER" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "a pool that contains a stranger still relabels cleanly (rc=0)"
+assert_eq "$(put_body_for 99)" "" "a runner carrying no pool marker is NOT relabelled (it is not this gate's)"
+assert_eq "$(put_body_for 30)" '{"labels":["self-hosted-arm64","ubuntu-latest"]}' \
+  "…and the pool member in the same read IS relabelled (the selection is not just 'relabel nothing')"
+
+# (ii) A managed runner whose own host label is unreadable cannot be classified, so it must be
+#     REFUSED — counted as a failure, exit 2, no state advanced. Guessing the pool's arch here is
+#     how an x86 box gets stamped ARM64 in the first place.
+NOARCH="$T/rows-noarch.tsv"
+printf '30\tself-hosted\n30\tLinux\n30\tself-hosted-arm64\n30\tubuntu-latest\n' > "$NOARCH"
+run_gate mixed-noarch GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$NOARCH" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "2" "a managed runner with NO host arch label → exit 2 (could-not-classify)"
+assert_contains "$OUT" "runner 30 is not classifiable from its own host label" \
+  "the refusal NAMES the runner it could not classify"
+assert_eq "$(put_body_for 30)" "" "and nothing was PUT to it"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a partial classification advanced no state file"
+
+# (iii) THE HEADLINE REPAIR, PINNED: a runner the LEGACY gate already stamped carries BOTH
+# markers (self-hosted-arm64 from the old pool-wide body, self-hosted-x64 from its registration).
+# The HOST label must decide, so the stamped marker is dropped and the runner heals. This is the
+# state the live pool is one legacy tick away from (the farmed copy at ~/.pi/agent/scripts/ still
+# has the pool-wide stamp), and a fixture without the CONFLICT — where the marker agrees with the
+# host, or is absent — cannot tell host-precedence from marker-precedence: a mutant that lets the
+# marker win survives it (measured: suite green 131/131 with that mutation, before this case).
+STAMPED="$T/rows-stamped.tsv"
+printf '33\tself-hosted\n33\tLinux\n33\tX64\n33\tself-hosted-arm64\n33\tubuntu-latest\n' > "$STAMPED"
+run_gate mixed-stamped GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$STAMPED" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "(iii) a runner carrying a conflicting ARM64 marker still relabels cleanly"
+assert_eq "$(put_body_for 33)" '{"labels":["self-hosted-x64","ubuntu-latest"]}' \
+  "(iii) the HOST label wins: the stamped self-hosted-arm64 is dropped, self-hosted-x64 is restored"
+assert_not_contains "$(put_body_for 33)" "self-hosted-arm64" \
+  "(iii) and the false architecture claim is not re-written"
+
+# …and the answer must not depend on the ORDER gh happens to list the labels in. A derivation that
+# let the first or the last label win would pass one ordering and fail the other, so both are
+# pinned: here the marker comes BEFORE the host label.
+STAMPED_REV="$T/rows-stamped-rev.tsv"
+printf '34\tself-hosted\n34\tLinux\n34\tself-hosted-arm64\n34\tX64\n34\tubuntu-latest\n' > "$STAMPED_REV"
+run_gate mixed-stamped-rev GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$STAMPED_REV" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "(iii) the same conflicts relabel cleanly with the marker listed FIRST"
+assert_eq "$(put_body_for 34)" '{"labels":["self-hosted-x64","ubuntu-latest"]}' \
+  "(iii) host-precedence is ORDER-INDEPENDENT: marker-first still derives self-hosted-x64"
+
+# (d) MUTATION: restore the pool-wide stamp and (a) must FAIL. Without this the assertions above
+# could be satisfied by a constant body that happens to be right for today's pool — the exact shape
+# of the defect, which was harmless only while every runner really was ARM64.
+echo "── #2327 (d): MUTATION — restoring the pool-wide stamp must make (a) fail ──"
+MUT="$T/ci_runner_gate.mutant.sh"
+if python3 - "$GATE" "$MUT" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+anchor = '  local rows="$1" id="$2" eng="$3" rid name arch="" extra="" out="" l json=""'
+if anchor not in text:
+    sys.exit("mutation anchor not found — the per-runner derivation moved, so this mutation is stale")
+mutant = anchor + (
+    '\n  # MUTANT::2327d - the pre-#2327 POOL-WIDE stamp: one body for every runner, no host read.\n'
+    '  if [ "$eng" = on ]; then printf %s \'{"labels":["self-hosted-arm64","ubuntu-latest"]}\';\n'
+    '  else printf %s \'{"labels":["self-hosted-arm64"]}\'; fi\n'
+    '  return 0'
+)
+open(dst, "w", encoding="utf-8").write(text.replace(anchor, mutant, 1))
+PY
+then
+  ok "(d) the mutant gate was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$MUT"
+  run_gate mutant-on GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$MIXED" CI_GATE_QUEUE_THRESHOLD=1 --
+  GATE_UNDER_TEST=""
+  assert_eq "$RC" "0" "(d) the mutant still RUNS (rc=0) — so the red below is the property, not a crash"
+  if [ "$(put_body_for 33)" = '{"labels":["self-hosted-x64","ubuntu-latest"]}' ]; then
+    bad "(d) MUTATION SURVIVED: with the pool-wide stamp back, (a) still passes — (a) is not load-bearing"
+  else
+    ok "(d) mutation killed: (a) FAILS on the mutant (runner 33 received $(put_body_for 33))"
+  fi
+  assert_eq "$(put_body_for 33)" '{"labels":["self-hosted-arm64","ubuntu-latest"]}' \
+    "(d) and it fails EXACTLY as the defect did: the x86 runner is stamped ARM64 and loses its own marker"
+else
+  bad "(d) the mutant gate could not be generated (the mutation anchor moved) — (a) is unproven"
+fi
 
 echo "── --dry-run and --status stay read-only ──"
 run_gate dry GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 -- --dry-run
