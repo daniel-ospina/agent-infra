@@ -74,6 +74,7 @@ import {
   dispatchFloorMessage,
   isPushOrPrCreateCommand,
   reviewerRoleFor,
+  unspawnableMessage,
   extractMergePrNumber,
   extractMergeSelector,
   evidenceBodyIsCertifying,
@@ -119,7 +120,7 @@ import {
 } from "./index.js";
 // #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
 // suite green (the review of #2665 caught the hardcoded copy).
-import { SPAWN_UNSPAWNABLE_TOKEN } from "../shared/spawn-capacity.js";
+import { SPAWN_ATTEMPT_CAP, SPAWN_UNSPAWNABLE_TOKEN } from "../shared/spawn-capacity.js";
 // The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
 // this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
 import {
@@ -7948,12 +7949,31 @@ testAsync("#2206 review P2: the CAPACITY refusal is non-terminal in the text the
           reason.includes("THIS BLOCK IS NOT TERMINAL"),
           "the capacity refusal states it is not terminal in the text the model reads (#2206 review P2)"
         );
-        ok(/re-dispatch the reviewer/i.test(reason), "…and pairs it with the RETRY that arm asks for");
+        // ⛔ IT DEFERS TO THE ACTION PARAGRAPH INSTEAD OF NAMING A RETRY (#2206 re-review, P1).
+        // `describeSpawnCapacity` has five remedy branches and at the CAP it says "stop retrying",
+        // so a hardcoded "re-dispatch the reviewer" contradicted the remedy two lines above it.
+        ok(
+          /the ACTION paragraph above is the remedy for THIS fault/.test(reason),
+          "…and points at the ACTION paragraph, which is the remedy for the fault actually read"
+        );
+        ok(
+          !/the RETRY above/.test(reason),
+          "…never at a named RETRY: at the cap there is no RETRY paragraph to point at"
+        );
         equal(blocked.terminate, false, "…and stays non-terminating");
-        // The model-visible half, which this arm did not have at all before the fix.
+        // The model-visible half, which this arm did not have at all before the fix — and it must be
+        // THIS ARM's text, not the compliance text: BLOCK_MESSAGE says "Dispatch reviewers via task
+        // sub-agents, then retry the git operation", which is the one action the capacity diagnosis
+        // says cannot work (#2665's own note; #2206 re-review, P1). It arrives as a followUp that
+        // TRIGGERS A TURN, so it is what the model acts on.
         const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
         equal(recoveries.length, 1, "the capacity refusal delivers its one recovery message");
         equal(recoveries[0].options?.triggerTurn, true, "…triggering the turn that keeps the run alive");
+        equal(recoveries[0].message?.content, reason, "…carrying THIS arm's diagnosis, not the compliance text");
+        ok(
+          !/No reviewers were dispatched in this session/.test(recoveries[0].message?.content ?? ""),
+          "…and does NOT tell the lane it skipped a review it never had the chance to dispatch"
+        );
         // ONCE per session, the same bound as the floor: no unbounded retry loop.
         await fire("tool_result", { toolName: "task", details: SPAWN_CUT });
         await fire("tool_call", { toolName: "bash", input: { command: "git commit -m y" } });
@@ -7964,6 +7984,72 @@ testAsync("#2206 review P2: the CAPACITY refusal is non-terminal in the text the
         );
       } finally {
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2206 re-review P1/P2: at the CAP the pair forbids a retry, and the MICRO arm recovers too", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // Drive the session to the attempt CAP, where the ACTION paragraph says "stop retrying".
+        for (let i = 0; i < SPAWN_ATTEMPT_CAP; i++) {
+          await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        }
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the cap still refuses");
+        const reason = blocked.reason as string;
+        ok(/CAP REACHED/.test(reason), "the ACTION paragraph is the cap's own");
+        ok(/stop retrying/i.test(reason), "…i.e. it forbids a further attempt");
+        // The refusal must not contradict its own remedy on the model-visible channel either.
+        for (const r of sent.filter((s) => s.message?.customType === "reviewer-block-recovery")) {
+          const content = r.message?.content as string;
+          ok(
+            !/re-dispatch the reviewer \(the RETRY above\)/.test(content),
+            "no recovery may instruct a retry the cap paragraph forbids (#2206 re-review, P1)"
+          );
+        }
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        fs.rmSync("/tmp/agent-issue-complexity", { force: true });
+      }
+    });
+  });
+});
+
+testAsync("#2206 re-review P2: the MICRO capacity arm also delivers the recovery (both emitters)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      fs.writeFileSync("/tmp/agent-issue-complexity", "micro\n");
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the micro capacity arm refuses");
+        // The reason is the CAPACITY text, not the micro remediation (the #2665 split this arm
+        // documents), so the delivered message can be the same text without contradiction.
+        ok((blocked.reason as string).includes(UNSPAWNABLE_TOKEN), "the arm's own capacity verdict is what it returns");
+        // The measured defect: `micro` + a verdict-less spawn produced ZERO recoveries, so a
+        // `pi -p` micro lane got a tool result and nothing that re-opens the turn.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the MICRO capacity arm delivers its recovery (#2206 re-review, P2)");
+        ok(
+          (recoveries[0].message?.content as string).includes("THIS BLOCK IS NOT TERMINAL"),
+          "…carrying the capacity text, so both emitters are survivable"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        fs.rmSync("/tmp/agent-issue-complexity", { force: true });
       }
     });
   });

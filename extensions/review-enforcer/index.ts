@@ -4656,8 +4656,16 @@ export function unspawnableMessage(
     // the return) promise a refusal says it is not terminal. Only `terminate: false` was stated —
     // a field the MODEL never sees — while this text asked for a RETRY with nothing telling the
     // model the run continues, which is the measured failure #2204 (2) exists to fix.
+    //
+    // ⛔ IT DEFERS TO THE ACTION PARAGRAPH, IT DOES NOT NAME A RETRY (#2206 re-review, P1). The
+    // first cut said "re-dispatch the reviewer (the RETRY above)" UNCONDITIONALLY, and
+    // `describeSpawnCapacity` has five remedy branches: at the CAP it says "stop retrying … hand the
+    // lane back", and on the latch "do NOT retry in a loop" — so the last line the model read
+    // instructed the very retry the paragraph above forbade, and cited a RETRY that does not exist
+    // at the cap. The ACTION paragraph is the last one emitted in EVERY branch and is the remedy
+    // for the fault actually read, so it is what this line points at.
     "   → THIS BLOCK IS NOT TERMINAL: the run continues. Do not end the session on it —",
-    "     re-dispatch the reviewer (the RETRY above) and keep going.",
+    "     the ACTION paragraph above is the remedy for THIS fault; follow it, then keep going.",
     "   → THE REQUIREMENT IS UNCHANGED: a reviewer verdict is still mandatory before this git op",
     `     (${SPAWN_UNSPAWNABLE_TOKEN} is what the BOX did, not a waiver). The rail will also demand`,
     `     the attestation at the FINAL head — ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
@@ -4873,14 +4881,21 @@ export default function (pi: ExtensionAPI) {
     // The AUDIENCE comes from `reviewerRoleFor()` (#2148's split) — see `dispatchFloorMessage`: this
     // text now TRIGGERS A TURN, so telling a harness worker to dispatch a reviewer would be the
     // #2148 contradiction with a keystroke attached.
-    const deliverBlockRecovery = (tier: string, command: string): void => {
+    // ⛔ `message` IS A PARAMETER, NOT ALWAYS THE COMPLIANCE TEXT (#2206 re-review, P1). The
+    // capacity arm's diagnosis is "the BOX failed, re-running the blocked op cannot satisfy this
+    // floor" — and dropping `dispatchFloorMessage` on it delivered `❌ No reviewers were dispatched
+    // … Dispatch reviewers via task sub-agents, then retry the git operation`, i.e. the exact
+    // wrong action #2665's own note above says printing BLOCK_MESSAGE on that arm produces. It
+    // arrives as a `followUp` that TRIGGERS A TURN, so it is the instruction the model acts on.
+    // The floor arm keeps the default; the capacity arm passes its own `unspawnableMessage`.
+    const deliverBlockRecovery = (tier: string, command: string, message?: string): void => {
       if (blockRecoverySent) return;
-      const message = dispatchFloorMessage(tier, reviewerRole);
+      const body = message ?? dispatchFloorMessage(tier, reviewerRole);
       let sendQueued = false;
       if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
         try {
           (pi as any).sendMessage(
-            { customType: "reviewer-block-recovery", content: message, display: true },
+            { customType: "reviewer-block-recovery", content: body, display: true },
             { deliverAs: "followUp", triggerTurn: true }
           );
           sendQueued = true;
@@ -5286,6 +5301,11 @@ export default function (pi: ExtensionAPI) {
           // contradict the remedy it was just handed — the exact measured failure #2204 (2) fixes.
           // The value is the SDK default, so nothing changes at runtime; stating it is what stops a
           // future edit from reaching for `terminate: true` to "make the refusal stick".
+          //
+          // ⛔ AND THE MODEL-VISIBLE HALF, ON BOTH CAPACITY EMITTERS (#2206 re-review, P2): the
+          // first fix added this call to the non-micro branch only, so a `pi -p` micro lane still
+          // got a tool result and nothing that re-opens the turn — the exact #2204 (2) failure.
+          deliverBlockRecovery("micro", command, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
           return {
             block: true,
             reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
@@ -5328,8 +5348,9 @@ export default function (pi: ExtensionAPI) {
         // AND the model-visible half: `unspawnableMessage` now states it, and the recovery is
         // delivered here too (#2206 review, P2 — the arm stated `terminate: false` and nothing the
         // model reads, so a lane on the one arm #2204 calls "the refusal the model reads as the end
-        // of the run" still read it that way).
-        deliverBlockRecovery(tier, command);
+        // of the run" still read it that way). The message is THIS arm's, not the compliance text
+        // (#2206 re-review, P1).
+        deliverBlockRecovery(tier, command, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
         return {
           block: true,
           reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
