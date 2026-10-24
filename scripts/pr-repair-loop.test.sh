@@ -227,9 +227,12 @@ PY
 check "unset seams keep the previous defaults" "daniel-ospina/tortoise True" "$default_out"
 
 
-# ⛔ A NON-ZERO EXIT MUST BE *THIS* REFUSAL (review round 7): the artifact-missing arms assert rc≠0, so a
-# `foreign_loop_census` refusal from a peer lane's live `--loop` satisfies them without the check they
-# exist for. The census reads the BOX; the fixture must own that read too.
+# ⛔ THE CENSUS READS THE BOX, SO THE FIXTURE MUST OWN THAT READ (review rounds 7–8): every `--install`
+# arm below inherits a `pgrep` that finds no foreign loop, because the real one sees a PEER LANE's live
+# `--loop` — including the one this very suite spawns in its own --loop arm — and a census refusal would
+# then be indistinguishable from the refusal an arm actually tests. (The artifact-missing arms die before
+# the census, so they were never coloured by it; the user-scope linger arms were, fixed in the round-7
+# commit.) New `--install` arms inherit the stub for free. The census ITSELF is pinned below.
 mkdir -p "$TMP/stubbin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/stubbin/pgrep"
 chmod +x "$TMP/stubbin/pgrep"
@@ -482,6 +485,43 @@ check "the same install with linger=yes succeeds (rc=0)" 0 "$?"
 find "$TMP/fakehome" -name 'eldato-pr-repair.service' 2>/dev/null | grep -q . \
     && ok "the unit was written into the user scope" \
     || bad "the unit was not written into the user scope"
+
+# ⛔ THE DUPLICATE-CLAIM CENSUS MUST BE CONTRADICTIBLE (review round 8): the round-7 stub made the fixture
+# hermetic, which also meant NO arm asserted the refusal it silences — neutering the census left the suite
+# green, so all of #2700's hard rules (one worker per PR, one loop per repo per box) could be deleted
+# silently. Here the fixture chooses the pid the census sees: a REAL process whose argv IS a loop
+# invocation, so the /proc walk runs for real.
+mkdir -p "$TMP/foreign" "$TMP/claimbin" "$TMP/claimunit"
+printf '#!/usr/bin/env bash\nsleep 120\n' >"$TMP/foreign/pr-repair-loop.sh"
+chmod +x "$TMP/foreign/pr-repair-loop.sh"
+setsid bash "$TMP/foreign/pr-repair-loop.sh" --loop >/dev/null 2>&1 &
+FOREIGN_PID=$!
+sleep 0.3
+printf '#!/usr/bin/env bash\necho %s\n' "$FOREIGN_PID" >"$TMP/claimbin/pgrep"
+chmod +x "$TMP/claimbin/pgrep"
+# ⛔ EXPLICIT SCOPE, NEVER THE BOX'S OWN (measured the hard way, round 8): `UNIT_DIR=` empty does NOT mean
+# "just render" — the installer then probes `sudo -n true`, and on a cell where that succeeds it writes
+# into /etc/systemd/system. This arm did exactly that once. An explicit UNIT_DIR pins the whole fixture.
+env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
+    PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    "$INSTALLER" --install >"$TMP/census.out" 2>&1
+check "a live foreign --loop REFUSES the install (rc≠0)" 1 "$?"
+if grep -qi 'already live' "$TMP/census.out" && ! find "$TMP/claimunit" -name '*.service' 2>/dev/null | grep -q .; then
+    ok "the census refusal names the duplicate claim and installs NOTHING"
+else
+    bad "the census refusal is not discriminating (out: $(tr -d '\n' <"$TMP/census.out" | cut -c1-220))"
+fi
+# ...and the SAME box installs once that loop is gone: the refusal is the loop, not the arm.
+kill -TERM "$FOREIGN_PID" 2>/dev/null || true
+sleep 0.3
+cp "$TMP/stubbin/pgrep" "$TMP/claimbin/pgrep"
+env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
+    PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    "$INSTALLER" --install >"$TMP/census-gone.out" 2>&1
+check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
+find "$TMP/claimunit" -name 'eldato-pr-repair.service' 2>/dev/null | grep -q . \
+    && ok "the control arm installed into the FIXTURE unit dir" \
+    || bad "the control arm did not install into the fixture (out: $(tr -d '\n' <"$TMP/census-gone.out" | cut -c1-220))"
 
 echo "── the farm declares what the unit execs ──"
 for f in pr-repair-loop.sh install-repair-service.sh; do
