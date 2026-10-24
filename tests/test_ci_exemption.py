@@ -2762,6 +2762,57 @@ def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
     assert is_failure_key_loose("watchdog-kill::pytest"), "watchdog-kill:: is emitted as a literal"
 
 
+def test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path():
+    """⛔ THE PRODUCER'S ALPHABET MUST BE INSIDE THE DOOR'S, or the identity is silently dropped.
+
+    This is the property that keeps a red PR from certifying `CLEAN blocked=0`: `bash_shard_failures`
+    emits an id, and `parse_failure_rows`/`parse_rates` REJECT it unless `is_failure_key` admits it —
+    a produced-and-rejected id makes `decide` see an EMPTY PR set. Measured twice in #2648 review:
+    first for the family itself (cycle 2), then because `quote()` never escapes `~`, so
+    `scripts/lib/a~b.sh` emitted `bash-shard::scripts/lib/a~b.sh` which the door rejects (cycle 4).
+
+    The earlier fix named a test that pinned the alphabet equality and then never wrote it — the
+    docstring asserted a pin that did not exist (cycle 5). This is that pin, asserted on the
+    PROPERTY rather than on two constants, so it holds through any change of encoder.
+    """
+    hostile = [
+        "scripts/lib/a~b.sh",          # `~` — quote()'s always-safe set, the cycle-4 silent drop
+        "scripts/a b.test.sh",          # whitespace — the rate table is `uniq -c | awk`
+        "scripts/a\tb.sh",              # a tab, which would also break the capture's field split
+        "scripts/a%41.sh",             # a literal escape: must be RE-escaped, not passed through
+        "scripts/a@b#c.sh",            # characters `_slug` would fold away
+        "scripts/ü.sh",                 # multi-byte UTF-8
+        "\U0001F600",                    # a non-BMP code point (the cycle-5 collision source)
+        "scripts/x/y.sh",               # a plain path — must stay VERBATIM
+    ]
+    seen = {}
+    for label in hostile:
+        ids, _sigs = ci_exemption.bash_shard_failures(f"❌ failed shard: {label}")
+        assert len(ids) == 1, f"{label!r} produced {ids!r}"
+        token = ids[0][len(ci_exemption._BASH_SHARD_KEY_PREFIX):]
+        assert ci_exemption._SHARD_TOKEN_RE.match(token), (
+            f"{label!r} produced a token outside the encoder's own alphabet: {token!r}"
+        )
+        assert ci_exemption.is_failure_key(ids[0]), (
+            f"{label!r} -> {ids[0]!r} is REJECTED by the row door: the id would be produced, "
+            "printed, and silently dropped, so `decide` would see an empty PR set and emit "
+            "`CLEAN blocked=0` for a RED PR"
+        )
+        assert ci_exemption.is_failure_key_loose(ids[0]), label
+        seen.setdefault(ids[0], []).append(label)
+    collisions = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not collisions, f"two different labels share one identity: {collisions}"
+    # …and a plain path is still the path, so main and the PR compare on the real shard name.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failed shard: scripts/x/y.sh"
+    )[0] == ["bash-shard::scripts/x/y.sh"]
+    # The two labels that collided under the cycle-5 per-character fallback (`%%%02X` has no fixed
+    # width): they must stay distinct.
+    a = ci_exemption.bash_shard_failures("❌ failed shard: \U0001F600")[0]
+    b = ci_exemption.bash_shard_failures("❌ failed shard: \x1f600")[0]
+    assert a != b, f"the encoder is not injective: {a!r} == {b!r}"
+
+
 def test_bash_shard_identity_is_injective_over_the_listed_shards():
     """⛔ TWO DIFFERENT SHARDS MUST NOT SHARE ONE IDENTITY (#2648 reviews 2 and 3).
 

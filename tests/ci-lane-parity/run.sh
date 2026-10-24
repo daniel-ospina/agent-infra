@@ -1305,7 +1305,7 @@ else
   RC=$?
   SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
   if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
-    pass "a `bash -n` failure is NAMED in the verdict block (rc 1)"
+    pass "a bash -n failure is NAMED in the verdict block (rc 1)"
   else
     fail "a sweep failure was counted but not named (rc $RC): $SWEEP_VERDICT"
   fi

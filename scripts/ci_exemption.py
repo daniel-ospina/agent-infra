@@ -123,7 +123,6 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
 
 # --------------------------------------------------------------------------
 # Strict parsing — the union is an allowlist, so junk must not enter it
@@ -1700,42 +1699,40 @@ _BASH_SHARD_SIG = "bash-shard"
 #: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
 #: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free.
 #:
-#: ⛔ `quote()` IS NOT ENOUGH ON ITS OWN: urllib's ALWAYS-safe set includes `~`, which it therefore
-#: never escapes, so a path containing `~` produced `bash-shard::a~b.sh` while
-#: :data:`_NON_NODEID_KEY_RE` admitted only the chars below — the producer's alphabet was WIDER than
-#: the row door's, so the identity was produced, printed by the CLI, and silently DROPPED
-#: (`rejected=[…]`, `decide` → `CLEAN blocked=0`). Measured in #2648 cycle-4 review. Hence
-#: :data:`_SHARD_KEY_ALPHABET` + the post-pass below: the emitted token is confined to EXACTLY the
-#: door's alphabet, and `test_shard_token_alphabet_equals_the_row_doors` pins the equality.
-_SHARD_TOKEN_SAFE = "/._-"
-_SHARD_KEY_ALPHABET = re.compile(r"^[A-Za-z0-9_./%\-]+$")
-#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — kept equal to
-#: `_SHARD_KEY_ALPHABET` (asserted, not assumed).
-_SHARD_TOKEN_RE = _SHARD_KEY_ALPHABET
+#: ⛔ THE TOKEN IS ENCODED HERE, NOT BY `quote()`, and that is deliberate. urllib's ALWAYS-safe set
+#: includes `~`, so `quote` never escapes it: a path containing `~` produced
+#: `bash-shard::a~b.sh` while the row door admitted only the chars below, so the identity was
+#: produced, printed by the CLI, and silently DROPPED (`decide` → `CLEAN blocked=0`) — measured in
+#: #2648 cycle-4 review. Patching that with a `~`→`%7E` post-pass left a per-character fallback
+#: that was itself NOT injective (`"%%%02X" % ord(c)` has no fixed width, so `\U0001F600` and
+#: `\x1f`+`600` collided) — cycle-5 review. So the encoder is local, fixed-width UTF-8
+#: percent-encoding: injective BY CONSTRUCTION, no `quote`, and NO fallback branch at all.
+_SHARD_VERBATIM = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/"
+)
+#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — the verbatim set plus `%`.
+#: `test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path` pins
+#: `_shard_token(label)` ⊆ this for hostile labels, i.e. the producer cannot emit a key its own
+#: door rejects.
+_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./%\-]+$")
 
 
 def _shard_token(label: str) -> str:
-    """A whitespace-free, INJECTIVE token for a shard path — percent-encoded, never slugged.
+    """A whitespace-free, INJECTIVE token for a shard path.
 
-    See `_BASH_SHARD_RE` for why a slug is not injective. INJECTIVITY IS BY CONSTRUCTION: every
-    byte outside the allow-list becomes `%XX`, so two different paths cannot produce one token.
-    There is no fallback branch that could be non-injective, and so nothing to assert about a
-    "declared coarsening" — a previous version folded whitespace and then fell back to `_slug`,
-    which re-created the collision for `scripts/a b.test.sh` vs `scripts/a_b.test.sh`, and its
-    docstring's claim that the injectivity vector would catch it was false (that vector only
-    ever fed it the 80 listed paths, all of which are already inside the allow-list). Measured
-    in #2648 review cycle 3. For the runner's real list the token IS the path, verbatim.
+    See `_BASH_SHARD_RE` for why a slug is not injective, and `_SHARD_VERBATIM` for why this is
+    not `quote`. Each byte outside the verbatim set becomes `%XX` (fixed width, UTF-8), so two
+    different paths cannot produce one token, `%` itself is escaped (`%25`) and cannot forge an
+    escape, and there is NO fallback path that could be lossy. For the runner's 80 listed shards
+    the token IS the path, verbatim.
     """
-    token = quote(label.strip(), safe=_SHARD_TOKEN_SAFE)
-    # `quote` leaves `~` (and only `~` among the printable chars) unescaped, which is OUTSIDE the
-    # row door's alphabet — see `_SHARD_TOKEN_SAFE`. Escape it here so the producer cannot emit a
-    # key its own door rejects (#6798 class, measured in #2648 cycle-4 review).
-    token = token.replace("~", "%7E")
-    if not _SHARD_KEY_ALPHABET.match(token):  # pragma: no cover - unreachable, kept fail-closed
-        token = "".join(
-            c if _SHARD_KEY_ALPHABET.match(c) else "%%%02X" % ord(c) for c in token
-        )
-    return token
+    out: list[str] = []
+    for ch in label.strip():
+        if ch in _SHARD_VERBATIM:
+            out.append(ch)
+        else:
+            out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
+    return "".join(out)
 
 
 def bash_shard_failures(
