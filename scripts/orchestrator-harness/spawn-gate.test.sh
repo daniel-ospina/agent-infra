@@ -325,11 +325,13 @@ drive() { # drive <load> <label> <max-load>
   local load="$1" label="${2:-test agent}" max="${3:-10}"
   : > "$PI_LOG"
   # DISK_MIN_FREE_MB=1 so these LOAD checks cannot be decided by this host's free space, and the
-  # headroom gate (DISK_LANE_TREE_MB/DISK_LANE_RESERVE_MB, #2721) is neutralised for the same reason —
+  # headroom gate (DISK_LANE_TREE_MB / DISK_LANE_SELF_MB / DISK_LANE_RESERVE_MB, #2721) is neutralised
+  # for the same reason — and with ALL THREE terms at 0: leaving `self` to derive kept a 64MB bound
+  # (6144MB on a python-marker target) that this HOST's free space decided (#2721 review round 2) —
   # the disk
   # gate runs first now (that ordering is itself pinned below), so on a genuinely full CI box the
   # load-refusal assertions would otherwise come back 77 and read as a load-gate regression.
-  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
     . "$1"
     cd "$7" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
     LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
@@ -497,7 +499,7 @@ chmod +x "$TMP/bin74/pi"
 # failing for the reason it names.
 _capmod74="$HERE/capacity.sh"
 [ -f "$_capmod74" ] || _capmod74="$(cd "$HERE/.." >/dev/null 2>&1 && pwd)/orchestrator-harness/capacity.sh"
-got="$(PATH="$TMP/bin74:$TMP/bin:$PATH" O="$TMP/O" DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+got="$(PATH="$TMP/bin74:$TMP/bin:$PATH" O="$TMP/O" DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1" 2>/dev/null
   cap_procs_live() { printf "400"; }
   cap_ulimit_u() { printf "15641"; }
@@ -601,7 +603,7 @@ fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 
 # the arms that drive the real CALLERS must do it too. Only the arm that INTENDS a disk refusal varies
 # the floor (it sets DISK_MIN_FREE_MB=9999999).
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "1" ]; }; rc=$?
@@ -639,7 +641,7 @@ grep -q 'AGENT_DISK_REFUSED=' "$RIG/stale/spawn-gate.sh"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and the stale-helper fixture really carries no AGENT_DISK_REFUSED (the sed transformed it)" $rc
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$RIG/stale/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; src_=$?
 sgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$src_" -eq 75 ] && [ "$sgot" = "1" ]; }; rc=$?
@@ -664,7 +666,7 @@ ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $r
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
 printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "2" ]; }; rc=$?
@@ -677,7 +679,7 @@ ck "fix-one.sh (MANUAL/positional) refunds nothing — fixcount stays 2 (rc=$frc
 # process per suite run. A small limit bounds the leak to seconds without changing what is proven.
 : > "$PI_LOG"; : > "$MERGE_LOG"
 rows_d0=0; [ -s "$RO/state/disk.tsv" ] && rows_d0="$(wc -l < "$RO/state/disk.tsv" | tr -d ' ')"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 { [ "$frc" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: gate open -> the fixer RUNS and the merge chain IS re-run (rc=$frc)" $rc
@@ -989,7 +991,7 @@ for want in 0 1 75; do
   ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
 done
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
 [ "$arc" -eq 75 ]; rc=$?
 ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo's 0 (rc=$arc)" $rc
@@ -1000,7 +1002,7 @@ ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
 # ... and the SUCCESS arm too: a constant-75 wrapper would pass the line above and report every
 # successful adopt as a refusal.
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
@@ -1050,7 +1052,7 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
@@ -1085,14 +1087,14 @@ drive_disk() { # drive_disk <path> <floor-mb> [<warn-mb>]
   # does NOT stub `load1` (the disk gate is the subject and it runs first), so without this the
   # section would go red on a busy box — and its own POSITIVE CONTROL with it. A test that fails for
   # a reason unrelated to its subject is worse than no test: it teaches the reader to ignore red.
-  # ⛔ THE HEADROOM GATE IS NEUTRALISED HERE (DISK_LANE_TREE_MB=0 / DISK_LANE_RESERVE_MB=0), because
-  # these arms are the FLOOR's: without it a host with less free space than the shipped per-lane
-  # reserve (6 GiB for a python target, 1 GiB otherwise) refuses before the floor is ever consulted,
-  # and every "the floor refused" assertion would pass for a reason it does not name. The headroom
-  # gate has its OWN arms below, which drive it with explicit costs.
+  # ⛔ THE HEADROOM GATE IS NEUTRALISED HERE — ALL THREE TERMS, because these arms are the FLOOR's:
+  # without it a host with less free space than the shipped bound (8144 MB for a python target,
+  # 2064 MB otherwise) refuses before the floor is ever consulted, and every "the floor refused"
+  # assertion would pass for a reason it does not name. The headroom gate has its OWN arms below,
+  # which drive it with explicit costs.
   PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
   DISK_GATE_PATH="$path" DISK_MIN_FREE_MB="$floor" DISK_WARN_FREE_MB="$warn" \
-  DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+  DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
   bash -c '
     . "$1"
     cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
@@ -1170,7 +1172,7 @@ ck "a warn band below the floor is repaired to STRICTLY above it (got '$wb')" $r
 # fires on `mb < floor`, the warning on `mb < warn`, so a repaired-to-the-floor band could never
 # warn, i.e. the repair shipped the exact failure it existed to prevent while the value-only check
 # above stayed green. Drive the SHIPPED predicate AT the floor: the gate must allow it AND warn.
-band="$(DISK_MIN_FREE_MB=100 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_WARN_FREE_MB=1 bash -c '
+band="$(DISK_MIN_FREE_MB=100 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 DISK_WARN_FREE_MB=1 bash -c '
   . "$1"
   disk_ok 100  && a=allow   || a=refuse
   disk_low 100 && b=warn    || b=nowarn
@@ -1469,6 +1471,19 @@ ck "a pip target (requirements.txt, no uv.lock) derives the PYTHON triple, not t
 got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/monorepo")"
 [ "$got" = "350 6144 2000" ]; rc=$?
 ck "a MONOREPO whose lock sits one level down is detected too, so its lane is not admitted on 1 GB of headroom (got '${got:-<none>}')" $rc
+# ⛔ AND THE DEPTH MUST NOT NARROW THE MARKER SET (review round 2, P2): the first version checked only
+# uv.lock/pyproject.toml/requirements.txt one level down, so `backend/poetry.lock` or
+# `backend/Pipfile` + `setup.py` still derived the HARNESS pair — the false pass, disguised as depth.
+mkdir -p "$TMP/mono-poetry/backend" "$TMP/mono-pipenv/backend"
+printf '[tool.poetry]\n' > "$TMP/mono-poetry/backend/poetry.lock"
+printf '[[source]]\n' > "$TMP/mono-pipenv/backend/Pipfile"
+printf 'from setuptools import setup\n' > "$TMP/mono-pipenv/backend/setup.py"
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/mono-poetry")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "a one-level-down poetry.lock derives the python triple (got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/mono-pipenv")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "a one-level-down Pipfile + setup.py derives the python triple (got '${got:-<none>}')" $rc
 
 # THE PREDICATE's boundaries, including the unreadable fail-open (it must match the floor's polarity).
 bash -c '. "$1"; disk_headroom_ok 100 50 50 50' _ "$GATE"; rc=$?
@@ -1520,9 +1535,6 @@ res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=150 PI_LOG="$PI_LOG" O=
 ck "one lane's-worth of headroom left still ADMITS this spawn ($res)" $rc
 grep -q 'within one lane of the headroom bound' "$LOG"; rc=$?
 ck "...and WARNS that the NEXT lane will be refused DISK-NOHEADROOM — the warning fires where the band cannot reach" $rc
-grep -q 'NEEDLESS-NOISE-SENTINEL' "$LOG"; rc=$?
-[ "$rc" -ne 0 ]; rc=$?
-ck "...and the warning is not the refusal in disguise (the agent really started)" $rc
 # ... and the same reading with room for three lanes says nothing.
 : > "$LOG"; : > "$PI_LOG"
 res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=1000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
@@ -1620,7 +1632,7 @@ cap_clean() {   # restore the committed content WITHOUT a path-restore verb (tha
 # seam every other section uses), DISK_MIN_FREE_MB=1 and the headroom gate neutralised so the disk gate cannot decide an arm.
 drive_cap() { # drive_cap <cap-s> <label> [cwd] [wip-path]
   local cap="$1" label="$2" cwd="${3:-$CWT}" wip="${4:-}"
-  PATH="$CAPRIG/bin:$PATH" O="$CO" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 WIP_PATH="$wip" bash -c '
+  PATH="$CAPRIG/bin:$PATH" O="$CO" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 WIP_PATH="$wip" bash -c '
     . "$1"
     # ⛔ UNSET THE EXPORTED `pi` FUNCTION FIRST. Section 9 exports one (`export -f pi`) because a
     # function beats a caller-s own PATH prepend, and an exported function arrives in EVERY child
@@ -2172,7 +2184,7 @@ bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
   || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
 pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
 export -f pi
-( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
     bash "$HERE/nonblocking-dispatch.sh" caplane "$CWT" "$BG/prompt" 1 >"$BG/dispatch.out" 2>&1 )
 n=0; while [ ! -s "$BG/bg/caplane.rc" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n+1)); done
 st="$(O="$BG" bash "$HERE/nonblocking-dispatch.sh" --status caplane 2>&1)"
@@ -2202,7 +2214,7 @@ git -C "$NWT" remote add origin https://github.com/owner/repo.git
 git -C "$NWT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 pi() { sleep 30; }
 export -f pi
-( cd "$NWT" && O="$BG" WIP_PATH="$FB/notagit" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+( cd "$NWT" && O="$BG" WIP_PATH="$FB/notagit" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
     bash "$HERE/nonblocking-dispatch.sh" caplane2 "$NWT" "$BG/prompt" 1 >"$BG/dispatch2.out" 2>&1 )
 n=0; while [ ! -s "$BG/bg/caplane2.rc" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n + 1)); done
 st2="$(O="$BG" bash "$HERE/nonblocking-dispatch.sh" --status caplane2 2>&1)"
