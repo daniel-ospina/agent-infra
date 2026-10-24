@@ -547,6 +547,22 @@ case "$key" in
         printf 'could not find the log for run %s: log not found\n' "$id" >&2
         exit 1
       fi
+      # #1574: a TRANSIENT transport failure that CLEARS. `flaky-log-<id>` holds
+      # how many leading reads fail; the counter (`flaky-count-<id>`) advances per
+      # read, and once it passes that number the log is served from `log-<id>`.
+      # The stderr deliberately names no reason `fetch_failed_log` recognises: a
+      # real transient is auth/network/5xx text, NOT `log not found` — and the
+      # whole point of the split is that only the latter stops the retry.
+      if [ -f "$SCEN/flaky-log-$id" ]; then
+        n=$(( $(cat "$SCEN/flaky-count-$id" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$SCEN/flaky-count-$id"
+        if [ "$n" -le "$(cat "$SCEN/flaky-log-$id")" ]; then
+          printf 'HTTP 502: Bad Gateway (transient)\n' >&2
+          exit 1
+        fi
+        [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
+        exit 0
+      fi
       [ -f "$SCEN/fail-log-$id" ] && exit 1
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
@@ -986,12 +1002,20 @@ run_admin() {
   # the pre-fix rail behaved: every pre-existing scenario that expected an instant
   # refusal keeps it, and a test that wants the WAIT sets SUITE_FIRST_CHECKS_WAIT /
   # SUITE_MERGE_REF_WAIT (seconds) on the function call.
-  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
-    ADMIN_MERGE_FIRST_CHECKS_WAIT="${SUITE_FIRST_CHECKS_WAIT:-0}" \
-    ADMIN_MERGE_MERGE_REF_WAIT="${SUITE_MERGE_REF_WAIT:-0}" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
-    bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
+  #
+  # SUITE_NOSLEEP=1 puts the stub `sleep` first on the rail's own PATH (see the note on
+  # NOSLEEP_BIN below): for a scenario whose subject is the ACCUMULATED clock, not the waiting.
+  # An array, like run_admin_here, so the extra variable is one element rather than a
+  # conditional word inside a line continuation.
+  local -a env_args=(
+    "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_REPRO_CMD=${REPRO_CMD:-true}"
+    "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+    "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
+  )
+  [ "${SUITE_NOSLEEP:-0}" = "1" ] && env_args+=("PATH=$NOSLEEP_BIN:$PATH")
+  env "${env_args[@]}" bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
 
@@ -1016,6 +1040,25 @@ run_admin_here() {
   env "${env_args[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
+
+# ── the virtual-clock scenarios must not REAL-sleep (agent-infra#2483) ──────────
+# `wait_for_run` accumulates its own clock arithmetically — `waited=$((waited + adv))` at
+# scripts/admin-merge.sh:4698 — and never reads the wall clock. The step is clamped at :4652
+# (`step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1`), so the `ADMIN_MERGE_POLL_INTERVAL=0`
+# this suite already passes still means ONE arithmetic second per poll; the only real time is
+# `sleep "$adv"` at :4699, which merely PACES a `gh` that is stubbed here. Three scenarios drive
+# that clock across a bound by issuing 605/60/60 polls, which used to cost 614 s + 62 s + 62 s of
+# real sleeping for an arithmetic clock — ~13 of this shard's ~17 minutes, i.e. ~22% of the whole
+# `bash-suites` step (measured 2026-10-22, run 39857849778).
+# This stub removes the pacing and nothing else: the poll COUNT, the accumulated clock and every
+# assertion are unchanged, which is why (a2) below asserts the clock still passes 600 s. Same shape
+# as the `sleep() { :; }` probes in this file, but on PATH because the rail is a child process.
+# Applied per-scenario (SUITE_NOSLEEP=1 / an explicit PATH), never globally: the W7702 scenario
+# kills the rail from a `sleep 90` subshell, which must stay a REAL 90 s.
+NOSLEEP_BIN="$TMP/nosleep-bin"
+mkdir -p "$NOSLEEP_BIN"
+printf '#!/bin/sh\n# a stubbed pace: the subject is the accumulated clock, not the waiting (agent-infra#2483)\nexit 0\n' >"$NOSLEEP_BIN/sleep"
+chmod +x "$NOSLEEP_BIN/sleep"
 
 # ── bound-based wait fixtures (#1167 follow-on) ────────────────────────────
 # A remote run has NO within-job activity signal: `updatedAt` advances on
@@ -1477,7 +1520,19 @@ cfs_diff() { bash "$CFS" --diff "$1" "$2"; }
 # parser script itself and capture its streams for assertions. The extraction is
 # its OWN unit — the admin-merge rail is a separate consumer (#3756).
 cfs_run() {
-  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  # CI_FAILURE_SET_LOG_BACKOFF_S=0 — the suite must not SLEEP. The retry itself is
+  # exercised (attempts default to 3); only the wall-clock wait is removed, so a
+  # scenario that exhausts the retry does not add ~6s of dead time each.
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" CI_FAILURE_SET_LOG_BACKOFF_S=0 \
+    bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  return $?
+}
+
+# The same, with the #1574 retry DISABLED. Pins that the refusal message stops
+# promising a retry the operator turned off (review cycle 1, P2-1).
+cfs_run_no_retry() {
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" CI_FAILURE_SET_LOG_BACKOFF_S=0 \
+    CI_FAILURE_SET_LOG_ATTEMPTS=1 bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
   return $?
 }
 
@@ -2194,6 +2249,11 @@ rc=$?
 [ "$rc" -ne 0 ] && pass "a run with jobs and an unreadable log still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
 grep -q "could not fetch the failed-step log" "$TMP/cfs-err" && pass "the refusal is surfaced" || fail "expected the refusal on stderr"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a zero-job note must not be printed for a run that HAS jobs" || pass "no zero-job note for a run that has jobs"
+# #1574: the retry must be BOUNDED. A retry loop that never gives up would turn
+# this refusal into a hang, which is a worse failure than the one it replaces.
+n=$(grep -c '^run view 7778 ' "$SCEN/calls")
+[ "$n" -eq 3 ] && pass "the transient retry is bounded at 3 attempts before refusing" \
+  || fail "expected exactly 3 log-fetch attempts before the refusal, got $n"
 
 # The jobs-API slug must carry the RESOLVED repo (review cycle 5, P2). Forcing the
 # `{owner}/{repo}` placeholder unconditionally left the suite GREEN, because the
@@ -2974,6 +3034,91 @@ rc=$?
 [ "$rc" -eq 0 ] && pass "--help exits 0" || fail "--help expected exit 0, got $rc"
 grep -q 'usage:\|--main-union' "$TMP/cfs-out" && pass "--help prints the usage text" \
   || fail "--help did not print usage"
+
+# ── 5o. #1574: a TRANSIENT log-fetch error is retried ────────────────────
+# MEASURED, not hypothetical (2026-10-23): one `--log-failed` fetch of a 27-job
+# run is ~2.3 s and ~620 KB, and a widened baseline pass fetches EVERY failing run
+# in the window — the tortoise main window that hit this defect held 15, so one
+# pass makes 15 independent log fetches. ONE transient among them aborted the whole
+# pass with `BLOCK — could not extract main's rate table`, and the doctor then
+# recorded it as a PR refusal (`class=other`) cooling that head down for
+# MERGE_RETRY_S=3600. This scenario fails the first TWO reads and serves the
+# third, so on the retry-free code it refuses — the test is non-vacuous.
+echo "== 5o. a transient log-fetch error is retried and the baseline is read =="
+new_scen transientlog
+{ main_red_n main7795 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7795 7795
+} > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7795"
+printf '2\n' > "$SCEN/flaky-log-7795"          # the first 2 reads fail, the 3rd serves
+printf '3\n' > "$SCEN/jobs-count-7795"
+cfs_run --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -eq 0 ] && pass "a transient log-fetch error no longer aborts the baseline (exit 0)" \
+  || { fail "expected exit 0 — the transient read was not retried (got $rc)"; tail -4 "$TMP/cfs-err" | sed 's/^/       /'; }
+grep -q 'could not fetch the failed-step log' "$TMP/cfs-err" \
+  && fail "a RECOVERED read was still reported as a refusal" \
+  || pass "no refusal was reported for a recovered read"
+grep -q 'TRANSIENT error and SUCCEEDED on attempt 3' "$TMP/cfs-err" \
+  && pass "the recovery is DISCLOSED (attempt 3 of 3), never silent" \
+  || fail "expected the recovery to be disclosed on stderr"
+n=$(grep -c '^run view 7795 ' "$SCEN/calls")
+[ "$n" -eq 3 ] && pass "exactly 3 attempts were made (bounded, not a loop)" \
+  || fail "expected 3 log-fetch attempts for run 7795, got $n"
+grep -q 'tests/test_other.py::test_red_on_main' "$TMP/cfs-out" \
+  && pass "the rate table carries the recovered run's row" \
+  || fail "the rate table is missing the recovered row"
+
+# ── 5p. #1574: a PROVEN-ABSENT log is NOT retried ─────────────────────────
+# `log not found` is GitHub saying the log does not exist. Waiting cannot create
+# it, so the retry must be skipped and the #7131 job-level degradation must happen
+# on the FIRST read. Without this, every pruned run in every baseline pass pays
+# the full retry cost for a certainty — and on main that is not rare: the measured
+# window held 2 pruned runs out of 15.
+echo "== 5p. a PROVEN-ABSENT log is degraded on the FIRST read, never retried =="
+new_scen prunednoretry
+{ main_red_n main7796 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7796 7796
+} > "$SCEN/runs-main"
+: > "$SCEN/pruned-log-7796"            # the fake emits `log not found` and exits 1
+printf '3\n' > "$SCEN/jobs-count-7796"
+printf 'test (d)\n' > "$SCEN/jobs-failed-7796"   # the job-level fallback surface
+cfs_run --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -eq 0 ] && pass "a pruned log is attributed at job level, not refused (#7131)" \
+  || fail "expected exit 0 for the pruned-log degradation, got $rc"
+n=$(grep -c '^run view 7796 ' "$SCEN/calls")
+[ "$n" -eq 1 ] && pass "a PROVEN-ABSENT log is attempted ONCE (a retry cannot create it)" \
+  || fail "expected exactly 1 attempt for a pruned log, got $n — the retry is spending time on the permanent branch"
+grep -q 'has NO LOG (GitHub pruned it)' "$TMP/cfs-err" \
+  && pass "the pruned cause is still named" \
+  || fail "expected the pruned-log note on stderr"
+
+# ── 5q. #1574: the refusal's REMEDY must be true when the retry is off ──────
+# With CI_FAILURE_SET_LOG_ATTEMPTS=1 nothing is retried, so a message promising
+# "a TRANSIENT error is retried" sends the operator after a remedy that does not
+# exist. A misleading remediation is the specific class the #1482/#7131 wording
+# work exists to remove, so it is pinned rather than left to prose.
+echo "== 5q. with the retry DISABLED the refusal says so (no phantom remedy) =="
+new_scen norety
+{ main_red_n main7797 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7797 7797
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-7797"          # a persistent transport error
+printf '3\n' > "$SCEN/jobs-count-7797"
+cfs_run_no_retry --main-union-rates 10 --repo test-org/test-repo --exclude deadbeef
+rc=$?
+[ "$rc" -ne 0 ] && pass "with the retry disabled a transport error still refuses (exit $rc)" \
+  || fail "expected a non-zero exit with attempts=1, got 0"
+n=$(grep -c '^run view 7797 ' "$SCEN/calls")
+[ "$n" -eq 1 ] && pass "the attempts knob is honoured: exactly 1 attempt" \
+  || fail "expected 1 attempt with CI_FAILURE_SET_LOG_ATTEMPTS=1, got $n"
+grep -q 'the retry is DISABLED' "$TMP/cfs-err" \
+  && pass "the refusal STATES the retry is disabled" \
+  || fail "the refusal does not say the retry was disabled"
+grep -q 'a TRANSIENT error is retried' "$TMP/cfs-err" \
+  && fail "the refusal claims a retry that is DISABLED — a phantom remedy" \
+  || pass "it does not claim a retry that is off"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
@@ -5005,10 +5150,17 @@ green_shard 9663 "test (b)" 2796        # 46.6m — the recorded MEDIAN
 : > "$SCEN/status-9661"
 _i=0; while [ "$_i" -lt 605 ]; do printf 'in_progress\n' >> "$SCEN/status-9661"; _i=$((_i + 1)); done
 printf 'completed\n' >> "$SCEN/status-9661"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+# SUITE_NOSLEEP=1: the 605 polls must still HAPPEN — that is the whole scenario — but they no
+# longer each sleep a real second for a clock the rail accumulates arithmetically (agent-infra#2483).
+# The assertion below pins that the clock really did cross 600 s, so the stub cannot silently
+# shrink the window under test.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "(a2) a 46.6m shard healthy past 600s is NOT stalled (exit 0)" \
   || { fail "(a2) the healthy long shard was blocked (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -qE ', 60[0-9]s of the ' "$TMP/out" \
+  && pass "(a2) the ACCUMULATED clock passed 600s (the window under test was not shortened)" \
+  || fail "(a2) the wait never passed 600s — the stub shrank the window instead of the pacing"
 grep -q 'STALLED' "$TMP/err" && fail "(a2) the healthy long run was called STALLED" \
   || pass "(a2) …and it is NOT called STALLED"
 grep -q 'pr merge 42 --admin' "$SCEN/calls" && pass "(a2) the merge proceeded for the healthy long run" \
@@ -5029,7 +5181,9 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9612"
 target_shard 9611 "test (b)"
 green_shard 9613 "test (b)" 30
 printf 'in_progress\n' > "$SCEN/status-9611"
+# PATH: the bound is arithmetic (waited += step) — a real second per poll adds nothing (agent-infra#2483).
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" \
   ADMIN_MERGE_RERUN_FLOOR=1 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(b) a STALLED re-run blocks (exit $rc)" || fail "(b) a stalled run did not block"
@@ -5386,7 +5540,9 @@ cat > "$SCEN/jobs-9733.json" <<'JOBS'
 ]}
 JOBS
 printf 'in_progress\n' > "$SCEN/status-9731"
+# PATH: the derived bound is arithmetic too — no real second per poll (agent-infra#2483).
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" \
   ADMIN_MERGE_RERUN_FLOOR=1 \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
@@ -12785,6 +12941,683 @@ grep -q "$NEW_RB" "$TMP/err" && pass "(d) …and the residual failure is printed
 grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" \
   || pass "(d) no merge attempted on a red"
 [ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
+
+# ── 77. #9689: THE BASELINE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ───
+# A push burst to main spends the requested `--main-runs` window on runs that
+# MEASURED NOTHING. GitHub keeps ONE pending run per concurrency group, so on a
+# repo whose main lane must not cancel-in-progress each new push cancels the
+# PENDING one, and a cancelled-before-expansion run has ZERO jobs. Measured on
+# daniel-ospina/tortoise main (2026-10-23, default lane, default N=10): the 10
+# newest `python-ci.yml` runs were 1 queued + 9 `completed/cancelled`, so
+# `tested=0` — and admin-merge.sh refused EVERY merge with "the lane never
+# TESTED main, so there is no baseline". That is a statement about the WINDOW,
+# not about the lane: the same query read 20 wide found a measured run at
+# position 14. The listing now WIDENS (doubling, bounded by the 200-run policy
+# ceiling) until it holds the REQUESTED number of measured runs.
+#
+# Every assertion about the MEASURED WINDOW below is RED on the pre-#9689 parser:
+# a fixed 2-wide window over a diluted history yields tested=0, an EMPTY rate
+# table, and the block. (c) is the one deliberate exception — it is GREEN on both
+# revisions BY DESIGN, because it pins the false-PASS guard on the change rather
+# than the regression: a history with no measured run must still block.
+echo "== 77. #9689: the baseline window is a count of MEASUREMENTS =="
+new_scen dilutedbaseline
+HEAD_DW="dddd000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DW" > "$SCEN/head"
+lane_pass "$HEAD_DW" 8801 > "$SCEN/runs-$HEAD_DW"
+OLD_ID='tests/test_old.py::test_red_on_main'
+# main, NEWEST FIRST: three runs cancelled before they expanded a job (the
+# dilution), then two runs that MEASURED and failed a PRE-EXISTING id. A
+# `--main-runs 2` window therefore sees only cancelled runs — the #9689 window
+# — and the measured runs sit one widening deeper.
+{
+  lane_line completed cancelled dwc1 8811
+  lane_line completed cancelled dwc2 8812
+  lane_line completed cancelled dwc3 8813
+  lane_fail dww1 8814
+  lane_fail dww2 8815
+} > "$SCEN/runs-main"
+lane_jobs 8811   # zero jobs: cancelled before expansion, not "readable and green"
+lane_jobs 8812
+lane_jobs 8813
+lane_jobset 8814 failure 'test (a)'
+lane_jobset 8815 failure 'test (a)'
+log_failed "$OLD_ID" > "$SCEN/log-8814"
+log_failed "$OLD_ID" > "$SCEN/log-8815"
+
+# (a) THE PARSER measures a baseline it would have called "absent".
+cfs_run --main-union-rates 2 --runs-report "$TMP/dw-report.txt"
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "the rate pass succeeds over a diluted window (exit 0)" \
+  || fail "expected exit 0, got $rc: $(head -2 "$TMP/cfs-err")"
+WANT_RATE_ROW="$(printf '%s\t2\t2' "$OLD_ID")"
+grep -qxF "$WANT_RATE_ROW" "$TMP/cfs-out" \
+  && pass "and main's rate table MEASURES the pre-existing id (2 failures of 2 measured runs) instead of emitting nothing" \
+  || fail "the widened window did not measure the baseline: $(tr '\n' ' ' < "$TMP/cfs-out")"
+grep -qx 'tested=2' "$TMP/dw-report.txt" \
+  && pass "and the report says tested=2, so admin-merge's no-baseline block cannot fire" \
+  || fail "expected tested=2 in the report, got: $(tr '\n' ' ' < "$TMP/dw-report.txt")"
+grep -qF '#9689' "$TMP/cfs-err" && grep -qF 'widening to 4' "$TMP/cfs-err" \
+  && pass "and the WIDENING is announced, so a reader can tell the width was not the requested one" \
+  || fail "the widening was not announced: $(head -2 "$TMP/cfs-err")"
+
+# (a2) THE SAME HELPER SERVES THE UNION MODE. `--any-workflow` is this listing
+# with no workflow filter, so the widening is reached identically. READ THIS
+# ASSERTION FOR WHAT IT IS: the fake serves `runs-main` for BOTH modes, so this
+# pins the SHARED CODE PATH, not union lane composition (a chatty non-test lane
+# filling the width is the stated residual in the script's #9689 block).
+cfs_run --main-union-rates 2 --any-workflow --runs-report "$TMP/dw-any.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'tested=2' "$TMP/dw-any.txt"; then
+  pass "the union lane reads the same measured window (tested=2 with --any-workflow)"
+else
+  fail "the union lane still measured nothing (exit $rc): $(tr '\n' ' ' < "$TMP/dw-any.txt")"
+fi
+
+# (b) …and its SIGNATURE twin reads the SAME window: an empty `main_signatures`
+# makes the decision's subset rule fail CLOSED, so a rate table with no signature
+# half exempts nothing and the merge stays blocked for a second reason.
+cfs_run --main-union-signatures 2
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^$OLD_ID" "$TMP/cfs-out"; then
+  pass "the signature pass reads the same widened window (exit 0, the id is present)"
+else
+  fail "the signature pass did not reach the widened window (exit $rc): $(tr '\n' ' ' < "$TMP/cfs-out")"
+fi
+
+# (e) END TO END: the rail MERGES a green PR against that diluted window. This is
+# the defect as it was measured — a fully reviewed, green PR refused with "the
+# lane 'python-ci.yml' never TESTED main" for a reason that has nothing to do
+# with the PR. It runs BEFORE the new_scen calls below, so it keeps THIS
+# scenario's fixtures.
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "admin-merge.sh MERGES (exit 0) over a diluted main window — the #9689 false block is gone"
+else
+  fail "expected exit 0 for a green PR over a diluted window, got $rc"
+  sed 's/^/      /' "$SCEN/err" | head -8
+fi
+grep -q 'never TESTED main' "$SCEN/err" \
+  && fail "the rail STILL reports no baseline over a window that measured runs exist beneath" \
+  || pass "and the no-baseline block does not fire"
+[ -f "$SCEN/comment" ] && pass "and the head-bound evidence is posted" \
+                     || fail "no evidence comment posted for the merged PR"
+
+# (c) THE WIDENING CANNOT MANUFACTURE A BASELINE. A history that holds NO
+# measured run is still no baseline, however wide it is read — this is the
+# false-PASS guard on the whole change.
+new_scen dilutednever
+{
+  lane_line completed cancelled dwn1 8821
+  lane_line completed cancelled dwn2 8822
+  lane_line completed cancelled dwn3 8823
+} > "$SCEN/runs-main"
+lane_jobs 8821
+lane_jobs 8822
+lane_jobs 8823
+cfs_run --main-union-rates 2 --runs-report "$TMP/dn-report.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -s "$TMP/cfs-out" ]; then
+  pass "an all-unmeasured history yields an EMPTY rate table (exit 0): widening a window never invents a measurement"
+else
+  fail "a never-measured history emitted a baseline (exit $rc): $(tr '\n' ' ' < "$TMP/cfs-out")"
+fi
+grep -qx 'tested=0' "$TMP/dn-report.txt" \
+  && pass "and the report still says tested=0, so the rail still BLOCKS" \
+  || fail "expected tested=0, got: $(tr '\n' ' ' < "$TMP/dn-report.txt")"
+
+# (d) THE HISTORY IS THE CEILING, NOT THE POLICY BOUND. With one measured run in
+# existence the widening STOPS at the end of the history and reports what it
+# measured — it does not read to 200, and it does not call the shortfall a
+# baseline of the requested width. The STOP is pinned below by the widths actually
+# asked for (which the fake records), not only by `tested=1`: the two stop rules
+# this loop owns — an empty/exhausted history and the policy bound — are otherwise
+# unobservable, and deleting the exhaustion break would leave every assertion here
+# green.
+new_scen dilutedoneshort
+{
+  lane_line completed cancelled dwo1 8831
+  lane_line completed cancelled dwo2 8832
+  lane_fail dwo3 8833
+} > "$SCEN/runs-main"
+lane_jobs 8831
+lane_jobs 8832
+lane_jobset 8833 failure 'test (a)'
+log_failed "$OLD_ID" > "$SCEN/log-8833"
+cfs_run --main-union-rates 2 --runs-report "$TMP/do-report.txt"
+rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'tested=1' "$TMP/do-report.txt"; then
+  pass "a history holding ONE measured run reports tested=1, not a fabricated 2"
+else
+  fail "expected tested=1 from the exhausted history, got: $(tr '\n' ' ' < "$TMP/do-report.txt")"
+fi
+# …and the STOP itself: 2 → 4 → 8 is this history read to exhaustion. At 8 the
+# listing returns the same three runs as at 4, so a wider window cannot add a
+# measurement and the EXHAUSTION rule stops the loop (the 200-run bound is not
+# reached). Widening forever would satisfy `tested=1` just as well, which is why
+# the widths are asserted and not inferred.
+LIMITS="$(grep -o -- '--limit [0-9]*' "$SCEN/calls" | tr '\n' ' ')"
+if [ "$LIMITS" = "--limit 2 --limit 4 --limit 8 " ]; then
+  pass "and the widening STOPS once the history is exhausted: run-list widths 2 → 4 → 8, never further"
+else
+  fail "expected run-list widths '--limit 2 --limit 4 --limit 8 ', got: '$LIMITS'"
+fi
+
+# (f) A LISTING READ THAT FAILS MID-WIDENING IS A LISTING FAILURE, not a thinner
+# baseline: fail-closed, non-zero, and NO report file. `list_main_baseline` reads
+# the widened listing INSIDE the loop, so a read that dies on the second (wider)
+# pass must be refused exactly like a failing first read — an unreadable run list
+# can never be read as "nothing ran".
+new_scen dilutedlistfail
+{
+  lane_line completed cancelled dwf1 8841
+  lane_line completed cancelled dwf2 8842
+  lane_fail dwf3 8843
+} > "$SCEN/runs-main"
+printf '2' > "$SCEN/fail-run-list-nth"   # the SECOND `run list` — the widened one
+cfs_run --main-union-rates 2 --runs-report "$TMP/df-report.txt"
+rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'could not list main runs' "$TMP/cfs-err"; then
+  pass "a main listing that fails on the SECOND (widened) read exits non-zero and names the failure"
+else
+  fail "expected a listing-failure exit, got $rc: $(head -2 "$TMP/cfs-err")"
+fi
+[ -s "$TMP/df-report.txt" ] && fail "a failed widened listing still wrote a runs-report — a partial window could be read as a baseline" \
+                             || pass "and it wrote no runs-report, so nothing downstream can read a baseline from it"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 78. #2569: an EMPTY baseline and an UNREADABLE one are OPPOSITE claims
+# ═══════════════════════════════════════════════════════════════════════════════
+# The fleet refused EVERY landing (measured 2026-10-23, two cell merge roles) with:
+#
+#   admin-merge: ✗ BLOCK — could not extract main's rate table (parser exit 1).
+#
+# That one line is emitted for two opposite states, and the fix has to SEPARATE
+# them without relaxing either direction:
+#
+#   READ-OK + ZERO FAILING IDS  main is GREEN. The empty table is a MEASUREMENT and
+#                               a candidate must reach its merge decision.
+#   READ-FAILED                 a `gh` log fetch (or the listing itself) died. Still
+#                               BLOCK, and now SAYS which read failed and what the
+#                               window measured.
+#
+# A one-line "accept empty" would pass the first case and certify the second, so the
+# assertions below are written in BOTH directions on purpose. They fail on the
+# pre-fix tree: the green side had no line naming its measured count, and the
+# refused side had no counters at all (the parser wrote `--runs-report` ONLY after a
+# capture completed, so a fail-closed exit published nothing to say how far it got).
+echo "== 78. #2569: a GREEN main reaches its decision; an UNREADABLE one still refuses, and says which =="
+
+# (a) THE GREEN DIRECTION. main measured 10 runs and NOTHING failed: the rate table
+# is legitimately empty. The rail must proceed — and the evidence must name the
+# measurement, because "empty" alone is the same word an unreadable baseline gets.
+new_scen greenbaseline
+HEAD_GB="9a9a000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_GB" > "$SCEN/head"
+lane_pass "$HEAD_GB" 9101 > "$SCEN/runs-$HEAD_GB"
+lane_jobset 9101 success 'test (a)' 'test (b)'
+# TEN measured-and-green main runs: the window is full, nothing is diluted, and the
+# rate table has no rows to carry.
+{
+  lane_pass maingb01 9111
+  lane_pass maingb02 9112
+  lane_pass maingb03 9113
+  lane_pass maingb04 9114
+  lane_pass maingb05 9115
+  lane_pass maingb06 9116
+  lane_pass maingb07 9117
+  lane_pass maingb08 9118
+  lane_pass maingb09 9119
+  lane_pass maingb10 9120
+} > "$SCEN/runs-main"
+for i in 9111 9112 9113 9114 9115 9116 9117 9118 9119 9120; do
+  lane_jobset "$i" success 'test (a)' 'test (b)'
+done
+run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(a) a GREEN main with ZERO failing ids reaches its merge decision (exit 0)" \
+  || fail "(a) expected exit 0 for a green main, got $rc: $(head -3 "$SCEN/err")"
+grep -q "could not extract main's rate table" "$SCEN/err" \
+  && fail "(a) a GREEN main was refused as an unreadable baseline — the exact inversion #2569 names" \
+  || pass "(a) …and it is NOT refused as an unreadable baseline"
+grep -q "never TESTED main" "$SCEN/err" \
+  && fail "(a) a fully measured window was reported as untested" \
+  || pass "(a) …nor as an untested one (10 runs measured)"
+grep -q "EMPTY BY MEASUREMENT" "$SCEN/out" \
+  && pass "(a) the evidence says the table is empty BY MEASUREMENT, not by a failed read" \
+  || fail "(a) the empty table is not distinguished from an unreadable one: $(grep -c . "$SCEN/out") line(s) on stdout"
+grep -q "0 failing id(s) over 10 tested run(s) of 10 completed" "$SCEN/out" \
+  && pass "(a) …and NAMES the measured-run count (10 tested of 10 completed), not just 'empty'" \
+  || fail "(a) the measured-run count is not named: $(grep 'EMPTY BY' "$SCEN/out" | head -1)"
+grep -q "unreadable" "$SCEN/err" \
+  && fail "(a) the green path reported an unreadable read" \
+  || pass "(a) nothing on the green path reads as an unreadable read"
+grep -q "main is GREEN here" "$SCEN/out" \
+  && pass "(a) …and the GREEN claim is made where it is earned (examined=0)" \
+  || fail "(a) a measured-green window does not state its green claim: $(grep 'EMPTY BY' -A2 "$SCEN/out" | head -4)"
+# ⛔ AND THE SAME SENTENCE IN THE ARTIFACT (#2569 review, cycle 5). The green reason is
+# one variable feeding stdout AND the evidence body; the CLIPPED arm is pinned by (f)/(f2)
+# but the GREEN arm was pinned by nothing, so emptying it left stdout saying GREEN while
+# the evidence declared the table's completeness UNKNOWN — the stdout-vs-artifact
+# disagreement `main_side_reason` exists to close. `--dry-run` prints the body it would
+# post, so it is assertable here without a second run.
+grep -q "main side: 0 failing run(s).*EMPTY because the lane is GREEN" "$SCEN/out" \
+  && pass "(a) …and the EVIDENCE body carries the same green reason (not the UNKNOWN default)" \
+  || fail "(a) the evidence body disagrees with stdout about the green window: $(grep 'main side:' "$SCEN/out" | head -1)"
+
+# (b) THE REFUSING DIRECTION — NON-VACUITY. The SAME fixture with ONE failing main
+# run whose failed-step log cannot be fetched (a `gh` error with jobs present, the
+# measured fleet shape). This must still BLOCK, with the SAME message shape, and the
+# refusal must now say it is a FAILED READ over a measured window — the opposite of
+# (a), and the reason a reader could not previously tell the two apart.
+new_scen unreadablebaseline
+HEAD_UB="9b9b000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UB" > "$SCEN/head"
+lane_pass "$HEAD_UB" 9201 > "$SCEN/runs-$HEAD_UB"
+lane_jobset 9201 success 'test (a)'
+{
+  main_red_n mainub01 9211 3 'tests/test_other.py::test_red_on_main'
+  lane_fail mainub01 9215
+} > "$SCEN/runs-main"
+for i in 9211 9212 9213; do lane_jobset "$i" failure 'test (a)'; done
+lane_jobset 9215 failure 'test (a)'
+: > "$SCEN/fail-log-9215"          # the log CANNOT be fetched…
+printf '3\n' > "$SCEN/jobs-count-9215"  # …and the run DID have jobs, so it may hide a failure
+run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(b) an unreadable failing run still REFUSES (exit $rc) — the refusal is not relaxed" \
+  || fail "(b) expected a non-zero exit, got 0 — an unreadable baseline certified something"
+grep -q "could not extract main's rate table" "$SCEN/err" \
+  && pass "(b) …with the SAME message shape the fleet's logs carry" \
+  || fail "(b) the established message shape was not kept: $(head -2 "$SCEN/err")"
+grep -q "Refusing to certify a comparison computed over an unreadable baseline" "$SCEN/err" \
+  && pass "(b) …and the refusal's own justification is intact" \
+  || fail "(b) the refusal's justification line is missing"
+grep -q "FAILED READ, not an empty baseline" "$SCEN/err" \
+  && pass "(b) …and it now SAYS it is a failed read rather than an empty baseline" \
+  || fail "(b) the refusal does not distinguish itself from a green main: $(grep 'BLOCK' -A5 "$SCEN/err" | head -8)"
+# The rate path extracts through the COMPOSITE extractor, so the label is `parse:` and
+# the wording must NOT claim a failed FETCH (whose remedy — re-run — cannot clear a
+# parser failure). Both halves asserted: the parse wording is present, the fetch
+# wording is not.
+grep -q "was read but" "$SCEN/err" \
+  && pass "(b) …naming the COMPOSITE reason (read, but no identity) rather than a bare fetch" \
+  || fail "(b) the parse arm's wording is missing: $(grep 'FAILED READ' -A4 "$SCEN/err" | head -6)"
+# ⛔ THE NEGATIVE MUST TARGET THE CLAIM SHAPE, NOT THE WORD "fetched" (#2569 review,
+# cycle 5). The parse wording deliberately mentions a fetch as one POSSIBLE cause ("its
+# log could not be fetched, or the id parser could not read it"), so a grep for that
+# word can never discriminate — and an earlier version of this assertion grepped for a
+# phrase that exists nowhere in the producer, i.e. it could not fire at all. The CLAIM
+# is "the failed-step log of run <id> could not be fetched", which is the removed
+# rate-path arm's shape (and still the signature block's). That is what must not appear
+# here: re-running cannot clear a parser fault, so naming only a fetch sends the
+# operator at the wrong system.
+grep -q "failed-step log of run" "$SCEN/err" \
+  && fail "(b) the rate path CLAIMED a failed-step log fetch — its remedy cannot clear a parse failure" \
+  || pass "(b) …and does not claim a failed-step log fetch on the rate path"
+grep -q "run 9215" "$SCEN/err" \
+  && pass "(b) …NAMING the run whose log could not be read" \
+  || fail "(b) the unreadable run is not named: $(grep 'FAILED READ' -A3 "$SCEN/err" | head -5)"
+grep -q "tested=4" "$SCEN/err" \
+  && pass "(b) …and NAMES what the window DID measure (tested=4), so 'unreadable' is not read as 'unmeasured'" \
+  || fail "(b) the measured-run count is missing from the refusal: $(grep 'partially measured' -A2 "$SCEN/err" | head -4)"
+grep -q "EMPTY BY MEASUREMENT" "$SCEN/out" \
+  && fail "(b) an UNREADABLE baseline was reported as an empty-by-measurement (green) one" \
+  || pass "(b) the unreadable path never claims the measurement the green path claims"
+grep -q "pr merge" "$SCEN/calls" \
+  && fail "(b) a merge was attempted over an unreadable baseline" \
+  || pass "(b) no merge attempted"
+
+# (c) THE PARSER'S HALF. `--runs-report` is what carries the counters and the reason,
+# so the separation above rests on two properties of that file: it EXISTS with real
+# counters when the window was read, and it does NOT exist when the listing itself
+# failed (a window nobody listed has no counters, and a consumer must not be able to
+# read a report as a baseline).
+new_scen unreadreport
+{
+  main_red_n mainur01 9931 3 'tests/test_other.py::test_red_on_main'
+  lane_fail mainur01 9935
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-9935"
+printf '3\n' > "$SCEN/jobs-count-9935"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --runs-report "$TMP/ur-rep.txt" --provenance "$TMP/ur-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(c) the parser fails closed on an unreadable failing-run log (exit $rc)" \
+  || fail "(c) expected a non-zero exit, got 0"
+grep -qx 'unreadable=parse:9935' "$TMP/ur-rep.txt" 2>/dev/null \
+  && pass "(c) …and the runs report NAMES the unreadable run (unreadable=parse:9935)" \
+  || fail "(c) the report does not name the failed read: $(tr '\n' ' ' < "$TMP/ur-rep.txt" 2>/dev/null)"
+grep -qx 'tested=4' "$TMP/ur-rep.txt" 2>/dev/null \
+  && pass "(c) …with the counters it actually reached (tested=4), so a refusal can name the window" \
+  || fail "(c) the partial counters were not published"
+[ -s "$TMP/cfs-out" ] \
+  && fail "(c) a rate table was emitted alongside the refusal — a partial read must never be a baseline" \
+  || pass "(c) no rate table is emitted on the refusal path"
+
+new_scen listnoreport
+{ main_red_n mainlr01 9941 3 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+: > "$SCEN/fail-run-list"        # the LISTING itself cannot be read
+cfs_run --main-union-rates 10 --repo test-org/test-repo --runs-report "$TMP/lr-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(c) a failed LISTING still fails closed (exit $rc)" \
+  || fail "(c) expected a non-zero exit, got 0"
+grep -qF 'could not list main runs' "$TMP/cfs-err" \
+  && pass "(c) …naming the listing read as the failure" \
+  || fail "(c) the listing failure is not named: $(head -2 "$TMP/cfs-err")"
+[ -s "$TMP/lr-rep.txt" ] \
+  && fail "(c) a failed listing wrote a runs-report — a window nobody listed must not be readable as a baseline" \
+  || pass "(c) …and publishes NO report, so no consumer can read a baseline from it"
+# The label is NOT `log:` here: `--main-union-rates` extracts through the COMPOSITE
+# `extract_failed_tests` (fetch, then ids, then a job-level fallback), so its rc=1
+# does not say a FETCH failed. Reporting `log:` would name a remedy (re-fetch) that
+# cannot clear a parser failure — the opposite of what this issue exists to fix.
+if grep -q 'unreadable=log:9935' "$TMP/ur-rep.txt" 2>/dev/null; then
+  fail "(c) a composite extractor failure was labelled a LOG fetch — the remedy it names cannot work"
+else
+  pass "(c) a composite extractor failure is not mislabelled as a fetch failure"
+fi
+
+# (e) THE RAIL'S OTHER ARM. (b) pins the `log:` case; nothing above reaches the
+# "no read window at all" case, so flipping `log:*)` to `*)` would leave the whole
+# suite green while the rail claimed a measured window for a listing nobody could
+# read — the inversion #2569 names, one branch over. A parser that fails ONLY the
+# rate capture models it exactly: no report is written, so the rail must say the
+# window was unreadable and must NOT claim a partial measurement.
+new_scen unreadablewindow
+HEAD_UW="9d9d000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UW" > "$SCEN/head"
+lane_pass "$HEAD_UW" 9501 > "$SCEN/runs-$HEAD_UW"
+lane_jobset 9501 success 'test (a)'
+{ main_red_n mainuw01 9511 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9511 failure 'test (a)'
+lane_jobset 9512 failure 'test (a)'
+RATE_FAILING="$TMP/cfs-rate-unread.sh"
+cat > "$RATE_FAILING" <<'DIFFEOF4'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "--main-union-rates" ] && { echo "simulated main listing failure" >&2; exit 1; }
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF4
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$RATE_FAILING" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(e) an unreadable main LISTING still BLOCKS (exit $rc)" \
+  || fail "(e) expected a non-zero exit, got 0"
+grep -q "could not extract main's rate table" "$SCEN/err" \
+  && pass "(e) …with the established message shape" \
+  || fail "(e) the message shape changed: $(head -2 "$SCEN/err")"
+grep -q "UNREADABLE window, not an empty baseline" "$SCEN/err" \
+  && pass "(e) …and says the WINDOW was unreadable, not that a window was measured" \
+  || fail "(e) the unlisted-window case is not distinguished: $(grep 'BLOCK' -A6 "$SCEN/err" | head -8)"
+grep -q "FAILED READ, not an empty baseline" "$SCEN/err" \
+  && fail "(e) an unlisted window was reported as a FAILED READ over a measured one" \
+  || pass "(e) …and does NOT claim the partial measurement that the log arm claims"
+grep -q "pr merge" "$SCEN/calls" \
+  && fail "(e) a merge was attempted over an unreadable listing" \
+  || pass "(e) no merge attempted"
+
+# (f) AN EMPTY TABLE IS NOT ALWAYS GREEN. main's failure-only projection shows nothing
+# for a run that failed WITHOUT a parseable identity (a collection error, a job that
+# died before pytest), so `examined>0, extracted=0` with zero rows is main RED and
+# unmeasured. The evidence must say CLIPPED, not green (#2569 review): the two are
+# different claims about the same empty table, and only one of them is a certificate.
+new_scen clippedbaseline
+HEAD_CB="9e9e000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_CB" > "$SCEN/head"
+lane_pass "$HEAD_CB" 9601 > "$SCEN/runs-$HEAD_CB"
+lane_jobset 9601 success 'test (a)'
+{ lane_fail maincb01 9611; } > "$SCEN/runs-main"
+lane_jobset 9611 failure 'test (a)'
+# A failing run whose log carries NO `FAILED <nodeid>` line at all.
+printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z boom (runner died before pytest)\n' > "$SCEN/log-9611"
+run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(f) a clipped (not green) baseline does not BLOCK on the main side (the stated over-block trade)" \
+  || fail "(f) expected exit 0, got $rc"
+grep -q "EMPTY BY MEASUREMENT" "$SCEN/out" \
+  && pass "(f) the empty table is still named as a measurement" \
+  || fail "(f) the empty table is not named"
+grep -q "CLIPPED, not green" "$SCEN/out" \
+  && pass "(f) …and a run that failed with NO identity makes it CLIPPED, not green" \
+  || fail "(f) a clipped baseline is reported as a green one: $(grep 'EMPTY BY' -A2 "$SCEN/out" | head -4)"
+grep -q "main is GREEN here" "$SCEN/out" \
+  && fail "(f) main was certified GREEN over a window that held an unmeasured FAILING run" \
+  || pass "(f) no green claim is made over an unmeasured failing run"
+
+# (f2) …AND THE POSTED EVIDENCE MUST AGREE WITH STDOUT. `main side:` in the evidence
+# comment is the DURABLE artifact — a human and `verify-admin-merge-evidence.sh` read
+# it, and the verifier's own comment names that line as reading the zero as "EMPTY
+# because the lane is GREEN". Leaving it unconditional ships a certificate asserting
+# the opposite of the same run's stdout, which is the false-certificate direction this
+# rail exists to prevent (#2569 review, cycle 3).
+run_admin_here 42 --main-runs 10 >/dev/null 2>&1
+if [ -f "$SCEN/comment" ]; then
+  pass "(f2) the clipped run posts evidence (the artifact exists to assert on)"
+  grep -q "main side: 1 failing run(s)" "$SCEN/comment" \
+    && pass "(f2) …whose main-side line carries the real counts (1 failing run)" \
+    || fail "(f2) the main-side counts are missing: $(grep 'main side:' "$SCEN/comment" | head -1)"
+  grep -q "EMPTY because the lane is GREEN" "$SCEN/comment" \
+    && fail "(f2) the posted EVIDENCE certifies main GREEN over a window with an unmeasured failing run" \
+    || pass "(f2) …and it does NOT claim the lane was green"
+  grep -q "CLIPPED, not green" "$SCEN/comment" \
+    && pass "(f2) …instead saying CLIPPED, matching what stdout printed" \
+    || fail "(f2) the evidence does not say CLIPPED: $(grep 'main side:' "$SCEN/comment" | head -1)"
+else
+  fail "(f2) no evidence comment was posted for the clipped baseline run"
+fi
+
+# (d) THE SIGNATURE PASS GETS THE SAME DISCLOSURE, from its OWN report. It used to
+# be invoked with no `--runs-report` at all, so its counters and its reason were
+# discarded on every run — a second capture whose failure could only be described
+# by the rate pass's evidence. The wrapper below models a signature capture that
+# read its window and died on ONE failing run's log. NOTE the rate arm (b) labels
+# `parse:` — its extractor is composite — so the `log:` label is driven HERE, by the
+# one capture that calls `fetch_failed_log` directly.
+new_scen sigunreadable
+HEAD_SU="9c9c000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SU" > "$SCEN/head"
+lane_pass "$HEAD_SU" 9301 > "$SCEN/runs-$HEAD_SU"
+lane_jobset 9301 success 'test (a)'
+{ main_red_n mainsu01 9311 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9311 failure 'test (a)'
+lane_jobset 9312 failure 'test (a)'
+SIG_FAILING="$TMP/cfs-sig-unread.sh"
+cat > "$SIG_FAILING" <<'DIFFEOF3'
+#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+  if [ "$a" = "--main-union-signatures" ]; then
+    # Publish what a real fail-closed signature capture publishes, then refuse.
+    for b in "$@"; do
+      case "$prev" in --runs-report) printf 'tested=7\nunreadable=log:7700\n' > "$b" ;; esac
+      prev="$b"
+    done
+    echo "simulated signature log read failure" >&2
+    exit 1
+  fi
+  prev="$a"
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF3
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$SIG_FAILING" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d) a failed signature read still BLOCKS (exit $rc)" \
+  || fail "(d) expected a non-zero exit, got 0"
+grep -q "could not extract main's signature table" "$SCEN/err" \
+  && pass "(d) …with the established message shape" \
+  || fail "(d) the signature message shape changed: $(head -2 "$SCEN/err")"
+grep -q "run 7700" "$SCEN/err" \
+  && pass "(d) …naming the run the SIGNATURE pass could not read" \
+  || fail "(d) the signature refusal does not name its own failed run: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
+grep -q "A FAILED READ over a window that WAS listed" "$SCEN/err" \
+  && pass "(d) …and says the window was read, not that nothing was measured" \
+  || fail "(d) the signature refusal still reads like an unlisted window"
+grep -q "pr merge" "$SCEN/calls" \
+  && fail "(d) a merge was attempted over an unreadable signature baseline" \
+  || pass "(d) no merge attempted"
+
+# (d2) THE SIGNATURE BLOCK'S OTHER TWO ARMS. (d) drives `log:` only; collapsing the
+# three-way case to a single `*)` arm then keeps the whole suite green, and the rail
+# would tell an operator that a window WAS listed — naming an empty run id — for a
+# capture that listed nothing. Both remaining arms are driven here.
+new_scen sigunreadnowindow
+HEAD_SW="9f9f000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SW" > "$SCEN/head"
+lane_pass "$HEAD_SW" 9701 > "$SCEN/runs-$HEAD_SW"
+lane_jobset 9701 success 'test (a)'
+{ main_red_n mainsw01 9711 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9711 failure 'test (a)'
+lane_jobset 9712 failure 'test (a)'
+# No report written: the capture never got a read window.
+SIG_NOWINDOW="$TMP/cfs-sig-nowindow.sh"
+cat > "$SIG_NOWINDOW" <<'DIFFEOF5'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "--main-union-signatures" ] && { echo "simulated signature listing failure" >&2; exit 1; }
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF5
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$SIG_NOWINDOW" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d2) a signature capture with NO read window still BLOCKS (exit $rc)" \
+  || fail "(d2) expected a non-zero exit, got 0"
+grep -q "No signature pass ran over a read window" "$SCEN/err" \
+  && pass "(d2) …and says no signature pass ran over a read window" \
+  || fail "(d2) the no-window arm is not distinguished: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
+grep -q "window that WAS listed" "$SCEN/err" \
+  && fail "(d2) a capture that listed NOTHING was reported as a window that WAS listed" \
+  || pass "(d2) …and does NOT claim a window that was listed"
+
+# (d3) …and the `parse:` arm names its own run id (the mutation `parse:*` → `*)`
+# otherwise stays green while dropping the identity the operator needs).
+new_scen sigparse
+HEAD_SP="a1a1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SP" > "$SCEN/head"
+lane_pass "$HEAD_SP" 9751 > "$SCEN/runs-$HEAD_SP"
+lane_jobset 9751 success 'test (a)'
+{ main_red_n mainsp01 9761 2 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+lane_jobset 9761 failure 'test (a)'
+lane_jobset 9762 failure 'test (a)'
+SIG_PARSE_FAILING="$TMP/cfs-sig-parse.sh"
+cat > "$SIG_PARSE_FAILING" <<'DIFFEOF6'
+#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+  if [ "$a" = "--main-union-signatures" ]; then
+    for b in "$@"; do
+      case "$prev" in --runs-report) printf 'tested=9\nunreadable=parse:7788\n' > "$b" ;; esac
+      prev="$b"
+    done
+    echo "simulated signature parse failure" >&2
+    exit 1
+  fi
+  prev="$a"
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF6
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$SIG_PARSE_FAILING" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 2 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d3) a signature capture with a parse failure still BLOCKS (exit $rc)" \
+  || fail "(d3) expected a non-zero exit, got 0"
+grep -q "and run 7788" "$SCEN/err" \
+  && pass "(d3) …and names the run whose identity could not be parsed" \
+  || fail "(d3) the parse arm does not name its run: $(grep 'signature table' -A4 "$SCEN/err" | head -6)"
+grep -q "A FAILED READ over a window that WAS listed" "$SCEN/err" \
+  && pass "(d3) …under the measured-window disclosure (this one is measured)" \
+  || fail "(d3) the parse arm lost the measured-window disclosure"
+
+# (g) THE PRODUCER, NOT A MOCK. (d)/(d2)/(d3) intercept `--main-union-signatures` with
+# a wrapper that writes the report ITSELF, so they prove the RAIL reads a report — not
+# that `collect_union_signatures` writes one. Deleting any of its `write_runs_report`
+# calls would leave every assertion above green while the rail falls to its `*)` arm on
+# a LISTED window: an operator told "nothing was measured" when one log fetch died —
+# the misdiagnosis #2569 exists to end. These cases drive the REAL collector.
+new_scen sigproducerlog
+{
+  main_red_n mainsgl01 9801 2 'tests/test_other.py::test_red_on_main'
+  lane_fail mainsgl01 9805
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-9805"                # the log CANNOT be fetched…
+printf '3\n' > "$SCEN/jobs-count-9805"     # …and the run HAS jobs, so it may hide a failure
+cfs_run --main-union-signatures 10 --repo test-org/test-repo --runs-report "$TMP/sg-log-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g) the REAL signature collector fails closed on an unreadable log (exit $rc)" \
+  || fail "(g) expected a non-zero exit, got 0"
+grep -qx 'unreadable=log:9805' "$TMP/sg-log-rep.txt" 2>/dev/null \
+  && pass "(g) …and IT writes unreadable=log:9805 (not the test harness)" \
+  || fail "(g) the collector did not publish the failed fetch: $(tr '\n' ' ' < "$TMP/sg-log-rep.txt" 2>/dev/null)"
+grep -qx 'tested=3' "$TMP/sg-log-rep.txt" 2>/dev/null \
+  && pass "(g) …with the counters it reached (tested=3)" \
+  || fail "(g) the collector published no counters: $(tr '\n' ' ' < "$TMP/sg-log-rep.txt" 2>/dev/null)"
+
+# (g2)/(g3) THE `parse:` ARMS. `PYTHON_BIN` is resolved from PATH at startup
+# (`ci-failure-set.sh:236`), so a stub that fails ONLY for the sub-command under test
+# drives the two extraction sites without inventing a new seam; everything else
+# `exec`s the real interpreter.
+REAL_PY="$(command -v python3)"
+make_pystub() {  # <dir-name> <sub-command-to-fail>
+  local d="$TMP/$1" sub="$2"
+  mkdir -p "$d"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'for a in "$@"; do [ "$a" = "%s" ] && { echo "simulated parser failure" >&2; exit 1; }; done\n' "$sub"
+    printf 'exec "%s" "$@"\n' "$REAL_PY"
+  } > "$d/python3"
+  chmod +x "$d/python3"
+}
+new_scen sigparseids
+# ONE failing run, whose log DOES fetch: the stub then fails at the id parser, so the
+# label names that run unambiguously.
+{ main_red_n mainspi01 9821 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+make_pystub pystub-ids ids
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" PATH="$TMP/pystub-ids:$PATH" \
+  bash "$CFS" --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/sg-pids-rep.txt" >/dev/null 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g2) a failing ID PARSER fails the signature capture closed (exit $rc)" \
+  || fail "(g2) expected a non-zero exit, got 0"
+grep -qx 'unreadable=parse:9821' "$TMP/sg-pids-rep.txt" 2>/dev/null \
+  && pass "(g2) …and the collector labels it parse:9821 (a parser fault, not a fetch)" \
+  || fail "(g2) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-pids-rep.txt" 2>/dev/null)"
+
+new_scen sigparsesigs
+# Same shape, with the SIGNATURE extractor failing instead of the id parser: the label
+# proves this arm names its run too, not just the arm above.
+{ main_red_n mainsps01 9831 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+make_pystub pystub-sigs signatures
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" PATH="$TMP/pystub-sigs:$PATH" \
+  bash "$CFS" --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/sg-psig-rep.txt" >/dev/null 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g3) a failing SIGNATURE extractor fails the capture closed (exit $rc)" \
+  || fail "(g3) expected a non-zero exit, got 0"
+grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
+  && pass "(g3) …and the collector labels it parse:9831" \
+  || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
+
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

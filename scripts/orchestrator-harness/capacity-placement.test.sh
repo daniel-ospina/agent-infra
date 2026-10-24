@@ -240,6 +240,14 @@ ck "an UNWRITABLE state dir makes the writer FAIL LOUDLY (rc 1), never silently 
 # ── §7 the verb a human/agent actually reads: bin/harness status ─────────────────────────────────
 echo
 echo "── §7 bin/harness status: the answer, with the exit code that cannot lie ──"
+# ⛔ THE LANDING READ (agent-infra#2320) IS ONE OF `status`'S DIMENSIONS, and it makes TWO external
+# calls: `gh --version` and the branch-protection read. Without a stub this section stops being
+# hermetic — it would reach GitHub from a unit suite, on whatever `OR` the host happens to export —
+# and it would grade the operator's box instead of the fixture. The stub answers both calls.
+STUBGH="$TMP/stubgh"; mkdir -p "$STUBGH"
+printf '#!/usr/bin/env bash\ncase "$*" in\n  *--version*) printf "gh version 9.9.9 (test-stub)\\n" ;;\n  *protection/required_status_checks*) printf "pipeline-compliance\\n" ;;\n  *) printf "stub: %%s\\n" "$*" >&2; exit 1 ;;\nesac\n' > "$STUBGH/gh"
+chmod +x "$STUBGH/gh"
+PATH="$STUBGH:$PATH"; export PATH
 O="$TMP/O7"; mkdir -p "$O/state"
 cycle_record_write "$O" start=$(( NOW - 240 )) end="$NOW" cycle=1 interval=240 selected="pr:#2244" \
   selected_n=3 dispatched=2 ids="#2216,#2232" nothing=none placement=place placed_on=cell-4 bound=none \

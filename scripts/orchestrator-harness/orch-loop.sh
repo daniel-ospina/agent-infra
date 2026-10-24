@@ -278,16 +278,30 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
   || { echo "orch-loop: FATAL repo-authority.sh at $O is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >&2; exit 78; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
+# ── AGENT_GH_REAL: pin the ONE real gh this box resolves (agent-infra#2320) ──────────────────────
+# MEASURED 2026-10-22: the wrapper chain `gh-limit -> gh-rest -> .pi/agent/shims/gh` resolved to
+# ITSELF on the owner's Mac, gh-limit refused at depth 2, and every gh call returned EMPTY — so the
+# merge contract read UNREADABLE and NOTHING could land for hours. The shim's own resolution is what
+# hopped; a pin exported HERE (per box, DISCOVERED from PATH, never a hardcoded home) means no layer
+# needs to guess again. Best-effort and quiet by design: a box with no real gh keeps its current
+# behaviour, and `bin/harness status` NAMES that state — a controller that refuses to start because
+# its gh could not be pinned would be a worse failure than the one this prevents.
+# ⛔ GUARDED ON THE INTERFACE, like every other module here: an `$O` predating this change defines no
+# `ensure_agent_gh_real`, and an unguarded call would print a 127 into the cycle log on every pass.
+if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real || true; fi
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
 # Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
-# through ONE module. That is not tidiness: a tmux window on a cloud cell dies at ~21 log lines
-# (measured on all three cells, 2026-10-20) while the same lane in a DURABLE TERMINAL survives, so
-# the launcher, the census the caps read, and the reaper must all move together or the caps stop
-# binding (a census that still counts `tmux ls` reports 0 workers for durable terminals and the
-# ceiling never trips). See that file's header for the measurement and for the refusal stance.
+# through ONE module. That is not tidiness: the launcher, the census the caps read, and the reaper
+# must all move together or the caps stop binding (a census that still counts `tmux ls` reports 0
+# workers for durable terminals and the ceiling never trips). ⛔ On a Linux cell the module's own
+# `wt_launcher` decides between a durable terminal (cmux answers) and tmux with an explicit
+# HOME+keys.env contract (it does not) — the `~21 log lines` death that once made a cell resolve to
+# `none` was an ENVIRONMENT failure, not a tmux one (agent-infra#2210, reopened 2026-10-22), and
+# resolving to `none` refused every spawn on every cycle. See that file's header for the measurements
+# and for the refusal stance.
 for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
   [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
 done
@@ -299,6 +313,17 @@ done
 # the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
   command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
+done
+# ⛔ DEFINING THE VERBS IS NOT HAVING INITIALISED THE MODULE (#2248). The verbs above are FUNCTIONS;
+# the two embedded Python programs are VARIABLES assigned by a command substitution at source time,
+# and a substitution can come out empty while every function still parses. That is exactly what a
+# bash 3.2 mis-parse produced on macOS: `WT_TREE_PY` never got a value, the census fed `python3 -c ''`
+# and returned nothing — which reads identically to "no workers" — so the caps silently stopped
+# binding and the box logged a `controller … alive but the heartbeat is 3652s old` for an hour while
+# `launchctl` and `harness verify` both said GREEN. Check the DATA, and NAME the variable that is
+# empty, so the next occurrence costs one log line instead of an hour of false green.
+for _wt_py in WT_TREE_PY WT_WS_PY; do
+  [ -n "${!_wt_py:-}" ] || { echo "orch-loop: FATAL worker-terminal.sh did not initialise at ${WT_MOD:-$O} — $_wt_py is EMPTY (its embedded Python program was not assigned; on bash 3.2 this is the heredoc-in-command-substitution mis-parse, see agent-infra#2248) — refusing to run a controller whose census would read 0 workers and never trip its caps; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
@@ -467,6 +492,31 @@ mem_avail_mb() { # [<meminfo-file>]
   is_num "$mb" || return 1
   printf '%s\n' "$mb"
 }
+# measure_mem — the ONE place MEMAVAIL_MB / MEM_UNKNOWN are SET (agent-infra#1732).
+#
+# ⛔ ONE SEAM, TWO DECISION POINTS, NO SECOND DERIVATION. It read this pair INLINE in the [cap] block
+# only — measured on the pre-fix tree: ~620 lines BELOW the FIRST of the six spawn sites, ~225 below
+# the last, and ~2,000 below `can_spawn()`'s own definition — so a gate that "consults" these values is
+# reading the PREVIOUS cycle's figure, or (cycle 1) nothing at all. Both are a stale record
+# presented as current, the exact class this file keeps removing. The function is called at the cycle
+# prologue (before the FIRST spawn site) and again at the [cap] block (dispatch decides on a fresh
+# reading); the coercion lives HERE so the two cannot disagree about what a failed probe means.
+# Polarity is UNCHANGED and deliberate: a probe failure is UNKNOWN, not ample — we cannot see capacity,
+# so we do not add work. `MEMAVAIL_MB=0` is set with it so any consumer that compares only the number
+# still refuses; MEM_UNKNOWN is kept for consumers that must name WHY.
+measure_mem() {
+  if MEMAVAIL_MB="$(mem_avail_mb)"; then
+    MEM_UNKNOWN=0
+  else
+    MEMAVAIL_MB=0; MEM_UNKNOWN=1
+  fi
+  # ⛔ COERCE like L / SWFREE / SWTOTAL (#1985 review, P2). Those three are is_num-guarded; MEMAVAIL_MB
+  # was not, so an empty value reached `[ "$MEMAVAIL_MB" -le … ]` as `[: : integer expression expected`
+  # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
+  # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
+  if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
+}
+
 # $O is operator config, not attacker input, but a quote or metacharacter here would break every
 # spawn (the tmux command string is executed via sh -c). Fail loudly instead of failing mysteriously.
 case "$O" in
@@ -560,6 +610,83 @@ fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
+# ── CI BACK-PRESSURE (measured 2026-10-22) ─────────────────────────────────────
+# The THIRD capacity surface, and the one every gate above is blind to: `load=`, `mem_avail=`,
+# `swap_free=` and `capacity-placement` all read THIS BOX, so a box with 20 idle lane slots in front
+# of a 92-deep CI queue reads perfectly healthy and dispatches into it. Measured 2026-10-22 13:40:
+# tortoise queued=92 running=6 on 5 runners; agent-infra queued=97 running=7 — after a batch of
+# rebases took agent-infra from 4 to 31 BLOCKED PRs at once. Nothing finished because everything
+# started, and merges/hour fell while the work rose. `ci-queue.sh` is the MEASURED read (queue
+# depth vs the runner count, ceiling derived from the measured job duration — its header carries the
+# derivation); this block is the wiring, and the wiring is what makes it a gate instead of advice.
+_ciq_mod=""
+for _dir in "$O" "$(dirname "$0")"; do
+  [ -f "$_ciq_mod" ] || [ ! -f "$_dir/ci-queue.sh" ] || _ciq_mod="$_dir/ci-queue.sh"
+done
+[ -n "$_ciq_mod" ] && . "$_ciq_mod"
+if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then CIQ=1; else
+  CIQ=0
+# ⛔ THE DISCLOSURE NAMES EVERY FUNCTION THE GUARD ABOVE REQUIRES (#2333 review cycle 12, P2).
+  # Cycle 10 widened the guard to TEN names and left these messages naming six, so a `$O` copy
+  # missing only `ciq_ceiling` — the exact stale-copy shape that guard exists for — announced
+  # "needs ciq_read/…/ciq_is_count", i.e. named six functions that were all PRESENT and none of the
+  # one that was MISSING: a false statement about the box's own state, in the one line an operator
+  # reads to decide whether to re-seed. The names are LITERAL, not rendered from a variable defined
+  # in the module — an old module would not define it, which is exactly the case being reported.
+  # Keep this list IDENTICAL — same names, same ORDER — to the `declare -f` list above. (e13) in
+  # ci-queue.test.sh now DERIVES both lists from this file and asserts equality (it used to
+  # restate the names, so a widening stayed green); (e8) is the fix-one bail marker, not this.
+  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
+fi
+# ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
+# degrade is named on the [ci-queue] line every cycle (the same stance `capacity.sh`'s absence takes).
+# The defect this replaces is the other polarity: `! ciq_ci_allowed` against an UNSOURCED function
+# is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
+# reporting a healthy controller.
+if [ "${CIQ:-0}" = "1" ]; then
+  # ⛔ THE PREDICATE CAPTURES THE VERDICT **AND** MEMOIZES IT FOR THE CYCLE.
+  #   * CAPTURES (#2296 cycle 4, P2): `ciq_ci_allowed` reads in the CALLER's shell, so after it runs
+  #     the CIQ_* record IS this decision's reading. The deferral rows below print `${CIQ_VER:-…}`,
+  #     and `CIQ_VER` is otherwise assigned only later, in the dispatch block — so they used to render
+  #     `ci-queue(unmeasured)` on a cycle where the arm had MEASURED, a row that contradicts itself in
+  #     its next clause and sends an operator to check whether the module is installed.
+  #   * MEMOIZES (#2296 cycle 5, P2): the module's cache only covers a SUCCESSFUL read — on the
+  #     failure path (the outage the gate exists for) every call re-reads live, three `gh api` calls
+  #     each. Measured: 5 arms against a failing feed issued 15 calls, versus 3 against a working one.
+  #     A sweep of 30 red PRs would then issue ~180 serialised failing calls per cycle, inflating the
+  #     very cycle time the gate is meant to protect, while `gh-limit` is already the bottleneck.
+  #     ⛔ AND IT BOUNDS A **PASS**, NOT THE CYCLE (#2333 cycle 6 review, P2). The PR sweep below is a
+  #     PIPELINE (`printf | while read`), so every arm runs in a subshell and this memo dies with it;
+  #     the dispatch block then reads once more. On the failure path a cycle therefore issues at most
+  #     TWO live reads (one per pass), never one per arm — which is the property the memo actually
+  #     buys, and the only one a reader can check. An earlier version of this comment claimed "one
+  #     read per cycle": the dispatch block's own `ciq_read` is the second, so the claim was one the
+  #     code never made true, and a cycle-time instrument calibrated on it would undercount. The
+  #     `CIQ_ARM_*` pair is reset with the rest of the per-cycle state at the top of the loop, and
+  #     the test EXTRACTS that reset (ci-queue.test.sh (h0b)/(h0c)) so a hoisted reset — a memo that
+  #     pins cycle 1's verdict for the process's life — cannot pass.
+  ciq_push_ok() {
+    if [ -n "${CIQ_ARM_RC:-}" ]; then
+      CIQ_VER="${CIQ_ARM_VER:-}"; CIQ_RC="$CIQ_ARM_RC"
+      [ "$CIQ_ARM_RC" -eq 1 ] && return 0 || return 1
+    fi
+    # ⛔ THE COLD PATH MUST READ (#2296 cycle 6, P0). `ciq_eval` only EVALUATES the record in CIQ_*;
+    # it does not read. This predicate is called from the PR SWEEP, which runs BEFORE the dispatch
+    # block's one read, and the record is wiped at the top of every cycle — so evaluating here
+    # answered `unknown` on an empty record and refused EVERY fixer and EVERY rerun on EVERY cycle,
+    # forever, on a perfectly shallow queue. That is a permanent stop of the repair path, and the
+    # memoization below cannot fix it: the memo only remembers what the first call found. The read
+    # belongs here, in the cold path, exactly where `ciq_ci_allowed` (this function's original body)
+    # did it.
+    ciq_read "${OR:-}" >/dev/null 2>&1 || true
+    CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
+    CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"
+    [ "$CIQ_RC" -eq 1 ]
+  }
+else
+  ciq_push_ok() { return 0; }
+fi
+
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
 claim_live() { # claim_live <pr> [<head-sha>] — SPAWN GUARD: a local lock OR a cross-box lease
@@ -649,7 +776,11 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
 # fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
-# already owns this head). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# already owns this head) — OR when the CI-queue gate DEFERS the push before any work (fix-one.sh's
+# `ciq_ci_allowed` arm, #2296). Both are "no agent work was done", which is the only property this
+# marker asserts; the LOG LINE below names both causes, because a deferral logged as a cross-box
+# refusal sends an operator hunting for a lease that never existed (the #1720 "the log names the
+# wrong cause" class). The controller books the attempt at SPAWN (fixcount+1) and, on the
 # reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
 # used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
 # refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
@@ -677,12 +808,12 @@ refund_bailed_fixer() {
     if [ -f "$O/state/fixspend-$pr-$head" ]; then
       rm -f "$O/state/fixspend-$pr-$head"
       touch "$O/state/needsfix-$pr-$head"
-      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, findings marker restored" >>"$LOG"
     else
-      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
     fi
   else
-    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -1514,7 +1645,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   local yld="${5:-0}" ynote=""
   case "$yld" in ''|*[!0-9]*) yld=0 ;; esac
   if [ "$yld" -gt 0 ]; then
-    ynote=" | yields=$yld (yielded to peers for capacity — this is NOT \"the fleet has nothing to do\"; they stay free for other boxes until their yield expires)"
+    # ⛔ THE WORDS MUST MATCH THE GATE (#2409). A `land` refusal is REPO-WIDE: every box measures the
+    # same open count against the same landing rate, so telling the operator (and the funnel) that this
+    # was "for capacity" and the item is "free for other boxes" is FALSE for it — the remedy is to land
+    # an open PR, on this box or any other. `capacity_yield_live` exports the gate, so the sentence can
+    # name it instead of assuming load.
+    ynote=" | yields=$yld (stood down by a GATE refusal — this is NOT \"the fleet has nothing to do\"; a load/disk stand-down leaves them free for other boxes, a land-backlog one is repo-wide and clears only by landing)"
   fi
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
@@ -1636,7 +1772,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
 # revalidated" failure, applied to the fix that reports it.
 GH_LIMIT_STALE_S=900
 gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
-  local f rec kv at="" bucket="" reset="" rec_at="" now age
+  local f rec kv at="" bucket="" reset="" until="" rec_at="" now age
   f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
   [ -f "$f" ] || return 0
   rec="$(cat "$f" 2>/dev/null)" || return 0
@@ -1647,11 +1783,13 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
       at=*)        at="${kv#at=}" ;;
       bucket=*)    bucket="${kv#bucket=}" ;;
       reset=*)     reset="${kv#reset=}" ;;
+      until=*)     until="${kv#until=}" ;;
       recovered=*) rec_at="${kv#recovered=}" ;;
     esac
   done
   is_num "${at:-}" || return 0
   is_num "${reset:-}" || reset=""
+  is_num "${until:-}" || until=""
   [ "${reset:-0}" = 0 ] && reset="?"
   now="$(date +%s)"; age=$(( now - at ))
   { [ "$age" -ge 0 ] && [ "$age" -le "$GH_LIMIT_STALE_S" ]; } || return 0
@@ -1663,7 +1801,12 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
     printf 'gh=recovered(bucket=%s %ss)' "${bucket:-?}" "$age"
     return 0
   fi
-  printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
+  # ⛔ THE WINDOW IS `until=`, NOT `reset=`. A secondary/unclassified refusal retries in ~60 s while the
+  # bucket reset is ~43 min out; printing only `reset=` made the ONE line a human reads name a
+  # 43-minute block for a limit the layer clears in a minute — the misreading #2137 removes everywhere
+  # else. `until=` is the window this box actually honours, and it is printed BESIDE the reset (never
+  # instead of it) so every existing reader of the token keeps working.
+  printf 'gh=rate_limited(bucket=%s reset=%s until=%s %ss)' "${bucket:-?}" "$reset" "${until:-$reset}" "$age"
 }
 # "Is a worker with this name live?" — delegated to the ONE launcher (worker-terminal.sh), because the
 # answer now has to cover a DURABLE TERMINAL as well as a tmux session, and two implementations of
@@ -1683,10 +1826,51 @@ sess() { wt_alive "${1:-}"; }
 # Spawning an agent during a load spike makes the spike worse. A Mac reboot lands in an indexing
 # storm (Spotlight, PerfPowerServices, duetexpertd) that the LANE dispatch gate already respects
 # while the merge sweep did not — so a fresh boot got six reviewers piled onto it. The cheap actions
-# (gh pr merge / ready / run rerun) stay ungated, so merges keep flowing while the spike passes.
+# (gh pr merge / ready) stay ungated, so merges keep flowing while the spike passes. ⛔ `run rerun` is
+# NOT among them any more: it is the one verb here that ADDS to the CI queue the back-pressure gate is
+# holding work out of, so it is gated by `ciq_push_ok` (#2296). The merge rail's own second-sample
+# re-run is a deliberate exclusion, disclosed in `ci-queue.sh`'s header — it runs inside a merge
+# decision that REMOVES queue.
 # Nothing is starved: a held-back spawn retries next cycle, because the marker that authorises it
 # (needsfix-<PR>-<head>, fixcount-<PR>) is only written on a SUCCESSFUL spawn.
-can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
+#
+# ⛔ MEMORY IS PART OF THE SPAWN GATE (agent-infra#1732), AND IT IS THE BINDING ONE WHEN IT BINDS.
+# The load gate alone covered these sites while the DISPATCH gate was bounded by load + lanes + swap +
+# available memory — two gates over two different populations, with the resource that actually kills
+# this box (measured 2026-10-22: MemAvailable 653MB with 14 lanes, and the box OOM-killed its OWN
+# runners; the pool oscillated 12→8 three times) consulted on only one of them. Raising MAX_LOAD
+# widens the band in which the spawn sites proceed while memory is already the constraint, so the
+# spawn path must read it too.
+#
+# The polarity is the DISPATCH gate's, not the disk gate's: `mem_avail <= MIN_MEM_FREE_MB` refuses
+# (the same boundary for THAT arm, so the two gates cannot disagree about the `mem_avail` reading
+# itself), and UNKNOWN is NOT ample — a
+# probe we could not take is not evidence of capacity. That is deliberately FAIL-CLOSED while the
+# load reading stays fail-open (an unreadable load file must not stop every merge on a host without
+# procfs); the two are different probes with different failure costs, and `MEMAVAIL_MB` is only ever
+# set by measure_mem(), which zeroes it on failure so this holds even if MEM_UNKNOWN is ever unset.
+#
+# It reads the CYCLE-LEVEL reading measured in the prologue — the same posture as `L`, which the
+# spawn sites have always read from the cycle's own `load1`. The [cap] gate re-measures, because it
+# decides a dispatch and must see the present.
+# ⚠️ NOT COVERED HERE, BY DESIGN: the dispatch gate's OTHER arms (`lanes=`, `swap_free=`, and the
+# swap-joint `mem_avail <= 2*MIN_MEM_FREE_MB` arm that only arms when swap is also tight). A spawn
+# refused by those is a different population's decision and is not this gate's to make — so the
+# shared boundary is the plain `<= MIN_MEM_FREE_MB` arm, and nothing more.
+mem_spawn_ok() { [ "${MEM_UNKNOWN:-0}" != "1" ] && [ "${MEMAVAIL_MB:-0}" -gt "$MIN_MEM_FREE_MB" ]; }
+can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ] && mem_spawn_ok; }
+# spawn_gate_tok — the EVIDENCE a held-back spawn records, in the ONE shape all five slot refusals
+# print (agent-infra#1732). Before the memory arm these lines printed `load-gate=<L>/<MAX_LOAD>` only,
+# and that was complete: load was the whole gate. It is not any more — a memory-only refusal would now
+# print two healthy-looking numbers and name no cause, which is the silent-refusal class this file
+# removes elsewhere (#2126 T5). The token reports the reading AND the floor for both arms, so the line
+# answers "which gate bound" without a second lookup; UNKNOWN is spelled out rather than printed as a
+# number, because `0M/512M` is a refused-probe reading that reads like a real measurement.
+spawn_gate_tok() {
+  local mem="UNKNOWN"
+  [ "${MEM_UNKNOWN:-0}" = "1" ] || mem="${MEMAVAIL_MB:-?}M"
+  printf 'load-gate=%s/%s mem-gate=%s/%s' "${L:-0}" "${MAX_LOAD:-?}" "$mem" "${MIN_MEM_FREE_MB:-?}"
+}
 # head_reds <pr> -> GREEN | RED | UNKNOWN
 #
 # ⛔ THE RAIL'S QUESTION, NOT THE REPO'S REQUIRED SET. `admin-merge.sh` refuses on a red tree measured
@@ -1864,6 +2048,7 @@ CAPACITY_YIELD_WHY=""
 capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consume), 1 = dispatch
   local n="${1:-}" f ep until gate now
   CAPACITY_YIELD_WHY=""
+  CAPACITY_YIELD_GATE=""
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   f="$O/state/capacity-refused-$n"
   [ -r "$f" ] || return 1
@@ -1878,6 +2063,9 @@ capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consu
   # yield, and `until - ep` is the window the writer used. Accept only a coherent pair.
   [ "$until" -gt "$ep" ] || return 1
   CAPACITY_YIELD_WHY="gate=${gate:-?} until=$until ($(( until - now ))s left)"
+  # The GATE, for callers whose words depend on it (#2409): a `land` refusal is repo-wide, so the
+  # dispatch line must not claim the item is a peer's to take.
+  CAPACITY_YIELD_GATE="${gate:-}"
   return 0
 }
 
@@ -2263,6 +2451,18 @@ while true; do
   # measure would otherwise be read as this cycle's decision (the exact stale-flag class this file
   # keeps removing).
   CAP_STATE=unavailable; CAP_PLACE=""; CAP_BOUND=""; CAP_WHY=""; CAP_LPC_SELF=""
+  # ⛔ THE CI-QUEUE VERDICT IS PER-CYCLE STATE TOO, and it is reset HERE rather than at its read site
+  # (#2333 review P1). The read happens in the DISPATCH block near the end of the cycle, but the PR
+  # sweep that consumes `CIQ_VER` runs EARLY in it — and the sweep is a pipeline subshell, which
+  # inherits the parent's variables. Without this reset, `ci-queue(${CIQ_VER:-…})` in the sweep's
+  # disposition rows reports the PREVIOUS cycle's verdict from cycle 2 onwards: a row reading
+  # `ci-queue(ok(...))` directly beside the `[ci-queue] DEFERRED deep(...)` line that same cycle
+  # deferred on. One reset makes "unset here" true and keeps the row honest.
+  CIQ_RC=1; CIQ_VER=""; CIQ_STATE=""; CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""
+  CIQ_BUSY=""; CIQ_CEILING=""; CIQ_AGE=""
+  # …and the per-cycle MEMO of the gate's verdict (`ciq_push_ok`), for the reason its own comment
+  # gives: on a failed read the module's cache cannot help, so without this every arm re-reads live.
+  CIQ_ARM_RC=""; CIQ_ARM_VER=""
   # `K` is the count of issues queued into `.batch` THIS cycle (the dispatch block below increments
   # it). Reset with the rest of the per-cycle state so the cycle record can never report a previous
   # cycle's count as this one's, and `Y` likewise (yields/placements are per-cycle evidence).
@@ -2284,6 +2484,12 @@ while true; do
   REFRESH_RESOLVED=0; REFRESH_RC=0; REFRESH_SH=""; REFRESH_SH_SKEW=""; REFRESH_TRIED=""
   harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
+  # ⛔ MEASURE MEMORY HERE, ONCE, BEFORE THE FIRST SPAWN SITE — not only at the [cap] block below
+  # (agent-infra#1732). The six `can_spawn` sites run in section 1-3 of the cycle and the [cap] block
+  # runs in section 4, so a gate that read MEMAVAIL_MB there would decide on the PREVIOUS cycle's
+  # reading (and on cycle 1, on nothing). Same rule LAND_EPOCH/UPN follow above: a value must be read
+  # BEFORE the line that prints it, and before every gate that acts on it.
+  measure_mem
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
   echo "=== $(date) load=$L lanes=$(wt_count lane-) backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL}${HARNESS_TOKEN:+ harness=$HARNESS_TOKEN} ===" >> "$LOG"
@@ -3011,7 +3217,7 @@ while true; do
             refund_bailed_fixer "$PR" "$HEAD_N" 0
             RF_N=$(( RF_N - 1 ))
             printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
-            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim, or the CI-queue gate deferred the push) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
           fi
           # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
           # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so
@@ -3093,11 +3299,11 @@ while true; do
             echo "#$PR RED TREE at head=$HEAD_N — a worker already owns this PR (fix-$PR/merge-$PR live, or the cross-box claim holds it), NOT spawning a second (attempt $RF_N/${MAX_RED_FIX_TRIES:-2} spent). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "a worker already owns this PR — the rail refusal stands at this head"
           elif [ "$(wt_count fix-)" -lt "${MAX_RED_FIX:-4}" ] && can_spawn; then
-            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets a
-            # daemon-owned DURABLE TERMINAL exactly like every other worker — a tmux window or a
-            # transient `cloud exec` child dies at ~21 log lines (measured on all three cells, see
-            # `worker-terminal.sh`'s header), and a dead red-fixer is indistinguishable from one that
-            # found nothing to fix. Args go in a FILE so no PR-derived value reaches `sh -c`, and
+            # (1) THE SPAWN. Through the launcher (`wt_spawn`), so on a cell the red-fixer gets the
+            # surface that box actually has — a daemon-owned DURABLE TERMINAL where cmux answers, tmux
+            # with an explicit HOME+keys.env contract where it does not (the `~21 log lines` death was
+            # the missing environment, and a dead red-fixer is indistinguishable from one that found
+            # nothing to fix). Args go in a FILE so no PR-derived value reaches `sh -c`, and
             # `fix-one.sh` — which materialises the branch's OWN worktree from origin, captures the
             # failing checks and their logs, and re-runs the merge chain (which re-rails) when it
             # pushes. A red-fixer never runs in the hub checkout: the fixer script cd's into the
@@ -3151,7 +3357,7 @@ while true; do
             # (3) THE BOX CAP. Nothing is consumed: the refusal stays, the next cycle retries when a
             # slot frees, and the reason names the ceiling AND the load gate (the silent-capacity-refusal
             # shape #2126 T5 removed from the other five sites).
-            echo "#$PR RED TREE but NO red-fixer slot (fix lanes=$(wt_count fix-)/${MAX_RED_FIX:-4}, load-gate=L/${MAX_LOAD:-?}) — attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed, no fix-$PR. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            echo "#$PR RED TREE but NO red-fixer slot (fix lanes=$(wt_count fix-)/${MAX_RED_FIX:-4}, $(spawn_gate_tok)) — attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed, no fix-$PR. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "capacity: red-fixer ceiling ${MAX_RED_FIX:-4} reached or the spawn gate refused"
           fi
         fi
@@ -3277,19 +3483,53 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-              echo $((NFC + 1)) > "$CF"
-              echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
+            # ⛔ ONE PREDICATE, ONE SITE: THE QUEUE GATE NESTS INSIDE THE ELIGIBILITY IT QUALIFIES
+            # (#2333 cycle 7 P2, kept through the merge with main). Evaluated as a separate `elif`
+            # the predicate would be duplicated — and a duplicated predicate is what lets the DEFER
+            # arm drift from the SPAWN arm it is supposed to mirror: evaluated in the other order, a
+            # box with every fix lane busy AND a deep queue reported `ci-queue(deep(…))` as the
+            # binding reason and never printed its own `NO fixer slot` diagnosis, a disposition the
+            # capacity gate — not the queue — was binding. Nested, the deferral is reachable ONLY
+            # through the spawn's own predicate, so a non-eligible PR can never be reported as
+            # deferred, and no second copy can drift. (The review-gate fixer arm below cannot nest —
+            # it is a two-arm `if`/`elif` chain — so it hoists `_fix_eligible` for the same reason;
+            # see its own ⛔.) It also keeps ONE comparison against the drain-aware `$MF` per spawn
+            # site, which is the count `test-gates.sh` asserts as "every fixer spawn site uses the
+            # drain-aware budget" — a second copy of the comparison is not a second spawn site.
+            if ciq_push_ok; then
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+                echo $((NFC + 1)) > "$CF"
+                echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
+              else
+                echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
+              fi
             else
-              echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
+              # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
+              # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
+              # finish inside its own lease and (b) invalidate this PR's head-bound review record —
+              # the attestation is bound to a SHA, so the push destroys the artifact it exists to
+              # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
+              # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
+              # read decides again — that is what makes the deferral non-sticky.
+              # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
+              # reads on the COLD path (`orch-loop.sh`'s predicate), and this arm is only reached
+              # *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The old
+              # comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
+              # documented the cycle-6 P0 it was written to fix; an editor trusting it would
+              # "restore" a cold-path-less predicate and refuse every fixer for ever. The
+              # `unmeasured` default is kept as a defensive floor for the arm that cannot reach the
+              # read — precisely because the exact verdict also rides the `[ci-queue] DEFERRED …`
+              # line above, verbatim.
+              ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             fi
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
             # `elif` with no `else`, so a saturated box logged NOTHING and `lanes=0` was unexplained.
-            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
           continue
@@ -3348,7 +3588,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               disp "$PR" "${HEAD_N:-}" GREEN wait "rail worker spawn FAILED"
             fi
           else
-            echo "#$PR GREEN but NO merge slot (merge lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR GREEN but NO merge slot (merge lanes=$(wt_count merge-)/$MR, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" GREEN wait "capacity: merge-lane ceiling $MR reached or the spawn gate refused"
           fi
         elif [ "$MERGE_AUTHORITY" = "gate" ]; then
@@ -3446,11 +3686,22 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
-            # otherwise the gate is missing evidence -> re-record (fresh review).
+            # otherwise the gate is probably just missing evidence -> re-record (fresh review).
+            # ⛔ THE QUEUE GATE APPLIES TO THIS ARM TOO (#2333 cycle 3, P2). This spawn is a PUSHER as
+            # well — `fix-one.sh`'s product is a new head — so it obeys the same rule the other two
+            # fixer arms do: on a deep or unreadable queue the push would void this PR's head-bound
+            # review record and queue behind a backlog it cannot outlast. (The README and the suite
+            # both said "both fixer spawn arms"; there are three, and the suite pinned the gap.)
+            # The eligibility predicate is hoisted so the DEFER arm below can share it verbatim rather
+            # than duplicating the guard, and so a non-eligible PR can never be reported as deferred.
+            _fix_eligible=0
             if [ -n "${HEAD_N:-}" ] && [ "$_rgs" = "NEEDS-FIX" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && can_spawn \
                && [ "$(wt_count fix-)" -lt "$MF" ]; then
+              _fix_eligible=1
+            fi
+            if [ "$_fix_eligible" = "1" ] && ciq_push_ok; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
@@ -3476,6 +3727,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
+            elif [ "$_fix_eligible" = "1" ]; then
+              ciq_defer_note_here "review-gate fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
@@ -3497,7 +3751,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
               fi
             else
-              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, $(spawn_gate_tok))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
@@ -3534,17 +3788,30 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
-              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
+            # ONE PREDICATE, ONE SITE — the CONFLICTED arm above carries the full reasoning (#2333
+            # cycle 7 P2): the queue decision nests inside the eligibility it qualifies, so a deep
+            # queue is the BINDING reason only for a PR that could otherwise have spawned, and there
+            # is no second copy of the `$MF` comparison to drift from this one.
+            if ciq_push_ok; then
+              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+                echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+                echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
+              else
+                echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
+              fi
             else
-              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
+              # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
+              # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
+              # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
+              # for a cycle in which nothing was even started.
+              ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             fi
           else
-            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
         else
@@ -3565,7 +3832,25 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # of units actually spawned, which is the arithmetic this sidecar exists to keep closed.
         if grep -q python-ci-gate <<<"$V"; then
           RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
-          if [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
+          # ⛔ A RERUN IS A CI-SPENDING ACT, so it is gated like one (#2333 review P2). `gh run rerun`
+          # enqueues work on the same runners the gate is holding work OUT of — the one surface in
+          # this sweep that ADDS queue while the gate says "do not". Reviewing, re-recording and
+          # merging an existing head spends no new CI, which is why those arms stay ungated; a rerun
+          # does, so on a deep or unknown queue it is WITHHELD.
+          # ⛔ AND THE GATE SITS INSIDE THE `RID` GUARD (#2333 cycle 3, P2). Tested BEFORE it, an
+          # unreadable `gh pr checks` (RID empty → no rerun was ever possible) still produced a
+          # "rerun withheld" line AND a ledger row — a deferral credited for an act that could not
+          # have happened. And it only ever RECORDS the withholding when this PR has no row yet: an
+          # existing `act` is a stronger fact, and an existing `wait` may be a stronger reason
+          # (`parked: … needs a human`).
+          if [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ] && ! ciq_push_ok; then
+            ciq_defer_note_here "CI rerun for #$PR (run ${RID:-?} would enqueue another run behind the backlog)" >> "$LOG"
+            if ! awk -F'\t' -v p="$PR" '$1==p{f=1} END{exit f?0:1}' "$PRDISP" 2>/dev/null; then
+              dispreplace "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — rerun withheld; a rerun adds a run to the queue the gate is holding work out of"
+            else
+              echo "#$PR CI rerun WITHHELD by the ci-queue gate — this PR already has a disposition row this cycle, so it is left standing rather than overwritten" >> "$LOG"
+            fi
+          elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
             if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
               touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
               _prior="$(awk -F'\t' -v p="$PR" '$1==p && $4=="act"{printf "%s", $5}' "$PRDISP" 2>/dev/null | tail -1)"
@@ -3758,17 +4043,11 @@ PY
   # on a cell; `free`+`inactive` vm_stat pages on macOS. It fails CLOSED (rc != 0 -> UNKNOWN -> do
   # not add work) -- before #1702 the probe was vm_stat-only and therefore failed closed on EVERY
   # Linux cell, which is the false green (cycles complete, nothing ever dispatches) this PR removes.
-  if MEMAVAIL_MB="$(mem_avail_mb)"; then
-    MEM_UNKNOWN=0
-  else
-    # The probe itself failed. UNKNOWN, not ample: we cannot see capacity, so we do not add work.
-    MEMAVAIL_MB=0; MEM_UNKNOWN=1
-  fi
-  # ⛔ COERCE like L / SWFREE / SWTOTAL (#1985 review, P2). Those three are is_num-guarded; MEMAVAIL_MB
-  # was not, so an empty value reached `[ "$MEMAVAIL_MB" -le … ]` as `[: : integer expression expected`
-  # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
-  # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
-  if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
+  # ⛔ RE-MEASURED HERE ON PURPOSE (agent-infra#1732): the prologue already measured it for the spawn
+  # gate, but THIS read decides a dispatch, and a dispatch must see the present — memory can fall a
+  # long way during a cycle's sweep. One seam (`measure_mem`) sets the pair, so the two readings can
+  # never be derived differently; see measure_mem for the UNKNOWN-not-ample polarity.
+  measure_mem
   # ⛔ THE MERGE-PRIORITY GATE IS HANDED ITS EVIDENCE, NOT ITS CONCLUSION (see mp_reason): the unowned
   # COUNT, the epoch of the last recorded land, and the cap it is measured against. All of them are
   # read HERE, once, and BEFORE the [cap] line that prints them — read after it, that line printed `?`
@@ -3792,6 +4071,24 @@ PY
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
+  # ── THE CI QUEUE, MEASURED ONCE PER CYCLE (see ci-queue.sh's header for the arithmetic) ──────
+  # Read in THIS shell, never in a `$( )`: a command substitution would end the subshell with the
+  # record inside it, and every arm below (and the deferral line) would read an empty one.
+  CIQ_RC=1; CIQ_VER=""
+  if [ "${CIQ:-0}" = "1" ]; then
+    ciq_read "${OR:-}" >/dev/null 2>&1
+    CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
+    echo "[ci-queue] repo=${OR:-?} verdict=$CIQ_VER queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} busy=${CIQ_BUSY:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s horizon=$(ciq_horizon_min)m job_p90=$(ciq_job_p90_min)m" >> "$LOG"
+  elif [ -n "${_ciq_mod:-}" ]; then
+    # TWO distinct causes of CIQ=0, and THIS line must not confuse them (#2333 review, P2). The
+    # module was FOUND and did not source the ten-name interface — the [ci-queue] INCOMPLETE line
+    # above already named the missing names, and `_ciq_mod` (a global in this same shell) carries
+    # the path. Printing "NOT available" here was a false statement about the box's own state on
+    # the next line of the same log: the exact class the INCOMPLETE disclosure was fixed for.
+    echo "[ci-queue] $_ciq_mod is present but did not source the ten-name interface (see the [ci-queue] INCOMPLETE line above) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
+  else
+    echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
+  fi
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
@@ -3803,6 +4100,15 @@ PY
   # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
   elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
     GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  # ⛔ THE CI-QUEUE ARM: deep (or UNKNOWN) => the ISSUE path is CLOSED, and that is the "prefer work
+  # that does not need CI" rule made executable rather than advisory. Issue work opens NEW PRs, and
+  # every new PR is another full CI pass queued behind the backlog; the PR sweep above already ran
+  # and keeps running — reviewing, re-recording and merging EXISTING heads spends no new CI and
+  # REMOVES queue, so this arm costs the fleet nothing it was going to get anyway.
+  # UNKNOWN defers too (fail closed): an unreadable queue is not an empty one, and a gh outage would
+  # otherwise buy exactly the stampede on the one cycle the fleet could not see. The cache in
+  # ci-queue.sh keeps that from firing on a transient error (it reports state=cache, with its age).
+  elif [ "${CIQ:-0}" = "1" ] && [ "${CIQ_RC:-1}" != "1" ]; then GATE_WHY="ci-queue($CIQ_VER)"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
@@ -3998,7 +4304,11 @@ PY
       # the `parked-*` failure R8 names, on a per-machine capacity signal.
       if capacity_yield_live "$ISS"; then
         Y=$((Y+1))
-        echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        if [ "${CAPACITY_YIELD_GATE:-}" = "land" ]; then
+          echo "[dispatch] #$ISS stood down — this box refused it at the LAND-BACKLOG gate (the repo's open-PR backlog is over its own landing ceiling; repo-wide, so NO peer can clear it by waiting — the remedy is to land an open PR) until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        else
+          echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        fi
         continue
       fi
       # ── PLACEMENT: the LEAST-LOADED ELIGIBLE BOX takes it (measured, agent-infra 2026-10-21) ─────
@@ -4182,7 +4492,7 @@ PY
           # `product = $PB/$FLOOR_N in this batch`, giving the same phrase a second denominator — the
           # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
           # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
-          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
         else
           # ⛔ THE MET VERDICT IS PRINTED, NOT INFERRED FROM SILENCE (agent-infra#2054 indicator (a)). The
           # arms above only ever spoke when the floor MISSED, so "the floor worked" was the absence of a
@@ -4242,19 +4552,34 @@ PY
             _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
             if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
             else
-              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG"
             fi ;;
           *)
-            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — the floor never refuses a batch, so the batch still goes to dispatch; whether the CI-queue gate DEFERRED it is stated below (a deferral sets K=0)" >> "$LOG" ;;
         esac
       fi
     fi
     if [ -s "$O/.batch" ]; then
-      dispatch_funnel "$K" "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
-      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
+      # ⛔ A DEFERRED BATCH WAS NOT DISPATCHED (#2296 cycle 6, P2). `K` was incremented as each issue
+      # was CLAIMED, before this call — so a batch that the CI-queue gate refused would otherwise be
+      # counted here, in the funnel and in the cycle record, as work that happened. `dispatch-merge.sh`
+      # exits 3 on a deferral (after releasing the claims and dropping the rows); this reads it and
+      # records `dispatched=0` with the gate named, which is the same fact its own log line states.
+      _dmrc=0
+      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
+      if [ "$_dmrc" = "3" ]; then
+        echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="ci-queue(batch deferred)"
+      fi
+      # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
+      # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
+      # `held:` clause and the reason survived only in the cycle record and a separate log line — the
+      # sibling no-batch branch below passes it, so the two halves of one outcome printed differently.
+      dispatch_funnel "$K" "$(queue_state_token)" "$GATE_WHY" "" "${Y:-0}" >> "$LOG"
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
     # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
     # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch

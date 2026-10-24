@@ -79,6 +79,71 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── CI BACK-PRESSURE: the lane that PUSHES reads the CI queue first ──────────────
+# A fixer's product is a NEW HEAD, and a new head is a full CI pass plus (because the review
+# attestation is SHA-bound) the destruction of the artifact this lane's review chain just produced.
+# Measured 2026-10-22: tortoise queued=92 running=6 on 5 runners, agent-infra queued=97 running=7 —
+# a push into that finishes nothing. So the read happens HERE, in the lane's own path, before the
+# cross-box claim: a deferred fixer must not hold a claim it is not going to use.
+# ⛔ THE CONTROLLER GATES THIS TOO (orch-loop.sh defers the spawn), AND THAT IS DELIBERATE
+# belt-and-braces rather than duplication: `fix-one.sh` is also reached directly and by
+# `adopt-fix.sh`, so a gate that lived only in the controller would leave those paths pushing into
+# a stampede. Both read the same module, so they cannot disagree about the queue.
+# ⛔ AND THE DEFERRAL IS NOT STICKY: it writes the SAME bail marker the cross-box refusal writes,
+# which orch-loop.sh refunds, so the PR loses no attempt and is re-decided from a FRESH read on the
+# next dispatch. Nothing is dropped; nothing remembers that the queue was deep.
+# ⛔ THE ALLOW IS NOT RE-READ BEFORE THIS LANE'S OWN PUSH (#2333 review, P3). The reading above happens
+# once, at LANE START; the agent runs for up to `FIX_TIMEOUT` (default 2400 s) and pushes in its own
+# shell at the end of that window, so a lane can be allowed on a shallow queue and push into a deep
+# one - a window 2.7x `CIQ_STALE_MAX`, which no cache bound in the module describes. Disclosed rather
+# than closed here (residual (ii) in ci-queue.sh's header): a second reading at the push site has to
+# answer what a refusal would do to work that is already done.
+if [ -f "$SELF/ci-queue.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SELF/ci-queue.sh"
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then
+    if ! ciq_ci_allowed "$OR"; then
+      # `ciq_defer_note_here` evaluates the record the predicate JUST made in this shell — a second
+      # read could disagree with the decision and (before #2333's review) print no line at all.
+      ciq_defer_note_here "fixer #$PR (a push to $BR would invalidate head ${HEAD:-?})" >> "$L.log"
+      # ⛔ THE BAIL MARKER IS WHAT MAKES "no attempt consumed" TRUE. Two ways it used to be false
+      # (#2333 review P2): (a) a MANUAL run wrote it too, and `refund_bailed_fixer` consumes it to
+      # decrement a `fixcount` the manual run never incremented — this file's own invariant at the
+      # top says a manual run must not decrement a counter it never incremented; and (b) when
+      # `gh pr view` failed, HEAD was empty, NO marker was written, and the refund could not match
+      # anyway (`refund_bailed_fixer` returns on an empty head) — so the deferral DID consume an
+      # attempt while the log claimed it did not. Both are now said out loud instead of implied.
+      if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+        : > "$O/state/fixbail-$PR-$HEAD"
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+      elif [ "${CTRL:-0}" = "1" ]; then
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, but the head could NOT be read so no bail marker could be written — the controller cannot refund this attempt (it is re-decided next cycle)" >> "$L.log"
+      else
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed; manual run, so no attempt was booked and none is refunded" >> "$L.log"
+      fi
+      exit 0
+    fi
+    echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s — pushing is worth it" >> "$L.log"
+  else
+    # ⛔ A MODULE THAT IS PRESENT BUT INCOMPLETE IS SAID OUT LOUD (#2333 cycle 7, P2). Without this
+    # arm the guard's `else` was silent on the ONE surface whose product is a pushed head, while the
+    # other two callers announce the same state (dispatch-merge.sh, orch-loop.sh) — the "silence in
+    # one of three callers is how a gate rots into a decoration" rule this module's own header states.
+    # Keep the name list below byte-identical to the `declare -f` list above (#2333 review cycle 12,
+    # P2): a stale `$O` copy is exactly the case this message reports, so the list is LITERAL and
+    # cannot be rendered from a variable defined in the module being reported as incomplete.
+    echo "[fix $PR] WARNING — $SELF/ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min); the CI-queue gate is INERT for this run and the push proceeds UNMEASURED" >> "$L.log"
+  fi
+else
+  # …and so is an ABSENT one: the stale-`$O` shape `install.sh`/`check-single-source.sh` now detect.
+  # ⛔ THE REMEDY MUST BE A COMMAND THAT CAN SUCCEED (#2333 review, P2). It said
+  # `deploy-harness.sh --o <dir>`, but that script REFUSES any invocation without `--src`/`--repo`
+  # (`--src <harness dir> (or --repo <checkout>) is required`, exit 78) — so the one line printed
+  # exactly when the module is missing told the operator to run a bad invocation and get "nothing was
+  # copied" instead of a re-seed. Every sibling message (`dispatch-merge.sh`, `install.sh`,
+  # `report.sh`) passes `--repo <checkout>`; this one now does too.
+  echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>)" >> "$L.log"
+fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
@@ -136,10 +201,26 @@ fi
 # test-isolation, license-surface, pricing-artifact). Without this it would read only the review
 # comment — which for such a PR may not exist at all — and fix blind.
 : > "$L-failing.txt"
-FAILING_CHECKS="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
+# ⛔ THE READ IS OBSERVED BEFORE IT IS TRUSTED (agent-infra#2121, empty-as-pass). `gh pr checks …
+# 2>/dev/null | python3 -c` collapsed THREE different outcomes into the same empty string: the read
+# FAILED (gh non-zero, stderr discarded), the payload was UNPARSEABLE (the old `except: raise
+# SystemExit` exited 0 with nothing printed), and there genuinely ARE no failing checks. Only the
+# third is a fact — but this file is the fixer's ONLY evidence that CI is red, so a fixer was
+# dispatched believing the checks were green when the read had never happened. The read and the
+# parse are now observed separately, and an observation that did not happen is written INTO that
+# file as UNKNOWN (which also keeps it non-empty, so the fixer's prompt still sends it there).
+checks_json="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null)" || checks_rc=$?
+FAILING_CHECKS=''
+checks_unknown=''
+if [ "${checks_rc:-0}" -ne 0 ]; then
+  checks_unknown="the required-check read FAILED (gh rc=$checks_rc)"
+elif [ -z "$checks_json" ]; then
+  checks_unknown="the required-check read returned NO JSON"
+else
+FAILING_CHECKS="$(printf '%s' "$checks_json" | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)
-except Exception: raise SystemExit
+except Exception: raise SystemExit(1)
 # The SAME allow-list polarity the loop's classifier and admin-merge.sh use (agent-infra#1714): a
 # check is FAILING only when its state is neither a NAMED in-flight spelling nor one of the NON-RED
 # conclusions. CANCELLED/STALE are non-red by that rule - a superseded run
@@ -154,6 +235,20 @@ for c in (d if isinstance(d,list) else []):
     red.append(str(c.get('name') or ''))
 print(' '.join(red))
 " 2>/dev/null)"
+# ⛔ THE END LINE ABOVE IS PINNED BY SHAPE, deliberately: scripts/orchestrator-harness/selftest.sh
+# extracts this assignment with `awk '/^FAILING_CHECKS="/,/^" 2>\/dev\/null\)"$/'` and runs the
+# result as python. Appending `|| parse_rc=$?` to that line made the END MARKER unreachable, awk then
+# ran to EOF and the extracted "python" became the rest of the script — so the PARSE status is read
+# on the NEXT line instead of on the closing one. Keep the two marker lines exactly as they are.
+checks_parse_rc=$?
+if [ "$checks_parse_rc" -ne 0 ]; then
+  checks_unknown="the required-check payload could not be PARSED (rc=$checks_parse_rc)"
+fi
+fi
+if [ -n "$checks_unknown" ]; then
+  echo "=== NOTE: $checks_unknown — this file does NOT establish that CI is green. Treat the required checks as UNKNOWN and read them yourself before concluding the build is clean ===" >> "$L-failing.txt"
+  echo "[fix $PR] required-check read UNKNOWN ($checks_unknown) — proceeding (fail-open on purpose, and recorded in $L-failing.txt so the fixer sees it)" >> "$L.log"
+fi
 for c in $FAILING_CHECKS; do
   echo "=== failing required check: $c ===" >> "$L-failing.txt"
   RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
@@ -170,7 +265,7 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 cat > "$L-fixer.txt" <<EOF
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3

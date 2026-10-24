@@ -1,0 +1,14 @@
+# scripts/false-pass-baseline.tsv — grandfathered false-PASS findings (agent-infra#2121)
+#
+# WHY A BASELINE AND NOT A FIX: each group below is a KNOWN instance that belongs to its own
+# open issue (named per line). The check still reports it, and a NEW instance of the same rule
+# in the same file raises that (file, rule) count and FAILS — this file cannot swallow a
+# regression. Keyed by (path, rule, COUNT), never by line number: an unrelated edit above a
+# finding must not red a peer lane's CI.
+#
+# FORMAT: <path>	<rule>	<count>	<tracking issue + why this is still open>
+# Rewrite with: bash scripts/check-false-pass-shapes.sh --update-baseline
+# The 4th column is REQUIRED: an entry with no justification is reported as a finding.
+scripts/install-launchd.sh	empty-as-pass	2	#1743 — verify_targets() returns a success-default flag over a loop fed by plist_program_args, so a host without python3 (the PlistBuddy fallback emits nothing) verifies NOTHING and still passes; retire_pass() has the same shape over retired_labels(). Both belong to #1743's own fix (make "could not parse" distinguishable from "no arguments"), not to a silent edit here.
+scripts/cloud-cell-quiesce.sh	pre-existing-as-evidence	1	#2346 — `step "seeded $O with $(ls "$O"/*.sh | wc -l ...)"` counts the RUNTIME directory, which already held the previous seed, so the number is not evidence this run copied anything; the `cp` above it discards its status (`|| true`), so a wholly failed seed still prints `seeded ... N scripts`. The rest of #2041's class (bg/finish.sh was fixed there; these are the unswept siblings).
+scripts/deploy-crossbox.sh	pre-existing-as-evidence	1	#2346 — `say "seeded $O with $(ls "$O"/*.sh | wc -l ...)"` counts the TARGET directory, which may already hold files from an earlier deploy, so the count proves the directory is populated rather than that this run seeded it. Same root as #2041, which fixed only bg/finish.sh.

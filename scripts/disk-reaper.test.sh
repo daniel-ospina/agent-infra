@@ -42,6 +42,11 @@
 #       (never 6), uv's 4 and 7 are deferrals (pass 6, ok=0), venv's 4 is a red removal failure, 5 is
 #       red in apply and informative in dry-run, 2 is red, 3 outranks 4 across repos in both orders,
 #       and `detail=` names the DELEGATE's own code in every class (#2156, #2036).
+#   T55 the worktree class fails closed PER REPO: an unverifiable repo is skipped BY NAME
+#       (`skipped=<repo> reason=<why>`, recorded in `skipped_worktree=`) while the repo that CAN be
+#       verified is still reclaimed in the same pass — and the class verdict stays RED (#2443).
+#   T56 the installer NAMES the worktree class's gh prerequisite (auth is per-HOME), instead of
+#       letting the class be inert for an hour and then blamed on the wrong cause (#2443).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -1356,19 +1361,24 @@ else
     ok "T45 skipped — no python3"
 fi
 
-# ── T46: an UNCREATABLE lock dir is a filesystem problem (4, RED), not "the lock is held" (5) ────
+# ── T46: an UNWRITABLE state dir with no fallback is a REFUSAL (3, RED), never "the lock is held" ─
 # With no token, `file_mtime` on the missing dir is empty so `age=0`, and the contention arm reported it
-# BENIGN — a box that can never reap, certified. The lock dir's ABSENCE is the discriminator.
+# BENIGN — a box that can never reap, certified. The lock dir's ABSENCE is what must not be read as
+# contention. ⛔ agent-infra#2443 CHANGED WHAT "UNWRITABLE" MEANS: a pass now tries a tmpfs fallback
+# before refusing (T55), so the refusal arm is pinned here with the fallback DISABLED, and the fallback
+# arm is pinned in T55 — otherwise this test would silently stop testing anything.
 ENVNAME=t46
 REPO="$(mk_repo t46)"
 mkdir -p "$T/t46/state"
 chmod 500 "$T/t46/state"
-OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t46/state" DISK_REAPER_REPOS="$REPO" \
-    bash "$REAPER" --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t46/state" DISK_REAPER_STATE_DIR_FALLBACKS= \
+    DISK_REAPER_REPOS="$REPO" bash "$REAPER" --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
 chmod 700 "$T/t46/state"
-assert_eq "$RC" "4" "T46 a state dir whose lock cannot be created is a FAILURE (4), not a benign skip"
-assert_contains "$OUT" "cannot create" "T46 ... and the refusal names the filesystem problem"
+assert_eq "$RC" "3" "T46 a state dir that cannot be written, with no fallback, is a REFUSAL (3) — never a benign skip"
+assert_contains "$OUT" "cannot create state dir" "T46 ... and the refusal names the filesystem problem"
+assert_contains "$OUT" "refusing to start" "T46 ... and says the pass did not run"
 assert_absent "$OUT" "benign" "T46 ... and never calls it contention"
+assert_absent "$OUT" "class=venv" "T46 ... and no class line is printed for a pass that never started"
 
 # ── T47: a class that could not be SET UP records `misconfigured` + `not-run`, not `refused` + 0 ──
 # `refused` is defined as "the delegate RAN and said no"; a missing delegate never ran, and recording
@@ -1791,6 +1801,339 @@ assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T54 --help documents the sta
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T54 --help documents the watchdog pin"
 assert_contains "$OUT" "a delegate DEFERRED" "T54 --help carries the DEFERRED exit code, not a sentence cut mid-way"
 
+# ── T55: the worktree class fails closed PER REPO, and keeps reclaiming the others (#2443) ───────
+# MEASURED DEFECT (2026-10-23, a cell at 95% used): `gh` was present and working, but not
+# authenticated under the pass's HOME, so its PR query exited 4 ("requires authentication" per
+# `gh help exit-codes`). BOTH repos aborted, the pass reported `freed_df=0MB`, and the class line
+# said only `verdict=fail-closed` — no subject, no reason — while the abort blamed "gh unavailable or
+# the origin-remote probe failed". The GATE is right and is not touched here: a checkout whose PR
+# state is unknown is never removed. The defect is that one unverifiable repo could not be told apart
+# from the class having failed, so the disk could not self-heal and the message pointed elsewhere.
+# The pair below is the whole property: the bad repo is SKIPPED BY NAME and keeps its checkouts, the
+# good repo in the SAME PASS is still reclaimed, and the verdict stays fail-closed (skipping is not
+# a pass).
+ENVNAME=t55
+mkdir -p "$T/t55/bin"
+cat >"$T/t55/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+# Selective stub: the unverifiable repo answers with the AUTH exit code (4); every other repo answers
+# normally with no open PRs. This is the cell failure in one line — an installed, working tool whose
+# credentials are absent for THIS pass's HOME.
+case "$*" in
+    *t55-bad*) exit 4 ;;
+    *) : ;;
+esac
+exit 0
+SHIM
+chmod +x "$T/t55/bin/gh"
+REPO_GOOD="$(mk_repo t55-good)"
+WT_GOOD="$(mk_wt "$REPO_GOOD" merged feat/t55-good-merged)"
+commit_in "$WT_GOOD" "$RECENT_DATE" good
+"$REAL_GIT" -C "$REPO_GOOD" merge -q --no-edit feat/t55-good-merged
+"$REAL_GIT" -C "$REPO_GOOD" remote add origin https://github.com/daniel-ospina/t55-good.git
+REPO_BAD="$(mk_repo t55-bad)"
+WT_BAD="$(mk_wt "$REPO_BAD" merged feat/t55-bad-merged)"
+commit_in "$WT_BAD" "$RECENT_DATE" bad
+"$REAL_GIT" -C "$REPO_BAD" merge -q --no-edit feat/t55-bad-merged
+"$REAL_GIT" -C "$REPO_BAD" remote add origin https://github.com/daniel-ospina/t55-bad.git
+# Control: the fixture's worktree really is a candidate, so the assertions below are about the skip
+# and not about an empty pass.
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --dry-run --repo "$REPO_GOOD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T55 control: the same fixture IS reclaimable when gh answers (dry-run finds work)"
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_GOOD" --repo "$REPO_BAD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55 one unverifiable repo keeps the class RED (skipping is not a pass)"
+assert_nodir "$WT_GOOD" "T55 the repo that COULD be verified was still reclaimed (a bad repo must not disable the good ones)"
+assert_dir "$WT_BAD" "T55 the unverifiable repo's checkout was NOT touched (fail closed, per repo)"
+assert_contains "$OUT" "skipped=$REPO_BAD reason=gh-not-authenticated(rc=4)" \
+    "T55 the skip is reported as skipped=<repo> reason=<why> — the subject the verdict never had"
+assert_contains "$OUT" "UNTOUCHED" "T55 and says the skipped repo's checkouts were left alone"
+ST_T55="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST_T55" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
+    "T55 the pass record carries the skipped repo AND its reason"
+assert_contains "$ST_T55" "verdict_worktree=fail-closed" "T55 the class verdict is still fail-closed"
+assert_contains "$ST_T55" "open-PR gate unverifiable" "T55 and names the cause in detail="
+# ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST: `--print-status` is the surface
+# `cloud-cell-supervisor.sh` reads, so the skipped repo must be reachable from it and not only from a
+# hand-`cat` of the record (the same defect `classes=`/`repos=` had).
+OUT="$(run_reaper --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55 --print-status still answers 3 for a fail-closed pass"
+assert_contains "$OUT" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
+    "T55 --print-status carries the skipped repo and its reason"
+assert_absent "$ST_T55" "cannot run: " \
+    "T55 the class RAN, so it is never reported as `cannot run` (that field means could-not-be-set-up)"
+# and the reason survives a repo path that CONTAINS A SPACE: the skip line carries the path, so a
+# parser anchored on `skipped=<first token>` would silently anonymise exactly the repos most likely to
+# live under a hand-made directory — turning a named skip back into the class-wide verdict.
+ENVNAME=t55c
+REPO_SP="$(mk_repo 't55c')"          # mk_repo returns "$T/t55c"; give the repo a SPACED path
+mkdir -p "$T/t55c with space"
+cp -R "$REPO_SP/." "$T/t55c with space/"
+REPO_SP="$T/t55c with space"
+"$REAL_GIT" -C "$REPO_SP" remote add origin https://github.com/daniel-ospina/t55-bad.git
+WT_SP="$(mk_wt "$REPO_SP" merged feat/t55c-merged)"
+commit_in "$WT_SP" "$RECENT_DATE" sp
+"$REAL_GIT" -C "$REPO_SP" merge -q --no-edit feat/t55c-merged
+# and a single genuinely unverifiable repo still REFUSES to delete — the gate is never optional
+ENVNAME=t55b
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_BAD" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55b a single unverifiable repo => exit 3"
+assert_dir "$WT_BAD" "T55b and it removes NOTHING from that repo"
+assert_contains "$OUT" "skipped=$REPO_BAD reason=gh-not-authenticated(rc=4)" "T55b and names it"
+OUT="$(GH_BIN="$T/t55/bin/gh" run_reaper --apply --repo "$REPO_SP" --aged-days 7 --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55c a repo under a path with a SPACE is still a named skip"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" \
+    "skipped_worktree=$REPO_SP[gh-not-authenticated(rc=4)]" \
+    "T55c the recorded skip keeps BOTH the spaced path and the reason"
+assert_dir "$WT_SP" "T55c and its checkout was still left alone"
+# The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
+# (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
+# repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
+OUT="$(GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
+assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
+    "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"
+
+
+# ── T56: the installer NAMES the worktree class's gh prerequisite (#2443) ───────────────────────
+# The unit pins the delegates, the bounded library and GH_TIMEOUT — but gh's credentials are PER-HOME
+# and the rendered `Environment=HOME={{HOME}}` decides whether the open-PR gate can ever run. On the
+# measured cell that HOME held no `~/.config/gh`, so the class skipped every repo every hour while the
+# unit went red for a reason nobody could read. The installer is the only component that knows the HOME
+# it is rendering, so it must say so BEFORE the hour is wasted — and must NOT refuse (a box with no
+# working gh still wants its uv and venv classes).
+ENVNAME=t56
+REPO="$(mk_repo t56)"
+mkdir -p "$T/t56/bin-ok" "$T/t56/bin-bad" "$T/t56/home"
+cat >"$T/t56/bin-ok/gh" <<'SHIM'
+#!/usr/bin/env bash
+[ "$1 $2" = "auth status" ] && exit 0
+exit 0
+SHIM
+cat >"$T/t56/bin-bad/gh" <<'SHIM'
+#!/usr/bin/env bash
+# The measured failure's shape: installed, runs, and REFUSES on credentials.
+[ "$1 $2" = "auth status" ] && exit 1
+exit 0
+SHIM
+chmod +x "$T/t56/bin-ok/gh" "$T/t56/bin-bad/gh"
+cp "$REAPER" "$T/t56/reaper.sh"
+# A REALISTIC install tree: the installer pins the three delegates and the bounded library beside
+# the reaper and REFUSES an install missing any of them (T26) — a fixture without them would fail
+# on a guard this case is not about.
+cp "$HERE/pi-cache-reap.sh" "$HERE/reap-lane-venvs.sh" "$HERE/pi-reap-worktrees.sh" "$T/t56/"
+mkdir -p "$T/t56/lib"; cp "$HERE/lib/bounded.sh" "$T/t56/lib/bounded.sh"
+inst56() { # inst56 <bindir> — a full self-contained systemd install into a scratch unit dir
+    PATH="$1:$PATH" HOME="$T/t56/home" DISK_REAPER="$T/t56/reaper.sh" DISK_REAPER_REPOS="$REPO" \
+    SYSTEMD_UNIT_DIR="$T/t56/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t56/calls.log" \
+    bash "$INST" --install
+}
+OUT="$(inst56 "$T/t56/bin-bad" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 an installed-but-unauthenticated gh does NOT refuse the install (the other classes still run)"
+assert_contains "$OUT" "WILL SKIP EVERY REPO" "T56 ... it WARNS that the worktree class will skip every repo"
+assert_contains "$OUT" "NOT AUTHENTICATED" "T56 ... and names AUTHENTICATION, the thing that is actually wrong"
+assert_contains "$OUT" "gh auth login" "T56 ... and prints the remedy"
+assert_contains "$OUT" "gh:     unauthenticated" "T56 the install summary carries the gh verdict"
+OUT="$(inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a healthy gh still installs"
+assert_absent "$OUT" "WILL SKIP EVERY REPO" "T56 and no warning is emitted when the credentials are there (no false alarm)"
+assert_contains "$OUT" "gh:     authenticated" "T56 the summary states the positive verdict too"
+# and with NO gh at all the same prerequisite is named rather than silently assumed. GH_BIN is the
+# seam BOTH sides share (the delegate already honours it), so this arm is a real assertion about the
+# installer instead of a claim about whether this host happens to ship gh in /usr/bin.
+OUT="$(GH_BIN=/nonexistent/gh inst56 "$T/t56/bin-ok" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T56 a box with no gh still installs (its uv/venv classes are unaffected)"
+assert_contains "$OUT" "WILL SKIP EVERY REPO" "T56 ... and is warned that the worktree class will skip every repo"
+assert_contains "$OUT" "gh is not installed" "T56 ... naming the MISSING cause, not an auth one"
+assert_contains "$OUT" "gh:     missing" "T56 the summary distinguishes missing from unauthenticated"
+
+# ── T57: the reaper RUNS when its state dir is unusable — a full disk must not stop the pass ─────
+# MEASURED (2026-10-23 06:53Z, cell-1): `df /` = 100%, 0 bytes available, and the hourly pass printed
+# `cannot create state dir /home/cmux/.pi/agent/state` and exited 3 having run NO class — on the box
+# whose disk it exists to free. The reaper's state (lock, log, scratch, record) now moves to a tmpfs
+# candidate, DISCLOSED on its own output and in the record; with nothing writable anywhere it still
+# refuses, and the refusal names every candidate. Each arm below fails on the pre-change tree: (a)/(b)
+# exit 3 with no class line at all, (d) has no `state_dir=` field, (e) has no fallback to return from.
+ENVNAME=t55
+REPO="$(mk_repo t55)"
+mkdir -p "$T/t55"
+: >"$T/t55/notadir"          # a regular FILE, so `mkdir -p $T/t55/notadir/state` fails (ENOTDIR)
+FB="$T/t55/fb"
+t55_run() { # t55_run <state-dir> <fallbacks>
+    # ⛔ XDG_RUNTIME_DIR and DISK_REAPER_TMPFS_ROOT ARE PINNED INTO THE FIXTURE. peer_lock_dirs derives
+    # env-independent lock anchors from them (so a system unit with no XDG and a manual shell agree on
+    # the set), and leaving them at their real values would make every arm probe /run/user and /dev/shm
+    # — i.e. the box's LIVE pass — and flake. With both under $T the anchor logic is exercised and the
+    # suite stays hermetic.
+    HOME="$T/home" DISK_REAPER_STATE_DIR="$1" DISK_REAPER_STATE_DIR_FALLBACKS="$2" \
+    XDG_RUNTIME_DIR="$T/t55/xdg" DISK_REAPER_TMPFS_ROOT="$T/t55/shm" \
+    CACHE_REAP_UV_DIR="$T/t55/nc-uv" CACHE_REAP_NPM_DIR="$T/t55/nc-npm" CACHE_REAP_PIP_DIR="$T/t55/nc-pip" \
+    bash "$REAPER" --dry-run --only uv 2>&1
+}
+# (a) THE BUG. The configured state dir cannot be created; a tmpfs fallback can.
+OUT="$(t55_run "$T/t55/notadir/state" "$FB")"; RC=$?
+assert_eq "$RC" "0" "T57a a pass whose state dir cannot be created still RUNS (uv ok) instead of exiting 3 with no class"
+assert_contains "$OUT" "class=uv rc=0" "T57a ... the class line is there (the pre-change pass printed none)"
+assert_contains "$OUT" "state dir fallback" "T57a ... and the fallback is disclosed on the pass's own output"
+ST57="$(cat "$FB/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST57" "state_dir=$FB" "T57a the record names the dir the pass actually used"
+assert_contains "$ST57" "state_dir_primary=$T/t55/notadir/state" "T57a ... and the configured dir it could not use"
+assert_contains "$ST57" "was unusable" "T57a ... and the verdict says why, in detail="
+assert_contains "$ST57" "mode=dry-run" "T57a ... and it is still a normal pass record (not a special shape)"
+# (b) The fallback lock is a REAL lock, and it is the CANONICAL one: a live holder there defers the pass
+# (6) instead of running beside it. Mutual exclusion is the property #2443 must not trade for the
+# fallback; a fallback that ran unlocked would let two passes credit each other's `df` deltas — and,
+# because the delegate locks are handed this state dir, delete concurrently.
+mkdir -p "$T/t55/shm/pi-disk-reaper/disk-reaper.lock"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t55/shm/pi-disk-reaper/disk-reaper.lock/token"
+OUT="$(t55_run "$T/t55/notadir/state" "$FB")"; RC=$?
+assert_eq "$RC" "6" "T57b a live holder of the CANONICAL lock defers the pass (6) — the fallback takes a real lock"
+rm -rf "$T/t55/shm/pi-disk-reaper/disk-reaper.lock"
+# (c) Nothing writable anywhere: a refusal, said out loud, with no class silently skipped.
+OUT="$(t55_run "$T/t55/notadir/state" "$T/t55/notadir/also-unwritable")"; RC=$?
+assert_eq "$RC" "3" "T57c no writable state dir anywhere is still a REFUSAL (3)"
+assert_contains "$OUT" "no fallback was writable" "T57c ... and it names every candidate it tried"
+assert_absent "$OUT" "class=uv" "T57c ... and runs no class behind a refusal"
+# (d) A WRITABLE configured dir is used unchanged — no fallback, no new field.
+mkdir -p "$T/t55/state-ok"
+OUT="$(t55_run "$T/t55/state-ok" "$T/t55/fb-unused")"; RC=$?
+assert_eq "$RC" "0" "T57d a writable configured state dir still works"
+assert_absent "$OUT" "state dir fallback" "T57d ... with no fallback disclosure"
+ST57="$(cat "$T/t55/state-ok/disk-reaper.status")"
+assert_absent "$ST57" "state_dir=" "T57d ... and the record is BYTE-FOR-BYTE the pre-#2443 shape (no state_dir field at all)"
+assert_absent "$ST57" "state_dir_primary=" "T57d ... with no fallback field (the normal record is unchanged)"
+# (e) The record RETURNS to the configured path once that path can be written — the supervisor reads
+# only there, so a pass that freed the space must not leave its record invisible on tmpfs.
+mkdir -p "$T/t55/ro"
+chmod 500 "$T/t55/ro"
+t55_run "$T/t55/ro" "$T/t55/fb2" >/dev/null 2>&1
+assert_file "$T/t55/fb2/disk-reaper.status" "T57e an unwritable configured dir records to the fallback"
+chmod 700 "$T/t55/ro"
+t55_run "$T/t55/ro" "$T/t55/fb2" >/dev/null 2>&1
+assert_file "$T/t55/ro/disk-reaper.status" "T57e ... and the next pass records at the configured path again"
+assert_absent "$(cat "$T/t55/ro/disk-reaper.status")" "state_dir_primary=" "T57e ... back in the normal record shape, with no fallback field"
+# (f) A FALLBACK PASS MUST NOT RUN BESIDE A LIVE PASS ON THE CONFIGURED DIR (#2443 review). The
+# fallback only tells you the configured dir is unwritable NOW; a pass that started while it WAS
+# writable is still running and holding THAT lock for up to 3 x CLASS_TIMEOUT. Because the fallback
+# pass hands the delegates ITS state dir, their locks move too — so nothing else excludes two
+# concurrent `uv cache prune` / `git worktree remove` runs over the same caches. The disclosure the
+# first draft relied on is not a safety property; the refusal is. This arm fails on a tree that takes
+# only the tmpfs lock: it would run the class and return 0.
+mkdir -p "$T/t55/liveP" "$T/t55/liveP/disk-reaper.lock"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t55/liveP/disk-reaper.lock/token"
+chmod 500 "$T/t55/liveP"
+OUT="$(t55_run "$T/t55/liveP" "$T/t55/fb-liveP")"; RC=$?
+chmod 700 "$T/t55/liveP"
+assert_eq "$RC" "6" "T57f a live holder of the CONFIGURED dir's lock defers the fallback pass (6) — never two reaps beside each other"
+assert_absent "$OUT" "class=uv" "T57f ... and no class runs beside the live pass"
+assert_contains "$OUT" "must not run beside" "T57f ... naming the lock it refused to run beside"
+assert_absent "$(cat "$T/t55/fb-liveP/disk-reaper.status" 2>/dev/null)" "state_dir=" "T57f ... and a deferred pass writes no record (the previous one stands)"
+# (f2) THE SAME REFUSAL WHEN THE HOLDER COULD NOT WRITE ITS TOKEN. The token write is `|| true`, and on
+# a full disk `mkdir` can succeed while the token's data write fails — the state `state_dir_writable`
+# documents. Reading a tokenless lock as "free" put the gate fail-OPEN on precisely the filesystem
+# condition it exists for, so a tokenless lock younger than the stale bound counts as LIVE (mirroring
+# acquire_lock). This arm fails on a gate that requires a readable pid.
+mkdir -p "$T/t55/liveT" "$T/t55/liveT/disk-reaper.lock"
+: >"$T/t55/liveT/disk-reaper.lock/token"
+chmod 500 "$T/t55/liveT"
+OUT="$(t55_run "$T/t55/liveT" "$T/t55/fb-liveT")"; RC=$?
+chmod 700 "$T/t55/liveT"
+assert_eq "$RC" "6" "T57f2 a tokenless lock on the configured dir still counts as LIVE (6) — never fail-open"
+assert_absent "$OUT" "class=uv" "T57f2 ... and no class runs beside it"
+# (f3) THE OTHER DIRECTION OF THE GATE: a DEAD holder must NOT block. A gate that over-refuses is the
+# inert enforcer this feature exists to remove — a fallback pass would exit 6 for ever, never write a
+# record, and the unit would stay GREEN. This is the arm that reds if `kill -0`/the lstart fence is
+# dropped from peer_lock_live.
+mkdir -p "$T/t55/deadP" "$T/t55/deadP/disk-reaper.lock"
+printf 'pid=999999 started=%s lstart=Thu Jan  1 00:00:00 1970\n' "$(date +%s)" >"$T/t55/deadP/disk-reaper.lock/token"
+chmod 500 "$T/t55/deadP"
+OUT="$(t55_run "$T/t55/deadP" "$T/t55/fb-deadP")"; RC=$?
+chmod 700 "$T/t55/deadP"
+assert_eq "$RC" "0" "T57f3 a DEAD recorded holder does not block the fallback pass (0) — the gate must not over-refuse"
+assert_contains "$OUT" "class=uv rc=0" "T57f3 ... the class runs"
+assert_file "$T/t55/fb-deadP/disk-reaper.status" "T57f3 ... and the pass records its verdict"
+# (f4) ONE CANONICAL LOCK, SHARED BY EVERY PASS. A fallback pass takes its lock at a FIXED path
+# derived from the tmpfs root alone — no uid, no candidate choice — so a healthy pass and a fallback
+# pass, or two passes under different uids, contend on the SAME lock whichever ordering they start in.
+# (Enumerating candidate/uid locks was tried and abandoned: every variant left an ordering where two
+# passes reaped concurrently, because the SET depended on the checker's environment.) Here a live
+# holder at the canonical path must defer a fallback pass whose own candidates are elsewhere.
+CANON="$T/t55/shm/pi-disk-reaper/disk-reaper.lock"
+mkdir -p "$CANON"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$CANON/token"
+OUT="$(t55_run "$T/t55/notadir/state" "$T/t55/fb-canon")"; RC=$?
+assert_eq "$RC" "6" "T57f4 a live holder at the CANONICAL lock defers any fallback pass (6) — one name, one lock"
+assert_contains "$OUT" "$CANON" "T57f4 ... naming the canonical lock it refused to run beside"
+assert_absent "$OUT" "class=uv" "T57f4 ... and no class runs beside it"
+# (f4b) THE MIRROR ORDERING: a HEALTHY pass must defer to a live fallback pass. This was the declared
+# "residual (i)" while the peer set was an enumeration; with one fixed canonical path the healthy pass
+# checks it for a single stat, so the ordering is closed rather than traded.
+mkdir -p "$T/t55/healthy"
+OUT="$(t55_run "$T/t55/healthy" "$T/t55/fb-unused2")"; RC=$?
+assert_eq "$RC" "6" "T57f4b a live pass on the canonical lock defers a HEALTHY pass too (6) — both orderings covered"
+assert_absent "$OUT" "class=uv" "T57f4b ... and no class runs beside it"
+rm -rf "$CANON"
+# (f4c) ... AND THE HEALTHY PASS STILL RUNS when the canonical lock is free (the gate must not over-refuse).
+OUT="$(t55_run "$T/t55/healthy" "$T/t55/fb-unused2")"; RC=$?
+assert_eq "$RC" "0" "T57f4c with no canonical holder a healthy pass runs (0)"
+assert_contains "$OUT" "class=uv rc=0" "T57f4c ... the class runs"
+# (f4d) WHEN THE HOLDER CANNOT BE OBSERVED, FAIL CLOSED. A broken PS_BIN, a `ps` that timed out on a
+# hung /proc, or a hidepid /proc all make the start time unreadable while the holder is very much alive.
+# Reading that as "no holder" ran a pass beside a live one (measured: rc=0 with PS_BIN=/nonexistent).
+# The stale window keeps a genuinely dead holder from blocking for ever (T57f3 pins that side).
+CANON="$T/t55/shm/pi-disk-reaper/disk-reaper.lock"
+mkdir -p "$CANON"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$CANON/token"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t55/notadir/state" \
+    DISK_REAPER_STATE_DIR_FALLBACKS="$T/t55/fb-nops" XDG_RUNTIME_DIR="$T/t55/xdg" \
+    DISK_REAPER_TMPFS_ROOT="$T/t55/shm" PS_BIN=/nonexistent-ps \
+    CACHE_REAP_UV_DIR="$T/t55/nc-uv" CACHE_REAP_NPM_DIR="$T/t55/nc-npm" CACHE_REAP_PIP_DIR="$T/t55/nc-pip" \
+    bash "$REAPER" --dry-run --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "6" "T57f4d an unobservable ps FAILS CLOSED (6) — never run beside a holder we cannot see"
+assert_absent "$OUT" "class=uv" "T57f4d ... and no class runs beside it"
+rm -rf "$CANON"
+
+# (f4e) `ps -p` EXITS 1 FOR TWO DIFFERENT THINGS: "no such process" and "I could not look"
+# (hidepid, a sandbox, a PS_BIN shim). Folding the second into the first is fail-OPEN — the live holder
+# becomes invisible and the pass runs beside it. The control probe (`ps -p $$`) is what separates them.
+# ⛔ THE FIXTURE MUST PUT THE HOLDER ON THE **PRIMARY** LOCK. On the canonical lock a second gate
+# (`acquire_lock`, whose empty-lstart arm already fails closed) refuses with its own message, so the
+# arm passed with the control probe removed — vacuous. Here the pass resolves a writable fallback and
+# the ONLY gate that can see this holder is the peer check, and the assertion is on ITS message.
+mkdir -p "$T/t55/psbin"
+printf '#!/bin/sh\nexit 1\n' >"$T/t55/psbin/ps"; chmod +x "$T/t55/psbin/ps"
+mkdir -p "$T/t55/psP/disk-reaper.lock"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t55/psP/disk-reaper.lock/token"
+chmod 500 "$T/t55/psP"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t55/psP" \
+    DISK_REAPER_STATE_DIR_FALLBACKS="$T/t55/fb-ps1" XDG_RUNTIME_DIR="$T/t55/xdg" \
+    DISK_REAPER_TMPFS_ROOT="$T/t55/shm" PS_BIN="$T/t55/psbin/ps" \
+    CACHE_REAP_UV_DIR="$T/t55/nc-uv" CACHE_REAP_NPM_DIR="$T/t55/nc-npm" CACHE_REAP_PIP_DIR="$T/t55/nc-pip" \
+    bash "$REAPER" --dry-run --only uv 2>&1)"; RC=$?
+chmod 700 "$T/t55/psP"
+assert_eq "$RC" "6" "T57f4e a ps that exits 1 for EVERYTHING cannot hide a live holder (6) — rc 1 is not proof of absence"
+assert_contains "$OUT" "must not run beside" "T57f4e ... refused by the PEER gate (not by acquire_lock's own lock)"
+assert_absent "$OUT" "class=uv" "T57f4e ... and no class runs beside it"
+
+# (f5) A TRAILING SLASH IN A CANDIDATE MUST NOT MAKE THE PASS REFUSE AGAINST ITS OWN LOCK. The own-lock
+# skip was a string compare while the enumerated candidates are normalised, so `/path/fb/` produced
+# `$LOCK_DIR=/path/fb//disk-reaper.lock` and the pass named ITSELF as the live holder: exit 6 with no
+# class and no record — a green unit over a reaper that never reaps. `-ef`/normalised identity closes it.
+OUT="$(t55_run "$T/t55/notadir/state" "$T/t55/fb-slash/")"; RC=$?
+assert_eq "$RC" "0" "T57f5 a trailing slash on the resolved candidate does not make the pass refuse against itself"
+assert_contains "$OUT" "class=uv rc=0" "T57f5 ... the class runs"
+assert_absent "$OUT" "must not run beside" "T57f5 ... and it does not name itself as a holding peer"
+# (f6) THE CANONICAL PATH CARRIES NO UID. The name used to include the uid, so a pass run by hand as
+# another account was blind to the unit's lock (measured: rc=0 beside a live peer). The path is now the
+# same for every uid, and the liveness test does not use `kill -0` (which returns EPERM for a live
+# foreign-uid pid and read it as dead).
+CANON="$T/t55/shm/pi-disk-reaper/disk-reaper.lock"
+mkdir -p "$CANON"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$CANON/token"
+OUT="$(t55_run "$T/t55/notadir/state" "$T/t55/shm-only2")"; RC=$?
+assert_eq "$RC" "6" "T57f6 the canonical lock is uid-independent — a live holder defers a pass with an unrelated candidate list (6)"
+assert_contains "$OUT" "pi-disk-reaper/disk-reaper.lock" "T57f6 ... naming that lock"
+assert_absent "$OUT" "class=uv" "T57f6 ... and no class runs beside it"
+rm -rf "$CANON"
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
