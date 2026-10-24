@@ -1639,7 +1639,12 @@ PYEOF
   wpin "…and a cycle with no record says UNKNOWN rather than naming a cause it cannot know" "$ORCH" 'PR actions are UNKNOWN, not zero'
   wpin "…and a zero row count names BOTH of its causes instead of asserting one" "$ORCH" 'either the listing returned no rows, or the record could not be written'
   wpin "…and the funnel is told whether the ledger was written at all" "$ORCH" '"${PRDISP_REC:-unknown}"'
-  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (the open-PR listing was unchanged'
+  # ⛔ THE REASON NOW NAMES THE CAUSE (#2601): the old pin asserted the generic "unchanged — 304 — or
+  # unreadable" string, which collapsed a bounded cache-skip, a failed listing and a cache-less 304
+  # into one sentence an operator could not act on. The pin asserts the SUBSTITUTION — the cause is
+  # interpolated — so a build that hard-codes one cause again fails here.
+  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (${SWEEP_CACHE_NOTE:-'
+  wpin "…and the restorable actable set is persisted on every FULL sweep" "$ORCH" 'state/sweep-rows.tsv'
   wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
   wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
   wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"

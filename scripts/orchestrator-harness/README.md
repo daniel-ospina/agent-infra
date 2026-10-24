@@ -979,6 +979,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
+| `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
 
 ⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `MERGE_STALL_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
 carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
@@ -2679,13 +2680,19 @@ processes):
 * **A fallback may not LOWER the gate.** When the per-PR rows are gone, the count is the whole open
   listing ("assume nothing is owned"), and the scope-filtered swept set can read fully owned. The floor
   is applied (`⚠️ fail-closed floor: …`) so the smaller number can never open the issue path.
-  ⛔ `SWEEP_LIST` does **NOT** survive a non-200 sweep: it is reset every cycle (`SWEEP_LIST=""`
-  before the request) and only filled on a 200, so a 304 or a deferral leaves the sweep loop with
-  ZERO rows to read. An earlier version of this paragraph claimed otherwise; the same false claim was
-  in the loop's own comment and in a test comment, and all three were repaired with agent-infra#2126.
-  The consequence is the reason the per-PR disposition ledger exists: on such a cycle the sweep
-  attempts nothing, so the only honest thing the cycle can do is NAME that (`[pr] PR path: NO UNIT
-  SPAWNED this cycle — … no per-PR read this cycle`), never imply a dispatch.
+  ⛔ `SWEEP_LIST` survives a **304** and nothing else (#2640). It is reset every cycle
+  (`SWEEP_LIST=""` before the request); a **200** fills it AND persists it to
+  `state/sweep-rows.tsv` / `state/sweep-meta.tsv`, and a **304** restores it from that cache — because
+  a 304 is GitHub asserting "identical to what you cached", so the cached rows ARE that cycle's read.
+  The restore is bounded by `SWEEP_MAX_AGE` (the conditional header is only sent while the last full
+  sweep is younger than that), so it can never act on rows older than the floor. A **deferral** or a
+  **failed listing** leaves the sweep with ZERO rows — it made no request, and a failure is not an
+  assertion of "unchanged" — and it does NOT serve the cache. In all three no-read cases the only
+  honest thing the cycle can do is NAME the cause (`[pr] PR path: NO UNIT SPAWNED this cycle — …
+  no per-PR read this cycle (<cause>)`), never imply a dispatch. An earlier version of this paragraph
+  claimed the opposite for the 304 case in the other direction (that `SWEEP_LIST` never survives);
+  that was true of the shipped code until #2640 and was itself a defect: the box ran one cycle per
+  process, so a 304 cycle had no memory to inherit, and 152 of 221 measured cycles acted on nothing.
 
 ⚠️ **Three residuals, stated rather than hidden.** (a) A *reviewer* in flight holds no branch, so its
 PR reads un-owned: that over-counts the work queue — the safe direction here (take on MORE PR work,
