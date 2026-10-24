@@ -1138,7 +1138,7 @@ SCOUT_LOCK_STALE_SECS="${SCOUT_LOCK_STALE_SECS:-300}"
 # touched (SCOUT_REFUSE_WHY names its path, age and the remedy). Never silent: every arm logs, because
 # `git checkout` is what fails next and its message does not say which of the two it was.
 scout_clear_stale_lock() {
-  local gd lock age mtime
+  local gd lock age mtime age_cmp
   gd="$(git -C "$SC" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
   lock="$gd/index.lock"
   # ⛔ `-e` FOLLOWS SYMLINKS, SO A DANGLING ONE READS AS "NO LOCK" (#2688 review cycle 2, P2).
@@ -1148,18 +1148,27 @@ scout_clear_stale_lock() {
   # never happen and the cell loops TRANSIENT forever on an unrepaired lock. `-L` 
   # makes the symlink visible, and the NON-REGULAR ARM below then refuses with its truthful remedy.
   [ -e "$lock" ] || [ -L "$lock" ] || return 0
-  # ⛔ THE BOUND IS OPERATOR INPUT AND IT IS VALIDATED, NOT TRUSTED (#2688 review cycle 2, P1).
+  # ⛔ THE BOUND IS OPERATOR INPUT AND IT IS VALIDATED, NOT TRUSTED (#2688 review cycles 2-3, P1).
   # MEASURED: `SCOUT_LOCK_STALE_SECS=5m` makes `[ "$age" -lt "5m" ]` exit 2 with `integer expression
   # expected`, and `if` reads ANY non-zero status as FALSE — so the live-writer arm was skipped and a
   # 0-second-old LIVE lock reached the `rm -f` below, with a `REPAIR:` line asserting it was "0s old
-  # > 5ms". 0 is refused for the same reason: it makes NOW count as stale. A bound that cannot be
-  # evaluated means the pass cannot call any lock stale, so it refuses.
+  # > 5ms". The FIRST fix refused the literal `0`, and cycle 3 measured two spellings that got past it:
+  # `00`/`000` (zero-equivalent, but `$(( 00 ))` is 0 and `[ 0 -lt 0 ]` is false) and anything above
+  # INT64_MAX (accepted by a digits-only test, then the comparison itself errors). So the bound is
+  # constrained to a CANONICAL positive decimal — no leading zero, at most 9 digits (~31 years, well
+  # inside the integer range bash can compare) — and the comparison below refuses on ANY status > 1, so
+  # "could not compare" can never again be read as "not younger than the bound".
   case "$SCOUT_LOCK_STALE_SECS" in
-    ''|*[!0-9]*|0)
+    ''|*[!0-9]*|0*)
       SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
-      SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is not a positive whole number of seconds, so the staleness bound CANNOT BE EVALUATED and this pass cannot tell an orphaned lock from a LIVE WRITER'S — REFUSING TO JUDGE rather than delete it. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), or set it to a positive integer, then re-run"
+      SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is not a canonical positive whole number of seconds (no leading zero, no sign, no unit), so the staleness bound CANNOT BE EVALUATED and this pass cannot tell an orphaned lock from a LIVE WRITER'S — REFUSING TO JUDGE rather than delete it. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), or set it to a positive integer, then re-run"
       return 1 ;;
   esac
+  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then
+    SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+    SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is ${#SCOUT_LOCK_STALE_SECS} digits long — beyond the range this pass can compare without an arithmetic error, so the staleness bound CANNOT BE EVALUATED and it REFUSES TO JUDGE rather than delete a lock it cannot call stale. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), then re-run"
+    return 1
+  fi
   if [ ! -f "$lock" ]; then
     SCOUT_REFUSE_RC="$EXIT_NOT_PROVISIONABLE"
     SCOUT_REFUSE_WHY="scout at $SC has a NON-REGULAR FILE at $lock — git refuses every index write while it exists, and this pass will not delete something it cannot identify. Remove it by hand, then re-run"
@@ -1188,7 +1197,20 @@ scout_clear_stale_lock() {
     SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock whose age is not a sane number (mtime=${mtime}s, now=$(date +%s)s, age='${age}') — this pass cannot tell an orphaned lock from a LIVE WRITER'S, so it REFUSES TO JUDGE rather than delete it. The next cycle retries; if the lock is known to be orphaned, rm -f $lock, then re-run"
     return 1 ;;
   esac
-  if [ "$age" -lt "$SCOUT_LOCK_STALE_SECS" ]; then
+  # ⛔ THE COMPARISON IS CHECKED FOR ITS STATUS, NOT JUST FOR "TRUE" (#2688 review cycle 3, P1).
+  # `if [ … ]` reads every non-zero status as FALSE, so a comparison that ERRORED was indistinguishable
+  # from "the lock is NOT younger than the bound" — which is how a live lock reached `rm -f` twice.
+  # Status 0 = the lock IS younger than the bound (the live-writer refusal); status 1 = provably STALE
+  # (fall through and remove); anything else is "could not compare" and refuses.
+  age_cmp=0
+  [ "$age" -lt "$SCOUT_LOCK_STALE_SECS" ] || age_cmp=$?
+  case "$age_cmp" in
+    0|1) ;;
+    *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+       SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock whose age (${age}s, mtime=${mtime}s) could not be compared against the ${SCOUT_LOCK_STALE_SECS}s staleness bound (the comparison exited ${age_cmp}) — this pass cannot tell an orphaned lock from a LIVE WRITER'S, so it REFUSES TO JUDGE rather than delete it. The next cycle retries; if the lock is known to be orphaned, rm -f $lock, then re-run"
+       return 1 ;;
+  esac
+  if [ "$age_cmp" -eq 0 ]; then
     SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
     SCOUT_REFUSE_WHY="scout at $SC has a LIVE git lock at $lock (${age}s old, under the ${SCOUT_LOCK_STALE_SECS}s staleness bound) — a writer may hold it and removing it could corrupt the index, so this pass REFUSES TO JUDGE rather than delete it. It is cleared automatically once orphaned; the next cycle retries"
     return 1
