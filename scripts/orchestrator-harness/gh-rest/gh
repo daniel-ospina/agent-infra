@@ -344,6 +344,21 @@ case "$SUB" in
   [ "$SUB" = "issue view" ] && { kind=issue; base="repos/$REPO/issues/$NUM"; }
   raw="$(run_real api "$base" 2>&1)" || die "$raw"
   guard_api_error "$raw"
+  # ⛔ A VIEW OF ONE NUMBER IS NOT A LIST, AND A PR-NUMBERED TARGET IS NOT "NO ISSUE" (measured
+  # 2026-10-24, the empty agent-infra funnel). The projection below drops `pull_request` rows because
+  # a LIST of /issues is not a list of issues — that rule belongs to the LIST path ONLY. On VIEW it
+  # produced `out=[]`, and the "single object" promise was then printed as an EMPTY ARRAY with rc 0:
+  # `gh issue view 2645 --repo daniel-ospina/agent-infra --json number,title,state,stateReason,
+  # assignees,url` answered `[]`. `collision_preflight.py` reads that payload as `issue landed` AND
+  # `issue assignee/holder`, so it refused non-object JSON on BOTH surfaces: the candidate is
+  # INCOMPLETE, and six INCOMPLETE candidates are `ABORT: … judged NOTHING` — an empty backlog with
+  # capacity free, which is the one symptom this adapter must never manufacture. An issue and a PR
+  # SHARE a number sequence, so the question is legitimate and real gh answers it; DELEGATE rather
+  # than answer it with a shape the caller cannot read (and rather than invent an issue payload for a
+  # pull request, which would be the other fail-open).
+  if [ "$kind" = issue ] && printf '%s' "$raw" | jq -e 'type == "object" and (.pull_request != null)' >/dev/null 2>&1; then
+    delegate
+  fi
   case ",$JSON_F," in
     *,comments,*)
       cs="$(read_json '[.[][] | {body:.body, author:{login:(.user.login)}, createdAt:.created_at}]' \
