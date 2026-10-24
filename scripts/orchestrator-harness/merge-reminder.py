@@ -731,6 +731,17 @@ def _cron_line(o: Path, mins: int) -> str:
     return f"*/{mins} * * * * O={q_o} /usr/bin/env python3 {q_s} --o {q_o} {CRON_TAG}"
 
 
+_O_TOKEN = re.compile(r"O='([^']*)'|O=(\S+)")
+
+
+def _same_o_key(p: str) -> str:
+    """One spelling per `$O`: `--o` takes what the operator typed (symlink, relative, `~`)."""
+    try:
+        return str(Path(p).expanduser().resolve())
+    except OSError:
+        return p
+
+
 def _is_our_cron_line(line: str, tag: str, o: Path | None = None) -> bool:
     """True only for a line THIS file wrote: the tag AND this script's path.
 
@@ -748,10 +759,17 @@ def _is_our_cron_line(line: str, tag: str, o: Path | None = None) -> bool:
     # uninstall delete a PEER `$O`'s arm and an operator line that merely mentioned the script.
     # The `$O` token is what both copies render identically, and what distinguishes two reminders.
     if o is not None:
-        token = "O=" + shell_quote(str(o)).replace("%", "\\%")
-        if token in line:
-            return True
-        if "O=" in line:
+        # ⛔ THE SAME `$O` REACHED BY A DIFFERENT SPELLING IS THE SAME `$O`. The token is the literal
+        # `--o` argument, so `--o /real/O` and `--o /symlink/to/O` (or `--o .`) rendered different
+        # tokens: install appended a SECOND arm for the same directory, and an uninstall from the
+        # other spelling matched nothing — "nothing to remove", exit 0, arm still firing (measured).
+        # Compare RESOLVED paths, parsing the token out of the line instead of matching its text.
+        want = _same_o_key(str(o))
+        for m in _O_TOKEN.finditer(line):
+            val = m.group(1) if m.group(1) is not None else m.group(2)
+            if _same_o_key(val.replace("\\%", "%")) == want:
+                return True
+        if _O_TOKEN.search(line):
             return False              # a different `$O`'s entry (or an operator line naming one)
     # An entry written before the `O=` token existed carries only the script path.
     return quoted in line
@@ -1961,8 +1979,9 @@ def main(argv=None) -> int:
             main = main_sha(repo_path)
         except OSError as e:
             main = ""
-            skipped = (skipped + "; " if skipped else "") + \
-                f"UNREADABLE environment — {type(e).__name__}: {e}"
+            if "UNREADABLE environment" not in skipped:      # one sentence, not two
+                skipped = (skipped + "; " if skipped else "") + \
+                    f"UNREADABLE environment — {type(e).__name__}: {e}"
     line = one_line_of(landing, deploy, skipped, dispatched)
     err = compose(md, slug, main, budget, landing, deploy, skipped, line)
     if err:

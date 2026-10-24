@@ -1637,6 +1637,53 @@ ck "§26n ...while an uninstall for THAT \$O removes it" \
    "$(grep -q "O='$O2'" "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
 ck "§26n ...and the operator line is still there afterwards" \
    "$(qF 'pause-arm.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ THE SAME $O BY ANOTHER SPELLING IS THE SAME $O. `--o` is whatever the operator typed (a symlink,
+# a relative path), and keying on the literal string appended a SECOND arm for one directory while an
+# uninstall from the other spelling reported "nothing to remove" and exited 0 — over a live arm.
+: > "$FX/crontab.txt"
+mkdir -p "$TMP/realO"
+ln -sfn "$TMP/realO" "$TMP/linkO" 2>/dev/null || true
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$TMP/realO" \
+  --install-timer --interval 600 >/dev/null 2>&1
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$TMP/linkO" \
+  --install-timer --interval 600 >/dev/null 2>&1
+ck "§26o a second install through a SYMLINKED \$O replaces, not duplicates" \
+   "$([ "$(grep -c 'tortoise-merge-reminder' "$FX/crontab.txt")" -eq 1 ] && echo 0 || echo 1)"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$TMP/realO" \
+        --uninstall-timer 2>&1)"; rc3=$?
+ck "§26o ...and an uninstall from the CANONICAL spelling removes that same arm" \
+   "$([ "$rc3" -eq 0 ] && grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+# ...and the reverse direction: install canonical, uninstall through the symlink.
+: > "$FX/crontab.txt"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$TMP/realO" \
+  --install-timer --interval 600 >/dev/null 2>&1
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$TMP/linkO" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§26o ...and the reverse: uninstall through the SYMLINK removes the canonical install" \
+   "$(grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+
+# ⛔ AN UNREAD SURFACE MUST NOT SUPPRESS A RED THAT *WAS* READ. The guard exists to stop a false
+# "no red group"; if it fired on any unread candidate it would instead HIDE a red group — the worse
+# direction for a section whose job is to point at one root unblocking a batch.
+skout="$(python3 - "$SUT" <<'PYMOD'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+red = {"pr": {"number": 2}, "readings": "reds=1 in-flight=0", "reds": 1,
+       "red_labels": ["ci / build"]}
+unread = {"pr": {"number": 1}, "readings": "pr=OPEN reds=UNREADABLE", "reds": 0, "red_labels": []}
+print("mixed=%r" % m._shared_reds([unread, red]))
+print("allunread=%r" % m._shared_reds([unread]))
+print("clean=%r" % m._shared_reds([{"pr": {"number": 3}, "readings": "reds=0", "reds": 0,
+                                           "red_labels": []}]))
+PYMOD
+)"
+ck "§26p a red group that WAS read is still reported beside an unread candidate" \
+   "$(qF 'ci / build' "$skout" && echo 0 || echo 1)"
+ck "§26p ...and only the all-unread case abstains" \
+   "$(qF 'could not be read' "$skout" && qF 'No PR in this cycle carries a red group' "$skout" && echo 0 || echo 1)"
+: > "$FX/crontab.txt"
 : > "$FX/crontab.txt"
 
 

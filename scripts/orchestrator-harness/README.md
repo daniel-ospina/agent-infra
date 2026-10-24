@@ -2034,14 +2034,16 @@ them exits 3 naming the remedy rather than installing nothing quietly. Every arm
 ARTIFACT that schedules it (`launchctl print`, `systemctl is-active`, `crontab -l`) — a successful
 write is not a timer. `--uninstall-timer` removes **every** arm install can create (the unit, and
 the crontab entry on a box with no systemd) and verifies the removal. Our crontab entry is identified by the tag AND the `$O`
-it serves — not by the script path, because `$O/<script>` and the checkout copy are the same script
-to `install.sh`, and keying on the path made a cross-copy uninstall match nothing ("nothing to
-remove", exit 0, arm still firing) while keying on the script NAME made one `$O`'s uninstall delete a
-peer's arm and an operator line that merely mentioned the script. An unreadable crontab is an
+it serves, compared as RESOLVED paths (so `--o /o`, `--o /link/to/o` and `--o .` are one arm, not
+three) and not by the script path — `$O/<script>` and the checkout copy are the same script to
+`install.sh`, and keying on the path made a cross-copy uninstall match nothing ("nothing to remove",
+exit 0, arm still firing) while keying on the script NAME made one `$O`'s uninstall delete a peer's
+arm and an operator line that merely mentioned the script. An entry written before the token existed
+is still matched by its script path, and that legacy fallback is the only place the path is a key. An unreadable crontab is an
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
 **Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§26,
-190 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+195 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the
