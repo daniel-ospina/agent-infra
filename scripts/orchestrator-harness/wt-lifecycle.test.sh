@@ -45,6 +45,7 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: '$1', want: '$2')"; fi; }
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (found: $2)"; else ok "$3"; fi; }
 assert_dir()      { if [ -d "$1" ]; then ok "$2"; else bad "$2 (missing dir: $1)"; fi; }
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
 assert_nodir()    { if [ -d "$1" ]; then bad "$2 (still present: $1)"; else ok "$2"; fi; }
@@ -86,6 +87,48 @@ mk_repo() {
 # Every git call inside the library is then relative to that repo, exactly as in production.
 in_wt() {
     ( cd "$2" && WT_GIT="$REAL_GIT" bash -c ". '$WTL' || exit 99; $1" )
+}
+
+# ── the LANE ARMS MUST SUPPLY MAIN'S CREATION-GATE READING (#2409) ────────────────────────────────
+# L6/L7 execute the SHIPPED `lane.sh`, and `run_agent` now measures the repo's landing ratio before
+# it starts a CREATION worker (`KIND=lane`): it DERIVES `owner/name` from the worktree's `origin` and
+# REFUSES when it cannot (spawn-gate.sh `land_backlog_repo` → rc 74). Both of those are deliberate
+# main-side decisions (repo-slug.sh refuses a local-path remote ON PURPOSE, and UNREADABLE must HOLD,
+# never read as OK), so the FIXTURE is what has to look like a box — not the gate.
+#
+# ⛔ WITHOUT THIS THE ARMS PASS FOR THE WRONG REASON, WHICH IS HOW THIS WAS FOUND. `mk_repo` builds a
+# LOCAL bare origin, so the gate refused at `land-backlog` BEFORE any agent ran: the stub `pi` never
+# committed, and L7's three assertions then failed on a lane that never spawned (the trap had
+# correctly reaped a genuinely 0-commit worktree). L6 passed — but only because its assertion is
+# "the trap removed it", which a refusal satisfies too.
+#
+# The reading is SUPPLIED THE WAY A BOX SUPPLIES IT, following capacity-transfer.test.sh §LB: install
+# the REST adapter at `$O/gh-rest/gh`, which `lane.sh` prepends to PATH (install.sh ships it, and it
+# is in the drift list). There is deliberately NO env seam that switches the gate off — review cycle 1
+# reproduced one opening the gate on a repo with 82 open PRs — so a stub ADAPTOR is the only shape
+# that both answers the read and leaves the gate itself under test.
+#
+# The two reads: the OPEN pull count (floored at `--jq length`) and the recent MERGED close-count.
+# 0 open / 0 landings is UNDER the ceiling (floored at 5), so creation is ALLOWED — the state these
+# arms need in order to reach the agent at all.
+mk_lane_box() { # <env-dir> <repo> -> repo with a GitHub-shaped origin and an answering gh adapter
+    local e="$1" repo="$2"
+    mkdir -p "$e/gh-rest"
+    cat >"$e/gh-rest/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *'pulls?state=open'*)   printf '0\n' ;;   # under the ceiling (floored at 5) -> creation allowed
+  *'pulls?state=closed'*) : ;;             # no merged closes read -> landings 0
+  *) : ;;
+esac
+exit 0
+SH
+    chmod +x "$e/gh-rest/gh"
+    # The SLUG is what the gate parses, and it reads `remote.origin.url` only — nothing in L6/L7
+    # touches the network (wt_reap_if_empty reads the LOCAL `refs/remotes/origin/<br>`, never
+    # ls-remote), so repointing origin here cannot make the arms reach out. Every other arm keeps
+    # mk_repo's local bare origin, because THOSE do push and fetch.
+    "$REAL_GIT" -C "$repo" remote set-url origin https://github.com/daniel-ospina/agent-infra.git
 }
 
 # mk_failing_git <dir> <repo> <branch> — a `git` that performs the real `worktree add`, then makes
@@ -361,12 +404,18 @@ assert_contains "$OUT" "rc=0" "L5 once the holder is gone, the same call reaps"
 ENV=L6; REPO="$(mk_repo $ENV)"
 mkdir -p "$T/$ENV/o/logs" "$T/$ENV/o/state" "$T/$ENV/o/bin"
 printf '#!/bin/bash\nexit 0\n' >"$T/$ENV/o/bin/pi"; chmod +x "$T/$ENV/o/bin/pi"
+mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
         O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
         REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." \
         bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm owner/repo 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
+# ⛔ THE AGENT MUST HAVE ACTUALLY RUN. Without this the arm cannot tell "the trap reaped a 0-commit
+# lane" from "the lane refused to start and the trap reaped what provisioning left" — and the second
+# is exactly what the #2409 creation gate produced once main merged in.
+assert_not_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "land-backlog] REFUSED" \
+    "L6 the lane REACHED its agent (the creation gate did not refuse the fixture)"
 assert_nodir "$REPO/.worktrees/tm-15" "L6 the lane's own EXIT trap removed the worktree"
 assert_nobranch "$REPO" feat/15-tm "L6 …and its 0-ahead branch"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "worktree:" \
@@ -388,11 +437,14 @@ pi() {
 }
 export -f pi
 SH
+mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
 ( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
   REAP_LANE_VENV_DISABLE=1 \
   bash -c '. "$1"; exec bash "$2" 16 feat/16-tm owner/repo' _ "$T/$ENV/o/stub-pi.sh" "$LANE" \
   >/dev/null 2>&1 )
+assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
+    "L7 the lane REACHED its agent (the creation gate did not refuse the fixture)"
 assert_dir "$REPO/.worktrees/tm-16" "L7 a lane that committed keeps its worktree"
 assert_branch "$REPO" feat/16-tm "L7 and its branch"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count "origin/main..feat/16-tm")" "1" \
