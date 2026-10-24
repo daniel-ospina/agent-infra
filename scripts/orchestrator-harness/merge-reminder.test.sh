@@ -2798,7 +2798,7 @@ ck "§27b ...and no whitespace split of a flattened cmdline remains in the reade
 out="$(env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
   bash "$BOX" --o "$O" --repo "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES an explicit --repo that does not carry the harness" \
-   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'has NO INDEX ENTRY for scripts/orchestrator-harness/box-status.sh' <<<"$out" && ! grep -qE '\(mode ;' <<<"$out" && echo 0 || echo 1)"
 ck "§27b ...and it says so instead of omitting the ref line (an absent line is not an opinion)" \
    "$(grep -q "does not carry the harness" <<<"$out" && echo 0 || echo 1)"
 # ⛔ EVERY CANDIDATE AT ONCE, including this script's own checkout — which is why the probe runs from a
@@ -2894,7 +2894,7 @@ ck "§27b harness_repo_of REFUSES a checkout whose harness path is only the giti
 out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$SHAPED" --repo "$SHAPED" 2>&1)"
 ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
-   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'has NO INDEX ENTRY' <<<"$out" && grep -q 'pointer makes the PATH exist' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
@@ -2915,7 +2915,7 @@ ck "§27b the tracked-link fixture really has a mode-120000 index entry at the m
 out="$(env REPO= HARNESS_REPO="$LINKSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES a repo that ships a TRACKED SYMLINK as the harness file" \
-   "$(grep -q '^ref: UNRESOLVED (.*mode 120000' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (.*not a TRACKED REGULAR FILE there (mode 120000' <<<"$out" && echo 0 || echo 1)"
 out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" "$LINKSHAPE" <<'PYMOD'
@@ -2929,6 +2929,66 @@ print(0 if (got is None or Path(got).resolve() != shaped) else 1)
 PYMOD
 )"
 ck "§27b harness_repo_of REFUSES the same tracked-symlink shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A GITLINK IS NOT THE HARNESS EITHER, and the refusal must say so: `160000` is a submodule entry, not a
+# symlink, so a message that names only symlinks mis-describes the cause it actually found.
+LINKGIT="$FX/gitlink-shape"
+rm -rf "$LINKGIT"
+git init --quiet -b main "$LINKGIT" 2>/dev/null
+git -C "$LINKGIT" config user.email t@example.invalid
+git -C "$LINKGIT" config user.name t
+: > "$LINKGIT/README"
+git -C "$LINKGIT" add README
+git -C "$LINKGIT" commit --quiet -m "base"
+git -C "$LINKGIT" update-index --add --cacheinfo 160000,"$(git -C "$LINKGIT" rev-parse HEAD)",scripts/orchestrator-harness/box-status.sh
+ck "§27b the gitlink fixture really has a mode-160000 index entry at the marker path" \
+   "$(git -C "$LINKGIT" ls-files -s -- scripts/orchestrator-harness/box-status.sh | grep -q '^160000 ' && echo 0 || echo 1)"
+out="$(env REPO= HARNESS_REPO="$LINKGIT" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES a gitlink (160000) and names a gitlink, not only a symlink" \
+   "$(grep -q 'mode 160000' <<<"$out" && grep -q 'gitlink/submodule' <<<"$out" && echo 0 || echo 1)"
+# ...and the reminder's reader must refuse the same shape: a widened mode list (`"160000"` added) would
+# otherwise ship green, since only the box probe was pinned against it.
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$LINKGIT" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+print(0 if (got is None or Path(got).resolve() != shaped) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES the same gitlink shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ AN INHERITED GIT ENVIRONMENT MUST NOT HIJACK THE PROBE (round-6 review, measured: with
+# `GIT_DIR=<harness>/.git`, a non-harness checkout was returned as the harness repo because the index read
+# answered from the HARNESS). A probe describes the directory it was pointed at.
+# ⛔ `GIT_DIR` ALONE is the measured shape: with only that variable the index read answered from the
+# harness while `top` came from the candidate, so a NON-harness checkout was returned as the harness repo.
+out="$(env REPO= HARNESS_REPO="$PLAIN" GIT_DIR="$HERE_TOP/.git" \
+  HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status is not hijacked by an inherited GIT_DIR (the plain repo is still refused)" \
+   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   GIT_DIR="$HERE_TOP/.git" \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$PLAIN" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+plain = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(plain)
+print(0 if (got is None or Path(got).resolve() != plain) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of is not hijacked by an inherited GIT_DIR either" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A DIRECTORY OF THAT NAME IS NOT THE FILE (round-5 review follow-up, measured: with the index holding

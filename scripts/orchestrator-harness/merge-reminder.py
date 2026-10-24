@@ -216,13 +216,13 @@ class Skipped(Exception):
     """A cycle that could not be measured. Reported by name; NEVER an empty answer."""
 
 
-def run(cmd, timeout=60, cwd=None):
+def run(cmd, timeout=60, cwd=None, env=None):
     """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout."""
     try:
         # ⛔ `errors="replace"`: a command's non-UTF-8 output is a READING problem, and a UnicodeDecode
         # error here would escape every handler (same class as the boxes.tsv decode above).
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, cwd=cwd)
+                           timeout=timeout, cwd=cwd, env=env)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", f"timeout after {timeout}s: {' '.join(cmd[:3])}"
@@ -2686,13 +2686,20 @@ def harness_repo_of(o: Path) -> Path | None:
     # <stage>\t<path>`, and only a regular blob recorded at the exact path is the harness file. A
     # path-existence test follows the pointer; `--error-unmatch` alone is a PATHSPEC match, satisfied by a
     # mode-120000 symlink and by a tracked file BESIDE a directory of that name (both measured accepted).
+    # ⛔ AND THE PROBE MUST NOT INHERIT A GIT ENVIRONMENT (round-6 review, measured: with
+    # `GIT_DIR=<harness>/.git` in the environment, `git -C <a non-harness checkout> ls-files` answered from
+    # the HARNESS's index, so the non-harness repo was accepted and its main measured as the harness main).
+    # A probe describes the directory it is pointed at; the variables are dropped for these reads only.
+    genv = {k: v for k, v in os.environ.items()
+            if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                         "GIT_ALTERNATE_OBJECT_DIRECTORIES")}
     here = script_checkout()
     cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
              str(Path.home() / "orchestrator")]
     for c in cands:
         if not c:
             continue
-        rc, out, _ = run(["git", "-C", c, "rev-parse", "--show-toplevel"], timeout=15)
+        rc, out, _ = run(["git", "-C", c, "rev-parse", "--show-toplevel"], timeout=15, env=genv)
         top = (out or "").strip()
         if rc != 0 or not top:
             continue
@@ -2701,7 +2708,7 @@ def harness_repo_of(o: Path) -> Path | None:
         # main measured against (round-4 review follow-up, measured). And the PATH must match exactly
         # (round-5 follow-up): a pathspec also matches a tracked file BESIDE a directory of that name.
         rc2, entry, _ = run(["git", "-C", top, "ls-files", "-s", "--error-unmatch", "--",
-                             MANIFEST_MARKER], timeout=15)
+                             MANIFEST_MARKER], timeout=15, env=genv)
         line = (entry or "").strip().splitlines()[0] if (entry or "").strip() else ""
         head, _, ipath = line.partition("\t")          # `<mode> <object> <stage>\t<path>`
         mode = head.split(" ", 1)[0] if head else ""

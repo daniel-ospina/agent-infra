@@ -62,6 +62,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ⛔ A PROBE DESCRIBES THE DIRECTORY IT WAS POINTED AT. An ambient `GIT_DIR` / `GIT_INDEX_FILE` makes every
+# `git -C <candidate>` below read ANOTHER repo's index — measured (round-6 review): with
+# `GIT_DIR=<harness>/.git`, a NON-harness checkout was returned as the harness repo, because the index entry
+# it was asked about belonged to the harness. Cleared once, here, so no later read can be hijacked.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 sha12() { printf '%s' "${1:0:12}"; }
 is_sha() { case "${1:-}" in ''|*[!0-9a-fA-F]*) return 1 ;; esac; [ "${#1}" -ge 7 ]; }
 
@@ -115,7 +121,7 @@ elif [ -n "$stamp_commit" ]; then src="stamp"; id="$stamp_commit"; fi
 # marker is looked for at the toplevel, and `$REPO` resolves the same ref from inside the subdir), where a
 # literal-path test refused what `harness-refresh.sh`/`check-deployed-drift.sh` accept.
 harness_missing_reason() { # <path> -> why it is not the harness repo (empty = it is)
-  local c="$1" top
+  local c="$1" top marker tab entry mode ipath why_noun
   [ -n "$c" ] || { printf 'empty path'; return; }
   if ! git -C "$c" rev-parse --git-dir >/dev/null 2>&1; then
     printf '%s is not a git checkout' "$c"; return
@@ -143,7 +149,8 @@ harness_missing_reason() { # <path> -> why it is not the harness repo (empty = i
     return
   fi
   if [ "$mode" != "100644" ] && [ "$mode" != "100755" ]; then
-    printf '%s does not carry the harness: %s is not a TRACKED REGULAR FILE there (mode %s; a tracked symlink ships no harness bytes)' "$top" "$marker" "$mode"
+    why_noun="a tracked symlink (120000) or a gitlink/submodule (160000) ships no harness bytes"
+    printf '%s does not carry the harness: %s is not a TRACKED REGULAR FILE there (mode %s; %s)' "$top" "$marker" "$mode" "$why_noun"
     return
   fi
   if [ "$ipath" != "$marker" ]; then
