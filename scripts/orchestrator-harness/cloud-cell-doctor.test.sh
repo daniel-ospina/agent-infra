@@ -1141,6 +1141,10 @@ ELAPSED=$(( $(date +%s) - T0 ))
 result_has "SYNC FAILED" && ok "registry: a bounded-out sync is reported as a failure, not a silent no-op" \
   || bad "registry: the timed-out sync produced no failure line — $OUT"
 
+# ⛔ THE COPY NEEDS ITS SIBLINGS. Since #2573 the hygiene pass also sweeps worktree-root caches,
+# and that step FAILS CLOSED (`CANNOT-VERIFY`, rc=3) unless `live-ownership.sh` sits beside the
+# script it runs from — correct in production, and a real deployment ships the whole directory.
+# Without it these legs assert the registry store against a pass that died at step 4.
 # ── 12c) the STORE is the checkout ROOT, and only an agent-infra checkout is a store at all ───────
 # Both are review findings that the first cut of this change shipped, and both are silent: the worktree
 # lands inside the tracked source tree, or records are pushed to the WRONG repository. The fixture asks
@@ -1150,6 +1154,7 @@ say_case "hygiene: the store is the checkout ROOT (not the scripts/ dir), and a 
 reset_state
 mkdir -p "$R/hub/scripts/orchestrator-harness"
 cp "$DOCTOR" "$R/hub/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$R/hub/scripts/orchestrator-harness/live-ownership.sh"
 cp "$HERE/../registry-sync.sh" "$R/hub/scripts/registry-sync.sh"
 rm -f "$REC"; rm -rf "$R/hub/scripts/.worktrees"
 OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
@@ -1171,6 +1176,7 @@ esac
 # through to this very worktree's own agent-infra origin and reveal nothing about the guard.
 git init -q "$R/notagentinfra" && git -C "$R/notagentinfra" remote add origin "$R/tortoise.git"
 mkdir -p "$T/nc" && cp "$DOCTOR" "$T/nc/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$T/nc/live-ownership.sh"
 OUT="$(DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" HARNESS_REPO="$R/notagentinfra" \
         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
@@ -1315,6 +1321,7 @@ reset_state
 # reaches. (Pointing the seam at a nonexistent path is NOT the same test: the search would simply fall
 # through to the SHIPPED script and sync, which is exactly what a first attempt at this case did.)
 mkdir -p "$T/copy"; cp "$DOCTOR" "$T/copy/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$T/copy/live-ownership.sh"
 OUT="$( ( unset DOCTOR_REGISTRY_SYNC HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
          DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
          DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
