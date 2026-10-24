@@ -988,7 +988,7 @@ printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent
 RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30e an ambiguous peer record is NOT converged (exit 4), not reported same"
 assert_contains "$RS_LAST" "unreadable=1" "§30e ...and it is COUNTED unreadable"
-if printf '%s' "$RS_LAST" | grep -q 'same=1'; then bad "§30e the divergence was still reported same"; else ok "§30e ...and never reported same over two records that disagree"; fi
+if grep -q 'same=1' <<<"$RS_LAST"; then bad "§30e the divergence was still reported same"; else ok "§30e ...and never reported same over two records that disagree"; fi
 if cmp -s "$BOX13/$K_AMBIG.json" <(printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T10:00:00Z"}' "$HEAD_B"); then
   ok "§30e ...and the local record was not touched"
 else
@@ -1017,7 +1017,7 @@ cp "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"
 RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30f an ambiguous local record makes the pull NOT converged (exit 4)"
 assert_contains "$RS_LAST" "json vs field" "§30f ...naming the two-reader cause"
-if printf '%s' "$RS_LAST" | grep -q 'wrote=1'; then bad "§30f an older peer record was WRITTEN over a newer local one"; else ok "§30f ...and no peer record was written over it (rule 1 holds)"; fi
+if grep -q 'wrote=1' <<<"$RS_LAST"; then bad "§30f an older peer record was WRITTEN over a newer local one"; else ok "§30f ...and no peer record was written over it (rule 1 holds)"; fi
 if cmp -s "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"; then
   ok "§30f ...and the local record is byte-identical afterwards"
 else
@@ -1037,7 +1037,7 @@ K_UNI="daniel-ospina-agent-infra-2203"
 seed_payload "$STORE10" "$K_UNI" "{\"pr\":2203,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\u2028x\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
 RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
 assert_contains "$RS_LAST" "unreadable=" "§30g a non-ASCII COMPARED value is refused (the two readers cannot be shown to agree)"
-if printf '%s' "$RS_LAST" | grep -q 'pulled daniel-ospina-agent-infra-2203'; then bad "§30g the non-ASCII record was installed"; else ok "§30g ...and it is not installed"; fi
+if grep -q 'pulled daniel-ospina-agent-infra-2203' <<<"$RS_LAST"; then bad "§30g the non-ASCII record was installed"; else ok "§30g ...and it is not installed"; fi
 
 if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null; then
   bad "§30e the ambiguous record was PUBLISHED anyway"
