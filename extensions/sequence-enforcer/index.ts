@@ -322,6 +322,10 @@ const testExitRequests: number[] = [];
 export function _exitRequestsForTest(): number[] {
   return process.env.NODE_ENV === "test" ? testExitRequests : [];
 }
+/** Test seam: the outstanding in-flight call (or null) — proves it is never renewed. */
+export function _inFlightForTest(): { id: string; startedAt: number } | null {
+  return process.env.NODE_ENV === "test" ? inFlight : null;
+}
 
 // Only these can legitimately produce NO events for tens of minutes. A `read`
 // or an `edit` is instantaneous, so it must never mask a stall (the pre-existing
@@ -417,12 +421,14 @@ function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: M
   const key = checkpointKey(skill);
   unsatisfiableKeys.add(key);
   parkStreak.delete(key);
-  // MEASURED, never derived: `parks × 10` would claim thirty minutes of idle for
-  // parks spread across an hour of real work (review cycle 1, finding 3).
+  // MEASURED, never derived (review cycle 1 finding 3, cycle 2 finding 5):
+  // `parks × 10` is a count of WINDOWS, not of lines (a checkpoint park is
+  // one-shot) and says nothing about elapsed time. Report both real numbers.
   const idleMin = Math.max(0, Math.round((Date.now() - lastToolActivityAt) / 60_000));
+  const stepMin = Math.max(0, Math.round((Date.now() - skill.stepStartedAt) / 60_000));
   const { cause, remedy } = parkDiagnosis(step, mode);
   console.log(
-    `[sequence-enforcer] ⛔ SEQUENCE-GATE-UNSATISFIABLE — "${skill.path}" parked ${parks}× at step ${skill.stepIndex} "${step.name}" (gate: ${step.gate || "none"}), no tool call for ${idleMin} min.`,
+    `[sequence-enforcer] ⛔ SEQUENCE-GATE-UNSATISFIABLE — "${skill.path}" at step ${skill.stepIndex} "${step.name}" (gate: ${step.gate || "none"}): ${parks} idle windows with no advance at this step for ${stepMin} min (no tool call for ${idleMin} min).`,
   );
   // A warn session cannot be BLOCKED by this step, so say why ending it is still
   // right: warn is audit-only, not a waiver — the sequence cannot advance either.
@@ -436,7 +442,8 @@ function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: M
   );
   auditLog({
     ts: new Date().toISOString(), event: "sequence_gate_unsatisfiable", skill: skill.path, step: skill.stepIndex,
-    step_name: step.name, gate: step.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, idle_min: idleMin, cause, remedy,
+    step_name: step.name, gate: step.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP,
+    idle_min: idleMin, step_min: stepMin, cause, remedy,
   });
   endUnsatisfiableLane();
 }
@@ -448,21 +455,26 @@ function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: M
  * outright would leave the measured class invisible; review cycle 1, finding 5).
  * Coalesced: the line and its row are written once per idle episode.
  */
-function noteUngatedIdle(skill: SkillState, step: Step | undefined, mode: Mode): void {
+function noteNotGatedIdle(skill: SkillState, step: Step | undefined, mode: Mode, why: string): void {
   const key = checkpointKey(skill);
   if (idleEpisodeSeen.has(key)) return;
   idleEpisodeSeen.add(key);
   const idleMin = Math.max(0, Math.round((Date.now() - lastToolActivityAt) / 60_000));
   console.log(
-    `[sequence-enforcer] 💤 Idle — "${skill.path}" at step ${skill.stepIndex} "${step?.name ?? "?"}" (gate: auto), no tool call for ${idleMin} min. ` +
-    `This step declares NO gate: nothing is blocked and the sequence cannot stall here, so this is NOT a gate stall — ` +
-    `further idle windows in this episode are coalesced. A lane that never wakes is the lane reaper's call (fleet_state), not the sequence gate's.`,
+    `[sequence-enforcer] 💤 Idle — "${skill.path}" at step ${skill.stepIndex} "${step?.name ?? "?"}" (gate: ${step?.gate || "auto"}), no tool call for ${idleMin} min. ` +
+    `${why} So this is NOT a gate stall — further idle windows in this episode are coalesced, and there is no verdict to give. ` +
+    `A lane that never wakes is the lane reaper's call (fleet_state), not the sequence gate's.`,
   );
   auditLog({
     ts: new Date().toISOString(), event: "timeout_idle_ungated", skill: skill.path, step: skill.stepIndex,
-    step_name: step?.name ?? null, gate: "auto", mode, idle_min: idleMin,
+    step_name: step?.name ?? null, gate: step?.gate || "auto", mode, idle_min: idleMin,
   });
 }
+
+/** The two reasons a print lane can idle with no gate holding it. */
+const NO_GATE = "This step declares NO gate, so nothing is blocked and the sequence cannot stall here.";
+const WARN_CHECKPOINT_NO_GATE =
+  "This session is in warn mode, where a checkpoint does not block (the first call at it auto-advances), so nothing is holding the lane.";
 
 // #201: on 10-min idle, print-mode PARKS the skill (state preserved, timer
 // re-armed) instead of popping. Previously blocked-spam workers never timed
@@ -475,6 +487,12 @@ export function handleSequenceTimeout(
 ): void {
   const top = topSkill();
   if (!top) return;
+  // #1770 (review cycle 2, finding 4): the session escape / kill switch bypasses
+  // ALL enforcement — this terminal verdict included. The re-arm now lives in
+  // noteToolActivity, which runs ABOVE the handlers' bypass return, so without
+  // this guard an operator-escaped lane would still be parked and killed 30 min
+  // later — turning the documented escape into a delayed termination.
+  if (isKillSwitchActive()) return;
   // #357 (Task 8, j): checkpoint-stall PARK takes precedence over the 10-min POP
   // in ALL modes — a checkpoint is never popped (pop → re-read/re-pop loop +
   // silent enforcement loss). This is also the timer-driven path for a fully
@@ -487,9 +505,12 @@ export function handleSequenceTimeout(
   if (owner) {
     const step = owner.steps[owner.stepIndex];
     const mode = resolveMode(env, MODE_FILE, argv);
-    // (cycle 3): warn-mode sessions never park — the first call auto-advances,
-    // so a park would be recovery-signal noise in a success path (mirrors the
-    // handler's wall-clock guard). The re-arm stays unconditional.
+    const print = isPrintMode(env, argv);
+    // Review cycle 2 (finding 5): the verdict is PER STALL. Without this the
+    // re-arm below would re-park and re-verdict the same checkpoint every cap
+    // cycle wherever the exit does not land (the test seam, or a host that
+    // ignores process.exit) — "one stall, one verdict".
+    if (unsatisfiableKeys.has(checkpointKey(owner))) return;
     if (
       step?.gate === "checkpoint" && mode !== "warn" &&
       Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS
@@ -500,10 +521,20 @@ export function handleSequenceTimeout(
       // the very gate that blocks every git op. A human is present in an
       // interactive session (and can run the checker / the force-pass), so the
       // bound applies to print lanes only; interactive keeps the old behaviour.
-      if (isPrintMode(env, argv)) {
+      if (print) {
         const parks = bumpParkStreak(owner);
-        if (parks >= SEQUENCE_PARK_CAP) emitUnsatisfiable(owner, step, parks, mode);
+        if (parks >= SEQUENCE_PARK_CAP) {
+          emitUnsatisfiable(owner, step, parks, mode);
+          return; // NEVER re-arm after the verdict (cycle 2, finding 5)
+        }
       }
+    } else if (step?.gate === "checkpoint" && mode === "warn" && print) {
+      // Review cycle 2 (finding 2): warn mode applies NO checkpoint gate (nothing
+      // blocks, the first call auto-advances), so a warn print lane sitting at one
+      // is the same shape as an `auto` step. It used to be silent AND unbounded;
+      // it now keeps the one coalesced liveness line and never a verdict — the
+      // default `pi -p` lane is warn, so this is the common case.
+      noteNotGatedIdle(owner, step, mode, WARN_CHECKPOINT_NO_GATE);
     }
     // re-arm: parked state preserved; one-shot suppresses repeat parks
     sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
@@ -532,7 +563,7 @@ export function handleSequenceTimeout(
     // (that loop is keyed on `gate === "auto"`). Such a step stalls for real and
     // must still park, be named and be bounded.
     if (!topStep || topStep.gate === "auto") {
-      noteUngatedIdle(top, topStep, mode);
+      noteNotGatedIdle(top, topStep, mode, NO_GATE);
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
@@ -582,16 +613,21 @@ export function handleSequenceTimeout(
 function noteToolActivity(kind: "call" | "result", toolCallId: string, toolName = ""): void {
   lastToolActivityAt = Date.now();
   if (kind === "call") {
-    // A blocked call emits no tool_result, so a bash that the enforcer refuses
-    // leaves this set; the bound below (SEQUENCE_INFLIGHT_MAX_MS) is what keeps
-    // that from hiding a stall forever, and the next tool call replaces it.
-    inFlight = LONG_RUNNING_TOOLS.has(toolName) ? { id: toolCallId, startedAt: lastToolActivityAt } : null;
+    // ⛔ NEVER RENEW an outstanding call (review cycle 2, finding 1). A call the
+    // enforcer BLOCKS emits no tool_result, so a lane retrying a blocked `bash`
+    // would otherwise renew the suppression on every retry and could never be
+    // parked, logged or ended — the pre-#1770 symptom, silently. The clock starts
+    // at the FIRST unanswered call and SEQUENCE_INFLIGHT_MAX_MS bounds it; a
+    // completed call (tool_result) clears it, so the next one starts fresh.
+    if (!inFlight) inFlight = LONG_RUNNING_TOOLS.has(toolName) ? { id: toolCallId, startedAt: lastToolActivityAt } : null;
   } else {
     inFlight = null;
   }
-  // Progress means this is not one idle stall: the consecutive-park count and the
-  // ungated-idle episode both restart (review cycle 1, finding 3).
-  parkStreak.clear();
+  // Only the ungated-idle EPISODE restarts on activity. The park count deliberately
+  // does NOT (review cycle 2, finding 3): a lane that keeps making calls which do
+  // not advance the step would otherwise re-park line-1 every window forever and
+  // never reach the cap. The count is per (skill, step) and resets when the step
+  // ADVANCES — a new stepIndex is a new key.
   idleEpisodeSeen.clear();
   // One owner for the re-arm: this function (not the two handlers). Armed only
   // while a skill is on the stack — an empty stack needs no timer.

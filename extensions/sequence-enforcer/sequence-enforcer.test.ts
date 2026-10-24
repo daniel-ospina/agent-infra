@@ -22,7 +22,9 @@ import {
   parkDiagnosis,
   parkSuppressedByInFlight,
   SEQUENCE_PARK_CAP,
+  SEQUENCE_INFLIGHT_MAX_MS,
   _exitRequestsForTest,
+  _inFlightForTest,
   checkpointTokenOk,
   parseTokenTs,
   sanitizeRemoteUrl,
@@ -46,6 +48,7 @@ import {
   default as sequenceEnforcer,
   type Step,
 } from "./index.js";
+import { isEnforcementBypassed } from "../shared/kill-switch.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -3575,7 +3578,7 @@ await test("#1770.1 a step with gate:auto never parks — 12 idle windows = ONE 
     // Review cycle 1 (finding 5): the class must not go SILENT — one coalesced
     // liveness line per idle episode, explicitly labelled as NOT a gate stall.
     equal(logs.filter((l) => l.includes("💤 Idle")).length, 1, "ONE coalesced idle line for 12 idle windows (not 12)");
-    ok(/declares NO gate: nothing is blocked/.test(logs.join("\n")), "the line says plainly that no gate is holding the lane");
+    ok(/declares NO gate, so nothing is blocked/.test(logs.join("\n")), "the line says plainly that no gate is holding the lane");
     equal(auditEntries.filter((e) => e.event === "timeout_park").length, 0, "ZERO timeout_park rows (was 12)");
     equal(auditEntries.filter((e) => e.event === "timeout_idle_ungated").length, 1, "one ungated-idle row (the fleet liveness signal)");
     equal(_exitRequestsForTest().length, 0, "an ungated idle step never ends the lane");
@@ -3612,9 +3615,10 @@ await test("#1770.2 a GATED step: 1 named park, coalesced repeats, then SEQUENCE
     });
     const verdicts = logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE"));
     equal(verdicts.length, 1, "exactly ONE verdict line a monitor can grep");
-    ok(verdicts[0]!.includes("parked 3×"), "the verdict carries the COUNT (repeats are coalesced, not lost)");
+    ok(verdicts[0]!.includes("3 idle windows"), "the verdict carries the COUNT (repeats are coalesced, not lost)");
     ok(verdicts[0]!.includes("dispatch_reviewers") && verdicts[0]!.includes("gate: verifier"), "the verdict names the step + gate");
-    ok(/no tool call for \d+ min/.test(verdicts[0]!), "the idle window is stated as MEASURED elapsed time");
+    ok(/no advance at this step for \d+ min/.test(verdicts[0]!), "the step idle time is stated as MEASURED elapsed time");
+    ok(/no tool call for \d+ min/.test(verdicts[0]!), "and the last-activity time is separately measured");
     equal(logs.length, 5, "5 lines for the whole stall (1 park + 4 verdict) — NOT one per idle window");
     const rows = auditEntries.filter((e) => e.event === "timeout_park");
     equal(rows.length, 1, "one park row, not one per idle window");
@@ -3626,6 +3630,7 @@ await test("#1770.2 a GATED step: 1 named park, coalesced repeats, then SEQUENCE
     equal(unsat[0]!.step, 1);
     equal(unsat[0]!.parks, 3);
     equal(unsat[0]!.gate, "verifier");
+    ok(Number.isFinite(Number(unsat[0]!.step_min)) && Number(unsat[0]!.idle_min) >= 0);
     // Review cycle 1 (finding 2): pi's print mode binds NO shutdown handler, so
     // ctx.shutdown() alone was a no-op. The exit is a real process.exit(3),
     // observed here through the test seam that records the request instead.
@@ -3774,7 +3779,7 @@ await test("#1770.8 a CHECKPOINT park is bounded too (print only) — the gate t
   } finally { auditRelease(); }
 });
 
-await test("#1770.9 the verdict's idle window is MEASURED, and progress RESETS the count — no fabricated '30 min'", async () => {
+await test("#1770.9 activity that does NOT advance the step never resets the count — a retrying lane is still bounded (cycle 2, findings 3+6)", async () => {
   _resetStateForTest();
   auditCapture();
   const { pi, handlers } = fakePi();
@@ -3783,22 +3788,112 @@ await test("#1770.9 the verdict's idle window is MEASURED, and progress RESETS t
     await handlers.session_start!({}, { sessionManager: { getSessionId: () => "s-1770c" } });
     _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
     await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
-      handleSequenceTimeout(); // park 1
-      // REAL WORK between parks: a tool_result resets the consecutive count
-      await handlers.tool_result!({ toolName: "task", toolCallId: "x", content: [] } as any);
-      handleSequenceTimeout(); // park 1 of a NEW streak
-      handleSequenceTimeout(); // park 2 of the new streak
       captureStart();
-      try { handleSequenceTimeout(); } finally { captureStop(); } // park 3 → cap
+      try {
+        // A lane that keeps calling a tool which cannot advance a verifier step
+        // (`read`) between every window. Cumulative counting must reach the cap;
+        // resetting on activity would re-park line-1 forever (the log-spam class).
+        for (let i = 0; i < 3; i++) {
+          handleSequenceTimeout();
+          if (i < 2) await handlers.tool_result!({ toolName: "read", toolCallId: `r${i}`, content: [] } as any);
+        }
+      } finally { captureStop(); }
     });
+    equal(logs.filter((l) => l.includes("parking")).length, 1, "ONE park line for the whole stall — not one per window (that was the bug)");
+    equal(auditEntries.filter((e) => e.event === "timeout_park").length, 1, "one park row");
     const unsat = auditEntries.filter((e) => e.event === "sequence_gate_unsatisfiable");
-    equal(unsat.length, 1, "the cap is reached after 3 CONSECUTIVE idle windows, not 3 cumulative ones");
-    ok(
-      Number(unsat[0]!.idle_min) < 30,
-      `idle_min is the measured elapsed time since the last REAL activity (${unsat[0]!.idle_min} min), never parks×interval`,
-    );
-    ok(Number.isFinite(Number(unsat[0]!.idle_min)) && Number(unsat[0]!.idle_min) >= 0, "and it is a real number");
+    equal(unsat.length, 1, "the cap is reached after 3 idle windows even though the lane kept calling a non-advancing tool");
+    equal(unsat[0]!.parks, 3);
+    ok(Number.isFinite(Number(unsat[0]!.idle_min)) && Number.isFinite(Number(unsat[0]!.step_min)), "both times are measured numbers");
+    deepEqual(_exitRequestsForTest(), [3]);
   } finally { auditRelease(); }
+});
+
+await test("#1770.10 a BYPASSED session (session escape / kill switch) is never parked and never ended (cycle 2, finding 4)", async () => {
+  _resetStateForTest();
+  auditCapture();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: "1", AGENT_SESSION_ESCAPE: "1" },
+      async () => {
+        await handlers.session_start!({}, { sessionManager: { getSessionId: () => "s-esc" } });
+        // the skill is pushed AFTER session_start (which resets the stack) — a
+        // bypassed session must hold a REAL parked-capable state for this test
+        // to mean anything
+        _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+        ok(isEnforcementBypassed(), "pre-state: the session escape is ACTIVE");
+        captureStart();
+        try { for (let i = 0; i < 5; i++) handleSequenceTimeout(); } finally { captureStop(); }
+      },
+    );
+    equal(logs.filter((l) => l.includes("parking")).length, 0, "no park in a bypassed session");
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "no verdict — the escape must hold");
+    equal(auditEntries.filter((e) => e.event === "timeout_park").length, 0);
+    equal(_exitRequestsForTest().length, 0, "and NEVER an exit: the escape must not become a delayed termination");
+  } finally { auditRelease(); }
+});
+
+await test("#1770.11 checkpoint: gate-mode print lane is bounded ONCE; warn-mode print lane gets the idle line and no verdict (cycle 2, findings 2+5)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  const CKPT = () => [makeStep({ name: "implement", gate: "checkpoint", token_phase: "implement" })];
+  try {
+    // --- gate mode: bounded, exactly ONE verdict across MANY cap cycles
+    auditCapture();
+    _pushSkillForTest("/repo/skills/ckpt/SKILL.md", CKPT(), 0);
+    _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate" }, () => {
+      captureStart();
+      try { for (let i = 0; i < 9; i++) handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 1, "ONE verdict — not one per cap cycle (9 windows = 3 caps)");
+    equal(auditEntries.filter((e) => e.event === "sequence_gate_unsatisfiable").length, 1);
+    deepEqual(_exitRequestsForTest(), [3], "one exit request, not three");
+    equal(auditEntries.filter((e) => e.event === "checkpoint_block_recovery").length, 1, "the pre-existing one-shot park still fires once");
+    auditRelease();
+
+    // --- warn mode (the DEFAULT for pi -p): no gate applies, so no verdict —
+    // but not silent either (the cycle-2 finding: it was both silent AND unbounded)
+    _resetStateForTest();
+    auditCapture();
+    _pushSkillForTest("/repo/skills/ckpt/SKILL.md", CKPT(), 0);
+    _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, () => {
+      captureStart();
+      try { for (let i = 0; i < 6; i++) handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "no verdict: warn applies no checkpoint gate, so nothing is blocked");
+    equal(logs.filter((l) => l.includes("💤 Idle")).length, 1, "but the lane is VISIBLE — one coalesced idle line (was: nothing at all)");
+    ok(/warn mode, where a checkpoint does not block/.test(logs.join("\n")), "and the line says exactly why there is no verdict");
+    equal(_exitRequestsForTest().length, 0, "and the default print lane is never ended by an unapplied gate");
+  } finally { auditRelease(); }
+});
+
+await test("#1770.12 a REFUSED long call never renews the in-flight clock — a blocked-retry lane is still bounded (cycle 2, finding 1)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  sequenceEnforcer(pi as any);
+  try {
+    _pushSkillForTest("/repo/skills/demo/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn" }, async () => {
+      // A blocked `bash` emits NO tool_result. Retrying it must not restart the
+      // clock: the first unanswered call keeps its own startedAt.
+      await handlers.tool_call!({ toolName: "bash", toolCallId: "blocked-1", input: { command: "rm -rf /" } });
+      const first = _inFlightForTest();
+      ok(first, "an unanswered long call is tracked");
+      // (no sleep: the fake-timer harness would never resolve one — and the
+      // decisive signal is the surviving ID, not a millisecond delta)
+      await handlers.tool_call!({ toolName: "bash", toolCallId: "blocked-2", input: { command: "rm -rf /" } });
+      const second = _inFlightForTest();
+      equal(second!.startedAt, first!.startedAt, "the retry did NOT renew the clock (that was the defect)");
+      equal(second!.id, "blocked-1", "the FIRST unanswered call is the one being timed");
+    });
+    // and the bound really does expire: the pure predicate decides it
+    ok(!parkSuppressedByInFlight(Date.now() + SEQUENCE_INFLIGHT_MAX_MS + 1, _inFlightForTest()), "after the bound the lane is parkable again");
+  } finally { /* nothing to release */ }
 });
 
 // ── cleanup + summary ────────────────────────────────
