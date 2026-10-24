@@ -301,7 +301,15 @@ export const SEQUENCE_PARK_CAP = 3;
 // outlives this bound (and so cannot be a working call under any of the fleet's
 // own timeouts) resumes it.
 export const SEQUENCE_INFLIGHT_MAX_MS = 60 * 60 * 1000;
-const parkStreak = new Map<string, number>();
+// Total idle windows at one step before the lane is declared stuck EVEN WHILE it
+// keeps calling tools: 12 × 10 min = 2 h, twice the fleet's own 6 h-cap comment's
+// longest observed single tool, so a working lane cannot reach it by accident.
+export const SEQUENCE_STALL_CAP = 12;
+const parkStreak = new Map<string, number>();          // total windows at this step
+const consecutiveIdleWindows = new Map<string, number>(); // since the last tool activity
+// The park line carries the diagnosis, so it is written ONCE per (skill, step) —
+// not once per episode, and never once per window (that was the log-spam bug).
+const parkAnnounced = new Set<string>();
 // `gate: auto` steps: one idle line per episode (an episode ends at the next tool
 // activity) — the measured 12×/hour repetition collapses to one line, and the
 // fleet keeps a signal instead of silence (review cycle 1, finding 5).
@@ -405,22 +413,60 @@ function endUnsatisfiableLane(): void {
   }, 50);
 }
 
-/** Count one idle window for `skill`'s current step; returns the running count. */
-function bumpParkStreak(skill: SkillState): number {
+/**
+ * Return a BLOCK verdict, and record that the call is not "in flight": a blocked
+ * call produces no tool_result, and an unanswered call is what suppresses the
+ * idle clock — so a refused `bash` would otherwise look like a working one
+ * (review cycle 2 finding 1, cycle 3 finding 3's root).
+ */
+function blockedResult(reason: string): { block: true; reason: string } {
+  inFlight = null;
+  return { block: true, reason };
+}
+
+/**
+ * Count one idle window for `skill`'s current step. TWO numbers, because one
+ * cannot answer both questions (review cycle 3, finding 1 — a cumulative count
+ * alone kills a lane that is polling a background reviewer, i.e. following this
+ * verdict's own remedy):
+ *   • `consecutive` — windows since the last tool activity. A lane with NO
+ *     activity for 3 windows is dead, not working.
+ *   • `total` — windows at this step since it was entered. A lane that keeps
+ *     calling tools which cannot advance the step is stuck even while it looks
+ *     busy, and must still be bounded.
+ * The step advance resets both (a new stepIndex is a new key).
+ */
+function bumpParkStreak(skill: SkillState): { consecutive: number; total: number } {
   const key = checkpointKey(skill);
-  const parks = (parkStreak.get(key) ?? 0) + 1;
-  parkStreak.set(key, parks);
-  return parks;
+  const consecutive = (consecutiveIdleWindows.get(key) ?? 0) + 1;
+  const total = (parkStreak.get(key) ?? 0) + 1;
+  consecutiveIdleWindows.set(key, consecutive);
+  parkStreak.set(key, total);
+  return { consecutive, total };
+}
+
+/** Did this stall cross a bound, and which one? */
+function capReason(c: { consecutive: number; total: number }): "idle" | "stuck" | null {
+  if (c.consecutive >= SEQUENCE_PARK_CAP) return "idle";
+  if (c.total >= SEQUENCE_STALL_CAP) return "stuck";
+  return null;
 }
 
 /**
  * The terminal verdict: one greppable marker line, the derived WHY/REMEDY, an
  * audit row, and the exit. Called only from print-mode paths.
  */
-function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: Mode): void {
+function emitUnsatisfiable(
+  skill: SkillState, step: Step,
+  counts: { consecutive: number; total: number },
+  mode: Mode, why: "idle" | "stuck",
+): void {
   const key = checkpointKey(skill);
   unsatisfiableKeys.add(key);
   parkStreak.delete(key);
+  consecutiveIdleWindows.delete(key);
+  parkAnnounced.delete(key);
+  const parks = why === "idle" ? counts.consecutive : counts.total;
   // MEASURED, never derived (review cycle 1 finding 3, cycle 2 finding 5):
   // `parks × 10` is a count of WINDOWS, not of lines (a checkpoint park is
   // one-shot) and says nothing about elapsed time. Report both real numbers.
@@ -435,14 +481,22 @@ function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: M
   const warnNote = mode === "warn"
     ? " (warn mode: this step does not BLOCK, but it still cannot advance by waiting — a warn pass is audit-only, not a waiver of the sequence)"
     : "";
+  // Two different stalls share one verdict marker, and the difference matters to
+  // whoever reads it: an idle lane is dead; a busy lane is alive but its calls do
+  // not move THIS step (review cycle 3, finding 1).
+  const boundNote = why === "idle"
+    ? "BOUND: no tool call in any of the last windows — the lane is not working."
+    : `BOUND: the lane IS making tool calls, but ${counts.total} windows at this step have not advanced it — the calls are not the ones this gate waits for.`;
   console.log(`[sequence-enforcer]    WHY: ${cause}.${warnNote}`);
+  console.log(`[sequence-enforcer]    ${boundNote}`);
   console.log(`[sequence-enforcer]    REMEDY: ${remedy}.`);
   console.log(
     `[sequence-enforcer]    ENDING THIS LANE NOW (exit 3) — waiting cannot satisfy this gate; the ⛔ line above is the verdict a monitor greps.`,
   );
   auditLog({
     ts: new Date().toISOString(), event: "sequence_gate_unsatisfiable", skill: skill.path, step: skill.stepIndex,
-    step_name: step.name, gate: step.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP,
+    step_name: step.name, gate: step.gate || "none", mode, parks, bound: why,
+    cap: SEQUENCE_PARK_CAP, stall_cap: SEQUENCE_STALL_CAP, consecutive: counts.consecutive, total: counts.total,
     idle_min: idleMin, step_min: stepMin, cause, remedy,
   });
   endUnsatisfiableLane();
@@ -492,7 +546,14 @@ export function handleSequenceTimeout(
   // noteToolActivity, which runs ABOVE the handlers' bypass return, so without
   // this guard an operator-escaped lane would still be parked and killed 30 min
   // later — turning the documented escape into a delayed termination.
-  if (isKillSwitchActive()) return;
+  // ⛔ RE-ARM before returning (review cycle 3, finding 3): the escape can be
+  // lifted mid-session by a human deleting the machine-global kill file, with no
+  // tool event to re-arm anything — dropping the timer here would leave that lane
+  // with no watchdog at all for the rest of the session.
+  if (isKillSwitchActive()) {
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
   // #357 (Task 8, j): checkpoint-stall PARK takes precedence over the 10-min POP
   // in ALL modes — a checkpoint is never popped (pop → re-read/re-pop loop +
   // silent enforcement loss). This is also the timer-driven path for a fully
@@ -515,6 +576,17 @@ export function handleSequenceTimeout(
       step?.gate === "checkpoint" && mode !== "warn" &&
       Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS
     ) {
+      // ⛔ NO in-flight suppression here, and that is deliberate (review cycle 3
+      // finding 2 asked for one; it is unreachable — verified, not assumed). A
+      // checkpoint step that is still current has no fresh token, and then EVERY
+      // non-escape tool is blocked by the checkpoint branch of the tool_call
+      // handler (a long `task`/`bash` never reaches "in flight"), while the
+      // escape tools it does allow — read, loop_enforcer, the checker — are
+      // instantaneous. So a lane parked here is genuinely not working, and a
+      // token-ok checkpoint has already advanced. Adding the suppression would be
+      // dead code that also disabled the bound it exists to enforce.
+      // (An in-flight call CAN coexist with a checkpoint owner below a sub-skill
+      // in WARN mode only — and warn does not park checkpoints at all.)
       parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
       // #1770: BOUND it (review cycle 1, finding 4). `parkCheckpoint` is one-shot,
       // so the LINE never repeated — but the lane still sat forever with rc 0 at
@@ -522,9 +594,10 @@ export function handleSequenceTimeout(
       // interactive session (and can run the checker / the force-pass), so the
       // bound applies to print lanes only; interactive keeps the old behaviour.
       if (print) {
-        const parks = bumpParkStreak(owner);
-        if (parks >= SEQUENCE_PARK_CAP) {
-          emitUnsatisfiable(owner, step, parks, mode);
+        const counts = bumpParkStreak(owner);
+        const why = capReason(counts);
+        if (why) {
+          emitUnsatisfiable(owner, step, counts, mode, why);
           return; // NEVER re-arm after the verdict (cycle 2, finding 5)
         }
       }
@@ -569,27 +642,30 @@ export function handleSequenceTimeout(
     }
     // #1770 rule 2 — a GATED step's park is bounded, coalesced and NAMED.
     if (unsatisfiableKeys.has(checkpointKey(top))) return; // verdict already emitted — never re-arm, never repeat
-    const parks = bumpParkStreak(top);
+    const counts = bumpParkStreak(top);
     const { cause, remedy } = parkDiagnosis(topStep, mode);
-    if (parks === 1) {
+    if (!parkAnnounced.has(checkpointKey(top))) {
+      parkAnnounced.add(checkpointKey(top));
       console.log(
         `[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} "${topStep.name}" (gate: ${topStep.gate || "none"}) — 10 min with no tool call. ` +
         `WHY IT CANNOT ADVANCE BY WAITING: ${cause}. REMEDY: ${remedy}. ` +
-        `(park 1/${SEQUENCE_PARK_CAP} — repeats are coalesced; the next line is the verdict)`,
+        `(window ${counts.total}; reported once per step — the next line for this step is a verdict)`,
       );
       auditLog({
         ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex,
-        step_name: topStep.name, gate: topStep.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, cause, remedy,
+        step_name: topStep.name, gate: topStep.gate || "none", mode, parks: counts.total,
+        consecutive: counts.consecutive, cap: SEQUENCE_PARK_CAP, stall_cap: SEQUENCE_STALL_CAP, cause, remedy,
       });
     }
-    if (parks < SEQUENCE_PARK_CAP) {
+    const why = capReason(counts);
+    if (!why) {
       // park: keep stack/stepIndex/reviewers intact, re-arm the timer (silently —
-      // the first park already named the cause, and a repeat adds no information).
+      // the line above already named the cause, and repeats add no information).
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
-    // CAP REACHED — the gate is UNSATISFIABLE by waiting. Say so, and exit.
-    emitUnsatisfiable(top, topStep, parks, mode);
+    // A BOUND was crossed — the gate is UNSATISFIABLE by waiting. Say so, and exit.
+    emitUnsatisfiable(top, topStep, counts, mode, why);
     return; // NEVER re-arm: no further parks, no further lines
   }
   console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
@@ -607,11 +683,16 @@ export function handleSequenceTimeout(
 /**
  * Record REAL tool activity. Called from the tool_call and tool_result handlers
  * (every turn, before the early returns) so the idle window is measured from the
- * last event, the park count restarts on progress, and an in-flight call is
- * visible to the timeout path.
+ * last event, the CONSECUTIVE idle streak restarts, and an in-flight call is
+ * visible to the timeout path. The TOTAL window count at a step does NOT restart
+ * here — only a step advance resets it (bumpParkStreak).
  */
 function noteToolActivity(kind: "call" | "result", toolCallId: string, toolName = ""): void {
   lastToolActivityAt = Date.now();
+  // Activity ends the CONSECUTIVE idle streak; the TOTAL window count at this step
+  // deliberately survives it (see bumpParkStreak) so a lane that keeps making
+  // non-advancing calls is still bounded.
+  consecutiveIdleWindows.clear();
   if (kind === "call") {
     // ⛔ NEVER RENEW an outstanding call (review cycle 2, finding 1). A call the
     // enforcer BLOCKS emits no tool_result, so a lane retrying a blocked `bash`
@@ -2012,6 +2093,8 @@ export function _resetStateForTest(): void {
   // #1770: the park streak is per-session state too — a prior test's parks must
   // not pre-park (or prematurely cap) the next one.
   parkStreak.clear();
+  consecutiveIdleWindows.clear();
+  parkAnnounced.clear();
   idleEpisodeSeen.clear();
   unsatisfiableKeys.clear();
   lastEventCtx = null;
@@ -2048,6 +2131,8 @@ export default function (pi: ExtensionAPI) {
     // checkpoint one-shot above — a cap consumed by a PREVIOUS session must not
     // end this one on its first park).
     parkStreak.clear();
+    consecutiveIdleWindows.clear();
+    parkAnnounced.clear();
     idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
     inFlight = null;
@@ -2126,6 +2211,8 @@ export default function (pi: ExtensionAPI) {
     checkpointBlockStreak = null;
     auditCoalesce.clear();
     parkStreak.clear(); // #1770: same per-session hygiene on shutdown
+    consecutiveIdleWindows.clear();
+    parkAnnounced.clear();
     idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
     lastEventCtx = null;
@@ -2403,6 +2490,10 @@ export default function (pi: ExtensionAPI) {
           if (!shouldCoalesceBlocked(key)) {
             auditLog({ ts: new Date().toISOString(), event: result.freshTokenBlock ? "checkpoint_token_fresh" : "blocked", skill: target.path, step: ownerStep.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(ownerStep).allow, hint: guidance });
           }
+          // A blocked call is not in flight (VGATE review of cycle 4 found this
+          // one block return still leaving the state set). The shape is kept
+          // verbatim — the freshTokenBlock marker is a separate contract.
+          inFlight = null;
           return {
             block: true,
             reason: `${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`,
@@ -2435,10 +2526,7 @@ export default function (pi: ExtensionAPI) {
         if (!shouldCoalesceBlocked(key)) {
           auditLog({ ts: new Date().toISOString(), event: "blocked", skill: target.path, step: ownerStep.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(ownerStep).allow, hint: guidance });
         }
-        return {
-          block: true,
-          reason: `${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`,
-        };
+        return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`);
       }
       // allowed escape call → resets the consecutive-block streak (mixed spam).
       checkpointBlockStreak = null;
@@ -2458,10 +2546,7 @@ export default function (pi: ExtensionAPI) {
       // #357 (Task 5): handler owns the single blocked audit entry
       // (#201: enriched with allowed/hint gate context).
       auditLog({ ts: new Date().toISOString(), event: "blocked", skill: top.path, step: step.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(step).allow, hint: guidance });
-      return {
-        block: true,
-        reason: `${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`,
-      };
+      return blockedResult(`${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`);
     }
 
     // #357 (Task 5): warn-mode would-block — ONE warn_blocked entry, and skip
