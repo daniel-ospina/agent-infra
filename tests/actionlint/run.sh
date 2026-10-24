@@ -441,7 +441,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-head-ref.yml" "$CFIX/push-group-only.yml" "$CFIX/push-block-scalar.yml" \
   "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml" \
   "$CFIX/pr-trailing-comment.yml" "$CFIX/push-heredoc.yml" \
-  "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml"
+  "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml" \
+  "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -462,6 +463,13 @@ for pair in \
   "pr-scalar-concurrency.yml R1" \
   "pr-concurrency-sequence.yml R0" \
   "push-concurrency-alias.yml R0" \
+  "pr-target-run-id.yml R1" \
+  "pr-head-sha.yml R1" \
+  "pr-group-actor.yml R1" \
+  "push-cancel-nextline.yml R2" \
+  "push-cancel-folded.yml R2" \
+  "push-jobs-flow.yml R0" \
+  "push-on-alias.yml R0" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -474,6 +482,13 @@ for pair in \
     sed 's/^/      /' "$OUT"
   fi
 done
+
+# One file named twice is one workflow: the duplicate-group rule must not compare a file against
+# itself and refuse a correct workflow (#2660 round 4).
+conc_run 0 "the same file passed twice is one workflow" "$CFIX/pr-ok.yml" "$CFIX/pr-ok.yml"
+grep -q '1 file(s) scanned' "$OUT" \
+  && pass "the duplicate path was collapsed before the group comparison" \
+  || { fail "the same file was counted twice"; sed 's/^/      /' "$OUT"; }
 
 # Cross-file rule: two PR workflows that share one group would cancel each other. Neither file is
 # wrong on its own, so this can only be caught by reading the whole set.

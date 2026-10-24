@@ -147,6 +147,19 @@ if [ "${#FILES[@]}" -eq 0 ]; then
   exit 2
 fi
 
+# Deduplicate. The same file named twice is ONE workflow; without this, the duplicate-group rule below
+# compares a file against itself and refuses a correct workflow as "they would cancel each other"
+# (round 4, P2 — `check-workflow-concurrency.sh f.yml f.yml` was RED).
+DEDUPED=()
+for f in "${FILES[@]}"; do
+  seen=0
+  for d in "${DEDUPED[@]+"${DEDUPED[@]}"}"; do
+    [ "$d" = "$f" ] && { seen=1; break; }
+  done
+  [ "$seen" -eq 0 ] && DEDUPED+=("$f")
+done
+FILES=("${DEDUPED[@]}")
+
 TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency.XXXXXX")" || exit 2
 TMP_GROUPS="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency-groups.XXXXXX")" || exit 2
 trap 'rm -f "$TMP_OUT" "$TMP_GROUPS"' EXIT
@@ -177,6 +190,7 @@ function unq(s)  { if (s ~ /^\".*\"$/ ) return substr(s, 2, length(s) - 2)
 function addtrigger(v,   t) {
   t = unq(trim(v))
   if (t == "") return
+  if (t ~ /^\*/ || t ~ /^![^!]/) { concbad = 1; return }   # an alias / a tag: not a trigger this reader can resolve
   trig[t] = 1
 }
 # addflow() — `on: [push, pull_request]` and `on: {pull_request: {...}}`. A flow MAPPING carries its
@@ -211,13 +225,14 @@ function flush(   tg, k, n) {
   printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\037%d\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname, concbad
   delete trig; hasconc = 0; group = ""; cancel = ""; joblevel = 0; fname = ""; onindent = -1; cur = ""
   scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""; wfname = ""; concbad = 0
+  pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0
 }
 BEGIN {
   cur = ""; SQ = sprintf("%c", 39); DQ = "\""
   QCH = "[" DQ SQ "]"
   KEYPAT = QCH "?[A-Za-z_][A-Za-z0-9_-]*" QCH "?[ \t]*:"
   hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""
-  wfname = ""; concbad = 0
+  wfname = ""; concbad = 0; pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0
 }
 {
   if (FNR == 1) {                         # a new file begins: close the previous record FIRST
@@ -242,16 +257,37 @@ BEGIN {
   }
   lineindent = 0                          # 0 for a top-level line
   if (match(line, /^[ \t]+/)) lineindent = RLENGTH
-  if (line ~ /:[ \t]*[|>][-+0-9]*[ \t]*$/) { scalarindent = lineindent; next }
+
+  # A pending `group:` / `cancel-in-progress:` whose value was empty on its own line: the value is the
+  # following indented line(s), joined (a plain continuation, `|`, or `>-`). Leaving it absent is the
+  # DANGEROUS direction here: R2 treats an absent cancel as the non-cancelling default.
+  if (pendkey != "") {
+    if (lineindent > pendind) { pendval = pendval " " trim(line); next }
+    if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
+    pendkey = ""; pendval = ""; pendind = -1
+  }
+
+  # A concurrency child key that opens a scalar is a GROUP/CANCEL VALUE, which the section below reads
+  # (pending value). It must not be swallowed by the generic block-scalar skip.
+  if (cur == "concurrency" && match(line, "^[ \t]*" QCH "?(group|cancel-in-progress)" QCH "?[ \t]*:[ \t]*[|>]")) { }
+  else if (line ~ /:[ \t]*[|>][-+0-9]*[ \t]*$/) { scalarindent = lineindent; next }
 
   # A multi-line flow `on:` (`on: [push,` / `  pull_request]`) is accumulated until the brackets
   # balance: reading only the first line silently DROPPED the rest, so a push trigger vanished and
   # R2 was never evaluated (round 2, P1).
   if (flowopen) {
     flowbuf = flowbuf " " trim(line)
-    if (opens(flowbuf) <= closes(flowbuf)) {
+    flowdepth += opens(line) - closes(line)      # incremental: never re-scan the whole buffer
+    # Bounded: a file that never closes its flow is not a workflow this reader can resolve, and
+    # accumulating it without a ceiling makes the cost grow with attacker-chosen input
+    # (measured 35 s on an 838 KB crafted file before these two lines).
+    if (length(flowbuf) > 65536) {
+      concbad = 1; flowopen = 0; flowbuf = ""; flowmode = ""; flowdepth = 0
+      next
+    }
+    if (flowdepth <= 0) {
       if (flowmode == "concurrency") { parseconc(flowbuf) } else { addflow(flowbuf) }
-      flowopen = 0; flowbuf = ""; flowmode = ""
+      flowopen = 0; flowbuf = ""; flowmode = ""; flowdepth = 0
     }
     next
   }
@@ -269,16 +305,20 @@ BEGIN {
     if (cur == "on") {
       rest = trim(substr(line, index(line, ":") + 1))
       if (rest != "") {
-        if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "on"; flowbuf = rest }
+        if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "on"; flowbuf = rest; flowdepth = opens(rest) - closes(rest) }
         else { addflow(rest) }            # `on: push` / `on: [a, b]` / `on: {pull_request: {}}`
       }
+    }
+    if (cur == "jobs") {
+      rest = trim(substr(line, index(line, ":") + 1))
+      if (rest ~ /^\{/) { concbad = 1 }   # a flow-style jobs: is not modelled (a job-level block hides in it)
     }
     if (cur == "concurrency") {
       hasconc = 1
       rest = trim(substr(line, index(line, ":") + 1))
       if (rest != "") {
         if (rest ~ /^\{/) {
-          if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "concurrency"; flowbuf = rest }
+          if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "concurrency"; flowbuf = rest; flowdepth = opens(rest) - closes(rest) }
           else { parseconc(rest) }
         } else if (rest ~ /^\[/ || rest ~ /^\*/) {
           concbad = 1                   # a sequence or an alias: valid YAML, not modelled -> R0
@@ -306,14 +346,22 @@ BEGIN {
     next
   }
 
+  if (line ~ /^[ \t]*\?[ \t]/) { concbad = 1; next }   # explicit-key form: not modelled
+
   # A JOB-level `concurrency:` (indented while we are NOT in the workflow-level section). GitHub
   # honours it and this check does not model it, so it is refused (R0) rather than ignored.
   if (match(substr(line, lineindent + 1), "^" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
 
   if (cur == "concurrency") {
     t = trim(line)
-    if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) { group = unq(trim(substr(t, index(t, ":") + 1))) }
-    else if (match(t, "^" QCH "?cancel-in-progress" QCH "?[ \t]*:")) { cancel = unq(trim(substr(t, index(t, ":") + 1))) }
+    if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) {
+      v = unq(trim(substr(t, index(t, ":") + 1)))
+      if (v == "" || v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent } else { group = v }
+    }
+    else if (match(t, "^" QCH "?cancel-in-progress" QCH "?[ \t]*:")) {
+      v = unq(trim(substr(t, index(t, ":") + 1)))
+      if (v == "" || v ~ /^[|>]/) { pendkey = "cancel"; pendval = ""; pendind = lineindent } else { cancel = tolower(v) }
+    }
   }
 }
 END { flush() }' "${FILES[@]}" >"$TMP_OUT" 2>/dev/null
@@ -423,19 +471,30 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         resolved="${group//'${{ github.workflow }}'/$identity}"
         resolved="${resolved//'${{github.workflow}}'/$identity}"
         printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
-        if has_trigger "$triggers" pull_request_target; then
-          case "$group" in
-            *'github.event.pull_request.number'*) : ;;
-            *) fail "$fname: \`pull_request_target\` sets \`github.ref\` to the BASE branch, so a group keyed on '$group' collapses every PR into one — key it on \`github.event.pull_request.number\` [R1]" ;;
-          esac
-        else
-          case "$group" in
-            *'github.sha'*|*'github.run_id'*|*'github.run_number'*|*'github.run_attempt'*)
-              fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` or \`github.head_ref\` alone [R1]" ;;
-            *'github.ref'*|*'github.head_ref'*) : ;;
-            *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\` or \`github.head_ref\`. Keyed on a SHA it cancels nothing (each head is its own group) [R1]" ;;
-          esac
-        fi
+        # A per-commit variable makes every head (and every retry) its own group, so the block cancels
+        # NOTHING — the exact defect it exists to prevent. This refusal must apply on BOTH paths: it
+        # used to live only in the `pull_request` branch, so a `pull_request_target` group carrying
+        # `github.run_id` alongside the PR number reported GREEN (round 4, P1). The list is a SUFFIX
+        # test, not a closed set of spellings: `github.event.pull_request.head.sha` (the canonical
+        # per-head key) contains no `github.sha` substring and passed before (round 4, P1).
+        case "$group" in
+          *'.sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
+            fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` / \`github.head_ref\` alone [R1]" ;;
+          *)
+            if has_trigger "$triggers" pull_request_target; then
+              case "$group" in
+                *'github.event.pull_request.number'*) : ;;
+                *) fail "$fname: \`pull_request_target\` sets \`github.ref\` to the BASE branch, so a group keyed on '$group' collapses every PR into one — key it on \`github.event.pull_request.number\` [R1]" ;;
+              esac
+            else
+              case "$group" in
+                # The PR number is per-PR and stable across heads, so it is a correct key for
+                # `pull_request` too — refusing it was a false red (round 4, P2).
+                *'github.ref'*|*'github.head_ref'*|*'github.event.pull_request.number'*) : ;;
+                *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\`, \`github.head_ref\` or \`github.event.pull_request.number\`. Keyed on a SHA it cancels nothing (each head is its own group) [R1]" ;;
+              esac
+            fi ;;
+        esac
         if [ "$cancel" != "true" ]; then
           fail "$fname: triggers a pull request but \`cancel-in-progress\` is '${cancel:-<absent>}' — a superseded head is exactly what should be cancelled [R1]"
         fi
