@@ -1759,21 +1759,33 @@ function clause_before(pre,   parts, n) {
   n = split(pre, parts, /[.;:!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though)([[:space:]]|$)/)
   return parts[n]
 }
-function repair_led(cl,   n, w, i) {
-  n = split(cl, w, /[^[:alpha:]-]+/)
-  # ⛔ SKIP THE EMPTY LEADING FIELD (P2, eighth fresh review of #2288 — MEASURED: a verdict-shaped clause
-  # begins with punctuation, so `split` yields ["", "verdict", "clean", ...] and the three-slot window was
-  # `"", "verdict", "clean"` — the repair verb was UNREACHABLE on every verdict line, so
-  # `**Verdict:** CLEAN — fixed the 2 issues from round 1.` refused while the same sentence on its own
-  # line recorded). Up to three words may precede the verb ("The PR fixes", "We have also fixed").
-  # ⛔ THE VERB MAY SIT ANYWHERE IN THE CLAUSE *BEFORE* THE COUNT, NOT WITHIN THREE WORDS (P2, ninth fresh
-  # review of #2288 — MEASURED over-block, each a PAID re-run: `**Verdict:** CLEAN — the PR fixes 2 bugs in
-  # the parser.`, `**Verdict:** CLEAN — this PR closes 2 issues.`,
-  # `**Verdict:** CLEAN — We have also fixed 2 issues found in review.` all refused, because the window
-  # counted the verdict DECORATION as words, so at most one content word could precede the verb. The
-  # CLAUSE BOUNDARY is what keeps a repair in one clause from exempting a live count in the next, so a
-  # positional window adds nothing and costs real prose.
-  for (i = 1; i <= n; i++) if (w[i] ~ repair_re) return 1
+function repair_led(cl,   n, w, i, low) {
+  # ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — MEASURED
+  # REGRESSION this branch introduced: `repair_re` holds ordinary NOUNS (`fix`, `close`, `remove`), so
+  # matching it ANYWHERE in the clause made `**Verdict:** CLEAN — the retry fix leaves 2 blocking defects
+  # unresolved.` classify as "a repair" and mint a SIGNED clean record over a stated pair of blockers; the
+  # same sentences exited 7 before this branch. The window this replaced was precisely what rejected them.
+  # So the exemption is GRAMMATICAL: the verb must OPEN the clause (`Fixed the 3 issues`, `Closes the 2
+  # issues`), or follow a subject phrase that can govern it (`the PR fixes`, `this branch addresses`,
+  # `We have also fixed`), and it must not be a determiner-headed NOUN (`the fix`, `the removed guard`,
+  # `the closed path` — the `the X` subject list below is a closed set, so those cannot match).
+  low = cl; gsub(/[[:space:]]+/, " ", low)
+  # strip the VERDICT DECORATION first (`**Verdict:** CLEAN — `), or the subject phrase is never at the
+  # start and every legitimate repair would be refused (this lane: the first version of this fix did
+  # exactly that, measured)
+  for (i = 0; i < 4; i++) {
+    # ⛔ LEADING NON-ALNUM, NOT `[[:punct:]]` (this lane, MEASURED under mawk): a C-locale `[[:punct:]]`
+    # does not classify the multi-byte em dash, so the decoration strip left `— ` in place and every
+    # legitimate repair on a verdict line refused under mawk while passing under gawk.
+    sub(/^[^[:alnum:]]+/, "", low)
+    if (low ~ /^verdict[[:space:]]*[:.]?[[:space:]]*/) { sub(/^verdict[[:space:]]*[:.]?[[:space:]]*/, "", low); continue }
+    if (low ~ /^clean([^[:alnum:]]|$)/) { sub(/^clean[^[:alnum:]]*/, "", low); continue }
+  }
+  if (low ~ ("^(" repair ")([^[:alnum:]]|$)")) return 1
+  # ⛔ OPTIONAL GROUPS, NEVER `{0,3}` (this lane, caught by mawk: the first version of this line used an
+  # interval expression, which mawk does not support — it compiled, matched nothing, and every legitimate
+  # repair on a verdict line went back to refusing)
+  if (low ~ ("^(the pr|this pr|the branch|this branch|we|i|it|that|both|all)" S S S "[[:space:]]+(" repair ")([^[:alnum:]]|$)")) return 1
   return 0
 }
 BEGIN {
@@ -1793,6 +1805,8 @@ BEGIN {
   # `2 (two) blocking defects remain`, `(2) blocking defects remain`, `blocking defects remaining: (2)` and
   # `2 (P1) defects remain` each recorded a SIGNED clean record). `pnum` is the numeral OR a parenthesised
   # numeral, and the zero test strips the brackets before reading the number.
+  # one optional alphabetic word, used for the subject-phrase bridge (see repair_led)
+  S = "([[:space:]]+[[:alpha:]-]+)?"
   pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
   fwd = "(^|[^[:alnum:]])(" pnum ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
   mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"

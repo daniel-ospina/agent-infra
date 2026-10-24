@@ -2503,6 +2503,20 @@ do
   [ "$(rc_of)" = "7" ]; ck $? "refused (repair in an earlier sentence): $_cl (rc=$(rc_of))"
   no_record; ck $? "    ...nothing recorded"
 done
+# ⛔ A REPAIR MUST BE IN VERB POSITION, NOT MERELY PRESENT (P0, tenth fresh review of #2288 — a
+# REGRESSION this branch introduced: `repair_re` holds ordinary nouns (`fix`, `close`, `remove`), so
+# matching it anywhere in the clause made each of these mint a SIGNED clean record over stated blockers,
+# while the same sentences exited 7 before this branch).
+for _cl in \
+  '**Verdict:** CLEAN — the retry fix leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — the removed guard leaves 1 blocking issue open.' \
+  '**Verdict:** CLEAN — the closed path leaves 2 blocking problems.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (a repair NOUN is not a repair): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
 # …and the repair verb may sit anywhere in its own clause, so ordinary prose records (P2, ninth review:
 # the three-word window counted the verdict decoration, so only ONE content word could precede it).
 for _cl in \
@@ -2769,6 +2783,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 793 ]; ck $? "assertion-count pin: >= 793 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 799 ]; ck $? "assertion-count pin: >= 799 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
