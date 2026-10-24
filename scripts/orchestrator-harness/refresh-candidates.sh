@@ -2359,7 +2359,10 @@ _ck_tmp="$O/.checked-decided.$$"
              # `claims.sh` predates `claim_issue_preflight` — so orch-loop.sh records
              # `.refresh-blocked` and `status` names the reason, instead of a cell that looks healthy.
              echo "[reap] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question on #$_n} — the checked classification cannot be decided on this box"
-             echo "[reap]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             # ⛔ THE REMEDY NAMES THE VERIFYING SEEDER (agent-infra#2041/#2382): a bare `cp *.sh` ships the
+             # module with no verdict — the exact remedy deploy-harness.test.sh refuses to let a shipped
+             # script hand an operator, and this line was added by this branch while that gate was landing.
+             echo "[reap]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run)"
              rm -f "$_ck_tmp" 2>/dev/null; [ -n "$_ck_sorted" ] && rm -f "$_ck_sorted" 2>/dev/null
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           # ⛔ NEVER RELEASE ON A CODE THIS READER DOES NOT RECOGNISE (127 from a missing function, or
