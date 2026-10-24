@@ -1,0 +1,9 @@
+# `mask_quoted()` opened a quote state on any apostrophe, so an apostrophe in a PLAIN scalar (a job
+# `name: don't`) left the rest of the line "inside a string" — and a real job-level `concurrency:`
+# after it was masked out of R0's search. A cancelling job-level block read GREEN (#2660 round 9).
+name: Push job apostrophe name
+on:
+  push:
+    branches: [main]
+jobs:
+  build: {runs-on: ubuntu-latest, name: don't, concurrency: {group: shared, cancel-in-progress: true}, steps: [{run: echo ok}]}

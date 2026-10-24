@@ -1,0 +1,15 @@
+# Two apostrophes on one line pair up, so the quote state machine closed a "string" around the
+# COMMENT — the comment was kept as part of the value, and the group that carries no per-PR key
+# passed the "keyed on the PR" rule on the strength of prose. Every PR then shared one cancellation
+# domain (#2660 round 10). A quote only opens a scalar at a VALUE position.
+name: PR group apostrophe pair comment
+on:
+  pull_request:
+concurrency:
+  group: pr-group-apostrophe-pair-comment-don't-share   # github.ref handled elsewhere, won't be added
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

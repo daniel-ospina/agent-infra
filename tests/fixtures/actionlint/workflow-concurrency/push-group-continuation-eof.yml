@@ -1,0 +1,15 @@
+# A pending `group:` value at the end of the file: the declared-but-unreadable guard ran BEFORE the
+# pending value was resolved, so it refused a value it then read, purely because the block ended the
+# file (#2660 round 8).
+name: Push group continuation eof
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+concurrency:
+  group:
+    push-group-continuation-eof
