@@ -1135,17 +1135,39 @@ check_disk_reaper() {
   [ -n "$reaper" ] || die "disk-reaper.sh not found (looked at \$DISK_REAPER, \$HOME/.pi/agent/scripts, and beside this script) — a cell whose disk is never reaped stops dispatching at ~97%% used"
   [ -n "$installer" ] || die "install-disk-reaper-timer.sh not found — cannot schedule the disk reaper, and an unscheduled reaper never runs unattended"
 
+  # ⛔ TELL THE INSTALLER WHICH REPO TO SCAN (measured on a fresh CI runner, 2026-10-24). The installer's
+  # own fallback list is AMBIENT ($REPO / $TORTOISE_REPO / $WORKDIR / $AGENT_INFRA_PATH) and, on a box
+  # carrying none of them, it REFUSES — "no repo resolved on this box — the venv and worktree classes
+  # would fail closed every pass" — so this check died and the cell could NEVER be certified, on exactly
+  # the box that had just cloned its checkout. The refusal is right; the silence was not: this script
+  # already KNOWS the checkout ($WORKDIR, verified or cloned by check_repo), so it says so.
+  # WHAT IT SCANS: the operator's explicit list if there is one, else THIS cell's verified checkout —
+  # never an ambient $REPO / $AGENT_INFRA_PATH, which name the HARNESS or a developer's checkout, so
+  # adopting them would point a cell's reaper at a repo the cell does not own (that is why the arm that
+  # pins this uses a decoy). A candidate that is not an absolute path or not a checkout is dropped, so a
+  # bring-up that has not cloned yet still gets the installer's own refusal rather than a bogus unit.
+  local rp_repos rp_cand
+  if [ -n "${DISK_REAPER_REPOS:-}" ]; then
+    rp_repos="$DISK_REAPER_REPOS"                 # the operator's list, verbatim (colon-joined; the installer parses it)
+  else
+    rp_repos="${WORKDIR:-}"
+    case "$rp_repos" in
+      /*) git -C "$rp_repos" rev-parse --git-dir >/dev/null 2>&1 || rp_repos="" ;;
+      *) rp_repos="" ;;
+    esac
+  fi
+
   rc=0
   # TEMPLATES_DIR from the SAME checkout the layer came from: the farmed installer copy lives at
   # $HOME/.pi/agent/scripts, whose ../templates does not exist, so without this the templates are
   # "missing" on exactly the cell that was just provisioned.
-  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+  out="$(DISK_REAPER="$reaper" DISK_REAPER_REPOS="$rp_repos" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
          bash "$installer" --install 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
   [ "$rc" -eq 0 ] || die "the disk reaper timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
 
   rc=0
-  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+  out="$(DISK_REAPER="$reaper" DISK_REAPER_REPOS="$rp_repos" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
          bash "$installer" --status 2>&1)" || rc=$?
   [ "$rc" -eq 0 ] || die "the disk reaper timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
   next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
