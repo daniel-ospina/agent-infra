@@ -1742,11 +1742,20 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
     while read -r rd; do
       [ -n "$rd" ] || continue
       seen=$((seen + 1))
-      case "$rd" in
-        '${'[1-9]*':-}') printf 'defaulted %s %s\n' "$var" "$rd" ;;
-        '${'*':-'*)      printf 'invented %s %s\n' "$var" "$rd" ;;
-        *)               printf 'bare %s %s\n' "$var" "$rd" ;;
-      esac
+      # ⛔ THE DEFAULTED FORM IS ANCHORED, NOT A CONTAINS-MATCH (review P1, reproduced). The arm used
+      # to be the glob `${` + digit + `*` + `:-}`, which grades ANY expansion whose TEXT happens to
+      # contain `:-}` as safe-to-be-empty: `${1#*:-}` (strip a prefix), `${1%:-}`, `${1/foo/:-}` and
+      # the folded `${1:-${2#*:-}}` all became `defaulted` — and every one of them dies with
+      # `1: unbound variable` when the argument is absent. It is now exactly `${<digits>:-}`, which is
+      # the only spelling that means "absent → empty". A non-empty default stays `invented` (loud),
+      # and everything else is `bare`.
+      if grep -qE '[$][{][0-9]+:-[}]$' <<<"$rd"; then
+        printf 'defaulted %s %s\n' "$var" "$rd"
+      elif grep -qE '[$][{][0-9]+:-.+' <<<"$rd"; then
+        printf 'invented %s %s\n' "$var" "$rd"
+      else
+        printf 'bare %s %s\n' "$var" "$rd"
+      fi
       # The ANNOTATION, printed UNDER the verdict so it can never suppress it (`head -1` still
       # reads the verdict). A value that embeds the positional in a path/concatenation inherits its
       # function's contract — which is exactly why it must be graded, not excused.
@@ -1809,6 +1818,10 @@ bare|local ok="$(printf %s " #pad")" n="$1"
 bare|local n="${01}"
 bare|local n="${#01}"
 bare|local n="${!010}"
+bare|local s="${1#*:-}"
+bare|local s="${1%:-}"
+bare|local s="${1/foo/:-}"
+invented|local s="${1:-${2#*:-}}"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
 # …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
@@ -1859,6 +1872,11 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # line is bash-legal, and missing it attributed the read to the PRECEDING function, where an
   # allowlisted pair for the same NAME graded it REQUIRED (PASS 235→236). Hence the `\\[[:space:]]*$`
   # arm, which accepts a trailing backslash as well as a trailing comment.
+  # ⛔ AND THE BODY MAY OPEN ON THE HEADER LINE WITH ANY COMPOUND OPENER (review P1, reproduced):
+  # `ZzNew() (` , `ZzNew() if true; then`, `while`, `until`, `for`, `select`, `case`, `[[`, `((` are all
+  # bash-legal one-line headers, and missing them attributed the body's read to the PRECEDING function,
+  # where an allowlisted pair for the same name graded it REQUIRED (PASS 239→240). The `name()` form
+  # always has EMPTY parens, so an awk `function secs(t, n, …)` is still not a header.
   # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
   # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
   # nested helpers both sit after their function's only positional binding, so nothing is
@@ -1873,7 +1891,7 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*\{|[[:space:]]*\\[[:space:]]*$|[[:space:]]*(#.*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*\\[[:space:]]*$|[[:space:]]*(#.*)?$)' "$file" | cut -d: -f1); do
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*(\{.*|\(.*|(if|while|until|for|select|case|\[\[|\(\().*|\\[[:space:]]*|#.*)?)$' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -1901,8 +1919,11 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   printf 'ZzSpacedParen( ) {\n  local s="$1"\n}\n'
   printf 'ZzQuotedComment()  # it says "hi"\n{\n  local s="$1"\n}\n'
   printf 'ZzContHeader() \\\n{\n  local s="$1"\n}\n'
+  printf 'ZzSubshell() (\n  local s="$1"\n)\n'
+  printf 'ZzIfBody() if true; then\n  local s="$1"\nfi\n'
+  printf 'ZzCaseBody() case x in\n  local s="$1"\n  ;;\nesac\n'
 } > "$T/hdr.sh"
-for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment ZzContHeader; do
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment ZzContHeader ZzSubshell ZzIfBody ZzCaseBody; do
   _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
   [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
     || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
