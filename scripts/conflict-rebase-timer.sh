@@ -52,6 +52,12 @@ pass() {
   # silently. Resolve it here, and let the bot say so loudly when it cannot.
   local co="${CONFLICT_REBASE_CHECKOUT:-${AGENT_INFRA_PATH:-}}"
   local args=(--repo "$REPO" --max "$MAXPRS" --report "$STATE/last-report.md")
+  # ⛔ --include-behind IS THE SHIPPED DEFAULT, BECAUSE THE MEASUREMENT SAYS SO.
+  # 0 of 36 CONFLICTING PRs rebase cleanly (see the .py header), so a pass restricted
+  # to that class can only ever publish refusals. The BEHIND arm is the half that
+  # actually rebases — and it is conflict-free by definition. Set
+  # CONFLICT_REBASE_INCLUDE_BEHIND=0 to restrict a pass to the CONFLICTING class.
+  [ "${CONFLICT_REBASE_INCLUDE_BEHIND:-1}" = 0 ] || args+=(--include-behind)
   [ -n "$co" ] && args+=(--checkout "$co")
   # The suite and an operator both need to see the queue before trusting it.
   [ -n "${CONFLICT_REBASE_DRY_RUN:-}" ] && args+=(--dry-run)
@@ -78,11 +84,13 @@ case "${1:-}" in
       while :; do
         [ -f "$1/PAUSED" ] && { sleep 60; continue; }
         CONFLICT_REBASE_INTERVAL_S="$2" CONFLICT_REBASE_MAX="$3" CONFLICT_REBASE_REPO="$4" \
-          CONFLICT_REBASE_CHECKOUT="$6" bash "$5" start --once >/dev/null 2>&1
+          CONFLICT_REBASE_CHECKOUT="$6" CONFLICT_REBASE_INCLUDE_BEHIND="$7" \
+          bash "$5" start --once >/dev/null 2>&1
         sleep "$2"
       done
     ' "$PIDFILE" "$STATE" "$INTERVAL" "$MAXPRS" "$REPO" "$SELF" \
-      "${CONFLICT_REBASE_CHECKOUT:-${AGENT_INFRA_PATH:-}}" >/dev/null 2>&1 &
+      "${CONFLICT_REBASE_CHECKOUT:-${AGENT_INFRA_PATH:-}}" \
+      "${CONFLICT_REBASE_INCLUDE_BEHIND:-1}" >/dev/null 2>&1 &
     sleep 1
     new="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [ -n "$new" ] && kill -0 "$new" 2>/dev/null; then

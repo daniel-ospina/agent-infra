@@ -241,31 +241,56 @@ def remote_claims(scratch: Path) -> list[str]:
     return [ln.split("\t")[-1].strip() for ln in out.stdout.splitlines() if ln.strip()]
 
 
-def branch_has_live_lane(pr: dict, worktrees: list[tuple[str, str, str]], claims: list[str]) -> str | None:
-    """Return a human reason when another lane is (or may be) on this PR."""
+def branch_has_live_lane(pr: dict, worktrees: list[tuple[str, str, str]], claims: list[str],
+                         repo: str = "") -> str | None:
+    """Return a human reason when another lane is (or may be) on this PR.
+
+    ⛔ THE THREE SHAPES THAT ACTUALLY OCCUR, each of which this arm missed at first:
+    the fleet board reports `branch: "(detached)"` for most lanes (so a branch-only
+    match is structurally unable to fire); lane worktrees are named for WORKSPACES
+    (`ws_…`), not PR numbers (so a name-shaped match misses them); and a fork PR's
+    branch name can also exist in `origin` (so a fork must never reach the push).
+    """
     branch = pr["headRefName"]
+    head = str(pr.get("headRefOid") or "")
     try:
         fleet = json.loads(FLEET_STATE.read_text())
-    except OSError:
+    except FileNotFoundError:
         fleet = None
     except ValueError as e:
         # A HALF-WRITTEN fleet-state is not "nobody is on this PR" — the orchestrator
         # rewrites that file every pass.
         raise Unreadable(f"fleet-state unreadable: {e}") from e
+    except OSError as e:
+        # Permission/IO errors are NOT absence. Only absence is absence.
+        raise Unreadable(f"fleet-state unreadable: {e}") from e
+    if isinstance(fleet, dict):
+        board_repo = str(fleet.get("repo") or "")
+        if board_repo and repo and board_repo != repo:
+            # The board is a per-CELL snapshot of ONE repo; a board for another repo
+            # says nothing about this one. Ignored, and said out loud.
+            log(f"fleet-state speaks for {board_repo}, not {repo} — board arm ignored")
+            fleet = None
     if isinstance(fleet, dict):
         for lane in fleet.get("lanes") or []:
             ident = lane.get("identity") or {}
-            if ident.get("branch") and ident["branch"] == branch:
-                return f"fleet-state lane {ident.get('lane') or ident.get('workspace')}"
+            lb = str(ident.get("branch") or "")
+            ls = str(ident.get("head_sha") or "")
+            who = ident.get("lane") or ident.get("workspace") or "?"
+            if lb and lb not in ("(detached)", "HEAD") and lb == branch:
+                return f"fleet-state lane {who}"
+            if head and ls and ls == head:
+                return f"fleet-state lane {who} sits at this PR's head (detached)"
     n = str(pr["number"])
-    head = str(pr.get("headRefOid") or "")
     for path, wt_branch, wt_sha in worktrees:
         base = Path(path).name
-        if base == n:
+        if base.isdigit() and base == n:
             return f"worktree {path} is named for PR #{n}"
         if wt_branch and wt_branch == branch:
             return f"worktree {path} has the branch checked out"
-        if head and wt_sha == head and base.isdigit():
+        # ⛔ SHA ALONE, whatever the directory is called: a worktree detached at exactly
+        # this commit IS a lane on it.
+        if head and wt_sha == head:
             return f"worktree {path} sits at this PR's head (detached)"
     for ref in claims:
         tail = ref.rsplit("/", 1)[-1]
@@ -295,8 +320,14 @@ def ls_remote(scratch: Path, ref: str) -> str:
 
 # ─────────────────────────── content checks ───────────────────────────────────
 def cherry_state(repo: Path, upstream: str, head: str) -> tuple[int, int]:
-    """(kept, already_upstream) per `git cherry` — patch equivalence, not identity."""
-    out = git(repo, "cherry", upstream, head, check=False)
+    """(kept, already_upstream) per `git cherry` — patch equivalence, not identity.
+
+    ⛔ `check=True`: this runs AFTER the fetch, so a failure here is a real surface
+    failure. Read with `check=False` it returned 0 lines on error, which became
+    `Refused("nothing-left")` — a false statement about the branch (0 READ, not 0
+    landed) plus a 6-hour backoff that hid the PR.
+    """
+    out = git(repo, "cherry", upstream, head)
     kept = sum(1 for ln in out.splitlines() if ln.startswith("+ "))
     dropped = sum(1 for ln in out.splitlines() if ln.startswith("- "))
     return kept, dropped
@@ -325,26 +356,74 @@ def record_candidates(pr: int, repo: str) -> list[Path]:
     return out
 
 
+def _record_for_this_repo(f: Path, repo: str) -> dict | None:
+    """The parsed record, or None when it is not usable for THIS repo.
+
+    ⛔ A LEGACY `<pr>.json` IS SHARED ACROSS REPOS (the #426 collision: a stale record
+    from another repo sat in `441.json`). Acting on one would either rename ANOTHER
+    repo's attestation to `.superseded-<head>` or report "the existing attestation still
+    describes what would merge" about a record that does not apply. The enforcer treats
+    a repo-mismatched record as inert; so does this.
+    """
+    try:
+        rec = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+    # ⛔ VALID JSON IS NOT NECESSARILY A RECORD. `[]`, `"text"`, `123` and `null` all
+    # parse and then raise AttributeError on `.get` — which escaped as a traceback AFTER
+    # the push had happened, losing the record handling and the comment.
+    if not isinstance(rec, dict):
+        return None
+    rec_repo = str(rec.get("repo") or "")
+    if rec_repo and repo and rec_repo != repo:
+        return None
+    return rec
+
+
+def _json_parses(f: Path) -> bool:
+    try:
+        json.loads(f.read_text())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def record_state(pr: int, repo: str, new_diff: str) -> str:
-    """Do not let a record outlive the diff it attests. Returns what it did."""
+    """Do not let a record outlive the diff it attests. Returns what it did.
+
+    EVERY candidate is inspected (not just the first): a stale legacy `<pr>.json` from
+    another repo must not shadow this repo's record — and must not be renamed either.
+    """
+    found, kept, renamed = False, "", []
     for f in record_candidates(pr, repo):
         if not f.exists():
             continue
-        try:
-            rec = json.loads(f.read_text())
-        except (OSError, ValueError):
-            rec = {}
+        rec = _record_for_this_repo(f, repo)
+        if rec is None:
+            if f.exists() and not _json_parses(f):
+                # A record EXISTS here and cannot be parsed: the comment must not claim
+                # "no record existed" while an unparseable attestation sits at the
+                # canonical path the merge gate reads.
+                return f"UNREADABLE record at {f.name} — parses as no record; treat this head as UNREVIEWED"
+            log(f"#{pr} ignoring {f.name}: it names another repo — not this PR's record")
+            continue
+        found = True
         rec_head = str(rec.get("head_sha") or "?")
         rec_diff = str(rec.get("diff_sha256") or "")
         if new_diff and rec_diff and new_diff == rec_diff:
-            return f"kept: diff unchanged ({new_diff[:12]}), record at {rec_head[:12]} still attests it"
+            kept = f"kept: diff unchanged ({new_diff[:12]}), record at {rec_head[:12]} still attests it"
+            continue
         aside = f.with_name(f.name + f".superseded-{rec_head[:12]}")
         try:
             f.rename(aside)
         except OSError as e:  # pragma: no cover - disk state, not logic
             return f"UNREADABLE record store ({e}) — record left in place, PR must be re-reviewed"
-        return f"superseded: diff changed ({rec_diff[:12]} -> {new_diff[:12]}), record bound to {rec_head[:12]} moved aside"
-    return "none: no review record existed"
+        renamed.append(f"{rec_diff[:12] or '?'} -> {new_diff[:12] or '?'} at {rec_head[:12]}")
+    if renamed:
+        return f"superseded: diff changed ({'; '.join(renamed)}), record moved aside"
+    if kept:
+        return kept
+    return "none: no review record for this repo existed"
 
 
 def label_names(pr: int, repo: str) -> list[str]:
@@ -359,15 +438,22 @@ def strip_review_labels(pr: int, repo: str) -> list[str]:
     present = label_names(pr, repo)
     drop = [n for n in present if n in REVIEW_ASSERTING_LABELS]
     for n in drop:
-        gh("pr", "edit", str(pr), "--repo", repo, "--remove-label", n, check=False)
+        # ⛔ NO `check=False` HERE. A review-asserting label that survives a superseded
+        # record is exactly what REVIEW_ASSERTING_LABELS exists to prevent, and
+        # ignoring the failure made that silent. It raises -> the pass reports
+        # UNREADABLE and the post-push state is recorded as INCOMPLETE.
+        gh("pr", "edit", str(pr), "--repo", repo, "--remove-label", n)
     return drop
 
 
 def add_label(pr: int, repo: str, name: str) -> None:
+    # Creating the label may legitimately fail (it may already exist); APPLYING it may
+    # not — if the add fails, the refusal comment's instructions are a lie and the PR
+    # hides behind a backoff, so it must surface.
     gh("label", "create", name, "--repo", repo, "--force",
        "--description", "A rebase conflicts on CONTENT — the bot refused; a human decides",
        "--color", "B60205", check=False)
-    gh("pr", "edit", str(pr), "--repo", repo, "--add-label", name, check=False)
+    gh("pr", "edit", str(pr), "--repo", repo, "--add-label", name)
 
 
 def comment(pr: int, repo: str, body: str) -> None:
@@ -387,7 +473,7 @@ def comment(pr: int, repo: str, body: str) -> None:
 def list_open_prs(repo: str) -> list[dict]:
     out = gh(
         "pr", "list", "--repo", repo, "--state", "open", "--limit", "500",
-        "--json", "number,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,updatedAt,labels,title,baseRefName,statusCheckRollup",
+        "--json", "number,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,updatedAt,labels,title,baseRefName,statusCheckRollup,headRepository,isCrossRepository",
     )
     try:
         data = json.loads(out)
@@ -440,9 +526,8 @@ def checks_green(pr: dict, required: list[str]) -> bool:
 
 def clean_record_at_head(pr: int, repo: str, head: str) -> bool:
     for f in record_candidates(pr, repo):
-        try:
-            rec = json.loads(f.read_text())
-        except (OSError, ValueError):
+        rec = _record_for_this_repo(f, repo)
+        if rec is None:
             continue
         if str(rec.get("head_sha") or "") == head and str(rec.get("verdict") or "").startswith("clean"):
             return True
@@ -477,6 +562,7 @@ def too_young(p: dict, min_age_min: int) -> str | None:
 def select(prs: list[dict], args, required: list[str]) -> tuple[list[dict], list[tuple[int, str]]]:
     chos, skipped = [], []
     deny = set(args.deny)
+    repo = args.repo
     for p in sorted(prs, key=lambda x: x.get("updatedAt") or ""):
         n = p["number"]
         why = None
@@ -495,8 +581,17 @@ def select(prs: list[dict], args, required: list[str]) -> tuple[list[dict], list
             why = f"labelled {LABEL} (previous refusal)"
         elif backoff_get(n) > time.time():
             why = "backoff"
-        elif (p.get("baseRefName") or "main") != "main":
-            why = f"base {p.get('baseRefName')} (not main)"
+        elif p.get("isCrossRepository") or (
+                (p.get("headRepository") or {}).get("nameWithOwner") not in (None, "", repo)):
+            # ⛔ A FORK PR'S HEAD IS NOT `origin`'s BRANCH. `ls-remote <headRefName>` would
+            # match origin's unrelated branch of the same name, and the push would move THAT
+            # branch while the comment claims this PR's head moved. Absent fields mean
+            # "unknown", which is not "foreign".
+            why = f"head repo is not {repo} (fork PR) — its branch is not ours to push"
+        elif (p.get("baseRefName") or "") != "main":
+            # ⛔ A MISSING base is not `main` — same fail-open shape `too_young` closes
+            # one line below.
+            why = f"base {p.get('baseRefName') or '?'} (not main)"
         elif (young := too_young(p, args.min_age_min)):
             why = young
         elif (p.get("mergeable") or "").upper() == "CONFLICTING":
@@ -544,7 +639,19 @@ def scratch_repo(repo: str) -> Path:
 
 
 def rebase_pr(scratch: Path, pr: dict, args) -> dict:
-    """Do the whole safe thing for ONE PR. Raises Refused with a kind + detail."""
+    """Do the whole safe thing for ONE PR. Raises Refused with a kind + detail.
+
+    Any git/gh RuntimeError is translated to Unreadable at this boundary so the caller
+    reports exit 2 rather than crashing with a traceback (the documented contract)."""
+    try:
+        return _rebase_pr(scratch, pr, args)
+    except (Refused, Unreadable):
+        raise
+    except RuntimeError as e:
+        raise Unreadable(str(e)) from e
+
+
+def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
     branch = pr["headRefName"]
     want = pr["headRefOid"]
     ref = f"refs/heads/{branch}"
@@ -589,13 +696,24 @@ def rebase_pr(scratch: Path, pr: dict, args) -> dict:
                   "-c", "rebase.autoSquash=false", "-C", str(wt),
                   "rebase", "--no-rerere-autoupdate", "--onto", "refs/remotes/origin/main", mb])
         if rb.returncode != 0:
+            # ⛔ A FAILED REPLAY IS NOT AUTOMATICALLY A CONTENT CONFLICT. Reporting
+            # every non-zero exit as one labels someone's PR `needs-human-conflict`,
+            # tells them to resolve a conflict that may not exist, and hides the real
+            # fault (a signing hook, a full disk, an unreadable object) behind a
+            # diagnosis the operator never sees. Classify on EVIDENCE: unmerged index
+            # entries are a conflict; anything else is a replay FAILURE.
+            unmerged = sorted({ln.split("\t")[-1] for ln in
+                               run(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U"]).stdout.splitlines()
+                               if ln.strip()})
             run(["git", "-C", str(wt), "rebase", "--abort"])
-            # The conflicting commit is the one the rebase stopped on; name it.
             blob = rb.stdout + rb.stderr
+            if not unmerged:
+                first = next((ln for ln in blob.splitlines() if ln.strip()), "no output")
+                raise Refused("rebase-failed", f"the replay failed without a conflict: {first[:300]}")
+            # The conflicting commit is the one the rebase stopped on; name it.
             m = re.search(r"could not apply ([0-9a-f]{7,40})", blob)
             stuck = m.group(1) if m else ""
-            paths = sorted({ln.split(": ", 1)[-1] for ln in (rb.stdout + rb.stderr).splitlines()
-                            if ln.startswith("CONFLICT")})[:5]
+            paths = unmerged[:5]
             raise Refused("content-conflict",
                           f"rebase stopped on {stuck or 'a commit'}; conflicting paths: {', '.join(paths) or 'unreported'}")
         new_head = git(wt, "rev-parse", "HEAD").strip()
@@ -621,7 +739,7 @@ def rebase_pr(scratch: Path, pr: dict, args) -> dict:
         if new_count == 0:
             raise Refused("nothing-left", "every commit became empty against main — nothing to re-land")
         return {"branch": branch, "old_head": head, "new_head": new_head, "base": base,
-                "kept": kept, "dropped": dropped, "wt": wt}
+                "kept": kept, "dropped": dropped, "replayed": new_count, "wt": wt}
     finally:
         run(["git", "-C", str(scratch), "worktree", "remove", "--force", str(wt)])
         shutil.rmtree(wt, ignore_errors=True)
@@ -727,8 +845,11 @@ def main(argv: list[str]) -> int:
         try:
             required = required_contexts(args.repo)
         except Unreadable as e:
-            log(f"UNREADABLE required contexts ({e}) — the BEHIND arm is skipped, never guessed")
-            required = []
+            # ⛔ A PASS THAT COULD NOT READ THE REQUIRED CONTEXTS IS NOT A CLEAN PASS.
+            # Skipping the arm and exiting 0 makes the timer log "rc=0" for a pass that
+            # did nothing, which is the same fail-open shape as an empty failing set.
+            log(f"UNREADABLE required contexts ({e}) — refusing to act this pass")
+            return 2
     chos, skipped = select(prs, args, required)
     log(f"census: open={len(prs)} conflicting={len(conflicting)} candidates={len(chos)} "
         f"max={args.max} dry_run={args.dry_run}")
@@ -767,7 +888,7 @@ def main(argv: list[str]) -> int:
     for pr in chos:
         n = pr["number"]
         try:
-            lane = branch_has_live_lane(pr, worktrees, claims)
+            lane = branch_has_live_lane(pr, worktrees, claims, args.repo)
         except Unreadable as e:
             unreadable = True
             log(f"#{n} SKIP unreadable lane surface ({e})")
@@ -783,7 +904,17 @@ def main(argv: list[str]) -> int:
         attempted += 1
         try:
             res = rebase_pr(scratch, pr, args)
-        except Refused as r:
+        except (Refused, Unreadable) as r:
+            if isinstance(r, Unreadable):
+                # ⛔ A SURFACE FAILURE IS EXIT 2, NOT A TRACEBACK. `rebase_pr` calls
+                # git() which raises RuntimeError on a failed fetch; uncaught, that
+                # crashed the pass with exit 1, lost the report, and abandoned every
+                # remaining candidate — while the documented contract says 2.
+                unreadable = True
+                log(f"#{n} UNREADABLE while preparing ({r})")
+                results.append({"pr": n, "action": "skip", "detail": f"unreadable: {r}"})
+                continue
+            r = r  # Refused
             failed += 1
             log(f"#{n} REFUSED[{r.kind}] {r.detail}")
             results.append({"pr": n, "branch": pr["headRefName"], "action": "refused",
@@ -805,6 +936,11 @@ def main(argv: list[str]) -> int:
                     results[-1]["detail"] += f" | comment failed: {e}"
                 strikes = strikes_get(n) + 1
                 backoff_set(n, min(BACKOFF_REFUSE_BASE * (2 ** (strikes - 1)), BACKOFF_REFUSE_CAP), r.kind, strikes)
+            elif r.kind == "rebase-failed":
+                # Not a content conflict (no label), but a deterministic mechanical
+                # failure will repeat: a SHORT backoff keeps it from re-occupying a cap
+                # slot every 30-minute pass forever.
+                backoff_set(n, BACKOFF_OK, r.kind, strikes_get(n))
             elif r.kind in ("rebase-changed-content", "nothing-left"):
                 # A property of the BRANCH: retrying it changes nothing.
                 backoff_set(n, BACKOFF_OK, r.kind, strikes_get(n))
@@ -823,7 +959,7 @@ def main(argv: list[str]) -> int:
                             "kept": res["kept"], "dropped": res["dropped"],
                             "diff_before": h0[1][:12], "diff_status": h0[0]})
             log(f"#{n} WOULD REBASE {res['branch']} {res['old_head'][:12]} -> {res['new_head'][:12]} "
-                f"(kept={res['kept']} already-landed-dropped={res['dropped']}, diff={h0[1][:12]})")
+                f"(replayed={res.get('replayed', res['kept'])} already-landed-dropped={res['dropped']}, diff={h0[1][:12]})")
             continue
 
         diff_before = diff_hash(n, args.repo)
@@ -843,6 +979,7 @@ def main(argv: list[str]) -> int:
         head_ok = wait_head(n, args.repo, res["new_head"])
         diff_after = diff_hash(n, args.repo) if head_ok else ("unavailable", "")
         if not head_ok:
+            unreadable = True
             log(f"#{n} UNREADABLE pushed head did not become visible — treating the diff as unverified")
         try:
             rec = record_state(n, args.repo, diff_after[1])
@@ -882,12 +1019,22 @@ def write_report(path: str, args, prs: list[dict], conflicting: list[int],
     from collections import Counter
 
     hotspots = Counter()
+    # ⛔ PARSE WHAT THIS CODE ACTUALLY EMITS. The old regex looked for git's
+    # `Merge conflict in <path>` line, but the refusal detail has carried
+    # `…; conflicting paths: a, b` since before the first commit — so the report's
+    # headline table was always empty (a false negative on the finding that matters).
     for r in results:
         if r.get("kind") == "content-conflict":
-            for pth in re.findall(r"Merge conflict in ([^,]+)", r.get("detail") or ""):
-                hotspots[pth.strip()] += 1
+            m = re.search(r"conflicting paths: (.+)$", r.get("detail") or "", re.M)
+            if m:
+                for pth in m.group(1).split(", "):
+                    if pth.strip():
+                        hotspots[pth.strip()] += 1
     lines = [
         f"# conflict-rebase census — {args.repo}",
+        "",
+        f"_generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+        f"(mode: {'dry-run' if args.dry_run else 'live'}, cap --max {args.max})_",
         "",
         f"- open PRs: **{len(prs)}**",
         f"- `CONFLICTING`: **{len(conflicting)}**",
@@ -929,7 +1076,7 @@ def _success_body(n: int, res: dict, before: tuple[str, str], after: tuple[str, 
         "",
         f"- branch `{res['branch']}` rebased onto `main@{res['base'][:12]}`",
         f"- head `{res['old_head'][:12]}` → **`{res['new_head']}`**",
-        f"- commits replayed: {res['kept']}"
+        f"- commits replayed: {res.get('replayed', res['kept'])}"
         + (f"; {res['dropped']} commit(s) dropped because their patch is already in `main`" if res["dropped"] else ""),
         f"- GitHub now reports `mergeable={mergeable}`",
         f"- diff_sha256 before `{before[1][:16] or before[0]}` → after `{after[1][:16] or after[0]}`",

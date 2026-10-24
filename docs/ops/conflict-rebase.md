@@ -75,12 +75,27 @@ conflicting PR from the queue rather than resolving the conflict. What it remove
 ## Operation
 
 ```bash
-scripts/conflict-rebase.py --dry-run                 # the census, pushes nothing
-scripts/conflict-rebase.py --max 3                   # act on up to 3 conflicting PRs
-scripts/conflict-rebase.py --include-behind --max 3  # + the staleness arm
-scripts/conflict-rebase-timer.sh start               # every 30 min, max 3/run
+scripts/conflict-rebase.py --dry-run                        # the census, pushes nothing
+scripts/conflict-rebase.py --max 3                         # act on up to 3 conflicting PRs
+scripts/conflict-rebase.py --include-behind --max 3        # + the staleness arm
+scripts/conflict-rebase-timer.sh start                     # every 30 min, max 3/run
 scripts/conflict-rebase-timer.sh status | pause | resume | stop
 ```
+
+**The shipped schedule runs `--include-behind` and publishes a report every pass**
+(`$STATE/last-report.md`). That is deliberate: with 0 of 36 CONFLICTING PRs rebaseable, a
+pass restricted to that class can only publish refusals — the arm that actually rebases is
+the staleness one. `CONFLICT_REBASE_INCLUDE_BEHIND=0` restricts a pass to the CONFLICTING
+class; `CONFLICT_REBASE_DRY_RUN=1` makes every pass a census with no side effects.
+
+**Expect a ramp on the first day.** Every refusal publishes one label + one comment, so a
+queue of ~40 labelled PRs costs ~40 of each, at `--max 3` per 30-minute pass. That is the
+point (it converts "unknown ownership" into "needs a human"), but it is a visible event:
+pause with the brake file if the labels are unwanted.
+
+`--checkout` (or `CONFLICT_REBASE_CHECKOUT`, defaulting to `AGENT_INFRA_PATH`) is what
+makes the **detached-worktree** half of the lane-hold check work; without it the bot says
+so every pass and relies on the claim registry, the head-stability window and the lease.
 
 State lives in `~/.pi/agent/state/conflict-rebase/` (`backoff-<pr>.json`, `run.lock`,
 `scratch.git`, `PAUSED`). Exit 2 means a surface could not be read — never "nothing to do".
@@ -89,14 +104,19 @@ State lives in `~/.pi/agent/state/conflict-rebase/` (`backoff-<pr>.json`, `run.l
 
 - head identical across two `ls-remote` reads 30 s apart, **and** `--force-with-lease` bound
   to the observed sha — the second is the enforcement, the first is the manners;
-- no live lane: fleet state, local worktrees (including the sibling conflict lane's
-  **detached** `/tmp/rcwt/<PR>` directories, which a branch-only test reads as free), and
-  `refs/claims/*` (the fleet's designed CAS);
+- no live lane: fleet state (matched on `head_sha`, because most real lanes report
+  `branch: "(detached)"`), local worktrees including **detached** ones such as the sibling
+  conflict lane's `/tmp/rcwt/<PR>` directories, and `refs/claims/*` (the fleet's designed
+  CAS). An unreadable lane surface refuses the pass instead of reading as "nobody holds
+  it"; a board that names another repo is ignored, loudly;
+- fork PRs are skipped: a head in another repository is not `origin`'s branch to push;
+- a failed replay is classified by EVIDENCE (unmerged index entries) — a signing hook or a
+  full disk is reported as `rebase-failed`, not as a content conflict on someone's PR;
 - the cap bounds **attempts**, not successes (that bug labelled 36 PRs in one pass);
 - backoff for content conflicts (1 d → 14 d) and **none** for transient refusals — a
   dropped `ls-remote` once put a PR in a 6-hour backoff and mislabelled the read as
   "peer pushing";
-- `rerere` deliberately disabled: a replayed resolution is a content decision made when
+- `rerere` explicitly disabled: a replayed resolution is a content decision made when
   nobody is looking.
 
 ## The finding that matters more than the bot

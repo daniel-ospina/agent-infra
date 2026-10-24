@@ -143,7 +143,11 @@ PY
         n="${1:-}"; shift || true
         add=""; rem=""; while [ $# -gt 0 ]; do case "$1" in --add-label) add="$2"; shift 2;; --remove-label) rem="$2"; shift 2;; *) shift;; esac; done
         [ -n "$add" ] && printf '%s ADD %s\n' "$n" "$add" >>"$D/labels.txt"
-        [ -n "$rem" ] && printf '%s REMOVE %s\n' "$n" "$rem" >>"$D/labels.txt" ;;
+        [ -n "$rem" ] && printf '%s REMOVE %s\n' "$n" "$rem" >>"$D/labels.txt"
+        # ⛔ THE HANDLER MUST END SUCCESSFUL. A trailing `[ -n "$x" ] && …` whose test
+        # fails is the branch's exit status, so `gh pr edit --add-label` exited 1 and the
+        # bot's (correct) `check=True` read that as an UNREADABLE label surface.
+        exit 0 ;;
       *) : ;;
     esac ;;
   label) : ;;
@@ -166,13 +170,15 @@ head_of() { git -C "$TMP/origin.git" rev-parse "refs/heads/$1"; }
 now_iso() { date -u -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 OLD="$(now_iso)"
 
-pr_json() {  # pr_json <num> <branch> <sha> <mergeable> <state> <labels-json> [draft] [green] [updatedAt] [base]
-  python3 - "$1" "$2" "$3" "$4" "${5:-CLEAN}" "${6:-[]}" "${7:-false}" "${8:-false}" "${9:-$OLD}" "${10:-main}" <<'PY'
+pr_json() {  # pr_json <num> <branch> <sha> <mergeable> <state> <labels-json> [draft] [green] [updatedAt] [base] [fork]
+  python3 - "$1" "$2" "$3" "$4" "${5:-CLEAN}" "${6:-[]}" "${7:-false}" "${8:-false}" "${9:-$OLD}" "${10:-main}" "${11:-false}" <<'PY'
 import json, sys
-n, br, sha, mg, ms, labels, draft, green, upd, base = sys.argv[1:11]
+n, br, sha, mg, ms, labels, draft, green, upd, base, fork = sys.argv[1:12]
 roll = [{"name": "pipeline-compliance", "conclusion": "SUCCESS"}] if green == "true" else []
 print(json.dumps({"number": int(n), "headRefName": br, "headRefOid": sha, "mergeable": mg,
                   "mergeStateStatus": ms, "isDraft": draft == "true", "updatedAt": upd,
+                  "isCrossRepository": fork == "true",
+                  "headRepository": {"nameWithOwner": "someone/else" if fork == "true" else "acme/widgets"},
                   "labels": json.loads(labels), "title": br, "baseRefName": base,
                   "statusCheckRollup": roll}))
 PY
@@ -189,6 +195,7 @@ printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"aaaa1111"}\n' "$CLEAN_
 printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"bbbb2222"}\n' "$CONF_SHA" >"$TMP/reviews/acme-widgets-102.json"
 
 run_bot --max 3 --interval-s 0; RC=$?
+[ -n "${CR_DEBUG:-}" ] && { echo "--- debug1 ---"; cat "$TMP/bot.err"; echo "--- /debug1 ---"; }
 ck "$RC" "0" "a pass exits 0"
 
 NEW_CLEAN="$(head_of feat/clean)"
@@ -271,8 +278,12 @@ H_SHA="$(head_of feat/clean)"
 mkdir -p "$TMP/holds"
 git -C "$TMP/seed" worktree add -q --detach "$TMP/holds/601" "$H_SHA" 2>/dev/null || true
 write_prs "[$(pr_json 601 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
-OUT="$(run_bot --dry-run --max 1 --interval-s 0 --checkout "$TMP/seed" --json)"
+# ⛔ NOT A DRY RUN. With --dry-run the "nothing was touched" assertion cannot fail
+# even if the hold check were deleted entirely — the real coverage is that the run
+# touched nothing while it WOULD have rebased this branch.
+run_bot --max 1 --interval-s 0 --checkout "$TMP/seed" --json >/dev/null
 ck "$(head_of feat/clean)" "$H_SHA" "§11a a PR with a PR-named worktree is not touched"
+OUT="$(run_bot --dry-run --max 1 --interval-s 0 --checkout "$TMP/seed" --json)"
 has "$OUT" 'live lane' "§11b the skip names the live lane"
 
 seed_fixture
@@ -336,6 +347,91 @@ chmod +x "$TMP/fake/gh"
 run_bot --max 1 --interval-s 0; RC=$?
 ck "$RC" "2" "§8 exit 2 when the PR list cannot be read"
 has "$(cat "$TMP/bot.err")" "UNREADABLE" "§8 the log says UNREADABLE, not 'nothing to do'"
+
+# ═══════════════════════ §13: records that are not this repo's ═══════════════
+# The legacy `<pr>.json` name is shared across repos (#426). Acting on another repo's
+# record would either rename their attestation or claim it attests this PR.
+echo "§13 a foreign record is neither renamed nor claimed"
+seed_fixture
+F_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 901 feat/clean "$F_SHA" CONFLICTING CLEAN)]"
+printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"eeee5555","repo":"someone/else"}\n' "$F_SHA" >"$TMP/reviews/901.json"
+printf 'dddd4444\n' >"$FAKE_DIFFHASH"
+run_bot --max 1 --interval-s 0 >/dev/null
+ck "$([ -f "$TMP/reviews/901.json" ] && echo present || echo absent)" "present" "§13 another repo's record is LEFT ALONE (not renamed)"
+ck "$(ls "$TMP/reviews" | grep -c superseded)" "0" "§13 …and no .superseded copy was minted from it"
+
+# ═══════════════════════ §8b: an unreadable claim registry ═══════════════════
+# The claim registry is the fleet's 'a lane holds this' signal; reading it as empty
+# because it could not be read is the one fail-open that licenses a push.
+echo "§8b an unreadable claim registry is exit 2"
+seed_fixture
+CONFLICT_REBASE_ORIGIN="$TMP/does-not-exist.git" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "2" "§8b exit 2 when the claim registry cannot be read"
+has "$(cat "$TMP/bot.err")" "UNREADABLE claim registry" "§8b the reason names the claim registry"
+
+# ═══════════════════════ §14: the hold shapes that actually occur ══════════
+# Every one of these was a real hole: a branch-only board match (most lanes report
+# "(detached)"), a worktree named for a workspace rather than a PR number, and a fork
+# PR whose branch name also exists in origin.
+echo "§14 a detached lane, a non-numeric worktree, and a fork PR are all skipped"
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+cat >"$TMP/fleet.json" <<EOF
+{"repo": "$REPO", "generated_at": "2026-10-24T00:00:00+0000",
+ "lanes": [{"identity": {"lane": "cell-x", "branch": "(detached)", "head_sha": "$H_SHA"}}]}
+EOF
+export CONFLICT_REBASE_FLEET_STATE="$TMP/fleet.json"
+write_prs "[$(pr_json 1001 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
+OUT="$(run_bot --dry-run --max 1 --interval-s 0 --json)"
+ck "$(head_of feat/clean)" "$H_SHA" "§14a a detached lane at this head is not touched"
+has "$OUT" "sits at this PR's head" "§14b the skip names the detached lane"
+
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+mkdir -p "$TMP/holds"
+git -C "$TMP/seed" worktree add -q --detach "$TMP/holds/ws_a93c7534" "$H_SHA" 2>/dev/null || true
+write_prs "[$(pr_json 1002 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
+run_bot --max 1 --interval-s 0 --checkout "$TMP/seed" >/dev/null
+ck "$(head_of feat/clean)" "$H_SHA" "§14c a worktree at this head is not touched whatever it is named"
+
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 1003 feat/clean "$H_SHA" CONFLICTING CLEAN '[]' false false "$OLD" main true)]"
+OUT="$(run_bot --dry-run --max 1 --interval-s 0 --json)"
+ck "$(head_of feat/clean)" "$H_SHA" "§14d a fork PR's branch is not pushed"
+has "$OUT" '"why": "head repo is not' "§14e the skip names the fork"
+
+# ═══════════════════════ §15: the lease is the enforcement ═══════════════════
+# The stability window is manners; the lease is what actually refuses. Simulated by
+# moving the remote branch in the stub that runs immediately BEFORE the push.
+echo "§15 a peer push inside the window fails closed (lease)"
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+PEER="$(head_of feat/conflict)"
+cat >"$CONFLICT_REBASE_RECORD_SH" <<EOS
+#!/usr/bin/env bash
+git -C "$TMP/origin.git" update-ref refs/heads/feat/clean $PEER
+printf 'ok\\t%s\\n' "\$(cat \"\$FAKE_DIFFHASH\")"
+EOS
+chmod +x "$CONFLICT_REBASE_RECORD_SH"
+write_prs "[$(pr_json 1101 feat/clean "$H_SHA" CONFLICTING CLEAN)]"
+run_bot --max 1 --interval-s 0 >/dev/null
+ck "$(head_of feat/clean)" "$PEER" "§15a the peer's push was NOT overwritten"
+has "$(cat "$TMP/bot.err")" "lease-refused" "§15b the refusal is the lease"
+ck "$([ -f "$TMP/fake/comment-1101.md" ] && echo present || echo absent)" "absent" "§15c no success comment was posted for a push that did not happen"
+
+# ═══════════════════════ §16: the BEHIND arm's two gates ═══════════════════
+echo "§16 the BEHIND arm needs green AND a record"
+seed_fixture
+H_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 1201 feat/clean "$H_SHA" MERGEABLE BEHIND '[]' false true),$(pr_json 1202 feat/conflict "$(head_of feat/conflict)" MERGEABLE BEHIND '[]' false false)]"
+printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"aaaa1111"}\n' "$H_SHA" >"$TMP/reviews/acme-widgets-1201.json"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" "behind but not green" "§16a a red BEHIND PR is skipped for being red"
+# 1201 is green + recorded; the ONLY reason to skip it would be the head being fresh,
+# so assert it is the one that WOULD be rebased.
+has "$OUT" '"pr": 1201' "§16b the green+recorded BEHIND PR is considered"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
