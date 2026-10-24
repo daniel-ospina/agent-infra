@@ -62,26 +62,76 @@ brief_gate_sh="$(brief_gate_lib)" || {
   echo "[fix $PR] FATAL: brief-gate.sh not found — refusing to run a fixer whose brief nothing validated (#2258)" >&2; exit 78; }
 FIX_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section fixer)" || {
   echo "[fix $PR] FATAL: brief-gate.sh --section failed — refusing to run a fixer whose brief omits the research contract (#2258)" >&2; exit 78; }
+# ⛔ THE REPO-IDENTITY GATE (agent-infra#2694/#2724). This is the PR-lane half: a fixer given a
+# checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
+# reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
+# skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
+# ⛔ PHYSICAL PATH: every assertion below names the checkout, and a RELATIVE $REPO resolved from
+# inside itself names `$REPO/$REPO` (the C6 shape claim-cwd.test.sh pins for claims.sh).
+REPO_ABS="$(pwd -P)"
 
 # locate the branch's worktree
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
+
+# ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
+# A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
+# git and gh call below would act on one while reporting about the other — the measured wrong-repo
+# lane. Refuse by name, before materialising anything. ⛔ AFTER the `start` truncation above, so this
+# per-dispatch line survives in the log it is written to (A-verify finding, #2694).
+REPO_ASSERT_LINE="$(repo_target_assert "fixer #$PR target" "$REPO_ABS" "$OR" "")"; REPO_ASSERT_RC=$?
+printf '%s\n' "$REPO_ASSERT_LINE" >> "$L.log"
+if [ "$REPO_ASSERT_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: the checkout $REPO_ABS and the target repo $OR disagree (exit $REPO_ASSERT_RC) — no fixer started, no branch touched" >> "$L.log"
+  exit "$REPO_ASSERT_RC"
+fi
+
 [ -z "$WT" ] && {
   # Foreign (other-machine) branch: materialise a local worktree so the fixer has somewhere to work.
   if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
     git worktree add ".worktrees/fix-$PR" "$BR" >> "$L.log" 2>&1
   else
     git fetch origin "$BR" --quiet >> "$L.log" 2>&1
+    # ⛔ NAME THE REPO, NOT A MATERIALISATION FAILURE (#2694). The measured message a human read
+    # first was `cannot materialise <branch>`, which says nothing about the repo the branch is
+    # missing FROM. If the branch is not in THIS repo, say so — with the branch and the slug — and
+    # stop. A fetch that failed for network reasons is covered too: the branch is unproven here, and
+    # the refusal names both possibilities rather than blaming worktree creation.
+    if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
+      repo_target_branch_assert "fixer #$PR" "$REPO_ABS" "$BR" "$OR" >> "$L.log"
+      echo "[fix $PR] REFUSED: branch '$BR' is not in $OR (checkout $REPO_ABS) — it could not be read after fetching origin. This is a BRANCH/REPO mismatch, not a worktree-materialisation failure; refusing before any fixer starts" >> "$L.log"
+      exit "$REPO_TARGET_REFUSED"
+    fi
     git worktree add ".worktrees/fix-$PR" -b "$BR" "origin/$BR" >> "$L.log" 2>&1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
   [ -z "$WT" ] && { echo "[fix $PR] ABORT: could not materialise a worktree for $BR" >> "$L.log"; exit 1; }
   echo "[fix $PR] materialised worktree=$WT" >> "$L.log"
 }
+
+# ── THE POST-BUILD ASSERTION (agent-infra#2694/#2724) ──────────────────────────────────────────
+# The worktree now EXISTS. Read what it actually is and refuse to run the fixer when it is not the
+# target repo. A pre-build check proves what we asked for; this proves what we got. The branch half
+# distinguishes the right repo from a worktree checked out on another repo's branch.
+WT_REPO_LINE="$(repo_target_assert "fixer #$PR" "$WT" "$OR" "$REPO_ABS")"; WT_REPO_RC=$?
+printf '%s\n' "$WT_REPO_LINE" >> "$L.log"
+if [ "$WT_REPO_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: the materialised worktree is not $OR (exit $WT_REPO_RC) — no fixer started" >> "$L.log"
+  exit "$WT_REPO_RC"
+fi
+WT_BRANCH_LINE="$(repo_target_branch_assert "fixer #$PR" "$WT" "$BR" "$OR")"; WT_BRANCH_RC=$?
+printf '%s\n' "$WT_BRANCH_LINE" >> "$L.log"
+if [ "$WT_BRANCH_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: branch/checkout assertion failed (exit $WT_BRANCH_RC) — no fixer started" >> "$L.log"
+  exit "$WT_BRANCH_RC"
+fi
 
 # ── cross-box claim for the FIXER (P3.3, 2026-10-14 adversarial review) ───────
 # merge-one.sh claims before reviewing, but fix-one.sh ran the fixer FIRST and only then called

@@ -1976,7 +1976,10 @@ cmd_check() {
   # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
   # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
   # reports success.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh and fix-one.sh; all three
+  # `exit 78` without it, so its absence would make every dispatch refuse at startup while `check`
+  # still certified the cell — the same false PASS one layer down.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
