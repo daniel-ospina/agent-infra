@@ -130,10 +130,17 @@ def gh(*args):
 # budget below is small and shared.
 REST_PER_PAGE = 100   # GitHub's ceiling for /pulls -- the honest bound on ONE request
 # ⛔ THIS READ IS BOUNDED BY ITS CALLER. `beta-progress.py` runs inside a tick that the loop kills
-# at `run_bounded "$((TARGET - IN_PASS_RESERVE))"` = 540-150 = 390 s (heartbeat-loop.sh:80,108,294)
-# after 300-350 s of measured work, so a paging loop with no budget can outlive the slack and be
-# KILLED -- reporting nothing, instead of the `unavailable` line it can prove. Exceeding the budget
-# REFUSES the read (None), exactly like an unreadable page: a truncated window would under-count
+# by the `run_bounded "$((TARGET - IN_PASS_RESERVE))"` call that launches `orchestrator-heartbeat.sh`
+# (= 540 - 150 = 390 s; `TARGET` and `IN_PASS_RESERVE` in `scripts/heartbeat-loop.sh`) after 300-350 s
+# of measured work, so a paging loop with no budget can outlive the slack and be KILLED -- reporting
+# nothing, instead of the `unavailable` line it can prove.
+#
+# ⛔ CITED BY NAME, NOT BY LINE NUMBER (#2142 review). The earlier form named three line numbers; all
+# three had drifted onto unrelated lines (a cadence comment, a reserve comment, and the PIDFILE guard),
+# so a reader who followed the pointer could conclude the bound did not exist. A name survives an edit;
+# a line number does not -- the rule `.github/workflows/harness-single-source.yml` records.
+# Exceeding the budget REFUSES the read (None), exactly like an unreadable page: a truncated window
+# would under-count
 # `merged_today`, which is the error this fallback must not add.
 REST_TIMEOUT_S = 15   # per request
 # ⛔ ONE BUDGET FOR THE PAIR, not per read: `compute()` creates the deadline and hands it to both.

@@ -311,6 +311,34 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
         "merged_today must come from the SAME source as the open window, not from the "
         "GraphQL read that survived")
 
+    # ⛔ THE ASYMMETRIC ARM — the only direction where the rule can actually break, and the
+    # one both arms above miss (each drives REST to succeed on BOTH lists, so `ro` and `rm`
+    # fail or succeed TOGETHER and the pair guard is never exercised alone). Here GraphQL
+    # OPEN is refused while GraphQL merged is ALIVE, and REST answers the open list but
+    # REFUSES the merged one. Without this arm a mutant that assigns the two lists
+    # independently (`if ro is not None: openpr = ro` / `if rm is not None: merged = rm`)
+    # passes all 14 tests and emits a REST open-count beside a GraphQL merged-count — the
+    # exact defect rule (d) forbids (measured: open_prs=2 / merged_today=1).
+    def fake_gh_asymmetric(*args):
+        if args[:2] != ("pr", "list"):
+            return []
+        if "--state" in args and args[args.index("--state") + 1] == "open":
+            return None                                  # GraphQL open REFUSED
+        return [pr(300, merged=MERGED_TODAY)]            # GraphQL merged ALIVE
+
+    def fake_rest_asymmetric(state, limit=100, deadline=None):
+        if state == "open":
+            return [pr(100), pr(101)]                    # REST open answers
+        return None                                      # REST merged REFUSES
+
+    monkeypatch.setattr(bp, "gh", fake_gh_asymmetric)
+    monkeypatch.setattr(bp, "_rest_prs", fake_rest_asymmetric)
+
+    assert bp.compute() is None, (
+        "a REST open window beside a surviving GraphQL merged window is a MIXED read: with "
+        "no merged window on the same source the metric must be refused entirely, not "
+        "rendered from two differently-wrong reads")
+
 
 # ── (e) the window is PAGED, and a partial read is refused ──────────────────
 def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch):
