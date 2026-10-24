@@ -138,6 +138,27 @@ shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
 : > "$shard_ran_log" 2>/dev/null || true
 trap 'rm -f "$shard_ran_log"' EXIT
 
+# ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
+# The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so the reader — and
+# the merge rail, which compares a PR's reds against main's by FAILURE IDENTITY — cannot tell WHICH
+# body of work is red. Measured cost (2026-10-24): main and every PR carried the same four red
+# shards for hours, `bash-suites` red on every PR head, and the rail could not subtract a base red it
+# could not name, so the whole queue froze on a 5-minute fix. The names were in the log all along,
+# tens of thousands of lines above the summary.
+#
+# Two prints, on purpose:
+#   * at the moment of failure — so the name sits NEXT TO its own output (a sharded job's log is
+#     sliced per job, and the recap below may be in a different job's log than the body);
+#   * as a recap at the end — so a reader who greps the summary does not have to walk the log.
+# LISTED shards only: the runtime sentinel at the end of this file deliberately runs a failing stub,
+# and a green run must never print a FAILED SHARD line for it (`shard_is_listed` is 0 there).
+shard_failed_list=""
+shard_fail() {
+  [ "$shard_is_listed" = 1 ] || return 0
+  shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"
+  echo "❌ FAILED SHARD: $1"
+}
+
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
@@ -178,7 +199,7 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -417,6 +438,14 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
+  # The recap (#2643). `shard_failed_list` is empty only when the failures were all SYNTAX-SWEEP
+  # failures (those name their own file at the `bash -n` line) — say so rather than printing a
+  # dangling label, and never let an empty list read as "no failing shard".
+  if [ -n "$shard_failed_list" ]; then
+    echo "❌ failing shard(s): $shard_failed_list"
+  else
+    echo "❌ no shard is named here — every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+  fi
   exit 1
 fi
 if [ "$slice_count" -gt 0 ]; then
