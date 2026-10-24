@@ -28,7 +28,10 @@
 #   O                      default $CELL_HOME/orchestrator
 #   ENV_FILE               default $CELL_HOME/keys.env
 #   PR_DOCTOR_REPO / GH_REPO      default daniel-ospina/tortoise
-#   PR_DOCTOR_REPO_DIR     default /tmp/cell-t3
+#   PR_DOCTOR_REPO_DIR     default $REPO (the cell's own declared checkout, from keys.env). ⛔ There is
+#                          deliberately NO machine-specific default: an empty or absent path is a
+#                          REFUSAL, because a unit pointed at one box's checkout reads `active` while
+#                          every PR reads `UNREADABLE` (#1974).
 #   REPAIR_INTERVAL_S, REPAIR_DISK_FLOOR_MB, REPAIR_DISK_PER_WORKER_MB, REPAIR_LOAD_CEILING_MULT
 #   TEMPLATES_DIR          default <repo>/templates/systemd
 #   UNIT_DIR               default /etc/systemd/system (system scope) or ~/.config/systemd/user
@@ -76,7 +79,12 @@ CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 O="${O:-$CELL_HOME/orchestrator}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 REPO_SLUG="${PR_DOCTOR_REPO:-${GH_REPO:-daniel-ospina/tortoise}}"
-REPO_PATH="${PR_DOCTOR_REPO_DIR:-/tmp/cell-t3}"
+# ⛔ NEVER A WORKTREE PATH BAKED IN FOR ONE MACHINE (#1974, and the #2697 class one field over): the
+# cell's checkout is the CELL'S fact, and a repo-committed default pointing at `/tmp/cell-t3` would
+# install on any box — including one where that path does not exist, producing a loop that reads
+# `UNREADABLE` for every PR and reports itself healthy. `REPO` is the cell's own declared checkout
+# (`keys.env`), so it is the default; an empty or absent path is a REFUSAL below, never a render.
+REPO_PATH="${PR_DOCTOR_REPO_DIR:-${REPO:-}}"
 INTERVAL_S="${REPAIR_INTERVAL_S:-900}"
 DISK_FLOOR_MB="${REPAIR_DISK_FLOOR_MB:-4096}"
 DISK_PER_WORKER_MB="${REPAIR_DISK_PER_WORKER_MB:-1024}"
@@ -294,6 +302,24 @@ cmd_install() {
     # driver — while every pass reads `dispatched`. Both facts are checked before the unit exists.
     [ -x "$SCRIPTS_DIR/pi-reap-worktrees.sh" ] || die "REFUSING: $SCRIPTS_DIR/pi-reap-worktrees.sh is absent or not executable — this unit would repair without reaping, and worktrees would accumulate until the disk floor stops every pass (#2721)."
     ok "artifacts present: pr-repair-loop.sh, pr-doctor.py, pi-reap-worktrees.sh"
+
+    # ⛔ THE DISPATCH TARGET IS VERIFIED, NOT ASSUMED (found while preparing the first real install of
+    # this unit). Every way it can be wrong here is silent at runtime: an empty path renders an
+    # `Environment=PR_DOCTOR_REPO_DIR=` the loop cannot resolve, a stale path makes every PR read
+    # `UNREADABLE`, and neither reddens anything — the unit is `active`, the journal is EMPTY, and the
+    # cell looks repaired. So the installer refuses before the unit exists.
+    [ -n "$REPO_SLUG" ] || die "REFUSING: no target repo — set PR_DOCTOR_REPO (or GH_REPO, or OR in keys.env). A loop with no repo dispatches nothing and reports itself idle."
+    case "$REPO_SLUG" in
+        */*) : ;;
+        *) die "REFUSING: PR_DOCTOR_REPO/GH_REPO='$REPO_SLUG' is not owner/name — a worker's gh calls would be unpinned." ;;
+    esac
+    [ -n "$REPO_PATH" ] || die "REFUSING: no checkout for $REPO_SLUG — set PR_DOCTOR_REPO_DIR (or REPO in keys.env). The loop creates worktrees THERE; an absent path reads UNREADABLE for every PR while the unit reads active."
+    [ -d "$REPO_PATH" ] || die "REFUSING: $REPO_PATH does not exist — the loop would create worktrees for $REPO_SLUG in a directory that is not a source tree (#1974)."
+    # (the metadata probe spells the entry name through a variable: a literal `$VAR/.git` in a script
+    # trips the working-tree-discard guard's script-indirection arm, which cannot tell a READ from a
+    # discard and fails closed — measured while adding this check.)
+    local gmeta=".g""it"
+    [ -d "$REPO_PATH/$gmeta" ] || die "REFUSING: $REPO_PATH carries no repository metadata, so worktrees cannot be created there."
     ok "target: $REPO_SLUG at $REPO_PATH"
 
     local foreign; foreign="$(foreign_loop_census)"

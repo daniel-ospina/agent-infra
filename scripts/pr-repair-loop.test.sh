@@ -527,6 +527,25 @@ check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
     && ok "the control arm installed into the FIXTURE unit dir" \
     || bad "the control arm did not install into the fixture (out: $(tr -d '\n' <"$TMP/census-gone.out" | cut -c1-220))"
 
+# ⛔ THE DISPATCH TARGET IS VERIFIED, NOT ASSUMED (found while preparing the first real install): the
+# installer used to default the checkout to `/tmp/cell-t3` — one machine's path committed into every
+# cell's unit. Three ways to get it wrong are silent at runtime (the unit reads `active`, the journal is
+# empty, every PR reads `UNREADABLE`), so each is a refusal, and each is pinned here with an otherwise
+# perfect fixture (artifacts present, explicit scope) — the arm can only pass if THIS refusal fired.
+tgt() { # <label> <expect-substring> <env...>
+    local label="$1" want="$2"; shift 2
+    env PATH="$TMP/stubbin:$PATH" UNIT_DIR="$TMP/tgtunit" SYSTEMCTL=/bin/true \
+        PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
+        GH_REPO= REPO= "$@" "$INSTALLER" --install >"$TMP/tgt-$label.out" 2>&1
+    check "a dispatch target with $label is REFUSED (rc≠0)" 1 "$?"
+    grep -qi "$want" "$TMP/tgt-$label.out" \
+        && ok "the $label refusal names the reason" \
+        || bad "the $label refusal did not name '$want' (out: $(tr -d '\n' <"$TMP/tgt-$label.out" | cut -c1-200))"
+}
+tgt no-checkout "no checkout" PR_DOCTOR_REPO_DIR= PR_DOCTOR_REPO=daniel-ospina/tortoise
+tgt absent-checkout "does not exist" PR_DOCTOR_REPO_DIR="$TMP/not-a-checkout" PR_DOCTOR_REPO=daniel-ospina/tortoise
+tgt bad-slug "is not owner/name" PR_DOCTOR_REPO_DIR="$TMP/farmfull" PR_DOCTOR_REPO=nope
+
 echo "── the farm declares what the unit execs ──"
 # ⛔ NO PIPE INTO `grep -q` (scripts/check-no-sigpipe-grep.sh): a quiet grep exits on the first match and
 # the producer takes SIGPIPE, so under `set -o pipefail` a MATCH can read as a failure. Capture and test in
