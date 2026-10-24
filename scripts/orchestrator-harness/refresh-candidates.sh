@@ -2353,7 +2353,15 @@ mkdir -p "$O/state" 2>/dev/null || true
 # `tool_err=none` in the record for a run that HAD written a stderr diagnostic and exited 2: a
 # positive assertion of "no stderr" about a tool that wrote one. They now pass their own arm name.
 snapshot_datum() {   # <arm>
-  [ -n "${PRE_FAIL_AT:-}" ] && return 0
+  # A DEGRADED VERDICT IS THE WEAKEST REASON TO HOLD A DATUM (review of #2401, sixth round).
+  # The degraded arms record no surface row, so a pool of issue #42 degraded (rc 0, no stderr) then
+  # #43 the real refusal (rc 2, stderr) snapshotted #42's HEALTHY datum while unusable_cause quoted
+  # #43's words — the section 1d defect one arm over, and it lost the rc=2 and the diagnostic that
+  # matter. A later arm may therefore REPLACE a preflight-degraded snapshot; it may never replace a
+  # real one (that is the first-record rule).
+  if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_ARM:-}" != "preflight-degraded" ]; then
+    return 0
+  fi
   PRE_FAIL_AT="${N:-}"; PRE_FAIL_RC="${PRE_RC:-}"; PRE_FAIL_ERR="${PRE_ERR_LINE:-}"
   PRE_FAIL_ARM="${1:-}"
 }
@@ -2403,12 +2411,17 @@ PRE_FAIL_ARM=""      # …and WHICH arm produced that record. The claim-registry
                      # AFTER a CLEAN pre-flight (`rc 0`), so a bare `rc=0 stderr=none` beside their
                      # cause reads as a contradiction; naming the arm makes the datum unambiguous
                      # without giving the pre-flight another run's numbers (review of #2401, R1).
-preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first line|none>"
+# TWO LENGTHS, ON PURPOSE (review of #2401, sixth round). The RECORD keeps the full 200-char stderr
+# line in tool_err=; the INLINE datum cuts it to 80 so the surface clause and the datum both survive
+# refresh_cause_brief's 400-char cut. Measured before this: a 200-char stderr pushed the BLOCKED line
+# to 566 characters and cut issue-assignee-ho mid-word — the datum destroyed the reading it exists
+# to serve.
+preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first 80 chars|none>"
   [ -n "${PRE_FAIL_RC:-}" ] || return 0
   printf 'issue=#%s cmd=%s rc=%s stderr=%s' \
     "${PRE_FAIL_AT:-?}" \
     "$(basename "${PREFLIGHT:-pre-flight}") --repo ." \
-    "$PRE_FAIL_RC" "${PRE_FAIL_ERR:-none}"
+    "$PRE_FAIL_RC" "$(printf '%s' "${PRE_FAIL_ERR:-none}" | cut -c1-80)"
 }
 # The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
 # the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
@@ -2811,6 +2824,10 @@ while read -r N; do
       # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
       # pass) and is REPORTED, which is what the arm did before the port folded it into the
       # verdict-less one.
+      # THIS ARM RECORDS NO ROW, SO IT MUST STILL TAKE THE DATUM (review of #2401, sixth round): an
+      # INCOMPLETE report with no parseable surface row (the parser's own documented "emits nothing"
+      # path) left tool_rc=unrecorded / tool_err=none while PRE_RC and the stderr line were in hand.
+      snapshot_datum preflight-incomplete
       V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
@@ -3024,7 +3041,7 @@ if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
   # in the first 400 characters IS what an operator sees. The prose sentence used to occupy all of it,
   # and the datum (command, rc, the tool's own stderr line) was not in the record at all.
   refresh_fail preflight "$EXIT_TRANSIENT" \
-    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_datum:+ — pre-flight $_us_datum}${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
+    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_datum:+ — pre-flight $_us_datum}${_us_cause:+ — first cause: $_us_cause}" \
     "judged=$judged" "unusable=${_us_summary:-unknown}" \
     "tool_rc=${PRE_FAIL_RC:-unrecorded}" "tool_err=${PRE_FAIL_ERR:-none}" \
     "tool_issue=${PRE_FAIL_AT:-unrecorded}" "tool_arm=${PRE_FAIL_ARM:-none}" \

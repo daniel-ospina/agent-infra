@@ -387,6 +387,48 @@ PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
 
+# mk_tool_degraded_then_hard <dir> <degraded-n> — the DEGRADED verdict first (rc 0, no stderr) and a
+# hard INCOMPLETE second (rc 2, with a stderr diagnostic). The degraded arms record no surface row, so
+# they are the weakest reason to hold a datum: a snapshot taken there reported the HEALTHY first run
+# while the first cause quoted the second (review of #2401, sixth round).
+mk_tool_degraded_then_hard() {
+  local d="$1" deg_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+if n == $deg_n:
+    print("open PRs                        CLEAN       0     0 PR(s) enumerated")
+    print("ALSO INCOMPLETE: 1 surface(s) could not be queried (issue assignee/holder)")
+    print("VERDICT: CLEAN (exit 0) — a DEGRADED clean")
+    sys.exit(0)
+print("issue assignee/holder           INCOMPLETE  0     " + why)
+print("INCOMPLETE SURFACES")
+print("  [issue assignee/holder] " + why)
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_incomplete_norow <dir> — an INCOMPLETE verdict whose surface block yields NO parseable row
+# (the parser's own documented "emits nothing" path), with a stderr diagnostic and rc 2. That arm
+# records no unusable row, so it used to abort with tool_rc=unrecorded / tool_err=none while both
+# were in hand (review of #2401, sixth round).
+mk_tool_incomplete_norow() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+print("SURFACE                         STATUS      HITS  NOTE")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried")
+sys.stderr.write("PREFLIGHT: cannot resolve the target repository\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -618,6 +660,76 @@ esac
 case "$(rec "$D" unusable)" in
   *"preflight-no-verdict"*) ok "blank-stderr: and the verdict-less arm still names the record (the fixture is not vacuous)" ;;
   *) bad "blank-stderr: unusable='$(rec "$D" unusable)' — the fixture did not reach the arm under test" ;;
+esac
+
+# ── 1k) A DEGRADED SNAPSHOT MUST YIELD TO A LATER HARD FAILURE ──────────────────
+mk_case fail-degraded-first 42 43
+mk_tool_degraded_then_hard "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_issue)" = "43" ] \
+  && ok "degraded-first: the datum is the HARD failure (#43), not the earlier healthy run" \
+  || bad "degraded-first: tool_issue='$(rec "$D" tool_issue)' (want 43) — the degraded arm's rc 0 won"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "degraded-first: and its rc (2), not the degraded run's 0" \
+  || bad "degraded-first: tool_rc='$(rec "$D" tool_rc)' (want 2)"
+case "$(rec "$D" tool_err)" in
+  *"FLEET BOARD: cannot answer"*) ok "degraded-first: and its stderr diagnostic" ;;
+  *) bad "degraded-first: tool_err='$(rec "$D" tool_err)' lost the diagnostic" ;;
+esac
+
+# ── 1l) AN INCOMPLETE ARM WITH NO ROW STILL CARRIES THE DATUM ──────────────────
+mk_case fail-norow 42
+mk_tool_incomplete_norow "$D"
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "no-row: the INCOMPLETE arm records the pre-flight's rc even with no surface row" \
+  || bad "no-row: tool_rc='$(rec "$D" tool_rc)' (want 2) — the datum was available and dropped"
+[ "$(rec "$D" tool_arm)" = "preflight-incomplete" ] \
+  && ok "no-row: and names the arm, so its datum cannot be read as another arm's" \
+  || bad "no-row: tool_arm='$(rec "$D" tool_arm)' (want preflight-incomplete)"
+
+# ── 1m) THE SURFACE MUST SURVIVE A LONG STDERR (the datum must not crowd it out) ─
+# The inline stderr is cut to 80 characters so the surface clause and the datum both fit
+# `refresh_cause_brief`'s 400-char cut. Measured before that: a 200-char stderr pushed the BLOCKED
+# line to 566 characters and left `issue-assignee-ho` — the surface, cut mid-word.
+mk_case fail-longstderr 42
+mk_tool_stderr "$D"
+python3 - "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'FLEET BOARD: cannot answer — no live-session store on this box',
+    'FLEET BOARD: cannot answer — no live-session store on this box; probe=/tmp/cell-home/.pi/'
+    'agent/state/live-sessions.json absent; RegistryUnreadable(FileNotFoundError: /tmp/cell-home/'
+    '.pi/agent/state/lane-registry.tsv)',
+)
+open(path, "w").write(src)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D"
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+# The beat prints `why=` cut at 400 (refresh_cause_brief), so the window that matters is the line's
+# first ~450 characters — not the whole line. Asserting on the untruncated line grades nothing.
+_window="$(printf '%s' "$OUT_DRIVE" | cut -c1-450)"
+case "$_window" in
+  *"failing surface(s): issue-assignee-holder"*) ok "longstderr: the surface survives intact inside the printed window" ;;
+  *) bad "longstderr: the surface was crowded out of the printed window — $_window" ;;
+esac
+case "$_window" in
+  *"rc=2"*) ok "longstderr: and the datum's rc still survives" ;;
+  *) bad "longstderr: the datum's rc was crowded out — $_window" ;;
+esac
+# ⛔ AND THE INLINE STDERR IS BOUNDED (80), while the RECORD keeps the whole line (review of #2401,
+# sixth round). Without this pair the shortening was ungraded: the full 200-char diagnostic reached
+# the printed line and ate the budget the surface and the datum both need.
+case "$_window" in
+  *"RegistryUnreadable"*) bad "longstderr: the UNBOUNDED diagnostic reached the printed line — the inline stderr is not being shortened" ;;
+  *) ok "longstderr: the inline diagnostic is bounded, so the surface and rc keep their room" ;;
+esac
+case "$(rec "$D" tool_err)" in
+  *"RegistryUnreadable"*) ok "longstderr: while the RECORD still carries the whole diagnostic" ;;
+  *) bad "longstderr: the record lost the full diagnostic — tool_err='$(rec "$D" tool_err)'" ;;
 esac
 
 # ── 1f) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
