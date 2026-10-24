@@ -1,0 +1,16 @@
+# FAILURE-CLASS FIXTURE (positive): a push-triggered workflow that declares a group but no
+# cancellation — accepted by R2 (the literal `false` is the only allowed value on push).
+name: push-cancel-false
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

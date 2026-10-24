@@ -46,7 +46,7 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
-cleanup() { rm -f "$OUT" ${CASE5_JSON:+"$CASE5_JSON"}; }
+cleanup() { rm -f "$OUT" ${CASE5_JSON:+"$CASE5_JSON"}; rm -rf ${CASE6_DIR:+"$CASE6_DIR"}; }
 trap cleanup EXIT
 
 pass() { echo "   ✅ $1"; }
@@ -408,6 +408,105 @@ JS
     esac
   fi
 fi
+echo ""
+echo "== Case 6: the supersession invariant (scripts/check-workflow-concurrency.sh, #2474) =="
+# WHY this is a case here rather than a new shard: the rules are about the SAME artifact this
+# suite already parses (workflow YAML), the suite already runs in ci.yml's `actionlint` job, and a
+# new tests/<dir>/run.sh would add a shard to the lane while the shard baseline mapping is
+# unresolved (#2610). No new lane, no new shard, no new dependency.
+#
+# The fixtures are the failure CLASSES, and every one of them is RED for its OWN rule (the tag is
+# asserted, not just the exit code): a fixture that reds for the wrong reason pins nothing. The
+# mutations below are the load-bearing half — they prove the rules are live against THIS repo's
+# real files, not just against fixtures written to agree with the checker.
+CONC="$ROOT/scripts/check-workflow-concurrency.sh"
+CFIX="$ROOT/tests/fixtures/actionlint/workflow-concurrency"
+CASE6_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wfconc.XXXXXX")"
+
+conc_run() { # conc_run <expected-exit> <label> [args...]
+  local expected="$1"; shift
+  local label="$1"; shift
+  bash "$CONC" "$@" >"$OUT" 2>&1
+  local actual=$?
+  if [ "$actual" -eq "$expected" ]; then
+    pass "$label (exit $actual)"
+  else
+    fail "$label — expected exit $expected, got $actual"
+    sed 's/^/      /' "$OUT"
+  fi
+}
+
+conc_run 0 "the four well-formed fixtures pass" \
+  "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml"
+
+# name + the rule tag the refusal must carry
+for pair in \
+  "pr-no-concurrency.yml R1" \
+  "pr-cancel-false.yml R1" \
+  "pr-group-sha.yml R1" \
+  "pr-target-group-ref.yml R1" \
+  "pr-group-no-identity.yml R1" \
+  "push-cancel-true.yml R2" \
+  "reusable-concurrency.yml R3"; do
+  name="${pair% *}"; tag="${pair#* }"
+  conc_run 1 "$name blocks" "$CFIX/$name"
+  if grep -q "\[$tag\]" "$OUT"; then
+    pass "$name is refused by $tag (not by a neighbouring rule)"
+  else
+    fail "$name did not report rule $tag"
+    sed 's/^/      /' "$OUT"
+  fi
+done
+
+conc_run 0 "the live repo workflows satisfy the invariant"
+if grep -q "11 file(s) scanned" "$OUT"; then
+  pass "all 11 live workflows were scanned (no silent glob hole)"
+else
+  fail "expected the live scan to cover 11 workflows"
+  sed 's/^/      /' "$OUT"
+fi
+
+# --- mutations on the LIVE files: the rules must be load-bearing ---------------------------
+# One directory per variant, each keeping the workflow's own BASENAME — the rules read the file
+# stem (identity) and the exemption set reads the basename, so a renamed copy would be measuring
+# a different file than the one the rule is about.
+mkdir -p "$CASE6_DIR/full" "$CASE6_DIR/stripped" "$CASE6_DIR/exempt" "$CASE6_DIR/push"
+# (a) control: a faithful copy of ci.yml is green, so the red below is the MUTATION, not the copy.
+cp "$ROOT/.github/workflows/ci.yml" "$CASE6_DIR/full/ci.yml"
+conc_run 0 "a faithful copy of the live ci.yml passes" "$CASE6_DIR/full/ci.yml"
+# (b) strip ci.yml's concurrency block → R1 must RED it.
+awk '/^concurrency:/{skip=1;next} skip&&/^[ \t]/{next} {skip=0} {print}' \
+  "$ROOT/.github/workflows/ci.yml" >"$CASE6_DIR/stripped/ci.yml"
+conc_run 1 "ci.yml with its concurrency block removed is RED" "$CASE6_DIR/stripped/ci.yml"
+grep -q '\[R1\]' "$OUT" && pass "the removal is caught by R1" || fail "the removal was not caught by R1"
+# (c) give the EXEMPT guard a concurrency block → the exemption must go stale and RED (#2474).
+cp "$ROOT/.github/workflows/pipeline-compliance.yml" "$CASE6_DIR/exempt/pipeline-compliance.yml"
+printf 'concurrency:\n  group: pipeline-compliance-${{ github.ref }}\n  cancel-in-progress: true\n' \
+  >>"$CASE6_DIR/exempt/pipeline-compliance.yml"
+conc_run 1 "a guard workflow that gains concurrency is RED (stale #2474 exemption)" \
+  "$CASE6_DIR/exempt/pipeline-compliance.yml"
+grep -q '\[R4\]' "$OUT" && pass "the stale exemption is caught by R4" || fail "the stale exemption was not caught by R4"
+# (d) flip the push-triggered gate back to cancelling → R2 must RED it (this was the live defect).
+sed 's/^  cancel-in-progress: false$/  cancel-in-progress: true/' \
+  "$ROOT/.github/workflows/enforce-skills.yml" >"$CASE6_DIR/push/enforce-skills.yml"
+conc_run 1 "a push-triggered workflow restored to cancelling is RED" "$CASE6_DIR/push/enforce-skills.yml"
+grep -q '\[R2\]' "$OUT" && pass "the regression is caught by R2" || fail "the regression was not caught by R2"
+
+# --- repo-mode anti-vacuity: a check that read nothing must not report PASS ----------------
+mkdir -p "$CASE6_DIR/nopr/.github/workflows"
+cp "$CFIX/push-ok.yml" "$CASE6_DIR/nopr/.github/workflows/push-ok.yml"
+conc_run 2 "a tree with no PR-triggered workflow refuses to pass (exit 2)" \
+  --root "$CASE6_DIR/nopr"
+grep -q 'R1 verified NOTHING' "$OUT" && pass "the vacuity refusal names R1" || fail "the vacuity refusal did not name R1"
+
+# --- a renamed/vanished guard must not silently fall out of the exemption bookkeeping ------
+mkdir -p "$CASE6_DIR/noexempt/.github/workflows"
+cp "$ROOT/.github/workflows/harness-single-source.yml" "$CASE6_DIR/noexempt/.github/workflows/harness-single-source.yml"
+conc_run 1 "a tree missing the exempt guards is RED, not silently exempt-free" --root "$CASE6_DIR/noexempt"
+grep -q 'named in EXEMPT_FILES but no such PR-triggered workflow was scanned' "$OUT" \
+  && pass "the missing exemptions are named" \
+  || fail "the missing exemptions were not named"
+
 echo ""
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures actionlint test(s) failed"

@@ -24,9 +24,24 @@ on:
       - '.github/workflows/enforce-skills.yml'   # gate changes self-verify
   workflow_dispatch:           # manual
 
+# ⛔ NO CANCELLATION HERE — this workflow runs on `schedule` AND on `push: [main]`, and BOTH of
+# those execute ON THE DEFAULT BRANCH. A `cancel-in-progress: true` group therefore cancels a
+# main-branch run of this gate: a later push (or the nightly, which shares the same ref) kills the
+# in-flight run for an earlier commit, and no replacement run is created for that head — so main's
+# drift verdict for that commit is LOST, silently, with no issue filed (this job's own failure path
+# is what files one). That is the same non-red-that-measured-nothing shape as #2474, one layer out:
+# there is no guard wait here, so nothing re-triggers it.
+#
+# The group carries `github.event_name` as well as the ref (`schedule` and `push` both evaluate
+# `github.ref` to refs/heads/main, so a ref-only key puts the nightly and the push gate in the same
+# cancellation domain). With cancellation off, a push and a nightly on the same ref run side by side
+# instead of one eating the other. Residual, disclosed: GitHub keeps at most one RUNNING and one
+# PENDING run per group, so a third simultaneous arrival evicts the pending one — at this delivery
+# rate (one nightly, path-filtered pushes, ~1-2 min each) that is not reachable, and it is the same
+# trade ci-main.yml's auto-file-on-failure documents rather than a new one.
 concurrency:
-  group: enforce-skills
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
