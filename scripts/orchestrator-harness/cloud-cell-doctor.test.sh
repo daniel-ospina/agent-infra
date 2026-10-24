@@ -332,8 +332,9 @@ result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pas
 
 # ── 1a2b) an UNREADABLE census is unverifiable, not a clean pass ────────────────────────────────
 # ⛔ THE DOCTOR'S OWN ARM (#2163 review, cycle 6). `DOCTOR_TEST_REAP_ABSTAIN`/`INERT`/`TREES` drive the
-# REAP PASS line's fields; nothing drove the `count` read, so deleting either `pass_rc=3` in the doctor's
-# census classifier (cloud-cell-doctor.sh:926-933) left this suite green and an unreadable census
+# REAP PASS line's fields; nothing drove the `count` read, so the ONE `pass_rc=3` the census classifier
+# owns (`cloud-cell-doctor.sh:940`, the `?-numerator` arm — the catch-all above it REWRITES only) left
+# this suite green and an unreadable census
 # rendered as `lanes=?/? zombie=?` at rc=0 — the exact false PASS the arm's own comment names.
 say_case "an UNREADABLE lane census is cannot-verify (rc=3), never a clean pass"
 reset_tmux; reset_ps; reset_state
@@ -341,23 +342,25 @@ mk_lane lane-42 4242
 DOCTOR_TEST_REAP_CENSUS=unreadable doc reap
 [ "$RC" -eq 3 ] && ok "census-abstain: rc=3 (the census could not be read)" || bad "census-abstain: rc=$RC — an unreadable census read as a clean pass — $OUT"
 result_has "lanes=?/?" && ok "census-abstain: the pass line says ?/? rather than a fabricated 0" || bad "census-abstain: the census is not reported as unknown — $OUT"
-result_has "unverifiable=1" && ok "census-abstain: ONE failed read is counted ONCE" || bad "census-abstain: the abstention count is wrong (one failed read must read unverifiable=1) — $OUT"
+result_has "unverifiable=1 failed=" && ok "census-abstain: ONE failed read is counted ONCE" || bad "census-abstain: the abstention count is wrong (one failed read must read unverifiable=1) — $OUT"
 grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "census-abstain: the census was actually READ (the leg is not vacuous)" || bad "census-abstain: no count call — this arm cannot have fired"
 
 # …and the OTHER classifier arm: output that is not a census AT ALL (an unexecutable tool, the
 # `bounded 60` SIGKILL) must take the `*)` catch-all to the same rc=3 — #2163 review cycle 7 found
-# that arm still unpinned. ⛔ WHAT IS LOAD-BEARING (measured, cycles 7-8): the catch-all only REWRITES
-# the census into the `?`-numerator shape, and the arm below owns the count and the rc; removing the
-# catch-all's own `pass_rc=3` changes nothing (185/0), while removing BOTH turns this leg red at rc=0
-# (183/0). `unverifiable=1` for ONE failed read is pinned here because the two arms counting it
-# separately made a single garbled read read as `unverifiable=2` (cycle 8, fixed in the doctor).
+# that arm still unpinned. ⛔ WHAT IS LOAD-BEARING (each number MEASURED, not inferred):
+#   • at the PRE-FIX head (71edb272) removing the catch-all's own `pass_rc=3` alone left it 185/0;
+#   • at THIS head that assignment no longer exists, so the single remaining one (`:940`) is the
+#     load-bearing escalation — reverting it turns the suite 185 PASS / 2 FAIL (both census legs red);
+#   • `unverifiable=1` for ONE failed read is pinned because the two arms counting it separately made
+#     a single garbled read read as `unverifiable=2` (cycle 8, fixed in the doctor) — restoring that
+#     increment turns the suite 186 PASS / 1 FAIL.
 say_case "a GARBLED census read is cannot-verify (rc=3), not a clean pass"
 reset_tmux; reset_ps; reset_state
 mk_lane lane-42 4242
 DOCTOR_TEST_REAP_CENSUS=garble doc reap
 [ "$RC" -eq 3 ] && ok "census-garble: rc=3 (the read did not parse)" || bad "census-garble: rc=$RC — a garbled read read as a clean pass — $OUT"
 result_has "lanes=?/?" && ok "census-garble: the pass line says ?/? rather than a fabricated 0" || bad "census-garble: the census is not reported as unknown — $OUT"
-result_has "unverifiable=1" && ok "census-garble: ONE garbled read is counted ONCE (not twice, #2163 cycle 8)" || bad "census-garble: a single garbled read was over-counted — $OUT"
+result_has "unverifiable=1 failed=" && ok "census-garble: ONE garbled read is counted ONCE (not twice, #2163 cycle 8)" || bad "census-garble: a single garbled read was over-counted — $OUT"
 grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "census-garble: the census was actually READ (the leg is not vacuous)" || bad "census-garble: no count call — this arm cannot have fired"
 
 # ── 1a3) a process pass that judged NOTHING is unverifiable, not a health record ──────────────
