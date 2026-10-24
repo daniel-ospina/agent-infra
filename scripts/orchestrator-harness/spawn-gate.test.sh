@@ -1619,7 +1619,16 @@ ck "…and its replay line contains no git-apply invocation at all" $rc
 # a real dispatch, a worker killed at a 1 s cap, and the status line read back.
 BG="$CAPRIG/bg"; mkdir -p "$BG/logs" "$BG/state"
 cap_clean; cap_dirty
-printf 'a prompt\n' > "$BG/prompt"
+# ⛔ THIS FIXTURE IS GATED TOO (review cycle 4, P1). `nonblocking-dispatch.sh` runs the research-first
+# gate in the FOREGROUND, so a bare `a prompt` brief is refused with 80 and NO worker is ever started —
+# the three cap-kill arms below then read "lost (no exit status recorded)" and assert a cap kill on a
+# dispatch that never happened. MEASURED: 165 passed / 3 failed, and the same rc/status string reproduced
+# standalone. Rendered from the validator with the role the dispatcher gates on (`worker`, i.e. KIND=bg),
+# and asserted at BUILD time: a fixture that drifts must fail here, by name, not three arms later as a
+# mysterious "lost" lane.
+{ printf 'a prompt for a background worker\n\n'; bash "$HERE/brief-gate.sh" --section worker; } > "$BG/prompt"
+bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
+  || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
 pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
 export -f pi
 ( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 \
