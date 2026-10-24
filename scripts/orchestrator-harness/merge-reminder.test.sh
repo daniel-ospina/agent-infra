@@ -2061,6 +2061,14 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an unreadable inventory states NO fraction (no 0/1 over the placeholder)" \
    "$(qF 'not compared — the box inventory could not be read' "$MDF" && nq 'on this cycle' "$MDF" \
       && nq 'box(es) run this cycle' "$MDF" && echo 0 || echo 1)"
+# ⛔ AND NO BOX IS NAMED. Dropping the placeholder term from the standing gate left the suite fully
+# green while the report went back to `STANDING=MARKERS-BROKEN` naming `<inventory> (not verified)` —
+# a box that does not exist.
+ck "§27 ...and nothing was probed, so the standing is UNMEASURED (not MARKERS-BROKEN)" \
+   "$(qF 'STANDING=NOT-MEASURED' "$MDF" && nq 'MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and --json explains WHY the row is a placeholder (note, not empty reasons)" \
+   "$(run_sut --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(0 if r["inventory"]=="unread" and "line is not" in r["note"] else 1)' 2>/dev/null \
+      || echo 1)"
 ck "§27 ...and the row says boxes.tsv could not be read" \
    "$(qF 'boxes.tsv=UNREADABLE boxes.tsv' "$MDF" && echo 0 || echo 1)"
 
@@ -2070,8 +2078,8 @@ write_no_landing; reset_o
 : > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
-ck "§27 an EMPTY inventory says it lists no boxes (not 'absent', not 0/0)" \
-   "$(qF 'the inventory exists and lists NO boxes' "$MDF" && nq '0/0' "$MDF" \
+ck "§27 an EMPTY inventory says it lists no boxes (not 'absent', and no fraction)" \
+   "$(qF 'the inventory exists and lists NO boxes' "$MDF" && nq 'on this cycle' "$MDF" \
       && nq 'no \`state/boxes.tsv\`' "$MDF" && qF 'STANDING=NOT-MEASURED' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ AN ABSENT INVENTORY IS NOT A ONE-BOX FLEET. goal 2 is "the local box AND all three cmux cells";
@@ -2090,6 +2098,33 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 ...and is NOT announced when the inventory is there" \
    "$(nq 'only THIS box was probed' "$MDF" && nq 'LOCAL ONLY' "$MDF" && echo 0 || echo 1)"
+# ⛔ THE LOCAL ROW IS A PROBED BOX. Excluding `absent` from `compared` made the DEFAULT path print
+# "not compared" beside the box it had just compared, and aim the remediation at a read that never
+# failed (the agent-infra default: nothing provisions `$O/state/boxes.tsv`).
+write_no_landing; reset_o
+rm -f "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 the LOCAL-ONLY box is still FRACTIONED (a probe is a probe)" \
+   "$(q 'on this cycle' "$MDF" && nq 'not compared' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the action says LOCAL ONLY without claiming the read failed" \
+   "$(nq 'could not be compared' "$MDF" && qF 'LOCAL ONLY' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ A BOX THAT DID NOT ANSWER IS NOT A BOX THAT DRIFTED. `0/1 on this cycle's main` asserts a version
+# for a box whose version was never read, and then orders it deployed.
+write_no_landing; reset_o
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-unread.sh" \
+  > "$O/state/boxes.tsv"
+cat > "$TMP/box-unread.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "harness: UNREADABLE"
+exit 2
+STUB
+chmod +x "$TMP/box-unread.sh"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a box that did not ANSWER states no fraction (1/2 is a claim about both)" \
+   "$(nq 'on this cycle' "$MDF" && qF 'box(es) did not answer' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════

@@ -150,6 +150,11 @@ GOAL_SEARCH_BUDGET = 8   # SEARCH-quota calls per run for the goal readings. ⛔
 # nothing — and the retry that DID recover (a third read after the goals) is how one report came to
 # print the recovered sha in its header while the goals block called the same sha unreadable and
 # accused a box sitting on it. ONE value, read once with a real backoff, used by every consumer.
+# The inventory states that are NOT a probed box: an unreadable `boxes.tsv`, a file that exists and
+# lists no rows, and an absent file with no local probe script. Each says which in its `note`, and none
+# may be counted, fractioned, or reported as a marker.
+PLACEHOLDER = ("unread", "empty", "noprobe")
+
 MAIN_READ_ATTEMPTS = 3
 MAIN_READ_BACKOFF_S = 0.5
 
@@ -1766,13 +1771,17 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
                  "on_pin": False, "reasons": [], "inventory": "unread", "note": str(e)}]
     if not boxes:
-        # A file that EXISTS and lists no rows is its own state, not the same thing as an absent one
-        # (which falls back to THIS box). Reporting it as "no inventory and no local probe" claimed a
-        # fallback that was never taken, and `0/0 on this cycle's main` stated a comparison over
-        # nothing.
+        # ⛔ TWO DIFFERENT EMPTIES. A file that EXISTS and lists no rows is one state; a missing file
+        # whose local fallback is also unavailable (`box-status.sh` not beside this script — a staged
+        # install) is another. `read_inventory` returns [] for both, so the state is decided from the
+        # file itself: reporting "the inventory exists and lists NO boxes" about a file that does not
+        # exist is the same class of invented reading this block exists to refuse.
+        present = (o / "state" / "boxes.tsv").is_file()
         return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
-                 "on_pin": False, "reasons": [], "inventory": "empty",
-                 "note": "the inventory exists and lists NO boxes"}]
+                 "on_pin": False, "reasons": [],
+                 "inventory": "empty" if present else "noprobe",
+                 "note": ("the inventory exists and lists NO boxes" if present else
+                          "no `state/boxes.tsv` and no `box-status.sh` — nothing could be probed")}]
     rows: list[dict] = []
     for name, status_cmd, _activate in boxes:
         # ⛔ A SUMMARY READ, BOUNDED SHORT: this probe runs BEFORE the landing decision, so an
@@ -1817,7 +1826,7 @@ def _drift_text(rows: list[dict]) -> str:
         return "NOT-MEASURED (the box inventory was not read)"
     parts = []
     for r in rows:
-        if r.get("inventory") in ("unread", "empty"):
+        if r.get("inventory") in PLACEHOLDER:
             # ⛔ A PLACEHOLDER ROW IS NOT A BOX. Printing it as `UNREADABLE` beside a fraction of it
             # ("0/1") read as one probed box that failed, so the report told the owner to deploy a box
             # that does not exist. It says what happened instead.
@@ -1885,20 +1894,30 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
 
     # Only THIS box was probed, because the inventory is missing — the cells were never read.
     local_only = bool(drift) and all(r.get("inventory") == "absent" for r in drift)
-    # ⛔ A FRACTION NEEDS A COMPARISON AND REAL BOXES. No `origin/main` means nothing was compared; a
-    # placeholder row (`unread`/`empty`) means no box was probed at all, so "0/1" would invent both the
-    # numerator and the denominator.
-    compared = bool(drift) and bool(main_sha) and all(r.get("inventory") == "file" for r in drift)
-    why_not_compared = ("`origin/main` was unreadable" if not main_sha else
-                        "the box inventory could not be read" if any(
-                            r.get("inventory") == "unread" for r in drift) else
-                        "the inventory lists no boxes")
+    # ⛔ A FRACTION NEEDS A COMPARISON, REAL BOXES, AND AN ANSWER FROM EACH. No `origin/main` means
+    # nothing was compared; a placeholder row means no box was probed; an unreadable box means THAT
+    # box's version was never read, so a denominator counting it asserts an unmeasured fact about it
+    # (and the action then orders a deploy of a box nobody looked at).
+    # ⛔ `absent` IS A REAL PROBED BOX: the synthesized local row is probed like any other, and
+    # excluding it made the DEFAULT fleet path (no `state/boxes.tsv`) print "not compared" beside the
+    # box it had just compared, with the remediation aimed at a read that never failed.
+    placeholder = [r for r in drift if r.get("inventory") in PLACEHOLDER]
+    compared = (bool(drift) and not placeholder and bool(main_sha)
+                and all(r.get("readable") for r in drift))
+    why_not_compared = (
+        "`origin/main` was unreadable" if not main_sha else
+        "the box inventory could not be read" if any(r.get("inventory") == "unread" for r in drift) else
+        "the inventory exists and lists NO boxes" if any(
+            r.get("inventory") == "empty" for r in drift) else
+        "no box could be probed (no inventory and no `box-status.sh`)" if any(
+            r.get("inventory") == "noprobe" for r in drift) else
+        f"{sum(1 for r in drift if not r.get('readable'))} box(es) did not answer")
     currents = [r for r in drift if r.get("on_pin")]
     boxes_bad = [r for r in drift if not r.get("on_pin")]
     # ⛔ THE STANDING IS DECIDED BY THE DRIFT ALONE. A queue count that did not come back is its OWN
     # sub-note: folding it in here downgraded a MEASURED drift (a box provably off-pin) to
     # `NOT-MEASURED` on exactly the degraded cycles where the owner needs the drift reported.
-    if not drift or any(r.get("inventory") in ("unread", "empty") for r in drift):
+    if not drift or placeholder:
         # ⛔ A PLACEHOLDER ROW MEANS NO BOX WAS PROBED, so the honest standing is UNMEASURED — not
         # MARKERS-BROKEN, which would name a box (`<inventory> (not verified)`) that does not exist.
         goal2 = "NOT-MEASURED"
@@ -1919,7 +1938,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"PRs merged today={dm}",
         f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
         "  harness: " + _drift_text(drift) +
-        (f" ({len(currents)}/{len(drift)} on this cycle's main)" if compared else
+        ("" if not drift else
+         f" ({len(currents)}/{len(drift)} on this cycle's main)" if compared else
          f" (not compared — {why_not_compared})"),
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
@@ -1930,7 +1950,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
                      "never read, so this is not 'the fleet is on the pin'")
     for r in drift:
-        if r.get("inventory") in ("unread", "empty"):
+        if r.get("inventory") in PLACEHOLDER:
             lines.append(f"  ⚠️ harness: {r.get('note') or 'the box inventory could not be read'} — no "
                          f"box was probed this cycle")
     for name, why in unreadable:
@@ -1974,7 +1994,9 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                 f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
                 f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
                 f"every box is the marker; deploy/activate it (the deploy arm below) before anything "
-                f"else, one box at a time. ")
+                f"else, one box at a time. "
+                + ("⛔ LOCAL ONLY — the inventory is absent, so nothing is known about the cells. "
+                   if local_only else ""))
         actions.append(head)
     elif goal2 == "MARKERS-HOLD":
         # ⛔ "queue read (…)" IS A MEASUREMENT CLAIM. The standing is decided by the DRIFT alone now
@@ -2517,7 +2539,7 @@ def main(argv=None) -> int:
                        "relation": r["relation"], "readable": r["readable"],
                        "source": r.get("source", ""), "controller": r.get("controller", ""),
                        "on_pin": bool(r.get("on_pin")), "reasons": list(r.get("reasons") or []),
-                       "inventory": r.get("inventory", "")}
+                       "inventory": r.get("inventory", ""), "note": r.get("note", "")}
                       for r in drift],
             "landing": [{"pr": r["pr"]["number"], "head": r["pr"]["head"], "rank": r["rank"],
                          "verdict": r["verdict"], "readings": r["readings"],
