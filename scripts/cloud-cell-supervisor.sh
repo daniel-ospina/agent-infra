@@ -26,7 +26,10 @@
 #           normally not needed by hand — it exists for a cell you want to fix without starting.
 #   prune   reclaim the regenerable disk the lanes leave behind and report the review scratch that
 #           accumulates under /tmp. --scratch[=DAYS] also deletes scratch checkouts older than DAYS.
-#           A full disk is what breaks a cell FIRST.
+#           A full disk is what breaks a cell FIRST. --exclude-root=PATH (repeatable, absolute) skips
+#           the per-worktree cache sweep at PATH — the seam the doctor's hygiene role uses to leave a
+#           worktree a LIVE process is sitting in alone while still reclaiming the idle ones
+#           (agent-infra#2573; the exclusion is reported by path, never applied silently).
 #           ⛔ A per-worktree `.venv` is NOT removed here any more (agent-infra#1932). This sweep used
 #           to `rm -rf` it at every worktree root, with no idea whether the lane using it was alive;
 #           the only guard on the unattended path was a tmux NAME regex (`^(lane|fix|merge)-`) that
@@ -49,8 +52,11 @@
 #   reap    one wedged-session pass, gated (namespace, log, two observations, human ancestry)
 #   merge   land PRs with a clean attestation at head, through `admin-merge.sh`, and record every
 #           refusal with its reason (never an override; never a blind retry at the same head)
-#   hygiene `uv cache prune`, worktree-root caches (only when no worker is live), stale worktrees
-#           via the shipped `pi-reap-worktrees.sh` (armed only under disk pressure by default)
+#   hygiene `uv cache prune`, the `cloud-cell-*` temp dirs (agent-infra#2573), idle docker
+#           images/volumes, worktree-root caches (a root a live process holds is EXCLUDED and named,
+#           never a reason to skip every root), stale worktrees via the shipped
+#           `pi-reap-worktrees.sh` (armed only under disk pressure by default). Every pass reports a
+#           `df` delta and never a `du` sum.
 #
 # The verbs run ONE pass and are idempotent; `start` runs the loop that schedules them. Both write
 # the same `$O/state/roles/<role>.state` records, so "configured" and "ran a pass at HH:MM:SSZ" are
@@ -2754,14 +2760,58 @@ registered_worktree() {
   return 1
 }
 
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573) — an EXCLUSION list, never an INCLUSION one.
+# The doctor's hygiene role can prove, PER WORKTREE ROOT, whether a live process is sitting in it
+# (the shipped `orchestrator-harness/live-ownership.sh` cwd census), so it excludes exactly the roots
+# a worker is in and lets the rest be swept. An INCLUSION list ("sweep only these") would silently
+# drop every root the caller did not enumerate — including $HARNESS_REPO's, which the doctor does not
+# even know about — so the sweep would lose coverage while still reporting success. Newline-separated
+# (a path can contain spaces), canonicalised at COMPARE time so a symlinked spelling cannot slip
+# past, and matched as a PATH PREFIX in ONE direction only (#2573 review, P1):
+#   * a held root is excluded EXACTLY, and
+#   * every ANCESTOR of it is excluded too — `sweep_root_caches` at an ancestor runs
+#     `find -maxdepth 5 -name __pycache__`, which reaches INTO the held worktree.
+# ⛔ The prefix must NOT run the other way. `case "$root" in "$cand"/*)` would make one held root
+# exclude every SIBLING under it — and on the fleet layout (`<repo>/.worktrees/<lane>`) a single live
+# lane holds `<repo>`, so ALL other lanes' roots would be skipped while the caller reported N roots
+# swept. That is the same self-disable shape #2573 exists to remove, one level down; measured
+# 2026-10-19 on the two-worktree fixture.
+EXCLUDE_ROOTS=""
+root_excluded() { # <root> -> 0 when the caller proved a LIVE process holds it
+  local root cand
+  [ -n "${EXCLUDE_ROOTS:-}" ] || return 1
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 1   # unresolvable: nothing of ours to spare
+  [ "$root" != "/" ] || return 1
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    # A root that no longer exists cannot be held by anything: nothing to exclude (and nothing to
+    # sweep either — `sweep_root_caches` skips a missing root).
+    cand="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
+    [ "$root" = "$cand" ] && return 0
+    # The held path protects itself and the roots whose sweep would recurse INTO it — never its
+    # siblings (see the header).
+    case "$cand" in "$root"/*) return 0 ;; esac
+  done <<< "$EXCLUDE_ROOTS"
+  return 1
+}
+
+exclude_root_add() { # <absolute path>
+  if [ -n "${EXCLUDE_ROOTS:-}" ]; then EXCLUDE_ROOTS="$EXCLUDE_ROOTS"$'\n'"$1"; else EXCLUDE_ROOTS="$1"; fi
+}
+
 cmd_prune() {
   local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
+  EXCLUDE_ROOTS=""
   for a in "$@"; do
     case "$a" in
       --caches) caches_only=1 ;;
+      --exclude-root=*) case "${a#*=}" in
+                          /*) exclude_root_add "${a#*=}" ;;
+                          *) die "prune: --exclude-root needs an ABSOLUTE path (got '${a#*=}'): a relative one would be resolved against whatever directory the caller happened to be in" ;;
+                        esac ;;
       --scratch) do_scratch=1 ;;
       --scratch=*) do_scratch=1; days="${a#*=}" ;;
-      *) die "usage: $0 prune [--caches] [--scratch[=DAYS]]" ;;
+      *) die "usage: $0 prune [--caches] [--exclude-root=PATH]… [--scratch[=DAYS]]" ;;
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
@@ -2851,9 +2901,22 @@ cmd_prune() {
     # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
     # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
     # largest consumer was a 5.6G `.venv` in ONE LINKED worktree, which this loop could never reach.
-    while IFS= read -r root; do sweep_root_caches "$root"; done \
+    while IFS= read -r root; do
+      # ⛔ A HELD ROOT IS NAMED, NOT SILENTLY DROPPED. The caller excluded it because a live process
+      # has a cwd inside it; a skip nobody can see is the same defect as the clamp this replaces
+      # (the doctor declining to reclaim precisely when the box is busiest).
+      if root_excluded "$root"; then
+        say "prune: caches NOT swept at $root — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+        continue
+      fi
+      sweep_root_caches "$root"
+    done \
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
-    sweep_root_caches "$r"
+    if root_excluded "$r"; then
+      say "prune: caches NOT swept at $r — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+    else
+      sweep_root_caches "$r"
+    fi
   done
   reap_global_caches
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }

@@ -1340,6 +1340,75 @@ rm -rf "$R/repo-wt/.venv"; mkdir -p "$R/repo-wt/.venv"; printf 'x\n' > "$R/repo-
 PRUNE_VENV_MIN_AGE=0 prunesup --caches
 [ -e "$R/repo-wt/.venv" ] && bad "prune --caches did not reclaim a provably-dead lane's .venv (the delegation is dead)" \
                           || ok "prune --caches reclaims a lane .venv once the reaper can prove it is dead"
+
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573). The doctor's hygiene role proves, per worktree
+# root, whether a LIVE process has a cwd inside it, and excludes exactly those so the rest can still be
+# swept on the busiest box. The verb must therefore honour the exclusion — and it must stay an
+# EXCLUSION: every root the caller does NOT name (here the main checkout; in production $HARNESS_REPO's
+# worktrees, which the doctor cannot even enumerate) keeps its coverage. Both directions, one arm.
+mkdir -p "$R/repo-wt/node_modules" "$R/repo/.pytest_cache"
+printf 'x\n' > "$R/repo-wt/node_modules/marker"; printf 'x\n' > "$R/repo/.pytest_cache/marker"
+prunesup --caches --exclude-root="$R/repo-wt"
+[ -e "$R/repo-wt/node_modules" ] && ok "prune --exclude-root: the EXCLUDED root keeps its caches (a live process holds it)" \
+                                 || bad "prune --exclude-root swept a root it was told to spare"
+[ -e "$R/repo/.pytest_cache" ] && bad "prune --exclude-root: a root the caller did NOT exclude was left unswept (an exclusion list must not narrow coverage)" \
+                               || ok "prune --exclude-root: a root the caller did NOT name is still swept (exclusion, never inclusion)"
+case "$PR_OUT" in
+  *"NOT swept at $R/repo-wt"*) ok "prune --exclude-root: the skip is REPORTED by path, never silent" ;;
+  *) bad "prune --exclude-root: the excluded root was skipped without saying so — $PR_OUT" ;;
+esac
+# A ROOT CAN BE THE MAIN CHECKOUT, and the cache loop reaches it through a SECOND call site (the
+# `sweep_root_caches "$r"` line). Excluding only the linked-worktree loop would leave that one armed.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the MAIN checkout root is spared when it is the excluded one" \
+                             || bad "prune --exclude-root: the main checkout's own root was swept despite the exclusion"
+# A path that no longer exists cannot be held by a live process (and `sweep_root_caches` skips a missing
+# root anyway), so a stale exclusion must not silently disable the sweep.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/gone-root"
+[ -e "$R/repo/node_modules" ] && bad "prune --exclude-root: a vanished exclusion path disabled the sweep (it spared a root nothing holds)" \
+                             || ok "prune --exclude-root: an exclusion path that no longer exists does not stop the sweep"
+# ⛔ THE DECISIVE CASE (agent-infra#2573 review, P1): the caller excludes the PARENT root, which is
+# exactly what the doctor does when the cwd census finds a live process anywhere under the repo (the
+# fleet layout: every lane worktree is `<repo>/.worktrees/<lane>`). A prefix match on the DESCENDANT
+# side then skips every worktree under it — all lanes spared, while the caller reports "swept N idle
+# root(s)". Restoring `case "$root" in "$cand"/*` reddens this arm.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneC" HEAD 2>/dev/null || true
+mkdir -p "$R/repo/.worktrees/laneC/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneC/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/.worktrees/laneC/node_modules" ] && bad "prune --exclude-root: an excluded PARENT spared every worktree UNDER it — one live lane disables the sweep (the #2573 clamp, one level down)" \
+                                              || ok "prune --exclude-root: a worktree UNDER an excluded parent is still swept"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the excluded parent's OWN root is still spared" \
+                             || bad "prune --exclude-root: the excluded parent's own caches were swept"
+
+# ⛔ ONE HELD ROOT MUST NOT SPARE ITS SIBLINGS (agent-infra#2573 review, P1). The fleet puts every lane
+# worktree under `<repo>/.worktrees/<lane>`, so a prefix match in the WRONG direction — `case "$root" in
+# "$cand"/*` — made ONE live lane exclude every sibling root, while the caller still reported "swept N
+# idle root(s)": the same self-disable #2573 exists to remove, one level down. Two NESTED registered
+# worktrees are the reproduction; restoring that arm reddens the two `ok`s below.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneA" HEAD
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneB" HEAD
+mkdir -p "$R/repo/.worktrees/laneA/node_modules" "$R/repo/.worktrees/laneB/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneA/node_modules/marker"
+printf 'x\n' > "$R/repo/.worktrees/laneB/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo/.worktrees/laneA"
+[ -e "$R/repo/.worktrees/laneA/node_modules" ] && ok "prune --exclude-root: a NESTED held worktree keeps its caches" \
+                                              || bad "prune --exclude-root: the nested excluded worktree was swept"
+[ -e "$R/repo/.worktrees/laneB/node_modules" ] && bad "prune --exclude-root: one held worktree spared its SIBLING (the clamp is back, one level down)" \
+                                              || ok "prune --exclude-root: a SIBLING of a held worktree is still swept (exclusion is per-root, not per-repo)"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: an ANCESTOR of a held root is spared too (its own find -maxdepth 5 recurses INTO it)" \
+                             || bad "prune --exclude-root: the parent checkout was swept while a held worktree sat inside it"
+# A RELATIVE exclusion would be resolved against whatever directory the caller happened to be in, so it
+# is refused — a silent misresolution is a held root that gets swept.
+prunesup --caches --exclude-root=relative/path
+[ "$PR_RC" -ne 0 ] && case "$PR_OUT" in
+  *"--exclude-root needs an ABSOLUTE path"*) ok "prune --exclude-root: a relative path is REFUSED (it would resolve against the caller's cwd)" ;;
+  *) bad "prune --exclude-root: rc=$PR_RC but the refusal is not explained — $PR_OUT" ;;
+esac || bad "prune --exclude-root: a relative exclusion path was accepted (rc=$PR_RC)"
 # (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
 # checkout is what the flag exists to reclaim.
 git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD

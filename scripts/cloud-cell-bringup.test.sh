@@ -236,7 +236,15 @@ printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapoff $*" >> "$SWAP_ST
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "sysctl $*" >> "$SWAP_STUB_LOG"\nfor a in "$@"; do case "$a" in vm.swappiness=*) printf "%%s\\n" "${a#vm.swappiness=}" > "$SWAP_SYSCTL_FILE" ;; esac; done\nexit 0\n' > "$STUB/sysctl"
 chmod +x "$STUB"/*
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
-mkdir -p "$T/home" "$T/cell/.git" "$T/tok"
+mkdir -p "$T/home" "$T/tok"
+# ⛔ A REAL CHECKOUT, NOT AN EMPTY `.git` DIRECTORY (measured on CI, 2026-10-24). `mkdir -p "$T/cell/.git"`
+# is not a repository: real git refuses it, so the disk-reaper installer's `git -C <path> rev-parse
+# --git-dir` dropped the ONLY candidate it could have scanned and refused to install. Locally that was
+# masked because the developer shell exports AGENT_INFRA_PATH, which the installer accepted instead —
+# the arm then asserted a unit whose DISK_REAPER_REPOS named the DEVELOPER'S checkout, not the cell's.
+git init -q "$T/cell" >/dev/null 2>&1 || { echo "fixture: git init failed" >&2; exit 1; }
+git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture \
+    commit -q --allow-empty -m fixture >/dev/null 2>&1 || { echo "fixture: git commit failed" >&2; exit 1; }
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
 TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
@@ -278,7 +286,14 @@ export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
 BR_RC=0; BR_OUT=''
 br() {
-  BR_OUT="$(PATH="$STUB:$PATH" \
+  # ⛔ HERMETIC FROM THE BOX (measured on a fresh CI runner, 2026-10-24). Every ambient repo variable is
+  # CLEARED here, because the disk-reaper installer falls back to them when nothing tells it which repo
+  # to scan: with $AGENT_INFRA_PATH exported by a developer's shell the install succeeded locally while
+  # the SAME suite failed 24 arms on CI, where nothing is exported — a host dependency wearing a test's
+  # clothes. With them cleared, the only repo the installer can learn about is the one the bring-up
+  # passes from its own verified checkout, which is what the `Environment=DISK_REAPER_REPOS=` arm asserts.
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS \
+            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
@@ -370,6 +385,30 @@ if grep -q 'Environment=DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper
 else
   bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"
 fi
+
+say_case "the reaper timer scans the CELL's own checkout, never an ambient \$REPO"
+# ⛔ THIS IS THE ARM THAT PINS THE PRODUCT FIX (measured on a fresh CI runner, 2026-10-24). The installer
+# falls back to ambient variables when nobody tells it which repo to scan — and it REFUSES outright when
+# that fallback yields nothing, which withheld CELL READY on a box that had just cloned its checkout.
+# The bring-up already KNOWS the checkout it verified, so it must say so; an ambient $REPO naming some
+# OTHER checkout must not win. A decoy repo here makes the two answers DIFFERENT, which is what makes the
+# assertion able to fail: without the fix the unit names the decoy.
+git init -q "$T/decoy" >/dev/null 2>&1 || { echo "fixture: git init decoy failed" >&2; exit 1; }
+git -C "$T/decoy" -c user.email=fixture@example.invalid -c user.name=fixture \
+    commit -q --allow-empty -m decoy >/dev/null 2>&1 || { echo "fixture: decoy commit failed" >&2; exit 1; }
+printf '%s\n' "$TOK_BODY" > "$TOK"
+rm -f "$T/systemd-units/eldato-disk-reaper.service" "$T/systemd-units/eldato-disk-reaper.timer"
+BR_AMBIENT_REPO="$T/decoy" br ok normal --check
+case "$(cat "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null)" in
+  *"DISK_REAPER_REPOS=$T/cell"*)
+    ok "the installed unit scans the CELL's checkout the bring-up just verified" ;;
+  *) bad "the installed unit does not scan the cell's checkout — $(grep -h 'DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null || echo 'no unit at all')" ;;
+esac
+case "$(cat "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null)" in
+  *"$T/decoy"*)
+    bad "an ambient \$REPO($T/decoy) was scanned instead of the cell's own checkout — the reaper would reap a repo this cell does not own" ;;
+  *) ok "an ambient \$REPO is NOT substituted for the cell's checkout" ;;
+esac
 
 say_case "a cell whose reaper timer cannot be ENABLED is refused (not certified)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
