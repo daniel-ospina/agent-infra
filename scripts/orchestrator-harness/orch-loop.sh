@@ -3568,12 +3568,23 @@ while true; do
     # `ok` header and is still believed until it ages out. Two causes with opposite consequences
     # must not share one sentence — an auditor was being pointed at the network when the cause was
     # the disk.
+    # ⛔ FOUR ARMS, NOT THREE (round-3 review, P2). Fetch and publish FAIL INDEPENDENTLY — a full disk
+    # breaks BOTH in one cycle (`git fetch` writes packs into $REPO/.git, the publish writes under
+    # $O/state) — and the conjunction is the case where the "the failed answer WAS published, so
+    # everything is unreadable" sentence is FALSE: nothing was published, so whatever snapshot was
+    # already on disk still answers, with its own header and its own `read_at`. Measured on the
+    # shipped reader: `fetch=failed write=failed` → `claim-held`, not `claim-unreadable`. A `refs=`
+    # count is printed ONLY where the number describes what was published or what the fetch answered;
+    # on a failed publish the body could not be produced, so the count is not knowable and is not
+    # claimed.
     if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
       echo "[claims] snapshot read=ok refs=${CLAIM_SNAPSHOT_REFS:-?} max_age=${CLAIM_SNAPSHOT_MAX_AGE:-?}s" >> "$LOG"
     elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
       echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place and is believed until it is older than ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, after which every selection answer is claim-unreadable. This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
+    elif [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
+      echo "[claims] ⛔ claim-unreadable: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?} refs=${CLAIM_SNAPSHOT_REFS:-?}) — its failed header WAS published, so every selection answer this cycle is claim-unreadable: no PR is spawned or armed and no issue dispatched on the assumption that silence means freedom" >> "$LOG"
     else
-      echo "[claims] ⛔ claim-unreadable: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?} refs=${CLAIM_SNAPSHOT_REFS:-?}) — every selection answer this cycle is claim-unreadable, so no PR is spawned or armed and no issue dispatched on the assumption that silence means freedom" >> "$LOG"
+      echo "[claims] ⛔ BOTH halves failed (fetch=${CLAIM_SNAPSHOT_FETCH:-?} write=${CLAIM_SNAPSHOT_WRITE:-?}): nothing was fetched AND nothing was published, so selection this cycle ran on WHATEVER SNAPSHOT WAS ALREADY ON DISK — believed only while that file's own header says ok and it is inside ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and unreadable otherwise (or when there is no previous snapshot at all). The cause is on THIS BOX on both sides — \$REPO/.git for the fetch, \$O/state for the publish — not only in the registry" >> "$LOG"
     fi
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
