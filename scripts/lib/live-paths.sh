@@ -92,7 +92,15 @@ lp_census() { # <dir>
                 _pid="${_f#"$proc"/}"; _pid="${_pid%/cmdline}"
                 lp_num "$_pid" || continue
                 tr '\0' '\n' <"$_f" 2>/dev/null | while IFS= read -r _tok; do
-                    case "$_tok" in /*) printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;; esac
+                    # ⛔ ABSOLUTE TOKENS ONLY — and an absolute path can arrive ATTACHED: a holder that
+                    # names the tree as `--repo=/abs/tree` or `WORKTREE=/abs/tree` matched no `/*` case, so
+                    # it did not protect the tree it named (measured: the tree was reaped while a live
+                    # process had it in argv). Emit the part after `=`; a relative value still emits
+                    # nothing, so the "absolute only" rule is unchanged.
+                    case "$_tok" in
+                        /*)   printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;;
+                        *=/*) printf 'arg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;;
+                    esac
                 done
             done
         } >>"$out" 2>/dev/null
@@ -208,6 +216,12 @@ lp_path_named() { # <census> <canonical-path>
                 case "$p" in
                     *"/$base")   _pp="$(lp_canon "${p%/$base}")" || _pp=""; _cand="${_pp%/}/$base" ;;
                     *"/$base/"*) _pp="$(lp_canon "${p%%/$base/*}")" || _pp=""; _cand="${_pp%/}/$base" ;;
+                    # ⛔ AND THE TOKEN THAT **IS** AN ALIAS FOR THE TREE. `agent --repo /tmp/alias-a`,
+                    # where `alias-a` is a symlink to the candidate, matches neither shape above (its
+                    # last component is the ALIAS's name), so the arm was blind to the simplest symlink
+                    # spelling of all and the tree was reaped while that process was alive. A stat is
+                    # cheap; only a token that exists earns the `lp_canon` call.
+                    *) if [ -d "$p" ] || [ -L "$p" ]; then _cand="$(lp_canon "$p")" || _cand=""; fi ;;
                 esac
                 if [ -n "${_cand:-}" ] && _lp_rel "$_cand" "$path"; then
                     LP_NAME_WHY="argv pid $pid (canonicalised)"; return 0
