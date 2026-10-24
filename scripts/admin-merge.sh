@@ -5189,7 +5189,8 @@ reproduce_residual_on_base() {
   [ -s "$residual" ] || return 1
   # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
   # P2). The parser's other non-nodeid identities — `collect-error::<file>`
-  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) — are
+  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) and
+  # `pipeline-compliance::<letter>::<subject>` (#1185) — are
   # real residual rows but they name no pytest nodeid. Handed to the runner as
   # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
   # directory not found`), so a residual that mixes a collection error with real
@@ -5198,7 +5199,7 @@ reproduce_residual_on_base() {
   # already filters them from the candidate set; this is the function's own
   # guard, so the contract holds for any caller.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -5392,8 +5393,14 @@ main_measured_files() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    # #1185: a gate identity is keyed by its CHECK, not by a file — the same
+    # per-entry identity `job-unreadable::` uses, and for the same reason: a main
+    # baseline red on a DIFFERENT check must not read as a pre-existing failure in
+    # this one. The generic `s/::.*//` above is suppressed for the family so it
+    # cannot also claim a "file" called `pipeline-compliance`.
+    sed -n 's/^\(pipeline-compliance::[^:]*\)::.*/\1/p' "$mainfails"
   } | sort -u
 }
 
@@ -5410,7 +5417,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -5418,6 +5425,11 @@ main_baseline_units() {
     # above is suppressed for the family and a main baseline red on a DIFFERENT
     # job would read as pre-existing in this one.
     sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
+    # #1185: the unit is the CHECK (`pipeline-compliance::<letter>`), for exactly
+    # the #7131 reason — main red on check (a) must not read as a pre-existing
+    # failure in this PR's check (c). The letter stays ON the unit, so it can
+    # never collide with a test file of the same name.
+    sed -n 's/^\(pipeline-compliance::[^:]*\)::.*/\1/p' "$mainfails"
   } | sort -u
 }
 
@@ -5439,6 +5451,11 @@ failure_file_key() {
     # pre-existing failure in this one. Without this arm the generic default
     # would collapse every job onto the literal `job-unreadable`.
     job-unreadable::*) printf '%s\n' "${1#job-unreadable::}" ;;
+    # #1185: the unit is the CHECK, `pipeline-compliance::<letter>` — main red on
+    # check (a) must not read as a pre-existing failure in this PR's check (c),
+    # and the generic default would collapse the whole family onto the literal
+    # `pipeline-compliance`.
+    pipeline-compliance::*) local p="${1#pipeline-compliance::}"; printf '%s\n' "pipeline-compliance::${p%%::*}" ;;
     *) printf '%s\n' "${1%%::*}" ;;
   esac
 }
@@ -5465,7 +5482,8 @@ intersect_sets() {
 #   * a guard-step identity has no local pytest runner, so it cannot be
 #     reproduced and must always remain in the residual.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
-#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131) also name no
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `pipeline-compliance::<letter>::<subject>` #1185) also name no
 #     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
 #     NOTHING, so they are not candidates either — they are units the rail can
 #     NAME, never measurements a local run can clear (#3715 review, P2).
@@ -5482,6 +5500,7 @@ repro_scope() {
     [ -n "$nid" ] || continue
     case "$nid" in
       guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
   done < "$scratch"
@@ -6625,8 +6644,9 @@ main() {
   fi
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
-    say_err "   yielded NO parseable failure identity (neither a 'FAILED <nodeid>' line nor an"
-    say_err "   attributable guard-step '::error::' annotation), so their failures are NOT in the"
+    say_err "   yielded NO parseable failure identity (none of: a 'FAILED <nodeid>' line, an"
+    say_err "   attributable guard-step '::error::' annotation, or a 'check-pipeline-compliance.sh'"
+    say_err "   '❌ [<letter>] …' line), so their failures are NOT in the"
     say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
@@ -7074,6 +7094,15 @@ main() {
         say_err "   the E5 second sample the re-run would take. No merge."
       fi
       say_err "   $repro_line"
+      # §33 (#1147): the REASON, not just the node id — the SAME lines the
+      # post-rerun refusal prints below. This path used to drop them, so an
+      # operator who blocked with `--no-rerun` got only the FILE-level diagnosis
+      # below and never the decision's own per-id reason. That gap is what made a
+      # `pipeline-compliance` check (#1185) read as "main carries no failure in
+      # pipeline-compliance::c" instead of "blocked by check (c): <subject>" — and
+      # for a GATE failure this is the path a lane should take, because a re-run
+      # cannot mint the artifact the check is asking for.
+      grep -v '^EXEMPT' "$TMP/unique.lines" 2>/dev/null | sed 's/^/   /' >&2 || true
       # §37 (main): WHY each residual could not be attributed to this PR — the
       # FILE-level diagnosis. Complementary to the decision's id-level reason
       # lines below, not a replacement: the decision says WHAT it decided and on

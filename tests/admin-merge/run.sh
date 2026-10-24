@@ -13939,8 +13939,119 @@ grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
   || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
 
 
+# ── #1185. a pipeline-compliance GATE failure NAMES its check ────────────────
+#
+# THE MEASURED DEFECT (agent-infra #2623, run 40066552772, head d1024c5d): the
+# only failing job was `pipeline-compliance`, and its log said — in plain text —
+# `❌ [c] no head-bound code-review record for daniel-ospina/agent-infra#2623`.
+# The id universe knew two shapes (a pytest `FAILED <nodeid>` line and an
+# attributable guard-step `::error::` annotation), so the run yielded NO id,
+# `examined > extracted`, and step 1c refused the merge with "NO parseable failure
+# identity … This is a refusal, not a comparison" — one step short of the answer,
+# on what `aiconsol`'s 04:42Z sweep measured as the DOMINANT red across all 70 open
+# agent-infra PRs. Three rails died this way on 2026-10-24 (#2430, #2608, #2623).
+#
+# THE SHAPE, taken verbatim from that run's `--log-failed` (so the fixture cannot
+# drift into a format the gate never prints): the echoed script SOURCE (whose
+# line CONTAINS `❌`, and which must not become an identity), the `✅`/`⏭` pass
+# lines, the `❌ [<letter>] …` failure line, and the terminal
+# `❌ PIPELINE COMPLIANCE: BLOCKED (N failure(s)).` SUMMARY.
+PC_KEY='pipeline-compliance::c::no-head-bound-code-review-record-for-daniel-ospina-agent-infra-2623'
+PC_WFID=331293210
+PC_WFNAME='Pipeline Compliance'
+PC_EV=pull_request
+pipeline_check_log() {  # <letter> <repo#pr> [<head>]
+  local letter="$1" subject="$2" head="${3:-d1024c5def3eb0c43dac4bd7ca26b35bf4d458d9}"
+  local j='pipeline-compliance' s='Check pipeline compliance'
+  printf '%s\t%s\t2026-10-24T05:35:03.6481374Z \033[36;1m    echo "❌ scripts/check-pipeline-compliance.sh missing from checkout" >&2\033[0m\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:05.6316993Z === Pipeline Compliance Gate ===\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.6994729Z ✅ [a] linked issue #2622 (closing keyword in PR body)\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.7057090Z ✅ [b] scoping comment present on issue #2622\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8116270Z ❌ [%s] no head-bound code-review record for %s — check (%s) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (%s…): a line of exactly the form review recorded: reviews/2623.json verdict=<clean> @ %s\n' "$j" "$s" "$letter" "$subject" "$letter" "${head:0:12}" "$head"
+  printf '%s\t%s\t2026-10-24T05:35:08.8121031Z       Missing: the code-review record marker for this PR at this head.\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8124200Z       Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>)\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8126798Z ⏭  [d] Skipped: issue #2622 has no complexity:standard/complex label\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8150523Z ⏭  [e] Skipped: no runtime code changes in this PR.\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8151938Z ❌ PIPELINE COMPLIANCE: BLOCKED (1 failure(s)).\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8152222Z    Fix the items above, then re-run.\n' "$j" "$s"
+  printf '%s\t%s\t2026-10-24T05:35:08.8173424Z ##[error]Process completed with exit code 1.\n' "$j" "$s"
+}
+
+# (a) THE PARSER: one gate identity, keyed on the CHECK and the subject it names —
+# and the terminal summary is NOT an identity.
+#
+# ⛔ THIS IS THE DISCRIMINATING CASE. Delete the `pipeline_check_failures` pass
+# (or drop `_PIPELINE_KEY_RE` from `is_failure_key`) and the id set is EMPTY:
+# the exact-string assertion below REDs, and so does (b)'s. That is what makes it
+# a test rather than a green that would pass without the arm.
+new_scen pipelineparse
+PC_HEAD="7c7c000000000000000000000000000000000000"
+lane_fail "$PC_HEAD" 9861 > "$SCEN/runs-$PC_HEAD"
+pipeline_check_log c 'daniel-ospina/agent-infra#2623' > "$SCEN/log-9861"
+cfs_run --commit "$PC_HEAD"; rc=$?
+[ "$rc" -eq 0 ] && pass "(#1185 a) the extraction reads a gate-failure capture (exit $rc)" \
+  || fail "(#1185 a) the extraction exited $rc on a gate-failure capture: $(head -2 "$TMP/cfs-err")"
+out="$(cat "$TMP/cfs-out")"
+[ "$out" = "$PC_KEY" ] && pass "(#1185 a) …as exactly ONE identity — the check letter plus the subject it names" \
+  || fail "(#1185 a) expected the gate identity, got: $out"
+grep -q 'pipeline-checks=1' "$TMP/cfs-err" && pass "(#1185 a) …and REPORTS the attribution (pipeline-checks=1)" \
+  || fail "(#1185 a) the attribution is silent: $(head -3 "$TMP/cfs-err")"
+printf '%s\n' "$out" | grep -q 'BLOCKED' \
+  && fail "(#1185 a) the terminal 'PIPELINE COMPLIANCE: BLOCKED (N failure(s))' SUMMARY became a failure id" \
+  || pass "(#1185 a) …and the terminal SUMMARY line is not an identity (it names a count, no artifact)"
+printf '%s\n' "$out" | grep -q 'echo' \
+  && fail "(#1185 a) the echoed script SOURCE (a line containing ❌) became an identity" \
+  || pass "(#1185 a) …nor does the echoed script source, which merely mentions ❌ mid-line"
+
+# (b) THE RAIL: the refusal NAMES the check instead of calling it unattributable —
+# and it is still a REFUSAL (never a pass) on the PR's own tree.
+new_scen pipelinecheck
+printf '%s\n' "$PC_HEAD" > "$SCEN/head"
+lane_fail "$PC_HEAD" 9861 > "$SCEN/runs-$PC_HEAD"
+pipeline_check_log c 'daniel-ospina/agent-infra#2623' > "$SCEN/log-9861"
+lane_fail mainpc 9862 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9862"
+run_admin 42 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(#1185 b) a failing gate check on the PR's own tree still BLOCKS (exit $rc)" \
+  || fail "(#1185 b) a pipeline-compliance failure was CERTIFIED — attribution must never be an exemption"
+grep -q 'parseable failure identity' "$TMP/err" \
+  && fail "(#1185 b) the run is STILL refused as unattributable — the dominant red is unnamed" \
+  || pass "(#1185 b) …the 'NO parseable failure identity' refusal is GONE (the failure is attributed)"
+grep -q 'blocked by check (c):' "$TMP/err" && pass "(#1185 b) …and the refusal NAMES the check: 'blocked by check (c): …'" \
+  || fail "(#1185 b) the refusal does not name the check: $(grep -c . "$TMP/err") line(s), first: $(head -2 "$TMP/err" | tr '\n' ' ')"
+grep -q 'no-head-bound-code-review-record-for-daniel-ospina-agent-infra' "$TMP/err" \
+  && pass "(#1185 b) …and the SUBJECT it failed on (repo#PR), not just the letter" \
+  || fail "(#1185 b) the refusal names no subject"
+grep -q 'pr merge' "$SCEN/calls" && fail "(#1185 b) a merge was attempted on a failing gate check" \
+  || pass "(#1185 b) no merge attempted"
+
+# (c) A SUPERSEDED gate failure never outvotes a GREEN re-run at the same head.
+# The supersede rule (#1358) is applied before any log is read, so the new
+# identity can never RESURRECT a replaced red: a `pipeline-compliance` run that
+# printed `❌ [c]` and was then re-run green at the same commit, workflow and event
+# must not be counted, and its log must never be fetched.
+new_scen pipelinecheck-superseded
+printf '%s\n' "$PC_HEAD" > "$SCEN/head"
+{ lane7_pass "$PC_HEAD" 9873 "$PC_WFID" "$PC_WFNAME" "$PC_EV"
+  lane7_fail "$PC_HEAD" 9871 "$PC_WFID" "$PC_WFNAME" "$PC_EV"
+} > "$SCEN/runs-$PC_HEAD"
+pipeline_check_log c 'daniel-ospina/agent-infra#2623' > "$SCEN/log-9871"
+lane_jobset 9871 success 'test (a)' 'test (b)'
+lane_jobset 9873 success 'test (a)' 'test (b)'
+lane_pass mainpc2 9874 > "$SCEN/runs-main"
+run_admin 42 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && pass "(#1185 c) a gate failure SUPERSEDED by a green re-run at the same head does not block (exit 0)" \
+  || fail "(#1185 c) the superseded gate failure still blocked the merge (exit $rc): $(head -3 "$TMP/err" | tr '\n' ' ')"
+grep -q 'pr merge 42' "$SCEN/calls" && pass "(#1185 c) …the merge ran" \
+  || fail "(#1185 c) …no merge was attempted"
+grep -q 'run view 9871 ' "$SCEN/calls" \
+  && fail "(#1185 c) …but the SUPERSEDED run's log was fetched — the identity resurrected a replaced red" \
+  || pass "(#1185 c) …and the superseded run's log was never read"
+
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
 fi
+
 echo "✅ all $checks admin-merge tests passed"

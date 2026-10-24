@@ -380,6 +380,10 @@ refresh_on_exit() {
   local rc=$?
   gh_pass_cache_stop
   rm -f "${UNUSABLE_LOG:-}" 2>/dev/null
+  # ⛔ NEVER UNLINK /dev/null. The degraded redirect above can point there, and `rm -f /dev/null`
+  # succeeds as root (review of #2401, fourth round). uid-1000 controllers are unaffected either
+  # way; the guard costs one test and removes a footgun from a root-run supervisor.
+  [ "${PRE_ERR_FILE:-}" = "/dev/null" ] || rm -f "${PRE_ERR_FILE:-}" 2>/dev/null
   [ "$REFRESH_RECORDED" = "1" ] && return 0
   REFRESH_RECORDED=1
   if [ "$rc" -eq 0 ]; then
@@ -2322,11 +2326,51 @@ QUEUED_THIS_PASS=""    # issue numbers this pass put in candidates.txt (the hand
 # reason. An unrecognisable output yields NO row, and the abort then says `unknown` rather than naming
 # a surface it could not read.
 UNUSABLE_LOG="$O/state/.unusable.$$"
+# The pre-flight's STDERR for the candidate being judged (#2401). A FILE, not a pipe or a merged
+# stream: the reader needs the tool's diagnostic SEPARATELY from its report, and `2>&1` is exactly
+# what made them one blob. Removed by the EXIT trap with `UNUSABLE_LOG`.
+#
+# ⛔ A REDIRECTION ON THE PRE-FLIGHT IS A REDIRECTION THAT CAN STOP IT (review of #2401, third round).
+# `2>"$PRE_ERR_FILE"` is part of the COMMAND: if `$O/state` is missing or unwritable the tool never
+# runs, every candidate comes back verdict-less, the verdict-less arm increments `pretry-<N>` and at
+# RETRY_MAX the issue is appended to `checked.txt` — the silent permanent suppression #1716 removed,
+# reachable by one missing directory. Reproduced: the shipped `selftest.sh` fixtures that do not
+# create `$O/state` went red on this branch for exactly that reason (measured: 2 -> 10 failures), so
+# the hazard was reachable in the suite before it was reachable on a box. Degrading to /dev/null
+# loses the diagnostic in that state and never the verdict, and the EXIT trap's `rm -f` tolerates it.
+PRE_ERR_FILE="$O/state/.preflight-err.$$"
+mkdir -p "$O/state" 2>/dev/null || true
+: > "$PRE_ERR_FILE" 2>/dev/null || PRE_ERR_FILE=/dev/null
+# ⛔ THE DATUM BELONGS TO THE FIRST RUN THAT MADE THIS PASS UNUSABLE, NOT TO THE LAST ONE JUDGED
+# (review of #2401). `PRE_RC` / `PRE_ERR_LINE` are overwritten by EVERY candidate, so a pass whose
+# pool was `#42 INCOMPLETE (rc 2, stderr …)` then `#43 unusable, rc 0` recorded `tool_rc=0
+# stderr=none` beside `first cause: claim gate: … could not answer` — the record CONTRADICTED its own
+# first cause and asserted a healthy tool where the failing run exited 2.
+#
+# ⛔ AND EVERY ARM THAT MAKES THE PASS UNUSABLE CALLS IT, not only `record_unusable` (third round):
+# the DEGRADED verdict arms (`CLEAN`/`COLLISION` + `ALSO INCOMPLETE:`) increment `V_UNJUDGED` and
+# record no surface row — so with the helper called only from `record_unusable` they left
+# `tool_err=none` in the record for a run that HAD written a stderr diagnostic and exited 2: a
+# positive assertion of "no stderr" about a tool that wrote one. They now pass their own arm name.
+snapshot_datum() {   # <arm>
+  # A DEGRADED VERDICT IS THE WEAKEST REASON TO HOLD A DATUM (review of #2401, sixth round).
+  # The degraded arms record no surface row, so a pool of issue #42 degraded (rc 0, no stderr) then
+  # #43 the real refusal (rc 2, stderr) snapshotted #42's HEALTHY datum while unusable_cause quoted
+  # #43's words — the section 1d defect one arm over, and it lost the rc=2 and the diagnostic that
+  # matter. A later arm may therefore REPLACE a preflight-degraded snapshot; it may never replace a
+  # real one (that is the first-record rule).
+  if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_ARM:-}" != "preflight-degraded" ]; then
+    return 0
+  fi
+  PRE_FAIL_AT="${N:-}"; PRE_FAIL_RC="${PRE_RC:-}"; PRE_FAIL_ERR="${PRE_ERR_LINE:-}"
+  PRE_FAIL_ARM="${1:-}"
+}
 record_unusable() {   # <slug> [<reason>]
   local slug="$1" reason="${2:-}"
   # One field, no spaces: this lands in a `key=value` record and in a greppable log line.
   slug="$(printf '%s' "$slug" | tr ' /' '--' | tr -cd 'A-Za-z0-9._:-')"
   [ -n "$slug" ] || slug="unnamed-surface"
+  snapshot_datum "$slug"
   printf '%s\t%s\n' "$slug" "$(printf '%s' "$reason" | tr '\n\t' '  ')" >> "$UNUSABLE_LOG" 2>/dev/null || true
 }
 # `slug:n …` in first-seen order — a count per surface, which is what tells an operator whether ONE
@@ -2339,7 +2383,45 @@ unusable_summary() {
 }
 unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable
   [ -s "$UNUSABLE_LOG" ] || return 0
-  awk -F'\t' 'NF>1 && $2!="" { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+  # ⛔ NO `$2 != ""` FILTER (review of #2401, second round). The datum snapshot is taken on the
+  # first `record_unusable` CALL, so skipping an empty-reason row (a verdict-less run with no
+  # output; a table row whose NOTE column was omitted — a shape the parser explicitly supports)
+  # made the "first cause" a DIFFERENT record than the datum describes: measured
+  # `tool_issue=42 tool_rc=0 stderr=none` beside a #43 refusal, asserting a healthy tool where the
+  # run exited 2. Both readers must name the same first record by construction; when its reason is
+  # empty the prose cause is legitimately absent and the datum alone carries the fact.
+  awk -F'\t' 'NF>1 { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+}
+# ── THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT ──────────
+# ⛔ THE CAUSE IS THE PRODUCER'S PROSE, AND PROSE IS NOT A DATUM (#2401). The refusal above names the
+# surface and quotes the tool's note, but the note is a SENTENCE: on cell-4 it read `…could not answer
+# — the board's live-session store could not be read… (tried: `cmux sessi` because the 320-char bound
+# landed mid-word, and the SPECIFIC thing that had to change (two live pids running in REAPED
+# worktrees) never appeared on the dispatch line at all. Meanwhile the tool's exit status — a
+# measurement — was captured at the call site and then used ONLY for the `-eq 3` provisioning guard,
+# so a pre-flight that answered INCOMPLETE (rc 2) and one that CRASHED produced the same sentence.
+# These two carry the measured half, and they LEAD the cause so no downstream bound can cut them
+# (`refresh_cause_brief` truncates `why=` at 400 chars, `unusable_cause` at 320).
+PRE_RC=""            # the pre-flight's OWN exit status for the candidate just judged
+PRE_ERR_LINE=""     # the first non-empty STDERR line it wrote (its diagnostic, when it has one)
+PRE_FAIL_AT=""       # the FIRST candidate that made this pass unusable, and ITS datum — see
+PRE_FAIL_RC=""       # `record_unusable`: the last candidate's rc would contradict the first cause
+PRE_FAIL_ERR=""
+PRE_FAIL_ARM=""      # …and WHICH arm produced that record. The claim-registry arms record unusable
+                     # AFTER a CLEAN pre-flight (`rc 0`), so a bare `rc=0 stderr=none` beside their
+                     # cause reads as a contradiction; naming the arm makes the datum unambiguous
+                     # without giving the pre-flight another run's numbers (review of #2401, R1).
+# TWO LENGTHS, ON PURPOSE (review of #2401, sixth round). The RECORD keeps the full 200-char stderr
+# line in tool_err=; the INLINE datum cuts it to 80 so the surface clause and the datum both survive
+# refresh_cause_brief's 400-char cut. Measured before this: a 200-char stderr pushed the BLOCKED line
+# to 566 characters and cut issue-assignee-ho mid-word — the datum destroyed the reading it exists
+# to serve.
+preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first 80 chars|none>"
+  [ -n "${PRE_FAIL_RC:-}" ] || return 0
+  printf 'issue=#%s cmd=%s rc=%s stderr=%s' \
+    "${PRE_FAIL_AT:-?}" \
+    "$(basename "${PREFLIGHT:-pre-flight}") --repo ." \
+    "$PRE_FAIL_RC" "$(printf '%s' "${PRE_FAIL_ERR:-none}" | cut -c1-80)"
 }
 # The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
 # the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
@@ -2490,7 +2572,46 @@ while read -r N; do
     [ -n "${GH_REPO:-}" ] && echo "[refresh] GH_REPO='$GH_REPO' (ambient) is NOT the repo this pass grades — pinning GH_REPO=$OR for the pre-flight, so no gh read can answer about another repository"
     GH_REPO="$OR"; export GH_REPO
   fi
-  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
+  # ⛔ STDERR IS CAPTURED, NOT MERGED (#2401). It used to be `2>&1`, which made the tool's DIAGNOSTIC
+  # indistinguishable from its REPORT — so the one line a failing producer writes to say what went
+  # wrong could only ever arrive as the LAST line of a blob whose head the parsers read, and a producer
+  # that prints only `FATAL: …` on stderr left `VERDICT` absent with no cause anywhere. Kept apart here,
+  # then folded back into `$PRE` below so every existing parser and the `tail -3` diagnostics still see
+  # the same text they always did.
+  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>"$PRE_ERR_FILE")"; PRE_RC=$?
+  PRE_ERR_LINE="$(grep -m1 -v '^[[:space:]]*$' "$PRE_ERR_FILE" 2>/dev/null | cut -c1-200)"
+  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT A BOUNDED SLICE (review of #2401, second round). The
+  # first attempt kept only the FIRST line; the second kept `tail -40`. Both are NARROWINGS relative
+  # to the `2>&1` this replaces, and `tail -40` is the dangerous one: a producer that writes its
+  # report to stderr and then >40 more lines loses its VERDICT line, falls out of the INCOMPLETE arm
+  # (which deliberately neither strikes nor clears) into the verdict-less arm — which INCREMENTS
+  # `retry-<N>` and, at RETRY_MAX, permanently appends the issue to `checked.txt`. That is the
+  # silent, invisible suppression #1716 removed, reachable by a CHATTY producer. Measured on the
+  # same fixture: `origin/main` -> `unusable=issue-assignee-holder:1`, never retired; `tail -40` ->
+  # `unusable=preflight-no-verdict:1`, `pretry=1`. A `cat` is exact parity with the old surface and
+  # adds no flood risk the old code did not already have.
+  # ⛔ THE FOLD IS TERMINATED AND LABELLED (#2401, third round). The producer's report ends with its
+  # `VERDICT:` line, and the block parser's ONLY terminator is `^[A-Z][A-Z ]+ — `. Appending stderr
+  # straight after the report therefore left `inblk` open into the stderr text, so a stderr line
+  # beginning with `[` was parsed as a SURFACE ROW — a surface the producer never reported, against
+  # the parser's stated contract, and `tool_arm` would then be that fabricated slug. Measured:
+  # report + `[preflight] live-session store probe failed` -> a phantom
+  # `preflight<TAB>live-session store probe failed` row. `STDERR —` matches the terminator and can
+  # never itself become a row. (Under the old `2>&1` this was unreachable: stderr arrived first.)
+  # ⛔ THE LABEL MUST MATCH THE TERMINATOR, INCLUDING ITS TRAILING SPACE (review of #2401, fourth
+  # round). The block parser's terminator is `^[A-Z][A-Z ]+ — ` — a SPACE after the em dash — and the
+  # first draft's label was a bare `STDERR —`, which does NOT match, so `inblk` stayed open into the
+  # folded stderr and a stderr line beginning with `[` was parsed as a SURFACE ROW. Measured with the
+  # shipped parser: report + `STDERR —` + `  [preflight] …probe failed` -> `unusable=… preflight:1`,
+  # a surface the producer never reported, and `tool_arm=preflight` — the fabricated slug this
+  # change's own comment says is impossible. The label now carries trailing text so ` — ` matches.
+  #
+  # ⛔ AND A BLANK STDERR IS NOT FOLDED AT ALL: a whitespace-only file made the label itself the
+  # verdict-less arm's `first cause` ("STDERR —") beside `tool_err=none` — a record contradicting
+  # itself. A file with no non-blank line says nothing, so nothing is folded.
+  if [ -s "$PRE_ERR_FILE" ] && grep -q '[^[:space:]]' "$PRE_ERR_FILE" 2>/dev/null; then
+    PRE="$PRE"$'\n'$'STDERR — not the pre-flight report\n'"$(cat "$PRE_ERR_FILE" 2>/dev/null)"
+  fi
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
   # Python >= 3.12 guard (#5128), which prints an explanation and NO `VERDICT` line. Absorbing that
@@ -2547,6 +2668,7 @@ while read -r N; do
       # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
@@ -2661,6 +2783,7 @@ while read -r N; do
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
@@ -2701,6 +2824,10 @@ while read -r N; do
       # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
       # pass) and is REPORTED, which is what the arm did before the port folded it into the
       # verdict-less one.
+      # THIS ARM RECORDS NO ROW, SO IT MUST STILL TAKE THE DATUM (review of #2401, sixth round): an
+      # INCOMPLETE report with no parseable surface row (the parser's own documented "emits nothing"
+      # path) left tool_rc=unrecorded / tool_err=none while PRE_RC and the stderr line were in hand.
+      snapshot_datum preflight-incomplete
       V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
@@ -2902,14 +3029,23 @@ if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
   # discarded one line before it would have been printed.
   _us_summary="$(unusable_summary)"
   _us_cause="$(unusable_cause)"
+  _us_datum="$(preflight_datum)"
   if [ -n "$_us_summary" ]; then
     echo "[refresh] unusable: $_us_summary — the failing surface(s) this pass could not query"
   fi
   echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736).${_us_summary:+ Failing surface(s): $_us_summary.} Retrying next cycle."
   [ -n "$_us_cause" ] && echo "[refresh]   cause: $_us_cause"
+  [ -n "$_us_datum" ] && echo "[refresh]   datum: pre-flight $_us_datum"
+  # ⛔ THE MEASURED HALF LEADS THE PERSISTED CAUSE (#2401). `refresh_cause_brief` renders this `why=`
+  # into the caller's `[dispatch] BLOCKED: refresh failed — stage=<st>: <why cut 400>`, so whatever sits
+  # in the first 400 characters IS what an operator sees. The prose sentence used to occupy all of it,
+  # and the datum (command, rc, the tool's own stderr line) was not in the record at all.
   refresh_fail preflight "$EXIT_TRANSIENT" \
-    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
-    "judged=$judged" "unusable=${_us_summary:-unknown}"
+    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_datum:+ — pre-flight $_us_datum}${_us_cause:+ — first cause: $_us_cause}" \
+    "judged=$judged" "unusable=${_us_summary:-unknown}" \
+    "tool_rc=${PRE_FAIL_RC:-unrecorded}" "tool_err=${PRE_FAIL_ERR:-none}" \
+    "tool_issue=${PRE_FAIL_AT:-unrecorded}" "tool_arm=${PRE_FAIL_ARM:-none}" \
+    "tool_cmd=$(basename "${PREFLIGHT:-pre-flight}") --repo ."
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog
