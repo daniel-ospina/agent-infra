@@ -147,8 +147,8 @@ def test_both_sources_failing_keeps_the_unavailable_path(monkeypatch, no_cache, 
 # ── the exit-0 promise survives an UNEXPECTED failure, not just a refused one ──
 def test_main_prints_the_unavailable_line_even_if_compute_raises(monkeypatch, no_cache, capsys):
     """`main()`'s contract is "Exit 0 always — a metrics failure must never take the heartbeat
-    down with it", and the heartbeat pipes stderr away
-    (`orchestrator-heartbeat.sh:181`): an exception here prints NOTHING where the operator needs
+    down with it", and the `DELIV=$(...)` capture in `orchestrator-heartbeat.sh` sends stderr to
+    /dev/null: an exception here prints NOTHING where the operator needs
     the `unavailable` line. Measured before this guard: a page whose `number` was an object
     raised TypeError out of `sys.exit(main())` and produced no line at all. The row guards make
     that payload unreachable; this pins the belt that keeps a FUTURE one from silencing the beat.
@@ -182,6 +182,17 @@ def test_a_cache_this_version_cannot_render_falls_through_to_a_real_line(monkeyp
         {"ts": int(_time.time()), "p0": {"open": "many", "with_pr": 0, "without": 0},
          "p1": {"open": 0, "with_pr": 0, "without": 0},
          "open_prs": 1, "merged_today": 1},                           # `%d` on a str
+        # ⛔ `bool` IS AN `int` (#2142 review). `isinstance(True, int)` is True, so a cache
+        # carrying JSON `true` for a counter passed this validator and rendered
+        # `1 open PRs, 1 merged today` as if it had been MEASURED — a fabricated number in the
+        # beat, the false-reading class this file refuses to print. `_rest_prs` already rejects
+        # bool for `number`; the two guards must agree on what a count is.
+        {"ts": int(_time.time()), "p0": {"open": 0, "with_pr": 0, "without": 0},
+         "p1": {"open": 0, "with_pr": 0, "without": 0},
+         "open_prs": True, "merged_today": 1},                        # bool counter
+        {"ts": int(_time.time()), "p0": {"open": True, "with_pr": 0, "without": 0},
+         "p1": {"open": 0, "with_pr": 0, "without": 0},
+         "open_prs": 1, "merged_today": 1},                           # bool tier counter
         [1, 2, 3],                                                    # not even a mapping
     ]
     for cached in bad:
@@ -592,7 +603,38 @@ def test_a_repeat_from_a_NON_COUNTED_row_still_refuses_the_window(monkeypatch):
     assert bp._rest_prs("merged", limit=400) is None, (
         "the repeat was of a row the merged filter DROPS — it is still proof the list moved, and "
         "the moved list is also the short one")
-    assert calls == [1, 2], calls
+    # ⛔ THE RETRY IS PINNED HERE (#2142 review): a repeat abandons that ATTEMPT and the read is
+    # retried ONCE, so a persistently-shifting window costs exactly two page-sets and still
+    # REFUSES. The pages are the same both times because the stub's list keeps moving — which is
+    # the point: a retry must never turn two different windows into a number.
+    assert calls == [1, 2, 1, 2], calls
+
+
+def test_a_repeat_on_the_first_attempt_is_retried_once_and_can_succeed(monkeypatch):
+    """The complement of the refusal above: a repeat is CHURN evidence, not proof the read can
+    never be trusted. On a box running ~17 concurrent gh clients the mover is usually an update
+    that has settled by the time the page-set is re-read, so attempt 1 refuses and attempt 2
+    returns the REAL window (#2142 review). Without this the fallback would print `unavailable`
+    for most of its attempts and the DELIVERY line would be lost to churn rather than to a
+    rate limit — the exact regression this PR exists to prevent."""
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    rounds = []
+
+    def pages(url, tok, timeout=None):
+        page = int(url.rsplit("page=", 1)[1])
+        rounds.append(page)
+        attempt = rounds.count(1)          # 1 while reading the FIRST attempt's page 1
+        if attempt == 1 and page == 2:
+            return [rest_row(100)] + [rest_row(n) for n in range(101, 200)]   # churned window
+        if page == 1:
+            return [rest_row(n) for n in range(1, 101)]
+        return [rest_row(n) for n in range(101, 201)]                      # settled on retry
+
+    monkeypatch.setattr(bp, "_rest_get_json", pages)
+    rows = bp._rest_prs("open", limit=200)
+    assert rows is not None, "the retry must be able to turn churn into a real window"
+    assert [r["number"] for r in rows] == list(range(1, 201)), "the retry returned a short window"
+    assert rounds.count(1) == 2, rounds      # exactly ONE retry, never a loop
 
 
 # ── token: env first, then gh's hosts.yml — and never on stdout ─────────────
@@ -758,6 +800,15 @@ def test_a_page_of_unusable_rows_refuses_instead_of_reporting_zero(monkeypatch):
         [{"number": 7, "head": ["ref"]}],                  # head wrong type
         [{"number": 7, "merged_at": {"at": 1}}],          # merged_at compared to a str
         [{"number": True}],                                # bool is not a PR number
+        # ⛔ AND THE TWO FIELDS THAT REACH A REGEX (#2142 review). The heading above says the
+        # guard covers the types, but `title` and `head.ref` were never checked, so a dict title
+        # passed the guard, reached `pat.search()` in `covered()` and raised TypeError — which
+        # the catch-all turned into the WHOLE metric reading `unavailable` instead of this page
+        # being refused. Every field the read later HASHES, DEREFERENCES, COMPARES or SEARCHES
+        # must be checked here, or the guard's claim is false.
+        [{"number": 7, "title": {"a": 1}, "head": {"ref": "fix/7-x"}}],
+        [{"number": 7, "title": ["t"], "head": {"ref": "fix/7-x"}}],
+        [{"number": 7, "title": "t", "head": {"ref": {"x": 1}}}],
     ):
         monkeypatch.setattr(bp, "_rest_get_json",
                             lambda url, tok, timeout=None, _p=page: list(_p))

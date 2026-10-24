@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 
 REPO = "daniel-ospina/tortoise"
@@ -37,6 +38,15 @@ TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost
 # so a little is allowed and no more; see the validator in `main()` for why the bound is not
 # optional. `compute()` writes `int(time.time())`.
 CACHE_TS_SKEW_S = 300
+
+
+def _count(x):
+    """An int that is NOT a bool (#2142 review). `isinstance(True, int)` is True, so a foreign or
+    hand-corrupted cache `{"open_prs": true, "merged_today": true, "p0": {"open": true, ...}}`
+    passed the validator and rendered `1 open PRs, 1 merged today` as if it had been MEASURED --
+    the false-reading class this file refuses to print. `_rest_prs` already rejects bool for
+    `number`; this is the same test on the cache side, so both guards agree on what a count is."""
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
 # ── gh RESOLUTION AND FAILURE CONTRACT (fixed 2026-10-01) ────────────────────
@@ -239,7 +249,14 @@ def _rest_get_json(url, tok, timeout=REST_TIMEOUT_S):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:
+    except Exception as exc:
+        # ⛔ A REASON, NOT SILENCE (#2142 review). Still returns None (UNKNOWN, never empty), but a
+        # hand run and a CI log now say WHY -- otherwise a real transport defect is
+        # indistinguishable from a rate-limit refusal, on every beat, forever. The reason is the
+        # exception TYPE plus the URL: the credential lives only in the request header and is
+        # never formatted here, which is the one thing this line must not do.
+        sys.stderr.write("beta-progress: rest read failed: %s %s\n"
+                         % (type(exc).__name__, url.split("?", 1)[0]))
         return None
 
 
@@ -258,10 +275,22 @@ def _rest_prs(state, limit=100, deadline=None):
     offset from THAT request's `per_page` ((page-1)*per_page), so shrinking it on the last
     page re-reads rows an earlier page already returned and leaves a hole at the end (a
     limit of 250 returned rows 1-200 + a duplicate of 101-150, missing 201-250 -- measured).
-    The final page is trimmed AFTER it arrives instead. This pages until the caller's window
-    is filled or the collection ends. It does NOT return the first page as if it were the
-    window: a silently short list would under-count `merged_today`, which is the one error
-    this fallback must not add. A page
+    The final page is trimmed AFTER it arrives instead. It does NOT return the first page as if
+    it were the window: a silently short list would under-count `merged_today`, which is the one
+    error this fallback must not add.
+
+    ⛔ `limit` BOUNDS ROWS READ, NOT ROWS RETURNED (#2142 review). The loop advances on
+    `len(keep)` -- the rows it FETCHED -- so it spends the same row budget `gh pr list --limit`
+    spent. In the closed window the rows are then filtered to merges, so `out` holds the merges
+    among the `limit` most-recently-updated CLOSED PRs and is SHORTER than `limit` whenever some
+    of those rows were closed without merging (measured: 396/400). That is exactly the bound
+    stated below, not a short read -- but it is why `merged` here is not interchangeable with
+    `gh pr list --state merged --limit 400`, and why the earlier form of this paragraph read as
+    a promise the code does not make. Driving the loop on `len(out)` instead would fill the
+    window with merges only at the cost of an UNBOUNDED number of requests against the very
+    bucket this fallback exists because we are rationing; the disclosed row bound is the honest
+    trade, and `merged_today` stays exact while a day's merges (plus the abandoned rows updated
+    beside them) fit inside it. A page
     that cannot be read -- or a read whose SHARED deadline (`deadline`, an epoch-seconds
     instant the caller owns; None = no bound) has passed -- returns None for the WHOLE read; a
     partial list is indistinguishable from a complete one at the call site. The deadline is a
@@ -314,69 +343,96 @@ def _rest_prs(state, limit=100, deadline=None):
     path = "open" if state == "open" else "closed"
     if deadline is None:
         deadline = time.time() + REST_BUDGET_S
-    out, seen, page = [], 0, 1
-    numbers = set()      # the identity both call sites count; a REPEAT means the list moved
-    while seen < limit:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return None           # budget spent -- refuse, never return a short window
-        url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
-               "&per_page=%d&page=%d" % (REPO, path, REST_PER_PAGE, page))
-        raw = _rest_get_json(url, tok, min(REST_TIMEOUT_S, remaining))
-        if not isinstance(raw, list):
-            return None
-        keep = raw[:limit - seen]          # trim the FINAL page to the caller's window
-        for p in keep:
-            # ⛔ ONE SHAPE CHECK, TYPES INCLUDED. Presence alone is not enough: the repeat check
-            # HASHES `number`, the mapping DEREFERENCES `head`, and `compute()` compares
-            # `merged_at` -- so `{"number": {}}` raised TypeError out of `sys.exit(main())`
-            # and printed NO line at all, breaking the "exit 0 always" promise, while
-            # `{"head": "x"}` raised AttributeError. A page whose rows are not the documented
-            # shape is an UNREADABLE page, not an empty answer -- `continue` here once consumed
-            # a window of unusable rows and returned [], the false zero this file's header says
-            # was fixed on 2026-10-01. Refuse the whole read.
-            if not isinstance(p, dict):
+    # ⛔ ONE RETRY ON A REPEAT (#2142 review). A repeat proves the list moved DURING the read,
+    # and on a box running ~17 concurrent gh clients most movers are churn that a SECOND attempt
+    # reads cleanly -- so the read is attempted once more BEFORE it refuses. The cost is bounded
+    # and stated: at most ONE extra page-set (ceil(limit/100) requests), spent only on a path that
+    # was going to print `unavailable` anyway, and out of the SAME shared `deadline` (so a retry
+    # can never outlive the tick). A SECOND repeat still refuses, so a genuinely unstable window
+    # never yields a number -- a few requests are cheap, a wrong number is the false line this
+    # file exists to prevent.
+    for attempt in (1, 2):
+        out, seen, page = [], 0, 1
+        numbers = set()   # the identity both call sites count; a REPEAT means the list moved
+        repeated = False  # set by the repeat detector; only THIS attempt is abandoned by it
+        while seen < limit:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None           # budget spent -- refuse, never return a short window
+            url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
+                   "&per_page=%d&page=%d" % (REPO, path, REST_PER_PAGE, page))
+            raw = _rest_get_json(url, tok, min(REST_TIMEOUT_S, remaining))
+            if not isinstance(raw, list):
                 return None
-            n = p.get("number")
-            if not isinstance(n, int) or isinstance(n, bool):
-                return None
-            head = p.get("head")
-            if head is not None and not isinstance(head, dict):
-                return None
-            if p.get("merged_at") is not None and not isinstance(p.get("merged_at"), str):
-                return None
-            # ⛔ THE REPEAT CHECK COMES FIRST -- BEFORE the closed-without-merge filter, and its
-            # set holds EVERY row's number, dropped ones included. The repeat is evidence about
-            # the LIST, not about which rows count: the row that shifts the live order mid-read
-            # is very often an unmerged closed PR (bot churn, a superseded PR closed, a
-            # re-labelled one), and filtering it out BEFORE the check hid the only sound signal
-            # the read has. Measured: 100 unmerged rows on page 1, then one PR merges (now at
-            # offset 0) and an unmerged row repeats on page 2 -- the guard never fired and the
-            # read returned 0 rows, a REAL "0 merged today" line while the truth was 1. That is
-            # the false zero this file's header says was fixed on 2026-10-01, and the one error
-            # this fallback must not add.
-            if n in numbers:
-                # ⛔ A REPEAT PROVES THE LIST MOVED DURING THE READ, and a moved list is also a
-                # SHORT one: the row that entered at the head after page 1 was read is at
-                # offset 0 and will be returned by NO page. Deduping would hide the
-                # double-count and leave `merged_today` short by every merge that landed
-                # mid-read -- so refuse the whole read instead (see the docstring).
-                return None
-            numbers.add(n)
-            if state != "open" and not p.get("merged_at"):
-                continue      # closed-without-merge is not a merged PR
-            out.append({
-                "number": n,
-                "title": p.get("title") or "",
-                "headRefName": (head or {}).get("ref") or "",
-                "mergedAt": p.get("merged_at") or "",
-            })
-        seen += len(keep)
-        if len(raw) < REST_PER_PAGE:
-            break             # last page of the collection
-        page += 1
+            keep = raw[:limit - seen]          # trim the FINAL page to the caller's window
+            for p in keep:
+                # ⛔ ONE SHAPE CHECK, TYPES INCLUDED. Presence alone is not enough: the repeat check
+                # HASHES `number`, the mapping DEREFERENCES `head`, and `compute()` compares
+                # `merged_at` -- so `{"number": {}}` raised TypeError out of `sys.exit(main())`
+                # and printed NO line at all, breaking the "exit 0 always" promise, while
+                # `{"head": "x"}` raised AttributeError. A page whose rows are not the documented
+                # shape is an UNREADABLE page, not an empty answer -- `continue` here once consumed
+                # a window of unusable rows and returned [], the false zero this file's header says
+                # was fixed on 2026-10-01. Refuse the whole read.
+                if not isinstance(p, dict):
+                    return None
+                n = p.get("number")
+                if not isinstance(n, int) or isinstance(n, bool):
+                    return None
+                head = p.get("head")
+                if head is not None and not isinstance(head, dict):
+                    return None
+                if p.get("merged_at") is not None and not isinstance(p.get("merged_at"), str):
+                    return None
+                # ⛔ AND THE TWO FIELDS THAT REACH A REGEX (#2142 review) -- not only the three that are
+                # hashed, dereferenced or compared. `covered()` runs `pat.search()` over `title` and
+                # `headRefName`, so `title: {"a": 1}` passed the guard above, arrived at `pat.search()`
+                # as a dict in `compute()` and raised TypeError -- which the catch-all below turned into
+                # the WHOLE metric reading `unavailable`, instead of this page being REFUSED as
+                # unreadable (measured). A row is the documented shape or it is not a row.
+                if p.get("title") is not None and not isinstance(p.get("title"), str):
+                    return None
+                ref = (head or {}).get("ref")
+                if ref is not None and not isinstance(ref, str):
+                    return None
+                # ⛔ THE REPEAT CHECK COMES FIRST -- BEFORE the closed-without-merge filter, and its
+                # set holds EVERY row's number, dropped ones included. The repeat is evidence about
+                # the LIST, not about which rows count: the row that shifts the live order mid-read
+                # is very often an unmerged closed PR (bot churn, a superseded PR closed, a
+                # re-labelled one), and filtering it out BEFORE the check hid the only sound signal
+                # the read has. Measured: 100 unmerged rows on page 1, then one PR merges (now at
+                # offset 0) and an unmerged row repeats on page 2 -- the guard never fired and the
+                # read returned 0 rows, a REAL "0 merged today" line while the truth was 1. That is
+                # the false zero this file's header says was fixed on 2026-10-01, and the one error
+                # this fallback must not add.
+                if n in numbers:
+                    # ⛔ A REPEAT PROVES THE LIST MOVED DURING THE READ, and a moved list is also a
+                    # SHORT one: the row that entered at the head after page 1 was read is at
+                    # offset 0 and will be returned by NO page. Deduping would hide the
+                    # double-count and leave `merged_today` short by every merge that landed
+                    # mid-read -- so this ATTEMPT is abandoned (the retry above), and a SECOND
+                    # repeat refuses the whole read.
+                    repeated = True
+                    break
+                numbers.add(n)
+                if state != "open" and not p.get("merged_at"):
+                    continue      # closed-without-merge is not a merged PR
+                out.append({
+                    "number": n,
+                    "title": p.get("title") or "",
+                    "headRefName": ref or "",
+                    "mergedAt": p.get("merged_at") or "",
+                })
+            if repeated:
+                break     # the repeat abandoned this attempt -- fetching the next page is pointless
+            seen += len(keep)
+            if len(raw) < REST_PER_PAGE:
+                break             # last page of the collection
+            page += 1
 
-    return out
+        if not repeated:
+            return out
+    return None
 
 
 def compute():
@@ -456,29 +512,42 @@ def main():
                   # bounded (measured: 3 consecutive beats, `compute()` never called). Bounding it
                   # makes such a cache a MISS, so one refresh overwrites it.
                   and 0 < cached["ts"] <= time.time() + CACHE_TS_SKEW_S
-                  and isinstance(cached.get("open_prs"), int)
-                  and isinstance(cached.get("merged_today"), int)
+                  and _count(cached.get("open_prs"))
+                  and _count(cached.get("merged_today"))
                   and all(isinstance(cached.get(tier), dict)
-                          and all(isinstance(cached[tier].get(k), int)
+                          and all(_count(cached[tier].get(k))
                                   for k in ("open", "with_pr", "without"))
                           for tier in ("p0", "p1"))):
             cached = None
         if cached is not None and time.time() - cached.get("ts", 0) < TTL:
             data = cached
-    except Exception:
-        pass
+    except Exception as exc:
+        # ⛔ NOT SILENT (#2142 review). The beat discards stderr, so this costs nothing where it
+        # matters and is the ONLY reason an operator hand-running the script gets -- a genuine
+        # defect in the fallback was otherwise indistinguishable from "GraphQL refused", which is
+        # the silence this PR exists to remove. The message is the exception's own text (a
+        # JSONDecodeError carries a position, never the payload), so it can leak no data.
+        sys.stderr.write("beta-progress: cache unreadable: %s: %s\n"
+                         % (type(exc).__name__, exc))
     if data is None:
         # ⛔ EXIT 0 ALWAYS (module header), AND A LINE ALWAYS. `compute()` is a pile of
         # compares, hashes and dereferences over data an API returned; an unexpected shape must
         # reach the operator as the honest `unavailable` line, not as a traceback to /dev/null.
         # Measured before this guard: a page whose `number` was an object raised TypeError out of
-        # `sys.exit(main())` and printed NOTHING, while `orchestrator-heartbeat.sh:181` pipes
-        # stderr away -- the exact "reports nothing instead of the line it can prove" failure this
-        # file exists to avoid. The row guards above make that payload unreachable; this keeps a
+        # `sys.exit(main())` and printed NOTHING, while the `DELIV=$(...)` capture in
+        # `orchestrator-heartbeat.sh` sends stderr to /dev/null -- the exact "reports nothing
+        # instead of the line it can prove" failure this file exists to avoid. Cited by NAME for
+        # the reason stated at `REST_TIMEOUT_S` above (#2142 review): the number this used to name
+        # is a line that moves. The row guards above make that payload unreachable; this keeps a
         # FUTURE one from taking the beat's measurement down silently.
         try:
             data = compute()
         except Exception:
+            # ⛔ AND THE REASON GOES TO STDERR (#2142 review). `compute()` has no other reporter:
+            # a traceback here is discarded by the beat and invaluable in a hand run or CI log, and
+            # it changes no stdout contract. `format_exc` prints source lines, not locals, so no
+            # credential reaches it.
+            sys.stderr.write("beta-progress: compute failed:\n%s" % traceback.format_exc())
             data = None
         if data is None:
             print("DELIVERY: unavailable (metrics read failed)")
