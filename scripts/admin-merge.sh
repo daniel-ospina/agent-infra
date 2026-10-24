@@ -78,6 +78,70 @@
 #      wording problem (#1261, proven twice in one day). See THE PR'S EVALUATED TREE
 #      below.
 #
+# ── THE ONE DECLARED LANE EQUIVALENCE (#2610) ─────────────────────────────
+# ONE equivalence, declared once, with its reason and the workflow lines that justify
+# it — because a rail that can SEE two lanes running one suite under two names and
+# does not say so answers "NO BASE COUNTERPART FOR THIS CHECK" about a red that is
+# the base's own, and that false absence is what reads as "unattributable".
+#
+#   script-validate        (on the BASE — .github/workflows/ci-main.yml)
+#     ⊇ bash-suites (<n>)  (on the PR   — .github/workflows/ci.yml)
+#
+# WHY IT IS TRUE — the repo says it about itself. ⚠️ EVERY ci.yml COORDINATE BELOW IS
+# ANCHORED BY ITS QUOTED TEXT, and the quotes are the authority: ci.yml is a busy file
+# and line numbers in it ROT (measured: a merge onto main added 49 lines above this
+# region and moved the job from :896 to :945, which left an earlier version of this very
+# block citing an unrelated `http-pool-hygiene` step — the declaration then looked
+# unsubstantiated, i.e. the false absence came back through the citation instead of the
+# logic). Re-locate by the quote, and fix the number when you move it.
+#   * ci.yml:945 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
+#     `shard: [1, 2, …]` at :1035, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
+#     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
+#     (ci.yml:1073, `run: bash scripts/run-bash-shards.sh`);
+#   * ci-main.yml:378 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
+#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:455 is that
+#     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
+#     `script-validate` (ci-main.yml:376);
+#   * ci.yml:1047 — "ci-main.yml's `script-validate`: one runtime for the list, in
+#     both lanes" (also ci.yml:372, "today — ci-main.yml's script-validate job runs bash
+#     shards only"). ⛔ NOT ci.yml:948: that line is the HISTORY of the pre-#1369 split
+#     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
+#     describes a body WIDER than the list, so citing it here would argue AGAINST the
+#     containment this pair rests on (review cycle 3).
+#   So main's ONE check RUNS the same list the PR slices, one shard at a time: the
+#   base reports this program under the other lane's name.
+#
+# ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
+# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:422
+# `node --check`, :440 the lane-parity guard, :444 its mutation self-test, :455 the shard
+# list) and the other two are `actions/checkout` (:413) and `actions/setup-node` (:418) —
+# while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
+# be the shard list's red — or ANY other step's, including the setup ones. The equivalence
+# therefore establishes that the base RUNS this program and carries A red under its name;
+# it can never establish that the base's red is this suite's. That is why the answer is
+# phrased as a candidate (`base-caused via`) and why the paragraph under it says so out
+# loud.
+#
+# WHAT IT DOES NOT BUY, stated here so it cannot be read as more than it is:
+#   * it is a NAME-level statement about two LANES, not an identity-level statement
+#     about two failures — and, per the containment note above, not even a
+#     program-identity statement at job level. It can say the base carries a red
+#     under a name that runs this program; it can NEVER say the base's red IS this
+#     failure.
+#   * it exempts NOTHING. The decision compares failures by IDENTITY, and a shard
+#     whose log yielded none still has none — step 1c still refuses. What changes is
+#     that the refusal can now NAME what it refused (`base-caused via script-validate
+#     ≡ bash-suites (<n>)`) instead of reporting an absence it did not establish.
+#   * it applies ONLY on the base side (base -> PR). A PR check with no declared
+#     counterpart keeps the unqualified `NO BASE COUNTERPART` answer: this is one
+#     pair, not a policy that shell failures are probably fine.
+#   * it does not touch §4.5. The PR's own evaluated tree still BLOCKS on a red
+#     there, base-shared or not — that gate exists for the repair direction, which
+#     requires the red to be GONE from the PR's tree (#1261).
+#
+# The value lives in `declared_base_equivalent`, its ONE implementation; the ONE
+# reader is the step-1c named refusal (`named_unattributable_runs`).
+#
 # ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
 # violations in `tools/embedded_evidence.py`. The ruff gate is the
@@ -1150,6 +1214,51 @@ fetch_run_failed_job_names() {
 # only read for a run already known to be failed, where an unfinished job is not the
 # failure the log was fetched for; every NAMED non-red is excluded for the same reason.
 
+# declared_base_equivalent <pr-check-name> — THE DECLARED LANE EQUIVALENCE (#2610):
+# print the BASE-side check NAME this PR-side check is equivalent to, or nothing when
+# there is none. The pair, its reason and its citations are in the header ("THE ONE
+# DECLARED LANE EQUIVALENCE"); this is the ONE implementation and
+# `named_unattributable_runs` is its ONLY reader.
+#
+# ⛔ STRUCTURAL, NOT A PREFIX, AND DELIBERATELY NARROW. Every arm is a specific,
+# cited pair. A rule that read "a shell suite failed" as an equivalence would make
+# every shell red base-caused — the blanket excuse the mapping's own requirements
+# forbid. A name not named here returns NOTHING and keeps the unqualified
+# "NO BASE COUNTERPART" answer.
+#
+# ⛔ THE MATCH REQUIRES exactly `<spaces>(<digits>)` — the matrix axis. It does not
+# bound the digits: the matrix's `/N` denominator is DERIVED from
+# `strategy.job-total` (ci.yml's shard comment), so a hard-coded 1..8 here would go
+# stale the day the matrix widens. A shard number that does not exist cannot appear
+# on any surface, so the un-bounded form cannot manufacture a counterpart.
+#
+# ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
+# `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
+# programs that PR job runs — the lane-parity guard and its mutation self-test — are
+# STEPS inside `script-validate` (ci-main.yml:440, :444). So a `bash-suites-gate` red
+# ALSO has a base counterpart under that name, and this ONE pair does not map it: that
+# refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
+# scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
+# it would be a second pair with its own fixture, and the brief for this change is
+# explicitly one pair.
+#
+# No exit status is used to mean "no equivalence": an empty stdout is the answer, so a
+# caller can never mistake "not mapped" for a failure of the mapping.
+declared_base_equivalent() {
+  local name="${1:-}" shard
+  case "$name" in
+    'bash-suites ('*')')
+      shard="${name#bash-suites (}"
+      shard="${shard%)}"
+      case "$shard" in
+        ''|*[!0-9]*) return 0 ;;
+      esac
+      printf '%s\n' 'script-validate'
+      ;;
+  esac
+  return 0
+}
+
 # named_unattributable_runs <unattributed-file> <base-ref> <expected-count> — THE NAMED
 # REFUSAL (#2610). `<unattributed-file>` is the collector's `--unattributed` output, NOT
 # `--provenance`: see the ⛔ note above the body.
@@ -1189,8 +1298,16 @@ fetch_run_failed_job_names() {
 # subset is written by `collect_union_rows`, the one place that decides `extracted`.
 named_unattributable_runs() {
   local unattributed="${1:-}" base="${2:-}" expected="${3:-}" line runref run_id names name kind
-  local base_reds base_status base_total red_names named_count
-  [ -s "$unattributed" ] || return 0
+  local mapped mapped_kind base_reds base_status base_total red_names named_count
+  local kind_rc mapped_rc
+  # ⛔ NO EARLY `-s` RETURN HERE (#2610 review, cycle 6). It used to sit above, and it
+  # answered the ONE anomaly the completeness cross-check below exists to catch with total
+  # silence: this function is only reachable from `pr_extracted < pr_examined`, so
+  # `expected >= 1` on every call — an absent or empty subset file therefore means the named
+  # list is MISSING ENTIRELY, and returning early printed nothing instead of
+  # "the collector published 0 … where the refusal counted N — this list is INCOMPLETE".
+  # An empty `grep -c` on a missing file is `0`, so the cross-check fires first and the
+  # `named_count = 0` return BELOW is the silent path (nothing to name, count agrees).
   # ⛔ `grep -c` PRINTS `0` AND EXITS 1 on no match, so a `|| printf '0'` fallback makes the
   # count the two-line string `0\n0` — and a `0\n0` header is not a count (#2610 review). The
   # fallback is only for grep being unavailable; the default covers the no-match case. The
@@ -1233,6 +1350,14 @@ named_unattributable_runs() {
     say_err "   ⚠️  the collector published $named_count unattributable run(s) where the refusal"
     say_err "   counted ${expected} — this list is INCOMPLETE, so read it as a sample, not as the set"
   fi
+  # Nothing to name. Only silent when the count AGREES with the refusal (the cross-check
+  # above has already spoken for the disagreement case, which is the one that matters).
+  # ⛔ A STRING COMPARE, not `-eq`: `named_count` can be the UNKNOWN marker `?`, and a numeric
+  # comparison against it is a shell diagnostic that reads as a broken instrument.
+  if [ "$named_count" = "0" ]; then return 0; fi
+  # The number is only printed when it was actually MEASURED (#2610 review, round 5): an
+  # `NAMED (0)` over a list that then prints runs is a measured-looking claim about
+  # something never measured.
   if [ "$named_count" = "?" ]; then
     say_err "   The failing run(s), NAMED — each check below is one whose failed-step"
   else
@@ -1268,19 +1393,73 @@ named_unattributable_runs() {
           # ⛔ THE NAME GOES OUT OF BAND (#2610 review, P3-3): `awk -v n="$name"` processes
           # backslash escapes in the assignment, so a check named `win\build` would be
           # compared as `winbuild` and answered "no counterpart" when the base carries it.
-          kind="$(printf '%s\n' "$base_reds" | NR_NAME="$name" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }')"
+          # ⛔ A HERE-STRING, NOT `printf | awk` (#2610 review, cycle 7, P2). Under this
+          # file's `set -uo pipefail` (line 660), `awk` exits at its FIRST match, the `printf`
+          # upstream takes SIGPIPE, and `pipefail` makes the whole substitution return **141**
+          # — so a lookup that SUCCEEDED was reported as a READ FAILURE and its correct answer
+          # thrown away (measured: `run1 rc=141 kind=[blocking: failure]` over 20k red lines).
+          # That is the banned `printf | quiet-consumer` idiom (#841/#864); a here-string has
+          # no upstream process to signal, so the status is awk's alone.
+          kind_rc=0
+          kind="$(NR_NAME="$name" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }' <<< "$base_reds")" || kind_rc=$?
+          # ⛔ THE NON-EMPTY ANSWER WINS OVER THE STATUS (#2610 review, cycle 7). A read that
+          # produced output DID read, whatever awk's exit status says afterwards; the failure
+          # arm is only for the case where the lookup came back EMPTY *and* said so.
           if [ -n "$kind" ]; then
             say_err "       base: '${name}' IS red on '${base}' (${kind}) — the same check NAME fails on"
             say_err "       both surfaces; the decision still compares IDENTITIES, and this run has none"
+          elif [ "$kind_rc" -ne 0 ]; then
+            # ⛔ A FAILED LOOKUP IS NOT "no counterpart" (#2610 review, cycle 6). An empty
+            # `kind` from a DEAD lookup renders as the exact false absence this whole change
+            # exists to abolish. Note what is — and is not — claimed here: `$base_reds` is a
+            # SHELL VARIABLE, so this is NOT a failed read of the base (that is `base_status`
+            # = unreadable, the `*)` arm); it is the comparison over it that did not run.
+            say_err "       base: the lookup over the base's red list FAILED (awk exit ${kind_rc}) — a"
+            say_err "       failure, not an absence: the counterpart question is UNANSWERED here"
           else
-            say_err "       base: NO BASE COUNTERPART FOR THIS CHECK — '${name}' is not among the"
-            say_err "       ${base_total:-?} check(s) the base surface reports, of which these NAME(s) are"
-            # ⛔ `paste` emits NO line for zero input lines, so a `sed 's/^$/none/'` AFTER it is
-            # dead code — the empty base (a GREEN base, the common case) printed `red: ` and
-            # nothing (#2610 review, P2-1). Default the CAPTURE, and print the whole answer on
-            # one line so neither half can be missing while the other is present.
-            red_names="$(printf '%s\n' "$base_reds" | cut -f1 | sed '/^$/d' | paste -sd, -)"
-            say_err "       red: ${red_names:-none}"
+            # ── THE DECLARED LANE EQUIVALENCE (#2610) ──────────────────────────
+            # The base's counterpart red can sit under a DIFFERENT NAME for the SAME
+            # suite: `script-validate` on main is `bash-suites (<n>)` on a PR. Without
+            # this arm the answer below is a FALSE ABSENCE — "not among the checks the
+            # base reports" — about the base's OWN red, and a false absence is the one
+            # thing this refusal must never print.
+            # ⛔ THE MAPPED NAME GOES OUT OF BAND TOO (same reason as P3-3 above): it is
+            # a constant today, but a future pair must not inherit an `awk -v` hole.
+            mapped="$(declared_base_equivalent "$name")"
+            mapped_kind=""
+            mapped_rc=0
+            if [ -n "$mapped" ]; then
+              # Same here-string reason as the same-name lookup above (cycle 7, P2).
+              mapped_kind="$(NR_NAME="$mapped" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }' <<< "$base_reds")" || mapped_rc=$?
+            fi
+            if [ -n "$mapped_kind" ]; then
+              say_err "       base: base-caused via ${mapped} ≡ ${name} (${mapped_kind})"
+              say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
+              say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
+              say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
+              say_err "       (.github/workflows/ci-main.yml:455), and '${name}' is one shard of that same"
+              say_err "       list on a PR (.github/workflows/ci.yml:945/1073), one runtime in both lanes"
+              say_err "       (ci.yml:1047). The base therefore carries a red under a name that RUNS this"
+              say_err "       list — but that job has FIVE other steps (node --check :422, the lane-parity"
+              say_err "       guard :440, its self-test :444, plus checkout :413 and setup-node :418), so the"
+              say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
+              say_err "       an established identity: no identity was produced, so nothing here is"
+              say_err "       comparable yet"
+            elif [ "$mapped_rc" -ne 0 ]; then
+              # Same non-empty-wins ordering as the same-name lookup above (cycle 7): a failed
+              # lookup must not be narrated as "no counterpart" — that is the false absence.
+              say_err "       base: the lookup over the base's red list FAILED while testing the declared"
+              say_err "       equivalence (awk exit ${mapped_rc}) — UNANSWERED, not 'no counterpart'"
+            else
+              say_err "       base: NO BASE COUNTERPART FOR THIS CHECK — '${name}' is not among the"
+              say_err "       ${base_total:-?} check(s) the base surface reports, of which these NAME(s) are"
+              # ⛔ `paste` emits NO line for zero input lines, so a `sed 's/^$/none/'` AFTER it is
+              # dead code — the empty base (a GREEN base, the common case) printed `red: ` and
+              # nothing (#2610 review, P2-1). Default the CAPTURE, and print the whole answer on
+              # one line so neither half can be missing while the other is present.
+              red_names="$(printf '%s\n' "$base_reds" | cut -f1 | sed '/^$/d' | paste -sd, -)"
+              say_err "       red: ${red_names:-none}"
+            fi
           fi
           ;;
         *)
@@ -1294,6 +1473,8 @@ named_unattributable_runs() {
   say_err "   identity is what makes a red comparable to the base, and (with a matching signature)"
   say_err "   exempt. NONE of the runs above yielded one, so nothing about them is comparable yet —"
   say_err "   a name answer alone cannot exempt a red, and an absent name is not a verdict."
+  say_err "   A DECLARED LANE EQUIVALENCE is the same kind of answer: it names the base red this"
+  say_err "   check corresponds to under the other lane's name, and exempts NOTHING."
   say_err "   Remedy: make the failing step print a parseable identity — a"
   say_err "   '::error::<message>' annotation or a 'FAILED <nodeid>' line — then re-run the rail."
   return 0
@@ -2209,9 +2390,14 @@ poll_merge_artifact() { # <pr> [attempts-override]
 # resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). The base branch's
 # head surface is measured for CONTEXT ONLY (it says whether main is currently
 # red); the tree that GATES the merge is the PR's own evaluated tree (#1261).
-# An unreadable or empty answer is not fatal — the caller defaults to `main`,
-# which every repo in this fleet uses — but the root cause is that a PR can
-# target a non-default branch, so the answer is preferred when it exists.
+# An unreadable or empty answer is not fatal, and each caller decides what to do with it
+# (#2610 review, cycle 6): the §2c tree call site (`base_ref="$(resolve_base_ref …)"` followed
+# by `|| base_ref=main`) defaults to `main`, which every repo in this fleet uses, while the
+# step-1c NAMING caller deliberately does NOT (see the call site and its comment) — it hands
+# the empty string to the refusal's UNANSWERED arm, because asserting a red is "on main"
+# about a ref the rail never resolved is a claim about reality it did not measure.
+# The root cause for the default: a PR can target a non-default branch, so the answer is
+# preferred when it exists.
 resolve_base_ref() {
   local pr="$1"; shift
   # shellcheck disable=SC2086

@@ -13743,6 +13743,21 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # trigger, so the base probe measures it and then EXEMPTS it as not-PR-evaluable. A reader
 # built on the blocking-red set alone would answer "no such red" about the one red that
 # exists — that is the shape pinned here, not the `unknown`-evaluability arm.
+#
+# ⛔ THE DECLARED EQUIVALENCE ARM (#2610). That same real split is ALSO the one pair the rail
+# declares equivalent (`script-validate` on main CONTAINS `bash-suites (<n>)` on a PR — header,
+# "THE ONE DECLARED LANE EQUIVALENCE"), so this scenario exercises the mapping arm: the answer
+# must be `base-caused via script-validate ≡ bash-suites (5)`, never "no base counterpart".
+# Two more arms keep that from becoming a blanket excuse: (n1) a check name the mapping does
+# NOT name (`bash-suites-gate`, the nearest near-miss — a prefix rule would only map it if the
+# digits guard were dropped too, i.e. TWO guards stand between them) keeps today's
+# unqualified absence answer, and (n2) is the mutation — with the equivalence
+# deleted the mapped answer must disappear, so these assertions rest on that arm alone.
+# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
+# JOB, so its two programs run as STEPS inside `script-validate` (ci-main.yml:440/:444) and
+# that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
+# (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
+# so rather than claiming the programs differ.
 echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
 new_scen named-refusal
 HEAD_NR="f9f90000000000000000000000000000000000ab"
@@ -13770,16 +13785,24 @@ grep -q "check 'bash-suites (5)'" "$SCEN/err" \
 grep -q "run 9901" "$SCEN/err" \
   && pass "(b) …and the RUN it failed in" \
   || fail "(b) the refusal names no run"
-grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
-  && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
-  || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE: base-caused via script-validate ≡ bash-suites (5)" \
+  || fail "(c) the declared-equivalence answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+# The shard NAME must be carried: the refusal is about ONE shard, and `bash-suites` alone
+# does not say which one.
+grep -q "≡ bash-suites (5) (" "$SCEN/err" \
+  && pass "(c) …carrying the SHARD name it is about" \
+  || fail "(c) the mapped answer does not carry the shard: $(grep -n 'base-caused' "$SCEN/err" 2>/dev/null | head -2)"
 # ⛔ THE EXEMPTED-BASE-RED ARM. main's `script-validate` is measured by the probe and then
 # EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
-# An arm reading only the blocking reds prints an EMPTY list here — the false absence this
-# fixture exists to catch, and the exact shape of the real repo tonight.
-grep -q "red: script-validate" "$SCEN/err" \
-  && pass "(c) …naming the base's own red even though the probe EXEMPTED it as not-PR-evaluable" \
-  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader answers 'none'): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+# An arm reading only the blocking reds finds no counterpart at all — so the `exempt:` CLASS
+# in this answer is what pins the ALL_REDS reader (the false absence this fixture exists for).
+grep -q 'base: base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
+  && pass "(c) …naming the base's own red as EXEMPT even though it is not in the blocking set" \
+  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader finds no counterpart): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+grep -q "NO BASE COUNTERPART" "$SCEN/err" \
+  && fail "(c) it ALSO claimed no counterpart about the base's own suite — the arms are not exclusive" \
+  || pass "(c) …and does NOT also claim an absent counterpart"
 grep -q "The EXEMPTION DECISION compares failures by FAILURE IDENTITY" "$SCEN/err" \
   && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
   || fail "(d) the message could be read as an exemption — the two questions are not separated"
@@ -13925,24 +13948,156 @@ grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
   && fail "(g) it ALSO claimed no counterpart — the arms are not exclusive" \
   || pass "(g) …and does NOT claim an absent counterpart on the same surface"
+# ── (n1) A NEAR-MISS NAME KEEPS TODAY'S ABSENCE ANSWER. The mapping is ONE pair, not a
+# prefix rule: `bash-suites-gate` is not a shard of the list. TWO independent guards stand
+# between them — the case pattern and the digits check — so a pattern-only widening still
+# returns nothing (pinned by (n3) below, which builds exactly that mutant). ⚠️ Its own
+# programs DO run inside main's
+# `script-validate` (as steps), so this is a SCOPING exclusion with a known residual (#2610),
+# not a claim that no counterpart exists — see the note on `declared_base_equivalent`.
+# This is also where the base's EXEMPTED red is re-pinned on the UNMAPPED path: the answer
+# still has to name `script-validate` as the base's red.
+new_scen named-refusal-unmapped
+# The scenario dir is captured BY NAME because (n3) re-enters it later: `SCEN` is a global
+# that a later `new_scen` overwrites (the cycle-2 P1), and this arm must not inherit another.
+SCEN_UNMAPPED="$SCEN"
+HEAD_NU="f9f90000000000000000000000000000000000e1"
+printf '%s\n' "$HEAD_NU" > "$SCEN/head"
+lane_fail "$HEAD_NU" 9951 > "$SCEN/runs-$HEAD_NU"
+: > "$SCEN/log-9951"
+echo 'bash-suites-gate' > "$SCEN/jobs-failed-9951"
+write_pr_checks "$(check_run 5051 'bash-suites-gate' completed failure 9951)"
+write_main_checks "$(check_run 4051 'script-validate' completed failure 6104)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6104"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6104 push 'CI on main'
+{ main_red_n mainnu01 9952 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n1) a check name the mapping does NOT name still BLOCKS (exit $rc)" \
+  || fail "(n1) the rail merged over an unmapped unattributable red"
+grep -q "base: base-caused via" "$SCEN/err" \
+  && fail "(n1) 'bash-suites-gate' was mapped to the shard equivalence — the match is a PREFIX, not a pair" \
+  || pass "(n1) …and is NOT declared equivalent (one declared pair; only widening the pattern AND dropping the digits guard would map it)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(n1) …keeping today's unqualified absence answer" \
+  || fail "(n1) the unmapped answer changed: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: script-validate$" "$SCEN/err" \
+  && pass "(n1) …naming the base's EXEMPTED red in the absence answer (the ALL_REDS reader)" \
+  || fail "(n1) the base's exempted red vanished from the unmapped answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+
+# ── (n2) MUTATION: DELETE THE EQUIVALENCE, AND THE MAPPED ANSWER MUST GO. The three (c) arms
+# assert a line the mapping arm alone produces; this proves it. The mutant keeps everything
+# else identical — `declared_base_equivalent` returns nothing — so a passing (c) against the
+# mutant would mean the line came from somewhere other than the arm.
+SCEN_EQ="$TMP/scen-named-refusal"
+MUTD2="$TMP/mut-equivalence"; rm -rf "$MUTD2"; mkdir -p "$MUTD2"
+awk '
+  /^declared_base_equivalent\(\) \{/ { infn = 1; print; print "  return 0   # MUTANT (#2610): the declared equivalence is deleted"; next }
+  infn && /^\}/ { infn = 0; print; next }
+  infn { next }
+  { print }
+' "$ADM" > "$MUTD2/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD2/"
+bash -n "$MUTD2/admin-merge.sh" \
+  && pass "(n2) the mutant (equivalence deleted) is still valid bash" \
+  || fail "(n2) the mutant does not parse — the mutation is not a clean arm deletion"
+# ⛔ THE ARM MUST BE ABLE TO FAIL, AND THAT IS ASSERTED, NOT ASSUMED (#2610 review). An absence
+# assertion is only as strong as the presence it depends on: without this precondition the arm
+# below reads "the mapped line is gone" about a scenario that never printed it. Measured with the
+# equivalence neutered BEFORE this arm existed: the suite reported
+#   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
+# while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
+# own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+  && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
+  || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
+SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD2/admin-merge.sh" 42 --main-runs 1 >"$SCEN_EQ/eq-mut-out" 2>"$SCEN_EQ/eq-mut-err"
+qrc=$?
+# The SAME refusal must still fire — a mutant that died earlier would make the absence arm
+# vacuously true, so this arm is only meaningful once THIS one holds.
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && pass "(n2) the mutant still refuses at step 1c — the refusal is not what the arm adds" \
+  || fail "(n2) the mutant did not reach step 1c (exit $qrc): $(head -3 "$SCEN_EQ/eq-mut-err" 2>/dev/null)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && fail "(n2) deleting the equivalence changed nothing — the (c) assertions pin no line the arm produces" \
+  || pass "(n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+  && pass "(n2) …and the pre-change answer is what the mutant prints instead" \
+  || fail "(n2) the mutant printed neither answer: $(grep -n 'base:' "$SCEN_EQ/eq-mut-err" 2>/dev/null | head -3)"
+
+# ── (n3) THE DIGITS GUARD IS ITS OWN GUARD. (n1) proves the gate is not mapped TODAY; this
+# proves WHY, so a lane that widens the pattern alone cannot quietly get a mapped line — and
+# so a lane that reads the two guards as one cannot "simplify" the digits check away without
+# a red arm. The mutant is the REAL function with ONLY the case pattern widened to
+# `bash-suites*`: the digits guard survives, so `bash-suites-gate` must still be rejected.
+MUTD3="$TMP/mut-prefix"; rm -rf "$MUTD3"; mkdir -p "$MUTD3"
+awk '
+  $0 == "    \047bash-suites (\047*\047)\047)" { print "    bash-suites*)"; next }
+  { print }
+' "$ADM" > "$MUTD3/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD3/"
+bash -n "$MUTD3/admin-merge.sh" \
+  && pass "(n3) the prefix-widened mutant is still valid bash" \
+  || fail "(n3) the mutant does not parse — the mutation is not a clean pattern widening"
+grep -q 'bash-suites\*)' "$MUTD3/admin-merge.sh" \
+  && pass "(n3) …and it really carries the widened pattern (not the shipped one)" \
+  || fail "(n3) the widening did not apply — the arm would be vacuous"
+# ⛔ SAME PRECONDITION DISCIPLINE AS (n2)/(m): the absence arms below are about a line the
+# UNMUTATED rail must NOT print on this scenario, so assert the answer it DOES print first. A
+# scenario that had drifted to a different check name would otherwise satisfy every absence arm
+# at once and prove nothing about the digits guard.
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_UNMAPPED/err" 2>/dev/null \
+  && pass "(n3) precondition: the UNMUTATED rail on this scenario prints today's absence answer" \
+  || fail "(n3) precondition FAILED — the unmutated rail did not print the absence answer, so the absence arms below would pass vacuously: $(grep -c 'base:' "$SCEN_UNMAPPED/err" 2>/dev/null || printf 'unreadable')"
+SCEN="$SCEN_UNMAPPED" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD3/admin-merge.sh" 42 --main-runs 1 >"$SCEN_UNMAPPED/px-out" 2>"$SCEN_UNMAPPED/px-err"
+prc=$?
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && pass "(n3) the widened mutant still refuses at step 1c" \
+  || fail "(n3) the widened mutant did not reach step 1c (exit $prc): $(head -3 "$SCEN_UNMAPPED/px-err" 2>/dev/null)"
+grep -q "base: base-caused via" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && fail "(n3) widening the PATTERN alone mapped 'bash-suites-gate' — the digits guard is not load-bearing" \
+  || pass "(n3) …and the DIGITS guard alone still rejects 'bash-suites-gate' (a prefix rule is not enough)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_UNMAPPED/px-err" 2>/dev/null \
+  && pass "(n3) …falling through to today's unqualified absence answer" \
+  || fail "(n3) the widened mutant printed no absence answer either: $(grep -n 'base:' "$SCEN_UNMAPPED/px-err" 2>/dev/null | head -3)"
+
 # ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
+# ⛔ THE SCENARIO IS RE-POINTED EXPLICITLY (#2610 review, cycle 2 P1). `SCEN` is a GLOBAL that
+# each `new_scen` overwrites, so this block used to run the mutant in whichever scenario the
+# LAST arm happened to open. Adding scenarios (n1)/(n2) above moved that to a scenario whose
+# check is `bash-suites-gate`, where the grep below is satisfied by BOTH branches — the arm
+# could no longer fail, and a regression that deleted the naming arm outright would have kept
+# the suite green. Pin the scenario the assertion is ABOUT (named-refusal: check
+# `bash-suites (5)`, a real run, the mapped arm) instead of inheriting one.
 MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
 grep -v 'named_unattributable_runs "$TMP/pr-unattributed.txt"' "$ADM" > "$MUTD/admin-merge.sh"
 cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
 bash -n "$MUTD/admin-merge.sh" \
   && pass "(m) the mutant (naming arm deleted) is still valid bash" \
   || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
-SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
-  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN_EQ/mut-out" 2>"$SCEN_EQ/mut-err"
 mrc=$?
+# ⛔ THE ARM MUST BE ABLE TO FAIL: the SAME scenario run through the UNMUTATED rail must print
+# the check's name, or the absence below proves nothing.
+grep -q "check 'bash-suites (5)'" "$SCEN_EQ/err" 2>/dev/null \
+  && pass "(m) the scenario this mutation runs actually exercises the named check" \
+  || fail "(m) the pinned scenario never printed the check's name — the mutation would be vacuous"
 # The SAME refusal must still fire — a mutant that died earlier would make the absence arm
 # vacuously true, so the arm below is only meaningful once THIS one holds.
-grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/mut-err" 2>/dev/null \
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/mut-err" 2>/dev/null \
   && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
-  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN/mut-err" 2>/dev/null)"
-grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
+  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN_EQ/mut-err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN_EQ/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
