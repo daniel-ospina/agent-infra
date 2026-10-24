@@ -951,7 +951,11 @@ seed_payload "$STORE9" "$K_WS4" "{\"pr\":2010 , \"head_sha\":\"$HEAD_A\" , \"ver
 printf '{"pr":2010 , "head_sha":"%s" , "verdict":"clean" , "repo":"daniel-ospina/agent-infra" , "reviewed_at":"2026-12-31T00:00:00Z"}' "$HEAD_B" > "$BOX12/$K_WS4.json"
 cp "$BOX12/$K_WS4.json" "$T/ws4.before"
 RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
-assert_contains "$RS_LAST" "older_refused=1" "§30d(2) a stamp with a space before the comma still ORDERS (space before the comma is trimmed)"
+# ⛔ ASSERT ON THIS RECORD, NOT ON THE COUNTER: BOX12 already holds §30d's `…-2008` (newer than its
+# own peer), so every later pull in this box also counts one `older_refused` — an `older_refused=1`
+# assertion measured the previous fixture, not this one (and failed in CI for exactly that reason).
+assert_contains "$RS_LAST" "keep daniel-ospina-agent-infra-2010" "§30d(2) a stamp with a space before the comma still ORDERS (space before the comma is trimmed)"
+assert_contains "$RS_LAST" "unreadable=0" "§30d(2) ...and no field with a trailing space is read as unusable"
 if cmp -s "$BOX12/$K_WS4.json" "$T/ws4.before"; then
   ok "§30d(2) ...and the newer local record survives byte-identically"
 else
@@ -997,6 +1001,44 @@ printf '{\n  "pr": 2102,\n  "evidence": {"head_sha": "%s"},\n  "head_sha": "%s",
 RS_LAST="$(rsx "$STORE10" "$BOX13" push 2>&1)"; RS_RC=$?
 assert_eq "$RS_RC" "4" "§30e push refuses an ambiguous LOCAL record (exit 4)"
 assert_contains "$RS_LAST" "not one this box's rail can USE" "§30e ...naming the reason"
+assert_contains "$RS_LAST" "a record this box cannot USE was skipped" "§30e ...and the summary does not blame the store for a LOCAL defect"
+
+# ── §30f: the FOURTH SURFACE. `pull_one` gates the PEER record, but every arm below decides by
+# comparing `field` readings of THIS box's record against it — so an ambiguous LOCAL record decides
+# too. Measured before the fix: a local record with a nested `evidence.reviewed_at` on an earlier line
+# read 2020 to `field` while json (the rail) read 2026-12-31, so the peer looked NEWER and an older
+# `clean` REPLACED a newer `not-clean` (`wrote=1 older_refused=0 conflicts=0`, exit 0) — rule 1
+# defeated on the one surface the earlier gates did not cover.
+echo "── §30f an ambiguous LOCAL record is never ordered against (rule 1 cannot be defeated)"
+K_AMBLOCAL="daniel-ospina-agent-infra-2201"
+seed_payload "$STORE10" "$K_AMBLOCAL" "{\"pr\":2201,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T10:00:00Z\"}"
+printf '{\n  "pr": 2201,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "not-clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-12-31T00:00:00Z"\n}\n' "$HEAD_B" > "$BOX13/$K_AMBLOCAL.json"
+cp "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30f an ambiguous local record makes the pull NOT converged (exit 4)"
+assert_contains "$RS_LAST" "json vs field" "§30f ...naming the two-reader cause"
+if printf '%s' "$RS_LAST" | grep -q 'wrote=1'; then bad "§30f an older peer record was WRITTEN over a newer local one"; else ok "§30f ...and no peer record was written over it (rule 1 holds)"; fi
+if cmp -s "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"; then
+  ok "§30f ...and the local record is byte-identical afterwards"
+else
+  bad "§30f the local record was rewritten from an older peer"
+fi
+
+# ── §30g: the reader's edge shapes. `"key": null` is valid JSON and BOTH readers see no value, so it
+# must stay USABLE (refusing it would wedge a legitimate record for ever); a COMPARED value holding a
+# non-ASCII character must be REFUSED (a real U+2028 made the shell sed truncate where the python
+# replica did not, so the slow path would decide on a truncated value the gate had just vouched for).
+echo "── §30g the reader's edge shapes: null is usable, non-ASCII compared values are not"
+K_NULL="daniel-ospina-agent-infra-2202"
+seed_payload "$STORE10" "$K_NULL" "{\"pr\":2202,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"supersedes\":null}"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_contains "$RS_LAST" "pulled daniel-ospina-agent-infra-2202" "§30g a record whose compared key is null still materialises"
+K_UNI="daniel-ospina-agent-infra-2203"
+seed_payload "$STORE10" "$K_UNI" "{\"pr\":2203,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\u2028x\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_contains "$RS_LAST" "unreadable=" "§30g a non-ASCII COMPARED value is refused (the two readers cannot be shown to agree)"
+if printf '%s' "$RS_LAST" | grep -q 'pulled daniel-ospina-agent-infra-2203'; then bad "§30g the non-ASCII record was installed"; else ok "§30g ...and it is not installed"; fi
+
 if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null; then
   bad "§30e the ambiguous record was PUBLISHED anyway"
 else

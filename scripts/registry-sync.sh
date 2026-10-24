@@ -319,30 +319,47 @@ def rec(p):
 # compared keys are not unambiguous in BOTH readings is UNREADABLE (exit 4) — never guessed at.
 AGREED_KEYS = ("reviewed_at", "pr", "verdict", "head_sha", "repo", "mint", "carried_from", "merge_base_sha", "supersedes")
 FIELD_TAIL = re.compile("([^\",}]*)\"?")
+# ⛔ FAITHFUL TO sed, BYTE FOR BYTE — a divergence here refuses a legitimate record as `unreadable`
+# for ever (measured on a /tmp variant: a record read identically by json and by the shell sed was
+# still refused, because this function disagreed with BOTH). Three traps, each one measured:
+#   * `str.splitlines()` also splits on U+2028/U+2029/VT/FF; sed splits on `\n` only.
+#   * `open()` defaults to universal newlines, turning a lone CR into a line break sed never sees.
+#   * python `[ \t]` is not POSIX `[[:space:]]` (which also has \r \f \v), and `str.strip()` strips
+#     more than the shell trim does.
+SPACE = " \t\r\v\f"
 def field_text(text, name):
-    # A faithful replication of `field()`: first LINE that matches, LAST match on that line (the sed
-    # prefix is greedy), capture up to the first quote/comma/brace, then trim. Any divergence between
-    # this and the shell sed is a bug in one of them, so the agreement test is what pins them.
-    pat = re.compile("\"" + re.escape(name) + "\"[ \\t]*:[ \\t]*\"?")
-    for line in text.splitlines():
+    pat = re.compile("\"" + re.escape(name) + "\"[" + SPACE + "]*:[" + SPACE + "]*\"?")
+    for line in text.split("\n"):
         last = None
         for m in pat.finditer(line):
             last = m
         if last is None:
             continue
         tail = FIELD_TAIL.match(line, last.end())
-        return (tail.group(1) if tail else "").strip()
+        return (tail.group(1) if tail else "").strip(SPACE)
     return ""
 def agrees(p):
-    text = open(p, encoding="utf-8", errors="replace").read()
+    text = open(p, encoding="utf-8", errors="replace", newline="").read()
     d = rec(p)
     if d is None:
         return False
     for k in AGREED_KEYS:
         jv = d.get(k)
         tv = field_text(text, k)
+        # ⛔ NO NON-ASCII IN A COMPARED VALUE. Every compared value is ASCII by construction (a
+        # 40-hex sha, a stamp, a verdict token, an owner/name, an int). A multi-byte character makes
+        # the two readers disagree in a way this program cannot model: a real U+2028 in `repo` made
+        # the SHELL sed truncate the value ("o/r") while the text replica kept it whole — i.e. the
+        # slow path would decide on a truncated value that this gate had just vouched for. Refusing
+        # is the conservative direction and it is locale-independent; a record that needs a
+        # non-ASCII compared value is not one the rail can bind to a key anyway.
+        for v in (jv, tv):
+            if isinstance(v, str) and not v.isascii():
+                return False
         if jv is None:
-            if tv != "":
+            # `"key": null` is valid JSON and BOTH readers see no value; the text capture reads the
+            # literal `null`, so accepting it here is not a relaxation, it is the same answer.
+            if tv not in ("", "null"):
                 return False
             continue
         if isinstance(jv, bool) or not isinstance(jv, (str, int)):
@@ -907,7 +924,7 @@ pull_one() { # <key>
   # ⛔ USABILITY BEFORE ORDERING. A record the rail cannot read must never win the comparison: it
   # would replace a usable local record with bytes `read_record` refuses (see `record_usable`).
   if ! record_usable "$tmp"; then
-    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
+    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, not strict JSON, or its compared fields do not read the same way twice — json vs field); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
     rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
   # ⛔ THE KEY MUST MATCH WHAT THE RECORD SAYS IT IS, on the way IN as well as out. `push` refuses
@@ -938,6 +955,19 @@ pull_one() { # <key>
   lf=""
   if lf="$(local_record_for_key "$key")" && [ -n "$lf" ]; then
     same_bytes "$lf" "$tmp" && { SAME=$((SAME + 1)); rm -f "$tmp"; return 0; }
+    # ⛔ THE FOURTH SURFACE. The peer is gated above, but every arm below DECIDES by comparing
+    # `field` readings of THIS box's record against the peer — so an ambiguous local record decides
+    # too. Measured with a nested `evidence.reviewed_at` on an earlier line: `field` read 2020 while
+    # json (the rail) read 2026-12-31, so the peer looked NEWER and an older `clean` REPLACED a newer
+    # `not-clean` (`wrote=1 older_refused=0 conflicts=0`, exit 0); the same shape with a nested
+    # `evidence.head_sha` reported a real head divergence as `same`. Refusing to order against an
+    # ambiguous local record is the only direction that cannot destroy a usable verdict: the peer's
+    # bytes are NOT installed here, so a box holding a corrupt record stays put until that record is
+    # fixed or removed (which the rail cannot use it either way) — never silently downgraded.
+    if ! record_usable "$lf"; then
+      warn "  ⚠️ skip $key — this box's LOCAL record is not one the rail can USE, or its compared fields do not read the same way twice (json vs field), so no peer record can be ordered against it (#2374 rule 1). Fix or remove that local file; the peer's bytes can then be pulled."
+      UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+    fi
     lat="$(field "$lf" reviewed_at)"
     if [ -n "$lat" ] && [[ "$lat" > "$rat" ]]; then
       say "  · keep $key — this box is NEWER ($lat > $rat); an older record never overwrites a newer one (#2374 rule 1)"
@@ -1186,7 +1216,10 @@ summary() { # <verb>
   fi
   if [ "$UNREADABLE" -gt 0 ]; then
     warn "registry-sync.sh: $UNREADABLE record(s) were SKIPPED because they could not be read or ordered — this is"
-    warn "  NOT a converged state (the store holds records this box cannot use). Nothing was overwritten."
+    # ⛔ "the STORE holds records this box cannot use" was wrong on two of the three arms: `push`
+    # publishes LOCAL records and `pull` now also refuses to order against an unusable LOCAL record,
+    # so the defect can be either side. Name the state, not a side.
+    warn "  NOT a converged state (a record this box cannot USE was skipped, on the store side or this box). Nothing was overwritten."
     return 4
   fi
   return 0
