@@ -1085,6 +1085,17 @@ INCOMPLETE SURFACES
 
 VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (open PRs)')"
   holder_run "$D8" f3; ck "a title echo cannot forge a holder-only INCOMPLETE (the verdict line is the answer, the body is not)" "$(holder_queued "$D8")"
+  # (f4) A SURFACE-TABLE-ONLY REPORT — NO `INCOMPLETE SURFACES` BLOCK (#1977 review, P2). The producer
+  # emits both shapes (see `mk_tool_incomplete … table` in origination-funnel.test.sh) and the measured
+  # cell output quoted in #1935 is this one, yet every fixture here carried the block — so the block-row
+  # grep read TRUE in the suite and FALSE on the live cell, and the headline fix was a no-op there
+  # (fail-closed, so silent). The row is read through `preflight_unusable_surfaces`, which handles both
+  # shapes; this arm is what makes that a requirement instead of an accident.
+  D9="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board live-session store could not be read
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D9" f4
+  if [ "$(holder_queued "$D9")" = 1 ]; then ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 0; else ck "a TABLE-ONLY holder report (no INCOMPLETE SURFACES block) IS re-routed — the shape the live cell emits" 1; fi
 fi
 
 # ── 5m) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────
@@ -1216,6 +1227,33 @@ case "$(cat "$TMP/repo-localpath.out")" in
   *) xr=1 ;;
 esac
 ck "…and the resolver really returned 0 for it (the NOTE is not printed on the way to a refusal)" $xr
+
+# ⛔ "DECLARED" IS THE OPERATOR'S CLAIM, NOT THE VARIABLE'S PRESENCE (#1977 review, P1).
+# `orch-loop.sh` EXPORTS `OR` on EVERY cycle — including the one where it fell back to its own default —
+# so a child that reads mere presence as "declared" refuses the local-path checkout above on EVERY
+# production pass (rc 3 → `.refresh-blocked` → a merge-only cell), while the loop's own comment calls
+# that shape legitimate. The loop therefore passes its intent in `OR_OPERATOR_DECLARED`, and these
+# three arms pin the distinction: intent=0 tolerates, intent=1 proves, no marker keeps the old rule.
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
+  HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-localpath-loop.out")" in
+  *"cannot prove it is a checkout"*) xr=1 ;;
+  *"the pairing is not cross-checked"*) xr=0 ;;
+  *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
+esac
+ck "an EXPORTED \$OR the loop DERIVED (OR_OPERATOR_DECLARED=0) does not refuse a local-path checkout" $xr
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
+  HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=1 O="$TMP/repolocalpath/op1" bash "$REFRESH" --check > "$TMP/repo-localpath-decl.out" 2>&1 ); rc=$?
+[ "$rc" -eq 3 ] && xr=0 || xr=1
+ck "an OPERATOR-DECLARED \$OR (OR_OPERATOR_DECLARED=1) still REFUSES a local-path checkout (rc=3)" $xr
+# ⛔ AND THE REFUSAL IS THE ONLY MESSAGE. `repo_unresolved` speaks for an UNSET $REPO; on a rejected
+# EXPLICIT one it appended "$REPO is not set" beside the true reason and prescribed the value already
+# in hand — two contradictory refusals in one run (review P2).
+case "$(cat "$TMP/repo-localpath-decl.out")" in
+  *"is not set"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "a REJECTED explicit \$REPO is not also reported as UNSET (one cause, one message)" $xr
 
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────

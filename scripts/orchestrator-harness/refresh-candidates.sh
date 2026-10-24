@@ -15,7 +15,20 @@
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
 OR_FROM_ENV="${OR:-}"
-OR_DECLARED=0; [ -n "$OR_FROM_ENV" ] && OR_DECLARED=1
+# ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
+# `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
+# (#2040: the export is load-bearing, since this script runs as its child). Presence therefore marked
+# every production run DECLARED, and a checkout whose `origin` is a local path or `file://` remote was
+# then REFUSED with rc 3 — a merge-only cell — on the very shape the loop's own comment calls
+# legitimate ("a local mirror or a `file://` origin is a legitimate checkout, and refusing to start
+# would turn a grading mismatch into a dead cell"). The loop now says whether the OPERATOR named OR,
+# in OR_OPERATOR_DECLARED; absent that marker (a hand-run, bring-up, or an operator shell) the old
+# rule stands, because there an exported OR really IS the operator's claim and must be proven.
+OR_DECLARED="${OR_OPERATOR_DECLARED:-}"
+case "$OR_DECLARED" in
+  0|1) ;;
+  *) OR_DECLARED=0; [ -n "$OR_FROM_ENV" ] && OR_DECLARED=1 ;;
+esac
 OR="${OR_FROM_ENV:-daniel-ospina/tortoise}"
 # ⛔ THE LANDED PRUNE MUST NOT ACT ON A REPO NOBODY NAMED (review P1, cycle 4). The listings below only
 # ever READ `$OR`, and a wrong `$OR` there cost a wrong listing. The landed prune is a WRITE: it DROPS
@@ -948,7 +961,14 @@ cmd_check() {
   # The checkout first: every verdict below is about THIS repo, so an unresolved $REPO is not a
   # per-issue "repo not found" (transient, retried forever) — it is provisioning, and retrying
   # cannot mend it.
-  if ! resolve_repo; then repo_unresolved; return "$EXIT_NOT_PROVISIONABLE"; fi
+  # ⛔ repo_unresolved() SPEAKS ONLY FOR AN UNSET $REPO (#1977 review, P2). When the operator DID set
+  # one and the resolver rejected it (unprovable origin, mismatch), resolve_repo has already printed
+  # that reason; adding "$REPO is not set" beside it is a second, FALSE refusal whose remedy is the
+  # value already in hand.
+  if ! resolve_repo; then
+    [ -n "$REPO" ] || repo_unresolved
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
   # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
   # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and each of
   # those already performs ONE `gh auth status` itself — the supervisor's in cmd_check, the bringup's
@@ -1384,7 +1404,10 @@ if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 refresh_stage provision "provisioning (state dir, gh environment, scout worktree, interpreter)"
 # Same refusal on the run path, before any network work: a pass that cannot say which checkout it
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
-if ! resolve_repo; then repo_unresolved; exit "$EXIT_NOT_PROVISIONABLE"; fi
+if ! resolve_repo; then
+  [ -n "$REPO" ] || repo_unresolved
+  exit "$EXIT_NOT_PROVISIONABLE"
+fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
@@ -3568,15 +3591,29 @@ while read -r N; do
     # Re-routing the second shape would ask `refs/claims/issue-<N>` instead of believing the board —
     # and a lane that took no claim (started by hand) or whose lease EXPIRED (claims.sh returns CLEAN
     # for an expired claim) has no live ref, so the candidate would be queued WHILE a lane is
-    # attributed to it: the duplicate-dispatch class this gate exists to prevent. The line is matched
-    # ANCHORED at the report's own two-space hit shape, so a surface name or heading quoted in an
-    # issue title (which the tool echoes) cannot forge it.
-    # Same here-string discipline as `hits_blocking` above (#841/#864): the piped quiet grep takes
-    # SIGPIPE on a large report and reads FALSE, which is the one condition that turns a board that
-    # DID answer into a claim-registry substitution.
-    if [ "$HOLDER_ONLY" -eq 1 ] && [ "$hits_blocking" -eq 0 ] && \
-       grep -qE '^  \[issue assignee/holder\] claim gate: the FLEET BOARD could not answer' <<<"$PRE"; then
-      HOLDER_BY_CLAIMS=1
+    # attributed to it: the duplicate-dispatch class this gate exists to prevent. FORGING is refused by
+    # the parser's own grammar rather than by an anchor: a row only counts when its STATUS token is
+    # INCOMPLETE/DEGRADED, so a surface name quoted in an issue title (which the tool echoes) — a bare
+    # line with no status column — never becomes a row.
+    # ⛔ THE ROW IS READ THROUGH THE SHAPE-INDEPENDENT PARSER, NOT A BARE BLOCK-ROW GREP (#1977
+    # review, P2 — a fail-CLOSED no-op). `preflight_unusable_surfaces` exists precisely because the
+    # producer emits two report shapes: the canonical `INCOMPLETE SURFACES` block (`  [surface] note`)
+    # and a SURFACE-TABLE-ONLY report, which is the shape the measured cell output in #1935 shows and
+    # this repo's own fixtures render (`origination-funnel.test.sh`, `mk_tool_incomplete … table`). A
+    # grep anchored on the block row never matches the table shape, so the re-route silently did not
+    # fire and the cell kept refusing every candidate — the headline fix reading as a no-op while
+    # every fixture carried the block. Requiring the ROW (surface AND the whole-board note prefix)
+    # from the parser keeps the condition the same and makes it independent of which shape arrived.
+    # A here-string, not a pipe: the piped quiet grep takes SIGPIPE on a large report and reads FALSE
+    # (#841/#864), which would turn a board that DID answer into a claim-registry substitution.
+    holder_note=""
+    if [ "$HOLDER_ONLY" -eq 1 ] && [ "$hits_blocking" -eq 0 ]; then
+      holder_note="$(preflight_unusable_surfaces "$PRE" 2>/dev/null | awk -F'\t' '$1 == "issue assignee/holder" { print $2; exit }')" || holder_note=""
+    fi
+    case "$holder_note" in
+      'claim gate: the FLEET BOARD could not answer'*) HOLDER_BY_CLAIMS=1 ;;
+    esac
+    if [ "$HOLDER_BY_CLAIMS" -eq 1 ]; then
       echo "[refresh] ?#$N the pre-flight's HOLDER surface could not answer (the fleet board has no cmux lane/session store on this box) — the cross-box claim registry decides the holder question instead of refusing the candidate (agent-infra#1935)"
       V=CLEAN
     fi

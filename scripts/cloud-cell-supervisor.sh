@@ -1083,7 +1083,7 @@ QUEUE_REMOTE=""      # the origin URL we READ from the checkout (empty = nothing
 QUEUE_DERIVED=""     # owner/repo parsed out of it (empty = underivable)
 QUEUE_REPO=""        # the EFFECTIVE queue target the controller session will receive
 QUEUE_DECLARED=""    # what the operator/keys.env asked for (empty = not declared)
-QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable = refuse
+QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable|nocheckout = refuse
 
 # Read the pair. NEVER dies: `status` must still answer when the pair cannot be read — it is the verb
 # an operator runs to discover that it cannot — and every other verb keeps its own preconditions. The
@@ -1095,7 +1095,11 @@ resolve_queue_target() {
   # operator happened to be standing in — and then held the REAL checkout against it. A controller's
   # queue must follow the checkout it names, never the caller's cwd.
   if [ -z "$REPO" ]; then
-    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="unreadable"; return 1
+    # ⛔ ITS OWN STATE, NOT `unreadable` (#1977 review, P2). With no checkout there is no origin
+    # remote to be unreadable, and rendering it as one sent the operator hunting an origin problem on
+    # a repo that does not exist — while `status`, the verb that is supposed to DISCOVER this, printed
+    # an empty path. The cause is the missing checkout, so the state names it.
+    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="nocheckout"; return 1
   fi
   QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
   QUEUE_DERIVED=""
@@ -1174,6 +1178,7 @@ queue_state_text() {
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
     mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
@@ -3175,7 +3180,7 @@ cmd_status() {
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
   # `status` is the verb an operator runs to DISCOVER that the pair is wrong.
-  say "queue: ${QUEUE_REPO:-<unknown>} @ $REPO — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
+  say "queue: ${QUEUE_REPO:-<unknown>} @ ${REPO:-<unset>} — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
   # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
   # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
   if [ -f "$STAMP" ]; then

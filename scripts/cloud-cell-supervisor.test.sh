@@ -2019,6 +2019,26 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ⛔ NO CHECKOUT IS ITS OWN STATE, NOT AN "UNREADABLE ORIGIN" (#1977 review, P2). With `REPO` unset
+# there is no checkout and therefore no origin remote to be unreadable, and rendering it as one sends
+# the operator hunting an origin problem on a repo that does not exist — while the path printed empty
+# (`@ — origin <none>`). `status` is the very verb that must DISCOVER this, so it names the cause and
+# the missing value. rc stays 0: the verb reports, it does not refuse.
+qsup status "" "$Q/st-status-nocheckout"
+[ "$Q_RC" -eq 0 ] && ok "status: an UNSET REPO still answers (rc=0) — it is the verb an operator discovers it with" \
+                  || bad "status exited $Q_RC with no checkout, so nothing answers the discovery question"
+case "$Q_OUT" in
+  *"@ <unset>"*) ok "status: names the missing checkout value (<unset>) instead of printing an empty path" ;;
+  *) bad "status printed no <unset> placeholder for a missing REPO — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NO CHECKOUT"*) ok "status: says NO CHECKOUT when REPO is unset" ;;
+  *) bad "status did not name the missing checkout as the cause — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"no origin remote"*) bad "status blamed a missing origin remote on a checkout that does not exist — $Q_OUT" ;;
+  *) ok "status: does not misattribute the missing checkout to an unreadable origin" ;;
+esac
 # ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
 # MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
 # environment, not the caller's, so an ambient export silently vanishes when a server already exists —
