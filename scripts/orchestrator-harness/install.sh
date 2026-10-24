@@ -1091,7 +1091,7 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"; ;;
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
