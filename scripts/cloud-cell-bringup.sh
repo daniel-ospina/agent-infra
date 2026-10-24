@@ -1283,6 +1283,35 @@ check_harness_apply() {
   next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
   ok "harness activation scheduled — timer next=${next:-?} (record: ${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.status)"
 }
+# ── the two periodic passes: objective reminder + controller watchdog (agent-infra#2691) ────────
+# Both were built on the operator's Mac and stayed there. On a cell they are systemd timers (the same
+# mechanism the disk reaper uses), rendered by install-cell-timers.sh. This check RUNS that install verb
+# and READS IT BACK, exactly as check_disk_reaper and check_controller_service do — a cell that cannot
+# schedule them is REFUSED, because a reminder that never fires is the failure mode with no signal (it
+# exits 0 and writes one log line nobody reads), and a watchdog with no clock protects nothing.
+check_cell_timers() {
+  local installer="" out rc
+  for cand in "${CELL_TIMERS_INSTALLER:-}" \
+              "${LAYER_ROOT:-}/scripts/install-cell-timers.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-cell-timers.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-cell-timers.sh not found (looked at \$CELL_TIMERS_INSTALLER, \$LAYER_ROOT/scripts, and beside this script) — the objective reminder and the controller watchdog would never run on this cell, and neither absence reds anything"
+  # The env is built as an ARRAY, not a string: a checkout path with a space in it would otherwise split
+  # into two assignments and render units pointing at the wrong tree (the same failure the disk reaper's
+  # installer refuses at install time; this avoids producing it at all).
+  local -a cenv=(CELL_HOME="${CELL_HOME:-$HOME}" O="${O:-${CELL_HOME:-$HOME}/orchestrator}")
+  [ -n "${LAYER_ROOT:-}" ] && cenv+=("TEMPLATES_DIR=$LAYER_ROOT/templates/systemd")
+
+  rc=0
+  out="$(env "${cenv[@]}" bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the cell timers could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager with linger) before this cell is used; an unscheduled reminder and watchdog are silent by construction"
+  rc=0
+  out="$(env "${cenv[@]}" bash "$installer" --status 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the cell timers are not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  ok "periodic passes scheduled — objective reminder (10 min) and controller watchdog (5 min) are enabled and active"
+}
 
 # ── controller: the SERVICE that keeps the dispatcher alive (agent-infra#2402) ──────────────────
 # The controller lived and died as a tmux SESSION, and a tmux session has nothing above it: when the box
@@ -1385,6 +1414,10 @@ main() {
       # either earlier would probe a directory that has not been populated yet.
       check_harness_apply
       check_controller_service
+      # AFTER the controller service: the two periodic passes (objective reminder, controller watchdog)
+      # are systemd timers on the SAME manager this box just proved it has. Without this check they are
+      # "reachable" only in the sense that a template exists — which is the inert-enforcer shape.
+      check_cell_timers
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
