@@ -452,7 +452,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-group-apostrophe-comment.yml" "$CFIX/pr-on-column0-sequence.yml" \
   "$CFIX/pr-on-sequence-mapping.yml" \
   "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml" \
-  "$CFIX/push-flow-apostrophe-false.yml"
+  "$CFIX/push-flow-apostrophe-false.yml" "$CFIX/push-on-flow-apostrophes-false.yml" \
+  "$CFIX/pr-workflow-ref.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -499,6 +500,9 @@ for pair in \
   "pr-group-apostrophe-pair-comment.yml R1" \
   "pr-multiline-value-sha.yml R1" \
   "push-flow-apostrophe.yml R2" \
+  "push-on-flow-apostrophes.yml R2" \
+  "pr-on-flow-apostrophes.yml R1" \
+  "pr-workflow-sha.yml R1" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -604,6 +608,19 @@ if grep -q 'no pull_request-triggered workflow was found' "$OUT"; then
   sed 's/^/      /' "$OUT"
 else
   pass "the unreadable workflow is not also reported as no PR workflow found"
+fi
+
+# The awk program the checker RUNS must be the program in the file. The program is single-quoted, so a
+# bare apostrophe in one of its comments closes the shell string early; `conc_run` folds 2>&1 into
+# $OUT, which HID that (the breakage showed up as `command: not found` on stderr while every assertion
+# still passed). Assert stderr is empty so a future edit cannot reintroduce it unseen (#2660 round 12).
+ERROUT="$(mktemp "${TMPDIR:-/tmp}/wfconc-err.XXXXXX")"
+bash "$CONC" "$CFIX/pr-ok.yml" >/dev/null 2>"$ERROUT"
+if [ -s "$ERROUT" ]; then
+  fail "the checker wrote to stderr (its awk program may be mis-quoted)"
+  sed 's/^/      /' "$ERROUT"
+else
+  pass "the checker runs its own awk program (stderr empty)"
 fi
 
 # Two different workflows using the canonical format() idiom are disjoint at runtime. Judging them by

@@ -274,17 +274,18 @@ function stripcomment(s,   out, i, n, c, q, nx) {
   if (q != "") return stripcomment_simple(s)
   return out
 }
-# has_closing(s, i, q) — TRUE when a quote of the same kind as s[i] closes later on the line, which
-# is what distinguishes a quoted VALUE (a shell-quoted JSON blob in a `run:` scalar) from a stray
-# apostrophe inside a plain scalar.
-function has_closing(s, i, q,   j, n, c) {
-  n = length(s)
-  for (j = i + 1; j <= n; j++) {
-    c = substr(s, j, 1)
-    if (q == DQ && c == "\\") { j++; continue }
-    if (c == q) return 1
-  }
-  return 0
+# qopens(s, i) — TRUE when the quote at s[i] opens a quoted scalar. Two independent tests, and both
+# are needed: a VALUE position (a quoted group value, a quoted list item, a quoted word after a
+# colon or a colon-space) always opens one, and
+# anywhere else only a quote that cannot be inside a word does. "a second quote appears later" is NOT
+# such a test: two plain scalars each carrying one apostrophe (a description reading Dont-ask, then a
+# second reading its-fine) paired up across a separating comma and swallowed every flow entry between
+# them — the trigger set lost its `push` and `workflow_call` entirely (#2660 round 12).
+function qopens(s, i,   p) {
+  if (at_val_start(s, i)) return 1
+  if (i <= 1) return 1
+  p = substr(s, i - 1, 1)
+  return (p !~ /[A-Za-z0-9_]/)
 }
 # at_val_start(s, i) — TRUE when the quote at position i OPENS a quoted scalar: YAML only quotes at a
 # value position, so an apostrophe inside a plain scalar (or inside a comment) is just a character.
@@ -327,7 +328,7 @@ function mask_quoted(s,   out, i, n, c, q, nx, start, seg, j) {
       }
       continue
     }
-    if ((c == DQ || c == SQ) && (at_val_start(s, i) || has_closing(s, i, c))) { q = c; start = i; continue }
+    if ((c == DQ || c == SQ) && qopens(s, i)) { q = c; start = i; continue }
     out = out c
   }
   # UNCLOSED quote: a plain scalar with an apostrophe, not a string. Returning the raw line keeps the
@@ -353,7 +354,7 @@ function splitqv(v, arr,   n, i, c, q, cur, len, nx) {
       }
       continue
     }
-    if ((c == DQ || c == SQ) && (at_val_start(v, i) || has_closing(v, i, c))) { q = c; cur = cur c; continue }
+    if ((c == DQ || c == SQ) && qopens(v, i)) { q = c; cur = cur c; continue }
     if (c == ",") { arr[++n] = cur; cur = ""; continue }
     cur = cur c
   }
@@ -602,7 +603,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
     printf '  %-32s %-46s %s\n' "$fname" "${triggers:-<none>}" "$choice"
   fi
 
-  # R4's bookkeeping records that this file WAS scanned, before any refusal can `continue` past it.
+  # The R4 exemption bookkeeping records that this file WAS scanned, before any refusal can
+  # `continue` past it.
   # Recorded only in the R4 arm, a guard refused by R0 was additionally reported as "named in
   # EXEMPT_FILES but no such PR-triggered workflow was scanned" — a false second diagnostic that sends
   # the author looking for a rename (round 8, P2).
@@ -640,11 +642,12 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
   has_trigger "$triggers" push && is_push=1
   is_reusable=0
   has_trigger "$triggers" workflow_call && is_reusable=1
-  # R3's hazard is that a callee's `concurrency` groups two CALLERS together. A workflow that is both
-  # reusable AND PR-triggered must declare a cancelling block to satisfy R1, and in the callee's
+  # The R3 hazard is that the block inside a callee groups two CALLERS together. A workflow that is
+  # both
+  # reusable AND PR-triggered must declare a cancelling block to satisfy R1, and in that
   # context that block is exactly this hazard — one block cannot serve both, so the combination is
   # refused rather than half-satisfied in silence (round 5, P2). `pipeline-compliance.yml` carries
-  # both triggers but no block, so it keeps satisfying R3's absence rule.
+  # both triggers but no block, so it keeps satisfying the R3 absence rule.
   if [ "$is_reusable" -eq 1 ] && [ "$is_pr" -eq 1 ] && [ "$hasconc" -eq 1 ]; then
     fail "$fname: triggers BOTH \`workflow_call\` and a pull-request event — R1 requires a cancelling block, and in the callee's context that block groups two CALLERS on one ref together (R3). Split the reusable workflow out [R3]"
   fi
@@ -687,7 +690,7 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
           "$stem"-*|*'github.workflow'*) : ;;
           *) fail "$fname: \`concurrency.group\` ('$group') does not carry this workflow's own identity — expected a '$stem-' PREFIX or \`github.workflow\`; two workflows on one PR would cancel EACH OTHER [R1]" ;;
         esac
-        # The group a RUN will see: `github.workflow` is the workflow's NAME, not its file name, so
+        # The group a RUN will see: `github.workflow` is the NAME, not the file name, so
         # the comparison must resolve it — otherwise two workflows with different names that share
         # the canonical `${{ github.workflow }}-${{ github.ref }}` idiom would be false-red as
         # "they would cancel each other" (round 2 P2), when their runtime groups differ.
@@ -698,7 +701,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # was refused as "they would cancel each other", and a genuinely shared group was missed
         # (round 5, P2). sed is anchored on `[^}]*` so two expressions on one line are two matches.
         # The identity is the workflow NAME, so every reference to it must be resolved before two
-        # files are compared — including one inside `format('{0}-{1}', github.workflow, …)`, where a
+        # files are compared — including one inside the `format` idiom whose args are (0)-dash-(1)
+        # style placeholders plus github.workflow, where a
         # template-level sed cannot reach it (its `}` closes the pattern first). Comparing the raw
         # template refused two DIFFERENT workflows as sharing one group (round 11, P2).
         resolved="${group//'github.workflow'/$identity}"
@@ -711,7 +715,7 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # test, not a closed set of spellings: `github.event.pull_request.head.sha` (the canonical
         # per-head key) contains no `github.sha` substring and passed before (round 4, P1).
         case "$group" in
-          *'.sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
+          *'.sha'*|*'_sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
             fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` / \`github.head_ref\` alone [R1]" ;;
           *)
             if has_trigger "$triggers" pull_request_target; then
