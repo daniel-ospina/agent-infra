@@ -226,7 +226,7 @@ printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"   # header onl
 printf '60\n' > "$T/swappiness"                                     # the image default, so the pin is a CHANGE
 SWAP_LOG="$T/swap-calls.log"
 # `fallocate` allocates SPARSELY for the fixture (dd seek), so a 4 GiB request costs no disk here.
-printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
+printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\nn="${sz%%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || exit 1\n[ "$(wc -c < "$f")" = "$((n * 1048576))" ] || exit 1\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/fallocate"
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "mkswap $*" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/mkswap"
 # `swapon <file>` appends a REAL /proc/swaps row (path, type, size_kb, used_kb, prio) to the fixture,
 # so the script's own reading of the swap record is what the case asserts on. `--show` is only there
@@ -243,7 +243,7 @@ mkdir -p "$T/home" "$T/tok"
 # masked because the developer shell exports AGENT_INFRA_PATH, which the installer accepted instead —
 # the arm then asserted a unit whose DISK_REAPER_REPOS named the DEVELOPER'S checkout, not the cell's.
 git init -q "$T/cell" >/dev/null 2>&1 || { echo "fixture: git init failed" >&2; exit 1; }
-git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture \
+git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
     commit -q --allow-empty -m fixture >/dev/null 2>&1 || { echo "fixture: git commit failed" >&2; exit 1; }
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
 TOK="$T/tok/.gh-tok"
@@ -310,10 +310,13 @@ br() {
   # in keys.env is DROPPED" arm stay green even with its own post-source drop deleted (measured: the
   # mutated bring-up still passed that arm as `GH_REPO=daniel-ospina/tortoise` ambient, and reddened
   # without it). The one arm that needs an ambient slug asks for it by name.
-  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
+  # `INFRA_ROOT` is cleared for the same reason as the others: the bring-up tries it FIRST when it
+  # resolves the infra checkout, so a developer shell that exports it makes the layer arms grade a
+  # DIFFERENT checkout (measured: an ambient decoy's installer ran and the suite still reported 142/0).
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
-            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
+            ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
@@ -414,7 +417,7 @@ say_case "the reaper timer scans the CELL's own checkout, never an ambient \$REP
 # OTHER checkout must not win. A decoy repo here makes the two answers DIFFERENT, which is what makes the
 # assertion able to fail: without the fix the unit names the decoy.
 git init -q "$T/decoy" >/dev/null 2>&1 || { echo "fixture: git init decoy failed" >&2; exit 1; }
-git -C "$T/decoy" -c user.email=fixture@example.invalid -c user.name=fixture \
+git -C "$T/decoy" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
     commit -q --allow-empty -m decoy >/dev/null 2>&1 || { echo "fixture: decoy commit failed" >&2; exit 1; }
 printf '%s\n' "$TOK_BODY" > "$TOK"
 rm -f "$T/systemd-units/eldato-disk-reaper.service" "$T/systemd-units/eldato-disk-reaper.timer"
@@ -979,7 +982,7 @@ printf 'DEEPSEEK_API_KEY=fake\nexport REPO=daniel-ospina/tortoise\n' > "$T/keys.
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
 case "$BR_OUT" in
-  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a `*/*` test made this arm unreachable)" ;;
+  *"REPO='daniel-ospina/tortoise' is not an absolute path"*) ok "an owner/name REPO is named, not silently accepted (a '*/*' test made this arm unreachable)" ;;
   *) bad "bring-up accepted REPO=daniel-ospina/tortoise without a word — the guard is inert for the class it names: $BR_OUT" ;;
 esac
 printf 'DEEPSEEK_API_KEY=fake\nexport REPO=/srv/cell/checkout\n' > "$T/keys.env"
