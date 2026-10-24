@@ -133,6 +133,25 @@ STALE_WORKTREE_DAYS="${STALE_WORKTREE_DAYS:-7}"
 # gates (clean / unreferenced / reachable / aged) still decide every individual removal.
 HYGIENE_WORKTREES="${HYGIENE_WORKTREES:-auto}"
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
+# ── the sinks this harness's OWN family fills (agent-infra#2573) ─────────────────────────────────
+# THE TEMP DIRS. `cloud-cell-<pid>.<rand>` is what this family's `mktemp -d` leaves under $TMPDIR, and
+# a run killed by ENOSPC never reaches its trap — so they accumulate for the life of the box. MEASURED
+# 2026-10-21 on cell-3: removing ONE stale `/tmp/cloud-cell-1718.SmGtAK` (plus a docker prune) took
+# the box from 2,506 MB to 27,134 MB free, and the same two steps took cell-4 from 678 MB (below the
+# dispatcher's 1500 MB floor, so every dispatch there was refused) to 11,756 MB.
+HYGIENE_TMP_DIR="${HYGIENE_TMP_DIR:-${TMPDIR:-/tmp}}"
+# ⛔ THE PID IN THE NAME IS THE PROOF, AND IT IS NOT ALWAYS A PID. The token before the first `.` is
+# a pid for `mktemp -d …/cloud-cell-<pid>.XXXXXX`, and then `kill -0` answers it exactly — but the SAME
+# spelling comes from `mktemp -d …/cloud-cell-1718.XXXXXX` (`scripts/cloud-cell-bringup.test.sh`, where
+# 1718 is an ISSUE number) and `…/cloud-cell-test.XXXXXX` (`scripts/cloud-cell-supervisor.test.sh`).
+# On the numeric ones a RECYCLED pid could authorise deleting a LIVE suite's fixture, so a second,
+# independent gate is required: nothing may have been written into the directory for this long. A name
+# that carries no number at all has no liveness proof, so it is REPORTED and never reaped.
+HYGIENE_TMP_MIN_AGE_S="${HYGIENE_TMP_MIN_AGE_S:-3600}"
+# The docker CLI, overridable like every other tool seam here (so the suite can drive the DECISIONS
+# without a daemon). See `hygiene_docker_sweep` for the two verbs this role is allowed to run and the
+# one it is not.
+DOCKER_BIN="${DOCTOR_DOCKER_BIN:-docker}"
 # A role that has not passed inside this window is STALE in `status`. The roles run IN SEQUENCE in
 # one loop, so the bound must cover the WORST PASS IN FRONT OF IT — not two intervals, and not one
 # call: a merge pass is bounded by MERGE_BUDGET_S (checked between candidates, so the last candidate
@@ -148,7 +167,7 @@ DOCTOR_GRACE_S="${DOCTOR_GRACE_S:-300}"
 for _v in DOCTOR_INTERVAL MERGE_INTERVAL HYGIENE_INTERVAL LOOP_TICK REAP_MIN_S REAP_SAMPLE_S \
           CONTROLLER_STALE_S CONTROLLER_START_TIMEOUT RAIL_TIMEOUT MERGE_MAX_PRS MERGE_RETRY_S \
           HYGIENE_TIMEOUT STALE_WORKTREE_DAYS MIN_FREE_MB DOCTOR_GRACE_S REAP_TIMEOUT \
-          READ_CALL_TIMEOUT MERGE_BUDGET_S MERGE_READ_TIMEOUT; do
+          READ_CALL_TIMEOUT MERGE_BUDGET_S MERGE_READ_TIMEOUT HYGIENE_TMP_MIN_AGE_S; do
   num_ok "${!_v}" || { printf 'FATAL: %s must be a whole number 0..999999999 (got "%s")\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WORKTREES must be auto|dry-run|apply (got "%s")\n' "$HYGIENE_WORKTREES" >&2; exit 2 ;; esac
@@ -163,8 +182,8 @@ case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WO
 #     wedge test is vacuous and the reaper KILLS the live lane it exists to spare.
 #   REAP_MIN_S=0 — removes the age floor outright, so a lane younger than the window is eligible.
 for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT \
-          REAP_SAMPLE_S REAP_MIN_S; do
-  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
+          REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S; do
+  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor, and a zero HYGIENE_TMP_MIN_AGE_S leaves a recycled pid as the ONLY proof a temp dir is idle) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
 # not that role's own duration — it is the sum of everything that can run in between. Building each
@@ -1228,15 +1247,447 @@ for p in d:
 
 # ── HYGIENE (the disk the cell fills without noticing) ───────────────────────────────────────────
 # MEASURED: a machine-global `uv` cache reached 7.1 GB and one cell went 258 MB → dispatch refused
-# (#1987); before that, an abandoned 5.8 GB worktree. The two sinks are pruned here, with the
-# shipped tools and the shipped gates — this role adds the SCHEDULE, not another reaper.
+# (#1987); before that, an abandoned 5.8 GB worktree. The sinks are pruned here, with the shipped
+# tools and the shipped gates — this role adds the SCHEDULE, not another reaper.
+#
+# ⛔ WHAT #2573 ADDED, AND WHY IT MATTERED MORE THAN THE SCHEDULE. Three sinks were outside every
+# pass, and the sweep that DID exist disabled itself exactly when the box was busiest:
+#   * `/tmp/cloud-cell-<pid>.<rand>` — this family's own `mktemp -d` dirs, kept for the life of the
+#     box because a run killed by ENOSPC never reaches its trap;
+#   * docker images/volumes no container is using (cell-3 held 24.9 GB of images and 5.2 GB of
+#     volumes while lanes died of ENOSPC);
+#   * the worktree-root cache sweep, which ran only when NO worker session was live — i.e. it
+#     declined to reclaim precisely when the box was busiest, and an unreadable session list had the
+#     same effect.
+# The rule those three share is the brief's, and it is not negotiable: RECLAIM ONLY ON PROOF OF
+# IDLENESS, STATE THE PROOF IN THE LOG, AND REPORT ANYTHING UNCLEAR INSTEAD OF REAPING IT. Evidence
+# beats tidiness — a candidate with diagnostic value stays.
+#
+# ⛔ EVERY SAVINGS CLAIM IS A `df` DELTA. A `du` sum is not space the filesystem got back: MEASURED
+# the same night, `du -sm` read 4,115 MB on a directory whose contents summed to ~22 MB, and free
+# space on these boxes OSCILLATES by GBs inside a minute (cell-3: 6570 → 3341 → 2411 MB in 30 s), so
+# one sample is not a state either. The reapers keep their own no-`du` rule; this role reports the
+# filesystem's own answer, signed, and never clamps a negative delta to zero.
+
+# Each sub-sweep leaves its RESULT FRAGMENT in HYG_FRAG and its VERDICT in HYG_SUB_RC (0 = the step
+# ran, or was deliberately not needed; 3 = cannot-verify) — the same split the role's record uses, so
+# a step that could not run can never be folded into a clean pass. ⛔ NOT on stdout and NOT read back
+# through `$( … )`: a command substitution runs in a SUBSHELL, so the verdict assigned inside it is
+# lost and every failed sub-step would arrive at the caller as rc=0 (measured while building this).
+# Every destructive call goes through the pass's STOP fence (`cell_stopped_midpass`) and is VERIFIED
+# afterwards: the artifact, never the send.
+HYG_SUB_RC=0
+HYG_FRAG=""
+
+# `df` in MiB, empty when unreadable — every caller reads empty as "no delta can be claimed".
+hyg_df_mb() { free_mb "${1:-$CELL_HOME}"; }
+
+# "<before>MB → <after>MB (±NMB)", or the abstention. Signed on purpose: a NEGATIVE delta is the
+# truth on a box another lane is writing to, and printing "+0" there would be the same lie inverted.
+hyg_df_delta() { # <before> <after>
+  if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+    printf 'df UNREADABLE (%s → %s) — no delta can be claimed' "${1:-?}" "${2:-?}"
+    return 0
+  fi
+  printf '%sMB → %sMB (%+dMB)' "$1" "$2" "$(( $2 - $1 ))"
+}
+
+# ── (1) THE TEMP DIRS THIS FAMILY LEAVES BEHIND (agent-infra#2573) ───────────────────────────────
+# PROOF REQUIRED, all three, and each is named in the log:
+#   a. the pid its NAME carries is not alive (`kill -0` — exact, because the name carries it);
+#   b. nothing has been written into it for HYGIENE_TMP_MIN_AGE_S (the name is not always a pid —
+#      see the config block — so a recycled pid must not be the only evidence);
+#   c. it is a real directory, not a symlink (we never follow one out of $TMPDIR).
+# ANYTHING UNCLEAR IS REPORTED: no pid in the name, a pid we may not probe (EPERM), an unreadable
+# mtime. A live pid is never touched.
+hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
+  local dry="${1:-}" root d name tok mt age now kerr why walk=""
+  local reaped=0 kept=0 failed=0 would=0 df_before df_after
+  root="${HYGIENE_TMP_DIR:-${TMPDIR:-/tmp}}"
+  HYG_SUB_RC=0
+  HYG_FRAG=""
+  if [ ! -d "$root" ]; then HYG_FRAG="temp: $root absent"; return 0; fi
+  # ⛔ UNREADABLE IS NOT EMPTY. Without this, a root this pass may not list produces the same "0 reaped,
+  # 0 left" as a clean one, and the role reports a sweep it never performed.
+  if [ ! -r "$root" ] || [ ! -x "$root" ]; then
+    log "[hygiene] CANNOT-VERIFY: the temp root $root cannot be listed — no candidate was judged"
+    HYG_FRAG="CANNOT-VERIFY: temp root $root unreadable"
+    HYG_SUB_RC=3
+    return 0
+  fi
+  df_before="$(hyg_df_mb "$root")"
+  now="$(date +%s)"
+  for d in "$root"/cloud-cell-*; do
+    # An unmatched glob stays literal, and a bare path is not ours to judge.
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    name="$(basename "$d")"
+    tok="${name#cloud-cell-}"; tok="${tok%%.*}"
+    why=""
+    if [ -L "$d" ]; then
+      why="it is a SYMLINK, not a temp directory this family created (we never follow one)"
+    elif [ ! -d "$d" ]; then
+      why="it is not a directory"
+    else
+      case "$tok" in
+        ''|*[!0-9]*)
+          why="no pid in the name ('$tok') — this spelling has no liveness proof, so it is not reaped" ;;
+        # ⛔ A NUMBER IS NOT A PID (review round 2, P2). `kill -0` answers two different questions and
+        # this code read both as "dead": a token that CANNOT be a pid proves nothing about liveness.
+        # `kill -0 0` SUCCEEDS (it signals the caller's own process GROUP), so `cloud-cell-0.*` would
+        # otherwise never be reapable; a leading zero is octal to arithmetic; and a date-stamped
+        # spelling like `cloud-cell-20260101.XXXX` is above the kernel pid ceiling yet fails with
+        # "No such process" — i.e. it would be reaped on the age floor alone, which is exactly the
+        # reap-without-proof the no-pid arm above refuses.
+        0|0*) why="the token '$tok' cannot be a pid (0 is a process GROUP and a leading zero is not a decimal pid), so its liveness is UNKNOWN" ;;
+        *)
+          if [ "$tok" -gt 4194304 ]; then
+            why="the token '$tok' is above the kernel pid ceiling (4194304), so it is not a pid and its liveness is UNKNOWN"
+          elif kerr="$(kill -0 "$tok" 2>&1)"; then
+            why="pid $tok from the name is ALIVE"
+          else
+            case "$kerr" in
+              *ermitted*|*"not owner"*|*EPERM*)
+                why="pid $tok from the name cannot be probed here (not permitted), so its liveness is UNKNOWN" ;;
+              # The ONE answer that means "gone": bash says "(pid) - No such process", BSD says
+              # "pid: no such process". Anything else is an answer we could not read.
+              ''|*"No such process"*|*"no such process"*) ;;
+              *)
+                # Any OTHER complaint means `kill` could not answer the liveness question at all — and
+                # an unanswerable probe is not a dead pid.
+                why="the liveness of token '$tok' could not be probed ($(printf '%s' "$kerr" | head -1)), so it is UNKNOWN" ;;
+            esac
+          fi ;;
+      esac
+    fi
+    if [ -z "$why" ]; then
+      mt="$(mtime_epoch "$d")"
+      case "${mt:-}" in
+        ''|*[!0-9]*)
+          why="its mtime cannot be read, so its idleness cannot be proven" ;;
+        *)
+          age=$(( now - mt ))
+          [ "$age" -ge "$HYGIENE_TMP_MIN_AGE_S" ] || \
+            why="it was written to ${age}s ago, under the ${HYGIENE_TMP_MIN_AGE_S}s idle floor (a pid can be recycled)" ;;
+      esac
+    fi
+    if [ -z "$why" ]; then
+      # ⛔ A DIRECTORY'S OWN MTIME DOES NOT MOVE WHEN SOMETHING IS WRITTEN INTO A SUBDIRECTORY
+      # (review, P2). `$d`'s mtime changes only for an entry created/removed at ITS top level; a write
+      # to `$d/sub/file` touches `$d/sub`, never `$d`. On the pid-less spellings the header itself
+      # documents (`cloud-cell-test.XXXXXX`) the age gate was therefore the ONLY gate, blind to exactly
+      # the activity it claimed to have measured — while the log reported "untouched ${age}s" as PROOF.
+      # An entry newer than the directory itself means a descendant was written after the directory's
+      # last change: its age does not cover it, so the candidate is REPORTED, not reaped.
+      # ⛔ NO `-maxdepth` (review round 2, P2): a CREATED entry bumps its parent directory's mtime, but
+      # an in-place APPEND (`echo >> $d/a/b/c/log`) bumps only the FILE's — so any depth bound leaves a
+      # hole a live writer can sit in while the directory's own age stays ancient. The walk is one
+      # linear pass over a candidate that already passed the cheap gates, and `sed -n 1p` reads to EOF
+      # (no SIGPIPE, unlike `head`).
+      # ⛔ THE WALK'S EXIT STATUS IS PART OF THE PROOF (review round 3, P2). `[ -n "$(find …)" ]` cannot
+      # tell "nothing newer" from "the walk did not complete": a find that fails (EACCES below the root,
+      # a resource limit) prints nothing and exits non-zero, and the candidate would then be reaped on
+      # evidence the pass never obtained — with the log asserting "untouched Ns".
+      if ! walk="$(find "$d" -newer "$d" -print 2>/dev/null)"; then
+        why="the nested-write walk over it could not be completed, so its idleness cannot be proven"
+      elif [ -n "$walk" ]; then
+        why="an entry INSIDE it was written after its own mtime (a nested write), so its age does not prove it is idle"
+      fi
+    fi
+    if [ -n "$why" ]; then
+      kept=$((kept + 1))
+      log "[hygiene] temp: LEFT $d — $why"
+      continue
+    fi
+    if [ "$dry" = "--dry-run" ]; then
+      would=$((would + 1))
+      log "[hygiene] WOULD reap temp dir $d (proof: the name's token $tok is not a LIVE pid, it is untouched ${age}s — past the ${HYGIENE_TMP_MIN_AGE_S}s floor — and nothing inside it is newer)"
+      continue
+    fi
+    if cell_stopped_midpass; then
+      kept=$((kept + 1))
+      log "[hygiene] temp: LEFT $d — STOP arrived mid-pass (nothing new is started after a stop)"
+      continue
+    fi
+    # The ARTIFACT is the removal, not `rm`'s exit status.
+    if rm -rf -- "$d" 2>/dev/null && [ ! -e "$d" ] && [ ! -L "$d" ]; then
+      reaped=$((reaped + 1))
+      # ⛔ Name what was MEASURED (review round 7, P2). The name's token is not always a pid — the header
+      # documents `cloud-cell-1718.XXXXXX` (an ISSUE number) and `cloud-cell-test.XXXXXX` (no number) — so
+      # "pid $tok is not alive" claims an evidence the code may not have had, and it omits the gate that
+      # actually protects those spellings: the idle floor (plus the nested-write walk).
+      log "[hygiene] temp: reaped $d (proof: the name's token $tok is not a LIVE pid, it is untouched ${age}s — past the ${HYGIENE_TMP_MIN_AGE_S}s floor — and nothing inside it is newer)"
+    else
+      failed=$((failed + 1))
+      log "[hygiene] CANNOT-VERIFY: could not remove $d — it is STILL THERE"
+    fi
+  done
+  df_after="$(hyg_df_mb "$root")"
+  log "[hygiene] temp: df ($root): $(hyg_df_delta "$df_before" "$df_after") ($reaped reaped, $kept left)"
+  if [ "$failed" -gt 0 ]; then
+    HYG_FRAG="CANNOT-VERIFY: temp $reaped reaped, $failed FAILED to remove"
+    HYG_SUB_RC=3
+    return 0
+  fi
+  if [ "$dry" = "--dry-run" ]; then
+    HYG_FRAG="temp: would reap $would, $kept left"
+  else
+    HYG_FRAG="temp $reaped reaped, $kept left"
+  fi
+}
+
+# ── (2) DOCKER: the images and volumes NOTHING is using (agent-infra#2573) ───────────────────────
+# ⛔ EXACTLY TWO VERBS. `docker image prune -af` removes only images no CONTAINER references and
+# `docker volume prune -f` only volumes no container uses, so a live test container keeps its image
+# and its volumes. `docker system prune -a --volumes` (which also removes STOPPED CONTAINERS — a
+# test's evidence — and networks) is NOT run here, and must not be: it is a verb with a different
+# blast radius, and no disk emergency justifies widening to it silently.
+# A box with NO DAEMON holds zero bytes, which is a true "nothing to reclaim"; every other failure to
+# answer (permission, a broken socket) is cannot-verify, because a clean row would say we had pruned.
+hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
+  local dry="${1:-}" derr root df_before df_after img_rc=0 vol_rc=0 last srv srv_major vol_note
+  HYG_SUB_RC=0
+  HYG_FRAG=""
+  if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then HYG_FRAG='docker absent'; return 0; fi
+  if ! derr="$("$DOCKER_BIN" info 2>&1 >/dev/null)"; then
+    # ⛔ UNREACHABLE IS A CLASS, NOT TWO SPELLINGS (review, P2). Docker words the same condition at
+    # least three ways — "Cannot connect to the Docker daemon … Is the docker daemon running?",
+    # "permission denied while trying to connect to the Docker daemon socket … dial unix …", and a
+    # missing socket ("connect: no such file or directory"). A box where the loop's user simply cannot
+    # reach a healthy daemon has nothing to reclaim, so matching only the first spelling turned
+    # `last_rc=3` permanent: a red hygiene row on every hourly pass on a HEALTHY machine, which is how
+    # an operator learns to ignore the row (same reasoning as the 4/5/7 carve-out noted in
+    # `reap_global_caches`, cloud-cell-supervisor.sh).
+    case "$derr" in
+      # ⛔ A DENIED SOCKET IS NOT AN ABSENT DAEMON (review round 3, P2 — and round 2 had narrowed this
+      # the wrong way). "Cannot connect … Is the docker daemon running?" means the box holds NOTHING for
+      # us to reclaim: a true, clean "nothing to do". A daemon that EXISTS and refuses this user means
+      # the opposite — the reclaimable images and volumes are there and this pass cannot touch them.
+      # Reporting that as "no daemon" put a green row and a false cause on the exact shape the issue
+      # measured (24.9 GB of idle images on cell-3).
+      *"permission denied"*|*"not permitted"*|*"operation not permitted"*)
+        log "[hygiene] CANNOT-VERIFY: the docker daemon is unreachable from this user — $(printf '%s' "$derr" | head -1)"
+        HYG_FRAG='CANNOT-VERIFY: docker daemon unreachable (permission) — reclaimable images/volumes exist but this pass cannot prune them'
+        HYG_SUB_RC=3
+        return 0 ;;
+      *"docker daemon"*|*"Dial unix"*|*"dial unix"*|*"Is the docker daemon running"*)
+        log "[hygiene] docker: no daemon ($(printf '%s' "$derr" | head -1)) — nothing to reclaim"
+        HYG_FRAG='docker: no daemon'
+        return 0 ;;
+      *)
+        log "[hygiene] CANNOT-VERIFY: docker info failed — $(printf '%s' "$derr" | head -1)"
+        HYG_FRAG='CANNOT-VERIFY: docker info failed (cannot tell whether a prune is possible)'
+        HYG_SUB_RC=3
+        return 0 ;;
+    esac
+  fi
+  if [ "$dry" = "--dry-run" ]; then
+    log "[hygiene] WOULD run: docker image prune -af; docker volume prune -f"
+    HYG_FRAG='would prune idle docker images/volumes'
+    return 0
+  fi
+  if cell_stopped_midpass; then HYG_FRAG='STOP arrived mid-pass — docker prune skipped'; return 0; fi
+  # ⛔ THE REDIRECT IS WHERE THE PRUNE IS DECIDED. Without the directory the SHELL fails before `docker`
+  # runs at all, and both prunes then report rc=1 — recorded as "docker prune FAILED", a cannot-verify
+  # naming the wrong cause while the reclaim silently did not happen (measured: a manual `hygiene` verb
+  # on an $O whose logs/ the loop had not created yet — and the same on a full disk, which is exactly
+  # the case this role exists for).
+  mkdir -p "$O/logs" 2>/dev/null || true
+  root="$("$DOCKER_BIN" info --format '{{.DockerRootDir}}' 2>/dev/null | head -1)"
+  [ -n "$root" ] && [ -d "$root" ] || root="$CELL_HOME"
+  df_before="$(hyg_df_mb "$root")"
+  run_bounded "$HYGIENE_TIMEOUT" "$DOCKER_BIN" image prune -af >"$O/logs/docker-prune.log" 2>&1; img_rc=$?
+  # ⛔ THE VOLUME VERB'S BLAST RADIUS IS DAEMON-VERSION DEPENDENT (review round 7, P2 — and it is the
+  # data-loss-shaped one). `docker volume prune` has removed ANONYMOUS unused volumes only since 23.0;
+  # `-a/--all` exists precisely because the default set CHANGED there. On an older daemon the same
+  # command takes every UNUSED volume, NAMED ones included — the durable volume `docker compose down`
+  # deliberately preserves — and this pass runs hourly, unattended, on boxes with free disk. So the verb
+  # is gated on the SERVER major; an unreadable version skips it and says so (fail-closed), because the
+  # safe direction here is "do not run a destructive verb whose set we could not establish".
+  srv="$("$DOCKER_BIN" version --format '{{.Server.Version}}' 2>/dev/null | head -1)"
+  srv_major="${srv%%.*}"
+  vol_note=""
+  case "$srv_major" in
+    ''|*[!0-9]*)
+      vol_note="volume prune SKIPPED (server version unreadable: '${srv:-none}')"
+      vol_rc=0 ;;
+    *)
+      if [ "$srv_major" -ge 23 ]; then
+        run_bounded "$HYGIENE_TIMEOUT" "$DOCKER_BIN" volume prune -f >>"$O/logs/docker-prune.log" 2>&1; vol_rc=$?
+        vol_note="volume prune rc=$vol_rc"
+      else
+        vol_rc=0
+        vol_note="volume prune SKIPPED (server $srv < 23.0 prunes NAMED unused volumes too — not a verb this role may run)"
+      fi ;;
+  esac
+  df_after="$(hyg_df_mb "$root")"
+  last="$(tail -2 "$O/logs/docker-prune.log" 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+  log "[hygiene] docker: image prune rc=$img_rc $vol_note; df ($root): $(hyg_df_delta "$df_before" "$df_after"); docker's own report: ${last:-none}"
+  if [ "$img_rc" -ne 0 ] || [ "$vol_rc" -ne 0 ]; then
+    HYG_FRAG="CANNOT-VERIFY: docker prune FAILED (image rc=$img_rc volume rc=$vol_rc)"
+    HYG_SUB_RC=3
+    return 0
+  fi
+  case "$srv_major" in
+    ''|*[!0-9]*)
+      # The image prune ran; the volume verb did not, because its blast radius was not established.
+      HYG_FRAG="docker: images pruned; VOLUME PRUNE SKIPPED (server version unreadable) — df $(hyg_df_delta "$df_before" "$df_after")"
+      HYG_SUB_RC=3
+      return 0 ;;
+  esac
+  HYG_FRAG="docker pruned (images+volumes); df $(hyg_df_delta "$df_before" "$df_after")"
+}
+
+# ── (3) THE WORKTREE-ROOT CACHE SWEEP, PER ROOT (agent-infra#2573) ───────────────────────────────
+# The shipped sweep deletes `node_modules` / `.pytest_cache` / `__pycache__` at every worktree root (a
+# per-worktree `.venv` is NOT its business any more — #1932 gave that delete to `reap-lane-venvs.sh`,
+# which proves per-LANE liveness). This role used to gate the WHOLE sweep on "no worker session is
+# live", i.e. it declined to reclaim exactly when the box was busiest, and an unreadable session list
+# had the same effect. A live worker is NOT a reason to skip a worktree that provably belongs to
+# nobody, so the decision is now PER ROOT and the evidence is the shipped cwd census
+# (`live-ownership.sh` — ONE implementation of "who is in this checkout"):
+#   * a root with a live process's cwd inside it is EXCLUDED and NAMED;
+#   * every other root is swept, however many workers are live elsewhere on the box;
+#   * an UNREADABLE census proves nothing about ANY root, so the sweep is skipped and the pass is
+#     cannot-verify — the same fail-closed direction as the unreadable session list above.
+# The exclusion is passed as `--exclude-root=` (an EXCLUSION, never an inclusion list) so the roots
+# this file does not enumerate — `$HARNESS_REPO`'s, which it does not even know — keep their coverage.
+hygiene_cache_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
+  # ⛔ `excl` IS LOCAL, AND THAT IS THE WHOLE FIX FOR ONE P1 (review round 2). A global array is never
+  # reset, and `run_loop` calls this function over and over IN ONE PROCESS: `hr` restarts at 0 each
+  # pass, so a pass that held fewer roots overwrote only the low indices and left the rest behind. The
+  # exclusion set then grew monotonically to the historical maximum of held roots — after one busy
+  # period the sweep excluded roots nothing holds, printed "a LIVE process holds it" about them, and
+  # still recorded "swept N idle root(s)". Same failure as the clamp this role exists to remove, with
+  # a slower fuse. `cloud-cell-doctor.hygiene.test.sh` calls the function TWICE in one shell to pin it.
+  local dry="${1:-}" names rc sup roots r lo lg held="" hr=0 idle_n=0 live_n=0 census_clone="" wl=""
+  local -a excl=()
+  HYG_SUB_RC=0; HYG_FRAG=""
+  names="$(harness_sessions)"
+  case "$names" in
+    *"$SESS_UNREADABLE_MARK"*)
+      log "[hygiene] cannot verify the worker sessions — skipping the worktree-root cache sweep (fail-closed)"
+      # ⛔ rc=3, like every other cannot-verify sub-step in this role: the sweep was NOT evaluated, so a
+      # clean pass would tell a monitor that a destructive step it never ran was fine.
+      HYG_FRAG='CANNOT-VERIFY: caches-sweep skipped (session list unreadable)'
+      HYG_SUB_RC=3; return 0 ;;
+  esac
+  sup="${SUPERVISOR:-}"
+  if [ -z "$sup" ] || [ ! -f "$sup" ]; then
+    # The sweep is ONE of the role's stated jobs; a missing executor must not make it vanish into a
+    # clean pass (same rule as the worktree reaper below).
+    HYG_FRAG='CANNOT-VERIFY: worktree cache sweep skipped (supervisor not found)'
+    HYG_SUB_RC=3; return 0
+  fi
+  # ⛔ THE CENSUS IS TAKEN WHETHER OR NOT A SESSION IS LIVE (review, P2). A tmux session is a
+  # DECLARATION about the past; a process's cwd is a LIVE FACT. "No session on this box" is not "no
+  # live process on this box" — a lane whose workspace is gone keeps its pid (the fleet's documented
+  # case, and why the pre-dispatch gate reads the pid rather than the workspace) — so the session
+  # count changes the WORDING below, never whether the evidence is gathered. Gating the census on the
+  # session list was the same self-disable shape this role exists to remove: it swept with NO exclusion
+  # on exactly the boxes where a headless process was holding a root.
+  live_n="$(printf '%s' "$names" | awk 'NF{n++} END{printf "%d\n", n+0}')"
+  [ "$live_n" -gt 0 ] && wl="; workers live"
+  # BOTH repos the sweep executor prunes: `$REPO` and `$HARNESS_REPO` (the harness checkout is
+  # handed to the doctor loop by the supervisor). A root outside them this file cannot see — so it
+  # cannot exclude it either — which is why the exclusion is passed as an EXCLUSION and why the
+  # census is given the harness repo as a second CLONE rather than as an unknown.
+  roots="$(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')"
+  if [ -n "${HARNESS_REPO:-}" ] && [ "$HARNESS_REPO" != "$REPO" ] \
+     && git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    roots="$roots
+$(git -C "$HARNESS_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')"
+    census_clone="$HARNESS_REPO"
+  fi
+  # A duplicate root (the same repo named twice) must not produce two exclusion args.
+  roots="$(printf '%s\n' "$roots" | awk 'NF && !seen[$0]++')"
+  if [ -z "$roots" ]; then
+    # ⛔ AN EMPTY ENUMERATION IS A FAILED READ, not an answer: `git -C "$REPO" worktree list` exits
+    # 128 with its complaint discarded by `2>/dev/null`, so "no roots" means the question could not be
+    # put to git at all ($REPO unset or not a checkout). Reading it as "nothing is provably idle, carry
+    # on" was the same fail-open as every other unreadable read in this role — and it left `status`
+    # showing hygiene green on a box whose cache sweep had never once run.
+    log "[hygiene] CANNOT-VERIFY: no worktree root of ${REPO:-<REPO unset>} could be enumerated (git worktree list returned nothing) — the cache sweep was not evaluated"
+    HYG_FRAG='CANNOT-VERIFY: caches-sweep skipped (no worktree root enumerated)'
+    HYG_SUB_RC=3
+    return 0
+  fi
+  lo="$SELF_DIR/live-ownership.sh"
+  if [ ! -f "$lo" ]; then
+    log "[hygiene] CANNOT-VERIFY: $lo is missing — no cwd census, so no worktree root can be proven idle; sweep skipped"
+    HYG_FRAG='CANNOT-VERIFY: caches-sweep skipped (no cwd census available)'
+    HYG_SUB_RC=3; return 0
+  fi
+  lg="$(mktemp "${TMPDIR:-/tmp}/hyg-live-cwd.XXXXXX" 2>/dev/null)" || {
+    HYG_FRAG='CANNOT-VERIFY: caches-sweep skipped (cannot create the census scratch file)'
+    HYG_SUB_RC=3; return 0; }
+  # The census is a READ this pass ACTS on, so it is bounded like every other read here — and it is
+  # run in a CHILD shell because `bounded`/`timeout(1)` can only execute a COMMAND: handing it this
+  # file's own function name fails `127` under `timeout -k`, i.e. the bound would turn every census
+  # into cannot-verify on any box where timeout(1) exists. The child sources the SAME library, so
+  # there is still exactly ONE implementation of "who is in this checkout".
+  bounded "$READ_CALL_TIMEOUT" bash -c '. "$1"/live-ownership.sh && lo_scan "$2" "$3" "$4"' \
+    _ "$SELF_DIR" "$lg" "$REPO" "$census_clone"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$lg"
+    log "[hygiene] CANNOT-VERIFY: the live-cwd census could not be taken (lo_scan rc=$rc) — no worktree root can be proven idle, so the cache sweep is skipped (fail-closed)"
+    HYG_FRAG="CANNOT-VERIFY: caches-sweep skipped (live-cwd census unreadable rc=$rc)"
+    HYG_SUB_RC=3; return 0
+  fi
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    if awk -F'\t' -v p="$r" '$4 == p || index($4, p "/") == 1 { f = 1; exit } END { exit !f }' "$lg" 2>/dev/null; then
+      printf -v held '%s\n%s' "$held" "$r"
+      # The EXCLUSION argv: `--exclude-root=<HELD path>`, one array element per root so a path with a
+      # space in it survives (`set --`/word-splitting would not). ⛔ HELD is excluded; an IDLE root is
+      # exactly what this sweep came for and must never be excluded.
+      excl[$hr]="--exclude-root=$r"
+      hr=$((hr + 1))
+      log "[hygiene] caches: LEFT $r — a LIVE process has a cwd inside it (proof: the cwd census, which is a floor on VISIBLE processes)"
+    else
+      idle_n=$((idle_n + 1))
+    fi
+  done <<< "$roots"
+  rm -f "$lg"
+  if [ "$idle_n" -eq 0 ]; then
+    log "[hygiene] caches: every worktree root is held by a live process — nothing swept$wl"
+    HYG_FRAG="caches-sweep skipped (every root held$wl)"
+    return 0
+  fi
+  if [ "$dry" = "--dry-run" ]; then
+    log "[hygiene] WOULD sweep worktree caches at $idle_n idle root(s)$wl, excluding $(printf '%s' "$held" | tr '\n' ' ')"
+    HYG_FRAG="would sweep worktree caches ($idle_n idle root(s)$wl)"
+    return 0
+  fi
+  if cell_stopped_midpass; then HYG_FRAG='STOP arrived mid-pass — worktree cache sweep skipped'; return 0; fi
+  # EXCLUSION argv, never an inclusion list: every root this file does not enumerate keeps its
+  # coverage (`$HARNESS_REPO`'s worktrees are swept by the same verb and are never named here).
+  # ⛔ `${excl[@]+...}`: this file still states `/bin/bash 3.2` compatibility, where expanding an
+  # EMPTY array under `set -u` is an unbound-variable ABORT — and "no root is held" is the normal
+  # case on a quiet box, so the plain form would fail the sweep exactly when it has most to do.
+  run_bounded "$HYGIENE_TIMEOUT" bash "$sup" prune --caches ${excl[@]+"${excl[@]}"} >>"$O/logs/doctor.log" 2>&1
+  rc=$?
+  # ⛔ "no VISIBLE holder" — not "idle" (review round 2, P2). The census cannot see another user's or a
+  # hardened process (live-ownership.sh states this), so the record says what was MEASURED instead of
+  # presenting a floor as proof.
+  log "[hygiene] caches: swept $idle_n root(s) with no VISIBLE holder$wl; excluded $(printf '%s' "$held" | tr '\n' ' ')"
+  if [ "$rc" -eq 0 ]; then
+    HYG_FRAG="worktree caches swept ($idle_n idle root(s)$wl)"
+  else
+    HYG_FRAG="CANNOT-VERIFY: worktree cache sweep FAILED rc=$rc"
+    HYG_SUB_RC=3
+  fi
+}
 run_hygiene() {
   begin_pass
   # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
   # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
   # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
   # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
-  local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev
+  local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0
+  # ⛔ THE PASS-LEVEL `df` READ COMES FIRST, and the delta printed at the END is the ONLY savings this
+  # role may claim. Not a `du` sum (see the section header), and not docker's own "Total reclaimed"
+  # line — that is a different instrument reporting on a different question.
+  df_before="$(hyg_df_mb "$CELL_HOME")"
   # 1) the package cache. `uv cache prune` removes UNUSED entries (safe while lanes resolve); it is
   #    NOT `uv cache clean` — emptying a cache a live lane is reading is the class #1987 forbids.
   if command -v uv >/dev/null 2>&1; then
@@ -1250,12 +1701,14 @@ run_hygiene() {
       run_bounded "$HYGIENE_TIMEOUT" uv cache prune >>"$O/logs/doctor.log" 2>&1
       rc=$?
       after="$(du -sm "$CELL_HOME/.cache/uv" 2>/dev/null | awk '{print $1}')"
-      log "[hygiene] uv cache prune rc=$rc ${before:-?}MB -> ${after:-?}MB"
+      # ⛔ The `du` pair is INFORMATIONAL and labelled as such: the cache's own bookkeeping is the
+      # right way to say "the prune ran over this directory", and it is never the savings figure.
+      log "[hygiene] uv cache prune rc=$rc (du ${before:-?}MB -> ${after:-?}MB on the cache dir — informational; the df delta below is the claim)"
       # ⛔ A prune that FAILED (or was cut at HYGIENE_TIMEOUT, rc=124/137) did not happen: recording a
       # clean pass would read green in `status` while the disk keeps filling — the silent-no-op class
       # this role exists to remove. Every other failed sub-step in this role is rc=3; so is this one.
       if [ "$rc" -eq 0 ]; then
-        result="uv ${before:-?}MB->${after:-?}MB"
+        result="uv pruned"
       else
         result="${result}${result:+; }CANNOT-VERIFY: uv cache prune FAILED rc=$rc"
         h_rc=3
@@ -1264,47 +1717,22 @@ run_hygiene() {
   else
     result="uv absent"
   fi
-  # 2) worktree-root caches (`.venv`, `node_modules`, `__pycache__`) via the supervisor's own sweep.
-  #    ⛔ Never while a worker session is live: the sweep deletes `.venv`, and a lane using it would
-  #    re-resolve mid-run (the reason `cmd_start` guards the same delete). The supervisor's `prune`
-  #    WARNS about a running controller but does not guard it, so the guard lives here.
-  #    ⛔ An UNREADABLE session list is not "no workers": the guard fails CLOSED (skip the sweep and
-  #    say so), never open.
-  local names; names="$(harness_sessions)"
-  case "$names" in
-    *"$SESS_UNREADABLE_MARK"*)
-      log "[hygiene] cannot verify the worker sessions — skipping the worktree-root cache sweep (fail-closed)"
-      # ⛔ rc=3, like every other cannot-verify sub-step in this role: the sweep was NOT evaluated, so a
-      # clean pass would tell a monitor that a destructive step it never ran was fine.
-      result="${result}${result:+; }CANNOT-VERIFY: caches-sweep skipped (session list unreadable)"
-      h_rc=3 ;;
-    *)
-      if [ "$(printf '%s' "$names" | awk 'NF{n++} END{printf "%d\n", n+0}')" -gt 0 ]; then
-        log "[hygiene] worker sessions are live — skipping the worktree-root cache sweep"
-        result="${result}${result:+; }caches-sweep skipped (workers live)"
-          elif [ -n "${SUPERVISOR:-}" ] && [ -f "$SUPERVISOR" ]; then
-        if cell_stopped_midpass; then
-          result="${result}${result:+; }STOP arrived mid-pass — worktree cache sweep skipped"
-        elif [ "$dry" = "--dry-run" ]; then
-          result="${result}${result:+; }would sweep worktree caches"
-        else
-          run_bounded "$HYGIENE_TIMEOUT" bash "$SUPERVISOR" prune --caches >>"$O/logs/doctor.log" 2>&1
-          rc=$?
-          if [ "$rc" -eq 0 ]; then
-            result="${result}${result:+; }worktree caches swept"
-          else
-            result="${result}${result:+; }CANNOT-VERIFY: worktree cache sweep FAILED rc=$rc"
-            h_rc=3
-          fi
-        fi
-      else
-        # The sweep is ONE of the role's three stated jobs; a missing supervisor must not make it
-        # vanish into a clean pass (same rule as the worktree reaper below).
-        result="${result}${result:+; }CANNOT-VERIFY: worktree cache sweep skipped (supervisor not found)"
-        h_rc=3
-      fi ;;
-  esac
-  # 3) stale worktrees — the shipped reaper, whose own gates preserve anything dirty, unreferenced or
+  # 2) the `cloud-cell-<pid>.<rand>` temp dirs this family leaves behind (#2573). Proof, per dir, and
+  #    the reason it is either reaped or LEFT is in the log — see `hygiene_tmp_sweep`.
+  hygiene_tmp_sweep "$dry"
+  [ "$HYG_SUB_RC" -ne 0 ] && [ "$h_rc" -eq 0 ] && h_rc="$HYG_SUB_RC"
+  result="${result}${result:+; }${HYG_FRAG}"
+  # 3) docker images/volumes nothing is using (#2573). Two verbs only, both "not in use by ANY
+  #    container" by docker's own semantics — never `system prune`.
+  hygiene_docker_sweep "$dry"
+  [ "$HYG_SUB_RC" -ne 0 ] && [ "$h_rc" -eq 0 ] && h_rc="$HYG_SUB_RC"
+  result="${result}${result:+; }${HYG_FRAG}"
+  # 4) worktree-root caches, decided PER ROOT on the live-cwd census (#2573). A live worker elsewhere
+  #    on the box is not a reason to leave a worktree nobody holds full of regenerable caches.
+  hygiene_cache_sweep "$dry"
+  [ "$HYG_SUB_RC" -ne 0 ] && [ "$h_rc" -eq 0 ] && h_rc="$HYG_SUB_RC"
+  result="${result}${result:+; }${HYG_FRAG}"
+  # 5) stale worktrees — the shipped reaper, whose own gates preserve anything dirty, unreferenced or
   #    unreachable. `auto` arms it only under disk pressure: the failure being prevented is a FULL
   #    disk, and a tidy box does not need a destructive verb run for tidiness.
   wt="${DOCTOR_WORKTREE_REAPER:-}"
@@ -1344,37 +1772,37 @@ run_hygiene() {
       result="${result}${result:+; }STOP arrived mid-pass — worktree reaper skipped"
       # ⛔ `$h_rc`, NEVER a hardcoded 0: a stop arriving after a FAILED uv prune (or a failed cache
       # sweep) must not erase that cannot-verify and turn the pass green — the exact false green the
-      # sibling sub-steps above exist to prevent.
-      # ⛔ AND A REHEARSAL KEEPS THE WORSE VERDICT HERE TOO. This branch writes the record and returns
-      # BEFORE the dry-run merge below, so a rehearsal interrupted by a stop recorded its OWN rc — 0
-      # by construction, because a rehearsal performs no action and nothing it did can fail — over a
-      # stored cannot-verify. The rehearsal is the verb an operator is told to run FIRST, so that path
-      # cleared a failure it had never probed. The same merge as the main path applies: the worse of
-      # the stored verdict and this pass's own, with an unreadable stored verdict fail-closed at rc=3.
-      if [ "$dry" = "--dry-run" ]; then
-        state_write_rehearsal hygiene "$h_rc" "$result"
-        log "[hygiene] STOP arrived during this pass — dry-run: $result"
-        return "$h_rc"
-      fi
-      state_write hygiene "$h_rc" "$result"
-      log "[hygiene] STOP arrived during this pass — worktree reaper NOT run"
-      return "$h_rc"
-    fi
-    run_bounded "$HYGIENE_TIMEOUT" bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      result="${result}${result:+; }worktrees $mode"
+      # sibling sub-steps above exist to prevent. This used to `return` here, which ALSO skipped the
+      # df delta every pass must print; the single exit below keeps both properties.
+      stop_reaper=1
     else
-      # A reaper that failed or was killed at HYGIENE_TIMEOUT is not a completed hygiene step: on a
-      # full disk its own git operations fail, and "worktrees apply" would claim a reap that did not
-      # happen — the silent no-op this role exists to remove.
-      result="${result}${result:+; }CANNOT-VERIFY: worktrees $mode FAILED rc=$rc"
-      h_rc=3
+      run_bounded "$HYGIENE_TIMEOUT" bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        result="${result}${result:+; }worktrees $mode"
+      else
+        # A reaper that failed or was killed at HYGIENE_TIMEOUT is not a completed hygiene step: on a
+        # full disk its own git operations fail, and "worktrees apply" would claim a reap that did not
+        # happen — the silent no-op this role exists to remove.
+        result="${result}${result:+; }CANNOT-VERIFY: worktrees $mode FAILED rc=$rc"
+        h_rc=3
+      fi
     fi
   else
     # The role's stated jobs include the disk sink that broke a cell twice. "I could not find the
     # reaper" is not a completed hygiene pass — it is cannot-verify, and it must not read as green.
     result="${result}${result:+; }CANNOT-VERIFY: worktree reaper (pi-reap-worktrees.sh) not found"
+    h_rc=3
+  fi
+  # 6) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
+  df_after="$(hyg_df_mb "$CELL_HOME")"
+  if [ -n "$df_before" ] && [ -n "$df_after" ]; then
+    log "[hygiene] df ($CELL_HOME): $(hyg_df_delta "$df_before" "$df_after")"
+    result="${result}${result:+; }df $(hyg_df_delta "$df_before" "$df_after")"
+  else
+    # An unreadable instrument cannot be reported as a delta — and must not read as a clean pass.
+    log "[hygiene] CANNOT-VERIFY: free space at $CELL_HOME could not be read ($(hyg_df_delta "$df_before" "$df_after"))"
+    result="${result}${result:+; }CANNOT-VERIFY: df unreadable at $CELL_HOME (no delta)"
     h_rc=3
   fi
   # ⛔ A REHEARSAL IS NOT A VERDICT. `--dry-run` is the verb an operator is told to run FIRST, and it
@@ -1387,6 +1815,9 @@ run_hygiene() {
     return "$h_rc"
   fi
   state_write hygiene "$h_rc" "$result"
+  if [ "$stop_reaper" = 1 ]; then
+    log "[hygiene] STOP arrived during this pass — worktree reaper NOT run"
+  fi
   log "[hygiene] $result"
   return "$h_rc"
 }
@@ -1933,6 +2364,12 @@ parse_dry() {
   [ -n "$seen" ] && printf '%s\n' '--dry-run'
   return 0
 }
+
+# ⛔ SOURCING DEFINES FUNCTIONS; IT DOES NOT RUN A PASS. Without this guard a suite cannot exercise a
+# per-PASS invariant (the exclusion set is reset each pass — see `hygiene_cache_sweep`), because the
+# only way to reach that function twice in one shell is to source this file, and the dispatch below
+# would then execute a role as a side effect of the import.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 case "${1:-status}" in
   reap|doctor|merge|hygiene)
