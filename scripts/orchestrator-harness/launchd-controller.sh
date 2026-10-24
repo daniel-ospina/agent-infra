@@ -145,7 +145,17 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
+CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
+
+# ⛔ THE PIN KEYS ARE HERE BECAUSE THE JOB'S CYCLE READS THEM (agent-infra#2215 / #2231). `harness-refresh.sh`
+# runs INSIDE this controller's cycle and decides from `HARNESS_PIN` / `HARNESS_PIN_FILE` / `HARNESS_REPO`
+# whether this box is current and what to materialise if it is behind; `HARNESS_PIN_DIR` is the root the
+# materialiser it launches puts the per-commit worktrees under (`cloud-cell-supervisor.sh`), so it is read
+# one hop downstream but still inside this cycle. They are rendered into the plist by
+# `launchd.plist.template` and would otherwise be dropped on the floor at this hop, which pins a Mac to
+# `behind … pin NOT advanced` (exit 25) forever — the pane would inherit them only by accident from the
+# tmux SERVER. Case E asserts this list and the plist's EnvironmentVariables dict agree in BOTH
+# directions, so a key added to one side and not the other is a red, not a silent gap.
 
 # ⛔ FORWARD ON PRESENCE, NEVER ON NON-EMPTINESS (review P1). An EMPTY value in the plist is a
 # MEANING, not an absence: `install.sh` deliberately renders `OR` empty (#2040), which tells
