@@ -231,6 +231,14 @@ fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
 [ -f "$CFS" ] || { echo "❌ missing $CFS"; exit 1; }
 [ -f "$ADM" ] || { echo "❌ missing $ADM"; exit 1; }
 
+# ── #2235: THE SUITE DOES NOT INHERIT THE OPERATOR'S AMBIENT SELECTOR ───────
+# `GH_REPO` is gh's own repo selector, and a cell exports it (keys.env). An inherited
+# value would make EVERY scenario in this file run against the operator's repo — which
+# is the defect under test, arriving through the test harness. So it is DROPPED here,
+# once, and a scenario that needs an ambient value sets it for its own invocation
+# (the run_* helpers pass it through when it is present).
+unset GH_REPO
+
 # ── fake gh ───────────────────────────────────────────────
 # Driven entirely by files under $SCEN (the scenario dir). Records every
 # invocation in $SCEN/calls so the suite can assert on the merge command.
@@ -264,16 +272,31 @@ case "$key" in
     pr="${3:-}"
     # The draft probe is a DISTINCT question from the head resolutions: answer it
     # from its own fixture and never let it consume the head-seq sequence.
-    want_draft=0; want_head=0; want_base=0; want_merged=0; jprev=""
+    want_draft=0; want_head=0; want_base=0; want_merged=0; want_url=0; jprev=""
     for x in "$@"; do
       if [ "$jprev" = "--json" ]; then
         case "$x" in *isDraft*) want_draft=1 ;; esac
         case "$x" in *headRefOid*) want_head=1 ;; esac
         case "$x" in *baseRefName*) want_base=1 ;; esac
         case "$x" in *mergedAt*) want_merged=1 ;; esac
+        case "$x" in *url*) want_url=1 ;; esac
       fi
       jprev="$x"
     done
+    # ── #2235: THE PR'S OWN URL. "Already merged" is a claim about ONE PR, and a bare
+    # number identifies none (PR #2234 exists in both tortoise and agent-infra), so the
+    # rail proves the (repo, number) pair from the one field that carries both. Default =
+    # the scenario's OWN repo-slug (agent-infra when the fixture is absent), so every
+    # scenario written before this arm keeps its verdict; `pr-url` overrides it to model
+    # a url that answers for a DIFFERENT repository — the fail-open the rail must refuse.
+    if [ "$want_url" = 1 ] && [ "$want_merged" = 0 ] && [ "$want_head" = 0 ] \
+       && [ "$want_draft" = 0 ] && [ "$want_base" = 0 ]; then
+      if [ -f "$SCEN/pr-url" ]; then cat "$SCEN/pr-url"; exit 0; fi
+      if [ -f "$SCEN/pr-url-fail" ]; then printf 'gh: could not read the pull request\n' >&2; exit 1; fi
+      printf 'https://github.com/%s/pull/%s\n' \
+        "$(cat "$SCEN/repo-slug" 2>/dev/null || printf 'daniel-ospina/agent-infra')" "${pr:-0}"
+      exit 0
+    fi
     if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
       # #1750: a DRAFT READ THAT FAILS needs its own seam, because the defect is exactly a
       # failed read rendered as a value — with no way to fail this probe, no scenario could
@@ -987,6 +1010,20 @@ new_scen() {
   rm -rf "$SCEN"
   mkdir -p "$SCEN"
   : > "$SCEN/calls"
+  # ── #2235: A SCENARIO IS A CHECKOUT ─────────────────────────────────────────────────────────────
+  # `run_admin_cwd "$SCEN" …` runs the rail with its CWD set to the scenario, which is how the lane-
+  # selector and base-reproduction arms hand it a target tree. The rail now resolves its repo FROM
+  # THAT CHECKOUT (`git rev-parse --show-toplevel` + `git remote get-url origin`) instead of trusting
+  # an ambient `GH_REPO`, and a cwd that is not a checkout is exactly the state it refuses. A
+  # fixture that is not a checkout would therefore test the refusal on every one of those arms — the
+  # defects they exist for would go unmeasured. So the fixture IS one, with the repo every other
+  # fixture already names (the `repo-slug` fixtures below are all this repo too).
+  # The remote is a URL only: nothing here fetches, and `--depth`/network is never touched.
+  if ! git init -q "$SCEN" 2>/dev/null; then
+    echo "❌ cannot git-init a scenario fixture — the rail's repo resolution cannot be exercised" >&2
+    exit 1
+  fi
+  git -C "$SCEN" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
   REPRO_CMD=true
   # The ≥3.12 interpreter the #6928 fixtures supply (see selector_interp_*). It is
   # scenario-scoped STATE, so it is reset here: a scenario that forgot to set it
@@ -1007,6 +1044,13 @@ run_admin() {
   # NOSLEEP_BIN below): for a scenario whose subject is the ACCUMULATED clock, not the waiting.
   # An array, like run_admin_here, so the extra variable is one element rather than a
   # conditional word inside a line continuation.
+  #
+  # ⛔ AN `env` ARRAY, NOT A COMMAND PREFIX WITH AN EXPANDED ASSIGNMENT (#2235). Every word of the
+  # old prefix was a LITERAL assignment (`SCEN="$SCEN" ADMIN_MERGE_POLL_INTERVAL=0 bash …`), so the
+  # prefix itself was fine — what broke was adding GH_REPO to it as `"${GH_REPO:+GH_REPO=\"$GH_REPO\"}"`:
+  # quotes produced by an expansion are LITERAL CHARACTERS, and an empty expansion is not re-parsed
+  # either, so the word became a command name (rc 127) and the rail never ran. `env` takes each
+  # assignment as its own argument, so neither branch can mis-parse.
   local -a env_args=(
     "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
     "ADMIN_MERGE_REPRO_CMD=${REPRO_CMD:-true}"
@@ -1015,6 +1059,9 @@ run_admin() {
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
   [ "${SUITE_NOSLEEP:-0}" = "1" ] && env_args+=("PATH=$NOSLEEP_BIN:$PATH")
+  # #2235: an ambient GH_REPO reaches the rail only when THIS invocation sets one, so a scenario can
+  # model the inherited-selector defect explicitly instead of relying on the operator's shell.
+  [ -n "${GH_REPO:-}" ] && env_args+=("GH_REPO=$GH_REPO")
   env "${env_args[@]}" bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
@@ -1032,6 +1079,10 @@ run_admin_here() {
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
+  # #2235: an ambient GH_REPO reaches the rail only when THIS invocation sets one, so a
+  # scenario can model the inherited-selector defect explicitly instead of relying on
+  # whatever the operator's shell happens to carry.
+  [ -n "${GH_REPO:-}" ] && env_args+=("GH_REPO=$GH_REPO")
   # REPRO_CMD="" means "OMIT the seam": the PRODUCTION path runs (a real base
   # worktree). A suite that always sets the seam never executes the runner
   # selection, the worktree materialisation/removal, or the alarm wrapper — the
@@ -11949,8 +12000,15 @@ review_record() {
 # Every scenario below reaches the guard through the 4.6 STALE-GREEN refusal, the
 # first of the two call sites that perform the update.
 run_admin_guarded() {
-  HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  # ⛔ `env` ARRAY, NOT A COMMAND PREFIX WITH AN EXPANDED ASSIGNMENT — see run_admin()'s note. A
+  # `"${VAR:+K="$VAR"}"` word is not an assignment word, so the prefix splits into a command name
+  # and the rail never runs (rc 127, which a caller can mistake for a refusal).
+  local -a genv=(
+    "HOME=$SCEN/home" "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_POLL_INTERVAL=0"
+  )
+  [ -n "${GH_REPO:-}" ] && genv+=("GH_REPO=$GH_REPO")
+  env "${genv[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -12941,6 +12999,268 @@ grep -q "$NEW_RB" "$TMP/err" && pass "(d) …and the residual failure is printed
 grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" \
   || pass "(d) no merge attempted on a red"
 [ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
+# ═══════════════════════════════════════════════════════════════════════════════
+# §77. #2235 — THE RAIL NEVER ACTS ON A DIFFERENT REPO THAN ITS CHECKOUT
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE DEFECT, VERBATIM (measured twice in one session, 2026-10-20/21): every cell's
+# `keys.env` exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY, so an agent-infra PR
+# number was resolved and reported against TORTOISE:
+#
+#   $ bash scripts/admin-merge.sh 2232        # agent-infra PR, ambient GH_REPO=tortoise
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+#   RC=0
+#
+# A September tortoise PR. Exit 0, zero work, a ✅ over nothing. The same leak produced
+# `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open
+# agent-infra PRs, and four PRs looked "already merged" while unmerged on origin/main.
+#
+# WHAT THESE CASES PIN, and why each one is here rather than implied:
+#   (a) an ambient GH_REPO that DISAGREES with the checkout is a STOP-WORK condition that
+#       fires BEFORE ANY API CALL — proved by the fake `gh` recording NOTHING. That is the
+#       load-bearing assertion: a refusal that still called the API would be the same
+#       fail-open one line later, because the CALL is what decides the verdict.
+#   (b) the refusal names BOTH repos (an operator cannot fix what is not named).
+#   (c) an ambient GH_REPO that AGREES (case-folded — `gh` accepts any case) proceeds, so
+#       the gate is not a blanket refusal of every cell that has the line in its env.
+#   (d) "ALREADY MERGED" is not reported when the PR's own url names another repository —
+#       the number alone identifies nothing.
+#   (e) "ALREADY MERGED" is not reported when the resolved target is not this checkout's
+#       repo: a success line about a foreign repo is the exact shape of the defect.
+#   (f) the SAME-PR no-op still works (the negative control: a gate that refused every
+#       no-op would pass every case above).
+#   (g) an explicit --repo is still honoured — the documented selector is not reversed.
+#   (h) with no selector at all the CHECKOUT's origin answers, and the evidence line says so.
+#   (i) an UNREADABLE pr identity is not a no-op (a failed read must not read as a value).
+#   (j) the same slug on ANOTHER HOST is not the same PR (the url proof compares the host).
+#   (k) with no checkout and no selector, `gh repo view` (GH_REPO stripped) is the last resort.
+#   (l) a ZERO-PADDED PR is the same PR (gh parses `0042` as 42; the url echoes 42).
+#   (m) `[HOST/]OWNER/REPO` — gh's documented GH_REPO/--repo form — is the same repo, not a clash.
+#   (n) `--print-bounds <run-id>` refuses before any call (it reads timings with no --repo).
+echo "== §77 #2235: the rail resolves its repo by evidence, never from an ambient GH_REPO =="
+
+# (a)+(b) THE DISAGREEMENT REFUSAL — BEFORE ANY API CALL.
+new_scen repo-ambient-disagrees
+GH_REPO=daniel-ospina/tortoise run_admin_cwd "$SCEN" 2232
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(a) an ambient GH_REPO naming ANOTHER repo refuses (exit $rc)" \
+  || fail "(a) a foreign ambient GH_REPO was ACCEPTED (exit $rc) — the #2235 fail-open"
+# ⛔ ZERO INVOCATIONS, not "no merge": the fake logs argv on its FIRST line, so any gh
+# call at all — including the pre-check's state read — shows up here. A refusal that
+# happens after the state read is still a rail that graded the wrong repo.
+[ ! -s "$SCEN/calls" ] \
+  && pass "(a) …and made NO gh call at all (the fake recorded no invocation)" \
+  || fail "(a) …but it called gh BEFORE refusing: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+grep -qF 'daniel-ospina/tortoise' "$SCEN/err" && grep -qF 'daniel-ospina/agent-infra' "$SCEN/err" \
+  && pass "(b) …naming BOTH repos in play" \
+  || fail "(b) …but did not name both repos (err: $(head -2 "$SCEN/err" | tr '\n' ' '))"
+grep -q 'GH_REPO' "$SCEN/err" \
+  && pass "(b) …and names the selector to fix (GH_REPO)" \
+  || fail "(b) …without naming GH_REPO as the thing to remove"
+grep -q 'env -u GH_REPO' "$SCEN/err" \
+  && pass "(b) …and prints the one-line fix" \
+  || fail "(b) …without a remedy the operator can run"
+
+# (c) THE AGREEING AMBIENT PASSES — case-folded. `gh` treats owner/repo
+# case-insensitively and echoes back the spelling it was handed, so a verbatim
+# comparison would refuse a cell whose keys.env says the same repo in another case.
+new_scen repo-ambient-agrees
+GH_REPO=Daniel-Ospina/Agent-Infra run_admin_cwd "$SCEN" 42
+rc=$?
+grep -q 'REFUSING — the inherited GH_REPO' "$SCEN/err" \
+  && fail "(c) an ambient GH_REPO naming the SAME repo (other case) was refused" \
+  || pass "(c) an ambient GH_REPO naming the SAME repo (case-folded) is not refused"
+grep -q 'admin-merge: repo daniel-ospina/agent-infra' "$SCEN/out" \
+  && pass "(c) …and the resolved repo is printed on the evidence line" \
+  || fail "(c) …but the evidence line does not name the repo it acted on: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+[ -s "$SCEN/calls" ] \
+  && pass "(c) …and the rail proceeded to its normal reads (not refused)" \
+  || fail "(c) …but it made no call at all, so 'not refused' is unproven"
+
+# (d) THE URL NAMES ANOTHER REPO ⇒ NOT A NO-OP. The state read says MERGED, but the PR
+# whose url comes back is a FOREIGN one — which is what a bare-number lookup produced.
+new_scen repo-url-foreign
+touch "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/tortoise/pull/2232\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 2232
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(d) a MERGED state whose PR url names ANOTHER repo is refused (exit $rc)" \
+  || fail "(d) it reported ALREADY MERGED for a PR whose url answers for another repo (exit $rc)"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && fail "(d) …and still printed the ✅ no-op line" \
+  || pass "(d) …and printed NO ✅ no-op line"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(d) …but attempted a merge" \
+  || pass "(d) …and attempted no merge"
+
+# (e) THE TARGET IS NOT THIS CHECKOUT'S REPO ⇒ NOT A NO-OP, even with a self-consistent
+# url. A success line about a foreign repo is the defect's shape whichever way it arises.
+new_scen repo-noop-cross-repo
+touch "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/tortoise/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 42 --repo daniel-ospina/tortoise
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(e) a no-op for a --repo target that is NOT this checkout's repo is refused (exit $rc)" \
+  || fail "(e) it certified a cross-repo no-op (exit $rc)"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && fail "(e) …and still printed the ✅ no-op line" \
+  || pass "(e) …and printed NO ✅ no-op line"
+
+# (f) THE NEGATIVE CONTROL — the SAME-PR no-op still succeeds. Without this, a gate that
+# refused every no-op would satisfy (a)-(e) while breaking the at-least-once property the
+# no-op exists for.
+new_scen repo-noop-same-pr
+touch "$SCEN/merged"
+run_admin_cwd "$SCEN" 42
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(f) the SAME-PR no-op still exits 0 (the gate is not a blanket refusal)" \
+  || fail "(f) a legitimate same-repo no-op was refused (exit $rc): $(head -3 "$SCEN/err" | tr '\n' ' ')"
+grep -q 'ALREADY MERGED' "$SCEN/out" \
+  && pass "(f) …and still reports the observed artifact" \
+  || fail "(f) …but no longer reports it"
+
+# (g) AN EXPLICIT --repo IS STILL HONOURED (a real merge path, not a no-op), so the fix
+# does not reverse the documented selector. The head fixture is absent, so the run stops
+# at the head read — the observable is that it GOT there, carrying --repo.
+new_scen repo-explicit-ok
+run_admin_cwd "$SCEN" 42 --repo daniel-ospina/tortoise
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(g) an explicit --repo naming another repo is honoured (it proceeds and then refuses on the absent head, exit $rc)" \
+  || fail "(g) an explicit --repo exited 0 with no head fixture — unexpected"
+grep -q -- '--repo daniel-ospina/tortoise' "$SCEN/calls" \
+  && pass "(g) …and every call carries the explicit --repo (the selector reaches gh)" \
+  || fail "(g) …but the explicit --repo never reached gh: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+grep -q 'resolved from --repo' "$SCEN/out" \
+  && pass "(g) …and the evidence line names --repo as the source" \
+  || fail "(g) …but the evidence line does not name its source"
+
+# (h) THE REFUSAL-ON-WRONG-REPO IS NOT A REFUSAL OF *ALL* AMBIENT STATE: with NO ambient
+# selector and no --repo, the checkout's own origin is used and printed.
+new_scen repo-from-checkout
+run_admin_cwd "$SCEN" 42
+grep -q 'resolved from checkout origin' "$SCEN/out" \
+  && pass "(h) with no selector at all the repo comes from the checkout's origin, and says so" \
+  || fail "(h) the checkout's origin was not the resolution source: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+
+# (i) AN UNREADABLE PR IDENTITY IS NOT A NO-OP. The state read says MERGED; the proof read
+# fails. "Cannot prove it is the same PR" must not become "it is" — the same fail-open one
+# call deeper (a read that failed rendered as a value). This arm existed as a fake-gh seam
+# (`$SCEN/pr-url-fail`) with NO scenario driving it, i.e. an untested refusal.
+new_scen repo-url-unreadable
+: > "$SCEN/merged"
+: > "$SCEN/pr-url-fail"
+run_admin_cwd "$SCEN" 42
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(i) a MERGED state whose PR identity cannot be read is refused (exit $rc)"
+else
+  fail "(i) it reported ALREADY MERGED without being able to name the PR (exit $rc)"
+fi
+if grep -qi 'could not\|cannot\|unreadable\|identity' "$SCEN/err"; then
+  pass "(i) …and says the identity could not be read"
+else
+  fail "(i) …but the refusal does not say why (err: $(head -2 "$SCEN/err" | tr '\n' ' '))"
+fi
+if grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  fail "(i) …and still printed the ✅ no-op line"
+else
+  pass "(i) …and printed NO ✅ no-op line"
+fi
+
+# (j) THE SAME SLUG ON ANOTHER HOST IS NOT THE SAME PR. The url proof compares owner, name
+# and number — a proof that IGNORED the host certified `https://evil.example.com/…`, so a
+# mirror/GHE PR elsewhere would certify this repo's no-op. `GH_HOST` is ambient state of
+# exactly the kind #2235 is about: it was neither stripped nor checked anywhere.
+new_scen repo-url-foreign-host
+: > "$SCEN/merged"
+printf 'https://evil.example.com/daniel-ospina/agent-infra/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 42
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(j) a MERGED PR url on a DIFFERENT host is refused (exit $rc)"
+else
+  fail "(j) a foreign-host url certified the no-op (exit $rc)"
+fi
+if grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  fail "(j) …and still printed the ✅ no-op line"
+else
+  pass "(j) …and printed NO ✅ no-op line"
+fi
+
+# (k) THE LAST RESORT: NOT A CHECKOUT AT ALL, NO SELECTOR, NO AMBIENT GH_REPO. Then — and
+# only then — `gh repo view` (with GH_REPO stripped) may name the target, and the evidence
+# line must say so. Without this arm the whole third resolution arm was unexercised, so
+# "(1) and (2) work" could not distinguish a working (3) from a missing one.
+new_scen repo-from-gh
+mkdir -p "$TMP/nocheckout"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_cwd "$TMP/nocheckout" 42
+if grep -q 'resolved from gh repo view' "$SCEN/out"; then
+  pass "(k) with no checkout and no selector the repo comes from 'gh repo view', and says so"
+else
+  fail "(k) 'gh repo view' was not the resolution source: $(head -2 "$SCEN/out" | tr '\n' ' ')"
+fi
+if grep -q 'repo view' "$SCEN/calls"; then
+  pass "(k) …and the read really happened (not a hard-coded default)"
+else
+  fail "(k) …but no 'gh repo view' call was made"
+fi
+
+# (l) A ZERO-PADDED PR IS THE SAME PR. The rail accepts `01631` (see its argv note) and gh
+# parses it as 1631, echoing `…/pull/1631` — so a STRING compare on the url's number refused a
+# PR that is genuinely already merged (exit 2, a false block on the no-op path).
+new_scen repo-noop-zero-padded
+: > "$SCEN/merged"
+printf 'https://github.com/daniel-ospina/agent-infra/pull/42\n' >"$SCEN/pr-url"
+run_admin_cwd "$SCEN" 0042
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'ALREADY MERGED' "$SCEN/out"; then
+  pass "(l) a zero-padded PR number still certifies the same-PR no-op"
+else
+  fail "(l) '0042' was refused against url /pull/42 (exit $rc) — gh parses it as 42"
+fi
+
+# (m) THE DOCUMENTED `[HOST/]OWNER/REPO` FORM. `gh help environment` documents GH_REPO that way
+# and `--repo` accepts it, so `github.com/<this repo>` names THIS repo. Case-folding alone graded
+# it as a DIFFERENT repo and refused a correct invocation — a false block on the fix's own path.
+new_scen repo-ambient-host-form
+GH_REPO=github.com/daniel-ospina/agent-infra run_admin_cwd "$SCEN" 42
+if grep -q 'REFUSING — the inherited GH_REPO' "$SCEN/err"; then
+  fail "(m) GH_REPO in its documented host form was graded as a DIFFERENT repo"
+else
+  pass "(m) GH_REPO in its documented [HOST/]OWNER/REPO form is not a disagreement"
+fi
+new_scen repo-explicit-host-form
+run_admin_cwd "$SCEN" 42 --repo github.com/daniel-ospina/agent-infra
+if grep -q "refusing --repo" "$SCEN/err"; then
+  fail "(m) --repo in its documented host form was refused as 'not an <owner>/<repo>'"
+else
+  pass "(m) --repo accepts [HOST/]OWNER/REPO, as gh does"
+fi
+
+# (n) `--print-bounds <run-id>` MUST REFUSE TOO. That arm exits BEFORE a PR is required and reads
+# the RUN's shard durations + the GREEN population with NO --repo, so it resolved through the
+# ambient GH_REPO and reported another repo's timings with no refusal (the same leak, one symptom
+# over). Every `--print-bounds <run-id>` arm in this suite passes --repo, which is why it was
+# invisible; this one carries the leak and must stop before any call.
+new_scen repo-print-bounds-refuses
+GH_REPO=daniel-ospina/tortoise run_admin_cwd "$SCEN" --print-bounds 2232
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(n) --print-bounds with a foreign ambient GH_REPO refuses (exit $rc)"
+else
+  fail "(n) --print-bounds answered for the ambient repo (exit $rc) — it read timings for another repo"
+fi
+if [ ! -s "$SCEN/calls" ]; then
+  pass "(n) …and made NO gh call at all"
+else
+  fail "(n) …but it called gh BEFORE refusing: $(head -3 "$SCEN/calls" | tr '\n' ' ')"
+fi
 
 # ── 77. #9689: THE BASELINE WINDOW COUNTS MEASUREMENTS, NOT RUN OBJECTS ───
 # A push burst to main spends the requested `--main-runs` window on runs that
