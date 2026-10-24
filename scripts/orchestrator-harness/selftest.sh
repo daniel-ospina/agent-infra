@@ -2616,15 +2616,36 @@ fi
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
-# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# Each is asserted to carry can_spawn, which is the property under test.
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
+# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
+# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
+# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
+# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
+# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
+# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
+# With nesting, the two populations are disjoint by construction, so each is counted directly. The
+# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
+# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
+# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
+# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
+# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
+# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
+# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
+# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
+fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
+[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
+ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
+[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
+ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1

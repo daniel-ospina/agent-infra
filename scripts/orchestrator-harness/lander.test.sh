@@ -598,6 +598,107 @@ grep -q '^R' "$(state_file)" 2>/dev/null && bad "2-PASS: the resolved R row was 
                                         || ok "2-PASS: the resolved R row was consumed"
 [ "$(post_count)" = "0" ] && ok "2-PASS: pass 2 issued no POST (the new attempt measures the tree)" \
                           || bad "2-PASS: pass 2 re-ran a run it had already re-run ('$(rerun_calls)')"
+say_case "case 24 — a SAME-SECOND tie must resolve to the RED, in both orders (fail-closed, not list order)"
+# `startedAt` has one-second resolution and `max()` returns the FIRST maximal element, so a red and a
+# green attempt started in the same second used to resolve by LIST ORDER (measured: [success,failure]
+# merged; [failure,success] did not). Covered in both orders so a positional tie-break cannot pass.
+# ⛔ NO `set --` HERE. It clobbers the SCRIPT POSITIONAL PARAMETERS, and `--nonvacuity` is read from
+# `$1` at the end of this file — so a `set --` inside one case silently turned the non-vacuity mutant
+# gate into a no-op that exited 0 (caught by the verification gate: the mutant check never ran).
+for order in "success:failure" "failure:success"; do
+  new_case
+  base_tip "$BASE_ISO"
+  seed 125 MERGEABLE CLEAN false bbbb0000111122223333444455556666777788889
+  ORDER_FIRST="${order%%:*}"; ORDER_SECOND="${order##*:}"
+  python3 - "$FX/checks-125.json" "$ORDER_FIRST" "$ORDER_SECOND" <<'PY'
+import json, sys
+p, first, second = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump([
+    {"name": "sigpipe-grep", "state": first,  "workflow": "CI", "startedAt": "2026-10-23T13:58:23Z"},
+    {"name": "sigpipe-grep", "state": second, "workflow": "CI", "startedAt": "2026-10-23T13:58:23Z"},
+], open(p, "w"))
+PY
+  run_lander
+  [ -z "$(merged_nums)" ] && ok "TIE ($order): a same-second red is NOT merged away" \
+                          || bad "TIE ($order): a same-second red was MERGED (merge calls: '$(merged_nums)')"
+  grep -q 'FAILED check' <<<"$OUT" && ok "TIE ($order): and it is still reported as a failing check" \
+                                   || bad "TIE ($order): the red is not reported ($OUT)"
+done
+
+say_case "case 25 — a run carrying an EXCLUDED check is dropped ENTIRELY (the POST re-runs every failed job in it)"
+new_case
+base_tip "$BASE_ISO"
+seed 126 MERGEABLE CLEAN false cccc0000111122223333444455556666777788889
+checks 126 sigpipe-grep:failure pipeline-compliance:failure
+# ONE run carries both: the stale sigpipe red and the excluded required check.
+surface 126 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|7030|1201" \
+            "pipeline-compliance|FAILURE|2026-10-23T01:00:05Z|7030|1202"
+run_lander
+[ -z "$(rerun_calls)" ] && ok "EXCLUDED-RUN: the shared run was NOT re-run (which would have re-run #2467's check)" \
+                         || bad "EXCLUDED-RUN: the run carrying the excluded check WAS re-run ('$(rerun_calls)')"
+has "$OUT" "run(s)-dropped=1" && ok "EXCLUDED-RUN: the dropped run is COUNTED" \
+                              || bad "EXCLUDED-RUN: the drop is invisible ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+
+say_case "case 26 — each unreadable surface is a NAMED refusal (the guards the fail-closed claim rests on)"
+# 26a: GraphQL errors
+new_case
+rm -f "$FX/rollup.json"
+printf '{"errors":[{"message":"something the API refused"}]}\n' >"$FX/rollup.json"
+seed 127 MERGEABLE CLEAN false dddd0000111122223333444455556666777788889
+checks 127 sigpipe-grep:success
+run_lander
+[ -z "$(rerun_calls)" ] && ok "REFUSAL(errors): 0 re-runs on a GraphQL-error surface" \
+                         || bad "REFUSAL(errors): re-ran on an errored surface ('$(rerun_calls)')"
+has "$OUT" "returned GraphQL errors" && ok "REFUSAL(errors): the reason is NAMED, not 'printed nothing explanatory'" \
+                                     || bad "REFUSAL(errors): the reason is not surfaced ($(printf '%s\n' "$OUT" | grep stale-rerun | head -2))"
+# 26b: unparseable body
+new_case
+printf 'not json at all\n' >"$FX/rollup.json"
+seed 128 MERGEABLE CLEAN false eeee0000111122223333444455556666777788889
+checks 128 sigpipe-grep:success
+run_lander
+[ -z "$(rerun_calls)" ] && ok "REFUSAL(unparseable): 0 re-runs" || bad "REFUSAL(unparseable): re-ran ('$(rerun_calls)')"
+has "$OUT" "could not be parsed" && ok "REFUSAL(unparseable): the reason is NAMED" \
+                                  || bad "REFUSAL(unparseable): reason missing ($(printf '%s\n' "$OUT" | grep stale-rerun | head -2))"
+# 26c: a TRUNCATED surface (pageInfo.hasNextPage) is refused, not sampled
+new_case
+printf '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[{"number":129,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":true},"nodes":[{"__typename":"CheckRun","databaseId":1301,"name":"sigpipe-grep","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-23T01:00:00Z","checkSuite":{"app":{"slug":"github-actions"},"workflowRun":{"databaseId":7040,"workflow":{"name":"CI"}}}}]}}}}]}}]}}}}\n' >"$FX/rollup.json"
+seed 129 MERGEABLE CLEAN false ffff0000111122223333444455556666777788889
+checks 129 sigpipe-grep:failure
+run_lander
+[ -z "$(rerun_calls)" ] && ok "REFUSAL(truncated): a truncated check surface re-runs NOTHING" \
+                         || bad "REFUSAL(truncated): re-ran from a truncated surface ('$(rerun_calls)')"
+has "$OUT" "TRUNCATED" && ok "REFUSAL(truncated): the refusal names truncation" \
+                        || bad "REFUSAL(truncated): truncation not named ($(printf '%s\n' "$OUT" | grep stale-rerun | head -2))"
+# 26d: the PR LIST truncated
+new_case
+printf '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true},"nodes":[]}}}}\n' >"$FX/rollup.json"
+seed 130 MERGEABLE CLEAN false aaaa1111000022223333444455556666777788889
+checks 130 sigpipe-grep:success
+run_lander
+[ -z "$(rerun_calls)" ] && ok "REFUSAL(truncated list): 0 re-runs when the PR list is a SAMPLE" \
+                         || bad "REFUSAL(truncated list): re-ran from a sampled board ('$(rerun_calls)')"
+has "$OUT" "PR list was TRUNCATED" && ok "REFUSAL(truncated list): named" \
+                                   || bad "REFUSAL(truncated list): not named ($(printf '%s\n' "$OUT" | grep stale-rerun | head -2))"
+
+say_case "case 27 — the two numeric guards that bound a mutation are pinned"
+# 27a: an overflowed CAP must not lift the ceiling
+new_case
+base_tip "$BASE_ISO"
+seed 131 MERGEABLE CLEAN false bbbb1111000022223333444455556666777788889
+checks 131 sigpipe-grep:failure
+surface 131 "sigpipe-grep|FAILURE|2026-10-23T01:00:00Z|7050|1401"
+STALE_RERUN_CAP=999999999999999999999999 run_lander
+has "$OUT" "budget N=50 run(s)" && ok "GUARD(cap): an overflowed STALE_RERUN_CAP is clamped to the 50 ceiling" \
+                                || bad "GUARD(cap): the ceiling did not hold ($(printf '%s\n' "$OUT" | grep 'stale-rerun: stale-by-base'))"
+# 27b: an unusable TMPDIR must SAY SO rather than going silent
+new_case
+base_tip "$BASE_ISO"
+seed 132 MERGEABLE CLEAN false cccc1111000022223333444455556666777788889
+checks 132 sigpipe-grep:success
+OUT_SO="$(O="$O" TMPDIR=/proc/definitely-not-writable GH_TOKEN=stub-invalid-token bash "$LANDER" --repo stub/repo --max 5 2>&1)"
+has "$OUT_SO" "no scratch directory" && ok "GUARD(tmpdir): an unusable TMPDIR produces a LINE, not silence" \
+                                     || bad "GUARD(tmpdir): the step went silent ($(printf '%s\n' "$OUT_SO" | grep stale-rerun | head -2))"
 # ══ summary ═════════════════════════════════════════════════════════════════════════════════
 printf '\n%s of %s assertions passed, %s failed\n' "$PASS" "$((PASS+FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
