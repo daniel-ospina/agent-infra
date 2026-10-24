@@ -1433,6 +1433,24 @@ case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "no tool anywhere: the refusal is LOUD and named" ;;
   *) bad "no tool anywhere: no NOT PROVISIONABLE verdict — output: $OUT" ;;
 esac
+# ⛔ THE REFUSAL MUST NAME WHERE IT LOOKED (2026-10-24). "no pre-flight could be resolved" is true of
+# every possible cause, and each cause has a DIFFERENT fix, so an operator reading it has to guess
+# which of the five paths the resolver tried. Pinned: the serviced repo's own copy (scout, then main
+# checkout) AND every tortoise candidate are printed, in resolution order, with no fabricated path.
+case "$OUT" in
+  *"looked for (in this order):"*"$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"*)
+    ok "no tool anywhere: the refusal names the paths it searched, scout copy first" ;;
+  *) bad "no tool anywhere: the refusal does not name the searched paths — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"$D/home/Documents/GitHub/tortoise/tools/collision_preflight.py"*"$D/home/eldato/tortoise/tools/collision_preflight.py"*)
+    ok "no tool anywhere: both conventional tortoise checkouts are named in order" ;;
+  *) bad "no tool anywhere: the tortoise candidates are not both named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"//tools/collision_preflight.py"*) bad "no tool anywhere: an empty candidate produced a fabricated path" ;;
+  *) ok "no tool anywhere: no fabricated path from an empty variable" ;;
+esac
 case "$OUT" in
   *"uv sync failed"*) bad "no tool anywhere: misreported as a uv failure" ;;
   *) ok "no tool anywhere: not misreported as a uv/environment failure" ;;
