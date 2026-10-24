@@ -488,13 +488,17 @@ mirror_origin_refs() {
     done
 }
 
-# mutate_reaper <outfile> <mutation-name> — write a MUTANT copy of the reaper.
+# mutate_reaper_anchored <outfile> <mutation-name> — write a MUTANT copy of the reaper.
+# ⛔ DELIBERATELY NOT CALLED `mutate_reaper`: main's #2354 section defines a
+# `mutate_reaper <sed-expr>` helper with the SAME NAME but a different signature.
+# One file cannot hold both — the later definition shadows the earlier and every
+# leg of the shadowed side fails for the wrong reason. Keep the names distinct.
 # The real script is never edited: a mutation test that edits its subject in
 # place can leave a half-mutated reaper behind on any failure. Anchors live here
 # (not at the call site) so the escapes are written once, and each must match
 # EXACTLY once or the run aborts — a no-op substitution is the classic way a
 # mutation test passes while proving nothing.
-mutate_reaper() {
+mutate_reaper_anchored() {
     python3 -c '
 import sys
 src, name, out = sys.argv[1:4]
@@ -507,8 +511,8 @@ ANCHORS = {
     # (c): drop the ANCESTRY requirement, so every branch gets the merged
     # exemption and an unmerged head is no longer held by the age floor.
     "no-ancestry-gate": (
-        "    [ \"$refs\" = \"merged\" ] && age_floor=\"$REAP_WT_MERGED_AGE_DAYS\"",
-        "    age_floor=\"0\"   # MUTANT: the ancestry requirement is dropped",
+        "        [ \"$rc\" = 0 ] && merged=1",
+        "        merged=1   # MUTANT: the ancestry requirement is dropped",
     ),
     # gate 3: drop the UNPUSHED-COMMIT check.
     "no-unpushed-gate": (
@@ -1721,6 +1725,9 @@ ENV=N4; REPO="$(mk_repo $ENV)"
 "$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
 WT_U="$(add_named_wt "$REPO" "$ENV-unmerged" feat/n4-unmerged)"
 commit_in_wt "$WT_U" "$RECENT_DATE" n4
+# a real clone has tracking refs; without them gate 3 ("no unpushed commits")
+# would hold these rows for a reason N4/N6 do not test (see mirror_origin_refs)
+mirror_origin_refs "$REPO"
 OUT="$(FAKE_GH_REFS="" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_U")" "reason=too-recent" "N4(d) an unmerged commit 2d old => KEPT, reason=too-recent (the gate that refused)"
 
@@ -1767,6 +1774,9 @@ WT_SCRATCH="$(add_named_wt "$REPO" "$ENV/wt-4200" feat/n6-scratch)"
 WT_NAMED="$(add_named_wt "$REPO" "$ENV/named" feat/n6-named)"
 commit_in_wt "$WT_SCRATCH" "$RECENT_DATE" n6a
 commit_in_wt "$WT_NAMED" "$RECENT_DATE" n6b
+# a real clone has tracking refs; without them gate 3 ("no unpushed commits")
+# would hold these rows for a reason N4/N6 do not test (see mirror_origin_refs)
+mirror_origin_refs "$REPO"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=reclaimable" \
     "N6 a dead lane's wt-* scratch dir 2d old is reclaimed (REAP_WT_SCRATCH_AGE_DAYS)"
@@ -1780,6 +1790,7 @@ WT_WTFOO="$(add_named_wt "$REPO" "$ENV/wtfoo" feat/n6-wtfoo)"
 WT_CELL="$(add_named_wt "$REPO" "$ENV/cell-wt-5300" feat/n6-cell)"
 commit_in_wt "$WT_WTFOO" "$RECENT_DATE" n6c
 commit_in_wt "$WT_CELL" "$RECENT_DATE" n6d
+mirror_origin_refs "$REPO"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_WTFOO")" "reason=too-recent" \
     "N6 the pattern is ANCHORED: wtfoo/ is not a wt-* scratch dir (a naive prefix rule reclaims it)"
@@ -2066,7 +2077,7 @@ assert_dir "$WT_E5" "E5 (e) --apply KEPT the stranded-stash worktree"
 # A mutant is a COPY of the reaper with ONE predicate deleted. If the fixture
 # it protects is still kept, that fixture's assertion is not testing the gate.
 MUT1="$T/mutant-no-clean-gate.sh"
-mutate_reaper "$MUT1" no-clean-gate
+mutate_reaper_anchored "$MUT1" no-clean-gate
 
 # M1 fixture = E2's shape (merged + one uncommitted file)
 ENV=M1; REPO="$(mk_repo_pushable $ENV)"
@@ -2083,7 +2094,7 @@ assert_contains "$(row_for "$OUT" "$WT_M1")" "reason=reclaimable" \
     "M1 MUTATION: dropping the clean gate WRONGLY reaps it => E2 is discriminating"
 
 MUT2="$T/mutant-no-ancestry-gate.sh"
-mutate_reaper "$MUT2" no-ancestry-gate
+mutate_reaper_anchored "$MUT2" no-ancestry-gate
 
 # M2 fixture = E3 (unmerged + open PR) AND E3b (unmerged, no PR)
 ENV=M2; REPO="$(mk_repo_pushable $ENV)"
@@ -2146,8 +2157,8 @@ fi
 # ── M3/M4: gates 3 and 4 are load-bearing too ─────────────────────────
 # A gate with no mutation is a gate nobody has proved is connected to the
 # decision. These two prove E4 and E5 discriminate.
-MUT3="$T/mutant-no-unpushed-gate.sh"; mutate_reaper "$MUT3" no-unpushed-gate
-MUT4="$T/mutant-no-stash-gate.sh";  mutate_reaper "$MUT4" no-stash-gate
+MUT3="$T/mutant-no-unpushed-gate.sh"; mutate_reaper_anchored "$MUT3" no-unpushed-gate
+MUT4="$T/mutant-no-stash-gate.sh";  mutate_reaper_anchored "$MUT4" no-stash-gate
 
 ENV=M3; REPO="$(mk_repo_pushable $ENV)"
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/m3-unpushed main
