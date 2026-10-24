@@ -216,6 +216,33 @@ printf '%s\n' "$*" >> "$S/calls"
 exit "$(cat "$S/rc" 2>/dev/null || echo 0)"
 SH
 
+# lane-reap (#2163): a DOUBLE, so this suite asserts the DELEGATION (and the census in the pass
+# line) without letting a second reaper loose on the fixture's process table. lane-reap.sh has its
+# own hermetic suite; this file's contract is "the doctor schedules it with the right posture".
+cat > "$T/bin/lane-reap" <<'SH'
+#!/bin/bash
+S="${DOCTOR_TEST_LANE_REAP:?}"
+printf '%s\n' "$*" >> "$S/calls"
+case "${1:-}" in
+  # ⛔ The two answers carry DIFFERENT tokens (#2163 review, P2). When both printed
+  # `lanes=1/2 zombie=0`, deleting the `count` call would still leave the census assertion green —
+  # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
+  count) printf 'lanes=3/7 zombie=2\n' ;;
+  # DOCTOR_TEST_REAP_ABSTAIN models a pass that could not JUDGE every tree: the reaper's own
+  # `abstained=` counter is the only token that distinguishes it from an idle one.
+  # DOCTOR_TEST_REAP_INERT models the CELL shape: a pass that judged NO tree while refusing every
+  # lane it found by POLICY (`trees=0/0 … refused=1 inert=1 abstained=0`). That line is the one the
+  # doctor recorded as a healthy reaper, every pass, for ever.
+  # DOCTOR_TEST_REAP_TREES models the OTHER shape the reaper calls clean — a pass that DID judge
+  # trees and refused a human-owned lane beside them (`trees=0/1 … inert=1`, exit 0). `inert=` is a
+  # POLICY count, so the doctor must escalate the INERT PASS (nothing judged), never the field alone.
+  # DOCTOR_TEST_REAP_REFUSAL adds the per-tree refusal LINE, which `tail -1` used to discard.
+  reap)  [ -n "${DOCTOR_TEST_REAP_REFUSAL:-}" ] && printf '  REFUSE root=99 log=/x/L-a.log — %s\n' "$DOCTOR_TEST_REAP_REFUSAL"
+         printf 'lane-reap: trees=%s zombie=0 candidates=0 reaped=0 refused=1 inert=%s unidentifiable=%s abstained=%s mode=%s\n' \
+           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_UNIDENT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
+esac
+exit 0
+SH
 cat > "$T/bin/wt-reaper.sh" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "${DOCTOR_TEST_WT:?}/calls"
@@ -234,16 +261,17 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh"
 # The `uv` double records its calls here; without it the double fails (it is `:?`-guarded), and a
 # fixture that forgot to pass it would read as "uv cache prune FAILED" — a truthy-looking false red.
 export DOCTOR_TEST_UV="$T/uv"
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
-mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv"
+mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session"; touch "$T/tmux/sessions"; }
-reset_state() { rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
 reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."* "$T/ps/etime."*; }
+reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles" "$T/lane-reap"; rm -f "$T/lane-reap/calls"; }
 mk_lane() { # <name> <pid> [<log mtime, `touch -t` form; default ancient>]
   printf '%s\n' "$1" >> "$T/tmux/sessions"
   printf '%s\n' "$2" > "$T/tmux/panes/$1"
@@ -275,6 +303,140 @@ doc reap
 killed lane-42 && ok "reap: killed the exact session target (=lane-42)" || bad "reap: did NOT kill lane-42 — $OUT"
 case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" in *"reaped lane-42"*) ok "reap: recorded 'reaped lane-42' in its state" ;; *) bad "reap: state does not record the reap — $(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" ;; esac
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "0" ] && ok "reap: state last_rc=0" || bad "reap: state last_rc missing/wrong"
+# #2163: the same pass must SCHEDULE the process reaper, and its census must be in the pass line.
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap: delegated the process pass ARMED (reap --apply)" || bad "reap: the process pass was not delegated armed — $(cat "$T/lane-reap/calls" 2>/dev/null)"
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "reap: read the evidence census (count)" || bad "reap: the census was not read"
+result_has "lanes=3/7 zombie=2" && ok "reap: the pass line carries the CENSUS (lanes=<live>/<total> zombie=<n>)" || bad "reap: the census is missing from the pass line — $OUT"
+result_has "trees=1/2" && ok "reap: the process pass's own line is in the pass line too" || bad "reap: the process pass result is missing — $OUT"
+
+# ── 1a2) an ABSTAINING process pass is unverifiable, not a quiet pass ──────────────────────────
+# ⛔ `reaped=0 refused=0` over trees the reaper could not judge is not "nothing to do" (#2163
+# review, P2). Only the literal `CANNOT-VERIFY` token used to escalate, so the reaper's own
+# `abstained=` counter — the one field that says a safety read failed — never reached the pass rc.
+say_case "a process pass that ABSTAINED is unverifiable (rc=3), not an idle pass"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_ABSTAIN=2 doc reap
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap-abstain: the pass was still delegated" || bad "reap-abstain: the process pass was not delegated — $(cat "$T/lane-reap/calls" 2>/dev/null)"
+[ "$RC" -eq 3 ] && ok "reap-abstain: rc=3 (a safety read failed)" || bad "reap-abstain: rc=$RC — an abstaining pass read as clean — $OUT"
+result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pass line" || bad "reap-abstain: the abstention count is missing — $OUT"
+
+# ── 1a3) a process pass that judged NOTHING is unverifiable, not a health record ──────────────
+# ⛔ THE CELL SHAPE (#2163 review r3, P2). On a cell every lane is `ancestry-unknown`, so the armed
+# pass judged ZERO trees while refusing all of them: `trees=0/0 … refused=1 abstained=0 mode=apply`,
+# rc 0 — and `state_write reap 0` recorded a HEALTHY reaper every pass, from an instrument that is
+# inert there by design. `abstained=` cannot see it (nothing failed to read; a policy decided), so
+# the reaper counts it in `inert=` and this role records that shape as its OWN verdict.
+say_case "a process pass that judged NOTHING (inert) is a POLICY verdict (rc=4), never a clean pass"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_TREES=0/0 DOCTOR_TEST_REAP_INERT=2 doc reap
+[ "$RC" -eq 4 ] && ok "reap-inert: rc=4 (a POLICY verdict, not cannot-verify)" || bad "reap-inert: rc=$RC — an inert pass read as clean or as a failed read — $OUT"
+result_has "inert=2" && ok "reap-inert: the inert count is in the pass line" || bad "reap-inert: the inert count is missing — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "4" ] \
+  && ok "reap-inert: state records rc=4 (never a healthy 0, never a failed 3)" \
+  || bad "reap-inert: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")"
+
+# ── 1a4) an inert count on a pass that DID judge trees is CLEAN, not a failed pass ────────────
+# ⛔ ONE INERT LANE IS NOT A FAILED PASS (#2163 review r4, P2). `inert=` is a POLICY count, not a
+# failure: `lane-reap.sh` returns 4 only when `total == 0 && inert > 0` and returns 0 when it judged
+# lanes while refusing a human-owned one beside them (its own `INERT-MIXED` leg pins that). The
+# doctor's `*inert=[!0]*` arm escalated ANY non-zero `inert=`, so on a box with one human-owned or
+# `ancestry-unknown` lane it wrote `reap FAILED` every pass over a pass the reaper calls clean
+# — the mirror of the r3 bug, one field too wide.
+say_case "a policy refusal beside a JUDGED lane is not a failed pass (rc=0)"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_TREES=0/1 DOCTOR_TEST_REAP_INERT=1 doc reap
+[ "$RC" -eq 0 ] && ok "reap-inert-mixed: rc=0 (a judged lane keeps the pass clean)" || bad "reap-inert-mixed: rc=$RC — a clean pass was recorded as FAILED — $OUT"
+result_has "inert=1" && ok "reap-inert-mixed: the refusal is still REPORTED in the pass line" || bad "reap-inert-mixed: the inert count is missing — $OUT"
+result_has "trees=0/1" && ok "reap-inert-mixed: …beside the tree that WAS judged" || bad "reap-inert-mixed: the judged-tree count is missing — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "0" ] \
+  && ok "reap-inert-mixed: state records the HEALTHY pass" \
+  || bad "reap-inert-mixed: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") — a clean pass recorded as failed"
+# ── 1a4b) a policy-inert reap is INERT, not FAILED — the health verb stays GREEN ───────────────
+# ⛔ THE PERMANENT RED (#2163 review r8, P1). On a Linux CELL every armed pass is policy-inert
+# (`ancestry-unknown`, §11.4), so recording it as `FAILED` made `cloud-cell-supervisor.sh status` exit
+# 1 for ever on a healthy cell, and `[ "$rrc" -eq 0 ] && rrc=1` collapsed a genuine restart failure
+# into the same number. The verdict is NAMED (never a silent green) and it does not fail the verb.
+say_case "a policy-inert reap is reported INERT (rc=4) and does not red the health verb"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_TREES=0/0 DOCTOR_TEST_REAP_INERT=2 doc reap
+[ "$RC" -eq 4 ] && ok "reap-inert: the reap pass is rc=4" || bad "reap-inert: rc=$RC — $OUT"
+: > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 30 & SP_PID=$!
+loop_up "$SP_PID"
+NOW0="$(date +%s)"
+for r in doctor merge hygiene; do
+  printf 'role=%s\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=0\nlast_result=ok\n' "$r" "$NOW0" > "$T/o/state/roles/$r.state"
+done
+doc status
+[ "$RC" -eq 0 ] && ok "status: a cell whose only non-zero role is a policy-inert reap is GREEN" \
+  || bad "status: rc=$RC — a working policy reddened the cell — $OUT"
+result_has "INERT" && ok "status: …and the row NAMES the verdict (never a silent green)" \
+  || bad "status: the policy verdict is not named — $OUT"
+# …and the staleness bound still applies: a reaper that STOPPED passing is not hidden by rc=4.
+printf 'role=reap\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=4\nlast_result=inert-pass\n' "$(( NOW0 - 100000 ))" > "$T/o/state/roles/reap.state"
+doc status
+[ "$RC" -ne 0 ] && result_has "STALE" \
+  && ok "status: a policy-inert reaper that stopped passing reads STALE, not healthy" \
+  || bad "status: rc=$RC — an ancient rc=4 pass read as current — $OUT"
+kill "$SP_PID" 2>/dev/null || true; SP_PID=""
+rm -f "$T/o/state/roles/.desired"
+
+# ── 1a4c) a policy verdict never OVERWRITES a stored cannot-verify (rehearsal) ──────────────────
+# ⛔ rc=4 IS A POLICY VERDICT, NOT A SEVERITY (#2163 review r8, P1). "Keep whichever rc is larger"
+# ranked a rehearsal's 4 above a stored 3 — and above a stored 1 — so a dry run recorded INERT over a
+# failure that was still true. Only a FAILING rc may supersede; a clean 0 never clears a failure.
+say_case "a policy-inert rehearsal does not overwrite a stored cannot-verify"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+printf 'role=reap\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=3\nlast_result=cannot-verify: session list unreadable\n' "$(date +%s)" > "$T/o/state/roles/reap.state"
+DOCTOR_TEST_REAP_TREES=0/0 DOCTOR_TEST_REAP_INERT=2 doc reap --dry-run
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok "rehearsal: the stored cannot-verify SURVIVES a policy-inert rehearsal" \
+  || bad "rehearsal: the rehearsal overwrote rc=3 with $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")"
+
+# ── 1a5) an UNUSABLE PIPE IDENTITY is escalated, but its cause names IDENTITY ─────────────────
+# ⛔ A READABLE BOX IS NOT A BLIND ONE (#2163 review r5, P3). `unidentifiable=` counts trees the
+# reaper could not judge because its platform prints no per-pipe name for an anonymous pipe — every
+# READ succeeded. It used to arrive as `abstained=`, whose only cause line said "the descriptors
+# could not be read", so `reap FAILED rc=3` sent the operator after an lsof/permissions fault that
+# never happened. It must still ESCALATE (it is an abstention), and the cause must name identity.
+say_case "an unidentifiable pipe identity escalates with an IDENTITY cause, not a blind read"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+: > "$T/o/logs/doctor.log"
+DOCTOR_TEST_REAP_UNIDENT=1 \
+  DOCTOR_TEST_REAP_REFUSAL="pipe-identity-unusable (the descriptors WERE read; this platform prints no per-pipe name, so a tee beside the tree cannot be shown to be its own writer)" \
+  doc reap
+[ "$RC" -eq 3 ] && ok "reap-unident: rc=3 (an abstention never reads as a clean pass)" || bad "reap-unident: rc=$RC — an identity abstention read as clean — $OUT"
+result_has "unidentifiable=1" && ok "reap-unident: the identity counter is in the pass line" || bad "reap-unident: the identity counter is missing — $OUT"
+grep -q 'proc-first:.*pipe-identity-unusable' "$T/o/logs/doctor.log" 2>/dev/null \
+  && ok "reap-unident: [reap] names IDENTITY as the cause" \
+  || bad "reap-unident: the cause never reached [reap] — $(grep '\[reap\]' "$T/o/logs/doctor.log" 2>/dev/null | tail -2)"
+if grep -q 'descriptors could not be read' "$T/o/logs/doctor.log" 2>/dev/null; then
+  bad "reap-unident: a cause line claims a BLIND READ on a box where every read succeeded"
+else
+  ok "reap-unident: …and no cause line claims a blind read"
+fi
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok "reap-unident: state records the FAILED pass" \
+  || bad "reap-unident: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") — a failed pass recorded as healthy"
+
+# ⛔ AND THE REASON REACHES THE LOG (#2163 review r3, P2). `tail -1` kept the summary and threw away
+# every per-tree reason, so `[reap]` could not say WHY nothing was judged — and a refusal was
+# indistinguishable from an idle box.
+say_case "the first per-tree refusal reaches the doctor's reap log"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+: > "$T/o/logs/doctor.log"
+DOCTOR_TEST_REAP_REFUSAL="ancestry-unknown (no positive fleet evidence in the chain)" doc reap
+result_has "ancestry-unknown" && ok "reap-reason: the refusal line is in the pass line" || bad "reap-reason: the refusal line is missing — $OUT"
+grep -q 'proc-first:.*ancestry-unknown' "$T/o/logs/doctor.log" 2>/dev/null \
+  && ok "reap-reason: [reap] logs the FIRST refusal, not only the summary" \
+  || bad "reap-reason: the refusal never reached [reap] — $(grep '\[reap\]' "$T/o/logs/doctor.log" 2>/dev/null | tail -2)"
 
 # ── 1b) a lane whose log advanced INSIDE the floor is NOT reaped ────────────────────────────────
 # REAP_MIN_S is the whole reason a SCHEDULED reap pass is safe: a lane that spoke recently is between
@@ -493,6 +655,41 @@ case "$OUT" in
   *) ok 'doctor: the failed-unit outcome has its own wording (an operator can tell it from a transient)' ;;
 esac
 
+# ⛔ THE rc-5 ARM CARRIES ITS OWN SLOT, AND THE SLOT IS DISCRIMINATED (#2163 review r8, P1). The arm
+# used `[ "$rrc" -eq 0 ] && rrc=1` — it only ever RAISED a zero — so a nested reap that recorded
+# cannot-verify (3) swallowed a unit that had CONVERGED TO FAILED and the pass said "cannot verify"
+# over a cell with NO dispatcher. `[ "$RC5" -ne 0 ]` above cannot see that: it passes for 1 AND 3, so
+# a revert to the old shape keeps the suite green. This leg pins the SLOT: rc=5 + an abstaining reap
+# must be rc=1, not 3. RED on revert: fold rc 5 back into `[ "$rrc" -eq 0 ] && rrc=1` and RC5A becomes 3.
+say_case "a FAILED unit OUTRANKS a nested reap's cannot-verify (rc=5 + abstain -> rc=1, not 3)"
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '5\n' > "$T/sup/rc"
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_ABSTAIN=2 doc doctor; RC5A="$RC"
+rm -f "$T/sup/rc"
+# ⛔ PIN THE PRECONDITION, or the leg cannot tell "the slot held" from "there was nothing to hold":
+# if the abstain plumbing ever stops reaching the doctor's nested reap, `rrc` is 0 and BOTH the old and
+# the new shape yield 1 — the pin would decay silently. The stored reap row is the measurable datum
+# (the doctor truncates the nested result to 160 chars, so `abstained=` is NOT readable from $OUT).
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok 'doctor: precondition — the nested reap recorded cannot-verify (3)' \
+  || bad "doctor: the nested reap did NOT record cannot-verify (last_rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")) — this leg proves nothing about dominance"
+[ "$RC5A" -eq 1 ] \
+  && ok 'doctor: a FAILED unit records rc=1 even when the nested reap is cannot-verify (3)' \
+  || bad "doctor: the nested reap's cannot-verify swallowed the FAILED unit (rc=$RC5A, want 1) — the exact defect this arm's own comment names"
+# ⛔ THE *RECORDED PASS LINE* IS THE ARTIFACT, not the log echo: `result=` carries `unit FAILED — no
+# dispatcher`, while `CONVERGED TO FAILED` is log-only wording. Asserting the log token alone cannot
+# see a dropped `result` — the row is what a later reader/sweep reads.
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" in
+  *'unit FAILED'*) ok 'doctor: …and the RECORDED pass line still names the unit FAILED (not just the log)' ;;
+  *) bad "doctor: the FAILED unit is missing from the recorded pass line — $(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" ;;
+esac
+case "$OUT" in
+  *'CONVERGED TO FAILED'*) ok 'doctor: …and the operator-facing log names it CONVERGED TO FAILED' ;;
+  *) bad "doctor: the FAILED unit vanished from the log — $OUT" ;;
+esac
+
 # ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
 # `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a
 # tautology in `loop` mode (the only mode a cell runs), so a cell whose controller had DIED read
@@ -613,7 +810,8 @@ kill -TERM "$LOOP_PID" 2>/dev/null || true; LOOP_PID=""
 # ── 12) HYGIENE: the package cache is pruned; worktrees are armed only under pressure ───────────
 say_case "hygiene: uv cache prune runs; the worktree reaper is gated"
 reset_state; rm -f "$T/uv/uv-calls" "$T/wt/calls"
-export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
+export DOCTOR_TEST_UV="$T/uv"
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
 # ⛔ MIN_FREE_MB=0 pins the DISK PRESSURE this arm is about: `auto` arms the reaper when free space is
 # under MIN_FREE_MB*2, so on a nearly-full runner (measured: 1 GB free, 99% used) an un-pinned "healthy
 # disk" arm asserts --dry-run against a host that is under pressure and fails for the wrong reason.
@@ -746,6 +944,18 @@ rm -f "$T/sup/rc"
 ( DOCTOR_SUPERVISOR=/nonexistent/sup bash "$DOCTOR" doctor >/dev/null 2>&1 ); DRC=$?
 [ "$DRC" -eq 3 ] && ok "doctor: no supervisor to restart with -> rc=3 cannot-verify" \
   || bad "doctor: no-supervisor gave rc=$DRC (want 3)"
+
+say_case "doctor: a nested reap cannot-verify does not swallow a FAILED restart"
+reset_state; : > "$T/o/state/roles/.desired"; reset_tmux
+rm -f "$T/sup/calls"; printf '1\n' > "$T/sup/rc"
+( DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" DOCTOR_TEST_REAP_ABSTAIN=1 bash "$DOCTOR" doctor >/dev/null 2>&1 ); DRC=$?
+rm -f "$T/sup/rc"
+# ⛔ `[ "$rrc" -eq 0 ] && rrc=1` only ever RAISED A ZERO (#2163 review r8, P1): with the nested reap
+# at rc=3 a controller that was DOWN and could not be restarted recorded 3 as well, so "controller is
+# down" was no longer expressible in the rc at all. The supervision FAILURE is dominant.
+[ "$DRC" -eq 1 ] && ok "doctor: restart FAILED + reap rc=3 -> rc=1 (controller-is-down stays expressible)" \
+  || bad "doctor: rc=$DRC (want 1) — the restart failure collapsed into the reap's rc"
+rm -f "$T/o/state/roles/.desired"
 
 say_case "merge: the rail runs FROM the target checkout, and the pass is bounded"
 reset_state; reset_tmux; rm -f "$T/rail/calls" "$T/rail/rc" "$T/rail/sleep"
