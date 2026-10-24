@@ -262,8 +262,6 @@ function advanceCheckpoint(skill: SkillState): void {
   }
 }
 
-// ── Sequence timeout — auto-clear stale sequences ─────
-
 let sequenceTimeout: ReturnType<typeof setTimeout> | null = null;
 const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -278,20 +276,36 @@ const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 // WHY A STEP-0 PARK IS A NO-OP, PROVABLY: `getExpectedToolsForStep` returns
 // `{allow: [], block: []}` for `gate: auto`, and `wouldBlockUnderGate` is false
 // for every tool name — so in warn, gate AND strict an `auto` step blocks
-// nothing. Parking it therefore "preserves" a state that no gate reads, and the
+// nothing. Parking it therefore "preserves" a state no gate reads, and the
 // ONLY artifact the park can ever produce is the log line. That is the whole
 // difference between a lane working and a lane stuck: twelve busy-looking lines.
 //
-// So two rules, and neither one relaxes any gate:
-//   1. an UNGATED step parks nothing — no line, no audit row, timer re-armed;
-//   2. a GATED step that parks is bounded: the first park names WHY the step
-//      cannot advance and WHAT to do, repeats are coalesced (no line), and at
-//      the cap the lane EXITS carrying `SEQUENCE-GATE-UNSATISFIABLE` — one line
-//      a monitor can grep — instead of parking forever with no `.rc`.
-// Park interval stays the fixed 10-minute sequence timer (no backoff to tune:
-// repeats cost nothing once coalesced, and the cap ends the stall).
+// The rules, NONE of which relaxes a gate:
+//   1. an UNGATED (`gate: auto`) step does not park: it logs ONE coalesced idle
+//      line per idle episode (the liveness signal the fleet reads), never a
+//      verdict — there is no gate there, so nothing can be unsatisfiable;
+//   2. a GATED step (verifier, checkpoint, empty gate) parks once with the cause
+//      and remedy DERIVED from its own gate, repeats are coalesced, and at the
+//      cap the lane EXITS 3 carrying `SEQUENCE-GATE-UNSATISFIABLE` — one line a
+//      monitor greps — instead of parking forever with no `.rc`;
+//   3. a TOOL CALL IN FLIGHT is not idle (see parkSuppressedByInFlight);
+//   4. the counted window is CONSECUTIVE idle, and the verdict reports the
+//      MEASURED elapsed time, never `parks × interval`.
+// Park interval stays the fixed 10-minute sequence timer.
 export const SEQUENCE_PARK_CAP = 3;
+// Review cycle 1 (finding 1): a blocking `task` dispatch can legitimately run for
+// tens of minutes — this fleet's own silence bound for a child is 20 min
+// (DEFAULT_STREAM_STALL_MS) and its longest observed single tool is ~40 min — so
+// a 30-minute cap measured from events alone would fail HEALTHY reviewer lanes.
+// While a tool is in flight the timer does not count the window; only a call that
+// outlives this bound (and so cannot be a working call under any of the fleet's
+// own timeouts) resumes it.
+export const SEQUENCE_INFLIGHT_MAX_MS = 60 * 60 * 1000;
 const parkStreak = new Map<string, number>();
+// `gate: auto` steps: one idle line per episode (an episode ends at the next tool
+// activity) — the measured 12×/hour repetition collapses to one line, and the
+// fleet keeps a signal instead of silence (review cycle 1, finding 5).
+const idleEpisodeSeen = new Set<string>();
 // Keys that already reached the cap in this session. After the verdict the lane
 // is ENDING, so a stray second timer (or a direct call) must not re-park, re-log
 // or re-verdict it — one stall, one verdict.
@@ -299,6 +313,33 @@ const unsatisfiableKeys = new Set<string>();
 // The timer has no ctx of its own; the last event's ctx is where `shutdown`
 // lives (loop-enforcer uses the same ctx.shutdown to end a session).
 let lastEventCtx: { shutdown?: () => void } | null = null;
+// The most recent tool call with no matching tool_result yet.
+let inFlight: { id: string; startedAt: number } | null = null;
+// Last tool activity — the MEASURED basis of the verdict's idle window.
+let lastToolActivityAt = Date.now();
+// Test seam: the exit request is recorded instead of ending the test process.
+const testExitRequests: number[] = [];
+export function _exitRequestsForTest(): number[] {
+  return process.env.NODE_ENV === "test" ? testExitRequests : [];
+}
+
+// Only these can legitimately produce NO events for tens of minutes. A `read`
+// or an `edit` is instantaneous, so it must never mask a stall (the pre-existing
+// timeout tests drive `read` and expect the park immediately).
+const LONG_RUNNING_TOOLS = new Set(["bash", "task", "subagent", "task_collect", "task_status", "web_fetch", "loop_enforcer"]);
+
+/**
+ * Is the idle clock suppressed because a tool call is in flight?
+ * Exported pure (test seam) — the timestamps are the whole rule.
+ */
+export function parkSuppressedByInFlight(
+  now: number,
+  flight: { startedAt: number } | null,
+  maxMs: number = SEQUENCE_INFLIGHT_MAX_MS,
+): boolean {
+  if (!flight) return false;
+  return now - flight.startedAt < maxMs;
+}
 
 /**
  * Why THIS step can never advance by waiting, and what actually moves it.
@@ -313,8 +354,6 @@ export function parkDiagnosis(step: Step, mode: Mode): { cause: string; remedy: 
     };
   }
   if (gate === "checkpoint") {
-    // Normally unreachable (the checkpoint branch above parks first), kept so a
-    // checkpoint step that ever reaches here still names a CLEAR-able remedy.
     return {
       cause: `a "checkpoint" step advances ONLY on a fresh \`parallel_work_check\` PASS token for phase "${step.token_phase || "(missing token_phase — unpassable)"}"`,
       remedy: gateGuidance(step, mode).replace(/^→ /, ""),
@@ -343,18 +382,86 @@ export function parkDiagnosis(step: Step, mode: Mode): { cause: string; remedy: 
 }
 
 /**
- * End the lane instead of parking it forever: the verdict line + the audit row
- * are the greppable artifact, and `process.exitCode` / `ctx.shutdown()` make the
- * absence of a `.rc` impossible — a stalled gate is now a TERMINAL state.
+ * End the lane instead of parking it forever.
+ *
+ * ⛔ pi's PRINT mode binds NO shutdown handler: `dist/modes/print-mode.js` passes
+ * `mode` + `commandContextActions` to `bindExtensions` and no `shutdownHandler`,
+ * so `ctx.shutdown()` is a NO-OP there (runner default). Ending on it alone would
+ * print "ending this lane" and change nothing (review cycle 1, finding 2). So:
+ * the exit is `process.exit(3)`, after the verdict line has had a moment to reach
+ * a piped stdout; the durable record is the audit row (appendFileSync). In an
+ * rpc/interactive host ctx.shutdown() IS bound, so it is also invoked.
  */
 function endUnsatisfiableLane(): void {
+  if (process.env.NODE_ENV === "test") { testExitRequests.push(3); return; } // never kill the suite
   try { process.exitCode = 3; } catch { /* exitCode is advisory; the marker line is the contract */ }
-  const ctx = lastEventCtx;
-  if (ctx && typeof ctx.shutdown === "function") {
-    // Deferred off the timer stack (mirrors loop-enforcer's /end): shutting down
-    // inside pi's timer callback would tear down the session mid-callback.
-    setTimeout(() => { try { ctx.shutdown!(); } catch { /* best-effort */ } }, 100);
-  }
+  setTimeout(() => {
+    try { if (lastEventCtx && typeof lastEventCtx.shutdown === "function") lastEventCtx.shutdown(); } catch { /* best-effort */ }
+    setTimeout(() => process.exit(3), 200);
+  }, 50);
+}
+
+/** Count one idle window for `skill`'s current step; returns the running count. */
+function bumpParkStreak(skill: SkillState): number {
+  const key = checkpointKey(skill);
+  const parks = (parkStreak.get(key) ?? 0) + 1;
+  parkStreak.set(key, parks);
+  return parks;
+}
+
+/**
+ * The terminal verdict: one greppable marker line, the derived WHY/REMEDY, an
+ * audit row, and the exit. Called only from print-mode paths.
+ */
+function emitUnsatisfiable(skill: SkillState, step: Step, parks: number, mode: Mode): void {
+  const key = checkpointKey(skill);
+  unsatisfiableKeys.add(key);
+  parkStreak.delete(key);
+  // MEASURED, never derived: `parks × 10` would claim thirty minutes of idle for
+  // parks spread across an hour of real work (review cycle 1, finding 3).
+  const idleMin = Math.max(0, Math.round((Date.now() - lastToolActivityAt) / 60_000));
+  const { cause, remedy } = parkDiagnosis(step, mode);
+  console.log(
+    `[sequence-enforcer] ⛔ SEQUENCE-GATE-UNSATISFIABLE — "${skill.path}" parked ${parks}× at step ${skill.stepIndex} "${step.name}" (gate: ${step.gate || "none"}), no tool call for ${idleMin} min.`,
+  );
+  // A warn session cannot be BLOCKED by this step, so say why ending it is still
+  // right: warn is audit-only, not a waiver — the sequence cannot advance either.
+  const warnNote = mode === "warn"
+    ? " (warn mode: this step does not BLOCK, but it still cannot advance by waiting — a warn pass is audit-only, not a waiver of the sequence)"
+    : "";
+  console.log(`[sequence-enforcer]    WHY: ${cause}.${warnNote}`);
+  console.log(`[sequence-enforcer]    REMEDY: ${remedy}.`);
+  console.log(
+    `[sequence-enforcer]    ENDING THIS LANE NOW (exit 3) — waiting cannot satisfy this gate; the ⛔ line above is the verdict a monitor greps.`,
+  );
+  auditLog({
+    ts: new Date().toISOString(), event: "sequence_gate_unsatisfiable", skill: skill.path, step: skill.stepIndex,
+    step_name: step.name, gate: step.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, idle_min: idleMin, cause, remedy,
+  });
+  endUnsatisfiableLane();
+}
+
+/**
+ * A `gate: auto` step has no gate to satisfy, so it can never be "unsatisfiable"
+ * — but a lane that stops calling tools is still worth ONE greppable line per
+ * episode (the fleet's `timeout_park` audit row was that signal, and deleting it
+ * outright would leave the measured class invisible; review cycle 1, finding 5).
+ * Coalesced: the line and its row are written once per idle episode.
+ */
+function noteUngatedIdle(skill: SkillState, step: Step | undefined, mode: Mode): void {
+  const key = checkpointKey(skill);
+  if (idleEpisodeSeen.has(key)) return;
+  idleEpisodeSeen.add(key);
+  const idleMin = Math.max(0, Math.round((Date.now() - lastToolActivityAt) / 60_000));
+  console.log(
+    `[sequence-enforcer] 💤 Idle — "${skill.path}" at step ${skill.stepIndex} "${step?.name ?? "?"}" (gate: auto), no tool call for ${idleMin} min. ` +
+    `This step declares NO gate: nothing is blocked and the sequence cannot stall here, so this is NOT a gate stall — ` +
+    `further idle windows in this episode are coalesced. A lane that never wakes is the lane reaper's call (fleet_state), not the sequence gate's.`,
+  );
+  auditLog({
+    ts: new Date().toISOString(), event: "timeout_idle_ungated", skill: skill.path, step: skill.stepIndex,
+    step_name: step?.name ?? null, gate: "auto", mode, idle_min: idleMin,
+  });
 }
 
 // #201: on 10-min idle, print-mode PARKS the skill (state preserved, timer
@@ -379,11 +486,24 @@ export function handleSequenceTimeout(
   const owner = findCheckpointGateOwner();
   if (owner) {
     const step = owner.steps[owner.stepIndex];
+    const mode = resolveMode(env, MODE_FILE, argv);
     // (cycle 3): warn-mode sessions never park — the first call auto-advances,
     // so a park would be recovery-signal noise in a success path (mirrors the
     // handler's wall-clock guard). The re-arm stays unconditional.
-    if (step?.gate === "checkpoint" && resolveMode(env, MODE_FILE, argv) !== "warn" && Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS) {
+    if (
+      step?.gate === "checkpoint" && mode !== "warn" &&
+      Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS
+    ) {
       parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
+      // #1770: BOUND it (review cycle 1, finding 4). `parkCheckpoint` is one-shot,
+      // so the LINE never repeated — but the lane still sat forever with rc 0 at
+      // the very gate that blocks every git op. A human is present in an
+      // interactive session (and can run the checker / the force-pass), so the
+      // bound applies to print lanes only; interactive keeps the old behaviour.
+      if (isPrintMode(env, argv)) {
+        const parks = bumpParkStreak(owner);
+        if (parks >= SEQUENCE_PARK_CAP) emitUnsatisfiable(owner, step, parks, mode);
+      }
     }
     // re-arm: parked state preserved; one-shot suppresses repeat parks
     sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
@@ -395,24 +515,30 @@ export function handleSequenceTimeout(
   const topStep = top.steps[top.stepIndex];
   if (isPrintMode(env, argv)) {
     const mode = resolveMode(env, MODE_FILE, argv);
-    // #1770 rule 1 — an UNGATED step parks NOTHING. `gate: auto` blocks no tool
-    // in any mode (see the SEQUENCE_PARK_CAP rationale above), so a park here
-    // preserves a state no gate reads and emits a line that reads exactly like a
-    // lane doing work. Re-arm silently: there is no gate at this step to stall.
+    // #1770 rule 3 — a tool call IN FLIGHT is not idle: a blocking `task` (the
+    // reviewer dispatch this very step prescribes) can run for tens of minutes
+    // with no events at all. Re-arm silently until it outlives the fleet's own
+    // bounds, so a working lane is never failed and a hung one still is.
+    if (parkSuppressedByInFlight(Date.now(), inFlight)) {
+      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+      return;
+    }
+    // #1770 rule 1 — an UNGATED step does not park. `gate: auto` blocks no tool
+    // in any mode (see the SEQUENCE_PARK_CAP rationale above), so there is no
+    // gate here to stall: log ONE coalesced idle line for liveness and move on.
     // ⛔ ONLY an explicit `auto`. A step with an EMPTY gate is NOT ungated —
     // `getExpectedToolsForStep` routes it to the standard work phase, which
     // blocks every git/destructive call, and it has no auto-advance trigger
     // (that loop is keyed on `gate === "auto"`). Such a step stalls for real and
-    // must still park, be named and be bounded (pg review of this change).
+    // must still park, be named and be bounded.
     if (!topStep || topStep.gate === "auto") {
+      noteUngatedIdle(top, topStep, mode);
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
     }
     // #1770 rule 2 — a GATED step's park is bounded, coalesced and NAMED.
-    const key = checkpointKey(top);
-    if (unsatisfiableKeys.has(key)) return; // verdict already emitted — never re-arm, never repeat
-    const parks = (parkStreak.get(key) ?? 0) + 1;
-    parkStreak.set(key, parks);
+    if (unsatisfiableKeys.has(checkpointKey(top))) return; // verdict already emitted — never re-arm, never repeat
+    const parks = bumpParkStreak(top);
     const { cause, remedy } = parkDiagnosis(topStep, mode);
     if (parks === 1) {
       console.log(
@@ -432,28 +558,7 @@ export function handleSequenceTimeout(
       return;
     }
     // CAP REACHED — the gate is UNSATISFIABLE by waiting. Say so, and exit.
-    unsatisfiableKeys.add(key);
-    parkStreak.delete(key);
-    const idleMin = Math.round((parks * SEQUENCE_TIMEOUT_MS) / 60_000);
-    console.log(
-      `[sequence-enforcer] ⛔ SEQUENCE-GATE-UNSATISFIABLE — "${top.path}" parked ${parks}× at step ${top.stepIndex} "${topStep.name}" (gate: ${topStep.gate || "none"}), no advance in ${idleMin} min.`,
-    );
-    // A warn session cannot be BLOCKED by this step, so say why ending it is
-    // still right: warn is audit-only, not a waiver — the sequence cannot advance
-    // either, and 30 min with no tool call is not a working lane.
-    const warnNote = mode === "warn"
-      ? " (warn mode: this step does not BLOCK, but it still cannot advance by waiting — a warn pass is audit-only, not a waiver of the sequence)"
-      : "";
-    console.log(`[sequence-enforcer]    WHY: ${cause}.${warnNote}`);
-    console.log(`[sequence-enforcer]    REMEDY: ${remedy}.`);
-    console.log(
-      `[sequence-enforcer]    ENDING THIS LANE (exit 3) — waiting cannot satisfy this gate; the ⛔ line above is the verdict a monitor greps.`,
-    );
-    auditLog({
-      ts: new Date().toISOString(), event: "sequence_gate_unsatisfiable", skill: top.path, step: top.stepIndex,
-      step_name: topStep.name, gate: topStep.gate || "none", mode, parks, cap: SEQUENCE_PARK_CAP, idle_min: idleMin, cause, remedy,
-    });
-    endUnsatisfiableLane();
+    emitUnsatisfiable(top, topStep, parks, mode);
     return; // NEVER re-arm: no further parks, no further lines
   }
   console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
@@ -466,6 +571,31 @@ export function handleSequenceTimeout(
   } else {
     clearBridgeState();
   }
+}
+
+/**
+ * Record REAL tool activity. Called from the tool_call and tool_result handlers
+ * (every turn, before the early returns) so the idle window is measured from the
+ * last event, the park count restarts on progress, and an in-flight call is
+ * visible to the timeout path.
+ */
+function noteToolActivity(kind: "call" | "result", toolCallId: string, toolName = ""): void {
+  lastToolActivityAt = Date.now();
+  if (kind === "call") {
+    // A blocked call emits no tool_result, so a bash that the enforcer refuses
+    // leaves this set; the bound below (SEQUENCE_INFLIGHT_MAX_MS) is what keeps
+    // that from hiding a stall forever, and the next tool call replaces it.
+    inFlight = LONG_RUNNING_TOOLS.has(toolName) ? { id: toolCallId, startedAt: lastToolActivityAt } : null;
+  } else {
+    inFlight = null;
+  }
+  // Progress means this is not one idle stall: the consecutive-park count and the
+  // ungated-idle episode both restart (review cycle 1, finding 3).
+  parkStreak.clear();
+  idleEpisodeSeen.clear();
+  // One owner for the re-arm: this function (not the two handlers). Armed only
+  // while a skill is on the stack — an empty stack needs no timer.
+  if (topSkill()) resetSequenceTimeout();
 }
 
 function resetSequenceTimeout() {
@@ -1846,8 +1976,12 @@ export function _resetStateForTest(): void {
   // #1770: the park streak is per-session state too — a prior test's parks must
   // not pre-park (or prematurely cap) the next one.
   parkStreak.clear();
+  idleEpisodeSeen.clear();
   unsatisfiableKeys.clear();
   lastEventCtx = null;
+  inFlight = null;
+  lastToolActivityAt = Date.now();
+  testExitRequests.length = 0;
   // #1770: `endUnsatisfiableLane` sets a non-zero exit code; a test that drives
   // the cap must not leave the suite exiting 3.
   process.exitCode = 0;
@@ -1878,7 +2012,10 @@ export default function (pi: ExtensionAPI) {
     // checkpoint one-shot above — a cap consumed by a PREVIOUS session must not
     // end this one on its first park).
     parkStreak.clear();
+    idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
+    inFlight = null;
+    lastToolActivityAt = Date.now();
     if (sequenceTimeout) {
       clearTimeout(sequenceTimeout); sequenceTimeout = null; // cycle 2: a stale timer must never fire into a new session
     }
@@ -1953,8 +2090,10 @@ export default function (pi: ExtensionAPI) {
     checkpointBlockStreak = null;
     auditCoalesce.clear();
     parkStreak.clear(); // #1770: same per-session hygiene on shutdown
+    idleEpisodeSeen.clear();
     unsatisfiableKeys.clear();
     lastEventCtx = null;
+    inFlight = null;
     if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
     clearBridgeState();
   });
@@ -2106,6 +2245,10 @@ export default function (pi: ExtensionAPI) {
     // #377: refresh the session id at the audit-writing boundary (a session
     // can fork/restore mid-process without session_start).
     captureAuditSession(_ctx);
+    // #1770: record REAL activity before any early return — the idle window is
+    // measured from the last tool event, and an in-flight call must be visible to
+    // the timeout path (a blocking `task` emits no result for many minutes).
+    noteToolActivity("call", String((event as any).toolCallId ?? ""), String((event as any).toolName ?? ""));
     const top = topSkill();
     const toolName = (event as any).toolName ?? event.toolName ?? "";
     if (isKillSwitchActive()) {
@@ -2115,7 +2258,6 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
     if (!top) return undefined;
-    resetSequenceTimeout();
 
     const step = top.steps[top.stepIndex];
     if (!step) return undefined;
@@ -2340,6 +2482,8 @@ function tokenStateLabel(reason: string): string {
   pi.on("tool_result", async (event, _ctx) => {
     // #377: refresh the session id at the audit-writing boundary.
     captureAuditSession(_ctx);
+    // #1770: the call that produced this result is no longer in flight.
+    noteToolActivity("result", String((event as any).toolCallId ?? ""));
     const top = topSkill();
     if (isKillSwitchActive()) {
       const reason = bypassReason();
@@ -2348,7 +2492,6 @@ function tokenStateLabel(reason: string): string {
       return undefined;
     }
     if (!top) return undefined;
-    resetSequenceTimeout();
 
     // #357 (Task 7, c): checkpoint advancement via the marker contract — the
     // producer-timing case: an escape call (or operator-written token) transitions

@@ -22,8 +22,16 @@ Non-interactive `pi -p` sessions (epic-executor sub-agents, background workers) 
 
 Audit visibility (`~/.pi/agent/audit/enforcement.jsonl`) for background workers:
 - `warn_blocked` — a call that WOULD have been blocked under gate mode was allowed in warn mode; includes `allowed` + `hint` context.
-- `timeout_park` — a stale sequence was parked at step N in print mode (state preserved), not popped.
+- `timeout_park` — a GATED step was parked at step N in print mode (state preserved), not popped. Written ONCE per stall (repeats are coalesced), carries `step_name`, `gate`, `parks`, `cap`, and the derived `cause`/`remedy`.
+- `timeout_idle_ungated` — a `gate: auto` step went idle in print mode. Written ONCE per idle episode (coalesced; an episode ends at the next tool call). This is the liveness signal for a parked worker — an `auto` step declares no gate, so it can never be a gate stall and never produces a verdict.
+- `sequence_gate_unsatisfiable` — TERMINAL (#1770): a gated step was parked `cap`× (3 × 10 min) with no tool activity, so the lane emitted `SEQUENCE-GATE-UNSATISFIABLE` and exited 3. Carries `step_name`, `gate`, `parks`, `cap`, the MEASURED `idle_min`, and the derived `cause`/`remedy`. A lane that ends here did not fail silently — grep the marker in its log.
 - `blocked` entries now include `allowed` + `hint` so orchestrators can see why a worker is stuck and what the exit is.
+
+**Park policy (#1770).** Parks are BOUNDED and NAMED, and a step with no gate is never park-bounded:
+- `gate: auto` → never parks; one coalesced `timeout_idle_ungated` line per idle episode, no verdict, no exit (nothing is blocked, so nothing can be unsatisfiable).
+- `gate: verifier` / empty gate / `checkpoint` (print lanes only) → park once with the cause + remedy derived from that step's own gate, coalesce repeats, and at 3 consecutive parks exit 3 with `SEQUENCE-GATE-UNSATISFIABLE`.
+- A tool call IN FLIGHT (`bash`, `task`, `subagent`, `task_collect`, `task_status`, `web_fetch`, `loop_enforcer`) suppresses the idle clock for up to 60 min — a blocking reviewer dispatch is working, not stalled. Progress (any tool call/result) restarts the consecutive-park count, so the verdict's `idle_min` is measured, never `parks × interval`.
+- Interactive (non-print) sessions are unaffected: they still pop a stale sequence, and a checkpoint park is never escalated to an exit there (a human is present and can run the checker or the force-pass).
 
 ## Checkpoint Gates (#357 post-fix reality)
 
