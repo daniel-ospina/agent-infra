@@ -1113,22 +1113,40 @@ else
   bad "install.sh is missing from the harness directory — the remedy cannot be pinned"
 fi
 # ⛔ THE CLASS, NOT ONE FILE, AND NOT ONE MENTION PER FILE (review P2 2026-10-21; site-level
-# 2026-10-22). The check above looks at install.sh only, so five operator-facing sites in the SAME
-# commit's own edited files kept printing the unverified depth-1 copy — including the two
-# controller-startup FATALs an operator actually sees. The first version of THIS loop then asserted
-# only that each file mentioned the helper somewhere, and said so honestly: for `orch-loop.sh` (10
-# remedy sites) reverting ONE of them left the suite GREEN. That is a guard that reports the wrong
-# verdict — the exact class this file exists to catch, one level up (#2041). So the assertion is now
-# **site-level by construction**: a scan for the _effect_ (a bare `cp … *.sh` handed to an operator),
-# not a count of the word we hope replaced it.
-# Scanned: every shipped script in the harness directory and in `scripts/`, EXCEPT test suites and
-# `selftest.sh`. A test fixture that seeds a throwaway runtime with a `cp` is not operator advice, and
-# reddening on it would make this assertion cry wolf until someone deleted it — which is how a real
-# check gets removed. That exclusion is COUNTED AND PRINTED rather than silent, so it cannot quietly
-# grow into a hole: if the excluded count moves, the suite output shows it.
-# ⛔ Only NON-COMMENT lines count. Comments in this tree describe the old `cp` in order to condemn it
-# (`install.sh:817`, `check-deployed-drift.sh:61`); reddening on prose would punish the record of the
-# defect. First non-space character `#` = prose and is skipped.
+# 2026-10-22; effect-scan corrected 2026-10-24). The check above looks at install.sh only, so five
+# operator-facing sites in the SAME commit's own edited files kept printing the unverified depth-1
+# copy — including the two controller-startup FATALs an operator actually sees. The first version of
+# THIS loop asserted only that each file mentioned the helper somewhere, and said so honestly: for
+# `orch-loop.sh` (10 remedy sites) reverting ONE of them left the suite GREEN — a guard reporting the
+# wrong verdict, the exact class this file exists to catch, one level up (#2041).
+# So there are TWO arms, because each one alone is defeatable and the pair is not:
+#   (1) EVERY remedy site still NAMES deploy-harness.sh. An effect-scan alone cannot see a remedy
+#       that was DELETED outright, or swapped for a third mechanism (`install -m 755`, `rsync -a`,
+#       or `cp -R "$H"/. "$O"/` — the last being the #2041 incident line verbatim): none of those
+#       is a `cp … *.sh`, so no effect-scan will ever catch them.
+#   (2) NO shipped script hands anyone a bare `cp … *.sh`. A name-check alone cannot see a 10th
+#       remedy added to a file that already names the helper once.
+# ⛔ `cp` MAY BE THE FIRST TOKEN (review P1 2026-10-24 — this is why (2) was rewritten). The previous
+# pattern required a non-space, non-`#` character BEFORE ` cp `, so it matched only a `cp` embedded in
+# a message and MISSED every remedy written as a command — `cp "$H"/*.sh "$O"/` at the start of a
+# line — which is the commonest shape in this tree, and the shape of both live implementation sites.
+# Measured: the suite printed GREEN over exactly that, so the guard certified the class it exists to
+# forbid. The pattern now matches `cp` anywhere, and the anti-comment intent is served by a SECOND
+# pass that drops hit lines whose first non-space character is `#`, instead of by the pattern itself.
+# Scanned: every shipped script in the harness directory and in `scripts/`. The FLOOR IS PER
+# DIRECTORY, because a single combined count cannot tell that `$HERE/../*.sh` — the whole `scripts/`
+# half — has dropped out of the population, which is what happens when this suite runs from `$O`
+# (there `$HERE/..` is `$HOME`) while the count stays comfortably above any combined floor.
+# EXCLUDED, and COUNTED so the exclusion cannot quietly grow into a hole: test suites (`*.test.sh`,
+# `test*.sh`, `selftest.sh`). A fixture that seeds a throwaway runtime with a `cp` is not operator
+# advice, and reddening on it would make this cry wolf until someone deleted the check — which is how
+# a real check gets removed. Prose that describes the old `cp` in order to condemn it keeps being
+# skipped, and the pattern's trailing `[^[:space:]`]` additionally keeps a backticked
+# "a bare `cp *.sh` can deploy" from matching, so the record of the defect is not punished.
+# NAMED_DEPLOY_IMPLS are the deploy IMPLEMENTATIONS issue #2041 explicitly leaves as remaining work
+# (`deploy-crossbox.sh:59`, `cloud-cell-quiesce.sh:78`). They are reported SEPARATELY and printed
+# with their line rather than silently exempted, so the exclusion is visible and cannot absorb a new
+# violation.
 # ⚠️ COORDINATION NOTE (open PR #2271 `feat/mac-pin-parity`): that PR rewrites the same two install.sh
 # warning lines and substitutes a pinned tree (`cp '$SHIPPED'/*.sh`). If it lands, the assertion above
 # SHOULD red — a depth-1 glob copy is exactly what this forbids — and the correct resolution is to
@@ -1137,29 +1155,46 @@ fi
 REMEDY_SITES="install.sh orch-loop.sh dispatch-merge.sh chain-merge.sh refresh-candidates.sh check-deployed-drift.sh report.sh merge-one.sh cloud-cell-supervisor.sh"
 for _site in $REMEDY_SITES; do
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
-  [ -n "$_sp" ] && ok "remedy site present: $_site (the assertion below is not vacuous for it)" || bad "remedy site missing from the harness: $_site"
+  if [ -z "$_sp" ]; then
+    bad "remedy site missing from the harness: $_site"
+  else
+    grep -q 'deploy-harness\.sh' "$_sp" 2>/dev/null \
+      && ok "remedy site names the verified redeploy helper: $_site" \
+      || bad "  $_site does not name deploy-harness.sh — its remedy is the unverified copy again"
+  fi
 done
 
-BARE_PAT='^[[:space:]]*[^#[:space:]].*[[:space:]]cp[[:space:]].*[*]\.sh'
-BARE_HITS=""; SCANNED=0; EXCL=0
+BARE_PAT='cp[[:space:]][^|;&]*[*]\.sh[[:space:]]+[^[:space:]`]'
+NAMED_DEPLOY_IMPLS="deploy-crossbox.sh cloud-cell-quiesce.sh"
+BARE_HITS=""; NAMED_HITS=""; SCANNED_HARNESS=0; SCANNED_SCRIPTS=0; EXCL=0
 for _f in "$HERE"/*.sh "$HERE"/../*.sh; do
   [ -f "$_f" ] || continue
-  case "$_f" in *.test.sh) continue ;; esac
-  if [ "$(basename "$_f")" = "selftest.sh" ]; then
-    EXCL=$((EXCL + $(grep -cE "$BARE_PAT" "$_f" 2>/dev/null || true)))
-    continue
+  _b="$(basename "$_f")"
+  case "$_b" in *.test.sh|test*.sh) continue ;; esac
+  if [ "$_b" = "selftest.sh" ]; then
+    _n="$(grep -cE "$BARE_PAT" "$_f" 2>/dev/null)"; [ -n "$_n" ] || _n=0
+    EXCL=$((EXCL + _n)); continue
   fi
-  SCANNED=$((SCANNED + 1))
-  _h="$(grep -nE "$BARE_PAT" "$_f" 2>/dev/null || true)"
-  [ -n "$_h" ] && BARE_HITS="$BARE_HITS
-  $(basename "$_f"): $_h"
+  if [ "$_f" = "$HERE/$_b" ]; then SCANNED_HARNESS=$((SCANNED_HARNESS + 1)); else SCANNED_SCRIPTS=$((SCANNED_SCRIPTS + 1)); fi
+  _h="$(grep -nE "$BARE_PAT" "$_f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  [ -n "$_h" ] || continue
+  case " $NAMED_DEPLOY_IMPLS " in
+    *" $_b "*) NAMED_HITS="$NAMED_HITS
+  $_b: $_h" ;;
+    *) BARE_HITS="$BARE_HITS
+  $_b: $_h" ;;
+  esac
 done
-[ "$SCANNED" -ge 10 ] && ok "scanned $SCANNED shipped scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED shipped scripts scanned — the bare-cp scan covers almost nothing"
-ok "selftest.sh excluded as a test fixture: $EXCL bare-cp fixture line(s), not operator advice (counted, not silent)"
+[ "$SCANNED_HARNESS" -ge 20 ] && ok "scanned $SCANNED_HARNESS harness scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_HARNESS harness scripts scanned — that half of the population is gone"
+[ "$SCANNED_SCRIPTS" -ge 40 ] && ok "scanned $SCANNED_SCRIPTS scripts/ scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_SCRIPTS scripts/ scripts scanned — that half is gone (run this suite from the checkout, not from \$O)"
+ok "test fixtures excluded and COUNTED, not silent: selftest.sh $EXCL bare-cp fixture line(s); *.test.sh / test*.sh suites skipped"
 if [ -z "$BARE_HITS" ]; then
-  ok "no shipped script hands an operator a bare 'cp *.sh' redeploy — every remedy site names the verified helper"
+  ok "no shipped script hands anyone a bare 'cp *.sh' redeploy outside the named deploy implementations"
 else
   bad "shipped script(s) still hand an operator the unverified depth-1 copy (remedy must name deploy-harness.sh):$BARE_HITS"
+fi
+if [ -n "$NAMED_HITS" ]; then
+  ok "named deploy IMPLEMENTATIONS still use depth-1 cp (issue #2041 remaining work — reported, not hidden):$NAMED_HITS"
 fi
 
 echo
