@@ -104,11 +104,20 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `extensions/` also launches `pi` and is outside this guard's declared population. It can also
   # FALSE-POSITIVE on a non-launcher carrying a `-p` token and a `--no-session` mention, which fails
   # CLOSED (RED, and the file is named), so it cannot hide a launch path.
+  # A NON-LAUNCHER PATH IS EXCLUDED BY NAME, and the exclusion is ASSERTED rather than trusted.
+  # `pi-done-not-exited.py` (#2163) INSPECTS print-mode `pi` processes: it quotes
+  # `pi -p --no-session` in its prose and matches the launch shape in a regex (it is how it tells a
+  # launcher from a bystander), but it launches nothing. Carrying those tokens is precisely the
+  # false-positive class this detector's STATED LIMITS paragraph names, and the exclusion list is
+  # where the paragraph says a non-launcher belongs — declaring it in EXPECTED_PI instead would
+  # assert the opposite of the truth, that a census of launch paths contains a file with none.
+  # The exclusion hides nothing: the assertion below the censuses requires that file to carry no
+  # spawn primitive at all, so a future launch path added to it comes back into the census.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -143,6 +152,14 @@ got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
 ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
+
+# ... and the one path excluded by NAME is really a NON-launcher, because that is the whole reason it
+# may sit outside the census. Asserted on the SPAWN PRIMITIVES, deliberately not on `run_agent` —
+# this file names `run_agent` and `pi` in prose and matches both in regexes on purpose (telling a
+# launcher from a bystander is its job). If it ever gains a way to START a process, this goes RED and
+# the path comes out of the exclusion list above.
+if grep -qE 'subprocess|Popen|os\.system|os\.exec|os\.spawn|os\.fork|popen' "$HERE/pi-done-not-exited.py" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primitive), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
