@@ -29,8 +29,25 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+clear_workers() {
+  local f
+  for f in "$TMP/O/state"/worker-* "$TMP/O/state/.wt-census"; do
+    [ -e "$f" ] && mv "$f" "$TMP/worker.spent.$RANDOM" 2>/dev/null
+  done
+  return 0
+}
+
 
 [ -f "$ORCH" ] || { echo "FATAL: $ORCH not found"; exit 1; }
+# ⛔ THE HOST'S OWN TMUX MUST NOT LEAK INTO THIS SUITE'S CENSUS (agent-infra#2653 review round 12).
+# `wt_table` counts worker-named tmux sessions with no record of their own; on a box where the
+# controller is RUNNING those are real, so the lane-count assertions read `10/9` or `12/9` depending on
+# what the machine was doing. ⛔ A SHELL FUNCTION IS NOT ENOUGH — the census invokes tmux through
+# `wt_bounded` (`perl -e 'alarm shift; exec @ARGV'`), i.e. `exec`, which can only find a FILE. So this
+# is a file stub answering the EMPTY polarity (`no server running` => no tmux session can exist).
+mkdir -p "$TMP/bin-tmuxnone"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "no server running on /tmp/fixture"\nexit 1\n' > "$TMP/bin-tmuxnone/tmux"
+chmod +x "$TMP/bin-tmuxnone/tmux"
 
 # ── the shipped quoter (the spawn lines call `shq`) ───────────────────────────────────────────────
 grep -E '^shq\(\) \{' "$ORCH" > "$TMP/shq.sh"
@@ -56,6 +73,39 @@ sed -n '/^review_gate_state() {/,/^}/p' "$ORCH" > "$TMP/rgs.sh"
 [ -s "$TMP/rgs.sh" ] && grep -q 'NEEDS-FIX' "$TMP/rgs.sh" \
   || { echo "FATAL: review_gate_state() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/spawntok.sh" ] || { echo "FATAL: spawn_gate_tok() not found in orch-loop.sh"; exit 1; }
+# ⛔ THE REVIEW-DISPATCH KEY, EXTRACTED AND NOT STUBBED (agent-infra#2653). The review arm now decides
+# through `review_disp_decide`/`review_disp_record`/`review_lane_holders` before it looks at capacity,
+# and those live OUTSIDE the [acting-case] block — so an undefinected command here would make `_rvd`
+# EMPTY, no branch match, and every drive would silently fall through to the capacity arm while the
+# assertions below stayed green on the wrong path. That is the same `! 127` polarity trap this suite
+# documents for `ciq_push_ok` and `is_num`. A block that does not extract aborts the section.
+sed -n '/# \[reviewdisp:begin\]/,/# \[reviewdisp:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/reviewdisp.sh"
+[ -s "$TMP/reviewdisp.sh" ] && grep -q 'review_disp_decide' "$TMP/reviewdisp.sh" \
+  || { echo "FATAL: the [reviewdisp] block is missing from orch-loop.sh — the review key is untested"; exit 1; }
+# ⛔ `is_limit` IS THE KEY'S VALIDATOR AND IS DEFINED OUTSIDE THE BLOCK. Undefined it is
+# `command not found` (127), so `is_limit "$n" || n=0` coerces EVERY count to 0 and the cap can never
+# bind — the drive would prove an unbounded budget while its own assertions expected one. Extracted,
+# not stubbed, for the same reason as `review_gate_state` above.
+# ⛔ `is_limit` IS A ONE-LINER — extract that LINE, not a `/^}/`-terminated block: the block form runs
+# from the definition to the next `}` in the file, which is ~150 lines of the controller's top-level
+# startup code. Sourced into the drive subshell that code aborted every drive (measured: the whole
+# suite went 22 red with empty logs), and it would have LOOKED like a code defect in the arm.
+grep -E '^is_limit\(\) \{' "$ORCH" > "$TMP/islimit.sh"
+[ -s "$TMP/islimit.sh" ] && grep -q 'is_num' "$TMP/islimit.sh" \
+  || { echo "FATAL: is_limit() not found in orch-loop.sh"; exit 1; }
+# The drain rule the review budget feeds: `mp_reason <unowned> <lanes> <workers> [<open>]` prints the
+# hold-down reason, or NOTHING when no PR is un-owned (the only state that opens the issue path).
+sed -n '/^mp_reason() {/,/^}/p' "$ORCH" > "$TMP/mpreason.sh"
+# ⛔ THE SHIPPED `park_ctrl`, NOT A STUB (review of #2664, P2). A `park_ctrl() { return 0; }` stub made
+# every "…PARKED" claim in T7 unverified: the log line is emitted BEFORE the park, so dropping the park
+# from either branch left the arm green while the PR re-entered it every cycle for ever — the exact
+# endless-wait shape the reviewathead bound exists to end, and the one thing that stops re-entry is the
+# `parked-<PR>` file this function writes.
+sed -n '/^park_ctrl() {/,/^}/p' "$ORCH" > "$TMP/parkctrl.sh"
+[ -s "$TMP/parkctrl.sh" ] && grep -q 'parkreason-' "$TMP/parkctrl.sh" \
+  || { echo "FATAL: park_ctrl() not found in orch-loop.sh"; exit 1; }
+[ -s "$TMP/mpreason.sh" ] && grep -q 'merge-priority' "$TMP/mpreason.sh" \
+  || { echo "FATAL: mp_reason() not found in orch-loop.sh"; exit 1; }
 
 # ⛔ NO SYNTAX CHECK OF A TEMP FILE HERE, AND NO REMOVAL OF ONE (#709). Both forms are read by the
 # main-worktree-guard as an unverifiable script operand or discard target, and it then refuses to run
@@ -86,6 +136,7 @@ fi
 
 # ── the driver: run the shipped case for ONE PR under stubs ──────────────────────────────────────
 # drive <V> <merge-authority> [<lanes-in-use:0>] [<spawn-ok:1>] [<authority-unknown:0>] [<mergeable:CLEAN>]
+#       [<max-review-tries:3>] [<head:abc1234> — pass "" for an UNREADABLE head]
 # `lanes-in-use` is how many fake WORKERS the surface reports, so the arm's own
 # `wt_count fix-` / `wt_count merge-` ceiling test is exercised for real. `MF`/`MR` stay at 9.
 # The surface is a fake `cmux` (worker-terminal.sh's durable terminal): this suite drives the launcher's
@@ -96,8 +147,7 @@ fi
 # Writes:  $TMP/d.tsv (the ledger the shipped disp() produced)   $TMP/spy (spawn argv)
 #          $TMP/gspy (gh argv)                                    $TMP/d.log (the log lines)
 drive() {
-  : > "$TMP/spy"; : > "$TMP/gspy"; : > "$TMP/d.log"; mkdir -p "$TMP/O/state"; : > "$LEDGER"
-  # `lanes-in-use` fake rows: half fix-, half merge-, so BOTH ceilings are reachable from one knob.
+  : > "$TMP/spy"; : > "$TMP/gspy"; : > "$TMP/d.log"; mkdir -p "$TMP/O/state"; : > "$LEDGER"  # `lanes-in-use` fake rows: half fix-, half merge-, so BOTH ceilings are reachable from one knob.
   : > "$TMP/lanes"; _i=0
   while [ "$_i" -lt "${3:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; echo "merge-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   (
@@ -109,7 +159,7 @@ drive() {
     # INSIDE the subshell: `$O` is set here, so a marker written in the function body would land in
     # `/state/…` and the review-gate fixer arm would silently take the re-record path instead.
     [ "${NEEDSFIX:-0}" = "1" ] && : > "$O/state/needsfix-$PR-abc1234"
-    MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate python-ci-gate pipeline-compliance'
+    MF=9; MR=9; MAX_FIX_TRIES=3; MAX_REVIEW_TRIES=3; REQ='ai-review-gate python-ci-gate pipeline-compliance'
     REVIEW_GATE='ai-review-gate'; DRAFT=false
     # shellcheck disable=SC1090
     . "$TMP/shq.sh"
@@ -121,7 +171,22 @@ drive() {
     # stub is the SURFACE: `cmux tree --json` renders `$TMP/lanes` (written per drive, so the same
     # stub serves an idle box and a saturated one) as `wt-<worker>` workspaces with a live terminal.
     SPAWN_OK="${4:-1}"
+    # ⛔ THE ARM'S OWN INPUTS ARE POSITIONAL ON PURPOSE, so a drive can move them (review of #2653):
+    # `[6]` is `MAX_REVIEW_TRIES` (default 3) — the CAP drive must be able to LOWER it, because with
+    # `n == max` the `CAP <n> <max>` parse bug is invisible and the number the "never a silent stop"
+    # line prints is untested. `[7]` is the head (`HEAD_N`), empty means an unreadable head.
+    MAX_REVIEW_TRIES="${7:-3}"; HEAD_N="${8-abc1234}"
     WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # ⛔ THE RECORD STORE IS READ BY THE SHIPPED KEY (agent-infra#2653/#2517), so the fixture needs a
+    # HOME the arm can find it in. It is the SAME path `record-review.sh` writes; a drive that left it
+    # at the real `$HOME` would read the developer's own review history and grade nothing.
+    HOME="$TMP/home"; mkdir -p "$HOME/.pi/agent/reviews"
+    # The holders line computes a log age; give the portable probe a deterministic answer (2h).
+    file_mtime_epoch() { echo $(( $(date +%s) - 7200 )); }
+    # shellcheck disable=SC1090
+    . "$TMP/islimit.sh"
+    # shellcheck disable=SC1090
+    . "$TMP/reviewdisp.sh"
     # shellcheck disable=SC1090
     . "$HERE/worker-terminal.sh"
     cmux() {
@@ -176,11 +241,20 @@ PY
         *) return 0 ;;
       esac
     }
+    # ⛔ NEUTRALISE THE HOST'S OWN TMUX (measured, agent-infra#2653 round 11): `wt_table` counts
+    # worker-named tmux sessions that have no record of their own, so on a box where the controller is
+    # RUNNING this suite's census was `9 fixture lanes + the box's live merge-*/fix-* sessions` — the
+    # lane-count assertions then read 12/9 and depended on what the machine happened to be doing. A
+    # stub that answers nothing makes the tmux arm UNKNOWN, which invents no rows.
+    PATH="$TMP/bin-tmuxnone:$PATH"
     sess() { return 1; }
     claim_live() { return 1; }
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
-    park_ctrl() { return 0; }
+    # ⛔ THE SHIPPED park_ctrl (review of #2664, P2) — a stub makes every "PARKED" assertion a claim
+    # about a log line that is written BEFORE the park.
+    # shellcheck disable=SC1090
+    . "$TMP/parkctrl.sh"
     # ⛔ THE CI-QUEUE PREDICATE IS STUBBED LIKE EVERY OTHER NEIGHBOUR (#2333 review cycle 2, P1).
     # It is not decoration: `orch-loop.sh` now calls `ciq_push_ok` in both fixer arms, and an
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
@@ -253,6 +327,7 @@ PY
     # the mergeability probe IS the routing decision, so the stub must answer it (a stub that prints
     # nothing makes the arm read MSTAT="" and fall through — silently grading the wrong path).
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo CONFLICTING ;; esac; return 0; }
+    PATH="$TMP/bin-tmuxnone:$PATH"   # see the file stub at the top: the host's live sessions must not leak
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
@@ -300,7 +375,7 @@ drive "" rail 0
 
 echo
 echo "=== T1: a claim has a spawn behind it, and a failed spawn is never silent ==="
-drive GREEN rail 0 1
+clear_workers; drive GREEN rail 0 1
 _g=$(spawns); _a="$(acts)"
 [ "$_g" -ge 1 ] && [ "$_a" = "1" ] && [ "$_g" = "$_a" ] \
   && ok "GREEN+rail: 1 spawn and exactly 1 \`act\` row (the ledger's act count IS the spawn count)" \
@@ -368,6 +443,11 @@ drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
   || bad "GREEN+rail at the ceiling: acts=$(acts) — the refusal is still silent"
+# ⛔ THE NEEDS-FIX MARKER FROM THE DEFER DRIVE ABOVE MUST GO (agent-infra#2653 review round 5): with
+# findings on disk this arm now names the FIXER ceiling (correctly — a fixer is the remedy for a head
+# that has findings), so leaving the marker here would grade the wrong branch while still passing on
+# "refused". `mv`, not `rm` (#709).
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.t5.spent.$RANDOM" 2>/dev/null || true
 drive 'FAILED:ai-review-gate' rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO re-record slot' "$TMP/d.log" \
   && ok "review-gate red at the review-lane ceiling: refused and named" \
@@ -382,6 +462,298 @@ drive 'FAILED:docs-lint' rail 0 1
 [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -qi 'no arm: no red check' "$TMP/d.log" \
   && ok "a red that is not a required check: nothing spawned, but the PR is NAMED (no silent red)" \
   || bad "a non-required red is still unattributed (acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';'))"
+
+echo
+echo "=== T7: the review remedy is DISPATCHABLE, keyed on (PR, head), and BOUNDED (agent-infra#2653) ==="
+# ⛔ WHAT THIS SECTION IS FOR. The controller printed the correct remedy (`NEEDS-REVIEW — the remedy is
+# another review`) and then took no action on it for 26 hours, while the box reported 5-18 idle
+# workers. The measured reason was capacity (`review lanes=11/6`, eleven of them dead records), but the
+# second half of the defect is that a review had no (PR, head) identity at all: nothing could say "this
+# head is already reviewed" or "this head has spent its budget", so the only two possible behaviours
+# were "dispatch again" and "dispatch forever". These drives pin the four states as BEHAVIOUR.
+REV_DISP="$TMP/O/state/reviewdisp-4242"
+STORE="$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-4242.json"
+# ⛔ `mv`, NOT `rm`, AND NO GLOB (#709): the main-worktree-guard refuses a discard whose target is a
+# `$TMP/…` path, and it then refuses to run this whole file for every unhatched session.
+clear_revdisp() { mv "$REV_DISP" "$TMP/revdisp.spent.$RANDOM" 2>/dev/null || true; }
+clear_store()   { mv "$STORE" "$TMP/store.spent.$RANDOM" 2>/dev/null || true; }
+seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
+# ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above leave
+# a `needsfix-4242-abc1234` marker behind (they need it to exercise the DEFER arm), and every drive
+# here shares ONE `$O/state`. Leaving it in place routes these drives into the FIXER arm and the whole
+# section would then grade a path it never reached — measured: (a) reported "spawns=1" for a fixer.
+clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
+# ⛔ A DRIVE THAT SPAWNS LEAVES A WORKER RECORD, WHICH INFLATES THE NEXT DRIVE'S CENSUS (measured):
+# the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read
+# `review lanes=10/9`. Records are files, so move the ones this fixture's PR could own out of the way —
+# `mv`, never `rm` on a `$TMP/…` path (#709).
+clear_workers
+# The shipped park_ctrl WRITES parked/parkreason into the shared `$TMP/O/state`, so each park assertion
+# starts from a clean slate: a leftover `parked-4242` from an earlier drive would make the next
+# assertion pass for the wrong reason (and the negative one — a failed spawn parks nothing — impossible).
+clear_parked() { mv "$TMP/O/state/parked-4242" "$TMP/parked.spent.$RANDOM" 2>/dev/null || true
+                 mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.spent.$RANDOM" 2>/dev/null || true; }
+clear_needsfix; clear_parked
+# The holders line reads a worker's log age: give it a real log file so the age is an age, not `?m`.
+mkdir -p "$TMP/O/logs"; : > "$TMP/O/logs/merge-0.log"
+
+# (a) a NEEDS-REVIEW head with capacity dispatches EXACTLY ONE review lane, keyed on (PR, head)
+clear_store; clear_revdisp
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && [ "$(acts)" = "1" ] && grep -q '^#4242 re-record$' "$TMP/d.log" \
+   && grep -q 'fresh review, attempt 1/3' "$LEDGER" 2>/dev/null; then
+  ok "(a) one NEEDS-REVIEW head + capacity = exactly ONE review lane, and it is recorded as an act"
+else
+  bad "(a) spawns=$(spawns) acts=$(acts) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
+fi
+[ "$(cat "$REV_DISP" 2>/dev/null)" = "abc1234 1" ] \
+  && ok "(a) …and the dispatch is RECORDED against (PR=4242, head=abc1234) as \"abc1234 1\"" \
+  || bad "(a) the (PR,head) key was not written: [$(cat "$REV_DISP" 2>/dev/null)]"
+
+# (b1) ONE review per (PR, head): a head the store already records CLEAN is NOT re-reviewed
+clear_revdisp
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && grep -q 'REVIEW-AT-HEAD' "$TMP/d.log"; then
+  ok "(b1) same head, review ALREADY recorded => NOTHING dispatched, and the refusal is named REVIEW-AT-HEAD"
+else
+  bad "(b1) spawns=$(spawns) acts=$(acts) — a reviewed head still bought a fresh review"
+fi
+grep -q 'holding:' "$TMP/d.log" && bad "(b1) the AT-HEAD refusal was reported as a capacity problem" \
+  || ok "(b1) …and it is not misreported as a capacity refusal (the reason is the head, not the box)"
+clear_store
+
+# (b2) the BOUND holds at the cap, and it says REVIEW-CAP with the count — never a silent stop
+clear_parked; clear_store; seed_revdisp abc1234 3
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && grep -q 'REVIEW-CAP 3/3' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ]; then
+  ok "(b2) MAX_REVIEW_TRIES spent at this head => no dispatch, REVIEW-CAP with the count, and the head is PARKED"
+else
+  bad "(b2) spawns=$(spawns) acts=$(acts) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the review budget is unbounded at a fixed head"
+fi
+
+# (c) a PUSH re-arms it: the same PR at a NEW head is dispatchable again, and the budget restarts
+seed_revdisp def5678 3
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && [ "$(acts)" = "1" ] && [ "$(cat "$REV_DISP" 2>/dev/null)" = "abc1234 1" ]; then
+  ok "(c) the head moved => dispatchable again, and the count RESTARTS at this head (1), not 4"
+else
+  bad "(c) spawns=$(spawns) key=[$(cat "$REV_DISP" 2>/dev/null)] — a push did not re-arm the review budget"
+fi
+
+# (c2) the count INCREMENTS from what this head already spent (review of #2653, P2). Without this
+# drive `_rvn=0` hard-coded passes (a) and (c), because both only ever assert the value `1`.
+clear_store; seed_revdisp abc1234 1
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && [ "$(cat "$REV_DISP" 2>/dev/null)" = "abc1234 2" ] \
+   && grep -q 'fresh review, attempt 2/3' "$LEDGER" 2>/dev/null; then
+  ok "(c2) a second dispatch at the same head spends the SECOND attempt (2/3), not a reset to 1"
+else
+  bad "(c2) spawns=$(spawns) key=[$(cat "$REV_DISP" 2>/dev/null)] — the attempt number is not derived from the record"
+fi
+
+# (c3) a FAILED spawn spends NOTHING — the `fixcount` rule, applied to the review budget
+clear_parked; clear_store; clear_revdisp
+drive 'FAILED:ai-review-gate' rail 0 0
+# ⛔ `acts`/`waits`, NOT `spawns`: the stub records the ATTEMPT in `$TMP/spy` before it refuses, so a
+# failed spawn still has a spy line (the suite's own existing rule: a failed spawn is a WAIT, never an
+# act). The artifact under test here is the (PR, head) KEY, which must not exist at all.
+if [ "$(acts)" = "0" ] && [ ! -e "$REV_DISP" ] && [ ! -e "$TMP/O/state/parked-4242" ] \
+   && grep -q 're-record spawn FAILED' "$TMP/d.log"; then
+  ok "(c3) a FAILED review spawn records NO attempt and parks NOTHING (bookkeep only on success)"
+else
+  bad "(c3) acts=$(acts) key-exists=$([ -e "$REV_DISP" ] && echo yes || echo no) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+
+# (b3) the CAP line reports the SPEND, not the budget, when an operator LOWERS the limit
+# (review of #2653, P2 — `CAP <n> <max>`: reading the LAST field reports max and is invisible while
+# n == max, i.e. always at the default).
+clear_store; seed_revdisp abc1234 3
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 2
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-CAP 3/2' "$TMP/d.log"; then
+  ok "(b3) REVIEW-CAP prints 3/2 for a head that spent 3 with the limit lowered to 2"
+else
+  bad "(b3) log=$(tr '\n' ';' < "$TMP/d.log") — the cap line reports the budget as the spend"
+fi
+
+# (b4) a LEGACY record (`<pr>.json`, written when `--repo` was absent) is evidence too
+# (review of #2653, P2 — merge-one.sh::record_at_head checks BOTH names for this reason).
+clear_revdisp
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$TMP/home/.pi/agent/reviews/4242.json"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD' "$TMP/d.log"; then
+  ok "(b4) a LEGACY store record at this head also reads AT-HEAD (both names are consulted)"
+else
+  bad "(b4) spawns=$(spawns) log=$(head -2 "$TMP/d.log" | tr '\n' ';') — a legacy record bought a fresh review"
+fi
+mv "$TMP/home/.pi/agent/reviews/4242.json" "$TMP/legacy.spent.$RANDOM" 2>/dev/null || true
+
+# (b5) AT-HEAD is bounded: the one state that neither dispatches nor parks must ESCALATE
+# (review of #2653, P2 — otherwise it logs a wait row every cycle for ever).
+clear_parked
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+printf 'abc1234 3\n' > "$TMP/O/state/reviewathead-4242"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+   && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log" \
+   && grep -q 'LIFT THIS PARK' "$TMP/d.log"; then
+  ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK, the exact re-record command, AND the park-lift (a re-record alone is provably inert)"
+else
+  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, or its command was eaten by a backtick substitution"
+fi
+clear_store; mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.spent.$RANDOM" 2>/dev/null || true
+
+# (f) an UNREADABLE head spends nothing: a review is head-scoped evidence
+# (review of #2653, P3 — an empty HEAD_N recorded a count under a key nobody can compare, then
+# parked the PR claiming the budget when the cause was an API read).
+clear_store; clear_revdisp
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 3 ""
+if [ "$(spawns)" = "0" ] && [ ! -f "$REV_DISP" ] && grep -q 'HEAD is UNREADABLE' "$TMP/d.log"; then
+  ok "(f) an unreadable head dispatches NOTHING and records NO attempt — the refusal names the head"
+else
+  bad "(f) spawns=$(spawns) key=[$(cat "$REV_DISP" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+
+# (g) `MAX_REVIEW_TRIES=0` is REPORT-ONLY — no dispatch, and NOTHING parked (review round 3, P2:
+# parking every NEEDS-REVIEW head on its first cycle would remove PRs from the sweep with a reason
+# claiming a reviewer failure that never happened, and disagree with merge-one.sh's `0`).
+clear_store; clear_revdisp; clear_parked
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 0
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'MAX_REVIEW_TRIES=0 on this box (REPORT-ONLY' "$TMP/d.log"; then
+  ok "(g) MAX_REVIEW_TRIES=0 is REPORT-ONLY: nothing dispatched, NOTHING parked, and the line says so"
+else
+  bad "(g) spawns=$(spawns) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+
+# (h) an UNWRITABLE review budget is named and STOPS the loop (review round 3, P2). A swallowed write
+# made the bound itself best-effort: the count read back as 0 for ever and the arm re-bought a paid
+# review EVERY cycle with no REVIEW-CAP ever reached.
+clear_store; clear_revdisp; clear_parked
+mkdir -p "$TMP/O/state/reviewdisp-4242"      # a DIRECTORY of that name: the write cannot land
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && grep -q 'CANNOT BE WRITTEN' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ]; then
+  ok "(h) an unwritable budget record is NAMED and the head parks — the cap cannot be outrun silently"
+else
+  bad "(h) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/reviewdisp-4242" "$TMP/revdisp.dir.$RANDOM" 2>/dev/null || true
+clear_parked
+
+# (i) an UNWRITABLE escalation counter must be NAMED, not silently coerced (review round 3, P2). A
+# swallowed write restarts the count at 1 every cycle, so AT-HEAD could never escalate — the endless
+# wait it exists to end, wearing a bounded-looking face.
+clear_store; clear_parked
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+mkdir -p "$TMP/O/state/reviewathead-4242"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-UNBOUNDED' "$TMP/d.log"; then
+  ok "(i) an unwritable escalation counter says REVIEW-AT-HEAD-UNBOUNDED (an inert bound is never silent)"
+else
+  bad "(i) log=$(tr '\n' ';' < "$TMP/d.log") — the escalation silently restarted instead of naming itself"
+fi
+mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.dir.$RANDOM" 2>/dev/null || true
+clear_store; clear_parked
+
+# (j) REPORT-ONLY OUTRANKS AT-HEAD (review round 4, P2). REPORT-ONLY sat AFTER the store check, so on a
+# report-only box a head that already carried a CLEAN record took the AT-HEAD path — where `1 >= 0` is
+# true — and PARKED on the first refusal as `REVIEW-AT-HEAD-STUCK 1/0`: a PR removed from the sweep with
+# a reason naming a budget the box never had, contradicting "REPORT-ONLY: nothing dispatched, NOTHING
+# parked". The sibling red-fixer role's rule is "REPORT-ONLY IS DECIDED BEFORE THE COUNTER IS READ".
+clear_parked; clear_revdisp
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 0
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'REPORT-ONLY' "$TMP/d.log" \
+   && ! grep -q 'REVIEW-AT-HEAD-STUCK' "$TMP/d.log"; then
+  ok "(j) MAX_REVIEW_TRIES=0 outranks AT-HEAD: a recorded review is NOT parked on a report-only box"
+else
+  bad "(j) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+clear_store; clear_parked
+
+# (k) a PARK THAT DID NOT LAND is reported as what it is (review round 4, P2). The park IS the
+# terminator: an unwritable `parked-<PR>` means the PR re-enters the arm every cycle while the log says
+# PARKED. Same hazard class as (h)/(i), one level up — the one place rounds 2-3 did not look.
+clear_store; seed_revdisp abc1234 3; clear_parked
+mkdir -p "$TMP/O/state/parked-4242"          # a DIRECTORY of that name: the park cannot land
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'PARK DID NOT LAND' "$TMP/d.log" && ! grep -q 'PARKED (an unfixable head' "$TMP/d.log"; then
+  ok "(k) an unwritable PARK is named (PARK DID NOT LAND), never reported as PARKED"
+else
+  bad "(k) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/parked-4242" "$TMP/parked.dir.$RANDOM" 2>/dev/null || true
+clear_revdisp
+
+# (l) A HEAD WITH FINDINGS NEVER REACHES THE REVIEW KEY (review round 5, P1). `_fix_eligible` is 0 when
+# the FIXER ceiling is full, and the chain used to fall through into the review key — which would CAP
+# and park that head with a reason claiming "the reviewer produced no usable verdict … a fixer has no
+# findings", when `state/needsfix-<PR>-<head>` exists ON DISK. That parks a PR a fixer could still
+# repair and points the operator at the wrong subsystem.
+clear_store; clear_revdisp; clear_parked; seed_revdisp abc1234 3
+NEEDSFIX=1; drive 'FAILED:ai-review-gate' rail 9 1; unset NEEDSFIX
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'NO fixer slot' "$TMP/d.log" \
+   && ! grep -q 'REVIEW-CAP' "$TMP/d.log"; then
+  ok "(l) findings + a full fixer ceiling names the FIXER slot — the review budget never bounds a NEEDS-FIX head"
+else
+  bad "(l) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.l.spent.$RANDOM" 2>/dev/null || true
+clear_revdisp; clear_parked
+
+# (m) an unwritable budget AND an unwritable PARK: the branch must not claim PARKED (review round 5,
+# P2) — that would be the inert bound wearing a green face, while the head buys another review.
+clear_store; clear_revdisp; clear_parked
+mkdir -p "$TMP/O/state/reviewdisp-4242" "$TMP/O/state/parked-4242"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && grep -q 'PARK DID NOT LAND' "$TMP/d.log" && ! grep -q '(PARKED)' "$TMP/d.log"; then
+  ok "(m) budget unwritable AND park unwritable: PARK DID NOT LAND, and the line does not claim PARKED"
+else
+  bad "(m) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/reviewdisp-4242" "$TMP/revdisp.m.dir.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/parked-4242" "$TMP/parked.m.dir.$RANDOM" 2>/dev/null || true
+
+# (d) the review-LANE cap still binds, and the refusal NAMES its holders and their age
+clear_store; clear_revdisp
+clear_workers; drive 'FAILED:ai-review-gate' rail 9 1
+# ⛔ THE NUMERATOR IS PINNED AT 9 (review round 12 of #2653): `wt_table` also counts worker-named TMUX
+# sessions that have no record of their own, and on a box where the controller is RUNNING those are
+# real — which is why this assertion was briefly widened to `[0-9]+`. The cause is fixed in the fixture
+# now (the host's tmux is stubbed out in `drive`, and `clear_workers` removes the records a previous
+# drive's spawn left), so the count IS the 9 merge lanes the `lanes-in-use` knob writes, and pinning it
+# also keeps the census's OVER-count regression class (a worker counted more than once — this file's own
+# `w:`/`t:`/name triple) from passing as "the ceiling was reached anyway".
+if [ "$(spawns)" = "0" ] && grep -Eq 'NO re-record slot \(review lanes=9/9' "$TMP/d.log" \
+   && grep -q 'holding: merge-0(120m)' "$TMP/d.log"; then
+  ok "(d) review-lane ceiling reached => refused, and the line names the lanes holding it WITH their age"
+else
+  bad "(d) spawns=$(spawns) state=[$(ls "$TMP/O/state" | grep -c '^worker-' )] files=[$(ls "$TMP/O/state" | grep '^worker-' | tr '\n' ',')] log=$(tr '\n' ';' < "$TMP/d.log") — a count with no owner is the state that hid the stall"
+fi
+
+# (e) once the review is recorded the MERGE path is reached, and the issue path's own rule opens
+#     with it: the review queue is what held it, so an empty un-owned count is the only open state.
+drive GREEN rail 0 1
+if [ "$(spawns)" -ge 1 ] && [ "$(acts)" -ge 1 ] && ! grep -q 'REVIEW-AT-HEAD\|NO re-record slot' "$TMP/d.log"; then
+  ok "(e) the head now merges (rail spawn) — the review arm is no longer the PR's state at all"
+else
+  bad "(e) spawns=$(spawns) log=$(head -2 "$TMP/d.log" | tr '\n' ';') — the PR never left the review queue"
+fi
+# shellcheck disable=SC1090
+. "$TMP/mpreason.sh"
+# ⛔ `is_num` IS A DEPENDENCY OF `mp_reason`, NOT DECORATION: undefined it is `command not found`, so
+# EVERY count reads UNREADABLE and the rule always holds the issue path shut — the assertion below
+# would then "pass" for the wrong reason on the `1` case and fail on the `0` case.
+# shellcheck disable=SC1090
+. "$TMP/isnum.sh"
+[ -z "$(mp_reason 0 0 0)" ] \
+  && ok "(e) …and with NO un-owned PR the drain rule has no reason: the ISSUE PATH IS OPEN" \
+  || bad "(e) mp_reason 0 still holds the issue path shut: [$(mp_reason 0 0 0)]"
+[ -n "$(mp_reason 1 0 0)" ] \
+  && ok "(e) …while one un-owned PR still holds it (the rule is threshold-free, unchanged)" \
+  || bad "(e) mp_reason 1 named no reason — the gate that closes the issue path is inert"
 
 echo
 echo "=== T1b: a cycle that acted on nothing must SAY so (never 'dispatching') ==="
