@@ -226,9 +226,19 @@ _git() {
 # all: `_claim_commit` swallowed stderr and returned an empty sha, so the caller logged
 # "could not build claim commit" with no repo, no cwd and no git error to act on.
 _claim_repo_problem() {
-  local repo="${CLAIM_REPO:-.}" cwd
-  cwd="$(pwd 2>/dev/null || printf '?')"
-  if ! ( cd "$repo" 2>/dev/null ); then
+  # ⛔ THIS DIAGNOSIS MUST APPLY THE SAME TWO RESOLUTION GUARDS AS `_git`, or it re-opens the hazards
+  # measured directly above (and pinned by `claim-cwd.test.sh` C9): `cd` without `CDPATH=` follows the
+  # caller's CDPATH into a foreign repo, and `cd` without `--` reads a bare `-P`/`-L` as an OPTION and
+  # SUCCEEDS into $HOME — so the line said "readable" about a directory nobody named. And a
+  # SET-BUT-EMPTY CLAIM_REPO must not be reported as `.`: `_git` refuses that value, so printing `.`
+  # here would name a repo the caller never selected.
+  local repo="${CLAIM_REPO-}" cwd
+  cwd="${PWD:-?}"
+  if [ -z "$repo" ]; then
+    printf 'CLAIM_REPO is SET BUT EMPTY (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$cwd"
+    return 0
+  fi
+  if ! ( CDPATH= cd -- "$repo" 2>/dev/null ); then
     printf 'not a readable directory: CLAIM_REPO=%s (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$repo" "$cwd"
     return 0
   fi

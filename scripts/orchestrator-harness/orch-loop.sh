@@ -2712,13 +2712,20 @@ while true; do
   if [ -f "$O/claims.sh" ]; then
     # shellcheck source=/dev/null
     . "$O/claims.sh"
-    # ⛔ THE DEFAULT IS NO LONGER `.`, BUT THIS IS STILL REQUIRED (agent-infra#1996). launchd starts
-    # the job at cwd `/` and macOS DENIES the read of it, so a relative registry resolves against a
-    # cwd that cannot even be read: every git call inside claims.sh then fails, and the snapshot came
-    # back empty with live claims on origin — measured: 3 claims on origin, 0 snapshot lines. Setting
-    # it explicitly also means the sweep does not depend on $REPO being exported in this shell.
+    # ⛔ CLAIM_REPO IS STILL SET EXPLICITLY HERE (agent-infra#1996). launchd starts the job at cwd `/`
+    # and macOS DENIES the read of it, so a relative registry resolves against a cwd that cannot even
+    # be read: every git call inside claims.sh then fails, and the snapshot came back empty with live
+    # claims on origin — measured: 3 claims on origin, 0 snapshot lines. Setting it explicitly also
+    # means the sweep does not depend on $REPO being exported in this shell. The `.` DEFAULT still
+    # exists in claims.sh for the workers that `cd "$REPO"` first; what changed is that the
+    # controller no longer relies on it.
     CLAIM_REPO="$REPO"
-    claim_snapshot "$O/state/claims-snapshot"
+    # ⛔ ITS FAILURE REASON GOES TO $LOG, not to stderr. This job runs in a DETACHED tmux pane (see
+    # launchd-controller.sh), so anything on stderr reaches no file at all: a registry refresh that
+    # failed for ever was silent, and the sweep then decided from a frozen snapshot — expired leases
+    # read free (spawn -> CAS-refusal churn) and live ones read held (the fleet refuses work) with
+    # nothing in the operator's only surface saying why. Same idiom as `claim_prune` below.
+    claim_snapshot "$O/state/claims-snapshot" 2>>"$LOG"
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
       touch "$O/state/.claims-pruned"
