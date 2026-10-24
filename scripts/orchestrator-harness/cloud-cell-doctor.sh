@@ -2612,6 +2612,10 @@ run_status() {
 #   so the omission is a recorded decision, not an implication of coverage: extending the walk to
 #   function bodies is the fix if a positional read outside a `local` ever carries a real hazard.
 #   Read this as "every `local` binding of a positional", never "every positional read in the file".
+#   A positional is counted in ANY spelling this audit recognises: `$N`, `${N}`, `${N:-…}`,
+#   `${N##*/}`, and the operators `${#N}` (length) and `${!N}` (indirect) — the last two were blind
+#   spots until review found that `local n="${#1}"` died on an absent argument while the scan saw no
+#   read at all and the fail-closed counter had nothing to compare against.
 # ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local `, so a binding
 #   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either, and
 #   neither is the continuation half of a binding split over lines (`local s="$1" \` + `tmp="$2"`)
