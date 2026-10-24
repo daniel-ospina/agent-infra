@@ -8272,6 +8272,45 @@ test("#1382 (i): a KEYWORD compound carries a body to a runner (if/for/while/cas
     "the reported prose shape is still DATA, so the guard did not bring the false positive back");
 });
 
+// The seven shapes a fresh review measured PAST the first version of this guard. Each was an
+// EXECUTION with the gate silent (a real `bash` printed a marker; `isGitOp(raw)` true,
+// `isGitOp(maskHeredocData(raw))` false). They are the reason the guard now refuses to mask ANY
+// body inside a frame instead of testing whether that frame's stdout reaches a program: enumerating
+// frame spellings × sink routes is a shell parser, and this file has recorded that it cannot
+// enumerate that class. Every one of these must now keep the merge VISIBLE.
+test("#1382 (i2): the frame guard cannot be walked past by a spelling it does not model", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const walkedPast: ReadonlyArray<readonly [string, string]> = [
+    // A prose `fi`/`}`/`)`/`esac` inside an EARLIER heredoc body popped the frame, so the next
+    // opener read as "no frame". Both a keyword frame and a subshell are pinned.
+    ["prose `fi` in an earlier body", `if true; then\ncat <<'A' > /tmp/notes.md\nfi\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["prose `)` in an earlier body", `(\ncat <<'A' > /tmp/notes.md\n)\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\n) | bash`],
+    // POSIX: a linebreak may follow `|`, so this is ONE pipeline — the pipe arm read it per line.
+    ["pipe then newline", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi |\nbash`],
+    // The write and the run share a line, so a "later lines" scan never saw the run.
+    ["same-line redirect then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p_e.sh; bash /tmp/p_e.sh`],
+    ["same-line tee then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | tee /tmp/p_f.sh; bash /tmp/p_f.sh`],
+    // The sink is on a line BEFORE the opener (process substitution), so a from-the-opener scan missed it.
+    ["process substitution before the opener", `bash <(if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi)`],
+    // The program is a VARIABLE, so no vocabulary of program names can see it.
+    ["variable program", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | $SHELL`],
+  ];
+  for (const [label, command] of walkedPast) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: the body reaches a program, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge`);
+  }
+  // ⛔ THE STATED COST, PINNED SO IT CANNOT DRIFT SILENTLY: a heredoc that IS data, written INSIDE a
+  // frame, is NO LONGER masked — a framed report quoting the verb is refused again. This is a false
+  // POSITIVE and it is the direction this file is allowed to be wrong in; the alternative measured
+  // above is a silent admin merge. Pinned as behaviour, so relaxing it requires changing this test.
+  // The body is genuinely DATA and its PROSE quotes the verb and a pipe — at origin/main this was
+  // MASKED (no false positive); it is refused now, and that is the price of closing the fail-opens.
+  ok(isGitOp(maskHeredocData(`if true; then\ncat >> /tmp/notes.md <<'EOF'\nBoth landed: ${MERGE}\nthe old flow was cat x.sh | bash\nEOF\nfi\nwc -l /tmp/notes.md`)),
+    "a framed DATA writer is NOT masked — the declared over-block, for a silent admin merge avoided");
+});
+
 // ── Summary ───────────────────────────────────────────
 // Run the async factory tests strictly sequentially (they mutate process.env).
 for (const run of pending) await run();
