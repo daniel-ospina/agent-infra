@@ -92,6 +92,91 @@ test("an UNRECOGNISED status stays a verdict (a future success status must not b
   equal(classifySpawnOutcome({ details: { status: "banana" } }).outcome, "verdict");
 });
 
+// ── the OTHER producer failure shapes (P1 of the code review of #2665) ─────────────────
+// The floor may not depend on builtin-tools' #1508 `isError` hook having run FIRST: extension
+// order is a readdir, so on one box the hook is upstream and on another it is downstream. These
+// pin that the CLASSIFIER reads the producer's own fields, order-independently.
+section("classifySpawnOutcome — the producer's other failure shapes (order-independent)");
+
+test("a subagent FAILED result is read from details.results[] (the micro tier's own path)", () => {
+  // extensions/subagent sets `isError` on its RETURNED result and carries no status/killed in
+  // details — so before this arm, a failed `subagent` reviewer was COUNTED as a review.
+  const failed = classifySpawnOutcome({
+    details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [{ exitCode: 1, stopReason: "error" }] },
+  });
+  equal(failed.outcome, "failed");
+  ok(failed.evidence.startsWith("results[]"), `names the per-result field: ${failed.evidence}`);
+  // A SUCCESSFUL subagent result stays a verdict — the guard against a blanket over-block.
+  equal(
+    classifySpawnOutcome({ details: { results: [{ exitCode: 0, stopReason: "stop" }] } }).outcome,
+    "verdict",
+  );
+  // …including each of the stop reasons the subagent tool itself treats as a failure.
+  for (const stopReason of ["error", "aborted", "timeout", "cut"]) {
+    equal(
+      classifySpawnOutcome({ details: { results: [{ exitCode: 0, stopReason }] } }).outcome,
+      "failed",
+      `stopReason=${stopReason} is a failure to the producer too`,
+    );
+  }
+});
+
+test("a non-zero exitCode is FAILED (composeTaskResult's failure branch carries no status)", () => {
+  const c = classifySpawnOutcome({ details: { model: "m", provider: "p", exitCode: 1 } });
+  equal(c.outcome, "failed");
+  equal(c.evidence, "exitCode=1");
+});
+
+test("`exitCode` present is a NO-OUTPUT settle — 0 (clean-empty) and null (signal death) are not verdicts", () => {
+  // Third review of #2665: `details.exitCode` is emitted ONLY on a non-clean composition, so its
+  // presence — at any value — means the child produced no readable result. `exitCode: 0` is the
+  // "SUCCESS-but-SILENT" settle (`reason: clean-empty`), which for a review gate is no verdict.
+  equal(classifySpawnOutcome({ details: { exitCode: 0 } }).outcome, "cut");
+  equal(classifySpawnOutcome({ details: { exitCode: null } }).outcome, "cut");
+  // …EXCEPT the success branch that only adds exitCode after the completion watchdog reaped it.
+  equal(
+    classifySpawnOutcome({ details: { model: "m", provider: "p", exitCode: 0, killedAfterCompletion: true } }).outcome,
+    "verdict",
+    "a reaped-after-completion success still carries its verdict",
+  );
+});
+
+test("a failing FALLBACK leg (`fallbackStatus`) is read, in both refused and failed forms", () => {
+  equal(classifySpawnOutcome({ details: { fallbackStatus: "failed" } }).outcome, "failed");
+  equal(classifySpawnOutcome({ details: { fallbackStatus: "circuit_open" } }).outcome, "refused");
+  equal(classifySpawnOutcome({ details: { fallbackStatus: "done" } }).outcome, "verdict");
+});
+
+test("failoverHalt splits: a PRE-SPAWN halt is REFUSED, a halt after an attempt is FAILED", () => {
+  const pre = classifySpawnOutcome({ details: { failoverHalt: true, haltAttempted: false, haltReason: "blocked" } });
+  equal(pre.outcome, "refused", "no child existed, so it cannot be a capacity retry");
+  ok(pre.evidence.includes("haltAttempted=false"), "carries the field that decided it");
+  equal(classifySpawnOutcome({ details: { failoverHalt: true, haltAttempted: true } }).outcome, "failed");
+});
+
+test("`failoverHopSpawnFailed` and `details.isError` are FAILED", () => {
+  equal(classifySpawnOutcome({ details: { failoverHopSpawnFailed: true } }).outcome, "failed");
+  equal(classifySpawnOutcome({ details: { isError: true } }).outcome, "failed");
+});
+
+test("an EMPTY `results: []` is a REFUSAL, not a verdict (the subagent tool's no-work arms)", () => {
+  // Review of #2665: invalid mode / too-many-parallel / missing agent-or-task all return
+  // `results: []` with no status and no isError — a request that never ran. Counting it as a
+  // review is the same false PASS the module exists to close. A legitimate run always has ≥1.
+  const c = classifySpawnOutcome({
+    details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [] },
+  });
+  equal(c.outcome, "refused");
+  equal(c.evidence, "results=[]");
+});
+
+test("PRECEDENCE: a cut still outranks every later field", () => {
+  equal(
+    classifySpawnOutcome({ details: { killed: true, exitCode: 1, results: [{ exitCode: 1 }] } }).outcome,
+    "cut",
+  );
+});
+
 // ── Machine capacity ──────────────────────────────────
 
 section("readMachineCapacity — measures the box, never invents a number");

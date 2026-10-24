@@ -73,6 +73,33 @@ const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_op
 const FAILED_STATUS = new Set(["failed"]);
 const CUT_STATUS = new Set(["cut"]);
 
+/**
+ * The `subagent` tool's failure predicate, mirrored from its own
+ * `isFailedResult` (`extensions/subagent/index.ts`) rather than inferred from `isError`.
+ * ⛔ WHY MIRRORED AND NOT READ FROM `isError`: the subagent tool sets `isError: true` on its
+ * RETURNED result and carries no `status`/`killed` in `details` (which is `{mode, agentScope,
+ * projectAgentsDir, results}`). Whether that `isError` reaches a `tool_result` handler depends on
+ * extension load order and on pi's own result pipeline — and `subagent` is the MICRO tier's own
+ * dispatch path, so a load-order accident there would be a silent false PASS. Reading the
+ * per-result fields the tool itself decides on is self-sufficient.
+ */
+const SUBAGENT_FAILED_STOP = new Set(["error", "aborted", "timeout", "cut"]);
+
+/** One `subagent` per-result entry, as `details.results[]` carries it. */
+interface SubagentResultLike {
+  exitCode?: unknown;
+  stopReason?: unknown;
+}
+
+/**
+ * A `results[]` entry is a failure exactly when the subagent tool would call it one: a non-zero
+ * exit, or a stop reason that means the worker was killed or errored rather than done.
+ */
+function subagentResultFailed(r: SubagentResultLike): boolean {
+  if (typeof r.exitCode === "number" && r.exitCode !== 0) return true;
+  return typeof r.stopReason === "string" && SUBAGENT_FAILED_STOP.has(r.stopReason);
+}
+
 /** The subset of a pi `tool_result` event this module reads. Absent fields are normal. */
 export interface SpawnResultLike {
   details?: Record<string, unknown> | null;
@@ -109,6 +136,72 @@ export function classifySpawnOutcome(result: SpawnResultLike | null | undefined)
   }
   if (status !== null && CUT_STATUS.has(status)) {
     return { outcome: "cut", evidence: `status=${status}` };
+  }
+  // ── the other producer failure shapes (review of #2665, P1) ────────────────────────────
+  // `builtin-tools` computes this SAME predicate for its own #1508 `isError` hook
+  // (`extensions/builtin-tools/index.ts`, "the INNER SPAWN adds a nonzero exit code …"). The
+  // floor may not depend on that hook having run FIRST: `emitToolResult` folds each handler's
+  // `isError` in for LATER extensions only, and extension order is a readdir — so on one box the
+  // hook is upstream and on another it is downstream. Reading the producer's own fields is
+  // order-independent.
+  const fallbackStatus = typeof details.fallbackStatus === "string" ? details.fallbackStatus : null;
+  if (fallbackStatus !== null && REFUSED_STATUS.has(fallbackStatus)) {
+    return { outcome: "refused", evidence: `fallbackStatus=${fallbackStatus}` };
+  }
+  if (fallbackStatus !== null && (FAILED_STATUS.has(fallbackStatus) || CUT_STATUS.has(fallbackStatus))) {
+    return { outcome: "failed", evidence: `fallbackStatus=${fallbackStatus}` };
+  }
+  if (details.failoverHalt === true) {
+    // `haltAttempted === false` is a PRE-SPAWN halt: no child ever existed, so it is a refusal and
+    // the remedy is not "wait for a child".
+    const attempted = details.haltAttempted === true;
+    return {
+      outcome: attempted ? "failed" : "refused",
+      evidence: `failoverHalt=true haltAttempted=${attempted} haltReason=${typeof details.haltReason === "string" ? details.haltReason : "unreported"}`,
+    };
+  }
+  if (details.failoverHopSpawnFailed === true) {
+    return { outcome: "failed", evidence: "failoverHopSpawnFailed=true" };
+  }
+  if (typeof details.exitCode === "number" && details.exitCode !== 0) {
+    return { outcome: "failed", evidence: `exitCode=${details.exitCode}` };
+  }
+  // ⛔ `exitCode` IS ONLY EMITTED ON A NON-CLEAN COMPOSITION (review of #2665, third round).
+  // `builtin-tools` writes `details.exitCode` in exactly three places: the non-clean
+  // composition (`{model, provider, exitCode: code}` — "a SUCCESS-but-SILENT child that exited 0
+  // with empty stdout", labelled `reason: "clean-empty"`), `composeTaskResult`'s failure branch
+  // (`{model, provider, exitCode}` — `null` on signal death), and the success branch guarded by
+  // `killedAfterCompletion === true`. A CLEAN success carries `{model, provider}` and NO
+  // `exitCode`. So a present `exitCode` that is NOT the reaped-after-completion case is a child
+  // that produced no readable result — regardless of the exit status it happens to have.
+  // (Before this arm, `exitCode: 0` and `exitCode: null` both counted as reviewer verdicts.)
+  if (details.exitCode === null) {
+    return { outcome: "cut", evidence: "exitCode=null (signal death, no output)" };
+  }
+  if (typeof details.exitCode === "number" && details.exitCode === 0 && details.killedAfterCompletion !== true) {
+    return { outcome: "cut", evidence: "exitCode=0 clean-empty (no output)" };
+  }
+  if (Array.isArray(details.results)) {
+    const results = details.results as SubagentResultLike[];
+    // ⛔ AN EMPTY `results` IS NOT A VERDICT (review of #2665). The subagent tool emits
+    // `results: []` on its NO-WORK arms (invalid mode, too many parallel tasks, missing
+    // agent/task) — a request that never ran. Every legitimate run yields at least one result,
+    // so an empty array is a spawn-side refusal, not a review. Without this arm those arms were
+    // COUNTED as reviewer dispatches, the same false PASS this module exists to close.
+    if (results.length === 0) {
+      return { outcome: "refused", evidence: "results=[]" };
+    }
+    const bad = results.find((r) => r && typeof r === "object" && subagentResultFailed(r));
+    if (bad) {
+      const why =
+        typeof bad.exitCode === "number" && bad.exitCode !== 0
+          ? `exitCode=${bad.exitCode}`
+          : `stopReason=${String(bad.stopReason)}`;
+      return { outcome: "failed", evidence: `results[].${why}` };
+    }
+  }
+  if (details.isError === true) {
+    return { outcome: "failed", evidence: "details.isError=true" };
   }
   // An explicit tool error with no recognised status: the tool did not produce a result the
   // gate can read as a verdict. Treated as `failed` (the weakest of the three claims) rather
@@ -189,6 +282,15 @@ function num(v: number | null): string {
 export type SpawnFaultClass = "capacity" | "breaker" | "refusal" | "mixed";
 
 /** The three per-attempt predicates, named so the renderer and the class agree by construction. */
+/** The class ONE attempt belongs to — the single definition both the classifier-set and the
+ *  caller's bounded ledger use, so "which class survives the window" cannot drift from
+ *  "which class decides the remedy". */
+export function attemptClass(a: SpawnAttempt): "capacity" | "breaker" | "refusal" {
+  if (a.outcome === "cut" || a.outcome === "failed") return "capacity";
+  if (a.outcome === "refused" && /circuit_open/.test(a.evidence)) return "breaker";
+  return "refusal";
+}
+
 export function faultClasses(attempts: readonly SpawnAttempt[]): {
   capacity: boolean;
   breaker: boolean;
@@ -201,11 +303,10 @@ export function faultClasses(attempts: readonly SpawnAttempt[]): {
   let refusalAt: SpawnAttempt | null = null;
   let capacity = false;
   for (const a of attempts) {
-    if (a.outcome === "cut" || a.outcome === "failed") capacity = true;
-    if (a.outcome === "refused") {
-      if (/circuit_open/.test(a.evidence)) breakerAt = a;
-      else refusalAt = a;
-    }
+    const cls = attemptClass(a);
+    if (cls === "capacity") capacity = true;
+    else if (cls === "breaker") breakerAt = a;
+    else refusalAt = a;
   }
   return { capacity, breaker: breakerAt !== null, refusal: refusalAt !== null, breakerAt, refusalAt };
 }

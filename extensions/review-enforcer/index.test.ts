@@ -7364,6 +7364,140 @@ testAsync("#spawngate 2d — a REFUSAL-only ledger reaches the argument remedy t
   });
 });
 
+testAsync("#spawngate 2e — a failed `subagent` dispatch does not satisfy the floor (the micro tier's own path)", async () => {
+  // P1 of the review of #2665: `subagent` reports failure ONLY on its returned result (isError)
+  // and carries no status/killed in details, so a load-order accident made its failures COUNT.
+  // The classifier now reads details.results[] itself, so this holds whatever order the
+  // extensions loaded in.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "subagent",
+          details: {
+            mode: "single",
+            agentScope: "user",
+            projectAgentsDir: null,
+            results: [{ exitCode: 1, stopReason: "error" }],
+          },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a failed subagent reviewer must NOT satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "capacity verdict");
+        ok(/results\[\]/.test(reason), "names the per-result evidence it read");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2f — a REFUSED BACKGROUND spawn is a capacity attempt, not 'no reviewers dispatched'", async () => {
+  // Review of #2665 non-blocking finding: the background early-return preceded classification,
+  // so the #1662 refused-background shape still got the compliance verdict its own test comment
+  // says it should not. The block is unchanged (no false PASS) — the TEXT was wrong.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocked (it never satisfied the floor)");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the REFUSAL is reported as what it is");
+        ok(!/No reviewers were dispatched/.test(reason), "not as the never-tried verdict");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2g — class coverage survives the bounded ledger (a breaker cannot age out)", async () => {
+  // Review of #2665: the trim dropped index 0 when no later attempt shared its class, evicting
+  // exactly the unique-class oldest the rule protects. Measured [breaker, 11×failed] → the
+  // breaker was gone and the verdict flipped to CAPACITY ("retry under less load") — the
+  // wrong-remedy failure this change exists to remove.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // ONE breaker, then enough failures to push it past SPAWN_ATTEMPT_KEEP.
+        await fire("tool_result", {
+          toolName: "task",
+          details: { model: "m", provider: "p", status: "circuit_open", retryable: false },
+        });
+        for (let i = 0; i < 11; i++) {
+          await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        }
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "still blocked");
+        const reason = (r as any).reason as string;
+        ok(reason.includes("BREAKER OBSERVED"), "the breaker survives the window");
+        ok(!/less loaded moment/.test(reason), "so the capacity-only remedy is not printed");
+        equal(
+          readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block")[0].spawn_attempts,
+          12,
+          "the count is still the true total",
+        );
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2h — a terminal collect is classified on the CHILD's nested details too (no-output → attempt)", async () => {
+  // Review of #2665: the collect view reports `background`-run status, and its mapping calls a
+  // no-output `clean-empty` settle `done`. Classifying on the view alone let a background
+  // reviewer that printed nothing satisfy the floor while the FOREGROUND path called the same
+  // shape a `cut`. The nested payload (`view.details`) carries the child's own `exitCode`.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", {
+          toolName: "task_collect",
+          details: {
+            run_id: "RUN-NOOUT",
+            status: "done",
+            terminal: true,
+            exit_code: 0,
+            details: { model: "m", provider: "p", exitCode: 0 },
+          },
+        });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a reaped lane with no output must NOT satisfy the floor");
+        ok(/exitCode=0 clean-empty/.test((r as any).reason), "the child's own field decides");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("#spawngate 3/4 — NO over-block: a real reviewer (no failure fields) still satisfies the floor", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {

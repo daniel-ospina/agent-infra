@@ -26,6 +26,7 @@ import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 import { redactCommand } from "../shared/redact-command.js";
 import {
+  attemptClass,
   classifySpawnOutcome,
   describeSpawnCapacity,
   readMachineCapacity,
@@ -4658,7 +4659,6 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
       // #1662 review: `task_collect` is idempotent — every result carries the
       // `run_id` it reaped (`details: view`). Count each run's verdict once, so
       // re-collecting a finished lane cannot inflate the dispatch total (and
@@ -4672,20 +4672,54 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // #2665: a spawn that produced NO VERDICT is an ATTEMPT, not a dispatch. Before this
-      // split the counter below fired on ANY `task`/`subagent` result, so a retry-exhausted
+      // #2665: a spawn that produced NO VERDICT is an ATTEMPT, not a dispatch — classified BEFORE
+      // the background early-return, because a REFUSED background spawn (`status:"invalid-cwd"`
+      // with `background:true`, the #1662 shape) used to return as "no reviewers dispatched": the
+      // capacity-read-as-compliance mislabel this change exists to remove. Before the split, the
+      // counter below fired on ANY `task`/`subagent` result, so a retry-exhausted
       // (`status:"failed"`), cut (`killed:true`) or pre-spawn-refused child satisfied the
       // ≥1-dispatch floor and the lane's unreviewed `git push` was ALLOWED — a false PASS,
       // measured (see `shared/spawn-capacity.ts`). The classification reads ONLY fields the
       // producer set, and the evidence it read is carried into the audit row and the refusal.
       const spawn = classifySpawnOutcome({
-        details: reviewDetails as Record<string, unknown> | undefined,
+        // A terminal `task_collect` result is a `TaskRunStatusView`: the CHILD's composed payload
+        // sits at `view.details`, and the run's own `status`/`reason` sit at the top level. Read
+        // BOTH (nested last, so the child's own `killed`/`exitCode` win), because classifying on
+        // the view alone re-opened the same fail-open one path over (review of #2665): the
+        // background status mapping reports a no-output `clean-empty` settle as `done`, so the
+        // view said "done" while the child's details carried `exitCode:0` with no output — and
+        // the FOREGROUND path already classifies that same shape as `cut`.
+        details: isTerminalCollect
+          ? {
+              ...(reviewDetails as Record<string, unknown>),
+              ...((typeof (reviewDetails as { details?: unknown })?.details === "object" &&
+              (reviewDetails as { details?: unknown }).details !== null
+                ? (reviewDetails as { details: Record<string, unknown> }).details
+                : {}) as Record<string, unknown>),
+            }
+          : (reviewDetails as Record<string, unknown> | undefined),
         isError: (event as { isError?: unknown }).isError,
       });
       if (spawn.outcome !== "verdict") {
         spawnAttemptsTotal++;
         spawnAttempts.push({ tool: event.toolName, outcome: spawn.outcome, evidence: spawn.evidence });
-        if (spawnAttempts.length > SPAWN_ATTEMPT_KEEP) spawnAttempts = spawnAttempts.slice(-SPAWN_ATTEMPT_KEEP);
+        // Bounded ledger WITH CLASS COVERAGE (review of #2665): dropping the oldest entry
+        // unconditionally let a breaker seen once age out of the window, after which a
+        // breaker-plus-failures ledger printed the CAPACITY "retry under less load" remedy. Drop
+        // the OLDEST entry whose class has a LATER duplicate, so every class that occurred
+        // survives the window. (A first-match drop was wrong in the not-found case: it evicted
+        // exactly the UNIQUE-class oldest the rule protects — measured [breaker, 11×failed].)
+        if (spawnAttempts.length > SPAWN_ATTEMPT_KEEP) {
+          let dropAt = -1;
+          for (let i = 0; i < spawnAttempts.length - 1; i++) {
+            const cls = attemptClass(spawnAttempts[i]);
+            if (spawnAttempts.slice(i + 1).some((a) => attemptClass(a) === cls)) {
+              dropAt = i;
+              break;
+            }
+          }
+          spawnAttempts.splice(dropAt >= 0 ? dropAt : 0, 1);
+        }
         console.error(
           `[review-enforcer] ⚠️ Sub-agent spawn produced NO verdict (${spawn.outcome}: ${spawn.evidence}) — ` +
             `recorded as ATTEMPT ${spawnAttemptsTotal}, NOT counted as a dispatch (#2665)`
@@ -4699,6 +4733,10 @@ export default function (pi: ExtensionAPI) {
         });
         return undefined;
       }
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH — counting it would
+      // satisfy the ≥1-dispatch gate while the reviewer is still running. A verdict-less
+      // background result was classified ABOVE (as an attempt); this guards the COUNTING only.
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
 
       dispatchCount++;
       console.log(
