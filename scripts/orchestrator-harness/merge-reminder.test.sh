@@ -42,7 +42,17 @@
 #       statuses are ordered by TIME in both payload directions (and an undateable one is
 #       UNREADABLE); a record bound to another repo is not a record for this one;
 #   §21 the crontab arm (a box with no systemd): install VERIFIES the entry exists, the entry is
-#       quoted, and `--uninstall-timer` REMOVES it — the arm install can create.
+#       quoted, and `--uninstall-timer` REMOVES it — the arm install can create;
+#   §22 ABSENCE IS NOT GREEN and partial pages are not quiet: an EMPTY check surface refuses, a
+#       combined status state=failure with no failing entry read is UNREADABLE, and `lease_until=0`
+#       is LIVE (claims.sh's sentinel) rather than expired;
+#   §23 the DEPLOY arm's own bound: an unattainable target is attempted, RECORDED, then a WAIT, then
+#       a REFUSE by count — never a restart every cycle — and a box our own failed activation left
+#       STOPPED is reported as our damage;
+#   §24 evidence details: `box-status.sh` reads a RIGHT-PADDED ps line (the pid-parse defect that
+#       reported a live controller as STOPPED), the systemd unit's ExecStart starts with the
+#       interpreter exactly once, uninstall spares an operator line that merely mentions the tag,
+#       and the darwin plist is rendered/loaded/removed with bootout BEFORE bootstrap.
 #
 # HERMETIC: no network, no real gh, no real rail, no real scheduler. `gh`, `ps`, the rail and the
 # box probe are stubs on PATH / in a fixture; the CLAIM gate is driven against a REAL git repo with
@@ -108,7 +118,7 @@ case "$2" in
   repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
   repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
   repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
-  repos/*/status)                    cat "$FIXTURE/status.json" ;;
+  repos/*/status*)                   cat "$FIXTURE/status.json" ;;
   *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
 esac
 STUB
@@ -193,7 +203,8 @@ run_sut() { # extra args…
     python3 "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
       --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 "$@"
 }
-reset_o() { rm -f "$O/state/mergeclaim-"*.lock "$O/state/merge-reminder.attempts"; }
+reset_o() { rm -f "$O/state/mergeclaim-"*.lock "$O/state/merge-reminder.attempts" \
+                 "$O/state/merge-reminder.deploys"; }
 # A landing that REFUSES (its record is bound to an OLDER head), so the deploy arm is reached: a
 # dispatch in the same cycle defers that arm by design, which would hide the deploy gates under test.
 write_no_landing() {
@@ -324,7 +335,7 @@ case "$2" in
   repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
   repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
   repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
-  repos/*/status)                    cat "$FIXTURE/status.json" ;;
+  repos/*/status*)                   cat "$FIXTURE/status.json" ;;
   *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
 esac
 STUB
@@ -479,8 +490,14 @@ if [ -s "$mut/claimless.py" ]; then
   out="$(env FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
         python3 "$mut/claimless.py" --o "$O" --reviews "$REV" --repo "$SLUG" \
         --rail "$TMP/rail.sh" --rail-wait-s 5 --dry-run)"
+  mrc=$?
+  # ⛔ A NEGATIVE ASSERTION ALONE PASSES ON A MUTANT THAT NEVER RAN: `nq` on empty output is true,
+  # so an import error, a syntax error or any crash read as "the gate is gone". Require the mutant to
+  # have EXITED 0 and reached the verdict the gate was blocking.
   ck "§15a with the claim gate removed, a HELD claim no longer refuses (the gate is live)" \
-     "$(nq 'REFUSE(claim=' "$out" && echo 0 || echo 1)"
+     "$([ "$mrc" -eq 0 ] && nq 'REFUSE(claim=' "$out" && q 'GO' "$out" && echo 0 || echo 1)"
+  ck "§15a (the mutant actually RAN: rc=$mrc, and it reached a GO)" \
+     "$(q 'GO (not dispatched: --dry-run)' "$out" && echo 0 || echo 1)"
   git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
 else
   ck "§15a the claim-gate mutant was produced" 1
@@ -504,8 +521,11 @@ JSON
   out="$(env FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
         python3 "$mut/inflightless.py" --o "$O" --reviews "$REV" --repo "$SLUG" \
         --rail "$TMP/rail.sh" --rail-wait-s 5 --dry-run)"
+  mrc=$?
   ck "§15b with the in-flight gate removed, a moving surface reads as landable (the gate is live)" \
-     "$(nq 'REFUSE(in-flight=' "$out" && echo 0 || echo 1)"
+     "$([ "$mrc" -eq 0 ] && nq 'REFUSE(in-flight=' "$out" && q 'GO' "$out" && echo 0 || echo 1)"
+  ck "§15b (the mutant actually RAN: rc=$mrc, and it reached a GO)" \
+     "$(q 'GO (not dispatched: --dry-run)' "$out" && echo 0 || echo 1)"
 else
   ck "§15b the in-flight mutant was produced" 1
 fi
@@ -775,6 +795,200 @@ env HOME="$H3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
   --uninstall-timer >/dev/null 2>&1
 ck "§21 --uninstall-timer removes the crontab entry (the arm install created)" \
    "$(grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+
+# ═══ §22 an EMPTY surface is not a green one, and a partial page is not a quiet one ═══════════
+echo "-- §22 absence of evidence, and the truncation cross-checks"
+# A head pushed moments ago has no check runs and no statuses; a review record can already exist
+# (reviewing is local). `reds=0 in-flight=0` from a surface of ZERO groups is a GO on code that was
+# never tested — "if the surface is empty, report that you read nothing there and stop".
+write_baseline; reset_o
+printf '{"total_count":0,"check_runs":[]}\n' > "$FX/checks.json"
+printf '{"state":"success","statuses":[]}\n' > "$FX/status.json"
+out="$(run_sut)"; rc=$?
+ck "§22a an empty surface REFUSES by name" "$(qF 'REFUSE(surface=empty)' "$out" && echo 0 || echo 1)"
+ck "§22a nothing was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+# The combined state survives a truncated page; a `failure` with no failing entry READ means the
+# entry was dropped, which is the one signal this endpoint offers.
+write_baseline; reset_o
+cat > "$FX/status.json" <<JSON
+{"state":"failure","statuses":[
+ {"context":"vercel/deploy","state":"success","created_at":"2026-10-23T05:00:00Z",
+  "updated_at":"2026-10-23T05:00:00Z"}]}
+JSON
+out="$(run_sut --json)"; rc=$?
+ck "§22b combined state=failure with no failing entry read is UNREADABLE" \
+   "$(qF 'combined commit-status state is' "$out" && qF 'REFUSE(UNREADABLE)' "$out" && echo 0 || echo 1)"
+ck "§22b nothing was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+# ── the `0` lease sentinel: claims.sh says UNPARSEABLE => LIVE, so it must NOT read as expired ──
+write_baseline; reset_o
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+printf 'claim owner=cell-2 lease_until=0 nonce=zero\n' > "$TMP/claimmsg-zero"
+ZERO_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-zero")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+git -C "$REPO_SRC" push --quiet origin "$ZERO_SHA:refs/claims/pr-42" 2>/dev/null
+out="$(run_sut)"; rc=$?
+ck "§22c lease_until=0 is LIVE (claims.sh's sentinel), so the claim still refuses" \
+   "$(q 'REFUSE(claim=refs/claims/pr-42' "$out" && echo 0 || echo 1)"
+ck "§22c nothing was dispatched on a claim every other reader calls live" \
+   "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+
+# The three documented ABSTENTIONS, each driven so the string is not merely printed somewhere.
+write_baseline; reset_o
+printf '[{"number":42,"title":"closed","state":"closed","draft":false,"mergeable":true,\n  "updated_at":"2026-10-23T04:00:00Z","head":{"sha":"%s"}}]\n' "$HEAD" > "$FX/pulls.json"
+out="$(run_sut)"; rc=$?
+ck "§22d a CLOSED PR refuses by name (the listing can return one)" \
+   "$(qF 'REFUSE(pr=closed)' "$out" && echo 0 || echo 1)"
+
+write_no_landing; reset_o
+# A box probe that answers no `roles:` line at all: an unanswered question cannot license a restart.
+printf 'harness: ffffffff [behind] source=pin\ncontroller: RUNNING(pid 2)\n' > "$FX/box.txt"
+out="$(run_sut)"; rc=$?
+ck "§22e an UNREADABLE roles reading refuses (absent is not idle)" \
+   "$(qF 'REFUSE(roles=UNREADABLE)' "$out" && echo 0 || echo 1)"
+ck "§22e and nothing was activated" "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+
+write_baseline; reset_o
+cat > "$BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$BIN/ps"
+out="$(run_sut)"; rc=$?
+ck "§22f an UNREADABLE process table is rail=UNREADABLE, never 'idle'" \
+   "$(qF 'REFUSE(rail=UNREADABLE)' "$out" && echo 0 || echo 1)"
+ck "§22f nothing was dispatched on an abstention" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+cat > "$BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+# ⛔ NEVER an EMPTY table: `box-status.sh` treats an unreadable/empty process table as CANNOT-VERIFY
+# (correctly — a controller state from an unread read is the #1989 defect), so the stub always answers
+# with at least one row. Cases that need a rail add theirs to $FIXTURE/ps.txt.
+out="$(cat "$FIXTURE/ps.txt" 2>/dev/null)"
+printf '%s\n' "${out:-1 ps}"
+STUB
+chmod +x "$BIN/ps"
+
+# ═══ §23 the DEPLOY arm's own bound: an unattainable target must not restart forever ═══════════
+echo "-- §23 deploy attempts are recorded and bounded"
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
+# The activation runs but the artifact never becomes current: the box stays `behind`.
+cat > "$TMP/box-noop.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "activate-ran" >> "$FIXTURE/activate.txt"
+exit 0
+STUB
+chmod +x "$TMP/box-noop.sh"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-noop.sh" > "$O/state/boxes.tsv"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§23a an activation that does not reach main is UNVERIFIED, never assumed" \
+   "$(qF 'UNVERIFIED' "$out" && echo 0 || echo 1)"
+ck "§23a the attempt was RECORDED (so the next cycle can read it)" \
+   "$(grep -q '^local ' "$O/state/merge-reminder.deploys" 2>/dev/null && echo 0 || echo 1)"
+# ...and a second cycle inside --retry-s does not try again blindly.
+rm -f "$FX/activate.txt"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§23b a recent failed attempt is a WAIT, not another restart" \
+   "$(qF 'WAIT(deploy-retry-after=' "$out" && echo 0 || echo 1)"
+ck "§23b and nothing was activated" "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+# With the pair already tried DEPLOY_MAX_ATTEMPTS times, the arm STOPS and says a human must look.
+: > "$O/state/merge-reminder.deploys"
+for n in 1 2 3; do
+  printf 'local ffffffffffff %s %s unverified\n' "${MAIN12}" "$(( $(date +%s) - 1000 ))" \
+    >> "$O/state/merge-reminder.deploys"
+done
+rm -f "$FX/activate.txt"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§23c three unverified attempts REFUSE by count, naming a human" \
+   "$(qF 'REFUSE(deploy-attempts=3' "$out" && echo 0 || echo 1)"
+ck "§23c and it did not restart the box a fourth time" \
+   "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+# A STOPPED box that OUR OWN failed activation left stopped is attributed to us, not to an operator.
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: STOPPED\nroles: idle\n' > "$FX/box.txt"
+out="$(run_sut)"; rc=$?
+ck "§23d a STOPPED box after OUR unverified attempt is reported as OUR damage" \
+   "$(qF 'our last activation of this box did not verify' "$out" && echo 0 || echo 1)"
+ck "§23d and it still does not start it behind an operator's back" \
+   "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+
+# ═══ §24 box-status.sh's controller pid, and the timer arms' rendered shape ═════════════════════
+echo "-- §24 evidence details"
+# ⛔ `ps -axo pid=,command=` RIGHT-PADS the pid column. A parse that assumes no leading blanks yields
+# an EMPTY pid for a box that IS running a controller — which read as `controller: STOPPED`, and made
+# the deploy arm refuse to fix a drifted box on the false ground that an operator had stopped it.
+P="$TMP/padbin"; mkdir -p "$P"
+cat > "$P/ps" <<'STUB'
+#!/usr/bin/env bash
+printf '   4567 bash %s/orch-loop.sh --watch\n' "$FIXTURE"
+STUB
+chmod +x "$P/ps"
+outbox="$(env FIXTURE="$TMP/fakebox" PATH="$P:/usr/bin:/bin" bash "$BOX" --o "$O" 2>&1)"; brc=$?
+ck "§24a a RIGHT-PADDED ps line still names the controller and its pid" \
+   "$(qF 'controller: RUNNING(pid 4567)' "$outbox" && echo 0 || echo 1)"
+ck "§24a (and it does not claim the box is STOPPED: rc=$brc)" \
+   "$(nq 'controller: STOPPED' "$outbox" && echo 0 || echo 1)"
+
+# The systemd unit must actually EXECUTE: argv[0] is the interpreter, so prefixing
+# `/usr/bin/env python3` made the unit run the interpreter AS the script — and the timer still
+# reported itself active, so the reminder never ran at all.
+H4="$TMP/home4"; mkdir -p "$H4"
+env HOME="$H4" FIXTURE="$FX" PATH="$TMP/sysbin:/usr/bin:/bin" \
+  python3 "$SUT" --o "$O" --install-timer --interval 600 >/dev/null 2>&1
+svc="$(cat "$H4/.config/systemd/user/merge-reminder.service" 2>/dev/null)"
+ck "§24b the unit's ExecStart starts with the INTERPRETER, not with a duplicated one" \
+   "$(grep -q '^ExecStart=.*python[0-9.]*' <<<"$svc" && nq 'ExecStart=/usr/bin/env python3 ' "$svc" && echo 0 || echo 1)"
+ck "§24b and it names this script exactly once" \
+   "$([ "$(grep -o 'merge-reminder\.py' <<<"$svc" | wc -l)" -eq 1 ] && echo 0 || echo 1)"
+
+# A crontab line that merely MENTIONS our tag is not ours to delete.
+: > "$FX/crontab.txt"
+printf '%s\n' '*/5 * * * * /usr/bin/true # paused tortoise-merge-reminder during freeze' > "$FX/crontab.txt"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§24c an operator line that only MENTIONS the tag survives uninstall" \
+   "$(grep -q 'paused tortoise-merge-reminder during freeze' "$FX/crontab.txt" && echo 0 || echo 1)"
+
+# ...and the darwin plist has the same argv-shape risk, driven hermetically (the repo already drives
+# a launchd installer this way in install-launchd-durability.test.sh).
+D="$TMP/darwinbin"; DH="$TMP/home5"; mkdir -p "$D" "$DH"
+cat > "$D/launchctl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FIXTURE/launchctl.txt"
+exit 0
+STUB
+cat > "$D/plutil" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+cat > "$D/uname" <<'STUB'
+#!/bin/bash
+echo Darwin
+STUB
+chmod +x "$D/launchctl" "$D/plutil" "$D/uname"
+outd="$(env HOME="$DH" FIXTURE="$FX" PATH="$D:/usr/bin:/bin" "$PY3" -c '
+import importlib.util, sys, pathlib
+sys.platform = "darwin"          # drive the darwin branch on a Linux CI box, hermetically
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+rc = m.install_timer(pathlib.Path(sys.argv[2]), 600, False)
+print("rc=%d" % rc)
+' "$SUT" "$O" 2>&1)"; drc=$?
+PL="$DH/Library/LaunchAgents/com.tortoise.merge-reminder.plist"
+ck "§24d darwin: the plist was rendered and loaded (rc suffix: $(tail -1 <<<"$outd"))" \
+   "$([ -s "$PL" ] && q 'rc=0' "$outd" && echo 0 || echo 1)"
+ck "§24d darwin: ProgramArguments names the script ONCE and carries the interval" \
+   "$([ "$(grep -o 'merge-reminder\.py' "$PL" 2>/dev/null | wc -l)" -eq 1 ] && grep -q '<key>StartInterval</key>' "$PL" && echo 0 || echo 1)"
+ck "§24d darwin: the job is booted out BEFORE it is bootstrapped (launchd requires it)" \
+   "$(awk '/bootout/{b=NR} /bootstrap/{s=NR} END{exit !(b && s && b<s)}' "$FX/launchctl.txt" && echo 0 || echo 1)"
+env HOME="$DH" FIXTURE="$FX" PATH="$D:/usr/bin:/bin" "$PY3" -c '
+import importlib.util, sys, pathlib
+sys.platform = "darwin"
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+sys.exit(m.install_timer(pathlib.Path(sys.argv[2]), 600, True))
+' "$SUT" "$O" >/dev/null 2>&1
+ck "§24e darwin: --uninstall-timer removes the plist" "$([ ! -e "$PL" ] && echo 0 || echo 1)"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

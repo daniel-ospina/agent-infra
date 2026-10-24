@@ -357,17 +357,24 @@ def check_surface(budget: Budget, slug: str, head: str) -> dict:
         raise Skipped(f"UNREADABLE check-runs — this read saw {len(checks)} of {total} entries "
                       f"(one page); a truncated surface can hide a whole red group")
 
-    rc, out, err = budget.api(f"repos/{slug}/commits/{head}/status")
+    rc, out, err = budget.api(f"repos/{slug}/commits/{head}/status?per_page=100")
     if rc != 0:
         raise Skipped(f"UNREADABLE statuses rc={rc} {one_line(err)}")
     try:
-        statuses = (json.loads(out) or {}).get("statuses") or []
+        status_payload = json.loads(out) or {}
+        statuses = status_payload.get("statuses") or []
     except (ValueError, AttributeError):
         raise Skipped("UNREADABLE statuses — the answer was not a JSON status list")
     if len(statuses) >= 100:
-        # This endpoint has no `total_count`, so a full page is the only truncation signal it offers.
+        # This endpoint has no `total_count`, so a FULL page is the only truncation signal it offers
+        # — which is why the read must ask for the maximum page in the first place (#2603 review:
+        # without `per_page=100` GitHub answers 30 and the guard below could never fire).
         raise Skipped("UNREADABLE statuses — a full page (100) was returned; completeness cannot "
                       "be proven from one page")
+    # The COMBINED state is the one field that survives truncation, so it is the cross-check on the
+    # page: `failure` with no failing status read means entries were dropped (or one was not
+    # classified), and that is NOT a quiet surface.
+    combined = str(status_payload.get("state") or "").strip().lower()
 
     groups: dict[tuple, dict] = {}
 
@@ -416,6 +423,16 @@ def check_surface(budget: Budget, slug: str, head: str) -> dict:
                        f"updated_at nor created_at, so which entry is newest cannot be established")
             continue
         offer(key, stamp, verdict, f"status / {ctx or '<unnamed>'}")
+
+    status_groups = [v for k, v in groups.items() if k and k[0] == "status"]
+    if not problem and combined == "failure" and not any(
+            v["verdict"] == "red" for v in status_groups):
+        problem = ("the combined commit-status state is `failure` but no failing status was read "
+                   "— the page is incomplete, so its absences prove nothing")
+    if not problem and combined == "pending" and not any(
+            v["verdict"] == "in_flight" for v in status_groups):
+        problem = ("the combined commit-status state is `pending` but no in-flight status was read "
+                   "— the page is incomplete, so its absences prove nothing")
 
     reds = sorted({v["label"] for v in groups.values() if v["verdict"] == "red"})
     inflight = sorted({v["label"] for v in groups.values() if v["verdict"] == "in_flight"})
@@ -499,36 +516,45 @@ def claim_state(o: Path, repo_path: Path, pr: int, head: str) -> tuple[str, str]
     # The claim's own commit message carries `owner` and `lease_until` (claims.sh). Read it when it
     # is cheap to do so; a failure to read the LEASE is not a failure to see the CLAIM, so the
     # refusal stands and the holder just carries less detail.
-    # ⛔ A FULL fetch of the one ref, not `--depth=1`: a shallow fetch is refused outright over a
-    # local path transport ("--depth is ignored in local clones"), which is exactly how a fixture —
-    # or a box whose origin is a disk path — would silently lose the lease and turn an EXPIRED claim
-    # into a permanent one. A claim ref is a single commit, so the full fetch is a few objects.
-    rc, _, _ = run(["git", "-C", str(repo_path), "fetch", "--no-tags", "origin", ref], timeout=60)
+    # ⛔ A PRIVATE REF, NEVER `FETCH_HEAD`. There is ONE FETCH_HEAD per .git, shared by every worktree
+    # and rewritten by ANY concurrent fetch — reading it made a LIVE claim readable as an EXPIRED one
+    # (harness-refresh.sh records the same decision for its own reads, with a staged race test). The
+    # ref is ours alone, and a FULL fetch of one claim commit (not `--depth=1`, which a local-path
+    # transport refuses outright) is a few objects.
+    tmp_ref = f"refs/reminder/claim-{pr}-{os.getpid()}-{int(time.time())}"
+    msg = ""
+    rc, _, _ = run(["git", "-C", str(repo_path), "fetch", "--no-tags", "origin",
+                    f"{ref}:{tmp_ref}"], timeout=60)
     if rc == 0:
-        rc2, msg, _ = run(["git", "-C", str(repo_path), "log", "-1", "--format=%B", "FETCH_HEAD"],
-                          timeout=15)
+        rc2, out_msg, _ = run(["git", "-C", str(repo_path), "log", "-1", "--format=%B", tmp_ref],
+                              timeout=15)
         if rc2 == 0:
-            # ⛔ THE SHAPE IS `claims.sh`'s, NOT AN INVENTED ONE: one line,
-            # `claim owner=<x> lease_until=<epoch-seconds> nonce=<…>`, parsed with the same
-            # non-anchored patterns `_lease_of` uses — a claim minted by the real writer must be
-            # readable here, or every claim reads as lease-less and none can ever expire.
-            m_owner = re.search(r"\bowner=([^\s]+)", msg or "")
-            m_lease = re.search(r"\blease_until=([^\s]+)", msg or "")
-            extra = []
-            if m_owner:
-                extra.append(f"owner={m_owner.group(1).strip()}")
-            if m_lease:
-                lease_until = m_lease.group(1).strip()
-                extra.append(f"lease_until={lease_until}")
-            if extra:
-                holder = f"{ref}@({', '.join(extra)})"
+            msg = out_msg or ""
+    run(["git", "-C", str(repo_path), "update-ref", "-d", tmp_ref], timeout=15)
+    if msg:
+        # ⛔ THE SHAPE IS `claims.sh`'s, NOT AN INVENTED ONE: one line,
+        # `claim owner=<x> lease_until=<epoch-seconds> nonce=<...>`, parsed with the same
+        # non-anchored patterns `_lease_of` uses — a claim minted by the real writer must be
+        # readable here, or every claim reads as lease-less and none can ever expire.
+        m_owner = re.search(r"\bowner=([^\s]+)", msg)
+        m_lease = re.search(r"\blease_until=([^\s]+)", msg)
+        extra = []
+        if m_owner:
+            extra.append(f"owner={m_owner.group(1).strip()}")
+        if m_lease:
+            lease_until = m_lease.group(1).strip()
+            extra.append(f"lease_until={lease_until}")
+        if extra:
+            holder = f"{ref}@({', '.join(extra)})"
     if lease_until:
         # `lease_until` is EPOCH SECONDS (claims.sh: "an EPOCH SECOND, which is 10 digits TODAY");
-        # an ISO stamp is tolerated for an older writer. ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE
-        # — the same polarity as `_lease_unparseable`/`_lease_is_live`, because the failure direction
-        # of a gate is not symmetric: refusing costs a cycle, stealing a live claim disowns a lane.
+        # an ISO stamp is tolerated for an older writer. ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE,
+        # which includes the `0` SENTINEL: claims.sh's `_lease_unparseable` treats `'' | 0 | non-digit`
+        # (and 19+ digits) as unparseable, `_lease_is_live` then answers LIVE, and test-claims.sh pins
+        # "`lease_until=0` reads as UNPARSEABLE => LIVE (rc=1)". Reading 0 as an expired epoch here
+        # would be a FIFTH polarity about the same fact — and it would steal a live claim.
         lease_ts = None
-        if re.fullmatch(r"\d{1,18}", lease_until):
+        if re.fullmatch(r"\d{1,18}", lease_until) and int(lease_until) != 0:
             lease_ts = float(lease_until)
         elif _ts(lease_until) is not None:
             lease_ts = _ts(lease_until)
@@ -644,6 +670,31 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+CRON_TAG = "# tortoise-merge-reminder"
+
+
+def _cron_line(o: Path, mins: int) -> str:
+    """The crontab entry, quoted for /bin/sh AND for cron.
+
+    ⛔ `%` IS EATEN BY CRON BEFORE THE SHELL EVER SEES IT (it means "newline + stdin"), so a `$O`
+    containing one produced an entry cron mangles while the post-write verification still found the
+    tag and reported success. Escaped here.
+    """
+    q_o = shell_quote(str(o)).replace("%", "\\%")
+    q_s = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
+    return f"*/{mins} * * * * O={q_o} /usr/bin/env python3 {q_s} --o {q_o} {CRON_TAG}"
+
+
+def _is_our_cron_line(line: str, tag: str) -> bool:
+    """True only for a line THIS file wrote: the tag AND this script's path.
+
+    ⛔ A bare tag match deleted an operator's own line that merely mentioned it (e.g. a `# paused
+    tortoise-merge-reminder during freeze` entry) and reported that as removing our arm (#2603
+    review). Install and uninstall now share this one predicate.
+    """
+    return tag in line and shell_quote(str(Path(__file__).resolve())) in line
+
+
 def local_activate(o: Path, platform: str | None = None) -> str:
     """The activation verb for THIS box, resolved the way the doctor resolves the rail: the shipped
     location first, then `$O`, then the pi agent scripts.
@@ -671,16 +722,20 @@ def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
     rc, out, err = run(["bash", "-c", status_cmd], timeout=timeout)
     text = (out or "") + ("\n" + err if err else "")
     d = {"name": name, "rc": rc, "raw": text, "harness": "", "relation": "", "source": "",
-         "controller": "", "roles": "", "readable": True}
+         "controller": "", "ctrl_pids": [], "roles": "", "readable": True}
     for line in text.splitlines():
         line = line.strip()
         m = re.match(r"harness:\s*([0-9a-f]{7,40})\s*\[([^\]]+)\]\s*(?:source=(\S+))?", line)
         if m:
             d["harness"], d["relation"] = m.group(1).lower(), m.group(2).strip().lower()
             d["source"] = (m.group(3) or "").strip().lower()
-        m = re.match(r"controller:\s*([A-Za-z_]+)", line)
+        m = re.match(r"controller:\s*([A-Za-z_]+)(?:\(pid ([0-9, ]*)\))?", line)
         if m:
             d["controller"] = m.group(1).upper()
+            # The pid(s) are the only part of `RUNNING` that cannot be pre-existing: a restart the
+            # box's own verb failed to perform leaves the OLD process running, and its pid is what
+            # tells the two apart (#2603 review: "verified by artifact" accepted one).
+            d["ctrl_pids"] = [x for x in re.split(r"[,\s]+", m.group(2) or "") if x.isdigit()]
         m = re.match(r"roles:\s*(.*)$", line)
         if m:
             d["roles"] = m.group(1).strip()
@@ -689,8 +744,57 @@ def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
     return d
 
 
+DEPLOYS = "merge-reminder.deploys"
+DEPLOY_MAX_ATTEMPTS = 3
+
+
+def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
+    """-> (attempts recorded for this box at this from->to pair, epoch of the LAST one).
+
+    ⛔ A DEPLOY NEEDS A BOUND AS MUCH AS A MERGE DOES. Without one, a box that cannot reach
+    `origin/main` — pinned `ahead` of it, `diverged` from it, or with an `apply` that never advances
+    the pin — is stopped and started EVERY cycle, forever, because every gate that could stop it
+    re-opens 600 s later (the deploy lock is released, roles go idle again, the controller comes back
+    RUNNING). The ledger is what makes "this has been tried" a fact the next cycle can read.
+    """
+    p = o / "state" / DEPLOYS
+    try:
+        text = p.read_text()
+    except OSError:
+        return 0, 0
+    n, last = 0, 0
+    frm12, to12 = frm[:12], to[:12]
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == box and parts[1] == frm12 and parts[2] == to12:
+            n += 1
+            try:
+                last = max(last, int(parts[3]))
+            except ValueError:
+                continue
+    return n, last
+
+
+def record_deploy(o: Path, box: str, frm: str, to: str, verdict: str) -> None:
+    p = o / "state" / DEPLOYS
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            fh.write(f"{box} {frm[:12]} {to[:12]} {int(time.time())} {' '.join(verdict.split())}\n")
+        lines = p.read_text().splitlines()[-400:]
+        tmp = p.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(tmp, p)
+    except OSError:
+        pass          # a ledger that cannot be written must not turn a refusal into an action
+
+
+def _controller_pids(d: dict) -> list[str]:
+    return [str(x) for x in (d.get("ctrl_pids") or [])]
+
+
 def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
-               dry: bool, act: bool = True) -> list[dict]:
+               dry: bool, act: bool = True, retry_s: int = RETRY_S) -> list[dict]:
     """Question 2 made actionable. Runs AFTER the landing decision by construction (the caller
     passes `dispatched_landing`, and a dispatch in the same cycle suppresses this arm: restarting a
     controller under the rail we just started destroys the run we just paid for).
@@ -782,8 +886,17 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 results.append(entry)
                 continue
             if d["controller"] == "STOPPED":
-                entry["verdict"] = ("activate=skipped(controller=STOPPED — an operator's stop is "
-                                    "intent, not drift)")
+                # ⛔ THIS ARM CANNOT TELL AN OPERATOR'S STOP FROM ITS OWN FAILED ACTIVATION, so it
+                # does not start the box — and it says WHICH one the ledger suggests. (A `stop ->
+                # apply -> start` chain whose `apply` failed leaves the cell DOWN; reporting that as
+                # "the operator stopped it" would bury the arm's own damage.)
+                n, _last = deploy_attempts(o, name, d["harness"], main_sha)
+                why = (f" — our last activation of this box did not verify ({n} attempt(s) recorded); "
+                       f"a human must confirm the box state before this arm touches it again"
+                       if n else
+                       " — this arm cannot tell an operator's stop from its own failed activation, "
+                       "so it does not start it")
+                entry["verdict"] = f"activate=skipped(controller=STOPPED{why})"
                 results.append(entry)
                 continue
             if not activate_cmd:
@@ -797,6 +910,19 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
             if not act:
                 entry["verdict"] = ("DRIFTED — activate=skipped(--no-act: the reminder-only mode "
                                     "covers BOTH arms)")
+                results.append(entry)
+                continue
+            attempts, last_try = deploy_attempts(o, name, d["harness"], main_sha)
+            if attempts >= DEPLOY_MAX_ATTEMPTS:
+                entry["verdict"] = (f"REFUSE(deploy-attempts={attempts} at harness="
+                                    f"{d['harness'][:12] or '<none>'}) — this box has not reached "
+                                    f"{main_sha[:12]} in {attempts} attempts; a human must look")
+                results.append(entry)
+                continue
+            if last_try and (time.time() - last_try) < retry_s:
+                entry["verdict"] = (f"WAIT(deploy-retry-after={int(retry_s - (time.time() - last_try))}s)"
+                                    f" — an activation of this box was recorded "
+                                    f"{int(time.time() - last_try)}s ago")
                 results.append(entry)
                 continue
             if not held_deploy_lock:
@@ -821,17 +947,24 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 continue
             entry["log"] = str(log)
             # VERIFY BY ARTIFACT, never by the command's exit code: re-probe until the box reports
-            # the main sha as current and a running controller, or the bound expires. A stamp
-            # identity IS acceptable HERE — and only here — because the activation we just issued
-            # restarted the controller, so the process that answers now is the seeded one.
+            # the main sha as current AND a controller whose pid is NEW, or the bound expires.
+            # ⛔ THE PID IS PART OF THE ARTIFACT. `stop -> apply -> start` is one shell chain whose
+            # exit code is never read, so a controller that survived a FAILED stop satisfies
+            # "RUNNING" while still executing the old tree — and a `source=stamp` identity is
+            # rewritten by `apply` BEFORE `start`, so without a new pid a stamp-only box could go
+            # `behind` -> `current` with no new process at all. A NEW pid proves a new process.
+            pre_pids = set(_controller_pids(d))
             deadline = time.time() + verify_s
             verified = False
             last = None
             while True:
                 time.sleep(min(15, max(1, verify_s // 6)))
                 last = probe_box(name, status_cmd)
+                post_pids = set(_controller_pids(last))
+                fresh = bool(post_pids - pre_pids) if pre_pids else bool(post_pids)
                 if last["readable"] and last["harness"][:12] == main_sha[:12] \
-                        and last["relation"] == "current" and last["controller"] == "RUNNING":
+                        and last["relation"] == "current" and last["controller"] == "RUNNING" \
+                        and fresh:
                     verified = True
                     break
                 if time.time() >= deadline:
@@ -840,7 +973,11 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                                 if verified else
                                 f"UNVERIFIED harness={(last or {}).get('harness', '')[:12] or '<none>'} "
                                 f"relation={(last or {}).get('relation') or '<none>'} "
-                                f"controller={(last or {}).get('controller') or '<none>'}")
+                                f"controller={(last or {}).get('controller') or '<none>'} "
+                                f"pids={(','.join(_controller_pids(last or {})) or '<none>')} "
+                                f"(a NEW pid is required: {','.join(sorted(pre_pids)) or '<none>'} "
+                                f"before)")
+            record_deploy(o, name, d["harness"], main_sha, entry["verdict"])
             results.append(entry)
     finally:
         if held_deploy_lock:
@@ -901,6 +1038,15 @@ def decide(pr: dict, attest_state: str, attest_detail: str, surface: dict,
     if unread:
         out.update(verdict=f"{REFUSE}(UNREADABLE)", detail=unread)
         return out
+    if not surface.get("groups"):
+        # ⛔ ABSENCE OF EVIDENCE IS NOT EVIDENCE OF GREEN. A head pushed moments ago carries no check
+        # runs and no commit statuses, and a review record can exist before CI registers anything: a
+        # surface of ZERO groups would otherwise read `reds=0 in-flight=0` and be a GO on a head that
+        # was never tested. (`groups` is computed for exactly this question.)
+        out.update(verdict=f"{REFUSE}(surface=empty)",
+                   detail="the head carries NO check runs and NO commit statuses — an empty surface "
+                          "is not a green one (a just-pushed head, or a read that returned nothing)")
+        return out
     if surface["reds"]:
         out.update(verdict=f"{REFUSE}(reds={len(surface['reds'])})",
                    detail="newest attempt per group is RED: " + "; ".join(surface["reds"][:4]))
@@ -951,9 +1097,16 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
 
     ⛔ A DEAD PID IS REAPED, NOT RESPECTED. These locks are written by a 10-minute timer, so a
     SIGKILL or a crash leaves a pid file whose owner is gone; treating that as "somebody is landing"
-    is the stale-flag class that starves the gate forever (#8175). The reap is safe BECAUSE the pid
-    is provably dead — nobody holds it — and the re-create is the same atomic O_EXCL. A LIVE pid is
-    never reaped and never taken over: that direction stays fail-closed.
+    is the stale-flag class that starves the gate forever (#8175).
+
+    ⛔ AND THE REAP ITSELF IS SERIALISED. `unlink` + `O_EXCL`-create is NOT atomic against a second
+    reaper: two processes that both read the same dead pid can both unlink, and the second can
+    unlink the FIRST one's freshly written lock — after which both return `taken=True` and two rails
+    run for one PR, the exact defect this lock exists to prevent (#2603 review, reproduced). So the
+    reap runs under `<lock>.reap`, the pid is re-read UNDER that mutex (a live creator may have
+    replaced the file since our first read), and a creator that wins the unlink window makes the
+    reaper's create fail — one winner either way. The reap mutex is itself reapable when its owner
+    is dead, for the same reason as the lock.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -966,27 +1119,64 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
         except FileExistsError:
             return None
 
-    fd = _create()
-    if fd is not None:
+    def _take(fd) -> tuple[bool, str]:
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
         return True, "taken"
+
+    fd = _create()
+    if fd is not None:
+        return _take(fd)
     try:
         pid = path.read_text().strip()
     except OSError:
         pid = "?"
     if _pid_alive(pid):
         return False, f"running pid={pid}"
+
+    reap = path.with_name(path.name + ".reap")
+    rfd = None
+    for _attempt in (0, 1):
+        try:
+            rfd = os.open(str(reap), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            try:
+                rpid = reap.read_text().strip()
+            except OSError:
+                rpid = "?"
+            if _pid_alive(rpid):
+                return False, f"running (a reap is in progress pid={rpid})"
+            try:
+                reap.unlink()          # a dead reaper is the same stale flag, one level down
+            except OSError:
+                return False, f"stale-lock pid={pid} (the reap mutex could not be cleared)"
+        except OSError as e:
+            return False, f"stale-lock pid={pid} ({type(e).__name__}: could not serialise the reap)"
+    if rfd is None:
+        return False, f"running (a reap is in progress)"
     try:
-        path.unlink()
-    except OSError as e:
-        return False, f"stale-lock pid={pid} ({type(e).__name__}: could not reap)"
-    fd = _create()
-    if fd is None:
-        return False, "running (the reap lost the race)"
-    os.write(fd, str(os.getpid()).encode())
-    os.close(fd)
-    return True, f"stale-reaped pid={pid}"
+        os.write(rfd, str(os.getpid()).encode())
+        os.close(rfd)
+        try:
+            pid2 = path.read_text().strip()
+        except OSError:
+            pid2 = pid
+        if _pid_alive(pid2):
+            return False, f"running pid={pid2}"
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        fd = _create()
+        if fd is None:
+            return False, "running (a creator won the reap window)"
+        return _take(fd)
+    finally:
+        try:
+            reap.unlink()
+        except OSError:
+            pass
 
 
 def any_rail_live(o: Path, ps_rows) -> str:
@@ -1026,18 +1216,16 @@ def dispatch_rail(rail: str, pr: int, slug: str, o: Path, wait_s: int) -> tuple[
     process scan is consulted first, and when it names a live attempt the refusal is
     `rail=running`, not a reap.
     """
+    # ⛔ READ THE TABLE AT THE MOMENT OF ACTION, ON EVERY PATH. The gates read a snapshot taken
+    # BEFORE this cycle's REST calls (up to 2 candidates x 3 reads), and `admin-merge.sh` takes no
+    # lock of its own — so a rail a human (or another agent) started in that window was invisible
+    # when there was no lock file to inspect, which is the COMMON first-dispatch path.
+    live = any_rail_live(o, _ps_table())
+    if live == UNREADABLE:
+        return False, "rail=UNREADABLE", ""
+    if live:
+        return False, f"rail=running ({live})", ""
     lock = o / "state" / f"mergeclaim-{pr}.lock"
-    if lock.exists():
-        try:
-            holder = lock.read_text().strip()
-        except OSError:
-            holder = "?"
-        if not _pid_alive(holder):
-            live = any_rail_live(o, _ps_table())
-            if live == UNREADABLE:
-                return False, "rail=UNREADABLE", ""
-            if live:
-                return False, f"rail=running ({live})", ""
     taken, info = _take_pid_lock(lock)
     if not taken:
         if info.startswith("running") or info.startswith("stale-lock"):
@@ -1382,10 +1570,10 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
                 return 3
             removed.append(f"{unit}.timer/.service")
         if shutil.which("crontab"):
-            tag = "# tortoise-merge-reminder"
+            tag = CRON_TAG
             rc, out, _ = run(["crontab", "-l"], timeout=30)
-            if tag in (out or ""):
-                kept = [ln for ln in (out or "").splitlines() if tag not in ln]
+            if any(_is_our_cron_line(ln, tag) for ln in (out or "").splitlines()):
+                kept = [ln for ln in (out or "").splitlines() if not _is_our_cron_line(ln, tag)]
                 try:
                     subprocess.run(["crontab", "-"], input="\n".join(kept) + "\n", text=True,
                                    capture_output=True, timeout=30, check=True)
@@ -1393,7 +1581,7 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
                     print(f"⛔ could not rewrite the crontab: {e}", file=sys.stderr)
                     return 3
                 rc2, out2, _ = run(["crontab", "-l"], timeout=30)
-                if tag in (out2 or ""):
+                if any(_is_our_cron_line(ln, tag) for ln in (out2 or "").splitlines()):
                     print(f"⛔ the crontab entry is STILL there ({tag}). Next: crontab -e",
                           file=sys.stderr)
                     return 3
@@ -1409,7 +1597,10 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
             "[Unit]\nDescription=merge reminder (harness)\n\n[Service]\nType=oneshot\n"
             f"WorkingDirectory={o}\nEnvironment=O={o}\nEnvironment=HOME={Path.home()}\n"
             f"Environment=PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}\n"
-            f"ExecStart=/usr/bin/env python3 {' '.join(shell_quote(a) for a in argv)}\n")
+            # ⛔ `argv[0]` IS the interpreter, so prefixing `/usr/bin/env python3` made the unit run
+            # the interpreter AS the script (an immediate SyntaxError) while the timer reported
+            # itself active — the reminder then never ran at all, silently (#2603 review).
+            f"ExecStart={' '.join(shell_quote(a) for a in argv)}\n")
         timer.write_text(
             "[Unit]\nDescription=merge reminder timer\n\n[Timer]\n"
             f"OnBootSec=60s\nOnUnitActiveSec={interval}s\nAccuracySec=10s\n\n"
@@ -1424,16 +1615,15 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         print(f"installed + started {unit}.timer every {interval}s ({timer})")
         return 0
     if shutil.which("crontab"):
-        tag = "# tortoise-merge-reminder"
+        tag = CRON_TAG
         mins = max(1, interval // 60)
         # Quote EVERY interpolated path: `$O` and the checkout path are operator-supplied, and cron
         # runs the line through /bin/sh — an unquoted space turns the schedule into a command that
         # cannot run, which then reads exactly like a reminder with nothing to say.
-        entry = (f"*/{mins} * * * * O={shell_quote(str(o))} /usr/bin/env python3 "
-                 f"{shell_quote(str(Path(__file__).resolve()))} --o {shell_quote(str(o))} {tag}")
+        entry = _cron_line(o, mins)
         rc, out, _ = run(["crontab", "-l"], timeout=30)
         current = out if rc == 0 else ""
-        kept = [ln for ln in current.splitlines() if tag not in ln]
+        kept = [ln for ln in current.splitlines() if not _is_our_cron_line(ln, tag)]
         kept.append(entry)
         # Feed the crontab through stdin (the `run()` helper cannot); the rc is still checked.
         try:
@@ -1447,7 +1637,7 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         # VERIFY THE ARTIFACT, not the write: `crontab -` exiting 0 is the same class of evidence as
         # `cmux send` exiting 0 — it says bytes were handed over, not that a timer exists.
         rc2, out2, _ = run(["crontab", "-l"], timeout=30)
-        if rc2 != 0 or tag not in (out2 or ""):
+        if rc2 != 0 or not any(_is_our_cron_line(ln, tag) for ln in (out2 or "").splitlines()):
             print(f"⛔ wrote the crontab but the entry is NOT there (rc={rc2}). "
                   f"Next: crontab -l | grep '{tag}'", file=sys.stderr)
             return 3
@@ -1562,11 +1752,12 @@ def main(argv=None) -> int:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.
         # `args.act` is passed because `--no-act` is the INSPECT mode and it covers both arms.
-        deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run, args.act)
+        deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run, args.act,
+                            args.retry_s)
 
     if not main:
         main = main_sha(repo_path)
-    line = one_line_of(landing, deploy, skipped)
+    line = one_line_of(landing, deploy, skipped, dispatched)
     err = compose(md, slug, main, budget, landing, deploy, skipped, line)
     if err:
         # ⛔ THE REMINDER IS THE DELIVERABLE: a cycle whose file could not be written did not run,
@@ -1574,7 +1765,7 @@ def main(argv=None) -> int:
         # false-pass shape as a green reading over an unread surface.
         print(f"⛔ could not write {md}: {err}", file=sys.stderr)
         skipped = (skipped + "; " if skipped else "") + f"UNREADABLE report — {err}"
-        line = one_line_of(landing, deploy, skipped)
+        line = one_line_of(landing, deploy, skipped, dispatched)
 
     if args.json:
         print(json.dumps({
@@ -1597,9 +1788,14 @@ def main(argv=None) -> int:
     return 3 if skipped else 0
 
 
-def one_line_of(landing: list[dict], deploy: list[dict], skipped: str) -> str:
+def one_line_of(landing: list[dict], deploy: list[dict], skipped: str,
+                dispatched: bool = False) -> str:
     if skipped:
-        return f"MERGE-REMINDER SKIPPED — {skipped} (no dispatch)"
+        # A dispatch can happen BEFORE the skip is discovered (the report write is what failed), so
+        # "SKIPPED (no dispatch)" would contradict a rail that is already running.
+        tail = (" (a rail WAS dispatched this cycle — see $O/logs/merge-reminder-rail-*.log for "
+                "its rc)" if dispatched else " (no dispatch)")
+        return f"MERGE-REMINDER SKIPPED — {skipped}{tail}"
     if not landing:
         head = "no landing candidates"
     else:

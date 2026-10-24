@@ -108,7 +108,12 @@ ps_out="$(ps -axo pid=,command= 2>/dev/null)"
 ctrl=""
 while IFS= read -r line; do
   case "$line" in *orch-loop.sh*) ;; *) continue ;; esac
-  pid="${line%% *}"; rest="${line#"$pid"}"
+  # ⛔ `ps -axo pid=,command=` RIGHT-PADS the pid column, so `${line%% *}` matches from the FIRST
+  # pad space and can yield an EMPTY pid — which then read as `controller: STOPPED` for a box that
+  # is running a controller, and made the deploy arm refuse to fix a drifted box on the false
+  # ground that the operator had stopped it (#2603 review, reproduced). Strip leading blanks first.
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  pid="${trimmed%%[[:space:]]*}"; rest="${line#"$pid"}"
   case "$rest" in
     *"$O/orch-loop.sh"*|*"/orchestrator-harness/orch-loop.sh"*|*"/orch-loop.sh"*) ctrl="$ctrl $pid" ;;
   esac

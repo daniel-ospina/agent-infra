@@ -552,15 +552,15 @@ done
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
     || die "gh-limit.py does not parse"
 }
-# The merge reminder (#2603) is a TIMER'S entry point, and a syntax error in it is a cycle that dies
+# The merge reminder (#2603) is a TIMER'S ENTRY POINT, and a syntax error in it is a cycle that dies
 # with a traceback in a log nobody reads — the same class as a broken gh-limit.py, so it takes the
 # same parse gate. `box-status.sh` is a `*.sh` and is already covered by the sweep above.
-if [ -f "$HERE/merge-reminder.py" ]; then
-  command -v python3 >/dev/null 2>&1 \
-    || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
-  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
-    || die "merge-reminder.py does not parse"
-fi
+# ⛔ UNGUARDED, like its neighbour: a `[ -f ]` guard made a MISSING file pass this gate, so a
+# checkout without merge-reminder.py was reported as parsing fine while the timer had no script.
+command -v python3 >/dev/null 2>&1 \
+  || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
+  || die "merge-reminder.py is missing or does not parse"
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────

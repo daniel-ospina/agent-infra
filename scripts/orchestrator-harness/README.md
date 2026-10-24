@@ -1939,7 +1939,8 @@ these were read at the moment of action:
 | a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
 | quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592) |
 | no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
-| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` naming the PR |
+| a surface that was actually READ | `reds=0 in-flight=0` | a surface of ZERO groups is `REFUSE(surface=empty)`: a head pushed moments ago has no check runs and no commit statuses, and a review record can precede CI — **absence of evidence is not evidence of green** |
+| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` naming the PR — re-read AT THE MOMENT OF ACTION, not only from the pre-REST snapshot |
 
 ⛔ **The rail is the authority and this file never merges.** `admin-merge.sh` re-reads the surface
 with its own allow-list polarity, binds its evidence to one SHA, refuses a moved head and classifies
@@ -1956,14 +1957,20 @@ doctor deliberately omits, not an endorsement of the doctor's division of labour
 ⛔ **A stale record is not a record, and a threshold is not a gate.** `merge-one.sh` and the doctor
 take the local landing lock (`$O/state/mergeclaim-<PR>.lock`) before racing a head; the reminder
 takes the SAME lock with `O_EXCL` immediately before the spawn, so the first lander on this box wins
-and the loser refuses `rail=running`. It then WAITS (bounded, default 900 s) for the rail's own exit
+and the loser refuses `rail=running`. The reap of a dead lock runs **under its own mutex**
+(`<lock>.reap`) — `unlink` + `O_EXCL`-create is not atomic against a second reaper, and two reapers
+can otherwise both return "taken" and run two rails for one PR. It then WAITS (bounded, default
+900 s) for the rail's own exit
 so the cycle reports the rail's rc rather than assuming its spawn was a success; **past the bound it
 LEAVES the lock in place** (the fence survives the rail, which the process scan alone would not
 cover), and a later cycle reaps a DEAD-pid lock **only when no landing attempt is live** — the dead
 pid proves nobody holds the lock, not that no rail is in flight. A live pid is never reaped or taken
 over. The same re-verification applies to claims: an **expired lease is free**, exactly as
 `claims.sh`'s `_lease_is_live` defines it, because a box that died mid-review would otherwise block
-the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable`.
+the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable` — **including the
+`0` sentinel**, which `test-claims.sh` pins as "UNPARSEABLE => LIVE". The claim message is read from a
+PRIVATE ref, never `FETCH_HEAD` (one per `.git`, rewritten by any concurrent fetch), and its shape is
+`claims.sh`'s (`claim owner=… lease_until=<epoch> nonce=…`).
 Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
 `--match-head-commit` keeps that from landing an unanalysed head, and closing it properly means
 minting the cross-box claim — which is `merge-one.sh`'s job, not this timer's.
@@ -1972,12 +1979,23 @@ minting the cross-box claim — which is `merge-one.sh`'s job, not this timer's.
 ACTIONABLE: after the landing decision (never instead of it), a drifted box is restarted with ITS OWN
 verb — on a cell, `cloud-cell-supervisor.sh stop → apply → start` — and only when no role pass is
 mid-flight (a restart inside a reap kills work no later pass re-runs). It is VERIFIED BY ARTIFACT,
-never by the command's exit code: `harness: <sha> [current]` **and** `controller: RUNNING`, re-probed
-until `--verify-deploy-s` expires, else `deploy=<box>:UNVERIFIED` with the readings. The boxes are an
+never by the command's exit code: `harness: <sha> [current]` **and** `controller: RUNNING` **with a
+pid that is NEW relative to the pre-activation read**, re-probed until `--verify-deploy-s` expires,
+else `deploy=<box>:UNVERIFIED` with the readings. The new pid is load-bearing: `stop → apply → start`
+is one shell chain whose exit code is never read, so a controller that survived a failed stop would
+otherwise satisfy "RUNNING" while executing the old tree — and a `source=stamp` identity is rewritten
+by `apply` BEFORE `start`. The boxes are an
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
 whatever remote path that box already uses — no new control surface is invented here.
 
-It refuses five things, each one a way an actuator becomes an incident:
+It is also **bounded**: every activation is recorded (`state/merge-reminder.deploys`), a repeat of
+the same box/from/to pair inside `--retry-s` is a `WAIT(deploy-retry-after=…)`, and a third
+unverified attempt refuses by count (`REFUSE(deploy-attempts=3 …)`) naming a human. Without that
+bound a box that cannot reach `origin/main` — pinned `ahead`, `diverged`, or an `apply` that never
+advances the pin — would be stopped and started every cycle forever, because every gate that could
+stop it re-opens 600 s later.
+
+It refuses six things, each one a way an actuator becomes an incident:
 
 * **an UNREADABLE `origin/main`** — with an empty main every box reads as drifted, and the verify
   loop compares against the same empty value and could never pass: a restart every cycle, forever;
@@ -1988,7 +2006,10 @@ It refuses five things, each one a way an actuator becomes an incident:
   (600 s) is shorter than `--rail-wait-s` (900 s), so overlapping cycles are reachable by
   construction and the second would restart the controller under the first one's rail. The deploy
   arm also takes its own `state/merge-reminder-deploy.lock`, so two cycles never deploy at once;
-* **a STOPPED controller** — an absent `.desired` is the operator's intent, not drift;
+* **a STOPPED controller** — but this arm cannot tell an operator's stop from its OWN failed
+  activation (a `stop → apply → start` whose `apply` failed leaves the cell down), so it reports
+  `activate=skipped(controller=STOPPED …)` and, when the deploy ledger shows our own unverified
+  attempt, says so instead of blaming the operator;
 * **a `source=stamp` identity reported as `current`** — `harness-refresh.sh` states the stamp records
   what was SEEDED, not what is RUNNING, so a matching stamp reads `UNPROVEN` and activates nothing.
 
@@ -2007,13 +2028,15 @@ write is not a timer. `--uninstall-timer` removes **every** arm install can crea
 the crontab entry on a box with no systemd) and verifies the removal, so uninstall cannot leave an
 arm firing behind a "nothing to remove".
 
-**Status: IMPLEMENTED, TESTED for the arms this repo's CI can drive.** `merge-reminder.test.sh` is a
-shard in both lanes (§1–§21, 92 assertions) and drives the systemd and crontab paths end-to-end with
-stubbed schedulers, plus `box-status.sh`, every landing/deploy gate, and two mutation controls. The
-**launchd branch is implemented and deliberately NOT driven by the suite** — CI runs on Linux, and a
-macOS plist load cannot be faked honestly; that branch is validated by `plutil -lint` before a live
-plist is replaced, and its `bootout` is checked with `launchctl print`. Do not read "tested" as
-covering it. Residual, named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for
+**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§24,
+122 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
+how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
+-l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the
+plist is rendered, `bootout` is asserted to precede `bootstrap`, and uninstall removes it) — plus
+`box-status.sh` including a RIGHT-PADDED `ps` line (whose parse once reported a live controller as
+`STOPPED`), every landing and deploy gate, the deploy attempt bound, and two mutation controls that
+require the mutant to have RUN. Residual, named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for
 reminder-only), so a box that runs the timer WILL dispatch a rail on complete evidence — that is the
 feature, and the gate list above is what makes it safe; the review-record store it reads is this
 box's `~/.pi/agent/reviews`, so a peer box's verdict reaches it only through `registry-sync.sh`.
