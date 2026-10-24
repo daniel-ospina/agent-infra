@@ -255,12 +255,14 @@ if [ "$1" = "api" ]; then
     # simulate a response with no merge base (→ refuse).
     if grep -qF -- "compare/" <<<"$*"; then
         [ "${STUB_COMPARE_FAIL:-0}" = "1" ] && exit 1
-        # #2470/#2472 — the API ANSWERING and REFUSING this revision (a fork head,
+        # #2470/#2511 — the API ANSWERING and REFUSING this revision (a fork head,
         # a rewritten sha): HTTP 404/422, a NON-ZERO exit, and the status on
         # STDERR, which is where `gh` puts it and where `review_surface_rows`
-        # classifies it. rc 3 (positive evidence → refuse) must never be confused
-        # with a TRANSPORT failure (rc 1 → warn and proceed); §8.16 pins both,
-        # and pins a STATUS-BEARING transport failure (403 rate limit / 5xx)
+        # classifies it. (#2472 introduced the CAP; #2511 introduced this
+        # status-aware refusal — the two are cited where they belong, here and in
+        # the §8 preamble.) rc 3 (positive evidence → refuse) must never be
+        # confused with a TRANSPORT failure (rc 1 → warn and proceed); §8.16 pins
+        # both, and pins a STATUS-BEARING transport failure (403 rate limit / 5xx)
         # separately, because `gh` reports one too and the classifier keys on the
         # status, not on its absence.
         if [ -n "${STUB_COMPARE_HTTP:-}" ]; then
@@ -895,8 +897,14 @@ rm -rf "$T/labels"
 # was written; the WORDING is a class, not an arm: `review_surface_rows` returns
 # one rc per cause CLASS, so REFUSED (a compare 404/422) and INCONSISTENT (a
 # `mb` header with no row) are the SAME rc 3 and share its cause-list message —
-# they are pinned as one class with two causes, and the count/parity refusals
-# above them are the same class again. rc 0/1/2 each have wording of their own.
+# they are pinned as one class with two causes. rc 0/1/2 each have wording of
+# their own. The count/parity refusal ("changes N path(s) but GitHub reports M —
+# the changed-path list is truncated or inconsistent") is a rc-0 path with its OWN
+# message, so it is pinned separately below: without that vector, deleting the
+# arm (`[ "$MICRO_DISTINCT" -ge 300 ] || [ "$MICRO_DISTINCT" != "$MICRO_EXPECT" ]`)
+# leaves this suite green (measured), i.e. a truncated or forged changed-path
+# list could certify a surface. `tests/record-review/run.sh` §30vi pins only the
+# `--print-tier` classification (`too_large`), never this record-path refusal.
 #
 #   EMPTY        the API ANSWERED: 0 changed files            → rc 2, exit 4
 #   UNREADABLE   transport, no status / status-bearing 403/5xx → rc 1, WARN + record
@@ -1006,6 +1014,19 @@ STUB_FILES="scripts/admin-merge.sh" STUB_BODY="Fixes #424364" STUB_LABELS="compl
 [ "$RECORD_RC" = "4" ] && ok "8.16 rail: a rail path in a micro diff still refuses (exit 4)" || bad "8.16 rail: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424364.json" ] && ok "8.16 rail: no record written" || bad "8.16 rail: wrote a clean-micro record for a rail edit"
 assert_contains "$RECORD_ERR" "touches an ALWAYS-FULL surface" "8.16 rail: the refusal names the ALWAYS-FULL surface"
+
+# PARITY/TRUNCATION — the payload delivers a DIFFERENT number of distinct paths
+# than GitHub's own `changed_files` says the PR has (the compare endpoint caps at
+# 300 entries and does not paginate, so an AT-THE-CAP list may be short — and a
+# short list could be missing the one rail path that would have selected `full`).
+# This arm had no vector anywhere: `tests/record-review/run.sh` §30vi pins the
+# `--print-tier` `too_large` status only, so deleting the record-path arm left
+# both suites green (measured). Note the message is its OWN, not the rc-3 list.
+STUB_CHANGED_FILES=2 STUB_BODY="Fixes #424369" STUB_LABELS="complexity:micro" run_micro_verdict 424369
+[ "$RECORD_RC" = "4" ] && ok "8.16 parity: a 1-row payload for a 2-file PR refuses (exit 4)" || bad "8.16 parity: a truncated list must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424369.json" ] && ok "8.16 parity: no record written for a truncated list" || bad "8.16 parity: certified a surface from a list GitHub says is short"
+assert_contains "$RECORD_ERR" "the changed-path list is truncated or inconsistent" "8.16 parity: the refusal names the truncated/inconsistent list"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 parity: the truncation arm has its own wording (not the rc-3 cause list)"
 
 # 9. #980 argv/env fail-closed guard ─────────────────────────────
 # The second-model flag/env surface was REMOVED. Its removal must fail CLOSED:
@@ -1471,22 +1492,27 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      if A's writer silently failed (the vacuity this block exists to close).
 #      424520-424523 is verified unused by every other vector in this file.
 #  (2) The env-prefix assignments: `VAR=val func` is NOT a leak — a prefix
-#      assignment before a FUNCTION call is restored when the call returns
-#      (measured on bash 5.2.21 and 3.2.57: previously-unset comes back unset,
-#      previously-set comes back at its old value; only SPECIAL BUILTINS keep it).
-#      Every runner here (`run_record_verdict`, `run_record_diff_with`) already
-#      performs its `export`s INSIDE its own `( … )` subshell, so under this
-#      model NOTHING a runner exports can escape the call either — measured: after
-#      a `run_record_diff_with` the four variables come back unset, or at their
-#      pre-set value.
-#      The carriers that DO need the `unset` below are the TOP-LEVEL exports:
-#      `export STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9/§8.9a/§8.14/§8.15
-#      (each block unsets itself after use, and this line is the belt for the
-#      ones that return early). §8.16's `run_micro_verdict` relies on the RESTORE
-#      half of the same semantics — `STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"`
-#      must not leak a surface into the next vector — and this note documented
-#      that behaviour backwards until a review measured it (#2615).
-unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
+#      assignment before a FUNCTION call is restored when the call returns,
+#      UNLESS the callee itself assigns/exports that variable (measured on bash
+#      5.2.21: plain callee → previously-unset comes back unset, previously-set
+#      at its old value; `f(){ export V=inside; }; V=p f` → V=inside). Special
+#      builtins keep the value only under `set -o posix`, which this suite does
+#      not use — both clauses matter, and the first is why every runner here does
+#      its `export`s INSIDE its own `( … )` subshell: nothing a runner exports can
+#      escape the call (measured: after a `run_record_diff_with` the four
+#      variables come back unset, or at their pre-set value).
+#      The carriers that survive a call are the TOP-LEVEL exports: `export
+#      STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9 / §8.9a / §8.9b / §8.14 /
+#      §8.15 (the five blocks that install a per-issue label map). Each unsets its
+#      own after use; the line below is DEFENSIVE for a future block that returns
+#      early, and it now names them so the belt is real rather than claimed
+#      (measured: the line is removable today without changing the suite — that is
+#      what "defensive" means here, not that it is unnecessary).
+#      §8.16's `run_micro_verdict` relies on the RESTORE half of the same
+#      semantics — `STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"` must not leak a
+#      surface into the next vector — and this note documented that behaviour
+#      backwards until a review measured it (#2615).
+unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA STUB_LABELS_DIR STUB_LABELS P2 MB
 
 # ─────────────────────────────────────────────────────────────────────────
 # 11.11 #1398 — the 300-file diff cap: classify by CONTENT, fall back to a
