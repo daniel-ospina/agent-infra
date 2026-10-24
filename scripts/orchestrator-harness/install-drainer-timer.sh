@@ -188,9 +188,17 @@ if [ "$TARGET" = "user" ]; then
             && mv -f "$tmpd/svc.new" "$tmpd/$UNIT_SRC_SERVICE"
     fi
     linger="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+    # ⛔ A PREVIEW MUST NOT ENABLE LINGERING. `loginctl enable-linger` is a PERSISTENT system change
+    # (usually needing root), and running it here made `--dry-run` — documented as creating nothing —
+    # mutate the box. In preview mode it is READ only, and the plan is printed instead.
     if [ "$linger" != "yes" ]; then
-        loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
-        linger="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+        if [ "$MODE" = "--dry-run" ]; then
+            printf 'would enable lingering for %s (loginctl enable-linger) — without it a user timer stops with your last session
+' "$(id -un)"
+        else
+            loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+            linger="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+        fi
     fi
     if [ "$linger" != "yes" ]; then
         rm -rf "$tmpd"
@@ -200,7 +208,9 @@ if [ "$TARGET" = "user" ]; then
 fi
 if [ "$MODE" = "--dry-run" ]; then
     if [ -d "$DRAINER_STATE" ]; then
-        [ -w "$DRAINER_STATE" ] || printf 'WARNING: state dir %s exists and is NOT writable by %s\n' "$DRAINER_STATE" "$(id -un)"
+        # The install REFUSES an unwritable state dir; a preview that only warned would green-light an
+        # install that cannot work — so the preview reaches the same verdict and exits non-zero.
+        [ -w "$DRAINER_STATE" ] || { rm -rf "$tmpd"; err "state dir $DRAINER_STATE exists and is NOT writable by $(id -un) — every pass would fail closed (this preview refuses it, as the install would)"; exit 1; }
     else
         printf 'would create %s/logs\n' "$DRAINER_STATE"
     fi

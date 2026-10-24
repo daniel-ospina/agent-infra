@@ -115,6 +115,10 @@ LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 3000)"
 # VALIDATE FIRST, THEN DERIVE: the fallback below is computed from the already-validated integer.
 LANE_WAIT_MAX="$(_num LANE_WAIT_MAX "$LANE_WAIT_MAX" "$((LANE_TIMEOUT + 100))")"
 LANE_POLL_S="$(_num LANE_POLL_S "$LANE_POLL_S" 30)"
+# ⛔ THE ONE SEAM THAT USED TO SKIP VALIDATION. `${RC_GRACE_S:-30}` reached a `[ -lt ]`: `abc` made
+# bash print "integer expression expected" and END the grace loop on its first test, so a healthy lane
+# that records its status a moment late was reported as refused-or-lost for a FORMATTING reason.
+RC_GRACE_S="$(_num RC_GRACE_S "${RC_GRACE_S:-}" 30)"
 PR_BUDGET="$(_num PR_BUDGET "$PR_BUDGET" 6)"
 SLICE_WIDTH="$(_num SLICE_WIDTH "$SLICE_WIDTH" 10)"
 SLICE_TOTAL="$(_num SLICE_TOTAL "$SLICE_TOTAL" 70)"
@@ -182,7 +186,15 @@ if ! _lock_claim; then
   fi
   _lock_claim || { say "SKIP: cannot take the lock at $LOCK"; exit 0; }
 fi
-cleanup() { rm -rf "$LOCK" 2>/dev/null; }
+# ⛔ RELEASE IS OWNERSHIP-CHECKED. `rm -rf "$LOCK"` on any exit is how a finished tick deletes a
+# SUCCESSOR's lock: the signal path ran it, then the EXIT trap ran it again, and a tick that had claimed
+# the lock in that gap lost it to a rm of a directory it did not own (the #1761 shape). Only the pid
+# file that names US may be removed.
+cleanup() {
+  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -rf "$LOCK" 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 # ──8<── /lock-guard ───────────────────────────────────────────────────────────────────────────
 # ⛔ THE BEAT IS WRITTEN AS SOON AS THE TICK OWNS THE LOCK, BEFORE any guard that can skip. Its
@@ -298,8 +310,10 @@ rm_worktree() {
   fi
   git -C "$SEED_REPO" worktree remove --force "$wt" >/dev/null 2>&1 \
     || say "WARN: could not remove the worktree at $wt — a later tick reaps it; it is named, not silent"
+  rm -f "$wt.lane-pid" 2>/dev/null
 }
-_on_signal() { beat 2>/dev/null; rm_worktree; cleanup; exit 143; }
+# The signal path does NOT release the lock itself: the EXIT trap does, once, with the ownership check.
+_on_signal() { beat 2>/dev/null; rm_worktree; exit 143; }
 trap 'beat 2>/dev/null; rm_worktree; cleanup' EXIT
 trap _on_signal INT TERM
 # ⛔ `git worktree prune` IS NOT A LEFTOVER REAPER: it only drops administrative entries whose
@@ -308,13 +322,21 @@ trap _on_signal INT TERM
 # the pid the removal candidate's own name carries: a `wt-drainer-*` whose suffix pid is dead is
 # reclaimable; a live one is still in use.
 _reap_leftovers() {
-  local w pid_suffix n=0
+  local w lane n=0
   for w in "$AI"/wt-drainer-*; do
+    case "$w" in *.lane-pid) continue ;; esac       # the sidecar is not a worktree
     [ -d "$w" ] || continue
-    pid_suffix="${w##*-}"
-    case "$pid_suffix" in '' | *[!0-9]*) continue ;; esac
-    kill -0 "$pid_suffix" 2>/dev/null && continue
+    # ⛔ THE LANE'S OWN PID, never the tick's. The worktree's name carries THIS tick's `$$` (which is
+    # dead the moment the tick exits — i.e. exactly on the TIMEOUT path, whose lane is still running).
+    # Reaping on that suffix deleted a live lane's checkout with its uncommitted work, deterministically,
+    # on the tick after every timeout. The sidecar is written when the lane pid becomes known; NO sidecar
+    # means UNKNOWN, and an unknown tree is left for an operator (a health job does not guess).
+    lane=""
+    [ -f "$w.lane-pid" ] && lane="$(tr -dc '0-9' 2>/dev/null <"$w.lane-pid")"
+    [ -n "$lane" ] || continue
+    kill -0 "$lane" 2>/dev/null && continue
     git -C "$SEED_REPO" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w" 2>/dev/null
+    rm -f "$w.lane-pid" 2>/dev/null
     n=$((n + 1))
   done
   git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
@@ -332,8 +354,12 @@ fi
 # the running lane's transcript is destroyed and its exit status is lost, so this tick would poll
 # ANOTHER lane's pid. Same shape as the worktree path above.
 lane_pid=""
+dispatched=0
 NAME="ai-drain-$(date +%H%M%S)-$$"
 say "START: slice=$start swap=${swap_free_mb}MB lanes=$lanes worktree=$wt lane=$NAME dispatcher=$DISPATCH"
+# `dispatched=1` BEFORE the call: from here on, a signal must treat the lane as possibly live — the
+# dispatcher has already created it by the time it returns, and a TERM trap can land in that gap.
+dispatched=1
 if ! bash "$DISPATCH" "$NAME" "$wt" "$BRIEF" "$LANE_TIMEOUT" >>"$LOG" 2>&1; then
   say "FAIL: dispatcher refused ($DISPATCH)"
   exit 1
@@ -358,6 +384,7 @@ fi
 # are recorded because both mean "do not start another": a tick that died while its lane still runs
 # must not have a second lane added beside it.
 printf '%s' "$lane_pid" >"$LOCK/lane-pid" 2>/dev/null
+printf '%s' "$lane_pid" >"$wt.lane-pid" 2>/dev/null   # the reaper's evidence (see _reap_leftovers)
 # A BEAT WHILE WE HOLD THE LOCK. A pass can legitimately last `LANE_TIMEOUT` seconds, and the
 # inventory row derives "fresh" from 2×this job's StartInterval — a healthy 50-minute pass would
 # otherwise read LATE against its own 20-minute interval. `beat()` is defined above, together with

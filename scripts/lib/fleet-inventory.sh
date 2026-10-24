@@ -980,9 +980,16 @@ fleet_row_ai_drainer() { # <harness-path>
   # `scripts/orchestrator-harness/` doubled the path, so `requires` never resolved and the row took
   # the SKIPPED branch — i.e. the one state it exists for ("the code is here and nothing installs
   # it") rendered as a PASS, which is the green-by-absence this file exists to end.
+  local state="$FLEET_DRAINER_STATE" declared
   [ -n "$harness" ] && code="$harness/ai-drainer.sh"
+  # ⛔ THE JOB'S OWN DECLARATION WINS, exactly as the `second-controller` row does: the plist renders
+  # `AI={{AI_DRAINER_STATE}}`, and an operator who activated the job at a non-default state dir would
+  # otherwise be judged against the seam's default — a permanent LATE on a healthy drainer (the false
+  # red that teaches operators to ignore the screen).
+  declared="$(fleet_plist_value com.eldato.ai-drainer EnvironmentVariables.AI)"
+  [ -n "$declared" ] && state="$declared"
   _fleet_row_launchd_job ai-drainer com.eldato.ai-drainer "$code" "ai-drainer" \
-    "$FLEET_DRAINER_STATE/state/ai-drainer.beat" \
+    "$state/state/ai-drainer.beat" \
     "${code:-$FLEET_AGENT_SCRIPTS/ai-drainer.sh}"
 }
 
@@ -1006,7 +1013,14 @@ fleet_row_second_controller() {
   # `fleet_plist_value` extracts a TOP-LEVEL key (plutil -extract). Reading the root key returned
   # nothing and the row silently fell back to the seam — a healthy controller at a non-default path
   # read MISSING, which is the false red this line exists to prevent.
-  declared="$(fleet_plist_value "$label" EnvironmentVariables.O)"
+  # ⛔ THREE OUTCOMES, and they must not collapse: a value, ABSENT, and COULD-NOT-READ (rc 2). The
+  # plain assignment swallowed the third, so an unreadable definition silently fell back to the seam and
+  # the row then judged a directory the job does not use — the false verdict this line prevents.
+  if ! declared="$(fleet_plist_value "$label" EnvironmentVariables.O)"; then
+    fleet_row second-controller "one orch-loop.sh for its declared state dir, with a fresh heartbeat" \
+      "$label: job definition unreadable" UNKNOWN \
+      "$plist exists but its declared O could not be read, so which directory this controller owns cannot be determined — an unreadable read is never a pass"; return 0
+  fi
   [ -n "$declared" ] && o="$declared"
   local exp="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
   if [ ! -f "$plist" ]; then
