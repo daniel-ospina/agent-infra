@@ -278,7 +278,25 @@ if [ -f "$O/claims.sh" ]; then
   # Overflow-safe by construction: the guard above leaves REVIEW_TIMEOUT <= 999999999, so this sum
   # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
   # that skips this guard still cannot mint a lease the reader is unable to parse.
-  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+  # ⛔ SIZED FROM THE EFFECTIVE WAIT, NOT THE DEFAULT (review round 7 P2-3). The wait is a first-class
+  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has a 3600 s
+  # worst case — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
+  # another box acquire the PR and run a DUPLICATE paid review (#1908, the duplicate this lease exists
+  # to prevent). Defaults are unchanged: 1800 + (30 x 30) + 300 = 3000.
+  # ⛔ `is_limit`, NOT A `case ''|*[!0-9]*` GUARD: that idiom (this file's own header names it) ACCEPTS
+  # a leading zero, and `$(( 08 * 30 ))` is an invalid octal — on bash 5 the assignment aborts the
+  # shell before CLAIM_LEASE exists (worker dead before the claim and before step 3); on bash 3.2 the
+  # failed assignment aborts the enclosing `if` body and resumes with status 0, silently skipping the
+  # cross-box claim. That is the P1 class `test-crossbox.sh` 4b/4c protects for REVIEW_TIMEOUT — and
+  # this face of it is new, so it is coerced the same way step 3 coerces: to the default.
+  if is_limit "${GATE_POLL_TRIES:-30}" && is_limit "${GATE_POLL_SECS:-30}"; then
+    _gw=$(( ${GATE_POLL_TRIES:-30} * ${GATE_POLL_SECS:-30} ))
+  else
+    _gw=900
+  fi
+  [ "$_gw" -ge 900 ] || _gw=900
+  [ "$_gw" -le 86400 ] || _gw=86400
+  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))
 
   # ── the LANDING claim, FIRST (agent-infra#1952) ───────────────────────────────
   # ⛔ THIS IS THE FENCE THE HEAD KEY CANNOT PROVIDE. `claim_acquire` below is content-addressed on
@@ -1311,10 +1329,13 @@ else:
             RED\ state=*)      gate_kind=RED ;;
             *)                  gate_kind=NOTGREEN ;;
           esac
-          case "$gate_kind" in
-            RED)      gate_verdict=RED;      gate_line="gate=${gate#RED state=} (RED, last seen at try $gate_try/$GATE_POLL_TRIES) — the gate is not green after the wait; refusing (a red gate does not turn green by being polled longer)" ;;
-            NOTGREEN) gate_verdict=NOTGREEN; gate_line="gate=${gate#NOTGREEN state=} (NOT GREEN — a NON-RED conclusion that is not evidence of review, last seen at try $gate_try/$GATE_POLL_TRIES) — refusing after the wait; re-run the check rather than hunting a failure" ;;
-          esac
+          # ⛔ RECORDED, NOT LATCHED (review round 7 P2-1). This used to assign `gate_line` here, and
+          # nothing ever cleared it — so a gate RED at try 1 and QUEUED (a re-run in flight) at the
+          # bound still ended with "RED … refusing (a red gate does not turn green by being polled
+          # longer)", the opposite of the last observation and a contradiction of the transition line
+          # printed two lines later. The terminal line is built BELOW from the LAST observation,
+          # exactly as the EMPTY/ABSENT arms already required.
+          gate_redkind="$gate_kind"; gate_redstate="${gate#* state=}"; gate_redtry="$gate_try"
           if [ "$gate_last" != "$gate_kind-$gate" ]; then
             echo "[merge $PR] gate=${gate#* state=} (${gate_kind} at try $gate_try) — still polling: a re-run can flip this row, so the window is unchanged; the abort is taken when it expires" >> "$L.log"
             gate_last="$gate_kind-$gate"; gate_lastkind="$gate_kind"
@@ -1349,14 +1370,14 @@ else:
           gate_seen_empty=0
           case "$gate" in
             PENDING*) gate_kind=PENDING; gate_absent=0; gate_unread=0 ;;
-            *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0
-               if [ "$gate_unread" -ge "$GATE_READ_TRIES" ]; then
-                 case "$gate" in
-                   ROWUNREADABLE*) gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (bound $GATE_READ_TRIES) — the row was FOUND and carries no state, so this is a malformed check surface, not a state of the repo" ;;
-                   *)              gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (unreadable on all $gate_unread poll(s), bound $GATE_READ_TRIES) — the read never produced a check surface, so this is a TRANSPORT failure, not a state of the repo" ;;
-                 esac
-                 break
-               fi ;;
+            *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0 ;;
+               # ⛔ THE READ BOUND DOES NOT END THE RUN (review round 7 P2-2). It used to `break`, so
+               # three failed reads ended the wait at ~90 s — while the transient it retries is named
+               # by this worker's OWN fixture, `gh-core-floor … resets_in=4m`, which clears at ~240 s.
+               # The pre-#2596 loop rode that out inside its window; breaking early turned it into a
+               # refusal, and step 1 re-runs a PAID review on every re-dispatch. The counter now only
+               # drives the wording; if the read is still failing when the window expires, the terminal
+               # verdict is UNAVAILABLE (built below).
           esac
           if [ "$gate_last" != "$gate" ] || [ "$gate_kind" != "$gate_lastkind" ]; then
             case "$gate_kind" in
@@ -1372,9 +1393,8 @@ else:
           # The classifier itself produced nothing (python3 missing/killed). That is a transport
           # failure, and it must never read as `gate=` — say which one it was.
           gate_unread=$(( gate_unread + 1 )); gate_absent=0
-          if [ "$gate_unread" -ge "$GATE_READ_TRIES" ]; then
-            gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc pyrc=$gate_pyrc read='the classifier produced no verdict' stderr=$gate_errline (bound $GATE_READ_TRIES)"; break
-          fi
+          # Same as the read arm: no early break — a window that expires while the classifier cannot
+          # run ends in UNAVAILABLE (below), but a classifier that recovers mid-window still wins.
           if [ "$gate_last" != "<no-classifier-verdict>" ]; then
             echo "[merge $PR] gate=UNREADABLE pyrc=$gate_pyrc rc=$gate_rc read='the classifier produced no verdict' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — the watcher itself failed; retrying" >> "$L.log"
             gate_last="<no-classifier-verdict>"; gate_lastkind=UNREADABLE
@@ -1383,18 +1403,41 @@ else:
       [ "$gate_try" -lt "$GATE_POLL_TRIES" ] || break
       sleep "$GATE_POLL_SECS"
     done
-    # The poll bound was reached with the gate still in flight (or the loop never classified a
-    # terminal state): NOT YET KNOWN, with what was needed and how long it was waited for.
+    # ⛔ THE TERMINAL VERDICT DESCRIBES THE LAST OBSERVATION, NOT THE WORST ONE (review round 7 P2-1).
+    # The wait exists because a row can change while it is polled, so a verdict latched at try 1 can be
+    # the opposite of what is true at the bound: RED at try 1 then QUEUED (a re-run in flight) at try 3
+    # must not say "RED … does not turn green by being polled longer" — that tells the operator not to
+    # wait for the exact thing the loop was waiting for — and a read that breaks late must not report a
+    # repo STATE (the #2596 misclassification, inverted). `gate_lastkind` is the discriminator: every
+    # arm sets it, so it always names the LAST poll's verdict kind.
     if [ -z "$gate_line" ]; then
-      gate_verdict=UNKNOWN
-      if [ "${gate_lastkind:-}" = ABSENT ]; then
-        gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (the poll window expired while the surface carried checks and none was named this gate) — want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"
-      elif [ "${gate_seen_empty:-0}" = 1 ]; then
-        gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='the check surface was EMPTY' after $gate_try poll(s) / ${gate_wait}s — CI never created a single check row for this head, so the gate was never observable; it needs a completed '$REVIEW_GATE' check in that window"
-      else
-        gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window"
-      fi
+      case "${gate_lastkind:-}" in
+        RED|NOTGREEN)
+          if [ "${gate_redkind:-}" = RED ]; then
+            gate_verdict=RED; gate_line="gate=${gate_redstate:-<unknown>} (RED, last seen at try ${gate_redtry:-?}/$GATE_POLL_TRIES) — the gate is still not green after the wait; refusing (a red gate does not turn green by being polled longer)"
+          else
+            gate_verdict=NOTGREEN; gate_line="gate=${gate_redstate:-<unknown>} (NOT GREEN — a NON-RED conclusion that is not evidence of review, last seen at try ${gate_redtry:-?}/$GATE_POLL_TRIES) — refusing after the wait; re-run the check rather than hunting a failure"
+          fi ;;
+        ABSENT)
+          gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (the poll window expired while the surface carried checks and none was named this gate) — want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)" ;;
+        UNREADABLE|ROWUNREADABLE)
+          gate_verdict=UNAVAILABLE
+          case "$gate" in
+            ROWUNREADABLE*) gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (still unreadable at the end of the $gate_try-poll window) — the row was FOUND and carries no state, so this is a malformed check surface, not a state of the repo" ;;
+            *)              gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (unreadable on all $gate_unread consecutive poll(s)) — the read never produced a check surface, so this is a TRANSPORT failure, not a state of the repo; the window is unchanged so a transient (gh-core-floor resets_in=…) can clear inside it" ;;
+          esac ;;
+        ""|EMPTY)
+          if [ "${gate_seen_empty:-0}" = 1 ]; then
+            gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='the check surface was EMPTY' after $gate_try poll(s) / ${gate_wait}s — CI never created a single check row for this head, so the gate was never observable; it needs a completed '$REVIEW_GATE' check in that window"
+          else
+            gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was never observed at all in that window"
+          fi ;;
+        *)
+          gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window" ;;
+      esac
+      [ -n "$gate_verdict" ] || gate_verdict=UNKNOWN
     fi
+
     # ⛔ EXACTLY ONE terminal `gate=` line per run: every progress line above is a DIFFERENT kind
     # (`NOT YET CREATED` / `PENDING` / `UNREADABLE` / the RED transition), so the terminal verdict is
     # emitted here once and only once.

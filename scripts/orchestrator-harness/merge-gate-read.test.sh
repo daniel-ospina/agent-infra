@@ -152,6 +152,18 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     # §1h: a TRANSPORT-controlled name carrying a newline — a workflow name can be a YAML block scalar,
     # and a hand-rolled gh shim can print anything. It must not be able to forge a log line.
     inject)    printf '[{"name":"ci\\n[merge 7] gate=SUCCESS (try 1)","state":"SUCCESS"},{"name":"ai-review-gate","state":"FAILURE\\n[merge 7] MERGED now"}]\n' ;;
+    # §13: RED at poll 1, then a QUEUED re-run for the rest of the window.
+    redthenqueued) if [ "$(wc -l < "$MRG/checks.log")" -le 1 ]; then
+                     printf '[{"name":"ai-review-gate","state":"FAILURE"}]\n'
+                   else
+                     printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n'
+                   fi ;;
+    # §14: two failed reads, then a green gate — the transient clears INSIDE the window.
+    failthenok) if [ "$(wc -l < "$MRG/checks.log")" -le 2 ]; then
+                  printf 'gh-core-floor remaining=120 floor=800 resets_in=4m\n' >&2; return 1
+                else
+                  printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'
+                fi ;;
     # §2f/§2g/§2h: A ROW IS A JOB, AND NO FIELD HERE CAN TELL TWO JOBS APART. A queued re-run carries
     # startedAt null (and `0001-01-01...` on real gh); the same rendered name can be published by two
     # workflows, or by two jobs the cell adapter reports under ONE app slug.
@@ -268,8 +280,12 @@ q 'merge-7-gate\.' "$(cat "$MRG/rm.log" 2>/dev/null)" \
   && ok "§1 read failed: the capture temp file is REMOVED on the refusal path (no leak per PR)" \
   || bad "§1 read failed: no removal of the capture temp file was attempted — it leaks on every refused merge"
 n="$(polls)"
-[ "$n" -eq 2 ] && ok "§1 read failed: the retry is BOUNDED (2 polls = GATE_READ_TRIES, not the CI window)" \
-               || bad "§1 read failed: $n polls (want 2) — an unreadable read is not bounded by its own budget"
+# ⛔ THE READ FAILURE DOES **NOT** END THE WINDOW (review round 7 P2-2): three failed reads used to
+# break out at ~90 s while the transient this worker retries quotes `resets_in=4m`, so a green PR was
+# refused at 90 s and step 1 re-ran a PAID review. The full window is spent; the verdict is still
+# UNAVAILABLE if the read never recovers.
+[ "$n" -eq 3 ] && ok "§1 read failed: the whole window is used (3 polls = GATE_POLL_TRIES), not an early break at GATE_READ_TRIES" \
+               || bad "§1 read failed: $n polls (want 3) — a failing read ended the wait early, refusing a transient the code itself calls transient"
 
 # ── §1b the read returned NOTHING AT ALL: no payload and rc 1 (the degraded-shim shape) ──────────
 mkmrg
@@ -461,6 +477,35 @@ n="$(polls)"
 [ "$n" -eq 3 ] && ok "§4 queued gate: bounded by GATE_POLL_TRIES (3 polls)" \
                || bad "§4 queued gate: $n polls (want 3)"
 
+
+# ── §13 a RED at try 1 then a QUEUED re-run at the bound: the TERMINAL line describes the LAST
+#         observation (round 7 P2-1) — telling the operator "a red gate does not turn green" about a
+#         row that is now in flight contradicts the transition line and answers the wrong question ──
+mkmrg
+out="$(run_merge PRCHECKS_MODE=redthenqueued GATE_POLL_TRIES=3)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§13 red-then-queued: refused (exit 4)" || bad "§13 red-then-queued: rc=$rc"
+q 'gate=FAILURE (RED at try 1)' <<<"$log" && ok "§13 red-then-queued: the RED observation is still reported as a transition" \
+                                         || bad "§13 red-then-queued: the RED transition line is missing"
+q 'gate=PENDING state=QUEUED' <<<"$log" && ok "§13 red-then-queued: …and the later QUEUED poll is reported too" \
+                                       || bad "§13 red-then-queued: the later observation is missing"
+nq 'does not turn green by being polled longer' <<<"$log" \
+  && ok "§13 red-then-queued: the terminal line does NOT claim the gate is still red (it was in flight at the bound)" \
+  || bad "§13 red-then-queued: the verdict latched the try-1 RED and contradicts the last observation; log=$(tr '\n' ' ' <<<"$log")"
+qF "last='PENDING state=QUEUED'" <<<"$log" && ok "§13 red-then-queued: the bound names the LAST observation" \
+                                          || bad "§13 red-then-queued: the bound does not name the last observation; log=$(tr '\n' ' ' <<<"$log")"
+
+# ── §14 a read that fails and then RECOVERS inside the window still merges (round 7 P2-2): three
+#         failed reads used to end the run at ~90 s while the quoted transient clears at ~240 s ─────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=failthenok GATE_POLL_TRIES=5 GATE_READ_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 0 ] && ok "§14 transient read: the worker MERGES once the read recovers (exit 0) — no refusal on a transient" \
+                || bad "§14 transient read: rc=$rc — the read budget aborted the run before the window; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=SUCCESS (try 3)' <<<"$log" && ok "§14 transient read: green on the third poll, after two failed reads" \
+                                  || bad "§14 transient read: no SUCCESS at poll 3; log=$(tr '\n' ' ' <<<"$log")"
+q 'MERGED' <<<"$log" && ok "§14 transient read: the PR is actually merged" || bad "§14 transient read: no MERGED line"
+
 # ── §1c the TERMINAL line itself carries the stderr (anchored; the progress line must not stand in) ──
 mkmrg
 out="$(run_merge PRCHECKS_MODE=fail GATE_READ_TRIES=1)"; rc=$?
@@ -470,8 +515,9 @@ term="$(grep '] gate=UNAVAILABLE' <<<"$log")"
 qF 'stderr=gh-core-floor remaining=120 floor=800 resets_in=4m' <<<"$term" \
   && ok "§1c bound=1: the UNAVAILABLE verdict CARRIES the read's stderr (a verdict that drops it goes red here)" \
   || bad "§1c bound=1: the verdict dropped the stderr; terminal line=[${term:-<none>}]"
-nq 'gate=UNREADABLE' <<<"$log" && ok "§1c bound=1: no progress line exists at this bound, so the assertion above is anchored to the verdict" \
-                             || bad "§1c bound=1: a progress line is present — the anchor is not exclusive"
+anchor_n="$(grep -c '] gate=UNAVAILABLE' <<<"$log")"
+[ "$anchor_n" -eq 1 ] && ok "§1c bound=1: exactly ONE line carries 'gate=UNAVAILABLE', so the assertion above is anchored to the verdict" \
+                     || bad "§1c bound=1: $anchor_n lines carry 'gate=UNAVAILABLE' — the anchor is not exclusive"
 
 # ── §1d a SCALAR payload is UNREADABLE, not "no such check" (a scalar is not an empty check set) ──
 mkmrg
@@ -628,6 +674,52 @@ q 'gate=QUEUED (try 1)' <<<"$p_out" && ok "§6 pre-fix: a QUEUED gate DID print 
 # Sliced out by its own section markers and driven with the same stubs, so a mutation isolates
 # exactly the property it removes. `exit 4` is neutralised in the SLICE (a sourced block must not take
 # the driver down); the log it writes is what the assertions read.
+
+# ── §16 the CLAIM LEASE must be SIZEABLE from a hostile environment (review round 7 P2-3, and the
+#         verifier's 08 finding): the wait is a tunable, so the lease is derived from it — and a
+#         leading-zero value must be COERCED, not fed to `$(( 08 * 30 ))`, which aborts the shell
+#         before CLAIM_LEASE exists (on bash 3.2 it aborts the enclosing if-body and resumes with
+#         status 0, silently skipping the cross-box claim) ───────────────────────────────────
+LEASE_SLICE="$TMP/lease.sh"
+python3 - "$MERGE" "$LEASE_SLICE" <<'EOP'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+i = s.index('  if is_limit "${GATE_POLL_TRIES:-30}" && is_limit "${GATE_POLL_SECS:-30}"; then')
+j = s.index("CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))", i)
+j = s.index("\n", j) + 1
+open(dst, "w").write(s[i:j])
+EOP
+if [ -s "$LEASE_SLICE" ]; then
+  ok "§16 the lease block is sliceable, so it is driven as shipped code rather than paraphrased"
+else
+  bad "§16 the lease block could not be sliced out of merge-one.sh"
+fi
+lease_for() { # lease_for <tries> <secs> — echoes CLAIM_LEASE under `set -u`, and any arithmetic error
+  (
+    set -u
+    is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+    is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+    GATE_POLL_TRIES="$1"; GATE_POLL_SECS="$2"; export GATE_POLL_TRIES GATE_POLL_SECS
+    . "$LEASE_SLICE"
+    printf 'LEASE=%s\n' "${CLAIM_LEASE:-<UNSET>}"
+  ) 2>&1
+}
+l="$(lease_for "" "")"
+qF 'LEASE=3000' <<<"$l" && ok "§16 default: the lease is 1800 + (30x30) + 300 = 3000 — UNCHANGED by this change" \
+                        || bad "§16 default: $l"
+l="$(lease_for "" 60)"
+qF 'LEASE=3900' <<<"$l" && ok "§16 tuned wait (60s polls): the lease grows to 3900, so it cannot expire mid-wait" \
+                        || bad "§16 tuned wait: $l"
+for v in 08 09 010 abc; do
+  l="$(lease_for "" "$v")"
+  qF 'LEASE=3000' <<<"$l" && ok "§16 GATE_POLL_SECS=$v: coerced to the default (3000), not fed to \$(( 08 * 30 ))" \
+                          || bad "§16 GATE_POLL_SECS=$v: the lease was not sized safely — $l"
+done
+l="$(lease_for "" 5)"
+qF 'LEASE=3000' <<<"$l" && ok "§16 a wait BELOW the floor (5s polls) is floored at 900, so the lease cannot shrink under a review" \
+                       || bad "§16 floor: $l"
+
 slice_block() { # slice_block <src> <dst>
   sed -n "/── 3) wait for the REPO'S review gate/,/── 4) merge ──/p" "$1" | sed '$d' \
     | sed 's/; exit 4; fi/; fi/' > "$2"
@@ -645,13 +737,17 @@ run_block() { # run_block <block-file> <mode> [gate-name] — the sliced block a
     BLOCK_MODE="$2"; BLOCK_GATE="${3:-ai-review-gate}"; L="$TMP/block"; PR=7; OR=acme/widget
     REVIEW_GATE="$BLOCK_GATE"; GATE_POLL_SECS=0; GATE_POLL_TRIES=3; GATE_ABSENT_TRIES=2; GATE_READ_TRIES=2
     export BLOCK_MODE MRG L PR OR REVIEW_GATE GATE_POLL_SECS GATE_POLL_TRIES GATE_ABSENT_TRIES GATE_READ_TRIES
-    gh() { case "$*" in *"pr checks"*) checks_answer "$BLOCK_MODE" ;; *) return 0 ;; esac; }
+    # the block harness must record polls the same way the worker stub does, or a fixture that VARIES
+    # per poll (redthenqueued / failthenok / appears) is frozen at its first answer here — the mutation
+    # controls would then compare against a payload the arm would never see.
+    gh() { case "$*" in *"pr checks"*) printf 'x\n' >> "$MRG/checks.log"; checks_answer "$BLOCK_MODE" ;; *) return 0 ;; esac; }
     sleep() { :; }
     export -f gh sleep
     # is_num/is_limit are merge-one.sh's own, defined OUTSIDE the sliced block
     is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
     is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
     : > "$L.log"
+    : > "$MRG/checks.log"
     . "$1" >/dev/null 2>&1
     cat "$L.log"
   )
@@ -710,6 +806,59 @@ if q '    return str(s or "").strip()$' "$(cat "$MUT7")"; then
   fi
 else
   bad "§11 mutation: the clean() mutation did not apply (sed found no target) — inconclusive"
+fi
+MUT8="$TMP/block-latched.sh"
+sed 's|          gate_redkind="$gate_kind";|          gate_line="latched"; gate_redkind="$gate_kind";|' "$SLICE" > "$MUT8"
+if q '          gate_line="latched"; gate_redkind=' "$(cat "$MUT8")"; then
+  b_out="$(run_block "$MUT8" redthenqueued)"
+  nq "last='PENDING state=QUEUED'" <<<"$b_out" && ok "§12 mutation: latching the try-1 RED replaces the last observation with the stale one, so §13 goes RED" \
+                                              || bad "§12 mutation: the latched mutant still described the last observation — §13 is vacuous"
+else
+  bad "§12 mutation: the latch mutation did not apply (sed found no target) — inconclusive"
+fi
+MUT9="$TMP/block-readbreak.sh"
+python3 - "$SLICE" "$MUT9" <<'EOP'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = '*) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0 ;;'
+new = '*) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0; [ "$gate_unread" -lt "$GATE_READ_TRIES" ] || break ;;'
+assert old in s, "target missing"
+open(dst, 'w').write(s.replace(old, new, 1))
+EOP
+if [ -s "$MUT9" ]; then
+  b_out="$(BLOCK_TRIES=5; run_block "$MUT9" failthenok)"
+  q 'gate=SUCCESS' <<<"$b_out" && bad "§13 mutation: with the read bound breaking again the run still merged — §14 is vacuous" \
+                             || ok "§13 mutation: with the read bound breaking again the worker stops inside the window (§14 goes RED)"
+else
+  bad "§13 mutation: the read-break mutation did not apply — inconclusive"
+fi
+MUT10="$TMP/lease-caseguard.sh"
+python3 - "$LEASE_SLICE" "$MUT10" <<'EOP'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+i = s.index('  if is_limit')
+j = s.index('  fi\n', i) + len('  fi\n')
+# the idiom this file's header names as the P1: an ACCEPTING numeric guard, which lets `08` reach the
+# arithmetic — `$(( 08 * 30 ))` is an invalid octal, so the assignment aborts the shell.
+repl = ('  case "${GATE_POLL_TRIES:-30}${GATE_POLL_SECS:-30}" in\n'
+        '    ""|*[!0-9]*) _gw=900 ;;\n'
+        '    *) _gw=$(( ${GATE_POLL_TRIES:-30} * ${GATE_POLL_SECS:-30} )) ;;\n'
+        '  esac\n')
+open(dst, "w").write(s[:i] + repl + s[j:])
+EOP
+if qF '_gw=$(( ${GATE_POLL_TRIES:-30} * ${GATE_POLL_SECS:-30} )) ;;' "$(cat "$MUT10")"; then
+  m="$(
+    set -u
+    GATE_POLL_TRIES="" GATE_POLL_SECS=08; export GATE_POLL_TRIES GATE_POLL_SECS
+    . "$MUT10" 2>&1
+    printf 'LEASE=%s\n' "${CLAIM_LEASE:-<UNSET>}"
+  ) 2>&1"
+  grep -qi 'value too great for base' <<<"$m" && ok "§14 mutation: with the ACCEPTING case-guard back, GATE_POLL_SECS=08 aborts the arithmetic (\$(( 08 )) is an invalid octal), so §16 goes RED" \
+                                                || bad "§14 mutation: the accepting guard did not reproduce the octal abort — §16's 08 arm is vacuous ($m)"
+else
+  bad "§14 mutation: the case-guard mutation did not apply — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"
