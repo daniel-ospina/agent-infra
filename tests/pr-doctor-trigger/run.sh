@@ -75,6 +75,9 @@ PY
 # ── the fake gh: one call shape only (`pr list --json …`), plus the two failure shapes ─────────
 cat >"$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
+# ONE invocation log, so "one `gh pr list` per read" is COUNTED rather than asserted in prose: a
+# per-PR call added inside a pass would show up here as N+1 lines for N PRs (review cycle 5).
+printf '%s\n' "$*" >>"$FAKE_GH_LOG"
 mode="$(cat "$FAKE_GH_MODE" 2>/dev/null || echo ok)"
 case "$mode" in
   fail)    echo "HTTP 502: bad gateway" >&2; exit 1 ;;
@@ -93,9 +96,13 @@ SH
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
 export FAKE_GH_STATE="$GH_STATE" FAKE_GH_MODE="$GH_MODE" FAKE_DOCTOR_LOG="$DOCTOR_LOG"
+GH_LOG="$TMP/gh-calls.log"; : >"$GH_LOG"; export FAKE_GH_LOG="$GH_LOG"
 
 surface() { # <mergeStateStatus> <updatedAt>  — one open PR; the whole observable surface
   printf '[{"number":101,"mergeStateStatus":"%s","updatedAt":"%s","isDraft":false}]\n' "$1" "$2" >"$GH_STATE"
+}
+surface3() { # three PRs — the shape that catches a PER-PR `gh` call
+  printf '[{"number":101,"mergeStateStatus":"CONFLICTING","updatedAt":"2026-10-24T18:00:00Z","isDraft":false},{"number":102,"mergeStateStatus":"BEHIND","updatedAt":"2026-10-24T18:01:00Z","isDraft":false},{"number":103,"mergeStateStatus":"BLOCKED","updatedAt":"2026-10-24T18:02:00Z","isDraft":true}]\n' >"$GH_STATE"
 }
 n_doctor() { [ -f "$DOCTOR_LOG" ] && wc -l <"$DOCTOR_LOG" | tr -d ' ' || printf '0'; }
 reset_doctor() { : >"$DOCTOR_LOG"; }
@@ -172,6 +179,19 @@ assert_contains "$out" "prs=0" "and it reports zero PRs"
 echo ok >"$GH_MODE"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── A4. ONE gh call per read — the cost claim, counted"
+# "One `gh pr list` per poll (no per-PR calls)" is what makes this cheap enough to poll; prose cannot
+# pin it. Three PRs, one read: exactly one `gh` invocation, or the arm fails.
+: >"$GH_LOG"
+surface3
+reset_doctor
+python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-a4 --repo-dir "$APP" \
+  --once --dry-run-print --state-dir "$TMP/state/a4" >"$TMP/a4.log" 2>&1
+assert_eq "$(wc -l <"$GH_LOG" | tr -d ' ')" "1" "three PRs cost exactly ONE gh call (not one per PR)"
+assert_contains "$(cat "$TMP/a4.log")" "103" "and the read still saw every PR"
+surface CONFLICTING "2026-10-24T18:00:00Z"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── B. cold start runs ONE pass; an identical read runs NONE (counted, not read off stdout)"
 surface CONFLICTING "2026-10-24T18:00:00Z"
 reset_doctor
@@ -239,6 +259,56 @@ assert d.get("last_pass") == 0, "last_pass must be 0 after a failed pass: %r" % 
 assert d.get("last_attempt", 0) > 0, "last_attempt must be recorded: %r" % d
 PY
 assert_eq "$?" "0" "the state records last_pass=0 (backstop NOT consumed) and a real last_attempt"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── C3. --retry-min BOUNDS a repeated failure (one pass per floor, not one per poll)"
+# ⛔ THE KNOB ADDED BEYOND THE BRIEF NEEDED A TEST (review cycle 5). `--retry-min` exists because
+# `pr-doctor` has a non-crash non-clean exit (`EXIT_UNDELIVERED = 3`, which is what the box reports
+# right now) and treating it as a crash retried a FULL pass every poll. Only C2 touched the floor and
+# it ran `--retry-min 0`, which cannot tell the floor from its absence — deleting the clause left the
+# suite green. Here the backstop is always due (`--backstop 0`) and the pass keeps failing: with the
+# floor there is ONE attempt in four polls without it there are four.
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_doctor; S="$TMP/state/c3"; mkdir -p "$S"; LOG="$TMP/c3.log"
+FAKE_DOCTOR_RC=3 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c3 --repo-dir "$APP" \
+  --poll 1 --debounce 0 --backstop 0 --retry-min 600 --state-dir "$S" >"$LOG" 2>&1 &
+c3pid=$!
+wait_dir 1 100
+sleep 4
+stop_loop "$c3pid"
+assert_eq "$(n_doctor)" "1" "a failing pass is retried ONCE per --retry-min, not once per poll"
+assert_contains "$(cat "$LOG")" "DOCTOR-FAILED rc=3" "and the failure is named"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── C4. the debounce is a DEADLINE: the pass lands at it, not at the next poll tick"
+# ⛔ THE OTHER HALF OF THE MEASURED QUANTISATION DEFECT (review cycle 5). With `--poll 60
+# --debounce 90` the settling window used to sleep a whole poll and wake at
+# `poll + ceil(debounce/poll)*poll` = 180 s instead of 150 s. Every loop arm ran `--poll 1`, where
+# "sleep to the next tick" and "sleep to the deadline" are the SAME 1 s, so reverting the deadline
+# sleep left the suite green. `--poll 6 --debounce 7` separates them: the deadline sleep wakes at
+# ~7 s, a per-tick sleep at 12 s (6, then 6 more for the last 1 s).
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_doctor; S="$TMP/state/c4"; mkdir -p "$S"; LOG="$TMP/c4.log"; : >"$LOG"
+python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c4 --repo-dir "$APP" \
+  --poll 6 --debounce 7 --backstop 1000000 --state-dir "$S" >"$LOG" 2>&1 &
+c4pid=$!
+if wait_dir 1 200; then pass "cold pass first (poll=6)"; else fail "no cold pass at poll=6"; fi
+reset_doctor
+surface BEHIND "2026-10-24T18:30:00Z"
+t_det=""
+wait_for "$LOG" "CHANGE settling" 200 && t_det="$(date +%s)"
+wait_dir 1 200; t_run="$(date +%s)"
+stop_loop "$c4pid"
+assert_eq "$(n_doctor)" "1" "poll=6 debounce=7 runs exactly one pass"
+if [ -n "$t_det" ]; then
+  el=$(( t_run - t_det ))
+  # shipped: ~7 s after the change is observed. A per-tick sleep: 12 s. The threshold sits between
+  # them with >1.5x headroom on both sides of the gap; the arm measures a DEADLINE, not an instant.
+  [ "$el" -le 9 ] && pass "it woke at the DEADLINE (${el}s after the change was observed, not +12s)" \
+                  || fail "the settling window slept to the next tick (${el}s)"
+else
+  fail "the settling window never logged CHANGE"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── D. an UNREADABLE surface is not QUIET (#2271)"
@@ -381,19 +451,32 @@ SC_STATE="$TMP/sc-state"; printf 'inactive\n' >"$SC_STATE"   # a down box: the i
 cat >"$TMP/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 # a systemctl that logs every verb and tracks an ACTIVE state the suite can seed and read back.
+# ⛔ TWO KNOBS EXIST SO THE INSTALLER'S READ-BACK GATES CAN FAIL (review cycle 5). Without them the
+# fake answered `enabled` unconditionally and flipped to `active` on any start, so DELETING either
+# gate left the suite green — an assertion that cannot fail is not a test of the gate.
+#   SYSTEMCTL_ENABLED_FILE - what `is-enabled` answers (default `enabled`)
+#   SYSTEMCTL_STICKY_FILE  - when it holds `1`, start/restart does NOT activate (a unit that dies)
 echo "$*" >>"$SYSTEMCTL_LOG"
 st="$(cat "$SYSTEMCTL_STATE" 2>/dev/null || echo inactive)"
 case "$1" in
-  is-enabled) printf 'enabled\n' ;;
+  is-enabled) printf '%s\n' "$(cat "$SYSTEMCTL_ENABLED_FILE" 2>/dev/null || echo enabled)" ;;
   is-active)  printf '%s\n' "$st" ;;
-  start|restart|enable) case "$1" in start|restart) printf 'active\n' >"$SYSTEMCTL_STATE" ;; esac ;;
+  start|restart|enable)
+    case "$1" in
+      start|restart)
+        [ "$(cat "$SYSTEMCTL_STICKY_FILE" 2>/dev/null || echo 0)" = 1 ] || printf 'active\n' >"$SYSTEMCTL_STATE"
+        ;;
+    esac ;;
   stop) printf 'inactive\n' >"$SYSTEMCTL_STATE" ;;
   *) : ;;
 esac
 exit 0
 SH
 chmod +x "$TMP/bin/systemctl"
+SC_ENABLED_FILE="$TMP/sc-enabled"; printf 'enabled\n' >"$SC_ENABLED_FILE"
+SC_STICKY_FILE="$TMP/sc-sticky"; printf '0\n' >"$SC_STICKY_FILE"
 export SYSTEMCTL_LOG="$SC_LOG" SYSTEMCTL_STATE="$SC_STATE"
+export SYSTEMCTL_ENABLED_FILE="$SC_ENABLED_FILE" SYSTEMCTL_STICKY_FILE="$SC_STICKY_FILE"
 inst() { # <restart-sec>
   ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
   SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl TEMPLATES_DIR="$ROOT/templates/systemd" \
@@ -448,6 +531,25 @@ bogus="$(REPAIR_UNIT_NAME=bogus.service ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="
 [ "$brc2" -ne 0 ] && pass "--status REFUSES a unit whose ExecStart is not the trigger (rc=$brc2)" \
   || fail "--status reported ✅ over ExecStart=/bin/false — a false PASS"
 assert_contains "$bogus" "ExecStart: ExecStart=/bin/false" "and it prints the ExecStart it actually read"
+# ⛔ THE READ-BACK GATES MUST BE ABLE TO FAIL (review cycle 5). The body claims `is-enabled` must say
+# `enabled` and `is-active` GATES the verdict — "a unit that is enabled but not running is the #2700
+# shape one layer down". Deleting either gate used to leave the suite at ALL PASSED: the fake answered
+# `enabled` unconditionally and activated on any start. Both arms now drive the failure.
+printf 'disabled\n' >"$SC_ENABLED_FILE"
+printf 'active\n' >"$SC_STATE"
+inst 15 >"$TMP/g-notenabled.log" 2>&1; ne_rc=$?
+printf 'enabled\n' >"$SC_ENABLED_FILE"
+[ "$ne_rc" -ne 0 ] && pass "an install whose unit is NOT enabled fails (rc=$ne_rc)" \
+  || fail "an enabled-but-refused unit was reported as a successful install"
+assert_contains "$(cat "$TMP/g-notenabled.log")" "NOT enabled" "and it names the disabled unit"
+printf '1\n' >"$SC_STICKY_FILE"; printf 'inactive\n' >"$SC_STATE"
+inst 20 >"$TMP/g-notactive.log" 2>&1; na_rc=$?
+printf '0\n' >"$SC_STICKY_FILE"; printf 'active\n' >"$SC_STATE"
+# ⚠️ this arm pays the installer's real 10 s activation budget on purpose: the failure it proves IS
+# the wait expiring, and a shortened wait would not be the shipped code path.
+[ "$na_rc" -ne 0 ] && pass "an install whose unit never becomes ACTIVE fails (rc=$na_rc)" \
+  || fail "an enabled-but-DEAD unit was reported as a successful install — the #2700 shape"
+assert_contains "$(cat "$TMP/g-notactive.log")" "NOT ACTIVE" "and it says the unit is enabled but not running"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── H. a trigger with NO doctor is DOCTOR-MISSING, never a clean pass"
@@ -498,7 +600,7 @@ stop_loop "$pid"
 # (section A3 alone is 12), so any one case could be deleted while the floor printed `ok` — a
 # tripwire blind to the exact event it names. Deleting the smallest arm now trips it. Bump it when
 # you add arms; never lower it to make a failing run pass.
-assert_eq "$([ "$PASS" -ge 88 ] && echo ok || echo short)" "ok" "assertion floor (≥88 fired, got $PASS)"
+assert_eq "$([ "$PASS" -ge 99 ] && echo ok || echo short)" "ok" "assertion floor (≥99 fired, got $PASS)"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
