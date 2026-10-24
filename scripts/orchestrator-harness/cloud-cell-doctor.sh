@@ -1388,7 +1388,7 @@ run_hygiene() {
   #    is the opposite: this role claimed work it was asked to do and did not do it. So the pass stays
   #    green and the COUNTS are logged, which is what #2577 asks for — a stalled sync is visible in
   #    `refs=` vs `files=` long before it blocks a lane.
-  local rsync="" rs_out="" rs_refs="" store=""
+  local rsync="" rs_out="" rs_refs="" rs_why="" store=""
   local -a rs_store_args=()
   case "$DOCTOR_REGISTRY_SYNC" in
     off|none|0)
@@ -1452,6 +1452,7 @@ run_hygiene() {
             result="${result}${result:+; }registry union NOT RUN — surface-check rc=$rc, cause unknown"
           fi
         else
+        rs_why=""
         # --dir is EXPLICIT: the registry the cell's LANES read is this HOME's, and a step that
         # certified a registry nobody reads would be the same false green as no count at all.
         rs_out="$(run_bounded "$DOCTOR_REGISTRY_SYNC_TIMEOUT" bash "$rsync" union \
@@ -1463,15 +1464,37 @@ run_hygiene() {
         rs_refs="$(printf '%s\n' "$rs_out" | grep -E '^[a-z-]+: refs=' | tail -1)"
         if [ -z "$rs_refs" ]; then
           case "$rc" in
-            124|137) rs_refs="union TIMED OUT after ${DOCTOR_REGISTRY_SYNC_TIMEOUT}s (no summary printed)" ;;
+            # ⛔ 143 IS THE BOUND FIRING ON A BOX WITH NO `timeout(1)`. `run_bounded` falls back to
+            # `bounded` (a watchdog: TERM then KILL), which leaves 143 — and stock macOS, which the
+            # script names as a supported box, has no `timeout`. Without 143 here a bound-killed
+            # union logged "FAILED … cause UNKNOWN" on exactly the platform the harness documents as
+            # the messy one, and the one datum that says "raise the bound / this box is too slow"
+            # (measured: watchdog-arm kill → 143) was replaced by a failure that looks like a push
+            # fault.
+            124|137|143) rs_refs="union TIMED OUT after ${DOCTOR_REGISTRY_SYNC_TIMEOUT}s (no summary printed)" ;;
             *)     rs_refs="union rc=$rc with NO counts line — the registry state is UNKNOWN" ;;
           esac
         fi
         case "$rc" in
           0) log "[hygiene] review-registry $rs_refs"
              result="${result}${result:+; }registry ${rs_refs#*: }" ;;
-          3|4) log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs): nothing was overwritten, but records the fleet holds are unusable here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."
-             result="${result}${result:+; }registry rc=$rc ${rs_refs#*: }" ;;
+          3|4) # ⛔ THE NUMBER THAT SAYS WHY IS ALREADY IN `$rs_out`. `skipped=` is the UNREADABLE
+             # class only, so a DIVERGENT registry logged "NOT a converged state … skipped=0" in one
+             # breath, and the conflicts count and the keys naming them were discarded even though
+             # the step held them — measured: `union: … conflicts=2 …` plus `2 record(s) DIVERGE at
+             # the same reviewed_at: …-3001 …-3002` logged as `registry rc=3 … skipped=0`. The
+             # script prints that verdict line itself, so the doctor carries it through instead of
+             # paraphrasing the state as "0 skipped".
+             rs_why="$(printf '%s\n' "$rs_out" | grep -E 'record\(s\) (DIVERGE|were SKIPPED)' | tail -1)"
+             [ -n "$rs_why" ] || rs_why="no verdict line from the sync script"
+             log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs; $rs_why): nothing was overwritten, but records the fleet holds are unusable or DIVERGE here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."
+             result="${result}${result:+; }registry rc=$rc ${rs_refs#*: } ($rs_why)" ;;
+          # ⛔ A BOUND FIRING IS NOT A FAILURE. 124/137 are `timeout(1)`; 143 is the watchdog arm
+          # `run_bounded` uses where `timeout` does not exist (stock macOS). Folding all three into
+          # "union FAILED" told an operator to look for a push fault, when the actionable datum is
+          # "this box is too slow for the bound" — the only remedy that differs.
+          124|137|143) log "[hygiene] WARN review-registry union TIMED OUT rc=$rc after ${DOCTOR_REGISTRY_SYNC_TIMEOUT}s ($rs_refs) — the registry did NOT converge on this pass. Raise DOCTOR_REGISTRY_SYNC_TIMEOUT (or shrink the registry) and re-run; nothing was overwritten. Not fatal by design (#2577)."
+             result="${result}${result:+; }registry union TIMED OUT rc=$rc" ;;
           *) log "[hygiene] WARN review-registry union FAILED rc=$rc ($rs_refs) — this box's registry did NOT converge, so a PR reviewed on a PEER still reads NO-RECORD in the merge role until a later pass succeeds. Not fatal by design (#2577): the failure direction is fewer records, which the merge role already treats as cannot-verify."
              result="${result}${result:+; }registry union FAILED rc=$rc" ;;
         esac
