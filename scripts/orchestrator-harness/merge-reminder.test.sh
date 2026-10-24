@@ -184,8 +184,11 @@ STUB
 # ⛔ The stub must not expand $MAIN12 at RUN time: it runs in the REMINDER's environment, where that
 # variable does not exist (a stub that did would write an empty sha and the artifact check would pass
 # against nothing). The "after" artifact is written HERE, with the value already baked in.
-printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
-  "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
+# ⛔ AND THE TREE IT EXECUTES. `controller: RUNNING` is not activation: the pin names what the NEXT
+# launch runs, so a box whose controller still execs an older tree is `restart-pending` and counts for
+# nothing (#2680). `running:` is the only line that answers it.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
 cat > "$TMP/box-activate.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "activate-ran" >> "$FIXTURE/activate.txt"
@@ -233,9 +236,12 @@ write_baseline() {
   # a record AT the live head, in the shape record-review.sh writes
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-10-23T04:10:00Z"}\n' \
     "$HEAD" "$SLUG" > "$REV/${SLUG//\//-}-42.json"
-  # deploy: the box is CURRENT, so the deploy arm is a no-op in every landing case
-  printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 1)\nroles: idle\n' \
-    "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.txt"
+  # deploy: the box is CURRENT and ACTIVATED, so the deploy arm is a no-op in every landing case.
+  # ⛔ `running:` IS PART OF "CURRENT" (#2680): the pin names the version the NEXT launch runs, so a
+  # controller that execs an older tree is `restart-pending` — deployed, not activated, and it may not
+  # count. A baseline without this line would make every landing case look healthy on a stale process.
+  printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 1)\nrunning: %s\nroles: idle\n' \
+    "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.txt"
   printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-activate.sh" > "$O/state/boxes.tsv"
 }
 run_sut() { # extra args…
@@ -1898,8 +1904,11 @@ ck "§27 an INCOMPLETE search answer is not a count (never P0=0 / DONE)" \
 
 # GOAL 2's markers: every box on the pin, else the marker is BROKEN and the drifted box is NAMED.
 write_no_landing; reset_o
-printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
-  "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
+# ⛔ AND THE TREE IT EXECUTES. `controller: RUNNING` is not activation: the pin names what the NEXT
+# launch runs, so a box whose controller still execs an older tree is `restart-pending` and counts for
+# nothing (#2680). `running:` is the only line that answers it.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
 printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 4243)\nroles: idle\n' \
   "${OTHER:0:12}" > "$FX/box.behind.txt"
 cat > "$TMP/box-cur.sh" <<'STUB'
@@ -2057,7 +2066,7 @@ printf 'cell-1	bash %s
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an unreadable origin/main states NO comparison (\`not compared\`), never 0/N" \
-   "$(qF 'not compared — `origin/main` was unreadable' "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
+   "$(qF "not compared — the harness repo's \`origin/main\` was unreadable" "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and its action says so IN FULL and still NAMES the boxes" \
    "$(qF 'repair that read first.' "$MDF" && qF 'cell-1 (main=UNREADABLE' "$MDF" \
       && nq 'boxes run this cycle' "$MDF" && echo 0 || echo 1)"
@@ -2371,6 +2380,129 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box that did not ANSWER states no fraction (1/2 is a claim about both)" \
    "$(nq 'on this cycle' "$MDF" && qF 'gave no answer' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
+
+# ═══ §27b GOAL 2 IS THE **HARNESS** REPO'S MAIN, AND "ACTIVATED" IS THE RUNNING TREE ═════════════
+# Two measured false readings on the owner's goal 2 (agent-infra#2679, #2680). Both were found on the
+# live fleet minutes after #2611 merged, and both are the class this file exists to refuse: a goal
+# word derived from something other than the fact it claims.
+#
+# ⛔ #2679 — TWO MAINS, AND THEY ARE NOT INTERCHANGEABLE. The cycle's `origin/main` belongs to the repo
+# it SWEEPS (right for the PR/claim gates) and a harness sha is an AGENT-INFRA commit. Measured with
+# the sweep repo set to a tortoise checkout (the fleet's default shape for two of its cells): goal 2
+# read `0/1 boxes ... deploy/activate it` against `main=5f40d832c254` — a TORTOISE sha — for a box
+# sitting exactly on the harness pin. The harness repo is resolved from the payload (`$O`) or
+# `HARNESS_REPO`, and the box's own status command is told so in its ENVIRONMENT (`REPO=`), because a
+# status command inherits the sweep repo and would compare against the wrong main by itself.
+write_no_landing; reset_o
+HREPO="$FX/hrepo"
+rm -rf "$HREPO" "$FX/hrepo-origin.git"
+git init --quiet -b main "$HREPO" 2>/dev/null
+git -C "$HREPO" config user.email t@example.invalid
+git -C "$HREPO" config user.name t
+: > "$HREPO/README"
+git -C "$HREPO" add README
+git -C "$HREPO" commit --quiet -m "harness fixture base"
+git init --quiet --bare "$FX/hrepo-origin.git"
+git -C "$HREPO" remote add origin "$FX/hrepo-origin.git"
+git -C "$HREPO" push --quiet origin main
+HMAIN40="$(git -C "$HREPO" rev-parse origin/main)"
+HMAIN12="$(printf '%s' "$HMAIN40" | cut -c1-12)"
+ck "§27b the harness fixture's main really differs from the swept repo's (the case under test)" \
+   "$([ "$HMAIN40" != "$MAIN40" ] && echo 0 || echo 1)"
+# A box that IS on the harness main, activated at it.
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$HMAIN12" "$HMAIN12" > "$FX/box.hmain.txt"
+cat > "$TMP/box-hmain.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.hmain.txt"
+STUB
+chmod +x "$TMP/box-hmain.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-hmain.sh" > "$O/state/boxes.tsv"
+out="$(HARNESS_REPO="$HREPO" run_sut --json)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b --json publishes BOTH mains, and they are different reads" \
+   "$(printf '%s' "$out" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+m, h = d.get("main") or "", d.get("harness_main") or ""
+print(0 if m and h and m != h else 1)' 2>/dev/null || echo 1)"
+ck "§27b goal 2 judges the box against the HARNESS main (#2679)" \
+   "$(qF "cell-1=$HMAIN12 [current]" "$MDF" && echo 0 || echo 1)"
+ck "§27b ...so the goal HOLDS on a box that is on the harness main, whatever the swept repo's main is" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and the header names the harness main BESIDE the swept one" \
+   "$(qF "**harness main:** \`$HMAIN12\`" "$MDF" && echo 0 || echo 1)"
+# The status command is TOLD which repo the comparison is about — it inherits the sweep repo otherwise,
+# and the measured failure was a box answering `[unknown]` against a tortoise main for an agent-infra pin.
+cat > "$TMP/box-env.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$HMAIN12" "$HMAIN12"
+# The observation goes to a FILE: the SUT's stdout is one line by design, so a probe's own output
+# cannot be read back from it.
+printf '%s\n' "${REPO:-<unset>}" > "$FIXTURE/saw-repo.txt"
+STUB
+chmod +x "$TMP/box-env.sh"
+rm -f "$FX/saw-repo.txt"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-env.sh" > "$O/state/boxes.tsv"
+out="$(HARNESS_REPO="$HREPO" run_sut)"; rc=$?
+ck "§27b the box's status command is given REPO=<the harness repo>, not the swept repo (#2679)" \
+   "$([ "$(cat "$FX/saw-repo.txt" 2>/dev/null)" = "$HREPO" ] && echo 0 || echo 1)"
+
+# ⛔ #2680 — "ACTIVATED" IS THE TREE THE CONTROLLER EXECUTES. A pin is advanced for the NEXT launch
+# (`harness-refresh.sh` names that `restart-pending`), so `controller: RUNNING` off the pin certified a
+# box as deployed-AND-activated while the process executed pre-fix code. Measured on the hub: pin and
+# payload at `f9381dae2ee5`, controller exec'ing `harness/f6a1a01772bd/orch-loop.sh`, goal reading
+# `1/1 ... deployed AND activated`.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "${OTHER:0:12}" > "$FX/box.restartpending.txt"
+cat > "$TMP/box-rp.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.restartpending.txt"
+STUB
+chmod +x "$TMP/box-rp.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-rp.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b a box whose controller still execs ANOTHER tree is restart-pending, named with that tree" \
+   "$(qF "restart-pending(running=${OTHER:0:12})" "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and it does NOT count as deployed-and-activated (0/1)" \
+   "$(qF '0/1 box(es) on this cycle' "$MDF" && qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and the deploy table calls it deployed-but-NOT-activated, never 'current'" \
+   "$(qF 'deployed-but-NOT-activated' "$MDF" && nq '| cell-1 | '"$MAIN12"' [current] | RUNNING(pid 4242) | idle | current |' "$MDF" && echo 0 || echo 1)"
+# A payload whose status command does not answer the question at all (an older `box-status.sh`) may not
+# be counted either: silence is not activation. Fail-closed, the same rule the roles read follows.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.norunning.txt"
+cat > "$TMP/box-norun.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.norunning.txt"
+STUB
+chmod +x "$TMP/box-norun.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-norun.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b a status command that never answers the running tree is NOT activated (fail-closed)" \
+   "$(qF 'running=NOT-REPORTED' "$MDF" && qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and it is not counted either (0/1)" \
+   "$(qF '0/1 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
+# The running-tree reader is a COMPARISON, not a constant: if the `running:` line agrees with the pin the
+# box counts (the baseline fixtures prove the HOLD side; this proves the same fixture flips on ONE field).
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" > "$FX/box.samerun.txt"
+cat > "$TMP/box-samerun.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.samerun.txt"
+STUB
+chmod +x "$TMP/box-samerun.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-samerun.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b the SAME fixture with running==pin counts (the term is the comparison, not the line)" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '1/1 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"
