@@ -221,7 +221,17 @@ LOG2="$T/launchctl-retire.log"  # isolated log for the HOME2 retirement section
 # a reason that has nothing to do with the template under test, and the same suite would be green on CI
 # and red on the operator's laptop (the host-dependence §1 was fixed for). Pinning it to THIS tree makes
 # the rendered target the checkout being tested, which is what every other assertion assumes.
-export AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
+#
+# ⛔ NOT `export VAR="$(…)"` (#2569 lane). A DECLARATION builtin's exit status is the builtin's,
+# not the substitution's, so a FAILED `cd` and an EMPTY answer were the same observable and the
+# suite would pin an installer run against an empty root. A bare assignment carries the
+# substitution's status, so the `||` below is a real check — and `check-false-pass-shapes.sh`
+# (which scans this file) no longer reports the `discarded-status` shape it was red for on main.
+AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" || {
+  echo "install-launchd.test.sh: cannot resolve the checkout root from SCRIPT_DIR='$SCRIPT_DIR'" >&2
+  exit 1
+}
+export AGENT_INFRA_PATH
 
 run_installer() { # <home> [extra env assignments...]
     (
