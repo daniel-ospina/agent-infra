@@ -731,7 +731,7 @@ def _cron_line(o: Path, mins: int) -> str:
     return f"*/{mins} * * * * O={q_o} /usr/bin/env python3 {q_s} --o {q_o} {CRON_TAG}"
 
 
-def _is_our_cron_line(line: str, tag: str) -> bool:
+def _is_our_cron_line(line: str, tag: str, o: Path | None = None) -> bool:
     """True only for a line THIS file wrote: the tag AND this script's path.
 
     ⛔ A bare tag match deleted an operator's own line that merely mentioned it (e.g. a `# paused
@@ -739,12 +739,22 @@ def _is_our_cron_line(line: str, tag: str) -> bool:
     review). Install and uninstall now share this one predicate.
     """
     quoted = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
-    # ⛔ THE ENTRY NAMES THE COPY THAT INSTALLED IT. `deploy-harness.sh` seeds `$O` and `install.sh`
-    # treats `$O/<script>` and the checkout copy as the same script, so an uninstall from the OTHER
-    # copy matched nothing — it printed "nothing to remove", exited 0, and left the arm firing
-    # (measured). The basename identifies our entry from either path; an operator line that merely
-    # mentions the tag still carries no script name and still survives.
-    return tag in line and (quoted in line or Path(__file__).name in line)
+    if tag not in line:
+        return False
+    # ⛔ THE ENTRY NAMES THE COPY THAT INSTALLED IT *AND* THE `$O` IT SERVES. `deploy-harness.sh` seeds
+    # `$O/<script>` and `install.sh` treats that as the same script as the checkout copy, so keying on
+    # the SCRIPT alone made a cross-copy uninstall match nothing (it printed "nothing to remove",
+    # exited 0, and left the arm firing — measured) — while keying on the script NAME made one `$O`'s
+    # uninstall delete a PEER `$O`'s arm and an operator line that merely mentioned the script.
+    # The `$O` token is what both copies render identically, and what distinguishes two reminders.
+    if o is not None:
+        token = "O=" + shell_quote(str(o)).replace("%", "\\%")
+        if token in line:
+            return True
+        if "O=" in line:
+            return False              # a different `$O`'s entry (or an operator line naming one)
+    # An entry written before the `O=` token existed carries only the script path.
+    return quoted in line
 
 
 def local_activate(o: Path, platform: str | None = None) -> str:
@@ -1627,6 +1637,12 @@ def _shared_reds(landing: list[dict], skipped: str = "") -> str:
         if skipped:
             return "NOT-READ — no PR surface was examined this cycle (see the SKIPPED line above)."
         return "No open PRs this cycle, so no red group can be shared."
+    unread = [r for r in landing
+              if "reds=UNREADABLE" in (r.get("readings") or "")
+              or "reds=NOT-READ" in (r.get("readings") or "")]
+    if unread and not any(r.get("red_labels") for r in landing):
+        return (f"NOT-READ for {len(unread)} of {len(landing)} candidate(s) — their surfaces could "
+                f"not be read, so no red group is reported as absent.")
     return ("No PR in this cycle carries a red group. (A PR whose surface was NOT READ is not "
             "evidence of a green one.)")
 
@@ -1728,8 +1744,8 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
                 print(f"⛔ {why}", file=sys.stderr)
                 return 3
             out = "\n".join(current_lines)
-            if any(_is_our_cron_line(ln, tag) for ln in (out or "").splitlines()):
-                kept = [ln for ln in (out or "").splitlines() if not _is_our_cron_line(ln, tag)]
+            if any(_is_our_cron_line(ln, tag, o) for ln in (out or "").splitlines()):
+                kept = [ln for ln in (out or "").splitlines() if not _is_our_cron_line(ln, tag, o)]
                 try:
                     subprocess.run(["crontab", "-"], input="\n".join(kept) + "\n", text=True,
                                    capture_output=True, timeout=30, check=True)
@@ -1737,7 +1753,7 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
                     print(f"⛔ could not rewrite the crontab: {e}", file=sys.stderr)
                     return 3
                 rc2, out2, _ = run(["crontab", "-l"], timeout=30)
-                if any(_is_our_cron_line(ln, tag) for ln in (out2 or "").splitlines()):
+                if any(_is_our_cron_line(ln, tag, o) for ln in (out2 or "").splitlines()):
                     print(f"⛔ the crontab entry is STILL there ({tag}). Next: crontab -e",
                           file=sys.stderr)
                     return 3
@@ -1786,7 +1802,7 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         if not read_ok:
             print(f"⛔ {why}", file=sys.stderr)
             return 3
-        kept = [ln for ln in current_lines if not _is_our_cron_line(ln, tag)]
+        kept = [ln for ln in current_lines if not _is_our_cron_line(ln, tag, o)]
         kept.append(entry)
         # Feed the crontab through stdin (the `run()` helper cannot); the rc is still checked.
         try:
@@ -1800,7 +1816,7 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         # VERIFY THE ARTIFACT, not the write: `crontab -` exiting 0 is the same class of evidence as
         # `cmux send` exiting 0 — it says bytes were handed over, not that a timer exists.
         rc2, out2, _ = run(["crontab", "-l"], timeout=30)
-        if rc2 != 0 or not any(_is_our_cron_line(ln, tag) for ln in (out2 or "").splitlines()):
+        if rc2 != 0 or not any(_is_our_cron_line(ln, tag, o) for ln in (out2 or "").splitlines()):
             print(f"⛔ wrote the crontab but the entry is NOT there (rc={rc2}). "
                   f"Next: crontab -l | grep '{tag}'", file=sys.stderr)
             return 3
@@ -1892,6 +1908,10 @@ def main(argv=None) -> int:
 
     md = o / STATE_MD
     skipped = ""
+    # ⛔ BOUND BEFORE THE GUARD: `repo_path_of` can raise, and the retry below dereferences it. An
+    # UnboundLocalError there replaced the caught OSError with a crash that wrote NO report — the
+    # defect class this guard exists for, one name to the right.
+    repo_path: Path | None = None
     landing: list[dict] = []
     deploy: list[dict] = []
     budget = Budget("gh")          # replaced once gh resolves; carries the header's numbers
@@ -1932,9 +1952,11 @@ def main(argv=None) -> int:
                        "controller": "", "roles": "", "source": "",
                        "readings": "", "verdict": f"SKIPPED({e})"}]
 
-    if not main:
-        # ⛔ INSIDE A GUARD: this retry re-runs `git` after the cycle's try block, so on the very
-        # environment the try block was meant to describe it was the one call that could still crash.
+    if not main and repo_path is not None:
+        # ⛔ INSIDE A GUARD, AND ONLY WHEN THERE IS A PATH: this retry re-runs `git` after the cycle's
+        # try block, so on the very environment the try block was meant to describe it was the one
+        # call that could still crash — and when the repo probe itself raised, there is no path to
+        # retry against (`repo_path is None`), which must not become an UnboundLocalError.
         try:
             main = main_sha(repo_path)
         except OSError as e:

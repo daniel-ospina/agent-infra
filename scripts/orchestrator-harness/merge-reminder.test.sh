@@ -1574,6 +1574,71 @@ ck "§26j a NON-EXECUTABLE git does not crash the cycle (rc=$rc, no traceback)" 
    "$(nq 'Traceback' "$out" && [ "$rc" -le 3 ] && echo 0 || echo 1)"
 ck "§26j ...and the deliverable was still written" "$([ -s "$O/MERGE-REMINDER.md" ] && echo 0 || echo 1)"
 
+# ⛔ AND WHEN THE REPO PROBE ITSELF RAISES there is no path to retry against: `repo_path` must be bound
+# before the guard, or the retry dies with an UnboundLocalError that REPLACES the caught OSError — a
+# crash with no report, which is the whole defect class this guard exists for (a deployed `$O` with the
+# controller's cwd gone does exactly this).
+write_baseline; reset_o
+rm -f "$O/MERGE-REMINDER.md"
+out="$(python3 - "$SUT" "$O" <<'PYMOD' 2>&1
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def boom(o):
+    raise OSError(2, "No such file or directory: the process cwd has gone")
+m.repo_path_of = boom
+rc = m.main(["--o", sys.argv[2], "--repo", "daniel-ospina/agent-infra", "--no-act"])
+print("rc=%s" % rc)
+PYMOD
+)"
+ck "§26l an OSError out of the repo probe is a REPORTED cycle, not an UnboundLocalError" \
+   "$(nq 'UnboundLocalError' "$out" && nq 'Traceback' "$out" && qF 'rc=3' "$out" && echo 0 || echo 1)"
+ck "§26l ...and the deliverable names the unreadable environment" \
+   "$(qF 'UNREADABLE environment — ' "$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ A SHARED-RED SECTION MUST NOT ASSERT AN ABSENCE IT DID NOT MEASURE: with every candidate's surface
+# UNREADABLE there is no "no PR carries a red group" — that is a claim about a read that never happened.
+write_baseline; reset_o
+printf '{"state":"error","statuses":[],"total_count":0}\n' > "$FX/status.json"
+out="$(run_sut 2>&1)"; rc=$?
+ck "§26m an UNREADABLE surface is not reported as 'no PR carries a red group'" \
+   "$(qF 'could not be read, so no red group is reported as absent' "$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)" && nq 'No PR in this cycle carries a red group' "$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ ONE \$O's CRON ARM IS NOT ANOTHER'S. Matching the bare script name let an uninstall for $O2 remove
+# the arm $O1 installed (silently), and let an operator line that merely MENTIONS the script be deleted.
+: > "$FX/crontab.txt"
+cat > "$TMP/cronbin/crontab" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+  -l) if [ -s "$FIXTURE/crontab.txt" ]; then /bin/cat "$FIXTURE/crontab.txt"; exit 0; fi
+      echo "no crontab for tester" >&2; exit 1 ;;
+  -)  /bin/cat > "$FIXTURE/crontab.txt"; exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$TMP/cronbin/crontab"
+printf '30 4 * * * /usr/local/bin/pause-arm.sh  # tortoise-merge-reminder paused; docs: merge-reminder.py\n' \
+  > "$FX/crontab.txt"
+O2="$TMP/o2"; mkdir -p "$O2"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O2" \
+  --install-timer --interval 600 >/dev/null 2>&1
+ck "§26n an operator line that MENTIONS the script survives another \$O's install" \
+   "$(qF 'pause-arm.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+ck "§26n ...and the new \$O's own arm was added" \
+   "$(qF "O='$O2'" "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§26n ...and an uninstall for a DIFFERENT \$O does not remove it" \
+   "$(qF "O='$O2'" "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O2" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§26n ...while an uninstall for THAT \$O removes it" \
+   "$(grep -q "O='$O2'" "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+ck "§26n ...and the operator line is still there afterwards" \
+   "$(qF 'pause-arm.sh' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+: > "$FX/crontab.txt"
+
 
 # ⛔ THE PROCESS TABLE IS RE-READ AT THE MOMENT OF ACTION. A rail that appears only in the SECOND
 # read (after the gates and this cycle's REST calls) must still refuse the dispatch.
