@@ -710,7 +710,7 @@ PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED
 # The convergence counters (#2577). `ADDED`/`UPDATED` are PULL-side only — they describe what this
 # box's registry RECEIVED — while `WROTE` counts both directions. `files=` is read after the run.
 ADDED=0 UPDATED=0
-CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS=""
+CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS="" PUSH_FAILED_KEYS=""
 
 # ⛔ THE COUNTERS COUNT RECORDS, NOT EVENTS. `union` runs pull AND then push, so one defective key
 # is seen by BOTH directions and every increment happened twice: measured, ONE ambiguous local record
@@ -721,6 +721,13 @@ CONFLICT_KEYS="" UNREADABLE_KEYS="" FAILED_KEYS=""
 # and what the doctor logs; a number nobody can act on is worse than no number.)
 unreadable() { UNREADABLE=$((UNREADABLE + 1)); UNREADABLE_KEYS="$UNREADABLE_KEYS $1"; }
 failed()     { FAILED=$((FAILED + 1)); FAILED_KEYS="$FAILED_KEYS $1"; }
+# ⛔ `push_failed()` REGISTERS ITS KEY TOO, because `summary()` asks whether EVERY failure was on the
+# push side (`[ "$fcount" -eq "$pfcount" ]`). Comparing a DEDUPED total against an EVENT count answers
+# that question wrongly the moment one key fails in both directions: the pull's failure is deduped
+# away, the counts then look equal, and the operator is told "the pull side succeeded" while it did
+# not. (The arm structure makes that unlikely for one key — a pull only fails when it must WRITE, a
+# push only when it must PUBLISH — so this is defence, not a reproduced path; it costs one variable.)
+push_failed() { failed "$1"; PUSH_FAILED=$((PUSH_FAILED + 1)); PUSH_FAILED_KEYS="$PUSH_FAILED_KEYS $1"; }
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
   CONFLICT=$((CONFLICT + 1))
@@ -892,7 +899,7 @@ push_one() { # <key> <source-file>
     build_store_blobs || :
   done
   warn "  ⚠️ FAILED $key — the push was refused twice (a peer moved the ref, or this box cannot push to $REMOTE). The record stays LOCAL and is not lost; re-run to retry."
-  failed "$key"; PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
+  push_failed "$key"; return 0
 }
 
 pull_one() { # <key>
@@ -1213,6 +1220,10 @@ summary() { # <verb>
   if [ -n "$FAILED_KEYS" ]; then
     fcount="$(printf '%s\n' $FAILED_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   fi
+  local pfcount="$PUSH_FAILED"
+  if [ -n "$PUSH_FAILED_KEYS" ]; then
+    pfcount="$(printf '%s\n' $PUSH_FAILED_KEYS | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+  fi
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
     "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$ccount" "$UNKEYED" "$ucount" "$fcount"
   # THE CONVERGENCE LINE (#2577). Printed LAST so a caller that greps `^<verb>:` for the tail (the
@@ -1224,7 +1235,7 @@ summary() { # <verb>
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
     # failed PUSH means the records WERE read and this box could not publish. Naming both as a single
     # records-are-UNKNOWN state sent an operator to re-run a path that fails identically.
-    if [ "$PUSH_FAILED" -gt 0 ] && [ "$fcount" -eq "$PUSH_FAILED" ]; then
+    if [ "$pfcount" -gt 0 ] && [ "$fcount" -eq "$pfcount" ]; then
       warn "registry-sync.sh: $fcount record(s) could not be PUBLISHED — the pull side succeeded, so this box"
       warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
     else
