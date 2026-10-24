@@ -72,7 +72,14 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # was 7 — a superseded sha presented as current, the same class as the static goal string it replaced.
 # A step that must not be skipped cannot sit behind a step that can kill the run. objective.py takes
 # seconds and depends on nothing the scan produces, so it goes FIRST.
-_obj=$(bounded 120 /usr/bin/python3 "$SCRIPTS/objective.py" 2>/dev/null | tail -1)
+_obj=$(OBJECTIVE_CALLER_BOUND_S=180 \
+         bounded 180 /usr/bin/python3 "$SCRIPTS/objective.py" 2>/dev/null | tail -1)
+# ⛔ 180s, NOT 120s (#2227). Same reason as `heartbeat-loop.sh`'s bound: `objective.py`'s
+# `QUEUE_READ_MAX_S` is 100 s -- 1.6x the MEASURED 63.0 s a serialised `gh pr view` costs at 13
+# lanes (#2005) -- so a 120 s bound killed this step mid-read on the crowded box it exists for.
+# The bound is also DECLARED to the child (`OBJECTIVE_CALLER_BOUND_S`) so the reader clips its own
+# read to fit: these two files deploy separately (this one IS in the fleet farm), and a bound the
+# reader cannot see is how a budget becomes a kill timer.
 if [ -n "$_obj" ]; then
   log "refreshed objective.last: $(printf '%s' "$_obj" | grep -oE 'main=[^ ]+ open=[0-9]+' | head -1)"
 else
