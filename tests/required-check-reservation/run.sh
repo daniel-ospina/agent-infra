@@ -107,6 +107,16 @@ mutate() {
 }
 
 reservation='["self-hosted","Linux","X64","required-check"]'
+
+# append <src> <dst> <text> — copy then append. Used by the arms that add a whole unrecognised
+# shape (a second `jobs:` mapping, a stray top-level blob) rather than re-spelling an existing one.
+append() {
+  node -e '
+    const fs = require("fs");
+    const [src, dst, text] = process.argv.slice(1);
+    fs.writeFileSync(dst, fs.readFileSync(src, "utf8") + text);
+  ' "$1" "$2" "$3"
+}
 fallback="'[\"ubuntu-latest\"]'"
 
 echo "== required-check reservation (#2752) =="
@@ -312,6 +322,193 @@ if mutate "$WF" "$TMP/wf-flowstray2.yml" '    runs-on: ubuntu-latest' '    runs-
   run_expect_nonzero "17 a ']' in a comment followed by a stray line is NEVER green" "$TMP/wf-flowstray2.yml" "$DOC"
 else
   fail "17 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# ── 18–22. Round 6 ──────────────────────────────────────────────────────────────────────────────
+# FINDING 18 (P1, false PASS): a job whose whole body is a one-line FLOW MAPPING is invisible to
+# the job-start regex, so the job VANISHED from the sweep and T2 certified "no other job asks for
+# the reservation" over a tree that had one. The remainder after the job key is now captured and
+# makes the job OPAQUE — never green, never silently dropped.
+if mutate "$WF" "$TMP/wf-flowmapping.yml" '  workflow-drift:' '  sneaky: {runs-on: [ubuntu-latest, required-check], steps: [{run: echo hi}]}
+  workflow-drift:'; then
+  run_expect 2 "18 UNREADABLE a flow-mapping job body is not silently skipped" "$TMP/wf-flowmapping.yml" "$DOC"
+else
+  fail "18 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# FINDING 19 (P1, false PASS, same root): a QUOTED job key at job indent matched nothing at all, so
+# the job and its routing were dropped while grading "every other job".
+if mutate "$WF" "$TMP/wf-quotedkey.yml" '  workflow-drift:' '  "sneaky":
+    runs-on: [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "19 UNREADABLE a quoted job key is not silently skipped" "$TMP/wf-quotedkey.yml" "$DOC"
+else
+  fail "19 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# FINDING 20 (P2, false BLOCK): an anchor on an UNCHANGED routing was graded as a routing CHANGE
+# ("expected exactly 'ubuntu-latest', got [&hosted ubuntu-latest]") — a false block, and a message
+# asserting a change that did not happen. Attachment syntax is stripped before grading.
+if mutate "$WF" "$TMP/wf-anchor.yml" '    runs-on: ubuntu-latest' '    runs-on: &hosted ubuntu-latest'; then
+  run_expect 0 "20 CONTROL a YAML anchor on an unchanged routing stays GREEN" "$TMP/wf-anchor.yml" "$DOC"
+else
+  fail "20 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# ...and an ALIAS points at a definition this reader does not follow, so it refuses rather than
+# guessing which side it names.
+if mutate "$WF" "$TMP/wf-alias.yml" '    runs-on: ubuntu-latest' '    runs-on: *hosted'; then
+  run_expect 2 "21 UNREADABLE an unresolvable alias routing is not graded" "$TMP/wf-alias.yml" "$DOC"
+else
+  fail "21 MUTATION-NOT-APPLIED (no plain runs-on to re-spell)"
+fi
+
+# FINDING 22 (P1, false PASS): T1 graded the joined text by SUBSTRING, so a literal `required-check`
+# could be ANDed onto the required job with the variable expression and the suite stayed green —
+# while GitHub ANDs the labels, making the documented `ubuntu-latest` default unsatisfiable.
+if mutate "$WF" "$TMP/wf-anded.yml" "    runs-on: \${{ fromJSON(vars.PIPELINE_COMPLIANCE_RUNS_ON || '[\"ubuntu-latest\"]') }}" '    runs-on:
+      - ${{ fromJSON(vars.PIPELINE_COMPLIANCE_RUNS_ON || '["ubuntu-latest"]') }}
+      - required-check'; then
+  run_expect 1 "22 MUTANT a literal label ANDed onto the required routing is REFUSED" "$TMP/wf-anded.yml" "$DOC"
+else
+  fail "22 MUTATION-NOT-APPLIED (the variable expression was not found in the workflow)"
+fi
+
+# ── 23–26. VGATE round 6 ───────────────────────────────────────────────────────────────────────
+# FINDING 23 (P1, GREEN over a reservation): the reusable-workflow exemption tested `uses:` ALONE,
+# so a job carrying BOTH `uses:` and a `runs-on` spelled in a form this reader does not parse
+# (`"runs-on":`) was skipped as exempt — while YAML put it on the reservation. The exemption now
+# requires the job block to contain no `runs-on` key in ANY spelling.
+if mutate "$WF" "$TMP/wf-usesquoted.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    "runs-on": [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "23 UNREADABLE a 'uses:' job with an unparsed 'runs-on' is NOT exempt" "$TMP/wf-usesquoted.yml" "$DOC"
+else
+  fail "23 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# …and the genuine reusable-workflow job must still be exempt, or the fix would red every real tree.
+if mutate "$WF" "$TMP/wf-usesonly.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+  workflow-drift:'; then
+  run_expect 0 "24 CONTROL a genuine reusable-workflow job stays EXEMPT" "$TMP/wf-usesonly.yml" "$DOC"
+else
+  fail "24 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# FINDING 25 (unreadable input graded GREEN): a TAB-indented job line is not matched by the
+# space-only job-indent guard, so it was absorbed into the previous block and vanished.
+if mutate "$WF" "$TMP/wf-tab.yml" '  workflow-drift:' '	sneaky:
+		runs-on: [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "25 UNREADABLE a tab-indented job is not silently absorbed" "$TMP/wf-tab.yml" "$DOC"
+else
+  fail "25 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# FINDING 26 (unreadable input graded GREEN): a `---` document separator inside `jobs:` starts a
+# SECOND document; the reader graded the first and never saw the reservation in the second.
+if mutate "$WF" "$TMP/wf-docsep.yml" 'jobs:' 'jobs:
+---
+  sneaky:
+    runs-on: [ubuntu-latest, required-check]'; then
+  run_expect 2 "26 UNREADABLE a second document inside 'jobs:' is not graded" "$TMP/wf-docsep.yml" "$DOC"
+else
+  fail "26 MUTATION-NOT-APPLIED (the 'jobs:' anchor was not found)"
+fi
+
+# ── 27–31. VGATE round 6, second pass ──────────────────────────────────────────────────────────
+# The exemption was a DENY-list ("does this block contain a runs-on key?") and four spellings
+# walked past it while YAML put the job on the reservation: an explicit `? runs-on` key, a `<<:`
+# merge, an anchored key, and a tagged key. It is now an ALLOW-list over job-level keys, which
+# cannot be spelled around — an unknown line REFUSES the input rather than exempting the job.
+if mutate "$WF" "$TMP/wf-explicitkey.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    ? runs-on
+    : [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "27 UNREADABLE a '? runs-on' explicit key is not exempted" "$TMP/wf-explicitkey.yml" "$DOC"
+else
+  fail "27 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+if mutate "$WF" "$TMP/wf-mergekey.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    <<: &r {runs-on: [ubuntu-latest, required-check]}
+  workflow-drift:'; then
+  run_expect 2 "28 UNREADABLE a '<<:' merge key is not exempted" "$TMP/wf-mergekey.yml" "$DOC"
+else
+  fail "28 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+if mutate "$WF" "$TMP/wf-anchorkey.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    &k runs-on: [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "29 UNREADABLE an anchored key is not exempted" "$TMP/wf-anchorkey.yml" "$DOC"
+else
+  fail "29 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+if mutate "$WF" "$TMP/wf-taggedkey.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    !!str runs-on: [ubuntu-latest, required-check]
+  workflow-drift:'; then
+  run_expect 2 "30 UNREADABLE a tagged key is not exempted" "$TMP/wf-taggedkey.yml" "$DOC"
+else
+  fail "30 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# …and a real reusable job stays exempt, including the keys real workflows use. Without this the
+# allow-list could tighten into a blanket refusal that reds every tree carrying a `uses:` job.
+if mutate "$WF" "$TMP/wf-reusable.yml" '  workflow-drift:' '  sneaky:
+    uses: actions/checkout@v4
+    permissions:
+      contents: read
+    with:
+      node-version: "22"
+    secrets: inherit
+  workflow-drift:'; then
+  run_expect 0 "31 CONTROL a reusable job with standard keys stays EXEMPT" "$TMP/wf-reusable.yml" "$DOC"
+else
+  fail "31 MUTATION-NOT-APPLIED (no sibling job key to prepend to)"
+fi
+
+# ── 32–37. VGATE round 6, third pass: TOTAL COVERAGE ────────────────────────────────────────────
+# Every hole so far was the same shape of failure: a line the reader did not recognise was SKIPPED
+# while it certified "no other job asks for the reservation". The reader now refuses a file it
+# cannot follow instead of grading the part it happens to understand. These arms pin the family.
+for spec in \
+  'jobs: {sneaky: {runs-on: [ubuntu-latest, required-check]}}|32 UNREADABLE an inline flow jobs: mapping is REFUSED' \
+  'jobs:  # second|33 UNREADABLE a commented second jobs: is REFUSED' \
+  'jobs: &j|34 UNREADABLE an anchored jobs: value is REFUSED' \
+  'jobs: !!map|35 UNREADABLE a tagged jobs: value is REFUSED' \
+  '{jobs: {sneaky: {runs-on: [ubuntu-latest, required-check]}}}|36 UNREADABLE a whole-file flow document is REFUSED'; do
+  text="${spec%%|*}"
+  label="${spec#*|}"
+  if append "$WF" "$TMP/wf-append.yml" "$text"$'\n'; then
+    run_expect 2 "$label" "$TMP/wf-append.yml" "$DOC"
+  else
+    fail "$label — MUTATION-NOT-APPLIED"
+  fi
+done
+
+# A stray INDENTED line inside a `uses:` job made the file invalid YAML but was swallowed as
+# "nested content" — while the suite treats the analogous stripes elsewhere as unreadable. Nested
+# content is now allowed only under a key whose value really is nested.
+if append "$WF" "$TMP/wf-usesstray.yml" $'jobs: {}\n  sneaky:\n    uses: actions/checkout@v4\n      runs-on: [ubuntu-latest, required-check]\n'; then
+  run_expect 2 "37 UNREADABLE a stray nested line in a 'uses:' job is not swallowed" "$TMP/wf-usesstray.yml" "$DOC"
+else
+  fail "37 MUTATION-NOT-APPLIED"
+fi
+
+# …and a legitimate top-level key AFTER the jobs mapping must still be fine (the column-0 rule
+# must not turn into a blanket refusal of everything that follows `jobs:`).
+if append "$WF" "$TMP/wf-toplevel.yml" $'permissions: read-all\n'; then
+  run_expect 0 "38 CONTROL a top-level key after 'jobs:' stays GREEN" "$TMP/wf-toplevel.yml" "$DOC"
+else
+  fail "38 MUTATION-NOT-APPLIED"
 fi
 
 echo

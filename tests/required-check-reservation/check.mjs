@@ -53,6 +53,34 @@ const RESERVATION = '["self-hosted","Linux","X64","required-check"]';
 const VAR_NAME = "PIPELINE_COMPLIANCE_RUNS_ON";
 const FALLBACK = '["ubuntu-latest"]';
 
+// Job-level keys this reader models. ⛔ A `uses:` job is exempt from the sweep ONLY if every line of
+// its block is blank, a comment, one of these keys at 4 spaces, or NESTED content (≥ 5 spaces).
+// This is an ALLOW-LIST on purpose. A deny-list ("does the block contain a runs-on spelling?") lost
+// to `? runs-on` / `: [ … ]`, `<<: &r {runs-on: [ … ]}`, `&k runs-on:` and `!!str runs-on:` — each
+// skipped the job as "reusable" while YAML put it on the reservation (VGATE round 6). A whitelist
+// cannot be spelled around: an unrecognised line REFUSES the input instead of exempting it.
+const JOB_KEY_OK = /^    (uses|name|needs|if|permissions|with|secrets|strategy|timeout-minutes|continue-on-error|env|concurrency|outputs|environment):/;
+// Keys whose VALUE is a nested mapping/sequence. Only under these may an indented line be anything.
+// A blanket `≥5 spaces` allowance swallowed a 6-space `runs-on:` inside a `uses:` job — a stray line
+// that even makes the file invalid YAML — while the suite grades the analogous stripes elsewhere as
+// unreadable (VGATE round 6).
+const JOB_KEY_NESTS = /^    (with|secrets|env|strategy|permissions|outputs|concurrency|environment):/;
+
+function reusableJobExempt(block) {
+  // block[0] is the job key line itself (`  extension-tests:`); the body starts at block[1].
+  let nestable = false;
+  for (const line of block.slice(1)) {
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    if (JOB_KEY_OK.test(line)) {
+      nestable = JOB_KEY_NESTS.test(line);
+      continue;
+    }
+    if (nestable && /^ {5,}\S/.test(line)) continue; // nested content of one of the keys above
+    return false;
+  }
+  return true;
+}
+
 const problems = [];
 const fail = (m) => problems.push(m);
 const cannot = (m) => {
@@ -80,6 +108,14 @@ function readOrDie(file, what) {
 // claim that it asserts values. Strip the spelling, keep the value.
 function normLabel(raw) {
   const s0 = String(raw).trim();
+  // A YAML ANCHOR (`&hosted ubuntu-latest`) or a tag (`!foo ubuntu-latest`) is attachment syntax,
+  // not part of the value. Grading it made a clean job report "changed its routing … got
+  // [&hosted ubuntu-latest]" — a false block asserting a change that did not happen (round 6).
+  const attached = /^[&!]\S+\s+(.+)$/.exec(s0);
+  if (attached) return normLabel(attached[1]);
+  // An ALIAS (`*hosted`) points at an anchor defined elsewhere; this reader does not resolve them,
+  // and guessing which side it names is exactly the kind of guess this module refuses.
+  if (s0[0] === "*") cannot(`routing uses an alias '${s0}' this reader cannot resolve — refusing to grade it`);
   // A QUOTED scalar: the value ends at its matching quote, so a `# comment` after it is not part
   // of the label. (Round 4's control arm caught `"ubuntu-latest"  # default hosted` being graded as
   // one long string — the shapes that red a clean job are exactly what a control arm is for.)
@@ -118,16 +154,66 @@ function parseJobs(file) {
   const text = readOrDie(file, "workflow");
   const lines = text.split("\n");
   const jobs = new Map(); // id -> {block, runsOn, runsOnLabels, timeout, uses, runsOnOpaque}
+  // ⛔ TOTAL COVERAGE. Every line of the file must match a shape this reader models, or the file is
+  // `cannot-measure`. The alternative — skipping lines it does not recognise — is how SEVEN distinct
+  // false PASSes hid in this reader: a job written as a flow mapping, a quoted job key, `? runs-on`,
+  // a `<<:` merge, an anchored/tagged key, a stray continuation, and a no-op duplicate `jobs:`.
+  // Each one was a line the reader dropped while certifying "no other job asks for the reservation".
+  // A refusal is honest and actionable; a silent skip is a certification of something never read.
+  const TOP_KEY = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:(.*)$/;
   let inJobs = false;
+  let sawJobs = false;
   let current = null;
   for (const line of lines) {
-    if (/^jobs:\s*$/.test(line)) {
-      inJobs = true;
+    // A TAB cannot indent YAML, so a tab-led line means the file is not parseable at all — and a tab
+    // is not matched by the space-only job-indent guard, so such a job would be absorbed into the
+    // previous block and vanish from the sweep (VGATE round 6). Refuse the input instead.
+    if (/^\t/.test(line)) {
+      cannot(`${path.basename(file)}: tab-indented line ${JSON.stringify(line)} — YAML cannot be indented with tabs, so this file is unreadable`);
+    }
+    // A document separator starts a SECOND document; grading the first while a reservation sits in
+    // the second certified a tree the reader never read (round 6).
+    if (/^---(\s|$)/.test(line)) {
+      cannot(`${path.basename(file)}: a '---' document separator — multi-document workflows are not graded`);
+    }
+    if (/^ /.test(line)) {
+      // An INDENTED line. Outside `jobs:` it belongs to some other top-level key and is not graded;
+      // inside `jobs:` it is handled by the job arms below.
+      if (!inJobs) continue;
+    } else {
+      // A COLUMN-0 line must be a top-level key. Anything else (a whole-file flow mapping, a stray
+      // token) means this reader is not looking at the document it thinks it is — refuse.
+      if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+      const tk = TOP_KEY.exec(line);
+      if (!tk) {
+        cannot(
+          `${path.basename(file)}: unmodelled column-0 line ${JSON.stringify(line.trim().slice(0, 80))} ` +
+            `— refusing to grade a document this reader cannot follow`
+        );
+      }
+      if (tk[1] === "jobs") {
+        // `jobs:` in ANY spelling is the mapping under test. A spelling with an inline body
+        // (`jobs: {sneaky: …}`, `jobs: &j`, `jobs: !!map`) is a shape this reader does not model; a
+        // SECOND `jobs:` key is last-wins in YAML, so which mapping is graded would be a guess.
+        if (sawJobs) {
+          cannot(`${path.basename(file)}: a second 'jobs:' key (${JSON.stringify(line.trim())}) — YAML is last-wins, so this reader will not guess which mapping is graded`);
+        }
+        const rest = stripComment(tk[2]).trim();
+        if (rest.length > 0) {
+          cannot(`${path.basename(file)}: inline 'jobs:' value ${JSON.stringify(rest)} — only a block 'jobs:' mapping is modelled`);
+        }
+        sawJobs = true;
+        inJobs = true;
+        current = null;
+        continue;
+      }
+      // Any other top-level key ends the jobs mapping.
+      inJobs = false;
       current = null;
       continue;
     }
-    if (!inJobs) continue;
-    // A new top-level key ends the jobs mapping.
+    // A new top-level key ends the jobs mapping. (Unreachable for the shapes this reader models —
+    // the column-0 arm above already returned — kept as a guard so the invariant is local.)
     if (/^[A-Za-z_]/.test(line)) {
       inJobs = false;
       current = null;
@@ -161,8 +247,13 @@ function stripComment(s) {
 // A job id with an optional trailing comment (`  workflow-drift: # drift guard`) is still a
     // job start. Without this, that job's lines were appended to the PREVIOUS job, overwriting its
     // routing — a clean tree then reddened with T1/T3 blaming the wrong job (review round 4).
-    const job = /^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$/.exec(line);
+    // ⛔ The remainder is captured, NOT required to be empty: a job whose whole body is a one-line
+    // FLOW MAPPING (`sneaky: {runs-on: [ubuntu-latest, required-check], steps: …}`) matched the old
+    // `(?:#.*)?$` form as nothing at all, so the job vanished and T2 certified "no other job asks
+    // for the reservation" over a tree that had one (review round 6). Such a body is unmeasurable.
+    const job = /^  ([A-Za-z0-9_-]+):(.*)$/.exec(line);
     if (job) {
+      const rest = stripComment(job[2]).trim();
       current = {
         block: [line],
         runsOn: null,
@@ -176,7 +267,20 @@ function stripComment(s) {
         uses: false,
       };
       jobs.set(job[1], current);
+      // A non-comment remainder after the job key is a flow-mapping (or other inline) body, whose
+      // `runs-on` this reader does not model. Opaque, never green.
+      if (rest.length > 0) current.runsOnOpaque = true;
       continue;
+    }
+    // ⛔ A line at JOB indent (1–3 spaces) that is not a job start is a jobs-mapping shape this
+    // reader does not model — a quoted key (`"sneaky":`), a key with a space before the colon, or
+    // a job written some other way. Dropping it certified "no other job anywhere asks for the
+    // reservation" over a tree that had one, in THIS file or in another workflow file (round 6).
+    if (/^ {1,3}\S/.test(line) && !/^\s*#/.test(line)) {
+      cannot(
+        `${path.basename(file)}: unmodelled line at job indent (${JSON.stringify(line.trim())}) — ` +
+          `this reader cannot grade that jobs mapping, so it will not certify it`
+      );
     }
     if (!current) continue;
     current.block.push(line);
@@ -361,6 +465,23 @@ if (!/fromJSON\(/.test(runsOn)) {
 if (/^\s*(\[|self-hosted)/.test(runsOn)) {
   fail(`T1 ${JOB_ID}'s runs-on may not be an unconditional self-hosted label list; got: ${runsOn}`);
 }
+// T1b — the routing must resolve to EXACTLY ONE value. Grading the joined text by substring let a
+// literal label be ANDed onto the expression:
+//     runs-on:
+//       - ${{ fromJSON(vars.… || '["ubuntu-latest"]') }}
+//       - required-check
+// stayed GREEN, because `includes(VAR_NAME)` and `includes(FALLBACK)` both still held — while
+// GitHub ANDs the labels, so with the variable unset the required check needs a runner that is
+// BOTH `ubuntu-latest` and `required-check`, i.e. the documented default is unsatisfiable. That is
+// the "strictly worse than the queue" state this module exists to refuse (review round 6).
+if (Array.isArray(job.runsOnLabels) && job.runsOnLabels.length !== 1) {
+  fail(
+    `T1b ${JOB_ID}'s runs-on resolves to ${job.runsOnLabels.length} labels ` +
+      `(${job.runsOnLabels.map((l) => JSON.stringify(l)).join(", ")}) — it must be exactly the one ` +
+      `${VAR_NAME} expression; any extra label is ANDed onto it and the ${FALLBACK} default stops ` +
+      `being satisfiable`
+  );
+}
 
 // T3 — the fallback default must be present in the expression itself.
 if (!runsOn.includes(FALLBACK)) {
@@ -449,14 +570,19 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
           `cannot read`
       );
     }
-    // A reusable-workflow job (`uses:` and no `runs-on:`) owns no routing here. Anything ELSE with
-    // no readable routing is `cannot-measure`, never a skip: an unparsed `runs-on` is precisely how
-    // a second job would hide from this sweep.
+    // A reusable-workflow job (`uses:` and no `runs-on:`) owns no routing here. ⛔ But `uses:` alone
+    // is NOT enough to exempt: a job can carry BOTH an unmodelled `runs-on` spelling this reader
+    // cannot parse (`"runs-on":`, `? runs-on`, `<<: {runs-on: …}`) and a `uses:`, and testing
+    // `uses:` alone then skipped it — a GREEN over a routing that DID carry `required-check` (VGATE
+    // round 6). The exemption now requires the whole block to consist only of modelled job keys;
+    // anything else is `cannot-measure`, never a skip: an unparsed arm is exactly how a second
+    // reservation hides from this sweep.
     if (r === null || r === undefined) {
-      if (j.uses) continue;
+      if (j.uses && reusableJobExempt(j.block)) continue;
       cannot(
-        `${path.basename(abs)} job '${id}' has no readable 'runs-on' and no 'uses:' — refusing to ` +
-          `treat an unparsed routing as exempt (an unparsed arm is how a second reservation hides)`
+        `${path.basename(abs)} job '${id}' has no readable 'runs-on'${j.uses ? " (a 'uses:' job " +
+          "carries a line this reader cannot model, so its routing is unknown)" : " and no 'uses:'"} — refusing ` +
+          `to treat an unparsed routing as exempt (an unparsed arm is how a second reservation hides)`
       );
     }
     const isReserved = labels.some(
