@@ -38,9 +38,16 @@ LEAN BY DESIGN, and it follows the house pattern the other line-producers use
 heartbeat can call it every tick CHEAPLY, never raise. "Cheap" is not "free" on
 one path: a recompute that lands inside GitHub's lazy `mergeStateStatus` window
 re-reads a few times before it will call the queue blind (#1869), which spends
-up to `QUEUE_BLIND_BUDGET_S` of the beat's own 90 s refresh bound -- and a
+up to `QUEUE_READ_MAX_S` of the caller's own refresh bound -- and a
 refresh killed at that bound writes NO line at all. It reads; it does not act.
 Nothing dispatches from here.
+
+A LATE ANSWER IS NOT AN ABSENT ONE (#2227). `gh` is serialised per box (#2005), so on a
+crowded box a queue read legitimately costs ~63 s (measured at 13 lanes) against 0.09 s on
+the wire. Every read therefore reports HOW LONG it took: a read that answered late prints
+`queue_read=SLOW(waited=63.1s)` beside REAL counts, a read that never answered prints
+`queue_read=UNREADABLE(waited=100.4s, last_good=812s)` beside NO counts, and `BLIND` stays
+reserved for its #1869 meaning (the merge state never came back readable).
 
 THREE MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, all hit for real:
   1. A run's `createdAt -> updatedAt` INCLUDES QUEUE WAIT. It read 44.3 min and
@@ -247,6 +254,14 @@ GH_LAST_ERROR = ""
 # refusal (#2138 r7). NOTE `_rest_get` DECODES its own body, so it also raises for a 200 it could
 # not parse -- that is a body failure, and the classification below says so (#2138 r8).
 _REST_TRANSPORT = False
+
+# ⛔ THE LAST **FAILED** QUEUE READ, KEPT SO ITS REFUSAL CAN NAME ITSELF (#2227).
+# `queue()` returns None when nothing was read, which is the correct fail-closed answer (#1869) --
+# but a bare `None` also erases HOW LONG the read waited and WHAT it tried, so the beat could only
+# print `gh=UNREADABLE(queue)` with no wait and no age, and a 100 s serialisation delay read
+# exactly like an instant 403. Empty dict = no failed read this pass. AGE IS THE ONLY THING A
+# REFUSAL MAY BORROW FROM THE CACHE -- never a count (see `_last_good_age_s`).
+QUEUE_READ_FAIL = {}
 
 # ⛔ THE BINARY IS RESOLVED, NOT TAKEN FROM PATH ALONE (#1872, reviewer E). `pr-doctor.py`
 # records the incident at its own `GH` constant: on the fleet box `~/.pi/agent/shims/gh` is a
@@ -629,10 +644,47 @@ def _monotonic():
     An attempt count alone does not bound a re-sample loop: the READ can be slow (a full
     recompute costs ~12 s measured, and one hung `gh` costs up to its own 120 s timeout), so a
     fixed ladder of sleeps on top of a slow read is bounded by nothing the beat can honour
-    (`run_bounded 90`). The loop therefore checks a wall-clock deadline as well -- and a
-    deadline is only honest if it can be tested without waiting for it.
+    (`run_bounded` in `heartbeat-loop.sh`). The loop therefore checks a wall-clock deadline as
+    well -- and a deadline is only honest if it can be tested without waiting for it.
     """
     return time.monotonic()
+
+
+def _wall():
+    """Elapsed-time MEASUREMENT, a separate seam from `_monotonic()` (#2227).
+
+    Two functions over the same clock is not redundancy, it is what keeps two DIFFERENT claims
+    testable at once. `_monotonic()` answers "has the budget been spent?" and tests fake it as a
+    tick LADDER (`iter([0.0, budget + 1, ...])`), which is the only way to prove a bound without
+    sleeping. `_wall()` answers "how long did this take?" and tests fake it as ELAPSED SECONDS.
+    Sharing one seam would mean a test that fakes the bound is also, silently, claiming to have
+    measured a latency -- and the first fixture that returned a ladder would publish a 101-second
+    "latency" for a read that took none.
+
+    The distinction matters because the two facts are reported in different places and only one of
+    them may ever affect a decision: a spent budget stops a re-read (a bound), a long duration is
+    printed beside data that WAS read (a measurement). Nothing dispatches from a duration.
+    """
+    return time.monotonic()
+
+
+def _last_good_age_s():
+    """Age, in seconds, of the last CACHED objective line -- or None if there is none.
+
+    ⛔ AGE ONLY. THIS FUNCTION MUST NEVER RETURN A VALUE FROM THE CACHE (#1869). A refused read
+    that printed last hour's `waiting=14` would be the exact fail-open #1869 closed: a stale
+    number standing where an unread one belongs. What a reader of a refusal genuinely needs is
+    "how old is the last thing we DID establish", so that a refusal three hours into a bad window
+    cannot be mistaken for one that just started -- and the age alone answers that without
+    publishing a single count.
+
+    The cache is written by `main()` under the blind guard, so its mtime IS the last SUCCESSFUL
+    read: a failed read refuses to cache (see `main()`), which is what makes the age meaningful.
+    """
+    try:
+        return max(0, int(time.time() - os.path.getmtime(CACHE)))
+    except OSError:
+        return None
 
 
 def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
@@ -654,7 +706,7 @@ def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
     for i in range(attempts):
         # ⛔ `deadline` BOUNDS THE WHOLE RETRY POLICY, NOT JUST ONE ATTEMPT (#2138 r4, A). The
         # queue read's cap covers the read the fleet depends on -- but a retrying 5xx could spend
-        # `attempts x timeout` (3 x 120 s) and be killed by `run_bounded 90`, writing NO line at
+        # `attempts x timeout` (3 x 120 s) and be killed by `run_bounded`, writing NO line at
         # all. With a deadline, each attempt's timeout is clipped to what is left of it and the
         # backoff sleep is clipped too, so retries still happen (the resilience this function
         # exists for) inside a bound the caller can price into the tick.
@@ -1680,9 +1732,9 @@ KNOWN_MERGE_STATES = frozenset({"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND
 # publishing one sample from it beside fourteen from `gh pr list` is how two differently-wrong
 # reads get reported as one measurement. Sample the same query again.
 #
-# BUDGET, and why it is small: the beat's refresh is bounded at 90 s (`heartbeat-loop.sh`,
-# `run_bounded 90 objective-refresh`) and a full recompute already costs ~12 s (~513 graphql
-# calls, one per PR/check-suite). Each re-read is ONE list query plus a few seconds of waiting,
+# BUDGET: the beat's refresh is bounded by `run_bounded` in `heartbeat-loop.sh` (raised to 180 s
+# alongside this read in #2227; see `QUEUE_READ_MAX_S`) and a full recompute already costs ~12 s
+# (~513 graphql calls, one per PR/check-suite). Each re-read is ONE list query plus a few seconds of
 # and `classify_queue` runs ONCE after the loop, so a re-sample never repeats the per-PR storm.
 # A recompute window longer than this budget is genuinely not settled FOR THIS BEAT; BLIND is
 # then the truthful answer (and, until #1916, a BLIND line IS still cached -- `main()`'s guard
@@ -1690,9 +1742,99 @@ KNOWN_MERGE_STATES = frozenset({"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND
 # that as "the next beat re-samples": the next RECOMPUTE does).
 QUEUE_BLIND_ATTEMPTS = 4                      # 1 fresh read + 3 re-reads
 QUEUE_BLIND_BACKOFF_S = (2, 5, 10)            # ~17 s of waiting, all attempts together
-QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling, from read 1:
-                                              # a slow first read spends the budget it would
-                                              # otherwise spend on waiting
+
+# ⛔ THE READ BUDGET IS SET FROM A MEASUREMENT, NOT FROM TASTE (#2227). Every `gh` call on a box is
+# SERIALISED (per-box single flight, #2005 -- deliberate: one shared account, and GitHub's
+# secondary limit is triggered by concurrency, so the queue is the remedy). The consequence is that
+# a read's LATENCY is a function of HOW MANY LANES ARE ON THE BOX, and nothing to do with GitHub:
+#
+#     2026-10-20, three cloud cells, 9-14 lane processes per box
+#       lanes=13   `gh pr view`                 63.0 s     <- the worst case this budget answers to
+#       lanes=3    `gh pr view`                  0.676 s
+#       --         raw `curl api.github.com`     0.091 s   <- network + account are FINE
+#
+# The old budget was 20 s for the whole re-sample ladder and 45 s for the read, i.e. BOTH below the
+# measured worst case. A read that simply had not been served yet therefore hit its own timeout and
+# the beat published ABSENCE (`queue_read=BLIND`, `merged_24h=?`, `VERDICT=UNKNOWN`) for a fact it
+# had not established -- roughly hourly, and wrong every time. A budget under the measured latency
+# does not bound the read, it manufactures a false absence.
+GH_SERIALISED_LATENCY_S = 63.0                # MEASURED worst case (13 lanes, one box). Re-measure
+                                              # this before changing the budget below; do not
+                                              # substitute an estimate for it.
+# 1.6x the measurement: one MORE lane than the box we measured is ordinary traffic, not an outage,
+# and a budget that sits exactly ON the measurement re-introduces the false absence the first time
+# the fleet grows by one lane.
+QUEUE_READ_MAX_S = int(GH_SERIALISED_LATENCY_S * 1.6)     # = 100 s
+# ⛔ THIS CAPS THE WHOLE QUEUE READ -- primary AND fallback AND the re-sample ladder (#2138 r3, A;
+# #2227). Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and WRONG
+# for the slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive having
+# spent most of the budget, and a fresh 30 s socket push would carry the tick past
+# `heartbeat-loop.sh`'s own bound -- where a killed refresh writes NO line at all, strictly worse
+# than the refusal it replaces. Measured from the START of the read: the fallback and every re-read
+# get whatever is left of it, and a refusal that has already spent it gets NO socket and raises its
+# own cause, so the line still prints.
+# ⛔ THE COMPOSITION WITH THE CALLER'S BOUND IS PART OF THIS CONSTANT, AND IT IS ENFORCED BY
+# `test_the_caller_bound_leaves_room_for_the_whole_read` (#2227). The refresh is bounded by
+# `run_bounded` in `heartbeat-loop.sh` and by `bounded` in `lane-scan-fallback.sh`; both are sized
+# ABOVE this cap plus the ~12 s of tick work before `queue()` (`main_sha`, `main_health`,
+# `ci_critical_path`) and the per-PR `classify_queue()` storm after it (one check-run read per open
+# PR, ~12 s on a full recompute). Raising this cap without raising those makes the read budget
+# INERT: the process is killed first and writes nothing.
+# ⛔ THE RE-SAMPLE WINDOW IS DERIVED FROM THE SAME MEASUREMENT, AND IS NOT THE READ CAP (#2227).
+# It must fit ONE slow-but-successful read (63 s measured) plus the backoff ladder above (17 s),
+# or #1869's re-sample is unreachable on exactly the boxes that need it: a 20 s window was spent
+# merely being SERVED, so the ladder never ran and a merely-late merge state was declared blind.
+# It stays BELOW `QUEUE_READ_MAX_S` on purpose -- it is a SUB-window of the read, and the REST
+# second source is anchored to the OUTER cap, so a primary that eats this whole window still
+# leaves the fallback room to answer (that property is pinned by
+# `test_a_SLOW_primary_read_still_leaves_the_fallback_one_page`).
+QUEUE_BLIND_BUDGET_S = 85                     # = 63 s measured read + 17 s ladder + 5 s margin
+# A read that ANSWERS but costs more than this is reported as SLOW beside its data. The measured
+# quiet-box cost is 0.676 s (3 lanes), so 5 s is ~7x the fast path: comfortably above ordinary
+# jitter, comfortably below the 63 s serialised worst case. It NEVER changes a count or a verdict --
+# `read_s` is a property of the READ, not of the queue.
+SLOW_READ_S = 5.0
+
+# ⛔ THE READER CLIPS ITS OWN CAP TO THE CALLER'S BOUND, AND THAT IS A DEPLOYMENT FACT, NOT A
+# REFINEMENT (#2227). `QUEUE_READ_MAX_S` only bounds the READ; the PROCESS is bounded by whichever
+# shell wraps it, and those two are deployed SEPARATELY: `objective.py` is in the fleet farm, but
+# `heartbeat-loop.sh` is a DECLARED, WITHHELD entry there (#1553) because the live copy is ahead of
+# the repo. So this file can reach a box whose loop still kills the refresh at 90 s -- and a read
+# cap of 100 would then guarantee the refresh is SIGKILLed mid-read, writing NO line at all, which
+# is strictly worse than the false absence this change removes.
+# Therefore the caller DECLARES its bound and the reader clips to it: a box running the new loop
+# gets the full 100 s, a box running the old one gets 66 s (still above the 63 s measurement, and
+# it still PRINTS), and neither can be killed before it has said something.
+CALLER_BOUND_ENV = "OBJECTIVE_CALLER_BOUND_S"
+# The SMALLEST caller bound in the fleet today -- `heartbeat-loop.sh`'s historical 90 s. Used when a
+# caller declares nothing, so the default is the conservative one.
+DEFAULT_CALLER_BOUND_S = 90
+# What the read must leave the rest of the refresh: ~12 s of tick work before `queue()`
+# (`main_sha`, `main_health`, `ci_critical_path`) and ~12 s of per-PR `classify_queue()` after it.
+CALLER_OVERHEAD_S = 24
+
+
+def _read_cap_s():
+    """The wall-clock cap for ONE queue read, clipped to what the caller will actually allow.
+
+    A declared bound that cannot parse falls back to the conservative default rather than to the
+    optimistic one: guessing HIGH here is the direction that gets the process killed and loses the
+    line, and a lost line cannot be distinguished from a monitor that never ran.
+    """
+    raw = os.environ.get(CALLER_BOUND_ENV)
+    try:
+        bound = float(raw)
+        if not (bound > 0):
+            raise ValueError(raw)
+    except (TypeError, ValueError):
+        bound = float(DEFAULT_CALLER_BOUND_S)
+    # ⛔ NO 1.0 FLOOR (#2227 review, VGATE). A `max(1.0, …)` here would silently RE-EXCEED the
+    # caller's bound for any declaration at or below `CALLER_OVERHEAD_S` -- i.e. the clip would be
+    # defeated by the very expression that implements it, and the invariant this function states
+    # ("neither can be killed before it has said something") would be false for small bounds. A
+    # cap of 0 is the honest answer to "you have declared no room": the read fails fast on its own
+    # spent deadline and PRINTS `queue_read=UNREADABLE(waited=…)` instead of running past the kill.
+    return max(0.0, min(float(QUEUE_READ_MAX_S), bound - CALLER_OVERHEAD_S))
 
 
 # ⛔ THE QUEUE READ HAS A SECOND SOURCE, AND IT IS A DIFFERENT BUCKET (#2138).
@@ -1727,22 +1869,8 @@ QUEUE_REST_MAX_PAGES = 5                      # a bound on PAGES; reaching it wi
 QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clipped to the queue read's
                                               # own remaining budget and re-checked after every
                                               # page (`_queue_rest(deadline=…)`), so the fallback
-                                              # cannot add a 5 x 30 s tail to a beat that is killed
-                                              # at 90 s
-# ⛔ THIS CAPS THE QUEUE LIST FETCH (primary + fallback), NOT THE WHOLE QUEUE READ (#2138 r3, A).
-# Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and WRONG for the
-# slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive having spent
-# 60-75 s of the beat's 90 s refresh bound, and a fresh 30 s socket push the tick past
-# `run_bounded 90 objective-refresh` (`heartbeat-loop.sh`) -- where a killed refresh writes NO line
-# at all, strictly worse than the refusal it replaces. Half the bound, measured from the START of
-# the read: the fallback gets whatever is left of it (still a full page in the ordinary case), and
-# a refusal that has already spent it gets NO socket and raises its own cause, so the line prints.
-# ⛔ WHAT IS OUTSIDE THIS BOUND, SAID PLAINLY: the ~12 s of tick work before `queue()` runs
-# (`main_sha`, `main_health`, `ci_critical_path`) and the per-PR `classify_queue()` storm AFTER the
-# list is in hand (one check-run read per open PR, ~12 s on a full recompute) are neither included
-# nor claimed to be -- 12 + 45 + 12 is still under the 90 s kill, which is why the split is safe,
-# not because the cap covers them.
-QUEUE_READ_MAX_S = 45
+                                              # cannot add a 5 x 30 s tail to the read's own
+                                              # `QUEUE_READ_MAX_S` cap
 
 
 def _gh_hosts_path():
@@ -1941,7 +2069,7 @@ def _body_names_rate_limit(e, deadline=None):
     `timeout=0.5`** — 9.6x the timeout and 9.6x the page budget. That is the same mechanism this
     file already records for the 200 path, and the earlier version of this helper asserted the
     opposite for the error path. At `QUEUE_REST_TIMEOUT_S = 30` the worst case would be 4096 x 30 s,
-    i.e. a stall past `run_bounded 90 objective-refresh`, where the beat is killed with NO line
+    i.e. a stall past the caller's `run_bounded` bound, where the beat is killed with NO line
     written — the silent stall the chunk loop exists to prevent.
 
     So: `read1()` where it exists, `deadline` checked BEFORE every chunk, and `ERR_BODY_BYTES` as
@@ -2030,7 +2158,7 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     deadline between calls but called `r.read(8192)`, and on CPython that is
     `BufferedReader.read(n)` -> up to **n `recv`s**, each resetting the socket's per-recv timeout.
     The deadline cannot fire INSIDE a call, so the worst case was 8192 x `QUEUE_REST_TIMEOUT_S`,
-    i.e. a stall past `run_bounded 90 objective-refresh` — and a killed beat writes NO line, which
+    i.e. a stall past `run_bounded`'s bound — and a killed beat writes NO line, which
     is strictly worse than the refusal this fallback replaces. "At most one chunk" is a bound on
     BYTES, not on TIME; stated as one chunk it was false. So: `read1` where the response offers it
     (one recv per call, and `HTTPResponse.read1` exists on every CPython this repo runs), the
@@ -2183,8 +2311,10 @@ def _queue_rest(deadline=None):
     kill"; that is not true as written, and this file's own
     `test_a_response_that_arrives_past_the_budget_contributes_NO_chunk` demonstrates a page whose
     `open()` alone spends 60 s against a 10 s budget. The arithmetic in `QUEUE_READ_MAX_S`
-    (12 + 45 + 12 against the 90 s kill) leaves ~21 s of headroom, which is LESS than one 30 s
-    header phase -- so a header stall can carry the tick past the kill, where NO line prints.
+    (12 + 100 + 12 against the 180 s bound) leaves ~56 s of headroom -- less than two 30 s
+    header phases, so a header stall can still carry the tick past that bound, where NO line
+    prints. (#2227 raised the cap and the bound together; before it the same arithmetic left
+    ~21 s of headroom, which made the read budget a kill timer rather than a budget.)
     Stated rather than papered over: closing it needs a bound on the header phase (a shorter
     per-recv timeout, or a watchdog around `open()`), which is a change to `_rest_get`'s socket
     handling and not to this budget.
@@ -2405,8 +2535,12 @@ def queue():
     reads = 0
     resample_failed = 0
     read_start = _monotonic()
-    read_deadline = read_start + QUEUE_READ_MAX_S   # the cap the WHOLE read answers to (see above)
-    deadline = read_start + QUEUE_BLIND_BUDGET_S    # measured from the FIRST read
+    _cap = _read_cap_s()                            # clipped to the CALLER's bound (see above)
+    read_deadline = read_start + _cap               # the cap the WHOLE read answers to
+    deadline = read_start + min(float(QUEUE_BLIND_BUDGET_S), _cap)   # measured from read 1
+    _t0 = _wall()          # MEASUREMENT, not a bound -- see `_wall()`
+    attempts_tried = 1     # reads ATTEMPTED (not samples accepted): what the refusal reports
+    QUEUE_READ_FAIL.clear()
     for attempt in range(QUEUE_BLIND_ATTEMPTS):
         remaining = deadline - _monotonic()
         if attempt and remaining <= 0:
@@ -2581,10 +2715,31 @@ def queue():
                          else isinstance(e, (RuntimeError, subprocess.TimeoutExpired)))
             _note_gh_failure(f"queue read failed: {e}", surface, transport=transport)
             if sample is None:
+                # ⛔ A FAILED READ IS A FACT ABOUT THE READ, AND THE RECORD MUST SURVIVE THE
+                # `return None` (#2227). The caller cannot report "how long it waited" or "what
+                # it tried" from a bare `None` -- and a refusal whose message omits both is
+                # indistinguishable from one that failed instantly, which is exactly how a
+                # crowded box read as an outage. Recorded here, at the ONE exit that loses the
+                # data; the reader is `build()`'s queue segment.
+                #
+                # WHAT IT TRIED IS READ FROM THE FAILURE RECORD, NOT FROM THE ATTEMPT COUNTER:
+                # the primary failure path ALSO consults the REST second source, so a counter
+                # that stands at 1 would claim the fallback was never reached on the very ticks
+                # that ran it. `GH_LAST_ERROR` is the record of the LAST read that failed, and
+                # the REST arm prefixes its own cause with "rest second source".
+                _rest_tried = "rest second source" in (GH_LAST_ERROR or "")
+                QUEUE_READ_FAIL.update(
+                    waited_s=round(_wall() - _t0, 1),
+                    tries=attempts_tried,
+                    tried=("gh pr list --limit %d (GraphQL)" % QUEUE_PRIMARY_LIMIT
+                           + ("; then REST /pulls" if _rest_tried
+                              else "; the REST second source was not reached")),
+                    cause=str(e)[:160])
                 return None
             resample_failed += 1
             break
         reads += 1
+        attempts_tried = reads
         ms = Counter(p.get("mergeStateStatus") or "?" for p in non)
         unknown = _mergeable_unknown(ms)
         blind_now = _queue_read_is_blind(unknown, len(non), source)
@@ -2632,9 +2787,16 @@ def queue():
             # "an unread value must never render as a zero" shape this file forbids. No consumer
             # reads these two today; making them honest is what stops the next one inheriting a
             # false zero.
+            # `dirty`/`unstable` are None whenever the merge state was unread (see above).
             "dirty": None if (blind or unread) else ms.get("DIRTY", 0),
             "unstable": None if (blind or unread) else ms.get("UNSTABLE", 0), "unknown": unknown,
             "source": source,
+            # ⛔ HOW LONG THE READ TOOK IS PART OF THE ANSWER, NOT A DEBUG DETAIL (#2227). On this
+            # fleet a queue read costs 0.7 s on a quiet box and 63 s at 13 lanes, and until now
+            # both printed as a bare `open=14` -- so a reader could not tell a fast path from one
+            # that had spent the entire budget and got in by a hair. `read_s` is what lets
+            # `build()` say SLOW beside the data instead of leaving the reader to guess.
+            "read_s": round(_wall() - _t0, 1),
             "mergeable_reads": reads, "resample_failed": resample_failed,
             "classes": classes, "by_class": by_class, "surface": surface,
             # ⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872): `classify_queue()` returns it in
@@ -2784,12 +2946,28 @@ def build(prev=None):
         # can only be calibrated from the second: on the settling path the count is the datum, and
         # on the never-settling path it is the only datum there is.
         _rsf = " resample=FAILED" if q.get("resample_failed") else ""
+        # ⛔ THE WAIT IS PART OF EVERY `queue_read` TOKEN (#2227). It is appended AFTER the token's
+        # closing paren rather than inside it, so every existing pin on the token's shape
+        # (`queue_read=BLIND(14/14 unread, samples=4)`) still matches: the count, the threshold and
+        # the ordering are #1869's and are unchanged, and the DURATION is the new fact beside them.
+        # A refusal that says nothing about how long it waited reads like an instant one -- which is
+        # how a crowded box (63 s, measured) was reported as an outage (0.09 s on the wire).
+        _waited = q.get("read_s")
+        _wait_tok = (f" waited={_waited:.1f}s" if isinstance(_waited, (int, float)) else "")
+        # ⛔ SLOW IS NOT BLIND, AND THAT IS THE WHOLE POINT (#2227). The read ANSWERED -- the
+        # counts beside this token are DATA -- it simply answered late, because `gh` is serialised
+        # per box (#2005) and this box had 13 lanes on it. `BLIND` stays reserved for its #1869
+        # meaning (the merge state never came back readable), because a word that covers both
+        # "we waited 63 s and got an answer" and "we never got an answer" cannot be acted on.
+        _slow = (not _blind and _src != "rest"
+                 and isinstance(_waited, (int, float)) and _waited >= SLOW_READ_S)
         if _u:
             parts.append(f"mergeable_state_unknown={_u}")
         if _blind:
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
-            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads}){_rsf}"
+            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads})"
+                         f"{_rsf}{_wait_tok}"
                          " -- the QUEUE counts are NOT a clearance")
         elif _src == "rest":
             # ⛔ THE FALLBACK MUST NOT MANUFACTURE BLINDNESS (#2138), AND IT MUST NOT PASS FOR A
@@ -2803,7 +2981,8 @@ def build(prev=None):
             # says exactly which half is trustworthy.
             if _u:
                 parts.append(f"queue_read=REST(merge_state unread {_u}/{q['nondraft']},"
-                             f" samples={_reads}){_rsf} -- list read over REST; GitHub did not"
+                             f" samples={_reads}){_rsf}{_wait_tok} -- list read over REST;"
+                             " GitHub did not"
                              " compute the merge state, so the CLASS counts are NOT a clearance"
                              " (queue depth IS read)")
             else:
@@ -2812,7 +2991,8 @@ def build(prev=None):
                 # file could not read as a list, and when it hit its own row cap — so the old
                 # wording sent a reader to hunt a rate limit that never happened. Saying only
                 # what is known costs the same.
-                parts.append(f"queue_read=REST(samples={_reads}){_rsf} -- the open-PR list was"
+                parts.append(f"queue_read=REST(samples={_reads}){_rsf}{_wait_tok} -- the"
+                             " open-PR list was"
                              " read over REST because the GraphQL read produced no usable list"
                              " (refused, or an answer this file could not read as one)")
             # ⛔ THE FILE OVERLAY IS A THIRD, SEPARATE DEGRADATION, AND OMITTING ITS TOKEN IS
@@ -2824,7 +3004,14 @@ def build(prev=None):
             # `ASK-USER` exists for. So it is PRINTED as unread, before the `QUEUE(` segment.
             parts.append("ASK-USER: surface=UNREAD(rest list carries no file list)")
         elif _reads > 1 or _rsf:
-            parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}")
+            parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}{_wait_tok}")
+        elif _slow:
+            # THE READ THAT WAS MERELY LATE. No caveat, because there is nothing to caveat: the
+            # counts, the classes and the owner's list are all real. The sentence exists so a
+            # reader can see the fleet is queueing rather than the instrument being unreliable --
+            # and so `waited=` is never the only difference between two lines that look alike.
+            parts.append(f"queue_read=SLOW(waited={_waited:.1f}s, samples={_reads}){_rsf}"
+                         " -- the counts are DATA: the read answered late, it did not fail")
         if q.get("surface"):
             _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
             parts.append(f"ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else ""))
@@ -2890,6 +3077,26 @@ def build(prev=None):
         waiting = q["nondraft"]
     else:
         parts.append("queue=UNREADABLE")
+        # ⛔ A REFUSAL MUST NAME ITSELF (#2227): WHAT IT TRIED, HOW LONG IT WAITED, AND THE AGE OF
+        # THE LAST THING THAT WAS ACTUALLY READ. `queue=UNREADABLE` alone is three facts short of a
+        # diagnosis -- and the missing one that matters most is the WAIT, because a 100 s wait that
+        # timed out is a crowded box (a capacity fact: add no lanes, or spread them) while a 0.3 s
+        # refusal is a rate limit (a wait-a-minute fact). The two demand opposite responses and used
+        # to print the same token.
+        #
+        # ⛔ AND IT PRINTS NO COUNT. This is #1869's line, not a relaxation of it: the last good
+        # sample's AGE is borrowed from the cache's mtime, never its numbers, so a stale value can
+        # never stand in for an unread one. `last_good=none` is said out loud rather than omitted,
+        # because an absent token would read as "we have never read it" only by inference.
+        _lg = _last_good_age_s()
+        _lg_tok = f"last_good={_lg}s" if _lg is not None else "last_good=none"
+        _wait = QUEUE_READ_FAIL.get("waited_s")
+        _wait_ref = (f"waited={_wait:.1f}s" if isinstance(_wait, (int, float))
+                     else "waited=?")
+        parts.append(
+            f"queue_read=UNREADABLE({_wait_ref}, {_lg_tok})"
+            f" -- tried {QUEUE_READ_FAIL.get('tried') or 'gh pr list (GraphQL)'}; the QUEUE counts"
+            " are NOT shown because none were read (a stale number is never substituted)")
         waiting = None
     # ⛔ THE QUEUE'S SHAPE IS NOT THE DISPATCHER'S HEALTH, AND THE VERDICT MUST SURVIVE BOTH A BLIND
     # QUEUE AND A LONG ONE (2026-10-18, owner-reported + review). Emitted OUTSIDE every queue branch
