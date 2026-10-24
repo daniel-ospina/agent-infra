@@ -998,7 +998,7 @@ def activation_gap(d: dict) -> str:
     pin, reported "1/1 box(es) ... deployed AND activated". The one state goal 2 exists to catch (a
     merge that is not in effect anywhere) was the state it certified as met.
 
-    Four answers, each a fact about the read and never a default:
+    Six answers, each a fact about the read and never a default:
       ""                      the controller's argv resolves to this cycle's harness main;
       `restart-pending(...)`  it resolves to a DIFFERENT commit — the pin advanced, the process did not;
       `running=NONE`          no controller process was found to ask (the STOPPED reason owns that);
@@ -2645,19 +2645,33 @@ def harness_repo_of(o: Path) -> Path | None:
     the harness at a sha that does not exist in agent-infra. Pointed at the harness repo the same box
     reads `[current]`.
 
-    Resolution is the payload's own git identity (`$O` is inside the harness checkout/worktree), with
-    `HARNESS_REPO` honoured first because that is the variable the fleet's supervisor already exports.
+    Resolution: `HARNESS_REPO` first (the variable the fleet's supervisor already exports), then the
+    checkout containing `$O`, then the checkout containing THIS script, then the conventional
+    `$HOME/orchestrator` — and each candidate must carry the harness (`box-status.sh` at its root or
+    under `scripts/orchestrator-harness/`), so a candidate that is merely SOME checkout is skipped.
     """
     # ⛔ FOUR CANDIDATES, BECAUSE THE TIMER EXPORTS NONE OF THE FIRST TWO. Measured (round-1 review of
-    # PR #2683): the timer this file installs exports only `O`/`HOME`/`PATH` (`_timer_cmd`, below), and
-    # `--o` defaults to `$HOME/orchestrator` — which on the hub is NOT a checkout. So a resolution that
-    # consulted `HARNESS_REPO` and `$O` alone returned None in the DEFAULT and TIMER configurations, the
-    # caller fell back to the swept repo's main, and the report printed `**harness main:** 5f40d832c254`
-    # — a tortoise sha labelled as the harness main — over the very #2679 reading this change exists to
-    # remove. The third candidate fixes that: this script lives inside the harness payload
-    # (`$O/scripts/orchestrator-harness/merge-reminder.py`, and the same relative position in a repo
-    # checkout), so `parents[2]` IS the harness checkout. The fourth is the conventional location, kept
-    # only because it is the documented `--o` default.
+    # PR #2683): the timer this file installs exports only `O`/`HOME`/`PATH` (see the timer installer),
+    # and `--o` defaults to `$HOME/orchestrator` — which on the hub is NOT a checkout. So a resolution
+    # that consulted `HARNESS_REPO` and `$O` alone returned None in the DEFAULT and TIMER
+    # configurations, the caller fell back to the swept repo's main, and the report printed
+    # `**harness main:** 5f40d832c254` — a tortoise sha labelled as the harness main — over the very
+    # #2679 reading this change exists to remove. The third candidate fixes that: this script lives
+    # inside the harness payload (`$O/scripts/orchestrator-harness/merge-reminder.py`, and the same
+    # relative position in a repo checkout), so `parents[2]` IS the harness checkout. The fourth is the
+    # conventional location, kept only because it is the documented `--o` default.
+    #
+    # ⛔ AND A CANDIDATE MUST PROVE IT **IS** THE HARNESS REPO, NOT MERELY THAT IT IS A CHECKOUT (#2683
+    # round 2). `git rev-parse --show-toplevel` succeeding says "a repo", and two of the four candidates
+    # are paths an operator or a deploy script chose: `$O` (a flat payload can land anywhere) and
+    # `$HOME/orchestrator` (measured on this fleet as a TORTOISE checkout, `origin/main=5f40d832c254`).
+    # Accepting either on a checkout test alone brought #2679 back in full — and SILENTLY, because when
+    # that wrong repo happens to be the SWEPT repo the caller sees "same repo" and reuses the swept
+    # main, which is precisely the foreign-sha comparison the goal must never make. So a candidate
+    # qualifies only if it CARRIES THE HARNESS: `scripts/orchestrator-harness/box-status.sh` in a repo
+    # checkout, or `box-status.sh` at the root of a flat payload. That is an offline, local fact about
+    # the tree — never a remote URL, which forks legitimately change — and a non-harness checkout has
+    # neither.
     here = script_checkout()
     cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
              str(Path.home() / "orchestrator")]
@@ -2665,8 +2679,13 @@ def harness_repo_of(o: Path) -> Path | None:
         if not c:
             continue
         rc, out, _ = run(["git", "-C", c, "rev-parse", "--show-toplevel"], timeout=15)
-        if rc == 0 and (out or "").strip():
-            return Path(out.strip())
+        top = (out or "").strip()
+        if rc != 0 or not top:
+            continue
+        root = Path(top)
+        if (root / "scripts" / "orchestrator-harness" / "box-status.sh").is_file() \
+                or (root / "box-status.sh").is_file():
+            return root
     return None
 
 

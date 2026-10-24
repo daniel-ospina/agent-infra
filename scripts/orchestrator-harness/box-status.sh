@@ -92,10 +92,31 @@ elif [ -n "$stamp_commit" ]; then src="stamp"; id="$stamp_commit"; fi
 # made goal 2 unreachable on the cells whose sweep repo is not agent-infra.
 # Priority: the fleet's own `HARNESS_REPO`, then the payload's own checkout (`$O` is inside it),
 # then this script's checkout, and only then `$HOME/orchestrator` as the last resort.
-if [ -z "$REPO" ]; then
+#
+# ⛔ AND A CANDIDATE MUST PROVE IT **IS** THE HARNESS REPO, NOT MERELY THAT IT IS A CHECKOUT (#2683
+# round 2). `rev-parse --git-dir` succeeding says "a repo", and two of these candidates are paths a
+# human or a deploy script chose: `$O` (a flat payload can land anywhere) and `$HOME/orchestrator`
+# (measured on this fleet as a TORTOISE checkout, `origin/main=5f40d832c254`). Accepting either on a
+# checkout test alone compared a harness sha against tortoise's main — the wrong-repo reading this
+# script exists to remove, and it was SILENT because the answer still looked like a sha. A candidate
+# qualifies only if it CARRIES THE HARNESS: `scripts/orchestrator-harness/box-status.sh` in a repo
+# checkout, or `box-status.sh` at the root of a flat payload. Same rule as `harness_repo_of()` in
+# merge-reminder.py, so the two readers cannot disagree inside one report (#2680's lesson).
+carries_harness() {
+  [ -n "${1:-}" ] || return 1
+  [ -f "$1/scripts/orchestrator-harness/box-status.sh" ] || [ -f "$1/box-status.sh" ]
+}
+REF_WHY=""
+if [ -n "$REPO" ]; then
+  # An explicit `--repo` is an operator's assertion, but it is the SAME question, so it gets the same
+  # test — and a rejected one is named on `ref:` rather than silently accepted.
+  carries_harness "$REPO" || { REF_WHY="--repo '$REPO' does not carry the harness"; REPO=""; }
+else
   for c in "${HARNESS_REPO:-}" "$O" "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)" "$HOME/orchestrator"; do
     [ -n "$c" ] || continue
-    if git -C "$c" rev-parse --git-dir >/dev/null 2>&1; then REPO="$c"; break; fi
+    git -C "$c" rev-parse --git-dir >/dev/null 2>&1 || continue
+    carries_harness "$c" || continue
+    REPO="$c"; break
   done
 fi
 ref_sha=""
@@ -103,6 +124,9 @@ if [ -n "$REPO" ] && [ -d "$REPO" ]; then
   ref_sha="$(git -C "$REPO" rev-parse --verify "$REF" 2>/dev/null | head -1)"
 fi
 is_sha "${ref_sha:-}" || ref_sha=""
+if [ -z "$REPO" ] && [ -z "${REF_WHY:-}" ]; then
+  REF_WHY="no harness repo: no \$HARNESS_REPO, no checkout beside \$O, and none containing this script"
+fi
 
 relation="unknown"
 if [ -n "$id" ] && [ -n "$ref_sha" ] && [ -n "$REPO" ]; then
@@ -148,11 +172,24 @@ ctrl="${ctrl# }"
 running_ids=""
 if [ -n "$ctrl" ]; then
   for pid in $ctrl; do
-    cmd=""
-    if [ -r "/proc/$pid/cmdline" ]; then cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"; fi
-    [ -n "$cmd" ] || cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
     script=""
-    for w in $cmd; do case "$w" in */orch-loop.sh) script="$w" ;; esac; done
+    if [ -r "/proc/$pid/cmdline" ]; then
+      # ⛔ NUL-SEPARATED FIELDS, NOT A WHITESPACE SPLIT. `cmdline` is NUL-delimited precisely so that an
+      # argument may contain a space; flattening it with `tr '\0' ' '` and then iterating `for w in $cmd`
+      # turned a harness path with a space into two fragments, the last of which does not exist, so the
+      # box answered `running: UNREADABLE` while it was activated. `mapfile -d ''` keeps each argv
+      # element whole. (bash 4+; the deployed payload runs bash, not sh.)
+      argv=()
+      mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || argv=()
+      for w in "${argv[@]}"; do case "$w" in */orch-loop.sh) script="$w" ;; esac; done
+    fi
+    if [ -z "$script" ]; then
+      # The `ps` fallback is a SINGLE FLATTENED STRING by construction (there is no NUL-preserving
+      # portable form), so a path with a space is unresolvable here — the answer is then UNREADABLE
+      # (below), never a silently wrong tree. macOS lands here: `/proc` does not exist.
+      cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
+      for w in $cmd; do case "$w" in */orch-loop.sh) script="$w" ;; esac; done
+    fi
     [ -n "$script" ] || continue
     s="$(git -C "$(dirname "$script")" rev-parse HEAD 2>/dev/null | head -1)"
     is_sha "${s:-}" && running_ids="$running_ids $s"
@@ -196,7 +233,13 @@ else
   say "harness: $(sha12 "$id") [$relation] source=$src"
 fi
 say "stamp: $( [ -n "$stamp_commit" ] && sha12 "$stamp_commit" || printf 'UNRECORDED' )    pin: $( [ -n "$pin_commit" ] && sha12 "$pin_commit" || printf 'EMPTY' )"
-if [ -n "$ref_sha" ]; then say "ref: $REF=$(sha12 "$ref_sha")"; fi
+if [ -n "$ref_sha" ]; then
+  say "ref: $REF=$(sha12 "$ref_sha")"
+elif [ -n "$REF_WHY" ]; then
+  # A REFUSED repo is not an absent answer: the sha on `harness:` was compared against nothing, and a
+  # reader that cannot see why would take the missing line for "no opinion".
+  say "ref: UNRESOLVED ($REF_WHY)"
+fi
 if [ -n "$ctrl" ]; then
   say "controller: RUNNING(pid $(printf '%s' "$ctrl" | tr ' ' ','))"
 else
