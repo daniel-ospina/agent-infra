@@ -1098,20 +1098,32 @@ summary() { # <verb>
   return 0
 }
 
-# ── surface-check: would the checkout-guard CLASSIFY this script? (#2520) ──────────────────
+# ── surface-check: is THIS SCRIPT's git surface intact? (#2520) ─────────────────────────────
 # The one question a refused lane could not answer: is the sync command the rail told it to run
 # actually runnable here? A guard refusal happens before this file first line, so the caller gets
 # NO exit status — and silence has been read as success, which is the whole of #2520. This verb
-# turns that silence into a value: 0 = every git invocation here is one the guard can classify,
-# 5 = it would withhold the run, 3 = the check could not read its own source.
+# turns that silence into a value: 0 = the two rules below hold, 5 = they are violated, 3 = the
+# check could not read its own source.
 #
-# ⛔ IT IS A DELIBERATELY CONSERVATIVE RESTATEMENT OF TWO GUARD RULES, NOT A SECOND OPINION. The
-# rules are (a) a git invocation whose VERB arrives as a variable cannot be bounded, so the guard
-# fails closed on it, and (b) a verb that rewrites a working tree has no business in a registry
-# sync at all. Restating them can only OVER-refuse (a false 5 costs one grep), never under-refuse,
-# which is the safe direction for a check whose whole purpose is to catch a regression. The shipped
-# suite (§28) pins this against the guard OWN classifier on the real file and on two fixtures, so a
-# restatement that drifts reads as a red suite rather than as a quiet false OK.
+# ⛔ WHAT A 0 DOES **NOT** SAY, and the distinction is the whole reason this comment exists. The
+# checkout-guard has TWO content arms: (a) a git invocation whose VERB arrives as a variable cannot
+# be bounded (the arm #2520 was measured on, restated below), and (b) a DEEPER walk (#1484/#1485)
+# that blocks a script whose CONTENT mutates the hub — `push`, `update-ref`, `mktree`,
+# `commit-tree` — in a HUB-ROOTED session unless the script is named in the guard's own
+# `SANCTIONED_SCRIPT_RELPATHS`. A registry sync must push and update refs, so arm (b) refuses it in
+# a hub-rooted session no matter how clean this surface is, and NO RESTATEMENT HERE CAN CHANGE
+# THAT: measured with the guard's own `scriptGitVerdict(<this file>, "main")` → `block`, on this
+# head and on origin/main alike (the sanctioned scripts — record-review.sh, admin-merge.sh — read
+# `block` from that same function and are allowed only by the exemption that runs BEFORE it).
+# So: 0 means "this script has not re-introduced the surface defect #2520 was filed on". It does not
+# mean the guard will run it, and the doctor is told the difference. Making a hub-rooted session
+# run it is an OWNER decision about the guard's sanctioned list (#2621), never a quiet
+# edit to a safety gate from inside a lane.
+#
+# The two rules restated here are deliberately conservative: restating them can only OVER-refuse
+# (a false 5 costs one grep), never under-refuse. The shipped suite (§28) pins this against the
+# guard OWN classifier on the real file and on fixtures, so a restatement that drifts reads as a
+# red suite rather than as a quiet false OK.
 surface_check() {
   local hits rc
   hits="$(awk '
@@ -1172,14 +1184,14 @@ surface_check() {
     return 3
   fi
   if [ -z "$hits" ]; then
-    say "surface-check: OK — every git invocation in ${BASH_SOURCE[0]##*/} has a LITERAL verb the checkout-guard can classify, and none rewrites a working tree."
+    say "surface-check: OK — every git invocation in ${BASH_SOURCE[0]##*/} has a LITERAL verb and none rewrites a working tree (this is NOT a claim that the guard will run the script from a hub-rooted session — see #2621)."
     return 0
   fi
-  warn "surface-check: ⛔ the CHECKOUT-GUARD would withhold this script (#709): a git invocation whose"
-  warn "  verb it cannot bound makes EVERY verb here un-runnable, and the withheld run prints no exit"
+  warn "surface-check: ⛔ this script's git surface is NOT clean (the #2520 class): a git invocation whose"
+  warn "  verb cannot be bounded makes EVERY verb here un-runnable, and the withheld run prints no exit"
   warn "  status at all — which is exactly the state issue 2520 records. The offending line(s):"
   printf '%s\n' "$hits" | sed 's/^/  /' >&2
-  warn "  Fix the script git surface (one literal verb per line); never weaken the guard. Exit 5 = REFUSED."
+  warn "  Fix the script git surface (one literal verb per line); never weaken the guard. Exit 5 = SURFACE DEFECT."
   return 5
 }
 

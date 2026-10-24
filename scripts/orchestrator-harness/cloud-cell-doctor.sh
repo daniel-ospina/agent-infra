@@ -1423,24 +1423,33 @@ run_hygiene() {
         done
         rs_store_args=()
         [ -n "$store" ] && rs_store_args=(--repo "$store")
-        # ⏤ #2520: ASK THE GUARD'S OWN QUESTION BEFORE RUNNING. A withheld invocation leaves NO exit
-        # status at all — the guard refuses the whole command — so no arm on the run's rc can report
-        # it. `surface-check` is the script's own answer to "would the guard classify me?" (0 yes,
-        # 5 no, 3 cannot-check), and running it here is what makes a REFUSED registry visible in the
-        # log instead of reading as a silent, permanent LOCAL-ONLY box. Cheap: it only reads source.
+        # ⏤ #2520: ASK BEFORE RUNNING. A withheld invocation leaves NO exit status at all — the
+        # guard refuses the whole command — so no arm on the run's rc can report it. `surface-check`
+        # answers 0 surface-intact / 5 surface-defective / 3 cannot-check, and running it here is what
+        # makes a refused registry visible in the log instead of reading as a silent, permanent
+        # LOCAL-ONLY box. Cheap: it only reads the script's own source.
+        # ⛔ WHAT 0 DOES NOT MEAN: the guard has a SECOND content arm (#1484/#1485) that blocks a
+        # script whose content pushes/updates refs in a HUB-ROOTED session unless the script is on
+        # the guard's sanctioned list, and NO surface check can change that (#2621). A
+        # registry sync must push, so on a hub-rooted box the union is still withheld; the log below
+        # reports what this check actually verified, never "the guard will run it".
         rs_out="$(run_bounded "$DOCTOR_REGISTRY_NET_TIMEOUT" bash "$rsync" surface-check 2>&1)"; rc=$?
         if [ "$rc" -ne 0 ]; then
-          # ⛔ rc=3 IS NOT A REFUSAL. surface-check answers 0 classify / 5 would-refuse / 3
-          # could-not-check, and collapsing 3 into "the guard withheld it" reports a refusal that
-          # never happened — a box missing `awk`, or carrying an unreadable script, would log it for
-          # ever and never rediscover the real cause. The union still does not run (fail closed);
-          # only the STATEMENT differs, and it names the cause it actually has.
+          # ⛔ ONLY rc=5 IS A GUARD ATTRIBUTION. Every other non-zero was being folded into "the
+          # checkout-guard would withhold it" — but a bound firing (124), a script bash could not
+          # parse (2) or an interpreter/script that vanished (127) is NOT a guard refusal, and a log
+          # that names the guard sends the next lane to re-litigate the gate instead of fixing the
+          # fault. The union does not run on any of them (fail closed); only the STATEMENT differs,
+          # and each arm names the cause it actually has.
           if [ "$rc" -eq 3 ]; then
             log "[hygiene] WARN review-registry union NOT RUN — could not VERIFY the script's git surface (surface-check rc=3, NOT VERIFIED): the registry is UNCHANGED, not converged, and the cause is NOT a guard refusal: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
             result="${result}${result:+; }registry union NOT RUN — git surface could not be verified"
+          elif [ "$rc" -eq 5 ]; then
+            log "[hygiene] WARN review-registry union NOT RUN — the script's git surface is DEFECTIVE (#2520, surface-check rc=5), so the guard would withhold every verb; the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union REFUSED — git surface defect (#2520)"
           else
-            log "[hygiene] WARN review-registry union NOT RUN — the checkout-guard would withhold this script's git surface (#2520, surface-check rc=$rc), so the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
-            result="${result}${result:+; }registry union REFUSED by the checkout-guard"
+            log "[hygiene] WARN review-registry union NOT RUN — surface-check did NOT answer (rc=$rc: bound fired, unparseable script, or interpreter missing), so the cause is UNKNOWN and is NOT a guard refusal; the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union NOT RUN — surface-check rc=$rc, cause unknown"
           fi
         else
         # --dir is EXPLICIT: the registry the cell's LANES read is this HOME's, and a step that

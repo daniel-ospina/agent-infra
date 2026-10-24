@@ -32,7 +32,7 @@
 #   §23 `status` counts the STORE's records, not this box's cache
 #   §24 every network op is BOUNDED and cannot block on an invisible prompt
 #   §27 the convergence line — refs/files/added/updated/skipped counted from the RUN (#2577)
-#   §28 surface-check — the checkout-guard can CLASSIFY this script; a dynamic verb is exit 5 (#2520)
+#   §28 surface-check — this script's git surface is intact; a dynamic or unlisted verb is exit 5 (#2520)
 #   §29 a trailing-newline-only local record is CANONICALISED to the published bytes (#2577)
 #   §30 the equality fast path never MASKS an unstamped or mis-keyed record that is already
 #       mirrored here — it is still counted unreadable (exit 4), never `same` (#2577 rules 1/3)
@@ -715,12 +715,19 @@ assert_absent "$BOX8" "$BOX8/daniel-ospina-agent-infra-1919.json" "§27 ...no fi
 # ═══ 28. the SURFACE CHECK: the guard can classify this script (#2520) ════════
 # The regression fence for #2520 itself. The bug was not a wrong answer from the guard — it was
 # that the script's ONE dynamic-argv wrapper made EVERY verb un-runnable from an agent's shell, and
-# the refusal left no exit status at all. `surface-check` asks the guard's OWN classifier, so this
-# assertion cannot drift from what the guard will actually do.
-echo "── §28 surface-check: 0 when the guard can classify this script, 5 when it would refuse it"
+# the refusal left no exit status at all. `surface-check` restates the two surface rules the script
+# itself must keep, and §28 pins that restatement against the guard's own classifier below.
+# ⛔ A 0 HERE IS NOT "THE GUARD WILL RUN IT". The guard's SECOND content arm (#1484/#1485) blocks a
+# script whose content pushes/updates refs in a HUB-ROOTED session unless it is on the guard's
+# sanctioned list, and a registry sync must push — so the contract is "this script has not
+# re-introduced the surface defect", which is what the message says and what the doctor relies on
+# (#2621).
+echo "── §28 surface-check: 0 when this script's git surface is intact, 5 when it is defective"
 OUT="$(bash "$SYNC" surface-check 2>&1)"; RC=$?
-assert_eq "$RC" "0" "§28 the shipped script is CLASSIFIABLE (union/status/pull are runnable from an agent shell)"
+assert_eq "$RC" "0" "§28 the shipped script's git surface is INTACT (no dynamic verb, no working-tree verb)"
 assert_contains "$OUT" "every git invocation" "§28 ...and it says so in one line"
+assert_contains "$OUT" "NOT a claim that the guard will run the script from a hub-rooted session" \
+  "§28 ...and it does NOT claim the guard will run it (the #2621 residual, stated not implied)"
 # ⛔ THE FIXTURES ARE ASSEMBLED WITH %s PLACEHOLDERS, and the reason is the guard itself: it reads
 # a script an agent asks it to run, and its tokenizer scans STRING LITERALS as text, so a test file
 # that spells the refused construct verbatim is refused WHOLE (measured: `Form: script-indirection`
@@ -733,8 +740,7 @@ printf '\nbad_one() { "timeout" 5 git -C "%s" -c gc.auto=0 "%s"; }\n' "$STORE" '
 OUT="$(bash "$BAD" surface-check 2>&1)"; RC=$?
 assert_eq "$RC" "5" "§28 a dynamic-argv wrapper is REFUSED (exit 5) — the check is non-vacuous"
 assert_contains "$OUT" "dynamic verb" "§28 ...and the refusal names the construct"
-assert_contains "$OUT" "CHECKOUT-GUARD" "§28 ...and names the GUARD, so the next lane does not rediscover #2520"
-# ...and the other half of the contract: a registry sync must never need a working-tree verb at all
+assert_contains "$OUT" "#2520" "§28 ...and names the issue, so the next lane does not rediscover it"
 WT="$T/registry-sync-wt.sh"
 cp "$SYNC" "$WT"
 printf '\nbad_two() { git -C "$STORE" %s -- .; }\n' "chec"'kout' >> "$WT"
@@ -751,6 +757,16 @@ printf '\nbad_three() { git -C "%s" %s push -u; }\n' "$STORE" "sta"'sh' >> "$WT2
 OUT="$(bash "$WT2" surface-check 2>&1)"; RC=$?
 assert_eq "$RC" "5" "§28 an UNLISTED working-tree verb (stash) is REFUSED — the allowlist is closed, not a blocklist"
 assert_contains "$OUT" "working-tree verb" "§28 ...and it names the class, so the fix is obvious"
+# ⛔ AND THE CASE THAT ACTUALLY DISCRIMINATES. `stash` is in the working-tree CLASS string, so a
+# rewrite that reverts to "block the wt list, allow everything else" still returns 5 for it — the
+# assertion above would stay green through the exact regression it names. A verb in NEITHER list is
+# refused only by the allowlist branch, so this is the fence (review cycle 2).
+WT3="$T/registry-sync-wt3.sh"
+cp "$SYNC" "$WT3"
+printf '\nbad_four() { git -C "%s" gre''p foo; }\n' "$STORE" >> "$WT3"
+OUT="$(bash "$WT3" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 a verb in NEITHER list is REFUSED (exit 5) — only a closed allowlist can do that"
+assert_contains "$OUT" "unlisted verb" "§28 ...and it says the verb is unlisted, not that it rewrites a tree"
 # "I could not check" is not a pass either.
 mkdir -p "$T/nopath"
 OUT="$(env PATH="$T/nopath" "$BASH" "$SYNC" surface-check 2>&1)"; RC=$?
