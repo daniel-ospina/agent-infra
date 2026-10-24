@@ -3343,10 +3343,12 @@ while true; do
     # `backlog empty queue=READ(192)` shape, one surface over.
     # ⛔ AND A FAILED FETCH IS NOT A FAILED PUBLISH (review, P2). Both used to print the same
     # "the fetch did NOT answer … no PR is spawned or armed" line, which was FALSE for a write
-    # failure: the fetch answered, nothing was published, and the PREVIOUS snapshot keeps its own
-    # `ok` header and is still believed until it ages out. Two causes with opposite consequences
-    # must not share one sentence — an auditor was being pointed at the network when the cause was
-    # the disk.
+    # failure: the fetch answered and nothing was published, so the PREVIOUS snapshot is still on
+    # disk with its OWN header — and whether it is believed is that header's answer, not this
+    # comment's: the reader believes it only while the header says `ok` AND it is inside the age
+    # bound, and answers `claim-unreadable` for a prior `failed` header or for no prior snapshot at
+    # all. Two causes with opposite consequences must not share one sentence — an auditor was being
+    # pointed at the network when the cause was the disk.
     # ⛔ FOUR ARMS, NOT THREE (round-3 review, P2). Fetch and publish FAIL INDEPENDENTLY — a full disk
     # breaks BOTH in one cycle (`git fetch` writes packs into $REPO/.git, the publish writes under
     # $O/state) — and the conjunction is the case where the "the failed answer WAS published, so

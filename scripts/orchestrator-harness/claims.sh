@@ -1373,10 +1373,14 @@ claim_snapshot() {
   else
     # ⛔ A FAILED PUBLISH IS NOT A FAILED FETCH (review, P2). `fetch` keeps the FETCH's own answer;
     # `write` records this failure. On a failed FETCH the published header itself says `failed`, so
-    # the reader refuses it; on a failed PUBLISH nothing is published, the PREVIOUS snapshot survives
-    # with its own `ok` header, and it is still believed until it ages out at
-    # CLAIM_SNAPSHOT_MAX_AGE. Collapsing the two made the cycle log assert a stand-down that did not
-    # happen, and pointed an auditor at the network when the cause was the disk.
+    # the reader refuses it at any age. On a failed PUBLISH nothing is published, so the PREVIOUS
+    # snapshot survives with its OWN header — and that header decides, not this function: the reader
+    # believes it only while the header says `ok` AND it is inside CLAIM_SNAPSHOT_MAX_AGE, and answers
+    # `claim-unreadable` for a prior `failed` header or for no prior snapshot at all. (An earlier
+    # draft of this very comment said the snapshot was believed "until it ages out", which the reader
+    # falsifies in two of those three cases — do not reintroduce the unqualified form.) Collapsing the
+    # two made the cycle log assert a stand-down that did not happen, and pointed an auditor at the
+    # network when the cause was the disk.
     write=failed; n=0
     rm -f "$tmp" "$body" 2>/dev/null || true
   fi
