@@ -28,6 +28,9 @@
 #   (c) a STALE scout (an orphaned lock) is REPAIRED and the report names the lock by PATH;
 #   (d) NON-VACUITY: with the cause-recording reverted, (a) goes red — the record says "no cause".
 #   (a2) an index.lock whose AGE cannot be read is REFUSED, never repaired (#2688 review, P1).
+#   (a3) an UNEVALUABLE SCOUT_LOCK_STALE_SECS is refused, and a fresh lock survives it.
+#   (a4) a DANGLING SYMLINK at index.lock is refused and named, not mistaken for "no lock".
+#   (a5) a DIRTY scout records WHY it refused — not the "no recorded reason" fallback.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -118,9 +121,9 @@ mk_case healthy
 rp "$D"
 ck "(b) healthy provision proceeds (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 ck "(b) the pass recorded an outcome PAST provision (stage=$(rec stage))" \
-   "$([ "$(rec stage)" != provision ]; echo $?)"
+   "$([ -s "$D/o/state/refresh-last" ] && [ -n "$(rec stage)" ] && [ "$(rec stage)" != provision ]; echo $?)"
 ck "(b) no provision failure was recorded (result=$(rec result))" \
-   "$([ "$(rec result)" != fail ] || [ "$(rec stage)" != provision ]; echo $?)"
+   "$([ -s "$D/o/state/refresh-last" ] && [ -n "$(rec result)" ] && [ "$(rec result)" != fail ]; echo $?)"
 ck "(b) the scout was actually moved to origin/main" \
    "$(git -C "$D/repo/.worktrees/dispatch-scout" diff --quiet origin/main --; echo $?)"
 
@@ -182,6 +185,58 @@ case "$WHY" in *"$LOCK"*) r=0 ;; *) r=1 ;; esac
 ck "(a2) the cause NAMES the lock path (why=${WHY:0:120})" "$r"
 case "$WHY" in *"AGE COULD NOT BE DETERMINED"*) r=0 ;; *) r=1 ;; esac
 ck "(a2) the cause says the AGE is unknown, not that the lock is orphaned" "$r"
+
+# ── (a3) AN UNEVALUABLE STALENESS BOUND IS ALSO A REFUSAL, NOT A REPAIR ──────────────────────────────
+# `[ "$age" -lt "5m" ]` exits 2 (`integer expression expected`) and `if` reads ANY non-zero as FALSE, so
+# an operator's non-numeric SCOUT_LOCK_STALE_SECS skipped the live-writer arm and reached the `rm -f` —
+# deleting a 0-second-old LIVE lock while printing a `REPAIR:` line (#2688 review cycle 2, P1).
+BOUNDN=0
+for bad in 5m abc 0 '300 '; do
+  BOUNDN=$((BOUNDN+1))
+  mk_case "bound-$BOUNDN"
+  LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
+  : > "$LOCK"
+  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+          SCOUT_LOCK_STALE_SECS="$bad" \
+          HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
+          bash "$REFRESH" 6 2>&1)"
+  RC=$?
+  ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+  ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' did NOT delete a FRESH lock" "$([ -e "$LOCK" ]; echo $?)"
+  case "$OUT" in *"REPAIR: removed"*) r=1 ;; *) r=0 ;; esac
+  ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' printed no REPAIR line" "$r"
+  case "$(rec why)" in *"CANNOT BE EVALUATED"*) r=0 ;; *) r=1 ;; esac
+  ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' records that the bound cannot be evaluated" "$r"
+done
+
+# ── (a4) A DANGLING SYMLINK AT index.lock IS SEEN, NOT MISTAKEN FOR "NO LOCK" ─────────────────────────
+# `[ -e ]` follows symlinks, so a dangling one read as "no lock": nothing aged, refused or repaired it,
+# git still could not create the lock, and the checkout refusal promised a self-heal that cannot happen
+# (#2688 review cycle 2, P2). The NON-REGULAR arm must refuse, name the path, and NOT delete it.
+mk_case dangling-lock
+LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
+ln -s "$D/does-not-exist" "$LOCK"
+rp "$D"
+ck "(a4) a dangling index.lock symlink refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+ck "(a4) the symlink was NOT deleted (still present)" "$([ -L "$LOCK" ]; echo $?)"
+WHY="$(rec why)"
+case "$WHY" in *"$LOCK"*) r=0 ;; *) r=1 ;; esac
+ck "(a4) the cause NAMES the lock path (why=${WHY:0:120})" "$r"
+
+# ── (a5) A DIRTY SCOUT RECORDS *WHY* IT REFUSED, NOT "refused without a recorded reason" ─────────────
+# The two `scout_sync` refusal arms set the rc and printed their own lines but never `SCOUT_REFUSE_WHY`,
+# so `state/refresh-last` — the file the controller's `[dispatch] BLOCKED` line quotes — said
+# "scout_sync refused without a recorded reason" while the cause sat one log line above (#2688 review
+# cycle 2, P2): #2229's own symptom, surviving in the change that exists to remove it.
+mk_case dirty-scout
+printf 'local edit\n' >> "$D/repo/.worktrees/dispatch-scout/README.md"
+rp "$D"
+ck "(a5) a dirty scout refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+WHY="$(rec why)"
+case "$WHY" in *"UNCOMMITTED"*) r=0 ;; *) r=1 ;; esac
+ck "(a5) the recorded cause names UNCOMMITTED work (why=${WHY:0:120})" "$r"
+case "$WHY" in *"recorded no cause"*|*"without a recorded reason"*) r=1 ;; *) r=0 ;; esac
+ck "(a5) the recorded cause is NOT the 'no recorded reason' fallback" "$r"
 
 # ── (d) NON-VACUITY: revert the cause-recording, and (a) MUST go red ────────────────────────────────
 # A copy of the SHIPPED script with ONE line reverted to the pre-fix shape (`|| exit "$SCOUT_REFUSE_RC"`

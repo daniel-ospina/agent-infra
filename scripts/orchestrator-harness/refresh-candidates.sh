@@ -1141,7 +1141,25 @@ scout_clear_stale_lock() {
   local gd lock age mtime
   gd="$(git -C "$SC" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
   lock="$gd/index.lock"
-  [ -e "$lock" ] || return 0
+  # ⛔ `-e` FOLLOWS SYMLINKS, SO A DANGLING ONE READS AS "NO LOCK" (#2688 review cycle 2, P2).
+  # MEASURED: with `index.lock` a symlink to a nonexistent path, `[ -e ]` is false, so nothing aged,
+  # refused or repaired it — yet git still cannot create the lock (`File exists`), so the checkout
+  # refusal promised a self-heal ("cleared by the next pass once it is older than Ns") that could
+  # never happen and the cell loops TRANSIENT forever on an unrepaired lock. `-L` 
+  # makes the symlink visible, and the NON-REGULAR ARM below then refuses with its truthful remedy.
+  [ -e "$lock" ] || [ -L "$lock" ] || return 0
+  # ⛔ THE BOUND IS OPERATOR INPUT AND IT IS VALIDATED, NOT TRUSTED (#2688 review cycle 2, P1).
+  # MEASURED: `SCOUT_LOCK_STALE_SECS=5m` makes `[ "$age" -lt "5m" ]` exit 2 with `integer expression
+  # expected`, and `if` reads ANY non-zero status as FALSE — so the live-writer arm was skipped and a
+  # 0-second-old LIVE lock reached the `rm -f` below, with a `REPAIR:` line asserting it was "0s old
+  # > 5ms". 0 is refused for the same reason: it makes NOW count as stale. A bound that cannot be
+  # evaluated means the pass cannot call any lock stale, so it refuses.
+  case "$SCOUT_LOCK_STALE_SECS" in
+    ''|*[!0-9]*|0)
+      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+      SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is not a positive whole number of seconds, so the staleness bound CANNOT BE EVALUATED and this pass cannot tell an orphaned lock from a LIVE WRITER'S — REFUSING TO JUDGE rather than delete it. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), or set it to a positive integer, then re-run"
+      return 1 ;;
+  esac
   if [ ! -f "$lock" ]; then
     SCOUT_REFUSE_RC="$EXIT_NOT_PROVISIONABLE"
     SCOUT_REFUSE_WHY="scout at $SC has a NON-REGULAR FILE at $lock — git refuses every index write while it exists, and this pass will not delete something it cannot identify. Remove it by hand, then re-run"
@@ -1250,10 +1268,12 @@ scout_sync() {
     # must never destroy (worktree-hygiene-sweep.sh:26, AGENTS.md). UNTRACKED files are not at risk —
     # a checkout leaves them alone — which is why the scout venv survives this and is not re-paid for.
     if [ -n "$(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
-      echo "[refresh] TRANSIENT: scout at $SC carries UNCOMMITTED changes to tracked files — moving the gate would destroy them, so it REFUSES TO JUDGE (#2174):"
-      git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | sed 's/^/[refresh]   /'
-      echo "[refresh]   fix: commit or discard them in $SC (it is a dedicated throwaway checkout), then re-run. Nothing was queued or marked checked."
+      # ⛔ THE REASON MUST CROSS TO THE RECORD, NOT ONLY TO THE LOG (#2688 review cycle 2, P2). This
+      # arm set `SCOUT_REFUSE_RC` and printed its own lines, but never `SCOUT_REFUSE_WHY` — so
+      # `state/refresh-last`, which is what the controller's `[dispatch] BLOCKED` line quotes, said
+      # `scout_sync refused without a recorded reason` while the cause sat one log line above it.
+      # That is #2229's symptom surviving in the change that exists to remove it.
+      scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries UNCOMMITTED changes to tracked files ($(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | tr '\n' ';')) — moving the gate would destroy them; commit or discard them in $SC (it is a dedicated throwaway checkout), then re-run"
       return 1
     fi
     # ⛔ COMMITS ARE WORK TOO (review cycle 2 P2, cycle 3 P2). `checkout -B` REWRITES the branch ref
@@ -1263,9 +1283,8 @@ scout_sync() {
     commits="$(git -C "$SC" rev-list --count "$target..HEAD" 2>/dev/null || echo 0)"
     case "${commits:-0}" in
       ''|0) ;;
-      *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
-         echo "[refresh] TRANSIENT: scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them, so it REFUSES TO JUDGE (#2174). Nothing was queued or marked checked."
-         echo "[refresh]   keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+      *) # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
          return 1 ;;
     esac
     echo "[refresh] scout STALE at $before, refreshing to origin/main ${target:0:9} (#2174)"
