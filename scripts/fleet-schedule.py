@@ -101,10 +101,12 @@ STATE = ""
 TICK = 0
 JOB_TIMEOUT = 0
 
-# The placeholder set — the SAME nine `scripts/install-launchd.sh` renders. A template that
-# carries any OTHER {{NAME}} is an error here, not an empty string: the launchd renderer would
-# substitute empty for a name it does not know too, so the two backends agree only because the
-# list is a contract, and this one refuses rather than guesses.
+# The placeholder set — the SAME ten `scripts/install-launchd.sh` renders (its own
+# `for ph in …` list at install-launchd.sh:462 is the contract; a name added there and not
+# here turns every cell's --install/--start into a refusal, so the two lists move together).
+# A template that carries any OTHER {{NAME}} is an error here, not an empty string: the launchd
+# renderer would substitute empty for a name it does not know too, so the two backends agree
+# only because the list is a contract, and this one refuses rather than guesses.
 PLACEHOLDERS = (
     "HOME",
     "PATH",
@@ -115,6 +117,7 @@ PLACEHOLDERS = (
     "PYTHON_BIN",
     "PI_BIN_DIR",
     "WORKTREE_HYGIENE_MODE",
+    "REAP_ORPHAN_MODE",
 )
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_][A-Z0-9_]*)\}\}")
 
@@ -165,8 +168,30 @@ def wt_hygiene_mode(home: str) -> str:
     return "--dry-run"
 
 
+def reap_orphan_mode(home: str) -> str:
+    """`0` (apply) only when the arming record names who armed it and when — the SAME two-key
+    test scripts/install-launchd.sh's reap_orphan_mode() applies. It ships DISARMED, so the
+    default is `1` (REAP_ORPHAN_DRY_RUN=1 ⇒ --dry-run): the safe value.
+
+    ⛔ NEVER empty. The plist renders this into REAP_ORPHAN_DRY_RUN, and an empty value is
+    neither "on" nor "off" — the one shape that reads as armed without being armed. The
+    arming record is the SAME file the installer uses, so a cell armed by hand is armed here.
+    """
+    record = os.environ.get("REAP_ORPHAN_ARM_FILE") or os.path.join(
+        home, ".pi", "agent", "state", "pi-reap-orphans.armed"
+    )
+    try:
+        with open(record, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return "1"
+    if re.search(r"^armed-by=.", body, re.M) and re.search(r"^armed-date=.", body, re.M):
+        return "0"
+    return "1"
+
+
 def placeholder_values() -> dict:
-    """Resolve the nine placeholders. Empty string means 'unresolved' (the job is SKIPPED)."""
+    """Resolve the ten placeholders. Empty string means 'unresolved' (the job is SKIPPED)."""
     home = os.environ.get("CELL_HOME") or os.environ.get("HOME") or ""
     infra = INFRA_ROOT
     tortoise = os.environ.get("TORTOISE_REPO", "")
@@ -207,6 +232,7 @@ def placeholder_values() -> dict:
         "PYTHON_BIN": python_bin,
         "PI_BIN_DIR": pi_bin_dir,
         "WORKTREE_HYGIENE_MODE": wt_hygiene_mode(home),
+        "REAP_ORPHAN_MODE": reap_orphan_mode(home),
     }
 
 
@@ -585,6 +611,15 @@ def busy_jobs(now):
         # marker lacking it is foreign/corrupted/restored, and dropping it fails CLOSED: the tick
         # then reads as stale (correctly) instead of as "a long job is running".
         if started <= 0:
+            continue
+        # ⛔ AND A START DATED IN THE FUTURE IS NOT AN EXEMPTION EITHER. The clamp below is
+        # computed FROM the marker's own `started`, so a future-dated one yields a future deadline
+        # and `now <= deadline` holds for the whole span — a wedged loop certified as busy for
+        # years. Reachable without corruption: our writer stamps `time.time()`, so a backward clock
+        # step during a run (VM resume, NTP correcting a fast RTC — the same cases the stamp arm
+        # refuses) leaves a SIGKILL-surviving marker future-dated, and a restored state dir does it
+        # too. Same slack the stamp arm uses, so skew inside one poll is still tolerated.
+        if started > now + max(3 * TICK, 300):
             continue
         deadline = min(deadline, started + JOB_TIMEOUT + 3 * TICK)
         if now <= deadline:
@@ -1295,6 +1330,21 @@ def cmd_stop():
     pid = loop_pid()
     if not pid:
         print("loop not running (OFF switch set — remove it or run --start to resume)")
+        return 0
+    # ⛔ A STALE PID IS NOT THE LOOP. `loop_pid()` answers "is that pid alive", and after the loop
+    # died its number can be recycled onto an unrelated process — a lane, the controller, the
+    # supervisor. Signalling it would kill someone else's work and report "loop stopped", which is
+    # the reading AGENTS.md forbids (a first-match reading is not evidence). Every other arm
+    # (verify, status, spawn, loop start) already applies the command-line check; this one did not.
+    if not pid_is_our_loop(pid):
+        print(
+            "loop not running (the pid in %s/loop.pid, %d, is not fleet-schedule --loop — stale "
+            "pidfile repaired; OFF switch set)" % (STATE, pid)
+        )
+        try:
+            os.unlink(os.path.join(STATE, "loop.pid"))
+        except OSError:
+            pass
         return 0
     try:
         os.kill(pid, signal.SIGTERM)
