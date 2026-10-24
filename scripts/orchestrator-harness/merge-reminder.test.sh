@@ -2968,13 +2968,29 @@ ck "§27b harness_repo_of REFUSES the same gitlink shape" \
 # ⛔ AN INHERITED GIT ENVIRONMENT MUST NOT HIJACK THE PROBE (round-6 review, measured: with
 # `GIT_DIR=<harness>/.git`, a non-harness checkout was returned as the harness repo because the index read
 # answered from the HARNESS). A probe describes the directory it was pointed at.
-# ⛔ `GIT_DIR` ALONE is the measured shape: with only that variable the index read answered from the
-# harness while `top` came from the candidate, so a NON-harness checkout was returned as the harness repo.
-out="$(env REPO= HARNESS_REPO="$PLAIN" GIT_DIR="$HERE_TOP/.git" \
-  HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
-  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
-ck "§27b box-status is not hijacked by an inherited GIT_DIR (the plain repo is still refused)" \
-   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+# ⛔ `GIT_DIR` AND `GIT_INDEX_FILE` ARE BOTH MEASURED HIJACKS (round-7 review: pinning only `GIT_DIR` lets a
+# narrowing of the unset list ship green, with the hijack back). With `GIT_DIR` alone the index read answered
+# from the harness while `top` came from the candidate, so a NON-harness checkout was returned as the harness
+# repo; `GIT_INDEX_FILE` alone did the same through the index path.
+# ⛔ TWO VARIABLES, TWO CASES. `GIT_DIR` redirects the whole repository; `GIT_INDEX_FILE` redirects only the
+# index read. A single case that swaps one for the other leaves the other unpinned (round-8 review: that is
+# exactly how the `GIT_DIR` pin died here). And each variable is given a path that EXISTS in this checkout:
+# `$HERE_TOP/.git` is a 47-byte gitdir FILE in a linked worktree, so `…/.git/index` is not a file there and
+# the pin would be vacuous in the very lane the suite runs in.
+HARNESS_INDEX="$(git -C "$HERE_TOP" rev-parse --git-path index)"
+ck "§27b the pin fixtures are real paths (gitdir may be a FILE in a worktree)" \
+   "$([ -e "$HERE_TOP/.git" ] && [ -e "$HARNESS_INDEX" ] && echo 0 || echo 1)"
+for hijack in GIT_DIR GIT_INDEX_FILE; do
+  case "$hijack" in
+    GIT_DIR)         hval="$HERE_TOP/.git" ;;
+    GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
+  esac
+  out="$(env REPO= HARNESS_REPO="$PLAIN" "$hijack"="$hval" \
+    HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+    PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+  ck "§27b box-status is not hijacked by an inherited $hijack (the plain repo is still refused)" \
+     "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+done
 out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    GIT_DIR="$HERE_TOP/.git" \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
@@ -2988,8 +3004,74 @@ got = m.harness_repo_of(plain)
 print(0 if (got is None or Path(got).resolve() != plain) else 1)
 PYMOD
 )"
+# ⛔ AND THE MAIN READ, not just the identity probe: `origin_main()` feeds the PR gates, the drift table and
+# goal 2, so an inherited `GIT_DIR` there would print ANOTHER repo's main as this cycle's main.
+out_main="$(env REPO="$REPO_SRC" GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
+   PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$REPO_SRC" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+repo = Path(sys.argv[2])
+# the truth, read with NO ambient git env at all
+truth = m.run(["git", "-C", str(repo), "rev-parse", "--verify", "origin/main"], env=m.git_env())[1].strip()
+got = m.main_sha(repo)          # ambient GIT_DIR points at a DIFFERENT repo, with no origin/main
+print(0 if truth and got == truth else 1)
+PYMOD
+)"
+# ⛔ AND EVERY *OTHER* GIT READ TOO (round-8 review, measured): eight of twelve `run(["git", …])` calls
+# inherited the environment, and under `GIT_DIR=<a foreign repo>/.git` the checkout-vs-flag MISMATCH GUARD
+# (`github_origin`) returned "" — i.e. it failed OPEN — while `git_dir` named another repository. The rule is
+# enforced once, in `run()`; this case pins it there rather than at each call site, so a call added later is
+# covered the day it is written.
+# `$HERE_TOP` (not the fixture repo): `github_origin` answers "" for a non-github origin BY DESIGN, so the
+# fixture would make this case vacuous for the wrong reason.
+out_all="$(env GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
+   PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$HERE_TOP" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+repo = Path(sys.argv[2])
+slug = m.github_origin(repo)          # the mismatch guard: must NOT fail open under a foreign GIT_DIR
+gdir = m.git_dir(repo)
+truth_gdir = m.run(["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
+                   env=m.git_env())[1].strip()
+ok = (slug != "" and truth_gdir and gdir.strip() == truth_gdir)
+print(0 if ok else 1)
+PYMOD
+)"
+ck "§27b every git read is sanitised (github_origin does not fail open under a foreign GIT_DIR)" \
+   "$(grep -qx 0 <<<"$out_all" && echo 0 || echo 1)"
+
+ck "§27b main_sha ignores an inherited GIT_DIR (it reads the repo it was pointed at)" \
+   "$(grep -qx 0 <<<"$out_main" && echo 0 || echo 1)"
+
 ck "§27b harness_repo_of is not hijacked by an inherited GIT_DIR either" \
    "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+for hijack in GIT_DIR GIT_INDEX_FILE; do
+  case "$hijack" in
+    GIT_DIR)         hval="$HERE_TOP/.git" ;;
+    GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
+  esac
+  out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+     "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" \
+     PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+     python3 - "$SUT" "$PLAIN" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+plain = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(plain)
+print(0 if (got is None or Path(got).resolve() != plain) else 1)
+PYMOD
+)"
+  ck "§27b harness_repo_of is not hijacked by an inherited $hijack either" \
+     "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+done
 
 # ⛔ A DIRECTORY OF THAT NAME IS NOT THE FILE (round-5 review follow-up, measured: with the index holding
 # `…/box-status.sh/x`, the pathspec matched THAT entry, so a repo whose harness path is a directory was
