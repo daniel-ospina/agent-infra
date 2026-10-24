@@ -2306,7 +2306,7 @@ function describeNonDiffValue(v: string): string {
  *
  * The default mirrors the budget the HEAD read already waits under
  * (`rateLimitMaxWaitMs`, 10 min): a diff read is the same kind of shared-pool call and
- * was MEASURED at 399s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
+ * was MEASURED at 395/603/3066 s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
  * below that class keeps killing reads that were merely queued. Raise it where the
  * gate is configured with a longer acquire timeout. A genuinely unreachable API still
  * ends in `null` — bounded, and now legible.
@@ -4571,9 +4571,10 @@ export default function (pi: ExtensionAPI) {
         // text only (a failed READ is not a failed review). The DECISION still consumes
         // `currentDiffHash` and nothing else, through the same predicate as before.
         // #2353 (rebased): the read's BOUND comes from `diffHashReadTimeoutMs()`, not a
-        // fixed 60 s — every gh call here queues at the shared gate first (600 s of
-        // acquire budget), so a 60 s child was killed mid-queue and the null read was
-        // rendered as "the content changed" (measured: 395/603/3066 s end-to-end).
+        // fixed 60 s — every gh call here queues at the shared gate first (300 s of
+        // acquire budget by default, `AGENT_GH_GATE_ACQUIRE_TIMEOUT`), so a 60 s child
+        // was killed mid-queue and the null read was rendered as "the content changed"
+        // (measured: 395/603/3066 s end-to-end).
         const liveDiffRead = record && isDiffSha256(record.diff_sha256) &&
           currentHead !== null &&
           record.head_sha !== currentHead

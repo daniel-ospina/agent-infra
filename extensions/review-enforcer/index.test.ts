@@ -573,7 +573,7 @@ test("the flag cannot turn a READ MATCH into a block (the carry arm still wins)"
 test("a readable-but-DIFFERENT digest keeps head_advanced (a fresh review IS owed)", () => {
   const r = evaluateMergeGate(
     138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" },
-    false, null, DIFF_B, false
+    false, null, DIFF_B
   );
   equal(r.status, "block");
   equal((r as any).reasonTag, "head_advanced", "a real content change must NOT read as unreadable");
