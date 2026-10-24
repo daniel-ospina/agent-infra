@@ -511,6 +511,34 @@ else
   fail "38 MUTATION-NOT-APPLIED"
 fi
 
+# ── 39–42. Round 7: EQUALITY, not count, on the required routing ────────────────────────────────
+# A count was not enough. One SCALAR carrying the expression plus a literal token is ONE label to
+# GitHub, so `includes(VAR_NAME)` and `length === 1` both held and the suite stayed GREEN — while
+# with the variable unset the default arm matches no runner, the required check queues to the 24 h
+# self-hosted cancel, and a `cancelled` check is non-red in the merge rail. The repo's ONLY required
+# context would read non-red with no verdict. Asserted now by exact match on the resolved label.
+EXPR_FIND="    runs-on: \${{ fromJSON(vars.PIPELINE_COMPLIANCE_RUNS_ON || '[\"ubuntu-latest\"]') }}"
+# The VALUE only — the block-sequence arm needs the item text, not the `runs-on:` prefix.
+EXPR_VAL="${EXPR_FIND#    runs-on: }"
+
+if mutate "$WF" "$TMP/wf-eqscalar.yml" "$EXPR_FIND" "$EXPR_FIND required-check"; then
+  run_expect 1 "39 MUTANT the expression plus a literal token in ONE scalar is REFUSED" "$TMP/wf-eqscalar.yml" "$DOC"
+else
+  fail "39 MUTATION-NOT-APPLIED (the variable expression was not found)"
+fi
+
+if mutate "$WF" "$TMP/wf-eqcomma.yml" "$EXPR_FIND" "$EXPR_FIND, required-check"; then
+  run_expect 1 "39b MUTANT the expression plus a comma-separated token is REFUSED" "$TMP/wf-eqcomma.yml" "$DOC"
+else
+  fail "39b MUTATION-NOT-APPLIED (the variable expression was not found)"
+fi
+
+if mutate "$WF" "$TMP/wf-eqblock.yml" "$EXPR_FIND" $'    runs-on:\n      - '"$EXPR_VAL"$' required-check'; then
+  run_expect 1 "40 MUTANT a one-item block sequence carrying a token is REFUSED" "$TMP/wf-eqblock.yml" "$DOC"
+else
+  fail "40 MUTATION-NOT-APPLIED (the variable expression was not found)"
+fi
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "❌ required-check reservation: $fails failed, $passes passed"

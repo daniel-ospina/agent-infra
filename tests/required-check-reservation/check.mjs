@@ -465,21 +465,29 @@ if (!/fromJSON\(/.test(runsOn)) {
 if (/^\s*(\[|self-hosted)/.test(runsOn)) {
   fail(`T1 ${JOB_ID}'s runs-on may not be an unconditional self-hosted label list; got: ${runsOn}`);
 }
-// T1b — the routing must resolve to EXACTLY ONE value. Grading the joined text by substring let a
-// literal label be ANDed onto the expression:
-//     runs-on:
-//       - ${{ fromJSON(vars.… || '["ubuntu-latest"]') }}
-//       - required-check
-// stayed GREEN, because `includes(VAR_NAME)` and `includes(FALLBACK)` both still held — while
-// GitHub ANDs the labels, so with the variable unset the required check needs a runner that is
-// BOTH `ubuntu-latest` and `required-check`, i.e. the documented default is unsatisfiable. That is
-// the "strictly worse than the queue" state this module exists to refuse (review round 6).
-if (Array.isArray(job.runsOnLabels) && job.runsOnLabels.length !== 1) {
+// T1b — the routing must resolve to EXACTLY ONE value, and that value must be EXACTLY the
+// documented expression. A count alone was not enough: a SINGLE scalar that carries the expression
+// and a literal token
+//     runs-on: ${{ fromJSON(vars.… || '["ubuntu-latest"]') }} required-check
+// is one label to GitHub, so `includes()` held, `length === 1` held, and the suite stayed GREEN —
+// while with the variable unset the default arm matches no runner at all, the required check queues
+// to the 24 h self-hosted cancel, and a `cancelled` check is non-red in the merge rail: the ONLY
+// required context reads non-red with no verdict. That is the "strictly worse than the queue" state
+// this module exists to refuse (review rounds 6 and 7), so the assertion is EQUALITY on the value.
+const EXPR_RE = new RegExp(
+  `^\\$\\{\\{\\s*fromJSON\\(\\s*vars\\.${VAR_NAME}\\s*\\|\\|\\s*'${FALLBACK.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  )}'\\s*\\)\\s*\\}\\}$`
+);
+if (!(Array.isArray(job.runsOnLabels) && job.runsOnLabels.length === 1 && EXPR_RE.test(job.runsOnLabels[0].trim()))) {
+  const got = Array.isArray(job.runsOnLabels)
+    ? `${job.runsOnLabels.length} label(s): ${job.runsOnLabels.map((l) => JSON.stringify(l)).join(", ")}`
+    : "no readable label list";
   fail(
-    `T1b ${JOB_ID}'s runs-on resolves to ${job.runsOnLabels.length} labels ` +
-      `(${job.runsOnLabels.map((l) => JSON.stringify(l)).join(", ")}) — it must be exactly the one ` +
-      `${VAR_NAME} expression; any extra label is ANDed onto it and the ${FALLBACK} default stops ` +
-      `being satisfiable`
+    `T1b ${JOB_ID}'s runs-on does not resolve to exactly the documented ${VAR_NAME} expression — got ` +
+      `${got}. Anything else (an extra label, or a scalar carrying the expression plus a literal ` +
+      `token, which GitHub reads as ONE label) makes the ${FALLBACK} default unsatisfiable`
   );
 }
 
