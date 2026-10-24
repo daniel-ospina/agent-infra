@@ -5245,8 +5245,9 @@ build_evidence() {
 #     "cannot be attributed to this PR", and therefore never a merge), a
 #     guard-step identity (no local runner), and the other non-nodeid families a
 #     local pytest cannot execute (`collect-error::<file>` #6798,
-#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131 — passed as argv
-#     they make pytest exit 4 having run NOTHING). `repro_scope` then
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
+#     pytest exit 4 having run NOTHING). `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
@@ -5290,7 +5291,8 @@ reproduce_residual_on_base() {
   [ -s "$residual" ] || return 1
   # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
   # P2). The parser's other non-nodeid identities — `collect-error::<file>`
-  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) and
+  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131),
+  # `bash-shard::<path>` (#2643), `runner::<job>` and
   # `pipeline-compliance::<letter>::<subject>` (#1185) — are
   # real residual rows but they name no pytest nodeid. Handed to the runner as
   # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
@@ -5300,7 +5302,7 @@ reproduce_residual_on_base() {
   # already filters them from the candidate set; this is the function's own
   # guard, so the contract holds for any caller.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^bash-shard::' -e '^runner::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -5490,12 +5492,22 @@ reproduce_residual_on_base() {
 # Conflating the two makes the base reproduction refuse an id the base itself
 # reproduces as FAILED — the false block #3715 exists to remove (a real
 # regression when this set was widened; caught in review).
+#
+# `bash-shard::<path>` IS here, and is the one aggregate that belongs: the shard IS
+# a file, so main having failed it is a measurement OF that file — the opposite of
+# the `collect-error::` case, where nothing in it ran. `runner::<job>` and
+# `job-unreadable::<slug>` are NOT: an aggregate failure names no file inside the
+# job, so claiming one would be inventing a measurement. Their rows therefore fall
+# through to the generic `s/::.*//` and stay a non-file unit, which can never equal
+# a nodeid's file — fail-closed for clearance, which is why nothing else is needed.
 main_measured_files() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
     sed '/^guard-step::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    # #2643: the shard path IS the measured file (see the note above).
+    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
     # #1185: a gate identity is keyed by its CHECK, not by a file — the same
     # per-entry identity `job-unreadable::` uses, and for the same reason: a main
     # baseline red on a DIFFERENT check must not read as a pre-existing failure in
@@ -5518,7 +5530,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^bash-shard::/d; /^runner::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -5526,6 +5538,13 @@ main_baseline_units() {
     # above is suppressed for the family and a main baseline red on a DIFFERENT
     # job would read as pre-existing in this one.
     sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
+    # #2643/#6798: the file-coarse aggregates — the unit is the SHARD PATH / the
+    # JOB SLUG, exactly as `failure_file_key` derives it. Without these arms the
+    # generic `s/::.*//` above is suppressed for the family, every shard collapses
+    # onto the literal `bash-shard`, and a main baseline red in ONE shard reads as
+    # pre-existing in a DIFFERENT one.
+    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n 's/^runner::\(.*\)$/\1/p' "$mainfails"
     # #1185: the unit is the CHECK (`pipeline-compliance::<letter>`), for exactly
     # the #7131 reason — main red on check (a) must not read as a pre-existing
     # failure in this PR's check (c). The letter stays ON the unit, so it can
@@ -5552,6 +5571,13 @@ failure_file_key() {
     # pre-existing failure in this one. Without this arm the generic default
     # would collapse every job onto the literal `job-unreadable`.
     job-unreadable::*) printf '%s\n' "${1#job-unreadable::}" ;;
+    # #2643/#6798: the file-coarse aggregates group by the PATH / JOB SLUG they
+    # name — the same unit `main_baseline_units` derives. The generic default
+    # would collapse every shard onto the literal `bash-shard` (and every JS
+    # aggregate onto `runner`), so a main baseline red in one shard would be
+    # reported as "measured on this lane" for a DIFFERENT shard's failure.
+    bash-shard::*) printf '%s\n' "${1#bash-shard::}" ;;
+    runner::*) printf '%s\n' "${1#runner::}" ;;
     # #1185: the unit is the CHECK, `pipeline-compliance::<letter>` — main red on
     # check (a) must not read as a pre-existing failure in this PR's check (c),
     # and the generic default would collapse the whole family onto the literal
@@ -5584,6 +5610,7 @@ intersect_sets() {
 #     reproduced and must always remain in the residual.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `bash-shard::<path>` #2643, `runner::<job>`,
 #     `pipeline-compliance::<letter>::<subject>` #1185) also name no
 #     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
 #     NOTHING, so they are not candidates either — they are units the rail can
@@ -5601,7 +5628,7 @@ repro_scope() {
     [ -n "$nid" ] || continue
     case "$nid" in
       guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
-      pipeline-compliance::*) continue ;;
+      bash-shard::*|runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
   done < "$scratch"
@@ -6408,9 +6435,11 @@ main() {
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
     say_err "   yielded NO parseable failure identity (none of: a 'FAILED <nodeid>' line, an"
-    say_err "   attributable guard-step '::error::' annotation, or a 'check-pipeline-compliance.sh'"
-    say_err "   '❌ [<letter>] …' line), so their failures are NOT in the"
-    say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
+    say_err "   attributable guard-step '::error::' annotation, or the other families the parser"
+    say_err "   knows: collect-error::, watchdog-kill::, job-unreadable::, bash-shard::, runner::,"
+    say_err "   pipeline-compliance:: ('check-pipeline-compliance.sh' prints '❌ [<letter>] …' — #1185)),"
+    say_err "   so their failures are NOT in the set and 'blocked by the decision: 0' would be a false"
+    say_err "   certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
     # NAME the dropped tokens here too: when a run's failures were ENTIRELY
