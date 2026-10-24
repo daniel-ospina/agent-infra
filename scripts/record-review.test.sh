@@ -381,6 +381,16 @@ run_record_verdict() { # <verdict> <repo-or-empty> <pr> [sha] → $RECORD_RC $RE
         export PATH="$T/bin:$PATH"
         export GH_STUB_LOG="$LOG"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        # ⛔ THE clean-micro SURFACE CAP NEEDS A READABLE CHANGED-PATH PAYLOAD, and this runner never
+        # supplied one: the stub's `compare/` branch answers with a merge base and NO rows, which the
+        # shipped cap reads as rc 3 ("the changed-path payload cannot be certified") and refuses with
+        # exit 4 — so every §8/§9 arm that expects a clean-micro ALLOW came back 4, and the 22
+        # assertions pinning the LABEL guard were reporting the CAP's refusal instead of the guard they
+        # are about. Pre-existing on origin/main (`PASS=622 FAIL=22`), not caused by this change. One
+        # benign docs path is enough: the cap refuses a merge/land rail, a CI workflow or an extension,
+        # none of which this fixture claims to touch.
+        # `-`, not `:-`: C3's arm proves an EMPTY file list refuses, so an explicit "" must survive.
+        export STUB_FILES="${STUB_FILES-docs/notes.md}"
         rc=0
         if [ -n "$repo" ]; then
             bash "$RECORD" "$pr" "$sha" "$verdict" "$repo" $ev 2>"$errfile" || rc=$?
