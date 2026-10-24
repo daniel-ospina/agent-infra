@@ -485,6 +485,27 @@ log_has "$NEST — an entry INSIDE it was written after its own mtime" \
   && ok "temp: …and the keep NAMES the nested write (a silent keep is the defect the log exists to prevent)" \
   || bad "temp: the nested-write keep is unexplained — $(grep -F 'temp:' "$T/o/logs/doctor.log" 2>/dev/null | head -3)"
 
+say_case "the temp idle floor is honoured at the value the operator set (HYGIENE_TMP_MIN_AGE_S)"
+# ⛔ THE FLOOR IS THE SECOND GATE (the pid is the first): it covers pid RECYCLING, so the SAME dead-pid
+# dir must be reaped under a small floor and kept under a large one — driven through the shipped knob,
+# not through the fixture's own posture. This arm is the `guardedBy` pin the heartbeat/progress-edge
+# registry cites for HYGIENE_TMP_MIN_AGE_S (extensions/shared/heartbeat-progress-edges.ts).
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+DEAD7="$(dead_pid)"
+TEN_MIN_AGO="$(python3 -c 'import datetime,time;print(datetime.datetime.utcfromtimestamp(time.time()-600).strftime("%Y%m%d%H%M"))')"
+mk_tmpdir "cloud-cell-${DEAD7}.LLLL" "$TEN_MIN_AGO" >/dev/null
+HYGIENE_TMP_MIN_AGE_S=60 doc hygiene
+[ -e "$T/tmp/cloud-cell-${DEAD7}.LLLL" ] \
+  && bad "temp: a dir 10 min old survived a 60 s floor (the floor is not read from HYGIENE_TMP_MIN_AGE_S)" \
+  || ok "temp: under a 60 s floor the 10-min-old dir is reclaimed (the floor is read from the environment)"
+mk_tmpdir "cloud-cell-${DEAD7}.NNNN" "$TEN_MIN_AGO" >/dev/null
+HYGIENE_TMP_MIN_AGE_S=3600 doc hygiene
+[ -e "$T/tmp/cloud-cell-${DEAD7}.NNNN" ] \
+  && ok "temp: under a 3600 s floor the SAME age is KEPT (the floor is a real gate, not decoration)" \
+  || bad "temp: a dir younger than its floor was reaped — the recycling hole the floor exists to bound"
+log_has "under the 3600s idle floor" && ok "temp: …and the keep names the floor it failed" \
+                                    || bad "temp: the age-floor keep is unexplained"
+
 say_case "a token that cannot be a pid is NOT 'the pid is dead' (0, a leading zero, a date stamp)"
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
 # `kill -0 0` SUCCEEDS (0 is the caller's own process GROUP), so a name shaped like that would read as
