@@ -163,6 +163,12 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     monkeypatch.setattr(objective.subprocess, "run", fake_run)
     monkeypatch.setattr(objective, "_sleep", sleeps.append)
     monkeypatch.setattr(objective, "_rest_get", fake_rest_get)
+    # ⛔ THE SHIPPED CALLERS DECLARE THEIR BOUND (#2227), so this is the production composition:
+    # `heartbeat-loop.sh` and `lane-scan-fallback.sh` hand the reader `OBJECTIVE_CALLER_BOUND_S=180`
+    # and the reader clips its read to fit inside it. The CONSERVATIVE default (a box whose loop
+    # predates the declaration) is pinned separately, by deleting this env in
+    # `test_the_caller_bound_leaves_room_for_the_whole_read`.
+    monkeypatch.setenv(objective.CALLER_BOUND_ENV, "180")
     monkeypatch.setattr(objective, "_gh_token", lambda: gh_token or "")
     return sleeps
 
@@ -1872,6 +1878,10 @@ def test_a_double_refusal_still_reports_rate_limited_and_unreadable(monkeypatch)
     If REST fails too, nothing has been read: `queue=UNREADABLE` and `gh=RATE-LIMITED(queue)`
     must appear unchanged, and the verdict must still be the rate-limit one (which outranks the
     queue). Main was readable throughout, so it keeps saying so.
+
+    ⛔ AND THE REFUSAL MUST NAME ITSELF (#2227). `queue_read=UNREADABLE(waited=…, last_good=…)`
+    carries the two facts a reader needs to tell a crowded box from an outage, and prints NO
+    count -- the fail-closed half of #1869 is that this token may say less, never more.
     """
     install(monkeypatch, pr_list=REST_REFUSED, rest_prs=None)   # no second source
     line = objective.build()
@@ -1879,7 +1889,10 @@ def test_a_double_refusal_still_reports_rate_limited_and_unreadable(monkeypatch)
     assert "gh=RATE-LIMITED(queue)" in line, line
     assert "VERDICT=GH-RATE-LIMITED" in line, line
     assert "main=GREEN" in line, line
-    assert "queue_read=" not in line, line
+    qr = line[line.index("queue_read=UNREADABLE("):]
+    assert "waited=" in qr and "last_good=" in qr, line      # WHAT IT WAITED, HOW OLD THE LAST GOOD
+    assert "tried " in qr, line                              # ...and WHAT IT TRIED
+    assert "waiting=" not in line, line                      # ...and NO count from an unread queue
 
 
 def test_a_rest_payload_is_never_an_empty_queue(monkeypatch):
@@ -3382,3 +3395,203 @@ def test_the_graphql_fallback_asks_the_SAME_repo_the_rest_read_does(monkeypatch)
     assert "name=agent-infra" in argv, argv
     # ...and the shipped default cannot leak back in beside the derived one.
     assert "name=tortoise" not in argv, argv
+
+
+# ── #2227: A LATE ANSWER IS NOT AN ABSENT ONE ───────────────────────────────────────────────
+# MEASURED 2026-10-20 on three cloud cells: `gh` is serialised PER BOX (#2005), so ONE
+# `gh pr view` cost **63.0 s at 13 lanes** against **0.676 s at 3** and **0.091 s on the wire**.
+# Every reader with a tight budget therefore reported ABSENCE for a fact it had not established:
+# `queue_read=BLIND(14/14 unread, samples=3)`, `merged_24h=?`, `VERDICT=UNKNOWN`. The state was
+# not wrong -- it was NOT YET SERVED.
+#
+# FOUR PROPERTIES, and each one is load-bearing on its own:
+#   (a) a read that ANSWERS slowly is DATA, carrying its latency, and is never called BLIND;
+#   (b) a read that FAILS says what it tried, how long it waited, and how old the last good
+#       sample is -- so a busy box cannot read like an outage, nor a stale refusal like a live one;
+#   (c) a cached number is NEVER presented as current (#1869's rule, which this change must not
+#       relax): a refusal carries an AGE and no counts;
+#   (d) the read budget and the CALLER'S bound compose -- a budget above the caller's kill is an
+#       inert bound that writes NO line, which is strictly worse than an honest refusal.
+
+def _clock_at(monkeypatch, ticks):
+    """Fake `_wall()` as a list of readings. Distinct from `_monotonic()`, which fakes BOUNDS."""
+    it = iter(ticks)
+    monkeypatch.setattr(objective, "_wall", lambda: next(it))
+
+
+def test_a_read_that_ANSWERS_slowly_is_DATA_with_its_latency(monkeypatch):
+    """(a) 63 s is a measurement, not a failure -- the exact shape the fleet misread hourly.
+
+    The read answers with a READABLE merge state and simply takes 63 s (the measured worst case).
+    The line must carry the counts, the latency, and NO blind/fail-closed caveat -- and the verdict
+    must be a property of the QUEUE, not of the clock.
+    """
+    install(monkeypatch, pr_list=[_Result(0, json.dumps(
+        [_pr(n, "BLOCKED") for n in range(1, 5)]))])
+    _clock_at(monkeypatch, [0.0, 63.1])
+    line = objective.build()
+    assert "queue_read=SLOW(waited=63.1s" in line, line
+    assert "the counts are DATA" in line, line
+    assert "queue_read=BLIND" not in line, line
+    assert "NOT a clearance" not in line, line
+    assert "open=4" in line and "waiting=4" in line, line
+    assert "gh=" not in line, line
+    assert "VERDICT=UNKNOWN" not in line, line
+    # ...and the cut the fleet reads this line through still reaches the qualifier (#1872).
+    assert line.index("queue_read=SLOW") < line.index(QUEUE_SEG), line
+
+
+def test_a_fast_read_stays_silent_so_SLOW_means_something(monkeypatch):
+    """The negative control for (a): a fast read prints no `queue_read` token at all.
+
+    Without this, `queue_read=SLOW` could be printed unconditionally and the first test would pass
+    on a build that cannot tell a fast read from a late one. 0.7 s is the MEASURED quiet-box cost.
+    """
+    install(monkeypatch, pr_list=[_Result(0, json.dumps([_pr(1, "BLOCKED"), _pr(2, "DIRTY")]))])
+    _clock_at(monkeypatch, [0.0, 0.676])
+    line = objective.build()
+    assert "queue_read=" not in line, line
+    assert "open=2" in line and "waiting=2" in line, line
+
+
+def test_a_REFUSED_read_says_what_it_tried_how_long_it_waited_and_the_age_of_the_last_good(
+        monkeypatch, tmp_path):
+    """(b) The refusal names itself: cause, wait, and the AGE of the last good sample.
+
+    Measured failure shape: `lane-actions read failed rc=1: lane-status.py failed: TimeoutExpired`
+    -- pr-doctor surfaced a stack-trace fragment with no duration and no age, so a box that was
+    merely crowded was indistinguishable from a dead monitor.
+    """
+    cache = tmp_path / "objective.last"
+    cache.write_text("2020-01-01T00:00:00+00:00\nOBJECTIVE VERDICT=ADVANCING waiting=3\n")
+    aged = 1800
+    # Age the cache by its MTIME (the thing `_last_good_age_s` reads), not by patching os.path --
+    # a global getmtime stub would also change what the rest of `build()` sees.
+    _stamp = objective.time.time() - aged
+    os.utime(str(cache), (_stamp, _stamp))
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    install(monkeypatch, pr_list=_Result(1, "", "API rate limit exceeded"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 100.4])
+    line = objective.build()
+    assert "queue_read=UNREADABLE(waited=100.4s, last_good=" in line, line
+    assert "tried gh pr list" in line, line          # WHAT it tried
+    assert "waited=100.4s" in line, line             # HOW LONG it waited
+    assert "1800s" in line or "1799s" in line, line  # HOW OLD the last good sample is
+
+
+def test_a_cached_value_is_never_presented_as_current(monkeypatch, tmp_path):
+    """(c) #1869 SURVIVES: a refusal may borrow the cache's AGE, never its numbers.
+
+    The cache holds `waiting=3 open=3`. The read fails. If any of those appear on the line, this
+    change reopened the exact fail-open #1869 closed -- a stale number standing where an unread
+    one belongs, on the one line the fleet acts from.
+    """
+    cache = tmp_path / "objective.last"
+    cache.write_text("2020-01-01T00:00:00+00:00\n"
+                     "OBJECTIVE VERDICT=ADVANCING main=GREEN@deadbeef open=3 drafts=0 "
+                     "nondraft=3 waiting=3 ci_crit_med=5.0m\n")
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    install(monkeypatch, pr_list=_Result(1, "", "read timed out"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 99.0])
+    line = objective.build()
+    assert "queue_read=UNREADABLE(" in line, line
+    for stale in ("waiting=3", "open=3", "nondraft=3", "ci_crit_med=5.0m"):
+        assert stale not in line, (stale, line)
+    assert "the QUEUE counts are NOT shown because none were read" in line, line
+    assert "VERDICT=UNKNOWN" in line, line
+
+
+def test_a_stale_refusal_cannot_serve_as_a_cached_line(monkeypatch, tmp_path, capsys):
+    """(c), second half: an UNREADABLE queue must not be CACHED either.
+
+    `main()`'s blind guard keys on `queue=UNREADABLE`, and this change adds a second token for the
+    same fact. Pinned so the guard cannot drift away from the vocabulary: a refusal that got
+    cached would be served for the whole serve window, which is how one blip became a blackout.
+    """
+    cache = tmp_path / "objective.last"
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+    install(monkeypatch, pr_list=_Result(1, "", "transport wedged"), rest_prs=None)
+    _clock_at(monkeypatch, [0.0, 97.5, 97.5, 97.5])
+    objective.main()
+    assert not cache.exists(), "a refused read was CACHED and would be served to the fleet"
+
+
+def test_the_caller_bound_leaves_room_for_the_whole_read(monkeypatch):
+    """(d) THE BUDGET AND THE KILL MUST COMPOSE, OR THE BUDGET IS INERT.
+
+    `objective.py` caps its read; two shell callers bound the PROCESS. If a caller's bound is at or
+    below the read cap, the process is SIGKILLed mid-read and writes NO line at all -- so raising
+    the read budget while leaving the caller behind makes this fix strictly worse than the false
+    absence it replaces.
+
+    ⛔ AND THEY DEPLOY SEPARATELY (#2227): `objective.py` is in the fleet farm, `heartbeat-loop.sh`
+    is a DECLARED, WITHHELD farm entry (#1553). So the caller must DECLARE its bound and the reader
+    must CLIP to it -- a box running the new reader under the OLD loop has to keep printing. Both
+    halves are pinned: the shell export matches its own `run_bounded`, and the reader honours it
+    while defaulting to the SMALLEST deployed bound when nothing is declared.
+    """
+    import re
+    here = pathlib.Path(__file__).resolve().parent
+    declared = {}
+    for fname, pat in (
+            ("heartbeat-loop.sh",
+             r'OBJECTIVE_CALLER_BOUND_S=(\d+)\s*\\?\s*\n?\s*run_bounded\s+(\d+)\s+"objective-refresh"'),
+            ("lane-scan-fallback.sh",
+             r'OBJECTIVE_CALLER_BOUND_S=(\d+)\s*\\?\s*\n?\s+bounded\s+(\d+)\s+/usr/bin/python3\s+'
+             r'"\$SCRIPTS/objective\.py"')):
+        text = (here / fname).read_text()
+        m = re.search(pat, text)
+        assert m, (fname, "the objective invocation/bound was not found -- fix the pattern")
+        assert int(m.group(1)) == int(m.group(2)), (
+            fname, "the DECLARED bound must equal the bound actually enforced")
+        declared[fname] = int(m.group(1))
+
+    # A declared bound the reader cannot fit its read into is a kill timer, not a budget.
+    for fname, b in declared.items():
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, str(b))
+        cap = objective._read_cap_s()
+        assert cap + objective.CALLER_OVERHEAD_S <= b, (fname, cap, b)
+        assert cap > objective.GH_SERIALISED_LATENCY_S, (
+            fname, cap, "a cap at or below the MEASURED 63 s serialised latency re-creates the "
+            "false absence this change exists to remove")
+
+    # ...and with NOTHING declared (a box whose loop predates this change) the conservative default
+    # still has to finish and print, while staying above the measurement.
+    monkeypatch.delenv(objective.CALLER_BOUND_ENV, raising=False)
+    default_cap = objective._read_cap_s()
+    assert default_cap + objective.CALLER_OVERHEAD_S <= objective.DEFAULT_CALLER_BOUND_S, (
+        default_cap, objective.DEFAULT_CALLER_BOUND_S)
+    assert default_cap > objective.GH_SERIALISED_LATENCY_S, default_cap
+
+    # An unparseable declaration is not an optimistic one: it falls back to the CONSERVATIVE
+    # default, because guessing high is the direction that loses the line.
+    for junk in ("", "abc", "0", "-5"):
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, junk)
+        assert objective._read_cap_s() == default_cap, junk
+
+    # ⛔ THE CLIP MUST HOLD AT EVERY DECLARED BOUND, NOT ONLY AT THE SHIPPED ONES (#2227 review,
+    # VGATE). A `max(1.0, …)` floor in `_read_cap_s()` re-exceeded the caller's own bound for any
+    # declaration at or below `CALLER_OVERHEAD_S` -- the clip defeated by the expression implementing
+    # it. Only 180 / the 90 default were exercised, so the floor was invisible.
+    for b in (25, 24, 20, 10, 1, 0.5):
+        monkeypatch.setenv(objective.CALLER_BOUND_ENV, str(b))
+        cap = objective._read_cap_s()
+        # EXACTLY the clip, never a floor above it: a bound below the caller's own overhead leaves
+        # NO room, and the honest cap is 0 (the read fails fast and prints).
+        assert cap == max(0.0, min(float(objective.QUEUE_READ_MAX_S),
+                                   b - objective.CALLER_OVERHEAD_S)), (b, cap)
+        assert cap <= max(0.0, b - objective.CALLER_OVERHEAD_S), (b, cap)
+
+    # The full cap is the one reachable only with a caller that declared room for it.
+    assert objective.QUEUE_READ_MAX_S > objective.GH_SERIALISED_LATENCY_S, (
+        objective.QUEUE_READ_MAX_S, objective.GH_SERIALISED_LATENCY_S)
+    assert objective.QUEUE_BLIND_BUDGET_S < objective.QUEUE_READ_MAX_S, (
+        "the re-sample window is a SUB-window of the read: a primary that eats it must still "
+        "leave the REST second source room to answer")
+    assert objective.QUEUE_BLIND_BUDGET_S >= (objective.GH_SERIALISED_LATENCY_S
+                                             + sum(objective.QUEUE_BLIND_BACKOFF_S)), (
+        "the re-sample window cannot fit one measured slow read plus the ladder -- #1869's "
+        "re-sample would be unreachable on exactly the boxes that need it")
+

@@ -92,6 +92,15 @@ trap 'ai1711_cleanup; tmux kill-session -t "=${DOCTOR_SESSION:-cell-doctor}" 2>/
 # exercised deliberately, not by accident).
 export DOCTOR_SESSION="cell-doctor-test-$$"
 tmux kill-session -t "=cell-doctor" 2>/dev/null || true
+# ⛔ THE SERVICE SEAM IS PINNED AWAY FROM THIS BOX (#2402). `cloud-cell-supervisor.sh` now asks whether a
+# controller SERVICE is installed and enabled, and delegates `start`/`stop` to the service manager when it
+# is. That answer is MACHINE state (`/etc/systemd/system`, `$HOME/.config/systemd/user`), so on a cell
+# where the controller is service-managed — the state #2402 exists to create — this suite would drive the
+# REAL unit: `start` would start the production dispatcher and `stop` would stop it, from a test.
+# Every invocation below inherits these exports (no `env -i` wraps the supervisor), so one pin covers all
+# of them; the arms that exercise service mode live in `install-controller-service.test.sh`, which points
+# both dirs at its own fixtures.
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/no-system-units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units"
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }
@@ -2247,6 +2256,246 @@ case "$OUT" in
   *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
   *) bad "status: still reports a controller after stop — $OUT" ;;
 esac
+
+# ── #2402 cycle-2: a unit stop's EFFECT is read AFTER the teardown ─────────────────────────────────
+# The effect check used to run AT the `systemctl stop` call, where the two states are indistinguishable:
+#   (a) unit installed but DISABLED (the migration state) — the unit stop is a deliberate NO-OP and the
+#       pid teardown stops the controller. Reading early failed a stop that then succeeded, and
+#       `harness-down` turned that into a refusal over a quiet box;
+#   (b) the OTHER scope's unit under `Restart=always` — the stop lands on the wrong manager and a
+#       controller comes back AFTER the teardown. Only a post-teardown observation can see it, and
+#       skipping the check whenever the addressed unit is disabled hides exactly this case.
+say_case "stop on a service-managed box: the unit's effect is read AFTER the teardown"
+S2="$T/svc2"; rm -rf "$S2"; mkdir -p "$S2/units" "$S2/o" "$S2/home" "$S2/repo" "$S2/bin"
+: > "$S2/units/eldato-orchestrator.service"
+cat > "$S2/bin/systemctl" <<'SH'
+#!/bin/bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  stop)       [ -n "${SVC_HOOK:-}" ] && [ -x "${SVC_HOOK:-}" ] && "$SVC_HOOK"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S2/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S2/o/orch-loop.sh"
+svc_sup() { # <verb>
+  PATH="$S2/bin:$PATH" SYSTEMCTL="$S2/bin/systemctl" SVC_HOOK="${SVC_HOOK:-}" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S2/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S2/home" ENV_FILE="$S2/keys.env" SESSION="svc2402-$$" O="$S2/o" REPO="$S2/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+# (a) BENIGN migration state: the teardown stops it, and the verdict must be a clean stop.
+rm -f "$S2/o/.orch.lock"; bash "$S2/o/orch-loop.sh" & S2P=$!
+printf '%s\n' "$S2P" > "$S2/o/.orch.lock"; sleep 0.3
+unset SVC_HOOK
+S2_OUT="$(svc_sup stop)"; S2_RC=$?
+[ "$S2_RC" -eq 0 ] && ok "stop: installed-but-DISABLED → rc=0 (the teardown's stop is not a false failure)" \
+                   || bad "stop: rc=$S2_RC over a stop that succeeded — $S2_OUT"
+case "$S2_OUT" in
+  *'not reporting a stop'*) bad "stop: warned 'not reporting a stop' over a quiet box — $S2_OUT" ;;
+  *) ok "stop: no false 'not reporting a stop' in the migration state" ;;
+esac
+kill -0 "$S2P" 2>/dev/null && kill -9 "$S2P" 2>/dev/null
+# (b) a controller comes BACK after the teardown (the other scope's Restart=always): the verb must FAIL.
+cat > "$S2/hook" <<SH
+#!/bin/bash
+( sleep 1; bash "$S2/o/orch-loop.sh" >/dev/null 2>&1 & printf '%s\n' "\$!" > "$S2/o/.orch.lock" ) >/dev/null 2>&1 &
+SH
+chmod +x "$S2/hook"; rm -f "$S2/o/.orch.lock"
+SVC_HOOK="$S2/hook" S2B_OUT="$(SVC_HOOK="$S2/hook" svc_sup stop)"; S2B_RC=$?
+[ "$S2B_RC" -ne 0 ] && ok "stop: a controller that returns AFTER the teardown FAILS the verb (restart=always, wrong scope)" \
+                    || bad "stop: reported success over a controller that came back — $S2B_OUT"
+case "$S2B_OUT" in
+  *'AFTER the teardown'*) ok "stop: the warning says the controller returned after the teardown" ;;
+  *) bad "stop: failed without naming what it saw — $S2B_OUT" ;;
+esac
+[ -f "$S2/o/.orch.lock" ] && ok "stop: left the lock in place (its owner was alive — #1761's duplicate)" \
+                          || bad "stop: released a lock whose owner was alive"
+S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; } 2>/dev/null || true
+
+# ── #2402 review round 6 P1: a unit is OURS when its keys.env repoints $O ─────────────────────────
+# The unit renders the INSTALLER's $O, and the controller re-sources $ENV_FILE, which may repoint $O —
+# both files say so in their own words ("this installer's $O and the controller's can legitimately
+# differ"). Ownership read as a bare string comparison against the rendered value therefore called this
+# cell's OWN installed, enabled unit ANOTHER state dir's the moment keys.env carried an `O=` line: `stop`
+# skipped `systemctl stop`, killed the pid, printed "released lock", and `Restart=always` re-created the
+# controller within RestartSec — the "reported stopped, still running" false pass this PR exists to
+# remove — while `status` printed "nothing will restart it" over a supervised cell.
+say_case "unit ownership survives a keys.env that repoints \$O, and a genuinely foreign unit is still foreign"
+S3="$T/svc3"; rm -rf "$S3"; mkdir -p "$S3/units" "$S3/o" "$S3/home" "$S3/repo" "$S3/bin" "$T/no-user-units"
+printf 'O=%s/o\n' "$S3" > "$S3/home/keys.env"
+# the installer rendered ITS OWN $O — a different path from the one keys.env resolves the controller to
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+cat > "$S3/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S3/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S3/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S3/o/orch-loop.sh"
+svc3_sup() { # <verb>
+  PATH="$S3/bin:$PATH" SYSTEMCTL="$S3/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S3/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S3/home" ENV_FILE="$S3/home/keys.env" SESSION="svc2402b-$$" O="$S3/o" REPO="$S3/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3P=$!
+printf '%s\n' "$S3P" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3_OUT="$(svc3_sup stop)"
+# ⛔ THE DISCRIMINATOR IS `systemctl stop`, NOT rc: a kill alone returns 0 over a controller that returns.
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: addressed the UNIT of a cell whose keys.env repoints $O (the rendered O is not the owner — the resolution is)' \
+  || bad "stop: never called 'systemctl stop' — this cell's own unit was read as another state dir's, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3_OUT"
+kill -9 "$S3P" 2>/dev/null || true
+S3C="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3C" ] && kill -9 "$S3C"; } 2>/dev/null || true
+# NEGATIVE CONTROL: the SAME rendered shape, but its env file does NOT resolve to this cell's $O. Ownership
+# must stay PROVEN-foreign (the resolution must not become "any unit on the box is ours", which would stop
+# another cell's dispatcher).
+printf 'OTHER=1\n' > "$S3/home/other-keys.env"
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; : > "$S3/sc.log"
+S3N_OUT="$(svc3_sup stop)"; S3N_RC=$?
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && bad "stop: stopped a unit whose env file resolves a DIFFERENT state dir — the widened ownership would stop another cell's controller — $S3N_OUT" \
+  || ok 'stop: a unit whose env file resolves another state dir stays FOREIGN and is left alone (the negative control)'
+case "$S3N_OUT" in
+  *"NOT this one"*) ok 'stop: the foreign unit is NAMED, not silently skipped' ;;
+  *) bad "stop: left the foreign unit alone without naming it — $S3N_OUT" ;;
+esac
+rm -f "$S3/units/eldato-orchestrator.service"
+# ── #2402 review round 9 P1: the MIRROR direction — rendered `O` is ours, keys.env says elsewhere ────────
+# The arm above pins "rendered ≠ $O, resolves $O". The mirror is just as real and just as damaging:
+# `verify_unit` REQUIRES `Environment=O=$O`, so every copy the INSTALLER renders carries the installer's own
+# $O while the controller it starts may run in the dir `keys.env` resolves. A supervisor whose $O was pinned
+# before an operator repointed keys.env (or whose env file was edited since it started) then read its OWN
+# unit as another state dir's: `stop` skipped `systemctl stop`, killed the pid, printed "released lock", and
+# `Restart=always` re-created the controller within RestartSec — the same false pass, from the opposite read.
+# So ownership is the UNION of the two answers the unit carries about itself, and only a copy that provably
+# matches NEITHER stays foreign (the negative control above).
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/o
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3MP=$!
+printf '%s\n' "$S3MP" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3M_OUT="$(svc3_sup stop)"
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: a unit that RENDERS this state dir’s O is addressed even when keys.env repoints the controller elsewhere (the union, not the resolution alone)' \
+  || bad "stop: called a unit that renders THIS state dir's O foreign — the installer's own copies always render it, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3M_OUT"
+kill -9 "$S3MP" 2>/dev/null || true
+S3MC="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3MC" ] && kill -9 "$S3MC"; } 2>/dev/null || true
+rm -f "$S3/units/eldato-orchestrator.service"
+# ── §(l-n) THE UNIT'S OWN `HOME`, AND THE INVOKER'S HOME, DECIDE WHICH UNIT A VERB ADDRESSES ──
+# ⛔ TWO DEFECTS MEASURED ON THE ROUND-16 HEAD (review P2 round 17, #2402), both of which this suite was
+# BLIND to (mutations that reverted either fix left it at 455/0), and both of which present as the
+# "reported stopped, still running" false pass:
+#  (1) `env_file_owner_o` evaluated `keys.env` with the CALLER's HOME, so `O=$HOME/o` named the caller's home
+#      and a foreign cell's unit read as this cell's own (or this cell's as foreign);
+#  (2) the USER unit directory was derived from the RE-POINTED `HOME` (= $CELL_HOME), while the installer
+#      writes to the INVOKER's `$HOME/.config/systemd/user` — so with CELL_HOME != HOME every verb looked in a
+#      directory no installer writes and reported `supervision: NONE` over an ENABLED unit.
+say_case "a unit's keys.env resolving \$HOME uses the UNIT's home, and the user unit dir is the INVOKER's"
+S5="$T/svc5"; rm -rf "$S5"; mkdir -p "$S5/units" "$S5/o" "$S5/home" "$S5/uh" "$S5/repo" "$S5/bin" "$S5/invokerhome/.config/systemd/user"
+printf 'O=$HOME/o\n' > "$S5/uh/keys.env"
+cat > "$S5/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S5/uh
+Environment=CELL_HOME=$S5/home
+Environment=ENV_FILE=$S5/uh/keys.env
+Environment=O=$S5/installer-orchestrator
+Restart=always
+SH
+cat > "$S5/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S5/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S5/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S5/o/orch-loop.sh"
+svc5_sup() { # <verb> [extra env…]
+  PATH="$S5/bin:$PATH" SYSTEMCTL="$S5/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S5/units" \
+    HOME="$S5/invokerhome" CELL_HOME="$S5/home" ENV_FILE="$S5/home/keys.env" \
+    SESSION="svc2402c-$$" O="$S5/o" REPO="$S5/repo" OR="daniel-ospina/agent-infra" \
+    SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 "$@" 2>&1
+}
+# (1) the resolution must follow the UNIT's HOME. `status` names the dir a foreign unit supervises.
+S5_OUT="$(svc5_sup bash "$SUP" status)"
+case "$S5_OUT" in
+  *"$S5/uh/o"*) ok "unit HOME: a keys.env spelling O=\$HOME/o resolves against the UNIT's Environment=HOME=" ;;
+  *) bad "unit HOME: the resolution did not use the unit's HOME — a foreign cell's unit reads as this cell's (or this cell's as foreign): $S5_OUT" ;;
+esac
+case "$S5_OUT" in
+  *"$S5/invokerhome/o"*) bad "unit HOME: the resolution used the CALLER's HOME — ONE unit file, two owners depending on who runs the verb: $S5_OUT" ;;
+  *) ok "unit HOME: and it does NOT use the caller's HOME" ;;
+esac
+# (2) with CELL_HOME != HOME and NO CONTROLLER_USER_UNIT_DIR, the USER copy must still be FOUND — the installer
+# writes it under the INVOKER's home, so a reader deriving it from $CELL_HOME is reading a directory that never
+# exists. The unit there is OURS (it renders this state dir), so `status` must not answer `supervision: NONE`.
+# ⛔ ITS OWN FIXTURE: arm (1) deliberately leaves a FOREIGN copy in the SYSTEM dir above, and that copy is the
+# resolved one — reusing this root would test the system-dir walk, not the invoker-home reader.
+S6="$T/svc6"; rm -rf "$S6"; mkdir -p "$S6/system" "$S6/o" "$S6/home" "$S6/repo" "$S6/bin" "$S6/invokerhome/.config/systemd/user"
+cat > "$S6/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S6/sc.log"
+case "\${1:-}" in
+  is-enabled) [ -f "$S6/user-enabled" ] && { printf 'enabled\n'; exit 0; }; printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S6/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S6/o/orch-loop.sh"; touch "$S6/user-enabled"
+cat > "$S6/invokerhome/.config/systemd/user/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S6/invokerhome
+Environment=CELL_HOME=$S6/home
+Environment=ENV_FILE=$S6/home/keys.env
+Environment=O=$S6/o
+Restart=always
+SH
+S6_OUT="$(env -u CONTROLLER_USER_UNIT_DIR PATH="$S6/bin:$PATH" SYSTEMCTL="$S6/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$S6/system" \
+          HOME="$S6/invokerhome" CELL_HOME="$S6/home" ENV_FILE="$S6/home/keys.env" \
+          SESSION="svc2402d-$$" O="$S6/o" REPO="$S6/repo" OR="daniel-ospina/agent-infra" \
+          SCOPE=own HARNESS="" bash "$SUP" status 2>&1)"
+# ⛔ MATCH THE SUPERVISION ROW, NOT A SUBSTRING OF THE WHOLE REPORT: `status` also prints "gh: not installed"
+# and "NO RECORD" lines, and a loose match graded an unrelated answer as this arm's verdict.
+if grep -q 'supervision:.*NONE' <<<"$S6_OUT"; then
+  bad "invoker HOME: the USER unit at the INVOKER's \$HOME/.config/systemd/user was not found (CELL_HOME != HOME) — status claims nothing supervises an ENABLED unit: $S6_OUT"
+elif grep -q 'supervision:.*ACTIVE' <<<"$S6_OUT"; then
+  ok "invoker HOME: the USER unit is found through the INVOKER's HOME, not the re-pointed \$CELL_HOME"
+else
+  bad "invoker HOME: status gave no supervision verdict at all for an enabled USER unit: $S6_OUT"
+fi
+
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
@@ -3529,6 +3778,104 @@ if [ "$LITERAL_SEEDS" -eq 0 ] && [ "$SEED_RAN" -eq "$SEED_DECLARED" ]; then
 else
   bad "a fixture hand-writes its own worker list ($LITERAL_SEEDS literal seed line(s)) or a site did not run (ran=$SEED_RAN, declared $SEED_DECLARED) — seed \$SEED_WORKERS instead"
 fi
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# keys.env cannot override a bound the INSTALLER validated (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# The unit renders `CONTROLLER_ORPHAN_TIMEOUT` / `CONTROLLER_HANDOVER_TIMEOUT` into its ENVIRONMENT so the
+# supervisor reads the values the installer proved fit StartLimitBurst inside StartLimitIntervalSec. But
+# `source_env_file` runs with `set -a`, so a `CONTROLLER_ORPHAN_TIMEOUT=3600` line in keys.env replaced the
+# validated 60 — and at 3600 the burst can never fill (3 x (3600+15) >> 300 s), so the unit restarted
+# forever while the template, the installer, the doc and `--status` all printed 60: exactly the pre-fix
+# state the arithmetic exists to remove. The re-assert is the same caller-describes-the-caller shape
+# ORCH_FOREGROUND already had; it is pinned structurally because a behavioural arm would have to park on
+# the very wait it bounds.
+say_case "keys.env cannot override the validated controller bounds (the caller's values survive the source)"
+_src_block="$(awk '/^ORCH_FOREGROUND_IN=/,/^export HOME=/' "$SUP" 2>/dev/null)"
+grep -q '^source_env_file' <<<"$_src_block" \
+  && ok 'env-file override: the snapshot/restore block straddles the source (non-vacuous)' \
+  || bad 'env-file override: the re-assert block does not surround source_env_file'
+# CONTROLLER_UNIT is the fourth member: the template renders the name, so a keys.env line must not re-point it
+# (review P1 round 14, #2402 — `stop` printed success with no systemctl call while the enabled unit kept the
+# controller alive, and `start` launched a tmux controller beside it).
+for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT \
+          SYSTEMCTL CONTROLLER_SYSTEM_UNIT_DIR CONTROLLER_USER_UNIT_DIR; do
+  grep -q "^${_v}_IN=" <<<"$_src_block" \
+    && ok "env-file override: $_v is SNAPSHOTTED before the source" \
+    || bad "env-file override: $_v is not snapshotted — a keys.env line would silently replace the value the installer validated"
+  grep -q "${_v}=\"\$${_v}_IN\"" <<<"$_src_block" \
+    && ok "env-file override: $_v is re-asserted AFTER the source" \
+    || bad "env-file override: $_v is not restored after source_env_file — keys.env can still win"
+done
+# ⛔ CONTROLLER_INVOKER_HOME IS THE FOURTH OF THAT FAMILY BUT SITS OUTSIDE THE BLOCK ABOVE (it is captured
+# at :315, before ORCH_FOREGROUND_IN, so the awk range cannot see it). Pinned directly, or its fence can be
+# deleted with every arm above still green. RED on revert: the `$CONTROLLER_INVOKER_HOME_IN` assignment goes.
+grep -q 'CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"' "$SUP" \
+  && ok 'env-file override: CONTROLLER_INVOKER_HOME is re-asserted after the source' \
+  || bad 'env-file override: CONTROLLER_INVOKER_HOME is not restored after source_env_file — keys.env can re-point the directory every unit reader uses'
+
+# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18, #2402).
+# `$HOME` at read time is the INVOKER's; the doctor's session forces `HOME=$CELL_HOME`, while an operator's
+# standalone install wrote the unit under the OPERATOR's home. With `CELL_HOME != $HOME` the doctor found
+# nothing, skipped the service branch and launched a tmux controller BESIDE the enabled unit (#1761).
+grep -q 'controller_user_unit_dirs' "$SUP" && grep -q '^passwd_home()' "$SUP" \
+  && ok 'unit lookup: the user-scope search carries the passwd-home candidates, not only the invoker HOME' \
+  || bad 'unit lookup: the user-scope unit is resolved from a single HOME guess again — a CELL_HOME != HOME cell loses its unit (and its NOT-ACTIVE fence)'
+grep -q 'getent passwd "\$1"' "$SUP" \
+  && ok 'unit lookup: passwd_home reads the database, so neither `export HOME=$CELL_HOME` nor sudo can re-point it' \
+  || bad 'unit lookup: passwd_home does not read the passwd database — the caller environment decides again'
+grep -q 'dirname "\$_UNIT_PATH")" != ' "$SUP" \
+  && ok 'unit lookup: the manager scope is taken from the resolved copy (any user dir), not one guessed path' \
+  || bad 'unit lookup: the scope is decided by comparing against one guessed user directory — a unit found in another candidate would be addressed on the SYSTEM manager'
+# ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THESE CALLERS ARE NOT THE SERVICE MANAGER (review P1 round 18,
+# #2402). The unit exports =1 and every lane shell inherits it through the tmux server it created, so an
+# unpinned `start` either parks against the handover bound and reports a false failure (`harness up`) or
+# `exec`s the loop outside the unit's cgroup (`orchestrator-bringup.sh`).
+grep -q 'ORCH_FOREGROUND=0 hu_run' "$HERE/harness-up" \
+  && ok 'caller pin: harness-up starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: harness-up starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin'
+grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-bringup.sh" \
+  && ok 'caller pin: orchestrator-bringup.sh starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: orchestrator-bringup.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 execs the loop outside the unit cgroup'
+# ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
+# sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
+# it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.
+# Both halves are behavioural arms in install-controller-service.test.sh §C and cloud-cell-doctor.test.sh;
+# this pin fails if either end of the contract is deleted here.
+grep -q 'ORCH_AUTOMATED_RESTART' "$SUP" && grep -q '          return 4' "$SUP" \
+  && ok 'automated restart: the supervisor carries the fence and its rc=4 outcome' \
+  || bad 'automated restart: the ORCH_AUTOMATED_RESTART fence (or its rc=4 outcome) is gone from the supervisor'
+# ⏱ THE DOCTOR'S `ORCH_FOREGROUND=0` PIN MUST BE EXPORTED (review P2 round 9, #2402). A bare assignment
+# holds only by two accidents — an inherited export attribute (the case the pin exists to defeat) or the
+# child's own `:-0` default — so neither is the guarantee. RED on revert: `export` removed → the grep misses.
+grep -q 'set +a; export ORCH_FOREGROUND=0;' "$SUP" \
+  && ok 'doctor: the ORCH_FOREGROUND=0 pin is EXPORTED, so an inherited =1 cannot ride into the doctor session' \
+  || bad 'doctor: ORCH_FOREGROUND=0 is a bare assignment — it holds only by an inherited export attribute or the child default, neither of which is the pin'
+# ⛔ NO "already running" ANSWER IN SERVICE MODE (review P2 round 11, #2402). `foreground_handover` returns 0
+# when the controller it waited for is GONE, so a `say "already running …"` placed AFTER it announced a pid
+# that no longer exists and returned 0 without launching anything — a clean pass over a cell with no
+# dispatcher. Every such answer must therefore sit in the NON-foreground arm of its branch (an `else`),
+# never on the path the handover returns to. RED on revert: putting the `say` back after the handover leaves
+# it outside an `else` and this pin reports the line.
+say_case 'every "already running" answer sits in the NON-foreground arm (service mode falls through to launch)'
+_ar_bad="$(awk '
+  { line[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (line[i] !~ /say "already running/) continue
+      found = 0
+      for (j = i - 1; j >= 1 && j >= i - 9; j--) {
+        # The answer is correct if it sits in the NON-foreground arm, which this file spells two ways: an
+        # `else` after a foreground test, or a branch whose own condition requires `ORCH_FOREGROUND != 1`.
+        if (line[j] ~ /^[[:space:]]*else[[:space:]]*$/) { found = 1; break }
+        if (line[j] ~ /ORCH_FOREGROUND/ && line[j] ~ /!= 1/) { found = 1; break }
+      }
+      if (!found) printf "%d ", i
+    }
+  }
+' "$SUP")"
+[ -z "$_ar_bad" ] \
+  && ok 'service mode: no "already running" answer is reachable after a completed handover' \
+  || bad "service mode: an \"already running\" answer sits on the handover path (lines: $_ar_bad) — after the handover the controller is GONE, so this reports a dead pid and exits 0 without launching"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

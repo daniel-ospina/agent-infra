@@ -5206,8 +5206,21 @@ try {
   expectBool("#1139: the fail-closed remedy is printed only when that file exists",
     pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
     !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
-  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
-    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+  // #2332 reshaped this predicate: the anchor is no longer the ONLY gate, so the
+  // pin is on the three things that must all still fail CLOSED — (1) an absent
+  // module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a
+  // missing/unreadable pin JSON yields an empty map, so no relpath is exempt),
+  // and (3) a throwing probe still keeps the M5 set gated. A regression in any
+  // of them turns "cannot tell" into "allow", which is the fail-open this test
+  // exists for.
+  // ⚠️ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {` is
+  // not: it occurs in an unrelated function too, so mutating arm 1 to
+  // `if (true) {` left the assertion green (measured at #2332 review). The pin
+  // is on the arm-1 open + its own loop, which appears exactly once.
+  expectBool("#1139 T6: a null anchor / an absent pin / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (_frameworkRoot) {\n    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {") &&
+    (pinSrc.match(/if \(_frameworkRoot\) \{\n    for \(const rel of SANCTIONED_SCRIPT_RELPATHS\) \{/g) ?? []).length === 1 &&
+    pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) continue;") &&
     pinSrc.includes("catch { rel = null; }") &&
     pinSrc.includes("if (rel === null) return true;"), true);
   expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
