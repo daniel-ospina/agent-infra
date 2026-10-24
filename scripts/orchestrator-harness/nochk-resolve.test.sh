@@ -223,11 +223,14 @@ OUT="$(run --retries 0)"
 case_ "case 6: a truncated authority surface is refused, never classified from part of the evidence"
 reset "ok:[]"
 printf '%s' '{"total_count":7,"check_runs":[{"id":5,"name":"python-ci-gate","status":"completed","conclusion":"success"}]}' > "$S/checkruns"
+echo 'feedfacecafe1234' > "$S/head"     # a MOVED head: the refusal must disclose it too
 OUT="$(run)"
 [ "$(tok "$OUT")" = "READ-FAILED" ] && ok "READ-FAILED — a partial surface is not a class" \
   || bad "expected READ-FAILED, got '${OUT}'"
 case "$(det "$OUT")" in *truncated*) ok "the detail names the truncation with both counts" ;;
   *) bad "the detail does not name truncation: '$(det "$OUT")'" ;; esac
+case "$(det "$OUT")" in *"head moved since this cycle read it"*) ok "…and a MOVED head is disclosed on this path too" ;;
+  *) bad "the truncation refusal dropped the moved-head disclosure: '$(det "$OUT")'" ;; esac
 
 # ══ CASE 6b — an UNRECOGNISED payload is unreadable, never "no surface" ═════════════════════════
 case_ "case 6b: an authority/runs payload this code cannot read is UNREADABLE, never an empty surface"
@@ -709,6 +712,33 @@ mkdir -p "$S/nochkstate/nochk-4242-abc1234def56.posttries"
 OUT="$(run --attempt-bound 1 --repair-owner "" --post)"
 case "$(det "$OUT")" in *"[post=failed-inert]"*) ok "the uncountable post bound is NAMED ([post=failed-inert])" ;;
   *) bad "an uncountable post bound is silent: '$(det "$OUT")'" ;; esac
+
+# ══ CASE 26 — the STARTUP GUARD (a guard nothing runs is not a guard) ══════════════════════════
+case_ "case 26: a missing check-class.py is FATAL; a missing nochk-resolve.py only warns"
+GUARD="$TMP/guard.sh"
+sed -n '/^nochk_require_classifier() {/,/^}/p' "$HERE/orch-loop.sh" > "$GUARD"
+if [ -s "$GUARD" ] && grep -q 'exit 78' "$GUARD"; then
+  ok "the startup guard is extracted from the shipped loop"
+else
+  bad "nochk_require_classifier() is missing from orch-loop.sh — the FATAL path is untested"
+fi
+mkdir -p "$TMP/guardO/logs"
+( . "$GUARD"; nochk_require_classifier "" "/x/nochk-resolve.py" "$TMP/guardO" "/x" ) >/dev/null 2>"$TMP/guard.err"
+RC=$?
+[ "$RC" = "78" ] \
+  && ok "a missing check-class.py exits 78 (EVERY PR's classification would be empty)" \
+  || bad "a missing check-class.py exited $RC — the controller would run on empty classes"
+grep -q 'check-class.py not found' "$TMP/guardO/logs/orch-loop.log" 2>/dev/null \
+  && ok "…and the FATAL is written to the cycle log, naming the consequence and the remedy" \
+  || bad "the FATAL was not logged"
+( . "$GUARD"; nochk_require_classifier "/x/check-class.py" "" "$TMP/guardO" "/x" ) >/dev/null 2>&1
+RC=$?
+[ "$RC" = "0" ] \
+  && ok "a missing nochk-resolve.py does NOT kill the controller (it really is one arm)" \
+  || bad "a missing arm exited $RC — a degraded arm must not stop the box"
+grep -q 'NOCHECKS ARM ABSENT' "$TMP/guardO/logs/orch-loop.log" 2>/dev/null \
+  && ok "…and it is named in the log (degraded, never silent)" \
+  || bad "the missing arm was not named"
 
 echo
 echo "──────────────────────────────────────────────"

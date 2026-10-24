@@ -862,7 +862,12 @@ fi
 # The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
 # the only scripts its `bash -n` sweep sees are the ones under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
-cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
+# ⛔ EVERY FILE THE INSTALLER GATES ON MUST BE STAGED (agent-infra#2719). `install.sh` parse-gates
+# `check-class.py` and `nochk-resolve.py` (the controller cannot classify a single PR without the
+# first), so a fixture that stages four files makes the installer DIE — measured: §F went 31 red the
+# moment that gate landed, and the gate was right, the fixture was incomplete.
+cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" \
+   "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"
 # install.sh probes the real binaries: gh (network), tmux, pi, uv.
