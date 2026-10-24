@@ -1315,11 +1315,10 @@ esac
 # file as two. `canon_dir` normalises it on the way out.
 say_case 'a doubled leading slash is the same directory, not a different one'
 DS="$(arm_root ds)"; mk_systemctl "$DS/bin" "$DS/state" "$DS/sc.log"
-# ⛔ AND THE NORMALISATION MUST NOT DEPEND ON `readlink` (re-review P1, #2666): with `readlink -f` present it
-# already collapses `//`, so the branch that needs the explicit normalisation is the one where it cannot
-# answer — and that is the branch a minimal box runs. The stub makes `readlink` fail so the `pwd -P` branch
-# (which PRESERVES the doubled slash) is the one exercised; removing the normalisation then admits a real
-# systemd directory.
+# ⛔ AND THE NORMALISATION MUST NOT DEPEND ON EITHER RESOLVER (re-review P1 rounds 5 and 6, #2666): with
+# `realpath` or `readlink -f` present they collapse `//` themselves, so the branch that needs the explicit
+# collapse is the one where NEITHER can answer — the branch a minimal box runs. `pwd -P` PRESERVES the doubled
+# slash, so without the collapse `//etc/systemd/user` is graded as "outside every tree" and admitted.
 printf '#!/bin/bash\nexit 1\n' > "$DS/bin/readlink"; chmod +x "$DS/bin/readlink"
 for _ds in '//etc/systemd/user' '///etc/systemd/system.control' '//etc/xdg/systemd/user'; do
   _DS_RC=0; _DS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ds" inst ds --dry-run 2>&1)" || _DS_RC=$?
@@ -1405,6 +1404,77 @@ case "$UR_OUT" in
   *'cannot be resolved to a physical path'*) ok 'and the refusal says it could not resolve, and names the fix' ;;
   *) bad "the unresolvable refusal does not say what was wrong — $UR_OUT" ;;
 esac
+# ⛔ A DIRECTORY THAT EXISTS BUT CANNOT BE ENTERED IS STILL UNRESOLVED (VGATE round 6, #2666). The fail-closed
+# arm above points at a NON-EXISTENT directory, so it never reaches the `pwd -P` branch — and a collapse applied
+# before the emptiness test would turn a failed `cd` into `/`, which the gate then accepts: the directory would
+# be ADMITTED rather than refused, and `mkdir -p "$UNIT_DIR"` would recreate the raw path that was never graded.
+say_case 'a directory that exists but cannot be entered is REFUSED, not read as the root'
+UC="$(arm_root uc)"; mk_systemctl "$UC/bin" "$UC/state" "$UC/sc.log"
+printf '#!/bin/bash\nexit 1\n' > "$UC/bin/realpath"; chmod +x "$UC/bin/realpath"
+printf '#!/bin/bash\nexit 1\n' > "$UC/bin/readlink"; chmod +x "$UC/bin/readlink"
+mkdir -p "$UC/unreadable"; chmod 000 "$UC/unreadable"
+if [ "$(id -u)" -eq 0 ]; then
+  # uid 0 traverses a 000 directory, so the `cd` cannot fail this way and the arm has no premise.
+  ok 'skipped (uid 0 can enter a 000 directory: the failed-cd branch is not reachable as root)'
+else
+  UC_RC=0; UC_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$UC/unreadable" inst uc --dry-run 2>&1)" || UC_RC=$?
+  [ "$UC_RC" -ne 0 ] && ok 'an un-enterable directory is REFUSED (a failed cd never becomes /)' \
+                     || bad "an un-enterable directory was ADMITTED — the sentinel was skipped — $UC_OUT"
+  case "$UC_OUT" in
+    *'cannot be resolved to a physical path'*) ok 'and it reaches the unresolvable refusal, naming the fix' ;;
+    *'resolves to /'*) bad "the failed cd was read as the ROOT — $UC_OUT" ;;
+    *) bad "the un-enterable refusal does not name the reason — $UC_OUT" ;;
+  esac
+fi
+chmod 755 "$UC/unreadable" 2>/dev/null || true
+# ⛔ A LEADING SLASH RUN, WITH **BOTH** RESOLVERS UNAVAILABLE, ON A DIRECTORY THAT EXISTS (review P1 round 6,
+# #2666). The earlier `//` arms stub only `readlink`, so `realpath` answered and collapsed the run for them;
+# the fail-closed arm stubs both but points at a NON-EXISTENT directory, so it never reaches the `pwd -P`
+# branch. This is the remaining corner: `pwd -P` answers, and it PRESERVES exactly two leading slashes.
+say_case 'a leading slash run is collapsed even when only pwd -P can answer'
+SLR="$(arm_root slr)"; mk_systemctl "$SLR/bin" "$SLR/state" "$SLR/sc.log"
+printf '#!/bin/bash\nexit 1\n' > "$SLR/bin/realpath"; chmod +x "$SLR/bin/realpath"
+printf '#!/bin/bash\nexit 1\n' > "$SLR/bin/readlink"; chmod +x "$SLR/bin/readlink"
+for _slr in '//etc/systemd/user' '///etc/systemd/user' '//etc/xdg/systemd/user'; do
+  _SLR_RC=0; _SLR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_slr" inst slr --dry-run 2>&1)" || _SLR_RC=$?
+  [ "$_SLR_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_slr is REFUSED when only pwd -P can answer" \
+                      || bad "SYSTEMD_UNIT_DIR=$_slr was ADMITTED through the pwd -P branch — $_SLR_OUT"
+done
+# ⛔ EVERY LINE OF THE TREE LIST NEEDS AN ARM, OR THE LINE IS DELETABLE (review P2 round 6, #2666). Deleting the
+# `/run/user/*/systemd` pattern left the whole suite green. `/run/user/<uid>/systemd/user` is a real user-manager
+# unit root and this box's uid is not privileged to create it, so it is graded by `realpath -m` as spelled.
+say_case 'the per-user /run tree is refused too (its pattern is not deletable)'
+RUR="$(arm_root rur)"; mk_systemctl "$RUR/bin" "$RUR/state" "$RUR/sc.log"
+RUR_RC=0; RUR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/run/user/$(id -u)/systemd/user" inst rur --dry-run 2>&1)" || RUR_RC=$?
+[ "$RUR_RC" -ne 0 ] && ok '/run/user/<uid>/systemd/user is REFUSED (a user-manager unit root nothing here reads)' \
+                   || bad "/run/user/<uid>/systemd/user was ADMITTED — the pattern is deletable — $RUR_OUT"
+# ⛔ AND THE UNIT NAME IS NOT A PATH (review residual round 6, #2666). `$UNIT_DIR/$UNIT_NAME` is the write path;
+# a name carrying `/` or `..` would leave the directory that was graded.
+say_case 'CONTROLLER_UNIT must be a bare unit name, never a path'
+CU="$(arm_root cu)"; mk_systemctl "$CU/bin" "$CU/state" "$CU/sc.log"
+# ⛔ THE ASSERTION IS THE REFUSAL, NOT `rc != 0` (review round 6, #2666): without the name rule the verb fails
+# anyway — one directory up there is no template of that name — so a bare non-zero check passed on the wrong
+# error and the arm could not fail. Each case must be refused BY THIS GUARD.
+for _cu in '../evil.service' 'a/b.service' '..'; do
+  _CU_RC=0; _CU_OUT="$(EXTRA_ENV="CONTROLLER_UNIT=$_cu" inst cu --dry-run 2>&1)" || _CU_RC=$?
+  case "$_CU_OUT" in
+    *'REFUSING CONTROLLER_UNIT'*) [ "$_CU_RC" -ne 0 ] \
+        && ok "CONTROLLER_UNIT='$_cu' is REFUSED by the name rule (it would write outside the graded dir)" \
+        || bad "CONTROLLER_UNIT='$_cu' named the rule but exited 0" ;;
+    *) bad "CONTROLLER_UNIT='$_cu' was not refused by the name rule — $_CU_OUT" ;;
+  esac
+done
+case "$_CU_OUT" in
+  *'REFUSING CONTROLLER_UNIT'*) ok 'and the refusal names the variable' ;;
+  *) bad "the CONTROLLER_UNIT refusal does not name the variable — $_CU_OUT" ;;
+esac
+# …and a legitimate bare name still installs (the control that stops the arm above passing by refusing all).
+CU2="$(arm_root cu2)"; mk_systemctl "$CU2/bin" "$CU2/state" "$CU2/sc.log"
+mkdir -p "$CU2/tpl"; sed "s/eldato-orchestrator/cell-alpha/g" "$TPL" > "$CU2/tpl/cell-alpha.service"
+CU2_RC=0; CU2_OUT="$(EXTRA_ENV="CONTROLLER_UNIT=cell-alpha.service" TPL_DIR="$CU2/tpl" inst cu2 --install 2>&1)" || CU2_RC=$?
+[ "$CU2_RC" -eq 0 ] && ok 'a bare CONTROLLER_UNIT still installs (the name rule is a boundary, not a blanket)' \
+                   || bad "a legitimate CONTROLLER_UNIT was refused — $CU2_OUT"
+
 # ⛔ AND THE PHYSICAL SPELLING OF A NOT-YET-EXISTING USER ROOT (re-review P2, #2666): with `$HOME` a symlink and
 # `~/.local/share/systemd` absent, the `$HOME` spelling was refused while its PHYSICAL spelling was admitted —
 # same directory, two verdicts. Both must resolve to the same root now.

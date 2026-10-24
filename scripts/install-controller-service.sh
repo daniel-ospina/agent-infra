@@ -75,6 +75,13 @@ set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_NAME="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
+# THE UNIT NAME IS A NAME, NOT A PATH (review residual round 6, #2666). `CONTROLLER_UNIT` is concatenated
+# onto the directory this installer GRADES (`$UNIT_DIR/$UNIT_NAME`), so a value carrying `/` or `..` would
+# write outside the directory that was checked — the guard would grade one path and `install` the other. The
+# template filename is taken from the same value, so a traversal here is also a template traversal.
+case "$UNIT_NAME" in
+    ''|.|..|*/*) printf '%s: %s\n' "${0##*/}" "REFUSING CONTROLLER_UNIT='$UNIT_NAME': it must be a bare unit file name (no '/', not '.' or '..') — it is appended to the unit directory this installer grades, so a path here would write outside it, and the template filename comes from the same value" >&2; exit 2 ;;
+esac
 # Templates are NOT farmed (only scripts are), so a farmed copy of this installer must be able to find
 # them in the checkout that installed the layer. ⛔ THE CANDIDATE MUST CARRY *THIS* TEMPLATE, not merely
 # exist: $AGENT_INFRA_PATH is set on every cell and is often a DIFFERENT (older) checkout, so a
@@ -199,7 +206,20 @@ canon_dir() { # <dir> — the physical path `mkdir -p` WOULD land on, or `__unre
     fi
     if [ -d "$d" ]; then
         out="$( cd "$d" 2>/dev/null && pwd -P )"
-        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        # A LEADING SLASH RUN IS ONE SLASH (review P1 round 6, #2666): POSIX makes a leading `//`
+        # implementation-defined and bash's `pwd -P` PRESERVES it, so on a box where neither `realpath` nor
+        # `readlink -f` can answer, `//etc/systemd/user` came back spelled with two slashes and matched no
+        # tree pattern — ADMITTED, where the same directory with one slash is refused. Collapsing it here
+        # means every branch returns the same spelling for the same directory.
+        # ⛔ AND ONLY WHEN `cd` ACTUALLY ANSWERED (VGATE round 6, #2666): collapsing BEFORE the emptiness
+        # test turned a failed `cd` — a directory that exists but cannot be entered (mode), or one removed
+        # between `-d` and `cd` — into `/`, which the `[ -n "$out" ]` gate then accepted. That is the exact
+        # fail-open this branch is not allowed to have: a directory the guard cannot grade must reach the
+        # `__unresolved__` sentinel below, never be read as the root.
+        if [ -n "$out" ]; then
+            while [ "${out#/}" != "$out" ]; do out="${out#/}"; done
+            printf '%s\n' "/$out"; return 0
+        fi
     fi
     printf '%s%s\n' "$CANON_UNRESOLVED" "$d"
 }
