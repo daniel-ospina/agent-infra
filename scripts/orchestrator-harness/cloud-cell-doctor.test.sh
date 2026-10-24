@@ -1427,15 +1427,33 @@ done <<<"$ROLES"
 # were filed `derived` — ungraded ✅ notes — even though both are bare reads that die on an absent
 # argument. `derived` is now an ANNOTATION printed under the verdict (the value embeds the positional
 # in a path or a concatenation), never a bucket that suppresses grading.
+# ⛔ THE COMMENT STRIP IS QUOTE-AWARE (review P1). Stripping at the first whitespace-plus-`#` on the
+# line also truncated a value that CONTAINS that sequence: `local what="reap #$1 lane"` lost the read
+# from the scan AND from the count in one stroke, so no record and no `unparsed` — PASS=230, identical
+# to baseline, over a binding that dies under `set -u`. Because one string now feeds both halves, a
+# strip that is wrong is wrong twice. The scan therefore cuts only at a `#` that is preceded by
+# whitespace AND is OUTSIDE quotes; `="#ff"` stays intact either way.
+strip_comment() {
+  printf '%s\n' "$1" | awk '
+    { out = ""; qd = 0; qs = 0
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (c == "\\" && i < length($0)) { out = out c substr($0, i + 1, 1); i++; continue }
+        if (c == "\"" && !qs) qd = 1 - qd
+        else if (c == "\047" && !qd) qs = 1 - qs
+        if (c == "#" && !qd && !qs && i > 1 && substr($0, i - 1, 1) ~ /[ \t]/) break
+        out = out c
+      }
+      print out }'
+}
 audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
   local body="$1" assign var val rd seen=0 alln=0
   # ⛔ ONE STRING FOR BOTH THE SCAN AND THE COUNT (review P1). The count used to strip a trailing
   # `# …` comment while the assignment scan read the RAW line, so a comment that looks like an
   # assignment contributed a phantom "seen" read: `seen == alln`, no `unparsed` was emitted, and the
   # fail-closed counter went silent on exactly the shape it exists for. Stripping ONCE, here, before
-  # either use, makes the two compare the same string. The strip needs WHITESPACE before the `#`, so
-  # a value like `="#ff"` is untouched.
-  body="${body%%[[:space:]]#*}"
+  # either use, makes the two compare the same string.
+  body="$(strip_comment "$body")"
   while read -r assign; do
     [ -n "$assign" ] || continue
     var="${assign%%=*}"; val="${assign#*=}"
@@ -1505,6 +1523,7 @@ bare|local dry="$1 "
 bare|local x="$1$2"
 bare|local n="${#1}"
 bare|local n="${!1}"
+bare|local what="reap #$1 lane"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
 # …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
@@ -1544,6 +1563,10 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ NO `$` AFTER THE BRACE ARM: a trailing comment (`state_write_rehearsal() { # <role> …`) is
   # normal in this file, and anchoring there silently dropped 22 of the 48 headers — which made a
   # line resolve to the PRECEDING function, i.e. exactly the misattribution this fixes.
+  # ⛔ AND A TRAILING COMMENT BEFORE A NEXT-LINE BRACE (review P1, reproduced): `ZzFutureHelper()  #
+  # note` + `{` on the following line is bash-legal, and an EOL-anchored next-line arm missed it, so
+  # the read resolved to the PRECEDING function and PASS went 230→231 with the mutant's read ✅ under
+  # `run_bounded`. Both arms therefore accept an optional trailing comment.
   # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
   # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
   # nested helpers both sit after their function's only positional binding, so nothing is
@@ -1558,7 +1581,7 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\(\)([[:space:]]*\{|[[:space:]]*$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\(\)([[:space:]]*\{|[[:space:]]*(#[^\"]*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*(#[^\"]*)?$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -1581,9 +1604,10 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   printf 'ZzTightHelper(){\n  local s="$1"\n}\n'
   printf 'function ZzKeyword {\n  local s="$1"\n}\n'
   printf 'zz-dashed-name() {\n  local s="$1"\n}\n'
-  printf 'zz_next_line()\n{\n  local s="$1"\n}\n'
+  printf 'ZzNextLine()\n{\n  local s="$1"\n}\n'
+  printf 'ZzCommentBrace()  # a note\n{\n  local s="$1"\n}\n'
 } > "$T/hdr.sh"
-for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name zz_next_line; do
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace; do
   _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
   [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
     || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
@@ -1603,7 +1627,7 @@ audit_scan() { # <file>
       [ -n "${verdict:-}" ] || continue
       printf '%s %s %s %s %s\n' "$verdict" "$ln" "${fn:-?}" "$var" "$rd"
     done < <(audit_line "$body")
-  done < <(grep -nE '^[[:space:]]*local ' "$file")
+  done < <(grep -nE '^[[:space:]]*local[[:space:]]' "$file")
 }
 # Grade one file's reads against REQUIRED_READS. Counts land in AUDIT_*; the RETURN is the number of
 # ungraded/fatal pairs, so a caller can assert on it without re-deriving the decision.
