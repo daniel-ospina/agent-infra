@@ -428,6 +428,15 @@ do_install() {
     case "${RESTART_SEC:-}" in
         ''|*[!0-9]*) err "REFUSING: ORCH_RESTART_SEC must be a whole number of seconds (got '$RESTART_SEC')"; return 1 ;;
     esac
+    # ⛔ BASE 10, NORMALISED ONCE (review P1 round 15, #2402). The shape test above accepts a LEADING-ZERO
+    # value, and `$(( 015 ))` is OCTAL 13 while `[ ]` and systemd read the same `015` as DECIMAL 15 — so the
+    # guard modelled a different number from the one it rendered into the unit and the one systemd parsed.
+    # Measured: `ORCH_RESTART_SEC=015 ORCH_START_TIMEOUT_SEC=100` was refused quoting a 76 s remedy computed
+    # from 13 s, and following that 76 s makes a real per-attempt cost of 101 s → 3 × 101 > 300, the endless
+    # restart this arithmetic exists to exclude; `ORCH_START_TIMEOUT_SEC=060 ORCH_RESTART_SEC=200` printed a
+    # remedy the very next guard refused (octal quotient, decimal comparison). Normalising here makes the
+    # modelled, rendered and parsed numbers the same integer.
+    case "$RESTART_SEC" in 0?*) RESTART_SEC=$(( 10#$RESTART_SEC )) ;; esac
     [ "$RESTART_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_RESTART_SEC must be >= 1 (got '$RESTART_SEC') — 0 is not a delay"; return 1; }
     # ⛔ THE ORPHAN CEILING MUST FIT `StartLimitBurst` ATTEMPTS INSIDE `StartLimitIntervalSec` — NOT MERELY
@@ -451,6 +460,10 @@ do_install() {
     sl_burst="$(sed -n 's/^StartLimitBurst=//p' "$tpl" 2>/dev/null | head -1)"
     case "${sl_iv:-}" in ''|*[!0-9]*) sl_iv=300 ;; esac
     case "${sl_burst:-}" in ''|*[!0-9]*) sl_burst=3 ;; esac
+    # same base-10 normalisation as RESTART_SEC above: a zero-padded template value would otherwise be octal
+    # in the quotient and decimal in the comparison.
+    case "$sl_iv" in 0?*) sl_iv=$(( 10#$sl_iv )) ;; esac
+    case "$sl_burst" in 0?*) sl_burst=$(( 10#$sl_burst )) ;; esac
     # ⛔ A BURST OF 0 IS "NO START LIMIT" — refuse it rather than divide by it (see the magnitude guard
     # below), because that is the endless-restart mode this whole arithmetic exists to exclude.
     [ "$sl_burst" -ge 1 ] 2>/dev/null \
@@ -460,6 +473,7 @@ do_install() {
     esac
     [ "$START_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be >= 1 (got '$START_TIMEOUT_SEC')"; return 1; }
+    case "$START_TIMEOUT_SEC" in 0?*) START_TIMEOUT_SEC=$(( 10#$START_TIMEOUT_SEC )) ;; esac
     # ⛔ THE RELATION IS DIVIDED, NEVER MULTIPLIED (review P2, #2402). The shape test above accepts a
     # 19-DIGIT value, and `sl_burst * (START_TIMEOUT_SEC + RESTART_SEC)` then WRAPS NEGATIVE — measured:
     # 3 * (3074457345618258602 + 15) = -9223372036854775765 — so `-lt $sl_iv` PASSED and a unit with an
@@ -504,10 +518,16 @@ do_install() {
     # derived without them is a bound this guard then refuses (measured: 39 s at the 60 s default failed the
     # very next check, because 3 × (60 + 39 + 10) = 327 > 300).
     sl_max_rs_at_ceiling=$(( (sl_iv - 1) / sl_burst - START_TIMEOUT_SEC - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC ))
+    # ⛔ THE RULE IN THE SENTENCE MUST BE THE RULE THE GUARD ENFORCES (review P2 round 15, #2402). It said the
+    # ceiling and RestartSec "must sum to at most" the raw quotient (99 at the shipped window), while the
+    # check below allows at most that minus the poll quantum and the per-attempt overhead (89) — so an
+    # operator who split the budget instead of copying the example was refused by the same message that
+    # told them they were fine. Computed ONCE here, used in both the sentence and the guard.
+    sl_sum_max=$(( (sl_iv - 1) / sl_burst - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC ))
     if [ "$sl_maxtime" -lt 1 ]; then
         err "REFUSING: no orphan ceiling fits this start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave nothing for RestartSec=${RESTART_SEC}s plus a >= 1s ceiling (the minimum window is ${sl_min_iv}s), so NO configuration would converge to failed."
         if [ "$sl_max_rs_at_ceiling" -ge 1 ]; then
-            err "  ORCH_RESTART_SEC=${RESTART_SEC} is what made the window too small: use ORCH_RESTART_SEC <= ${sl_max_rs_at_ceiling} with the current ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} — the two must sum to at most $(( (sl_iv - 1) / sl_burst ))s inside ${sl_iv}s."
+            err "  ORCH_RESTART_SEC=${RESTART_SEC} is what made the window too small: use ORCH_RESTART_SEC <= ${sl_max_rs_at_ceiling} with the current ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} — the two must sum to at most ${sl_sum_max}s inside ${sl_iv}s."
         elif [ "$sl_max_rs" -ge 1 ]; then
             err "  ORCH_RESTART_SEC=${RESTART_SEC} plus ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} overrun the window together: lower BOTH — e.g. ORCH_RESTART_SEC <= ${sl_max_rs} with ORCH_START_TIMEOUT_SEC=1 — so the ceiling plus RestartSec fits ${sl_burst} attempts inside ${sl_iv}s."
         else

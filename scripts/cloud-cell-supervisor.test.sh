@@ -3652,7 +3652,7 @@ grep -q '^source_env_file' <<<"$_src_block" \
 # CONTROLLER_UNIT is the fourth member: the template renders the name, so a keys.env line must not re-point it
 # (review P1 round 14, #2402 — `stop` printed success with no systemctl call while the enabled unit kept the
 # controller alive, and `start` launched a tmux controller beside it).
-for _v in ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT; do
+for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT; do
   grep -q "^${_v}_IN=" <<<"$_src_block" \
     && ok "env-file override: $_v is SNAPSHOTTED before the source" \
     || bad "env-file override: $_v is not snapshotted — a keys.env line would silently replace the value the installer validated"
