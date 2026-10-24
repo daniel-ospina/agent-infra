@@ -1411,7 +1411,8 @@ hu_row_launchd() {
 hu_capacity() {
   local load1="" ncpu="" dfree="" probe="shim" rec="" capsh="$SELF_PATH/orchestrator-harness/capacity.sh"
   local ceil percpu perlanes loadlanes dpath diskfloor diskcost avail disklen lanes now fixed="none"
-  local forkhead="" forksrc="" forkreserve="" forklane="" forkavail="" forklanes="" binding="" fr=""
+  local forkhead="" forksrc="" forkreserve="" forklane="" forkavail="" forklanes="" forkbound=1 binding="" fr=""
+  local fmin="" frh="" frc=0
   # ── the reading: capacity.sh's record first, the shim probes as the fallback ────────────────────
   if [ -f "$capsh" ]; then
     # ⛔ BOUNDED, and a FAILED probe is not a reading: a `capacity.sh` that cannot answer leaves the
@@ -1443,11 +1444,32 @@ hu_capacity() {
   # same shape at 0.32x load. The record's own field is consumed first (one instrument: capacity.sh),
   # and the shim is the fallback for a box with no capacity.sh beside the launcher — the record names
   # which answered, so a fallback can never pass as the fleet instrument.
-  case "$rec" in
-    *fork_headroom=*)
-      forkhead="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_headroom=\([0-9][0-9]*\).*/\1/p' | head -1)"
-      forksrc="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_source=\([^ ]*\).*/\1/p' | head -1)"
-      [ -n "$forkhead" ] && [ -z "$forksrc" ] && forksrc="$probe" ;;
+  # ⛔ capacity.sh IS THE ONE INSTRUMENT, AND ITS `fork` VERB IS THE READING ALONE. The #2552 batch
+  # landed the fork read on main while this branch was in review, under a DIFFERENT record schema
+  # (`procs=`/`procs_max=`/`fork=`/`src=`) than this branch had invented (`fork_headroom=`). A branch
+  # cannot win that: two publishers under one `refs/boxes` namespace is the defect, not the field name,
+  # so the RECORD is main's and this launcher CONSUMES it. Deriving `procs_max − procs` here would be a
+  # second implementation of `cap_h_for`'s arithmetic, so the verb answers with `headroom=` already
+  # computed there — and `min_fork_headroom=` carries the fleet's declared margin, so this file cannot
+  # invent a second one either.
+  if [ -f "$capsh" ]; then
+    fr="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" fork 2>/dev/null)"; frc=$?
+    # 254 is capacity.sh's own "THE READ COULD NOT FORK" (bash terminates on a failed fork): the box
+    # is out of pids, which is the TOTAL failure this dimension exists for. Name it, do not retry.
+    [ "$frc" -eq 254 ] && { printf 'capacity_refused reason=fork_exhausted probe=capacity.sh\n'; return 3; }
+  fi
+  case "$fr" in
+    *[[:space:]]headroom=*)
+      frh="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]headroom=\([^ ]*\).*/\1/p' | head -1)"
+      fmin="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]min_fork_headroom=\([0-9][0-9]*\).*/\1/p' | head -1)"
+      forksrc="$(printf '%s' "$fr" | sed -n 's/.*[[:space:]]src=\([^ ]*\).*/\1/p' | head -1)"
+      # `min_fork_headroom=` contains the substring `headroom=` but never after a SPACE, so the two
+      # extractions cannot collide.
+      case "$frh" in
+        unbounded)  forkhead=unbounded; forksrc="capacity.sh:${forksrc:-no-ceiling}" ;;
+        ''|*[!0-9]*) : ;;
+        *)          forkhead="$frh"; forksrc="capacity.sh:${forksrc:-unknown}" ;;
+      esac ;;
   esac
   if [ -z "$forkhead" ]; then
     fr="$(hp_fork_headroom 2>/dev/null)" || fr=""
@@ -1458,6 +1480,11 @@ hu_capacity() {
   # ⛔ AN UNMEASURABLE FORK LIMIT IS NOT UNLIMITED HEADROOM. `ulimit -u` is a shell builtin and exists
   # everywhere these boxes run, so this refusal is rare — but "I could not look" must never be spent
   # as "there is room", which is the whole class #1745/#2293 record. `up` refuses on it like load/disk.
+  # ⛔ AND `unbounded` IS NOT UNMEASURABLE — IT IS THE OPPOSITE. `procs_max=0` means NO CEILING WAS
+  # FOUND, so `cap_h_for` answers `unbounded`, and a box no process limit bounds cannot be bound by
+  # one. It is kept as a distinct WORD so the arithmetic below skips the dimension; collapsing it into
+  # a number would either refuse every healthy unbounded box (read as 0 headroom) or pretend a ceiling
+  # exists (read as a huge one, which then divides into a fabricated lane count).
   [ -n "$forkhead" ] || { printf 'capacity_refused reason=fork_unreadable probe=%s\n' "$probe"; return 3; }
   # ⛔ BASE 10 EXPLICITLY, EVERYWHERE A KNOB REACHES `$(( ))`. The digit check above rejects
   # non-numbers but ACCEPTS a leading zero, and bash reads `0400` as OCTAL 256 — so
@@ -1491,18 +1518,30 @@ hu_capacity() {
   # `uv sync` tree. 800 kept free is ~20 idle lanes' worth, and is the cushion a fork storm eats first
   # (#2304: 3.4k processes from one recursion). Both are knobs because both are measurements of a
   # WORKLOAD, not caps.
-  forkreserve="${HU_FORK_RESERVE:-800}";  case "$forkreserve" in ''|*[!0-9]*) forkreserve=800 ;; esac
+  # ⛔ THE RESERVE IS THE FLEET'S DECLARED MARGIN, NOT A SECOND ONE. `min_fork_headroom` IS
+  # `CAP_MIN_FORK_HEADROOM` in capacity.sh (200) — the number the fleet's own placement gate refuses
+  # on. This launcher defaulting to its own 800 would mean two readers disagree about one reading, so
+  # the default comes FROM the instrument, and 200 is only the fallback for a box with no capacity.sh.
+  # `HU_FORK_PER_LANE` stays a workload measurement, not a cap: one `pi` holds ~11 threads and a lane
+  # adds its shell, the worker terminal, git/gh calls and (for a test lane) a pytest or `uv sync` tree.
+  forkreserve="${HU_FORK_RESERVE:-${fmin:-200}}"; case "$forkreserve" in ''|*[!0-9]*) forkreserve=200 ;; esac
   forklane="${HU_FORK_PER_LANE:-40}";     case "$forklane" in ''|*[!0-9]*) forklane=40 ;; esac
   [ "$forklane" -ge 1 ] 2>/dev/null || forklane=40
-  forkavail=$(( 10#$forkhead > 10#$forkreserve ? 10#$forkhead - 10#$forkreserve : 0 ))
-  forklanes=$(( forkavail / 10#$forklane ))
+  if [ "$forkhead" = unbounded ]; then
+    # No ceiling found => this dimension cannot bind. `forkbound=0` is what the derivation reads; the
+    # numbers are left at 0 and are NEVER compared, so an unbounded box cannot read as "0 lanes".
+    forkbound=0; forkavail=0; forklanes=0
+  else
+    forkavail=$(( 10#$forkhead > 10#$forkreserve ? 10#$forkhead - 10#$forkreserve : 0 ))
+    forklanes=$(( forkavail / 10#$forklane ))
+  fi
   # ── the derivation, IN THE ORDER THE DIMENSIONS FAIL: fork (total), disk (total, and the one that
   # breaks a box first in practice), load (soft). `binding=` names WHICH one produced the number, so a
   # reader can tell "the box is full" from "the box could not fork" from "this is just busy" — three
   # states that used to print as one lane count.
   lanes=$(( loadlanes < disklen ? loadlanes : disklen ))
   binding=disk; [ "$loadlanes" -lt "$disklen" ] && binding=load
-  if [ "$forklanes" -lt "$lanes" ]; then lanes=$forklanes; binding=fork; fi
+  if [ "$forkbound" -eq 1 ] && [ "$forklanes" -lt "$lanes" ]; then lanes=$forklanes; binding=fork; fi
   [ -n "${HARNESS_UP_MAX_LANES:-}" ] && fixed="$HARNESS_UP_MAX_LANES"
   now="$(date +%s 2>/dev/null)"
   printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s lanes_by_load=%s lanes_by_disk=%s lanes_by_fork=%s fork_headroom=%s fork_source=%s binding=%s lanes=%s fixed_ignored=%s probe=%s at=%s\n' \
@@ -1529,7 +1568,9 @@ hu_row_capacity() {
   dfree="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]disk_free_mb=\([0-9]*\).*/\1/p' | head -1)"
   fixed="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
   probe="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]probe=\([^ ]*\).*/\1/p' | head -1)"
-  forkhead="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_headroom=\([0-9]*\).*/\1/p' | head -1)"
+  # `[^ ]*`, not `[0-9]*`: `unbounded` is a legitimate reading and must print as itself rather than
+  # as `?`, which is how an absent datum is rendered.
+  forkhead="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_headroom=\([^ ]*\).*/\1/p' | head -1)"
   forksrc="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fork_source=\([^ ]*\).*/\1/p' | head -1)"
   binding="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]binding=\([a-z]*\).*/\1/p' | head -1)"
   lb_load="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes_by_load=\([0-9]*\).*/\1/p' | head -1)"
@@ -1935,7 +1976,13 @@ hu_start_loop() {
     *) warn "gh: could not be verified ($(hu_bound_explain "$gh_rc" "${HU_GH_TIMEOUT:-20}")) — not treated as authenticated, and not as absent" ;;
   esac
   [ -f "$SELF_PATH/orchestrator-bringup.sh" ] || { warn "loop: no orchestrator-bringup.sh beside $SELF — cannot start the controller this way"; return 1; }
-  hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
+  # ⛔ `ORCH_FOREGROUND=0` IS PINNED, NOT INHERITED (review P2 round 17, #2402). A service-managed
+  # controller exports `ORCH_FOREGROUND=1` into its WHOLE process tree, and a tmux server that controller
+  # started carries it into every lane shell — so this delegation, run from such a shell, would take
+  # `start`'s FOREGROUND branch, `exec` the loop inside the CALLER and leave the enabled unit unsupervised
+  # (the surface reads supervised while the controller dies with the shell). The value describes the
+  # CALLER, so the caller pins it.
+  ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
   if [ "$rc" -eq 0 ]; then say "loop: ok"; return 0; fi
   warn "loop: start failed ($(hu_bound_explain "$rc" "$BOUND")) — see the output above"
@@ -1949,7 +1996,9 @@ hu_start_supervisor() {
   if [ "$PLATFORM" != "cell" ]; then say "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
   if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then say "supervisor: ok (session '$sess' is up)"; return 0; fi
   [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] || { warn "supervisor: no cloud-cell-supervisor.sh beside $SELF, and no session '$sess'"; return 1; }
-  hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
+  # ⛔ same inheritance fence as the loop arm above (review P2 round 17, #2402): inside a service-managed
+  # controller's tree, an inherited `ORCH_FOREGROUND=1` would re-parent the controller into THIS shell.
+  ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/sup.log" | tail -n 30
   [ "$rc" -eq 0 ] || { warn "supervisor: start failed ($(hu_bound_explain "$rc" "$BOUND"))"; return 1; }
   say "supervisor: ok"; return 0

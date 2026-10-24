@@ -173,23 +173,25 @@ run() { # <verb> [extra argv…]
 row() { printf '%s\n' "$OUT" | grep -E "^$1 " | head -1; }
 
 # Plate sighting: the tightest fork limits are a cgroup ceiling far below the rlimits — #2293's shape.
-# Math, with HU_FORK_RESERVE=800 and HU_FORK_PER_LANE=40: headroom 1000 → 5 lanes (load would allow 9,
-# disk far more), so FORK is the binding dimension; 3397 → 64 lanes, so load binds; 1 → 0 lanes.
-printf 'cgroup-pids 1100 100\nrlimit-nproc 15641 2009\nthreads-max 31282 2493\n' > "$TMP/fork-tight"
+# Math, with the reserve at its DEFAULT — the fleet's own `CAP_MIN_FORK_HEADROOM` (200), which this
+# launcher now reads from capacity.sh's `fork` verb instead of declaring a second one — and
+# HU_FORK_PER_LANE=40: headroom 360 → 4 lanes (load would allow 9, disk far more), so FORK is the
+# binding dimension; 3397 → 79 lanes, so load binds; 1 → 0 lanes.
+printf 'cgroup-pids 460 100\nrlimit-nproc 15641 2009\nthreads-max 31282 2493\n' > "$TMP/fork-tight"
 printf 'cgroup-pids 4692 1295\nrlimit-nproc 15641 2009\nthreads-max 31282 2493\n' > "$TMP/fork-generous"
 printf 'cgroup-pids 10000 9999\nrlimit-nproc 15641 2009\n' > "$TMP/fork-none"   # 1 task spare
 
 # ══ (A)+(B) FORK HEADROOM IS READ FIRST, BINDS, AND IS PRINTED IN THE ORDER IT FAILS ════════════
 FORKFILE="$TMP/fork-tight" run status
 cap_row="$(row capacity)"
-ck "(A) a tight fork limit BINDS the lane count (1000 spare / 40 per lane = 5 of load's 9) [$cap_row]" \
-   "$(has "$cap_row" 'lanes=5 ' && has "$cap_row" 'binding=fork' && echo 0 || echo 1)"
+ck "(A) a tight fork limit BINDS the lane count (360 spare / 40 per lane = 4 of load's 9) [$cap_row]" \
+   "$(has "$cap_row" 'lanes=4 ' && has "$cap_row" 'binding=fork' && echo 0 || echo 1)"
 ck "(A) …and the row says a fork limit is what bound it, not load or disk" \
    "$(has "$cap_row" 'binding=fork' && echo 0 || echo 1)"
 ck "(B) the dimensions print in the order they FAIL: fork → disk → load" \
    "$(grep -q 'fork headroom=.*→ disk free=.*→ load=' <<<"$cap_row" && echo 0 || echo 1)"
 ck "(B) …and the fork number is attributed to the LIMIT that produced it (cgroup≠rlimit here)" \
-   "$({ has "$cap_row" 'fork headroom=1000 (cgroup-pids)' || has "$cap_row" 'fork headroom=1000 (shim:cgroup-pids)'; } && echo 0 || echo 1)"
+   "$({ has "$cap_row" 'fork headroom=360 (cgroup-pids)' || has "$cap_row" 'fork headroom=360 (shim:cgroup-pids)'; } && echo 0 || echo 1)"
 
 # A box whose fork headroom is one task: no lane may be placed, and the verdict is DEGRADED (not OK).
 FORKFILE="$TMP/fork-none" run status
@@ -217,19 +219,27 @@ ck "(A) an unmeasurable fork limit REFUSES the placement (never a fixed cap, nev
    "$(has "$cap_row" 'REFUSED' && has "$cap_row" 'fork/task headroom' && echo 0 || echo 1)"
 ck "(A) …and cannot-verify is BROKEN (rc=2, got $RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 
-# The record path (capacity.sh, the fleet instrument) is consumed — including its fork fields, which
-# an older writer may not have measured. The stub is the RECORD PRODUCER (it prints a record, it does
-# not compute one), so what is asserted is the launcher's CONSUMPTION of fork_headroom.
+# The record path (capacity.sh, the fleet instrument) is consumed — including its fork reading, which
+# comes from its OWN `fork` verb rather than from this launcher re-deriving `procs_max − procs`.
+# ⛔ THE STUB SPEAKS THE LANDED SCHEMA (`procs=`/`procs_max=`/`fork=`/`src=`, and `headroom=` from the
+# verb), because that schema is main's and this branch's short-lived `fork_headroom=` record field was
+# dropped — two publishers under one `refs/boxes` namespace is the defect, not the field name.
 cat > "$HARNESS/capacity.sh" <<'SH'
 #!/usr/bin/env bash
-printf 'host=fixture ncpu=4 load1=400 lpc=100 lanes=0 disk_free_mb=9000 mem_free_mb=4000 fork_headroom=1000 fork_source=cgroup-pids at=%s\n' "$(date +%s)"
+case "${1:-}" in
+  probe) printf 'host=fixture ncpu=4 load1=400 lpc=100 lanes=0 disk_free_mb=9000 mem_free_mb=4000 procs=400 procs_max=15641 fork=1 at=%s\n' "$(date +%s)" ;;
+  fork)  printf 'procs=400 procs_max=15641 fork=1 src=uid headroom=15241 min_fork_headroom=200\n' ;;
+  *)     exit 2 ;;
+esac
 SH
 chmod +x "$HARNESS/capacity.sh"
 run status
-ck "(A) the record's OWN fork fields are consumed (via names the fleet instrument, not the shim)" \
+ck "(A) the record's OWN fork reading is consumed (via names the fleet instrument, not the shim)" \
    "$(row capacity | grep -q 'via=capacity.sh' && echo 0 || echo 1)"
-ck "(A) …and the record's fork reading — not a fresh shim probe — decides the placement" \
-   "$(row capacity | grep -q 'fork headroom=1000 (cgroup-pids)' && echo 0 || echo 1)"
+ck "(A) …and the instrument's fork reading — not a fresh shim probe — decides the placement" \
+   "$(row capacity | grep -q 'fork headroom=15241 (capacity.sh:uid)' && echo 0 || echo 1)"
+ck "(A) …and the reserve it applied is the FLEET's 200, read from the verb, not a second declaration" \
+   "$(row capacity | grep -q 'by fork=376 ' && echo 0 || echo 1)"
 rm -f "$HARNESS/capacity.sh"
 
 # ══ (C) LANES ARE COUNTED **AND** JUDGED ════════════════════════════════════════════════════════
