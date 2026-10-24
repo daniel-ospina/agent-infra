@@ -97,11 +97,19 @@ lp_census() { # <dir>
                     # it did not protect the tree it named (measured: the tree was reaped while a live
                     # process had it in argv). Emit the part after `=`; a relative value still emits
                     # nothing, so the "absolute only" rule is unchanged.
+                    # `relarg` = a token the holder resolves against ITS OWN cwd. Emitted for every
+                    # non-absolute token; the match joins it with that pid's cwd row, in one awk pass.
                     case "$_tok" in
                         /*) printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;;
                         *=*) case "${_tok#*=}" in
                                  /*) printf 'arg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;;
+                                 *)  case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
                              esac ;;
+                        # ⛔ PATH-LIKE ONLY. Emitting every token exploded the table 100x on a real box
+                        # (32,686 rows over 127 pids, measured) because a bare word (`sleep`, `--flag`,
+                        # a java classpath element) can never name a tree — and the matcher requires a
+                        # `/` anyway. A token without one is not a candidate spelling.
+                        *) case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
                     esac
                 done
             done
@@ -136,7 +144,9 @@ lp_census() { # <dir>
                         # the ATTACHED spelling (`--repo=/abs`, `VAR=/abs`) — the /proc arm emits it,
                         # and leaving it out made the two arms disagree about what a holder "named"
                         n = split($i, kv, "=")
-                        if (n == 2 && kv[2] ~ /^\//) printf "arg\t%s\t%s\n", pid, kv[2]
+                        if (n == 2 && kv[2] ~ /^\//) { printf "arg\t%s\t%s\n", pid, kv[2]; continue }
+                        if (n == 2 && kv[2] !~ /^\//) { if (kv[2] ~ /\//) printf "relarg\t%s\t%s\n", pid, kv[2]; continue }
+                        if ($i ~ /\//) printf "relarg\t%s\t%s\n", pid, $i
                       } }'
             fi
         } >>"$out" 2>/dev/null
@@ -205,7 +215,7 @@ lp_path_held() { # <census> <canonical-path>
 # was pointed at, so argv is a different witness from cwd.
 LP_NAME_WHY=""
 lp_path_named() { # <census> <canonical-path>
-    local f="$1" path="$2" kind pid p _pp base _cand _pcwd
+    local f="$1" path="$2" kind pid p _pp base _cand _relpid
     base="${path##*/}"
     LP_NAME_WHY=""
     [ -n "$path" ] && [ -r "$f" ] || return 1
@@ -255,22 +265,29 @@ lp_path_named() { # <census> <canonical-path>
     done <"$f"
     # ⛔ AND A TOKEN THAT IS RELATIVE TO THE HOLDER'S OWN CWD. "Absolute only" exists because resolving a
     # token against OUR cwd would be a lie — but the holder's cwd is in the SAME table, so resolving
-    # against THAT is the truth, and a holder naming the tree as `rel-argv/f.txt` from its parent used to
-    # name nothing at all (measured: the tree was reaped under a live holder whose cwd was its parent).
-    # Only tokens that are neither absolute nor `KEY=/abs` reach here; the holder's cwd comes from the
-    # /proc (already physical) or the `lsof` row, and `..` components are not normalised — such a token
-    # simply does not match, which fails closed (the tree is KEPT by the age/other arms, never reaped
-    # because of it).
-    while IFS="$(printf '\t')" read -r kind pid p; do
-        [ "$kind" = arg ] || continue
-        case "$p" in /*) continue ;; *=*) continue ;; esac
-        _pcwd="$(awk -F'\t' -v p="$pid" '$1=="cwd" && $2==p {print $3; exit}' "$f" 2>/dev/null)"
-        [ -n "$_pcwd" ] || continue
-        case "$p" in *..*) continue ;; esac
-        if _lp_rel "${_pcwd%/}/$p" "$path"; then
-            LP_NAME_WHY="argv pid $pid (relative to its cwd ${_pcwd})"; return 0
-        fi
-    done <"$f"
+    # against THAT is the truth, and a holder naming the tree as `wt-rel/f.txt` from its parent used to
+    # name nothing at all. One awk pass does the join (a per-row subprocess would be hundreds of forks):
+    # the row is a witness when `cwd + "/" + token` IS the candidate or sits under it — an exact
+    # boundary, so `wt1-sibling` cannot match `wt1`, and a `..` component simply does not match (which
+    # leaves the tree to the other arms: it is never reaped BECAUSE of the token).
+    _relpid="$(awk -F'\t' -v cand="$path" '
+        $1 == "cwd" { cwd[$2] = $3; next }
+        $1 == "relarg" {
+            if (!($2 in cwd)) next
+            tok = $3
+            # A PATH-LIKE token only. A bare word (`sleep`, `180`) also "resolves" under a process
+            # whose cwd IS the candidate, and matching it reported `reason=argv-named` for a tree whose
+            # only witness was the cwd — stealing the reason from the arm that actually proved it.
+            if (tok !~ /\//) next
+            if (tok ~ /(^|\/)\.\.(\/|$)/) next
+            full = cwd[$2] "/" tok
+            if (full == cand || index(full, cand "/") == 1) { print $2; exit 0 }
+        }
+        END { exit 1 }' "$f" 2>/dev/null)"
+    if [ -n "$_relpid" ]; then
+        LP_NAME_WHY="argv pid $_relpid (relative to its own cwd)"
+        return 0
+    fi
     return 1
 }
 
