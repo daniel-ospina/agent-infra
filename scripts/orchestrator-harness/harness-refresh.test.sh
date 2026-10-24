@@ -1072,6 +1072,84 @@ rm -f "$D/o/.orch.lock"
 case "$R" in *relation=restart-pending*) ok "a live controller whose identity comes only from the stamp is restart-pending, not current" ;;
               *) bad "a live controller on stamp-only identity was reported: $R" ;; esac
 
+# ⛔ A36 (#2641): THE CELL THAT IS ACTIVATED AND STILL SAYS `restart-pending`. MEASURED 2026-10-24 on
+# pi-cell-3, twelve minutes after a correct activation: pin == `$O`'s stamp == the tree the controller
+# executed == `848ba4b1`, and the record still printed `relation=restart-pending running=848ba4b133a7`.
+# Cause: `$SELF` is `$O`, a cell's `$O` is a flat seed with NO git identity, so `self:` never resolves
+# there and the stamp fallback (then the `stamp:*` downgrade) owns the answer forever. The running
+# identity IS available — `$O/.orch.lock` names the owning controller and ITS argv names the tree it
+# executes — so this case drives a real process with that argv and requires the record to name ITS
+# commit, not the stale stamp's.
+_CASE=$((_CASE+1)); echo "=== A36: a pin-per-commit cell resolves RUNNING from the live controller's tree, not the flat seed's stamp ==="
+D="$T/a24"; mkdir -p "$D/o/state" "$D/pins" "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+# The seed's stamp names C1: the STALE answer this case must not accept.
+printf '{"commit": "%s"}\n' "$C1" > "$D/o/.agent-infra-stamp.json"
+_T24="$D/pins/$(short "$C2")"
+git -C "$T/src" worktree add --detach "$_T24" "$C2" >/dev/null 2>&1
+# A controller-shaped process: `bash <tree>/scripts/orchestrator-harness/orch-loop.sh` — the exact argv
+# `cloud-cell-supervisor.sh start` launches, and the shape both sibling readers match on. The fixture's
+# orch-loop.sh is a one-line echo, so it is replaced with a sleeper; the tree stays a valid git worktree
+# whose HEAD is still $C2 (`rev-parse` ignores the working tree), which is the only thing read here.
+printf '#!/bin/bash\nsleep 120\n' > "$_T24/scripts/orchestrator-harness/orch-loop.sh"
+_O26="$_T24/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26" & _P24=$!
+sleep 1
+printf '%s\n' "$_P24" > "$D/o/.orch.lock"
+R="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$D/o" 2>&1)"; RC=$?
+rm -f "$D/o/.orch.lock"
+case "$R" in *relation=current*) ok "a correctly-activated cell reports current — not restart-pending forever" ;;
+              *restart-pending*) bad "an activated cell still reads restart-pending (the always-on alarm): $R" ;;
+              *) bad "unexpected record: $R" ;; esac
+case "$R" in *"running=$(short "$C2")"*) ok "…and running= names the tree the controller EXECUTES" ;;
+              *"running=$(short "$C1")"*) bad "running= still came from the (stale) seed stamp: $R" ;;
+              *) bad "running= is neither the running tree nor the seed stamp: $R" ;; esac
+
+# ⛔ A36c: A PROCESS THAT ONLY MENTIONS THE PATH IS NOT THE CONTROLLER. This is the false-PASS direction
+# the repo already settled twice (supervisor `_controller_ps_awk`: "Match the INVOCATION, not the
+# string"; drift tool: shell at `t[1]`, path at `t[2]`): a `sed`/`tail`/`diff` that merely READS the new
+# tree would report `current` while the controller still executes the old one — and would fire the
+# ahead/diverged refusals off a reader's argv on a healthy box. The real controller is killed first and
+# the LOCK names the reader, so a mention-based read answers C2 (tip) while the invocation rule must
+# leave RUNNING on the stamp (C1).
+_CASE=$((_CASE+1)); echo "=== A36c: a process that only MENTIONS the harness path (a reader) is not the controller ==="
+kill "$_P24" 2>/dev/null; wait "$_P24" 2>/dev/null
+_O26R="$_T24/scripts/orchestrator-harness/orch-loop.sh"
+tail -f "$_O26R" >/dev/null 2>&1 & _R24=$!
+sleep 1
+printf '%s\n' "$_R24" > "$D/o/.orch.lock"
+R3="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC3=$?
+rm -f "$D/o/.orch.lock"; kill "$_R24" 2>/dev/null; wait "$_R24" 2>/dev/null
+case "$R3" in *"running=$(short "$C2")"*) bad "a READER of the tip tree answered for the box (false current): $R3" ;;
+               *"running=$(short "$C1")"*) ok "a mention of the path does not resolve RUNNING (the lock named a live reader)" ;;
+               *) bad "the record named neither tree — the stage was skipped, not exercised: $R3" ;; esac
+
+# ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
+# across repos on one machine, so "a controller is running" and "MY controller is running" are different
+# questions (the #1856 shape the supervisor answers with its ownership read). A peer repo's controller
+# must never supply this box's commit — that would report `current` from another repo's tree — so with
+# the lock naming a controller OUTSIDE `HARNESS_PIN_DIR`, RUNNING must stay on the stamp.
+_CASE=$((_CASE+1)); echo "=== A36b: a controller outside the recorded pin root cannot answer for this box ==="
+_T24B="$D/elsewhere/src-other"
+_mkdir_p="$(dirname "$_T24B")"
+mkdir -p "$_mkdir_p"
+git -C "$T/src" worktree add --detach "$_T24B" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T24B/scripts/orchestrator-harness/orch-loop.sh"
+_O26B="$_T24B/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26B" & _P24C=$!
+sleep 1
+printf '%s\n' "$_P24C" > "$D/o/.orch.lock"
+R2="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC2=$?
+rm -f "$D/o/.orch.lock"; kill "$_P24C" 2>/dev/null; wait "$_P24C" 2>/dev/null
+case "$R2" in *relation=current*) ok "a foreign controller's tree does not buy a current verdict" ;;
+               *relation=restart-pending*) ok "a foreign controller's tree does not buy a current verdict" ;;
+               *) bad "unexpected record: $R2" ;; esac
+case "$R2" in *"running=$(short "$C1")"*) ok "…and RUNNING stayed on the stamp, not on the foreign tree" ;;
+               *) bad "the fallback did not name the stamp's commit: $R2" ;; esac
+
 # ⛔ A20: THE BOUND MUST EXIST ON macOS, WHERE `timeout` DOES NOT. A bare `timeout` call is rc=127 on the
 # Mac half of the fleet, and `if !` reads 127 as a FAILED FETCH — so the box would never fetch and would
 # warn on every cycle: the defect this script removes, re-created by its own bound. Driven through the
