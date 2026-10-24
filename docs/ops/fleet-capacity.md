@@ -378,3 +378,135 @@ Tests:
 `scripts/ci_runner_pool.test.sh` (in both bash lanes), whose install stubs model GitHub's own cwd
 contract and listener argv, and which includes a mutant with the floor comparison defused that must
 stop refusing.
+
+
+## 9. The required-check reservation — so the ONE required status never queues behind advisory work
+
+`agent-infra` has exactly one required status context (branch protection =
+`["pipeline-compliance"]`, measured). That job is ~9 s of work. On 2026-10-24 it was measured
+queueing **13 minutes** for those 9 seconds, behind 66 queued runs (~1,650 jobs) of *advisory*
+work — `bash-suites` alone is an 8-job matrix. A `pipeline-compliance` that is `queued` is
+indistinguishable from a broken gate, so merges stall for hours while every recorded, green
+candidate PR sits there.
+
+The fix is a **reservation**, not a new gate: a small number of runner slots that carry a dedicated
+label `required-check`, which only `pipeline-compliance` asks for. Same check, same commit, same
+assertions — it simply does not wait behind 1,600 advisory jobs.
+
+### 9.1 The job side (this repo)
+
+`.github/workflows/pipeline-compliance.yml` routes **only** the `pipeline-compliance` job through
+the `PIPELINE_COMPLIANCE_RUNS_ON` variable, whose default is `ubuntu-latest` (the reservation value
+is declared in that job's comment block). It also carries `timeout-minutes: 20` (#2055): a hung
+step on a reserved slot would otherwise hold a runner and silently park the only required check.
+
+Every other job keeps `ubuntu-latest`. `tests/required-check-reservation/run.sh` pins all three
+properties, including a mutation that moves one more job onto the reservation (it must fail).
+
+**The default is the fallback, deliberately.** GitHub Actions has no fallback/OR in `runs-on`:
+labels are ANDed, and a job whose labels match no online runner does not run at all — it waits
+`queued` until GitHub cancels it (the self-hosted **job-queue limit is 24 h**: *"A job can be in
+the queue for 24 hours before it is automatically cancelled"*). An unconditional
+`[self-hosted, Linux, X64, required-check]` would therefore make the repo's *only* required check
+unsatisfiable until a runner is labelled — worse than the queue — and would deadlock every
+consumer reusing this file via `workflow_call`. With the variable unset the job runs exactly as it
+does today; the reservation is one command to engage and the same one to release.
+
+That 24 h cancel is **not a safe place to wait**, which is the second half of the same argument: a
+`cancelled` check is in the rail's `NON_RED_CONC` allow-list (`scripts/admin-merge.sh`), so a reservation that was
+engaged but never labelled would end as a **non-red** required check instead of a visibly `queued`
+one — the rail's own fail-open class (#2474). Hence §9.3's release deadline.
+
+A second job or a matrix arm is **not** an option: branch protection requires the context to be
+named exactly `pipeline-compliance`, and a matrix arm renames it (`pipeline-compliance ([...])`)
+while a second job reports a different context. Either way the required context is never
+satisfied and every PR blocks.
+
+### 9.2 Applying the label — the exact, reproducible call
+
+Do this **before** engaging the variable, then verify. `<id>` is a runner id from the listing.
+
+1. List the runners and pick the slots to reserve:
+
+```bash
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
+  --jq '.runners[] | {id, name, status, busy, labels: [.labels[].name]}'
+```
+
+2. Add `required-check` to each reserved runner and remove `ubuntu-latest` from it. Use the
+   non-destructive pair — **`PUT …/labels` REPLACES every custom label on the runner** (it is
+   documented as *"Remove all previous custom labels and set the new custom labels"*), so using it
+   here would silently delete any other custom label a fleet cell carries and leave work that
+   targets that label unrunnable:
+
+```bash
+# add the reservation label (additive; POST does not touch the rest)
+gh api -X POST repos/daniel-ospina/agent-infra/actions/runners/ID/labels \
+  -f 'labels[]=required-check'
+
+# then remove ONLY the label that leaks the reservation back to advisory work
+gh api -X DELETE repos/daniel-ospina/agent-infra/actions/runners/ID/labels/ubuntu-latest
+```
+
+If you do use `PUT` (e.g. to rebuild a mislabelled runner in one call), you must pass the
+**complete surviving CUSTOM label set** — every custom label from step 1's listing plus
+`self-hosted-x64` and `required-check`. Do **not** list `self-hosted`/`Linux`/`X64`: those are
+AUTOMATIC labels GitHub stamps from the host, they are not part of the custom set `PUT` replaces,
+and `scripts/ci_runner_gate.sh` excludes them from its own body for exactly that reason.
+
+Removing `ubuntu-latest` is part of the reservation, not a detail: a reserved runner that still
+carries `ubuntu-latest` keeps accepting advisory jobs, so the reservation is advisory too. Keep
+`self-hosted-x64` — the pool marker is what makes the runner selectable at all, and dropping it
+strands a registered-but-jobless runner (#2373).
+
+3. Verify the reservation is visible to the scheduler (THE ARTIFACT, not the send):
+
+```bash
+gh api --paginate repos/daniel-ospina/agent-infra/actions/runners \
+  --jq '.runners[] | select([.labels[].name] | index("required-check")) | "\(.id) \(.name) status=\(.status) labels=\([.labels[].name]|join(","))"'
+```
+
+### 9.3 Engaging and releasing the reservation
+
+```bash
+# ENGAGE — the required check now uses the reserved slots.
+gh variable set PIPELINE_COMPLIANCE_RUNS_ON --repo daniel-ospina/agent-infra \
+  --body '["self-hosted","Linux","X64","required-check"]'
+
+# RELEASE (the fallback) — back to exactly today's behaviour, immediately.
+gh variable delete PIPELINE_COMPLIANCE_RUNS_ON --repo daniel-ospina/agent-infra
+```
+
+`RELEASE` is the documented fallback and it is always available: it is what keeps a dead or
+unlabelled reservation from being an outage of the only required check.
+
+**⛔ RELEASE WITHIN 24 HOURS of a reservation going dark.** Tell-tale: the required check is sitting
+`queued` on the engaged label. Do not wait it out. GitHub's self-hosted **job-queue limit is 24 h**,
+and the job is then `cancelled` — which `scripts/admin-merge.sh` treats as **non-red**
+(`NON_RED_CONC`), so past that point the required context stops being a visible obstruction and
+becomes a silent one. Release the variable first, then repair the label; verify the required check
+is neither `queued` nor `cancelled` on the head before trusting the rail.
+
+### 9.4 Residuals, stated because they are not fixed here
+
+- **A `cancelled` REQUIRED check is non-red in the rail** (`NON_RED_CONC` allow-list in `scripts/admin-merge.sh`,
+  `{success, neutral, skipped, cancelled, stale}`). This is pre-existing and is the same class as
+  #2474 (a cancelled guard leg satisfying a completeness check with no verdict); the reservation
+  makes it *reachable* via the 24 h queue cancel, which is why §9.3 carries a deadline. The rail
+  fix — a `cancelled` context that is REQUIRED must not be non-red — belongs to #2474, not here.
+
+- **The label is not durable on its own.** `scripts/ci_runner_gate.sh` preserves custom labels it
+  did not add, so it will not strip `required-check` — but on its fallback arm it *adds*
+  `ubuntu-latest` to the pool, which leaks reserved slots back to advisory work. Keep the reserved
+  runners out of that gate's pool, or re-assert §9.2 after a fallback flip.
+- **A dead reserved listener is a single point of failure** for the only required check. This is
+  #2682 blocker 2 (the `ai-runner-*` restart loop) and it is *why* the fallback in §9.3 exists.
+- **#2682 blocker 1 is still open.** It recorded: keep the required check off self-hosted capacity
+  until a dedicated, ephemeral, credential-free runner exists. The runners available today are
+  persistent fleet cells and this repo is public, so engaging the reservation runs the PR's own
+  `scripts/check-pipeline-compliance.sh` on a fleet machine. Engaging it is therefore an operator
+  decision — the change ships **off** by default for exactly that reason.
+- The starvation engine is that the pool advertises `ubuntu-latest` at all (the standing-rule
+  violation in #2344/#2656, whose blast radius #2589 measured). The durable fix is that the pool
+  stops advertising it, as `daniel-ospina/tortoise`'s pool does. The reservation reduces the blast
+  radius; it does not remove it.
