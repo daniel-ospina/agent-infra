@@ -1137,9 +1137,10 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
     """
     results: list[dict] = []
     if not main_sha:
-        return [{"box": "<origin/main>", "harness": "", "relation": "", "source": "",
-                 "controller": "", "roles": "", "drift": False, "log": "",
-                 "verdict": "UNREADABLE origin/main — no activation (nothing to compare a box with)"}]
+        return [{"box": "<harness origin/main>", "harness": "", "relation": "", "source": "",
+                 "controller": "", "roles": "", "running": "", "drift": False, "log": "",
+                 "verdict": "UNREADABLE harness origin/main — no activation (nothing to compare a "
+                            "box with)"}]
     try:
         boxes = read_inventory(o)
     except Skipped as e:
@@ -1220,12 +1221,19 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                         # It is NOT a drift, so no activation is dispatched: the arm restarts a box
                         # that is on the WRONG commit, and a restart here would kill whatever the live
                         # controller is mid-flight on to gain a deploy the next launch gets anyway.
+                        # ⛔ "STILL EXECUTES <sha>" IS A READING, so it is only said when a tree was
+                        # READ. For `running=NONE|UNREADABLE|MIXED|NOT-REPORTED` no single executed tree
+                        # exists, and asserting one would be the same defect in the other direction —
+                        # the verdict word and the action are identical either way.
+                        run = (d.get("running") or "").strip().lower()
+                        what = (f"the RUNNING controller still EXECUTES {run[:12]}" if run and
+                                run not in ("none", "unreadable", "mixed") else
+                                "no single executed tree could be read")
                         entry["verdict"] = (
                             f"deployed-but-NOT-activated — harness {d['harness'][:12]} [current] is "
-                            f"the pin, but the RUNNING controller still EXECUTES "
-                            f"{(d.get('running') or '<unread>')[:12]} ({gap}). The pin names what the "
-                            f"NEXT launch runs; the restart is what activates this box, and this arm "
-                            f"does not restart a controller that is mid-flight")
+                            f"the pin, but {what} ({gap}). The pin names what the NEXT launch runs; "
+                            f"the restart is what activates this box, and this arm does not restart a "
+                            f"controller that is mid-flight")
                     else:
                         entry["verdict"] = "current"
                 results.append(entry)
@@ -1343,21 +1351,33 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 # BEHIND (an older status command, which is the state this arm exists to fix), and the
                 # pid it then finds is the pre-existing controller the check was added to exclude.
                 fresh = bool(pre_pids) and bool(post_pids - pre_pids)
+                # ⛔ AND THE BOX MUST BE **ACTIVATED**, BY THE SAME PREDICATE THE GOALS USE. Without
+                # this term the verify loop wrote `VERIFIED … controller=RUNNING` for a box whose
+                # controller still executed the OLD tree — a false PASS recorded in the deploy LEDGER
+                # and later quoted back as "our activation at this pin VERIFIED", which stops the arm
+                # repairing a box it itself broke. Reachable in the exact state the comment above names:
+                # a controller that survived a FAILED stop keeps the old tree, the started replacement
+                # supplies the FRESH pid, and the pid satisfies every other term while `box-status.sh`
+                # reports `running: MIXED` (or the old sha). One predicate, both readers (#2680).
+                gap = activation_gap(last)
                 if last["readable"] and last["harness"][:12] == main_sha[:12] \
                         and last["relation"] == "current" and last["controller"] == "RUNNING" \
-                        and fresh:
+                        and fresh and not gap:
                     verified = True
                     break
                 if time.time() >= deadline:
                     break
-            entry["verdict"] = (f"VERIFIED harness={last['harness'][:12]} [current] controller=RUNNING"
+            entry["verdict"] = (f"VERIFIED harness={last['harness'][:12]} [current] controller=RUNNING "
+                                f"running={(last.get('running') or '?')[:12]}"
                                 if verified else
                                 f"UNVERIFIED harness={(last or {}).get('harness', '')[:12] or '<none>'} "
                                 f"relation={(last or {}).get('relation') or '<none>'} "
                                 f"controller={(last or {}).get('controller') or '<none>'} "
+                                f"running={(last or {}).get('running') or '<not reported>'} "
                                 f"pids={(','.join(_controller_pids(last or {})) or '<none>')} "
                                 f"(a NEW pid is required: {','.join(sorted(pre_pids)) or '<none>'} "
-                                f"before)")
+                                f"before"
+                                + (f"; activation: {gap}" if (last and gap) else "") + ")")
             if not record_deploy(o, name, d["harness"], main_sha, entry["verdict"]):
                 entry["verdict"] += (" [⚠️ the deploy ledger could NOT be written — the attempt "
                                      "bound is inert until $O/state is writable]")
@@ -2020,7 +2040,8 @@ def _drift_text(rows: list[dict]) -> str:
 
 
 def goal_progress(drift: list[dict], budget: Budget, slug: str,
-                  skipped: str = "", main_sha: str = "") -> tuple[list[str], list[str]]:
+                  skipped: str = "", main_sha: str = "",
+                  main_why: str = "") -> tuple[list[str], list[str]]:
     """Measure BOTH goals. -> (the readings as markdown lines, what to do IN GOAL ORDER).
 
     ⛔ A COUNT THAT COULD NOT BE READ IS `NOT-MEASURED`, NEVER `0`. Zero is a claim ("there are
@@ -2086,7 +2107,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     compared = (bool(drift) and not placeholder and bool(main_sha)
                 and all(r.get("readable") for r in drift))
     why_not_compared = (
-        "the harness repo's `origin/main` was unreadable" if not main_sha else
+        (main_why or "the harness repo's `origin/main` was unreadable") if not main_sha else
         "the box inventory could not be read" if any(r.get("inventory") == "unread" for r in drift) else
         "the inventory exists and lists NO boxes" if any(
             r.get("inventory") == "empty" for r in drift) else
@@ -2135,8 +2156,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
     if not main_sha:
-        lines.append("  ⚠️ harness: the harness repo's `origin/main` could not be read, so 'the same "
-                     "version everywhere' cannot be asserted at all")
+        lines.append("  ⚠️ harness: " + (main_why or "the harness repo's `origin/main` could not be "
+                     "read") + ", so 'the same version everywhere' cannot be asserted at all")
     if local_only:
         lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
                      "never read, so this is not 'the fleet is on the pin'")
@@ -2267,7 +2288,7 @@ def compose(md: Path, slug: str, main_sha: str, budget: Budget,
     body = f"""# Merge reminder — {now_iso()}
 
 **Target:** `{slug}` · **origin/main:** `{main_sha[:12] or 'UNREADABLE'}` ·
-**harness main:** `{(harness_main or 'UNREADABLE')[:12]}`{'' if (not harness_main or harness_main == main_sha) else f' (the harness repo\'s `origin/main` — what goal 2 compares a box against, NOT `{slug}`\'s)'} ·
+**harness main:** `{(harness_main or 'UNRESOLVED')[:12]}`{'' if (not harness_main or harness_main == main_sha) else f' (the harness repo\'s `origin/main` — what goal 2 compares a box against, NOT `{slug}`\'s)'} ·
 **REST:** {budget.calls}/{REST_BUDGET} metered (+1 exempt `rate_limit`) ·
 **search:** {budget.search_calls}/{GOAL_SEARCH_BUDGET} (the goal readings; a SEPARATE quota) ·
 **core:** {(str(budget.core_remaining) + '/' + str(budget.core_limit)) if budget.core_limit else 'UNREADABLE (rate_limit was not reached)'}
@@ -2572,7 +2593,13 @@ def github_origin(repo_path: Path) -> str:
 def repo_path_of(o: Path) -> Path:
     explicit = os.environ.get("REPO")
     cands = [explicit] if explicit else []
-    cands += [str(Path(__file__).resolve().parents[2]), str(Path.home() / "orchestrator")]
+    # ⛔ THE SAME SHALLOW-COPY CRASH AS `script_checkout` (PR #2683 round-1 review). `parents[2]` raises
+    # IndexError on a copy with fewer than three parents, and this line runs INSIDE the cycle's try — so
+    # the traceback escaped as "no report written at all", the one failure mode the OSError handlers
+    # exist to prevent. It was found by the verifier AFTER the guard was added to `harness_repo_of`,
+    # because a mutation run had restored a pre-guard copy: the fix is only real once both call sites
+    # use it, and only a read of the file (not a memory of the patch) shows that.
+    cands += [str(script_checkout() or ""), str(Path.home() / "orchestrator")]
     for c in cands:
         if c and run(["git", "-C", c, "rev-parse", "--git-dir"], timeout=15)[0] == 0:
             return Path(c).resolve()
@@ -2592,6 +2619,19 @@ def git_dir(path: Path) -> str:
     return (out or "").strip() if rc == 0 else ""
 
 
+def script_checkout() -> Path | None:
+    """`Path(__file__).parents[2]`, BOUNDED — the harness checkout this script lives in.
+
+    ⛔ `parents[2]` RAISES IndexError ON A SHALLOW COPY. A deployed flat copy at `/tmp/mr.py` has two
+    parents, and indexing the third escaped as a traceback with no report written at all — the same
+    "no deliverable" failure the OSError handlers exist to prevent, from an expression that reads as a
+    constant. A script outside any checkout has no checkout, which is a state to answer (None), not to
+    crash on.
+    """
+    ps = Path(__file__).resolve().parents
+    return ps[2] if len(ps) > 2 else None
+
+
 def harness_repo_of(o: Path) -> Path | None:
     """The checkout the DEPLOYED harness belongs to — the repo goal 2's "same version" means.
 
@@ -2608,7 +2648,19 @@ def harness_repo_of(o: Path) -> Path | None:
     Resolution is the payload's own git identity (`$O` is inside the harness checkout/worktree), with
     `HARNESS_REPO` honoured first because that is the variable the fleet's supervisor already exports.
     """
-    cands = [os.environ.get("HARNESS_REPO") or "", str(o)]
+    # ⛔ FOUR CANDIDATES, BECAUSE THE TIMER EXPORTS NONE OF THE FIRST TWO. Measured (round-1 review of
+    # PR #2683): the timer this file installs exports only `O`/`HOME`/`PATH` (`_timer_cmd`, below), and
+    # `--o` defaults to `$HOME/orchestrator` — which on the hub is NOT a checkout. So a resolution that
+    # consulted `HARNESS_REPO` and `$O` alone returned None in the DEFAULT and TIMER configurations, the
+    # caller fell back to the swept repo's main, and the report printed `**harness main:** 5f40d832c254`
+    # — a tortoise sha labelled as the harness main — over the very #2679 reading this change exists to
+    # remove. The third candidate fixes that: this script lives inside the harness payload
+    # (`$O/scripts/orchestrator-harness/merge-reminder.py`, and the same relative position in a repo
+    # checkout), so `parents[2]` IS the harness checkout. The fourth is the conventional location, kept
+    # only because it is the documented `--o` default.
+    here = script_checkout()
+    cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
+             str(Path.home() / "orchestrator")]
     for c in cands:
         if not c:
             continue
@@ -2716,6 +2768,7 @@ def main(argv=None) -> int:
     # into an UnboundLocalError with no report written (caught by §28's mismatch test, which is the
     # only path that reaches the goal block with the resolution never run).
     hmain = ""
+    main_why = ""
     slug = args.repo or "<unresolved>"
     drift: list[dict] = []
     goal_lines: list[str] = []
@@ -2743,10 +2796,23 @@ def main(argv=None) -> int:
         # — so the comparison must use the HARNESS repo's `origin/main`, never the swept repo's. When
         # the two are the same repo (the normal agent-infra sweep) this REUSES the single read, so the
         # one-read discipline is untouched and there is no second value to diverge from.
-        hmain = main
         hrepo = harness_repo_of(o)
-        if hrepo is not None and git_dir(hrepo) and git_dir(hrepo) != git_dir(repo_path):
+        if hrepo is None:
+            # ⛔ UNRESOLVED IS NOT "THE SWEPT REPO". The first cut defaulted `hmain` to the swept repo's
+            # main whenever the harness repo could not be resolved, so the goals compared a harness sha
+            # against a foreign main AND the header printed that foreign sha under a `**harness main:**`
+            # label — an assertion about a read that never happened, in the block the owner acts on.
+            hmain = ""
+            main_why = ("the harness repo could not be resolved (no `HARNESS_REPO`, no checkout beside "
+                        "`$O`, and none containing this script)")
+        elif git_dir(hrepo) and git_dir(hrepo) == git_dir(repo_path):
+            hmain = main          # ONE repo, ONE read: the one-read discipline is untouched here
+            main_why = ""
+        else:
             hmain = origin_main(hrepo)
+            main_why = ""
+            if not hmain:
+                main_why = "the harness repo's `origin/main` was unreadable"
         budget = Budget(resolve_gh(o))
         budget.rate_limit()
         # ⛔ ORDER: DRIFT → THE TWO GOALS → THE PR READS (owner's ask, 2026-10-24).
@@ -2756,7 +2822,8 @@ def main(argv=None) -> int:
         # LOCAL artifact read (no REST), the goals spend the SEARCH quota (a different bucket), so
         # neither can starve the landing arm's documented `REST_BUDGET`.
         drift = drift_rows(o, hmain, harness_repo=hrepo)
-        goal_lines, goal_actions = goal_progress(drift, budget, slug, main_sha=hmain)
+        goal_lines, goal_actions = goal_progress(drift, budget, slug, main_sha=hmain,
+                                                 main_why=main_why)
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
@@ -2775,7 +2842,8 @@ def main(argv=None) -> int:
         # whole file exists to prevent.
         goal_lines, goal_actions = goal_progress(
             drift, budget, slug,
-            skipped=skipped or "the cycle did not reach the goal read", main_sha=hmain)
+            skipped=skipped or "the cycle did not reach the goal read", main_sha=hmain,
+            main_why=main_why)
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.

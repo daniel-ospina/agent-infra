@@ -250,7 +250,15 @@ run_sut() { # extra args…
   # left ambient, the same suite passed on a box that HAS a pin and went red on a clean machine (and
   # leaked the developer's sha into the report).
   mkdir -p "$TMP/home"
+  # ⛔ HARNESS_REPO IS PINNED TO THE FIXTURE REPO. The SUT resolves the harness checkout from
+  # `HARNESS_REPO`, `$O`, its own location and `$HOME/orchestrator`; left ambient, the third candidate
+  # is THIS worktree (a real agent-infra checkout), so the harness main would be the real repo's and
+  # every goal-2 assertion would compare against a sha the fixtures never heard of. Pinning it to the
+  # fixture repo models the real relationship — a box whose harness repo IS the repo it sweeps — and it
+  # exercises the same-repo path (ONE read, reused). A case that needs the two repos to DIFFER passes
+  # `HARNESS_REPO=<other repo> run_sut`, which this default does not override.
   env -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN HOME="$TMP/home" \
+    HARNESS_REPO="${HARNESS_REPO:-$REPO_SRC}" \
     FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
     python3 "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
       --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 "$@"
@@ -535,8 +543,11 @@ spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 o = Path(sys.argv[2])
 got = m.deploy_arm(o, "", False, 1, False, True)
-ok = (len(got) == 1 and got[0]["box"] == "<origin/main>"
-      and "UNREADABLE origin/main" in got[0]["verdict"])
+# ⛔ THE ROW NAMES THE **HARNESS** MAIN (PR #2683): that is the value this arm compares a box with, and
+# a refusal that says "origin/main" leaves the reader unsure WHICH main could not be read — the same
+# ambiguity the #2679 defect grew out of.
+ok = (len(got) == 1 and got[0]["box"] == "<harness origin/main>"
+      and "UNREADABLE harness origin/main" in got[0]["verdict"])
 print(0 if ok else 1)
 PYMOD
 )"
@@ -2503,6 +2514,112 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27b the SAME fixture with running==pin counts (the term is the comparison, not the line)" \
    "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '1/1 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ #2683 ROUND 1 — THE RESOLUTION MUST WORK IN THE CONFIGURATION THE TOOL ITSELF INSTALLS. The first
+# cut consulted `HARNESS_REPO` and `$O` only. The timer exports neither (`O`/`HOME`/`PATH`), and `--o`
+# defaults to `$HOME/orchestrator`, which on the hub is NOT a checkout — so the resolution returned None,
+# the caller fell back to the SWEPT repo's main, and the header printed a tortoise sha under a
+# `**harness main:**` label. The third candidate (this script's own checkout) is what makes it work; the
+# fourth is the documented `--o` default. Driven here from a COPY of the SUT outside every checkout,
+# with `HARNESS_REPO` unset and a `$HOME` that has no `orchestrator/`: the honest answer is UNRESOLVED,
+# never the swept repo's main.
+write_no_landing; reset_o
+mkdir -p "$TMP/nowhere"
+cp "$SUT" "$TMP/nowhere/mr.py"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 "$TMP/nowhere/mr.py" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
+     --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 --no-act --json 2>/dev/null)"
+ck "§27b a SUT outside every checkout with no HARNESS_REPO reports harness_main as UNRESOLVED, not the swept main" \
+   "$(printf '%s' "$out" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print(0 if d.get("harness_main") == "" and (d.get("main") or "") != "" else 1)' 2>/dev/null || echo 1)"
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+# The value is EXTRACTED from the header line rather than grepped as a substring: the line carries
+# backticks, and a fixed-string pattern around them is a pattern no reader can verify by eye.
+# The header is read from the FILE, not from a captured copy: the report the copy-run wrote is the
+# artifact under test, and a stale `$MDF` from an earlier case in the same block is exactly the kind of
+# two-readers disagreement this file keeps repairing.
+ck "§27b ...and the header says UNRESOLVED instead of printing a foreign sha" \
+   "$([ "$(sed -n 's/.*harness main:\*\*[[:space:]]*`\([^`]*\)`.*/\1/p' "$O/MERGE-REMINDER.md" | head -1)" = "UNRESOLVED" ] && echo 0 || echo 1)"
+ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against the swept repo" \
+   "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
+# ...and the SAME copy DOES resolve when it sits inside a checkout (the case the fix exists for).
+cp "$SUT" "$TMP/nowhere/mr-in-repo.py"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# candidate 3 is this script's own checkout: the resolution must find it even with nothing exported
+got = m.harness_repo_of(Path("/nonexistent-o"))
+here = Path(sys.argv[1]).resolve().parents[2]
+print(0 if got is not None and Path(got) == here.resolve() else 1)
+PYMOD
+)"
+ck "§27b ...and a SUT inside a checkout resolves it from its own location (no env needed)" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+
+# ⛔ #2683 ROUND 1 — THE VERIFY LOOP WROTE `VERIFIED` OVER A BOX THAT WAS NOT ACTIVATED. Its criterion
+# checked main/relation/controller/new-pid and never the executed tree, so a controller that survived a
+# failed `stop` (old tree) plus a started replacement (new pid) satisfied every term while
+# `box-status.sh` reported `running: MIXED`. That wrote a false VERIFIED into the deploy LEDGER, which is
+# later quoted back as "our activation at this pin VERIFIED" — the sentence that stops the arm repairing
+# a box it itself broke.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 7)\nrunning: ffffffffffff\nroles: idle\n' > "$FX/box.txt"
+cat > "$TMP/box-newpid-oldtree.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "activate-ran" >> "$FIXTURE/activate.txt"
+# The pin arrived and a NEW pid answers — but the process executes the OLD tree.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 99)\nrunning: ffffffffffff\nroles: idle\n' \
+  "$(sed -n 's/^harness: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" > "$FIXTURE/box.txt"
+exit 0
+STUB
+chmod +x "$TMP/box-newpid-oldtree.sh"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-newpid-oldtree.sh" > "$O/state/boxes.tsv"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+# ⛔ `nq 'VERIFIED'` WOULD PASS ON "UNVERIFIED" — the substring is inside the failure word, so the
+# assertion has to look for the recorded verdict, which only a pass writes as `=VERIFIED`.
+ck "§23g a NEW pid that still executes the OLD tree is UNVERIFIED, never VERIFIED" \
+   "$(qF 'UNVERIFIED' "$out" && nq '=VERIFIED' "$out" && echo 0 || echo 1)"
+ck "§23g ...and it names the activation gap that failed the check" \
+   "$(qF 'activation: restart-pending(running=ffffffffffff)' "$out" && echo 0 || echo 1)"
+ck "§23g ...and the ledger does NOT record a VERIFIED attempt" \
+   "$(! grep -q '=VERIFIED' "$O/state/merge-reminder.deploys" 2>/dev/null && echo 0 || echo 1)"
+# The contrast: the SAME fixture with running==pin IS verified (§14's armed case), so the term is a
+# comparison and not a blanket refusal.
+
+# ⛔ A SHALLOW COPY MUST NOT CRASH THE CYCLE (#2683 round-1 review). `Path(__file__).parents[2]` raises
+# IndexError on a file with two parents — a flat `/tmp/mr.py`, which is exactly the shape the issue
+# describes for the ORIGINAL pre-port deployment (`~/.pi/agent/state/merge-reminder.py`). The exception
+# escaped from inside the cycle's try, so the run produced NO report at all: the deliverable lost, from
+# an expression that reads as a constant. Both call sites use the bounded `script_checkout()`.
+SHALLOW="/tmp/mr-shallow.$$.py"
+cp "$SUT" "$SHALLOW"
+out="$(python3 - "$SHALLOW" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+try:
+    here = m.script_checkout()
+    rp = m.repo_path_of(Path("/nonexistent-o"))
+    hr = m.harness_repo_of(Path("/nonexistent-o"))
+except Exception as e:                       # noqa: BLE001 - the point is that nothing raises
+    print(1); raise SystemExit
+print(0 if here is None and isinstance(rp, Path) and hr is None else 1)
+PYMOD
+)"
+ck "§27b a SCRIPT WITH TWO PARENTS (/tmp/x.py) resolves instead of raising IndexError" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+rm -f "$SHALLOW"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"
