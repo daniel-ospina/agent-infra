@@ -1382,7 +1382,7 @@ reap_venv() {
 # accounts: per root, a `df` reading before and after, never a `du` sum.
 reap_abandoned_arm() {
     local roots root b a d out rc _r
-    AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""; AW_REAPED=0
+    AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""; AW_REAPED=0; AW_SETUP_FAIL=0
     if [ -z "$ABANDONED_WT_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree arm=abandoned FAIL-CLOSED — reap-abandoned-worktrees.sh not found (looked at \$ABANDONED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         AW_NOTE="abandoned-worktree owner missing"
@@ -1503,7 +1503,14 @@ reap_worktree() {
     # arm ran: `cannot run: worktree-no-repo` in `detail=` is the truth about the half that did not
     # run, and the rc (3) already carries the red. The alternative — `fail-closed`, which means "the
     # delegate RAN and could not do the work" — would misdescribe it.
-    if [ "$REPO_ARM_OK" = 1 ]; then VERDICT_WT="$(class_verdict "$RC_WT")"; else VERDICT_WT="misconfigured"; fi
+    # `misconfigured` is "a class that could not be SET UP at all" — so a missing ABANDONED delegate
+    # belongs here too, not under `fail-closed` ("the delegate ran and could not do the work"), which
+    # is what the record said beside `detail=cannot run: abandoned-worktree-delegate-missing`.
+    if [ "$REPO_ARM_OK" = 1 ] && [ "${AW_SETUP_FAIL:-0}" = 0 ]; then
+        VERDICT_WT="$(class_verdict "$RC_WT")"
+    else
+        VERDICT_WT="misconfigured"
+    fi
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS
     # than a clean class, so its verdict stays fail-closed (3) — skipping is not a pass — but the line
@@ -1533,6 +1540,11 @@ reap_worktree() {
         # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
         # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.
         sweep_end=$(( $(now) + DU_BUDGET )); swept=0
+        # ⛔ ONE DIRECTORY, ONE CANDIDATE. `rows` concatenates BOTH arms' output, and a checkout can be
+        # selected by both (the registered arm removes its record, the abandoned arm matches the path),
+        # so the same `remove` row arrived twice: `candidates` was reported as 2 for one directory and
+        # its `du` was added twice. Dedupe on the PATH before counting or sizing anything.
+        seen_paths=" "
         while IFS= read -r line; do
             if [[ "$line" == remove* ]]; then
                 # The owner's row is `remove   <path>` (ragged columns): drop the verb, then LEADING
@@ -1545,6 +1557,8 @@ reap_worktree() {
                 # row asserted the wrong cause. The path is the rest of the line, verbatim.
                 path="${path%"${path##*[![:space:]]}"}"
                 [[ "$path" == /* ]] || continue
+                case "$seen_paths" in *" $path "*) continue ;; esac
+                seen_paths="$seen_paths$path "
                 why="du could not read it (already gone, or unreadable)"
                 if [ "$(now)" -ge "$sweep_end" ]; then size="?"; why="du budget exhausted"
                 else size="$(du_mb "$path")" || size="?"; fi
