@@ -77,9 +77,17 @@ from datetime import datetime, timedelta, timezone
 # second predicate (#1872) -- but it hardcoded tortoise, so a consumer standing in ANY other repo
 # read a DIFFERENT repo's check-runs and attestations: every agent-infra PR came back
 # `rerun-checks`, or `record-review` forever because it looked for tortoise's attestation file. The
-# repo is therefore an INPUT: such a consumer supplies it as `OBJECTIVE_REPO`. ⚠️ NOTHING SHIPPED
-# SETS IT TODAY, so every shipped caller gets the default below and answers exactly as before --
-# which is the property the first test in `test_objective.py`'s seam block pins.
+# repo is therefore an INPUT: such a consumer supplies it as `OBJECTIVE_REPO`. ⚠️ `pr-doctor.py` is
+# the first shipped consumer to supply it (#2700): its `_objective()` sets the variable to its own
+# `REPO` BEFORE it execs this file, then restores it -- so the default below is what every OTHER
+# caller still gets, and that is the property `test_objective.py`'s seam block pins (it deletes the
+# variable first, so it pins the default rather than the ambient state of whichever suite ran before
+# it). The remaining shipped callers that do NOT supply it, and are therefore still answered about
+# tortoise, are the direct script callers of this file: `heartbeat-loop.sh:470`,
+# `orchestrator-heartbeat.sh:224`, `cadence-nudge.sh:329,475`, `lane-scan-fallback.sh:76`, and
+# `pr-loop.py`'s own `_objective()`. Fixing those, and the required-set half of the same seam, is
+# the open work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
+# Naming them here is so the next lane can find them from the file that knows.
 REPO = os.environ.get("OBJECTIVE_REPO") or "daniel-ospina/tortoise"
 STATE = os.path.expanduser("~/.pi/agent/state")
 CACHE = os.path.join(STATE, "objective.last")
