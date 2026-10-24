@@ -1209,11 +1209,15 @@ check_disk_reaper() {
   # would fail closed every pass" — so this check died and the cell could NEVER be certified, on exactly
   # the box that had just cloned its checkout. The refusal is right; the silence was not: this script
   # already KNOWS the checkout ($WORKDIR, verified or cloned by check_repo), so it says so.
-  # WHAT IT SCANS: the operator's explicit list if there is one, else THIS cell's verified checkout —
-  # never an ambient $REPO / $AGENT_INFRA_PATH, which name the HARNESS or a developer's checkout, so
-  # adopting them would point a cell's reaper at a repo the cell does not own (that is why the arm that
-  # pins this uses a decoy). A candidate that is not an absolute path or not a checkout is dropped, so a
-  # bring-up that has not cloned yet still gets the installer's own refusal rather than a bogus unit.
+  # WHAT IT SCANS: the operator's explicit list if there is one, else THIS cell's verified checkout.
+  # NEVER an ambient $REPO / $AGENT_INFRA_PATH, which name the HARNESS or a developer's checkout: a
+  # reaper scoped at a repo the cell does not own deletes work the cell is not responsible for.
+  # ⛔ AND AN EMPTY LIST IS NOT "THE INSTALLER WILL REFUSE" (measured by review, 2026-10-24): the
+  # installer treats an EMPTY `DISK_REAPER_REPOS` exactly like an unset one and falls through to ITS
+  # OWN ambient list (`$REPO`, `$TORTOISE_REPO`, `$WORKDIR`, `$AGENT_INFRA_PATH`), so passing "" would
+  # have handed it the operator's shell — the adoption this check exists to prevent, on the one path
+  # where the cell could not name a repo for itself (an interrupted clone that leaves a `.git`
+  # `check_repo`'s `[ -d ]` accepts but git does not). So this REFUSES instead, by name.
   local rp_repos rp_cand
   if [ -n "${DISK_REAPER_REPOS:-}" ]; then
     rp_repos="$DISK_REAPER_REPOS"                 # the operator's list, verbatim (colon-joined; the installer parses it)
@@ -1223,6 +1227,7 @@ check_disk_reaper() {
       /*) git -C "$rp_repos" rev-parse --git-dir >/dev/null 2>&1 || rp_repos="" ;;
       *) rp_repos="" ;;
     esac
+    [ -n "$rp_repos" ] || die "the cell's checkout (${WORKDIR:-<unset>}) is not a usable git repository, and no DISK_REAPER_REPOS was given — refusing to schedule a reaper whose scan list would fall back to an AMBIENT repo (\$REPO / \$AGENT_INFRA_PATH name the harness or a developer's checkout, not this cell). Fix the checkout at that path, or set DISK_REAPER_REPOS explicitly."
   fi
 
   rc=0

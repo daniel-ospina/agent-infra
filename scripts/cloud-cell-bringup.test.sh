@@ -934,10 +934,17 @@ say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
 # first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
 # exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
 # check below graded another repo. Nothing in the suite covered it: every `br …` case writes
-# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
-# missing provider key — the ORDERING is what proves the drop happened before any check ran).
+# $T/keys.env first. Assert the DROP line on the no-file arm — and the ORDERING, on the first
+# repo-reading check that arm can actually reach (see the ⛔ below: it could not, until the key came
+# from the environment the way the operator's shell carries it).
+# ⛔ THE PROVIDER KEY MUST COME FROM SOMEWHERE (measured on the CI runner, 2026-10-24): this arm used
+# to rely on the CALLER's shell exporting DEEPSEEK_API_KEY, so `ok: gh login` — the first
+# repo-reading check the ordering is anchored on — never printed, on CI or in any shell without a
+# key, and the assertion could not observe the claim it makes (drop=3 check=none). The scenario it
+# models is "the operator's shell carries the key, keys.env is absent", so the key is supplied the
+# way that operator would: in the ENVIRONMENT, never in the file this arm proves is absent.
 rm -f "$T/absent.env"
-BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" br ok normal --check
+BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" DEEPSEEK_API_KEY="fake" br ok normal --check
 case "$BR_OUT" in
   *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
   *) bad "with keys.env absent, bring-up did not drop an operator-shell GH_REPO — output: $BR_OUT" ;;
