@@ -326,7 +326,8 @@ python3 "$MUT/pr-doctor-trigger.py" --repo fake-owner/suite-f --repo-dir "$MUT" 
   --poll 1 --debounce 1 --backstop 1000000 --state-dir "$MS" >"$MLOG" 2>&1 &
 mpid=$!
 wait_for "$MLOG" "PASS-BEGIN" 100 || fail "the mutant never ran its cold pass"
-sleep 1; reset_doctor
+wait_dir 1 100 || true                       # an ARRIVAL: poll, never sleep (review cycle 2, F3)
+reset_doctor
 surface BEHIND "2026-10-24T18:59:00Z"          # a REAL change the mutant cannot see
 sleep 4
 assert_eq "$(n_doctor)" "0" "the mutant MISSES the change — i.e. case C's assertion is load-bearing"
@@ -338,8 +339,8 @@ echo "── G. the SERVICE wiring: ExecStart runs the TRIGGER, Restart=always, 
 INSTALLER="$ROOT/scripts/orchestrator-harness/install-repair-service.sh"
 [ -f "$INSTALLER" ] && pass "the repair-service installer ships" || fail "no $INSTALLER"
 unit="$(ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
-        REPAIR_REPO=fake-owner/suite-g TEMPLATES_DIR="$ROOT/templates/systemd" \
-        bash "$INSTALLER" --dry-run 2>&1)"; irc=$?
+        TEMPLATES_DIR="$ROOT/templates/systemd" \
+        bash "$INSTALLER" --dry-run 2>/dev/null)"; irc=$?
 assert_eq "$irc" "0" "--dry-run renders without touching the service manager"
 exec_line="$(grep -m1 '^ExecStart=' <<<"$unit")"
 assert_contains "$exec_line" "pr-doctor-trigger.py" "ExecStart runs the TRIGGER"
@@ -348,10 +349,74 @@ assert_contains "$exec_line" "--backstop 1800" "the timer survives ONLY as --bac
 assert_contains "$unit" "Restart=always" "Restart=always (an ORDERLY exit must come back, #2402)"
 assert_not_contains "$unit" "Restart=on-failure" "not on-failure — the measured case is an exit 0"
 assert_not_contains "$unit" "{{TRIGGER}}" "the render substitutes every placeholder"
+# ⛔ A REPO MISMATCH IS REFUSED, NOT RENDERED (review cycle 2, F1). The doctor's PR LIST is hardcoded
+# while its classifier READS OBJECTIVE_REPO, so a unit pointed at any other repo lists one repo's PRs
+# and asks the other for their check-runs: every PR unreadable, pass refused (rc 2), which the
+# trigger reads as a CLEAN 1800 s window. Rendering it would ship a service whose only output is a
+# refusal.
+split="$(ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
+          REPAIR_REPO=fake-owner/other TEMPLATES_DIR="$ROOT/templates/systemd" \
+          bash "$INSTALLER" --dry-run 2>&1)"; src=$?
+[ "$src" -ne 0 ] && pass "a non-tortoise REPAIR_REPO is REFUSED (rc=$src), not rendered" \
+  || fail "the installer rendered a unit whose every pass would be refused"
+assert_contains "$split" "OBJECTIVE_REPO" "and the refusal names the seam that makes it real"
 darwin="$(ELDATO_PLATFORM=Darwin bash "$INSTALLER" --dry-run 2>&1)"; drc=$?
 [ "$drc" -ne 0 ] && pass "the installer REFUSES a non-systemd platform (rc=$drc)" \
   || fail "the installer 'succeeded' on Darwin — an artifact nothing reads"
 assert_contains "$darwin" "install-launchd.sh" "and it names the installer that owns that platform"
+
+# ── G2. the INSTALL path, driven through a fake systemctl (review cycle 2, F2/F5) ─────────────
+FAKE_UNIT_DIR="$TMP/units"; mkdir -p "$FAKE_UNIT_DIR"
+SC_LOG="$TMP/systemctl.log"; : >"$SC_LOG"
+SC_STATE="$TMP/sc-state"; printf 'active\n' >"$SC_STATE"
+cat >"$TMP/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+# a systemctl that logs every verb and tracks an ACTIVE state the suite can seed and read back.
+echo "$*" >>"$SYSTEMCTL_LOG"
+st="$(cat "$SYSTEMCTL_STATE" 2>/dev/null || echo inactive)"
+case "$1" in
+  is-enabled) printf 'enabled\n' ;;
+  is-active)  printf '%s\n' "$st" ;;
+  start|restart|enable) case "$1" in start|restart) printf 'active\n' >"$SYSTEMCTL_STATE" ;; esac ;;
+  stop) printf 'inactive\n' >"$SYSTEMCTL_STATE" ;;
+  *) : ;;
+esac
+exit 0
+SH
+chmod +x "$TMP/bin/systemctl"
+export SYSTEMCTL_LOG="$SC_LOG" SYSTEMCTL_STATE="$SC_STATE"
+inst() { # <restart-sec>
+  ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
+  SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl TEMPLATES_DIR="$ROOT/templates/systemd" \
+  REPAIR_RESTART_SEC="$1" REPAIR_STATE_DIR="$TMP/state" \
+  bash "$INSTALLER" --install 2>&1
+}
+inst 15 >"$TMP/g-install.log" 2>&1
+assert_eq "$?" "0" "--install succeeds against a service manager (fake systemctl)"
+[ -f "$FAKE_UNIT_DIR/eldato-pr-doctor-trigger.service" ] \
+  && pass "the unit file is written to the resolved unit dir" || fail "no unit file after --install"
+n_before="$(grep -c '^restart' "$SC_LOG")"
+printf 'active\n' >"$SC_STATE"
+inst 15 >"$TMP/g-reinstall.log" 2>&1
+assert_eq "$?" "0" "a second --install over identical bytes exits 0"
+assert_eq "$(grep -c '^restart' "$SC_LOG")" "$n_before" \
+  "it does NOT restart an unchanged unit (a gratuitous restart orphans the doctor)"
+# ⛔ THE REGRESSION THIS ARM EXISTS FOR (review cycle 2, F2): a re-install is the operator's natural
+# recovery action for a trigger that is DOWN, and "unchanged bytes" must not mean "nothing to do".
+printf 'inactive\n' >"$SC_STATE"
+: >"$SC_LOG"
+inst 15 >"$TMP/g-recover.log" 2>&1; rrc=$?
+assert_eq "$rrc" "0" "--install over an unchanged but STOPPED unit exits 0"
+assert_eq "$(grep -c '^start' "$SC_LOG")" "1" "and it STARTED it (recovery must not be a silent no-op)"
+# ⛔ A RENDER CONSTRAINT MUST NOT GATE THE READING VERB (review cycle 2, F5).
+REPAIR_RESTART_SEC=100 ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
+  bash "$INSTALLER" --install >"$TMP/g-badrestart.log" 2>&1; brc=$?
+[ "$brc" -ne 0 ] && pass "REPAIR_RESTART_SEC=100 is REFUSED at --install (StartLimit could never fire)" \
+  || fail "an unfireable StartLimit was installed"
+assert_contains "$(cat "$TMP/g-badrestart.log")" "StartLimitBurst" "and the refusal shows the arithmetic"
+REPAIR_RESTART_SEC=100 ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
+  bash "$INSTALLER" --status >"$TMP/g-status.log" 2>&1; strc=$?
+assert_eq "$strc" "0" "--status still answers with the same bad render value (reading verbs are not gated)"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── H. a trigger with NO doctor is DOCTOR-MISSING, never a clean pass"
@@ -386,9 +451,8 @@ surface BEHIND "2026-10-24T19:00:00Z"                    # a REAL change, then k
 wait_for "$LOG" "CHANGE" 100 || fail "the change was never observed"
 stop_loop "$pid"                                        # killed BEFORE the 20 s debounce elapses
 assert_eq "$(n_doctor)" "0" "nothing ran yet (the change is still in its coalescing window)"
-printf '%s\n' "$(cat "$S"/pr-doctor-trigger-suite-i.state.json)" | grep -qF '"pending_since"' \
-  && pass "the pending change was PERSISTED, not just remembered" \
-  || fail "no pending_since in the state: a restart would silently drop the change"
+assert_contains "$(cat "$S"/pr-doctor-trigger-suite-i.state.json)" '"pending_since"' \
+  "the pending change was PERSISTED, not just remembered"
 LOG="$TMP/i2.log"
 pid="$(start_loop "$S" fake-owner/suite-i 20 "$LOG")"
 wait_dir 1 300 || true
