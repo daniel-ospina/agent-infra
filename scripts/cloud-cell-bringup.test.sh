@@ -292,8 +292,13 @@ br() {
   # the SAME suite failed 24 arms on CI, where nothing is exported — a host dependency wearing a test's
   # clothes. With them cleared, the only repo the installer can learn about is the one the bring-up
   # passes from its own verified checkout, which is what the `Environment=DISK_REAPER_REPOS=` arm asserts.
-  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS \
-            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" \
+  # `-u DEEPSEEK_API_KEY` for the SAME reason as the repo vars: on a developer's box the provider key is
+  # exported and the run sails past `check_provider`, while on a bare runner the identical invocation
+  # dies there - measured 2026-10-24, where the GH_REPO-ordering arm asserted an `ok: gh login` line the
+  # CI run never reached (the key it needed came from the author's shell, not from the fixture). An arm
+  # that needs a key must pass one explicitly (`BR_EXTRA_ENV=...`), so no arm silently inherits one.
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS -u DEEPSEEK_API_KEY \
+            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
@@ -931,7 +936,12 @@ say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
 # $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
 # missing provider key — the ORDERING is what proves the drop happened before any check ran).
 rm -f "$T/absent.env"
-BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" br ok normal --check
+# A PROVIDER KEY FROM THE OPERATOR SHELL, WHICH IS THIS ARM'S WHOLE PREMISE (no keys.env at all):
+# without one the run stops at `check_provider` and never reaches a repo-reading check, so the ordering
+# assertion has no second line to compare against - which is exactly how it failed on the runner
+# (`drop=3 check=none`) while passing on the author's box, where the key was exported.
+BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" BR_EXTRA_ENV="DEEPSEEK_API_KEY=fake" \
+  br ok normal --check
 case "$BR_OUT" in
   *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
   *) bad "with keys.env absent, bring-up did not drop an operator-shell GH_REPO — output: $BR_OUT" ;;
