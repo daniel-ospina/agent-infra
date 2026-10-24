@@ -1124,11 +1124,12 @@ reap_lane_venv() {
 #     READING and false of the FLOOR. `MEM_MIN_AVAIL_MB` (and the two factors behind it:
 #     `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`) is read from the environment at source time
 #     exactly like MAX_LOAD, so a caller that exports `MEM_MIN_AVAIL_MB=1` has stated a floor of its
-#     own and is not gated on memory — that is the documented lever, and it is also the disarm. The
-#     harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a memory-tight
-#     box does not answer a load arm with 73; the four values an operator sets deliberately are
-#     stated in README §7 and rendered by install.sh into the plist, so no caller can claim it did
-#     not know.
+#     own and is not gated on the FLOOR — that disarms the LOW arm only: `mem_gate_verdict` returns
+#     UNREADABLE and refuses BEFORE any comparison, so an unreadable probe stays refused whatever the
+#     floor says. The harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a
+#     memory-tight box does not answer a load arm with 73; the four values an operator sets
+#     deliberately are stated in README §7 and rendered by install.sh into the plist, so no caller can
+#     claim it did not know.
 #   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim
 #     about print mode, and parsing argv to exempt "interactive" would create a SECOND definition of
 #     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
@@ -1141,12 +1142,13 @@ reap_lane_venv() {
 #     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
 #     its own gates rather than deferring to this one.
 #   * The MEMORY gate (#2387) IS here, and its STATE is read from the box's own probe (/proc/meminfo
-#     or vm_stat), so it needs no ARGUMENT from the caller — a caller could not know the box's free
-#     memory even in principle, which is exactly why it can be enforced at this layer while the disk
-#     gate cannot. Its floor is per-BOX (not per-volume), so unlike the disk reading there is nothing
-#     per-spawn a caller knows that this layer does not. ⚠️ The FLOOR is still caller-settable — see
-#     the MAX_LOAD bullet above, which states that limit for both gates rather than pretending this
-#     one is exempt.
+#     or vm_stat), so it needs no ARGUMENT from the caller. Its floor is per-BOX (not per-volume),
+#     which is the real reason it can be enforced at this layer while the disk gate cannot: the disk
+#     reading is per-SPAWN (`DISK_GATE_PATH` is the worktree this agent will fill), so a shim that
+#     cannot know which worktree that is has nothing to measure. ⚠️ A caller CAN take this reading
+#     (`run_agent` does, three functions up), so this is not "the caller could not know" — it is "the
+#     caller need not supply it, and the floor it cannot supply is settable" — see the MAX_LOAD bullet
+#     above, which states that limit for both gates rather than pretending this one is exempt.
 #   * `pi` invocations that never leave the current process — none exist today (there is no in-process
 #     API use of the harness's model calls), and if one appeared it would be outside every PATH gate.
 #   * ⛔ THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT, AND IT DOES NOT PASS THROUGH PATH.
