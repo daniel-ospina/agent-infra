@@ -246,6 +246,27 @@ sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
+# mk_tool_stderr <dir> — the SAME failure as `mk_tool_incomplete`, plus the one thing a real
+# pre-flight adds when it cannot answer: a DIAGNOSTIC LINE ON STDERR, and its own non-zero exit. The
+# harness used to merge stderr into the report (`2>&1`) and to keep the tool's rc only for its `-eq 3`
+# guard, so neither could reach the record (#2401). This fixture is what makes that reachable and
+# assertable end to end.
+mk_tool_stderr() {
+  local d="$1"
+  mk_tool_incomplete "$1"
+  # Append the stderr write WITHOUT touching the fixture above (so the two cannot drift apart).
+  python3 - "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'sys.exit(2)',
+    'sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")\nsys.exit(2)',
+)
+open(path, "w").write(src)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -319,6 +340,65 @@ case "$(rec "$D" cmd)" in
   *collision_preflight*) ok "fail: the record names the command that failed" ;;
   *) bad "fail: the record's cmd does not name the pre-flight — '$(rec "$D" cmd)'" ;;
 esac
+
+# ── 1c) THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT (#2401) ─
+# ⛔ WHY THIS SECTION EXISTS. §1 pins the SURFACE and the producer's prose. On cell-4 that was not
+# enough: the prose is a sentence, the harness bounded it at 320/400 characters, and the one datum that
+# would have ended a 12-hour cell-wide dispatch stop — a pre-flight exiting 2 because two live pids sat
+# in REAPED worktrees — appeared nowhere. Measured:
+#
+#   [dispatch] BLOCKED: refresh failed — stage=preflight: none of the 12 judged candidate(s) produced a
+#   usable verdict … failing surface(s): issue-assignee-holder:12 — first cause: claim gate: the FLEET
+#   BOARD could not answer — … (tried: `cmux sessi          <- the datum was cut mid-word
+#
+# and `state/refresh-last` carried no `rc=` of the TOOL at all (its `rc=1` is the PASS's own exit).
+# So: the tool's rc, the tool's command and the tool's own stderr line must be in the RECORD (where a
+# controller reads them) and inside the first 400 characters of `why=` (where the beat prints them).
+mk_case fail-datum 42
+mk_tool_stderr "$D"
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "datum: the record carries the PRE-FLIGHT's own rc (2), not the pass's" \
+  || bad "datum: tool_rc='$(rec "$D" tool_rc)' (want 2) — the tool's exit was thrown away"
+case "$(rec "$D" tool_cmd)" in
+  "collision_preflight.py --repo .") ok "datum: the record names the exact command that ran" ;;
+  *) bad "datum: tool_cmd='$(rec "$D" tool_cmd)' does not name the pre-flight invocation" ;;
+esac
+case "$(rec "$D" tool_err)" in
+  *"FLEET BOARD: cannot answer"*) ok "datum: the record carries the tool's FIRST STDERR LINE" ;;
+  *) bad "datum: tool_err='$(rec "$D" tool_err)' lost the stderr diagnostic" ;;
+esac
+# THE BOUND IS THE POINT: whatever the beat prints must contain the datum. `refresh_cause_brief` cuts
+# `why=` at 400 characters, so the assertion is made on that cut — not on the whole record.
+_why400="$(rec "$D" why | cut -c1-400)"
+case "$_why400" in
+  *"pre-flight cmd=collision_preflight.py --repo . rc=2 stderr=FLEET BOARD: cannot answer"*)
+    ok "datum: the QUOTABLE 400 characters carry command, rc and stderr — not just prose" ;;
+  *) bad "datum: the datum is outside the beat's 400-char cut, so it is invisible — '$_why400'" ;;
+esac
+# …and it survives the LAST bound, the one the caller applies to the record it prints.
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"rc=2"*) ok "datum: the BLOCKED line carries the pre-flight's rc" ;;
+  *) bad "datum: the BLOCKED line has no rc=2 — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"collision_preflight.py"*) ok "datum: the BLOCKED line names the command that ran" ;;
+  *) bad "datum: the BLOCKED line names no command — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"FLEET BOARD: cannot answer"*) ok "datum: the BLOCKED line carries the tool's own stderr line" ;;
+  *) bad "datum: the BLOCKED line carries no stderr diagnostic — $OUT_DRIVE" ;;
+esac
+
+# ── 1d) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
+# A regression that swaps the prose for the datum would still name a surface but would stop saying the
+# pass judged NOTHING, which is the reading #1736 exists to guarantee. Both must be present.
+case "$OUT" in
+  *"judged NOTHING"*) ok "datum: the abort still says the pass judged NOTHING" ;;
+  *) bad "datum: the abort lost 'judged NOTHING' — $OUT" ;;
+esac
+
 
 # ── 1b) THE TABLE-ONLY SHAPE STILL NAMES THE SURFACE (the parser's fallback) ────
 mk_case fail-table 42
