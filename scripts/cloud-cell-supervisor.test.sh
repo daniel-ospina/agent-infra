@@ -3755,19 +3755,42 @@ grep -q 'CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"' "$SUP" \
   && ok 'env-file override: CONTROLLER_INVOKER_HOME is re-asserted after the source' \
   || bad 'env-file override: CONTROLLER_INVOKER_HOME is not restored after source_env_file — keys.env can re-point the directory every unit reader uses'
 
-# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18, #2402).
+# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18/19, #2402).
 # `$HOME` at read time is the INVOKER's; the doctor's session forces `HOME=$CELL_HOME`, while an operator's
 # standalone install wrote the unit under the OPERATOR's home. With `CELL_HOME != $HOME` the doctor found
 # nothing, skipped the service branch and launched a tmux controller BESIDE the enabled unit (#1761).
-grep -q 'controller_user_unit_dirs' "$SUP" && grep -q '^passwd_home()' "$SUP" \
-  && ok 'unit lookup: the user-scope search carries the passwd-home candidates, not only the invoker HOME' \
-  || bad 'unit lookup: the user-scope unit is resolved from a single HOME guess again — a CELL_HOME != HOME cell loses its unit (and its NOT-ACTIVE fence)'
+# ⛔ THE PIN MUST NAME THE CANDIDATES, NOT THE FUNCTIONS (review P1 round 19, #2402 / D). The first version
+# grepped `controller_user_unit_dirs` and `passwd_home` — strings that survive deletion of every passwd
+# candidate, because the functions remain. Mutation-verified by the reviewer: deleting both passwd lines left
+# this suite at PASS=481 FAIL=0, a pin with no state in which it fails. These greps name the assignments, so
+# deleting either candidate reds its arm.
+grep -q 'h="\$(passwd_home "\$(id -u)")"' "$SUP" \
+  && ok 'unit lookup: the invoking uid passwd home is a candidate (the directory systemctl --user reads)' \
+  || bad 'unit lookup: the invoking uid passwd home is GONE from the candidate list — a doctor running under HOME=$CELL_HOME cannot see the operator install again'
+grep -q 'h="\$(passwd_home "\${SUDO_USER:-}")"' "$SUP" \
+  && ok 'unit lookup: SUDO_USER passwd home is a candidate (so sudo does not hide the operator unit)' \
+  || bad 'unit lookup: the SUDO_USER passwd home is GONE from the candidate list — sudo bash … --status goes back to answering over root home'
 grep -q 'getent passwd "\$1"' "$SUP" \
   && ok 'unit lookup: passwd_home reads the database, so neither `export HOME=$CELL_HOME` nor sudo can re-point it' \
   || bad 'unit lookup: passwd_home does not read the passwd database — the caller environment decides again'
 grep -q 'dirname "\$_UNIT_PATH")" != ' "$SUP" \
   && ok 'unit lookup: the manager scope is taken from the resolved copy (any user dir), not one guessed path' \
   || bad 'unit lookup: the scope is decided by comparing against one guessed user directory — a unit found in another candidate would be addressed on the SYSTEM manager'
+# ⛔ THE FENCE ON THE TWO UNIT DIRECTORIES MUST BE UNCONDITIONAL (review P1 round 19, #2402 / B). The
+# timeout siblings keep `[ -z "$_IN" ] ||` because an unset timeout legitimately comes from the env file; a
+# DIRECTORY has no such reading (its default is computed downstream), so the conditional form restored
+# nothing when nobody supplied a value — which is every production caller. The fence was inert.
+grep -qE '^CONTROLLER_SYSTEM_UNIT_DIR="\$CONTROLLER_SYSTEM_UNIT_DIR_IN"$' "$SUP" && grep -qE '^CONTROLLER_USER_UNIT_DIR="\$CONTROLLER_USER_UNIT_DIR_IN"$' "$SUP" \
+  && ok 'env-file override: the two unit DIRECTORIES are re-asserted UNCONDITIONALLY, so keys.env cannot re-point the search' \
+  || bad 'env-file override: the unit directories are re-asserted only when the caller supplied one — a keys.env line still hides the installed unit (the fence is inert)'
+# ⛔ AND `PS_BIN` DECIDES WHICH PIDS `stop` MAY SIGNAL (review P1 round 19, #2402 / B): its age answer feeds
+# `lock_controller_pid`, so a keys.env stub makes a recycled pid that merely looks like the controller look
+# like the lock owner and get TERM/KILL. RED on revert: the snapshot or the restore is deleted.
+if grep -q '^PS_BIN_IN="\${PS_BIN:-}"' "$SUP" && grep -qE '^PS_BIN="\$PS_BIN_IN"$' "$SUP"; then
+  ok 'env-file override: PS_BIN is snapshotted and restored, so keys.env cannot forge the process-age rule behind stop'
+else
+  bad 'env-file override: PS_BIN is unfenced — a keys.env stub can forge the age rule and have stop signal a pid that is not the controller'
+fi
 # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THESE CALLERS ARE NOT THE SERVICE MANAGER (review P1 round 18,
 # #2402). The unit exports =1 and every lane shell inherits it through the tmux server it created, so an
 # unpinned `start` either parks against the handover bound and reports a false failure (`harness up`) or
@@ -3778,6 +3801,17 @@ grep -q 'ORCH_FOREGROUND=0 hu_run' "$HERE/harness-up" \
 grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-bringup.sh" \
   && ok 'caller pin: orchestrator-bringup.sh starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
   || bad 'caller pin: orchestrator-bringup.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 execs the loop outside the unit cgroup'
+# ⛔ AND THE LAST TWO CALLERS (review P1 round 19, #2402 / C, and P2 / D). `cloud-cell-quiesce.sh` is the
+# worst one to leave unpinned — it STOPS the unit a few lines before this `start`, so the foreground branch
+# has nothing to hand over to and execs the loop inside quiesce's own child, outside the unit's cgroup, while
+# quiesce's own "exactly one orch-loop" assertions still pass and it prints DONE. `watchdog-loop.sh` carries
+# the pin already; it had no arm, so deleting it left every suite green.
+grep -q 'ORCH_FOREGROUND=0 \\' "$HERE/cloud-cell-quiesce.sh" \
+  && ok 'caller pin: cloud-cell-quiesce.sh starts the supervisor with ORCH_FOREGROUND=0 (it stops the unit first, so an inherited =1 would exec a dispatcher outside the cgroup)' \
+  || bad 'caller pin: cloud-cell-quiesce.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 leaves an unsupervised dispatcher behind a DONE report'
+grep -q 'ORCH_FOREGROUND=0' "$HERE/orchestrator-harness/watchdog-loop.sh" \
+  && ok 'caller pin: watchdog-loop.sh starts the supervisor with ORCH_FOREGROUND=0' \
+  || bad 'caller pin: watchdog-loop.sh lost its ORCH_FOREGROUND=0 pin — an inherited =1 changes what its start does'
 # ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
 # sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
 # it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.

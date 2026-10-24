@@ -1142,9 +1142,19 @@ do_status() {
 # (or a silent no-op on a unit that is not there) and then report on the wrong unit. Three callers share
 # this: --status, --uninstall, and the supervisor's own scope helper.
 scope_for_dir() { # <unit dir> -> sets TARGET and SC
+    # ⛔ THE SCOPE IS "IS THIS THE SYSTEM DIRECTORY", NOT "IS IT THE CALLER'S HOME" (review P1 round 19, #2402 / B+D).
+    # This compared the directory to `$HOME/.config/systemd/user` — the CALLER's home — while the find beside it
+    # was widened to the passwd home of the invoking uid and `SUDO_USER`'s passwd home. Every copy found
+    # through those candidates is by construction NOT `$HOME/.config/systemd/user`, so it was classified
+    # SYSTEM and handed to the system manager: a healthy enabled user unit answered `enabled=not-enabled
+    # active=not-active` and `--status` exited 1 over it (the false red the widening was meant to fix), a
+    # foreign same-named system unit was read and reported as OURS (false green), and `--uninstall` could
+    # `disable --now` another cell's supervisor after printing that it had left that unit untouched. This is
+    # the supervisor's own rule (`sup_systemctl`: anything that is not the system dir is user scope), and the
+    # two must agree — one definition of "which manager owns this file".
     case "$1" in
-        "$HOME/.config/systemd/user") TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
-        *)                            TARGET="system"
+        "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"|"${SYSTEMD_UNIT_DIR:-}")
+                                      TARGET="system"
                                       # ⛔ THE SYSTEM SCOPE NEEDS THE PRIVILEGE THE INSTALL USED (review P2,
                                       # #2402). `choose_target` resolves it as `sudo -n systemctl`; deriving
                                       # a bare `systemctl` here meant `--uninstall` issued an UNPRIVILEGED
@@ -1155,6 +1165,7 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
                                       if [ -n "${SYSTEMCTL:-}" ]; then SC="$SYSTEMCTL"
                                       elif [ -n "${SUDO+x}" ]; then SC="${SUDO:+$SUDO }systemctl"
                                       else SC="sudo -n systemctl"; fi ;;
+        *)                            TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
     esac
 }
 # ⛔ A UNIT FILE'S PRESENCE IS NOT AN OWNERSHIP CLAIM (review P1, #2402). The unit NAME is machine-scoped
@@ -1481,7 +1492,23 @@ do_uninstall() {
         err "  that unit is still installed (and may still be enabled) — remove it too: re-run --uninstall"
         return 1
     fi
-    say "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $SUPERVISOR start', and note that a tmux controller is NOT restarted by anything (#2402)"
+    # ⛔ THE REMEDY MUST BE RUNNABLE (review P2 round 19, #2402 / C). `$SUPERVISOR` is resolved only on the
+    # INSTALL path (`resolve_supervisor` was called by `do_install` alone), so this printed
+    # `start it by hand with 'bash  start'` — the one instruction an operator is left with after removing the
+    # supervisor, and it cannot be followed. Resolve it here too, and fall back to the shipped script's own
+    # path so the sentence is never empty.
+    local _sup="${SUPERVISOR:-}"
+    if [ -z "$_sup" ]; then
+        # `resolve_supervisor` ERRS when it finds nothing, which would abort the message; the uninstall has
+        # already succeeded at this point, so take its candidates without the hard failure.
+        for _sup in "${ORCH_SUPERVISOR:-}" \
+                    "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" \
+                    "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
+            [ -n "$_sup" ] && [ -f "$_sup" ] && break || _sup=""
+        done
+        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farm it: bash pi-bootstrap/setup.sh)"
+    fi
+    say "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $_sup start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0
 }
 
