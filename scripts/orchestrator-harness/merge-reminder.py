@@ -166,6 +166,13 @@ def run(cmd, timeout=60, cwd=None):
         return 124, "", f"timeout after {timeout}s: {' '.join(cmd[:3])}"
     except FileNotFoundError as e:
         return 127, "", f"{e}"
+    except OSError as e:
+        # ⛔ A NON-EXECUTABLE/FULL/UNAVAILABLE BINARY IS AN ANSWER, NOT AN EXCEPTION. `EACCES` on a
+        # non-executable `git`, `EAGAIN`/`ENOMEM` on fork under load: these used to escape every
+        # handler — including the cycle's own guards — and kill the run with a traceback, no
+        # MERGE-REMINDER.md and no stated reason. rc 126 is the shell's own "found but not
+        # executable", so a caller can tell this apart from 127 (not found) and 124 (timeout).
+        return 126, "", f"{type(e).__name__}: {e}"
 
 
 # ── gh resolution + metered REST ────────────────────────────────────────────────────────────────
@@ -732,7 +739,12 @@ def _is_our_cron_line(line: str, tag: str) -> bool:
     review). Install and uninstall now share this one predicate.
     """
     quoted = shell_quote(str(Path(__file__).resolve())).replace("%", "\\%")
-    return tag in line and quoted in line
+    # ⛔ THE ENTRY NAMES THE COPY THAT INSTALLED IT. `deploy-harness.sh` seeds `$O` and `install.sh`
+    # treats `$O/<script>` and the checkout copy as the same script, so an uninstall from the OTHER
+    # copy matched nothing — it printed "nothing to remove", exited 0, and left the arm firing
+    # (measured). The basename identifies our entry from either path; an operator line that merely
+    # mentions the tag still carries no script name and still survives.
+    return tag in line and (quoted in line or Path(__file__).name in line)
 
 
 def local_activate(o: Path, platform: str | None = None) -> str:
@@ -1582,7 +1594,7 @@ artifact (`harness: <sha> [current]`, `controller: RUNNING`), never by the comma
 
 ## 3. One red for many PRs
 
-{_shared_reds(landing)}
+{_shared_reds(landing, skipped)}
 
 ---
 *This file is written by `scripts/orchestrator-harness/merge-reminder.py`. It never merges: a landed
@@ -1597,7 +1609,7 @@ PR is landed by `scripts/admin-merge.sh`, whose refusals are the record.*
         return f"{type(e).__name__}: {e}"
 
 
-def _shared_reds(landing: list[dict]) -> str:
+def _shared_reds(landing: list[dict], skipped: str = "") -> str:
     """Question 3: is one RED GROUP shared across several PRs (one root that unblocks a batch)?
     Built from the group LABELS this cycle measured — a count alone cannot say "same reason"."""
     by_label: dict[str, list[int]] = {}
@@ -1611,6 +1623,10 @@ def _shared_reds(landing: list[dict]) -> str:
         return ("A red group appears on ONE PR only (not a batch root): " +
                 "; ".join(f"#{r['pr']['number']}: {', '.join(r.get('red_labels') or [])}"
                           for r in landing if r.get("reds")))
+    if not landing:
+        if skipped:
+            return "NOT-READ — no PR surface was examined this cycle (see the SKIPPED line above)."
+        return "No open PRs this cycle, so no red group can be shared."
     return ("No PR in this cycle carries a red group. (A PR whose surface was NOT READ is not "
             "evidence of a green one.)")
 
@@ -1874,7 +1890,6 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
-    repo_path = repo_path_of(o)
     md = o / STATE_MD
     skipped = ""
     landing: list[dict] = []
@@ -1887,6 +1902,7 @@ def main(argv=None) -> int:
     # budget, the open-PR listing). A single candidate's surface failing inside landing_cycle is
     # handled there — it becomes an UNREADABLE reading for that PR, not a skipped cycle.
     try:
+        repo_path = repo_path_of(o)
         slug = repo_slug(repo_path, args.repo)
         main = main_sha(repo_path)
         budget = Budget(resolve_gh(o))
@@ -1917,7 +1933,14 @@ def main(argv=None) -> int:
                        "readings": "", "verdict": f"SKIPPED({e})"}]
 
     if not main:
-        main = main_sha(repo_path)
+        # ⛔ INSIDE A GUARD: this retry re-runs `git` after the cycle's try block, so on the very
+        # environment the try block was meant to describe it was the one call that could still crash.
+        try:
+            main = main_sha(repo_path)
+        except OSError as e:
+            main = ""
+            skipped = (skipped + "; " if skipped else "") + \
+                f"UNREADABLE environment — {type(e).__name__}: {e}"
     line = one_line_of(landing, deploy, skipped, dispatched)
     err = compose(md, slug, main, budget, landing, deploy, skipped, line)
     if err:

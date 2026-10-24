@@ -1527,6 +1527,53 @@ ck "§26g a dispatch + a failed report write is exit 3 (rc=$rc)" "$([ "$rc" -eq 
 ck "§26g ...and the line keeps the dispatch (never '(no dispatch)' beside a live rail)" \
    "$(qF 'a rail WAS dispatched this cycle' "$out" && nq '(no dispatch)' "$out" && echo 0 || echo 1)"
 
+# ⛔ THE ENTRY NAMES THE COPY THAT INSTALLED IT. `deploy-harness.sh` seeds `$O/<script>` and install.sh
+# treats it as the same script as the checkout copy, so an uninstall run from the OTHER copy matched
+# nothing — printed "nothing to remove", exited 0, and left the arm firing every 10 minutes.
+cp "$SUT" "$TMP/merge-reminder.py"
+: > "$FX/crontab.txt"; : > "$FX/systemctl.txt"
+cat > "$TMP/cronbin/crontab" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+  -l) if [ -s "$FIXTURE/crontab.txt" ]; then /bin/cat "$FIXTURE/crontab.txt"; exit 0; fi
+      echo "no crontab for tester" >&2; exit 1 ;;
+  -)  /bin/cat > "$FIXTURE/crontab.txt"; exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$TMP/cronbin/crontab"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$TMP/merge-reminder.py" \
+        --o "$O" --install-timer --interval 600 2>&1)"; rc3=$?
+out4="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" \
+        --o "$O" --uninstall-timer 2>&1)"; rc4=$?
+ck "§26h install from one copy, uninstall from the OTHER (rc install=$rc3 uninstall=$rc4)" \
+   "$([ "$rc3" -eq 0 ] && [ "$rc4" -eq 0 ] && echo 0 || echo 1)"
+ck "§26h ...and the arm the other copy installed is actually GONE" \
+   "$(grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
+ck "§26h ...and it did not claim 'nothing to remove' over a live entry" \
+   "$(nq 'nothing to remove' "$out4" && echo 0 || echo 1)"
+
+# ⛔ BOTH CLAIM SURFACES. `refs/claims/<N>-<head12>` was never populated by any fixture, so a gate that
+# stopped reading it would have stayed green (indicator (1) names three surfaces, not two).
+write_baseline; reset_o
+git -C "$REPO_SRC" push --quiet origin "HEAD~0:refs/claims/42-${HEAD:0:12}" 2>/dev/null \
+  || git -C "$REPO_SRC" push --quiet origin "HEAD:refs/claims/42-${HEAD:0:4}"
+out="$(run_sut --json)"; rc=$?
+ck "§26i a claim at refs/claims/<N>-<head12> REFUSES the dispatch" \
+   "$(qF 'REFUSE(claim=' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+git -C "$REPO_SRC" push --quiet origin ":refs/claims/42-${HEAD:0:12}" 2>/dev/null || true
+
+# ⛔ A BINARY THAT CANNOT BE EXECUTED IS AN ANSWER, NOT A TRACEBACK: `EACCES` on a non-executable `git`
+# used to escape every guard — no MERGE-REMINDER.md, no stated reason, exit 1.
+mkdir -p "$TMP/noexec"; printf '#!/bin/sh\nexit 0\n' > "$TMP/noexec/git"; chmod 644 "$TMP/noexec/git"
+out="$(env -u OR -u O FIXTURE="$FX" REPO="$REPO_SRC" \
+        PATH="$TMP/noexec:$BIN:/usr/bin:/bin:/usr/local/bin" \
+        "$PY3" "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
+        --rail-wait-s 5 --retry-s 900 2>&1)"; rc=$?
+ck "§26j a NON-EXECUTABLE git does not crash the cycle (rc=$rc, no traceback)" \
+   "$(nq 'Traceback' "$out" && [ "$rc" -le 3 ] && echo 0 || echo 1)"
+ck "§26j ...and the deliverable was still written" "$([ -s "$O/MERGE-REMINDER.md" ] && echo 0 || echo 1)"
+
 
 # ⛔ THE PROCESS TABLE IS RE-READ AT THE MOMENT OF ACTION. A rail that appears only in the SECOND
 # read (after the gates and this cycle's REST calls) must still refuse the dispatch.

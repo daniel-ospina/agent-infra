@@ -1993,8 +1993,9 @@ whatever remote path that box already uses — no new control surface is invente
 It is also **bounded**: every activation is recorded (`state/merge-reminder.deploys`,
 TAB-separated — a box name may contain a space, and a whitespace split would key on the first word and
 never bind), a repeat of
-the same box/from/to pair inside `--retry-s` is a `WAIT(deploy-retry-after=…)`, and a third
-unverified attempt refuses by count (`REFUSE(deploy-attempts=3 …)`) naming a human. Without that
+the same box/from/to pair inside `--retry-s` is a `WAIT(deploy-retry-after=…)`, and and once
+three unverified attempts are ON RECORD the NEXT cycle refuses by count (`REFUSE(deploy-attempts=3
+…)`) naming a human — three restarts happen; the fourth cycle is the one that stops. Without that
 bound a box that cannot reach `origin/main` — pinned `ahead`, `diverged`, or an `apply` that never
 advances the pin — would be stopped and started every cycle forever, because every gate that could
 stop it re-opens 600 s later. If the ledger cannot be WRITTEN the verdict says so
@@ -2032,11 +2033,13 @@ systemd USER timer (`merge-reminder.timer`) on Linux, else a crontab entry — a
 them exits 3 naming the remedy rather than installing nothing quietly. Every arm is verified by the
 ARTIFACT that schedules it (`launchctl print`, `systemctl is-active`, `crontab -l`) — a successful
 write is not a timer. `--uninstall-timer` removes **every** arm install can create (the unit, and
-the crontab entry on a box with no systemd) and verifies the removal, so uninstall cannot leave an
-arm firing behind a "nothing to remove".
+the crontab entry on a box with no systemd) and verifies the removal — including the entry the OTHER copy of this
+script installed (`$O/<script>` and the checkout copy are the same script to `install.sh`), so
+uninstall cannot leave an arm firing behind a "nothing to remove"; an unreadable crontab is an
+abstention (exit 3) that rewrites nothing rather than an empty crontab it would overwrite.
 
-**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§25,
-176 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§26,
+182 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the
