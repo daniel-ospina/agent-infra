@@ -2838,9 +2838,10 @@ Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes 
 `#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>` header, and a snapshot older than
 `CLAIM_SNAPSHOT_MAX_AGE` (900 s, ≈3.75 cycles at the shipped `CYC=240`) or written from a failed
 fetch reads `claim-unreadable`. A snapshot whose WRITE failed is never published at all: the
-previous one is left in place **with its own header**, so it keeps answering (and being believed)
-until it is older than `CLAIM_SNAPSHOT_MAX_AGE` — a failed publish is therefore NOT a stand-down,
-and it is reported separately (`CLAIM_SNAPSHOT_WRITE`) from a failed fetch. Publishing a 0-byte
+previous one is left in place **with its own header**, so it keeps answering only while that header
+says `ok` and it is inside `CLAIM_SNAPSHOT_MAX_AGE` — and it is `claim-unreadable` otherwise, or
+when there is no previous snapshot at all. A failed publish is therefore not automatically a
+stand-down, and it is reported separately (`CLAIM_SNAPSHOT_WRITE`) from a failed fetch. Publishing a 0-byte
 snapshot instead would read as "nothing is claimed", which is why that is refused.
 
 **Two signals, merged, never intersected.** Selection keeps the LOCAL evidence it always had — a live
