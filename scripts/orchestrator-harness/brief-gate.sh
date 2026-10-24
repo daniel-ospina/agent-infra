@@ -44,7 +44,9 @@
 #
 # Exit codes, because callers branch on them (they are NOT interchangeable):
 #   0   the brief satisfies the contract
-#   74  REFUSED — the brief is deficient, and nothing was started (BRIEF_GATE_REFUSED)
+#   80  REFUSED — the brief is deficient, and nothing was started (BRIEF_GATE_REFUSED)
+#       ⛔ 80, NOT 74: 74 is AGENT_LAND_BACKLOG (and pi's own EX_IOERR), and sharing it made a
+#       land-backlog refusal read as a brief refusal — opposite remedies (#2258 review).
 #   78  the gate CANNOT RUN (bad usage / unknown role) — a cannot-verify is never a pass
 #
 # Callers (one implementation, called from each): `spawn-gate.sh::run_agent` (which covers
@@ -55,7 +57,7 @@
 # without a gate reddens a test instead of drifting in ungated.
 set -u
 
-BRIEF_GATE_REFUSED=74
+BRIEF_GATE_REFUSED=80
 BRIEF_GATE_UNAVAILABLE=78
 
 # The closed vocabulary a `RUNG:` value must name. Rung 1 = the perplexity MCP; rung 2 = the
@@ -237,11 +239,11 @@ BRIEF
 # greps, exactly like `reviewer_preflight_line` (#2148). The long form is in the brief.
 brief_gate_line() { # brief_gate_line [role]
   local role="${1:-lane}"
-  printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 74).'
+  printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80).'
 }
 
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
-#   bash brief-gate.sh --check <file|-> [role]   → 0 pass · 74 refused (message on stderr) · 78 cannot verify
+#   bash brief-gate.sh --check <file|-> [role]   → 0 pass · 80 refused (message on stderr) · 78 cannot verify
 #   bash brief-gate.sh --missing <file|->        → the missing tokens, one per line
 #   bash brief-gate.sh --section [role]          → the canonical brief block
 #   bash brief-gate.sh --line [role]             → the one-line disclosure

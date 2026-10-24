@@ -1631,8 +1631,8 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
 # ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
-# no research contract (74) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
-# run_agent return 74 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
 # at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
 # test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
 # brief of the shape a real dispatch carries.
@@ -2593,8 +2593,11 @@ _slot_t=$(grep -E 'but NO [a-z-]+ slot \(' "$LOOP" | grep -cF '$(spawn_gate_tok)
 # token is satisfied by a COMMENT that mentions it — and this very function's comment block discusses
 # the token, so a decoy there would keep the check green while a real refusal line lost its evidence.
 # The comment 40 lines below names the same class; this is it.
-[ "$_slot_n" = "5" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 5 of 5)"; }
-ck "all five held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
+# 5 -> 6 for agent-infra#2653: the review arm gained a refusal for a head that HAS findings at a full
+# fixer ceiling. It names the FIX side (a fixer is the remedy there, never a review), and it carries the
+# same gate token because the same two gates can have held the spawn.
+[ "$_slot_n" = "6" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 6 of 6)"; }
+ck "all six held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
 sed -n '/^spawn_gate_tok() {/,/^}/p' "$LOOP" > "$TMP/spawntok.sh"
 if need "$TMP/spawntok.sh" "spawn_gate_tok() is extracted from the shipped loop"; then
   got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=100; MEM_UNKNOWN=0; spawn_gate_tok' _ "$TMP/spawntok.sh")"
@@ -2988,8 +2991,12 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # a coercion added without its pin must redden this check, not pass as "more is better".
 # 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
 # its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
-[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 18 -> 19 for agent-infra#2653 (MAX_REVIEW_TRIES: the controller now keys its own review dispatches
+# on merge-one.sh's per-head review budget, so the SAME limit feeds a `-ge` in a SECOND file — an
+# uncoerced copy there would let a typo run the review budget unbounded, which is the loop the bound
+# exists to prevent).
+[ "$_ngrd_n" = "19" ] && rcn=0 || { rcn=1; echo "      expected 19 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 19 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -3004,21 +3011,21 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 # enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
-           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
-           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; MAX_RED_FIX=; MAX_RED_FIX_TRIES=; STALE_MIN=; MAX_REVIEW_TRIES=
+           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s revtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$MAX_REVIEW_TRIES" "$STALE_MIN" ); }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 # ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
 # the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
 # CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
 # reddens the two cases above and below.
-[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
+[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
 # prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
 # read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
-[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
 # ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
 # passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
@@ -3061,17 +3068,17 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
 # cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
 # The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
 # drops the floor line leaves cyc=0 here — RED.
-[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
 ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
 # Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
-[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
 ck "a deliberate small CYC=5 survives the floor unchanged" $rc
 # And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
 # `is_num 08` must be FALSE, while `0` and a real number stay true.
@@ -3367,7 +3374,20 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # (agent-infra#1709 rec 4): the shipped sleep is now `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))`,
   # so JIT must be in the extracted driver or the arithmetic fails. A bare `grep 'sleep "$CYC"'`
   # matched the pre-jitter form ONLY and silently extracted nothing once jitter landed.
-  awk '/^  JIT=/{f=1} f{print} f&&/& wait \$!$/{exit}' "$LOOP" > "$TMP/cycsleep.sh"
+  # ⛔ EXTRACT THROUGH THE ENCLOSING `fi`, NOT ONLY TO THE FIRST `& wait $!` (agent-infra#2293). The
+  # shipped nap is now `if [ "${FORK_STARVED:-0}" = "1" ]; then fork_free_sleep … ; else sleep … & wait $!; fi`,
+  # so ending the extraction at the `wait` line handed the driver an UNCLOSED `if` — `bash -n` failed and
+  # this whole section went red (4 checks) on a tree whose shipped code is correct. The lookahead is
+  # BOUNDED: a tree with no `fi` after the wait keeps the old behaviour (extract through the wait line)
+  # rather than swallowing the rest of orch-loop.sh into the driver.
+  awk '
+    /^  JIT=/ { f=1 }
+    f { buf[++n] = $0 }
+    f && /& wait \$!$/ { w = n }
+    f && w && /^  fi$/ { last = n; done = 1; exit }
+    f && w && (n - w) >= 8 { last = w; done = 1; exit }
+    END { m = (done ? last : n); for (i = 1; i <= m; i++) print buf[i] }
+  ' "$LOOP" > "$TMP/cycsleep.sh"
   if need "$TMP/cycsleep.sh" "the interruptible cycle sleep is extracted from the shipped orch-loop.sh"; then
     # The extraction must still carry the JITTER, or a revert to a fixed interval would pass the
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.
@@ -3513,6 +3533,21 @@ if [ -f "$HERE/merged-not-closed.test.sh" ]; then
   fi
 else
   ck "merged-not-closed.test.sh is present (the ported instrument has coverage)" 1
+fi
+
+# #2603: THE MERGE REMINDER'S ACTUATOR ARM. The reminder is a fleet-critical timer that until now
+# lived outside version control; its arm decides whether to spend a rail attempt, so its gates are
+# pinned here as well as in `scripts/run-bash-shards.sh` (CI runs both lanes from that one list —
+# this block is what makes `./selftest.sh` the single local command that covers it).
+if [ -f "$HERE/merge-reminder.test.sh" ]; then
+  if bash "$HERE/merge-reminder.test.sh" > "$TMP/merge-reminder.out" 2>&1; then
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 0
+  else
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 1
+    grep -E '❌|PASS=' "$TMP/merge-reminder.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "merge-reminder.test.sh is present (the actuator arm has coverage)" 1
 fi
 
 if [ -f "$HERE/refresh-scout.test.sh" ]; then

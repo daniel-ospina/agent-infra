@@ -55,7 +55,14 @@
 # the concurrency caps must keep BINDING and a reaper must never kill what it cannot see. The other
 # direction — "we could not read it, so it is dead" — silently frees every slot and lets the box
 # spawn without limit exactly when the daemon is in trouble. `dead` is only ever concluded from a
-# POSITIVE read (the workspace is gone; the session name is absent).
+# POSITIVE read: (1) the workspace is gone, (2) the session name is absent, or (3) — added
+# deliberately with agent-infra#2653, see the `wt_table` absent-owner arm — the session OWNER is
+# confirmed ABSENT (`Connection refused` from an empty `cmux tree`, i.e. a socket nobody is listening
+# on, or the CLI's own `no server running`), because a durable terminal lives INSIDE the owner: no
+# owner, no terminal. That third read is a MEASUREMENT, not a guess, and it is deliberately narrow —
+# the errno-agnostic `cannot connect to session socket <path>: <reason>` wrapper does NOT qualify
+# (ENOENT / EACCES / EAGAIN are reachable with the daemon and its terminals ALIVE), so a merely
+# illegible or unreachable answer still leaves its workers UNKNOWN and the caps binding.
 #
 # ⛔ WHAT THIS FILE DELIBERATELY DOES NOT DO. No SILENT anything: a box with no surface at all is
 # refused out loud, and a tmux spawn that cannot be given an environment with a credential is refused
@@ -517,6 +524,69 @@ wt_launcher_env() {
   return 0
 }
 
+# WHY the launcher is not `terminal` — the PROBE'S OWN ANSWER, for the startup line and the refusal.
+# ⛔ THE ANSWER USED TO BE THROWN AWAY, AND THAT IS THE DEFECT THIS FUNCTION REMOVES. `cmux tree
+# --json >/dev/null 2>&1` keeps the DECISION and discards the REASON, so a box reports
+# `launcher=none (cmux=yes, uname=Linux)` — true, actionable in no way, and indistinguishable from a
+# tty gate, a TERM/TERM_PROGRAM gate, a `cmux tree` whose output SHAPE drifted, or a daemon that is
+# simply not there. Measured 2026-10-22 on cell-1 (agent-infra#2366): the answer the probe already
+# held was `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the box had no
+# daemon at all — and the binary that message names is the guest CLI's own CLIENT, which
+# /usr/local/libexec/cmux-cloud-adapter:762-772 requires as `[ -x "$CMUX_TUI_BIN" ]` for every verb
+# but identity and help. One log line would have said so; `none` alone left it to be re-derived.
+# An instrument that holds the datum and does not read it is a category-A defect, so the reason now
+# travels with the verdict.
+# ONE probe IN THIS FUNCTION, and the honest arithmetic for a caller — corrected after the rebase,
+# because the CALLER's cost is not this function's cost. This function makes ONE `cmux tree` call
+# (stderr only). What a `none` box costs end-to-end is FIVE, and the arithmetic is the union of both
+# sides of the merge: the startup banner's own `wt_launcher` read + this function's read (2), then the
+# SAME two on a refused spawn (2), PLUS main's deliberate re-measurement of `cmux tree` rc on the
+# refusal line (1) — main re-probes there because a presence test sent the operator to the wrong fault
+# (#2210). ⛔ An earlier draft of this comment said "TWO per startup line and per refused spawn — not
+# three", which was true only before main's rc re-measure landed; it is now FALSE and it disagrees
+# with the pinned count in the suite, so it is corrected here rather than left to misdirect the next
+# reader into resetting the pin. Pinned as a COUNT by the suite so it cannot creep back. ⚠️ Under
+# `set -e` a bare failing probe would exit the shell before `rc=$?`; every shipped call site wraps
+# this in `$( )` (a subshell absorbs the status) and both controllers run `set -u` only — but a new
+# direct caller must keep that in mind.
+wt_launcher_why() {
+  if ! command -v cmux >/dev/null 2>&1; then
+    printf 'cmux is not on PATH'
+    return 0
+  fi
+  # STDERR ONLY. `2>&1` duplicates fd2 onto the substitution's pipe BEFORE `>/dev/null` moves fd1, so
+  # the daemon's own complaint is kept and a multi-kilobyte workspace tree is not.
+  local err rc flat
+  err="$(cmux tree --json 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    # Reachable only when the LAUNCHER's own probe failed and this one did not — a probe flipped
+    # between two reads. Saying anything else here would name a mechanism the code does not have.
+    printf 'cmux tree --json answered on re-probe (it failed on the launcher read): a probe flip'
+    return 0
+  fi
+  # The sibling idiom for a captured message (see wt_spawn's own refusals): flatten, then bound.
+  flat="$(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
+  printf 'cmux tree --json failed (rc=%s): %s' "$rc" "${flat:-no stderr, exit status only}"
+}
+
+# THE controller's one startup line — which launcher this surface got, and WHY when it got none.
+# It lives here, beside the verb whose verdict it reports, so that a test can drive the REAL line
+# instead of a copy of it (the copy this fix first shipped was vacuous: it matched the reason on the
+# `REFUSED` line further down the same capture, so it passed with the startup half deleted).
+# The suffix is appended ONLY for `none` — the refused state. A healthy launchd Mac reports `tmux`,
+# which is DELIBERATE and not a degrade (see the table above), and stamping `failed:` on a designed
+# state is how `failed` stops meaning anything.
+wt_startup_banner() {
+  local la
+  la="$(wt_launcher)"
+  printf '[startup] worker launcher=%s (cmux=%s, uname=%s)' "$la" \
+    "$(command -v cmux >/dev/null 2>&1 && echo yes || echo no)" "$(uname -s 2>/dev/null)"
+  case "$la" in none) printf ' — %s' "$(wt_launcher_why)" ;; esac
+  printf '\n'
+  return 0
+}
+
 # `surface` (the named primitive) vs `layout` (the guest CLI's equivalent). Probed ONCE, because a
 # CLI that answers `surface ls` is a different build, not a transient state.
 wt_grammar() {
@@ -715,9 +785,13 @@ wt_tmux_names() {
 # never once hit (measured: three questions, three full `cmux tree` probes). The file carries its own
 # timestamp so this stays portable (no `stat` dialect in the hot path), it is written atomically, and
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
+# WT_ABSENT_CONFIRM — how long an absent session owner must persist before its records are concluded
+# dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
+WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
+case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -730,7 +804,27 @@ wt_table() {
         esac ;;
     esac
   fi
-  tree="$(cmux tree --json 2>/dev/null)" || tree=""
+  # ⛔ AN ABSENT SESSION OWNER IS A READING, NOT AN UNREADABLE ONE (agent-infra#2653, measured
+  # 2026-10-24). `cmux tree --json` was read with its stderr discarded, so a daemon that was NOT
+  # RUNNING — answering `cannot connect to session socket …: Connection refused (os error 111)` with
+  # an empty stdout — was indistinguishable from a daemon that answered something undecodable. Both
+  # read UNKNOWN, every `kind=terminal` record read UNKNOWN, and `unknown` counts as LIVE by the
+  # fail-closed rule below. The measured consequence on the live cell: 18 stale worker records (logs
+  # silent for 26-30h) counted as 18 live workers; `wt_close` could never PROVE a close (its
+  # verification read is the same unreadable census), so the records were kept forever; the review
+  # lane ceiling never fell (`review lanes=11/6` every cycle for 26h); no review was dispatched for
+  # the 8 NEEDS-REVIEW PRs; the PR queue could not drain; and the threshold-free merge-priority gate
+  # held the issue path shut while 175 candidates went undispatched on a box reporting idle lanes.
+  # A terminal lives INSIDE the session owner. If the owner is not running there is no terminal —
+  # that is a MEASUREMENT, not a guess, and it is the same polarity the tmux half already implements
+  # (`no server running` = EMPTY, `error connecting` = unreadable). A daemon that ANSWERS with
+  # something undecodable (a banner, a drifted shape) is still UNKNOWN, below, unchanged: the caps
+  # keep binding on a read that is merely illegible, and only a CONFIRMED-ABSENT transport empties
+  # the census.
+  tree_err="$dir/.wt-tree-err.$$"
+  tree="$(cmux tree --json 2>"$tree_err")" || tree=""
+  tree_err="$(cat "$tree_err" 2>/dev/null || true)"
+  rm -f "$dir/.wt-tree-err.$$" 2>/dev/null || true
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
   # header already records that the id shape differs) yields an EMPTY table while `$tree` is
@@ -743,7 +837,41 @@ wt_table() {
   if command -v tmux >/dev/null 2>&1; then names="$(wt_tmux_names)" && nrc=0 || nrc=3; else nrc=0; fi
   if [ -n "$tree" ]; then
     if raw="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else raw=""; fi
+  else
+    # NOTHING IS LISTENING => NOTHING IS RUNNING. ⛔ ONLY THE TWO SHAPES THAT NAME AN ABSENT SERVER
+    # COUNT — `Connection refused` (measured: a socket file with no listener, `os error 111`) and
+    # `no server running` (the CLI's own semantic answer, the same polarity `wt_tmux_names` gives).
+    # ⛔ AND **NOT** THE WRAPPER (`cannot connect to session socket …`): it is errno-agnostic, so it
+    # also carries `No such file or directory` (a repointed HOME, a wrong/unlinked socket path) and
+    # `Permission denied` — BOTH reachable while the daemon and its terminals are ALIVE. Emptying the
+    # census on those deletes a lived worker's record and stops every cap binding, which is the P1
+    # incident the tmux half's header records (`error connecting` = unreadable). A banner, a drifted
+    # shape, `cmux: cannot read`, a missing binary (127) or any other failure stays UNKNOWN too.
+    # ⛔ AND ONE SAMPLE IS NOT A STATE (review round 5 of #2653; this repo's own rule: "a measurement
+    # artifact is not a state — never take a destructive action from a first-match reading"). Terminal
+    # records carry no pid, so once this read concludes `dead` the record can only be judged by the
+    # owner: a HARD-KILLED daemon never closes its ptys or signals its children, so an orphaned worker
+    # could still be running while the harness frees its slot and deletes its handle — and a restart
+    # window is seconds. So the absent answer is CONFIRMED by two samples at least WT_ABSENT_CONFIRM
+    # apart; the first one only opens the window (still UNKNOWN, caps binding), and a readable census
+    # closes it. Two controller cycles (CYC=240) always span the default, so the 26h stall is fixed
+    # while a single refusal sample cannot empty the census.
+    case "$tree_err" in
+      *'Connection refused'*|*'no server running'*)
+        absent_now="$(date +%s 2>/dev/null || echo 0)"
+        absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
+        case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        if [ -z "$absent_since" ]; then
+          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null || true
+          absent_since="$absent_now"
+        fi
+        # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
+        # what the suites and an operator debugging a box use; the default window needs a second sample.
+        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
+    esac
   fi
+  # ANY readable answer closes the absent window: the owner came back (or was always there).
+  [ -n "$tree" ] && rm -f "$dir/.wt-absent-since" 2>/dev/null || true
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
   # An unreadable probe is UNKNOWN — never dead: see the polarity rule in the header.
@@ -904,7 +1032,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # command substitution, so it cannot hand a variable back).
       _cmrc=127
       if command -v cmux >/dev/null 2>&1; then _cmrc=0; cmux tree --json >/dev/null 2>&1 || _cmrc=$?; fi
-      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent))"
+      wt_warn "REFUSED $name: no worker surface on this host — \`cmux tree --json\` does not answer (cmux tree rc=$_cmrc$(command -v cmux >/dev/null 2>&1 && echo ', binary present' || echo ', no binary')) AND there is no tmux binary, so there is nothing to start a worker in (checked: uname=$(uname -s 2>/dev/null || echo unknown), tmux=$(command -v tmux >/dev/null 2>&1 && echo present || echo absent)) — why: $(wt_launcher_why)"
       return 1 ;;
     tmux)
       # The launchd Mac surface and the Linux cell (see wt_launcher) — WITH the environment contract.

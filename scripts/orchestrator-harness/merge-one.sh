@@ -144,7 +144,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
   # nothing, and `pi` shares the 0-255 status namespace with the gate codes.
   AGENT_STARTED=1
   start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ THE SAME RESOLVED MODEL AS spawn-gate.sh's `run_agent` (agent-infra#2208, review P1). This is a
+  # SECOND `run_agent` — the `chain-<N>` first-review spawn for every own-lane PR, i.e. the highest-
+  # volume model call the harness makes — and it carried the hardcoded `deepseek-v4-flash` the
+  # sibling was fixed for. Fixing one and not the other leaves the defect exactly where it costs
+  # most, and `spawn-gate.test.sh` already treats both files as one population
+  # (`EXPECTED_PI="merge-one.sh spawn-gate.sh"`), so the divergence was invisible to the suite.
+  # Keep the two defaults IDENTICAL: a lane must not run a different model than its reviewer.
+  local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  echo "[agent] provider=$lane_provider model=$lane_model" >> "$log"
+  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
@@ -784,12 +793,12 @@ fi
 # block or `brief-gate.sh` drifted — a HARNESS defect. Classified as a verdict-less review it would be
 # indistinguishable from a reviewer that produced nothing, and the loop would re-dispatch the same
 # broken brief until MAX_FIX_TRIES parked a PR that was never reviewed (the #1716/#1720 class). Exit
-# 74 names it: no agent ran, no verdict, no marker, and nothing to re-dispatch until the brief's own
+# 80 names it: no agent ran, no verdict, no marker, and nothing to re-dispatch until the brief's own
 # build is fixed.
-if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
+if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
-  exit 74
+  exit 80
 fi
 # ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
 # pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an

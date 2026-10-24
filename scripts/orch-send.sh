@@ -37,7 +37,7 @@ case "$MSG" in
 #
 # ⛔ IT APPLIES TO EVERY ORDER, not only the `@file` form: the incidents were both inline-text orders,
 # and a gate that only inspected files would be the bypass the next dispatcher gravitates to.
-# 74 = brief deficient (re-author) · 78 = validator missing on this box (a broken install, NOT a brief
+# 80 = brief deficient (re-author) · 78 = validator missing on this box (a broken install, NOT a brief
 # problem) — the two demand opposite actions, so they never share a code.
 _bg_lib="${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh"
 [ -f "$_bg_lib" ] || _bg_lib="$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness/brief-gate.sh"
@@ -48,7 +48,7 @@ if [ ! -f "$_bg_lib" ]; then
 fi
 if ! bash "$_bg_lib" --check - lane <<<"$MSG"; then
   echo "$LABEL: REFUSED — the order did not pass the research-first gate. NOT dispatched: the target was not even resolved."
-  exit 74
+  exit 80
 fi
 
 # Positive allowlist of legitimate lane checkouts.

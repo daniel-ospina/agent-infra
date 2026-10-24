@@ -122,7 +122,7 @@ EOF
 # a lane would ACTUALLY receive (the #2148 suite drives that seam), and a heredoc regression that
 # drops the research block refuses at BUILD time instead of being discovered by the gate inside
 # `run_agent` minutes later. When this fires the author is not at fault — the brief is GENERATED
-# here — so it is 78 (cannot run), never 74 (brief refused).
+# here — so it is 78 (cannot run), never 80 (brief refused).
 bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.log" || {
   echo "[lane $N] FATAL: the GENERATED brief fails brief-gate.sh — refusing to start a lane whose brief lost its research contract (a harness defect in the heredoc above, NOT a brief-authoring error) (#2258)" >&2
   exit 78
@@ -176,24 +176,50 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
-# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
-# exit 75 itself (#1720).
+# A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
+# AGENT_BRIEF_REFUSED (80)
+# or AGENT_DISK_REFUSED (77);
+# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
+# namespace and could exit 75 itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `load`, `disk` and `land` are
-  # the three values the gate can refuse on, and each is chosen by the code its own caller already
-  # distinguishes, so the record can never disagree with the exit status.
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk` and
+  # `land` are the four values the gate can refuse on, and each is chosen by the code its own caller
+  # already distinguishes, so the record can never disagree with the exit status.
+  # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
+  # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
+  # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
+  # refresh-candidates.sh correctly returns it to the pool. A BRIEF refusal has neither property: it
+  # is a property of the brief, it never clears by waiting or reclaiming, and re-dispatching the item
+  # to another machine refuses there too. Recording it as `gate=load` would tell the whole fleet a
+  # remedy that cannot arrive and would hide the one writer who CAN fix it. So: NO capacity record,
+  # a loud line on both surfaces, and the item is NOT yielded — it stays this box's to re-author.
+  # ⛔ AND IT IS DECIDED FIRST, ABOVE the capacity record, because that block's `else` is `load`:
+  # falling through to it would mint the very capacity record this arm exists to prevent.
+  if [ "$rc" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+    echo "[lane $N] NOT started: THE BRIEF WAS REFUSED (brief gate, exit $rc) — no agent ran, nothing was consumed, and this is NOT a capacity refusal, so the issue is NOT yielded to a peer: re-author the brief (the [brief-gate] block above names every missing element and prints the canonical section), then re-dispatch." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] brief refused — see $O/logs/lane-$N.log; re-author and re-dispatch (not a capacity refusal)" >&2
+    exit "$rc"
+  fi
   if [ -n "${capacity_record:-}" ]; then
-    case "$rc" in
-      "${AGENT_DISK_REFUSED:-77}") _cap_gate=disk ;;
-      "${AGENT_LAND_BACKLOG:-74}") _cap_gate=land ;;
-      *)                          _cap_gate=load ;;
-    esac
+    # ⛔ FORK IS CONSUMED, NOT BUCKETED AS LOAD (review P1, agent-infra#2293). `run_agent` returns
+    # AGENT_FORK_REFUSED for a box that is out of PROCESSES, and this branch used to fold every code
+    # except disk into `load` — publishing the remedy "re-dispatched when 1-min load falls" for a box
+    # that cannot even spawn the retry, which is exactly the rule spawn-gate.sh states at its own fork
+    # code ("a caller that reads a fork refusal as a load refusal retries forever on a box that cannot
+    # start a process to retry with"). The tolerant defaults keep an `$O/spawn-gate.sh` predating either
+    # code — which can never return it — routing exactly as it did.
+    # ⛔ FORK IS 73, NOT 74 (#2293 x #2409): 74 is the LAND-BACKLOG gate below, whose remedy is the
+    # opposite of a fork refusal's, so one code for both made this very case statement label one gate
+    # with the other's remedy (the integration batch's review caught it as a P0).
+    if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
+    elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
+    elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
+    else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
     # README §7.2 says it in as many words ("**The yield is gate-independent, deliberately**"), and
     # ARCHITECTURE repeats it. A `land` refusal looks like it wants a SHORT window: it is repo-wide,
@@ -202,7 +228,8 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # a recorded decision belongs in that decision's own home with the evidence in front of the owner
     # — not in a lane's commit. What the change DOES do about it: chain-merge.sh ends the chain on
     # exit 74 immediately (no 90-minute wait), and the refusal line below says plainly that waiting
-    # will not clear it. The window itself stays uniform.
+    # will not clear it. The window itself stays uniform. A `fork` refusal is subject to the same
+    # uniform window for the same reason, and the same non-claim: it does not clear by waiting.
     _cap_yield="$CAPACITY_YIELD_SECS"
     _cap_now="$(date +%s)"
     if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + _cap_yield ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
@@ -221,26 +248,18 @@ if [ "$AGENT_STARTED" = "0" ]; then
     fi
   fi
   # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
-  # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
-  # on a full filesystem waits for a remedy that cannot arrive.
+  # cleared by the box quietening, a disk refusal only by reclaiming space, and a FORK refusal only
+  # from OUTSIDE the box (agent-infra#2293). An operator told "load" on a full filesystem waits for a
+  # remedy that cannot arrive; told "load" on a fork-exhausted box, the retry itself cannot start.
   # ⛔ TOLERANT REFERENCE (review round 2, P2). `$O` is seeded file by file, so a NEW lane.sh can run
   # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
   # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
-  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
-  # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
-  # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
-  # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
-  # refresh-candidates.sh correctly returns it to the pool. A BRIEF refusal has neither property: it
-  # is a property of the brief, it never clears by waiting or reclaiming, and re-dispatching the item
-  # to another machine refuses there too. Recording it as `gate=load` would tell the whole fleet a
-  # remedy that cannot arrive and would hide the one writer who CAN fix it. So: NO capacity record,
-  # a loud line on both surfaces, and the item is NOT yielded — it stays this box's to re-author.
-  if [ "$rc" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
-    echo "[lane $N] NOT started: THE BRIEF WAS REFUSED (brief gate, exit $rc) — no agent ran, nothing was consumed, and this is NOT a capacity refusal, so the issue is NOT yielded to a peer: re-author the brief (the [brief-gate] block above names every missing element and prints the canonical section), then re-dispatch." >> "$O/logs/lane-$N.log"
-    echo "[lane $N] brief refused — see $O/logs/lane-$N.log; re-author and re-dispatch (not a capacity refusal)" >&2
-    exit "$rc"
-  fi
-  if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
+  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch;
+  # a pre-#2293 one cannot return 73 (the fork code — 74 is the LAND-BACKLOG code), so the fork
+  # default routes to the load branch too.
+  if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
+    echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose

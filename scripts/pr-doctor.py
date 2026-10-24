@@ -1994,7 +1994,7 @@ next step of merging. Do the work:
 # whose only defect is that this file fell behind.
 #
 # ⛔ FAIL-CLOSED AND LOUD WHEN THE HELPER IS GONE. `nonblocking-dispatch.sh` gates every brief in the
-# FOREGROUND with the same validator, so a brief that lost this block is REFUSED (rc=74) and appears
+# FOREGROUND with the same validator, so a brief that lost this block is REFUSED (rc=80) and appears
 # in the log with the helper's own teaching message -- a worker is never dispatched with a silent
 # half-contract. The line below makes the CAUSE visible here too, because "the spawn was refused" and
 # "this file could not render the contract" are different bugs.
@@ -2335,12 +2335,12 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
-        # brief-gate.sh), rc=74 (THE BRIEF WAS REFUSED by the research-first gate -- see
+        # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
         # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
         # worktree / no brief) and rc=127 (dispatcher missing) are permanent, fleet-wide causes, and
-        # the message is the only thing that names which one it is. 74 is deliberately NOT in
+        # the message is the only thing that names which one it is. 80 is deliberately NOT in
         # GATE_REFUSALS: that tuple is the 75/77 LOAD/DISK class written by run_agent into a
-        # backgrounded worker's `.rc`, whereas 74 comes back on the FOREGROUND call and no worker
+        # backgrounded worker's `.rc`, whereas 80 comes back on the FOREGROUND call and no worker
         # ever exists to have an `.rc`.
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")

@@ -35,7 +35,7 @@ provenance-stale before trusting the body.
 The block below is the canonical text `scripts/orchestrator-harness/brief-gate.sh --section lane`
 renders, and it is the SAME text every generated brief carries. Copy it, fill the `<…>` slots with
 YOUR pass, and keep the four labels: `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and the
-lane/fixer/bg launch seams refuse a brief without them (exit 74), naming what is missing. Do not
+lane/fixer/bg launch seams refuse a brief without them (exit 80), naming what is missing. Do not
 delete the labels to save space — a brief that carries the heading but no `RUNG:`/`CONTRADICTION TEST:`
 is refused too.
 
@@ -99,7 +99,8 @@ flag does either.
    without it (exit 3), because naming the current head is not evidence that a review happened.
    `--evidence` takes `comment:<id>`, `review:<id>`, `review-comment:<id>`, or the artifact's URL.
    `clean-low` (content-only diff) and `clean-micro` (micro issue) do not require it.
-   A record bound to an older head is stale and the rail refuses it, so record AFTER the last push.
+   A record bound to an older head is stale and the rail refuses it, so record AFTER the last push —
+   UNLESS the CARRY below applies.
 4. Only then run the rail:
 
    ```
@@ -124,6 +125,15 @@ flag does either.
 
 ⛔ **Never edit the PR body after recording.** `record-review.sh --evidence` verifies the review
 artifact; an edited body is a changed artifact the next reader cannot trust.
+⛔ **A CARRY IS NOT A RE-REVIEW (#2343).** You do not pay for a second review when a **valid** record
+   already exists. Pass the head **and the verdict** that record already names — the REVIEWED head, not the live one;
+   a `clean-micro` record stays `clean-micro`, because the lane arm does not compare verdicts — and
+   `record-review.sh` re-binds that verdict onto the live head — `mint:"carried"`, no
+   `--evidence`, no new reviewer. The script decides the arm itself, so there is no `--carry` flag.
+   It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably
+   red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a **rebase**
+   rewrites the head so the LANE arm cannot carry it, but an unchanged **DIFF digest** still carries
+   through the DIFF arm). A **fresh** mint still requires the dispatched reviewer.
 ⛔ **If the rail refuses, read the reason** — it names the command to run. Do not retry at the same
 head; a refusal at an unchanged head means the evidence, not the attempt, is what must change.
 

@@ -48,15 +48,15 @@ sed 's/^RUNG:.*/RUNG: web_search model="sonar"/' "$CANON" > "$TMP/rung-no-digit.
 echo
 echo "§A the validator's decisions on real brief files"
 bash "$GATE" --check "$TMP/no-research.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "(i) a brief with NO research section is REFUSED with 74 (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(i) a brief with NO research section is REFUSED with 80 (got $rc)"
 bash "$GATE" --check "$TMP/no-contradiction.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "(ii) research present but NO contradiction test is REFUSED with 74 (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(ii) research present but NO contradiction test is REFUSED with 80 (got $rc)"
 bash "$GATE" --check "$TMP/no-rung.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "(ii-b) research + contradiction but NO RUNG/tool line is REFUSED with 74 (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(ii-b) research + contradiction but NO RUNG/tool line is REFUSED with 80 (got $rc)"
 bash "$GATE" --check "$TMP/rung-no-tool.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "(ii-c) a RUNG with no tool named is REFUSED (a digit alone is not a decision) (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(ii-c) a RUNG with no tool named is REFUSED (a digit alone is not a decision) (got $rc)"
 bash "$GATE" --check "$TMP/rung-no-digit.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "(ii-d) a tool with no rung number is REFUSED (the rung is the cost decision) (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(ii-d) a tool with no rung number is REFUSED (the rung is the cost decision) (got $rc)"
 bash "$GATE" --check "$CANON" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(iii) a COMPLETE brief PASSES with 0 (got $rc)"
 for role in lane fixer reviewer worker; do
@@ -67,9 +67,9 @@ done
 # Fail-closed edges. Each one is a state a caller really reaches: a caller that forgot the file, a
 # pipeline that produced nothing, and a role typo in a wrapper.
 bash "$GATE" --check "$TMP/empty.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "an EMPTY brief is refused, not read as 'nothing to check' (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "an EMPTY brief is refused, not read as 'nothing to check' (got $rc)"
 bash "$GATE" --check "$TMP/does-not-exist.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "a MISSING brief file is refused (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "a MISSING brief file is refused (got $rc)"
 bash "$GATE" --check "$CANON" banana >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 78 ]; ck $? "an UNKNOWN role is 78 (cannot verify), never a pass (got $rc)"
 bash "$GATE" --no-such-flag >/dev/null 2>&1; rc=$?
@@ -129,7 +129,7 @@ bash "$MUT" --check "$TMP/no-contradiction.txt" lane >/dev/null 2>&1; rc=$?
 # only way to be wrong.
 sed 's/^  \[ -n "\$miss" \] || return 0$/  miss="${miss:-RESEARCH-SECTION}"  # MUTANT: always refuse/' "$GATE" > "$TMP/mutant-refuse.sh"
 bash "$TMP/mutant-refuse.sh" --check "$CANON" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
+[ "$rc" -eq 80 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
@@ -147,7 +147,7 @@ drive_run_agent() { # drive_run_agent <brief-file>
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$HERE/spawn-gate.sh" "$TMP/ra.log" "$1"
 }
 res="$(drive_run_agent "$TMP/no-research.txt")"
-[ "$res" = "rc=74 started=0" ]; ck $? "run_agent REFUSES an invalid brief: 74, AGENT_STARTED=0 ($res)"
+[ "$res" = "rc=80 started=0" ]; ck $? "run_agent REFUSES an invalid brief: 80, AGENT_STARTED=0 ($res)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and the model was NOT invoked (the stub pi wrote nothing)"
 grep -q 'brief-gate' "$TMP/ra.log"; ck $? "…and the refusal is in the agent log, where an operator greps for the item"
@@ -183,7 +183,7 @@ drive_m1() { # drive_m1 <brief-file>
     _ "$TMP/m1-runagent.sh" "$TMP/m1.log" "$1"
 }
 res="$(drive_m1 "$TMP/no-contradiction.txt")"
-[ "$res" = "rc=74 started=0" ]; ck $? "merge-one.sh's run_agent REFUSES an invalid reviewer brief: 74, started=0 ($res)"
+[ "$res" = "rc=80 started=0" ]; ck $? "merge-one.sh's run_agent REFUSES an invalid reviewer brief: 80, started=0 ($res)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and the reviewer model was NOT invoked"
 res="$(drive_m1 "$CANON")"
@@ -205,7 +205,7 @@ cp "$TMP/bin/pi" "$TMP/bg-o/gh-rest/pi"; chmod +x "$TMP/bg-o/gh-rest/pi"
 : > "$PI_LOG"
 out="$(O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
        bash "$NB" bgtest "$TMP/wt" "$TMP/no-research.txt" 5 2>&1)"; rc=$?
-[ "$rc" -eq 74 ]; ck $? "nonblocking-dispatch.sh REFUSES an invalid brief in the FOREGROUND with 74 (rc=$rc)"
+[ "$rc" -eq 80 ]; ck $? "nonblocking-dispatch.sh REFUSES an invalid brief in the FOREGROUND with 80 (rc=$rc)"
 grep -q 'RESEARCH FIRST' <<<"$out"; ck $? "…and the teaching message reached the CALLER (not a detached log)"
 [ ! -f "$TMP/bg-o/bg/bgtest.pid" ]; ck $? "…and NO worker was started (no pid file, so no launch to report)"
 [ -s "$PI_LOG" ]; rc=$?
@@ -226,7 +226,7 @@ export CMUX_LOG="$TMP/cmux.log"
 : > "$CMUX_LOG"
 PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
   bash "$ROOT/scripts/orch-send.sh" 00000000-0000-0000-0000-000000000000 test "just fix it, no research" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "orch-send.sh REFUSES an order with no research contract (rc=$rc)"
+[ "$rc" -eq 80 ]; ck $? "orch-send.sh REFUSES an order with no research contract (rc=$rc)"
 [ -s "$CMUX_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and cmux was never called (the refusal precedes target resolution — the defect is the brief, not the pane)"
 : > "$CMUX_LOG"
@@ -236,7 +236,7 @@ PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
 : > "$CMUX_LOG"
 PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
   bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 test "$TMP/no-research.txt" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 74 ]; ck $? "safe-send.sh REFUSES a non-compliant brief file (rc=$rc)"
+[ "$rc" -eq 80 ]; ck $? "safe-send.sh REFUSES a non-compliant brief file (rc=$rc)"
 [ -s "$CMUX_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and cmux was never called there either"
 # The ONE documented exemption: `--force` is the STOP route (see safe-send.sh's header). Pinned here

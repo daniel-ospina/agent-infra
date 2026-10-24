@@ -314,7 +314,7 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
     # ⛔ `fix-ci`, not a placeholder label: `brief()` returns "" for an unknown action, and an EMPTY
-    # brief is refused by the research gate (74) before the stub `run_agent` below is ever reached —
+    # brief is refused by the research gate (80) before the stub `run_agent` below is ever reached —
     # so the 75 this test is about would never be produced (#2258).
     ok, detail, record = pr.dispatch(_pr(11), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False and record is False
@@ -448,7 +448,7 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     prompt = tmp_path / "brief.txt"
-    # ⛔ A REAL BRIEF, NOT A PLACEHOLDER. `do the thing` is refused by the brief gate (74) before the
+    # ⛔ A REAL BRIEF, NOT A PLACEHOLDER. `do the thing` is refused by the brief gate (80) before the
     # dispatcher backgrounds anything, so the routing this test proves would never be exercised.
     prompt.write_text(subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
                                      capture_output=True, text=True, check=True).stdout)
@@ -1307,13 +1307,13 @@ _WORKERS = {
 
 
 # ⛔ A BRIEF THE RESEARCH GATE ADMITS (agent-infra#2258). `nonblocking-dispatch.sh` refuses a brief
-# with no research contract in the FOREGROUND (74), so a one-character stub like "b" never reaches
+# with no research contract in the FOREGROUND (80), so a one-character stub like "b" never reaches
 # the `run_agent` stub these tests install — every one of them would fail on the gate instead of on
 # the behaviour it is about. Rendered from the shipped validator, because it is the same text a real
 # dispatch carries and it cannot drift from the rules that judge it.
 # ⛔ `dispatch(pr, action, TEXT, dry)` TAKES THE ORDER TEXT AS ITS THIRD ARGUMENT — it does not call
 # `brief()`. So a fixture that passed the literal "brief" was dispatching an order of one word, which
-# the research gate now refuses (74) before any worker exists. The literal is replaced with this
+# the research gate now refuses (80) before any worker exists. The literal is replaced with this
 # rendered section at every such call site: the tests are about dispatch/routing/state, and they are
 # only about those if the order is one a real pass would send.
 _OK_BRIEF = subprocess.run(

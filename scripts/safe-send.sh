@@ -54,7 +54,9 @@ SCRIPTS="$(cd "$(dirname "$0")" && pwd)"     # safe-send lives beside lane-statu
 # would delay the one message whose value is that it arrives now, i.e. the gate would cause the harm
 # it exists to prevent. Every other send is gated. (The same file's no-pi guard above is NOT exempt:
 # it stays in force for --force too, because typing a brief into a bare shell executes it.)
-# 74 = brief deficient (re-author) · 78 = validator missing on this box (a broken install).
+# 80 = brief deficient (re-author) · 78 = validator missing on this box (a broken install).
+# ⛔ 80, NOT 74: 74 is AGENT_LAND_BACKLOG (and pi's own EX_IOERR), so sharing it made one code mean
+# "re-author the brief" and "the landing ratio is over the ceiling" — opposite remedies (#2258 review).
 if [ "$MODE" != "--force" ]; then
   _bg_lib="${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh"
   [ -f "$_bg_lib" ] || _bg_lib="$SCRIPTS/orchestrator-harness/brief-gate.sh"
@@ -66,7 +68,7 @@ if [ "$MODE" != "--force" ]; then
   if ! bash "$_bg_lib" --check "$FILE" lane; then
     echo "REFUSED [$LABEL] $WS — $FILE did not pass the research-first gate; NOT sent, and the pane was not even read." >&2
     echo "         Re-author the brief (the [brief-gate] block above names every missing element and prints\n         the canonical section), then re-send. --force sends a STOP over this gate, not a brief." >&2
-    exit 74
+    exit 80
   fi
 fi
 

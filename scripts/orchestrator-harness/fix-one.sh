@@ -296,7 +296,7 @@ FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test 
 EOF
 # ── THE GENERATED FIXER BRIEF IS CHECKED AT BUILD TIME (#2258) ─────────────────────────────────────
 # The fixer's brief is written HERE, so a failure is a harness defect (78, cannot run) and never a
-# brief-authoring refusal (74). Checking it before the spawn means a heredoc regression is caught with
+# brief-authoring refusal (80). Checking it before the spawn means a heredoc regression is caught with
 # the reason, instead of arriving as an empty fixer run that the caller reads as "the fix did not work".
 bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
   echo "[fix $PR] FATAL: the GENERATED fixer brief fails brief-gate.sh — refusing to run a fixer whose brief lost its research contract (a harness defect in the heredoc above) (#2258)" >> "$L.log"
@@ -310,7 +310,12 @@ bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
 # a box that splits them: a healthy main checkout would let the fixer start onto a full worktree
 # volume, which is the precise "cannot name the volume that actually fills" failure #1765 exists to
 # remove. `uv sync` writes the venv in $WT, so $WT is the reading that matters.
-DISK_GATE_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AND `WIP_PATH="$WT"` FOR THE SAME REASON, ONE STEP LATER (#2045). `DISK_GATE_PATH` names the
+# volume the fixer FILLS; `WIP_PATH` names the worktree whose UNCOMMITTED WORK a cap kill would
+# destroy. This script `cd`s into $REPO, so run_agent's default (`$PWD`, the main checkout) would
+# snapshot the wrong tree and report a CLEAN worktree while the fixer's work sat unsaved one
+# directory away — the loud-but-wrong verdict, which is worse than no snapshot at all.
+DISK_GATE_PATH="$WT" WIP_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
 # ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
 # refusals below, and `$?` read after any later command would be that command's status (§7.4).
 ar=$?
@@ -322,11 +327,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
   # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
   #
-  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and the two are OPPOSITE (#1765). A load refusal
-  # clears when the box quietens and the controller re-dispatches next cycle; a DISK refusal never
-  # clears on its own — no amount of waiting frees a filesystem. Naming a disk refusal "load gate"
-  # sends the operator to wait for an event that cannot fix it, which is the instrument false
-  # positive this file's callers exist to avoid.
+  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and they are OPPOSITE (#1765, and agent-infra#2293 for the
+  # third). A load refusal clears when the box quietens and the controller re-dispatches next cycle; a
+  # DISK refusal never clears on its own — no amount of waiting frees a filesystem; a FORK refusal never
+  # clears on its own either AND the box cannot start the retry it is being told to wait for. Naming
+  # either un-clearable one "load gate" sends the operator to wait for an event that cannot fix it,
+  # which is the instrument false positive this file's callers exist to avoid.
   # ⛔ TOLERANT REFERENCE, AND THE REASON IS A REAL SKEW (review round 2, P2 — REPRODUCED). The daemon
   # executes `$O/<script>` and $O is seeded file by file (cloud-cell-supervisor.sh's seed_and_stamp),
   # so a NEW caller can run against an OLD `$O/spawn-gate.sh` — the pre-#1765 helper defines
@@ -337,13 +343,22 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
   # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
   # survived.
-  # ⛔ A BRIEF REFUSAL IS A THIRD REMEDY, AND NOT ONE OF THE TWO ABOVE (#2258). The brief is GENERATED
-  # here (`brief-gate.sh --section fixer`), so it can only be refused if the heredoc lost the block or
-  # the helper drifted — a HARNESS defect. Naming it "load" or "disk" would send the operator to wait
-  # for a box or a filesystem that is fine, and the refund below still applies: nothing ran, so no
-  # attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
-  if [ "$ar" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
+  # ⛔ FORK FIRST AMONG THE CAPACITY CODES, AND IT IS THE P1 THE REVIEW FOUND: `run_agent` returns
+  # AGENT_FORK_REFUSED (73) for a box that is out of PROCESSES, and before this arm both that code and
+  # 75 reported "load gate: re-dispatched when 1-min load falls below MAX_LOAD" — a remedy for a box
+  # that cannot spawn the retry, and one that says nothing about the external restart that is the only
+  # thing that helps. The same tolerant default (73) covers AGENT_FORK_REFUSED: a pre-#2293 helper
+  # cannot return it, so the fork arm is inert on that tree and the code falls through as before.
+  #
+  # ⛔ A BRIEF REFUSAL IS A THIRD REMEDY, AND NOT ONE OF THE CAPACITY ONES (#2258). The brief is
+  # GENERATED here (`brief-gate.sh --section fixer`), so it can only be refused if the heredoc lost the
+  # block or the helper drifted — a HARNESS defect. Naming it "load" or "disk" would send the operator
+  # to wait for a box or a filesystem that is fine, and the refund below still applies: nothing ran, so
+  # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
+  if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
+    why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
