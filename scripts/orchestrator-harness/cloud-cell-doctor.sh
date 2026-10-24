@@ -1811,6 +1811,105 @@ run_hygiene() {
 #   * session UP but the heartbeat is STALE                 -> REPORT, never kill. A controller that
 #     is alive-but-slow may be mid-merge/mid-spawn; stopping it is a P0-consequence action
 #     (destroying live work) and stays human (README §6.5.5, AGENTS.md P0 rule).
+# ⛔ THE HEARTBEAT VERDICT IS ONE IMPLEMENTATION, TWO SUPERVISORS (review P1, #2402). A service-managed
+# controller has NO tmux session by design, so the session branch below can never evaluate it — and the
+# doctor's ABSENT branch would log `controller RESTARTED` every pass (the supervisor answers "already
+# running") while `CONTROLLER STALE` became unreachable on exactly the box shape #2402 creates. `$who`
+# names what is up so the log stays true in both modes. Sets the caller's `result` (bash dynamic scope).
+controller_heartbeat_verdict() { # <who>
+  local who="$1" hb t now age
+  hb=0
+  t="$(cat "$O/heartbeat" 2>/dev/null)"
+  # ⛔ A DIGIT RUN IS NOT NECESSARILY AN INSTANT (review P2, #2402) — the four guards
+  # install-controller-service.sh:253-264 documents, carried here because this helper is now the ONLY
+  # staleness signal on the service-managed path: `$(( ))` parses a LEADING-ZERO run as OCTAL while
+  # `[ ]` parses it as DECIMAL (a fabricated multi-year age), a FUTURE heartbeat makes the age NEGATIVE
+  # and `[ -N -le bound ]` is true for every negative (a DEAD controller reads FRESH forever), and a
+  # long run overflows. Anything unparseable is 0 — reported as "no heartbeat recorded yet", never fresh.
+  case "${t:-}" in
+    ''|*[!0-9]*) : ;;
+    *) if [ "${#t}" -le 12 ]; then
+         hb=$(( 10#$t ))
+         now="$(date +%s)"
+         if [ "$hb" -lt 1000000000 ] || [ "$hb" -gt "$(( now + 60 ))" ]; then hb=0; fi
+       fi ;;
+  esac
+  if [ "$hb" -gt 0 ]; then
+    age=$(( $(date +%s) - hb ))
+    [ "$age" -ge 0 ] || age=0
+    if [ "$age" -gt "$CONTROLLER_STALE_S" ]; then
+      log "[doctor] ⛔ CONTROLLER STALE: $who is up but its heartbeat is ${age}s old (> ${CONTROLLER_STALE_S}s). NOT killing it (a live controller may be mid-merge); reap and the independent merge role continue. Fix by hand if this persists."
+      result="$result; CONTROLLER STALE ${age}s (not killed)"
+    else
+      result="$result; controller RUNNING (heartbeat ${age}s)"
+    fi
+  else
+    result="$result; controller RUNNING (no heartbeat recorded yet)"
+  fi
+}
+
+# Is a controller OF THIS STATE DIR running with no session? The harness's own single-instance lock
+# ($O/.orch.lock, taken by orch-loop.sh) is the ONLY authority: liveness plus the #1178 identity rule.
+# FALSE is safe here: a false negative falls through to the pre-existing ABSENT→restart arm, which is
+# what the doctor did before services existed.
+# ⛔ FALSE IS SAFE; A FALLBACK WITNESS THAT CANNOT BE FALSE IS A FALSE PASS (review P0, #2402). This used
+# to end in `loop_alive`, which reads $ROLES_DIR/loop.pid — and run_loop() writes that file with its OWN
+# pid. Inside `doctor loop` (the only mode a cell runs: start_doctor_loop launches `doctor loop`) the
+# fallback was therefore a TAUTOLOGY: service_controller_present returned 0 for a cell whose controller had
+# died, the ABSENT→restart arm below became UNREACHABLE, and the doctor logged `controller RUNNING (no
+# heartbeat recorded yet)` over exactly the "dispatches nothing, reads as idle" defect #2402 exists to
+# remove — and over a start-limited `failed` unit that StartLimitBurst is designed to produce. A witness
+# must be able to say no; the controller's own lock owner is the only one that can.
+# ⛔ AND THE MATCH IS THE SHAPE `lock_controller_pid` USES (`<shell> <…/orch-loop.sh>`), NOT AN `$O/`
+# PREFIX: HARNESS_PIN_DIR is normally $CELL_HOME/harness, so the prefix form missed a live controller.
+# ⛔ AND THE SHAPE ALONE IS NOT OWNERSHIP EITHER — THE AGE IS (review P2, #2402). `lock_controller_pid`
+# (scripts/cloud-cell-supervisor.sh) carries the shape AND the age, and states why both are load-bearing:
+# the lock is data on disk and outlives a `kill -9`, so the OS can RECYCLE that pid onto a peer repo's
+# controller — which on this box is the same basename from the same shared harness path, so the shape
+# matches. That is the exact vector for which `lock_controller_pid` refuses a false positive, and this
+# function copied only half of it: with a recycled pid the ABSENT→restart arm became UNREACHABLE on a
+# service-managed cell and the doctor logged `controller RUNNING` over a dead controller — the same
+# "witness that cannot say no" this file fixed at P0 by another route (the loop.pid tautology).
+# A controller writes $O/.orch.lock AFTER it starts, so a process that BEGAN after the lock was written
+# cannot be its owner. Unprovable age returns 1 (NOT ours): a false negative falls through to the
+# ABSENT→restart arm, and that arm's `supervisor start` refuses over a controller that is really alive —
+# so the failing direction here is the safe one, unlike the supervisor's `stop`, which must not signal.
+service_controller_present() {
+  local pid c lt se r d h m s started
+  [ -f "$O/.orch.lock" ] || return 1
+  pid="$(tr -dc '0-9' < "$O/.orch.lock" 2>/dev/null || true)"
+  num_ok "${pid:-}" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  c="$("$PS_BIN" -p "$pid" -o command= 2>/dev/null)" || return 1
+  # shellcheck disable=SC2086
+  set -- $c
+  [ "$#" -ge 2 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) ;; *) return 1 ;; esac
+  # ── the age rule (pinned to `_proc_began_after`, scripts/cloud-cell-supervisor.sh) ──────────
+  # ⛔ NOT `num_ok`: an epoch is TEN digits and num_ok rejects >=10, so routing `lt` through it would
+  # make every lock "unprovable" and turn this witness into a permanent false negative.
+  lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null)" || return 1
+  case "${lt:-}" in ''|*[!0-9]*) return 1 ;; esac
+  se="$("$PS_BIN" -p "$pid" -o etime= 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$se" ] || return 1
+  d=0
+  case "$se" in *-*) d="${se%%-*}"; r="${se#*-}" ;; *) r="$se" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  # `10#` because etime ZERO-PADS and bash reads a leading zero as OCTAL (`08` is an error) — the
+  # same trap `_proc_start_epoch` documents after it was reproduced with an `08:31` stub.
+  d=$((10#${d:-0})); h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0}))
+  started=$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))
+  [ "$started" -le "$(( lt + 5 ))" ] || return 1
+  return 0
+}
+
 run_doctor() {
   begin_pass
   local dry="${1:-}" rc hb age result="" tmp rpid
@@ -1847,19 +1946,15 @@ run_doctor() {
     return 3
   fi
   if [ "$csp" -eq 0 ]; then
-    hb="$(cat "$O/heartbeat" 2>/dev/null)"
-    case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
-    if [ "$hb" -gt 0 ]; then
-      age=$(( $(date +%s) - hb ))
-      if [ "$age" -gt "$CONTROLLER_STALE_S" ]; then
-        log "[doctor] ⛔ CONTROLLER STALE: tmux '$SESSION' is up but its heartbeat is ${age}s old (> ${CONTROLLER_STALE_S}s). NOT killing it (a live controller may be mid-merge); reap and the independent merge role continue. Fix by hand if this persists."
-        result="$result; CONTROLLER STALE ${age}s (not killed)"
-      else
-        result="$result; controller RUNNING (heartbeat ${age}s)"
-      fi
-    else
-      result="$result; controller RUNNING (no heartbeat recorded yet)"
-    fi
+    controller_heartbeat_verdict "tmux '$SESSION'"
+  elif service_controller_present; then
+    # ⛔ SERVICE-MANAGED, AND THE SESSION ARM CANNOT SEE IT (review P1, #2402). No session exists by
+    # design (`exec`s the loop before the tmux launch), so without this branch every pass logged
+    # "controller restarted" from a start that answered "already running", and a WEDGED controller —
+    # alive, heartbeat stale — was never reported: the one signal that tells "dispatches nothing" from
+    # "idle" was dead on exactly the box shape this PR creates.
+    log "[doctor] controller is up WITHOUT a tmux session (service-managed) — evaluating its heartbeat instead of restarting it"
+    controller_heartbeat_verdict "the controller (service-managed)"
   elif [ "$dry" = "--dry-run" ]; then
     log "[doctor] WOULD restart the controller (tmux '$SESSION' absent, cell is started)"
     result="$result; would restart controller"
@@ -1881,6 +1976,7 @@ run_doctor() {
       # baseline on entry, so a stop landing between this launch and that snapshot (bash startup, the
       # whole source) would otherwise be invisible and the restart would complete after the stop.
       STOP_GENERATION_AT_LAUNCH="$PASS_STOP_GEN" \
+      ORCH_AUTOMATED_RESTART=1 \
       run_bounded "$CONTROLLER_START_TIMEOUT" bash "$SUPERVISOR" start >>"$O/logs/doctor.log" 2>&1 &
       local rpid=$!
       tmp="$ROLES_DIR/.restart.ident.tmp.$$"
@@ -1891,6 +1987,26 @@ run_doctor() {
       if [ "$rc" -eq 0 ]; then
         log "[doctor] controller restarted (supervisor start rc=0)"
         result="$result; controller RESTARTED"
+      elif [ "$rc" -eq 5 ]; then
+        # ⛔ A UNIT THAT CONVERGED TO `failed` IS NOT A CLEAN PASS (review P1 round 11, #2402). The supervisor
+        # now answers rc 5 for a unit the manager has given up on (start limit hit), and keeps rc 4 for the
+        # states a deliberate `systemctl stop` leaves. Scoring both as "not launched, not a failure" let a
+        # STARTED cell (`.desired` present) with NO dispatcher be recorded as a clean pass, with `doctor
+        # status` exiting 0 over it — the false green this whole change exists to remove, one layer in. A
+        # failed unit is exactly what `--status` prints as unsupervised, so this pass must not certify it.
+        log "[doctor] controller restart NOT launched — ${CONTROLLER_UNIT:-the controller unit} has CONVERGED TO FAILED (start limit): this cell has NO dispatcher and only a human re-arm brings it back"
+        result="$result; controller restart not launched (unit FAILED — no dispatcher)"
+        [ "$rrc" -eq 0 ] && rrc=1
+      elif [ "$rc" -eq 4 ]; then
+        # ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). `start` answers rc 4
+        # when an AUTOMATED restart would have to re-arm a unit the manager reports not active — a
+        # deliberate `systemctl stop` (`.desired` survives it, so this pass would otherwise undo the
+        # operator's stop within one pass) or a start limit that converged to `failed` (clearing it here
+        # is what made a keyless cell retry forever with every surface reading supervised). Honouring it is
+        # NOT a failed pass: the stop is the decision, and a failed unit is handled by the rc-5 arm above —
+        # which is why this message no longer claims "a start limit that converged to failed" as well.
+        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop); a human 'cloud-cell-supervisor.sh start' re-arms it"
+        result="$result; controller restart not launched (service-managed, unit not active)"
       else
         log "[doctor] controller restart FAILED (supervisor start rc=$rc) — see $O/logs/doctor.log"
         result="$result; controller restart FAILED rc=$rc"
