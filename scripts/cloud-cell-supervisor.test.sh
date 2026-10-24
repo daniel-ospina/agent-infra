@@ -3671,6 +3671,30 @@ grep -q 'ORCH_AUTOMATED_RESTART' "$SUP" && grep -q '          return 4' "$SUP" \
 grep -q 'set +a; export ORCH_FOREGROUND=0;' "$SUP" \
   && ok 'doctor: the ORCH_FOREGROUND=0 pin is EXPORTED, so an inherited =1 cannot ride into the doctor session' \
   || bad 'doctor: ORCH_FOREGROUND=0 is a bare assignment — it holds only by an inherited export attribute or the child default, neither of which is the pin'
+# ⛔ NO "already running" ANSWER IN SERVICE MODE (review P2 round 11, #2402). `foreground_handover` returns 0
+# when the controller it waited for is GONE, so a `say "already running …"` placed AFTER it announced a pid
+# that no longer exists and returned 0 without launching anything — a clean pass over a cell with no
+# dispatcher. Every such answer must therefore sit in the NON-foreground arm of its branch (an `else`),
+# never on the path the handover returns to. RED on revert: putting the `say` back after the handover leaves
+# it outside an `else` and this pin reports the line.
+say_case 'every "already running" answer sits in the NON-foreground arm (service mode falls through to launch)'
+_ar_bad="$(awk '
+  { line[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (line[i] !~ /say "already running/) continue
+      found = 0
+      for (j = i - 1; j >= 1 && j >= i - 9; j--) {
+        if (line[j] ~ /^[[:space:]]*else[[:space:]]*$/) { found = 1; break }
+        if (line[j] ~ /ORCH_FOREGROUND/ && line[j] ~ /!= 1|== 1/) { break }
+      }
+      if (!found) printf "%d ", i
+    }
+  }
+' "$SUP")"
+[ -z "$_ar_bad" ] \
+  && ok 'service mode: no "already running" answer is reachable after a completed handover' \
+  || bad "service mode: an \"already running\" answer sits on the handover path (lines: $_ar_bad) — after the handover the controller is GONE, so this reports a dead pid and exits 0 without launching"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

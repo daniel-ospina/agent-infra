@@ -2154,9 +2154,17 @@ cmd_start() {
     seen0="$(seen_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
     if [ -n "$down" ]; then
-      # ⛔ SERVICE MODE NEVER RETURNS 0 HERE (see foreground_handover): an orderly exit is a start/exit
-      # loop under `Restart=always`, and the handover is what makes the unit converge instead.
-      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
+      # ⛔ SERVICE MODE NEVER ANSWERS "ALREADY RUNNING" (see foreground_handover): an orderly exit is a
+      # start/exit loop under `Restart=always`, and the handover is what makes the unit converge instead.
+      # ⛔ AND IT MUST NOT FALL THROUGH TO THE `say` EITHER (review P2 round 11, #2402). `foreground_handover`
+      # returns 0 when the controller it waited for is GONE — so running the tail after it announced
+      # "already running (controller pid <the dead pid>)" and returned 0 WITHOUT launching anything: a
+      # documented `CELL READY` over a cell with no dispatcher, and under Restart=always another orderly
+      # exit. In service mode the handover IS the whole answer: the predecessor is gone, so execution falls
+      # through to the launch path below.
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+        foreground_handover || return 1
+      else
       say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
@@ -2173,17 +2181,23 @@ cmd_start() {
       superseded && return 1
       [ "$drc" -eq 0 ] || return 1
       return 0
+      fi
     fi
     # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
     # `start` spends in check/seed — report it, do not refuse), or the session belongs to ANOTHER
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
-      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
+      # Same rule as above: in service mode the handover replaces the answer, because a session with no
+      # controller of ours is an ORPHAN the handover waits out (short bound) and then falls through to.
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+        foreground_handover || return 1
+      else
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
       start_doctor_loop; local drc=$?
       superseded && return 1
       [ "$drc" -eq 0 ] || return 1
       return 0
+      fi
     fi
     die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
   fi
@@ -2202,7 +2216,9 @@ cmd_start() {
     # this read (the window spans `assert_queue_target`'s git/network reads) reaches this branch, returns 0
     # — and under `Restart=always` three orderly exits inside the start window leave the unit `failed`,
     # which is the loop the handover exists to remove, on the one path the PR's own comment claims is closed.
-    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
+    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+      foreground_handover || return 1
+    else
     say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
@@ -2211,6 +2227,7 @@ cmd_start() {
     superseded && return 1
     [ "$drc" -eq 0 ] || return 1
     return 0
+    fi
   fi
   if [ -n "$live" ]; then
     # ⛔ NOT "already running", and NOT rc=0. This state dir started NOTHING: the pid runs the harness
