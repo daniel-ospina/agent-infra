@@ -1918,6 +1918,185 @@ running — `$O` and the controller both move at the next `start` (which re-seed
 and until then every spawn line says `restart-pending`. The controller does not restart *itself*
 onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
 
+### 6.5.9 The reminder's actuator arm: a GO is a claim about evidence
+
+**The reminder.** One timer, every 600 s, answering **the owner's two goals first**, then three
+questions: what is closest to landing, what merged but is **not live** on a box, and what is red for
+the SAME reason across many PRs. It writes `$O/MERGE-REMINDER.md` and prints ONE line. Until #2603 that line read
+`#2579 (?) reds=0 [GREEN(wait:21)] :: …` — `(?)` for priority, and `GREEN` for a surface with
+twenty-one checks still in flight. Both read better than reality, so both are gone: every value is
+MEASURED, and an unread value says `UNREADABLE <reason>`.
+
+**The goals, and why they come FIRST.** The owner's ask (2026-10-24T04:10Z) was *"improve the reminder
+message so it reminds you of the goals properly"*, naming two: **(1) tortoise P0+P1 are DONE and
+MERGED** — a fix without a merged PR is not done — and **(2) the agent-infra harness runs
+AUTONOMOUSLY** — the full lifecycle on the local box AND all three cmux cells, the SAME harness
+version in main/local/every cell **deployed AND activated**, on both repos, with the PR queue not
+behind. So `## GOALS` states them, `## Where the goals stand this run` MEASURES them, and
+`## What to do (in GOAL order)` turns the readings into the next action.
+
+⛔ **The ORDER is the change, not the wording.** `main()` measures drift → the goals → the PR reads,
+in that order. The failure it fixes is measured: the PR reads ran first on 2026-10-24, spent the whole
+core budget (`8/8` at 04:22Z), and every goal line said *not measured* — a reminder that reported on
+PRs and forgot what the PRs are for. Drift is a LOCAL artifact read (no REST) and the goals spend the
+SEARCH quota, so this order cannot starve the landing arm.
+
+⛔ **A count that does not come back is `NOT-MEASURED`, never `0`** — zero is the claim that the goal
+is met. ⛔ The cycle's main is read ONCE, with a REAL backoff retry (`MAIN_READ_ATTEMPTS` / `MAIN_READ_BACKOFF_S` — two calls issued back to back fail together, and a later read gave the header a sha the goals had never compared against), and every consumer uses that one value. ⛔ THE BOX INVENTORY HAS FOUR STATES and each is reported as itself: `absent` (a probed LOCAL-ONLY row, announced in the goal-2 READINGS by a `⚠️` line and a `⛔ LOCAL ONLY` line — never in the action, and never in a report whose inventory file exists), `unread` (the file exists and could not be read — including a non-UTF-8 file), `empty` (it exists and lists NO boxes) and `noprobe` (no file and no `box-status.sh`, so nothing could be probed). None of the last three is a box: no fraction, no marker word, no deploy instruction, and the standing is `NOT-MEASURED`. The local-only fallback otherwise printed a fleet marker over a one-box read. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
+ONE PAGE, so a local `len()` counts the page and not the population. Measured on tortoise: a slice
+said `P0=4 · P1=5` while the label query answered **7 and 20** (>300 open issues). `_count` therefore
+asks `search/issues` for `total_count`, with the filter already applied by the server.
+
+**The arm.** The owner's ask (2026-10-23) was that the reminder lead to automated dispatch of the
+needed action, on the stated risk: *"we can merge and if it breaks then it's fast to repair, as long
+as it's not a catastrophic break."* So a GO dispatches the repo's own rail
+(`scripts/admin-merge.sh <PR> --repo …`, backgrounded, its own log) when — and only when — ALL of
+these were read at the moment of action:
+
+| gate | reading | what a failure means |
+|---|---|---|
+| open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | re-read from the SINGLE-PR endpoint, because the LIST endpoint answers `mergeable: null` for every PR (that inert gate is what made the arm never fire); `mergeable: null`/`NOT-READ` is a WAIT — `REFUSE(mergeable=unknown)` |
+| a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
+| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592). The combined commit-status `state` is cross-checked against the entries READ — but `pending` with **zero** statuses is GitHub's EMPTY state for a check-run-only head, not truncation, and treating it as truncation made every real head UNREADABLE. The combined token is read with an ALLOW-LIST (`success` / `pending` / `failure`): `error` is a red-class value and an unnamed future token is never green, because a value this reader cannot classify must abstain rather than pass |
+| no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
+| a surface that was actually READ | `reds=0 in-flight=0` | a surface of ZERO groups is `REFUSE(surface=empty)`: a head pushed moments ago has no check runs and no commit statuses, and a review record can precede CI — **absence of evidence is not evidence of green** |
+| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` / `merge-one.sh` naming the PR — re-read AT THE MOMENT OF ACTION, not only from the pre-REST snapshot. ⛔ Our OWN process is never that rail: `--rail <path>/admin-merge.sh` puts the rail's name in this timer's own argv, so a process whose pid is this process (or its parent) is skipped, as is any row running `merge-reminder.py` — counting them made the arm refuse itself every cycle, blaming a rail that did not exist |
+
+⛔ **The rail is the authority and this file never merges.** `admin-merge.sh` re-reads the surface
+with its own allow-list polarity, binds its evidence to one SHA, refuses a moved head and classifies
+main's reds by event. The reminder's check read is a COST gate — "is it worth spending a rail
+attempt?" — and, **unlike the cell doctor's `merge` role, it reads the check surface itself**. That
+divergence is deliberate and worth stating plainly rather than dressing as precedent: the doctor
+refuses to classify checks at all ("a second opinion here is the two-readers defect", #1872/#1714),
+whereas the reminder does, because an unread surface costs a rail attempt every cycle. It is
+acceptable only because the reminder can do nothing but REFUSE — the rail re-reads everything and a
+wrong refusal dispatches nothing — and it is a **drift risk**: this classifier has to track
+`admin-merge.sh`'s grouping/polarity rule, and nothing pins the two together. It is a cost gate the
+doctor deliberately omits, not an endorsement of the doctor's division of labour.
+
+⛔ **A stale record is not a record, and a threshold is not a gate.** `merge-one.sh` and the doctor
+take the local landing lock (`$O/state/mergeclaim-<PR>.lock`) before racing a head; the reminder
+takes the SAME lock with `O_EXCL` immediately before the spawn, so the first lander on this box wins
+and the loser refuses `rail=running`. The reap of a dead lock runs **under its own mutex**
+(`<lock>.reap`) — `unlink` + `O_EXCL`-create is not atomic against a second reaper, and two reapers
+can otherwise both return "taken" and run two rails for one PR. It then WAITS (bounded, default
+900 s) for the rail's own exit
+so the cycle reports the rail's rc rather than assuming its spawn was a success; **past the bound it
+LEAVES the lock in place** (the fence survives the rail, which the process scan alone would not
+cover), and a later cycle reaps a DEAD-pid lock **only when no landing attempt is live** — the dead
+pid proves nobody holds the lock, not that no rail is in flight. A live pid is never reaped or taken
+over. The same re-verification applies to claims: an **expired lease is free**, exactly as
+`claims.sh`'s `_lease_is_live` defines it, because a box that died mid-review would otherwise block
+the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable` — **including the
+`0` sentinel**, which `test-claims.sh` pins as "UNPARSEABLE => LIVE". The claim message is read from a
+PRIVATE ref, never `FETCH_HEAD` (one per `.git`, rewritten by any concurrent fetch), and its shape is
+`claims.sh`'s (`claim owner=… lease_until=<epoch> nonce=…`).
+Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
+`--match-head-commit` keeps that from landing an unanalysed head, and closing it properly means
+minting the cross-box claim — which is `merge-one.sh`'s job, not this timer's.
+
+**The deploy half.** A merged fix that never reached a box has fixed nothing, so drift is
+ACTIONABLE: after the landing decision (never instead of it), a drifted box is restarted with ITS OWN
+verb — on a cell, `cloud-cell-supervisor.sh stop → apply → start` — and only when no role pass is
+mid-flight (a restart inside a reap kills work no later pass re-runs). It is VERIFIED BY ARTIFACT,
+never by the command's exit code: `harness: <sha> [current]` **and** `controller: RUNNING` **with a
+pid that is NEW relative to the pre-activation read**, re-probed until `--verify-deploy-s` expires,
+else `deploy=<box>:UNVERIFIED` with the readings. The new pid is load-bearing: `stop → apply → start`
+is one shell chain whose exit code is never read, so a controller that survived a failed stop would
+otherwise satisfy "RUNNING" while executing the old tree — and a `source=stamp` identity is rewritten
+by `apply` BEFORE `start`. When the BEFORE read carries no pid at all (a box one deploy behind with an
+older status command), a restart cannot be proven and the deploy is `UNVERIFIED` — never a fallback
+to "any pid", which would accept exactly the pre-existing controller the rule excludes. ⛔ A box
+whose pin agrees but whose controller is not RUNNING is `deployed-but-NOT-activated`, never
+`current`: the arm does not start it, and it reads the LEDGER's last verdict — `our activation
+at this pin VERIFIED and the controller has been stopped since (an operator's stop)` when that
+row says VERIFIED, `OUR last activation of this box did not verify (N unverified attempt(s);
+last verdict: …)` otherwise, and `no activation of this box is recorded at this pin` when the
+ledger is empty. The drifted `controller=STOPPED` branch makes the same three-way reading. ⛔ The
+deploy BOUND is the CURRENT streak — unverified attempts since the box last provably reached
+this pin — so an arrival clears it; a lifetime total refused every later, legitimate attempt
+while quoting a count the ledger's own last row denied. A status command that never answered the controller question is
+`UNPROVEN controller=UNREADABLE`, never `deployed-but-NOT-activated`. Calling that row `current` made the table contradict the goals
+block one section above it, which reads the same box as `MARKERS-BROKEN — controller=STOPPED`. The boxes are an
+inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
+whatever remote path that box already uses — no new control surface is invented here.
+
+It is also **bounded**: every activation is recorded (`state/merge-reminder.deploys`,
+TAB-separated — a box name may contain a space, and a whitespace split would key on the first word and
+never bind), a repeat of
+the same **box + target sha** inside `--retry-s` is a `WAIT(deploy-retry-after=…)`, and once
+three unverified attempts are ON RECORD the NEXT cycle refuses by count (`REFUSE(deploy-attempts=3
+…)`) naming a human — three restarts happen; the fourth cycle is the one that stops. ⛔ The bound keys
+on the TARGET, not on the `from`→`to` pair: `from` is a value the activation itself changes, so a box
+that creeps forward without arriving (`diverged` → `behind`, a partial `apply`) missed its own row and
+was restarted every 600 s forever. Without the bound at all a box that cannot reach `origin/main` —
+pinned `ahead`, `diverged`, or an `apply` that never
+advances the pin — would be stopped and started every cycle forever, because every gate that could
+stop it re-opens 600 s later. If the ledger cannot be WRITTEN the verdict says so
+(`⚠️ the deploy ledger could NOT be written — the attempt bound is inert until $O/state is writable`): an unrecorded attempt is
+still an attempt, so the bound must not report itself satisfied while bounding nothing.
+
+It refuses five things, each one a way an actuator becomes an incident (the code's own docstring
+counts the same five):
+
+* **an UNREADABLE `origin/main`** — with an empty main every box reads as drifted, and the verify
+  loop compares against the same empty value and could never pass: a restart every cycle, forever;
+* **`--no-act`** — the reminder-only mode covers BOTH arms, because a controller restart is more
+  disruptive than the landing that mode already suppresses, and `--no-act` is how a human INSPECTS
+  the file before trusting it;
+* **a landing attempt live ANYWHERE on this box** — not only one this cycle dispatched. `--interval`
+  (600 s) is shorter than `--rail-wait-s` (900 s), so overlapping cycles are reachable by
+  construction and the second would restart the controller under the first one's rail. The deploy
+  arm also takes its own `state/merge-reminder-deploy.lock`, so two cycles never deploy at once;
+* **a STOPPED controller** — but this arm cannot tell an operator's stop from its OWN failed
+  activation (a `stop → apply → start` whose `apply` failed leaves the cell down), so it reports
+  `activate=skipped(controller=STOPPED …)` and, when the deploy ledger shows our own unverified
+  attempt, says so instead of blaming the operator;
+* **a `source=stamp` identity reported as `current`** — `harness-refresh.sh` states the stamp records
+  what was SEEDED, not what is RUNNING, so a matching stamp reads `UNPROVEN` and activates nothing.
+
+**Costs, and how a skipped run is never an empty one.** `GET /rate_limit` FIRST (it is unmetered),
+then at most `REST_BUDGET = 9` metered core calls: one open-PR listing, then per candidate three
+surface reads (workflow runs, `check-runs?filter=all`, legacy statuses) plus one **single-PR read for
+mergeability** — the LIST endpoint never computes it (every one of agent-infra's ten open PRs answered
+`null` in a 2026-10-24 reading), and reading that `null` as `REFUSE(mergeable=unknown)` made the whole
+arm INERT. A single-PR read that the budget cannot afford says `NOT-READ`, never an inherited value. The
+listing itself is one page of 100 and a FULL page is UNREADABLE by name, because it carries no
+`total_count` to prove it was not truncated (70 open PRs against a 30-row page hid 40 of them).
+The goal readings spend the SEARCH quota instead (`GOAL_SEARCH_BUDGET = 8`, counted in
+`budget.search_calls`) — a different limit on GitHub, so measuring the goals never spends a call the
+landing arm needed, and `REST_BUDGET` stays what this document says it is. Under
+`REST_RESERVE = 200` core calls the run is SKIPPED and SAYS SO (`skipped=rate-limited core=12/5000`,
+exit 3) — never `nothing to do`. The same exit and the same wording cover an unreadable PR listing.
+
+**Timers.** `merge-reminder.py --install-timer [--interval S]` renders and LOADS the platform's own
+schedule and verifies it: launchd (`com.tortoise.merge-reminder`, `StartInterval`) on macOS, a
+systemd USER timer (`merge-reminder.timer`) on Linux, else a crontab entry — and a box with NONE of
+them exits 3 naming the remedy rather than installing nothing quietly. Every arm is verified by the
+ARTIFACT that schedules it (`launchctl print`, `systemctl is-active`, `crontab -l`) — a successful
+write is not a timer. `--uninstall-timer` removes **every** arm install can create (the unit, and
+the crontab entry on a box with no systemd) and verifies the removal. Our crontab entry is identified by the tag AND our command AND the
+`$O` it serves, compared both literally and as RESOLVED paths (so `--o /o`, `--o /link/to/o`, `--o .`
+and an `$O` containing a quote are each one arm, not several) — not by the script path alone — `$O/<script>` and the checkout copy are the same script to
+`install.sh`, and keying on the path made a cross-copy uninstall match nothing ("nothing to remove",
+exit 0, arm still firing) while keying on the script NAME made one `$O`'s uninstall delete a peer's
+arm and an operator line that merely mentioned the script. An entry written before the token existed
+is still matched by its script path, and that legacy fallback is the only place the path is a key. An unreadable crontab is an
+abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
+
+**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
+277 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
+how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
+-l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the
+plist is rendered, `bootout` is asserted to precede `bootstrap`, and uninstall removes it) — plus
+`box-status.sh` including a RIGHT-PADDED `ps` line (whose parse once reported a live controller as
+`STOPPED`), every landing and deploy gate, the deploy attempt bound, and two mutation controls that
+require the mutant to have RUN. Residual, named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for
+reminder-only), so a box that runs the timer WILL dispatch a rail on complete evidence — that is the
+feature, and the gate list above is what makes it safe; the review-record store it reads is this
+box's `~/.pi/agent/reviews`, so a peer box's verdict reaches it only through `registry-sync.sh`.
+
 ---
 
 ## 7. Gaps: what is fixed, what is not
@@ -3236,6 +3415,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-doctor.hardening.test.sh` | #1989, the HARDENING half (a separate suite, not a fork of the one above): every read the doctor acts on must be classified, so an unreadable session list / client list / ancestry walk / pane read / log mtime / process table / open-PR read / review record is cannot-verify rather than an answer, while a benign non-answer (a fresh box with no server, a lane that ended between reads) is not; an action that did not take (a refused or unverifiable kill, cpu that went DOWN) is never a reap; the rail's rc classifier is a PREDICATE (`124..127`, any `128+N`); and a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says in the record that it was a rehearsal, on every role. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤9 metered REST calls (the 9th is the per-candidate mergeability read, which the LIST endpoint does not compute), a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
+| `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table |
+| `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
