@@ -1307,14 +1307,28 @@ named_unattributable_runs() {
   # list is MISSING ENTIRELY, and returning early printed nothing instead of
   # "the collector published 0 … where the refusal counted N — this list is INCOMPLETE".
   # An empty `grep -c` on a missing file is `0`, so the cross-check fires first and the
-  # `named_count -eq 0` return BELOW is the silent path (nothing to name, count agrees).
+  # `named_count = 0` return BELOW is the silent path (nothing to name, count agrees).
   # ⛔ `grep -c` PRINTS `0` AND EXITS 1 on no match, so a `|| printf '0'` fallback makes the
   # count the two-line string `0\n0` — and a `0\n0` header is not a count (#2610 review). The
   # fallback is only for grep being unavailable; the default covers the no-match case. The
   # predicate matches the loop's guard exactly, so the header cannot disagree with the body:
   # the loop skips a line with no NON-SPACE character, and so does this count.
-  named_count="$(grep -c '[^[:space:]]' "$unattributed" 2>/dev/null || true)"
-  [ -n "$named_count" ] || named_count=0
+  # ⛔ A COUNT THAT COULD NOT BE MADE IS NOT ZERO (#2610 review, round 5). `|| true` collapsed
+  # grep's exit 2/127 (unreadable / grep broken) into the same empty capture as a legitimate
+  # no-match, so the header could assert `NAMED (0)` while the loop below — whose guard is shell
+  # pattern matching, not grep — still printed runs underneath it. That is the one unmeasurable
+  # arm in this function that answered AFFIRMATIVELY; it now says the count is UNKNOWN.
+  # `$?` is captured BEFORE the case: inside a branch it is the case's own status, not grep's,
+  # and a diagnostic that names the wrong exit code is a claim about the instrument that is false.
+  named_count="$(grep -c '[^[:space:]]' "$unattributed")"
+  local count_rc=$?
+  case "$count_rc" in
+    0) ;;
+    1) named_count=0 ;;
+    *) named_count="?"
+       say_err "   ⚠️  the unattributable list could not be COUNTED (grep exit ${count_rc}) — the"
+       say_err "   count is UNKNOWN, not zero; the runs named below are still real" ;;
+  esac
   # The base's own surface, through the ONE probe (#1261) — never a second reader. A base
   # ref that could NOT be resolved is not a ref to probe: passing '' would have made the
   # reader assert "'X' IS red on ''" about a branch nobody resolved, so the ref is checked
@@ -1332,14 +1346,23 @@ named_unattributable_runs() {
   # THE COUNT IS CROSS-CHECKED, never assumed (#2610 review, P3-5): the refusal above prints
   # `N of M`, and this list is the SUBJECT of that count. A subset that is short of it would
   # otherwise read as a complete account of the unattributable runs.
-  if [ -n "$expected" ] && [ "$named_count" != "$expected" ]; then
+  if [ -n "$expected" ] && [ "$named_count" != "?" ] && [ "$named_count" != "$expected" ]; then
     say_err "   ⚠️  the collector published $named_count unattributable run(s) where the refusal"
     say_err "   counted ${expected} — this list is INCOMPLETE, so read it as a sample, not as the set"
   fi
   # Nothing to name. Only silent when the count AGREES with the refusal (the cross-check
   # above has already spoken for the disagreement case, which is the one that matters).
-  if [ "$named_count" -eq 0 ]; then return 0; fi
-  say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
+  # ⛔ A STRING COMPARE, not `-eq`: `named_count` can be the UNKNOWN marker `?`, and a numeric
+  # comparison against it is a shell diagnostic that reads as a broken instrument.
+  if [ "$named_count" = "0" ]; then return 0; fi
+  # The number is only printed when it was actually MEASURED (#2610 review, round 5): an
+  # `NAMED (0)` over a list that then prints runs is a measured-looking claim about
+  # something never measured.
+  if [ "$named_count" = "?" ]; then
+    say_err "   The failing run(s), NAMED — each check below is one whose failed-step"
+  else
+    say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
+  fi
   say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "${line//[[:space:]]/}" ] || continue
