@@ -1128,7 +1128,7 @@ ck "…and the refusal reaches the controller's log, not just stderr" $rc
 n_mux="$(grep -c '^CMUX ' "$TMP/O4n/cmux-calls.log" 2>/dev/null || echo 0)"
 [ "$n_mux" = "5" ] && rc=0 || rc=1
 printf '      cmux calls for one banner + one refused spawn: %s (want 5)\n' "$n_mux"
-ck "…and the whole refusal costs FOUR probes (2 banner + 2 spawn), not creeping further" $rc
+ck "…and the whole refusal costs FIVE probes (2 banner + 3 spawn, main's rc re-measure included), not creeping further" $rc
 # ⛔ THE PROBE'S OWN ANSWER MUST REACH THE OPERATOR (agent-infra#2366). `cmux tree --json >/dev/null
 # 2>&1` keeps the decision and discards the reason, so a launcher-less box prints `launcher=none
 # (cmux=yes, uname=Linux)` — a verdict with no cause, indistinguishable from a tty gate, a TERM gate,

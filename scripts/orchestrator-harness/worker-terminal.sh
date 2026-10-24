@@ -536,13 +536,19 @@ wt_launcher_env() {
 # but identity and help. One log line would have said so; `none` alone left it to be re-derived.
 # An instrument that holds the datum and does not read it is a category-A defect, so the reason now
 # travels with the verdict.
-# ONE probe IN THIS FUNCTION, and the honest arithmetic for a caller: it runs AFTER `wt_launcher` has
-# already probed (the verdict is what selects this path), so a `none` box costs TWO `cmux tree` calls
-# per startup line and per refused spawn — the verdict's and the reason's. Not three (an earlier draft
-# probed twice here), and pinned as a COUNT by the suite so it cannot creep back. ⚠️ Under `set -e` a
-# bare failing probe would exit the shell before `rc=$?`; every shipped call site wraps this in `$( )`
-# (a subshell absorbs the status) and both controllers run `set -u` only — but a new direct caller must
-# keep that in mind.
+# ONE probe IN THIS FUNCTION, and the honest arithmetic for a caller — corrected after the rebase,
+# because the CALLER's cost is not this function's cost. This function makes ONE `cmux tree` call
+# (stderr only). What a `none` box costs end-to-end is FIVE, and the arithmetic is the union of both
+# sides of the merge: the startup banner's own `wt_launcher` read + this function's read (2), then the
+# SAME two on a refused spawn (2), PLUS main's deliberate re-measurement of `cmux tree` rc on the
+# refusal line (1) — main re-probes there because a presence test sent the operator to the wrong fault
+# (#2210). ⛔ An earlier draft of this comment said "TWO per startup line and per refused spawn — not
+# three", which was true only before main's rc re-measure landed; it is now FALSE and it disagrees
+# with the pinned count in the suite, so it is corrected here rather than left to misdirect the next
+# reader into resetting the pin. Pinned as a COUNT by the suite so it cannot creep back. ⚠️ Under
+# `set -e` a bare failing probe would exit the shell before `rc=$?`; every shipped call site wraps
+# this in `$( )` (a subshell absorbs the status) and both controllers run `set -u` only — but a new
+# direct caller must keep that in mind.
 wt_launcher_why() {
   if ! command -v cmux >/dev/null 2>&1; then
     printf 'cmux is not on PATH'
