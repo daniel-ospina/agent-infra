@@ -120,10 +120,16 @@ harness_missing_reason() { # <path> -> why it is not the harness repo (empty = i
   fi
   top="$(git -C "$c" rev-parse --show-toplevel 2>/dev/null)"
   [ -n "$top" ] || { printf '%s has no work tree toplevel' "$c"; return; }
-  if git -C "$top" ls-files --error-unmatch scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1; then
-    return                                     # it IS the harness repo
-  fi
-  printf '%s does not carry the harness: scripts/orchestrator-harness/box-status.sh is not TRACKED there (a scripts -> $AGENT_INFRA_PATH/scripts pointer makes the PATH exist in any checkout)' "$top"
+  # ⛔ A TRACKED SYMLINK IS NOT THE HARNESS EITHER (round-4 review follow-up, measured: an index entry
+  # `120000 scripts/orchestrator-harness/box-status.sh` satisfies `ls-files --error-unmatch`, so a repo
+  # that ships no harness bytes was accepted and its own `origin/main` became the value goal 2 measured
+  # against). `ls-files -s` prints the MODE, and only a regular blob (100644/100755) is the harness file;
+  # 120000 is a link and 160000 a gitlink/submodule.
+  entry="$(git -C "$top" ls-files -s --error-unmatch scripts/orchestrator-harness/box-status.sh 2>/dev/null | head -1)"
+  case "${entry%% *}" in
+    100644|100755) return ;;                 # it IS the harness repo
+  esac
+  printf '%s does not carry the harness: scripts/orchestrator-harness/box-status.sh is not a TRACKED REGULAR FILE there (mode %s; a scripts -> $AGENT_INFRA_PATH/scripts pointer makes the PATH exist in any checkout, and a tracked symlink ships no harness bytes)' "$top" "${entry%% *}"
 }
 REF_WHY=""
 refused=""
@@ -229,8 +235,15 @@ if [ -n "$ctrl" ]; then
     # ⛔ A RELATIVE SCRIPT PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT OURS (round-3 review
     # follow-up, measured: a controller started as `bash ./orch-loop.sh` in tree A, with this probe run
     # from tree B, printed `running: <B's HEAD>` — a wrong tree, which is the one thing this reader must
-    # never do while the README claims it cannot). `/proc/<pid>/cwd` is the process's own working
+    # never do while the README claims it cannot). `/proc/<pid>/cwd` is the process's CURRENT working
     # directory; if it cannot be read the answer is UNREADABLE (below), never a guess.
+    #
+    # KNOWN LIMIT, stated rather than hidden: a controller that is started by a RELATIVE path and then
+    # `cd`s elsewhere is reported as the tree it moved INTO, because the kernel keeps no record of the
+    # exec-time cwd. Every launcher this repo ships uses an ABSOLUTE path
+    # (`launchd-controller.sh`, `watchdog-loop.sh`), so this is unreachable in the deployed shape — and it
+    # is still strictly better than resolving against OUR cwd, which names an unrelated tree on every
+    # relative start.
     case "$script" in
       /*) : ;;
       *)  pcwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"

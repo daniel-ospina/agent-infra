@@ -2691,9 +2691,13 @@ def harness_repo_of(o: Path) -> Path | None:
         top = (out or "").strip()
         if rc != 0 or not top:
             continue
-        rc2, _, _ = run(["git", "-C", top, "ls-files", "--error-unmatch",
-                         "scripts/orchestrator-harness/box-status.sh"], timeout=15)
-        if rc2 == 0:
+        # A TRACKED SYMLINK IS NOT THE HARNESS: `ls-files --error-unmatch` is satisfied by a mode-120000
+        # entry too, so a repo that ships no harness bytes would be taken for the harness repo and its own
+        # main measured against (round-4 review follow-up, measured). `ls-files -s` gives the mode; only a
+        # regular blob is the harness file.
+        rc2, entry, _ = run(["git", "-C", top, "ls-files", "-s", "--error-unmatch",
+                             "scripts/orchestrator-harness/box-status.sh"], timeout=15)
+        if rc2 == 0 and (entry or "").strip().split(" ", 1)[0] in ("100644", "100755"):
             return Path(top)
     return None
 
