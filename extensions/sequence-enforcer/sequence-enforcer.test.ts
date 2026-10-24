@@ -4139,8 +4139,17 @@ await test("#1770.20 the verdict really EXITS 3 with the marker on stdout — pr
   const dir = tmpDir("exit-e2e");
   const home = join(dir, "home");
   mkdirSync(home, { recursive: true });
-  const skill = join(dir, "SKILL.md");
-  writeFileSync(skill, "---\nname: exitfixture\nsteps:\n  - name: dispatch_reviewers\n    type: skill\n    gate: verifier\n---\nbody\n");
+  // ⛔ The driver MUST run inside a real git WORKTREE: the read tracker deactivates
+  // in a main checkout ("main checkout — pipeline not activated"), so a driver
+  // whose cwd is a normal checkout (every CI job) never activates a skill, never
+  // prints the verdict, and exits 0 — the suite went red in CI exactly that way
+  // (final review of cycle 10). `makeWorktreeSkill` builds the bare-repo + worktree
+  // fixture the other activation tests already use.
+  const { wt } = makeWorktreeSkill(
+    dir,
+    "---\nname: exitfixture\nsteps:\n  - name: dispatch_reviewers\n    type: skill\n    gate: verifier\n---\nbody\n",
+  );
+  const skill = join(wt, "SKILL.md");
   const driver = join(dir, "driver.mts");
   writeFileSync(
     driver,
@@ -4153,6 +4162,7 @@ await test("#1770.20 the verdict really EXITS 3 with the marker on stdout — pr
       `const handlers = {};`,
       `const pi = { on: (ev, h) => { (handlers[ev] ??= []).push(h); } };`,
       `mod.default(pi);`,
+      `process.chdir(${JSON.stringify(wt)});`, // a WORKTREE cwd: activation is what the verdict needs
       `const ctx = { cwd: process.cwd() };`,
       `for (const h of handlers.session_start ?? []) await h({}, ctx);`,
       `for (const h of handlers.tool_call ?? []) await h({ type: "tool_call", toolName: "read", toolCallId: "r1", input: { path: ${JSON.stringify(skill)} } }, ctx);`,
@@ -4163,7 +4173,7 @@ await test("#1770.20 the verdict really EXITS 3 with the marker on stdout — pr
   );
   let status = 0, out = "";
   try {
-    out = execFileSync("npx", ["-y", "tsx@4", driver], { cwd: REPO_ROOT, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] });
+    out = execFileSync("npx", ["-y", "tsx@4", driver], { cwd: wt, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] });
   } catch (e: any) {
     status = typeof e.status === "number" ? e.status : -1;
     out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
