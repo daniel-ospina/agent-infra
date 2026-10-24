@@ -1171,10 +1171,20 @@ case "$LAST" in
       # classifier would then be reading whatever survived the pipe.
       gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>"$gate_errf")"; gate_rc=$?
       gate="$(printf '%s' "$gate_raw" | GATE_NAME="$REVIEW_GATE" python3 -c '
-import sys, json, os
+import sys, json, os, re
 want = (os.environ.get("GATE_NAME") or "ai-review-gate").strip()
+# ⛔ EVERYTHING ECHOED INTO THE LOG GOES THROUGH `clean()` (review round 6 P2). `name` and `state` are
+# TRANSPORT-CONTROLLED — a workflow name can be a YAML block scalar, and the cell gh chain (#2320) is
+# hand-rolled — so a payload carrying `\n` forges a LINE in the merge log: a refused run logged
+# `[merge 7] gate=SUCCESS (try 1)` through `saw=`, i.e. the record a human reads to decide whether to
+# intervene positively claimed the gate was green. Control characters are collapsed to a space at this
+# boundary, so no field can ever start a new line — and `saw=`/`last=` stay single-line for the same
+# reason. (This is the same discipline the exception text below already applied.)
+_CTRL = re.compile(r"[\x00-\x1f\x7f]+")
+def clean(s):
+    return _CTRL.sub(" ", str(s or "")).strip()
 def canon(s):
-    s = (s or "").strip()
+    s = clean(s)
     if " / " in s:
         s = s.rsplit(" / ", 1)[1].strip()
     return s
@@ -1205,7 +1215,7 @@ if not isinstance(rows, list):
 if not rows:
     print("EMPTY saw=<none: the check surface is empty>")
     raise SystemExit(0)
-names = [str(c.get("name") or "").strip() for c in rows if isinstance(c, dict)]
+names = [clean(c.get("name")) for c in rows if isinstance(c, dict)]
 # ⛔ A SURFACE WHOSE ROWS CARRY NO USABLE NAME IS MALFORMED, NOT A WRONG GATE NAME (review round 3
 # P2-3). `[null]`, `["x","y"]` and `[{"name": null, …}]` all parse as a LIST, so they must not be
 # reported as "the surface carried checks, but none is named this gate" — there was no row to name.
@@ -1216,7 +1226,7 @@ if not any(names):
 PEND    = ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED")
 NON_RED = ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED")
 def state_of(c):
-    return str(c.get("state") or "").strip().upper()
+    return clean(c.get("state")).upper()
 def rank(s):
     # Allow-list polarity: 0 is the only green, and EVERY other conclusion is red — an unrecognised
     # or empty state must never fall through a gap (the merge-rail rule, applied here).
@@ -1271,7 +1281,7 @@ elif st in NON_RED:
 elif not st:
     # Its own token: the row WAS found (so this is not a transport failure, and the UNAVAILABLE
     # wording "the read never produced a check surface" would be false here).
-    print("ROWUNREADABLE the row named %s was found but carries no state field, so its polarity is unknown" % ("<" + str(hit.get("name") or "").strip() + ">"))
+    print("ROWUNREADABLE the row named %s was found but carries no state field, so its polarity is unknown" % ("<" + clean(hit.get("name")) + ">"))
 else:
     print("RED state=%s" % st)
 ' 2>>"$gate_errf")"; gate_pyrc=$?

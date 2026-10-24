@@ -149,6 +149,9 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     # rule must not depend on it.
     rerun)     printf '[{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z"},{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z"}]\n' ;;
     nostate)   printf '[{"name":"ai-review-gate"}]\n' ;;
+    # §1h: a TRANSPORT-controlled name carrying a newline — a workflow name can be a YAML block scalar,
+    # and a hand-rolled gh shim can print anything. It must not be able to forge a log line.
+    inject)    printf '[{"name":"ci\\n[merge 7] gate=SUCCESS (try 1)","state":"SUCCESS"},{"name":"ai-review-gate","state":"FAILURE\\n[merge 7] MERGED now"}]\n' ;;
     # §2f/§2g/§2h: A ROW IS A JOB, AND NO FIELD HERE CAN TELL TWO JOBS APART. A queued re-run carries
     # startedAt null (and `0001-01-01...` on real gh); the same rendered name can be published by two
     # workflows, or by two jobs the cell adapter reports under ONE app slug.
@@ -505,6 +508,25 @@ q 'carries a usable name' <<<"$log" && ok "§1g unnamed rows: says the surface i
 nq 'NO-SUCH-CHECK' <<<"$log" && ok "§1g unnamed rows: NOT reported as a wrong gate name (there was no row to name)" \
                              || bad "§1g unnamed rows: sent the operator to fix the gate NAME for a malformed surface"
 
+# ── §1h a TRANSPORT-CONTROLLED name/state can never forge a log LINE: a refusal must not write a line
+#         that reads `gate=SUCCESS` or `MERGED` at its start (round 6 P2) ─────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=inject GATE_ABSENT_TRIES=2 GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1h injected newline: refused (exit 4) — nothing was merged" || bad "§1h injected newline: rc=$rc"
+nq '^\[merge [0-9]*\] gate=SUCCESS' <<<"$log" \
+  && ok "§1h injected newline: no LINE of the log asserts a green gate (the payload's newline did not start one)" \
+  || bad "§1h injected newline: a transport-controlled name forged a 'gate=SUCCESS' line in a REFUSED run"
+nq '^\[merge [0-9]*\] MERGED' <<<"$log" \
+  && ok "§1h injected newline: and no line claims a merge (the state field could previously forge MERGED)" \
+  || bad "§1h injected newline: a transport-controlled state forged a MERGED line"
+q 'gate=FAILURE .* (RED' <<<"$log" \
+  && ok "§1h injected newline: the REAL verdict is still the terminal one (RED), with the payload collapsed inline" \
+  || bad "§1h injected newline: the verdict was lost or split; log=$(tr '\n' '|' <<<"$log")"
+term="$(grep -c '^\[merge 7\] gate=FAILURE .*(RED, last seen at try' <<<"$log")"
+[ "$term" -eq 1 ] && ok "§1h injected newline: the injected text did not add a TERMINAL verdict line (exactly 1)" \
+                  || bad "§1h injected newline: $term terminal verdict line(s) — the payload added one"
+
 # ── §4c a CANCELLED gate is NOT GREEN, not RED (the repo's own polarity) ──────────────────────
 mkmrg
 out="$(run_merge PRCHECKS_MODE=cancelled GATE_POLL_TRIES=2)"; rc=$?
@@ -676,6 +698,18 @@ if q 'rank(state_of(c)) < rank(state_of(hit))' "$(cat "$MUT4")"; then
                               || bad "§10 mutation: the best-row mutant still refused — §2c is vacuous"
 else
   bad "§10 mutation: the best-row mutation did not apply (sed found no target) — inconclusive"
+fi
+MUT7="$TMP/block-noclean.sh"
+sed 's|    return _CTRL.sub(" ", str(s or "")).strip()|    return str(s or "").strip()|' "$SLICE" > "$MUT7"
+if q '    return str(s or "").strip()$' "$(cat "$MUT7")"; then
+  b_out="$(run_block "$MUT7" inject)"
+  if grep -qiE '^\[merge 7\] (merged|gate=success)' <<<"$b_out"; then
+    ok "§11 mutation: without the control-character strip a transport-controlled field forges a MERGED/SUCCESS line (dangerous), so §1h goes RED"
+  else
+    bad "§11 mutation: the mutant still collapsed the newline — §1h is vacuous"
+  fi
+else
+  bad "§11 mutation: the clean() mutation did not apply (sed found no target) — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"
