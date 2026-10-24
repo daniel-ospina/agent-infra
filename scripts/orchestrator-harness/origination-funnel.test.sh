@@ -267,6 +267,59 @@ open(path, "w").write(src)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
+# mk_tool_mixed <dir> <fail-n> — TWO candidates, only the FIRST of which fails. The second answers
+# a DEGRADED CLEAN (rc 0, no stderr) — the shape that exposed a real defect in the first draft of
+# #2401: `PRE_RC`/`PRE_ERR_LINE` were overwritten per candidate, so the recorded datum described the
+# LAST run (`rc=0`, `stderr=none`) while `first cause` quoted the FIRST run's refusal — a record that
+# contradicted itself and asserted a healthy tool.
+mk_tool_mixed() {
+  local d="$1" fail_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read "
+       "(FileNotFoundError: /tmp/cell-home/.pi/agent/state/lane-registry.tsv)")
+if n == $fail_n:
+    print("issue assignee/holder           INCOMPLETE  0     " + why)
+    print("INCOMPLETE SURFACES")
+    print("  [issue assignee/holder] " + why)
+    print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+    sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")
+    sys.exit(2)
+# ⛔ THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
+# #2401, R2). A verdict-less run (no VERDICT line, rc 0) exercises `record_unusable`'s
+# `preflight-no-verdict` arm, so "re-snapshot on every record" is graded: it would leave
+# `tool_rc=0`/`tool_issue=<this one>` beside the FIRST candidate's refusal. A degraded CLEAN would
+# NOT grade that — it bumps `V_UNJUDGED` without recording anything (mutation-proved green).
+sys.exit(0)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_stderr_report <dir> — the whole report, INCLUDING the INCOMPLETE SURFACES block and the
+# VERDICT, written to STDERR only. This is what makes the fold-back graded (#2401 review): a producer
+# whose report arrives on stderr must still be PARSED, and removing the fold-back must turn the suite
+# red instead of silently degrading the record to `unusable=unknown`.
+mk_tool_stderr_report() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read "
+       "(FileNotFoundError: /tmp/cell-home/.pi/agent/state/lane-registry.tsv)")
+out = sys.stderr
+# ⛔ A HARMLESS FIRST LINE ON PURPOSE. Folding back only the FIRST stderr line would then keep a
+# diagnostic and drop the report — which is exactly the regression this fixture grades. (A fixture
+# whose first line already carried the surface row passed under that regression: measured.)
+out.write("FLEET BOARD: probing the live-session store\n")
+out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
+out.write("INCOMPLETE SURFACES\n")
+out.write("  [issue assignee/holder] " + why + "\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -372,8 +425,8 @@ esac
 # `why=` at 400 characters, so the assertion is made on that cut — not on the whole record.
 _why400="$(rec "$D" why | cut -c1-400)"
 case "$_why400" in
-  *"pre-flight cmd=collision_preflight.py --repo . rc=2 stderr=FLEET BOARD: cannot answer"*)
-    ok "datum: the QUOTABLE 400 characters carry command, rc and stderr — not just prose" ;;
+  *"pre-flight issue=#42 cmd=collision_preflight.py --repo . rc=2 stderr=FLEET BOARD: cannot answer"*)
+    ok "datum: the QUOTABLE 400 characters carry issue, command, rc and stderr — not just prose" ;;
   *) bad "datum: the datum is outside the beat's 400-char cut, so it is invisible — '$_why400'" ;;
 esac
 # …and it survives the LAST bound, the one the caller applies to the record it prints.
@@ -391,12 +444,60 @@ case "$OUT_DRIVE" in
   *) bad "datum: the BLOCKED line carries no stderr diagnostic — $OUT_DRIVE" ;;
 esac
 
-# ── 1d) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
-# A regression that swaps the prose for the datum would still name a surface but would stop saying the
-# pass judged NOTHING, which is the reading #1736 exists to guarantee. Both must be present.
-case "$OUT" in
-  *"judged NOTHING"*) ok "datum: the abort still says the pass judged NOTHING" ;;
-  *) bad "datum: the abort lost 'judged NOTHING' — $OUT" ;;
+# ── 1d) THE DATUM FOLLOWS THE FAILING RUN, NOT THE LAST ONE JUDGED ──────────────
+# ⛔ MEASURED DEFECT IN THE FIRST DRAFT (review of #2401): `PRE_RC`/`PRE_ERR_LINE` are overwritten by
+# every candidate, so a pool of `#42 INCOMPLETE (rc 2)` then `#43 degraded CLEAN (rc 0)` recorded
+# `tool_rc=0 stderr=none` beside `first cause: … could not answer` — the record CONTRADICTED its own
+# first cause, asserting a healthy tool where the failing run exited 2. The snapshot must be taken at
+# the first UNUSABLE record, which is the same arm `unusable_cause` quotes.
+mk_case fail-mixed 42 43
+mk_tool_mixed "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_rc)" = "2" ] \
+  && ok "mixed: the datum follows the FIRST failing run (rc 2), not the last (rc 0)" \
+  || bad "mixed: tool_rc='$(rec "$D" tool_rc)' (want 2) — the record contradicts its own first cause"
+[ "$(rec "$D" tool_issue)" = "42" ] \
+  && ok "mixed: and it names the candidate it belongs to (#42)" \
+  || bad "mixed: tool_issue='$(rec "$D" tool_issue)' (want 42)"
+[ "$(rec "$D" tool_arm)" = "issue-assignee-holder" ] \
+  && ok "mixed: and the ARM that recorded it, so the datum cannot be read as another arm's" \
+  || bad "mixed: tool_arm='$(rec "$D" tool_arm)' (want issue-assignee-holder)"
+case "$(rec "$D" why)" in
+  *"issue=#42"*"rc=2"*) ok "mixed: the persisted cause names #42 and its rc" ;;
+  *) bad "mixed: the cause does not name the failing candidate — '$(rec "$D" why)'" ;;
+esac
+# ── 1e) THE FOLD-BACK IS GRADED (a report on stderr still parses) ───────────────
+# De-merging stderr must not change what the PARSERS see. A producer that writes its whole report —
+# the INCOMPLETE SURFACES block and the VERDICT — to stderr must still be read; without the fold-back
+# the surface would be lost and the record would degrade to `unusable=unknown`.
+mk_case fail-stderr-report 42
+mk_tool_stderr_report "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "stderr-report: the surface is still parsed from a stderr-only report" ;;
+  *) bad "stderr-report: the fold-back lost the report — unusable='$(rec "$D" unusable)'" ;;
+esac
+case "$(rec "$D" why)" in
+  *"issue-assignee-holder"*) ok "stderr-report: and it reaches the persisted cause" ;;
+  *) bad "stderr-report: the cause names no surface — '$(rec "$D" why)'" ;;
+esac
+
+# ── 1f) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
+# ⛔ ASSERTED WHERE IT CAN FAIL (review of #2401). The first draft asserted on `$OUT` — the pass's own
+# stdout echo at the abort site, which contains `judged NOTHING` unconditionally — so a regression that
+# swapped the prose for the datum inside the PERSISTED cause (the artifact the controller actually
+# prints) left the suite green. The assertion belongs on the record and on the driven line.
+# ⛔ AND `$OUT_DRIVE` MUST BE RE-DRIVEN HERE, NOT INHERITED (review of #2401, R3): §1d/§1e never call
+# `drive_gate`, so the first draft graded §1c's case under this section's label — a passing assertion
+# attached to the wrong fixture.
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$(rec "$D" why)" in
+  *"produced a usable verdict"*) ok "datum: the persisted cause still says the pass judged nothing usable" ;;
+  *) bad "datum: the persisted cause lost 'produced a usable verdict' — '$(rec "$D" why)'" ;;
+esac
+case "$OUT_DRIVE" in
+  *"produced a usable verdict"*) ok "datum: and the BLOCKED line still carries it" ;;
+  *) bad "datum: the BLOCKED line lost it — $OUT_DRIVE" ;;
 esac
 
 

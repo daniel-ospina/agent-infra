@@ -2331,6 +2331,17 @@ record_unusable() {   # <slug> [<reason>]
   # One field, no spaces: this lands in a `key=value` record and in a greppable log line.
   slug="$(printf '%s' "$slug" | tr ' /' '--' | tr -cd 'A-Za-z0-9._:-')"
   [ -n "$slug" ] || slug="unnamed-surface"
+  # ⛔ THE DATUM BELONGS TO THE FIRST FAILING RUN, NOT TO THE LAST ONE JUDGED (review of #2401).
+  # `PRE_RC` / `PRE_ERR_LINE` are overwritten by EVERY candidate, so a pass whose pool was
+  # `#42 INCOMPLETE (rc 2, stderr …)` then `#43 degraded CLEAN` (rc 0, no stderr) recorded
+  # `tool_rc=0 stderr=none` beside `first cause: claim gate: … could not answer` — the record
+  # CONTRADICTED its own first cause and asserted a healthy tool where the failing run exited 2.
+  # Snapshot once, HERE, because this is the single arm every unusable candidate passes through:
+  # the datum then always describes the run whose words `unusable_cause` quotes.
+  if [ -z "${PRE_FAIL_AT:-}" ]; then
+    PRE_FAIL_AT="${N:-}"; PRE_FAIL_RC="${PRE_RC:-}"; PRE_FAIL_ERR="${PRE_ERR_LINE:-}"
+    PRE_FAIL_ARM="$slug"
+  fi
   printf '%s\t%s\n' "$slug" "$(printf '%s' "$reason" | tr '\n\t' '  ')" >> "$UNUSABLE_LOG" 2>/dev/null || true
 }
 # `slug:n …` in first-seen order — a count per surface, which is what tells an operator whether ONE
@@ -2357,11 +2368,19 @@ unusable_cause() {    # the FIRST failure's own words, bounded so one log line s
 # (`refresh_cause_brief` truncates `why=` at 400 chars, `unusable_cause` at 320).
 PRE_RC=""            # the pre-flight's OWN exit status for the candidate just judged
 PRE_ERR_LINE=""     # the first non-empty STDERR line it wrote (its diagnostic, when it has one)
-preflight_datum() {  # "cmd=<tool> <args> rc=<N> stderr=<first line|none>"
-  [ -n "${PRE_RC:-}" ] || return 0
-  printf 'cmd=%s rc=%s stderr=%s' \
+PRE_FAIL_AT=""       # the FIRST candidate that made this pass unusable, and ITS datum — see
+PRE_FAIL_RC=""       # `record_unusable`: the last candidate's rc would contradict the first cause
+PRE_FAIL_ERR=""
+PRE_FAIL_ARM=""      # …and WHICH arm produced that record. The claim-registry arms record unusable
+                     # AFTER a CLEAN pre-flight (`rc 0`), so a bare `rc=0 stderr=none` beside their
+                     # cause reads as a contradiction; naming the arm makes the datum unambiguous
+                     # without giving the pre-flight another run's numbers (review of #2401, R1).
+preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first line|none>"
+  [ -n "${PRE_FAIL_RC:-}" ] || return 0
+  printf 'issue=#%s cmd=%s rc=%s stderr=%s' \
+    "${PRE_FAIL_AT:-?}" \
     "$(basename "${PREFLIGHT:-pre-flight}") --repo ." \
-    "$PRE_RC" "${PRE_ERR_LINE:-none}"
+    "$PRE_FAIL_RC" "${PRE_FAIL_ERR:-none}"
 }
 # The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
 # the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
@@ -2520,8 +2539,14 @@ while read -r N; do
   # the same text they always did.
   PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>"$PRE_ERR_FILE")"; PRE_RC=$?
   PRE_ERR_LINE="$(grep -m1 -v '^[[:space:]]*$' "$PRE_ERR_FILE" 2>/dev/null | cut -c1-200)"
-  if [ -n "${PRE_ERR_LINE:-}" ]; then
-    PRE="$PRE"$'\n'"$PRE_ERR_LINE"
+  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT ONLY ITS FIRST LINE (review of #2401). Folding one
+  # line kept the RECORD field short while silently changing what every existing parser sees: a
+  # producer that writes its `INCOMPLETE SURFACES` block or its `VERDICT` on stderr (or a multi-line
+  # environment explanation on the rc-3 path, which `tail -3` then quotes) lost every line after the
+  # first, so `preflight_unusable_surfaces` found nothing and the record degraded to `unknown`. The
+  # fold is bounded (`tail -40`) only so a chatty producer cannot flood the captured variable.
+  if [ -s "$PRE_ERR_FILE" ]; then
+    PRE="$PRE"$'\n'"$(tail -40 "$PRE_ERR_FILE" 2>/dev/null)"
   fi
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
@@ -2948,7 +2973,8 @@ if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
   refresh_fail preflight "$EXIT_TRANSIENT" \
     "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_datum:+ — pre-flight $_us_datum}${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
     "judged=$judged" "unusable=${_us_summary:-unknown}" \
-    "tool_rc=${PRE_RC:-unrecorded}" "tool_err=${PRE_ERR_LINE:-none}" \
+    "tool_rc=${PRE_FAIL_RC:-unrecorded}" "tool_err=${PRE_FAIL_ERR:-none}" \
+    "tool_issue=${PRE_FAIL_AT:-unrecorded}" "tool_arm=${PRE_FAIL_ARM:-none}" \
     "tool_cmd=$(basename "${PREFLIGHT:-pre-flight}") --repo ."
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
