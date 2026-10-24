@@ -32,7 +32,10 @@
 #           in every file, and only a genuinely shared group is refused); and
 #         - the REF — `${{ github.ref }}` or `${{ github.head_ref }}`, or
 #           `${{ github.event.pull_request.number }}` for `pull_request_target` (there `github.ref`
-#           is the BASE branch, so a ref key collapses every PR into one group); and
+#           is the BASE branch, so a ref key collapses every PR into one group). It must be the ONLY
+#           per-commit variable: a group that ALSO carries `${{ github.sha }}` (or a
+#           `github.run_id` / `run_number` / `run_attempt`) resolves per head, so it cancels nothing
+#           while looking like an optimisation — an inert gate, refused by name; and
 #         - `cancel-in-progress: true` — a superseded head is precisely what should be cancelled.
 #   R2  PUSH — a workflow triggered by `push` MUST NOT cancel: no `concurrency:` block, no
 #       `cancel-in-progress` key at all (GitHub's own default is not to cancel), or the literal
@@ -51,10 +54,13 @@
 #       its `#2474` rationale is RED (an exception copied without its reasoning is how a fail-open
 #       becomes folklore), and an exempt file missing from the scan set is RED (a rename must not
 #       silently re-arm R1's absence by disappearing the name instead).
-#   R0  UNREADABLE IS NOT COMPLIANT — a workflow whose `on:` triggers this reader cannot resolve, or
-#       that declares a JOB-level `concurrency:` (which GitHub honours and this check does not
-#       model), is RED. Silence is not compliance: the dangerous direction for a check like this is
-#       reporting green over a file it could not read.
+#   R0  UNREADABLE IS NOT COMPLIANT — a workflow whose `on:` triggers this reader cannot resolve, that
+#       declares a JOB-level `concurrency:` (which GitHub honours and this check does not model), or
+#       whose `concurrency:` value is a sequence or an alias, is RED. Silence is not compliance: the
+#       dangerous direction for a check like this is reporting green over a file it could not read.
+#       The value FORMS that are modelled: an indented block of `group:`/`cancel-in-progress:`, a
+#       flow mapping (`concurrency: {group: …, cancel-in-progress: …}`), and the scalar shorthand
+#       (`concurrency: <group>`, which cannot express cancellation and so cannot satisfy R1).
 #
 # DECLARED OVER-BLOCKS (the cost of the rules above, stated rather than discovered)
 # ------------------------------------------------------------------------------
@@ -136,6 +142,11 @@ else
   done
 fi
 
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "❌ no workflow files were scanned — refusing to report PASS over an empty scan set (<$MODE>)" >&2
+  exit 2
+fi
+
 TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency.XXXXXX")" || exit 2
 TMP_GROUPS="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency-groups.XXXXXX")" || exit 2
 trap 'rm -f "$TMP_OUT" "$TMP_GROUPS"' EXIT
@@ -175,6 +186,20 @@ function addflow(v,   n, i, parts, t) {
   n = split(v, parts, /,[ \t]*/)
   for (i = 1; i <= n; i++) { t = parts[i]; sub(/:.*/, "", t); addtrigger(t) }
 }
+# parseconc() — a FLOW-mapping `concurrency: {group: …, cancel-in-progress: true}`. Without this the
+# block reader below sees no indented children, so `group`/`cancel` stay EMPTY and the R2 arm that
+# treats an absent key as the GitHub default reads a CANCELLING workflow as compliant (round-3 P0, from
+# enforce-skills.yml with its own two-line block rewritten as a flow mapping).
+function parseconc(v,   n, i, parts, t, k) {
+  gsub(/^[\[{]/, "", v); gsub(/[\]}]$/, "", v)
+  n = split(v, parts, /,[ \t]*/)
+  for (i = 1; i <= n; i++) {
+    t = parts[i]
+    k = t; sub(/:.*/, "", k); k = unq(trim(k))
+    if (k == "group") { group = unq(trim(substr(t, index(t, ":") + 1))) }
+    else if (k == "cancel-in-progress") { cancel = unq(trim(substr(t, index(t, ":") + 1))) }
+  }
+}
 function opens(v)  { return gsub(/[\[{]/, "", v) }
 function closes(v) { return gsub(/[\]}]/, "", v) }
 # flush() — print the record for the file just finished, then clear its state. Called at the first
@@ -183,15 +208,16 @@ function flush(   tg, k, n) {
   if (fname == "") return
   n = 0; tg = ""
   for (k in trig) { n++; tg = tg (n > 1 ? " " : "") k }
-  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname
+  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\037%d\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname, concbad
   delete trig; hasconc = 0; group = ""; cancel = ""; joblevel = 0; fname = ""; onindent = -1; cur = ""
-  scalarindent = -1; flowopen = 0; flowbuf = ""; wfname = ""
+  scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""; wfname = ""; concbad = 0
 }
 BEGIN {
   cur = ""; SQ = sprintf("%c", 39); DQ = "\""
   QCH = "[" DQ SQ "]"
   KEYPAT = QCH "?[A-Za-z_][A-Za-z0-9_-]*" QCH "?[ \t]*:"
-  hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; wfname = ""
+  hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""
+  wfname = ""; concbad = 0
 }
 {
   if (FNR == 1) {                         # a new file begins: close the previous record FIRST
@@ -202,7 +228,7 @@ BEGIN {
   line = $0
   sub(/\r$/, "", line)
   sub(/^[ \t]*#.*$/, "", line)            # whole-line comment
-  sub(/[ \t]+#[^#]*$/, "", line)          # trailing comment (only when preceded by whitespace)
+  sub(/[ \t]+#.*$/, "", line)             # trailing comment (the comment may itself contain a hash: #2474)
   if (trim(line) == "") next
 
   # BLOCK SCALARS: `run: |` bodies are TEXT, not keys. Without this, a `concurrency:` line inside a
@@ -223,7 +249,10 @@ BEGIN {
   # R2 was never evaluated (round 2, P1).
   if (flowopen) {
     flowbuf = flowbuf " " trim(line)
-    if (opens(flowbuf) <= closes(flowbuf)) { addflow(flowbuf); flowopen = 0; flowbuf = "" }
+    if (opens(flowbuf) <= closes(flowbuf)) {
+      if (flowmode == "concurrency") { parseconc(flowbuf) } else { addflow(flowbuf) }
+      flowopen = 0; flowbuf = ""; flowmode = ""
+    }
     next
   }
 
@@ -240,11 +269,24 @@ BEGIN {
     if (cur == "on") {
       rest = trim(substr(line, index(line, ":") + 1))
       if (rest != "") {
-        if (opens(rest) > closes(rest)) { flowopen = 1; flowbuf = rest }
+        if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "on"; flowbuf = rest }
         else { addflow(rest) }            # `on: push` / `on: [a, b]` / `on: {pull_request: {}}`
       }
     }
-    if (cur == "concurrency") { hasconc = 1 }
+    if (cur == "concurrency") {
+      hasconc = 1
+      rest = trim(substr(line, index(line, ":") + 1))
+      if (rest != "") {
+        if (rest ~ /^\{/) {
+          if (opens(rest) > closes(rest)) { flowopen = 1; flowmode = "concurrency"; flowbuf = rest }
+          else { parseconc(rest) }
+        } else if (rest ~ /^\[/ || rest ~ /^\*/) {
+          concbad = 1                   # a sequence or an alias: valid YAML, not modelled -> R0
+        } else {
+          group = unq(rest)             # the scalar shorthand `concurrency: <group>`
+        }
+      }
+    }
     next
   }
 
@@ -305,7 +347,7 @@ has_trigger() { # has_trigger <triggers> <name>
   return 1
 }
 
-while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed wfname; do
+while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed wfname concbad; do
   [ -n "${fname:-}" ] || continue
   scanned=$((scanned + 1))
 
@@ -322,6 +364,10 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
   fi
   if [ "$joblevel" -eq 1 ]; then
     fail "$fname: declares a JOB-level \`concurrency:\`, which GitHub honours and this check does not model — hoist it to a workflow-level \`concurrency:\` (see --help) [R0]"
+    continue
+  fi
+  if [ "${concbad:-0}" -eq 1 ]; then
+    fail "$fname: the \`concurrency:\` value is a sequence or an alias — valid YAML that this check does not model, and an unreadable cancellation policy must not read as compliant [R0]"
     continue
   fi
 
@@ -373,8 +419,9 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # the comparison must resolve it — otherwise two workflows with different names that share
         # the canonical `${{ github.workflow }}-${{ github.ref }}` idiom would be false-red as
         # "they would cancel each other" (round 2 P2), when their runtime groups differ.
-        resolved="${group//'${{ github.workflow }}'/$wfname}"
-        resolved="${resolved//'${{github.workflow}}'/$wfname}"
+        identity="${wfname:-$fname}"
+        resolved="${group//'${{ github.workflow }}'/$identity}"
+        resolved="${resolved//'${{github.workflow}}'/$identity}"
         printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
         if has_trigger "$triggers" pull_request_target; then
           case "$group" in
@@ -383,6 +430,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
           esac
         else
           case "$group" in
+            *'github.sha'*|*'github.run_id'*|*'github.run_number'*|*'github.run_attempt'*)
+              fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` or \`github.head_ref\` alone [R1]" ;;
             *'github.ref'*|*'github.head_ref'*) : ;;
             *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\` or \`github.head_ref\`. Keyed on a SHA it cancels nothing (each head is its own group) [R1]" ;;
           esac

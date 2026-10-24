@@ -439,7 +439,9 @@ conc_run() { # conc_run <expected-exit> <label> [args...]
 conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-ok.yml" "$CFIX/pr-target-ok.yml" "$CFIX/push-ok.yml" "$CFIX/push-cancel-false.yml" \
   "$CFIX/pr-head-ref.yml" "$CFIX/push-group-only.yml" "$CFIX/push-block-scalar.yml" \
-  "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml"
+  "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml" \
+  "$CFIX/pr-trailing-comment.yml" "$CFIX/push-heredoc.yml" \
+  "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -454,6 +456,12 @@ for pair in \
   "push-single-quoted.yml R2" \
   "push-space-colon.yml R2" \
   "push-multiline-flow.yml R2" \
+  "push-flow-map.yml R2" \
+  "push-cancel-true-capital.yml R2" \
+  "pr-sha-plus-ref.yml R1" \
+  "pr-scalar-concurrency.yml R1" \
+  "pr-concurrency-sequence.yml R0" \
+  "push-concurrency-alias.yml R0" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
