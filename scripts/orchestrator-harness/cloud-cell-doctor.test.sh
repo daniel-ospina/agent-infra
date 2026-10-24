@@ -1553,14 +1553,20 @@ for shape in unparseable-pid no-identity-record; do
 done
 reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
 
-say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick and every role's BARE entry (#2135/#2424)"
-# ⛔ THE BUG THESE CASES EXIST FOR. `run_loop` dispatches `run_role_pass doctor|merge|hygiene` with NO
-# mode argument; `run_role_pass` forwards `"$@"`, so each role's `local dry="$1"` read an UNBOUND `$1`
-# under `set -u` and the loop DIED on its first tick — every tick, on every cell
+say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick and every role's DIRECT entry (#2135/#2424)"
+# ⛔ THE BUG THESE CASES EXIST FOR. `run_loop` USED TO dispatch `run_role_pass doctor|merge|hygiene`
+# with NO mode argument; `run_role_pass` forwards `"$@"`, so each role's `local dry="$1"` read an
+# UNBOUND `$1` under `set -u` and the loop DIED on its first tick — every tick, on every cell
 # (`cloud-cell-doctor.sh: line 1385: $1: unbound variable`). Doctor is first, so it crashed; reap,
 # merge and hygiene carried the identical latent crash. The suite above never saw it because its loop
 # fixture has no `.desired` and quenches BEFORE the first dispatch, and because every CLI verb binds
-# `$1` (to "") — so only the BARE call shape the scheduler uses is fatal.
+# `$1` (to "") — so only the absent-mode call shape the scheduler used was fatal.
+# ⛔ THE LOOP IS NO LONGER THE DISCRIMINATOR, AND THIS SUITE MUST NOT PRETEND IT IS. #2424 shipped
+# TWICE: this branch defaults the mode in each role (`local dry="${1:-}"`), while #2555 landed
+# separately and made the loop bind it explicitly (`run_role_pass doctor ""`). Both fixes are in the
+# merged tree, so Arm A below can no longer drive an unbound `$1` on its own — the arms that call the
+# roles DIRECTLY (B/C/D) are what pin the absent argument now. Arm A still earns its place: it pins
+# that every derived role records a LIVE pass on the loop's real tick.
 #
 # ⛔ THE ROLE SET IS DERIVED FROM THE DISPATCHER, NEVER SPELLED HERE. A hardcoded list covers the four
 # roles that exist today and silently ignores the fifth: a new role added to `run_role_pass` with a
@@ -1731,7 +1737,7 @@ while read -r _r _f; do
   # match, awk takes SIGPIPE, and the pipeline status makes this `if` take the ELSE branch — the
   # measured flake was one role failing while the other three passed on the SAME file.
   if grep -q 'local dry="\${1:-}"' < <(awk "/^run_${_f}\\(\\) \\{/,/^\\}/" "$DOCTOR"); then
-    ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (the bare-dispatch shape the loop uses)"
+    ok "audit: run_${_f}'s mode read is DEFAULTED TO EMPTY (it survives the absent/empty mode the scheduler passes)"
   else
     bad "audit: run_${_f} does NOT read its mode as \"\${1:-}\" — a bare dispatch would kill or rehearse the scheduler"
   fi
