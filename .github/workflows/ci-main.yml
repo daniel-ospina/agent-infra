@@ -384,11 +384,11 @@ jobs:
     # sized from it (70 min on a step that now runs in ~6-8 s) was protecting nothing. That
     # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
     # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
-    # shard list. MEASURED AFTER #2529 (2026-10-24, this job's step 6 across 4 main runs, and the PR
-    # lane's equivalent across 12): **6, 6, 8, 8 s** here (12 samples on the PR lane: 6-12 s, worst
-    # 17 s). What remains expensive on this lane is the SHARDS step: measured 46m04s-53m49s on the
-    # same four runs, which is what the 110 min bound below is actually sized for, and what
-    # sharding main (the separate change named below) would cut.
+    # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the
+    # Actions API): step 6, the self-test, **6-9 s**; step 7, the shards, **46m38s-54m32s**. The PR
+    # lane's equivalent step, 17 runs sampled: 6-12 s with one 17 s outlier. What remains expensive
+    # here is the SHARDS step — that is what the 110 min bound below is sized for, and what sharding
+    # main (the separate change named below) would cut.
     #
     # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
     # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
@@ -445,9 +445,9 @@ jobs:
         timeout-minutes: 5
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
-        # 6-8 s measured on this job since #2529 (4 main runs, 2026-10-24; 6-17 s on the PR lane,
-        # 12 samples). 15 min ≈ 110x the 8 s worst observed here; the old 70 min was sized from a
-        # measurement taken before #2529 and could not fail fast on anything.
+        # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
+        # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the
+        # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
         timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
       - name: Bash shards — the ONE list both lanes run (#1369)
@@ -456,8 +456,9 @@ jobs:
         # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
-        # 46m04s-53m49s measured on this job (4 main runs, 2026-10-24) for the whole unsharded
-        # list; 110 min is ~2.1x. (The 73m37s figure this comment used to carry is PR #2412's,
+        # 46m38s-54m32s measured on this job (8 successful main runs, 2026-10-24) for the whole
+        # unsharded list; 110 min is ~2.0x the top of that range. (The 73m37s figure this comment
+        # used to carry is PR #2412's,
         # before the shard work that followed.) STEP-level for the reason in this job's header: a
         # job-level trip is `cancelled` and non-red to the rail, a step-level trip is `failure`
         # and red.

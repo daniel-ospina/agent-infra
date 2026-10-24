@@ -1100,10 +1100,11 @@ jobs:
   bash-suites-gate:
     # #1369's two guard steps, ONCE per PR — not once per slice. They lived in `bash-suites`
     # while it was a single job; inside a MATRIX they would run 8 times, and
-    # `tests/ci-lane-parity/run.sh` drives the runner's FAST copy several times (its pins execute
-    # a fixture built from the runner's own lines) and today costs ~8 s, but it is a whole suite per
-    # slice — running it 8 times would buy nothing and would re-create this PR's own defect in the
-    # job that exists to catch it.
+    # `tests/ci-lane-parity/run.sh` executes, once per runtime pin, a fixture built from the
+    # runner's own lines with every `run_shard` rewritten to the hermetic
+    # `tests/ci-lane-parity/stand-in-shard.sh` (there is no `runner-fast.sh` any more — #2529
+    # removed it). It costs ~8 s today, but it is a whole suite per slice: running it 8 times would
+    # buy nothing and would re-create this PR's own defect in the job that exists to catch it.
     #
     # ⛔ NOT conditional and no `needs:` — `check-ci-lane-parity` refuses `if`/`needs`/
     # `continue-on-error` on the call-carrying job exactly so a lane cannot be made to look wired
@@ -1114,10 +1115,11 @@ jobs:
     # THE 38m41s FIGURE THIS COMMENT USED TO CARRY — that measurement is PR #2412's (job
     # 120365087427, 2026-10-23T10:25Z), and it predates #2529 (`00814821`, 16:09Z the same day),
     # which stopped the suite's fixture re-running the real shard list and replaced it with one
-    # hermetic stand-in. MEASURED AFTER #2529 (2026-10-24, `bash-suites-gate` step 5 across 12 PR
-    # runs): 6, 6, 8, 8, 8, 8, 8, 8, 9, 9, 12 s, worst seen 17 s — the ~90 static arms, not shards,
-    # are the wall now. The stale figure outlived its cause by a day and was read as "the one
-    # confirmed per-PR cost left"; a bound derived from it protects nothing while it looks sized.
+    # hermetic stand-in. MEASURED AFTER #2529 (2026-10-24, `bash-suites-gate` step 5, 17 PR runs
+    # sampled from the Actions API): 6-12 s on 16 of them (3x6, 1x7, 8x8, 2x9, 2x12 s) and one
+    # 17 s outlier — the ~90 static arms, not the shard list, are the wall now. The stale figure
+    # outlived its cause by a day and was read as "the one confirmed per-PR cost left"; a bound
+    # derived from it protects nothing while it looks sized.
     #
     # 15 min ≈ 53x the worst observed 17 s: a bound BELOW the real run would false-block every PR
     # (a red that is not a defect is how a gate loses its authority), while a bound 400x above it
