@@ -163,24 +163,40 @@ wt_ahead_count() {
     printf '%s' "$n"
 }
 
-# wt_lock_is_stale_initializing <repo> <path> — 0 when this record is an add that never finished.
+# wt_lock_reason <path> -> the text of this record's `locked` file, or "" when there is none.
 # git writes `<gitdir>/worktrees/<name>/locked` containing `initializing` for the duration of
 # `worktree add`, and REMOVES it when the checkout completes. So a surviving `initializing` lock is
 # positive evidence that the add did not complete — the one signal that separates a partial
 # materialisation (no work can exist in it) from a checkout an operator marked locked on purpose.
-# The age floor only excludes an add that is in progress RIGHT NOW; it is not the safety.
-WT_INIT_LOCK_MIN_AGE="${WT_INIT_LOCK_MIN_AGE:-300}"
-wt_lock_is_stale_initializing() {
-    local path="$1" gd f reason age
+wt_lock_reason() {
+    local path="$1" gd f reason
     # The admin directory is resolved FROM THE CHECKOUT (`-C <path> rev-parse --git-dir`), never by
     # guessing `<common>/worktrees/<basename>` and never by scanning every record: a scan would
     # answer for the WRONG worktree, and "repair" one this call has no business touching.
-    gd="$(wt_git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 1
-    [ -n "$gd" ] || return 1
+    gd="$(wt_git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || gd=""
+    [ -n "$gd" ] || { printf ''; return 0; }
     f="$gd/locked"
-    [ -f "$f" ] || return 1
-    reason="$(cat "$f" 2>/dev/null)" || return 1
-    [ "$reason" = "initializing" ] || return 1
+    [ -f "$f" ] || { printf ''; return 0; }
+    reason="$(cat "$f" 2>/dev/null)" || reason=""
+    printf '%s' "$reason"
+}
+
+# wt_lock_is_initializing <path> — 0 when this record is an add that has not completed. The ONE probe
+# of the lock; the two predicates below both read it, so the "is there a lock" question and the "is it
+# old enough to be dead" question can never disagree about what the lock SAYS.
+wt_lock_is_initializing() {
+    [ "$(wt_lock_reason "$1")" = "initializing" ]
+}
+
+# wt_lock_initializing_age <path> — the lock's age in seconds, or "" when it is not an initializing
+# lock or the age cannot be read. Numeric or nothing: a garbled value is "cannot judge", never a number.
+WT_INIT_LOCK_MIN_AGE="${WT_INIT_LOCK_MIN_AGE:-300}"
+wt_lock_initializing_age() {
+    local path="$1" gd f age
+    wt_lock_is_initializing "$path" || { printf ''; return 0; }
+    gd="$(wt_git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || gd=""
+    [ -n "$gd" ] || { printf ''; return 0; }
+    f="$gd/locked"
     # ⛔ GNU `stat -c %Y` FIRST, then BSD `stat -f %m` — NEVER the reverse (agent-infra#1702, whose
     # note lives in orch-loop.sh beside every other copy of this ladder). GNU coreutils reads `-f` as
     # "filesystem status" and `%m` as a second FILENAME: it prints a whole filesystem block to stdout
@@ -189,17 +205,26 @@ wt_lock_is_stale_initializing() {
     # the interrupted-add repair below — the whole reason this function exists — was DEAD CODE in the
     # one environment (ubuntu CI / the cloud cells) where it would matter. The suite never caught it
     # because it was not wired into run-bash-shards.sh; spawn-gate.test.sh's wiring guard now fails
-    # on that, which is how it surfaced. Both probes are validated numerically, and a garbled value
-    # is "cannot judge" (return 1 = do not repair), never a number.
+    # on that, which is how it surfaced. Both probes are validated numerically.
     age="$(stat -c %Y "$f" 2>/dev/null || true)"
     case "$age" in ''|*[!0-9]*) age="" ;; esac
     if [ -z "$age" ]; then
         age="$(stat -f %m "$f" 2>/dev/null || true)"
         case "$age" in ''|*[!0-9]*) age="" ;; esac
     fi
-    [ -n "$age" ] || return 1
-    [ "$(( $(date +%s) - age ))" -ge "$WT_INIT_LOCK_MIN_AGE" ]
+    [ -n "$age" ] || { printf ''; return 0; }
+    printf '%s' "$(( $(date +%s) - age ))"
 }
+
+# wt_lock_is_stale_initializing <path> — 0 when this record is an add that never finished.
+# The age floor only excludes an add that is in progress RIGHT NOW; it is not the safety.
+wt_lock_is_stale_initializing() {
+    local age
+    age="$(wt_lock_initializing_age "$1")"
+    [ -n "$age" ] || return 1
+    [ "$age" -ge "$WT_INIT_LOCK_MIN_AGE" ]
+}
+
 
 # ── rollback ─────────────────────────────────────────────────────────────────────────────────────
 # wt_rollback <repo> <path> <branch> <created_branch 0|1> <base>
@@ -293,6 +318,26 @@ wt_provision() {
             wt_log provision "repairing an INTERRUPTED add at $wt_registered (lock reads 'initializing')"
             wt_rollback "$repo" "$wt_registered" "$br" 0 "$base" || return 3
             WT_RESULT="repaired interrupted add"
+        elif wt_lock_is_initializing "$wt_registered"; then
+            # ⛔ A **YOUNG** `initializing` LOCK IS NOT A USABLE WORKTREE (#2102 review P1, MEASURED).
+            # This arm used to fall through to the `elif` below, which asks the checkout two questions
+            # — does `symbolic-ref --short HEAD` name the branch, and does `rev-parse --verify HEAD`
+            # resolve — and BOTH are already true in a killed `worktree add`, because git creates the
+            # ref and writes HEAD BEFORE it populates the tree (the measured ordering quoted in this
+            # file's header). So for the first `${WT_INIT_LOCK_MIN_AGE}s` after an add died, the
+            # "reuse" answer was rc=0 against a half-materialised checkout: measured, a tree with
+            # every file missing answered `rc=0  WT_RESULT=reused existing worktree …`, and the caller
+            # spawned a lane into it — consequence #2 of the header, in the window the floor does not
+            # cover. `rc=0` MUST mean "a USABLE worktree exists at <path>", and a record git still
+            # marks `initializing` cannot prove that, whether the add is running or dead.
+            #
+            # rc=2 is the callers' documented "refuses to touch, nothing changed": dispatch-merge.sh
+            # releases the claim and the issue is retried on the next cycle, by which time the lock is
+            # either gone (a real add finished) or past the floor (a dead one is repaired above).
+            # Reaping it here instead would be a recursive delete of a checkout another process may
+            # be writing RIGHT NOW — that is what the floor exists to prevent.
+            WT_RESULT="record at $wt_registered is locked 'initializing' and younger than ${WT_INIT_LOCK_MIN_AGE}s — an add is either still running or died moments ago, and neither leaves a checkout that can be PROVEN usable (git writes the ref and HEAD before it populates the tree). Refusing to reuse it; nothing was changed — retry next cycle"
+            return 2
         elif [ "$(wt_git -C "$wt_registered" symbolic-ref --short HEAD 2>/dev/null)" = "$br" ] \
              && wt_git -C "$wt_registered" rev-parse --verify -q HEAD >/dev/null 2>&1; then
             # ⛔ rc=0 MUST MEAN "A USABLE WORKTREE EXISTS AT <path>" — THE PATH THE CALLER NAMED
@@ -613,7 +658,7 @@ wt_dirt() {
 # REPO, never from the checkout being deleted.
 wt_reap_if_empty() {
     local repo="$1" path="$2" br="$3" label="${4:-lane}" base="${5:-${WT_BASE:-origin/main}}"
-    local canon cwd_reg a oid holder holder_rc dirt verdict detail upstream
+    local canon cwd_reg a oid holder holder_rc dirt verdict detail upstream cur_br head_sha survivors
     WT_RESULT=""
     case "$path" in /*) ;; *) path="$repo/$path" ;; esac
     [ -d "$repo" ] || { WT_RESULT="repo does not exist"; return 1; }
@@ -628,6 +673,40 @@ wt_reap_if_empty() {
         # Never remove a directory that CONTAINS our cwd (only the lane's own checkout is ours).
         "$canon"/*) WT_RESULT="refusing to remove $canon: it contains the caller's cwd ($cwd_reg)"; return 2 ;;
     esac
+
+    # ⛔ THE CHECKOUT'S OWN HEAD IS THE ONE FACT THIS FUNCTION NEVER ASKED (#2102 review P1, MEASURED).
+    # Every gate below asks about `refs/heads/$br` — does it resolve, how far ahead of the base is it,
+    # was it pushed — and NOT ONE of them asks what the checkout is actually checked out ON. A lane
+    # that left HEAD DETACHED (an agent's `git checkout --detach`, a bisect, a rebase that died) and
+    # committed its work there passes all of them: the tree is clean (nothing to preserve), `$br` is
+    # still at the base (0 ahead), and there is no `origin/$br` (never pushed) — so the checkout was
+    # removed, the branch deleted by CAS, and the lane's commit left reachable from NOTHING.
+    # MEASURED before this guard: `rc=0  WT_RESULT=reaped … (lane 9 produced no commits)`, and
+    # `git for-each-ref --contains <sha>` then listed no ref at all — silent destruction of work,
+    # reported as "produced no commits". The reviewed reaper already treats this class as PRESERVE
+    # (`detached-unreachable`, above every remove class); this is the same rule at the earlier seam.
+    cur_br="$(wt_git -C "$path" symbolic-ref --short HEAD 2>/dev/null)" || cur_br=""
+    if [ "$cur_br" != "$br" ]; then
+        if [ -n "$cur_br" ]; then
+            WT_RESULT="the checkout is on refs/heads/$cur_br, NOT on refs/heads/$br — the work it holds is on another branch, so nothing here is provably this lane's empty work; kept"
+            return 1
+        fi
+        # Detached. Removing the checkout cannot orphan anything ONLY when the commit HEAD names is
+        # already held by a ref that survives this call. `refs/heads/$br` is excluded because this
+        # function deletes it — "it survives" must mean a ref we are not about to delete.
+        head_sha="$(wt_git -C "$path" rev-parse --verify -q HEAD 2>/dev/null)" || head_sha=""
+        survivors=""
+        if [ -n "$head_sha" ]; then
+            survivors="$(wt_git -C "$repo" for-each-ref --contains "$head_sha" --format='%(refname)' 2>/dev/null \
+                         | grep -vx "refs/heads/$br" || true)"
+        fi
+        if [ -z "$survivors" ]; then
+            WT_RESULT="the checkout's HEAD is DETACHED at ${head_sha:-an unreadable commit} and no ref that survives this call holds that commit — removing the checkout would orphan the lane's commits; kept (the reaper's detached-unreachable policy is bash scripts/pi-reap-worktrees.sh --repo '$repo')"
+            return 1
+        fi
+        # Detached at a commit a surviving ref already holds (typically the base tip): nothing can be
+        # lost by removing the checkout, so fall through — every gate below is unchanged.
+    fi
 
     holder=""; holder_rc=0
     holder="$(wt_live_holders "$canon")" || holder_rc=$?

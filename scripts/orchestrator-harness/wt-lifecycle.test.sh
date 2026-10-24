@@ -263,14 +263,32 @@ assert_dir "$REPO/.worktrees/tm-5" "W5 the worktree exists"
 assert_eq "$("$REAL_GIT" -C "$REPO/.worktrees/tm-5" status --porcelain | wc -l | tr -d ' ')" "0" \
     "W5 and it is clean (no phantom deletions)"
 
-# ── W6: an ACTIVE lock (`initializing` but young) is NOT touched ───────
+# ── W6: an ACTIVE lock (`initializing` but young) is REFUSED, not reused ───────
 ENV=W6; REPO="$(mk_repo $ENV)"
 "$REAL_GIT" -C "$REPO" worktree add -q "$REPO/.worktrees/tm-6" -b feat/6-tm origin/main
 GD="$("$REAL_GIT" -C "$REPO/.worktrees/tm-6" rev-parse --path-format=absolute --git-dir)"
 printf 'initializing\n' >"$GD/locked"
+# ⛔ THIS ARM'S EXPECTATION WAS INVERTED (#2102 review P1, MEASURED). It used to assert `rc=0` +
+# `reused` for a young `initializing` lock — "an add may still be running, leave it alone". But rc=0 is
+# the callers' "a USABLE worktree exists at <path>", and a HALF-MATERIALISED checkout answers it,
+# because git writes the ref and HEAD BEFORE it populates the tree (the ordering quoted in
+# wt-lifecycle.sh's header). Measured on the PRODUCTION default floor (300 s): a record locked
+# `initializing` whose tree has every file missing answered `rc=0  WT_RESULT=reused existing
+# worktree …`, and dispatch-merge.sh spawned a lane into it — consequence #2 of that header, in
+# exactly the window the floor does not cover. The lock is still NOT touched (that is what the floor
+# is for), but "not touched" is rc=2, not a claim of usability: the caller releases the claim and
+# retries next cycle.
+rm -f "$REPO/.worktrees/tm-6/keep.txt"     # the REAL measured residue: a partial tree reads as DELETED
+W6_FILES="$(cd "$REPO/.worktrees/tm-6" && ls)"
 OUT="$( cd "$REPO" && WT_GIT="$REAL_GIT" WT_INIT_LOCK_MIN_AGE=3600 bash -c ". '$WTL' || exit 99; wt_provision '$REPO' .worktrees/tm-6 feat/6-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" )"
-assert_contains "$OUT" "rc=0" "W6 a lock from an add in progress is left alone"
-assert_contains "$OUT" "WT_RESULT=reused" "W6 the worktree is reused (an add may still be running)"
+assert_contains "$OUT" "rc=2" "W6 a young 'initializing' lock is REFUSED, never reported usable"
+assert_contains "$OUT" "initializing" "W6 the refusal names the lock as the reason"
+case "$OUT" in *"WT_RESULT=reused"*) bad "W6 a half-materialised checkout was reported as a REUSABLE worktree" ;;
+                 *) ok "W6 …and it is never spelled 'reused' (rc=0 means usable; this is not)" ;; esac
+assert_eq "$(cd "$REPO/.worktrees/tm-6" && ls)" "$W6_FILES" \
+    "W6 nothing was created, repaired or deleted while an add may still be running"
+assert_dir "$REPO/.worktrees/tm-6" "W6 the record survives (the floor is not a licence to reap it)"
+assert_branch "$REPO" feat/6-tm "W6 the branch survives too"
 
 # ── W7: a path occupied by an unregistered directory is REFUSED ────────
 ENV=W7; REPO="$(mk_repo $ENV)"
@@ -390,6 +408,55 @@ assert_dir "$REPO/.worktrees/tm-14" "L5 the live checkout survives"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 OUT="$(in_wt "wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-14' feat/14-tm 'lane 14'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
 assert_contains "$OUT" "rc=0" "L5 once the holder is gone, the same call reaps"
+
+# ── L5b: a DETACHED-HEAD commit is PRESERVED, never orphaned ──────────────
+# ⛔ #2102 review P1, MEASURED. Every gate below used to ask only about `refs/heads/$br`; not one asked
+# what the checkout was checked out ON. So a lane that left HEAD detached and committed its work there
+# passed them all — clean tree, `$br` still at the base (0 ahead), never pushed — and the checkout was
+# removed and the branch CAS-deleted, leaving the lane's commit reachable from NOTHING while the log
+# said "produced no commits". The reviewed reaper already treats this class as PRESERVE
+# (`detached-unreachable`); this arm pins the same rule at the lane's own exit seam.
+ENV=L5b; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
+"$REAL_GIT" -C "$REPO/.worktrees/tm-15" checkout -q --detach origin/main
+printf 'lane work\n' >"$REPO/.worktrees/tm-15/w.txt"
+"$REAL_GIT" -C "$REPO/.worktrees/tm-15" add w.txt
+"$REAL_GIT" -C "$REPO/.worktrees/tm-15" commit -qm "lane 15 detached work"
+L5B_SHA="$("$REAL_GIT" -C "$REPO/.worktrees/tm-15" rev-parse HEAD)"
+L5B_AHEAD="$("$REAL_GIT" -C "$REPO" rev-list --count "origin/main..refs/heads/feat/15-tm")"
+assert_eq "$L5B_AHEAD" "0" "L5b precondition: the NAMED branch is 0 ahead (so every other gate would pass)"
+OUT="$(in_wt "wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-15' feat/15-tm 'lane 15'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5b a DETACHED-HEAD commit preserves the checkout"
+assert_contains "$OUT" "DETACHED" "L5b the reason says the HEAD is detached (not that the lane was empty)"
+assert_dir "$REPO/.worktrees/tm-15" "L5b the checkout survives (the commit inside it is the only copy)"
+assert_branch "$REPO" feat/15-tm "L5b the branch survives too"
+if "$REAL_GIT" -C "$REPO" cat-file -e "$L5B_SHA" 2>/dev/null; then ok "L5b the lane's commit still exists"; else bad "L5b the lane's commit was DESTROYED"; fi
+if [ -n "$("$REAL_GIT" -C "$REPO/.worktrees/tm-15" rev-parse --verify -q HEAD)" ]; then
+  ok "L5b …and it is still checked out somewhere (not merely an object)"; else bad "L5b the lane's work was left dangling"; fi
+
+# ── L5c: the same checkout, EMPTY, still reaps when nothing can be lost ──
+# The guard must not be a blanket "detached ⇒ keep": a lane that detached and committed NOTHING sits
+# on a commit a surviving ref already holds (the base tip), so removing it cannot orphan anything —
+# and keeping it would leave exactly the residue #2033 exists to remove.
+ENV=L5c; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
+"$REAL_GIT" -C "$REPO/.worktrees/tm-16" checkout -q --detach origin/main
+OUT="$(in_wt "wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-16' feat/16-tm 'lane 16'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "L5c a detached HEAD at a commit a survivor holds is still reapable"
+assert_nodir "$REPO/.worktrees/tm-16" "L5c the empty checkout is gone (no residue left behind)"
+assert_nobranch "$REPO" feat/16-tm "L5c and its 0-ahead branch with it"
+
+# ── L5d: a checkout on ANOTHER branch is PRESERVED ─────────────────────────
+# The other half of the same blind spot: the directory is a worktree of somebody else's branch. Removing
+# it loses that checkout (and any stash/scratch state) while the log would call the lane empty.
+ENV=L5d; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-17 feat/17-tm origin/main" "$REPO" >/dev/null
+"$REAL_GIT" -C "$REPO" branch feat/other-17 origin/main
+"$REAL_GIT" -C "$REPO/.worktrees/tm-17" checkout -q feat/other-17
+OUT="$(in_wt "wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-17' feat/17-tm 'lane 17'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5d a checkout on ANOTHER branch is preserved"
+assert_contains "$OUT" "feat/other-17" "L5d the reason names the branch it is actually on"
+assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 
 # ── L6: the SHIPPED lane.sh trap does the same, end to end ─────────────
 # The lane is executed for real: a stub `pi` returns immediately (so no model is called), the lane
