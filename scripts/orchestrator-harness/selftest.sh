@@ -471,7 +471,9 @@ ck "shipped reaper: the skipped pass says so (an unreadable listing is not an em
 # the same guard for the neighbouring `.open_iss` probe, which had the safe polarity by accident
 RO="$TMP/reap-failopen"; mkdir -p "$RO"
 printf '4114\n8888\n' > "$RO/dispatched.txt"
-printf '4114\n8888\n' > "$RO/checked.txt"
+# 5252 is checked and has NO local keep-fact (not queued, not dispatched, no PR, no lane): it is the
+# entry the CHECKED classification must publish as releasable even though `.open_iss` is unreadable.
+printf '4114\n8888\n5252\n' > "$RO/checked.txt"
 printf 'feat/8888-tm\n' > "$RO/.pr_brs"
 ( PATH="$R:$PATH" python3 "$R/reap.py" "$RO" ) > "$TMP/reap-failopen.out" 2>&1
 case "$(tr '\n' ' ' < "$RO/dispatched.txt")" in *4114*) rc=0;; *) rc=1;; esac
@@ -484,6 +486,17 @@ ck "shipped reaper: an UNREADABLE open-issue listing reaps nothing either" $rc
 # what the guard produces and what the pre-fix `|| : >` shape could not.
 grep -qF 'SKIPPED: .open_iss' "$TMP/reap-failopen.out" && rc=0 || rc=1
 ck "shipped reaper: the open-issue guard fires and names .open_iss (not vacuously safe)" $rc
+# ⛔ THE GUARD IS *SPLIT*, AND THIS IS ITS ONLY DISCRIMINATING ASSERTION (review P2, #2183). An
+# unreadable `.open_iss` must disable ONLY the `dispatched.txt` reap; the CHECKED classification
+# reads `candidates.txt`/`dispatched.txt`/`.pr_brs`/`tmux`/the claim registry and must still run.
+# Re-joining the guards (refusing both on either missing listing) leaves every assertion above
+# GREEN — the old single message also carries `SKIPPED: .open_iss` and `dispatched.txt` is
+# untouched under both — so only the ARTIFACT below can tell the two designs apart. 5252 has no
+# keep-fact and must be published as releasable; a re-joined guard publishes nothing, and the
+# entry stays suppressed for ever, which is the defect this patch removes.
+relopen="$(tr '\n' ' ' < "$RO/state/checked-release-candidates" 2>/dev/null)"
+case "$relopen" in *5252*) rc=0;; *) rc=1; echo "      releasable: '$relopen'";; esac
+ck "shipped reaper: an unreadable open-issue listing still RUNS the checked classification (the guard is split)" $rc
 # a PRESENT but EMPTY list is a REAL answer and must still reap
 RE="$TMP/reap-emptypr"; mkdir -p "$RE"
 printf '4114\n7777\n' > "$RE/dispatched.txt"
@@ -496,6 +509,51 @@ case "$kept" in *4114*) rc=1;; *) rc=0;; esac
 ck "shipped reaper: a genuinely EMPTY (readable) PR listing still reaps 4114" $rc
 case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" $rc
+
+# ── 5a2) THE CHECKED CLASSIFICATION: a suppression survives only while a re-checkable fact holds ──
+# `checked.txt` short-circuits the walk before ANY network call, so an entry in it is invisible to
+# every later pass — and before agent-infra#2183 nothing revalidated it: the only remover walked
+# `dispatched.txt`, a different file. A CLEAN-judged candidate that was never dispatched was therefore
+# suppressed for ever. These fixtures drive the SHIPPED heredoc (extracted above) and assert the
+# ARTIFACTS it publishes, never a log string.
+#   CQ: 4114 no keep-fact -> RELEASABLE (the queue can fill again)
+#   CQ: 5151 in candidates.txt -> kept as `queued`
+#   CQ: 6161 has a PR head ref -> kept as `pr`
+CK="$TMP/reap-checked"; mkdir -p "$CK"
+printf '5151\n' > "$CK/candidates.txt"
+printf '4114\n5151\n6161\n' > "$CK/checked.txt"
+printf '6161\n' > "$CK/.pr_brs"
+printf '4114\n5151\n6161\n' > "$CK/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CK" ) > "$TMP/reap-checked.out" 2>&1
+rel="$(tr '\n' ' ' < "$CK/state/checked-release-candidates" 2>/dev/null)"
+case "$rel" in *4114*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a checked entry with NO keep-fact is RELEASABLE (it is not suppressed for ever)" $rc
+case "$rel" in *5151*|*6161*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: a queued or PR-backed checked entry is never released" $rc
+kq="$(grep -c '^5151	queued$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kq:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a queued issue is recorded as 'queued'" $rc
+kp="$(grep -c '^6161	pr$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kp:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a PR-backed issue is recorded as 'pr'" $rc
+# ⛔ AND THE HEREDOC NEVER REWRITES checked.txt ITSELF: it publishes the classification and leaves the
+# single release rewrite to the claim filter, so an entry the registry KEEPS never has to be put back.
+ckx="$(tr '\n' ' ' < "$CK/checked.txt")"
+case "$ckx" in *4114*5151*6161*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the classification does NOT rewrite checked.txt (one release writer, later)" $rc
+# ⛔ THE SPLIT GUARD, the other direction: an UNREADABLE `.pr_brs` refuses the whole classification and
+# says so — releasing on the facts it happens to have would un-suppress entries that DO have a PR.
+CP="$TMP/reap-checked-nopr"; mkdir -p "$CP"
+printf '4114\n' > "$CP/checked.txt"
+printf '4114\n' > "$CP/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CP" ) > "$TMP/reap-checked-nopr.out" 2>&1
+[ -f "$CP/state/checked-release-candidates" ]; rc=$?
+[ "$rc" -eq 0 ] && rc=1 || rc=0
+ck "shipped reaper: with no PR listing the checked classification publishes NO candidates" $rc
+grep -q 'unjustified=-' "$CP/state/checked-reap" 2>/dev/null; rc=$?
+ck "shipped reaper: a refused classification records unjustified=- (unknown, not 0)" $rc
+grep -qF 'SKIPPED (checked: .pr_brs unreadable)' "$TMP/reap-checked-nopr.out"; rc=$?
+ck "shipped reaper: the refused classification NAMES the missing listing" $rc
 fi
 unset -f tmux
 
