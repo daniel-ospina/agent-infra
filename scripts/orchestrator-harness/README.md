@@ -3215,6 +3215,39 @@ been rate-limited while the REST sweep succeeded: exactly the fallback this desi
   ruling is unconditional (`Only when NO un-owned PR remains may the dispatcher create new work`), so a
   stall is a LAND/CAPACITY problem to fix, and the line exists to name it. `test-gates.sh` pins the
   absence of such an arm, and pins that the stall AGE is printed only — never handed to the gate.
+* **`acted` IS NOT `spawned`, SO THE PASS MUST SAY WHAT IT STARTED (agent-infra#2590).** A disposition
+  row is `act` for a spawned worker, for `gh pr merge`, for `gh run rerun`, for a draft-ready and for an
+  auto-merge **arm** — and an arm starts nothing. Measured on a live box: `[pr] PR path: 2 acted
+  (#9812,#9528)` beside `#9528 auto-armed`, and the funnel then claimed "dispatching PR-takeover" on the
+  strength of a button press. So every pass now emits exactly ONE terminal spawn line, read from an
+  ARTIFACT (`state/worker-<tag>` records, written by `wt_spawn` and by nothing else) rather than from a
+  count of claims:
+
+  ```
+  [spawn] SPAWNED 2 worker(s) this pass: fix-9813,merge-9818
+  [spawn] NONE — no worker was started by this pass (…); 3 act row(s) may still exist — an arm, a rerun or a draft-ready — and those start nothing
+  [spawn] UNMEASURED — this pass cannot say what it started (state/ cannot be enumerated …)
+  ```
+
+  Three readings, kept apart: a measured positive, a **measured zero**, and no measurement at all —
+  collapsing the third into the second is the same defect sign-reversed, and a zero from an unread
+  directory would be a claim with nothing behind it. The funnel's `dispatching PR-takeover` wording now
+  requires `spawned > 0`; an acts-only pass says `NO WORKER SPAWNED this cycle (N action(s) recorded, 0
+  worker records created)`. An absent spawn count (an older caller) leaves the old wording alone.
+* **A STALL IS AN ESCALATION, NOT A LOG LINE (agent-infra#2590).** `DRAIN STALLED` printed 8 times on a
+  box that sat at `lanes=0`, 9 un-owned and nothing landing for 3.4h, and read as normal. When a stall
+  coincides with **zero spawns** it is now `DRAIN DEADLOCK`, it writes `state/drain-stall`
+  (`at= passes= age= unowned= spawns= acts=`) so it OUTLIVES the pass, and the cycle status line carries
+  `drain=DEADLOCK(passes=…,unowned=…,no_land=…m,spawns=…)` — the one line every reader already parses.
+  The token self-heals: a land newer than the marker deletes it, so it cannot become the stale flag it
+  replaces. ⛔ It still opens NOTHING: the escalation exists to make the policy's promise *verifiable*,
+  never to add the release valve the ruling forbids.
+  ⛔ The land age is measured from `state/merged-<PR>.done`, and `merge-one.sh` is its only writer — so
+  the age answers "when did **this box** last land", not "when did the queue last move". Measured
+  2026-10-23: 7 PRs merged on the repo between 21:31Z and 22:40Z while the line said "no PR merged in
+  264m", because a PEER box held the landing claims. Both stall lines therefore name their population
+  and quote the pass's own dominant NAMED wait (the reason it spawned nothing), so an escalation cannot
+  misdiagnose a box whose only "problem" is that it is not the lander.
 * **Parked PRs are excluded from the gate's number** — a PR parked at `MAX_FIX_TRIES` is one the
   harness itself declared needs-a-human, and letting it hold the issue path shut forever would be the
   "stale flag that latches a gate" failure. The count is printed so the subtraction is visible.
