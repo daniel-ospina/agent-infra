@@ -2106,7 +2106,35 @@ reporting `budget fix=0` for hours), and `_state_file()` is its ONE naming autho
 deliberately no default set: `--all-repos` with no `PR_DOCTOR_REPOS` refuses, because a filesystem
 scan would answer with whatever checkouts happen to exist, which is a default by another name.
 
-agent-infra#1774, #1788.
+### WHICH CONTRACT A PASS JUDGES BY — resolved, or refused (agent-infra#2518)
+
+Resolving the repo is not the whole decision: `objective.py` also holds the **contract** a PR is
+judged by — the REQUIRED check contexts (minus `ai-review-gate` for the gated set) and the
+human-gated SURFACE paths. Those are `objective.py`'s built-ins, and they describe exactly one repo.
+A pass for any other repo reads ITS queue and would judge it by a declaration nobody wrote for it:
+**measured** on `daniel-ospina/agent-infra` with an all-green, clean-attested check list, that
+classifies `rerun-checks` (every green PR re-triggered, its attestation staled) and
+`touches_surface()` is always `False` (a surface-touching diff handed to the automated lander).
+
+So the contract's scope is decided per pass and **fails closed**:
+
+* The contract is the repo's own when the operator supplied it through `objective.py`'s existing
+  seams — `OBJECTIVE_REQUIRED='<ctx>,<ctx>'` and `OBJECTIVE_SURFACE='<path>,<path>'`. Both must be
+  non-empty: an empty value is "not supplied", never "this repo requires nothing".
+* It is also the repo's own for the **one** repo the built-ins describe (`REQUIRED_DEFAULT`) —
+  refusing that one would kill the shipped single-repo doctor.
+* Otherwise the pass **refuses to dispatch** and says so in its log. It still grades the queue and
+  prints the row — `open_prs`/`unplaced` are the measurement the fleet keeps losing — but an
+  unplaceable queue reports `UNPLACED` (`3`), not a confident order derived from another repo.
+
+⛔ The refusal is DERIVED from the resolved slug on every call, never stored: a module flag left over
+from the previous repo in an `--all-repos` set would refuse (or, worse, allow) the next one's
+dispatch for a reason about a different repo. ⚠️ **Declared residual:** the seams are machine-wide,
+so one `--all-repos` set cannot describe two repos at once — a set grading a repo whose contract was
+not supplied is read-only by design. Per-repo contract wiring is **agent-infra#2518**, and one doctor
+instance per repo is **#2281**.
+
+agent-infra#1774, #1788, #2281, #2518.
 
 ### 6.5.3 Ancestry is the safety rail
 
