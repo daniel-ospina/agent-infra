@@ -407,11 +407,21 @@ ORCH_AUTOMATED_RESTART_IN="${ORCH_AUTOMATED_RESTART:-0}"
 # legitimately comes from the env file (tmux mode has no unit to provide it).
 CONTROLLER_ORPHAN_TIMEOUT_IN="${CONTROLLER_ORPHAN_TIMEOUT:-}"
 CONTROLLER_HANDOVER_TIMEOUT_IN="${CONTROLLER_HANDOVER_TIMEOUT:-}"
+# ⛔ AND THE UNIT NAME ITSELF IS THE FOURTH MEMBER OF THAT FAMILY (review P1 round 14, #2402). The template
+# renders `Environment=CONTROLLER_UNIT={{UNIT_NAME}}` so the name is ONE fact; but `source_env_file` runs with
+# `set -a`, so a `keys.env` line `CONTROLLER_UNIT=other.service` re-pointed `controller_unit_copies` at a unit
+# that does not exist. Measured consequence on this checkout: `stop` printed "released lock" with NOT ONE
+# `systemctl` call (the installed unit invisible), and `Restart=always` brought the controller back inside
+# RestartSec — the "reported stopped, still running" false pass this PR exists to remove; `start` read
+# `is-enabled other.service` → `not-found` → "a real DISABLED answer" → launched a TMUX controller beside the
+# ENABLED unit (#1761). Snapshotted before the source and put back after it, like its three siblings.
+CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 [ -z "$CONTROLLER_ORPHAN_TIMEOUT_IN" ]   || CONTROLLER_ORPHAN_TIMEOUT="$CONTROLLER_ORPHAN_TIMEOUT_IN"
 [ -z "$CONTROLLER_HANDOVER_TIMEOUT_IN" ] || CONTROLLER_HANDOVER_TIMEOUT="$CONTROLLER_HANDOVER_TIMEOUT_IN"
+[ -z "$CONTROLLER_UNIT_IN" ]             || CONTROLLER_UNIT="$CONTROLLER_UNIT_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
