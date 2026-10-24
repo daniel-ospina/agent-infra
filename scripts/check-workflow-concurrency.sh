@@ -191,7 +191,10 @@ TMP_GROUPS="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency-groups.XXXXXX")" || exit 2
 # a rule); the strip only applies where the `#` follows whitespace, so a value is never truncated by
 # a `#` inside it. CR is stripped too: a CRLF file is valid YAML, and a `false\r` that prints as
 # `false` must not be refused as if it were a different value.
-awk '
+# LC_ALL=C: byte semantics, so a UTF-8 BOM is the three bytes it is on disk. Under a UTF-8 locale a
+# %c of 239 is a different, two-byte character and the comparison can never match. This also keeps
+# the reader's behaviour independent of the runner's locale.
+LC_ALL=C awk '
 # A KEY is: optional single/double quote, an identifier, optional quote, optional spaces, colon.
 # Both quote styles matter — a formatter that quotes mapping keys emits `'"'"'concurrency'"'"':`, and a
 # spelling the reader cannot see is a rule that silently does not apply (round 2 found exactly that:
@@ -209,6 +212,12 @@ function addtrigger(v,   t) {
   # resolve. Recording it as one left the file neither PR nor push, so every rule went vacuous
   # (round 4). A double-bang tag escaped that test by one character, and the test was the whole
   # guard (round 5).
+  # An anchor DECLARATION is not a trigger name. Stripping the anchor and recording the rest as a
+  # trigger left a bracketed fragment in the trigger set: onparsed was 1, no real trigger was
+  # present, and every rule went vacuous (round 6, P2).
+  while (t ~ /^&[A-Za-z0-9_-]+([ \t]|$)/) sub(/^&[A-Za-z0-9_-]+[ \t]*/, "", t)
+  gsub(/^[\[{]/, "", t); gsub(/[\]}]$/, "", t)
+  if (t == "") return                              # a bare anchor: its value is the block children
   if (t ~ /^\*/ || t ~ /^!/) { concbad = 1; concwhy = "the `on:` value is an alias or a tagged scalar, which this reader cannot resolve into trigger names"; return }
   trig[t] = 1
 }
@@ -248,14 +257,15 @@ function flush(   tg, k, n) {
   printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\037%d\037%s\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname, concbad, concwhy
   delete trig; hasconc = 0; group = ""; cancel = ""; joblevel = 0; fname = ""; onindent = -1; cur = ""
   scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""; wfname = ""; concbad = 0
-  pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""
+  pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""; pendblock = 0
 }
 BEGIN {
   cur = ""; SQ = sprintf("%c", 39); DQ = "\""
+  BOM = sprintf("%c%c%c", 239, 187, 191)
   QCH = "[" DQ SQ "]"
   KEYPAT = QCH "?[A-Za-z_][A-Za-z0-9_-]*" QCH "?[ \t]*:"
   hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""
-  wfname = ""; concbad = 0; pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""
+  wfname = ""; concbad = 0; pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""; pendblock = 0
 }
 {
   if (FNR == 1) {                         # a new file begins: close the previous record FIRST
@@ -265,6 +275,11 @@ BEGIN {
 
   line = $0
   sub(/\r$/, "", line)
+  # A UTF-8 BOM is legal at the start of a YAML stream. Un-stripped, the first key no longer matched
+  # the top-level key pattern, so a `concurrency:` block vanished — and unlike a BOM on `on:` there
+  # was no R0 either: the reader read nothing and told no one (round 6, P1).
+  if (substr(line, 1, 1) == BOM) line = substr(line, 2)
+  else if (substr(line, 1, 3) == BOM) line = substr(line, 4)
   lineindent = 0                          # 0 for a top-level line
   if (match(line, /^[ \t]+/)) lineindent = RLENGTH
 
@@ -274,7 +289,13 @@ BEGIN {
   # `#` line inside a `run: |` body from being mistaken for a key.
   if (scalarindent >= 0 && lineindent > scalarindent) next
   if (pendkey != "" && lineindent > pendind) {
-    pendval = pendval " " trim(line)
+    piece = trim(line)
+    if (pendblock == 0) {               # a plain continuation: a `#` here is a YAML COMMENT
+      sub(/[ \t]+#.*$/, "", piece)
+      sub(/^#.*$/, "", piece)
+      if (piece == "") next
+    }
+    pendval = pendval " " piece
     if (length(pendval) > 65536) { pendkey = ""; pendval = ""; pendind = -1; concbad = 1; concwhy = "a pending `concurrency` value larger than 65536 characters is not modelled" }
     next
   }
@@ -388,11 +409,11 @@ BEGIN {
     t = trim(line)
     if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) {
       v = unq(trim(substr(t, index(t, ":") + 1)))
-      if (v == "" || v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent } else { group = v }
+      if (v == "" || v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent; pendblock = (v ~ /^[|>]/ ? 1 : 0) } else { group = v }
     }
     else if (match(t, "^" QCH "?cancel-in-progress" QCH "?[ \t]*:")) {
       v = unq(trim(substr(t, index(t, ":") + 1)))
-      if (v == "" || v ~ /^[|>]/) { pendkey = "cancel"; pendval = ""; pendind = lineindent } else { cancel = tolower(v) }
+      if (v == "" || v ~ /^[|>]/) { pendkey = "cancel"; pendval = ""; pendind = lineindent; pendblock = (v ~ /^[|>]/ ? 1 : 0) } else { cancel = tolower(v) }
     }
   }
 }

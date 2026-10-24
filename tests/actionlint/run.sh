@@ -444,7 +444,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml" \
   "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml" \
   "$CFIX/pr-event-number.yml" "$CFIX/pr-target-headref.yml" "$CFIX/pr-eof.yml" \
-  "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml"
+  "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml" \
+  "$CFIX/pr-cancel-continuation-comment.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -477,6 +478,9 @@ for pair in \
   "pr-explicit-key.yml R0" \
   "pr-hidden-sha.yml R1" \
   "reusable-and-pr.yml R3" \
+  "pr-group-continuation-comment.yml R1" \
+  "push-bom.yml R2" \
+  "push-on-anchor.yml R2" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -502,6 +506,14 @@ conc_run 0 "one file under two spellings is one workflow" "$CFIX/pr-ok.yml" "$CF
 grep -q '1 file(s) scanned' "$OUT" \
   && pass "the second spelling resolved to the same file" \
   || { fail "a second spelling was counted as a second workflow"; sed 's/^/      /' "$OUT"; }
+
+# The BOM fixture only tests the BOM path while the BOM is still there: assert the bytes, so a
+# formatter that strips it cannot quietly turn this arm into a duplicate of push-cancel-true.yml.
+if [ "$(head -c 3 "$CFIX/push-bom.yml" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+  pass "push-bom.yml still begins with a UTF-8 BOM"
+else
+  fail "push-bom.yml lost its BOM — the arm no longer tests what it claims"
+fi
 
 # R0 has several causes and each must be NAMED: one message for all of them described two files as
 # "a sequence or an alias" that contained neither (#2660 round 5).
