@@ -188,6 +188,15 @@ echo
 echo "§C lane.sh's REAL output (LANE_DRY_RUN=1)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/o/logs"
+# ⛔ THE DRY-RUN CWD MUST BE THE TARGET REPO (agent-infra#2724/#2694). lane.sh now refuses (72) when
+# the worktree's origin is not the repo it was dispatched for. This section asserts the RENDERED
+# brief, not the repo gate, so the fixture is a checkout of the `acme/widget` it names.
+git init -q "$TMP" 2>/dev/null && git -C "$TMP" remote add origin https://github.com/acme/widget.git 2>/dev/null
+# …and it is checked out on the branch the lane was told it is on: lane.sh refuses a worktree on a
+# DIFFERENT named branch (the `prfixup` shape), so a fixture on `main` would be refused for the
+# branch before this section could read the rendered brief.
+git -C "$TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null \
+  && git -C "$TMP" checkout -q -b fix/2148-reviewer-preflight 2>/dev/null
 # A throwaway worktree dir: lane.sh reads $PWD for the log header and the venv reaper, and
 # REAP_LANE_VENV_DISABLE keeps the reaper out of the fixture's way.
 (

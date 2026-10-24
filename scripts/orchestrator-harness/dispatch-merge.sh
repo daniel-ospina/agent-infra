@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # dispatch-merge.sh <repo-path> <owner/repo> <issue> [<issue> ...]
 # For each issue: worktree -> lane (implement+PR) -> chain-merge (review+record+merge).
+#
+# ⛔ BOTH HALVES OF THE TARGET ARE MANDATORY AND ARE ASSERTED (agent-infra#2724/#2694). The checkout
+# ($1) and the repo slug ($2) are separate inputs that can disagree — the measured wrong-repo lane
+# was built from `/tmp/cell-t3` (tortoise) for an `agent-infra` brief. No target = REFUSED; a
+# worktree whose own `origin` is not the target = REFUSED before any lane or chain is spawned, with
+# both slugs named. Exit 72 is the repo-identity refusal, distinct from the capacity codes.
 set -u
-REPO="$1"; OR="$2"; shift 2
+REPO="${1:-}"; OR="${2:-}"; shift 2 2>/dev/null || true
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# Required module: without it the lane's worktree identity can never be asserted. FATAL, not optional.
+. "$SELF/repo-target.sh" || { echo "dispatch-merge: FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to dispatch worktrees whose repo cannot be asserted (#2724)"; exit 78; }
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  || { echo "dispatch-merge: FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to dispatch worktrees whose repo cannot be asserted (#2724)"; exit 78; }
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 # ⛔ THE SPAWN LINE MUST SAY SO WHEN THE BOX IS STALE (agent-infra#2215). `orch-loop.sh` exports this
 # from its once-per-cycle refresh: EMPTY when the controller's harness IS origin/main's tip, else
@@ -55,6 +66,21 @@ release_issue_claim_unspawned() { # <issue>
   fi
   return 0
 }
+# ── NO TARGET = REFUSED, AND THE CLAIMS ARE RELEASED (agent-infra#2724/#2694) ────────────────────
+# This runs AFTER `release_issue_claim_unspawned` is defined because the controller has ALREADY taken
+# `refs/claims/issue-<N>` for every id it handed us. "Nothing will start" must therefore also mean
+# "nothing stays claimed" — otherwise the issue is refused by every peer until the 3h lease expires.
+# The target is a parameter (never a default or a guess, #1974): an absent one is a named refusal.
+if [ -z "$OR" ]; then
+  echo "dispatch-merge: REFUSED (no-target) — no owner/name repo was named. The target is a parameter, never a default or a guess (#1974/#2724); pass <repo-path> <owner/repo> <issue...>."
+  for N in "$@"; do case "${N:-}" in ''|*[!0-9]*) continue ;; esac; release_issue_claim_unspawned "$N"; done
+  exit 72
+fi
+if [ -z "$REPO" ]; then
+  echo "dispatch-merge: REFUSED (no-repo-dir) — no checkout path was named; refusing to guess which checkout the lanes belong to (#1974/#2724)."
+  for N in "$@"; do case "${N:-}" in ''|*[!0-9]*) continue ;; esac; release_issue_claim_unspawned "$N"; done
+  exit 72
+fi
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THIS IS NOW A `gh` CONSUMER, SO IT RE-ASSERTS THE SHIMS (#2333 review P2). The `export PATH`
 # above puts the real `/opt/homebrew/bin/gh` FIRST, ahead of the controller's exported shim dirs, and
@@ -88,6 +114,20 @@ done
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
   exit 1; }
+# Physical path, so every assertion and spawn below names the checkout even when the caller passed a
+# relative one (after `cd`, `$REPO` would otherwise resolve from INSIDE itself).
+REPO_ABS="$(pwd -P)"
+
+# ── THE TARGET ASSERTION BEFORE ANY WORKSTREE IS BUILT (agent-infra#2724/#2694) ─────────────────
+# A pre-build check proves what was asked for. The POST-BUILD check below (on each worktree) proves
+# what was got; both are needed, and this one fails fast enough to release the batch's claims.
+TARGET_LINE="$(repo_target_assert "dispatch" "$REPO_ABS" "$OR" "")"; TARGET_RC=$?
+echo "$TARGET_LINE"
+if [ "$TARGET_RC" -ne 0 ]; then
+  echo "dispatch-merge: REFUSED — the checkout $REPO_ABS is not $OR; no lane and no chain will start (exit $TARGET_RC)"
+  for N in "$@"; do release_issue_claim_unspawned "$N"; done
+  exit "$TARGET_RC"
+fi
 git fetch origin main --quiet 2>/dev/null
 
 # ── CI BACK-PRESSURE, READ ONCE FOR THE WHOLE BATCH ─────────────────────────────────────────────
@@ -185,6 +225,19 @@ for N in "$@"; do
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
   fi
+  WT_ABS="$REPO_ABS/.worktrees/$WT"
+  # ── THE POST-BUILD ASSERTION (agent-infra#2724/#2694) ───────────────────────────────────────
+  # The worktree EXISTS. Read its own origin and checkout identity; if they are not the target, the
+  # lane would do its whole run in the wrong repository and every downstream gate (review, rail,
+  # attestation) would certify it perfectly. Refuse, release the claim, and record the line.
+  LANE_REPO_LINE="$(repo_target_assert "lane #$N" "$WT_ABS" "$OR" "$REPO_ABS")"; LANE_REPO_RC=$?
+  LANE_BRANCH_LINE="$(repo_target_branch_assert "lane #$N" "$WT_ABS" "$BR" "$OR")"; LANE_BRANCH_RC=$?
+  printf '%s\n%s\n' "$LANE_REPO_LINE" "$LANE_BRANCH_LINE" | tee -a "$O/logs/lane-$N.log"
+  if [ "$LANE_REPO_RC" -ne 0 ] || [ "$LANE_BRANCH_RC" -ne 0 ]; then
+    echo "#$N: REFUSED — the worktree built for this lane is not $OR; no lane, no chain, claim released (#2724/#2694)"
+    release_issue_claim_unspawned "$N"
+    continue
+  fi
   # #2216 brought a second disclosure into this line: WHICH harness the spawn was computed from, so a
   # lane that behaves unlike a peer is traceable to a stale checkout. Both disclosures belong on the
   # same line — the launcher names HOW it was spawned (durable terminal vs tmux), the token names
@@ -198,7 +251,7 @@ for N in "$@"; do
   # An EMPTY token (the box is current) appends nothing at all — `${T:+ …}`, never `${T:-…}`.
   _lan="$(wt_launcher)"
   _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
-  if wt_spawn "lane-$N" "$REPO/.worktrees/$WT" "bash '$O/lane.sh' $N '$BR' '$OR'"; then
+  if wt_spawn "lane-$N" "$WT_ABS" "bash '$O/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
   else
     echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"
@@ -217,7 +270,7 @@ for N in "$@"; do
   # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
-  if wt_spawn "chain-$N" "$REPO" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'"; then
+  if wt_spawn "chain-$N" "$REPO_ABS" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO_ABS' '$OR' $N '$BR'"; then
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # The same disclosure on the refusal path (see the lane spawn above): a chain that never started
