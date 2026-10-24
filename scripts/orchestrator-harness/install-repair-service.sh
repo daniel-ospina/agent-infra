@@ -36,9 +36,12 @@
 #   install-repair-service.sh --dry-run          # render and print; touch NOTHING
 #
 # Env seams (tests + unusual cells):
+#   REPAIR_REPO           the repo whose PR surface is watched (default daniel-ospina/tortoise). ⛔ ANY
+#                         OTHER VALUE IS REFUSED, not just warned about: `scripts/pr-doctor.py`
+#                         hardcodes the PR LIST's repo while its classifier READS `OBJECTIVE_REPO`, so
+#                         a different value makes every pass refuse. See the render-time gate
 #   PR_DOCTOR_TRIGGER     the trigger to install (default: beside this script's repo, else
 #                         $HOME/.pi/agent/scripts/pr-doctor-trigger.py)
-#   REPAIR_REPO           the repo whose PR surface is watched (default daniel-ospina/tortoise)
 #   PR_DOCTOR_REPO_DIR    the checkout the trigger EXPORTS to the doctor as
 #                         PR_DOCTOR_REPO_DIR (default: the doctor's own constant,
 #                         $HOME/Documents/GitHub/tortoise). ⛔ INERT TODAY: `scripts/pr-doctor.py` still
@@ -54,11 +57,22 @@
 #   REPAIR_UNIT_NAME      the unit FILE name (default eldato-pr-doctor-trigger.service)
 #   PYTHON_BIN            the interpreter the unit runs (default $(command -v python3))
 #   TEMPLATES_DIR         template dir (default: this repo's templates/systemd)
+#   REPAIR_DRYRUN_WANTED_BY  the `WantedBy=` a `--dry-run` renders (default multi-user.target, the
+#                         system-scope form — a dry run cannot resolve the real scope without asking
+#                         a service manager, which it must not do)
 #   SYSTEMD_UNIT_DIR      install dir OVERRIDE (tests: a temp dir, with SYSTEMCTL a fake)
 #   SYSTEMCTL             `systemctl` to call (tests: a shim; default `sudo -n systemctl` for a
 #                         system unit, `systemctl --user` otherwise)
 #   SUDO                  `sudo` probe (default `sudo -n`)
 #   ELDATO_PLATFORM       override `uname -s` (tests render the Darwin refusal on any host)
+#
+# ⛔ WHAT THE RENDERED `Environment=` LINES DO AND DO NOT DO (review cycle 2, F1). `OBJECTIVE_REPO` is
+# READ by the classifier (`scripts/objective.py:83`). `GH_REPO`, `PR_DOCTOR_REPO` and
+# `PR_DOCTOR_REPO_DIR` have NO reader in `scripts/pr-doctor.py` today — it hardcodes `REPO` and
+# `REPO_DIR` — so they are carried for the lane porting that seam and for the trigger, which exports
+# the same names to its child. They are NOT a working redirect, and this installer never claims they
+# are. Because the classifier DOES read `OBJECTIVE_REPO` while the PR list does not, a repo mismatch
+# is fatal rather than inert — which is why `REPAIR_REPO` is refused above the default.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -158,15 +172,65 @@ TRIGGER="$(find_trigger)" || die "pr-doctor-trigger.py not found (looked beside 
    repo's scripts/, and in \$HOME/.pi/agent/scripts). Install the farm first: pi-bootstrap/setup.sh"
 [ -f "$TRIGGER" ] || die "the trigger resolves to a non-file: $TRIGGER"
 
+# ── render-time gates: they apply to the verbs that PRODUCE the artifact ──────────────────────
+# ⛔ `--status` AND `--uninstall` ARE READING/REMOVAL VERBS AND MUST NEVER INHERIT A RENDER
+# CONSTRAINT (review cycle 2, F5). Both gates used to run before the action switch, so
+# `REPAIR_RESTART_SEC=100 --status` refused to REPORT on an installed unit and a
+# `REPAIR_REPO=... --uninstall` refused to remove one — the operator's only way out of a bad render
+# was refused by the render's own rules.
+case "$ACTION" in
+  --install|--dry-run)
+    # The repo the unit watches, and the ONE thing it cannot be today. `scripts/pr-doctor.py`
+    # hardcodes both `REPO = "daniel-ospina/tortoise"` (:167) and `REPO_DIR` (:168), while its
+    # CLASSIFIER (`scripts/objective.py:83`) reads `OBJECTIVE_REPO` at exec time. So on any repo but
+    # tortoise the doctor would LIST tortoise's PRs and then ask the OTHER repo for check-runs at
+    # each tortoise head sha — `422 No commit found for SHA`, every PR unreadable, pass refused (the
+    # measured #2700 defect) — and the trigger reads that refusal (rc 2) as a CLEAN window and waits
+    # 1800 s. Rendering that unit is shipping a service whose only output is a refusal, so this
+    # refuses to render it until the seam is ported. (review cycle 2, F1: the unit comment used to
+    # claim these Environment= lines CLOSE that defect; only the PR-LIST half is missing, and it is
+    # the half this installer cannot supply.)
+    if [ "$REPAIR_REPO" != "daniel-ospina/tortoise" ]; then
+      die "REPAIR_REPO=$REPAIR_REPO is not supported yet, and installing it would make every pass fail.
+   scripts/pr-doctor.py hardcodes REPO=daniel-ospina/tortoise for its PR LIST while its classifier
+   READS OBJECTIVE_REPO, so the unit would list tortoise's PRs and ask $REPAIR_REPO for their
+   check-runs: every PR unreadable, pass refused (rc 2), which the trigger reads as a clean 1800 s
+   window. Nothing was installed. The port that makes this real is the other lane's OBJECTIVE_REPO
+   change (see the PR body's REQUIRED FOLLOW-UP); leave REPAIR_REPO at its default until it lands."
+    fi
+    # ⛔ THE START LIMIT MUST BE ABLE TO FIRE (review cycle 1). `StartLimitIntervalSec=300` with
+    # `StartLimitBurst=3` only converges to `failed` if three attempts FIT in the window: at one
+    # start per `RestartSec`, that needs `3 x (RestartSec + 1) < 300`, i.e. RestartSec < 100. Above
+    # that the burst can never fill, the unit restarts for ever, and every aggregate reads supervised
+    # — the inert-enforcer shape this unit's own header rejects.
+    if [ "$RESTART_SEC" -ge 100 ]; then
+      die "REPAIR_RESTART_SEC=$RESTART_SEC cannot fill StartLimitBurst=3 inside StartLimitIntervalSec=300
+   (needs RestartSec < 100). A limit that can never fire is not a limit: the unit would restart for
+   ever while every surface read supervised."
+    fi
+    # The checkout the doctor is *supposed* to use. It is inert until the OBJECTIVE_REPO port lands
+    # (see the env-seam note above), so a missing path is a WARNING with its reason — not a refusal,
+    # and never silence.
+    if [ ! -d "$REPO_DIR" ]; then
+      say "⚠️  PR_DOCTOR_REPO_DIR=$REPO_DIR does not exist on this box. The trigger exports it, but"
+      say "    scripts/pr-doctor.py still hardcodes its own REPO_DIR, so this is a NAMED residual, not"
+      say "    a working redirect — see the required follow-up on the PR."
+    fi
+    ;;
+esac
+
 # ⛔ THE DRY RUN IS ANSWERED BEFORE THE SCOPE IS RESOLVED (review cycle 1). Resolving the scope
 # shells `sudo -n true` and `systemctl --user show-environment`, so a box with no passwordless sudo
 # and no user manager — a docker CI job, a dev container, a locked-down cell — could not PRINT the
 # unit it would install. A render is a pure function of the template and the env; it must never need
 # a service manager, and it must touch nothing (`--dry-run` is the debugging surface an operator uses
 # precisely when the service manager is what is broken). The scope-specific line is the only thing it
-# cannot know, so it renders the SYSTEM form — the cell's shape — and says so.
+# cannot know, so it renders the SYSTEM form and SAYS SO on stderr (review cycle 2, F6 — the comment
+# claimed it said so and it did not).
 if [ "$ACTION" = "--dry-run" ]; then
   WANTED_BY="${REPAIR_DRYRUN_WANTED_BY:-multi-user.target}"
+  printf '# dry run: renders the SYSTEM-scope form (WantedBy=%s). The real scope is resolved at\n' "$WANTED_BY" >&2
+  printf '#          --install time (system via sudo, else user manager); nothing was touched.\n' >&2
   render
   exit 0
 fi
@@ -174,24 +238,6 @@ fi
 if ! resolve_scope; then
   die "no service manager answered: no passwordless sudo for a system unit and no systemd user
    manager. Nothing was installed — a trigger that is 'installed' but never fires is a false PASS."
-fi
-# ⛔ THE START LIMIT MUST BE ABLE TO FIRE (review cycle 1). `StartLimitIntervalSec=300` with
-# `StartLimitBurst=3` only converges to `failed` if three attempts FIT in the window: at one start
-# per `RestartSec`, that needs `3 x (RestartSec + 1) < 300`, i.e. RestartSec < 100. Above that the
-# burst can never fill, the unit restarts for ever, and every aggregate reads supervised — the
-# inert-enforcer shape this unit's own header rejects.
-if [ "$RESTART_SEC" -ge 100 ]; then
-  die "REPAIR_RESTART_SEC=$RESTART_SEC cannot fill StartLimitBurst=3 inside StartLimitIntervalSec=300
-   (needs RestartSec < 100). A limit that can never fire is not a limit: the unit would restart for
-   ever while every surface read supervised."
-fi
-# The checkout the doctor is *supposed* to use. It is inert until the OBJECTIVE_REPO port lands
-# (see the env-seam note above), so a missing path is a WARNING with its reason — not a refusal,
-# and never silence.
-if [ ! -d "$REPO_DIR" ]; then
-  say "⚠️  PR_DOCTOR_REPO_DIR=$REPO_DIR does not exist on this box. The trigger exports it, but"
-  say "    scripts/pr-doctor.py still hardcodes its own REPO_DIR, so this is a NAMED residual, not"
-  say "    a working redirect — see the required follow-up on the PR."
 fi
 UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
 
@@ -203,9 +249,15 @@ case "$ACTION" in
     say "unit:     $UNIT_PATH ($SCOPE scope)"
     say "enabled:  $($SYSTEMCTL is-enabled "$UNIT_NAME" 2>&1)"
     say "active:   $($SYSTEMCTL is-active "$UNIT_NAME" 2>&1)"
-    # Read the ARTIFACT, not the send: the installed ExecStart must be the TRIGGER.
-    if grep -qF "$TRIGGER" "$UNIT_PATH" && grep -qF -- "--backstop 1800" "$UNIT_PATH"; then
+    # Read the ARTIFACT, not the send: the installed ExecStart must be the TRIGGER. ⛔ THE CHECK IS
+    # ON WHAT THE UNIT NAMES, NOT ON WHAT THIS INVOCATION WOULD HAVE RENDERED (review cycle 2): the
+    # strict `grep -qF "$TRIGGER"` made `--status` exit 4 unless the caller re-supplied the same
+    # `PR_DOCTOR_TRIGGER` the install used — a REPORT that depends on the report's own env is not a
+    # report, and the installed path is printed anyway. `--install` still pins the exact path, because
+    # there it is known.
+    if grep -qF 'pr-doctor-trigger.py' "$UNIT_PATH" && grep -qF -- "--backstop 1800" "$UNIT_PATH"; then
       ok "the installed ExecStart runs the trigger with the 1800 s backstop"
+      say "exec: $(grep -m1 '^ExecStart=' "$UNIT_PATH" | cut -c1-160)"
     else
       say "⛔ the installed unit does not carry the trigger + backstop — re-run --install"; exit 4
     fi
@@ -248,6 +300,17 @@ $SYSTEMCTL enable "$UNIT_NAME" >/dev/null 2>&1 \
 if [ "$CHANGED" -eq 1 ]; then
   $SYSTEMCTL restart "$UNIT_NAME" >/dev/null 2>&1 \
     || say "⚠️  restart failed; the unit is enabled and will come up at next boot (check --status)"
+else
+  # ⛔ UNCHANGED BYTES DO NOT MEAN NOTHING TO DO (review cycle 2, F2 — a regression the CHANGED fix
+  # introduced). A re-install is the operator's NATURAL recovery action for a trigger that is down,
+  # and skipping the restart left a stopped, enabled unit stopped while the installer printed three
+  # ✅s and exited 0 — "installed" answering about the file, not about what is running. Start it
+  # when it is not running; a start on a running unit is a no-op.
+  act0="$($SYSTEMCTL is-active "$UNIT_NAME" 2>&1)"
+  if [ "$act0" != "active" ]; then
+    say "the unit is installed and unchanged but NOT ACTIVE (systemctl: $act0) — starting it"
+    $SYSTEMCTL start "$UNIT_NAME" >/dev/null 2>&1 || true
+  fi
 fi
 # ⛔ READ BACK THE ARTIFACT, not the exit status of the verbs above: "installed" is a claim about
 # what the manager will RUN, and the only evidence is the manager's own answer plus the file.
@@ -256,6 +319,19 @@ en="$($SYSTEMCTL is-enabled "$UNIT_NAME" 2>&1)"
 [ "$en" = "enabled" ] || die "$UNIT_NAME is NOT enabled (systemctl says: $en) — nothing would restart
    a dead trigger. This is a FAILED install, not a warning."
 grep -qF "$TRIGGER" "$UNIT_PATH" || die "the installed unit does not name the trigger ($TRIGGER)"
-ok "$UNIT_NAME enabled ($en)"
-say "status: $($SYSTEMCTL is-active "$UNIT_NAME" 2>&1)  ·  journal: journalctl -u $UNIT_NAME -n 50"
+# ⛔ AND `is-active` GATES THE VERDICT TOO (review cycle 2, F2). A unit that is enabled and INSTALLED
+# but not RUNNING is the #2700 shape one layer down: it looks deployed on every surface an aggregate
+# reads and repairs nothing. A `Restart=always` unit takes a moment to come up, so this polls rather
+# than sampling once — but it FAILS rather than printing an encouraging status line.
+act=""
+i=0
+while [ "$i" -lt 10 ]; do
+  act="$($SYSTEMCTL is-active "$UNIT_NAME" 2>&1)"
+  [ "$act" = "active" ] && break
+  sleep 1; i=$((i + 1))
+done
+[ "$act" = "active" ] || die "$UNIT_NAME is enabled but NOT ACTIVE (systemctl says: $act) after 10 s.
+   Nothing is repairing. This is a FAILED install, not a warning: journalctl -u $UNIT_NAME -n 50"
+ok "$UNIT_NAME enabled ($en) and active"
+say "journal: journalctl -u $UNIT_NAME -n 50"
 exit 0

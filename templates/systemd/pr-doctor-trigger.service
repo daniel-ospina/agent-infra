@@ -39,13 +39,14 @@ User={{USER}}
 # it already dispatched.
 Environment=HOME={{HOME}}
 Environment=PATH={{PATH}}
-# The repo whose PR surface is watched. `pr-doctor` hardcodes its repo today (`REPO` at the top of
-# `scripts/pr-doctor.py`); the lane that ports the seam (`fix/2700-objective-repo`) makes these three
-# the ACTUAL input, and `pr-doctor`'s classifier reads `OBJECTIVE_REPO` at EXEC time — so the service
-# carries the repo as an `Environment=` line rather than leaving it to whichever file happens to be
-# checked out. That is the measured #2700 defect: the classifier asking about TORTOISE's check-runs
-# with AGENT-INFRA SHAs (`422 No commit found for SHA` on all 58 PRs, every PR UNREADABLE, pass
-# refused). The trigger exports the same three for its child, so this unit and the trigger agree.
+# The repo whose PR surface is watched. ⚠️ THESE LINES DO NOT CLOSE #2700 BY THEMSELVES (review
+# cycle 2, F1 — an earlier comment here claimed they did, and that was WRONG). Only the CLASSIFIER
+# reads `OBJECTIVE_REPO` (`scripts/objective.py:83`); `scripts/pr-doctor.py` still hardcodes `REPO`
+# (its PR list) and `REPO_DIR`. So they are only CORRECT TOGETHER: pointing this unit at any repo but
+# the doctor's own would list one repo's PRs and ask the other for their check-runs — `422 No commit
+# found for SHA`, every PR unreadable, pass refused — which is the #2700 defect, not its fix. That is
+# why `install-repair-service.sh` REFUSES to render a non-default `REPAIR_REPO` until the seam is
+# ported. Once it is, these four lines become the single fact they look like.
 Environment=GH_REPO={{GH_REPO}}
 Environment=PR_DOCTOR_REPO={{GH_REPO}}
 Environment=PR_DOCTOR_REPO_DIR={{REPO_DIR}}
