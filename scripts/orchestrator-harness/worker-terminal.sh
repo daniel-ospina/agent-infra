@@ -851,7 +851,12 @@ wt_table() {
     # while a single refusal sample cannot empty the census.
     case "$tree_err" in
       *'Connection refused'*|*'no server running'*)
-        absent_now="$(date +%s 2>/dev/null || echo 0)"
+        # ⛔ A FAILED CLOCK MUST NOT BECOME THE LITERAL `0` (review round 12 of #2653, P1): `|| echo 0`
+        # handed a failure STRAIGHT THROUGH the digit guard below, PERSISTED `0` as the stamp, and the
+        # already-elapsed arm then confirmed on ONE real sample with zero elapsed window — the exact P1
+        # the two-sample rule exists to prevent, on the state that survives the process. Capture the
+        # STATUS, so a failure lands in the fail-closed `-z` branch.
+        absent_now="$(date +%s 2>/dev/null)" || absent_now=""
         # ⛔ A FAILED CLOCK MUST NOT EMPTY THE CENSUS OR POISON THE STAMP (review round 11 of #2653, P2):
         # a `date` printing a diagnostic makes `$(( 10#… ))` error — `wt_table` aborts before printing,
         # and an empty table is read as "no workers" — and the failure would then PERSIST the stamp `0`,
@@ -886,9 +891,14 @@ wt_table() {
         # ⛔ AND THE EMPTINESS TEST IS A `case`, NOT `[ … -gt 0 ]` (review round 10): `[` on an empty
         # value prints its own diagnostic on EVERY window opening — the per-read bash noise silenced
         # everywhere else in this file. A stamp of literally `0` IS an already-elapsed window, kept.
+        # ⛔ AND A `0` STAMP IS NOT A SPECIAL CASE (review round 12 of #2653): the old `0) : ;;` arm kept
+        # it as an "already-elapsed window", which is exactly what let a failed clock (persisted as 0)
+        # confirm on the next sample. Judged by the ordinary staleness rule a `0` is older than
+        # `WT_ABSENT_STALE_MIN` on any real clock, so it is discarded → first sample → fail-closed, and
+        # epoch-zero / NTP-step inputs are covered by the same rule. (No suite writes a `0` stamp: every
+        # fixture writes `now - N`.)
         case "$absent_since" in
           '') : ;;
-          0)  : ;;
           *)  if [ "$absent_since" -gt "$absent_now" ] \
                  || [ $(( absent_now - absent_since )) -gt "$WT_ABSENT_STALE_MIN" ]; then
                 absent_since=""
@@ -1202,7 +1212,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
     set -- "$@" --cwd "$cwd" --no-open -- /bin/bash "$runf"
     out="$(cmux "$@" 2>&1)" || { wt_warn "REFUSED $name: cmux surface new-terminal failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
     id="$(printf '%s\n' "$out" | grep -oE 'term_[A-Za-z0-9]+|surface:[0-9]+' | head -1)"
-    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; return 1; }
+    [ -n "$id" ] || { wt_warn "REFUSED $name: cmux surface new-terminal printed no terminal id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; return 1; }
     ws=""
   else
     # The guest CLI's equivalent (see the header): one terminal surface, the run script typed into it.
@@ -1219,7 +1229,7 @@ PY
     id="$(printf '%s\n' "$out" | sed -n 's/.*"terminal_id": *"\([^"]*\)".*/\1/p' | head -1)"
     ws="$(printf '%s\n' "$out" | sed -n 's/.*"workspace_id": *"\([^"]*\)".*/\1/p' | head -1)"
     [ -n "$id" ] || { wt_warn "REFUSED $name: cmux created the workspace but printed no terminal_id (nothing to track or reap): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; \
-      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; wt_forget; return 1; }
+      [ -n "${ws:-}" ] && cmux workspace rm "$ws" >/dev/null 2>&1; rm -f "$envf" "$runf"; rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true; wt_forget; return 1; }
   fi
   mkdir -p "$dir" 2>/dev/null || true
   # ⛔ THE RECORD WRITE IS CHECKED. A spawn that returns 0 without a record is an UNTRACKABLE worker: the

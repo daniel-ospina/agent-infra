@@ -42,6 +42,13 @@ trap 'rm -rf "$TMP"' EXIT
 # or a subshell), which is exactly why scrubbing them here cannot weaken those assertions.
 unset GH_CONFIG_DIR XDG_CONFIG_HOME
 PASS=0; FAIL=0
+# ⛔ THE SUITE MUST NOT INHERIT AN AMBIENT `CYC` (review round 12 of #2653): the PR made CYC a real
+# input to `wt_table` (`WT_ABSENT_STALE_MIN = max(4*CYC, 2*window)`), and `install.sh` renders CYC into
+# the controller's environment (floor 5, documented quiet-cell values in the hundreds). Inherited, the
+# arms that seed a "600 s old" stamp flip: `CYC=60` → STALE_MIN 240 → the stamp is not stale →
+# different verdicts, 4 red. Scrubbed here, like GH_CONFIG_DIR/XDG_CONFIG_HOME above; the arms that
+# TEST the knob (q15/q16/q20) set it explicitly.
+unset CYC
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1));
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); fi
@@ -1655,6 +1662,22 @@ SH
 out="$(bash "$TMP/q10.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27" 2>&1)"
 case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "with NO usable capture the probe still runs and an rc!=0 reply is UNKNOWN (never the census)" $rc
+# ⛔ AND THE SAME ARM WITH A *GOOD* REPLY PINS THE READ ITSELF (review round 12 of #2653): with no
+# usable capture the probe must still be EXECUTED. Mutating the `else` branch to `tree=""; tree_err=""`
+# (round 6's defect) left the rc assertion above green, because a discarded reply and a never-run probe
+# are indistinguishable there — while it loses every daemon-derived row (the record-less workers the
+# census keeps), i.e. the under-count direction.
+cat > "$TMP/q10b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_JSON='{"workspaces":[{"id":"ws_l31","name":"wt-lane-31"}],"screens":[{"id":"s1","workspace_id":"ws_l31","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_l31"}],"terminals":[{"id":"term_l31","running":true}]}'
+TMPDIR="$O/nope/absent"                    # no capture possible
+. "$1"
+echo "count=$(wt_count lane-)"
+SH
+out="$(bash "$TMP/q10b.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27b" 2>&1)"
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "with NO usable capture a GOOD reply is still READ (a record-less worker is counted)" $rc
 
 # ⛔ THE LATCH MUST SURVIVE THE SUBSHELL (review round 11 of #2653, P2). Every consumer calls
 # `wt_table` in a command substitution, so round 9's in-shell variable latched nothing and the warning
