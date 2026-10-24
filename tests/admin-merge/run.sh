@@ -13785,7 +13785,7 @@ grep -q "check 'bash-suites (5)'" "$SCEN/err" \
 grep -q "run 9901" "$SCEN/err" \
   && pass "(b) …and the RUN it failed in" \
   || fail "(b) the refusal names no run"
-grep -q "base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
   && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE: base-caused via script-validate ≡ bash-suites (5)" \
   || fail "(c) the declared-equivalence answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
 # The shard NAME must be carried: the refusal is about ONE shard, and `bash-suites` alone
@@ -13797,7 +13797,7 @@ grep -q "≡ bash-suites (5) (" "$SCEN/err" \
 # EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
 # An arm reading only the blocking reds finds no counterpart at all — so the `exempt:` CLASS
 # in this answer is what pins the ALL_REDS reader (the false absence this fixture exists for).
-grep -q 'base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
+grep -q 'base: base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
   && pass "(c) …naming the base's own red as EXEMPT even though it is not in the blocking set" \
   || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader finds no counterpart): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
@@ -13963,7 +13963,7 @@ bash -n "$MUTD2/admin-merge.sh" \
 #   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
 # while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
 # own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
-grep -q "base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
   && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
   || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
 SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
@@ -13976,7 +13976,7 @@ qrc=$?
 grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && pass "(n2) the mutant still refuses at step 1c — the refusal is not what the arm adds" \
   || fail "(n2) the mutant did not reach step 1c (exit $qrc): $(head -3 "$SCEN_EQ/eq-mut-err" 2>/dev/null)"
-grep -q "base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && fail "(n2) deleting the equivalence changed nothing — the (c) assertions pin no line the arm produces" \
   || pass "(n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm"
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
