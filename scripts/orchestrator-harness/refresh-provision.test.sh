@@ -32,6 +32,9 @@
 #        the zero-equivalent (`00`, `000`) and out-of-range spellings a digits-only test admits.
 #   (a4) a DANGLING SYMLINK at index.lock is refused and named, not mistaken for "no lock".
 #   (a5) a DIRTY scout records WHY it refused — not the "no recorded reason" fallback.
+#   (c2) a lock aged EXACTLY the staleness bound REFUSES — the ">" wording stays true.
+#   (c3) the "comparison could not be performed" arm still refuses when the two form guards
+#        are deleted in a copy — so the third guard is live, not dead code.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -114,6 +117,9 @@ rp() {
 rec() { sed -n "s/^$1=//p" "${2:-$D/o/state/refresh-last}" 2>/dev/null | head -1; }
 age_lock() {   # <path> <seconds-in-the-past> — mtime is the only evidence of staleness git has
   touch -t "$(date -v-"$2"S +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$(( $(date +%s) - $2 ))" +%Y%m%d%H%M.%S)" "$1"
+}
+abs_lock() {   # <path> <epoch> — pin an EXACT mtime
+  touch -d "@$2" "$1" 2>/dev/null || touch -t "$(date -r "$2" +%Y%m%d%H%M.%S)" "$1"
 }
 
 # ── (b) A HEALTHY PROVISION PROCEEDS ────────────────────────────────────────────────────────────────
@@ -244,6 +250,67 @@ case "$WHY" in *"UNCOMMITTED"*) r=0 ;; *) r=1 ;; esac
 ck "(a5) the recorded cause names UNCOMMITTED work (why=${WHY:0:120})" "$r"
 case "$WHY" in *"recorded no cause"*|*"without a recorded reason"*) r=1 ;; *) r=0 ;; esac
 ck "(a5) the recorded cause is NOT the 'no recorded reason' fallback" "$r"
+
+# ── (c2) THE BOUNDARY REFUSES: a lock aged EXACTLY SCOUT_LOCK_STALE_SECS ─────────────────────────────
+# The comparison is `-le` and the repair line says ">": at equality the pass must REFUSE, or that line
+# prints "300s old > 300s", an inequality the code does not hold (#2688 review cycle 4, P2). Nothing
+# reached the boundary before — (a) ages 0s and (c) ages 3600s.
+# ⛔ THE BOUNDARY NEEDS A FIXED CLOCK, OR IT IS NOT OBSERVABLE AT ALL. `age_lock` writes a real mtime,
+# so by the time the pass reads `date +%s` the age has drifted to 301 and EQUALITY is never reached —
+# the very arm this control exists for would silently test the wrong thing. So a `date` shim (test-only,
+# this sandbox's PATH) answers `+%s` with a fixed epoch and delegates every other call to the real one.
+mk_case boundary-lock
+LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
+: > "$LOCK"
+REAL_DATE="$(command -v date)"
+cat > "$D/bin/date" <<SH
+#!/bin/bash
+if [ "\$1" = "+%s" ]; then printf '%s\n' 1700000000; exit 0; fi
+exec "$REAL_DATE" "\$@"
+SH
+chmod +x "$D/bin/date"
+abs_lock "$LOCK" 1699999700   # exactly SCOUT_LOCK_STALE_SECS (300s) before the shimmed "now"
+rp "$D"
+ck "(c2) a lock aged EXACTLY the 300s bound refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+ck "(c2) the boundary lock was NOT deleted" "$([ -e "$LOCK" ]; echo $?)"
+case "$(rec why)" in *"LIVE git lock"*) r=0 ;; *) r=1 ;; esac
+ck "(c2) the cause calls the boundary lock LIVE (why=$(rec why | cut -c1-90))" "$r"
+
+# ── (c3) THE STATUS ARM IS LIVE, NOT DEAD CODE ─────────────────────────────────────────────────────
+# Cycle 3 added a check that refuses when the age comparison ERRORS (status > 1). With the canonical-form
+# arm and the 9-digit guard in place that arm is unreachable BY CONSTRUCTION, so no ordinary case can pin
+# it — a guard nothing can observe is a guard that rots. This is the suite's `(d)` control pattern
+# applied to it: delete the two guards in a COPY and prove the third still refuses, keeping the lock.
+# Verified discriminating — on that copy WITHOUT the status arm the pass exits 0 and DELETES the lock.
+mk_case status-arm
+LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
+: > "$LOCK"
+MUT="$D/refresh-no-guards.sh"
+python3 - "$REFRESH" "$MUT" <<'PY2'
+import sys
+src = open(sys.argv[1]).read()
+canon = "    ''|*[!0-9]*|0*)"
+assert canon in src, "canonical-form arm missing — this control would be vacuous"
+src = src.replace(canon, "    ''|*[!0-9]*|0)")
+i = src.index('  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then')
+j = src.index('  fi\n', i) + len('  fi\n')
+src = src[:i] + src[j:]
+assert 'SCOUT_LOCK_STALE_SECS}" -gt 9' not in src, "length guard still present — control vacuous"
+assert '0*)' not in src, "canonical arm still present — control vacuous"
+open(sys.argv[2], "w").write(src)
+PY2
+ck "(c3) the no-guards control was actually produced" "$([ -s "$MUT" ]; echo $?)"
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        SCOUT_LOCK_STALE_SECS=9223372036854775808 \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
+        bash "$MUT" 6 2>&1)"
+RC=$?
+ck "(c3) with the two form guards deleted the STATUS arm still refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+ck "(c3) the lock SURVIVED — the comparison error was not read as 'stale'" "$([ -e "$LOCK" ]; echo $?)"
+case "$(rec why)" in *"could not be compared"*) r=0 ;; *) r=1 ;; esac
+ck "(c3) the cause says the comparison could not be performed (why=$(rec why | cut -c1-90))" "$r"
+case "$OUT" in *"REPAIR: removed"*) r=1 ;; *) r=0 ;; esac
+ck "(c3) no REPAIR line was printed on the uncomparable bound" "$r"
 
 # ── (d) NON-VACUITY: revert the cause-recording, and (a) MUST go red ────────────────────────────────
 # A copy of the SHIPPED script with ONE line reverted to the pre-fix shape (`|| exit "$SCOUT_REFUSE_RC"`

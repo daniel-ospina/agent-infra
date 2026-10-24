@@ -1200,10 +1200,20 @@ scout_clear_stale_lock() {
   # ⛔ THE COMPARISON IS CHECKED FOR ITS STATUS, NOT JUST FOR "TRUE" (#2688 review cycle 3, P1).
   # `if [ … ]` reads every non-zero status as FALSE, so a comparison that ERRORED was indistinguishable
   # from "the lock is NOT younger than the bound" — which is how a live lock reached `rm -f` twice.
-  # Status 0 = the lock IS younger than the bound (the live-writer refusal); status 1 = provably STALE
+  # Status 0 = the lock IS at or under the bound (the live-writer refusal); status 1 = provably STALE
   # (fall through and remove); anything else is "could not compare" and refuses.
+  # ⛔ AT EQUALITY IT REFUSES (#2688 review cycle 4, P2). The comparison was `<`, so a lock aged
+  # EXACTLY `SCOUT_LOCK_STALE_SECS` was removed while the `REPAIR:` line below printed "300s old >
+  # 300s" — an inequality the code did not hold, the same class cycle 2 fixed one line up. `-le`
+  # makes the printed relation true AND errs high at the seam, which is what the bound's own
+  # comment says it does. The (`c2`) arm pins the boundary, which nothing reached before.
+  # ⛔ THE `*)` ARM IS DELIBERATE DEFENCE IN DEPTH (review cycle 4, P2). As shipped it is
+  # UNREACHABLE: the canonical-form arm above admits 1-9 digits and `age` is digits by its own
+  # case, so the comparison can only return 0 or 1. It exists because that is a property of TWO
+  # other guards rather than of this line — the (`c3`) arm deletes both and proves this arm still
+  # refuses, so the guard cannot rot into dead code unnoticed.
   age_cmp=0
-  [ "$age" -lt "$SCOUT_LOCK_STALE_SECS" ] || age_cmp=$?
+  [ "$age" -le "$SCOUT_LOCK_STALE_SECS" ] || age_cmp=$?
   case "$age_cmp" in
     0|1) ;;
     *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
