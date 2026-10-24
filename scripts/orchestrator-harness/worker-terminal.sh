@@ -717,7 +717,7 @@ wt_tmux_names() {
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -730,7 +730,27 @@ wt_table() {
         esac ;;
     esac
   fi
-  tree="$(cmux tree --json 2>/dev/null)" || tree=""
+  # ⛔ AN ABSENT SESSION OWNER IS A READING, NOT AN UNREADABLE ONE (agent-infra#2653, measured
+  # 2026-10-24). `cmux tree --json` was read with its stderr discarded, so a daemon that was NOT
+  # RUNNING — answering `cannot connect to session socket …: Connection refused (os error 111)` with
+  # an empty stdout — was indistinguishable from a daemon that answered something undecodable. Both
+  # read UNKNOWN, every `kind=terminal` record read UNKNOWN, and `unknown` counts as LIVE by the
+  # fail-closed rule below. The measured consequence on the live cell: 18 stale worker records (logs
+  # silent for 26-30h) counted as 18 live workers; `wt_close` could never PROVE a close (its
+  # verification read is the same unreadable census), so the records were kept forever; the review
+  # lane ceiling never fell (`review lanes=11/6` every cycle for 26h); no review was dispatched for
+  # the 8 NEEDS-REVIEW PRs; the PR queue could not drain; and the threshold-free merge-priority gate
+  # held the issue path shut while 175 candidates went undispatched on a box reporting idle lanes.
+  # A terminal lives INSIDE the session owner. If the owner is not running there is no terminal —
+  # that is a MEASUREMENT, not a guess, and it is the same polarity the tmux half already implements
+  # (`no server running` = EMPTY, `error connecting` = unreadable). A daemon that ANSWERS with
+  # something undecodable (a banner, a drifted shape) is still UNKNOWN, below, unchanged: the caps
+  # keep binding on a read that is merely illegible, and only a CONFIRMED-ABSENT transport empties
+  # the census.
+  tree_err="$dir/.wt-tree-err.$$"
+  tree="$(cmux tree --json 2>"$tree_err")" || tree=""
+  tree_err="$(cat "$tree_err" 2>/dev/null || true)"
+  rm -f "$dir/.wt-tree-err.$$" 2>/dev/null || true
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
   # header already records that the id shape differs) yields an EMPTY table while `$tree` is
@@ -743,6 +763,20 @@ wt_table() {
   if command -v tmux >/dev/null 2>&1; then names="$(wt_tmux_names)" && nrc=0 || nrc=3; else nrc=0; fi
   if [ -n "$tree" ]; then
     if raw="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else raw=""; fi
+  else
+    # NOTHING IS LISTENING => NOTHING IS RUNNING. ⛔ ONLY THE TWO SHAPES THAT NAME AN ABSENT SERVER
+    # COUNT — `Connection refused` (measured: a socket file with no listener, `os error 111`) and
+    # `no server running` (the CLI's own semantic answer, the same polarity `wt_tmux_names` gives).
+    # ⛔ AND **NOT** THE WRAPPER (`cannot connect to session socket …`): it is errno-agnostic, so it
+    # also carries `No such file or directory` (a repointed HOME, a wrong/unlinked socket path) and
+    # `Permission denied` — BOTH reachable while the daemon and its terminals are ALIVE. Emptying the
+    # census on those deletes a lived worker's record and stops every cap binding, which is the P1
+    # incident the tmux half's header records (`error connecting` = unreadable). A banner, a drifted
+    # shape, `cmux: cannot read`, a missing binary (127) or any other failure stays UNKNOWN too.
+    case "$tree_err" in
+      *'Connection refused'*|*'no server running'*)
+        probe_ok=1 ;;
+    esac
   fi
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).

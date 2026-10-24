@@ -396,6 +396,12 @@ is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 # is a deliberate way to run the role REPORT-ONLY.
 is_limit "${MAX_RED_FIX:-}"       || MAX_RED_FIX=4
 is_limit "${MAX_RED_FIX_TRIES:-}" || MAX_RED_FIX_TRIES=2
+# ⛔ THE REVIEW ROLE'S BUDGET IS THE SAME KIND OF LIMIT, AND IT IS READ HERE NOW (agent-infra#2653).
+# `MAX_REVIEW_TRIES` was merge-one.sh's alone; the controller now keys its OWN review dispatches on
+# it (`review_disp_decide`), so it is coerced on the same line and to the same default (3) merge-one
+# ships — a divergence would put two budgets on one head. `0` stays valid: it means "never re-dispatch
+# a review at a head the controller already spent one on".
+is_limit "${MAX_REVIEW_TRIES:-}"   || MAX_REVIEW_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
 is_limit "${CYC:-}"               || CYC=240
 # ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
@@ -835,6 +841,116 @@ review_gate_state() {
   if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
 }
 
+# [reviewdisp:begin]
+# ── THE REVIEW-DISPATCH KEY: ONE REVIEW PER (PR, HEAD), BOUNDED, NEVER SILENT (agent-infra#2653) ──
+# `state/reviewdisp-<PR>` = "<head> <n>": how many review lanes the CONTROLLER has dispatched for that
+# (PR, head). The head is the key because a review is evidence ABOUT A HEAD — a push re-arms the
+# budget, and an unchanged head must never pay for the same review twice.
+# ⛔ WHY THIS EXISTS AT ALL. A review lane IS dispatchable (`merge-<PR>`, below), but the controller kept
+# no record of having dispatched one, so a head whose gate stayed red was re-reviewed once per cycle
+# forever, and every one of those is a PAID fresh-context reviewer. The mirror image is what the fleet
+# actually paid for: with `review_slots` bounded, a review that never binds to a (PR, head) cannot be
+# TOLD APART from one already in flight — measured 2026-10-24, `review lanes=11/6` for 26h while the
+# box's four stuck PRs had never been reviewed at all (no `state/reviewcount-*`, no record in the
+# enforcer's store). Capacity and truth are different instruments; this is the truth one.
+# THREE VERDICTS, EACH WITH ITS OWN NAMED LINE — no silent skip, and no fresh review bought twice:
+#   ALLOW <n>      dispatch; <n> is what this head has already spent
+#   AT-HEAD <n>    the enforcer's record store already holds a CLEAN record at EXACTLY this head. A
+#                  second review of an unchanged head is pure waste, so it is REFUSED with that
+#                  reason. (The gate re-triggers on `edited`, so the free remedy for a red gate over
+#                  a valid record is a RE-RECORD — merge-one.sh's CLEAN path — never a new review.)
+#   CAP <n> <max>  the head has spent MAX_REVIEW_TRIES re-records with no verdict: REPORTED as
+#                  REVIEW-CAP and PARKED, because an unfixable head must not loop (the same bound, on
+#                  the same counter, merge-one.sh applies — and the same reason it applies it).
+# ⛔ THE STORE IS READ, NOT A SECOND DEFINITION OF "REVIEWED" (agent-infra#2517). `review_store_file`
+# is the path `record-review.sh` writes (`FILE="$DIR/${REPO%/*}-${REPO#*/}-$PR.json"`); a reader that
+# invents its own layout finds nothing and reports "never reviewed" for every PR. Two fields are read,
+# the same two #2517's dispatch floor reads: the EXACT head, and a clean verdict.
+# ⛔ EVERY CANDIDATE, NOT THE FIRST NAME (merge-one.sh::record_at_head's rule, and for its reason):
+# the producer writes a REPO-QUALIFIED file and keeps the LEGACY `<pr>.json` for a record made
+# without `--repo` (a hand record, a pre-#426 leftover). Reading only the qualified name reports
+# "never reviewed" for a PR whose evidence is sitting in the legacy one — so the controller would buy
+# reviews until the budget was spent and then PARK a head that already had valid evidence.
+review_store_candidates() { # <pr> -> one record-store path per line (qualified first, then legacy)
+  printf '%s/.pi/agent/reviews/%s-%s-%s.json\n' "$HOME" "${OR%%/*}" "${OR#*/}" "$1"
+  printf '%s/.pi/agent/reviews/%s.json\n' "$HOME" "$1"
+}
+review_disp_read() { # <pr> -> "<head> <n>" (n coerced: it feeds -ge and $(( + 1 )))
+  local f="$O/state/reviewdisp-$1" h="" n=0
+  if [ -f "$f" ]; then read -r h n < "$f" 2>/dev/null || true; fi
+  is_limit "${n:-}" || n=0
+  printf '%s %s\n' "${h:-}" "$n"
+}
+review_disp_decide() { # <pr> <head> -> "ALLOW <n>" | "AT-HEAD <n>" | "CAP <n> <max>"
+  local pr="$1" head="${2:-}" rec h="" n=0 sf
+  # An unreadable head is not a key. The ARM refuses to spend a review on one (it names the HEAD
+  # being unreadable instead); this stays as the helper's own contract for any other caller.
+  [ -n "$head" ] || { printf 'ALLOW 0\n'; return 0; }
+  rec="$(review_disp_read "$pr")"; n="${rec##* }"; h="${rec% *}"
+  # A PUSH RE-ARMS. The count belongs to the head it was spent on, never to the PR.
+  [ "${h:-}" = "$head" ] || n=0
+  while IFS= read -r sf; do
+    [ -f "$sf" ] || continue
+    grep -qF "\"head_sha\":\"$head\"" "$sf" 2>/dev/null \
+      && grep -qF '"verdict":"clean' "$sf" 2>/dev/null \
+      && { printf 'AT-HEAD %s\n' "$n"; return 0; }
+  done <<EOF
+$(review_store_candidates "$pr")
+EOF
+  if [ "$n" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
+    printf 'CAP %s %s\n' "$n" "${MAX_REVIEW_TRIES:-3}"; return 0
+  fi
+  printf 'ALLOW %s\n' "$n"
+}
+review_disp_record() { # <pr> <head> <n> — written only AFTER a spawn succeeded (bookkeep on success)
+  printf '%s %s\n' "$2" "$3" > "$O/state/reviewdisp-$1" 2>/dev/null || true
+}
+# review_athead_next <pr> <head> -> the number of AT-HEAD refusals now standing for this head.
+# ⛔ AT-HEAD IS THE ONE STATE THAT NEITHER DISPATCHES NOR PARKS, SO IT MUST EVENTUALLY ESCALATE
+# (review of #2653, P2). Its remedy is a RE-RECORD, which only `merge-one.sh`'s CLEAN path can mint —
+# and the branch that withholds the review is exactly what prevents it from running. Left unbounded,
+# it is the same "the queue never drains and nothing says why" shape this change exists to end, so
+# after `MAX_REVIEW_TRIES` cycles at one head the PR PARKS with a reason naming the action.
+review_athead_read() { # <pr> -> "<head> <n>"
+  local f="$O/state/reviewathead-$1" h="" n=0
+  if [ -f "$f" ]; then read -r h n < "$f" 2>/dev/null || true; fi
+  is_limit "${n:-}" || n=0
+  printf '%s %s\n' "${h:-}" "$n"
+}
+review_athead_bump() { # <pr> <head> -> prints the new count
+  local rec n h
+  rec="$(review_athead_read "$1")"; n="${rec##* }"; h="${rec% *}"
+  [ "${h:-}" = "${2:-}" ] || n=0
+  n=$(( n + 1 ))
+  printf '%s %s\n' "$2" "$n" > "$O/state/reviewathead-$1" 2>/dev/null || true
+  printf '%s\n' "$n"
+}
+# review_lane_holders — the lanes the review ceiling is counting, WITH their log age.
+# ⛔ A COUNT WITHOUT AN OWNER IS WHAT MADE THE STALL INVISIBLE (agent-infra#2653). The live line said
+# `review lanes=11/6` for 26 hours; the 11 were dead records whose logs had been silent for 26-30h and
+# nothing said so. A refusal that names its holders and their age turns "the box is busy" into "these
+# eleven units are not alive", which is the only reading an operator can act on.
+review_lane_holders() { # -> "merge-<pr>(<age>) …" (max 6, then "+N more")
+  local n st f m age out="" extra=0 lim=6 count=0
+  while IFS="$(printf '\t')" read -r n st; do
+    case "$n" in merge-*) ;; *) continue ;; esac
+    case "$st" in dead) continue ;; esac
+    count=$(( count + 1 ))
+    if [ "$count" -gt "$lim" ]; then extra=$(( extra + 1 )); continue; fi
+    age="?m"
+    f="$O/logs/$n.log"
+    if [ -f "$f" ] && m="$(file_mtime_epoch "$f" 2>/dev/null)" && is_num "${m:-}"; then
+      age="$(( ( $(date +%s) - m ) / 60 ))m"
+    fi
+    out="$out${out:+, }$n($age)"
+  done <<EOF
+$(wt_table)
+EOF
+  [ "$extra" -gt 0 ] && out="$out${out:+, }+${extra} more"
+  printf '%s' "${out:-none}"
+}
+# [reviewdisp:end]
+
 # prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*`
 # markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
 # in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
@@ -858,11 +974,15 @@ prune_orphan_markers() {
   [ "$n" -lt 300 ] || return 0
   # ⛔ `needsfix-*`, `reviewcount-*` AND `-n` (review round 10 final pass). `needsfix` was the one
   # marker family that still leaked; `reviewcount-<PR>` was created by this branch and was in NO sweep
-  # family at all. And `sed` WITHOUT `-n` prints every non-matching line unchanged — so a name outside
+  # family at all. `reviewdisp-*` and `reviewathead-*` are the SAME class (head-bound review budgets
+  # written by the controller's review arm, agent-infra#2653): a stale `"<head> 3"` surviving a
+  # close-and-reopen would re-arm a spent budget on the same head, and one file per abandoned PR is
+  # the monotonic growth this file rejects everywhere else. And `sed` WITHOUT `-n` prints every
+  # non-matching line unchanged — so a name outside
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -873,7 +993,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^reviewcount-([0-9][0-9]*)$/\1/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|reviewdisp|reviewathead)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     rm -f "$mf"
@@ -3027,7 +3147,7 @@ while true; do
     # `MERGED|CLOSED)` arms would make the second unreachable behind the first's `continue`, so the
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
-      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" 2>/dev/null || true
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
       # A PR that leaves the queue carries no refusal and no budget: these are head-bound records, and
       # nothing else prunes them (review P3, cycle 4 — small, but one pair per abandoned PR, forever).
       [ "${REDFIX:-0}" = "1" ] && rail_refusal_clear "$O" "$PR" 2>/dev/null
@@ -3736,7 +3856,48 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "parked: still needs fixes after $NF attempts — needs a human"
+            # ── THE (PR, HEAD) REVIEW KEY IS CONSULTED BEFORE CAPACITY (agent-infra#2653) ────────
+            # ⛔ ORDER IS THE POINT. Capacity is a fact about the BOX; AT-HEAD and CAP are facts about
+            # the REVIEW. Testing capacity first reports "review-lane ceiling reached" for a head that
+            # should never have been reviewed again at all — the reading an operator gets is then about
+            # the machine, and the PR's real state is invisible (the 2026-10-24 stall: eight PRs
+            # reported as a capacity problem while four of them were merely un-reviewed).
+            # ⛔ AND AN UNREADABLE HEAD IS NOT A KEY (review of #2653, P3). A review is evidence ABOUT A
+            # HEAD; spending one on an empty `HEAD_N` (a failed `gh pr view … headRefOid`) records a
+            # count under a key nobody can compare, buys up to MAX_REVIEW_TRIES paid reviews, and then
+            # parks the PR with a reason claiming the budget when the real cause was an API read.
+            elif [ -z "${HEAD_N:-}" ]; then
+              echo "#$PR $V but the HEAD is UNREADABLE — no review dispatched (a review is head-scoped evidence; a review spent on an unnamed head cannot be keyed, compared, or recorded, and the budget would be spent against a key that means nothing)" >>"$LOG"
+              disp "$PR" - "$V" wait "head unreadable — a review is not spent on a guess (re-read next cycle)"
+            elif _rvd="$(review_disp_decide "$PR" "${HEAD_N:-}")"; [ "${_rvd%% *}" = "AT-HEAD" ]; then
+              # ⛔ AT-HEAD DOES NOT DISPATCH — AND IT MUST NOT WAIT FOREVER EITHER (review of #2653, P2).
+              # Its remedy is a RE-RECORD, which only merge-one.sh's CLEAN path mints, and this branch
+              # is what withholds the spawn that would run it. Bounded here, so the state reaches a
+              # HUMAN as an action item instead of logging a wait row every cycle for ever.
+              _ahn="$(review_athead_bump "$PR" "${HEAD_N:-}")"
+              if [ "$_ahn" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
+                echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human (a re-record, not a review, is the remedy — `record-review.sh $PR ${HEAD_N:-<head>} clean $OR --evidence comment:<that review's comment id>` re-triggers the gate, which fires on 'edited')" >>"$LOG"
+                park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-AT-HEAD-STUCK: a CLEAN review is already recorded at head=${HEAD_N:-?} and the ai-review-gate never went green over it after ${_ahn} cycle(s). No review is dispatched (a second review of an unchanged head is waste) and the controller has no re-record actuator — a human must re-record the existing evidence or re-run the gate. A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewathead-$PR'"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "parked: REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} — recorded review, red gate, needs a human"
+              else
+                echo "#$PR REVIEW-AT-HEAD at head=${HEAD_N:-?} (refusal ${_ahn}/${MAX_REVIEW_TRIES}) — a CLEAN review is already recorded at this exact head, so NO review is dispatched (a second review of an unchanged head is waste; the gate re-triggers on 'edited', so a RE-RECORD — merge-one.sh's CLEAN path — is the remedy for a red gate over a valid record, never a new review)" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-AT-HEAD: a CLEAN review is recorded at this head — no re-review dispatched (the record, not a reviewer, is the missing step)"
+              fi
+            elif [ "${_rvd%% *}" = "CAP" ]; then
+              # ⛔ THE MIDDLE FIELD IS THE COUNT (review of #2653, P2): `CAP <n> <max>` — `${_rvd##* }`
+              # is the LAST field, i.e. `max`, which only differs from `n` when an operator LOWERS
+              # MAX_REVIEW_TRIES — exactly the tuning the park reason invites, and the number the
+              # "never a silent stop" line reports would then be the budget instead of the spend.
+              _rvn="${_rvd#CAP }"; _rvn="${_rvn%% *}"
+              echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, PARKED (an unfixable head must not loop; a push re-arms it)" >>"$LOG"
+              park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-CAP: ${_rvn}/${MAX_REVIEW_TRIES} review re-records at head=${HEAD_N:-?} — the reviewer never produced a usable verdict at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewdisp-$PR'"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at this head — needs a human (bounded, never a silent stop)"
             elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
+              # ⛔ READ THE COUNT FROM THIS PR'S VERDICT, NOT FROM A VARIABLE LEFT BY THE LAST PR. The
+              # sweep loop is one shell, so a bare `_rvn` set in the CAP branch above would still hold
+              # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
+              # the attempt number, so a stale carry would silently spend another PR's budget.
+              _rvn="${_rvd##* }"
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
               # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
@@ -3744,14 +3905,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
               if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+                # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
+                # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
+                # a real attempt, and this counter is the only thing standing between a wedged reviewer
+                # and an unbounded run of paid reviews.
+                review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"
                 echo "#$PR re-record" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review)"
+                disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
               else
                 echo "#$PR re-record spawn FAILED (no review worker started this cycle)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
               fi
             else
-              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, $(spawn_gate_tok))" >>"$LOG"
+              # ⛔ THE REFUSAL NAMES ITS HOLDERS (agent-infra#2653): a count with no owner is what let 11
+              # dead worker records read as "the box is busy" for 26 hours.
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR — holding: $(review_lane_holders); $(spawn_gate_tok))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi

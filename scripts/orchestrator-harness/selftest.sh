@@ -2981,8 +2981,12 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # a coercion added without its pin must redden this check, not pass as "more is better".
 # 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
 # its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
-[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 18 -> 19 for agent-infra#2653 (MAX_REVIEW_TRIES: the controller now keys its own review dispatches
+# on merge-one.sh's per-head review budget, so the SAME limit feeds a `-ge` in a SECOND file — an
+# uncoerced copy there would let a typo run the review budget unbounded, which is the loop the bound
+# exists to prevent).
+[ "$_ngrd_n" = "19" ] && rcn=0 || { rcn=1; echo "      expected 19 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 19 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2997,21 +3001,21 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 # enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
-           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
-           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; MAX_RED_FIX=; MAX_RED_FIX_TRIES=; STALE_MIN=; MAX_REVIEW_TRIES=
+           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s revtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$MAX_REVIEW_TRIES" "$STALE_MIN" ); }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 # ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
 # the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
 # CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
 # reddens the two cases above and below.
-[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
+[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
 # prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
 # read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
-[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
 # ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
 # passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
@@ -3054,17 +3058,17 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
 # cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
 # The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
 # drops the floor line leaves cyc=0 here — RED.
-[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
 ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
 # Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
-[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
 ck "a deliberate small CYC=5 survives the floor unchanged" $rc
 # And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
 # `is_num 08` must be FALSE, while `0` and a real number stay true.

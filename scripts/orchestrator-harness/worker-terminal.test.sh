@@ -55,6 +55,10 @@ printf '%s\n' "CMUX $*" >> "${CMUX_LOG:-/dev/null}"
 if [ "${CMUX_ABSENT:-0}" = "1" ]; then echo "cmux: no daemon" >&2; exit 1; fi
 case "${1:-}" in
   tree)
+    # ⛔ AN ABSENT SESSION OWNER: no stdout, a transport error ON STDERR, non-zero rc. This is the
+    # measured shape of the live cell on 2026-10-24 (`cannot connect to session socket …: Connection
+    # refused (os error 111)`) and it is a READING, not an unreadable census (agent-infra#2653).
+    [ "${CMUX_TREE_ABSENT:-0}" = "1" ] && { printf '%s\n' "${CMUX_TREE_ABSENT_MSG:-cannot connect to session socket /tmp/cmux-tui-1000/cloud.sock: Connection refused (os error 111)}" >&2; exit 3; }
     [ "${CMUX_TREE_FAIL:-0}" = "1" ] && { echo "cmux: cannot read" >&2; exit 1; }
     # A SEQUENCED tree: the daemon answers differently on the nth call (a close is verified against a
     # SECOND read). `$CMUX_TREE_SEQ.1`, `.2`, … with `.last` as the fallback.
@@ -1449,6 +1453,84 @@ grep -qE '^[wt]:' <<<"$rows" && rc=1 || rc=0
 ck "…and no internal \`w:\`/\`t:\` key row leaks into the printed table" $rc
 printf '%s\n' "$rows" | awk -F'\t' '$1=="lane-1" && $2=="alive"{f=1} END{exit f?0:1}' && rc=0 || rc=1
 ck "…the rows are the worker names with their verdict" $rc
+
+echo
+echo "── Q) an ABSENT session owner is a READING: nothing is listening, so nothing is running ──"
+# ⛔ MEASURED 2026-10-24 (agent-infra#2653). The cmux daemon was not running and `cmux tree --json`
+# answered `cannot connect to session socket …: Connection refused` with EMPTY stdout. The probe read
+# that as UNREADABLE, every terminal record read UNKNOWN, and UNKNOWN counts as LIVE (the fail-closed
+# rule below, which is right for a transient blip). The harness therefore counted 18 worker records
+# whose logs had been silent for 26-30 HOURS as 18 live workers, `wt_close` could never PROVE a close,
+# the review-lane ceiling stayed at 11/6 for 26 hours, no review was dispatched for the 8 NEEDS-REVIEW
+# PRs, the PR queue could not drain, and the issue path stayed shut with 175 candidates waiting.
+# A terminal lives INSIDE the session owner: if the owner is not running, the terminal is gone. That is
+# a measurement — the same polarity the tmux half already implements.
+cat > "$TMP/q1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+printf 'kind=terminal\nid=term_stale1\nworkspace=ws_stale1\n' > "$WT_DIR/worker-merge-91"
+printf 'kind=terminal\nid=term_stale2\nworkspace=ws_stale2\n' > "$WT_DIR/worker-fix-92"
+. "$1"
+echo "alive=$(wt_alive merge-91 && echo yes || echo no)"
+echo "merge=$(wt_count merge-)"
+echo "fix=$(wt_count fix-)"
+wt_close merge-91; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-91" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/q1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O18" 2>&1)"
+case "$out" in *"alive=no"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an absent daemon reads its terminal records DEAD (nothing is listening)" $rc
+case "$out" in *"merge=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…so the REVIEW-lane census is 0, not 11 ghosts — the ceiling can free" $rc
+case "$out" in *"fix=0"*) rc=0 ;; *) rc=1;; esac
+ck "…and the fixer census with it (one polarity, every cap)" $rc
+case "$out" in *"close_rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…a close is now PROVEN (the verification read can finally answer)" $rc
+case "$out" in *"record=gone"*) rc=0 ;; *) rc=1;; esac
+ck "…and the stale record is released instead of pinning a slot forever" $rc
+# ⛔ THE OTHER DIRECTION, ON THE SAME FIXTURE: a daemon that ANSWERS but cannot be READ is a different
+# state and must stay UNKNOWN. Without this half the change is a licence to declare every worker dead
+# whenever the census is awkward, which is the false-PASS direction the polarity rule forbids.
+cat > "$TMP/q2.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_FAIL=1
+printf 'kind=terminal\nid=term_live1\nworkspace=ws_live1\n' > "$WT_DIR/worker-merge-93"
+. "$1"
+echo "alive=$(wt_alive merge-93 && echo yes || echo no)"
+echo "merge=$(wt_count merge-)"
+wt_close merge-93; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-93" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/q2.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O19" 2>&1)"
+case "$out" in *"alive=yes"*"merge=1"*"close_rc=1"*"record=kept"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a FAILED (not absent) census read is still UNKNOWN: alive, counted, unprovable, record KEPT" $rc
+# ⛔ AND THE WRAPPER IS NOT THE SIGNAL — THE ERRNO IS (review of #2653, P1). `cannot connect to session
+# socket <path>: <reason>` is errno-agnostic, so it also carries `No such file or directory` (a
+# repointed HOME / a wrong socket path) and `Permission denied` — BOTH reachable with the daemon and
+# its terminals ALIVE. Matching the wrapper would empty the census and DELETE a lived worker's
+# record, the P1 the tmux half's header records. Only an absent LISTENER (`Connection refused`) or the
+# CLI's own `no server running` may empty it.
+for _msg in 'cannot connect to session socket /tmp/x.sock: No such file or directory (os error 2)' \
+            'cannot connect to session socket /tmp/x.sock: Permission denied (os error 13)' \
+            'cannot connect to session socket /tmp/x.sock: Resource temporarily unavailable (os error 11)'; do
+  cat > "$TMP/q3.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4"
+printf 'kind=terminal
+id=term_live5
+workspace=ws_live5
+' > "$WT_DIR/worker-merge-95"
+. "$1"
+echo "alive=$(wt_alive merge-95 && echo yes || echo no)"
+echo "count=$(wt_count merge-)"
+SH
+  out="$(bash "$TMP/q3.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O20" "$_msg" 2>&1)"
+  case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1 ;; esac
+  ck "the WRAPPER with a different errno is still UNKNOWN: ${_msg##*: }" $rc
+done
 
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"
