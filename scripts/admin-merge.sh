@@ -1292,7 +1292,13 @@ named_unattributable_runs() {
   local unattributed="${1:-}" base="${2:-}" expected="${3:-}" line runref run_id names name kind
   local mapped mapped_kind base_reds base_status base_total red_names named_count
   [ -s "$unattributed" ] || return 0
-  named_count="$(grep -c '[^[:space:]]' "$unattributed" 2>/dev/null || printf '0')"
+  # ⛔ `grep -c` PRINTS `0` AND EXITS 1 on no match, so a `|| printf '0'` fallback makes the
+  # count the two-line string `0\n0` — and a `0\n0` header is not a count (#2610 review). The
+  # fallback is only for grep being unavailable; the default covers the no-match case. The
+  # predicate matches the loop's guard exactly, so the header cannot disagree with the body:
+  # the loop skips a line with no NON-SPACE character, and so does this count.
+  named_count="$(grep -c '[^[:space:]]' "$unattributed" 2>/dev/null || true)"
+  [ -n "$named_count" ] || named_count=0
   # The base's own surface, through the ONE probe (#1261) — never a second reader. A base
   # ref that could NOT be resolved is not a ref to probe: passing '' would have made the
   # reader assert "'X' IS red on ''" about a branch nobody resolved, so the ref is checked
@@ -1317,7 +1323,7 @@ named_unattributable_runs() {
   say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
   say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
   while IFS= read -r line; do
-    [ -n "$line" ] || continue
+    [ -n "${line//[[:space:]]/}" ] || continue
     runref="${line##*$'\t'}"
     run_id="${runref##*:}"
     if ! names="$(fetch_run_failed_job_names "$run_id" 2>/dev/null)"; then

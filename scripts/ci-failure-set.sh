@@ -1328,11 +1328,12 @@ collect_union_rows() {
         if [ -n "$per_run" ]; then
           printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
         fi
-      else
-        # A PRUNED log that names no failed job either: unattributable at both
-        # granularities (#7131, #2610).
-        [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
       fi
+      # ⛔ NOTHING TO DO IN AN `else`, and the absent branch is stated rather than assumed:
+      # `run_failed_job_ids` cannot return 0 with empty output (both its paths end
+      # `[ -n … ] || return 1`), so a pruned log naming no failed job takes the `return 1`
+      # above and FAILS THE CAPTURE CLOSED. It therefore never reaches `--unattributed` —
+      # see the ⛔ block in this function's docblock.
       continue
     fi
     if [ "$frc" -ne 0 ]; then
