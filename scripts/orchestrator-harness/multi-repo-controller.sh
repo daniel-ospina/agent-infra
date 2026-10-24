@@ -93,7 +93,13 @@ O_real="$(_canon "$O")"
 O_primary_real="$(_canon "$O_PRIMARY")"
 [ "$O_real" != "$O_primary_real" ] \
   || refuse "O ($O_real) IS the primary controller's state dir — a second controller there shares .orch.lock, candidates.txt and the lane registry with the first, so both dispatch into one queue and neither can tell whose work is whose. Give this repo its own dir: O=\$HOME/orchestrator-<repo>"
-[ "$HARNESS_PIN" != "$PIN_PRIMARY" ] \
+# ⛔ THE PIN GETS THE SAME PHYSICAL-PATH TREATMENT AS `O`. A string compare blessed
+# `$HOME/.pi/agent/state/./HARNESS-PIN`, `…/state//HARNESS-PIN` and a plist rendering
+# `{{AI_MULTI_REPO_STATE}}/state/HARNESS-PIN` with a doubled slash — all the PRIMARY's pin, i.e. exactly the
+# silent sharing this refusal exists for.
+PIN_real="$(_canon "$(dirname "$HARNESS_PIN")")/$(basename "$HARNESS_PIN")"
+PIN_primary_real="$(_canon "$(dirname "$PIN_PRIMARY")")/$(basename "$PIN_PRIMARY")"
+[ "$PIN_real" != "$PIN_primary_real" ] \
   || refuse "HARNESS_PIN ($HARNESS_PIN) IS the primary controller's pin — two controllers advancing one pin rewrite each other's harness provenance. Give this repo its own: HARNESS_PIN=$O/state/HARNESS-PIN"
 
 # ── the state dir and the pin: absent is a REFUSAL, not something to conjure mid-launch ───────

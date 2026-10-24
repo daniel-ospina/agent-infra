@@ -975,7 +975,12 @@ fleet_row_lander_drain() {
 FLEET_DRAINER_STATE="${FLEET_DRAINER_STATE:-${AI:-$FLEET_HOME/orchestrator-ai}}"
 fleet_row_ai_drainer() { # <harness-path>
   local harness="${1:-}" code=""
-  [ -n "$harness" ] && code="$harness/scripts/orchestrator-harness/ai-drainer.sh"
+  # ⛔ `$harness` IS the directory that HOLDS the harness scripts (the caller passes
+  # `harness_ctl_path`, and `fleet_row_controller` reads "$harness/orch-loop.sh"). Appending
+  # `scripts/orchestrator-harness/` doubled the path, so `requires` never resolved and the row took
+  # the SKIPPED branch — i.e. the one state it exists for ("the code is here and nothing installs
+  # it") rendered as a PASS, which is the green-by-absence this file exists to end.
+  [ -n "$harness" ] && code="$harness/ai-drainer.sh"
   _fleet_row_launchd_job ai-drainer com.eldato.ai-drainer "$code" "ai-drainer" \
     "$FLEET_DRAINER_STATE/state/ai-drainer.beat" \
     "${code:-$FLEET_AGENT_SCRIPTS/ai-drainer.sh}"
@@ -991,17 +996,28 @@ fleet_row_ai_drainer() { # <harness-path>
 # change — a hand-run second controller that vanishes on reboot, which nothing reported.
 FLEET_AI_STATE="${FLEET_AI_STATE:-$FLEET_HOME/orchestrator-ai}"
 fleet_row_second_controller() {
-  local o="$FLEET_AI_STATE" label="com.eldato.ai-multi-repo" plist pids lock n hb_age
+  local o="$FLEET_AI_STATE" label="com.eldato.ai-multi-repo" plist pids lock n hb_age declared
   plist="$(fleet_plist "$label")"
+  # ⛔ THE JOB'S OWN DECLARATION WINS over the seam. The second controller's state dir is rendered into
+  # its plist as `O`, so an operator who activated it somewhere else would otherwise be judged against
+  # a directory the job does not use (a permanent false MISSING, or worse a false OK against the wrong
+  # dir). The seam stays as the fallback for a box with no job.
+  declared="$(fleet_plist_value "$label" O)"
+  [ -n "$declared" ] && o="$declared"
   local exp="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
   if [ ! -f "$plist" ]; then
-    if [ -d "$o" ]; then
+    # ⛔ EVIDENCE THE SECOND CONTROLLER CREATED, not a directory something else owns. `-d "$o"` was the
+    # wrong predicate: `$HOME/orchestrator-ai` is ALSO the ai-drainer's default state dir, which the
+    # drainer creates on its first tick — so activating only the DRAINER manufactured a red row
+    # instructing the operator to install a second controller (model spend, per box). The `--init`
+    # artefact is the one thing only the launcher writes.
+    if [ -s "$o/state/HARNESS-PIN" ]; then
       fleet_row second-controller "$exp" "no job definition" MISSING \
-        "$o exists — so a second controller was set up on this box — but no job installs it (looked for $plist): it is hand-run or gone, and a reboot ends it silently. Render it: AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=$o bash scripts/install-launchd.sh"
+        "$o/state/HARNESS-PIN exists — so a second controller's identity was created on this box — but no job installs it (looked for $plist): it is hand-run or gone, and a reboot ends it silently. Render it: AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=$o bash scripts/install-launchd.sh"
       return 0
     fi
     fleet_row second-controller "$exp" "not installed" SKIPPED \
-      "neither a job definition ($plist) nor a state dir ($o) exists here — this box runs one repo's controller, which is the normal case (NOT a healthy second controller)"
+      "neither a job definition ($plist) nor a second controller's identity ($o/state/HARNESS-PIN) exists here — this box runs one repo's controller, which is the normal case (NOT a healthy second controller)"
     return 0
   fi
   if [ ! -d "$o" ]; then
