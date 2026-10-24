@@ -1280,6 +1280,55 @@ else
 fi
 
 echo ""
+echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no un-named red (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR (#2648 cycle-4 review): the first version named only the shard LOOP, so
+# a MIXED run — one listed shard failing PLUS a `bash -n` failure from the syntax sweep — yielded
+# exactly ONE identity. The rail's step-1c (`examined > extracted`) then PASSED, and the un-named file
+# disappeared from a certificate that named no residual: a truthful refusal turned into a FALSE PASS.
+# Nothing reddened if the sweep-naming half were reverted, which is what this arm closes.
+#
+# The fixture: every `run_shard` points at the PASSING stand-in (so the run is red ONLY because of the
+# sweep), and SWEEP_GLOBS is narrowed to a temp dir holding one file with a syntax error. Assert the
+# broken file is NAMED in the verdict block and that the run does NOT fall back to `could NOT be named`.
+BROKEN_DIR="$TMP/sweep-broken"
+mkdir -p "$BROKEN_DIR"
+printf 'if then\n' >"$BROKEN_DIR/broken.sh"
+awk -v pass="$PASS_SHARD" -v dir="$BROKEN_DIR" '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"" dir "/*.sh\")"; next }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " pass; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-sweepname.sh"
+if cmp -s "$RUNNER" "$TMP/runner-sweepname.sh"; then
+  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor a run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
+  RC=$?
+  SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
+    pass "a `bash -n` failure is NAMED in the verdict block (rc 1)"
+  else
+    fail "a sweep failure was counted but not named (rc $RC): $SWEEP_VERDICT"
+  fi
+  if grep -q 'could NOT be named' <<<"$SWEEP_VERDICT"; then
+    fail "a sweep failure was left UNNAMED — the rail gets an identity for the other shard and merges: $SWEEP_VERDICT"
+  else
+    pass "…and the verdict has no un-named remainder (the rail sees every failure)"
+  fi
+  # RED CONTROL: gut the recorder that the SWEEP calls, and the same run must go back to the count-only
+  # verdict — proving this arm pins the sweep's naming rather than any other line that prints a path.
+  awk '{ if ($0 ~ /^shard_named_failure\(\) \{/) { print "shard_named_failure() { :; }"; next } print }' \
+    "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepnoname.sh"
+  $FIXTURE_BOUND bash "$TMP/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
+  RC2=$?
+  SWEEP_NONAME="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepnoname.out")"
+  if [ "$RC2" -eq 1 ] && ! grep -qF "broken.sh" <<<"$SWEEP_NONAME" && grep -q 'could NOT be named' <<<"$SWEEP_NONAME"; then
+    pass "RED CONTROL: with the naming helper gutted the sweep failure is un-named again (rc 1)"
+  else
+    fail "the no-name control did not revert to an un-named verdict (rc $RC2): $SWEEP_NONAME"
+  fi
+fi
+
+echo ""
 echo "10. WIRING — a guard (or runner) nothing invokes protects nothing"
 for pair in "PR:$PR" "main:$MAIN"; do
   lane="${pair%%:*}"; wf="${pair#*:}"

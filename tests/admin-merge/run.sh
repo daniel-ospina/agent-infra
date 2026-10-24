@@ -2944,7 +2944,9 @@ grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-uniq
 # compares it against main's units — and there the collapse makes the rail say "main carries no
 # failure in <shard>", the exact opposite of the truth. Drive the derivation directly: the
 # scenario fixtures cannot reach that comparison without a three-run rate table.
-(
+  # ⛔ NOT IN A SUBSHELL (#2648 cycle-4 review): `pass`/`fail` increment the SUITE's counters,
+  # and inside `( … )` they incremented a child's — all six assertions printed ✅ and counted for
+  # nothing, so the arms they exist to pin stayed revertible with the suite green. Measured.
   # shellcheck disable=SC1090
   eval "$(sed -n '/^main_baseline_units() {/,/^}/p' "$ADM")"
   eval "$(sed -n '/^main_measured_files() {/,/^}/p' "$ADM")"
@@ -2981,7 +2983,6 @@ grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-uniq
   [ "$(failure_file_key 'bash-shard::scripts/aa-main.test.sh')" = 'scripts/aa-main.test.sh' ] \
     && pass "(i) failure_file_key derives the same unit (words and clearance cannot drift)" \
     || fail "(i) failure_file_key and main_baseline_units disagree about the unit"
-)
 
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)

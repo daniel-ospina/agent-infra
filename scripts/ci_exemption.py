@@ -1698,11 +1698,20 @@ _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
 
 #: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
-#: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free. Everything else is
-#: percent-encoded, and THAT is what makes the token injective.
+#: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free.
+#:
+#: ⛔ `quote()` IS NOT ENOUGH ON ITS OWN: urllib's ALWAYS-safe set includes `~`, which it therefore
+#: never escapes, so a path containing `~` produced `bash-shard::a~b.sh` while
+#: :data:`_NON_NODEID_KEY_RE` admitted only the chars below — the producer's alphabet was WIDER than
+#: the row door's, so the identity was produced, printed by the CLI, and silently DROPPED
+#: (`rejected=[…]`, `decide` → `CLEAN blocked=0`). Measured in #2648 cycle-4 review. Hence
+#: :data:`_SHARD_KEY_ALPHABET` + the post-pass below: the emitted token is confined to EXACTLY the
+#: door's alphabet, and `test_shard_token_alphabet_equals_the_row_doors` pins the equality.
 _SHARD_TOKEN_SAFE = "/._-"
-#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key: the safe set plus `%`.
-_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./%\-]+$")
+_SHARD_KEY_ALPHABET = re.compile(r"^[A-Za-z0-9_./%\-]+$")
+#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — kept equal to
+#: `_SHARD_KEY_ALPHABET` (asserted, not assumed).
+_SHARD_TOKEN_RE = _SHARD_KEY_ALPHABET
 
 
 def _shard_token(label: str) -> str:
@@ -1717,7 +1726,16 @@ def _shard_token(label: str) -> str:
     ever fed it the 80 listed paths, all of which are already inside the allow-list). Measured
     in #2648 review cycle 3. For the runner's real list the token IS the path, verbatim.
     """
-    return quote(label.strip(), safe=_SHARD_TOKEN_SAFE)
+    token = quote(label.strip(), safe=_SHARD_TOKEN_SAFE)
+    # `quote` leaves `~` (and only `~` among the printable chars) unescaped, which is OUTSIDE the
+    # row door's alphabet — see `_SHARD_TOKEN_SAFE`. Escape it here so the producer cannot emit a
+    # key its own door rejects (#6798 class, measured in #2648 cycle-4 review).
+    token = token.replace("~", "%7E")
+    if not _SHARD_KEY_ALPHABET.match(token):  # pragma: no cover - unreachable, kept fail-closed
+        token = "".join(
+            c if _SHARD_KEY_ALPHABET.match(c) else "%%%02X" % ord(c) for c in token
+        )
+    return token
 
 
 def bash_shard_failures(

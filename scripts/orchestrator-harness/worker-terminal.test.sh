@@ -68,6 +68,8 @@ gh_hosts_fixture() { # <home>
 # be pinned more tightly than "the resolution is correct on the box we are on", so the arm is the
 # RUNNER SHAPE: with `XDG_CONFIG_HOME` exported, the scrub-less copy fails here first and names the
 # values, and the scrubbed copy passes.
+_amb_gh_dir="${GH_CONFIG_DIR:-<unset>}"
+_amb_xdg_home="${XDG_CONFIG_HOME:-<unset>}"
 unset GH_CONFIG_DIR XDG_CONFIG_HOME
 _hermetic_probe="$TMP/hermetic-probe"
 _hermetic_hosts="$( set -u; . "$LIB" >/dev/null 2>&1; wt_gh_hosts "$_hermetic_probe" )"
@@ -76,7 +78,7 @@ if [ "$_hermetic_hosts" = "$_hermetic_probe/.config/gh/hosts.yml" ]; then
 else
   rc=1
   echo "      wt_gh_hosts(\$_hermetic_probe) => '$_hermetic_hosts'"
-  echo "      ambient: GH_CONFIG_DIR='${GH_CONFIG_DIR:-}' XDG_CONFIG_HOME='${XDG_CONFIG_HOME:-}'"
+  echo "      ambient BEFORE the scrub: GH_CONFIG_DIR='$_amb_gh_dir' XDG_CONFIG_HOME='$_amb_xdg_home'"
 fi
 ck "hermetic: no ambient GH_CONFIG_DIR/XDG_CONFIG_HOME retargets the credential probe" $rc
 
