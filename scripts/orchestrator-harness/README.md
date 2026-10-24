@@ -592,7 +592,7 @@ input to the environment contract.)
 Around the spawn, three properties hold:
 
 - **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
-  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s, because every caller reads it
+  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s; both are overridable), because every caller reads it
   through a command substitution), and a worker is identified the way its launcher named it: by the
   `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
   `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
@@ -602,8 +602,12 @@ Around the spawn, three properties hold:
   ⛔ **but "cannot be read" is not "is not there", and the difference is the whole census.** An
   ABSENT session owner is a *reading*, not an unreadable one: a terminal lives inside the session
   owner, so `cmux tree` answering `cannot connect to session socket …: Connection refused` (empty
-  stdout, nothing listening) means no durable terminal exists, and its records are **dead** — the same
-  polarity the tmux half already applies to `no server running`. A daemon that ANSWERS with something
+  stdout, nothing listening) means no durable terminal exists, and once that answer is **CONFIRMED —
+  two samples at least `WT_ABSENT_CONFIRM` (default 60 s) apart** — its records are **dead**; a single
+  refusal only opens the window and keeps the caps binding (a hard-killed owner leaves pty children
+  behind, and a restart window is seconds), while a readable census — or a successful terminal spawn,
+  which proves the owner answered — closes it again. This is the same polarity the tmux half already
+  applies to `no server running`. A daemon that ANSWERS with something
   undecodable (a banner, a drifted shape, `cmux: cannot read`) is still UNKNOWN and still pins every
   cap. Without that distinction there is no bound anywhere between "unreadable" and "slot held":
   measured 2026-10-24, a dead daemon left 18 stale worker records counted as 18 live workers for 26h,
