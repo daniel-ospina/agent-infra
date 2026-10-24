@@ -368,6 +368,75 @@ def test_a_failed_baseline_stat_on_an_existing_file_never_reaches_verified(P, tm
     assert verdict == P.PANE_ONLY
 
 
+def test_a_short_payload_is_not_certified_by_a_fragment_of_a_longer_word(P, tmp_path):
+    """⛔ A SHORT MARKER IS NOT A SUBSTRING (#1881 review, round 4 P1). `tail_marker` returns the
+    WHOLE compacted payload when it is shorter than `tail_chars`, and the comparison used to be a bare
+    `marker in compact(...)`: a payload of `ok` was certified by the lane writing "checking the token
+    now" ("token" contains "ok"), and a truncated `Retry` by `Retrying…`. The module's own defect
+    class includes an 8-byte payload that vanished, so short payloads are in scope — for them the
+    pre-fix check degenerated to "does this common word appear anywhere in the lane's next output".
+
+    Fails on the round-3 bytes: they return True here."""
+    f = tmp_path / "session.jsonl"
+    f.write_text(json.dumps({"type": "assistant", "content": "checking the token now"}) + "\n",
+                 encoding="utf-8")
+    assert P.transcript_has_payload(str(f), "ok") is False
+    assert P.screen_has_payload("assistant: checking the token now", "ok") is False
+
+
+def test_a_short_payload_appended_as_its_own_record_still_verifies(P, tmp_path):
+    """NON-VACUITY for the boundary rule: tightening it must not make a genuine short message
+    unverifiable, or the operator gets a false 'not submitted' for an order that arrived."""
+    f = tmp_path / "session.jsonl"
+    f.write_text(json.dumps({"type": "user", "content": "ok"}) + "\n", encoding="utf-8")
+    assert P.transcript_has_payload(str(f), "ok") is True
+    # ...and the same payload as a bare text line (a non-JSON transcript).
+    g = tmp_path / "plain.jsonl"
+    g.write_text("ok\n", encoding="utf-8")
+    assert P.transcript_has_payload(str(g), "ok") is True
+
+
+def test_an_unnameable_existing_transcript_never_licenses_the_two_mb_window(P, tmp_path, monkeypatch):
+    """⛔ THE ROUND-4 P1: AN UNNAMEABLE FILE IS NOT AN ABSENT FILE. `session_file_for` answers None for
+    both "the glob found no file" and "the glob found files but the stat raised", and the loop used
+    that None as proof the transcript did not exist before the send. So ONE transient `getmtime`
+    error on a pre-existing 18 MB transcript reopened the search at offset 0, and a days-old identical
+    message certified a send that appended nothing. Existence is answered by the GLOB alone.
+
+    Fails on the round-3 bytes: they reach VERIFIED here."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    real_getmtime = os.path.getmtime
+    calls = {"n": 0}
+
+    def flaky_getmtime(path):
+        # The PRE-SEND read fails once; every later read succeeds. The file was there all along.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient stat failure")
+        return real_getmtime(path)
+
+    monkeypatch.setattr(P.os.path, "getmtime", flaky_getmtime)
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        if argv[:2] == ["cmux", "send"]:
+            return _Proc("OK")                    # sent, but nothing appended
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("working...\n")          # the tail is not on the pane either
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict != P.VERIFIED, "an unnameable pre-existing transcript certified the send"
+
+
 def test_a_transcript_created_by_this_send_can_still_verify(P, tmp_path, monkeypatch):
     """⛔ ONE RESOLUTION IS NOT ENOUGH (#1881 review P2). pi creates the session file on the first
     user message, so resolving the path only BEFORE the send made VERIFIED unreachable for a lane

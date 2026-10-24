@@ -128,6 +128,34 @@ def tail_marker(text: str, tail_chars: int = DEFAULT_TAIL_CHARS) -> str:
     return compacted[-tail_chars:]
 
 
+# ⛔ A SHORT MARKER IS NOT A SUBSTRING (#1881 review, round 4 P1). `tail_marker` returns the WHOLE
+# compacted payload when it is shorter than `tail_chars`, and the comparison used to be a bare
+# `marker in compact(...)`. So a payload of `ok` was certified by any appended text that happened to
+# contain it — the lane writing "checking the token now" made "token" certify it, and a truncated
+# `Retry` was certified by `Retrying…`. The docstring's own defect class includes an 8-byte payload
+# that vanished entirely, so short payloads are in scope. Below this length the marker must match as a
+# TOKEN (no alphanumeric character on either side), never as a fragment of a longer word.
+MIN_SUBSTRING_MARKER = 16
+
+
+def _marker_matches(text: str | None, marker: str) -> bool:
+    """Whether `marker` occurs in `text` — as a TOKEN when it is short, as a run when it is long.
+
+    Whitespace is removed for the long form (a TUI wrap must not manufacture a false negative), and
+    kept-but-flattened for the short form (removing it would fuse words and defeat the boundary).
+    """
+    if not marker or not text:
+        return False
+    if len(marker) >= MIN_SUBSTRING_MARKER:
+        return marker in compact(text)
+    flat = flatten(text)
+    # A short payload IS the whole message, so an exact match against a flattened candidate is the
+    # strongest form; the boundary regex covers the rest without letting a fragment certify anything.
+    if compact(flat) == marker:
+        return True
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(marker)}(?![A-Za-z0-9])", flat) is not None
+
+
 def screen_has_payload(screen: str | None, sent_text: str,
                        tail_chars: int = DEFAULT_TAIL_CHARS) -> bool:
     """True iff the payload's tail marker appears on `screen`.
@@ -138,7 +166,7 @@ def screen_has_payload(screen: str | None, sent_text: str,
     marker = tail_marker(sent_text, tail_chars)
     if not marker:
         return False
-    return marker in compact(screen)
+    return _marker_matches(screen, marker)
 
 
 def resolve_session_id(workspace: str, run) -> str | None:
@@ -165,17 +193,33 @@ def resolve_session_id(workspace: str, run) -> str | None:
     return None
 
 
+def session_file_hits(session_id: str | None) -> list[str]:
+    """Every transcript path that exists for a KNOWN session id (glob only — no stat).
+
+    ⛔ "NO FILE EXISTS" AND "NO FILE COULD BE NAMED" ARE DIFFERENT FACTS (#1881 review, round 4 P1).
+    `session_file_for` answers None for both, and the send loop used that None as proof that the
+    transcript did not exist before the send — so one transient `getmtime` error on a pre-existing
+    18 MB transcript reopened the search at offset 0 and let a days-old identical message certify a
+    send that appended nothing. The glob is the only read that answers existence without touching a
+    stat, so it is the only read that may license offset 0.
+    """
+    if not session_id:
+        return []
+    home = os.path.expanduser("~")
+    return glob.glob(f"{home}/.pi/agent/sessions/*/*{session_id}*.jsonl")
+
+
 def session_file_for(session_id: str | None) -> str | None:
-    """The newest transcript for a KNOWN session id, or None when no file exists yet.
+    """The newest transcript for a KNOWN session id, or None when none can be NAMED.
+
+    None means "no path I can vouch for" — no file exists, or the stat failed. Callers that need to
+    distinguish those must ask `session_file_hits`.
 
     Takes the id rather than the workspace on purpose: the caller resolves the id ONCE, before the
     send, so a later lookup can only answer "does the file exist now", never "is this a different
     session".
     """
-    if not session_id:
-        return None
-    home = os.path.expanduser("~")
-    hits = glob.glob(f"{home}/.pi/agent/sessions/*/*{session_id}*.jsonl")
+    hits = session_file_hits(session_id)
     if not hits:
         return None
     try:
@@ -273,7 +317,7 @@ def transcript_has_payload(path: str, sent_text: str,
             chunk = fh.read().decode("utf-8", "replace")
     except Exception:                                          # noqa: BLE001
         return False
-    if marker in compact(chunk):
+    if _marker_matches(chunk, marker):
         return True
     # Decode the JSONL records the send appended. A fragment at either edge of the window may not
     # parse; that is fine, a partial line can only ever ADD candidates, never remove one.
@@ -282,7 +326,7 @@ def transcript_has_payload(path: str, sent_text: str,
         decoded = _decode_escaped(line)
         if decoded:
             candidates.append(decoded)
-    return any(marker in compact(candidate) for candidate in candidates)
+    return any(_marker_matches(candidate, marker) for candidate in candidates)
 
 
 def transcript_offset(path: str | None) -> int | None:
@@ -337,9 +381,12 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
     session_id = resolve_session_id(workspace, run)
+    # ⛔ EXISTENCE IS ANSWERED BY THE GLOB, NOT BY THE NAME (#1881 review, round 4 P1): a file whose
+    # stat failed is unnamed but NOT absent, and treating it as absent reopened the 2 MB window.
+    session_had_file = bool(session_file_hits(session_id))
     session_file = session_file_for(session_id)
     session_base = transcript_offset(session_file)
-    may_await_new_file = bool(session_id) and session_file is None
+    may_await_new_file = bool(session_id) and not session_had_file
 
     try:
         sent = cmux("send", "--workspace", workspace, text)

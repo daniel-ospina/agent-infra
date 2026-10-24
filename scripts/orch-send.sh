@@ -213,10 +213,18 @@ case "$cmux_payload_verdict" in
     echo "$LABEL:   Re-send ONLY if the pane no longer holds it — a re-send can duplicate the order."
     exit 6 ;;
   *)
-    echo "$LABEL: SENT BUT NOT VERIFIED — the payload TAIL is not on the pane and not in the transcript."
-    echo "$LABEL:   cmux send returns OK while delivering only a PREFIX under load (#1187),"
-    echo "$LABEL:   so this send is NOT recorded as delivered. CHECK THE PANE FIRST: a lane queued"
-    echo "$LABEL:   behind a busy turn can take a minute or more to flush its transcript."
+    # ⛔ IT MUST NOT ASSERT WHAT IT DID NOT OBSERVE (#1881 review, round 4 — non-blocking P2). This arm
+    # also receives the case where `cmux send` ITSELF exited non-zero: nothing was typed and neither
+    # the pane nor the transcript was read, so "SENT" and "the TAIL is not on the pane" were both
+    # claims about evidence that was never gathered (a shimmed `cmux` whose send exits 1 — "Access
+    # denied" — reaches exactly here). The direction stays fail-closed (exit 6, nothing recorded as
+    # delivered), but the wording names the two branches and points at the checker's own
+    # diagnostics, which distinguish a refused send from a lost tail.
+    echo "$LABEL: NOT VERIFIED AS DELIVERED — the payload tail was not confirmed."
+    echo "$LABEL:   Either cmux refused the send (nothing was typed) or it delivered a PREFIX under"
+    echo "$LABEL:   load (#1187); the checker's diagnostics below say which when it printed any."
+    echo "$LABEL:   CHECK THE PANE FIRST: a lane queued behind a busy turn can take a minute or more"
+    echo "$LABEL:   to flush its transcript."
     echo "$LABEL:   Re-send only once the pane shows the order is absent; for a long body, write it"
     echo "$LABEL:   to a file and send a short one-line pointer (newlines are collapsed anyway)."
     if [ -s "$_cmux_payload_err" ]; then
