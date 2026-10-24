@@ -1363,7 +1363,9 @@ claim_snapshot() {
   # header-less snapshot falls back to a fresh mtime, so every key then read `claim-absent` (FREE)
   # while the cycle log printed `read=ok refs=0`. That is the "an empty one reads UNOWNED" state
   # this header exists to refuse, reached from the write side. Fail closed instead: publish nothing,
-  # keep the previous (age-guarded) snapshot, and report the fetch as failed.
+  # keep the previous (age-guarded) snapshot, and report the failure as a WRITE failure
+  # (`CLAIM_SNAPSHOT_WRITE=failed`) — NOT as a fetch failure, because the fetch may well have
+  # answered, and the caller logs the two differently.
   if { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp" 2>/dev/null \
      && mv -f "$tmp" "$out" 2>/dev/null; then
     write=ok
