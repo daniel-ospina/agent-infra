@@ -1104,6 +1104,34 @@ assert_contains "$out" "REAP" "a 1:08:30 idle shell that predates HEAD is demote
 absent "$W_K6/.venv" "the env was actually removed"
 assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell:" "…and the demotion is named"
 
+# ── K7: the store cap may not TRUNCATE the scan into "no live holder" (#2721 review round 2, P2) ──
+# The cap is a runaway guard, and its first version counted only the cwd+tmux tables — so on a host
+# with no lsof (`REAP_VENV_ALLOW_DEGRADED_CWD=1`) and no tmux server it collapsed to 4, and a worktree
+# with five holders was truncated at the fourth and read as UNHELD, reaping a live lane's env. The
+# fifth holder here is a `python3` (never demotable), so the verdict must be KEEP: reaching it is the
+# property, and the pre-fix tree stops one row short and prints REAP.
+RK7="$(newrepo k7)"
+W_K7="$(mkwt "$RK7" five)"
+mkvenv "$W_K7"
+K7_TS=$(( $(date +%s) + 600 ))
+GIT_AUTHOR_DATE="@$K7_TS" GIT_COMMITTER_DATE="@$K7_TS" \
+  git -C "$W_K7" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD after the holders sat down"
+K7_CANON="$(canon "$W_K7")"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 4 ]; do
+    i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((5000 + i))" "$K7_CANON" "$i"
+  done
+  printf '5100 1 /usr/bin/python3 %s/.venv/bin/python\n' "$K7_CANON"
+} > "$T/k7-ps.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k7-ps.txt" FAKE_LSOF_FAIL=1 \
+        REAP_VENV_PROC_ROOT="$T/no-proc" REAP_VENV_ALLOW_DEGRADED_CWD=1 FAKE_ETIMES=600 \
+        --worktree "$W_K7" --apply)"
+assert_contains "$out" "KEEP" "the scan reaches the FIFTH holder and keeps the env (the cap does not truncate)"
+assert_contains "$out" "live-argv" "…and the verdict names the argv witness that decided it"
+exists "$W_K7/.venv" "the env survives — an idle shell and a working lane share the worktree"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

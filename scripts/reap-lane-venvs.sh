@@ -754,10 +754,18 @@ stale_shell_holder() {
 # another's.
 live_witness() {
     local canon="$1" hit pid note="" seen="" cap n=0
-    cap=$(( $(wc -l <"${CWD_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${TMUX_TABLE:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
+    # The cap is a RUNAWAY GUARD, not a schedule: it must exceed the number of DISTINCT holders any
+    # probe could report, so it counts EVERY table — including PS, which the argv arm reads (review
+    # round 2, P2: counting only cwd+tmux made the cap collapse to 4 on a host with no lsof and no
+    # tmux server, and a worktree with five holders was then truncated and read as unheld).
+    cap=$(( $(wc -l <"${CWD_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${TMUX_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${PS_TABLE:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
     [ "$cap" -ge 4 ] || cap=4
     while hit="$(tmux_witness_for "$canon" "$seen")"; do
-        n=$((n + 1)); [ "$n" -le "$cap" ] || break
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-tmux-pane\t%s\n' "$hit"; return 0
+        fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pane_pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
             note="$note pid=$pid(tmux-pane)"
@@ -768,7 +776,11 @@ live_witness() {
         fi
     done
     while hit="$(cwd_witness_for "$canon" "$seen")"; do
-        n=$((n + 1)); [ "$n" -le "$cap" ] || break
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-cwd\t%s\n' "$hit"; return 0
+        fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
             note="$note pid=$pid(cwd)"
@@ -779,7 +791,11 @@ live_witness() {
         fi
     done
     while hit="$(argv_witness_for "$canon" "$seen")"; do
-        n=$((n + 1)); [ "$n" -le "$cap" ] || break
+        n=$((n + 1))
+        if [ "$n" -gt "$cap" ]; then
+            log "stale-shell-scan TRUNCATED at $cap holders — treating this one as LIVE (fail-closed); report it"
+            printf 'live-argv\t%s\n' "$hit"; return 0
+        fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
             note="$note pid=$pid(argv)"
