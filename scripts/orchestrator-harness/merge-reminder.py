@@ -1817,10 +1817,13 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     The standing words are deliberately not cheerwords:
       `DONE`          every count read, and no open P0/P1 remains (goal 1 only);
       `OPEN`          counts read, work remains;
-      `MARKERS-HOLD`  every box reports the main sha as `[current]` and the queue was read — the
+      `MARKERS-HOLD`  every box's harness EQUALS this cycle's `origin/main`, its own `relation` is
+                      `current`, its `source` is not `stamp`, and its `controller` is RUNNING — the
                       MARKERS hold. That is not proof of autonomy: a drifting box or a queue that
-                      grows faster than it lands breaks these markers first;
-      `MARKERS-BROKEN` a box is drifted/unreadable, or the queue could not be read;
+                      grows faster than it lands breaks these markers first. The QUEUE is a separate
+                      reading and never moves this word (a count that did not come back says so);
+      `MARKERS-BROKEN` a box is off-pin, unreadable, seeded (`source=stamp`) or not RUNNING — and
+                      `main` unreadable, because then nothing was compared;
       `NOT-MEASURED`  the cycle never reached the goal read (a SKIPPED cycle), or the counts did
                       not come back.
     """
@@ -1906,19 +1909,32 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     if goal2 == "MARKERS-BROKEN":
         drift_names = ", ".join(f"{r['box']} ({'; '.join(r.get('reasons') or ['not verified'])})"
                                 for r in boxes_bad) or "<unread>"
-        actions.append(
-            f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
-            f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
-            f"every box is the marker; deploy/activate it (the deploy arm below) before anything else, "
-            f"one box at a time.")
+        # ⛔ NO COMPARISON WAS MADE WITHOUT `origin/main`, SO NO COUNT MAY BE STATED. "0/N boxes run
+        # this cycle's main" is a measured claim; with the ref unreadable it is an invented one, and it
+        # is printed in the paragraph the owner acts on.
+        head = (f"**Goal 2 (harness autonomy):** the boxes could not be compared to `origin/main` "
+                f"(the ref was unreadable) — repair the read first; then "
+                if not main_sha else
+                f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
+                f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
+                f"every box is the marker; deploy/activate it (the deploy arm below) before anything "
+                f"else, one box at a time. ")
+        actions.append(head)
     elif goal2 == "MARKERS-HOLD":
+        # ⛔ "queue read (…)" IS A MEASUREMENT CLAIM. The standing is decided by the DRIFT alone now
+        # (round-2 #9), so MARKERS-HOLD is reachable with the queue unread — and the sentence went on
+        # saying "queue read (NOT-MEASURED open, …)" two lines under the ⚠️ that says it was not.
+        queue_note = (f"queue read ({qo} open, {qm} merged today)"
+                      if not (qo_why or qm_why) else
+                      "queue NOT read this cycle (see the ⚠️ line)")
         actions.append(
-            f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) report `[current]`, "
-            f"queue read ({qo} open, {qm} merged today). That is the marker, not proof: keep the queue "
-            f"moving and keep every cell on the pin.")
+            f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) run this cycle's "
+            f"main, deployed AND activated; {queue_note}. That is the marker, not proof: keep the "
+            f"queue moving and keep every cell on the pin.")
     else:
-        actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — the boxes or the queue "
-                       "did not answer. Repair the read (below) instead of assuming the fleet is fine.")
+        actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — the boxes did not "
+                       "answer (no inventory and no local probe), so nothing about the fleet's version "
+                       "is asserted. Repair the read instead of assuming the fleet is fine.")
     actions.append("**Then, and only then, the PR table below:** it is the VEHICLE for the goals, not "
                    "the objective. A PR that moves neither goal is work, not progress.")
     return lines, actions
@@ -2353,6 +2369,12 @@ def main(argv=None) -> int:
                 f"claim refs and origin/main would be read from the WRONG repo (a live cross-box "
                 f"claim would read as claim=none). Run this from {slug}'s checkout")
         main = main_sha(repo_path)
+        if not main:
+            # ⛔ RE-READ IT HERE, NOT AFTER THE DEPLOY ARM. A transient `rev-parse` failure used to
+            # leave the goal block comparing every box against "" while `compose` printed the RECOVERED
+            # sha in the header — one report showing the sha and calling it unreadable, and accusing a
+            # box that was sitting on exactly that sha. The late retry below stays for the OSError path.
+            main = main_sha(repo_path)
         budget = Budget(resolve_gh(o))
         budget.rate_limit()
         # ⛔ ORDER: DRIFT → THE TWO GOALS → THE PR READS (owner's ask, 2026-10-24).

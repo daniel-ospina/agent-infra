@@ -1970,8 +1970,15 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box at the pin with controller=STOPPED cannot hold the marker" \
    "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && qF 'controller=STOPPED' "$MDF" && echo 0 || echo 1)"
-ck "§27 ...and the action says deployed is not activated" \
-   "$(qF 'deployed AND activated' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the action NAMES the box and its reason (not the old \`[current]\` wording)" \
+   "$(qF 'boxes run this cycle' "$MDF" && qF 'cell-1 (controller=STOPPED)' "$MDF" && echo 0 || echo 1)"
+# ...and the MACHINE surface must agree with the report: a consumer that re-derives the marker from
+# `relation` alone reproduces the fail-open this case exists for (the field was dropped once already).
+jout="$(run_sut --json 2>/dev/null)"; rc=$?
+jpin="$(printf '%s' "$jout" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(r["on_pin"], ";".join(r["reasons"]))' 2>/dev/null)"
+ck "§27 --json's drift[] carries on_pin=False for the STOPPED box" \
+   "$(qF 'False' "$jpin" && echo 0 || echo 1)"
+ck "§27 ...and names the reason there too" "$(qF 'controller=STOPPED' "$jpin" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
