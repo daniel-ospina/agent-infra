@@ -55,6 +55,10 @@ _REAL_REST_FILES = getattr(pr, "_rest_files", None)
 # …and the credential resolver, captured for the same reason: the autouse fixture stubs it to "" so
 # no test can borrow this operator's live `gho_*` credential by default (#2136 review round 6).
 _REAL_GH_TOKEN = getattr(pr, "_gh_token", None)
+# …and the TRANSPORT-CAPABILITY check (#2409), captured for the same reason: the autouse fixture stubs
+# it to "capable" so a pass test is not decided by whatever `$O` copy this box happens to have. The
+# tests that drive the guard restore this.
+_REAL_KIND_SUPPORT = getattr(pr, "dispatcher_kind_support", None)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
@@ -97,6 +101,14 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
+    # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
+    # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
+    # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
+    # right answer on a box and the WRONG default here: these tests are about the pass, and on a CI
+    # runner (or this operator's machine) the installed copy decides the answer, which made 42 tests
+    # fail for a reason none of them is about. Stub it to "capable"; the guard itself is driven directly,
+    # in both directions, by `test_a_stale_dispatcher_refuses_the_pass*` below.
+    monkeypatch.setattr(pr, "dispatcher_kind_support", lambda: "", raising=False)
 
 
 # ── 1. the machine's config reaches capacity() ────────────────────────────────────────────
@@ -1581,6 +1593,54 @@ def test_a_row_is_kept_when_the_rc_came_from_pi_not_the_gate(tmp_path, monkeypat
     st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
                 "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     assert pr.void_refused_rows(st) == []
+
+
+def test_a_stale_dispatcher_refuses_the_pass(tmp_path, monkeypatch):
+    """A dispatcher that predates the repair kind must refuse the pass, not silently downgrade (agent-infra#2409).
+
+    `pr-doctor` passes `prfix` so the creation back-pressure gate does not hold its PR-REPAIR workers.
+    The copy it reaches is the DEPLOYED one, which can be older (the same hazard the PIPE-SHAPE note
+    records): an older copy ignores the extra argument with no error and hardcodes `KIND=bg`, so every
+    repair becomes a creation spawn and is refused exactly when the backlog is deep — and nothing at
+    spawn time says the kind was dropped. Both directions are pinned below, because a check that can
+    only refuse would block every real box.
+    """
+    stale = tmp_path / "nonblocking-dispatch.sh"
+    stale.write_text("#!/usr/bin/env bash\nWT=\"${2:-}\"\nKIND=bg; export KIND\n")
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(stale))
+    monkeypatch.setattr(pr, "dispatcher_kind_support", _REAL_KIND_SUPPORT)   # undo the autouse stub
+    why = pr.dispatcher_kind_support()
+    assert "[bg|prfix]" in why, "the refusal must name what the copy cannot take"
+    assert "install.sh" in why, "and the remedy: refresh the deployed copy"
+    assert "KIND=bg" in why, "and the consequence, so an operator can see the drain re-gated"
+
+
+def test_the_SHIPPED_dispatcher_passes_the_kind_check(tmp_path, monkeypatch):
+    """…and the shipped script is CAPABLE, so the guard cannot rot into a permanent false refusal."""
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH",
+                        str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "dispatcher_kind_support", _REAL_KIND_SUPPORT)   # undo the autouse stub
+    assert pr.dispatcher_kind_support() == ""
+
+
+def test_a_missing_dispatcher_is_left_to_the_transport_axis(tmp_path, monkeypatch):
+    """A missing dispatcher is NOT this check's finding: `worker_status` already reports it unreadable,
+    and the pass refuses on that axis (rc 2). Reporting it here too would give one fact two names."""
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(tmp_path / "absent.sh"))
+    monkeypatch.setattr(pr, "dispatcher_kind_support", _REAL_KIND_SUPPORT)   # undo the autouse stub
+    assert pr.dispatcher_kind_support() == ""
+
+
+def test_main_REFUSES_on_a_stale_dispatcher(tmp_path, monkeypatch):
+    """…and `main()` turns the finding into a RECORDED refusal, not a quiet pass."""
+    stale = tmp_path / "nonblocking-dispatch.sh"
+    stale.write_text("#!/usr/bin/env bash\nKIND=bg\n")
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(stale))
+    monkeypatch.setattr(pr, "dispatcher_kind_support", _REAL_KIND_SUPPORT)   # undo the autouse stub
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "record_exit", lambda rc, reason, **kw: rc)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_REFUSING
 
 
 def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):

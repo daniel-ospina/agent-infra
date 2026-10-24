@@ -1157,6 +1157,41 @@ for shape in unparseable-pid no-identity-record; do
 done
 reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
 
+# ── 19) THE LOOP SURVIVES ITS FIRST TICK, AND AN ABSENT MODE IS A LIVE PASS (agent-infra#2424) ────
+# ⛔ THE BUG THIS CASE EXISTS FOR: `run_loop` dispatches `run_role_pass doctor` with NO mode
+# argument, so `"$@"` expanded to nothing and every role's `local dry="$1"` read an UNBOUND `$1`
+# under `set -u` — the loop DIED on its first tick, every tick, on every cell, and nothing recorded
+# it (`doctor` is first in the tick, so it crashed; `reap`/`merge`/`hygiene` carried the same latent
+# bug). The `.desired`-absent fixture above could NOT see it: that loop exits BEFORE its first
+# dispatch, which is exactly why the crash survived three recorded instances on cell-4.
+# ⛔ A SUBCOMMAND-DRIVING test is VACUOUS here: the CLI always binds `$1` (to ""), so only driving
+# `loop` exercises the ABSENT-argument shape. And "it did not crash" is not the criterion either —
+# a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE pass.
+say_case "loop: the first tick dispatches, and an absent mode is a LIVE pass (#2424)"
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not exit
+: > "$T/tmux/sessions"
+OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
+       timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
+case "$OUT" in
+  *"unbound variable"*) bad "loop: DIED on its first tick (the #2424 abort) — $OUT" ;;
+  *)                    ok "loop: the first tick dispatches with no unbound-variable abort" ;;
+esac
+for r in reap doctor merge hygiene; do
+  st="$T/o/state/roles/$r.state"
+  if [ ! -f "$st" ]; then bad "loop: role '$r' recorded NO pass (its state file is missing)"; continue; fi
+  p="$(sed -n 's/^passes=//p' "$st")"
+  res="$(sed -n 's/^last_result=//p' "$st")"
+  { [ -n "$p" ] && [ "$p" -ge 1 ]; } \
+    && ok "loop: role '$r' recorded a pass (passes=$p)" \
+    || bad "loop: role '$r' recorded passes='${p}' — it never completed a pass"
+  case "$res" in
+    *"a rehearsal"*) bad "loop: role '$r' ran as a REHEARSAL (dry-run branch) with no flag — $res" ;;
+    *)               ok "loop: role '$r' ran LIVE (absent mode ≠ --dry-run)" ;;
+  esac
+done
+reset_state; rm -f "$T/o/state/roles/.desired"
+
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

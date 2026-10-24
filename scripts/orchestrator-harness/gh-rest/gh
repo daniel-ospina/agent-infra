@@ -409,13 +409,21 @@ out=[]
 for c in runs:
     st=(c.get("status") or "").lower(); cc=(c.get("conclusion") or "").lower()
     # gh reports the conclusion once a run completes, otherwise the live status.
+    # ⛔ `startedAt`/`completedAt` ARE PART OF THE PROJECTION, NOT JUST THE ALLOW-LIST. They were in
+    # CHECK_FIELDS (so `gh pr checks --json ...,startedAt` passed the fields check and was NOT
+    # delegated) but were never emitted, so every caller that ordered check runs by attempt got
+    # `undefined` on every installed box — silently. MEASURED: the lander newest-attempt dedupe
+    # (`all(x.get("startedAt"))`) was inert through this adapter, so a re-run that came back green
+    # still read `1 FAILED check(s)`. An allow-list entry without a projection is a silent hole.
     out.append({"name":c.get("name"),"state":(cc if st=="completed" else st) or "pending",
                 "workflow":((c.get("app") or {}).get("slug") or ""),"link":c.get("details_url"),
-                "status":st,"conclusion":cc})
+                "status":st,"conclusion":cc,
+                "startedAt":c.get("started_at"),"completedAt":c.get("completed_at")})
 for s in stat:
     out.append({"name":s.get("context"),"state":(s.get("state") or "").lower() or "pending",
                 "workflow":(s.get("creator") or {}).get("login") or "","link":s.get("target_url"),
-                "status":"","conclusion":""})
+                "status":"","conclusion":"",
+                "startedAt":s.get("created_at"),"completedAt":s.get("updated_at")})
 print(json.dumps(out))' | emit || exit 1
   exit 0 ;;
 
