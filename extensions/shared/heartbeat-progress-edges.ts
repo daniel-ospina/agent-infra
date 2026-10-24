@@ -793,6 +793,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
   },
   {
+    name: "HYGIENE_TMP_MIN_AGE_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${HYGIENE_TMP_MIN_AGE_S:-3600}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh §temp — a dir whose embedded pid is dead AND whose mtime is past this floor is reaped, while a FRESH one (dead pid, written seconds ago) is KEPT with its reason; the `> 0` bound is refused at load by cloud-cell-doctor.sh's numeric validation, because a zero floor leaves a recycled pid as the only proof a temp dir is idle",
+    note: "#2573 — how long a `cloud-cell-<pid>.<rand>` temp dir must have been untouched before the hygiene role may reclaim it, once its embedded pid is provably gone. The pid is the primary proof; this floor is the SECOND gate that covers pid RECYCLING (the name's pid can be dead now and have belonged to something else by the time the dir was written). A zero floor makes the recycling hole unbounded, which is why the loader refuses it by name rather than silently accepting a vacuous bound.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",
